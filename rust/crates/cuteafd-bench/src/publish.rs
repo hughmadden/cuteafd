@@ -97,12 +97,17 @@ const FAMILIES: [&str; 6] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash"
 
 fn layout_label(p: &Placed) -> Option<&str> {
     p.dir.file_name()?.to_str()?.rsplit_once(&p.report.server.hardware.slug())
-        .map(|(_, label)| label.trim_start_matches('-')).filter(|label| !label.is_empty())
+        .map(|(_, label)| without_release_candidate(label.trim_start_matches('-'))).filter(|label| !label.is_empty())
+}
+
+fn without_release_candidate(name: &str) -> &str {
+    name.rsplit_once("-rc").filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(name, |(name, _)| name)
 }
 
 // Smoke matrix entry names are appended by cli::labeled_dir, not stored in report.id.
 fn reference_layout(p: &Placed) -> Option<u8> {
-    let name = p.dir.file_name()?.to_str()?;
+    let name = without_release_candidate(p.dir.file_name()?.to_str()?);
     if name.ends_with("-min") { Some(1) }
     else if name.ends_with("-max") { Some(2) }
     else { None }
@@ -144,7 +149,9 @@ fn basic_groups(placed: &[Placed]) -> BTreeMap<(usize, String, String), Vec<&Pla
             hardware.push('-');
             hardware.push_str(label);
         }
-        newest.entry((order, family, checkpoint(r), hardware)).or_insert(p);
+        newest.entry((order, family, checkpoint(r), hardware)).and_modify(|current| {
+            if (p.report.created.as_str(), &p.dir) > (current.report.created.as_str(), &current.dir) { *current = p; }
+        }).or_insert(p);
     }
     let mut groups: BTreeMap<(usize, String, String), Vec<&Placed>> = BTreeMap::new();
     for ((order, family, name, _), p) in newest {
@@ -207,6 +214,21 @@ fn quality_cell(b: &crate::report::Baseline) -> String {
     }
 }
 
+// Publication notes are report data; escape text and restrict links to archived reports.
+fn caveat(p: &Placed) -> String {
+    let Some(note) = p.report.server.setting("qualification.caveat") else { return String::new() };
+    let escaped = crate::render::svg::escape(note);
+    let mut text = escaped.strip_prefix("FAIL: not recommended.").map_or_else(|| escaped.clone(),
+        |rest| format!("<b>FAIL: not recommended.</b>{rest}"));
+    if let (Some(href), Some(label)) = (p.report.server.setting("qualification.caveat-link"),
+        p.report.server.setting("qualification.caveat-link-label")) {
+        if href.starts_with("benchmarks/") && !href.split('/').any(|part| part == "..") {
+            text.push_str(&format!("<a href=\"{}\">{}</a>.", crate::render::svg::escape(href), crate::render::svg::escape(label)));
+        }
+    }
+    format!("<br><sub>{text}</sub>")
+}
+
 /// The root README's results: one row per checkpoint (model and quant linking to
 /// its family page, then its three reference-column cards, each linking to the
 /// card SVG), then the same rows as a compact table.
@@ -232,13 +254,13 @@ pub fn results(placed: &[Placed]) -> String {
             else { "—" }), |p| {
             if let Some(reason) = p.report.no_fit_reason() {
                 return format!("<td width=\"27%\" valign=\"top\"><a href=\"{}\">doesn't fit 1× 5090 (32 GB) + {} Sparks</a>\
-                    <br><sub>{}</sub></td>", link(&p.dir, "report.json"), p.report.server.hardware.sparks.len(),
-                    crate::render::svg::escape(reason));
+                    <br><sub>{}</sub>{}</td>", link(&p.dir, "report.json"), p.report.server.hardware.sparks.len(),
+                    crate::render::svg::escape(reason), caveat(p));
             }
             let svg = link(&p.dir, "card.svg");
             format!("<td width=\"27%\" valign=\"top\"><a href=\"{svg}\"><img src=\"{svg}\" alt=\"{} on {}\"></a>\
-                <br><sub>{}</sub></td>", p.report.server.checkpoint(), p.report.server.hardware_line(),
-                short_hardware(&p.report))
+                <br><sub>{}</sub>{}</td>", p.report.server.checkpoint(), p.report.server.hardware_line(),
+                short_hardware(&p.report), caveat(p))
         });
         out.push_str(&format!("<tr>\n<td width=\"19%\" valign=\"top\"><a href=\"docs/models/{family}.md\"><b>{}</b></a>\
             <br><sub>{}</sub><br><sub>{}</sub></td>\n{}\n{}\n{}\n</tr>\n", family_title(family),
@@ -660,6 +682,50 @@ mod tests {
         let html = results(&[same_hw.clone(), minimum]);
         assert!(html.contains("(qwen38-exl3-vision)"));
         assert!(html.contains(&link(&same_hw.dir, "report.svg")));
+    }
+
+    #[test]
+    fn release_candidates_share_card_identity_and_newest_wins() {
+        let mut old = marked("older", 1, None);
+        old.dir = crate::cli::labeled_dir(Path::new("."), &old.report, Some("model-min"));
+        let mut rc2 = old.clone();
+        rc2.report.created = "2026-10-10T00:00:00Z".into();
+        rc2.dir = crate::cli::labeled_dir(Path::new("."), &rc2.report, Some("model-min-rc2"));
+        let mut rc3 = rc2.clone();
+        rc3.report.id = "newest".into();
+        rc3.report.created = "2026-10-11T00:00:00Z".into();
+        rc3.dir = crate::cli::labeled_dir(Path::new("."), &rc3.report, Some("model-min-rc3"));
+        assert_eq!(reference_layout(&rc3), Some(1));
+        assert_eq!(layout_label(&rc3), Some("model-min"));
+        let reports = [old, rc2, rc3.clone()];
+        let rows = reference_rows(&reports);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3.report.id, "newest");
+        assert_eq!(basic_groups(&[rc3]).values().next().unwrap().len(), 1);
+        assert_eq!(without_release_candidate("model-max-rc3"), "model-max");
+        assert_eq!(without_release_candidate("model-min-rcfoo"), "model-min-rcfoo");
+    }
+
+    #[test]
+    fn publication_caveats_are_escaped_report_data_for_fit_and_no_fit() {
+        let mut p = marked("with-note-min", 1, None);
+        let setting = |name: &str, value: &str| crate::report::Setting {
+            name: name.into(), value: Some(value.into()), source: "publication".into(), ..Default::default()
+        };
+        p.report.server.configuration.settings.extend([
+            setting("qualification.caveat", "FAIL: not recommended. KL > 0.06. With vision: "),
+            setting("qualification.caveat-link", "benchmarks/qwen4/vision/report.svg"),
+            setting("qualification.caveat-link-label", "vision <on>"),
+        ]);
+        assert_eq!(caveat(&p), "<br><sub><b>FAIL: not recommended.</b> KL &gt; 0.06. With vision: <a href=\"benchmarks/qwen4/vision/report.svg\">vision &lt;on&gt;</a>.</sub>");
+        assert!(results(&[p.clone()]).contains(&caveat(&p)));
+        p.report.server.configuration.settings.iter_mut().find(|s| s.name == "qualification.caveat-link").unwrap().value = Some("javascript:bad".into());
+        assert!(!caveat(&p).contains("href="));
+        p.report.baseline = None;
+        p.report.status = crate::report::RunStatus::Failed;
+        p.report.server.configuration.settings.push(setting("qualification.no-fit", "over budget"));
+        p.report.server.configuration.settings.push(setting("simulated", "5090"));
+        assert!(results(&[p.clone()]).contains(&caveat(&p)));
     }
 
     #[test]

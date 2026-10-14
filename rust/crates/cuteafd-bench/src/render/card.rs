@@ -1,5 +1,5 @@
-//! The 1200×675 share card: model, C1 and concurrent code decode beside 8K
-//! prefill (two headlines for old reports), three content bars, one hardware line, the non-default option
+//! The 1200×675 share card: model, C1 and code decode scaling beside 8K
+//! prefill, three content bars, one hardware line, the non-default option
 //! chips, the build footer and the fidelity badge.
 use super::bodies::{self, chips, content_color, LOGO, LOGO_ASPECT};
 use super::svg::{fit, text_width, Anchor, Doc, Font};
@@ -97,10 +97,13 @@ pub fn card_svg(report: &Report) -> String {
     // Publication evidence belongs in the full report, not the fixed-height option strip.
     let mut options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
         && !s.name.starts_with("provenance.") && !s.name.starts_with("qualification.")
+        && !(s.name == "pool-tokens" && matches!(s.value.as_deref(), Some("0" | "auto")))
         && s.name != "supersedes-checkpoint")
         .map(|s| s.chip()).collect();
-    if hw.power.as_ref().is_some_and(|power| power.capped()) {
-        options.insert(0, "POWER-CAPPED".into());
+    if let Some(power) = hw.power.as_ref().filter(|power| power.capped()) {
+        // Report the longest per-GPU evidence, not a sum of GPU-seconds.
+        let capped = power.gpus.iter().map(|gpu| gpu.cap_seconds).fold(0.0, f64::max);
+        options.insert(0, format!("POWER-CAPPED {}", seconds(capped)));
     }
     // Only two chip rows fit above the footer. Keep overflow in the full report.
     let omitted = |items: &[String]| {

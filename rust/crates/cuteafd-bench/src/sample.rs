@@ -159,6 +159,13 @@ mod tests {
         }], ..Default::default() });
         assert!(!render::card::card_svg(&report).contains("POWER-CAPPED"));
         report.server.hardware.power.as_mut().unwrap().gpus[0].cap_seconds = 0.25;
+        report.server.configuration.settings.push(Setting { name: "pool-tokens".into(), value: Some("0".into()),
+            source: "resolved".into(), ..Default::default() });
+        let card = render::card::card_svg(&report);
+        assert!(card.contains("POWER-CAPPED 250 ms"));
+        assert!(!card.contains("pool-tokens=0"));
+        report.server.hardware.power.as_mut().unwrap().gpus[0].cap_seconds = 5.001;
+        assert!(render::card::card_svg(&report).contains("POWER-CAPPED 5.00 s"));
         for i in 0..10 {
             report.server.configuration.settings.push(Setting { name: format!("long-option-{i}"), value: Some("x".repeat(80)),
                 source: "cli".into(), ..Default::default() });
