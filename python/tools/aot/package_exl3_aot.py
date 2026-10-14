@@ -7,6 +7,8 @@ from pathlib import Path as _Path
 _sys.path[:0] = [str(_Path(__file__).resolve().parents[1] / _d) for _d in ("lib",)]  # sibling tool dirs
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 import gc
 import hashlib
 import json
@@ -582,6 +584,34 @@ def tile_overrides(values: list[str], capacities: list[int], role: str, paired: 
     return result
 
 
+def compile_variant(payload):
+    args, raw, width, experts, capacity, topk, dtype, run_options = payload
+    import _pinned_sparkinfer
+    from export_b12x_exl3_aot import export
+    from _export_jobs import export_slot
+    import torch
+    with export_slot():
+        meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **run_options)
+        core = raw / 'libcuteafd_exl3.so'
+        subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
+            f'-I{args.cuda_include}', str(raw / 'v41_exl3_bridge.cc'),
+            str(raw / 'v41_exl3_core.o'), str(raw / 'v41_exl3_sum.o'),
+            f'-L{args.cuda_libdir}', '-lcudart', f'-L{args.runtime.parent}',
+            '-lcute_dsl_runtime', '-Wl,-z,defs',
+            '-o', str(core)], check=True)
+        runtime_files = ['v41_exl3.json', 'trellis_lut.bin', 'libcuteafd_exl3.so']
+        if meta['requires_route_preparation']:
+            routes = raw / 'routes'
+            subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
+                f'-I{args.cuda_include}', str(routes / 'v41_exl3_routes.cc'),
+                str(args.cuda_driver), '-Wl,-z,defs',
+                '-o', str(routes / 'libv41_exl3_routes.so')], check=True)
+            runtime_files += ['routes/v41_exl3_routes.json', 'routes/libv41_exl3_routes.so']
+        gc.collect()
+        torch.cuda.empty_cache()
+    return meta, runtime_files
+
+
 def build(args: argparse.Namespace) -> None:
     validate_destination(args.output)
     paired = getattr(args, 'paired_tp4', False)
@@ -607,7 +637,6 @@ def build(args: argparse.Namespace) -> None:
     tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, paired, geometry)
     # Import the source-pinned compiler only for builds, never package checks.
     import _pinned_sparkinfer
-    from export_b12x_exl3_aot import export
     import torch
 
     props = torch.cuda.get_device_properties(0)
@@ -624,6 +653,7 @@ def build(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix='.exl3-package-', dir=args.output.parent) as temporary:
         stage = Path(temporary)
         variants = []
+        pending = []
         for profile, width, experts, topk, dtype, destinations in profiles:
             for capacity in capacities:
                 tile = tiles.get(profile, {}).get(capacity)
@@ -671,58 +701,51 @@ def build(args: argparse.Namespace) -> None:
                     exports.append((schedule, profile_dir.with_name(f'{profile_dir.name}+{schedule}')
                                     / raw.name, {**options, **schedule_options}))
                 for schedule, raw, run_options in exports:
-                    meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **run_options)
-                    core = raw / 'libcuteafd_exl3.so'
-                    subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
-                        f'-I{args.cuda_include}', str(raw / 'v41_exl3_bridge.cc'),
-                        str(raw / 'v41_exl3_core.o'), str(raw / 'v41_exl3_sum.o'),
-                        f'-L{args.cuda_libdir}', '-lcudart', f'-L{args.runtime.parent}',
-                        '-lcute_dsl_runtime', '-Wl,-z,defs',
-                        '-o', str(core)], check=True)
-                    runtime_files = ['v41_exl3.json', 'trellis_lut.bin', 'libcuteafd_exl3.so']
-                    if meta['requires_route_preparation']:
-                        routes = raw / 'routes'
-                        subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
-                            f'-I{args.cuda_include}', str(routes / 'v41_exl3_routes.cc'),
-                            str(args.cuda_driver), '-Wl,-z,defs',
-                            '-o', str(routes / 'libv41_exl3_routes.so')], check=True)
-                        runtime_files += ['routes/v41_exl3_routes.json', 'routes/libv41_exl3_routes.so']
-                    for destination in destinations:
-                        directory = f'{destination}/m{capacity}' + ('' if schedule is None else f'-{schedule}')
-                        for name in runtime_files:
-                            target = stage / directory / name
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(raw / name, target)
-                        variant = {'directory': directory, **{key: meta[key] for key in
-                            ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits', 'blocks_per_sm')}}
-                        if 'tile' in meta:
-                            # What the compiler actually resolved, always: the pinned
-                            # policy varies per capacity (m16 is the known special case),
-                            # so a build without an override still has a real tile.
-                            variant['tile'] = meta['tile']
-                        if tile is not None and schedule is None:
-                            # An A/B tile override applies to the default export; a
-                            # schedule variant brings its own options.
-                            variant['tile_requested'] = list(tile)
-                        if 'route_block' in meta:
-                            variant['route_block'] = meta['route_block']
-                        if meta.get('token_major_rotation'):
-                            variant['token_major_rotation'] = True
-                        if meta.get('fused_input_rotation'):
-                            variant['fused_input_rotation'] = True
-                        if meta.get('warp_specialized'):
-                            variant['warp_specialized'] = True
-                        if 'input_format' in meta:
-                            variant['input_format'] = meta['input_format']
-                        if schedule is not None:
-                            variant['schedule'] = schedule
-                            variant['decode_schedule'] = meta['decode_schedule']
-                        variants.append(variant)
-                        if paired:
-                            variants[-1]['paired_boundary'] = meta['paired_boundary']
-                    # Large prefill exports must not retain another capacity's arenas.
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    pending.append((raw, width, experts, capacity, topk, dtype, run_options,
+                                    destinations, schedule, tile))
+        from _export_jobs import export_jobs
+        jobs = min(export_jobs(), len(pending))
+        print(f'EXL3 variants: {len(pending)} independent exports, {jobs} workers', flush=True)
+        payloads = [(args, *item[:7]) for item in pending]
+        # Spawn: a CUDA context must never be inherited through fork. Ordered
+        # map keeps manifest order identical to the sequential exporter.
+        with ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context('spawn'),
+                                 max_tasks_per_child=1) as pool:
+            for item, (meta, runtime_files) in zip(pending, pool.map(compile_variant, payloads)):
+                raw, width, experts, capacity, topk, dtype, run_options, destinations, schedule, tile = item
+                for destination in destinations:
+                    directory = f'{destination}/m{capacity}' + ('' if schedule is None else f'-{schedule}')
+                    for name in runtime_files:
+                        target = stage / directory / name
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(raw / name, target)
+                    variant = {'directory': directory, **{key: meta[key] for key in
+                        ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits', 'blocks_per_sm')}}
+                    if 'tile' in meta:
+                        # What the compiler actually resolved, always: the pinned
+                        # policy varies per capacity (m16 is the known special case),
+                        # so a build without an override still has a real tile.
+                        variant['tile'] = meta['tile']
+                    if tile is not None and schedule is None:
+                        # An A/B tile override applies to the default export; a
+                        # schedule variant brings its own options.
+                        variant['tile_requested'] = list(tile)
+                    if 'route_block' in meta:
+                        variant['route_block'] = meta['route_block']
+                    if meta.get('token_major_rotation'):
+                        variant['token_major_rotation'] = True
+                    if meta.get('fused_input_rotation'):
+                        variant['fused_input_rotation'] = True
+                    if meta.get('warp_specialized'):
+                        variant['warp_specialized'] = True
+                    if 'input_format' in meta:
+                        variant['input_format'] = meta['input_format']
+                    if schedule is not None:
+                        variant['schedule'] = schedule
+                        variant['decode_schedule'] = meta['decode_schedule']
+                    variants.append(variant)
+                    if paired:
+                        variants[-1]['paired_boundary'] = meta['paired_boundary']
         files = {str(p.relative_to(stage)): {'bytes': p.stat().st_size, 'sha256': digest(p)}
                  for p in sorted(stage.rglob('*')) if p.is_file()}
         manifest = {'schema': 'cuteafd.exl3-package.v1', 'role': args.role,

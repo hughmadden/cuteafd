@@ -304,12 +304,12 @@ def test_wip_dry_run_seed_inside_the_union_is_one_host(tmp_path):
     assert 'Spark targets (5): ostrich,dodo,emu,kiwi,rhea' in out
 
 
-def test_wip_dry_run_legacy_seed_is_spark_zero(tmp_path):
+def test_wip_dry_run_default_seed_is_build_only_kakapo(tmp_path):
     four = '\n'.join(SIX.splitlines()[:12])
     out = _wip_dry_run(tmp_path, four, 4)
     assert 'Spark hosts (4): ostrich,dodo,emu,kiwi' in out
-    assert 'seed host: ostrich (serving' in out
-    assert 'Spark targets (3): dodo,emu,kiwi' in out
+    assert 'seed host: kakapo (build-only' in out
+    assert 'Spark targets (4): ostrich,dodo,emu,kiwi' in out
 
 
 def test_build_only_seed_gets_a_build_container_and_never_a_distribution():

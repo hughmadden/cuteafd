@@ -22,7 +22,7 @@ def _dispatch():
 
 @pytest.mark.parametrize('setting,host,expected', [
     ('auto', '', 'capped turn'),
-    ('auto', 'oliver', 'capped remote turn'),
+    ('auto', 'oliver', 'remote capped turn'),
     ('remote', '', 'remote turn'),
     ('capped', 'oliver', 'capped turn'),
     ('turn', 'oliver', 'turn'),

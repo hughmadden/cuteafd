@@ -123,6 +123,7 @@ foreach(family IN LISTS CUTEAFD_V41_EXL3_BIT_FAMILIES)
       --cuda-driver "$<TARGET_FILE:CUDA::cuda_driver>"
       --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
     DEPENDS "${CUTEAFD_EXL3_TOOL}" "${CUTEAFD_EXL3_CONFIG_STAMP}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/_export_jobs.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_routes_aot.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
@@ -236,6 +237,7 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
       --cuda-driver "$<TARGET_FILE:CUDA::cuda_driver>"
       --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
     DEPENDS "${CUTEAFD_EXL3_TOOL}" "${CUTEAFD_EXL3_CONFIG_STAMP}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/_export_jobs.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_routes_aot.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

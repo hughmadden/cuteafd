@@ -77,7 +77,7 @@ mkdir -p "$lock_dir"
 # open in a uid container); each slot file is the host's real lock inode.
 container_lock_dir="/tmp/cuteafd-build-locks"
 docker_args+=(-e "CUTEAFD_LOCK_DIR=$container_lock_dir" --tmpfs "$container_lock_dir:mode=1777")
-for ((slot = 0; slot < ${CUTEAFD_BUILD_SLOTS:-3}; slot++)); do
+for ((slot = 0; slot < ${CUTEAFD_BUILD_SLOTS:-5}; slot++)); do
   slot_name="build.lock"
   ((slot == 0)) || slot_name="build.lock.$slot"
   touch "$lock_dir/$slot_name"
