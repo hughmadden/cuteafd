@@ -1,6 +1,7 @@
 # Issue #100: single-pass wide W8A8 GEMM in `native/shared/cuda/fp8_gemv.cu`
 
-Worktree `~/Developer/cuteafd-ds-k100`, branch `duel/ds-100` (not pushed), based on `origin/work/p0`.
+Worktree `~/Developer/cuteafd-ds-k100`, branch `duel/ds-100`, rebased onto `origin/work/p0`
+(`e123753b`) and pushed; PR #227 against `work/p0`.
 One file changed: `native/shared/cuda/fp8_gemv.cu`, +139/-4. One file added:
 `native/tests/fp8_gemv_wide_selftest.cu` (the standalone harness).
 
@@ -233,6 +234,44 @@ Where the win comes from, per 128-row block of the row height (16 blocks at M = 
   914 us = 1.47 TB/s, KV 134 MB / 85 us = 1.58 TB/s), i.e. at the memory system, with the activation
   tiles (2.6 MB slabs) reused out of cache across the 64 column-CTAs.
 
+## Serving sanity (GLM 5.3 Flash min + DFlash2, one launch)
+
+Run on the rebased branch (`wip-cards --cards glm53f-exl3-min --arm candidate=ds-k100-glmf-min:k`,
+1 RTX PRO 6000 `--wip k` + 2 Sparks on rhea/moa, DFlash2 attached), through the repo's own smoke
+driver. Baseline column is the card-refresh GLMF EXL3 min run
+(`~/.cache/cuteafd/builds/card-refresh/cards/glm53f-exl3-min/`), a different base image
+(`v2.0.0` vs this slot's `v2.0.0-rc2`), so the deltas are informational, not a controlled A/B.
+
+| GLMF EXL3 min, DFlash2 | card refresh (baseline) | this branch |
+| --- | --- | --- |
+| fidelity KL | 0.035519193704443675 | **0.035519193704443675** |
+| top-1 | 0.9551451187334924 | **0.9551451187334924** |
+| prefix-cache exact restore | pass | pass |
+| spec lossless (DFlash2, drafts on/off) | 128/128 identical | **128/128 identical** |
+| decode tok/s, drafts on | 96.2 | 89.7 |
+| decode tok/s, drafts off | 60.5 | 60.9 |
+| C1 code tok/s | 89.6 | 90.5 |
+| C8 aggregate tok/s | (not run) | 222.2 |
+| 8K prefill tok/s | 4,739 | 5,156 |
+| KV pool | 2,097,152 | 2,097,152 |
+| readiness | 42.9 s | 40.2 s |
+| smoke total (load + checks) | 3m 37s | 3m 22s |
+| launch -> ready | 104.5 s | 91.0 s |
+| driver wall | 8m 29s (3m 29s queue) | 39m 30s (35m 46s queue) |
+
+The change is exercised on this path, not merely loaded: the coordinator logs
+`fp8_prefill=[Mla, Ffn]` (prefill W8A8 over MLA and FFN, rows far past 64 -> the wide route) and
+`draft_linear=W8a8` for the DFlash2 drafter. Decode and verify stay at `plain_rows=[1,4,8,16,32,64]`
+and `verify_rows=64`, i.e. at or below the 64-row gate, so they run the byte-identical non-wide path
+by construction — which is why the KL and top-1 land on the baseline's numbers to the last digit
+(0 differing FP32 bits is proved in machine code above, not inferred from this run).
+
+The drafts-on decode figure (89.7 vs 96.2) is the one number that moved backwards. It is a single
+unpaired 128-token window on shared hardware and it is on the <=64-row path the SASS diff shows is
+byte-identical, so it is not attributable to this change; the quality gate (128/128 identical tokens,
+exact cache, KL/top-1 unchanged) is what the smoke is for and it passes. Reported as measured, not
+re-run, per the repo's warm-up rule.
+
 ## What I did not do
 
 - **No tuning past the stop bar**, per the brief. The pass split (`1408 + 640` for fc) is the derived
@@ -269,6 +308,11 @@ contract cases per shape). The poll loops that watched the first window are the 
 replaced mid-task by one backgrounded blocking command; they cost wall time, not tokens. Compiles are
 cheap because only one small translation unit is built in the cpu container rather than the whole
 native library.
+
+Landing phase (separate, after the measurement above, not included in the 95.6 min): rebase onto
+`origin/work/p0` + PR (minutes), one card-scoped WIP rebuild for the serving check (4 min of build,
+warm caches), and one GPU run -- 35m 46s of that was fair-queue wait behind another agent's 90-minute
+gpu0+gpu1 ticket, 3m 22s of actual smoke.
 
 ## Reproducing
 
