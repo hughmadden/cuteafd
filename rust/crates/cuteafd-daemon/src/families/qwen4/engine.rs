@@ -1576,6 +1576,30 @@ impl<'a> Qwen4Engine<'a> {
         }).collect()
     }
 
+    pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)
+        -> Result<cuteafd_core::PolicyGeometry> {
+        use crate::shared::draft::resource;
+        let remote = match &self.experts {
+            Some(Experts::Spark { transport, .. }) => transport.borrow().transport.installed_grouping()?,
+            _ => Vec::new(),
+        };
+        resource::geometry_with_grouping(&self.draft_homes(snapshot)?, self.cfg.experts, self.cfg.topk,
+            DECODE_ROWS, width, resource::COPY_EXTENSION, |layer, rows| match &self.experts {
+                Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
+                Some(Experts::LocalExl3(local)) => local.resident.borrow().as_ref()
+                    .context("Qwen installed EXL3 window missing")?.1.group_rows(rows),
+                Some(Experts::Tp2 { routed, .. }) => {
+                    let routed = routed.borrow();
+                    let group = routed.experts[0].group_rows(rows)?;
+                    ensure!(routed.experts[1].group_rows(rows)? == group,
+                        "Qwen installed TP2 ranks disagree on grouping");
+                    Ok(group)
+                }
+                Some(Experts::Spark { .. }) => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
+                _ => anyhow::bail!("Qwen layer {layer} has no installed expert grouping"),
+            })
+    }
+
     pub(crate) fn probe_begin(&self, rows: usize) {
         for probe in self.draft_probes.borrow_mut().iter_mut() { probe.begin(rows); }
     }

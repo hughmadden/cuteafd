@@ -1,5 +1,5 @@
 //! dSpark drafter (`mtp.*`): three window-only blocks that propose
-//! `dspark_block_size` tokens after a sequence's next token.
+//! up to `dspark_block_size` tokens after a sequence's next token.
 //!
 //! Every main step taps the target layers' outputs (mean over the mHC
 //! copies), projects them (`main_norm(main_proj(taps))`) and writes each
@@ -24,6 +24,14 @@ use std::ffi::c_void;
 pub(crate) struct DraftRequest<'p> {
     pub placement: &'p Placement,
     pub token: u32,
+}
+
+fn draft_rows(requests: usize, width: usize, native: usize, capacity: usize, inputs: usize) -> Result<usize> {
+    ensure!(width > 0 && width <= native && width < WINDOW, "dSpark width {width} outside 1..={native}");
+    let rows = requests.checked_mul(width).context("dSpark row extent overflow")?;
+    ensure!(requests > 0 && rows <= capacity && inputs == rows,
+        "dSpark {requests} requests at width {width} need {rows} rows (capacity {capacity}, inputs {inputs})");
+    Ok(rows)
 }
 
 fn offset(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -93,12 +101,15 @@ impl<'a> Engine<'a> {
     /// `inputs` holds the block's input tokens per request: the token, then
     /// the noise token (embedded on the device).
     pub fn draft(&self, requests: &[DraftRequest<'_>], inputs: &[u32]) -> Result<Vec<Vec<u32>>> {
+        self.draft_width(requests, inputs, self.cfg.dspark_block_size)
+    }
+
+    /// Runtime width uses the same installed stages and decode-sized workspace.
+    pub fn draft_width(&self, requests: &[DraftRequest<'_>], inputs: &[u32], block: usize) -> Result<Vec<Vec<u32>>> {
         let dspark = self.weights.dspark.as_ref().context("the checkpoint has no dSpark drafter")?;
         ensure!(self.draft_ready(), "dSpark stage experts are not resident on the coordinator");
-        let (h, block) = (self.cfg.dim, self.cfg.dspark_block_size);
-        let rows = requests.len() * block;
-        ensure!(!requests.is_empty() && rows <= self.decode_rows && inputs.len() == rows,
-            "draft step of {} requests", requests.len());
+        let h = self.cfg.dim;
+        let rows = draft_rows(requests.len(), block, self.cfg.dspark_block_size, self.decode_rows, inputs.len())?;
         let slot = &self.decode_workspace;
         if slot.borrow().is_none() {
             *slot.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
@@ -221,5 +232,23 @@ impl<'a> Engine<'a> {
         Ok(drafts.chunks_exact(block * 4)
             .map(|d| d.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect())
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_draft_extent_accepts_only_installed_widths_and_live_rows() {
+        assert_eq!(draft_rows(1, 3, 5, 64, 3).unwrap(), 3);
+        assert_eq!(draft_rows(12, 5, 5, 64, 60).unwrap(), 60);
+        for (requests, width, native, capacity, inputs) in [
+            (0, 5, 5, 64, 0), (1, 0, 5, 64, 0), (1, 6, 5, 64, 6),
+            (13, 5, 5, 64, 65), (2, 5, 5, 64, 9), (2, 5, 5, 64, 11),
+            (1, WINDOW, WINDOW, WINDOW, WINDOW), (usize::MAX, 2, 5, 64, 0),
+        ] {
+            assert!(draft_rows(requests, width, native, capacity, inputs).is_err());
+        }
     }
 }

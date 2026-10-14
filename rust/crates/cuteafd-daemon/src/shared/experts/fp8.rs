@@ -16,6 +16,27 @@ use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Pr
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
+fn traffic_contract(contract: cuteafd_ffi::fp8_moe::Fp8MoeTrafficContract)
+    -> cuteafd_transport::worker_selection::ExpertTrafficContract {
+    use cuteafd_ffi::fp8_moe::Fp8MoeTrafficContract as Ffi;
+    use cuteafd_transport::worker_selection::ExpertTrafficContract as Wire;
+    match contract { Ffi::ExactGrouping => Wire::ExactGrouping,
+        Ffi::ConservativeRouteUpperBound => Wire::ConservativeRouteUpperBound }
+}
+
+fn installed_variants(module: &Fp8MoeModule)
+    -> Result<Vec<cuteafd_transport::worker_selection::InstalledExpertVariant>> {
+    module.info().capacities.iter().map(|&capacity| {
+        let (_, contract) = module.weight_read_group_for_capacity(capacity, 0)?;
+        cuteafd_transport::worker_selection::InstalledExpertVariant::from_piecewise_queries(
+            capacity, traffic_contract(contract), |rows| {
+                let (group, current) = module.weight_read_group_for_capacity(capacity, rows)?;
+                ensure!(current == contract, "FP8 expert traffic contract changes within a capacity");
+                Ok(group)
+            })
+    }).collect()
+}
+
 /// Parallel readers per layer load.
 const READERS: usize = 16;
 
@@ -227,6 +248,7 @@ pub(crate) struct Fp8Experts<'a> {
     pub module: Fp8MoeModule,
     pub tp: usize,
     pub rank: usize,
+    weight_read_bytes: usize,
 }
 
 impl<'a> Fp8Experts<'a> {
@@ -302,14 +324,18 @@ impl<'a> Fp8Experts<'a> {
             let scratch = bf16.scratch_bytes(top)?;
             Ok::<_, anyhow::Error>((bf16, scratch))
         }).transpose()?;
-        let (resident_bytes, scratch_bytes) = resident_admission(Fp8Layer::bytes_for(tensors, tp, rank, slicing)?,
+        let layer_bytes = Fp8Layer::bytes_for(tensors, tp, rank, slicing)?;
+        let weight_read_bytes = tensors.weight_read_bytes_with(tp, rank, slicing)?;
+        ensure!(weight_read_bytes > 0 && weight_read_bytes.checked_mul(shape.experts) == Some(layer_bytes),
+            "FP8 layer read extent does not divide into experts");
+        let (resident_bytes, scratch_bytes) = resident_admission(layer_bytes,
             layers.len(), primary_scratch,
             bf16_module.as_ref().map(|(_, scratch)| *scratch), budget)?;
         tracing::info!(resident_bytes, scratch_bytes, budget, bf16_package = ?bf16_directory,
             "FP8 expert allocation admitted");
         let scratch = DeviceAllocation::new(library, scratch_bytes)?;
         Ok(Self { layers: Vec::with_capacity(layers.len()), scratch,
-            bf16_module: bf16_module.map(|(module, _)| module), module, tp, rank })
+            bf16_module: bf16_module.map(|(module, _)| module), module, tp, rank, weight_read_bytes })
     }
 
     /// Bounded P4 double banks: each checkpoint projection is read once, then
@@ -492,6 +518,29 @@ impl<'a> Fp8Experts<'a> {
     /// Whether the package takes FP8 K32 wire rows (else BF16 rows).
     pub fn wire_input(&self) -> bool {
         self.module.info().wire_input
+    }
+
+    pub fn weight_read_group(&self, rows: usize, bf16: bool)
+        -> Result<(usize, cuteafd_transport::worker_selection::ExpertTrafficContract)> {
+        let module = if bf16 && self.wire_input() {
+            self.bf16_module.as_ref().context("no BF16-input FP8 expert package is loaded")?
+        } else { &self.module };
+        let (group, contract) = module.weight_read_group(rows)?;
+        Ok((group, traffic_contract(contract)))
+    }
+
+    /// Stored checkpoint read extent, excluding scratch and allocator alignment.
+    pub fn weight_read_bytes(&self) -> usize { self.weight_read_bytes }
+
+    pub fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
+        rank: usize, capacity: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
+        use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping};
+        let report = InstalledExpertGrouping::new(loaded, rank, capacity, ExpertGroupingSelector::Fp8Nearest,
+            installed_variants(&self.module)?)?.with_weight_read_bytes(self.weight_read_bytes)?;
+        match &self.bf16_module {
+            Some(module) => report.with_bf16_variants(installed_variants(module)?),
+            None => Ok(report),
+        }
     }
 
     /// Routed experts of resident layer `index` for `rows` input rows (wire

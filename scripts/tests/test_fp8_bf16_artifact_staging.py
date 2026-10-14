@@ -182,8 +182,12 @@ static void mock_launch(void** args, int) {{
 }}
 """)
     source = package_tool.bridge_source(
-        [{"stem": stem, "capacity": 80, "scratch": 65536, "form": "auto", "entry": "mock_launch"}],
-        [1, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
+        [{"stem": stem, "capacity": 80, "scratch": 65536, "form": "auto", "entry": "mock_launch",
+          "weight_read_grouping": ({"contract": "conservative_route_upper_bound",
+              "segments": [{"end_rows": 80, "group_rows": 1}]} if "nvfp4" in geometry else
+              {"contract": "exact_grouping", "segments": [
+                  {"end_rows": 16, "group_rows": 16}, {"end_rows": 80, "group_rows": 64}]})}],
+        [4 if "nvfp4" in geometry else 1, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
     (tmp_path / "bridge.cc").write_text(source)
     library = tmp_path / "bridge.so"
     compiled = subprocess.run([compiler, "-shared", "-fPIC", "-std=c++17", "-pthread",
@@ -194,6 +198,15 @@ static void mock_launch(void** args, int) {{
     lib.cuteafd_fp8moe_destroy.argtypes = [ctypes.c_void_p]
     lib.cuteafd_fp8moe_launch.argtypes = [ctypes.c_void_p, ctypes.c_uint,
         ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_void_p]
+    lib.cuteafd_fp8moe_weight_read_group.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+    group, contract = ctypes.c_uint(), ctypes.c_uint()
+    for form in (0, 1, 2):
+        for rows, expected in ((0, 64), (1, 16), (16, 16), (17, 64), (80, 64)):
+            assert lib.cuteafd_fp8moe_weight_read_group(80, form, rows, ctypes.byref(group), ctypes.byref(contract)) == 0
+            assert (group.value, contract.value) == ((1, 2) if "nvfp4" in geometry else (expected, 1))
+    assert lib.cuteafd_fp8moe_weight_read_group(80, 0, 81, ctypes.byref(group), ctypes.byref(contract)) != 0
+    assert lib.mock_initialized() == 0  # The contract query must not initialize CUDA.
     contexts = []
     for rank in (0, 1):
         lib.mock_device(rank)

@@ -41,21 +41,22 @@ pub(crate) enum Evidence<'a> {
     /// prior's probabilities of them. The binding evaluates the prior, since
     /// its first feature is the request's own history rate.
     Selector { features: &'a [SelectorFeatures], prior: &'a [f64] },
-    /// Nothing but the request's past outcomes (MTP).
-    History,
+    /// The bounded pooled request-history prior (MTP and V4 dSpark, which
+    /// report token IDs but no confidence head).
+    History(&'a [f64]),
     /// A copy span of `match_len` matched tokens.
     Copy { match_len: usize },
 }
 
 impl<'a> Evidence<'a> {
-    /// The prior's per-position probability `p0`, where this evidence has a
-    /// prior today: a head's sigmoid, or the selector fit's output. `History`
-    /// and `Copy` priors arrive with their first bindings (D3/D4); until then
-    /// they carry no neural evidence.
+    /// The prior's per-position probability `p0`: a head's sigmoid, the
+    /// selector fit's output, or pooled history. Standalone copies carry no
+    /// neural evidence.
     pub fn prior(self) -> Option<&'a [f64]> {
         match self {
-            Self::Head(probabilities) | Self::Selector { prior: probabilities, .. } => Some(probabilities),
-            Self::History | Self::Copy { .. } => None,
+            Self::Head(probabilities) | Self::History(probabilities)
+                | Self::Selector { prior: probabilities, .. } => Some(probabilities),
+            Self::Copy { .. } => None,
         }
     }
 }
@@ -84,13 +85,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn head_and_selector_evidence_have_priors() {
+    fn neural_evidence_has_priors_without_relabeling_history_as_a_head() {
         let p = [0.9, 0.5];
         assert_eq!(Evidence::Head(&p).prior(), Some(&p[..]));
         let features = [SelectorFeatures { margin: 1., p_top: 0.8, entropy: 0.3, rank: 0. }];
         let fitted = [0.7];
         assert_eq!(Evidence::Selector { features: &features, prior: &fitted }.prior(), Some(&fitted[..]));
-        assert_eq!(Evidence::History.prior(), None);
+        assert_eq!(Evidence::History(&p).prior(), Some(&p[..]));
         assert_eq!(Evidence::Copy { match_len: 8 }.prior(), None);
         assert_eq!((sigmoid(0.), sigmoid(40.), sigmoid(-40.) > 0.), (0.5, 1., true));
     }

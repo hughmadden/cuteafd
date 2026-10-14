@@ -88,6 +88,7 @@ pub(crate) struct Engine<'a> {
     capture_only: std::cell::Cell<bool>,
     graph_captures: std::cell::Cell<usize>,
     expert_graph_captures: std::cell::Cell<usize>,
+    draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
 }
 
 /// The second GPU of a two-GPU head split (rank 1): its share of every
@@ -503,6 +504,7 @@ impl<'a> Engine<'a> {
             capture_only: std::cell::Cell::new(false),
             graph_captures: std::cell::Cell::new(0),
             expert_graph_captures: std::cell::Cell::new(0),
+            draft_probe: RefCell::new(None),
             rope_window: table(false)?,
             rope_compressed: table(true)?,
             pools,
@@ -1031,6 +1033,8 @@ impl<'a> Engine<'a> {
                     link.expect(1);
                 }
                 self.replay_on(0, key, segment)?;
+                // Preserve owner routes outside capture before another router reuses them.
+                self.probe_ring(layer, w, t, device.is_none() && layer >= local_layers)?;
                 if let Some(w1) = w1 {
                     // Rank 1's segments: layer 0 after rank 0's, then each next one before the
                     // host waits in this layer's exchange.
@@ -1046,6 +1050,7 @@ impl<'a> Engine<'a> {
                     Some(link) if layer >= local_layers => link.world_size(),
                     _ => self.decode_experts(layer, t, w, lane, cap, transports.first_mut(), runtime)?,
                 };
+                self.probe_mark(layer)?;
                 crate::shared::console::layer_mark(layer);
             }
             // The tail: the last post, its taps and the drafter's KV, then the head.
@@ -1777,8 +1782,57 @@ impl<'a> Engine<'a> {
         self.tp2.as_ref().map_or_else(|| self.local.borrow().as_ref().map_or(0, |l| l.layers()), |t| t.layers.end)
     }
 
+    pub(crate) fn local_expert_tp(&self) -> usize { if self.tp2.is_some() { 2 } else { 1 } }
+
     pub fn install_local(&mut self, local: Option<super::local::LocalExperts<'a>>) {
         *self.local.borrow_mut() = local;
+    }
+
+    pub(crate) fn local_group_rows(&self, rows: usize) -> Result<usize> {
+        match &self.tp2 {
+            Some(tp2) => tp2.group_rows(rows),
+            None => self.local.borrow().as_ref().context("local experts")?.group_rows(rows),
+        }
+    }
+
+    pub(crate) fn arm_draft_probe(&self) -> Result<()> {
+        *self.draft_probe.borrow_mut() = Some(crate::shared::draft::probe::RoundProbe::new(
+            self.library, vec![false; self.weights.layers.len()], self.cfg.n_activated_experts, self.decode_rows)?);
+        Ok(())
+    }
+
+    pub(crate) fn probe_begin(&self, rows: usize) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
+    }
+
+    pub(crate) fn probe_end(&self, ok: bool) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+            probe.end();
+            if !ok { let _ = probe.finish(); }
+        }
+    }
+
+    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
+        &[Option<f64>]) -> T) -> Option<T> {
+        let mut probe = self.draft_probe.borrow_mut();
+        let (routes, layer_us) = probe.as_mut()?.finish()?;
+        Some(observe(routes, &layer_us))
+    }
+
+    fn probe_mark(&self, layer: usize) -> Result<()> {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+            // SAFETY: the event is owner-local, outside capture, and read after token selection drains.
+            // The next segment closes this layer's TP2 FFN: shifted post/peer work is residual.
+            unsafe { probe.mark(layer, self.stream)? };
+        }
+        Ok(())
+    }
+
+    fn probe_ring(&self, layer: usize, w: &Workspace<'_>, rows: usize, staged: bool) -> Result<()> {
+        let mut probe = self.draft_probe.borrow_mut();
+        let Some(probe) = probe.as_mut().filter(|probe| probe.wants_ring(staged)) else { return Ok(()) };
+        // SAFETY: the owner router just completed in stream order; no graph captures this copy.
+        unsafe { probe.ring(self.library, layer, w.route_ids.buffer, rows, self.stream) }
     }
 
     fn local_output(&self, _layer: usize, _index: usize) -> Result<*mut c_void> {
@@ -1882,6 +1936,9 @@ impl<'a> Engine<'a> {
         self.profile.borrow_mut().add(Phase::RouterSync, timer);
         let timer = Instant::now();
         let staged = w.router_host.bytes();
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+            probe.staged(layer, &staged[..route_bytes]);
+        }
         let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
         let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
             row_index: (i / topk) as u32,

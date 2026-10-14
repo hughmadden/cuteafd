@@ -236,6 +236,13 @@ impl<'a> Pair<'a> {
         self.ranks[0].borrow().partial()
     }
 
+    pub(crate) fn group_rows(&self, rows: usize) -> Result<usize> {
+        let group = self.ranks[0].borrow().group_rows(rows)?;
+        ensure!(self.ranks[1].borrow().group_rows(rows)? == group,
+            "installed TP2 ranks disagree on expert grouping");
+        Ok(group)
+    }
+
     pub(crate) fn begin_checks(&self, rows: &[usize], force: bool) -> Result<()> {
         let steps = self.steps.get() + 1;
         self.steps.set(steps);

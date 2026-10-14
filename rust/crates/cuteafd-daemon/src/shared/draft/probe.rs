@@ -311,6 +311,63 @@ mod tests {
         assert_eq!(policy.stats().rounds, 1);
     }
 
+    #[test]
+    fn v4_mixed_tp2_ring_and_host_or_device_spark_routes_update_policy() {
+        use crate::shared::draft::{binding::{self, DraftPass, RoundRecord, RoundRequest},
+            clock::RoundTimes, evidence::{DraftSource, Evidence}};
+        use cuteafd_core::{DraftPolicy, LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+        let (layers, topk, rows) = (43, 6, 5);
+        for device_spark in [false, true] {
+            let local = 0..4;
+            let mut routes = RoundRoutes::new(layers, topk);
+            routes.begin(rows);
+            let ids: Vec<u32> = (0..rows * topk).map(|i| i as u32 % 256).collect();
+            let mut staged = vec![false; layers];
+            let mut ringed = vec![false; layers];
+            let mut slots = Vec::new();
+            for layer in 0..layers {
+                if local.contains(&layer) || device_spark {
+                    slots.push((layer, ids.clone()));
+                    ringed[layer] = true;
+                } else {
+                    routes.push(layer, &ids, ROUTE_MASK).unwrap();
+                    staged[layer] = true;
+                }
+            }
+            let bytes = ring(layers, rows, topk, &slots);
+            let mut missing = ringed.clone();
+            missing[2] = false;
+            assert_eq!(complete_routes(&mut routes, &bytes, rows, topk, &missing, &staged,
+                &mut RingCheck::default()), Err(RouteError::Missing(2)));
+            complete_routes(&mut routes, &bytes, rows, topk, &ringed, &staged, &mut RingCheck::default()).unwrap();
+            let geometry = PolicyGeometry {
+                layers: (0..layers).map(|layer| LayerResource { class: Some(if local.contains(&layer) { 0 } else { 1 }),
+                    slice_bytes: if local.contains(&layer) { 9e6 } else { 3e6 }, group_rows: 16, timed: layer > 0 }).collect(),
+                group_rows_by_rows: (0..=64).map(|rows| vec![if rows > 0 && rows <= 4 { 1 } else { 16 }; layers]).collect(),
+                experts: 256, topk: topk as u8, max_requests: 64, max_positions: 37, widths: vec![5],
+                classes: vec![ResourceClass::rtx(), ResourceClass::spark()], regimes: 1,
+            };
+            let mut policy = DraftPolicy::seeded(geometry, PolicySeed::weak(5)).unwrap();
+            let prior = [0.8; 3];
+            let requests = [
+                RoundRequest { id: 1, rows: 4, accepted: 3, source: DraftSource::Neural,
+                    evidence: Some(Evidence::History(&prior)), censor: None },
+                RoundRequest { id: 2, rows: 1, accepted: 1, source: DraftSource::Undrafted, evidence: None, censor: None },
+            ];
+            let layer_us: Vec<_> = (0..layers).map(|layer| (layer > 0).then_some(800.)).collect();
+            binding::observe(&mut policy, &RoundRecord { shared: false, requests: &requests, routes: &routes,
+                layer_us: &layer_us, times: RoundTimes { total_us: 50_000, draft_us: Some(3_000) },
+                draft: Some(DraftPass { width: 5, requests: Some(1) }), predicted: None }).unwrap();
+            assert_eq!(policy.stats().rounds, 1);
+            assert_eq!(policy.stats().verified_rows, 5);
+            assert_eq!(policy.stats().accepted_drafts, 2);
+            assert_eq!(&policy.stats().position_reached[..3], &[1, 1, 1]);
+            let cost = policy.cost_snapshot(false, 2);
+            assert!(cost.layers.iter().all(|class| class[3] == 1.));
+            assert_eq!(cost.draft[4], 1.);
+        }
+    }
+
     /// A ring id past u16 is a route error, never a silent truncation.
     #[test]
     fn ring_rejects_ids_past_u16() {

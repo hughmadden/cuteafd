@@ -437,9 +437,13 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let homes = resource::homes_with_local_tp2(
             &engine.weights.layers.iter().map(|layer| layer.dense).collect::<Vec<_>>(),
             None, &opened.snapshot, Some(ranks), engine.tp2_layers())?;
+        let remote = if homes.iter().any(|home| matches!(home, resource::LayerHome::Remote { .. })) {
+            transport.as_ref().context("GLM installed Spark transport missing")?.transport.installed_grouping()?
+        } else { Vec::new() };
+        let geometry = resource::geometry_with_grouping(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS,
+            d.cfg.drafts(), resource::COPY_EXTENSION, |layer, rows| engine.draft_group_rows(layer, rows, &remote))?;
         engine.arm_draft_probe()?;
-        SharedPolicy::new(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS, d.cfg.drafts(),
-            resource::Prior::Selector(d.selector_fit("glm5", false)?), draft_seed())
+        SharedPolicy::with_geometry(geometry, resource::Prior::Selector(d.selector_fit("glm5", false)?), draft_seed())
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total, mut admitted_total) = (0u64, 0u64, 0u64);
@@ -750,7 +754,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             // Undrafted members still contribute their anchors, routes and emitted tokens.
             let requests: Vec<_> = active.iter().map(|a| (a.ticket.id(),
                 eligible.iter().find(|&&(id, _)| id == a.ticket.id()).map_or(0, |&(_, room)| room))).collect();
-            shared.policy.choose_action(false, &requests, &actions, DECODE_ROWS)?.is_none_or(|action| action == 1)
+            let chosen = shared.policy.choose_action(false, &requests, &actions, DECODE_ROWS)?;
+            crate::shared::draft::binding::trace_action(&shared.policy, false, &requests, &actions, None,
+                DECODE_ROWS, chosen, chosen.unwrap_or(1));
+            chosen.is_none_or(|action| action == 1)
         };
         let timer = Instant::now();
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {

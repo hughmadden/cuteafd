@@ -89,6 +89,26 @@ type Launch = unsafe extern "C" fn(*mut c_void, u32, *const *mut c_void, i32, *m
 type Destroy = unsafe extern "C" fn(*mut c_void);
 type Scratch = unsafe extern "C" fn(u32, *mut u64) -> i32;
 type SetOptions = unsafe extern "C" fn(*mut c_void, u32) -> i32;
+type WeightReadGroup = unsafe extern "C" fn(u32, u32, u32, *mut u32, *mut u32) -> i32;
+
+/// A traffic bound must never masquerade as an installed kernel tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8MoeTrafficContract {
+    ExactGrouping,
+    ConservativeRouteUpperBound,
+}
+
+impl Fp8MoeTrafficContract {
+    fn from_words(group: u32, contract: u32) -> Result<(usize, Self)> {
+        ensure!((1..=4096).contains(&group), "invalid FP8 expert weight-read group {group}");
+        let contract = match contract {
+            1 => Self::ExactGrouping,
+            2 if group == 1 => Self::ConservativeRouteUpperBound,
+            _ => anyhow::bail!("invalid FP8 expert traffic contract {contract} with group {group}"),
+        };
+        Ok((group as usize, contract))
+    }
+}
 
 /// How FP8 expert packages run their large (prefill) row counts
 /// (`cuteafd_fp8moe_set_options`).
@@ -135,6 +155,8 @@ pub struct Fp8MoeModule {
     launch: Launch,
     destroy: Destroy,
     set_options: Option<SetOptions>,
+    weight_read_group: Option<WeightReadGroup>,
+    prefill: Fp8MoePrefill,
     _owner_thread: PhantomData<Rc<()>>,
 }
 
@@ -220,13 +242,14 @@ impl Fp8MoeModule {
         let destroy = *library.get::<Destroy>(b"cuteafd_fp8moe_destroy")?;
         // Packages built before the W8A16 fallback forms have no options.
         let set_options = library.get::<SetOptions>(b"cuteafd_fp8moe_set_options").ok().map(|f| *f);
+        let weight_read_group = library.get::<WeightReadGroup>(b"cuteafd_fp8moe_weight_read_group").ok().map(|f| *f);
         let Fp8MoeMetadata { info, scratch } = metadata;
         let mut context = std::ptr::null_mut();
         let status = create(&mut context);
         ensure!(status == 0, "FP8 expert package initialization failed with CUDA status {status}");
         let context = NonNull::new(context).context("FP8 expert package returned a null context")?;
         Ok(Self { _library: library, context, info, scratch, launch, destroy, set_options,
-            _owner_thread: PhantomData })
+            weight_read_group, prefill: Fp8MoePrefill::Auto, _owner_thread: PhantomData })
     }
 
     /// Selects the programs large row counts run. A package without the
@@ -240,11 +263,35 @@ impl Fp8MoeModule {
         // SAFETY: the context came from this library's create and is still live.
         let status = unsafe { set(self.context.as_ptr(), options) };
         ensure!(status == 0, "FP8 expert package rejected options {options:#x} ({status})");
+        self.prefill = prefill;
         Ok(())
     }
 
     pub fn info(&self) -> &Fp8MoeInfo {
         &self.info
+    }
+
+    /// The loaded capacity and selected form's static traffic contract.
+    pub fn weight_read_group(&self, rows: usize) -> Result<(usize, Fp8MoeTrafficContract)> {
+        let capacity = if rows == 0 { self.info.capacities.last().copied() }
+            else { self.info.capacity_for(rows) }
+            .context("FP8 expert traffic query exceeds installed capacities")?;
+        self.weight_read_group_for_capacity(capacity, rows)
+    }
+
+    pub fn weight_read_group_for_capacity(&self, capacity: usize, rows: usize)
+        -> Result<(usize, Fp8MoeTrafficContract)> {
+        ensure!(self.info.capacities.contains(&capacity) && rows <= capacity,
+            "FP8 expert traffic query names an uninstalled capacity");
+        let query = self.weight_read_group.context(
+            "FP8 expert package lacks installed traffic metadata; rebuild the package")?;
+        let (mut group, mut contract) = (0u32, 0u32);
+        // SAFETY: this static function belongs to the live loaded library and
+        // writes exactly two live words; it neither touches CUDA nor the context.
+        let status = unsafe { query(u32::try_from(capacity)?, self.prefill.option(),
+            u32::try_from(rows)?, &mut group, &mut contract) };
+        ensure!(status == 0, "FP8 expert weight-read grouping query failed ({status})");
+        Fp8MoeTrafficContract::from_words(group, contract)
     }
 
     /// Scratch bytes of the program for `capacity`.

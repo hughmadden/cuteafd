@@ -54,7 +54,7 @@ pub(super) fn geometry(local: impl Fn(usize) -> bool, slice_bytes: impl Fn(usize
         widths: if draft_width > NATIVE_WIDTH { vec![NATIVE_WIDTH, draft_width] } else { vec![draft_width] },
         classes: vec![ResourceClass::rtx(), ResourceClass::spark()],
         // Solo and shared: a lane's round beside an active peer lane.
-        regimes: 2,
+        group_rows_by_rows: Vec::new(), regimes: 2,
     }
 }
 

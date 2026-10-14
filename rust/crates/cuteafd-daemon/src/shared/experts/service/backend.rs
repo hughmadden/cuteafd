@@ -76,6 +76,14 @@ pub(super) enum Execution<'w, 'a> {
 }
 impl<'w, 'a> Execution<'w, 'a> {
     pub(super) fn is_paired(&self) -> bool { matches!(self, Self::Exl3(worker) if worker.is_paired()) }
+    pub(super) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
+        rank: usize) -> Result<Option<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
+        match self {
+            Self::Full(execution) => execution.installed_grouping(loaded, rank).map(Some),
+            Self::Exl3(execution) => execution.installed_grouping(loaded, rank).map(Some),
+            Self::Fp8(execution) => execution.installed_grouping(loaded, rank).map(Some),
+        }
+    }
     pub(super) fn bind_layer(&mut self, weights: &'w Weights<'a>, index: usize) -> Result<()> {
         match (self, weights) {
             (Self::Full(execution), Weights::Full(weights)) => execution.bind_layer(

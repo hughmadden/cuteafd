@@ -579,8 +579,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     let mtp = matches!(drafts, Drafts::Mtp { .. });
     let width = match drafts { Drafts::Mtp { depth, .. } => depth, Drafts::None => 0 };
     let mut shared = if width > 0 {
-        let geometry = resource::geometry(&engine.draft_homes(snapshot)?, engine.cfg.experts, engine.cfg.topk,
-            DECODE_ROWS, width, crate::shared::draft::copy::COPY_EXTENSION)?;
+        let geometry = engine.draft_geometry(snapshot, width)?;
         engine.arm_draft_probe()?;
         let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, cuteafd_core::PolicySeed::weak(width))?;
         crate::shared::draft::apply_length_rule(&mut policy);

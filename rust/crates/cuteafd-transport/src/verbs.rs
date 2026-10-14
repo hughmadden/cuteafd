@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::c_void;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -27,6 +27,17 @@ use std::time::{Duration, Instant};
 
 use crate::synthetic::{expert_response_from_protocol_v2_response, protocol_v2_request_from_expert_request, ProtocolV2ExecutorResponseRef, ProtocolV2ExpertExecutor, ProtocolV2RequestDevicePayload, SyntheticRouteExecutor};
 use crate::{is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
+
+const PERSISTENT_CONTROL_VERSION: u32 = 3;
+const PERSISTENT_CONTROL_LIMIT: usize = 64 * 1024;
+
+fn decode_persistent_control<T: DeserializeOwned>(value: serde_json::Value) -> Result<T> {
+    let version = value.get("wire_version").and_then(serde_json::Value::as_u64);
+    anyhow::ensure!(version == Some(u64::from(PERSISTENT_CONTROL_VERSION)),
+        "persistent expert bootstrap version mismatch: expected {}, received {}; rebuild coordinator and workers together",
+        PERSISTENT_CONTROL_VERSION, version.map_or_else(|| "legacy (missing)".into(), |v| v.to_string()));
+    Ok(serde_json::from_value(value)?)
+}
 
 const VERBS_HOST_RECV_WR_ID: u64 = 0x7256_1001;
 /// Request payloads above this size are staged by several threads. V4.1's
@@ -1774,6 +1785,7 @@ fn is_verbs_host_rdma_poll_timeout(error: &anyhow::Error) -> bool {
 
 struct VerbsHostProtocolV2PersistentClientSession {
     _stream: TcpStream,
+    expert_grouping: Option<crate::worker_selection::InstalledExpertGrouping>,
     addr: SocketAddr,
     endpoint: Arc<NativeRdmaEndpoint>,
     retained_response_ring: Option<RegisteredResponseRing>,
@@ -2119,6 +2131,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             distinct_endpoint_hosts(local_control_host("client"), peer.clone());
         let start = VerbsHostProtocolV2PersistentStart {
             message: "protocol_v2_persistent_start".to_owned(),
+            wire_version: PERSISTENT_CONTROL_VERSION,
             execution_lane,
             request_capacity_wire_bytes,
             response_capacity_wire_bytes,
@@ -2134,7 +2147,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             worker_selection_digest: crate::worker_selection::peer_selection_digest(addr)?,
         };
         write_control(&mut stream, &start)?;
-        let ready: VerbsHostProtocolV2PersistentReady = read_control(&mut reader)?;
+        let ready: VerbsHostProtocolV2PersistentReady = decode_persistent_control(read_control_value(&mut reader)?)?;
         if ready.message != "protocol_v2_persistent_ready" {
             bail!(
                 "verbs-host ProtocolV2 persistent client received invalid ready message {}",
@@ -2208,6 +2221,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         } else { None };
         Ok(Self {
             _stream: stream,
+            expert_grouping: ready.expert_grouping,
             addr,
             endpoint: Arc::new(endpoint),
             retained_response_ring,
@@ -3049,7 +3063,7 @@ fn handle_verbs_host_protocol_v2_connection(
             return handle_mapped_protocol_v2_ring_connection(stream, executor, library, start);
         }
         if message == "protocol_v2_persistent_start" {
-            let start: VerbsHostProtocolV2PersistentStart = serde_json::from_value(value)
+            let start: VerbsHostProtocolV2PersistentStart = decode_persistent_control(value)
                 .context("decoding verbs-host ProtocolV2 persistent start control message")?;
             return handle_verbs_host_protocol_v2_persistent_connection(
                 stream, reader, executor, library, start,
@@ -3347,6 +3361,7 @@ struct VerbsHostProtocolV2RunReady {
 #[derive(Debug, Serialize, Deserialize)]
 struct VerbsHostProtocolV2PersistentStart {
     message: String,
+    wire_version: u32,
     #[serde(default)]
     execution_lane: u32,
     request_capacity_wire_bytes: usize,
@@ -3393,6 +3408,9 @@ pub const VERBS_HOST_WRITE_FLAG_ERROR: u64 = 1 << 63;
 #[derive(Debug, Serialize, Deserialize)]
 struct VerbsHostProtocolV2PersistentReady {
     message: String,
+    wire_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expert_grouping: Option<crate::worker_selection::InstalledExpertGrouping>,
     server_endpoint: VerbsHostRcEndpointDescriptor,
     server_native_endpoint: VerbsHostNativeEndpointDescriptor,
     /// The start's flow label, echoed by a server that connected with it.
@@ -4426,12 +4444,14 @@ fn read_control<T: DeserializeOwned>(reader: &mut BufReader<TcpStream>) -> Resul
 }
 
 fn read_control_value(reader: &mut BufReader<TcpStream>) -> Result<serde_json::Value> {
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line)?;
+    let mut line = Vec::new();
+    let bytes = std::io::Read::by_ref(reader).take((PERSISTENT_CONTROL_LIMIT + 1) as u64).read_until(b'\n', &mut line)?;
     if bytes == 0 {
         bail!("verbs-host ProtocolV2 control plane closed");
     }
-    let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+    anyhow::ensure!(bytes <= PERSISTENT_CONTROL_LIMIT && line.last() == Some(&b'\n'),
+        "invalid or oversized verbs-host bootstrap control frame");
+    let value: serde_json::Value = serde_json::from_slice(&line)?;
     if value.get("message").and_then(serde_json::Value::as_str) == Some("protocol_v2_bootstrap_error") {
         bail!("verbs-host ProtocolV2 bootstrap rejected: {}",
             value.get("error").and_then(serde_json::Value::as_str).unwrap_or("unspecified peer error"));

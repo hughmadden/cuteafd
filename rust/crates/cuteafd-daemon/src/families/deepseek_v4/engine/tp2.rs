@@ -86,6 +86,12 @@ pub(super) struct Tp2State<'a> {
 
 impl Tp2State<'_> {
     pub(super) fn broadcast(&self) -> bool { self.source.get() == RouteSource::Broadcast }
+
+    pub(super) fn group_rows(&self, rows: usize) -> Result<usize> {
+        let group = self.ranks[0].borrow().group_rows(rows)?;
+        ensure!(group == self.ranks[1].borrow().group_rows(rows)?, "TP2 resource grouping differs by rank");
+        Ok(group)
+    }
 }
 
 impl<'a> Engine<'a> {
