@@ -19,9 +19,9 @@ text with `--text`. It does not require a Python package install.
 
 ```sh
 python3 scripts/agents/ext-agent.py start TASK --tool grok --effort high \
-  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief
+  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief --auto-approve
 python3 scripts/agents/ext-agent.py start TASK --tool agy --model gemini-4-argon-high \
-  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief
+  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief --auto-approve
 python3 scripts/agents/ext-agent.py wait TASK --until idle --timeout 600
 python3 scripts/agents/ext-agent.py status TASK --lines 30
 python3 scripts/agents/ext-agent.py transcript TASK --since-last
@@ -37,22 +37,27 @@ python3 scripts/agents/ext-agent.py prune --older-than 24
 `EXT_AGENT_RUNS` selects the private run store (default `~/.cache/ext-agent`).
 Names use letters, digits, underscores and hyphens. A run name is never reused:
 choose a new name to preserve transcripts. `EXT_AGENT_GROK` / `EXT_AGENT_AGY`
-can override the executable path. Preamble and brief are optional; omitting
-both starts at the idle prompt without sending a task. `start` may return
-`starting` with `ready_timeout`; the detached supervisor continues, so wait or
-inspect instead of starting a duplicate. The driver sets auto-approval and
-accepts directory trust for the explicitly selected cwd; only use a trusted
-worktree. It cannot log in for you.
+can override the executable path. Preamble and brief are optional files,
+combined in that order; omitting both starts at the idle prompt without sending
+a task. `start` may return `starting` with `ready_timeout`; the detached
+supervisor continues, so wait or inspect instead of starting a duplicate.
+Without `--auto-approve` the CLI keeps its own approval behavior and a
+directory-trust prompt surfaces at once as `asking`; `--auto-approve`
+explicitly enables the CLI's approval bypass and accepts directory trust for
+the selected cwd. This project authorizes that mode for our drivers, so pass
+`--auto-approve` with a trusted worktree. It is not authority to widen scope,
+merge, push or change defaults. It cannot log in for you.
 
 Multiline messages use bracketed paste followed by Enter. A send while busy
 is queued by the CLI; it is not guaranteed to alter the currently executing
 tool call. `submitted` confirms visible echo or a growing queue counter, not
 that the worker obeyed. On `submission unconfirmed`, inspect screen and
 transcript before resending: the turn may already be queued. Interrupt sends
-Escape; after interrupt, wait for idle before sending a replacement. Stop
-kills the pane and its process descendants and the supervisor. It cannot undo
-already executed commands or stop detached remote work; the worker must clean
-up its hardware/container jobs through the project's tools before stop.
+Ctrl+C for Grok and Escape for Antigravity; after interrupt, wait for idle
+before sending a replacement. Stop kills the pane and its process descendants
+and the supervisor. It cannot undo already executed commands or stop detached
+remote work; the worker must clean up its hardware/container jobs through the
+project's tools before stop.
 
 ## Resume after a restart
 
@@ -71,8 +76,15 @@ Use the same `EXT_AGENT_RUNS`, task name and original brief. The transcript
 cursor is shared by successive driver processes; full `transcript TASK` can
 recover earlier context without advancing it. Tell `main` you adopted the
 run, inspect whether it is busy/asking/error/idle, then continue the normal
-loop. Do not repeat already queued messages, recreate jobs or assume the task
-failed because the old driver disappeared. After stopping a finished run,
+loop. Before steering an adopted run, verify that its launch command in
+`events.jsonl` names the intended real CLI executable: a test killed mid-suite
+can leave fake executable and run-root overrides in the tmux server's
+environment, and a coordinator restarted inside that server inherits them.
+Tests must never use the default tmux server; a launch command that names a
+fake path means the run is not the worker you think it is, so replace it with
+a fresh run from a clean environment. Do not repeat already queued messages,
+recreate jobs or assume the task failed because the old driver disappeared.
+After stopping a finished run,
 `prune` archives exited directories under `<runs>/archive/`, removing them
 from `list` while retaining evidence. `--older-than H` is an age in hours;
 omitting it archives all fully stopped exited runs. Active runs are untouched.

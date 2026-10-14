@@ -281,12 +281,17 @@ Use the interactive stdlib driver for a worker that needs steering or answers:
 
 ```sh
 python3 scripts/agents/ext-agent.py start TASK --tool grok --effort high \
-  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief
+  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief --auto-approve
 python3 scripts/agents/ext-agent.py wait TASK --until idle --timeout 600
 python3 scripts/agents/ext-agent.py transcript TASK --since-last
 python3 scripts/agents/ext-agent.py send TASK 'One concise correction.'
 python3 scripts/agents/ext-agent.py stop TASK
 ```
+
+`--auto-approve` is explicit: without it the CLI keeps its own approval
+behavior and a directory-trust prompt surfaces as `asking` for the driver to
+answer. Our drivers pass it in a trusted worktree; it authorizes approvals
+inside that worktree, not merges, pushes or scope changes.
 
 Give the DeepSeek driver agent
 `scripts/agents/skills/ext-agent-driver/SKILL.md` and the worker's brief.
@@ -294,6 +299,7 @@ The worker cannot SendMessage; its driver reports milestones, unresolved
 questions and validated results to the orchestrator. `wait` blocks instead
 of agent-side polling. `idle` is an available input prompt, not proof the
 task is done. Busy sends are queued; inspect the answer to verify steering.
+`interrupt` uses each CLI's own key: Ctrl+C for Grok, Escape for Antigravity.
 Runs and transcripts live in `EXT_AGENT_RUNS` (default `~/.cache/ext-agent`).
 Antigravity 503s have bounded automatic backoff; state and retry evidence
 are exposed in JSON. Python 3, tmux and authenticated CLIs are required.

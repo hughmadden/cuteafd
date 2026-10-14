@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,7 @@ old = termios.tcgetattr(fd)
 tty.setraw(fd)
 sys.stdout.write('\x1b[?2004h')
 sys.stdout.flush()
-tool = 'grok' if '--always-approve' in sys.argv else 'agy'
+tool = 'grok' if '--minimal' in sys.argv else 'agy'
 prompt = '❯' if tool == 'grok' else '>'
 
 def show(text):
@@ -42,7 +43,7 @@ def idle(answer=''):
     show(answer + '\n' + prompt + '\n? for shortcuts')
 
 signal.signal(signal.SIGTERM, lambda *args: sys.exit(0))
-idle('READY')
+idle('Do you trust the contents of this directory?' if os.environ.get('FAKE_TRUST') else 'READY')
 message = ''
 inside = False
 pending = b''
@@ -63,7 +64,7 @@ try:
             if pending.startswith(b'\x1b') and len(pending) < 6 and inside:
                 break
             char, pending = pending[:1], pending[1:]
-            if char == b'\x1b':
+            if char in (b'\x1b', b'\x03'):
                 message = ''
                 idle('Interrupted')
             elif char in (b'\r', b'\n') and not inside:
@@ -82,7 +83,7 @@ try:
                 while time.monotonic() < deadline:
                     if select.select([fd], [], [], 0.05)[0]:
                         incoming = os.read(fd, 4096)
-                        if incoming == b'\x1b':
+                        if incoming in (b'\x1b', b'\x03'):
                             idle('Interrupted')
                             interrupted = True
                             break
@@ -109,10 +110,23 @@ finally:
 def cli(tmp_path, monkeypatch):
     if not shutil.which('tmux'):
         pytest.skip('tmux is required for the external driver integration tests')
+    # A private socket namespace: the tests never see, stop or race a tmux server
+    # they did not start, including the one a live worker may be using.
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    wrapper = bin_dir / 'tmux'
+    wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(shutil.which('tmux')) +
+                       ' -S ' + shlex.quote(str(tmp_path / 'tmux.sock')) + ' "$@"\n')
+    wrapper.chmod(0o755)
     fake = tmp_path / 'fake-cli'
     fake.write_text(FAKE)
     fake.chmod(0o755)
     run_root = tmp_path / 'runs'
+    monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+    monkeypatch.setenv('TMUX_TMPDIR', str(tmp_path))
+    # -S names the private socket; dropping an inherited TMUX keeps nothing else
+    # inside this test pointing at a server it does not own.
+    monkeypatch.delenv('TMUX', raising=False)
     monkeypatch.setenv('EXT_AGENT_RUNS', str(run_root))
     monkeypatch.setenv('EXT_AGENT_GROK', str(fake))
     monkeypatch.setenv('EXT_AGENT_AGY', str(fake))
@@ -128,8 +142,11 @@ def cli(tmp_path, monkeypatch):
         return json.loads(result.stdout)
 
     yield name, call, tmp_path
-    if (run_root / name / 'meta.json').exists():
-        call('stop', name)
+    try:
+        for meta in run_root.glob('*/meta.json'):
+            call('stop', meta.parent.name)
+    finally:
+        subprocess.run(['tmux', 'kill-server'], capture_output=True, timeout=10)
 
 
 @pytest.mark.parametrize('tool', ['grok', 'agy'])
@@ -160,6 +177,34 @@ def test_start_send_wait_and_transcript(cli, tool):
     assert call('status', name)['state'] == 'exited'
     assert subprocess.run(['tmux', 'has-session', '-t', 'ext-' + name], capture_output=True).returncode
     assert 'File exists' in call('start', name, '--tool', tool, ok=False)['error']
+
+
+def test_explicit_preamble_and_auto_approval_reach_worker(cli):
+    name, call, root = cli
+    preamble, brief = root / 'preamble', root / 'brief'
+    preamble.write_text('PROJECT RULES')
+    brief.write_text('BOUNDED TASK')
+    call('start', name, '--tool', 'grok', '--cwd', str(root),
+         '--preamble', str(preamble), '--brief', str(brief), '--auto-approve')
+    result = call('wait', name, '--until', 'idle', '--timeout', '8')
+    assert result['state'] == 'idle' and not result.get('timed_out')
+    messages = [json.loads(line) for line in (root / 'messages').read_text().splitlines()]
+    assert messages == ['PROJECT RULES\n\nBOUNDED TASK']
+    meta = json.loads((root / 'runs' / name / 'meta.json').read_text())
+    assert meta['auto_approve'] is True
+    launches = [json.loads(line) for line in (root / 'runs' / name / 'events.jsonl').read_text().splitlines()]
+    assert '--always-approve' in next(e['command'] for e in launches if e['event'] == 'launch')
+
+
+def test_default_does_not_accept_directory_trust(cli, monkeypatch):
+    name, call, root = cli
+    monkeypatch.setenv('FAKE_TRUST', '1')
+    result = call('start', name, '--tool', 'grok', '--cwd', str(root))
+    assert result['state'] == 'asking'
+    time.sleep(0.6)
+    events = [json.loads(line) for line in (root / 'runs' / name / 'events.jsonl').read_text().splitlines()]
+    assert not any(e['event'] == 'trust' for e in events)
+    assert not (root / 'messages').exists()
 
 
 def test_asking_then_answer(cli):
@@ -444,6 +489,23 @@ def test_running_background_command_with_prompt_is_busy():
 def test_bare_spinner_with_prompt_is_busy():
     assert driver.Grok().state('⠸ Thinking...\n❯\nGrok 4.7 high', {}) == 'busy'
     assert driver.Agy().state('⠸ Streaming response...\n>\n? for shortcuts', {}) == 'busy'
+
+
+def test_approval_bypass_is_explicit_and_interrupts_are_adapter_specific():
+    meta = {'executable': 'worker', 'cwd': '/workspace', 'model': 'custom', 'effort': 'high'}
+    for tool, flag in [('grok', '--always-approve'), ('agy', '--dangerously-skip-permissions')]:
+        adapter = driver.ADAPTERS[tool]
+        assert flag not in adapter.command(meta)
+        assert flag in adapter.command(meta | {'auto_approve': True})
+    assert driver.Grok().interrupt_key == 'C-c'
+    assert driver.Agy().interrupt_key == 'Escape'
+
+
+def test_preamble_and_brief_have_no_project_default(monkeypatch):
+    args = driver.parser().parse_args(['start', 'task', '--tool', 'grok'])
+    assert args.preamble is None and args.brief is None and not args.auto_approve
+    monkeypatch.delenv('EXT_AGENT_RUNS', raising=False)
+    assert driver.runs() == Path('~/.cache/ext-agent').expanduser().resolve()
 
 
 def test_wait_wake_flags_are_wired():

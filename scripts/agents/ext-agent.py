@@ -81,6 +81,7 @@ class Adapter:
     asking = r'(?i)\b(?:allow|approve|permission required|confirm|choose an option|waiting for (?:your|user))\b'
     tools = r'^\s*(?:[◆○●]\s*(?:Ran|Running|Read|Edit|Write|Search)|\$\s|(?:Bash|Read|Edit|Write|Search)\()'
     trust_key = 'Enter'
+    interrupt_key = 'Escape'
 
     def state(self, text, meta):
         lines = [line.rstrip() for line in text.splitlines() if line.strip()]
@@ -92,6 +93,8 @@ class Adapter:
                 re.search(r'\b[1-9][0-9]* commands? still running\b', '\n'.join(lines[-4:])) or
                 re.search(r'^[\s⠀-⣿]*(?:Waiting for response|Thinking|Working|Responding|Running command|Loading)[^\n]*', '\n'.join(lines[-3:]), re.M)):
             return 'busy'
+        if 'Do you trust the contents' in body:
+            return 'asking'
         # Only inspect the current turn, not old questions/errors in scrollback.
         marker = message_marker(meta.get('last_message', ''))
         if marker:
@@ -117,9 +120,12 @@ class Adapter:
 
 class Grok(Adapter):
     trust_key = 'y'
+    interrupt_key = 'C-c'
 
     def command(self, meta):
-        cmd = [meta['executable'], '--always-approve', '--minimal', '--no-alt-screen', '--cwd', meta['cwd']]
+        cmd = [meta['executable'], '--minimal', '--no-alt-screen', '--cwd', meta['cwd']]
+        if meta.get('auto_approve'):
+            cmd += ['--always-approve']
         if meta.get('model'):
             cmd += ['--model', meta['model']]
         if meta.get('effort'):
@@ -129,7 +135,9 @@ class Grok(Adapter):
 
 class Agy(Adapter):
     def command(self, meta):
-        cmd = [meta['executable'], '--dangerously-skip-permissions', '--add-dir', meta['cwd']]
+        cmd = [meta['executable'], '--add-dir', meta['cwd']]
+        if meta.get('auto_approve'):
+            cmd += ['--dangerously-skip-permissions']
         if meta.get('model'):
             cmd += ['--model', meta['model']]
         elif meta.get('effort'):
@@ -326,7 +334,7 @@ def supervise(path):
             changed = fingerprint != meta.get('screen_hash') or size != meta.get('raw_size')
             if changed:
                 meta = save(path, screen_hash=fingerprint, raw_size=size, last_output_at=time.time())
-            if 'Do you trust the contents' in text and not trust_sent:
+            if 'Do you trust the contents' in text and meta.get('auto_approve') and not trust_sent:
                 tmux('send-keys', '-t', meta['pane'], adapter.trust_key)
                 trust_sent = True
                 event(path, 'trust', cwd=meta['cwd'])
@@ -396,6 +404,7 @@ def start(args):
     now = time.time()
     meta = {'name': args.name, 'tool': args.tool, 'session': 'ext-' + args.name,
             'cwd': cwd, 'model': args.model, 'effort': args.effort,
+            'auto_approve': args.auto_approve,
             'executable': os.environ.get('EXT_AGENT_' + args.tool.upper(), args.tool),
             'brief': '\n\n'.join(pieces), 'created_at': now, 'last_output_at': now,
             'state': 'starting', 'quiet_seconds': args.quiet_seconds,
@@ -408,7 +417,7 @@ def start(args):
     deadline = time.monotonic() + args.ready_timeout
     while time.monotonic() < deadline:
         meta = read_meta(path)
-        if meta['state'] in ('idle', 'asking', 'error', 'exited') and (not pieces or meta.get('submitted_at') or meta['state'] in ('error', 'exited')):
+        if meta['state'] in ('idle', 'asking', 'error', 'exited') and (not pieces or meta.get('submitted_at') or meta['state'] in ('asking', 'error', 'exited')):
             return snapshot(path)
         if meta.get('submitted_at'):
             return snapshot(path)
@@ -544,6 +553,8 @@ def parser():
             c.add_argument('--cwd', default=os.getcwd())
             c.add_argument('--brief')
             c.add_argument('--preamble')
+            c.add_argument('--auto-approve', action='store_true',
+                           help='explicitly allow CLI auto-approval and directory trust for this run')
             c.add_argument('--ready-timeout', type=float, default=60)
             c.add_argument('--quiet-seconds', type=float, default=300)
             c.add_argument('--max-retries', type=int, default=4)
@@ -595,7 +606,7 @@ def main():
             elif args.command == 'transcript':
                 result = transcript(path, args.since_last)
             elif args.command == 'interrupt':
-                tmux('send-keys', '-t', meta['pane'], 'Escape')
+                tmux('send-keys', '-t', meta['pane'], ADAPTERS[meta['tool']].interrupt_key)
                 event(path, 'interrupt')
                 result = {'interrupted': True}
             elif args.command == 'stop':
