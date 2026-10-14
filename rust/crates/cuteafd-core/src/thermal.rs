@@ -186,13 +186,20 @@ fn active_reasons(bits: u64) -> Vec<&'static str> {
 }
 
 /// The latest reading of every GPU, for the console and `/v1/stats`.
+///
+/// `queried_s` is when this report was read, on the [`now_s`] clock. Each GPU's
+/// `sampled_s` is the time of the reading shown, on that same clock, or `null`
+/// when that GPU has no sample yet; `source` is that sample's sampler, or `null`
+/// with it. A repeated reading keeps `sampled_s` while `queried_s` moves.
 pub fn current() -> Value {
     let Ok(state) = state().lock() else { return Value::Null };
     if state.gpus.is_empty() { return Value::Null; }
     let gpus: Vec<Value> = state.gpus.iter().map(|gpu| {
-        let last = gpu.samples.back().map(|s| s.reading).unwrap_or_default();
+        let sample = gpu.samples.back();
+        let last = sample.map(|s| s.reading).unwrap_or_default();
         json!({
             "index": gpu.info.index, "uuid": gpu.info.uuid, "pci_bus_id": gpu.info.pci_bus_id, "name": gpu.info.name,
+            "sampled_s": sample.map(|s| s.t), "source": sample.map(|s| s.source.name()),
             "temperature_c": last.temperature_c,
             "tlimit_margin_c": gpu.slow.tlimit_margin_c,
             "mem_clock_mhz": last.mem_clock_mhz, "fan_pct": last.fan_pct,
@@ -202,7 +209,7 @@ pub fn current() -> Value {
             "slowdown_tlimit_c": gpu.info.slowdown_tlimit_c, "shutdown_tlimit_c": gpu.info.shutdown_tlimit_c,
         })
     }).collect();
-    let mut value = json!({"now_s": now_s(), "gpus": gpus});
+    let mut value = json!({"queried_s": now_s(), "gpus": gpus});
     if let Some(note) = &state.note { value["governor"] = note.clone(); }
     value
 }
@@ -437,5 +444,65 @@ mod tests {
         assert_eq!(w["power_limit_w"]["mean"], 500.0);
         assert_eq!(w["power_limit_w"]["min"], 400.0);
         assert_eq!(w["governor_bound"], "budget");
+    }
+
+    /// `install`/`push` share process state; one test keeps the cases from racing.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) { install(Vec::new()); }
+    }
+
+    #[test]
+    fn current_keeps_each_gpus_sample_time_while_the_query_time_advances() {
+        let _reset = Reset;
+        install(vec![
+            GpuInfo { index: 0, uuid: "GPU-a".into(), name: "A".into(), ..GpuInfo::default() },
+            GpuInfo { index: 1, uuid: "GPU-b".into(), name: "B".into(), ..GpuInfo::default() },
+        ]);
+
+        let none = current();
+        assert!(none.get("now_s").is_none(), "the query time is queried_s");
+        assert!(none["queried_s"].as_f64().is_some());
+        assert!(none["gpus"][0]["sampled_s"].is_null());
+        assert!(none["gpus"][1]["sampled_s"].is_null());
+        assert!(none["gpus"][0]["source"].is_null());
+        assert!(none["gpus"][0]["temperature_c"].is_null());
+
+        // An empty reading is still a sample: the timestamp is set and the other GPU stays empty.
+        let blank = 1_000_000.0;
+        push(blank, Source::Nvml, &[Reading::default()]);
+        let blanked = current();
+        assert_eq!(blanked["gpus"][0]["sampled_s"].as_f64(), Some(blank));
+        assert_eq!(blanked["gpus"][0]["source"].as_str(), Some("nvml"));
+        assert!(blanked["gpus"][0]["temperature_c"].is_null());
+        assert!(blanked["gpus"][1]["sampled_s"].is_null());
+        assert!(blanked["gpus"][1]["source"].is_null());
+
+        let t = 1_000_010.0;
+        push(t, Source::Nvml, &[fast(40, 180, 0, 30, 0), fast(55, 200, 10, 40, 0)]);
+        let first = current();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = current();
+        assert_eq!(first["gpus"][0]["sampled_s"].as_f64(), Some(t));
+        assert_eq!(second["gpus"][0]["sampled_s"].as_f64(), Some(t));
+        assert_eq!(first["gpus"][1]["sampled_s"].as_f64(), Some(t));
+        assert_eq!(second["gpus"][1]["sampled_s"].as_f64(), Some(t));
+        assert_eq!(second["gpus"][0]["temperature_c"].as_i64(), Some(40));
+        assert_eq!(second["gpus"][1]["temperature_c"].as_i64(), Some(55));
+        let (q0, q1) = (first["queried_s"].as_f64().unwrap(), second["queried_s"].as_f64().unwrap());
+        assert!(q1 > q0, "query time {q0} -> {q1}");
+        assert_ne!(second["gpus"][0]["sampled_s"].as_f64(), Some(q1));
+
+        // A shorter push updates only the leading GPUs, so their sample times can differ.
+        let later = 1_000_020.0;
+        push(later, Source::GpuPowerd, &[fast(41, 180, 0, 31, 0)]);
+        let split = current();
+        assert_eq!(split["gpus"][0]["sampled_s"].as_f64(), Some(later));
+        assert_eq!(split["gpus"][0]["source"].as_str(), Some("gpu-powerd"));
+        assert_eq!(split["gpus"][1]["sampled_s"].as_f64(), Some(t));
+        assert_eq!(split["gpus"][1]["source"].as_str(), Some("nvml"));
+        assert_eq!(split["gpus"][0]["temperature_c"].as_i64(), Some(41));
+        assert_eq!(split["gpus"][1]["temperature_c"].as_i64(), Some(55));
+        assert!(split.get("now_s").is_none());
     }
 }

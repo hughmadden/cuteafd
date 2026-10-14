@@ -132,8 +132,9 @@ impl Client {
         self.get("/v1/stats")
     }
 
-    /// The server's report clock (`/v1/thermal` `now_s`), or `None` when the server has no
-    /// throttle report (older build, or no NVML).
+    /// The server's report clock (`/v1/thermal` `now_s`): the query time a window is
+    /// measured on. A GPU's sample time is `current.gpus[].sampled_s` and is not this
+    /// mark. `None` when the server has no throttle report (older build, or no NVML).
     pub fn thermal_mark(&self) -> Option<f64> {
         let value = self.get("/v1/thermal").ok()?;
         value["available"].as_bool().filter(|a| *a)?;
