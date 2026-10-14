@@ -274,11 +274,21 @@ pub fn results(placed: &[Placed]) -> String {
     let mut table_rows = rows.clone();
     for ((_, family, name), reports) in basic_groups(placed) {
         for p in reports {
-            if !p.report.server.column_5090() && !rows.iter().any(|row| row.3.dir == p.dir) {
+            let current_build = rows.iter().filter(|row| row.0 == family && row.1 == name).any(|row| {
+                let current = &row.3.report.server.build;
+                let extra = &p.report.server.build;
+                if current.release.is_some() { extra.release == current.release }
+                else if current.commit.is_some() { extra.commit == current.commit }
+                else { crate::render::date(&p.report.created) == crate::render::date(&row.3.report.created) }
+            });
+            // Keep current supplementary cards; older layouts remain in the archive index.
+            if current_build && !p.report.server.column_5090() && !rows.iter().any(|row| row.3.dir == p.dir) {
                 table_rows.push((family.clone(), name.clone(), 3, p));
             }
         }
     }
+    table_rows.sort_by_key(|(family, name, class, p)|
+        (FAMILIES.iter().position(|f| *f == family).unwrap_or(FAMILIES.len()), name.clone(), *class, p.dir.clone()));
     for (family, name, class, p) in &table_rows {
         let r = &p.report;
         let label = if *class == 3 { layout_label(p).unwrap_or("extra layout") }
@@ -295,7 +305,8 @@ pub fn results(placed: &[Placed]) -> String {
         let concurrent = if concurrent.is_empty() { "—".into() } else { concurrent };
         let (prefill, ttft) = b.card.prefill.as_ref()
             .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
-        let hardware = format!("{} ({label})", short_hardware(r));
+        let hardware = r.server.setting("qualification.hardware-label").map(str::to_string)
+            .unwrap_or_else(|| format!("{} ({label})", short_hardware(r)));
         out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {hardware} | {} | {} | {concurrent} | {} | {} | {prefill} | {ttft} | {} | \
             [{} · {}]({}) |\n", family_title(family), r.capacity().compact(), decode("code"), decode("prose"),
             decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
@@ -726,6 +737,29 @@ mod tests {
         p.report.server.configuration.settings.push(setting("qualification.no-fit", "over budget"));
         p.report.server.configuration.settings.push(setting("simulated", "5090"));
         assert!(results(&[p.clone()]).contains(&caveat(&p)));
+    }
+
+    #[test]
+    fn supplementary_cards_belong_to_the_current_release() {
+        let mut current = marked("current", 1, None);
+        current.report.server.build.release = Some("v2.0.0-rc3".into());
+        current.dir = crate::cli::labeled_dir(Path::new("."), &current.report, Some("model-min-rc3"));
+        let mut extra = current.clone();
+        extra.dir = crate::cli::labeled_dir(Path::new("."), &extra.report, Some("model-vision-rc3"));
+        let mut old = extra.clone();
+        old.report.server.build.release = Some("v2.0.0-rc2".into());
+        old.dir = crate::cli::labeled_dir(Path::new("."), &old.report, Some("model-vision-rc2"));
+        let reports = [current, extra.clone(), old.clone()];
+        let html = results(&reports);
+        assert!(html.contains(&link(&extra.dir, "report.svg")));
+        assert!(!html.contains(&link(&old.dir, "report.svg")));
+        assert!(index(&reports).contains("model-vision-rc2/report.svg"));
+        let mut labelled = extra;
+        labelled.report.server.configuration.settings.push(crate::report::Setting {
+            name: "qualification.hardware-label".into(), value: Some("vision on RTX0, fixed pool".into()),
+            source: "publication".into(), ..Default::default()
+        });
+        assert!(results(&[labelled]).contains("| vision on RTX0, fixed pool |"));
     }
 
     #[test]
