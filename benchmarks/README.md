@@ -176,6 +176,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## Qwen 3.8
 
+- 2026-10-14 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 1× RTX PRO 6000 @ gpu-powerd 410/485 W (300–600) · build 92ad5b03d029 · [report](qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/report.svg)
 - 2026-10-09 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v2.0.0-rc3 · [report](qwen4/2026-10-09-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-rc3-sim5090/report.svg)
 - 2026-10-09 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 1 Spark · build v2.0.0-rc3 · [report](qwen4/2026-10-09-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-1spark-qwen38-exl3-rc3-sim5090/report.svg)
 - 2026-10-09 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 1× RTX PRO 6000 @ 325 W · build v2.0.0-rc3 · [report](qwen4/2026-10-09-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-nospark-vision-rc3/report.svg)
