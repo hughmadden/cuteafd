@@ -2,7 +2,6 @@ import hashlib
 import importlib.util
 import json
 import threading
-import time
 from pathlib import Path
 
 SCRIPT = Path(__file__).parents[1] / "qualify/qualify-prefix-cache.py"
@@ -93,36 +92,55 @@ def test_torture_checks_probes_and_idle_accounting():
 
 
 def test_a_prefill_cancel_hangs_up_while_the_server_is_silent():
+    """The client hangs up during a silent prefill; the server never completes the response.
+
+    The handler blocks until the peer closes. It writes no body and does not close on its
+    own, so the call cannot end because a sleep loop finished the response first.
+    """
     import http.server
+    import select
     import socketserver
     q = load()
+    silent = threading.Event()
     gone = threading.Event()
+    server_gave_up = threading.Event()
 
-    class Slow(http.server.BaseHTTPRequestHandler):
+    class Silent(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
-            self.rfile.read(int(self.headers["Content-Length"]))
+            length = int(self.headers["Content-Length"])
+            if length:
+                self.rfile.read(length)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
             self.wfile.flush()
-            # "Prefill": nothing is sent for a while; the client must hang up anyway.
-            for _ in range(50):
-                time.sleep(0.02)
-                try:
-                    self.wfile.write(b": keep\n")
-                    self.wfile.flush()
-                except OSError:
-                    gone.set()
-                    return
+            silent.set()
+            # Peer shutdown makes this readable. Nothing is written after the headers.
+            readable, _, _ = select.select([self.connection], [], [], 5)
+            if not readable:
+                server_gave_up.set()
+                return
+            try:
+                peer_closed = self.connection.recv(1) == b""
+            except OSError:
+                peer_closed = True
+            if peer_closed:
+                gone.set()
 
         def log_message(self, *args):
             pass
 
-    with socketserver.ThreadingTCPServer(("127.0.0.1", 0), Slow) as server:
+    class Server(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+
+    with Server(("127.0.0.1", 0), Silent) as server:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
-        started = time.monotonic()
         result = q.stream(base, {"messages": []}, cancel_after_s=0.1)
-        assert result["cancelled"] and time.monotonic() - started < 0.8
+        assert result["cancelled"]
+        assert result["finish_reason"] is None
+        assert result["content"] == "" and result["reasoning"] == ""
+        assert silent.is_set()
+        assert not server_gave_up.is_set()
         assert gone.wait(2), "the server saw the hang-up"
         server.shutdown()

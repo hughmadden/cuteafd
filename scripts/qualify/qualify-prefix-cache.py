@@ -77,20 +77,32 @@ def stream(base: str, body: dict, cancel_after_s: float | None = None, cancel_on
     then partial and marked cancelled): `cancel_after_s` hangs up after that long whether or
     not anything arrived (a cancel during prefill), `cancel_on_output` at the first output."""
     result = dict(reasoning="", content="", usage=None, finish_reason=None, cancelled=False)
+    # Set before the shutdown that wakes the reader. That read returns while the timer
+    # thread is still inside hang_up, so timer.is_alive() cannot mean "we did not hang up".
+    hung_up = threading.Event()
+
+    def cancel_prefill(response) -> None:
+        hung_up.set()
+        hang_up(response)
+
+    transport_error = None
     with open_request(base, dict(body, stream=True, stream_options={"include_usage": True})) as response:
-        timer = threading.Timer(cancel_after_s, hang_up, [response]) if cancel_after_s is not None else None
+        timer = threading.Timer(cancel_after_s, cancel_prefill, [response]) if cancel_after_s is not None else None
         if timer is not None:
             timer.start()
         try:
             read_events(response, result, cancel_on_output)
-        except (OSError, ValueError, http.client.HTTPException):
-            if timer is None or timer.is_alive():
-                raise
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            transport_error = error
         finally:
             if timer is not None:
+                # cancel() skips a callback that has not started. join() returns after
+                # one that has, so hung_up is visible before we decide.
                 timer.cancel()
-        hung_up = timer is not None and timer.finished.is_set() and not timer.is_alive() and result["finish_reason"] is None
-        result["cancelled"] = result["cancelled"] or hung_up
+                timer.join()
+        if transport_error is not None and not hung_up.is_set():
+            raise transport_error
+        result["cancelled"] = result["cancelled"] or (hung_up.is_set() and result["finish_reason"] is None)
         return result
 
 
