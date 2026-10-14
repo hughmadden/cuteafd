@@ -81,8 +81,12 @@ omitting it archives all fully stopped exited runs. Active runs are untouched.
 
 1. Start once, then SendMessage to `main`: tool/model, run name, worktree and
    brief. State whether ready or still starting.
-2. Block with `wait --until idle --timeout 600 --progress-interval 300` in a
-   background Bash call. Never write your own watcher; use wait with
+2. Block with `wait --until idle --timeout 600 --progress-interval 300` as a
+   foreground Bash call (`timeout` parameter about 70 s longer than the wait's
+   `--timeout`). Never use `run_in_background` for the wait: a background call
+   ends your turn, and every turn end wakes `main` with an empty notification
+   (TJ, 2026-10-14). Keep your turn open and loop foreground waits; message
+   `main` only for the trigger list. Never write your own watcher; use wait with
    `--progress-interval`. It emits progress JSON lines only when new output
    arrived: state, quiet time, context_pct, recent_tools and up to five distinct
    notable transcript markers (160 characters each). The final line is the
@@ -97,7 +101,7 @@ omitting it archives all fully stopped exited runs. Active runs are untouched.
 3. Every progress event means: summarize only the new increment in 1-2 lines
    in the driver log (message `main` only for the trigger list below), then
    immediately continue waiting: the task is not done. The CLI's wait keeps
-   blocking after progress; consume the next event from that same background
+   blocking after progress; consume the next event from that same wait
    call, never start a duplicate watcher. Only idle (then inspect deliverables),
    asking, or error ends the normal work cycle; exited is an error unless
    completion was already validated. If a timeout ends the process while busy,
