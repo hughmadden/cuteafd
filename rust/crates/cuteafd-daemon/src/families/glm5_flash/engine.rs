@@ -5265,7 +5265,8 @@ mod prefill_lane_tests {
             // b729115b uses canonical BF16 MMA at every positive row count.
             ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
             ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
-            ("integration/cuteafd/dsv4_mhc.py", 0x6b2a_c5a5_1dfa_46c5),
+            // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
+            ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
             ("integration/cuteafd/_common.py", 0x86ea_ace0_6ff1_26ca),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
