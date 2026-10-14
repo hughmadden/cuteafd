@@ -474,3 +474,22 @@ def test_native_family_decode_uses_one_wide_recipe_and_shared_admission() -> Non
     assert "ExpertReductionPlan::native" in admission
     assert "ExpertReductionPlan::native" in (shared / "experts/rtx/native.rs").read_text()
     assert "ExpertReductionPlan::native" in (ROOT / "rust/crates/cuteafd-daemon/src/families/deepseek_v4/local.rs").read_text()
+
+
+def test_native_m1_fc2_partition_changes_launch_only() -> None:
+    tree = ast.parse(SLICES.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "fc2_n_splits")
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SLICES), "exec"), namespace)
+    select = namespace["fc2_n_splits"]
+    assert select("spark", 1, 128, 4096) == 2
+    assert select("spark", 1, 128, 7168) == 2
+    for role in ("rtx_backbone", "rtx_tp2", "coordinator", "spark_tp2", "spark_tp3", "spark_tp6"):
+        assert select(role, 1, 128, 4096) == 1
+    for capacity in (2, 16, 80, 256, 1024, 4096):
+        assert select("spark", capacity, 128, 4096) == 1
+    assert select("spark", 1, 64, 4096) == 1
+    assert select("spark", 1, 128, 384) == 1
+    recipe = _slice_recipe()(128, 512, atomic=False, compact=False)
+    assert recipe["fc2_k_steps"] == 4 and recipe["plane_count"] == 4
+    assert recipe["plane_fold"] == "ascending_fp32"

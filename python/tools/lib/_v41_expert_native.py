@@ -84,26 +84,30 @@ def namespaced_symbol(name, prefix):
     return name
 
 
-def expert_symbol_prefix(*, local=False, tp2=False, spark_tp=None):
+def expert_symbol_prefix(*, local=False, tp2=False, spark_tp=None, family="v41"):
     """Native symbol prefix for one expert family.
 
     `spark_tp=2|3|6` selects the replicated-group Spark TP2/TP3/TP6 AOT families
     (roles 5/6/7); `local`/`tp2` keep the historical RTX families unchanged, and
     the default is the canonical TP4 family. At most one family may be selected.
     """
+    assert family in ("v41", "dsv4f", "dsv4p")
     assert sum(bool(x) for x in (local, tp2, spark_tp is not None)) <= 1
     if spark_tp is not None:
         assert spark_tp in SPARK_TP_PREFIX, spark_tp
-        return SPARK_TP_PREFIX[spark_tp]
-    if tp2:
-        return "cuteafd_v41_tp2_expert_"
-    if local:
-        return "cuteafd_v41_local_expert_"
-    return "cuteafd_v41_expert_"
+        assert family == "v41" or spark_tp == 2
+        prefix = SPARK_TP_PREFIX[spark_tp]
+    elif tp2:
+        prefix = "cuteafd_v41_tp2_expert_"
+    elif local:
+        prefix = "cuteafd_v41_local_expert_"
+    else:
+        prefix = "cuteafd_v41_expert_"
+    return prefix.replace("v41", family, 1)
 
 
-def library(path, *, local=False, tp2=False, spark_tp=None):
-    prefix = expert_symbol_prefix(local=local, tp2=tp2, spark_tp=spark_tp)
+def library(path, *, local=False, tp2=False, spark_tp=None, family="v41"):
+    prefix = expert_symbol_prefix(local=local, tp2=tp2, spark_tp=spark_tp, family=family)
     lib = C.CDLL(path)
     for name, args in {
         "cuteafd_v41_expert_info": [I, C.POINTER(Info)],
@@ -111,6 +115,7 @@ def library(path, *, local=False, tp2=False, spark_tp=None):
         "cuteafd_v41_expert_bind_scratch": [P, P, L, C.POINTER(P)],
         "cuteafd_v41_expert_initialize_scratch_async": [P, P, L, P],
         "cuteafd_v41_expert_launch": [P, C.POINTER(Launch)],
+        "cuteafd_set_expert_hidden": [U],
         "cuteafd_expert_packed_sizes": [U, C.POINTER(L)],
         "cuteafd_pack_expert_async": [C.POINTER(P), C.POINTER(P), U, P],
         "cuteafd_compact_routes_bf16_async": [P, P, U, P],
@@ -132,7 +137,7 @@ def check(code):
 
 
 class Native:
-    def __init__(self, lib, capacity, weights, wire, ids, routing, *, coordinator=False, full_backbone=False, tp2=False, spark_tp=None, storage=None):
+    def __init__(self, lib, capacity, weights, wire, ids, routing, *, coordinator=False, full_backbone=False, tp2=False, spark_tp=None, storage=None, geometry=None):
         assert spark_tp in (None, 2, 3, 6)
         assert sum((coordinator, full_backbone, tp2, spark_tp is not None)) <= 1
         self.lib = lib
@@ -146,6 +151,10 @@ class Native:
                     (0, 128, 5120, 2304, 2304, 3, capacity, 1)
                     if coordinator else (2, 384, 5120, 2304, 2304, 6, capacity, 7)
                     if full_backbone else (1, 384, 5120, 576, 640, 6, capacity, 7))
+        if geometry is not None:
+            assert not any((coordinator, full_backbone, tp2, spark_tp is not None))
+            hidden, intermediate, experts, topk = geometry
+            expected = (1, experts, hidden, intermediate, -(-intermediate // 128) * 128, topk, capacity, 7)
         assert (
             info.abi_version,
             info.role,
@@ -219,9 +228,9 @@ class Native:
         offset = slots[41] - self.storage.data_ptr()
         output_rows = capacity if self.token_accumulation else capacity * info.topk
         self.output = (
-            self.storage[offset : offset + output_rows * 5120 * 4]
+            self.storage[offset : offset + output_rows * info.hidden_size * 4]
             .view(torch.float32)
-            .reshape(output_rows, 5120)
+            .reshape(output_rows, info.hidden_size)
         )
 
     def run(self, rows):
