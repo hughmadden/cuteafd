@@ -257,7 +257,7 @@ driver. Baseline column is the card-refresh GLMF EXL3 min run
 | readiness | 42.9 s | 40.2 s |
 | smoke total (load + checks) | 3m 37s | 3m 22s |
 | launch -> ready | 104.5 s | 91.0 s |
-| driver wall | 8m 29s (3m 29s queue) | 39m 30s (35m 46s queue) |
+| driver wall | 8m 29s (4m 52s queue) | 39m 30s (36m 8s queue) |
 
 The change is exercised on this path, not merely loaded: the coordinator logs
 `fp8_prefill=[Mla, Ffn]` (prefill W8A8 over MLA and FFN, rows far past 64 -> the wide route) and
@@ -311,7 +311,7 @@ native library.
 
 Landing phase (separate, after the measurement above, not included in the 95.6 min): rebase onto
 `origin/work/p0` + PR (minutes), one card-scoped WIP rebuild for the serving check (4 min of build,
-warm caches), and one GPU run -- 35m 46s of that was fair-queue wait behind another agent's 90-minute
+warm caches), and one GPU run -- 36m 8s of that was fair-queue wait behind another agent's 90-minute
 gpu0+gpu1 ticket, 3m 22s of actual smoke.
 
 ## Reproducing
