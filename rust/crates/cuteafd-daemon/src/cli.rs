@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn native_host_cache_accepts_auto_and_legacy_byte_counts() {
         use clap::Parser;
-        use crate::families::deepseek_v41::v41_native_serve::memory::HostBudget;
+        use crate::shared::prefix::HostBudget;
         let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"];
         for (value, bytes) in [("auto", None), ("0", Some(0)), ("1GiB", Some(1<<30)),
@@ -973,7 +973,7 @@ pub(crate) struct NativeServeArgs {
 
     /// Pinned snapshot memory: auto sizes logical GPU+RAM capacity above retained entries * context; 0 disables it.
     #[arg(long, default_value = "0", env = "CUTEAFD_HOST_CACHE_BYTES")]
-    pub host_cache_bytes: crate::families::deepseek_v41::v41_native_serve::memory::HostBudget,
+    pub host_cache_bytes: crate::shared::prefix::HostBudget,
     /// Pinned allocation and registration granularity for the snapshot cache.
     #[arg(long, default_value_t = 256 << 20, env = "CUTEAFD_HOST_CACHE_CHUNK_BYTES")]
     pub host_cache_chunk_bytes: u64,

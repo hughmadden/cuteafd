@@ -168,7 +168,7 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
     let units = requests.cache().unit_capacity();
     let layout = super::prefix::layout(units, draft, true);
     let mut config = args.host_cache_config()?;
-    if matches!(args.host_cache_bytes, super::memory::HostBudget::Auto) {
+    if matches!(args.host_cache_bytes, crate::shared::prefix::HostBudget::Auto) {
         // Logical unit capacity, irrespective of which GPU owns each source. Do not count
         // replicated storage or eager tail copies as tokens.
         let raw_tokens = (units * crate::families::deepseek_v41::v41_backbone_cache::UNIT_TOKENS) as u64;

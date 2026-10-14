@@ -23,6 +23,10 @@ impl FromStr for HostBudget {
 }
 
 impl HostBudget {
+    pub fn explicit_bytes(self) -> u64 {
+        match self { Self::Auto => 0, Self::Bytes(bytes) => bytes }
+    }
+
     pub fn enabled(self) -> bool {
         !matches!(self, Self::Bytes(0))
     }

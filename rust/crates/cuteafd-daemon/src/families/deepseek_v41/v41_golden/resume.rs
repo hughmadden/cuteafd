@@ -165,11 +165,17 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
     };
     let mut cases = Vec::new();
     let result = (|| -> Result<()> {
-        for &p in at {
+        let namespace_stride = entries.saturating_mul(2).saturating_add(3);
+        ensure!(at.len().saturating_mul(2).saturating_mul(namespace_stride) < VOCAB - 1000,
+            "too many resume cases for distinct pressure namespaces");
+        for (case_index, &p) in at.iter().enumerate() {
             ensure!(p > 40 && p + 200 < tokens.len(), "--resume-at {p} needs 40 < P and P + 200 < {} golden tokens",
                 tokens.len());
             for image in [false, true] {
                 let mut prompt = tokens[..p].to_vec();
+                // Each case starts cold even when a previous case retained a shorter ancestor.
+                let namespace = 1000 + (case_index * 2 + usize::from(image)) * namespace_stride;
+                prompt[0] = namespace as u32;
                 if image { prompt[8] = cuteafd_loader::V41_IMAGE_TOKEN_ID; }
                 let label = format!("resume P={p} {}", if image { "image" } else { "text" });
                 let first = run(&queue, &prompt, rows, false, image, Vec::new())?;
@@ -214,13 +220,15 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
                     // no private eviction or promotion hook bypasses engine admission.
                     for n in 0..entries.saturating_mul(2).saturating_add(2) {
                         let mut other = prompt.clone();
-                        other[0] = ((n + 1000) % VOCAB) as u32;
+                        // Pressure leaves must not themselves hit a previous case's host bank.
+                        other[0] = (namespace + n + 1) as u32;
                         run(&queue, &other, 2, false, image, Vec::new())?;
                     }
                     let promoted = run(&queue, &prompt, rows, false, image, Vec::new())?;
                     ensure!(promoted.record.provenance.as_ref().and_then(|v| v.get("prefix_restore"))
                         .and_then(|v| v.get("host")).and_then(|v| v.as_bool()) == Some(true),
-                        "{label}: expected a host promotion, not a device hit or cold miss");
+                        "{label}: expected a host promotion, not a device hit or cold miss: {:?}",
+                        promoted.record.provenance);
                     exact(&mut cases, &first, "prompt", &promoted, "restore", &format!("{label} host round trip"))?;
                 }
 

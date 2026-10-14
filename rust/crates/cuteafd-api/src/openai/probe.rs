@@ -69,7 +69,7 @@ pub struct ProbeSpec {
     #[serde(default)]
     pub record_rows: usize,
     /// Hash initialized persistent state at prompt and turn frontiers (synchronous diagnostic).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub record_state: bool,
     /// Top entries kept per recorded row.
     #[serde(default)]
