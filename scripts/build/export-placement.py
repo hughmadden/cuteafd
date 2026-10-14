@@ -30,6 +30,9 @@ export can share a GPU with serving, or with someone else's job, under a cap.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
+import json
 import os
 import signal
 import subprocess
@@ -65,8 +68,75 @@ def admit(free_mib: int, max_cap_mib: int = MAX_CAP_MIB, headroom_mib: int = HEA
     cap = min(max_cap_mib, free_mib - headroom_mib)
     if cap < MIN_CAP_MIB:
         return None
-    jobs = max(1, (cap - SIZING_MIB) // CONTEXT_MIB)
+    jobs = max(1, cap // (SIZING_MIB + CONTEXT_MIB))
     return cap, jobs
+
+
+RAM_PER_WORKER_MIB = 4096
+RAM_HEADROOM_MIB = 8192
+
+
+@contextmanager
+def ledger(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = json.loads(path.read_text()) if path.exists() else {}
+        yield state
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(state))
+        temporary.replace(path)
+
+
+def available_ram():
+    return next(int(line.split()[1]) // 1024 for line in Path('/proc/meminfo').read_text().splitlines()
+                if line.startswith('MemAvailable:'))
+
+
+def reserve(path, token, row, ram_mib, owner, max_cap=MAX_CAP_MIB, max_jobs=64):
+    with ledger(path) as state:
+        if callable(row):
+            row = row()
+        if callable(ram_mib):
+            ram_mib = ram_mib()
+        if token in state.get('leases', {}):
+            raise ValueError('duplicate export reservation')
+        if not state.get('leases'):
+            state.clear()
+            state.update(baseline=int(row[2]), ram_baseline=ram_mib, total=int(row[3]), leases={})
+        leases = state['leases']
+        reserved = sum(item['cap'] for item in leases.values())
+        ram_reserved = sum(item['ram'] for item in leases.values())
+        # Account for reservations not yet allocated, and external allocations
+        # since the common baseline. Existing reservations are never reaped on
+        # a PID check alone: their owned container could still be running.
+        gpu_free = min(int(row[4]), state['total'] - max(state['baseline'], int(row[2])) - reserved)
+        ram_free = min(ram_mib, state['ram_baseline']) - ram_reserved
+        decision = admit(gpu_free, max_cap)
+        if decision is None:
+            return None
+        cap, jobs = decision
+        jobs = min(jobs, max_jobs, (ram_free - RAM_HEADROOM_MIB) // RAM_PER_WORKER_MIB)
+        if jobs < 2:
+            return None
+        cap = jobs * (SIZING_MIB + CONTEXT_MIB)
+        ram = jobs * RAM_PER_WORKER_MIB
+        leases[token] = dict(cap=cap, ram=ram, jobs=jobs, owner=owner)
+        return cap, jobs, state['baseline'], ram
+
+
+def release_reservation(path, token):
+    with ledger(path) as state:
+        state.get('leases', {}).pop(token, None)
+        if not state.get('leases'):
+            state.clear()
+
+
+def reservation_budget(path, token):
+    with ledger(path) as state:
+        if token not in state.get('leases', {}):
+            raise ValueError('export reservation disappeared')
+        return state['baseline'], sum(item['cap'] for item in state['leases'].values())
 
 
 def cgroup_pids(container_id: str) -> set[int]:
@@ -99,7 +169,12 @@ def watch(args) -> int:
     peak = 0
     while process.poll() is None:
         try:
-            used = export_mib(args.smi, args.gpu, args.cgroup, args.baseline_mib)
+            if getattr(args, 'ledger', None):
+                baseline, cap = reservation_budget(args.ledger, args.reservation)
+                used = export_mib(args.smi, args.gpu, None, baseline)
+                args.cap_mib = cap
+            else:
+                used = export_mib(args.smi, args.gpu, args.cgroup, args.baseline_mib)
         except (subprocess.SubprocessError, OSError, ValueError):
             used = 0  # a failed read never kills; the next one decides
         peak = max(peak, used)
@@ -163,6 +238,17 @@ def main(argv=None) -> int:
     a.add_argument('--gpu', required=True)
     a.add_argument('--max-cap-mib', type=int, default=MAX_CAP_MIB)
     a.add_argument('--headroom-mib', type=int, default=HEADROOM_MIB)
+    r = sub.add_parser('reserve')
+    r.add_argument('--ledger', type=Path, required=True)
+    r.add_argument('--reservation', required=True)
+    r.add_argument('--owner', type=int, required=True)
+    r.add_argument('--smi', default='nvidia-smi')
+    r.add_argument('--gpu', required=True)
+    r.add_argument('--max-jobs', type=int, default=os.cpu_count() or 1)
+    r.add_argument('--max-cap-mib', type=int, default=MAX_CAP_MIB)
+    d = sub.add_parser('release')
+    d.add_argument('--ledger', type=Path, required=True)
+    d.add_argument('--reservation', required=True)
     h = sub.add_parser('hold')
     h.add_argument('--gpus', default='1,0')
     h.add_argument('command', nargs=argparse.REMAINDER)
@@ -173,9 +259,22 @@ def main(argv=None) -> int:
     group = w.add_mutually_exclusive_group(required=True)
     group.add_argument('--cgroup')
     group.add_argument('--baseline-mib', type=int)
+    group.add_argument('--ledger', type=Path)
+    w.add_argument('--reservation')
     w.add_argument('--interval', type=float, default=1.0)
     w.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    if args.action == 'release':
+        release_reservation(args.ledger, args.reservation)
+        return 0
+    if args.action == 'reserve':
+        row = lambda: gpu_row(query(args.smi, 'gpu=index,uuid,memory.used,memory.total,memory.free'), args.gpu)
+        decision = reserve(args.ledger, args.reservation, row, available_ram, args.owner,
+                           args.max_cap_mib, args.max_jobs)
+        if decision is None:
+            return NO_TURN
+        print(*decision)
+        return 0
     if args.action == 'admit':
         row = gpu_row(query(args.smi, 'gpu=index,uuid,memory.used,memory.total,memory.free'), args.gpu)
         decision = admit(int(row[4]), args.max_cap_mib, args.headroom_mib)

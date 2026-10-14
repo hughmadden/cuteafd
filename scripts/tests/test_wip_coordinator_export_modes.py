@@ -1,5 +1,4 @@
-"""wip.sh's coordinator export: off-queue modes first (remote export host,
-capped beside serving), the fair GPU turn last, falling through on exit 75."""
+"""Coordinator exports never queue for a raptor GPU; remote waits are bounded."""
 import os
 import subprocess
 from pathlib import Path
@@ -21,11 +20,10 @@ def _dispatch():
 
 
 @pytest.mark.parametrize('setting,host,expected', [
-    ('auto', '', 'capped turn'),
-    ('auto', 'oliver', 'remote capped turn'),
-    ('remote', '', 'remote turn'),
-    ('capped', 'oliver', 'capped turn'),
-    ('turn', 'oliver', 'turn'),
+    ('auto', '', 'capped remote wait-remote'),
+    ('auto', 'oliver', 'capped remote wait-remote'),
+    ('remote', '', 'remote wait-remote'),
+    ('capped', 'oliver', 'capped remote wait-remote'),
 ])
 def test_mode_order(setting, host, expected):
     script = 'release_die() { echo "DIE $*"; exit 9; }\n' + _function('wip_coordinator_export_modes') + \
@@ -39,15 +37,14 @@ def test_unknown_mode_is_refused():
     script = 'release_die() { echo "DIE $*"; exit 9; }\n' + _function('wip_coordinator_export_modes') + \
         'CUTEAFD_WIP_COORDINATOR_EXPORT=bogus wip_coordinator_export_modes\n'
     result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
-    assert result.returncode == 9 and 'must be auto, remote, capped or turn' in result.stdout
+    assert result.returncode == 9 and 'must be auto, remote or capped' in result.stdout
 
 
 @pytest.mark.parametrize('capped,remote,expected_done,expected_calls', [
     (0, 0, 'capped', ['capped']),
     (75, 0, 'remote', ['capped', 'remote']),
-    (75, 75, 'turn', ['capped', 'remote', 'turn']),
 ])
-def test_dispatch_falls_through_to_the_fair_turn(tmp_path, capped, remote, expected_done, expected_calls):
+def test_dispatch_falls_through_to_remote(tmp_path, capped, remote, expected_done, expected_calls):
     trace = tmp_path / 'trace'
     script = f'''
 release_die() {{ echo "DIE $*"; exit 9; }}
@@ -82,8 +79,8 @@ def test_capped_export_runs_only_on_a_gpu_whose_lock_it_holds_and_is_watched():
 def test_remote_export_admits_from_the_hosts_wsl_smi_never_the_container():
     remote = (ROOT / 'scripts/build/export-remote.sh').read_text()
     assert 'smi=/usr/lib/wsl/lib/nvidia-smi' in remote
-    admit = remote.index('"$placement" admit --smi "$smi"')
-    container = remote.index('docker run --rm --device nvidia.com/gpu=all --user')
+    admit = remote.index('"$placement" reserve --ledger')
+    container = remote.index('docker run --rm --memory')
     assert admit < container  # admission precedes the export container
     assert 'mem_get_info' not in remote
     # Bulk data only through sparknest, never one ssh pipe.

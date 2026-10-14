@@ -39,9 +39,12 @@ def test_remote_exports_have_unique_paths_and_cleanup_owned_containers():
     assert 'flock -n "$slot_fd"' in text
 
 
-def test_fallback_seed_drains_before_queued_gpu_turn():
+def test_seed_admission_after_reuse_and_no_gpu_queue():
     text = (ROOT / 'wip.sh').read_text()
+    assert text.index('((wip_build_expert == 0)) || wip_build_resource_acquire') > text.index('wip_reused_expert=1')
+    capped = text[text.index('wip_capped_export() {'):text.index('wip_capped_export_on() {')]
+    assert capped.index('wip_build_resource_dir/granted') < capped.index('export-placement.py" hold')
     dispatch = text[text.index('    local mode exported=0'):text.index('    ((exported)) || release_die')]
-    assert dispatch.index('while kill -0 "$wip_build_resource_pid"') < dispatch.index('wip_hwlock "$wip_export_gpu_lock"')
-    both = text[text.index('    if ! build_expert; then'):text.index('  none)')]
-    assert both.index('wip_build_resource_release') < both.index('wip_wait_coordinator')
+    assert 'wip_hwlock' not in dispatch and 'wait-remote)' in dispatch
+    assert '[[ "$seed_host" != kakapo ]]' not in capped
+    assert text.index('distribute_expert_slot\nwip_resource_complete=1') < text.rindex('wip_build_resource_release')

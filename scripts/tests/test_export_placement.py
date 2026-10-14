@@ -39,9 +39,9 @@ def run(*args, timeout=60):
 
 
 @pytest.mark.parametrize('free,expected', [
-    (97000, (placement.MAX_CAP_MIB, (placement.MAX_CAP_MIB - placement.SIZING_MIB) // placement.CONTEXT_MIB)),
-    (32000, (placement.MAX_CAP_MIB, (placement.MAX_CAP_MIB - placement.SIZING_MIB) // placement.CONTEXT_MIB)),
-    (10000, (10000 - placement.HEADROOM_MIB, (10000 - placement.HEADROOM_MIB - placement.SIZING_MIB) // placement.CONTEXT_MIB)),
+    (97000, (placement.MAX_CAP_MIB, placement.MAX_CAP_MIB // (placement.SIZING_MIB + placement.CONTEXT_MIB))),
+    (32000, (placement.MAX_CAP_MIB, placement.MAX_CAP_MIB // (placement.SIZING_MIB + placement.CONTEXT_MIB))),
+    (10000, (10000 - placement.HEADROOM_MIB, (10000 - placement.HEADROOM_MIB) // (placement.SIZING_MIB + placement.CONTEXT_MIB))),
     (placement.MIN_CAP_MIB + placement.HEADROOM_MIB - 1, None),
     (2000, None),
 ])
@@ -153,3 +153,25 @@ def test_hold_never_uses_a_gpu_someone_else_holds(tmp_path):
     # moves on to the export host or the fair queue.
     result = _hold(tmp_path, held=('1', '0'))
     assert result.returncode == placement.NO_TURN and 'every candidate GPU lock is held' in result.stderr
+
+
+def test_reservations_share_baseline_and_cannot_double_admit(tmp_path):
+    path = tmp_path / 'ledger.json'
+    row = ['0', 'GPU-a', '65000', '98000', '33000']
+    first = placement.reserve(path, 'a', row, 64000, 1, max_cap=12288, max_jobs=8)
+    second = placement.reserve(path, 'b', row, 64000, 2, max_cap=12288, max_jobs=8)
+    assert first and second
+    baseline, budget = placement.reservation_budget(path, 'a')
+    assert baseline == 65000 and budget == first[0] + second[0]
+    state = __import__('json').loads(path.read_text())
+    assert sum(v['ram'] for v in state['leases'].values()) <= 64000 - placement.RAM_HEADROOM_MIB
+    assert first[0] == first[1] * (placement.CONTEXT_MIB + placement.SIZING_MIB)
+    # Baseline is shared, even when the second entrant sees allocated growth.
+    assert placement.reserve(path, 'c', ['0', 'GPU-a', '76000', '98000', '22000'], 32000, 3) is None
+    placement.release_reservation(path, 'a')
+    assert placement.reservation_budget(path, 'b')[1] == second[0]
+
+
+def test_ram_limits_concurrent_sizing_workers(tmp_path):
+    row = ['0', 'GPU-a', '1000', '98000', '97000']
+    assert placement.reserve(tmp_path / 'ledger.json', 'a', row, 16000, 1) is None

@@ -110,7 +110,7 @@ before → after tables with conditions.
   Cargo cache that has seen filesystem errors.
 - Initialize submodules recursively at their pinned commits in every fresh
   worktree before building or testing. Compile through
-  `scripts/build/build-slot.sh CMD` (three niced -j16 slots; slot 0 is
+  `scripts/build/build-slot.sh CMD` (five niced -j16 slots; slot 0 is
   `build.lock`, which wip.sh and build.sh take), held only while compiling.
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
@@ -119,6 +119,14 @@ before → after tables with conditions.
   `~/.cache/cuteafd/{gpu1,sparks}.lock` (flock) are the hardware mutexes;
   hold one only around the run that needs it and stop its containers before
   releasing it, so the next task finds a clean device.
+- Coordinator export placement: `auto` probes a free capped raptor GPU
+  without waiting, then oliver (config `CUTEAFD_EXPORT_HOST`, environment
+  override wins), with bounded remote retry and no queued GPU-turn fallback.
+  Independent EXL3 variants use bounded spawned workers; all exporters share
+  host-wide CPU/context admission. GB10 RAM admission uses `MemAvailable`:
+  CUDA allocations reclaim clean file cache; `MemFree` and cudaMemGetInfo
+  under-report usable unified memory. Remote exports reserve aggregate GPU
+  and host RAM before container creation and release only after it stops.
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
   Kernel changes go to `../sparkinfer-glmrt` master, quantizer changes to
   `../GPTQModel` main; push there first, then bump pin and lock here.
@@ -331,7 +339,11 @@ facts recorded somewhere for agents working on it.
   10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the
   first four is the qualified V4.1 default until a six-rank layout wins.
 - `kakapo` (GB10, 172.22.2.7): build seed only, never serves; 10 GbE, no
-  RoCE. Its sealed slots reach the Sparks through sparknest; `kakapo.lock`.
+  RoCE. Its sealed slots reach the Sparks through sparknest. Three counting
+  build leases (20 threads / 121 GiB), shared `kakapo.lock` umbrella plus
+  exclusive `kakapo.build.N.lock`, exclude legacy exclusive users. Full or
+  unavailable kakapo may fall back to idle rhea/moa under their exclusive
+  hardware locks. Independent instances share host-wide exporter worker slots.
 - Fabric: Sparks have two RoCE ports at 200 Gb/s each on separate
   subnets (rail A 10.55.0.x, rail B 10.55.1.x); raptor has one 400 Gb/s
   port carrying both rail subnets. The switch is being raised from 100G to

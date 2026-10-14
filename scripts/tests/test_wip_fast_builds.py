@@ -162,10 +162,9 @@ release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
-# The fair turn only (off-queue modes: test_wip_coordinator_export_modes.py).
-CUTEAFD_WIP_COORDINATOR_EXPORT=turn
+CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
-    result = subprocess.run(['bash', '-c', setup + helpers + '\nbuild_coordinator'], capture_output=True, text=True,
+    result = subprocess.run(['bash', '-c', setup + helpers + '\nwip_capped_export() { printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator'], capture_output=True, text=True,
                             env={**os.environ, 'HOME': str(tmp_path / 'home'), 'PATH': f'{tools}:{os.environ["PATH"]}',
                                  'TRACE': str(trace)})
     assert result.returncode == 0, result.stderr
@@ -180,10 +179,11 @@ def test_native_cache_hit_takes_no_gpu_turn(tmp_path):
     assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
 
 
-def test_native_cache_miss_queues_for_the_gpu(tmp_path):
+def test_native_cache_miss_probes_capped_without_queueing(tmp_path):
     stdout, lines = _wip_coordinator(tmp_path, hit=False)
-    assert 'queueing for gpu1' in stdout
-    assert any(line.startswith('turn ') and 'hwlock.py --locks gpu1' in line for line in lines)
+    assert 'done by capped' in stdout
+    assert 'capped' in lines
+    assert not any('hwlock.py --locks gpu1' in line for line in lines)
 
 
 def test_native_store_moves_entries_between_instance_and_host_store(tmp_path):

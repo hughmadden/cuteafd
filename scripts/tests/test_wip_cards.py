@@ -559,7 +559,7 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
     assert not any(line.startswith('flock') for line in lines)
 
 
-def test_coordinator_export_runs_under_a_held_turn_and_rust_under_none(tmp_path):
+def test_coordinator_export_probes_after_rust_without_queued_turn(tmp_path):
     function = _wip_function('build_coordinator() {', '\nbuild_expert() (') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     trace = tmp_path / 'trace'
@@ -570,18 +570,17 @@ release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
-# The fair turn as the only mode (off-queue modes: test_wip_coordinator_export_modes.py).
-CUTEAFD_WIP_COORDINATOR_EXPORT=turn
+CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
     modes = _wip_function('wip_coordinator_export_modes() {', '\n# wip_remote_export:')
-    subprocess.run(['bash', '-c', setup + modes + function + '\nbuild_coordinator'], check=True,
+    subprocess.run(['bash', '-c', setup + modes + function + '\nwip_capped_export() { printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator'], check=True,
                    env={**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))
-    turn = next(i for i, line in enumerate(lines) if line.startswith('turn '))
-    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native') and not line.startswith('turn '))
-    assert 'scripts/hw/hwlock.py --locks gpu1 --wait 1800 --' in lines[turn]
-    assert rust < turn < native < lines.index('end', turn)
+    capped = lines.index('capped')
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native'))
+    assert rust < capped < native
+    assert not any('hwlock.py --locks gpu1' in line for line in lines)
     assert all('CUTEAFD_WIP_EXPORT_LOCKS=off' in line for line in lines if 'build-wip-artifacts.sh' in line)
     wip = (ROOT / 'wip.sh').read_text()
     assert '/wip-export-gpu.lock' not in wip

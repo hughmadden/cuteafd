@@ -123,3 +123,109 @@ def test_build_slot_default_admits_five_and_keeps_nice(tmp_path):
     finally:
         for handle in held:
             handle.close()
+
+
+def test_failed_probe_is_unavailable(monkeypatch):
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(255, 'ssh')
+    monkeypatch.setattr(resource.subprocess, 'run', fail)
+    assert resource.probe('kakapo') is None
+
+
+def test_owner_death_before_grant_does_not_acquire(tmp_path):
+    held = resource.acquire(tmp_path, 'kakapo', 1)
+    lease = tmp_path / 'lease'
+    lease.mkdir()
+    os.mkfifo(lease / 'release')
+    owner = subprocess.Popen(['sleep', '30'])
+    process = subprocess.Popen(['python3', str(ROOT / 'scripts/build/build-resource.py'), '--slots', '1',
+                                '--owner', str(owner.pid), '--wait', '30', '--lease-dir', str(lease)],
+                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path)})
+    try:
+        time.sleep(0.1)
+        owner.terminate()
+        owner.wait(timeout=5)
+        assert process.wait(timeout=5) == 0
+        assert not (lease / 'granted').exists()
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+        for handle in held:
+            handle.close()
+
+
+def test_lease_has_no_elapsed_unlock_deadline_and_stops_before_unlock():
+    text = (ROOT / 'scripts/build/build-resource.py').read_text()
+    granted = text[text.index("(args.lease_dir / 'granted')"):]
+    assert 'deadline' not in granted and '7260' not in granted
+    assert granted.index('docker stop -t 10') < granted.index('handle.close()')
+
+
+def test_host_worker_admission_is_shared_across_builds(tmp_path, monkeypatch):
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path / 'host'))
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_WORKERS', '1')
+    monkeypatch.setenv('CUTEAFD_EXPORT_JOBS', '8')
+    monkeypatch.setenv('CUTEAFD_EXPORT_SLOT_DIR', str(tmp_path / 'build-a'))
+    with export.export_slot():
+        assert resource.try_lock(tmp_path / 'host/0.lock') is None
+        assert resource.try_lock(tmp_path / 'build-a/0.lock') is None
+    with export.export_slot():
+        assert resource.try_lock(tmp_path / 'host/0.lock') is None
+
+
+def test_context_ram_reservation_precedes_cuda_and_includes_reclaimable_cache(tmp_path, monkeypatch):
+    import platform
+    monkeypatch.setattr(export, '_context_lease', None)
+    monkeypatch.setattr(platform, 'machine', lambda: 'aarch64')
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
+    monkeypatch.setenv('CUTEAFD_EXPORT_WORKER_RAM_MIB', '1536')
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_WORKERS', '20')
+    original = Path.read_text
+    def text(path, *args, **kwargs):
+        if str(path) == '/proc/meminfo':
+            return 'MemFree: 6291456 kB\nMemAvailable: 125829120 kB\n'
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', text)
+    export.context_admission()
+    assert export._context_lease
+    assert json.loads((tmp_path / 'context-baseline.json').read_text())['available'] == 122880
+    assert (tmp_path / 'context.0.lock').read_text() == '1536'
+    export._context_lease.close()
+    export._context_lease = None
+
+
+@pytest.mark.parametrize('available,reservation,expected', [(120000, 1536, True), (7000, 4096, False)])
+def test_context_admission_accounts_live_reservations_across_worker_limits(tmp_path, monkeypatch, available, reservation, expected):
+    monkeypatch.setattr(export, '_context_lease', None)
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
+    monkeypatch.setenv('CUTEAFD_EXPORT_WORKER_RAM_MIB', str(reservation))
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_WORKERS', '2')
+    (tmp_path / 'context-baseline.json').write_text(json.dumps({'available': available}))
+    held = (tmp_path / 'context.9.lock').open('w+')
+    held.write('4096')
+    held.flush()
+    fcntl.flock(held, fcntl.LOCK_EX)
+    original = Path.read_text
+    def text(path, *args, **kwargs):
+        if str(path) == '/proc/meminfo':
+            return f'MemFree: 512000 kB\nMemAvailable: {available * 1024} kB\n'
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', text)
+    def stop_wait(seconds):
+        assert seconds == 60
+        raise TimeoutError('test stops the bounded admission wait')
+    monkeypatch.setattr(export.time, 'sleep', stop_wait)
+    try:
+        if expected:
+            export.context_admission()
+            assert export._context_lease
+            assert (tmp_path / 'context.0.lock').read_text() == str(reservation)
+        else:
+            with pytest.raises(TimeoutError):
+                export.context_admission()
+            assert export._context_lease is None
+    finally:
+        held.close()
+        if export._context_lease:
+            export._context_lease.close()
+        export._context_lease = None

@@ -324,7 +324,7 @@ cmake \
   -DPython3_EXECUTABLE="$(command -v python3)" \
   -DCUTEAFD_CUDA_ARCHITECTURES="$cuda_arch"
 # One process budget shared by variant workers across all Ninja package jobs.
-export CUTEAFD_EXPORT_SLOT_DIR="$build_dir/cache/export-slots"
+export CUTEAFD_EXPORT_SLOT_DIR="${CUTEAFD_EXPORT_SLOT_DIR:-$build_dir/cache/export-slots}"
 export CUTEAFD_EXPORT_HOST_CLASS="${CUTEAFD_EXPORT_HOST_CLASS:-$( [[ "$role" == coordinator ]] && echo raptor || echo remote )}"
 cmake --build "$build_dir/native"
 for export_lock_fd in "${export_lock_fds[@]}"; do

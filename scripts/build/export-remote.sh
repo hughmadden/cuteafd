@@ -85,14 +85,27 @@ smi=/usr/lib/wsl/lib/nvidia-smi
 [[ -x "$smi" ]] || smi=nvidia-smi
 root="$(mktemp -d "$HOME/.cache/cuteafd/builds/export-$key.XXXXXXXX")"
 container="cuteafd-export-$(basename "$root")"
-trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$root"' EXIT
+reservation="$(basename "$root")"
+ledger="$HOME/.cache/cuteafd/export-reservations.json"
+cleanup_export() {
+  # Confirm container termination before freeing its reservation or artifacts.
+  if docker container inspect "$container" >/dev/null 2>&1; then
+    docker rm -f "$container" >/dev/null || return 1
+  fi
+  [[ ! -f "$root/src/scripts/build/export-placement.py" ]] ||
+    python3 "$root/src/scripts/build/export-placement.py" release --ledger "$ledger" --reservation "$reservation"
+  rm -rf "$root"
+}
+trap cleanup_export EXIT
+trap 'exit 143' TERM HUP INT
+mkdir -p "$HOME/.cache/cuteafd/export-workers"
 mkdir -p "$root/src" "$root/build" "$root/output" "$root/home"
 zstd -d -q <"$area/source.tar.zst" | tar -C "$root/src" -xf -
 placement="$root/src/scripts/build/export-placement.py"
 python3 "$root/src/scripts/build/assert-build-filesystem.py" "$root"
 grep -Eq "name:[[:space:]]*\"?all\"?[[:space:]]*\$" /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null ||
   { echo "export-remote: no CDI device nvidia.com/gpu=all on $(hostname); run: sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml" >&2; exit 2; }
-read -r cap jobs baseline < <(python3 "$placement" admit --smi "$smi" --gpu 0 --max-cap-mib "$((24576 / slots))") || exit "$NO_TURN"
+read -r cap jobs baseline ram < <(python3 "$placement" reserve --ledger "$ledger" --reservation "$reservation" --owner "$$" --smi "$smi" --gpu 0 --max-cap-mib "$((24576 / slots))" --max-jobs "$((cores / slots))") || exit "$NO_TURN"
 ((jobs <= cores / slots)) || jobs=$((cores / slots))
 ((jobs > 0)) || jobs=1
 # Split the admitted context budget between Ninja exporters and EXL3 variants.
@@ -105,11 +118,11 @@ echo "export-remote: admitted cap ${cap} MiB, ${jobs} jobs, device ${baseline} M
 # WSL reports only total device use. Watch the bounded aggregate budget,
 # not an individual cap that would count a sibling export as ours.
 status=0
-python3 "$placement" watch --smi "$smi" --gpu 0 --cap-mib "$((cap * slots))" --baseline-mib "$baseline" -- \
-  docker run --rm --device nvidia.com/gpu=all --user "$(id -u):$(id -g)" --name "$container" \
-    -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" -e "CMAKE_BUILD_PARALLEL_LEVEL=$ninja_jobs" -e "CUTEAFD_EXPORT_JOBS=$variant_jobs" -e CUTEAFD_EXPORT_HOST_CLASS=remote \
-    --env-file "$area/scope.env" -e CUTEAFD_WIP_NATIVE_STORE=/wip/build/native-store \
-    -v "$root/src:/wip/source" -v "$root/build:/wip/build" -v "$root/output:/wip/output" -v "$root/home:/wip/home" \
+python3 "$placement" watch --smi "$smi" --gpu 0 --cap-mib "$cap" --ledger "$ledger" --reservation "$reservation" -- \
+  docker run --rm --memory "${ram}m" --memory-swap "${ram}m" --device nvidia.com/gpu=all --user "$(id -u):$(id -g)" --name "$container" \
+    -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" -e "CMAKE_BUILD_PARALLEL_LEVEL=$ninja_jobs" -e "CUTEAFD_EXPORT_JOBS=$variant_jobs" -e CUTEAFD_EXPORT_WORKER_RAM_MIB=4096 -e CUTEAFD_EXPORT_HOST_CLASS=remote -e CUTEAFD_EXPORT_HOST_SLOT_DIR=/export-slots -e "CUTEAFD_EXPORT_HOST_WORKERS=$cores" \
+    --env-file "$area/scope.env" -e "CMAKE_BUILD_PARALLEL_LEVEL=$ninja_jobs" -e "CUTEAFD_EXPORT_JOBS=$variant_jobs" -e CUTEAFD_WIP_NATIVE_STORE=/wip/build/native-store \
+    -v "$HOME/.cache/cuteafd/export-workers:/export-slots" -v "$root/src:/wip/source" -v "$root/build:/wip/build" -v "$root/output:/wip/output" -v "$root/home:/wip/home" \
     "$image" /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator export || status=$?
 if ((status == 0)); then
@@ -126,7 +139,6 @@ if ((status == 0)); then
     status="$NO_TURN"
   fi
 fi
-rm -rf "$root"
 exit "$status"
 REMOTE
   status=$?
