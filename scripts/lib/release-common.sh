@@ -605,48 +605,38 @@ release_profile_docker_args() {
   fi
 }
 
-# Print the ncu or nsys to exec. ROOT is empty in the container (absolute paths)
-# and a fixture directory in tests. The host must not call this to fill the
-# docker argv: its tree is not the image's.
-# ncu: /usr/local/bin/ncu, else the newest /opt/nvidia/nsight-compute/<version>/ncu.
-# nsys, the same way: /usr/local/bin/nsys, else /usr/local/cuda/bin/nsys, else the
-# newest /opt/nvidia/nsight-systems/<version>/nsys (the launcher lives at nsys or
-# bin/nsys). Version directory names are dotted numbers, so 2026.1.10 beats
-# 2026.1.9. A name that is not a version (latest) is not a candidate.
+# Print the profiler to exec. The container calls this with the tool name only,
+# so the search is the image's own files. Tests pass a fixture root as $2.
+# ncu: /usr/local/bin/ncu, else the newest /opt/nvidia/nsight-compute/*/ncu.
+# nsys: /usr/local/bin/nsys, else /usr/local/cuda/bin/nsys, else the newest
+# /opt/nvidia/nsight-systems/*/nsys. Version names are dotted numbers, so
+# 2026.1.10 beats 2026.1.9.
 release_profile_resolve_tool() {
-  local tool="$1" root="${2-}" stable candidate version best="" best_version=""
+  local tool="$1" root="${2-}" candidate version best="" best_version=""
   local restore_nullglob=0
-  local -a found=()
+  local -a stable=() found=()
   case "$tool" in
-    ncu|nsys) ;;
+    ncu) stable=("$root/usr/local/bin/ncu") ;;
+    nsys) stable=("$root/usr/local/bin/nsys" "$root/usr/local/cuda/bin/nsys") ;;
     *) printf 'unknown profiler %s\n' "$tool" >&2; return 127 ;;
   esac
-  stable="$root/usr/local/bin/$tool"
-  if [[ -f "$stable" && -x "$stable" ]]; then
-    printf '%s\n' "$stable"
-    return 0
-  fi
-  if [[ "$tool" == nsys ]]; then
-    stable="$root/usr/local/cuda/bin/nsys"
-    if [[ -f "$stable" && -x "$stable" ]]; then
-      printf '%s\n' "$stable"
+  for candidate in "${stable[@]}"; do
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
       return 0
     fi
-  fi
+  done
   shopt -q nullglob && restore_nullglob=1
   shopt -s nullglob
   if [[ "$tool" == ncu ]]; then
     found=("$root"/opt/nvidia/nsight-compute/*/ncu)
   else
-    found=("$root"/opt/nvidia/nsight-systems/*/bin/nsys "$root"/opt/nvidia/nsight-systems/*/nsys)
+    found=("$root"/opt/nvidia/nsight-systems/*/nsys)
   fi
   ((restore_nullglob)) || shopt -u nullglob
   for candidate in "${found[@]}"; do
     [[ -f "$candidate" && -x "$candidate" ]] || continue
-    version="$candidate"
-    version="${version#"$root"/opt/nvidia/nsight-compute/}"
-    version="${version#"$root"/opt/nvidia/nsight-systems/}"
-    version="${version%%/*}"
+    version="$(basename "$(dirname "$candidate")")"
     [[ "$version" =~ ^[0-9]+([.][0-9]+)+$ ]] || continue
     if [[ -z "$best" ]]; then
       best="$candidate"

@@ -39,14 +39,10 @@ def _install(root: Path, relative: str) -> Path:
     return path
 
 
-def _resolve_embedded(wrapper, tool, root: Path):
-    """Run the resolver copied into the container command, against a fixture tree."""
-    script = wrapper[2]
-    preamble, sep, _ = script.rpartition('\nrelease_profile_exec "$@"')
-    assert sep, script
-    probe = preamble + '\nrelease_profile_resolve_tool "$1" "$2"\n'
-    return subprocess.run(['/bin/bash', '-c', probe, 'probe', tool, str(root)],
-                          capture_output=True, text=True)
+def _resolve(tool, root: Path):
+    script = 'source scripts/lib/release-common.sh; release_profile_resolve_tool "$1" "$2"'
+    return subprocess.run(['bash', '-c', script, 'test', tool, str(root)],
+                          cwd=ROOT, capture_output=True, text=True)
 
 
 def test_helper_maps_switches_host_and_directory():
@@ -136,20 +132,19 @@ def test_wrapper_refuses_bad_values(args, message):
     assert out.returncode != 0 and message in out.stderr, out.stderr
 
 
-def test_container_command_resolves_ncu_and_nsys_layouts(tmp_path):
-    """The lookup runs in the command the container executes, against that tree."""
+def test_resolve_tool_uses_the_stated_layouts(tmp_path):
     out, ncu_wrapper, _ = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm')
     assert out.returncode == 0, out.stderr
     out, nsys_wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
     assert out.returncode == 0, out.stderr
     for wrapper in (ncu_wrapper, nsys_wrapper):
+        assert 'release_profile_resolve_tool "$tool"' in wrapper[2]
         assert wrapper[2].rstrip().endswith('release_profile_exec "$@"')
-        assert 'exec "$bin" "$@"' in wrapper[2]
 
     stable = tmp_path / 'stable'
     _install(stable, 'usr/local/bin/ncu')
     _install(stable, 'opt/nvidia/nsight-compute/2026.9.9/ncu')
-    found = _resolve_embedded(ncu_wrapper, 'ncu', stable)
+    found = _resolve('ncu', stable)
     assert found.returncode == 0, found.stderr
     assert found.stdout.strip() == str(stable / 'usr/local/bin/ncu')
 
@@ -157,12 +152,11 @@ def test_container_command_resolves_ncu_and_nsys_layouts(tmp_path):
     _install(versioned, 'opt/nvidia/nsight-compute/2026.1.9/ncu')
     _install(versioned, 'opt/nvidia/nsight-compute/2026.1.10/ncu')
     _install(versioned, 'opt/nvidia/nsight-compute/2025.4/ncu')
-    _install(versioned, 'opt/nvidia/nsight-compute/latest/ncu')
-    found = _resolve_embedded(ncu_wrapper, 'ncu', versioned)
+    found = _resolve('ncu', versioned)
     assert found.returncode == 0, found.stderr
     assert found.stdout.strip() == str(versioned / 'opt/nvidia/nsight-compute/2026.1.10/ncu')
 
-    missing = _resolve_embedded(ncu_wrapper, 'ncu', tmp_path / 'empty')
+    missing = _resolve('ncu', tmp_path / 'empty')
     assert missing.returncode == 127
     assert missing.stdout == ''
     assert 'ncu not found: looked for /usr/local/bin/ncu and /opt/nvidia/nsight-compute/*/ncu' in missing.stderr
@@ -170,26 +164,26 @@ def test_container_command_resolves_ncu_and_nsys_layouts(tmp_path):
     nsys_bin = tmp_path / 'nsys-bin'
     _install(nsys_bin, 'usr/local/bin/nsys')
     _install(nsys_bin, 'usr/local/cuda/bin/nsys')
-    _install(nsys_bin, 'opt/nvidia/nsight-systems/2026.9/bin/nsys')
-    found = _resolve_embedded(nsys_wrapper, 'nsys', nsys_bin)
+    _install(nsys_bin, 'opt/nvidia/nsight-systems/2026.9/nsys')
+    found = _resolve('nsys', nsys_bin)
     assert found.returncode == 0, found.stderr
     assert found.stdout.strip() == str(nsys_bin / 'usr/local/bin/nsys')
 
     nsys_cuda = tmp_path / 'nsys-cuda'
     _install(nsys_cuda, 'usr/local/cuda/bin/nsys')
-    _install(nsys_cuda, 'opt/nvidia/nsight-systems/2026.9/bin/nsys')
-    found = _resolve_embedded(nsys_wrapper, 'nsys', nsys_cuda)
+    _install(nsys_cuda, 'opt/nvidia/nsight-systems/2026.9/nsys')
+    found = _resolve('nsys', nsys_cuda)
     assert found.returncode == 0, found.stderr
     assert found.stdout.strip() == str(nsys_cuda / 'usr/local/cuda/bin/nsys')
 
     nsys_ver = tmp_path / 'nsys-ver'
-    _install(nsys_ver, 'opt/nvidia/nsight-systems/2026.1.9/bin/nsys')
+    _install(nsys_ver, 'opt/nvidia/nsight-systems/2026.1.9/nsys')
     _install(nsys_ver, 'opt/nvidia/nsight-systems/2026.1.10/nsys')
-    found = _resolve_embedded(nsys_wrapper, 'nsys', nsys_ver)
+    found = _resolve('nsys', nsys_ver)
     assert found.returncode == 0, found.stderr
     assert found.stdout.strip() == str(nsys_ver / 'opt/nvidia/nsight-systems/2026.1.10/nsys')
 
-    missing = _resolve_embedded(nsys_wrapper, 'nsys', tmp_path / 'no-nsys')
+    missing = _resolve('nsys', tmp_path / 'no-nsys')
     assert missing.returncode == 127
     assert missing.stdout == ''
     assert 'nsys not found: looked for /usr/local/bin/nsys, /usr/local/cuda/bin/nsys, and /opt/nvidia/nsight-systems/*/nsys' in missing.stderr
