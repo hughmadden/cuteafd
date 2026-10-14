@@ -267,6 +267,49 @@ DeepSeek and MiMo are not available in this environment.
   run left (worktree, uncommitted edits, known bugs) and that no other run is
   active. Codex picks up from the worktree state.
 
+## External agents: Grok and Gemini (TJ, 2026-10-14)
+
+Two more subscriptions are available. They can't go through the Agent tool or
+the gateway (no official API, and their backends would notice rewritten
+requests), so they run as CLIs. Their capacity is entirely the
+orchestrator's to use; TJ isn't using these subscriptions.
+
+| CLI | Model | Launch flags | Expected strengths |
+|---|---|---|---|
+| `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota (the backup Codex subscription expires in a few weeks) |
+| `agy` (Google Antigravity) | `gemini-4-argon-high`/`-medium`/`-low`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
+
+Launch and control, through a detached tmux session so a run can be watched,
+steered and stopped:
+
+```sh
+scripts/agents/ext-launch.sh grok|agy <name> [model] [effort]   # background; exit wakes the orchestrator
+tail ~/.cache/cuteafd/builds/codex-runs/<name>.log              # progress
+scripts/agents/ext-stop.sh <name>                                # stop
+```
+
+The brief format and preamble are the same as Codex's. These agents can't
+SendMessage, so the orchestrator reads `<name>.report.md` and the log. A
+meta-driver (a DeepSeek or Sol agent that drives the CLI in tmux, sends
+steering messages and summarises progress) is an option for long runs; try it
+once a plain run shows where steering would have helped.
+
+**They are on trial.** Every use is scored in `docs/agent-scorecard.md`:
+correctness, judgement, quality, creativity, wall time, plus notes. Trial
+patterns:
+- **Duels:** give the same task as a Sol or Opus agent to Gemini or Grok in a
+  separate worktree, and compare the results. Kernel design and optimization
+  are the best duels.
+- **Low-priority tasks** on their own.
+- **Reviews** of another agent's PR, compared with the code reviewer's.
+- **Research and vision** (Gemini): compare with our web search (Exa).
+
+The same gates and rules apply as for every agent: no tooling extensions, no
+sudo, no power changes, the fair queue for hardware, public-text hygiene. An
+external agent never merges, and never pushes to work/p0 or the fork's master.
+Compact the scorecard log into its summary table every ~10 entries, and
+update this section's table as the picture firms up.
+
 ## Running agents
 
 - Workers update current state with `scripts/dev/pr-sync push` at checkpoints
