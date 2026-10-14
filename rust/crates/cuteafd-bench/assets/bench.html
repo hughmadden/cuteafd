@@ -105,7 +105,10 @@ dialog h3 { margin: 0; font: 600 12px var(--sans); letter-spacing: .14em; text-t
 /* Traffic is identity-coded with line patterns as well as color. */
 #fabric { --fabric-1: #3987e5; --fabric-2: #d95926; --fabric-3: #199e70; padding: 16px; }
 html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --fabric-3: #1baf7a; }
-.fabric-plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 390px), 1fr)); gap: 20px; }
+.fabric-plots { display: grid; gap: 20px; }
+.fabric-host { min-width: 0; }
+.fabric-host > h4 { font: 600 13px var(--mono); margin: 10px 0; }
+.fabric-host-ports { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 390px), 1fr)); gap: 20px; }
 .fabric-port { min-width: 0; }
 .fabric-port h4 { margin: 10px 0; font: 600 12px var(--mono); overflow-wrap: anywhere; }
 .fabric-port small, .fabric-port summary { color: var(--ink-2); font: 11px var(--mono); }
@@ -144,7 +147,7 @@ html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --f
   </div>
   <section class="panel" id="fabric" hidden>
     <h3>Fabric traffic <small>1 Hz · last 60 observations · Gb/s</small></h3>
-    <p class="note">One graph per host and physical RDMA rail. Traffic uses max(transmit, receive) against the full-duplex link rate. Foreign is NIC minus engine and registered sources; protocol headers remain in NIC totals. Phase rates cover sampled windows with idle padding at 1 Hz, not exact request edges.</p>
+    <p class="note">One graph per host and physical RDMA rail. Traffic uses max(transmit, receive) with an autoscaled traffic axis; link capacity and utilization are labeled separately. Foreign is NIC minus engine and registered sources; protocol headers remain in NIC totals. Phase rates cover sampled windows with idle padding at 1 Hz, not exact request edges.</p>
     <div class="fabric-plots"></div><p class="fabric-assessments" role="status"></p>
   </section>
   <div class="grid" id="panels"></div>

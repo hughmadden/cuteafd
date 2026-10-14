@@ -9,6 +9,7 @@ const series = [
 ];
 const histories = new Map();
 let run, sequence = 0;
+let ranks = new Map();
 const esc = (text) => String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const cnp = (c) => {
   const values = ['np_cnp_sent', 'rp_cnp_handled'].map(key => c?.[`hw_counters/${key}`] ?? c?.[key]).filter(Number.isFinite);
@@ -38,24 +39,27 @@ function draw(container, key, history) {
     label.innerHTML = `<svg width="30" height="12" aria-hidden="true"><path d="M0 6 H30" stroke="var(--fabric-${i + 1})" stroke-width="2" stroke-dasharray="${s.dash}"/></svg>${s.name} ${fmt(last[s.key])} Gb/s`;
     legend.append(label);
   });
+  const utilization = document.createElement('span');
+  utilization.textContent = `Utilization ${fmt(Number.isFinite(port.utilization) ? port.utilization * 100 : null)}%`;
+  legend.append(utilization);
   section.append(legend);
   const plot = document.createElement('div'); plot.className = 'fabric-plot';
   const svg = document.createElementNS(NS, 'svg');
   svg.setAttribute('viewBox', '0 0 620 180'); svg.setAttribute('role', 'img');
-  svg.setAttribute('aria-label', `${key}: NIC, engine and foreign traffic, in Gb/s. Dashed rule is link capacity.`);
+  svg.setAttribute('aria-label', `${key}: NIC, engine and foreign traffic, in Gb/s. Autoscaled to observed traffic; link capacity is labeled separately.`);
   plot.append(svg);
-  const ceiling = Math.max(port.link_gbps || 0, ...history.map((p) => p.nic || 0), 1) * 1.06;
+  const observed = Math.max(...history.flatMap(p => series.map(s => p[s.key] || 0)));
+  const ceiling = observed > 0 ? observed * 1.15 : 1;
   const x = (i) => 46 + i / Math.max(history.length - 1, 1) * 560;
   const y = (v) => 148 - v / ceiling * 128;
   [0, ceiling / 2, ceiling].forEach((v) => {
     mark('path', { d: `M46 ${y(v)} H606`, stroke: 'var(--line)', 'stroke-width': 1 }, svg);
     const label = mark('text', { x: 40, y: y(v) + 4, 'text-anchor': 'end', fill: 'var(--ink-2)', 'font-size': 10 }, svg);
-    label.textContent = v.toFixed(0);
+    label.textContent = v >= 10 ? v.toFixed(0) : v.toFixed(v > 0 && v < 0.1 ? 3 : 2);
   });
   if (port.link_gbps) {
-    mark('path', { d: `M46 ${y(port.link_gbps)} H606`, stroke: 'var(--muted)', 'stroke-width': 1, 'stroke-dasharray': '4 5' }, svg);
-    const label = mark('text', { x: 604, y: y(port.link_gbps) - 4, 'text-anchor': 'end', fill: 'var(--ink-2)', 'font-size': 10 }, svg);
-    label.textContent = 'link';
+    const label = mark('text', { x: 604, y: 10, 'text-anchor': 'end', fill: 'var(--ink-2)', 'font-size': 10 }, svg);
+    label.textContent = `Link reference ${fmt(port.link_gbps)} Gb/s`;
   }
   series.forEach((s, slot) => {
     let path = '', previous = false;
@@ -100,7 +104,39 @@ function render() {
   const root = document.getElementById('fabric'); if (!root) return;
   root.hidden = histories.size === 0;
   const plots = root.querySelector('.fabric-plots'); plots.replaceChildren();
-  for (const [key, history] of histories) draw(plots, key, history);
+  const hosts = new Map();
+  for (const [key, history] of histories) {
+    const host = history.at(-1).port.host;
+    if (!hosts.has(host)) hosts.set(host, []);
+    hosts.get(host).push([key, history]);
+  }
+  const address = host => host.replace(/^\[([^\]]+)\](?::\d+)?$/, '$1').replace(/:\d+$/, '');
+  const rank = host => ranks.get(host) ?? ranks.get(address(host)) ?? Number.MAX_SAFE_INTEGER;
+  const ordered = [...hosts].sort(([a], [b]) => a === 'coordinator' ? -1 : b === 'coordinator' ? 1
+    : rank(a) - rank(b) || a.localeCompare(b, undefined, { numeric: true }));
+  for (const [host, ports] of ordered) {
+    const group = document.createElement('section'); group.className = 'fabric-host';
+    const heading = document.createElement('h4');
+    heading.textContent = host === 'coordinator' ? 'Coordinator' : rank(host) !== Number.MAX_SAFE_INTEGER ? `Rank ${rank(host)} · ${host}` : host;
+    group.append(heading);
+    const grid = document.createElement('div'); grid.className = 'fabric-host-ports';
+    let down = 0, idle = 0;
+    ports.sort(([, a], [, b]) => a.at(-1).port.device.localeCompare(b.at(-1).port.device, undefined, { numeric: true })
+      || a.at(-1).port.port - b.at(-1).port.port);
+    for (const [key, history] of ports) {
+      const state = history.at(-1).port.state || '';
+      const changed = new Set(history.map(p => p.port.state).filter(Boolean)).size > 1;
+      const traffic = history.some(p => series.some(s => Number.isFinite(p[s.key]) && p[s.key] > 0));
+      if (!changed && !traffic && /\b(DOWN|ACTIVE)\b/.test(state)) {
+        if (/\bDOWN\b/.test(state)) down++; else idle++;
+        continue;
+      }
+      draw(grid, key, history);
+    }
+    if (down) { const line = document.createElement('p'); line.className = 'note fabric-down'; line.textContent = `${down} port${down === 1 ? '' : 's'} down`; group.append(line); }
+    if (idle) { const line = document.createElement('p'); line.className = 'note fabric-idle'; line.textContent = `${idle} port${idle === 1 ? '' : 's'} idle`; group.append(line); }
+    group.append(grid); plots.append(group);
+  }
 }
 window.CuteFabric = {
   interval(event) {
@@ -127,6 +163,7 @@ window.CuteFabric = {
   },
   report(report) {
     if (!report) return;
+    ranks = new Map((report.server?.hardware?.sparks || []).flatMap(s => [[s.address, s.rank], ...(s.name ? [[s.name, s.rank]] : [])]));
     const warnings = (report.fabric || []).flatMap((phase) => phase.assessments || []);
     const root = document.getElementById('fabric');
     if (root) root.querySelector('.fabric-assessments').textContent = [...new Set(warnings)].join(' · ');
