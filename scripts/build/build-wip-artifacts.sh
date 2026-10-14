@@ -152,7 +152,11 @@ wip_tree_fingerprint() {
   find "$@" -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.cu' -o -name '*.cc' -o -name '*.h' -o -name '*.cmake' -o -name 'CMakeLists.txt' -o -name '*.py' \) \
     -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
 }
-wip_rust_fingerprint="$(printf '%s %s\n' "$(wip_tree_fingerprint "$source_dir/rust")" "$transformers_source_digest" | sha256sum | awk '{print $1}')"
+# Dev-only Cargo features (wip.sh validates dev-* names; the coordinator leg only).
+cargo_features="${CUTEAFD_WIP_CARGO_FEATURES:-}"
+cargo_feature_args=()
+[[ -z "$cargo_features" ]] || cargo_feature_args=(--features "$cargo_features")
+wip_rust_fingerprint="$(printf '%s %s features=%s\n' "$(wip_tree_fingerprint "$source_dir/rust")" "$transformers_source_digest" "$cargo_features" | sha256sum | awk '{print $1}')"
 wip_native_fingerprint="$(wip_tree_fingerprint "$source_dir/native" "$source_dir/python")"
 wip_fingerprint_marker="$build_dir/.source-content-fingerprint"
 wip_previous_fingerprint="$(cat "$wip_fingerprint_marker" 2>/dev/null || true)"
@@ -201,7 +205,7 @@ wip_native_key() {
     printf 'image %s\n' "${CUTEAFD_WIP_DEV_IMAGE_ID:?the native cache needs the dev image ID}"
     # Every scope switch that reaches CMake or an exporter.
     env | grep -E '^CUTEAFD_WIP_[A-Z0-9_]+=' |
-      grep -vE '^CUTEAFD_WIP_(EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
+      grep -vE '^CUTEAFD_WIP_(CARGO_FEATURES|EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" "$coordinator_aot" "$xgrammar"
     # The CuTe DSL host target the exporters pin (#127; python/tools/lib/_pinned_sparkinfer.py):
@@ -219,10 +223,10 @@ if [[ "$phase" == export ]]; then
 elif [[ "$phase" != native ]]; then
   rust_started=$SECONDS
   for host_isa in "${host_isas[@]}"; do
-    cuteafd_host_isa_cargo_build "$CARGO_TARGET_DIR" "$host_isa" "$source_dir/rust/Cargo.toml" --quiet
+    cuteafd_host_isa_cargo_build "$CARGO_TARGET_DIR" "$host_isa" "$source_dir/rust/Cargo.toml" --quiet "${cargo_feature_args[@]}"
   done
   printf '%s %s' "$wip_rust_fingerprint" "${host_isas[*]}" >"$rust_phase_marker"
-  wip_phase_mark rust $((SECONDS - rust_started)) "kache ${CUTEAFD_KACHE_MODE:-disabled}$([[ -d "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" ]] && echo ' fallback')"
+  wip_phase_mark rust $((SECONDS - rust_started)) "kache ${CUTEAFD_KACHE_MODE:-disabled}$([[ -d "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" ]] && echo ' fallback')${cargo_features:+ features $cargo_features}"
 else
   [[ "$(cat "$rust_phase_marker" 2>/dev/null || true)" == "$wip_rust_fingerprint ${host_isas[*]}" && -x "$(cuteafd_host_isa_daemon "$CARGO_TARGET_DIR" "${host_isas[0]}")" ]] ||
     { echo 'native phase needs a successful rust phase for this source and cache mode' >&2; exit 2; }

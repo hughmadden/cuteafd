@@ -15,6 +15,7 @@ use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::NativeLibrary;
+use cuteafd_core::coordinator_programs::AttentionReductionPlan;
 use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::expert::{SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
@@ -49,6 +50,7 @@ pub(crate) struct Engine<'a> {
     pub max_context: usize,
     pub stream: *mut c_void,
     quantize_grid: Fp8QuantizeGrid,
+    attention_reduction: AttentionReductionPlan,
     pub shape: PoolShape,
     pools: Vec<LayerCache<'a>>,
     rope_window: Dev<'a>,
@@ -475,6 +477,8 @@ impl<'a> Engine<'a> {
             parts.cfg.dim);
         // Layers past the backbone are the dSpark stages' window caches.
         let stages = parts.weights.dspark.as_ref().map_or(0, |d| d.stages.len());
+        let attention_reduction = AttentionReductionPlan::new(parts.decode_rows,
+            (stages > 0).then_some(parts.cfg.dspark_block_size), None)?;
         let pools = (0..parts.cfg.n_layers + stages).map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
         let table = |compressed: bool| -> Result<Dev<'a>> {
             let values = metadata::rope_table(&parts.cfg, compressed, parts.max_context.max(metadata::WINDOW));
@@ -520,6 +524,7 @@ impl<'a> Engine<'a> {
             max_context: parts.max_context,
             stream: parts.stream,
             quantize_grid,
+            attention_reduction,
             shape: parts.shape,
             prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None),
@@ -1032,7 +1037,8 @@ impl<'a> Engine<'a> {
                     // Announced before the replay can publish it: the proxy spins for it.
                     link.expect(1);
                 }
-                self.replay_on(0, key, segment)?;
+                if self.mixed_attention(weights.ratio, tables) { segment()?; }
+                else { self.replay_on(0, key, segment)?; }
                 // Preserve owner routes outside capture before another router reuses them.
                 self.probe_ring(layer, w, t, device.is_none() && layer >= local_layers)?;
                 if let Some(w1) = w1 {
@@ -1198,6 +1204,10 @@ impl<'a> Engine<'a> {
         DeviceLogits { ptr: w.vocab_logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream, greedy: None }
     }
 
+    fn mixed_attention(&self, ratio: usize, tables: &StepTables) -> bool {
+        tables.decode && ratio == 128 && self.attention_reduction.mixed_indexed_rows(&tables.c128_lengths)
+    }
+
     /// Which sparse attention a layer runs this step.
     fn attention_kind(&self, ratio: usize, tables: &StepTables) -> &'static str {
         match ratio {
@@ -1265,7 +1275,8 @@ impl<'a> Engine<'a> {
         let key = GraphKey { layer, rows: t, chunked: tables.chunked,
             attention: self.attention_kind(self.peer()?.layers[layer].ratio, tables),
             table_width: tables.c4_table_width, table_stride: tables.c4_table_stride, previous: usize::from(layer > 0), tp2_broadcast: false, exchange_f32: false };
-        self.replay_on(1, key, segment)
+        if self.mixed_attention(self.peer()?.layers[layer].ratio, tables) { segment() }
+        else { self.replay_on(1, key, segment) }
     }
 
     /// The layer's routed partials + shared expert, reduced, then mHC post
@@ -1542,6 +1553,34 @@ impl<'a> Engine<'a> {
         let m = &lane.tables;
         let mode = if tables.decode { "decode" } else { "prefill" };
         let attention = self.attention_kind(weights.ratio, tables);
+        if self.mixed_attention(weights.ratio, tables) {
+            // These exports have different SWA chunk folds. Keep each row on its
+            // serial route; common all-window/all-compressed graphs are unchanged.
+            let heads = self.cfg.n_heads / if weights.attention_split { 2 } else { 1 };
+            let at = |dev: &Dev<'_>, start: usize, count: usize, stride: usize| -> Result<*mut c_void> {
+                let end = start.checked_add(count).and_then(|n| n.checked_mul(stride))
+                    .context("attention row range overflow")?;
+                ensure!(end <= dev.buffer.bytes, "attention row range exceeds its buffer");
+                Ok(dev.buffer.ptr.cast::<u8>().wrapping_add(start * stride).cast())
+            };
+            for range in self.attention_reduction.indexed_ranges(&tables.c128_lengths) {
+                let (start, count) = (range.start, range.rows);
+                let attention = if range.compressed { "c128" } else { "win" };
+                self.run_on(rank, weights.attention_split, &format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
+                    ("q", at(&w.query, start, count, heads * 512 * 2)?),
+                    ("swa_cache", main),
+                    ("swa_indices", at(&m.swa_indices, start, count, metadata::WINDOW * 4)?),
+                    ("swa_lengths", at(&m.swa_lengths, start, count, 4)?),
+                    ("indexed_cache", indexed_cache),
+                    ("indexed_indices", at(&m.c128_indices, start, count, self.c128_width * 4)?),
+                    ("indexed_lengths", at(&m.c128_lengths, start, count, 4)?),
+                    ("attn_sink", weights.ptr("attn_sink")?),
+                    ("out", at(&w.attn_out, start, count, heads * 512 * 2)?),
+                    ("scratch", w.scratch.buffer.ptr),
+                ], &[Scalar::I32(i32::try_from(count)?)])?;
+            }
+            return Ok(());
+        }
         self.run_on(rank, weights.attention_split, &format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
             ("q", w.query.buffer.ptr), ("swa_cache", main), ("swa_indices", m.swa_indices.buffer.ptr),
             ("swa_lengths", m.swa_lengths.buffer.ptr), ("indexed_cache", indexed_cache),

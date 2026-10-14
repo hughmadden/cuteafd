@@ -25,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CMAKE_FILE = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
 
-DEFAULT_MAP = "1:64,16:192,80:192,256:192,1024:192,4096:192"
+DEFAULT_MAP = "1:192,16:192,80:192,256:192,1024:192,4096:192"
 TP2_CAP80_128 = "1:64,16:128,80:128,256:192,1024:192,4096:192"
 
 _STUB_EXPORTER = '''\
@@ -128,6 +128,7 @@ def run_width_override_scenario() -> dict:
         (tools / "lib" / "v41_spark_tp3_launch_geometry.py").write_text(
             "# stub\n", encoding="utf-8"
         )
+        (tools / "lib" / "expert_grouping.py").write_text("# stub\n", encoding="utf-8")
         build = tmp / "build"
         build.mkdir()
         log = tmp / "exports.log"

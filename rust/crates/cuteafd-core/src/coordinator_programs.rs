@@ -37,6 +37,25 @@ impl AttentionReductionPlan {
             backend: if compressed { SparseAttentionBackend::Bf16Aot } else { SparseAttentionBackend::NativeFp32 } }
     }
 
+    /// A row without indexed records must retain the window-only fold even when
+    /// another row has records. Only mixed steps need more than one launch.
+    pub fn mixed_indexed_rows(self, lengths: &[i32]) -> bool {
+        lengths.first().is_some_and(|first|
+            lengths.iter().any(|length| (*length > 0) != (*first > 0)))
+    }
+
+    pub fn indexed_ranges(self, lengths: &[i32])
+        -> impl Iterator<Item = IndexedAttentionRange> + '_ {
+        let mut start = 0;
+        std::iter::from_fn(move || {
+            let compressed = *lengths.get(start)? > 0;
+            let rows = lengths[start..].iter().take_while(|length| (**length > 0) == compressed).count();
+            let range = IndexedAttentionRange { start, rows, compressed };
+            start += rows;
+            Some(range)
+        })
+    }
+
     /// Admission may use validated checkpoint geometry before loading the drafter.
     /// Check raw geometry too: different widths can clamp to the same plan.
     pub fn validate_loaded(self, active_drafts: Option<usize>) -> Result<Self, AttentionPlanError> {
@@ -48,6 +67,46 @@ impl AttentionReductionPlan {
         }
         Ok(loaded)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedAttentionRange {
+    pub start: usize,
+    pub rows: usize,
+    pub compressed: bool,
+}
+
+/// A load-time dense output reduction. Live rows select storage, never arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputReductionPlan {
+    capacity_rows: usize,
+    expected_rows: usize,
+    split_slices: usize,
+}
+
+impl OutputReductionPlan {
+    pub fn new(capacity_rows: usize, expected_rows: usize, split_slices: usize) -> Result<Self, OutputPlanError> {
+        if capacity_rows == 0 || expected_rows == 0 || !matches!(split_slices, 1 | 2 | 4) {
+            return Err(OutputPlanError::InvalidRecipe);
+        }
+        Ok(Self { capacity_rows, expected_rows, split_slices })
+    }
+    pub fn expected_rows(self) -> usize { self.expected_rows }
+    pub fn split_slices(self) -> usize { self.split_slices }
+    pub fn validate(self, capacity: usize, expected_rows: usize, split_slices: usize,
+        all_rows: bool) -> Result<(), OutputPlanError> {
+        if capacity >= self.capacity_rows && expected_rows == self.expected_rows
+            && split_slices == self.split_slices && all_rows { Ok(()) }
+        else { Err(OutputPlanError::IncompatibleExport) }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum OutputPlanError {
+    #[error("invalid dense output reduction recipe")]
+    InvalidRecipe,
+    #[error("dense output export does not honor the immutable reduction plan")]
+    IncompatibleExport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +287,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn output_recipe_is_immutable_and_rejects_partial_row_exports() {
+        let plan = OutputReductionPlan::new(64, 16, 1).unwrap();
+        for _rows in 1..=64 {
+            assert_eq!((plan.expected_rows(), plan.split_slices()), (16, 1));
+            assert!(plan.validate(80, 16, 1, true).is_ok());
+        }
+        assert!(plan.validate(16, 16, 1, true).is_err());
+        assert!(plan.validate(80, 1, 2, true).is_err());
+        assert!(plan.validate(80, 16, 1, false).is_err());
+        assert!(OutputReductionPlan::new(0, 16, 1).is_err());
+        assert!(OutputReductionPlan::new(64, 0, 1).is_err());
+        assert!(OutputReductionPlan::new(64, 16, 3).is_err());
+    }
+
+    #[test]
     fn sparse_recipe_is_immutable_across_decode_verify_widths() {
         for plan_rows in 1..=64 {
             let plan = AttentionReductionPlan::new(64, Some(5), Some(plan_rows)).unwrap();
@@ -243,6 +317,38 @@ mod tests {
             }
             assert!(plan.validate_loaded(Some(7)).is_err());
             assert_eq!(plan.rows(), plan_rows);
+        }
+    }
+
+    #[test]
+    fn indexed_rows_keep_their_serial_recipe_across_boundaries_and_requests() {
+        let plan = AttentionReductionPlan::new(64, Some(5), None).unwrap();
+        for lengths in [vec![], vec![0], vec![1], vec![0; 6], vec![1; 6],
+            vec![0, 0, 1, 1, 1, 1], vec![1, 0, 0, 1, 0, 2]] {
+            let ranges: Vec<_> = plan.indexed_ranges(&lengths).collect();
+            assert_eq!(ranges.iter().map(|r| r.rows).sum::<usize>(), lengths.len());
+            assert_eq!(plan.mixed_indexed_rows(&lengths), ranges.len() > 1);
+            for range in ranges {
+                assert!(range.rows > 0);
+                for &length in &lengths[range.start..range.start + range.rows] {
+                    assert_eq!(range.compressed, length > 0);
+                    assert_eq!(range.compressed, plan.indexed_ranges(&[length]).next().unwrap().compressed);
+                }
+            }
+        }
+        assert_eq!(plan.indexed_ranges(&[0, 0, 1, 1]).collect::<Vec<_>>(), vec![
+            IndexedAttentionRange { start: 0, rows: 2, compressed: false },
+            IndexedAttentionRange { start: 2, rows: 2, compressed: true }]);
+        // Several requests flatten into one verify. The route depends only on
+        // this position's visible records, not a later row or request.
+        for starts in [[93, 123, 129], [122, 126, 127]] {
+            let lengths: Vec<_> = starts.into_iter().flat_map(|start|
+                (start..start + 6).map(|position| ((position + 1) / 128) as i32)).collect();
+            let ranges: Vec<_> = plan.indexed_ranges(&lengths).collect();
+            for (row, length) in lengths.iter().enumerate() {
+                let range = ranges.iter().find(|r| (r.start..r.start + r.rows).contains(&row)).unwrap();
+                assert_eq!(range.compressed, *length > 0);
+            }
         }
     }
 

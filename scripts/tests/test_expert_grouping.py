@@ -44,3 +44,19 @@ def test_every_native_wrapper_namespaces_the_additive_query():
             assert "#define cuteafd_expert_group_rows" in text, wrapper
     cmake = (ROOT / "native/cmake/shared/expert_families.cmake").read_text()
     assert "set(expert_ops info initialize output_kind group_rows" in cmake
+
+
+def test_v41_compressor_keeps_one_load_time_unsplit_projection_recipe():
+    text = (ROOT / "native/families/deepseek_v41/cuda/v41_compressor.cu").read_text()
+    assert "cublasGemmEx" not in text
+    assert "CUBLASLT_ALGO_CONFIG_SPLITK_NUM" in text
+    assert "split=0,reduction=CUBLASLT_REDUCTION_SCHEME_NONE" in text
+    assert "CUDA_R_16BF,k,16,k" in text
+    assert "cublasLtMatmulAlgoGetHeuristic" in text[:text.index("__global__")]
+    project = text[text.index("static int32_t project("):text.index('extern "C" int32_t cuteafd_v41_compressor_project')]
+    assert "cublasLtMatmulAlgoGetHeuristic" not in project
+    assert "&plan.algorithm" in project
+    assert "const uint32_t alignment=16" in text
+    assert "valid(input,x,16)" in project
+    assert "valid(weight,w,16)" in project
+    assert "valid(output,o,16)" in project

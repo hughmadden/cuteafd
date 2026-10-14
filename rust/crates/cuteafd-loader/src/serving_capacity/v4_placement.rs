@@ -43,7 +43,7 @@ pub fn deepseek_v4_native_workspace(hidden: u64, intermediate: u64, experts: u64
         .chain(capacities.into_iter().find(|&n| n >= maximum)) {
         let routes = product("V4 expert routes", &[capacity, topk])?;
         let atomic = capacity >= 256;
-        let planes = intermediate.div_ceil(if capacity == 1 { 64 } else { 128 });
+        let planes = intermediate.div_ceil(128);
         let partial = if atomic { 4 } else { product("V4 ordered partials", &[4, planes, routes, hidden])? };
         let output = product("V4 routed output", &[4, if atomic { capacity } else { routes }, hidden])?;
         let slots = [4, product("V4 packed routes", &[4, experts, routes])?, experts * 4, experts * 8,
@@ -120,7 +120,7 @@ mod tp2_tests {
     use super::*;
     #[test]
     fn native_tp2_workspace_matches_export_slots() {
-        // Export widths are 64 at m1, 128 otherwise; ordered output below
+        // Export widths are 128 at every capacity; ordered output below
         // m256 dominates the native scratch at m80 for both V4 geometries.
         for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 161453088), (7168, 3072, 384, 6, 297139088)] {
             assert_eq!(deepseek_v4_tp2_native_workspace(h, i, e, k, 4096).unwrap(), expected);

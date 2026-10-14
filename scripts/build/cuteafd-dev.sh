@@ -72,12 +72,16 @@ docker_args+=(
 # a private copy); the hardware locks and the fair queue stay host-only.
 lock_dir="$HOME/.cache/cuteafd"
 mkdir -p "$lock_dir"
-docker_args+=(-e "CUTEAFD_LOCK_DIR=$lock_dir")
+# The slot files live in a private, writable directory at the same path inside
+# (a bind-mounted file under an unmounted parent is not writable for flock's
+# open in a uid container); each slot file is the host's real lock inode.
+container_lock_dir="/tmp/cuteafd-build-locks"
+docker_args+=(-e "CUTEAFD_LOCK_DIR=$container_lock_dir" --tmpfs "$container_lock_dir:mode=1777")
 for ((slot = 0; slot < ${CUTEAFD_BUILD_SLOTS:-3}; slot++)); do
-  slot_lock="$lock_dir/build.lock"
-  ((slot == 0)) || slot_lock="$lock_dir/build.lock.$slot"
-  touch "$slot_lock"
-  docker_args+=(-v "$slot_lock:$slot_lock")
+  slot_name="build.lock"
+  ((slot == 0)) || slot_name="build.lock.$slot"
+  touch "$lock_dir/$slot_name"
+  docker_args+=(-v "$lock_dir/$slot_name:$container_lock_dir/$slot_name")
 done
 if [[ -n "${CUTEAFD_DEV_TARGET_DIR:-}" ]]; then
   python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$CUTEAFD_DEV_TARGET_DIR"
@@ -119,6 +123,13 @@ fi
 git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)"
 if [[ "$git_common_dir" != "$repo_root/.git" ]]; then
   docker_args+=(-v "$git_common_dir:$git_common_dir:ro")
+fi
+# Relative gitfiles (worktrees, submodules) resolve only from the checkout's real
+# path, not the /workspace/cuteafd alias: point the pinned SparkInfer tools at the
+# real-path copy (mounted above), still verified against the lock file.
+if [[ "$repo_root" != "/workspace/cuteafd" ]]; then
+  docker_args+=(-e "CUTEAFD_SPARKINFER_SOURCE_DIR=$repo_root/third_party/sparkinfer"
+                -e "CUTEAFD_SPARKINFER_LOCK_FILE=$repo_root/third_party/sparkinfer.lock.json")
 fi
 
 if [[ -t 0 && -t 1 ]]; then

@@ -1127,6 +1127,10 @@ attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # executor exists.
 case "$attention_placement:$family" in
   auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
+  # V4 layers is dev-only: a WIP slot may pass it to the daemon, which serves it only
+  # when built with the dev-v4-layers Cargo feature and refuses it otherwise.
+  layers:deepseek_v4) [[ -n "$wip_slot" ]] ||
+    release_die "deepseek_v4 attention placement layers is a dev-only executor; run it from a WIP slot built with CUTEAFD_WIP_CARGO_FEATURES=dev-v4-layers" ;;
   context:*|layers:*) release_die "$family cannot run attention placement $attention_placement: executor not implemented; only heads is qualified" ;;
   *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
 esac
