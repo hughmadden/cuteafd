@@ -709,6 +709,7 @@ impl<'a> OwnerPair<'a> {
         weights: [OwnerWeights<'a>; 2],
         max_rows: u32,
         geometry: cuteafd_core::ExpertGeometry,
+        timing: bool,
     ) -> Result<Self> {
         use crate::shared::memory::device::{Event, Stream};
         let devices = [weights[0].device(), weights[1].device()];
@@ -720,8 +721,8 @@ impl<'a> OwnerPair<'a> {
         ensure!(
             weights
                 .iter()
-                .all(|weight| weight.max_rows() >= max_rows as usize),
-            "owner pair exceeds admitted rank capacity"
+                .all(|weight| weight.max_rows() == max_rows as usize),
+            "owner pair must equal admitted rank capacity"
         );
         ensure!(
             (1..=4096).contains(&max_rows)
@@ -738,8 +739,7 @@ impl<'a> OwnerPair<'a> {
             Ok(OwnerRank {
                 stream: Stream::new(devices[rank])?,
                 ready: Event::new(devices[rank])?,
-                timing: std::env::var_os("CUTEAFD_TP2_TIMING")
-                    .is_some()
+                timing: timing
                     .then(|| {
                         Ok::<_, anyhow::Error>([
                             Event::new(devices[rank])?,

@@ -141,8 +141,14 @@ fn exl3_tp2_rank_outputs_and_peer_sums_match_b12x() -> Result<()> {
         weights.clone(),
         16,
         cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        false,
     )?;
-    let mut second = OwnerPair::new(weights, 16, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
+    let mut second = OwnerPair::new(
+        weights,
+        16,
+        cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        false,
+    )?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     for (step, rows) in [16usize, 1, 3, 16, 1].into_iter().enumerate() {
         let row_order: [Vec<usize>; 2] = std::array::from_fn(|lane| {

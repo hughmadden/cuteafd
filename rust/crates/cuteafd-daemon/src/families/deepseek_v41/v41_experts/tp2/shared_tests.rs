@@ -367,6 +367,7 @@ fn v41_equality(exl3: bool) -> Result<()> {
         weights,
         capacity as u32,
         cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        false,
     )?;
     let mut shared: [Box<dyn RtxExpertLayer + '_>; 2] = if exl3 {
         let [a, b] = Exl3Tp2::load_pair(

@@ -6,6 +6,7 @@ use super::exl3::{
 use super::layer::{ExpertLayer, ExpertWeights};
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
+use cuteafd_core::ExpertGeometry;
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41ExpertKernel, V41ExpertLaunchArgs, V41LocalExpertReducer,
 };
@@ -25,10 +26,10 @@ impl LocalInputFormat {
             Self::Fp8K32
         }
     }
-    fn row_bytes(self) -> usize {
+    fn row_bytes(self, geometry: ExpertGeometry) -> usize {
         match self {
-            Self::Fp8K32 => 5280,
-            Self::Bf16 => 10240,
+            Self::Fp8K32 => geometry.hidden as usize + geometry.hidden as usize / 32,
+            Self::Bf16 => geometry.row_bytes() as usize,
         }
     }
     fn select(
@@ -36,13 +37,14 @@ impl LocalInputFormat {
         rows: u32,
         bf16: CuteafdDeviceBuffer,
         fp8: CuteafdDeviceBuffer,
+        geometry: ExpertGeometry,
     ) -> Result<CuteafdDeviceBuffer> {
         let input = match self {
             Self::Bf16 => bf16,
             Self::Fp8K32 => fp8,
         };
         ensure!(
-            input.bytes == rows as usize * self.row_bytes(),
+            input.bytes == rows as usize * self.row_bytes(geometry),
             "local expert activation extent differs from {self:?} kernel input"
         );
         Ok(input)
@@ -72,8 +74,21 @@ pub(crate) struct LocalExpertWave<'a> {
     reducer: V41LocalExpertReducer<'a>,
     capacity: u32,
     input_format: LocalInputFormat,
+    geometry: ExpertGeometry,
 }
 impl<'a> LocalExpertWave<'a> {
+    fn require_geometry(geometry: ExpertGeometry) -> Result<()> {
+        ensure!(
+            geometry.same_shape(&ExpertGeometry::DEEPSEEK_V41) && geometry.layers > 0,
+            "native local expert ABI does not support geometry {}",
+            geometry.key()
+        );
+        ensure!(
+            geometry.same_shape(&cuteafd_core::expert_geometry()),
+            "local expert geometry differs from installed kernels"
+        );
+        Ok(())
+    }
     fn capacities(capacity: u32) -> Result<Vec<u32>> {
         ensure!(
             matches!(capacity, 1 | 16 | 80 | 256 | 1024 | 4096),
@@ -83,11 +98,21 @@ impl<'a> LocalExpertWave<'a> {
         capacities.push(capacity);
         Ok(capacities)
     }
-    pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        Self::device_bytes_for(library, capacity, false)
+    pub fn device_bytes(
+        library: &NativeLibrary,
+        capacity: u32,
+        geometry: ExpertGeometry,
+    ) -> Result<usize> {
+        Self::device_bytes_for(library, capacity, false, geometry)
     }
     /// The W4A4 family reports its own scratch plan and uses its own kernels.
-    pub fn device_bytes_for(library: &NativeLibrary, capacity: u32, nvfp4: bool) -> Result<usize> {
+    pub fn device_bytes_for(
+        library: &NativeLibrary,
+        capacity: u32,
+        nvfp4: bool,
+        geometry: ExpertGeometry,
+    ) -> Result<usize> {
+        Self::require_geometry(geometry)?;
         let arena = Self::capacities(capacity)?
             .into_iter()
             .try_fold(0usize, |largest, c| {
@@ -99,7 +124,7 @@ impl<'a> LocalExpertWave<'a> {
                 Ok::<_, anyhow::Error>(largest.max(usize::try_from(info.scratch_bytes)?))
             })?;
         arena
-            .checked_add(capacity as usize * 10240)
+            .checked_add(capacity as usize * geometry.row_bytes() as usize)
             .context("local expert workspace size overflow")
     }
     pub fn new(
@@ -107,9 +132,11 @@ impl<'a> LocalExpertWave<'a> {
         weights: Rc<Vec<ExpertWeights<'a>>>,
         capacity: u32,
         budget: usize,
+        geometry: ExpertGeometry,
     ) -> Result<Self> {
+        Self::require_geometry(geometry)?;
         ensure!(
-            !weights.is_empty() && weights.len() <= 40,
+            !weights.is_empty() && weights.len() <= geometry.layers as usize,
             "local experts require complete resident layers"
         );
         for (layer, weight) in weights.iter().enumerate() {
@@ -125,7 +152,7 @@ impl<'a> LocalExpertWave<'a> {
             "local expert layers mix activation formats"
         );
         ensure!(
-            Self::device_bytes_for(library, capacity, nvfp4)? <= budget,
+            Self::device_bytes_for(library, capacity, nvfp4, geometry)? <= budget,
             "local expert workspace exceeds budget"
         );
         let stream = LoadStream {
@@ -134,7 +161,8 @@ impl<'a> LocalExpertWave<'a> {
         };
         let scratch = DeviceAllocation::new(
             library,
-            Self::device_bytes_for(library, capacity, nvfp4)? - capacity as usize * 10240,
+            Self::device_bytes_for(library, capacity, nvfp4, geometry)?
+                - capacity as usize * geometry.row_bytes() as usize,
         )?;
         let mut states = Vec::new();
         for c in Self::capacities(capacity)? {
@@ -144,7 +172,8 @@ impl<'a> LocalExpertWave<'a> {
                 library.v41_local_expert_kernel(c)?
             };
             ensure!(
-                kernel.info().input_row_bytes()? == LocalInputFormat::for_nvfp4(nvfp4).row_bytes(),
+                kernel.info().input_row_bytes()?
+                    == LocalInputFormat::for_nvfp4(nvfp4).row_bytes(geometry),
                 "local expert kernel activation format differs from resident weights"
             );
             let mut slots = [std::ptr::null_mut(); 44];
@@ -170,18 +199,27 @@ impl<'a> LocalExpertWave<'a> {
                 weights,
             },
             input_format: LocalInputFormat::for_nvfp4(nvfp4),
-            output: DeviceAllocation::new(library, capacity as usize * 10240)?,
+            output: DeviceAllocation::new(
+                library,
+                capacity as usize * geometry.row_bytes() as usize,
+            )?,
             reducer: library.v41_local_expert_reducer()?,
             capacity,
+            geometry,
         })
     }
-    pub fn exl3_device_bytes(directory: &Path, capacity: u32) -> Result<usize> {
+    pub fn exl3_device_bytes(
+        directory: &Path,
+        capacity: u32,
+        geometry: ExpertGeometry,
+    ) -> Result<usize> {
+        Self::require_geometry(geometry)?;
         let directories: Vec<_> = Self::capacities(capacity)?
             .into_iter()
             .map(|c| directory.join(format!("m{c}")))
             .collect();
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
-            .checked_add(capacity as usize * 10240)
+            .checked_add(capacity as usize * geometry.row_bytes() as usize)
             .context("local EXL3 workspace overflow")
     }
     /// Trusted native package; all modules are bound before request processing.
@@ -191,9 +229,11 @@ impl<'a> LocalExpertWave<'a> {
         directory: &Path,
         capacity: u32,
         budget: usize,
+        geometry: ExpertGeometry,
     ) -> Result<Self> {
+        Self::require_geometry(geometry)?;
         ensure!(
-            !weights.is_empty() && weights.len() <= 40,
+            !weights.is_empty() && weights.len() <= geometry.layers as usize,
             "local EXL3 requires resident layers"
         );
         for (layer, weight) in weights.iter().enumerate() {
@@ -205,7 +245,7 @@ impl<'a> LocalExpertWave<'a> {
             );
         }
         ensure!(
-            Self::exl3_device_bytes(directory, capacity)? <= budget,
+            Self::exl3_device_bytes(directory, capacity, geometry)? <= budget,
             "local EXL3 workspace exceeds budget"
         );
         let stream = LoadStream {
@@ -241,8 +281,8 @@ impl<'a> LocalExpertWave<'a> {
                     .iter()
                     .map(|state| state.workspace_bytes())
                     .sum::<usize>()
-                + capacity as usize * 10240
-                == Self::exl3_device_bytes(directory, capacity)?,
+                + capacity as usize * geometry.row_bytes() as usize
+                == Self::exl3_device_bytes(directory, capacity, geometry)?,
             "local EXL3 shared workspace plan mismatch"
         );
         Ok(Self {
@@ -252,9 +292,13 @@ impl<'a> LocalExpertWave<'a> {
                 layers: weights.len(),
             },
             input_format: LocalInputFormat::Fp8K32,
-            output: DeviceAllocation::new(library, capacity as usize * 10240)?,
+            output: DeviceAllocation::new(
+                library,
+                capacity as usize * geometry.row_bytes() as usize,
+            )?,
             reducer: library.v41_local_expert_reducer()?,
             capacity,
+            geometry,
         })
     }
     pub fn contains(&self, layer: usize) -> bool {
@@ -271,7 +315,7 @@ impl<'a> LocalExpertWave<'a> {
         bf16: CuteafdDeviceBuffer,
         fp8: CuteafdDeviceBuffer,
     ) -> Result<CuteafdDeviceBuffer> {
-        self.input_format.select(rows, bf16, fp8)
+        self.input_format.select(rows, bf16, fp8, self.geometry)
     }
 
     /// # Safety
@@ -311,7 +355,7 @@ impl<'a> LocalExpertWave<'a> {
 
     fn output_rows(&self, rows: u32) -> CuteafdDeviceBuffer {
         let mut output = self.output.buffer;
-        output.bytes = rows as usize * 10240;
+        output.bytes = rows as usize * self.geometry.row_bytes() as usize;
         output
     }
 
@@ -328,10 +372,13 @@ impl<'a> LocalExpertWave<'a> {
             "local expert layer/rows are not resident or exceed capacity"
         );
         for (buffer, bytes) in [
-            (inputs[0], rows as usize * self.input_format.row_bytes()),
-            (inputs[1], rows as usize * 24),
-            (inputs[2], rows as usize * 24),
-            (shared, rows as usize * 10240),
+            (
+                inputs[0],
+                rows as usize * self.input_format.row_bytes(self.geometry),
+            ),
+            (inputs[1], rows as usize * self.geometry.topk as usize * 4),
+            (inputs[2], rows as usize * self.geometry.topk as usize * 4),
+            (shared, rows as usize * self.geometry.row_bytes() as usize),
         ] {
             ensure!(
                 buffer.bytes == bytes && buffer.device_id == self.output.buffer.device_id,
@@ -393,7 +440,7 @@ impl<'a> LocalExpertWave<'a> {
                         tensors: state.slots,
                         num_tokens: rows as i32,
                         max_rows: info.max_rows,
-                        scatter_rows: rows as i32 * 6,
+                        scatter_rows: rows as i32 * self.geometry.topk as i32,
                         rows_padded: info.rows_padded,
                         max_tasks: info.max_tasks,
                         max_phys_tiles: info.max_phys_tiles,

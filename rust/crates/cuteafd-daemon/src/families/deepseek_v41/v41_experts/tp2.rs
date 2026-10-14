@@ -157,11 +157,13 @@ mod tests {
             weights.clone(),
             capacity,
             cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+            false,
         )?;
         let mut second = OwnerPair::new(
             weights,
             capacity,
             cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+            false,
         )?;
         let mut inputs = Vec::new();
         for device in devices {

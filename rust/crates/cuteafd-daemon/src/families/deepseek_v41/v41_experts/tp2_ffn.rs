@@ -229,7 +229,12 @@ impl<'a> Wave<'a> {
                 PeerInputs::new(devices[1], capacity)?,
             ],
             shared: SharedWave::new(shared, capacity)?,
-            routed: OwnerPair::new(routed, capacity, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?,
+            routed: OwnerPair::new(
+                routed,
+                capacity,
+                cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+                std::env::var_os("CUTEAFD_TP2_TIMING").is_some(),
+            )?,
             output: [
                 Allocation::new(devices[0], capacity as usize * 10240)?,
                 Allocation::new(devices[1], capacity as usize * 10240)?,
@@ -532,8 +537,12 @@ mod tests {
             Wave::new(routed.clone(), shared.clone(), 1, 16)?,
             Wave::new(routed.clone(), shared.clone(), 1, 16)?,
         ];
-        let mut reference_routed =
-            OwnerPair::new(routed, 16, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
+        let mut reference_routed = OwnerPair::new(
+            routed,
+            16,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+            std::env::var_os("CUTEAFD_TP2_TIMING").is_some(),
+        )?;
         let mut reference_shared = SharedWave::new(shared, 16)?;
         let inputs = [
             PeerInputs::new(devices[0], 16)?,

@@ -1,5 +1,9 @@
 //! Native TP2 draft expert ownership and graph integration.
-use crate::shared::experts::rtx::draft::{rank, pair};
+use crate::shared::experts::rtx::draft::{rank, pair, Layout};
+pub(super) const LAYOUT: Layout = Layout {
+    geometry: cuteafd_core::ExpertGeometry { hidden: 5120, experts: 128, topk: 3, intermediate: 2304, layers: 3 },
+    stages: 3, owner: 1,
+};
 #[cfg(test)]
 mod checkpoint_tests;
 
@@ -22,14 +26,14 @@ pub(super) struct RoutedWave<'w, 'a> {
 }
 impl<'w,'a> RoutedWave<'w,'a> {
     pub fn device_bytes(library:&NativeLibrary,capacity:u32)->Result<[usize;2]> {
-        let mut bytes=pair::Pair::device_bytes(library,capacity)?;
+        let mut bytes=pair::Pair::device_bytes(library,capacity,LAYOUT)?;
         bytes[1]+=capacity as usize*(10240*2+12*2);
         Ok(bytes)
     }
     pub fn new(owner:&'w DsparkWeights<'a>,weights:[Rc<Weights<'a>>;2],stage:usize,capacity:u32)->Result<Self> {
         ensure!(stage<3 && owner.library.cuda_get_device()?==1,"draft TP2 transformer must reside on RTX1");
         let device=Device {library:owner.library,id:1};
-        Ok(Self {stream:Stream::new(device)?,pair:pair::Pair::new(weights,capacity)?,
+        Ok(Self {stream:Stream::new(device)?,pair:pair::Pair::new(weights,capacity,LAYOUT)?,
             inputs:[Allocation::new(device,capacity as usize*10240)?,Allocation::new(device,capacity as usize*12)?,Allocation::new(device,capacity as usize*12)?],
             shared:Allocation::new(device,capacity as usize*10240)?,owner,stage,capacity})
     }

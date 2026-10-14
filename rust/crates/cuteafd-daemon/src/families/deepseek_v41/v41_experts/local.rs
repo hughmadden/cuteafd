@@ -11,13 +11,26 @@ use std::{path::Path, rc::Rc};
 pub(crate) struct LocalExpertWave<'a>(Execution<'a>);
 impl<'a> LocalExpertWave<'a> {
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        Execution::device_bytes(library, capacity)
+        Execution::device_bytes(
+            library,
+            capacity,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        )
     }
     pub fn device_bytes_for(library: &NativeLibrary, capacity: u32, nvfp4: bool) -> Result<usize> {
-        Execution::device_bytes_for(library, capacity, nvfp4)
+        Execution::device_bytes_for(
+            library,
+            capacity,
+            nvfp4,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        )
     }
     pub fn exl3_device_bytes(directory: &Path, capacity: u32) -> Result<usize> {
-        Execution::exl3_device_bytes(directory, capacity)
+        Execution::exl3_device_bytes(
+            directory,
+            capacity,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        )
     }
     pub fn new(
         library: &'a NativeLibrary,
@@ -25,7 +38,13 @@ impl<'a> LocalExpertWave<'a> {
         capacity: u32,
         budget: usize,
     ) -> Result<Self> {
-        Ok(Self(Execution::new(library, weights, capacity, budget)?))
+        Ok(Self(Execution::new(
+            library,
+            weights,
+            capacity,
+            budget,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        )?))
     }
     /// # Safety
     /// The operator-selected package is trusted native code.
@@ -38,7 +57,14 @@ impl<'a> LocalExpertWave<'a> {
     ) -> Result<Self> {
         // SAFETY: the adapter forwards the trusted-package contract unchanged.
         Ok(Self(unsafe {
-            Execution::new_exl3(library, weights, directory, capacity, budget)?
+            Execution::new_exl3(
+                library,
+                weights,
+                directory,
+                capacity,
+                budget,
+                cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+            )?
         }))
     }
     pub fn contains(&self, layer: usize) -> bool {

@@ -210,8 +210,13 @@ def test_owner_pair_diagnostic_timing_waits_for_end_before_elapsed_query():
     owner = source.split("impl<'a> OwnerPair<'a>", 1)[1]
     constructor = owner.split("pub(crate) fn new(", 1)[1].split(
         "pub(crate) fn uses_bf16_input", 1)[0]
-    assert 'timing: std::env::var_os("CUTEAFD_TP2_TIMING")' in constructor
-    assert '.is_some()\n                    .then(||' in constructor
+    assert "timing: bool" in constructor
+    assert re.search(r"timing:\s*timing\s*\.then\(\|\|", constructor)
+    assert "CUTEAFD_TP2_TIMING" not in source
+    capacity_check = constructor.index("weight.max_rows() == max_rows as usize")
+    assert capacity_check < constructor.index("weights[rank].execution()?")
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert "CUTEAFD_TP2_TOKEN_SUMS" not in launcher
     execute = owner.split("pub(crate) async unsafe fn execute(", 1)[1].split(
         "#[cfg(test)]", 1)[0]
     diagnostics = execute.split("for rank in drain.ranks.iter() {", 1)[1].split(
