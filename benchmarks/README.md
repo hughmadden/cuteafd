@@ -149,6 +149,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## MiMo V2
 
+- 2026-10-14 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-MOPD · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build 92ad5b03d029 · [report](mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/report.svg)
 - 2026-10-14 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-MOPD · 1× RTX PRO 6000 @ gpu-powerd 450/450 W (345–545) + 6× DGX Spark · build 92ad5b03d029 · [report](mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min/report.svg)
 - 2026-10-14 · Release smoke · XiaomiMiMo/MiMo-V2.6-Flash-MOPD · 2× RTX PRO 6000 @ gpu-powerd 445/445 W (300–550) + 4× DGX Spark · build 92ad5b03d029 · [report](mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-2rtx-4spark-mimo26-flash-max/report.svg)
 - 2026-10-14 · Release smoke · XiaomiMiMo/MiMo-V2.6-Flash-MOPD · 1× RTX PRO 6000 @ gpu-powerd 440/455 W (300–550) + 2× DGX Spark · build 92ad5b03d029 · [report](mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min/report.svg)
