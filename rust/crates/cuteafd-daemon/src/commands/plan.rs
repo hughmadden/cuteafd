@@ -1241,8 +1241,8 @@ mod tests {
             (130 * mark, state(128)));
         assert_eq!(planned(&["--concurrency", "128"]).0, 258 * mark);
         assert_eq!((258 - 130) * mark, 18_895_339_520);
-        // Unset launch keys now plan serving's defaults: 18 marks and 8 state slots.
-        assert_eq!(planned(&[]), (18 * mark, state(8)));
+        // A 96 GiB logical profile defaults to C16: 34 marks and 16 state slots.
+        assert_eq!(planned(&[]), (34 * mark, state(16)));
         // The other knobs serve-glmf gets reach the layout as given.
         let custom = layout(&["--concurrency", "16", "--state-slots", "16", "--mark-lanes", "16",
             "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);
