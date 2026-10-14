@@ -484,12 +484,20 @@ def test_native_m1_fc2_partition_changes_launch_only() -> None:
     select = namespace["fc2_n_splits"]
     assert select("spark", 1, 128, 4096) == 2
     assert select("spark", 1, 128, 7168) == 2
-    for role in ("rtx_backbone", "rtx_tp2", "coordinator", "spark_tp2", "spark_tp3", "spark_tp6"):
+    assert select("rtx_tp2", 1, 128, 4096) == 2
+    assert select("rtx_tp2", 1, 128, 7168) == 2
+    for role in ("rtx_backbone", "coordinator", "spark_tp2", "spark_tp3", "spark_tp6"):
         assert select(role, 1, 128, 4096) == 1
     for capacity in (2, 16, 80, 256, 1024, 4096):
         assert select("spark", capacity, 128, 4096) == 1
+        assert select("rtx_tp2", capacity, 128, 4096) == 1
     assert select("spark", 1, 64, 4096) == 1
     assert select("spark", 1, 128, 384) == 1
+    assert select("rtx_tp2", 1, 64, 4096) == 1
+    assert select("rtx_tp2", 1, 128, 384) == 1
     recipe = _slice_recipe()(128, 512, atomic=False, compact=False)
     assert recipe["fc2_k_steps"] == 4 and recipe["plane_count"] == 4
+    assert recipe["plane_fold"] == "ascending_fp32"
+    recipe = _slice_recipe()(128, 1024, atomic=False, compact=False)
+    assert recipe["fc2_k_steps"] == 4 and recipe["plane_count"] == 8
     assert recipe["plane_fold"] == "ascending_fp32"
