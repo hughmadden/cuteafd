@@ -192,3 +192,7 @@ at least two seconds without streaming output before declaring idle/asking.
 This debounce prevents the prompt that remains visible during thinking from
 ending the wait early; state remains a heuristic, so verify the deliverable.
 The driver should spend most of its time blocked in wait, not deliberating.
+
+## Stay reachable
+
+Always block with both flags: `wait NAME --until idle --progress-interval 60 --timeout 600`. A wait returns at least every 10 minutes even if the worker is still busy, so you see messages from main, which can't reach you while you're blocked. On a timeout, summarize the increment in 1–2 lines and wait again; it isn't a failure.
