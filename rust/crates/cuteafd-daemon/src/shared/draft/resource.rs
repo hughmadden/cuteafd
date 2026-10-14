@@ -39,7 +39,9 @@
 //! DFlash2 sequence (fewer than four outcomes) verifies five drafts for its
 //! first four cycles, and a lone warm DFlash2 sequence keeps five drafts
 //! unless the selection beats them by 2% in predicted tokens per µs.
-use crate::families::glm5::dflash_policy::{DraftHistory, START_DRAFTS};
+use crate::shared::draft_policy::DraftHistory;
+
+const START_DRAFTS: usize = 5;
 use crate::shared::draft::binding::{self, DraftPass, ObserveError, RoundRecord, RoundRequest};
 use crate::shared::draft::clock::RoundTimes;
 use crate::shared::draft::evidence::{Censor, DraftSource, Evidence, SelectorFeatures};
@@ -47,6 +49,34 @@ use crate::shared::draft::routes::RoundRoutes;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{DraftCandidate, DraftPolicy, LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
 use std::sync::Mutex;
+
+/// Weight of a dSpark confidence head's prediction against the sequence's
+/// history rate, in logit space (`CUTEAFD_DSPARK_HEAD_WEIGHT`, default 0.75).
+fn head_weight() -> f64 {
+    static WEIGHT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *WEIGHT.get_or_init(|| std::env::var("CUTEAFD_DSPARK_HEAD_WEIGHT").ok().and_then(|v| v.parse().ok())
+        .filter(|w: &f64| (0.0..=1.0).contains(w)).unwrap_or(0.75))
+}
+
+/// Conditional acceptance per position from a dSpark confidence head (the
+/// predicted acceptance of each drafted token given the ones before it),
+/// blended in logit space with the history rate.
+pub(crate) fn head_confidence(history: &DraftHistory, head: &[f32]) -> Vec<f64> {
+    let rates = history.conditional(head.len());
+    let logit = |p: f64| {
+        let p = p.clamp(1e-4, 1.0 - 1e-4);
+        (p / (1.0 - p)).ln()
+    };
+    let w = head_weight();
+    head.iter().zip(rates).map(|(&c, rate)| {
+        let c = f64::from(c);
+        if !c.is_finite() {
+            return rate;
+        }
+        let z = w * logit(c) + (1.0 - w) * logit(rate);
+        1.0 / (1.0 + (-z).exp())
+    }).collect()
+}
 
 /// Resource classes: coordinator RTX and Spark expert ranks.
 const LOCAL: u8 = 0;
@@ -79,6 +109,18 @@ fn spark_class() -> ResourceClass {
 /// A lone warm DFlash2 sequence keeps `START_DRAFTS` unless the selection
 /// beats them by this ratio.
 const REFERENCE_MARGIN: f64 = 1.02;
+
+/// Price the block for its actual drafter members while retaining every verifier anchor.
+pub(crate) fn choose_block(policy: &mut DraftPolicy, requests: &[(u64, usize)], width: usize,
+    drafted_requests: usize, rows: usize, cold: bool) -> Result<bool> {
+    if drafted_requests == 0 || !requests.iter().any(|&(_, room)| room > 0) { return Ok(false); }
+    if cold { return Ok(true); }
+    let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
+        width, draft_us: policy.draft_cost_drafted(false, requests.len(), drafted_requests, width) }];
+    let chosen = policy.choose_action(false, requests, &actions, rows)?;
+    binding::trace_action(policy, false, requests, &actions, None, rows, chosen, chosen.unwrap_or(1));
+    Ok(chosen.is_none_or(|action| action == 1))
+}
 
 /// Fixed diagnostic counts still share the verifier budget, anchors included.
 pub(crate) fn trim_budget(lengths: &mut [usize], budget: usize) -> bool {
@@ -224,6 +266,13 @@ pub(crate) enum Prior {
     History,
 }
 
+impl Prior {
+    /// Only selector priors have a verified cold floor; head priors use core recovery.
+    pub(crate) fn cold_start(&self, history: &DraftHistory) -> bool {
+        matches!(self, Self::Selector(_)) && history.cold()
+    }
+}
+
 /// Per-position `p0` of one draft: the prior evaluated on its evidence and the
 /// request's history. `None` when the evidence does not fit the prior (an
 /// invalid selector row): the request then verifies on history alone.
@@ -235,7 +284,7 @@ pub(crate) fn prior(prior: &Prior, history: &DraftHistory, evidence: &DraftEvide
             fit.confidence(&rates, &features[..width]).unwrap_or(rates)
         }
         (_, DraftEvidence::Head(head)) =>
-            crate::families::glm5::dflash_policy::head_confidence(history, &head[..head.len().min(MAX_POSITIONS)]),
+            head_confidence(history, &head[..head.len().min(MAX_POSITIONS)]),
         (Prior::Head | Prior::History, DraftEvidence::Selector(features)) =>
             history.conditional(features.len().min(MAX_POSITIONS)),
         (_, DraftEvidence::History(rates)) => rates[..rates.len().min(MAX_POSITIONS)].to_vec(),
@@ -326,19 +375,20 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
 pub(crate) struct DecisionTrace {
     requests: Vec<(u64, Vec<f64>, usize, bool, bool)>,
     width: usize,
+    drafted_requests: usize,
     max_rows: usize,
     selection: Selection,
 }
 
 impl DecisionTrace {
-    pub fn capture(candidates: &[Candidate<'_>], width: usize, max_rows: usize, selection: &Selection) -> Self {
+    pub fn capture(candidates: &[Candidate<'_>], width: usize, drafted_requests: usize, max_rows: usize, selection: &Selection) -> Self {
         Self { requests: candidates.iter().map(|c| (c.id, c.prior.to_vec(), c.limit, c.selector, c.cold)).collect(),
-            width, max_rows, selection: Selection { lengths: selection.lengths.clone(), predicted: selection.predicted } }
+            width, drafted_requests, max_rows, selection: Selection { lengths: selection.lengths.clone(), predicted: selection.predicted } }
     }
     pub fn evaluate(self, policy: &mut DraftPolicy) -> serde_json::Value {
         let candidates: Vec<_> = self.requests.iter().map(|&(id, ref prior, limit, selector, cold)|
             Candidate { id, prior, limit, selector, cold }).collect();
-        decision_trace(policy, &candidates, self.width, self.max_rows, &self.selection)
+        decision_trace(policy, &candidates, self.width, self.drafted_requests, self.max_rows, &self.selection)
     }
 }
 
@@ -346,7 +396,7 @@ impl DecisionTrace {
 /// requests held at their chosen lengths. At C1 this enumerates every shape.
 /// Call only when tracing is enabled; evaluations do not train the policy.
 pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], width: usize,
-    max_rows: usize, selection: &Selection) -> serde_json::Value {
+    drafted_requests: usize, max_rows: usize, selection: &Selection) -> serde_json::Value {
     let cores: Vec<_> = candidates.iter().map(|c| DraftCandidate { id: c.id,
         confidence: &c.prior[..c.prior.len().min(c.limit).min(policy.geometry().max_positions)] }).collect();
     let requests: Vec<_> = cores.iter().enumerate().map(|(i, c)| {
@@ -357,7 +407,7 @@ pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'
         let candidates: Vec<_> = (0..=available).map(|length| {
             let mut lengths = selection.lengths.clone();
             lengths[i] = length;
-            let prediction = policy.diagnostic_evaluate(false, &cores, &lengths, width);
+            let prediction = policy.diagnostic_evaluate_drafted(false, &cores, &lengths, width, drafted_requests);
             serde_json::json!({"length": length, "expected_tokens": prediction.map(|p| p.0),
                 "predicted_us": prediction.map(|p| p.1)})
         }).collect();
@@ -366,7 +416,7 @@ pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'
     }).collect();
     let cost = policy.cost_snapshot(false, candidates.len());
     serde_json::json!({"engaged": policy.engaged(false, candidates.len()), "requests": requests,
-        "chosen": selection.lengths, "predicted_us": selection.predicted,
+        "chosen": selection.lengths, "predicted_us": selection.predicted, "drafted_requests": drafted_requests,
         "platt": policy.calibration(),
         "position_reached": policy.stats().position_reached,
         "cost": {"layers": cost.layers, "round": cost.round, "draft": cost.draft}})
@@ -513,6 +563,39 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_frozen_glmrt_calibration() {
+        let actual = crate::shared::draft_confidence::SelectorFit::default().confidence(&[0.75, 0.6, 0.8, 0.4, 0.9, 0.5, 0.7], &[
+            [0.0, 0.0625, 2.765625, 0.0], [1.0, 0.5, 1.0, 2.0], [4.0, 0.96875, 0.25, 0.0], [0.125, 0.25, 1.5, 4.0],
+            [8.0, 1.0, 0.0, 0.0], [2.0, 0.75, 0.75, 1.0], [3.0, 0.875, 0.5, 0.0],
+        ]).unwrap();
+        let expected = [0.06228691035179077, 0.27691696975472285, 0.7942950332348667, 0.1161585187943506,
+            0.9809519714258056, 0.37597938760974686, 0.5693257689991642];
+        for (a, b) in actual.iter().zip(expected) {
+            assert!((a - b).abs() < 1e-12);
+        }
+        assert!(crate::shared::draft_confidence::SelectorFit::default().confidence(&[0.75], &[[1.0, 0.5, 1.0, 16.0]]).is_none());
+    }
+
+    #[test]
+    fn block_action_preserves_cold_warmup_and_all_verifier_anchors() {
+        let requests = [(1, 7), (2, 0), (3, 0)];
+        let mut cold = DraftPolicy::seeded(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), seed()).unwrap();
+        assert!(!choose_block(&mut cold, &requests, 7, 0, 64, true).unwrap());
+        assert!(!choose_block(&mut cold, &[(1, 0)], 7, 1, 64, true).unwrap());
+        assert!(choose_block(&mut cold, &requests, 7, 1, 64, true).unwrap());
+        assert!(choose_block(&mut cold, &requests, 7, 1, 64, false).unwrap());
+        let mut shared = warm_policy(true);
+        let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
+            width: 7, draft_us: shared.draft_cost_drafted(false, requests.len(), 1, 7) }];
+        let mut direct = shared.clone();
+        for _ in 0..64 {
+            let expected = direct.choose_action(false, &requests, &actions, 64).unwrap();
+            assert_eq!(choose_block(&mut shared, &requests, 7, 1, 64, false).unwrap(),
+                expected.is_none_or(|index| index == 1));
+        }
+    }
 
     #[test]
     fn publication_cadence_is_bounded_and_resets() {
@@ -681,6 +764,10 @@ mod tests {
     }
 
     fn warm_policy(spark: bool) -> DraftPolicy {
+        warm_policy_with_draft_us(spark, 3_000)
+    }
+
+    fn warm_policy_with_draft_us(spark: bool, draft_us: u64) -> DraftPolicy {
         let mut policy = DraftPolicy::new(geometry(&homes(spark), 288, 8, 64, 7, 0).unwrap(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
         let mut routes = RoundRoutes::new(45, 8);
         for round in 0..400usize {
@@ -694,15 +781,30 @@ mod tests {
                 routes.push(layer, &ids, u32::MAX).unwrap();
             }
             let layer_us: Vec<Option<f64>> = (0..45).map(|l| (l > 0).then_some(300. + 40. * rows as f64)).collect();
-            let total = 4_000. + layer_us.iter().flatten().sum::<f64>() + 3_000.;
+            let total = 4_000. + layer_us.iter().flatten().sum::<f64>() + draft_us as f64;
             let p = [0.8; 7];
             let request: Vec<_> = (0..count).map(|id| Verified { id: id as u64 + 1, rows: per, accepted: per.min(3), source: DraftSource::Neural,
                 prior: Some(&p[..per - 1]), features: None, censor: None }).collect();
             observe(&mut policy, &request, &routes, &layer_us, RoundTimes { total_us: total as u64,
-                draft_us: Some(3_000) }, 7, None).unwrap();
+                draft_us: Some(draft_us) }, 7, None).unwrap();
         }
         assert!(policy.warm(false, 1));
         policy
+    }
+
+    #[test]
+    fn cold_head_can_skip_an_overpriced_block_in_an_engaged_policy() {
+        let mut policy = warm_policy_with_draft_us(true, 1_000_000);
+        assert!(policy.engaged(false, 1));
+        let mut history = DraftHistory::default();
+        let selector = Prior::Selector(crate::shared::draft_confidence::SelectorFit::default());
+        assert!(selector.cold_start(&history));
+        assert!(!Prior::Head.cold_start(&history));
+        assert!(!Prior::History.cold_start(&history));
+        assert!(!choose_block(&mut policy, &[(99, 7)], 7, 1, 64, Prior::Head.cold_start(&history)).unwrap());
+        assert!(choose_block(&mut policy, &[(99, 7)], 7, 1, 64, selector.cold_start(&history)).unwrap());
+        for _ in 0..4 { history.observe(1, 0); }
+        assert!(!selector.cold_start(&history));
     }
 
     #[test]
@@ -728,7 +830,7 @@ mod tests {
         let candidate = [Candidate { id: 4, prior: &[0.6; 7], limit: 6, selector: true, cold: false }];
         let chosen = select(&mut policy, &candidate, 7, 64);
         let before = policy.stats().clone();
-        let trace = DecisionTrace::capture(&candidate, 7, 64, &chosen).evaluate(&mut policy);
+        let trace = DecisionTrace::capture(&candidate, 7, 1, 64, &chosen).evaluate(&mut policy);
         assert_eq!(trace["requests"][0]["candidates"].as_array().unwrap().len(), 7);
         assert_eq!(trace["requests"][0]["calibrated"].as_array().unwrap().len(), 6);
         assert_eq!(trace["requests"][0]["chosen"], chosen.lengths[0]);
@@ -747,7 +849,7 @@ mod tests {
         let candidate = [Candidate { id: 4, prior: &[0.6; 7], limit: 7, selector: true, cold: true }];
         let chosen = select(&mut policy, &candidate, 7, 64);
         assert!(chosen.predicted.is_none());
-        let trace = decision_trace(&mut policy, &candidate, 7, 64, &chosen);
+        let trace = decision_trace(&mut policy, &candidate, 7, 1, 64, &chosen);
         assert_eq!(trace["engaged"], false);
         assert_eq!(trace["requests"][0]["cold_request"], true);
         let prices = trace["requests"][0]["candidates"].as_array().unwrap();
@@ -756,6 +858,32 @@ mod tests {
         assert!(!policy.engaged(false, 1));
         assert_eq!(policy.stats().rounds, 0);
         assert_eq!(select(&mut policy, &candidate, 7, 64).lengths, chosen.lengths);
+    }
+
+    #[test]
+    fn mixed_decision_trace_prices_only_actual_drafter_participants() {
+        let mut policy = warm_policy(true);
+        let candidates = [
+            Candidate { id: 1, prior: &[0.9; 7], limit: 7, selector: true, cold: false },
+            Candidate { id: 2, prior: &[], limit: 0, selector: false, cold: false },
+            Candidate { id: 3, prior: &[], limit: 0, selector: false, cold: false },
+        ];
+        let chosen = select_drafted(&mut policy, &candidates, 7, 64, 1);
+        assert_eq!(chosen.lengths[1..], [0, 0]);
+        let stats = policy.stats().clone();
+        let trace = DecisionTrace::capture(&candidates, 7, 1, 64, &chosen).evaluate(&mut policy);
+        assert_eq!(trace["drafted_requests"], 1);
+        let cores = [DraftCandidate { id: 1, confidence: &[0.9; 7] },
+            DraftCandidate { id: 2, confidence: &[] }, DraftCandidate { id: 3, confidence: &[] }];
+        for price in trace["requests"][0]["candidates"].as_array().unwrap() {
+            let length = price["length"].as_u64().unwrap() as usize;
+            let expected = policy.diagnostic_evaluate_drafted(false, &cores, &[length, 0, 0], 7, 1).unwrap();
+            assert_eq!(price["expected_tokens"], expected.0);
+            assert_eq!(price["predicted_us"], expected.1);
+            let full = policy.diagnostic_evaluate_drafted(false, &cores, &[length, 0, 0], 7, 3).unwrap();
+            assert!(full.1 > expected.1);
+        }
+        assert_eq!(*policy.stats(), stats);
     }
 
     #[test]

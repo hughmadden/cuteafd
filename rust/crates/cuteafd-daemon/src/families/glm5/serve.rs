@@ -762,15 +762,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             || active.iter().any(|a| a.drafts.cold() && eligible.iter().any(|&(id, _)| id == a.ticket.id())) { true } else {
             let shared = shared.as_mut().expect("eligible draft slots have a shared policy");
             let width = drafter.unwrap().cfg.drafts();
-            let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
-                width, draft_us: shared.policy.draft_cost_drafted(false, active.len(), eligible.len(), width) }];
             // Undrafted members still contribute their anchors, routes and emitted tokens.
             let requests: Vec<_> = active.iter().map(|a| (a.ticket.id(),
                 eligible.iter().find(|&&(id, _)| id == a.ticket.id()).map_or(0, |&(_, room)| room))).collect();
-            let chosen = shared.policy.choose_action(false, &requests, &actions, DECODE_ROWS)?;
-            crate::shared::draft::binding::trace_action(&shared.policy, false, &requests, &actions, None,
-                DECODE_ROWS, chosen, chosen.unwrap_or(1));
-            chosen.is_none_or(|action| action == 1)
+            resource::choose_block(&mut shared.policy, &requests, width, eligible.len(), DECODE_ROWS, false)?
         };
         let timer = Instant::now();
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {

@@ -1022,10 +1022,11 @@ impl DraftPolicy {
 
     /// Diagnostic evaluation including seed/physical priors before engagement.
     /// It does not make those warming predictions usable for selection.
-    pub fn diagnostic_evaluate(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
-        -> Option<(f64, f64)> {
+    pub fn diagnostic_evaluate_drafted(&mut self, shared: bool, candidates: &[DraftCandidate<'_>],
+        lengths: &[usize], width: usize, drafted_requests: usize) -> Option<(f64, f64)> {
         let _ = shared;
-        self.evaluate_bucket(draft_concurrency_bucket(candidates.len()), candidates, lengths, width, candidates.len())
+        if drafted_requests > candidates.len() { return None; }
+        self.evaluate_bucket(draft_concurrency_bucket(candidates.len()), candidates, lengths, width, drafted_requests)
     }
 
     fn evaluate_bucket(&mut self, bucket: usize, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize, drafted_requests: usize)
