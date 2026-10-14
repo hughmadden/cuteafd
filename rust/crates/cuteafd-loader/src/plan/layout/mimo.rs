@@ -681,7 +681,7 @@ mod tests {
     fn backend_slots_and_scope_categories_match_allocators() {
         assert_eq!(peer_slots(resolve_transport_lanes(false, "mimop", None).unwrap()), 8);
         assert_eq!(peer_slots(resolve_transport_lanes(true, "mimop", None).unwrap()), 12);
-        assert_eq!(reservation_category("context.rope_tables"), Category::Kv);
+        assert_eq!(reservation_category("prefill.step_inputs"), Category::Workspace);
         assert_eq!(reservation_category("state.prefill_kv_wide"), Category::Workspace);
         assert_eq!(reservation_category("prefill_first_lane.scratch"), Category::Workspace);
         assert_eq!(reservation_category("decode.page_table"), Category::Workspace);
