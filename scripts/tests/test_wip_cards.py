@@ -367,6 +367,21 @@ def test_requested_panels_preflight_and_report(entry, tmp_path):
     assert cards.summarize_job(job, 0)['status'] == 'pass'
 
 
+
+def test_summary_reads_c8_from_the_concurrency_sweep(entry, tmp_path):
+    job = make(entry, tmp_path)
+    report_dir = Path(job['state']) / 'reports' / 'one'
+    report_dir.mkdir(parents=True)
+    card = {'decode': [{'content': 'code', 'tok_s': 48.0}], 'prefill': {'tok_s': 2700.0},
+            'concurrency': [{'width': 4, 'aggregate_tok_s': 70.0}, {'width': 8, 'aggregate_tok_s': 90.5},
+                            {'width': 16, 'aggregate_tok_s': 114.0}]}
+    (report_dir / 'report.json').write_text(json.dumps({'baseline': {'card': card}}))
+    row = cards.summarize_job(job, 0)
+    assert (row['C1'], row['C8'], row['8K']) == (48.0, 90.5, 2700.0)
+    card['concurrency'] = [{'width': 4, 'aggregate_tok_s': 70.0}]
+    (report_dir / 'report.json').write_text(json.dumps({'baseline': {'card': card}}))
+    assert cards.summarize_job(job, 0)['C8'] is None
+
 def test_instance_hash_within_run_limit(entry, tmp_path):
     job = make({**entry, 'name': 'very-long-card-name-' * 5}, tmp_path, instance='long-' + 'a' * 35)
     instance = job['entry']['set']['INSTANCE']
