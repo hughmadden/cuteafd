@@ -1052,14 +1052,6 @@ for i in "${!hosts[@]}"; do
   done
 done
 
-# Loading leaves checkpoint pages cached on every Spark (sparknest passthrough), and GB10
-# CUDA allocations do not reclaim page cache: drop it once every rank is resident.
-# CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
-if ((${#hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] && command -v nest >/dev/null; then
-  drop_hosts=(); for host in "${hosts[@]}"; do drop_hosts+=(--host "$host"); done
-  nest drop-caches "${drop_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
-fi
-
 # Acknowledge the published boundary for every handoff launch, including the
 # single-RTX explicit-topology case the coordinator now publishes. Only a launch
 # with no handoff starts the coordinator at this point.
@@ -2249,27 +2241,6 @@ if [[ -n "$device_map" ]]; then
   device_map_env="-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map"
   device_map_args=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map")
 fi
-# SparkNest cache management stays available when installed. Without it the
-# workers advise their checkpoint pages after loading; global sudo cache drops
-# are an explicit operator opt-in, never required infrastructure.
-spark_hosts=()
-spark_host_names=()
-for ((rank = 0; rank < ranks; rank++)); do
-  spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")")
-  spark_host_names+=("$(get "SPARK_${rank}_HOST")")
-done
-drop_spark_caches() {
-  if command -v nest >/dev/null; then nest drop-caches "${spark_hosts[@]}" >/dev/null; return; fi
-  if [[ "${CUTEAFD_GLOBAL_PAGE_CACHE_DROP:-0}" != 1 ]]; then
-    echo "SparkNest absent: workers use checkpoint fadvise(DONTNEED); no global cache drop."
-    return 0
-  fi
-  local host failed=0
-  for host in "${spark_host_names[@]}"; do
-    ssh -n "$host" 'sync; echo 1 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null' || failed=1
-  done
-  return "$failed"
-}
 if [[ -n "$wip_slot" ]]; then
   # The slot must exist everywhere before anything starts, and the development images must
   # carry the SparkInfer revision this checkout pins.
@@ -2314,7 +2285,6 @@ STAGE
       { echo "$host: WIP slot $wip_slot is not staged (build it with ./wip.sh --slot $wip_slot)" >&2; exit 1; }
   done
 fi
-((ranks == 0)) || drop_spark_caches || echo "warning: could not drop Spark page caches" >&2
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   lane="$(get "SPARK_${rank}_LANE_A")"
@@ -2371,12 +2341,6 @@ print(matches[0])')"
     audio_backend="$backend"
   done
   family_args+=(--audio-encoder-backend "$audio_backend")
-fi
-# Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
-# workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
-# cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
-if ((ranks > 0 && ${#spark_hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]]; then
-  drop_spark_caches || echo "warning: could not drop Spark page caches after loading" >&2
 fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()

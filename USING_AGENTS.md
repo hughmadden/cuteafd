@@ -145,13 +145,11 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
   sparknest), so its CPU load never skews a serving card; rhea and
   moa serve cards too, so wait for an idle one without holding locks; never
   wrap `wip.sh` in a Spark lock yourself.
-- **Page cache:** GB10 doesn't reclaim it, and a full one OOMs expert
-  packing. The launchers already drop Spark caches through `nest
-  drop-caches` (SparkNest's installed setuid helper, no approval needed), so
-  stock card runs need nothing extra. When an agent must evict outside the
-  launcher, `agent-sudo -n` can't (that needs TJ's live approval). Use
-  unprivileged `posix_fadvise(DONTNEED)` on the checkpoint files and their
-  local sparknest objects, then gate on `MemAvailable`.
+- **Page cache:** GB10 CUDA allocations reclaim Linux page cache. Keep caches
+  warm for serving; SM121 admission uses `MemAvailable` bounded by cgroup
+  hard-limit headroom, not raw `cudaMemGetInfo` (which under-reports reclaimable
+  cache). Discrete RTX uses CUDA free. Cache eviction belongs only to deliberate
+  cold-read benchmarks.
 - **Briefs:** point at `scripts/agents/codex-preamble.md` in an up-to-date
   checkout. The main checkout can lag; a stale copy cost one agent a v1-era
   rule set.

@@ -2739,23 +2739,18 @@ def test_invalid_rdma_device_map_fails_before_workers_launch(tmp_path):
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
-def test_no_nest_launch_needs_no_sudo_page_cache_drop(tmp_path):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", with_nest=False)
+@pytest.mark.parametrize("with_nest", [False, True])
+def test_spark_launch_preserves_page_cache(tmp_path, with_nest):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", with_nest=with_nest)
     assert result.returncode == 0, result.stderr
     assert "drop_caches" not in result.stderr
-    assert "fadvise(DONTNEED)" in result.stdout
+    assert "drop-caches" not in result.stderr
 
 
-def test_spark_page_caches_drop_over_ssh_without_nest_when_opted_in(tmp_path):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", with_nest=False,
-                                   extra_env={"CUTEAFD_GLOBAL_PAGE_CACHE_DROP": "1"})
-    assert result.returncode == 0, result.stderr
-    lines = result.stderr.splitlines()
-    drops = [i for i, line in enumerate(lines) if line.startswith("ssh -n h0 ") and "drop_caches" in line]
-    assert len(drops) == 2, result.stderr  # before the workers start and once they are resident
-    worker = next(i for i, line in enumerate(lines) if "docker run -d --name cuteafd-spark-expert-" in line)
-    assert drops[0] < worker < drops[1]
-    assert "could not drop" not in result.stderr
+def test_serving_source_has_no_page_cache_drop():
+    source = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert "drop-caches" not in source
+    assert "drop_caches" not in source
 
 
 @pytest.mark.parametrize("keys,mode", [("", None), ("RDMA_BOND_BALANCE=off\n", None),

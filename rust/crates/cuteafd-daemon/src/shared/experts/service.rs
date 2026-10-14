@@ -109,27 +109,8 @@ pub(crate) struct NativeExpertServiceConfig {
     bf16_ingress: bool,
 }
 
-fn mem_available(text: &str) -> Result<usize> {
-    let value = text.lines().find_map(|line| line.strip_prefix("MemAvailable:"))
-        .context("/proc/meminfo has no MemAvailable")?;
-    let fields: Vec<_> = value.split_whitespace().collect();
-    ensure!(fields.len() == 2 && fields[1] == "kB", "invalid MemAvailable units");
-    fields[0].parse::<usize>()?.checked_mul(1024).context("MemAvailable overflow")
-}
-
-/// GB10 device and host allocations consume the same pool. CUDA's free-byte
-/// counter alone omits reclaimable cache; use the OS's unified availability.
-fn worker_available(library: &NativeLibrary) -> Result<usize> {
-    let info = library.cuda_device_info(library.cuda_get_device()?)?;
-    if info.compute_capability_major == 12 && info.compute_capability_minor == 1 {
-        mem_available(&std::fs::read_to_string("/proc/meminfo")?)
-    } else {
-        Ok(library.cuda_memory_info()?.0)
-    }
-}
-
 fn admit_worker_peak(library: &NativeLibrary, load_peak: usize, serve_peak: usize) -> Result<()> {
-    let available = worker_available(library)?;
+    let available = library.cuda_memory_info()?.0;
     ensure!(load_peak <= available && serve_peak <= available,
         "Spark worker needs {load_peak} bytes at load / {serve_peak} at serve but only {available} bytes are available");
     Ok(())
@@ -210,7 +191,7 @@ fn load_weights<'a>(
         // by construction; page-cache bytes are reclaimable and are not added.
         // This is a safety gate, so a failed query fails closed instead of
         // silently skipping the real-availability check.
-        let free = worker_available(library).context("query Spark memory for admission")?;
+        let free = library.cuda_memory_info().context("query Spark memory for admission")?.0;
         ensure!(
             budget.load_peak <= free && budget.serve_peak <= free,
             "explicit replicated Spark admission needs {} bytes at load / {} at serve \
@@ -440,7 +421,8 @@ fn log_spark_memory(
     owned_connections: Option<usize>,
     rings: Option<(usize, usize)>,
 ) {
-    let cuda = library.cuda_memory_info().ok();
+    let cuda = library.cuda_physical_memory_info().ok();
+    let allocatable = library.cuda_memory_info().ok();
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
     let field = |name: &str| -> Option<u64> {
         meminfo.as_deref()?.lines().find_map(|line| {
@@ -455,7 +437,9 @@ fn log_spark_memory(
         topology = ?config.topology.map(|topology| (topology.tp(), topology.ep())),
         owned_connections = ?owned_connections,
         cuda_free_bytes = cuda.map(|(free, _)| free),
+        cuda_free_scope = "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache, use host MemAvailable for admission",
         cuda_total_bytes = cuda.map(|(_, total)| total),
+        allocatable_free_bytes = allocatable.map(|(free, _)| free),
         host_mem_total_kib = field("MemTotal"),
         host_mem_free_kib = field("MemFree"),
         host_mem_available_kib = field("MemAvailable"),
@@ -512,15 +496,6 @@ mod tests {
             encoder: None,
             audio_encoder: None,
         }
-    }
-
-    #[test]
-    fn gb10_available_uses_reclaimable_memory_and_rejects_bad_snapshots() {
-        assert_eq!(mem_available("MemFree: 1 kB\nMemAvailable: 1024 kB\n").unwrap(), 1 << 20);
-        for text in ["MemFree: 1 kB", "MemAvailable: 8 MB", "MemAvailable: nope kB"] {
-            assert!(mem_available(text).is_err());
-        }
-        assert!(mem_available(&format!("MemAvailable: {} kB", usize::MAX)).is_err());
     }
 
     #[test]

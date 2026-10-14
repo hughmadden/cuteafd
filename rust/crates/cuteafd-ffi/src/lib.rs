@@ -36,7 +36,7 @@ static COORDINATOR_GPU_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic:
 static GPU_BUDGET_ALLOCATION: Mutex<()> = Mutex::new(());
 
 /// Set once before coordinator startup. Worker processes never install this
-/// ceiling; zero/unset preserves physical CUDA admission with no extra queries.
+/// ceiling; zero/unset preserves device allocatable admission.
 pub fn set_coordinator_gpu_budget(bytes: u64) -> Result<()> {
     anyhow::ensure!(bytes > 0, "coordinator GPU budget must be positive");
     COORDINATOR_GPU_BUDGET.compare_exchange(0, bytes, Ordering::Relaxed, Ordering::Relaxed)
@@ -48,6 +48,132 @@ pub fn coordinator_gpu_budget() -> Option<cuteafd_core::serving_capacity::GpuMem
     let bytes = COORDINATOR_GPU_BUDGET.load(Ordering::Relaxed);
     (bytes != 0).then_some(cuteafd_core::serving_capacity::GpuMemoryBudget(bytes))
 }
+/// Select the allocatable bytes without treating GB10's reclaimable cache as
+/// device usage. Fail closed if the unified-memory availability cannot be read.
+fn allocatable_bytes(major: i32, minor: i32, cuda_free: usize,
+    meminfo: impl FnOnce() -> Result<String>) -> Result<usize> {
+    if (major, minor) != (12, 1) { return Ok(cuda_free); }
+    let text = meminfo()?;
+    let value = text.lines().find_map(|line| line.strip_prefix("MemAvailable:"))
+        .context("/proc/meminfo has no MemAvailable")?;
+    let mut fields = value.split_whitespace();
+    let kib: usize = fields.next().context("missing MemAvailable value")?
+        .parse().context("invalid MemAvailable value")?;
+    anyhow::ensure!(fields.next() == Some("kB") && fields.next().is_none(), "invalid MemAvailable units");
+    kib.checked_mul(1024).context("MemAvailable byte overflow")
+}
+
+fn cgroup_allocatable_bytes(mut available: usize, membership: &str,
+    read: impl Fn(&Path) -> Result<Option<String>>) -> Result<usize> {
+    for line in membership.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (_, Some(controllers), Some(relative)) = (fields.next(), fields.next(), fields.next()) else { continue };
+        let (root, limit_file, current_file) = if controllers.is_empty() {
+            (Path::new("/sys/fs/cgroup"), "memory.max", "memory.current")
+        } else if controllers.split(',').any(|c| c == "memory") {
+            (Path::new("/sys/fs/cgroup/memory"), "memory.limit_in_bytes", "memory.usage_in_bytes")
+        } else { continue };
+        let relative = Path::new(relative.trim_start_matches('/'));
+        let member = if relative.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+            root.to_path_buf()
+        } else { root.join(relative) };
+        // Namespaces may expose only the mount root. Every visible ancestor's
+        // hard limit constrains allocations too, not just the worker's limit.
+        for path in member.ancestors().take_while(|p| p.starts_with(root)).chain(std::iter::once(root)) {
+            let Some(limit) = read(&path.join(limit_file))? else { continue };
+            if limit.trim() == "max" { continue }
+            let limit: u64 = limit.trim().parse().context("invalid cgroup memory limit")?;
+            let current = read(&path.join(current_file))?.context("missing cgroup memory usage")?;
+            let current: u64 = current.trim().parse().context("invalid cgroup memory usage")?;
+            available = available.min(usize::try_from(limit.saturating_sub(current)).unwrap_or(usize::MAX));
+        }
+    }
+    Ok(available)
+}
+
+fn cgroup_memory_headroom(available: usize) -> Result<usize> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").context("reading device cgroup membership")?;
+    cgroup_allocatable_bytes(available, &membership, |path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    })
+}
+
+#[cfg(test)]
+mod allocatable_memory_tests {
+    use super::{allocatable_bytes, cgroup_allocatable_bytes};
+
+    #[test]
+    fn gb10_respects_nested_cgroup_headroom_and_namespace_root() {
+        let files = std::collections::HashMap::from([
+            ("/sys/fs/cgroup/team/worker/memory.max", "100"),
+            ("/sys/fs/cgroup/team/worker/memory.current", "20"),
+            ("/sys/fs/cgroup/team/memory.max", "60"),
+            ("/sys/fs/cgroup/team/memory.current", "50"),
+            ("/sys/fs/cgroup/memory.max", "max"),
+        ]);
+        let read = |p: &std::path::Path| Ok(files.get(p.to_str().unwrap()).map(|s| s.to_string()));
+        assert_eq!(cgroup_allocatable_bytes(90, "0::/team/worker", read).unwrap(), 10);
+        assert_eq!(cgroup_allocatable_bytes(5, "0::/team/worker", read).unwrap(), 5);
+        let root = |p: &std::path::Path| Ok(match p.to_str().unwrap() {
+            "/sys/fs/cgroup/memory.max" => Some("30".into()),
+            "/sys/fs/cgroup/memory.current" => Some("40".into()),
+            _ => None,
+        });
+        assert_eq!(cgroup_allocatable_bytes(90, "0::/hidden/host/path", root).unwrap(), 0);
+        assert_eq!(cgroup_allocatable_bytes(90, "0::/../../host", root).unwrap(), 0);
+        assert_eq!(cgroup_allocatable_bytes(90, "0::/", read).unwrap(), 90);
+        let legacy = |p: &std::path::Path| Ok(match p.to_str().unwrap() {
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes" => Some("50".into()),
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes" => Some("15".into()),
+            _ => None,
+        });
+        assert_eq!(cgroup_allocatable_bytes(90, "7:memory:/", legacy).unwrap(), 35);
+        assert!(cgroup_allocatable_bytes(90, "0::/", |_| Ok(Some("invalid".into()))).is_err());
+        assert!(cgroup_allocatable_bytes(90, "0::/", |p| Ok(
+            p.ends_with("memory.max").then(|| "30".into()))).is_err());
+        assert!(cgroup_allocatable_bytes(90, "0::/", |_| anyhow::bail!("denied")).is_err());
+    }
+
+    #[test]
+    fn gb10_uses_memavailable_including_reclaimable_cache() {
+        assert_eq!(allocatable_bytes(12, 1, 1 << 30,
+            || Ok("MemFree: 1024 kB\nMemAvailable: 47185920 kB\nCached: 41943040 kB\n".into())).unwrap(), 45usize << 30);
+        assert_eq!(allocatable_bytes(12, 1, 123, || Ok("MemAvailable: 0 kB\n".into())).unwrap(), 0);
+    }
+
+    #[test]
+    fn logical_ceiling_charges_non_reclaimable_gb10_usage() {
+        let total = 64u64 << 30;
+        let available = allocatable_bytes(12, 1, 1 << 30,
+            || Ok("MemAvailable: 47185920 kB\n".into())).unwrap();
+        let sample = cuteafd_core::serving_capacity::DeviceMemory {
+            device: 0, total_bytes: total, baseline_free_bytes: available as u64,
+        };
+        let budget = cuteafd_core::serving_capacity::GpuMemoryBudget(48 << 30);
+        let effective = budget.apply(sample).unwrap();
+        assert_eq!(effective.total_bytes, 48 << 30);
+        assert_eq!(effective.baseline_free_bytes, 29 << 30);
+        assert!(budget.admit(sample, 29 << 30).is_ok());
+        assert!(budget.admit(sample, (29 << 30) + 1).is_err());
+    }
+
+    #[test]
+    fn discrete_rtx_keeps_cuda_free_without_reading_meminfo() {
+        assert_eq!(allocatable_bytes(12, 0, 123, || panic!("RTX must not read meminfo")).unwrap(), 123);
+    }
+
+    #[test]
+    fn gb10_fails_closed_on_unreadable_or_invalid_meminfo() {
+        assert!(allocatable_bytes(12, 1, 123, || anyhow::bail!("read failed")).is_err());
+        for text in ["MemFree: 1 kB", "MemAvailable: nope kB", "MemAvailable: 42 MB",
+            "MemAvailable: 42", "MemAvailable: 42 kB extra", &format!("MemAvailable: {} kB", usize::MAX)] {
+            assert!(allocatable_bytes(12, 1, 123, || Ok(text.into())).is_err(), "{text}");
+        }
+    }
+}
+
 pub use cuda_runtime::{select_copy_mechanism, CopyMechanism, CudaRuntime};
 pub mod nvml;
 #[cfg(feature = "test-support")]
@@ -1739,8 +1865,10 @@ impl NativeLibrary {
     }
 
     /// Physical free and total bytes, including other processes and CUDA's
-    /// untracked graph/module allocations. Audits can distinguish this from
-    /// the logical admission sample returned by `cuda_memory_info`.
+    /// untracked graph/module allocations. On GB10 this under-reports free
+    /// memory because allocations reclaim page cache; use allocatable memory
+    /// for sizing and keep this raw sample only for diagnostics. Audits distinguish
+    /// this from the logical admission sample returned by `cuda_memory_info`.
     pub fn cuda_physical_memory_info(&self) -> Result<(usize, usize)> {
         let info: Symbol<unsafe extern "C" fn(*mut usize, *mut usize) -> CuteafdStatus> =
             unsafe { self.lib.get(b"cuteafd_cuda_memory_info")? };
@@ -1750,11 +1878,26 @@ impl NativeLibrary {
         Ok((free, total))
     }
 
+    /// Allocatable free/total bytes on the current device, before logical budgets.
+    /// GB10 (SM121) allocations reclaim Linux page cache, so MemAvailable is the
+    /// shared device/host headroom, bounded by cgroup hard-limit headroom.
+    /// Discrete RTX (SM120) keeps cudaMemGetInfo.
+    pub fn cuda_allocatable_memory_info(&self) -> Result<(usize, usize)> {
+        let (free, total) = self.cuda_physical_memory_info()?;
+        let info = self.cuda_device_info(self.cuda_get_device()?)?;
+        let available = allocatable_bytes(info.compute_capability_major, info.compute_capability_minor, free,
+            || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
+        let available = if (info.compute_capability_major, info.compute_capability_minor) == (12, 1) {
+            cgroup_memory_headroom(available)?
+        } else { available };
+        Ok((available.min(total), total))
+    }
+
     /// Effective free/total bytes under the coordinator's logical ceiling.
-    /// Subtract physical usage, not the min of physical free and the budget:
+    /// Subtract non-reclaimable usage, not the min of available bytes and the budget:
     /// otherwise every successive owner would spend the same budget again.
     pub fn cuda_memory_info(&self) -> Result<(usize, usize)> {
-        let (free, total) = self.cuda_physical_memory_info()?;
+        let (free, total) = self.cuda_allocatable_memory_info()?;
         let Some(budget) = coordinator_gpu_budget() else { return Ok((free, total)) };
         let device = self.cuda_get_device()?;
         let sample = cuteafd_core::serving_capacity::DeviceMemory {

@@ -1293,7 +1293,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         self.drain_state()?;
         let sample = || self.gdn_banks.iter().map(|bank| bank.device.run(|| {
-            Ok(self.library.cuda_physical_memory_info()?.0)
+            Ok(self.library.cuda_allocatable_memory_info()?.0)
         })).collect::<Result<Vec<_>>>();
         let before = sample()?;
         let started = std::time::Instant::now();

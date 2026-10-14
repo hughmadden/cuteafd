@@ -117,6 +117,8 @@ def summarize(report):
 def render(path, summary):
     print(f"== {path} (stage {summary['stage']})")
     for dev in summary["devices"]:
+        print(dev.get("cuda_memory_scope",
+              "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache; host MemAvailable is allocatable headroom"))
         print(f"device {dev['device']}: used {gib(dev.get('used', 0))} GiB of {gib(dev.get('total', 0))}, "
               f"tracked {gib(dev['tracked'])}, untracked {gib(dev.get('untracked', 0))}, peak tracked {gib(dev['peak'])}")
         print("   by category: " + ", ".join(f"{c} {n / GIB:.2f}" for c, n in
