@@ -439,5 +439,30 @@ def test_compiled_numerical_attestation_is_additive_and_role_scoped() -> None:
     assert "CUTEAFD_JOIN(cuteafd_expert_info, _reduction)" in native
     assert "static_assert(sizeof(cuteafd_expert_info_t) == 64)" in native
     header = HEADER.read_text()
-    for prefix in ("v41", "v41_spark_tp2", "v41_spark_tp3", "v41_spark_tp6"):
+    for prefix in ("v41", "v41_local", "v41_tp2", "v41_spark_tp2", "v41_spark_tp3", "v41_spark_tp6"):
         assert f"cuteafd_{prefix}_expert_info_reduction" in header
+
+
+def test_native_family_decode_uses_one_wide_recipe_and_shared_admission() -> None:
+    cmake = (ROOT / "native/cmake/shared/expert_families.cmake").read_text()
+    wide = "1:128,16:128,80:128,256:128,1024:128,4096:128"
+    assert f'CUTEAFD_EXPERT_FAMILY_WIDTH "{wide}"' in cmake
+    assert wide in (ROOT / "scripts/build/compare-sm-exports.py").read_text()
+    recipe = _slice_recipe()
+    for intermediate in (512, 768, 1024, 1536, 2048, 3072):
+        serial = recipe(128, intermediate, atomic=False, compact=False)
+        assert serial["fc2_k_steps"] == 4
+        assert serial["plane_count"] == intermediate // 128
+        assert serial["plane_fold"] == "ascending_fp32"
+    ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/v41_experts.rs").read_text()
+    attestation = ffi.split("pub fn native_expert_reduction", 1)[1].split("fn expert_info_for", 1)[0]
+    assert "let name = family_symbol(name)?;" in attestation
+    for prefix in ("v41", "v41_local", "v41_tp2", "v41_spark_tp2", "v41_spark_tp3", "v41_spark_tp6"):
+        assert f"cuteafd_{prefix}_expert_info_reduction" in attestation
+    shared = ROOT / "rust/crates/cuteafd-daemon/src/shared"
+    execution = (shared / "experts/execution.rs").read_text()
+    admission = execution.split("fn native_reduction_plan", 1)[1].split("#[derive", 1)[0]
+    assert "expert_geometry().family()" not in admission
+    assert "ExpertReductionPlan::native" in admission
+    assert "ExpertReductionPlan::native" in (shared / "experts/rtx/native.rs").read_text()
+    assert "ExpertReductionPlan::native" in (ROOT / "rust/crates/cuteafd-daemon/src/families/deepseek_v4/local.rs").read_text()
