@@ -37,6 +37,21 @@ impl ExpertReductionPlan {
         Ok(Self { decode })
     }
 
+    /// One compiled-recipe check for all native families and routed-expert owners.
+    pub(crate) fn native(library: &cuteafd_ffi::NativeLibrary,
+        infos: impl IntoIterator<Item = cuteafd_ffi::V41ExpertInfo>) -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        let variants = infos.into_iter().map(|info| {
+            let recipe = library.native_expert_reduction(&info)?;
+            if info.capacity_rows <= 80 {
+                ensure!(recipe.plane_fold == 1 && recipe.implementation == 1,
+                    "native decode requires ordered FP32 slice planes, not atomic/hybrid arithmetic");
+            }
+            Ok((info.capacity_rows as usize, recipe))
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        Self::new(&variants).context("native MXFP4 decode differs from canonical m1 slice/fold recipe")
+    }
+
     pub(crate) fn execution_index(&self, rows: usize, required: usize,
         capacities: impl Iterator<Item = usize>) -> anyhow::Result<usize> {
         use anyhow::{ensure, Context};

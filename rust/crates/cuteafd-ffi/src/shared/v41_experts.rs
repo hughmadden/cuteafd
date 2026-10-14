@@ -677,19 +677,22 @@ impl NativeLibrary {
         }
     }
 
-    /// Query immutable MXFP4 Spark numerical metadata before allocation/readiness.
-    pub fn v41_spark_expert_reduction(&self, info: &V41ExpertInfo) -> Result<V41ExpertReduction> {
+    /// Query immutable native MXFP4 numerical metadata before allocation/readiness.
+    pub fn native_expert_reduction(&self, info: &V41ExpertInfo) -> Result<V41ExpertReduction> {
         type Query = unsafe extern "C" fn(i32, *mut V41ExpertReduction) -> i32;
         let name: &[u8] = match info.role {
             1 => b"cuteafd_v41_expert_info_reduction",
+            2 => b"cuteafd_v41_local_expert_info_reduction",
+            3 => b"cuteafd_v41_tp2_expert_info_reduction",
             5 => b"cuteafd_v41_spark_tp2_expert_info_reduction",
             6 => b"cuteafd_v41_spark_tp3_expert_info_reduction",
             7 => b"cuteafd_v41_spark_tp6_expert_info_reduction",
-            _ => anyhow::bail!("native slice reduction metadata requires a Spark role"),
+            _ => anyhow::bail!("native slice reduction metadata requires a routed-expert role"),
         };
+        let name = family_symbol(name)?;
         // SAFETY: additive C ABI writes exactly the repr(C) attestation structure.
-        let function = unsafe { self.lib.get::<Query>(name) }
-            .context("native Spark experts lack compiled reduction attestation; rebuild AOT exports")?;
+        let function = unsafe { self.lib.get::<Query>(&name) }
+            .context("native experts lack compiled reduction attestation; rebuild AOT exports")?;
         let mut result = V41ExpertReduction::default();
         // SAFETY: output is writable and capacity conversion is checked.
         let status = unsafe { function(i32::try_from(info.capacity_rows)?, &mut result) };

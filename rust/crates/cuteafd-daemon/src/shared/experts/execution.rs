@@ -22,28 +22,16 @@ fn compact_output_role(role: u32) -> bool {
 }
 
 /// Admit the exact states owned by this wave before allocating their scratch.
-/// RTX/NVFP4 and other families retain their existing dispatch contracts.
+/// NVFP4 and draft roles retain their separate dispatch contracts.
 fn native_reduction_plan(layer: ExpertLayer, library: &NativeLibrary, capacity: u32,
     nvfp4: bool) -> Result<Option<super::ExpertReductionPlan>> {
-    if nvfp4 || !compact_output_role(layer.role())
-        || cuteafd_core::expert_geometry().family() != Some("v41") {
-        return Ok(None);
-    }
+    if nvfp4 || !compact_output_role(layer.role()) { return Ok(None); }
     let mut capacities = vec![capacity]; // execution_state index 0: main
     if capacity > 1 { capacities.push(1); } // index 1: serial
     if capacity > 80 { capacities.push(80); } // index 2: grouped decode
-    let variants = capacities.into_iter().map(|rows| {
-        let info = layer.select_info(library, rows, false)?;
-        let recipe = library.v41_spark_expert_reduction(&info)?;
-        if rows <= 80 {
-            ensure!(recipe.plane_fold == 1 && recipe.implementation == 1,
-                "native Spark decode requires ordered FP32 slice planes, not atomic/hybrid arithmetic");
-        }
-        Ok((rows as usize, recipe))
-    }).collect::<Result<Vec<_>>>()?;
-    let plan = super::ExpertReductionPlan::new(&variants)
-        .context("native MXFP4 Spark decode differs from canonical m1 slice/fold recipe")?;
-    Ok(Some(plan))
+    let infos = capacities.into_iter().map(|rows| layer.select_info(library, rows, false))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(super::ExpertReductionPlan::native(library, infos)?))
 }
 
 #[derive(Debug, Clone, Copy)]

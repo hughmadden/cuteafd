@@ -66,6 +66,8 @@ typedef struct cuteafd_expert_reduction_t {
   uint32_t implementation, mma_k, block_threads, fc1_k_stage;
 } cuteafd_expert_reduction_t;
 int32_t cuteafd_v41_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
+int32_t cuteafd_v41_local_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
+int32_t cuteafd_v41_tp2_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
 int32_t cuteafd_v41_spark_tp2_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
 int32_t cuteafd_v41_spark_tp3_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
 int32_t cuteafd_v41_spark_tp6_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
