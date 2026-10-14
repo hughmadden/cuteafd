@@ -40,10 +40,10 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 - 2026-10-14 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 2× RTX PRO 6000 @ gpu-powerd 455/445 W (300–550) + 4× DGX Spark · build 92ad5b03d029 · [report](deepseek_v41/2026-10-14-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/report.svg)
 - 2026-10-14 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 1× RTX PRO 6000 @ gpu-powerd 445 W (415–540) + 3× DGX Spark · build 92ad5b03d029 · [report](deepseek_v41/2026-10-14-smoke-deepseek-v4-1-flash-1rtx-3spark-v41-flash-min/report.svg)
-- 2026-10-09 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 4 Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-rc3-sim5090/report.svg) · ⚠ quality gate failed
+- 2026-10-09 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 4 Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-rc3-sim5090/report.svg)
 - 2026-10-09 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 3 Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-1rtx-3spark-v41-flash-rc3-sim5090/report.svg)
-- 2026-10-09 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max-rc3/report.svg) · ⚠ quality gate failed
-- 2026-10-09 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min-rc3/report.svg) · ⚠ quality gate failed
+- 2026-10-09 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max-rc3/report.svg)
+- 2026-10-09 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min-rc3/report.svg)
 - 2026-10-09 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max-rc3/report.svg)
 - 2026-10-09 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 1× RTX PRO 6000 @ 325 W + 3× DGX Spark · build v2.0.0-rc3 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-1rtx-3spark-v41-flash-min-rc3/report.svg)
 - 2026-10-09 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 4 Spark · build v2.0.0-rc2 · [report](deepseek_v41/2026-10-09-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-rc2-sim5090/report.svg)
@@ -196,6 +196,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## Qwen 3.8
 
+- 2026-10-14 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (355–540) · build 92ad5b03d029 · [report](qwen4/2026-10-14-smoke-qwen3-8-flash-next-nvfp4-2rtx-qwen38-nvfp4-max/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 2× RTX PRO 6000 @ gpu-powerd 440/455 W (300–550) · build 92ad5b03d029 · [report](qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-2rtx-qwen38-exl3-max/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 1× RTX PRO 6000 @ gpu-powerd 410/485 W (300–600) · build 92ad5b03d029 · [report](qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/report.svg)
 - 2026-10-09 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v2.0.0-rc3 · [report](qwen4/2026-10-09-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-rc3-sim5090/report.svg)
