@@ -102,13 +102,14 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             // all bank borrows before waiting on this lane's draft workspace.
             let seeds = {
                 let active = active.borrow();
-                let mut requests = requests.borrow_mut();
+                let requests = requests.borrow();
                 let verify_rows = draft.borrow().as_ref().map_or(1, |d| d.max_verify_rows());
                 let capacity: Vec<_> = members.iter().map(|&slot| {
                     let r = active[slot].as_ref().unwrap();
                     (r.lease, (r.job.max_tokens-r.generated).min(verify_rows) as u32)
                 }).collect();
-                prefixes.borrow_mut().make_room(&mut requests, &capacity)?;
+                // Units cover each request's declared lifetime: validate the bindings only.
+                requests.cache().check_append_capacity(&capacity)?;
                 members.iter().map(|&slot| {
                     let r = active[slot].as_ref().unwrap();
                     Ok((r.id(), r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
@@ -308,6 +309,9 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
 async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, requests: &RefCell<&mut Requests<'a>>,
     prefixes: &RefCell<&mut PrefixCache<'a>>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>) -> Result<()> {
     request.console_retire();
+    let state = if !request.failed && requests.borrow().cache().request_id(request.lease).is_ok() {
+        requests.borrow_mut().record_state(request.lease, &request.job.probe, "turn")
+    } else { Ok(()) };
     // Chunk-4b: consult the turn bank before requiring the retained frontier, so
     // a cache-disabled deployment does not warn about a frontier it correctly
     // chose not to download.
@@ -317,9 +321,11 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
         let retained: Result<()> = async {
             let next = request.next_after_commit.as_ref().context("finished request has no retained logits")?;
             prefixes.borrow_mut().capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
-            let queued = prefixes.borrow_mut().queue_retain(lane, SnapshotKind::Turn, &request.tokens,
-                &request.image_keys, next, request.id(), request.lease, &mut requests.borrow_mut(),
-                draft.borrow_mut().as_deref_mut())?;
+            let id = super::super::prefix::draft_id(&*draft.borrow(), request.id());
+            let keys = super::super::prefix::keyed(&request.image_keys, &request.tokens);
+            let queued = prefixes.borrow_mut().queue_retain(lane, &mut requests.borrow_mut(),
+                draft.borrow_mut().as_deref_mut(), SnapshotKind::Turn, &keys, request.image_keys.spans(), next,
+                request.lease, id)?;
             if queued {
                 tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id(),
                     "independent snapshot queued");
@@ -344,5 +350,9 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
     }
     let target = requests.borrow_mut().release_if_present(request.lease);
     let speculative = draft.borrow_mut().as_deref_mut().map(|d| d.release(request.id())).transpose();
-    target.and(speculative.map(|_| ()))
+    if let Some(probe) = request.job.probe.as_ref().filter(|probe| probe.spec.record_state) {
+        if let Err(error) = &state { probe.fail(format!("state diagnostic: {error:#}")); }
+        probe.finish_state();
+    }
+    target.and(speculative.map(|_| ())).and(state)
 }

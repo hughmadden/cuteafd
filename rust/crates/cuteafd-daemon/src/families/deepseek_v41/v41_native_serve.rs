@@ -10,7 +10,6 @@ pub(crate) mod scores;
 use scores::RetainedScores;
 pub(crate) mod prefix;
 pub(crate) mod memory;
-use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;
 use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
 use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
 use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
@@ -501,10 +500,10 @@ fn worker(
         (args.prefix_cache_entries as usize).checked_mul(2).and_then(|n| n.checked_add(2))
             .context("snapshot slot count overflow")?
     };
-    let target_prefix_pool = (snapshot_slots > 0).then(|| crate::shared::memory::SnapshotPool::new(
-        &lib, crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes(), snapshot_slots)).transpose()?;
-    let draft_snapshot_bytes = draft.as_mut().map(|d| d.reserve_prefixes(snapshot_slots)).transpose()?.unwrap_or(0);
-    let snapshot_bytes = target_prefix_pool.as_ref().map_or(0, crate::shared::memory::SnapshotPool::device_bytes) + draft_snapshot_bytes;
+    let prefix_arenas = prefix::Arenas::new(
+        crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
+        draft.as_ref().map(|d| d.mark_device()), snapshot_slots)?;
+    let snapshot_bytes = prefix::Arenas::device_bytes(snapshot_slots, draft.is_some());
     tracing::info!(snapshot_slots, snapshot_bytes, "snapshot arenas reserved before serving");
     cuteafd_ffi::memory_ledger::relabel_other("v41/prefix-snapshots");
     if small_card { memory::startup_phase(&lib, "v41/prefix-snapshots", device_total)?; }
@@ -545,7 +544,7 @@ fn worker(
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
     if small_card { memory::startup_phase(&lib, "v41/kv", device_total)?; }
-    if let Some(pool) = target_prefix_pool { requests.install_prefix_pool(pool)?; }
+    requests.use_engine_pages()?;
     let mut local_layers = 0usize;
     // Published only on the single-RTX path; the 2-RTX distributed worker owns
     // its own handshake. Dropping it without a ready acknowledgement leaves the
@@ -642,7 +641,7 @@ fn worker(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
+    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     vision.connect()?;
     ready
@@ -678,6 +677,44 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     hold: &mut dyn FnMut() -> Result<()>,
 ) -> Result<RetainedScores> {
     use prefill_target::{V41Prefill, V41PrefillStep, V41PrefillTimes};
+    if let Some(probe) = job.probe.as_ref().filter(|probe| !probe.spec.cold_steps.is_empty()) {
+        probe.spec.validate_cold_steps(tokens.len(), tokens.len(), 1)?;
+        ensure!(!probe.spec.cold_steps[0].decode, "V4.1 cold replay must begin with encoder prefill");
+        let mut previous = 0;
+        let mut scores = None;
+        let mut draft = draft;
+        for (index, cold_step) in probe.spec.cold_steps.iter().enumerate() {
+            let chunk = &tokens[previous..cold_step.end];
+            if index == 0 {
+                let mut times = V41PrefillTimes::default();
+                let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
+                    other_transport, lease, tokens: chunk, chunk_rows, job, draft: draft.as_deref_mut(),
+                    hold, times: &mut times };
+                scores = Some(crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())?);
+            } else if cold_step.decode {
+                let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
+                    image_mask: None, kind: ExpertV2SourceKind::Decode }])?;
+                let result = (|| -> Result<RetainedScores> {
+                    // SAFETY: the probe's request and batch stay owned until execution and commit drain.
+                    runtime.block_on(unsafe { pass.execute_shared(&std::cell::RefCell::new(&mut *requests),
+                        &mut batch, transport, 0, &[chunk.len() - 1]) })?;
+                    let bytes = runtime.block_on(pass.download_logits(&batch, &[0]))?;
+                    runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
+                    RetainedScores::new(scores::VOCAB, bytes)
+                })();
+                if result.is_err() { pass.discard(&mut batch)?; }
+                scores = Some(result?);
+            } else {
+                if index + 1 == probe.spec.cold_steps.len() {
+                    requests.record_state(lease, &job.probe, "checkpoint")?;
+                }
+                scores = Some(prefill_continuation(lib, runtime, pass, requests, transport, lease,
+                    chunk, chunk_rows, job, draft.as_deref_mut(), hold)?);
+            }
+            previous = cold_step.end;
+        }
+        return scores.context("V4.1 cold replay produced no logits");
+    }
     let mut times = V41PrefillTimes::default();
     let mut step = V41PrefillStep { lib, runtime, pass, other, requests, transport,
         other_transport, lease, tokens, chunk_rows, job, draft, hold, times: &mut times };

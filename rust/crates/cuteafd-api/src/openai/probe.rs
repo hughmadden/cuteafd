@@ -68,6 +68,9 @@ pub struct ProbeSpec {
     /// first from the prefill or a retained row, the rest from decode steps).
     #[serde(default)]
     pub record_rows: usize,
+    /// Hash initialized persistent state at prompt and turn frontiers (synchronous diagnostic).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_state: bool,
     /// Top entries kept per recorded row.
     #[serde(default)]
     pub top_k: usize,
@@ -228,6 +231,15 @@ pub struct ProbeRow {
     pub finite: bool,
 }
 
+/// Canonical persistent state, excluding unused allocation bytes and physical page ids.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeState {
+    pub kind: String,
+    pub end: usize,
+    pub sha256: String,
+    pub bytes: usize,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeRecord {
     /// Whether an engine honoured the probe at all.
@@ -240,6 +252,8 @@ pub struct ProbeRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<serde_json::Value>,
     pub cached_tokens: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub states: Vec<ProbeState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cold_steps: Vec<ProbeColdStep>,
     pub rows: Vec<ProbeRow>,
@@ -265,13 +279,15 @@ pub struct Probe {
     dump: Mutex<Option<rows::RowDump>>,
     /// `spec.score_positions` as a set.
     positions: Option<std::collections::HashSet<usize>>,
+    state_complete: (Mutex<bool>, std::sync::Condvar),
 }
 
 impl Probe {
     pub fn new(spec: ProbeSpec) -> Arc<Self> {
         let dump = spec.dump_rows.as_ref().map(|path| rows::RowDump::new(path.clone()));
         let positions = spec.score_positions.as_ref().map(|positions| positions.iter().copied().collect());
-        Arc::new(Self { spec, record: Mutex::new(ProbeRecord::default()), dump: Mutex::new(dump), positions })
+        Arc::new(Self { spec, record: Mutex::new(ProbeRecord::default()), dump: Mutex::new(dump), positions,
+            state_complete: (Mutex::new(false), std::sync::Condvar::new()) })
     }
 
     /// Whether the row predicting `position` is recorded (`score_positions`); an engine may skip
@@ -293,7 +309,7 @@ impl Probe {
             r.engine = Some(engine.to_owned());
             r.prompt_ids = prompt_ids.to_vec();
             r.cached_tokens = cached_tokens;
-            if matches!(engine, "mimo_v2" | "glm5_flash" | "qwen4") { r.cold_steps = self.spec.cold_steps.clone(); }
+            if matches!(engine, "mimo_v2" | "glm5_flash" | "qwen4" | "deepseek_v41") { r.cold_steps = self.spec.cold_steps.clone(); }
             r.cold = self.spec.cold;
             r.no_speculation = self.spec.no_speculation;
         });
@@ -307,6 +323,26 @@ impl Probe {
 
     pub fn audio(&self, audio: Vec<ProbeAudio>) {
         self.with(|r| r.audio = audio);
+    }
+
+    /// Diagnostic consumers wait for retirement, not the earlier SSE Finish.
+    pub fn finish_state(&self) {
+        if !self.spec.record_state { return; }
+        let (lock, wake) = &self.state_complete;
+        if let Ok(mut done) = lock.lock() { *done = true; wake.notify_all(); }
+    }
+
+    pub fn wait_state(&self) -> anyhow::Result<()> {
+        let (lock, wake) = &self.state_complete;
+        let done = lock.lock().map_err(|_| anyhow::anyhow!("state completion lock poisoned"))?;
+        let (done, _) = wake.wait_timeout_while(done, std::time::Duration::from_secs(30), |done| !*done)
+            .map_err(|_| anyhow::anyhow!("state completion wait poisoned"))?;
+        anyhow::ensure!(*done, "state diagnostic retirement timed out");
+        Ok(())
+    }
+
+    pub fn state(&self, state: ProbeState) {
+        self.with(|r| r.states.push(state));
     }
 
     pub fn provenance(&self, value: serde_json::Value) {
@@ -599,13 +635,26 @@ mod tests {
     }
 
     #[test]
+    fn state_diagnostic_is_opt_in_and_waits_for_retirement() {
+        let spec: ProbeSpec = serde_json::from_str("{}").unwrap();
+        assert!(!spec.record_state);
+        let probe = Probe::new(ProbeSpec { record_state: true, ..Default::default() });
+        probe.state(ProbeState { kind: "turn".into(), end: 17, sha256: "ab".repeat(32), bytes: 128 });
+        probe.finish_state();
+        probe.wait_state().unwrap();
+        let record: ProbeRecord = serde_json::from_value(serde_json::to_value(probe.record()).unwrap()).unwrap();
+        assert_eq!(record.states[0].end, 17);
+        assert_eq!(record.states[0].kind, "turn");
+    }
+
+    #[test]
     fn cold_replay_requires_bounded_complete_non_speculative_geometry() {
         let mut spec = ProbeSpec { cold: true, no_speculation: true,
             cold_steps: vec![ProbeColdStep { end: 8, decode: false },
                 ProbeColdStep { end: 9, decode: true }, ProbeColdStep { end: 12, decode: false }],
             ..Default::default() };
         assert!(spec.validate_cold_steps(12, 8, 2).is_ok());
-        for engine in ["mimo_v2", "glm5_flash", "qwen4"] {
+        for engine in ["mimo_v2", "glm5_flash", "qwen4", "deepseek_v41"] {
             let probe = Probe::new(spec.clone());
             probe.admitted(engine, &[0; 12], 0);
             assert_eq!(probe.record().cold_steps, spec.cold_steps);
