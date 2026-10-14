@@ -501,6 +501,8 @@ pub enum PlacementError {
     UnsupportedHop { family: &'static str, hop: Hop },
     #[error("{family} cannot run attention placement {mode}: {reason}")]
     AttentionPlacement { family: &'static str, mode: AttentionPlacement, reason: &'static str },
+    #[error("glm5 attention placement context needs the context-split programs ({programs}); this build's programs manifest lacks at least one of them — export the GLM 5.3 context-split kernels or request `heads`")]
+    MissingContextPrograms { programs: String },
     #[error("placement arithmetic overflows: {0}")]
     Overflow(&'static str),
 }

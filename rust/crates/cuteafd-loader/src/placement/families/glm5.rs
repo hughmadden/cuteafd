@@ -42,8 +42,18 @@ pub struct GlmContext {
 pub const CONTEXT_PROGRAMS: [&str; 5] = ["glm_scored_index_topk_decode_m64", "glm_dsa_candidate_merge",
     "glm_lse_combine2", "glm_paged_staging_gather_kv", "glm_paged_staging_gather_index"];
 
+/// The `context` programs beside the split partials, for the fail-closed
+/// reason when a build's manifest lacks them (issue #202).
+pub fn context_program_list() -> String {
+    let mut names: Vec<String> = CONTEXT_PROGRAMS.iter().map(|n| (*n).to_string()).collect();
+    names.push("glm_sparse_mla_partial_h0_s*_m64".into());
+    names.push("glm_sparse_mla_partial_h32_s*_m64".into());
+    names.join(", ")
+}
+
 /// The `context` programs and scratch `lookup` (name -> scratch bytes) finds,
-/// or None when this build lacks any of them (auto then stays `heads`).
+/// or None when this build lacks any of them (a `context` request then fails
+/// closed; `heads` is the build's only attention executor).
 pub fn context_programs<'n>(names: impl IntoIterator<Item = &'n str> + Clone,
     lookup: impl Fn(&str) -> Option<u64>) -> Option<GlmContext> {
     let partial = |begin: u64| names.clone().into_iter()
@@ -343,7 +353,9 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }], by_kind: Vec::new(), ..LayerPolicy::default() },
         hops: HopSpec { row_bytes: cfg.hidden as u64 * 2, rows: inputs.prefill_rows.max(DECODE_ROWS),
             lanes: inputs.prefill_lanes, entry_gpu: 0, head_gpu: 0 },
-        // `context` is the recorded default where the build carries its programs.
+        // `context` is the recorded default where the build carries its
+        // programs. Without them this executor runs heads and only heads; a
+        // chosen `context` fails closed in `solve_working_set` (#202).
         executor: if inputs.context.is_some() { super::GLM5 }
             else { ExecutorModes { attention: AttentionPlacement::Heads, ..super::GLM5 } },
     })
@@ -362,6 +374,16 @@ pub struct GlmWorkingSet {
 pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
     attention: Option<AttentionPlacement>) -> Result<(Placement, GlmWorkingSet), PlacementError> {
     request(inputs)?;
+    // `context` is the auto default on a two-GPU pair, and the requested mode
+    // when asked for. A build whose manifest lacks its context programs cannot
+    // run it: fail closed with what to rebuild rather than silently
+    // downgrading the executor to heads (issue #202). Explicit heads is
+    // unaffected.
+    let context_chosen = attention.map_or(inputs.gpus.len() == 2,
+        |mode| mode == AttentionPlacement::Context);
+    if context_chosen && inputs.context.is_none() {
+        return Err(PlacementError::MissingContextPrograms { programs: context_program_list() });
+    }
     let routed = if inputs.skip_routed_experts { 0 }
         else { inputs.layers.saturating_sub(inputs.cfg.first_moe_layer) };
     let run = |branch: &GlmInputs<'_>, cap: Option<u64>, floor: Option<u64>| {
@@ -785,6 +807,11 @@ mod tests {
             onboard: default_onboard(), full_prefill_logits: false, context: None }
     }
 
+    /// The heads-only fixtures here carry no context programs, so a two-GPU
+    /// solve must request `heads` explicitly: auto resolves to `context`,
+    /// which fails closed without its programs (issue #202).
+    const HEADS: Option<AttentionPlacement> = Some(AttentionPlacement::Heads);
+
     #[test]
     fn planner_equals_runtime_glm5() {
         let cfg = config();
@@ -797,8 +824,8 @@ mod tests {
                     let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
                     *baseline = Baseline::Measured { free_bytes: *total - context_bytes - loaded_bytes };
                 }
-                let (p, pw) = solve_working_set(&planned, planned.tp2_workspace, None).unwrap();
-                let (r, rw) = solve_working_set(&runtime, runtime.tp2_workspace, None).unwrap();
+                let (p, pw) = solve_working_set(&planned, planned.tp2_workspace, HEADS).unwrap();
+                let (r, rw) = solve_working_set(&runtime, runtime.tp2_workspace, HEADS).unwrap();
                 assert_eq!(p, r);
                 assert_eq!(pw, rw);
                 if cards.len() == 2 {
@@ -858,7 +885,7 @@ mod tests {
                 cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2];
             }
             let serial = [64 << 20; 2];
-            let (p, working) = solve_working_set(&planned, serial, None).unwrap();
+            let (p, working) = solve_working_set(&planned, serial, HEADS).unwrap();
             assert_eq!(p.onboard_layers, routed);
             assert_eq!(working.spark.spark_ranks, 0);
             assert_eq!(working.spark.prefill_lanes, 1);
@@ -873,13 +900,13 @@ mod tests {
                 let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
                 *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
             }
-            assert_eq!(solve_working_set(&measured, serial, None).unwrap(), (p, working));
+            assert_eq!(solve_working_set(&measured, serial, HEADS).unwrap(), (p, working));
         }
         let mut input = inputs(&cfg, &[96 * GIB; 2]);
         input.requested_pool = Some(65536);
         for onboard in [Onboard::Layers(0), Onboard::Fraction(0.0), Onboard::Layers(2)] {
             input.onboard = onboard;
-            let (p, working) = solve_working_set(&input, [64 << 20; 2], None).unwrap();
+            let (p, working) = solve_working_set(&input, [64 << 20; 2], HEADS).unwrap();
             let n = onboard.layers(routed).unwrap();
             assert_eq!(p.onboard_layers, n);
             assert_eq!(working.spark.spark_layers, (cfg.first_moe_layer + n..cfg.layers).collect::<Vec<_>>());
@@ -901,7 +928,7 @@ mod tests {
         let mut input = inputs(&cfg, &[96 * GIB; 2]);
         input.requested_pool = Some(65536);
         input.onboard = Onboard::Layers(0);
-        let without_rtx = solve_working_set(&input, [64 << 20; 2], None).unwrap();
+        let without_rtx = solve_working_set(&input, [64 << 20; 2], HEADS).unwrap();
         assert!(without_rtx.1.spark.rtx_layers.is_empty());
         assert_eq!(without_rtx.1.tp2_workspace, [0; 2]);
         let request = request(&input).unwrap();
@@ -911,20 +938,20 @@ mod tests {
         assert!(request.fixed.iter().any(|row| row.group == "steps" && row.bytes > 0));
         input.tp2_workspace = [u64::MAX; 2];
         input.expert_workspace = u64::MAX;
-        assert_eq!(solve_working_set(&input, [u64::MAX; 2], None).unwrap(), without_rtx,
+        assert_eq!(solve_working_set(&input, [u64::MAX; 2], HEADS).unwrap(), without_rtx,
             "unselected RTX rows must never affect admission");
 
         input.onboard = Onboard::Layers(cfg.layers - cfg.first_moe_layer);
         input.expert_workspace = 0;
         input.tp2_workspace = [128 << 20; 2];
         for cost in &mut input.experts { cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2]; }
-        let all_local = solve_working_set(&input, [64 << 20; 2], None).unwrap();
+        let all_local = solve_working_set(&input, [64 << 20; 2], HEADS).unwrap();
         assert!(all_local.1.spark.spark_layers.is_empty());
         assert_eq!(all_local.1.spark.prefill_lanes, 1);
         assert_eq!(all_local.1.tp2_workspace, [64 << 20; 2]);
         input.spark_ranks = 0;
         input.prefill_lanes = 1;
-        assert_eq!(solve_working_set(&input, [64 << 20; 2], None).unwrap(), all_local,
+        assert_eq!(solve_working_set(&input, [64 << 20; 2], HEADS).unwrap(), all_local,
             "configured but unselected Spark peers must not affect admission");
         assert!(all_local.0.items.iter().all(|rank| rank.iter().all(|row| row.group != "Spark intake planes")));
         assert!(all_local.0.items.iter().all(|rank| rank.iter().any(|row| row.group == "peer exchange")));
@@ -940,21 +967,21 @@ mod tests {
         let mut input = inputs(&cfg, &[96 * GIB; 2]);
         for cost in &mut input.experts { cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2]; }
         let serial = [64 << 20; 2];
-        let (placed, working) = solve_working_set(&input, serial, None).unwrap();
+        let (placed, working) = solve_working_set(&input, serial, HEADS).unwrap();
         assert_eq!(placed.onboard_layers, cfg.layers - cfg.first_moe_layer);
         assert!(working.spark.spark_layers.is_empty());
         assert_eq!(working.spark.prefill_lanes, 1);
         let with_peers = GlmInputs { onboard: Onboard::Layers(0), ..input.clone() };
-        assert!(placed.pool_tokens > solve_working_set(&with_peers, serial, None).unwrap().0.pool_tokens,
+        assert!(placed.pool_tokens > solve_working_set(&with_peers, serial, HEADS).unwrap().0.pool_tokens,
             "pool-first must compare each branch's own costs, not take configured peer costs");
         input.spark_ranks = 0;
         input.prefill_lanes = 1;
-        assert_eq!(solve_working_set(&input, serial, None).unwrap(), (placed, working));
+        assert_eq!(solve_working_set(&input, serial, HEADS).unwrap(), (placed, working));
         input.layers = cfg.first_moe_layer;
         input.experts.clear();
         input.spark_ranks = 4;
         input.prefill_lanes = 3;
-        let (dense, working) = solve_working_set(&input, serial, None).unwrap();
+        let (dense, working) = solve_working_set(&input, serial, HEADS).unwrap();
         assert!(working.spark.rtx_layers.is_empty() && working.spark.spark_layers.is_empty());
         assert_eq!(working.spark.spark_ranks, 0);
         assert_eq!(working.spark.prefill_lanes, 1);
@@ -984,16 +1011,16 @@ mod tests {
                 + serial[rank] + (routed as u64 + 16) * (1 << 20);
             *budget = (capacity, Baseline::Measured { free_bytes: capacity });
         }
-        let (placed, working) = solve_working_set(&input, serial, None).unwrap();
+        let (placed, working) = solve_working_set(&input, serial, HEADS).unwrap();
         assert!(placed.onboard_layers < routed, "max must not select an all-local branch below 256K");
         assert_eq!(working.spark.spark_ranks, 4);
         assert!(placed.pool_tokens >= 65536);
         input.spark_ranks = 0;
         input.prefill_lanes = 1;
         input.onboard = Onboard::Layers(routed);
-        assert!(matches!(solve_working_set(&input, serial, None), Err(PlacementError::BelowFloor { .. })));
+        assert!(matches!(solve_working_set(&input, serial, HEADS), Err(PlacementError::BelowFloor { .. })));
         input.requested_pool = Some(131072);
-        assert_eq!(solve_working_set(&input, serial, None).unwrap().0.onboard_layers, routed,
+        assert_eq!(solve_working_set(&input, serial, HEADS).unwrap().0.onboard_layers, routed,
             "an explicit smaller pool remains its own floor");
     }
 
@@ -1002,24 +1029,24 @@ mod tests {
         let cfg = config();
         let mut input = inputs(&cfg, &[96 * GIB; 2]);
         let serial = [64 << 20; 2];
-        let (auto, working) = solve_working_set(&input, serial, None).unwrap();
-        assert_eq!(auto.onboard_layers, 0);
+        let (heads, working) = solve_working_set(&input, serial, HEADS).unwrap();
+        assert_eq!(heads.onboard_layers, 0);
         assert_eq!(working.spark.spark_ranks, 4);
-        assert_eq!(auto.pool_tokens, solve(&request(&input).unwrap()).unwrap().pool_tokens);
+        assert_eq!(heads.pool_tokens, solve(&request(&input).unwrap()).unwrap().pool_tokens);
         input.onboard = Onboard::ExpertsFirst { pool_floor: 262144 };
-        let (max, _) = solve_working_set(&input, serial, None).unwrap();
+        let (max, _) = solve_working_set(&input, serial, HEADS).unwrap();
         assert_eq!(max.onboard_layers, solve(&request(&input).unwrap()).unwrap().onboard_layers);
-        assert!(max.onboard_layers > auto.onboard_layers);
+        assert!(max.onboard_layers > heads.onboard_layers);
         input.onboard = Onboard::Layers(cfg.layers - cfg.first_moe_layer);
-        assert!(solve_working_set(&input, serial, None).is_err());
+        assert!(solve_working_set(&input, serial, HEADS).is_err());
         input.onboard = Onboard::Auto;
         input.requested_pool = Some(2 << 20);
-        assert!(matches!(solve_working_set(&input, serial, None), Err(PlacementError::PoolDoesNotFit { .. })));
+        assert!(matches!(solve_working_set(&input, serial, HEADS), Err(PlacementError::PoolDoesNotFit { .. })));
         input.experts.clear();
         input.requested_pool = Some(65536);
-        assert_eq!(solve_working_set(&input, serial, None).unwrap().0.onboard_layers, 0);
+        assert_eq!(solve_working_set(&input, serial, HEADS).unwrap().0.onboard_layers, 0);
         input.onboard = Onboard::Layers(1);
-        assert!(solve_working_set(&input, serial, None).is_err());
+        assert!(solve_working_set(&input, serial, HEADS).is_err());
     }
 
     #[test]
@@ -1113,8 +1140,8 @@ mod tests {
                 *baseline = Baseline::Measured { free_bytes: *total - context_bytes - loaded_bytes };
             }
             let serial = local.workspace_for(&cfg, 64, 1, false);
-            let (p, pw) = solve_working_set(&planned, serial, None).unwrap();
-            let (r, rw) = solve_working_set(&runtime, serial, None).unwrap();
+            let (p, pw) = solve_working_set(&planned, serial, HEADS).unwrap();
+            let (r, rw) = solve_working_set(&runtime, serial, HEADS).unwrap();
             assert_eq!((p.clone(), pw.clone()), (r, rw));
             assert_eq!(p.tp2.unwrap().first, 1);
             assert_eq!(pw.spark.rtx_layers, vec![1]);
@@ -1412,8 +1439,8 @@ mod tests {
                         let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
                         *baseline = Baseline::Measured { free_bytes: *total - context_bytes - loaded_bytes };
                     }
-                    let (p, pw) = solve_working_set(&planned, serial, None).unwrap();
-                    let (r, rw) = solve_working_set(&runtime, serial, None).unwrap();
+                    let (p, pw) = solve_working_set(&planned, serial, HEADS).unwrap();
+                    let (r, rw) = solve_working_set(&runtime, serial, HEADS).unwrap();
                     assert_eq!((p.clone(), pw.clone()), (r, rw));
                     assert_eq!(p.pool_tokens, 65536);
                     assert!(p.expert_ranges.iter().all(|range| range.layers == 0));

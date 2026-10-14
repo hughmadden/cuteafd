@@ -355,7 +355,10 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
         let options = layout::LayoutOptions { rtx_bytes: cards.clone(), context_tokens: 65536,
             pool_tokens: pool, prefill_rows: 4096, prefill_lanes: 3,
             glm5_drafter_disabled: true, ..Default::default() };
-        let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()), ..Default::default() }).unwrap();
+        // No manifest here: auto resolves context on two GPUs and now fails
+        // closed without its programs (#202), so request heads explicitly.
+        let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()),
+            attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..Default::default() }).unwrap();
         assert!(report.executable(), "{}", render(&report));
         let memory = report.memory_layout.unwrap();
         let gpus = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
@@ -400,7 +403,8 @@ fn glm5_attention_auto_requires_complete_context_programs() {
     names.extend(glm::CONTEXT_PROGRAMS.map(str::to_string));
     names.extend(["glm_sparse_mla_partial_h0_s1_m64", "glm_sparse_mla_partial_h32_s1_m64"].map(str::to_string));
     let path = dir.path().join("PROGRAMS.json");
-    // Both partials and every primitive are required; no manifest must also stay heads.
+    // Both partials and every primitive are required; auto (context) and an
+    // explicit context fail closed without them, while heads always runs.
     let missing = std::iter::once(None).chain(names.iter().filter(|name|
         glm::CONTEXT_PROGRAMS.contains(&name.as_str()) || name.starts_with("glm_sparse_mla_partial_"))
         .map(|name| Some(name.as_str()))).chain([Some("no-manifest")]);
@@ -416,33 +420,84 @@ fn glm5_attention_auto_requires_complete_context_programs() {
                 workspace_manifest: Some(if omitted == Some("no-manifest") { dir.path().join("absent.json") }
                     else { path.clone() }), ..Default::default()
             }), ..sparks(4) };
-            let expected = if gpus == 2 && omitted.is_none() { AttentionPlacement::Context }
-                else { AttentionPlacement::Heads };
             let auto = plan(dir.path(), &options).unwrap();
-            assert!(auto.executable(), "omitted {omitted:?}: {}", render(&auto));
-            assert_eq!(auto.attention_placement, expected, "omitted {omitted:?}, gpus {gpus}");
-            let explicit = plan(dir.path(), &PlanOptions {
-                attention_placement: Some(expected), ..options.clone()
+            let heads = plan(dir.path(), &PlanOptions {
+                attention_placement: Some(AttentionPlacement::Heads), ..options.clone()
             }).unwrap();
-            assert_eq!(auto.memory_layout, explicit.memory_layout);
-            assert_eq!(auto.placement_supported, explicit.placement_supported);
+            // Heads runs whatever the manifest holds.
+            assert!(heads.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(&heads));
+            assert_eq!(heads.attention_placement, AttentionPlacement::Heads);
             let context = plan(dir.path(), &PlanOptions {
-                attention_placement: Some(AttentionPlacement::Context), ..options
+                attention_placement: Some(AttentionPlacement::Context), ..options.clone()
             }).unwrap();
-            if expected == AttentionPlacement::Context {
-                assert!(context.executable(), "{}", render(&context));
+            if gpus == 1 {
+                // One GPU is always heads; an explicit context is refused at plan time.
+                assert!(auto.executable(), "omitted {omitted:?}: {}", render(&auto));
+                assert_eq!(auto.attention_placement, AttentionPlacement::Heads);
+                assert_eq!(auto.memory_layout, heads.memory_layout);
+                assert!(context.config_error.as_deref().is_some_and(|error| error.contains("context")),
+                    "omitted {omitted:?}: {}", render(&context));
+            } else if omitted.is_none() {
+                // The manifest carries every program: auto and context agree.
+                assert!(auto.executable() && context.executable(), "{}", render(&auto));
+                assert_eq!(auto.attention_placement, AttentionPlacement::Context);
+                assert_eq!(auto.memory_layout, context.memory_layout);
             } else {
-                assert!(!context.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(&context));
-                if gpus == 2 {
-                    assert!(!context.placement_supported);
-                    assert!(context.memory_layout.unwrap().notes.iter().any(|note|
-                        note.contains("cannot run layer 0 as ContextSplit")));
-                } else {
-                    assert!(context.config_error.unwrap().contains("context"));
+                // The manifest lacks a context program: auto (context) and an
+                // explicit context fail closed, naming the programs to rebuild,
+                // instead of silently downgrading to heads (#202).
+                for report in [&auto, &context] {
+                    assert!(!report.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(report));
+                    assert!(!report.placement_supported);
+                    assert_eq!(report.attention_placement, AttentionPlacement::Context);
+                    assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note|
+                        note.contains("context-split programs") && note.contains("glm_dsa_candidate_merge")),
+                        "omitted {omitted:?}, gpus {gpus}: {}", render(report));
                 }
+                assert_eq!(auto.memory_layout, context.memory_layout);
             }
         }
     }
+}
+
+#[test]
+fn glm5_heads_pool_refusal_reports_heads_not_context() {
+    use crate::placement::{families::glm5 as glm, AttentionPlacement};
+    let config = glm5_config();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&config).unwrap();
+    let dir = snapshot(config, &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    // A manifest without the context programs plus an explicit heads request:
+    // the heads solve refuses a pool past the device budget, and the report must
+    // name heads (the mode actually attempted), never context (#202).
+    let mut names = Vec::new();
+    for (capacity, mode) in [("m64", "decode"), ("m4096", "prefill")] {
+        for prefix in ["glm", "glm2"] {
+            let divisor = if prefix == "glm2" { 2 } else { 1 };
+            names.extend([format!("{prefix}_producer_{capacity}"),
+                format!("{prefix}_sparse_mla_{mode}_{capacity}"), format!("{prefix}_o_{capacity}"),
+                format!("{prefix}_ffn_i{}_{capacity}", cfg.moe_intermediate / divisor),
+                format!("{prefix}_ffn_i{}_{capacity}", cfg.dense_intermediate / divisor)]);
+        }
+        names.extend([format!("glm_index_producer_{capacity}"), format!("glm_index_topk_{mode}_{capacity}")]);
+    }
+    let programs: Vec<_> = names.iter().map(|name|
+        json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 4096}})).collect();
+    std::fs::write(dir.path().join("PROGRAMS.json"),
+        json!({"capacities": {"max_context": 1_048_576}, "programs": programs}).to_string()).unwrap();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
+        context_tokens: 1_048_576, pool_tokens: Some(1 << 40), glm5_drafter_disabled: true,
+        workspace_manifest: Some(dir.path().join("PROGRAMS.json")), ..Default::default()
+    }), attention_placement: Some(AttentionPlacement::Heads), ..sparks(0) };
+    let report = plan(dir.path(), &options).unwrap();
+    assert!(!report.executable(), "{}", render(&report));
+    assert!(!report.placement_supported, "{}", render(&report));
+    assert_eq!(report.attention_placement, AttentionPlacement::Heads);
+    let notes = &report.memory_layout.as_ref().unwrap().notes;
+    assert!(notes.iter().any(|note| note == "attention placement heads"), "{}", render(&report));
+    assert!(!notes.iter().any(|note| note.contains("placement context")), "{}", render(&report));
+    let hint = report.hints.iter().find(|hint| hint.what.contains("GLM placement")).unwrap();
+    assert!(hint.how.contains("heads") && !hint.how.contains("Use supported heads attention"), "{}", hint.how);
 }
 
 #[test]
@@ -3039,7 +3094,11 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
             // No context programs here; Qwen with Spark experts also keeps its single-owner default.
             let peer = gpus == 2 && auto.family.as_deref() != Some("qwen4");
-            let default = if !peer || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) {
+            // GLM 5.3 auto resolves context on two peers, which the absent manifest
+            // cannot run: the solve fails closed naming the programs (#202).
+            let default = if auto.family.as_deref() == Some("glm5") && peer {
+                AttentionPlacement::Context
+            } else if !peer || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) {
                 AttentionPlacement::Heads
             } else { executor.attention };
             assert_eq!(auto.attention_placement, default);
@@ -3054,7 +3113,8 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }
             if auto.family.as_deref() == Some("glm5") {
                 assert!(auto.memory_layout.is_some(), "{}", render(&auto));
-                assert!(auto.placement_supported, "{}", render(&auto));
+                // Supported on one GPU (heads); two-GPU auto fails closed without the programs.
+                assert_eq!(auto.placement_supported, !peer, "{}", render(&auto));
             }
             let explicit_default = plan(dir.path(), &PlanOptions {
                 attention_placement: Some(default), ..options.clone()

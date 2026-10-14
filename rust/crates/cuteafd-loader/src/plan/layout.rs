@@ -1083,8 +1083,17 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
             }
             Err(error) => {
                 report.placement_supported = false;
+                // A failure can come from a different mode than the static
+                // pre-solve default: auto resolves to the family default
+                // (context on two peers) against the manifest, not the
+                // plan-time constant. Report the placement actually attempted
+                // instead of the stale pre-solve value (issue #202).
+                report.attention_placement = glm5_attempted_attention(report.requested_attention, active_gpus);
+                if let Some(note) = notes.iter_mut().find(|n| n.starts_with("attention placement ")) {
+                    *note = format!("attention placement {}", report.attention_placement);
+                }
                 let what = format!("GLM placement: {error:#}");
-                report.hints.push(super::Hint { what: what.clone(), how: "Use supported heads attention and an admissible pool/local expert request; supply matching program and drafter headers.".into() });
+                report.hints.push(super::Hint { what: what.clone(), how: glm5_failure_hint(report.attention_placement) });
                 notes.push(what);
             }
         }
@@ -1436,6 +1445,33 @@ fn qwen_package_scratch(checkpoint: &super::Checkpoint, report: &PlanReport, wor
 }
 
 /// GLM's shared admission over header-derived coordinator storage.
+/// The attention placement GLM 5.3's solve attempts: the requested mode, or
+/// the family default for auto (context on a two-GPU peer pair, heads
+/// otherwise).
+fn glm5_attempted_attention(requested: Option<crate::placement::AttentionPlacement>, gpus: usize)
+    -> crate::placement::AttentionPlacement {
+    requested.unwrap_or(if gpus == 2 { crate::placement::AttentionPlacement::Context }
+        else { crate::placement::AttentionPlacement::Heads })
+}
+
+/// Why GLM 5.3's solve failed and what to change, naming the attempted mode,
+/// so a failure never points at a placement that was not tried (issue #202).
+fn glm5_failure_hint(mode: crate::placement::AttentionPlacement) -> String {
+    use crate::placement::AttentionPlacement;
+    let rebuild = "supply a PROGRAMS.json carrying the glm_* context-split kernels \
+        (rebuild the GLM 5.3 coordinator programs) so placement context can run";
+    match mode {
+        AttentionPlacement::Heads => format!("GLM 5.3 cannot admit this request with attention \
+            placement heads: heads replicates the MLA latent and DSA index on both GPUs, so a pool \
+            past the device budget does not fit. Use an admissible --pool-tokens, drop local RTX \
+            experts, or {rebuild}."),
+        AttentionPlacement::Context => format!("GLM 5.3 cannot admit this request with attention \
+            placement context: {rebuild}, or request `heads` explicitly."),
+        AttentionPlacement::Layers => "GLM 5.3 has no layers attention executor; \
+            use heads or context.".into(),
+    }
+}
+
 fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: &LayoutOptions,
     devices: &[DeviceLayout], manifest: Option<&serde_json::Value>, rows: u64, context: u64)
     -> anyhow::Result<(crate::placement::Placement, crate::placement::families::glm5::GlmWorkingSet)> {
