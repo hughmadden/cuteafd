@@ -688,6 +688,15 @@ source "$repo_root/scripts/build/host-isa.sh"
 wip_coordinator_host_isa="$(cuteafd_host_isa_list wip "${CUTEAFD_WIP_HOST_ISA:-}")" ||
   release_die "CUTEAFD_WIP_HOST_ISA: ${CUTEAFD_WIP_HOST_ISA:-}"
 wip_coordinator_host_isa="${wip_coordinator_host_isa//$'\n'/ }"
+# Dev-only Cargo features for the coordinator daemon (e.g. dev-v4-layers): a
+# space- or comma-separated list of dev-* names, keyed into the build and
+# recorded in the slot's build phases. Production features are never set here.
+wip_cargo_features="${CUTEAFD_WIP_CARGO_FEATURES:-}"
+wip_cargo_features="${wip_cargo_features//,/ }"
+for feature in $wip_cargo_features; do
+  [[ "$feature" =~ ^dev-[a-z0-9-]+$ ]] || release_die "CUTEAFD_WIP_CARGO_FEATURES: only dev-* features may be set ($feature)"
+done
+wip_cargo_features="$(echo $wip_cargo_features)"
 wip_build_key=""
 wip_coordinator_key=""
 wip_expert_key=""
@@ -708,7 +717,7 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
       printf 'spark-tp-roles %s\nbf16 %s\naudio %s\n' "$wip_spark_tp_roles" "$bf16_families" "$audio_aot"
       for key in EXL3_AOT NVFP4_AOT DSV4_MAX_CONTEXT DSV4_AOT GLM_AOT CONTEXT_SPLIT_AOT MIMO_AOT MIMO_GEOMETRIES \
         GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
-        EXL3_BITS VISION_ATTENTION_AOT; do
+        EXL3_BITS VISION_ATTENTION_AOT CARGO_FEATURES; do
         local_name="CUTEAFD_WIP_$key"
         printf '%s=%s\n' "$local_name" "${!local_name:-<default>}"
       done
@@ -1178,6 +1187,7 @@ build_coordinator() {
     "${cache_env[@]}" \
     -e "CUTEAFD_WIP_DEV_IMAGE_ID=$image_id" -e "CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}" \
     -e "CUTEAFD_WIP_HOST_ISA=${wip_coordinator_host_isa:-${CUTEAFD_WIP_HOST_ISA:-}}" \
+    -e "CUTEAFD_WIP_CARGO_FEATURES=${wip_cargo_features:-}" \
     -e CUTEAFD_WIP_EXPORT_LOCKS=off -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
