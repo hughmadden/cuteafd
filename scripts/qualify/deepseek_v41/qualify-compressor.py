@@ -11,14 +11,153 @@ from types import SimpleNamespace
 import torch
 
 
+def row_invariance(args):
+    """Bitwise compare official-weight native projections across live widths."""
+    widths=(1,2,3,4,5,6,15,16,17,38,64,80)
+    torch.cuda.set_device(args.device);torch.manual_seed(410233)
+    lib=C.CDLL(str(args.native_lib));P=C.c_void_p;I=C.c_int32
+    def bind(name,types):
+        fn=getattr(lib,name);fn.argtypes=types;fn.restype=I;return fn
+    create=bind('cuteafd_v41_compressor_create',[P,C.c_uint64,C.POINTER(P)])
+    destroy=bind('cuteafd_v41_compressor_destroy',[P])
+    project=bind('cuteafd_v41_compressor_project',[P,P,P,P,I,I,P])
+    key=bind('cuteafd_v41_index_key_project',[P,P,P,P,I,P])
+    heads=bind('cuteafd_v41_index_weights_project',[P,P,P,P,I,P])
+    def check(status):assert status==0,status
+    index=json.loads((args.snapshot/'model.safetensors.index.json').read_text())['weight_map']
+    hashes={};results=[]
+    def load(name):
+        with (args.snapshot/index[name]).open('rb') as f:
+            size=struct.unpack('<Q',f.read(8))[0];entry=json.loads(f.read(size))[name]
+            assert entry['dtype']=='BF16'
+            a,b=entry['data_offsets'];f.seek(8+size+a);data=f.read(b-a);assert len(data)==b-a
+        hashes[name]=hashlib.sha256(data).hexdigest()
+        return torch.frombuffer(bytearray(data),dtype=torch.bfloat16).reshape(entry['shape']).cuda()
+    streams=[torch.cuda.Stream(),torch.cuda.Stream()]
+    workspaces=[torch.empty(4*1024*1024,device='cuda',dtype=torch.uint8) for _ in streams]
+    handles=[P(),P()]
+    for workspace,handle in zip(workspaces,handles):check(create(workspace.data_ptr(),workspace.numel(),C.byref(handle)))
+    try:
+        for layer in (2,8,14,20):
+            ratio=1 if layer==20 else 2
+            cases=[(f'layers.{layer}.attn.compressor.{s}.weight',project,ratio)
+                   for s in (('wkv',) if ratio==1 else ('wkv','wgate'))]
+            cases.extend([(f'layers.{layer}.attn.indexer.wk.weight',key,1),
+                          (f'layers.{layer}.attn.indexer.weights_proj.weight',heads,1)])
+            for name,fn,ratio in cases:
+                weight=load(name);n,k=weight.shape
+                x=(torch.randn(max(widths),k,device='cuda')*.125).bfloat16()
+                dtype=torch.float32 if ratio==2 else torch.bfloat16
+                bits=torch.int32 if ratio==2 else torch.int16
+                torch.cuda.synchronize();serial=None
+                for lane,(stream,handle) in enumerate(zip(streams,handles)):
+                    with torch.cuda.stream(stream),torch.no_grad():
+                        def run(first,rows):
+                            out=torch.empty(rows,n,device='cuda',dtype=dtype)
+                            argv=[handle,x[first:first+rows].data_ptr(),weight.data_ptr(),out.data_ptr(),rows]
+                            if fn is project:argv.append(ratio)
+                            check(fn(*argv,stream.cuda_stream));return out
+                        current=torch.cat([run(i,1) for i in range(max(widths))]);stream.synchronize()
+                        if serial is None:serial=current
+                        assert torch.equal(current.view(bits),serial.view(bits)),name
+                        for rows in widths:
+                            got=run(0,rows);stream.synchronize()
+                            counts=(got.view(bits)!=serial[:rows].view(bits)).sum(1).tolist()
+                            record={'tensor':name,'shape':[n,k],'dtype':str(dtype),'lane':lane,'rows':rows,
+                                    'different_elements':sum(counts),'different_by_row':counts,
+                                    'max_abs_error':(got.float()-serial[:rows].float()).abs().max().item()}
+                            results.append(record)
+                            print('PASS' if not sum(counts) else 'FAIL',json.dumps(record),flush=True)
+                del weight,x,serial
+    finally:
+        for stream,handle in zip(streams,handles):stream.synchronize();check(destroy(handle))
+    assert len(hashes)==15 and len(results)==360
+    failed=sum(r['different_elements']!=0 for r in results)
+    args.output.write_text(json.dumps({'scope':'Official-weight compressor/index projections; synthetic inputs; no serving',
+        'device':args.device,'name':torch.cuda.get_device_name(args.device),'widths':widths,
+        'checkpoint_payload_sha256':hashes,'native_library_sha256':hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
+        'qualifier_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'results':results,'failed':failed},indent=2)+'\n')
+    print(f'SUMMARY {len(results)-failed} passed; {failed} failed; {len(results)} comparisons',flush=True)
+    return 1 if failed else 0
+
+
+def head_row_invariance(args):
+    """Qualify the serving W8A16 head's GROUPS1/8 variants and both TP2 shards."""
+    widths=(1,6,38)
+    torch.cuda.set_device(args.device);torch.manual_seed(410233)
+    lib=C.CDLL(str(args.native_lib));P=C.c_void_p;I=C.c_int32
+    pack=lib.cuteafd_fp8_w8a16_pack
+    pack.argtypes=[P,P,P,I,I,I,P];pack.restype=I
+    workspace_bytes=lib.cuteafd_fp8_w8a16_workspace
+    workspace_bytes.argtypes=[I,I,I];workspace_bytes.restype=C.c_size_t
+    linear=lib.cuteafd_fp8_w8a16_linear
+    linear.argtypes=[P,P,P,P,I,I,I,I,P,C.c_size_t,P];linear.restype=I
+    index=json.loads((args.snapshot/'model.safetensors.index.json').read_text())['weight_map']
+    with (args.snapshot/index['head.weight']).open('rb') as f:
+        size=struct.unpack('<Q',f.read(8))[0];entry=json.loads(f.read(size))['head.weight']
+        assert entry['dtype']=='BF16' and entry['shape']==[129280,5120]
+        a,b=entry['data_offsets'];f.seek(8+size+a);data=f.read(b-a);assert len(data)==b-a
+    payload_hash=hashlib.sha256(data).hexdigest()
+    weight=torch.frombuffer(bytearray(data),dtype=torch.bfloat16).reshape(entry['shape']).cuda()
+    del data
+    x=(torch.randn(max(widths),5120,device='cuda')*.125).bfloat16()
+    streams=[torch.cuda.Stream(),torch.cuda.Stream()];results=[]
+    torch.cuda.synchronize()
+    for first,n in ((0,129280),(0,64640),(64640,64640)):
+        packed=torch.empty(n*5120,device='cuda',dtype=torch.uint8)
+        scales=torch.empty(n,40,device='cuda',dtype=torch.float32)
+        # Serving packs BF16 head weights with the per-block Best scale rule (2).
+        assert pack(weight[first:first+n].data_ptr(),packed.data_ptr(),scales.data_ptr(),n,5120,2,
+                    torch.cuda.current_stream().cuda_stream)==0
+        torch.cuda.synchronize();serial=None
+        for lane,stream in enumerate(streams):
+            with torch.cuda.stream(stream),torch.no_grad():
+                bytes=workspace_bytes(max(widths),5120,n)
+                workspace=torch.empty(bytes,device='cuda',dtype=torch.uint8)
+                def run(start,rows):
+                    out=torch.empty(rows,n,device='cuda',dtype=torch.float32)
+                    assert linear(x[start:start+rows].data_ptr(),packed.data_ptr(),scales.data_ptr(),
+                                  out.data_ptr(),1,rows,5120,n,workspace.data_ptr(),bytes,stream.cuda_stream)==0
+                    return out
+                current=torch.cat([run(i,1) for i in range(max(widths))]);stream.synchronize()
+                if serial is None:serial=current
+                assert torch.equal(current.view(torch.int32),serial.view(torch.int32))
+                for rows in widths:
+                    got=run(0,rows);stream.synchronize()
+                    counts=(got.view(torch.int32)!=serial[:rows].view(torch.int32)).sum(1).tolist()
+                    record={'tensor':'head.weight','output_first':first,'shape':[n,5120],'lane':lane,'rows':rows,
+                            'different_elements':sum(counts),'different_by_row':counts,
+                            'max_abs_error':(got-serial[:rows]).abs().max().item()}
+                    results.append(record)
+                    print('FAIL' if sum(counts) else 'PASS',json.dumps(record),flush=True)
+        del packed,scales,serial
+    assert len(results)==18
+    failed=sum(r['different_elements']!=0 for r in results)
+    args.output.write_text(json.dumps({'scope':'Official BF16 head converted by serving Best FP8 scales; synthetic inputs',
+        'device':args.device,'name':torch.cuda.get_device_name(args.device),'widths':widths,
+        'checkpoint_payload_sha256':{'head.weight':payload_hash},
+        'native_library_sha256':hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
+        'qualifier_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'results':results,'failed':failed},indent=2)+'\n')
+    print(f'SUMMARY {len(results)-failed} passed; {failed} failed; {len(results)} comparisons',flush=True)
+    return 1 if failed else 0
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--native-lib',type=Path,required=True)
-    parser.add_argument('--reference-dir',type=Path,required=True)
+    parser.add_argument('--reference-dir',type=Path)
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--row-invariance',action='store_true')
+    mode.add_argument('--head-row-invariance',action='store_true')
     parser.add_argument('--snapshot',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--device',type=int,required=True)
     args=parser.parse_args()
+    if args.row_invariance:raise SystemExit(row_invariance(args))
+    if args.head_row_invariance:raise SystemExit(head_row_invariance(args))
+    if args.reference_dir is None:parser.error('--reference-dir required unless an invariance mode is set')
     root=Path(__file__).resolve().parents[3]
     lock=json.loads((root/'scripts/fixtures/ds41-reference-lock.json').read_text())
     source=args.reference_dir/'inference/model.py';config_path=args.reference_dir/'inference/config.json'
