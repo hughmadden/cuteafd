@@ -1,9 +1,10 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
-#include <cublas_v2.h>
+#include <cublasLt.h>
 #include <stdint.h>
 #include <new>
+#include <initializer_list>
 #include "cuteafd_v41_compressor.h"
 namespace {
 constexpr uint64_t workspace_bytes=4*1024*1024;
@@ -16,7 +17,82 @@ bool disjoint(const void* a,uint64_t na,const void* b,uint64_t nb) {
   return x+na<=y || y+nb<=x;
 }
 int32_t bs(cublasStatus_t s){return s==CUBLAS_STATUS_SUCCESS?0:-int32_t(s);}
-struct Handle {cublasHandle_t blas;void* workspace;int device;};
+struct ProjectionPlan {
+  cublasLtMatmulDesc_t operation=nullptr;
+  cublasLtMatrixLayout_t weight=nullptr,input=nullptr,output=nullptr;
+  cublasLtMatmulAlgo_t algorithm{};
+  ~ProjectionPlan() {
+    if(output)cublasLtMatrixLayoutDestroy(output);
+    if(input)cublasLtMatrixLayoutDestroy(input);
+    if(weight)cublasLtMatrixLayoutDestroy(weight);
+    if(operation)cublasLtMatmulDescDestroy(operation);
+  }
+};
+struct Handle {
+  cublasLtHandle_t blas=nullptr;
+  void* workspace=nullptr;
+  int device=0;
+  ProjectionPlan plans[4];
+  ~Handle(){if(blas)cublasLtDestroy(blas);}
+};
+cublasStatus_t set_rows(ProjectionPlan& plan,uint64_t rows) {
+  auto status=cublasLtMatrixLayoutSetAttribute(plan.input,CUBLASLT_MATRIX_LAYOUT_COLS,&rows,sizeof(rows));
+  if(status!=CUBLAS_STATUS_SUCCESS)return status;
+  return cublasLtMatrixLayoutSetAttribute(plan.output,CUBLASLT_MATRIX_LAYOUT_COLS,&rows,sizeof(rows));
+}
+cublasStatus_t create_plan(Handle* h,ProjectionPlan& plan,int n,int k,cudaDataType_t dtype) {
+  auto status=cublasLtMatmulDescCreate(&plan.operation,CUBLAS_COMPUTE_32F,CUDA_R_32F);
+  if(status!=CUBLAS_STATUS_SUCCESS)return status;
+  const cublasOperation_t transpose=CUBLAS_OP_T;
+  status=cublasLtMatmulDescSetAttribute(plan.operation,CUBLASLT_MATMUL_DESC_TRANSA,&transpose,sizeof(transpose));
+  if(status!=CUBLAS_STATUS_SUCCESS)return status;
+  status=cublasLtMatrixLayoutCreate(&plan.weight,CUDA_R_16BF,k,n,k);
+  if(status!=CUBLAS_STATUS_SUCCESS)return status;
+  status=cublasLtMatrixLayoutCreate(&plan.input,CUDA_R_16BF,k,16,k);
+  if(status!=CUBLAS_STATUS_SUCCESS)return status;
+  status=cublasLtMatrixLayoutCreate(&plan.output,dtype,n,16,n);
+  if(status!=CUBLAS_STATUS_SUCCESS)return status;
+  cublasLtMatmulPreference_t preference=nullptr;
+  status=cublasLtMatmulPreferenceCreate(&preference);
+  if(status!=CUBLAS_STATUS_SUCCESS)return status;
+  const size_t bytes=workspace_bytes;
+  status=cublasLtMatmulPreferenceSetAttribute(preference,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&bytes,sizeof(bytes));
+  // Serving allocations and every projection row stride preserve 16-byte alignment.
+  // Requiring it keeps tensor-core plans eligible; unaligned calls fail closed.
+  const uint32_t alignment=16;
+  for(auto attribute:{CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+                      CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES}) {
+    if(status==CUBLAS_STATUS_SUCCESS)
+      status=cublasLtMatmulPreferenceSetAttribute(preference,attribute,&alignment,sizeof(alignment));
+  }
+  cublasLtMatmulHeuristicResult_t candidates[32]{};
+  int count=0;
+  if(status==CUBLAS_STATUS_SUCCESS)
+    status=cublasLtMatmulAlgoGetHeuristic(h->blas,plan.operation,plan.weight,plan.input,plan.output,
+                                         plan.output,preference,32,candidates,&count);
+  cublasLtMatmulPreferenceDestroy(preference);
+  if(status!=CUBLAS_STATUS_SUCCESS)return status;
+  // Select at the same canonical M16 for every handle; never reselect on live M.
+  for(int i=0;i<count;++i) {
+    if(candidates[i].state!=CUBLAS_STATUS_SUCCESS)continue;
+    auto algorithm=candidates[i].algo;
+    const uint32_t split=0,reduction=CUBLASLT_REDUCTION_SCHEME_NONE;
+    if(cublasLtMatmulAlgoConfigSetAttribute(&algorithm,CUBLASLT_ALGO_CONFIG_SPLITK_NUM,&split,sizeof(split))!=CUBLAS_STATUS_SUCCESS ||
+       cublasLtMatmulAlgoConfigSetAttribute(&algorithm,CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,&reduction,sizeof(reduction))!=CUBLAS_STATUS_SUCCESS)continue;
+    bool supported=true;
+    for(uint64_t rows:{1,2,3,4,5,6,15,16,17,38,64,80,128,256,1024,4096}) {
+      status=set_rows(plan,rows);
+      if(status!=CUBLAS_STATUS_SUCCESS)return status;
+      cublasLtMatmulHeuristicResult_t checked{};
+      status=cublasLtMatmulAlgoCheck(h->blas,plan.operation,plan.weight,plan.input,plan.output,plan.output,&algorithm,&checked);
+      if(status!=CUBLAS_STATUS_SUCCESS || checked.state!=CUBLAS_STATUS_SUCCESS || checked.workspaceSize>workspace_bytes) {
+        supported=false;break;
+      }
+    }
+    if(supported){plan.algorithm=algorithm;return set_rows(plan,16);}
+  }
+  return CUBLAS_STATUS_NOT_SUPPORTED;
+}
 __global__ void index_store_kernel(const uint8_t* packed,const uint8_t* scales,
     const uint64_t* destinations,uint8_t* cache,uint8_t* cache_scales,uint64_t capacity) {
   const uint64_t row=blockIdx.x,dst=destinations[row];
@@ -115,15 +191,18 @@ extern "C" int32_t cuteafd_v41_compressor_create(void* workspace,uint64_t bytes,
   if(!h)return cudaErrorMemoryAllocation;
   auto cuda=cudaGetDevice(&h->device);
   if(cuda!=cudaSuccess){delete h;return cuda;}
-  auto status=cublasCreate(&h->blas);
+  auto status=cublasLtCreate(&h->blas);
   if(status!=CUBLAS_STATUS_SUCCESS){delete h;return bs(status);}
-  status=cublasSetMathMode(h->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
-  if(status!=CUBLAS_STATUS_SUCCESS){cublasDestroy(h->blas);delete h;return bs(status);}
+  const int n[]={512,512,128,32},k[]={5120,5120,512,5120};
+  for(int i=0;i<4;++i) {
+    status=create_plan(h,h->plans[i],n[i],k[i],i==0?CUDA_R_32F:CUDA_R_16BF);
+    if(status!=CUBLAS_STATUS_SUCCESS){delete h;return bs(status);}
+  }
   h->workspace=workspace;*output=h;return 0;
 }
 extern "C" int32_t cuteafd_v41_compressor_destroy(void* opaque) {
   if(!opaque)return cudaErrorInvalidValue;
-  auto* h=static_cast<Handle*>(opaque);auto status=cublasDestroy(h->blas);delete h;return bs(status);
+  delete static_cast<Handle*>(opaque);return 0;
 }
 static int32_t project(void* opaque,const uint16_t* input,
     const uint16_t* weight,void* output,int32_t rows,int32_t ratio,void* stream,int n,int k) {
@@ -132,18 +211,18 @@ static int32_t project(void* opaque,const uint16_t* input,
   if(cuda!=cudaSuccess)return cuda;
   if(device!=h->device)return cudaErrorInvalidDevice;
   const uint64_t x=uint64_t(rows)*k*2,w=uint64_t(n)*k*2,o=uint64_t(rows)*n*(ratio==2?4:2);
-  if(!valid(input,x,2)||!valid(weight,w,2)||!valid(output,o,ratio==2?4:2)||
+  if(!valid(input,x,16)||!valid(weight,w,16)||!valid(output,o,16)||
       !disjoint(input,x,output,o)||!disjoint(weight,w,output,o)||
       !disjoint(h->workspace,workspace_bytes,input,x)||!disjoint(h->workspace,workspace_bytes,weight,w)||
       !disjoint(h->workspace,workspace_bytes,output,o))return cudaErrorInvalidValue;
-  auto status=cublasSetStream(h->blas,reinterpret_cast<cudaStream_t>(stream));
-  if(status!=CUBLAS_STATUS_SUCCESS)return bs(status);
-  status=cublasSetWorkspace(h->blas,h->workspace,workspace_bytes);
+  if(n!=512 && ratio!=1)return cudaErrorInvalidValue;
+  auto& plan=h->plans[n==512?(ratio==2?0:1):(n==128?2:3)];
+  auto status=set_rows(plan,uint64_t(rows));
   if(status!=CUBLAS_STATUS_SUCCESS)return bs(status);
   const float alpha=1,beta=0;
-  return bs(cublasGemmEx(h->blas,CUBLAS_OP_T,CUBLAS_OP_N,n,rows,k,&alpha,
-      weight,CUDA_R_16BF,k,input,CUDA_R_16BF,k,&beta,output,ratio==2?CUDA_R_32F:CUDA_R_16BF,
-      n,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  return bs(cublasLtMatmul(h->blas,plan.operation,&alpha,weight,plan.weight,input,plan.input,
+      &beta,output,plan.output,output,plan.output,&plan.algorithm,h->workspace,workspace_bytes,
+      reinterpret_cast<cudaStream_t>(stream)));
 }
 extern "C" int32_t cuteafd_v41_compressor_project(void* handle,const uint16_t* input,
     const uint16_t* weight,void* output,int32_t rows,int32_t ratio,void* stream) {

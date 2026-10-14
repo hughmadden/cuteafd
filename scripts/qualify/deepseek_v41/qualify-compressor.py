@@ -6,19 +6,338 @@ import ctypes as C
 import hashlib
 import json
 import struct
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import torch
 
 
+def row_invariance(args):
+    """Bitwise compare official-weight native projections across live widths."""
+    widths=(1,2,3,4,5,6,15,16,17,38,64,80)
+    torch.cuda.set_device(args.device);torch.manual_seed(410233)
+    lib=C.CDLL(str(args.native_lib));P=C.c_void_p;I=C.c_int32
+    def bind(name,types):
+        fn=getattr(lib,name);fn.argtypes=types;fn.restype=I;return fn
+    create=bind('cuteafd_v41_compressor_create',[P,C.c_uint64,C.POINTER(P)])
+    destroy=bind('cuteafd_v41_compressor_destroy',[P])
+    project=bind('cuteafd_v41_compressor_project',[P,P,P,P,I,I,P])
+    key=bind('cuteafd_v41_index_key_project',[P,P,P,P,I,P])
+    heads=bind('cuteafd_v41_index_weights_project',[P,P,P,P,I,P])
+    def check(status):assert status==0,status
+    index=json.loads((args.snapshot/'model.safetensors.index.json').read_text())['weight_map']
+    hashes={};results=[];unaligned_rejections=0
+    def load(name):
+        with (args.snapshot/index[name]).open('rb') as f:
+            size=struct.unpack('<Q',f.read(8))[0];entry=json.loads(f.read(size))[name]
+            assert entry['dtype']=='BF16'
+            a,b=entry['data_offsets'];f.seek(8+size+a);data=f.read(b-a);assert len(data)==b-a
+        hashes[name]=hashlib.sha256(data).hexdigest()
+        return torch.frombuffer(bytearray(data),dtype=torch.bfloat16).reshape(entry['shape']).cuda()
+    streams=[torch.cuda.Stream(),torch.cuda.Stream()]
+    workspaces=[torch.empty(4*1024*1024,device='cuda',dtype=torch.uint8) for _ in streams]
+    handles=[P(),P()]
+    for workspace,handle in zip(workspaces,handles):check(create(workspace.data_ptr(),workspace.numel(),C.byref(handle)))
+    try:
+        for layer in (2,8,14,20):
+            ratio=1 if layer==20 else 2
+            cases=[(f'layers.{layer}.attn.compressor.{s}.weight',project,ratio)
+                   for s in (('wkv',) if ratio==1 else ('wkv','wgate'))]
+            cases.extend([(f'layers.{layer}.attn.indexer.wk.weight',key,1),
+                          (f'layers.{layer}.attn.indexer.weights_proj.weight',heads,1)])
+            for name,fn,ratio in cases:
+                weight=load(name);n,k=weight.shape
+                x=(torch.randn(max(widths),k,device='cuda')*.125).bfloat16()
+                dtype=torch.float32 if ratio==2 else torch.bfloat16
+                bits=torch.int32 if ratio==2 else torch.int16
+                torch.cuda.synchronize();serial=None
+                for lane,(stream,handle) in enumerate(zip(streams,handles)):
+                    with torch.cuda.stream(stream),torch.no_grad():
+                        def run(first,rows):
+                            out=torch.empty(rows,n,device='cuda',dtype=dtype)
+                            argv=[handle,x[first:first+rows].data_ptr(),weight.data_ptr(),out.data_ptr(),rows]
+                            if fn is project:argv.append(ratio)
+                            check(fn(*argv,stream.cuda_stream));return out
+                        # Exercise the native ABI guard, not only the Rust preflight.
+                        rejected_output=torch.empty(1,n,device='cuda',dtype=dtype)
+                        pointers=[x.data_ptr(),weight.data_ptr(),rejected_output.data_ptr()]
+                        for operand in range(3):
+                            unaligned=pointers.copy();unaligned[operand]+=2
+                            argv=[handle,*unaligned,1]
+                            if fn is project:argv.append(ratio)
+                            assert fn(*argv,stream.cuda_stream)==1, (name,operand)
+                            unaligned_rejections+=1
+                        current=torch.cat([run(i,1) for i in range(max(widths))]);stream.synchronize()
+                        if serial is None:serial=current
+                        assert torch.equal(current.view(bits),serial.view(bits)),name
+                        for rows in widths:
+                            got=run(0,rows);stream.synchronize()
+                            counts=(got.view(bits)!=serial[:rows].view(bits)).sum(1).tolist()
+                            record={'tensor':name,'shape':[n,k],'dtype':str(dtype),'lane':lane,'rows':rows,
+                                    'different_elements':sum(counts),'different_by_row':counts,
+                                    'max_abs_error':(got.float()-serial[:rows].float()).abs().max().item()}
+                            results.append(record)
+                            print('PASS' if not sum(counts) else 'FAIL',json.dumps(record),flush=True)
+                del weight,x,serial
+    finally:
+        for stream,handle in zip(streams,handles):stream.synchronize();check(destroy(handle))
+    assert len(hashes)==15 and len(results)==360 and unaligned_rejections==90
+    failed=sum(r['different_elements']!=0 for r in results)
+    args.output.write_text(json.dumps({'scope':'Official-weight compressor/index projections; synthetic inputs; no serving',
+        'device':args.device,'name':torch.cuda.get_device_name(args.device),'widths':widths,
+        'checkpoint_payload_sha256':hashes,'native_library_sha256':hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
+        'qualifier_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'results':results,'failed':failed,'unaligned_rejections':unaligned_rejections},indent=2)+'\n')
+    print(f'SUMMARY {len(results)-failed} passed; {failed} failed; {len(results)} comparisons',flush=True)
+    return 1 if failed else 0
+
+
+def projection_timing(args):
+    """Compare warmed direct/captured native projection costs on identical inputs."""
+    assert args.baseline_native_lib is not None, '--baseline-native-lib required'
+    widths=(1,6,38,2048,4096)
+    torch.cuda.set_device(args.device);torch.manual_seed(410233)
+    P=C.c_void_p;I=C.c_int32
+    cases=[('layers.2.attn.compressor.wkv.weight','cuteafd_v41_compressor_project',2),
+           ('layers.20.attn.compressor.wkv.weight','cuteafd_v41_compressor_project',1),
+           ('layers.2.attn.indexer.wk.weight','cuteafd_v41_index_key_project',1),
+           ('layers.2.attn.indexer.weights_proj.weight','cuteafd_v41_index_weights_project',1)]
+    index=json.loads((args.snapshot/'model.safetensors.index.json').read_text())['weight_map']
+    libraries=[];results=[];hashes={}
+    stream=torch.cuda.Stream()
+    for label,path in [('heuristic',args.baseline_native_lib),('fixed',args.native_lib)]:
+        lib=C.CDLL(str(path));workspace=torch.empty(4*1024*1024,device='cuda',dtype=torch.uint8);handle=P()
+        create=lib.cuteafd_v41_compressor_create;create.argtypes=[P,C.c_uint64,C.POINTER(P)];create.restype=I
+        destroy=lib.cuteafd_v41_compressor_destroy;destroy.argtypes=[P];destroy.restype=I
+        started=time.perf_counter();assert create(workspace.data_ptr(),workspace.numel(),C.byref(handle))==0
+        print('CREATE',label,(time.perf_counter()-started)*1e3,'ms',flush=True)
+        libraries.append((label,lib,workspace,handle,destroy))
+    try:
+        for name,symbol,ratio in cases:
+            with (args.snapshot/index[name]).open('rb') as f:
+                size=struct.unpack('<Q',f.read(8))[0];entry=json.loads(f.read(size))[name]
+                a,b=entry['data_offsets'];f.seek(8+size+a);data=f.read(b-a);assert len(data)==b-a
+            hashes[name]=hashlib.sha256(data).hexdigest()
+            weight=torch.frombuffer(bytearray(data),dtype=torch.bfloat16).reshape(entry['shape']).cuda()
+            n,k=weight.shape;x=(torch.randn(max(widths),k,device='cuda')*.125).bfloat16()
+            torch.cuda.synchronize()
+            for rows in widths:
+                for label,lib,workspace,handle,destroy in libraries:
+                    fn=getattr(lib,symbol);fn.argtypes=[P,P,P,P,I]+([I] if 'compressor_project' in symbol else [])+[P];fn.restype=I
+                    out=torch.empty(rows,n,device='cuda',dtype=torch.float32 if ratio==2 else torch.bfloat16)
+                    argv=[handle,x.data_ptr(),weight.data_ptr(),out.data_ptr(),rows]+([ratio] if 'compressor_project' in symbol else [])+[stream.cuda_stream]
+                    def launch():assert fn(*argv)==0
+                    with torch.cuda.stream(stream):
+                        for _ in range(20):launch()
+                        stream.synchronize();graph=torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph,stream=stream):
+                            for _ in range(20):launch()
+                        for mode,run,operations in [('direct',launch,1),('graph',graph.replay,20)]:
+                            start=torch.cuda.Event(enable_timing=True);end=torch.cuda.Event(enable_timing=True)
+                            start.record(stream);cpu_start=time.perf_counter()
+                            for _ in range(100):run()
+                            cpu_us=(time.perf_counter()-cpu_start)*1e6/(100*operations)
+                            end.record(stream);end.synchronize()
+                            record={'tensor':name,'shape':[n,k],'rows':rows,'arm':label,'mode':mode,
+                                    'device_us':start.elapsed_time(end)*1000/(100*operations),'host_us':cpu_us}
+                            results.append(record);print(json.dumps(record),flush=True)
+                        graph.reset()
+    finally:
+        stream.synchronize()
+        for label,lib,workspace,handle,destroy in libraries:assert destroy(handle)==0
+    assert len(results)==80
+    args.output.write_text(json.dumps({'scope':'Warmed direct/captured projection costs; synthetic activations; no serving',
+        'device':torch.cuda.get_device_name(args.device),'results':results,'checkpoint_payload_sha256':hashes,
+        'native_library_sha256':{label:hashlib.sha256(path.read_bytes()).hexdigest()
+            for label,path in [('heuristic',args.baseline_native_lib),('fixed',args.native_lib)]}},indent=2)+'\n')
+    print('SUMMARY 80 timings completed',flush=True)
+    return 0
+
+
+def projection_algorithms(args):
+    """Screen unsplit Lt choices without changing a serving handle or ABI."""
+    torch.cuda.set_device(args.device);torch.manual_seed(410233)
+    P=C.c_void_p;I=C.c_int;U=C.c_uint32;Z=C.c_size_t
+    class Algorithm(C.Structure):_fields_=[('data',C.c_uint64*8)]
+    class Heuristic(C.Structure):
+        _fields_=[('algo',Algorithm),('workspaceSize',Z),('state',I),('wavesCount',C.c_float),('reserved',I*4)]
+    lib=C.CDLL('libcublasLt.so.13')
+    def bind(name,types):
+        f=getattr(lib,name);f.argtypes=types;f.restype=I;return f
+    create=bind('cublasLtCreate',[C.POINTER(P)]);destroy=bind('cublasLtDestroy',[P])
+    desc_create=bind('cublasLtMatmulDescCreate',[C.POINTER(P),I,I])
+    desc_set=bind('cublasLtMatmulDescSetAttribute',[P,I,P,Z])
+    desc_destroy=bind('cublasLtMatmulDescDestroy',[P])
+    layout_create=bind('cublasLtMatrixLayoutCreate',[C.POINTER(P),I,C.c_uint64,C.c_uint64,C.c_int64])
+    layout_set=bind('cublasLtMatrixLayoutSetAttribute',[P,I,P,Z]);layout_destroy=bind('cublasLtMatrixLayoutDestroy',[P])
+    pref_create=bind('cublasLtMatmulPreferenceCreate',[C.POINTER(P)])
+    pref_set=bind('cublasLtMatmulPreferenceSetAttribute',[P,I,P,Z]);pref_destroy=bind('cublasLtMatmulPreferenceDestroy',[P])
+    heuristic=bind('cublasLtMatmulAlgoGetHeuristic',[P,P,P,P,P,P,P,I,C.POINTER(Heuristic),C.POINTER(I)])
+    algo_set=bind('cublasLtMatmulAlgoConfigSetAttribute',[C.POINTER(Algorithm),I,P,Z])
+    algo_get=bind('cublasLtMatmulAlgoConfigGetAttribute',[C.POINTER(Algorithm),I,P,Z,C.POINTER(Z)])
+    algo_check=bind('cublasLtMatmulAlgoCheck',[P,P,P,P,P,P,C.POINTER(Algorithm),C.POINTER(Heuristic)])
+    matmul=bind('cublasLtMatmul',[P,P,P,P,P,P,P,P,P,P,P,P,C.POINTER(Algorithm),P,Z,P])
+    def check(s):assert s==0,s
+    handle=P();check(create(C.byref(handle)))
+    workspace=torch.empty(4*1024*1024,device='cuda',dtype=torch.uint8)
+    stream=torch.cuda.Stream();widths=(1,2,3,4,5,6,7,15,16,17,38,64,80)
+    timing_widths=(1,6,38,2048,4096);records=[]
+    for n,k,dtype in [(512,5120,0),(512,5120,14),(128,512,14),(32,5120,14)]:
+        operation=P();a=P();b=P();out_layout=P();preference=P()
+        check(desc_create(C.byref(operation),68,0));transpose=I(1)
+        check(desc_set(operation,3,C.byref(transpose),C.sizeof(transpose)))
+        check(layout_create(C.byref(a),14,k,n,k));check(layout_create(C.byref(b),14,k,16,k))
+        check(layout_create(C.byref(out_layout),dtype,n,16,n));check(pref_create(C.byref(preference)))
+        size=Z(workspace.numel());check(pref_set(preference,1,C.byref(size),C.sizeof(size)))
+        alignment=U(args.projection_alignment)
+        for attribute in (5,6,7,8):check(pref_set(preference,attribute,C.byref(alignment),C.sizeof(alignment)))
+        def rows_set(rows):
+            value=C.c_uint64(rows)
+            for layout in (b,out_layout):check(layout_set(layout,3,C.byref(value),C.sizeof(value)))
+        candidates={}
+        for canonical in (1,6,16,38,80,4096):
+            rows_set(canonical);found=(Heuristic*32)();count=I()
+            check(heuristic(handle,operation,a,b,out_layout,out_layout,preference,32,found,C.byref(count)))
+            for rank,h in enumerate(found[:count.value]):
+                if h.state:continue
+                algorithm=Algorithm.from_buffer_copy(h.algo);zero=U(0)
+                if algo_set(C.byref(algorithm),2,C.byref(zero),4) or algo_set(C.byref(algorithm),3,C.byref(zero),4):continue
+                candidates.setdefault(bytes(algorithm),(canonical,rank,algorithm))
+        x=(torch.randn(4096,k,device='cuda')*.125).bfloat16();weight=(torch.randn(n,k,device='cuda')*.125).bfloat16()
+        out=torch.empty(4096,n,device='cuda',dtype=torch.float32 if dtype==0 else torch.bfloat16)
+        bits=torch.int32 if dtype==0 else torch.int16
+        torch.cuda.synchronize();alpha=C.c_float(1);beta=C.c_float(0)
+        for canonical,rank,algorithm in candidates.values():
+            supported=True
+            for rows in (*widths,128,256,1024,2048,4096):
+                rows_set(rows);h=Heuristic()
+                if algo_check(handle,operation,a,b,out_layout,out_layout,C.byref(algorithm),C.byref(h)) or h.state or h.workspaceSize>workspace.numel():supported=False;break
+            if not supported:continue
+            def launch():check(matmul(handle,operation,C.byref(alpha),weight.data_ptr(),a,x.data_ptr(),b,
+                C.byref(beta),out.data_ptr(),out_layout,out.data_ptr(),out_layout,C.byref(algorithm),
+                workspace.data_ptr(),workspace.numel(),stream.cuda_stream))
+            with torch.cuda.stream(stream):
+                rows_set(1)
+                # Offset input pointer for the M1 reference; layouts are unchanged.
+                for row in range(max(widths)):
+                    check(matmul(handle,operation,C.byref(alpha),weight.data_ptr(),a,x[row].data_ptr(),b,
+                        C.byref(beta),out[row].data_ptr(),out_layout,out[row].data_ptr(),out_layout,
+                        C.byref(algorithm),workspace.data_ptr(),workspace.numel(),stream.cuda_stream))
+                reference=out[:max(widths)].clone();stream.synchronize();different={}
+                for rows in widths:
+                    rows_set(rows);launch();stream.synchronize()
+                    different[str(rows)]=(out[:rows].view(bits)!=reference[:rows].view(bits)).sum().item()
+                attributes={}
+                for attribute in range(10):
+                    value=I();written=Z()
+                    if not algo_get(C.byref(algorithm),attribute,C.byref(value),4,C.byref(written)):attributes[str(attribute)]=value.value
+                record={'shape':[n,k],'dtype':dtype,'canonical':canonical,'rank':rank,'attributes':attributes,
+                        'algorithm_bytes':bytes(algorithm).hex(),'different_elements':different,'graph_us':{}}
+                if not any(different.values()):
+                    for rows in timing_widths:
+                        rows_set(rows)
+                        for _ in range(10):launch()
+                        stream.synchronize();graph=torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph,stream=stream):
+                            for _ in range(20):launch()
+                        start=torch.cuda.Event(enable_timing=True);end=torch.cuda.Event(enable_timing=True)
+                        start.record(stream)
+                        for _ in range(30):graph.replay()
+                        end.record(stream);end.synchronize()
+                        record['graph_us'][str(rows)]=start.elapsed_time(end)*1000/600
+                        graph.reset()
+                records.append(record);print(json.dumps(record),flush=True)
+        for layout in (a,b,out_layout):check(layout_destroy(layout))
+        check(pref_destroy(preference));check(desc_destroy(operation))
+    stream.synchronize();check(destroy(handle))
+    args.output.write_text(json.dumps({'scope':'Synthetic BF16 inputs/weights; unsplit Lt algorithm screen; not official-weight gate',
+        'device':torch.cuda.get_device_name(args.device),'widths':widths,'records':records},indent=2)+'\n')
+    print('SUMMARY',len(records),'supported candidates;',sum(not any(r['different_elements'].values()) for r in records),'row-invariant',flush=True)
+    return 0
+
+
+def head_row_invariance(args):
+    """Qualify the serving W8A16 head's GROUPS1/8 variants and both TP2 shards."""
+    widths=(1,6,38)
+    torch.cuda.set_device(args.device);torch.manual_seed(410233)
+    lib=C.CDLL(str(args.native_lib));P=C.c_void_p;I=C.c_int32
+    pack=lib.cuteafd_fp8_w8a16_pack
+    pack.argtypes=[P,P,P,I,I,I,P];pack.restype=I
+    workspace_bytes=lib.cuteafd_fp8_w8a16_workspace
+    workspace_bytes.argtypes=[I,I,I];workspace_bytes.restype=C.c_size_t
+    linear=lib.cuteafd_fp8_w8a16_linear
+    linear.argtypes=[P,P,P,P,I,I,I,I,P,C.c_size_t,P];linear.restype=I
+    index=json.loads((args.snapshot/'model.safetensors.index.json').read_text())['weight_map']
+    with (args.snapshot/index['head.weight']).open('rb') as f:
+        size=struct.unpack('<Q',f.read(8))[0];entry=json.loads(f.read(size))['head.weight']
+        assert entry['dtype']=='BF16' and entry['shape']==[129280,5120]
+        a,b=entry['data_offsets'];f.seek(8+size+a);data=f.read(b-a);assert len(data)==b-a
+    payload_hash=hashlib.sha256(data).hexdigest()
+    weight=torch.frombuffer(bytearray(data),dtype=torch.bfloat16).reshape(entry['shape']).cuda()
+    del data
+    x=(torch.randn(max(widths),5120,device='cuda')*.125).bfloat16()
+    streams=[torch.cuda.Stream(),torch.cuda.Stream()];results=[]
+    torch.cuda.synchronize()
+    for first,n in ((0,129280),(0,64640),(64640,64640)):
+        packed=torch.empty(n*5120,device='cuda',dtype=torch.uint8)
+        scales=torch.empty(n,40,device='cuda',dtype=torch.float32)
+        # Serving packs BF16 head weights with the per-block Best scale rule (2).
+        assert pack(weight[first:first+n].data_ptr(),packed.data_ptr(),scales.data_ptr(),n,5120,2,
+                    torch.cuda.current_stream().cuda_stream)==0
+        torch.cuda.synchronize();serial=None
+        for lane,stream in enumerate(streams):
+            with torch.cuda.stream(stream),torch.no_grad():
+                bytes=workspace_bytes(max(widths),5120,n)
+                workspace=torch.empty(bytes,device='cuda',dtype=torch.uint8)
+                def run(start,rows):
+                    out=torch.empty(rows,n,device='cuda',dtype=torch.float32)
+                    assert linear(x[start:start+rows].data_ptr(),packed.data_ptr(),scales.data_ptr(),
+                                  out.data_ptr(),1,rows,5120,n,workspace.data_ptr(),bytes,stream.cuda_stream)==0
+                    return out
+                current=torch.cat([run(i,1) for i in range(max(widths))]);stream.synchronize()
+                if serial is None:serial=current
+                assert torch.equal(current.view(torch.int32),serial.view(torch.int32))
+                for rows in widths:
+                    got=run(0,rows);stream.synchronize()
+                    counts=(got.view(torch.int32)!=serial[:rows].view(torch.int32)).sum(1).tolist()
+                    record={'tensor':'head.weight','output_first':first,'shape':[n,5120],'lane':lane,'rows':rows,
+                            'different_elements':sum(counts),'different_by_row':counts,
+                            'max_abs_error':(got-serial[:rows]).abs().max().item()}
+                    results.append(record)
+                    print('FAIL' if sum(counts) else 'PASS',json.dumps(record),flush=True)
+        del packed,scales,serial
+    assert len(results)==18
+    failed=sum(r['different_elements']!=0 for r in results)
+    args.output.write_text(json.dumps({'scope':'Official BF16 head converted by serving Best FP8 scales; synthetic inputs',
+        'device':args.device,'name':torch.cuda.get_device_name(args.device),'widths':widths,
+        'checkpoint_payload_sha256':{'head.weight':payload_hash},
+        'native_library_sha256':hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
+        'qualifier_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'results':results,'failed':failed},indent=2)+'\n')
+    print(f'SUMMARY {len(results)-failed} passed; {failed} failed; {len(results)} comparisons',flush=True)
+    return 1 if failed else 0
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--native-lib',type=Path,required=True)
-    parser.add_argument('--reference-dir',type=Path,required=True)
+    parser.add_argument('--reference-dir',type=Path)
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--row-invariance',action='store_true')
+    mode.add_argument('--head-row-invariance',action='store_true')
+    mode.add_argument('--projection-timing',action='store_true')
+    mode.add_argument('--projection-algorithms',action='store_true')
+    parser.add_argument('--baseline-native-lib',type=Path)
+    parser.add_argument('--projection-alignment',type=int,choices=(2,16,256),default=16)
     parser.add_argument('--snapshot',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--device',type=int,required=True)
     args=parser.parse_args()
+    if args.row_invariance:raise SystemExit(row_invariance(args))
+    if args.head_row_invariance:raise SystemExit(head_row_invariance(args))
+    if args.projection_timing:raise SystemExit(projection_timing(args))
+    if args.projection_algorithms:raise SystemExit(projection_algorithms(args))
+    if args.reference_dir is None:parser.error('--reference-dir required unless an invariance mode is set')
     root=Path(__file__).resolve().parents[3]
     lock=json.loads((root/'scripts/fixtures/ds41-reference-lock.json').read_text())
     source=args.reference_dir/'inference/model.py';config_path=args.reference_dir/'inference/config.json'
