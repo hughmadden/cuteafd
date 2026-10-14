@@ -33,8 +33,10 @@ use crate::plan::format::{Encoding, QuantOperand, RowTiling, ScaleEncoding};
 #[serde(rename_all = "snake_case", tag = "algo")]
 pub enum ModelOptAlgo {
     /// Packed E2M1 with E4M3 scales per `group` values along K and an FP32
-    /// per-tensor `weight_scale_2`.
-    Nvfp4 { group: usize },
+    /// per-tensor `weight_scale_2`. `w4a4` is the calibrated activation
+    /// quantization (`quant_algo: NVFP4`, an `input_scale` per weight) rather
+    /// than the weight-only `W4A16_NVFP4` export of the same storage.
+    Nvfp4 { group: usize, w4a4: bool },
     /// E4M3 with one FP32 scale per tensor.
     Fp8,
     /// E4M3 with `block` x `block` scales.
@@ -56,7 +58,8 @@ impl ModelOptAlgo {
         };
         Ok(match algo {
             // W4A16_NVFP4: the weight-only export of the same storage (no input_scale).
-            "NVFP4" | "W4A16_NVFP4" => Self::Nvfp4 { group: group.ok_or_else(|| need("group_size"))? },
+            "NVFP4" | "W4A16_NVFP4" => Self::Nvfp4 { group: group.ok_or_else(|| need("group_size"))?,
+                w4a4: algo == "NVFP4" },
             "FP8" => Self::Fp8,
             // FP8_PB_WO: the per-block weight-only spelling (config.json) of the same storage.
             "FP8_BLOCK_SCALES" | "FP8_PB_WO" => Self::Fp8BlockScales { block: group.ok_or_else(|| need("group_size"))? },
@@ -67,7 +70,7 @@ impl ModelOptAlgo {
 
     pub fn label(&self) -> String {
         match self {
-            Self::Nvfp4 { group } => format!("NVFP4 g{group}"),
+            Self::Nvfp4 { group, w4a4 } => format!("NVFP4 g{group}{}", if *w4a4 { "" } else { " W4A16" }),
             Self::Fp8 => "FP8 per-tensor".into(),
             Self::Fp8BlockScales { block } => format!("FP8 {block}x{block} blocks"),
             Self::Mxfp8 { group } => format!("MXFP8 g{group}"),
@@ -77,7 +80,7 @@ impl ModelOptAlgo {
     /// Whether `operand` is stored the way this algorithm writes it.
     pub fn matches(&self, operand: &QuantOperand) -> bool {
         match *self {
-            Self::Nvfp4 { group } => operand.is_nvfp4() && operand.scale.as_ref().is_some_and(|s| s.cols == group),
+            Self::Nvfp4 { group, .. } => operand.is_nvfp4() && operand.scale.as_ref().is_some_and(|s| s.cols == group),
             // Per-tensor FP8; sharded tables keep their one scale in a tensor of
             // its own (a lone scalar `weight_scale` group).
             Self::Fp8 => matches!(operand.encoding, Encoding::E4m3)
@@ -299,6 +302,21 @@ impl ModelOpt {
         }
     }
 
+    /// Whether the routed experts carry NVIDIA's calibrated W4A4 numerics: the
+    /// experts are NVFP4 *with* quantized activations (`quant_algo: NVFP4`),
+    /// not the weight-only `W4A16_NVFP4` export of the same storage. This is
+    /// the checkpoint's intended arithmetic, so its fidelity against a BF16
+    /// reference is expected behaviour rather than a defect.
+    pub fn experts_w4a4(&self) -> bool {
+        let w4a4 = |algo: &ModelOptAlgo| matches!(algo, ModelOptAlgo::Nvfp4 { w4a4: true, .. });
+        let experts: Vec<&ModelOptAlgo> = self.layers.iter()
+            .filter(|(module, _)| module.contains(".experts")).map(|(_, algo)| algo).collect();
+        match &self.default {
+            Some(algo) => w4a4(algo) && experts.iter().all(|a| w4a4(a)),
+            None => experts.iter().any(|a| w4a4(a)),
+        }
+    }
+
     /// One line: producer, algorithm and the declared modules by algorithm.
     pub fn summary(&self) -> String {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -373,7 +391,7 @@ mod tests {
     #[test]
     fn declarations_resolve_containers_packed_projections_and_globs() {
         let mo = ModelOpt::from_json(Some(&nvidia_glm53()), None).unwrap().unwrap();
-        let nvfp4 = ModelOptAlgo::Nvfp4 { group: 16 };
+        let nvfp4 = ModelOptAlgo::Nvfp4 { group: 16, w4a4: true };
         assert_eq!(mo.declared("model.layers.3.mlp.experts.17.gate_proj"),
             Declared::Quantized { algo: &nvfp4, module: "model.layers.3.mlp.experts" });
         assert_eq!(mo.declared("model.layers.1.mlp.up_proj"),
@@ -381,8 +399,19 @@ mod tests {
         assert_eq!(mo.declared("model.layers.78.mlp.experts.0.down_proj"), Declared::Excluded { glob: "model.layers.78*" });
         assert_eq!(mo.declared("model.layers.5.self_attn.o_proj"), Declared::Unlisted);
         assert!(mo.experts_nvfp4());
+        assert!(mo.experts_w4a4());
         assert_eq!(mo.kv_cache.as_deref(), Some("FP8"));
         assert!(mo.summary().contains("NVFP4 g16 x1 modules"), "{}", mo.summary());
+    }
+
+    #[test]
+    fn weight_only_nvfp4_is_not_w4a4() {
+        // The W4A16 export of the same storage: NVFP4 weights, no input scales.
+        let mo = ModelOpt::from_json(None, Some(&json!({"quant_method": "modelopt", "quant_algo": "W4A16_NVFP4",
+            "group_size": 16, "quantized_layers": {"model.layers.3.mlp.experts": {"quant_algo": "W4A16_NVFP4"}}})))
+            .unwrap().unwrap();
+        assert!(mo.experts_nvfp4() && !mo.experts_w4a4());
+        assert_eq!(mo.default.as_ref().unwrap().label(), "NVFP4 g16 W4A16");
     }
 
     #[test]
@@ -396,6 +425,7 @@ mod tests {
             Declared::Quantized { module: "*", .. }));
         assert!(matches!(mo.declared("model.language_model.layers.0.self_attn.q_proj"), Declared::Excluded { .. }));
         assert!(mo.experts_nvfp4());
+        assert!(mo.experts_w4a4());
         // local-inference-lab: the keys at the top level, MXFP8 MTP experts.
         let flat = json!({"producer": {"name": "modelopt", "version": "0.39"}, "quant_algo": "MIXED_PRECISION",
             "quant_method": "modelopt", "ignore": [], "quantized_layers": {
