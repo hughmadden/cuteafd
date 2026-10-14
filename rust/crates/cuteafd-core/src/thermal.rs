@@ -189,8 +189,8 @@ fn active_reasons(bits: u64) -> Vec<&'static str> {
 ///
 /// `queried_s` is when this report was read, on the [`now_s`] clock. Each GPU's
 /// `sampled_s` is the time of the reading shown, on that same clock, or `null`
-/// when that GPU has no sample yet. A repeated reading keeps `sampled_s` while
-/// `queried_s` moves.
+/// when that GPU has no sample yet; `source` is that sample's sampler, or `null`
+/// with it. A repeated reading keeps `sampled_s` while `queried_s` moves.
 pub fn current() -> Value {
     let Ok(state) = state().lock() else { return Value::Null };
     if state.gpus.is_empty() { return Value::Null; }
@@ -199,7 +199,7 @@ pub fn current() -> Value {
         let last = sample.map(|s| s.reading).unwrap_or_default();
         json!({
             "index": gpu.info.index, "uuid": gpu.info.uuid, "pci_bus_id": gpu.info.pci_bus_id, "name": gpu.info.name,
-            "sampled_s": sample.map(|s| s.t),
+            "sampled_s": sample.map(|s| s.t), "source": sample.map(|s| s.source.name()),
             "temperature_c": last.temperature_c,
             "tlimit_margin_c": gpu.slow.tlimit_margin_c,
             "mem_clock_mhz": last.mem_clock_mhz, "fan_pct": last.fan_pct,
@@ -465,6 +465,7 @@ mod tests {
         assert!(none["queried_s"].as_f64().is_some());
         assert!(none["gpus"][0]["sampled_s"].is_null());
         assert!(none["gpus"][1]["sampled_s"].is_null());
+        assert!(none["gpus"][0]["source"].is_null());
         assert!(none["gpus"][0]["temperature_c"].is_null());
 
         // An empty reading is still a sample: the timestamp is set and the other GPU stays empty.
@@ -472,8 +473,10 @@ mod tests {
         push(blank, Source::Nvml, &[Reading::default()]);
         let blanked = current();
         assert_eq!(blanked["gpus"][0]["sampled_s"].as_f64(), Some(blank));
+        assert_eq!(blanked["gpus"][0]["source"].as_str(), Some("nvml"));
         assert!(blanked["gpus"][0]["temperature_c"].is_null());
         assert!(blanked["gpus"][1]["sampled_s"].is_null());
+        assert!(blanked["gpus"][1]["source"].is_null());
 
         let t = 1_000_010.0;
         push(t, Source::Nvml, &[fast(40, 180, 0, 30, 0), fast(55, 200, 10, 40, 0)]);
@@ -495,7 +498,9 @@ mod tests {
         push(later, Source::GpuPowerd, &[fast(41, 180, 0, 31, 0)]);
         let split = current();
         assert_eq!(split["gpus"][0]["sampled_s"].as_f64(), Some(later));
+        assert_eq!(split["gpus"][0]["source"].as_str(), Some("gpu-powerd"));
         assert_eq!(split["gpus"][1]["sampled_s"].as_f64(), Some(t));
+        assert_eq!(split["gpus"][1]["source"].as_str(), Some("nvml"));
         assert_eq!(split["gpus"][0]["temperature_c"].as_i64(), Some(41));
         assert_eq!(split["gpus"][1]["temperature_c"].as_i64(), Some(55));
         assert!(split.get("now_s").is_none());
