@@ -248,6 +248,10 @@ if [[ -f "$repo_root/scripts/build/assert-build-filesystem.py" && "$host_artifac
 fi
 
 release_load_config "$config"
+case "$SPECULATOR" in
+  dspark|off) ;;
+  *) release_die "SPECULATOR must be dspark or off for DeepSeek V4.1" ;;
+esac
 release_spark_topology_explicit ||
   release_die "the candidate launcher requires explicit SPARK_TP and SPARK_EP (native replicated topology only)"
 spark_tp="$SPARK_TP"
@@ -488,7 +492,7 @@ coordinator_argv() {
     args+=(--pool-tokens "$planner_tokens")
   fi
   [[ -z "$MEMORY_RESERVATION" ]] || args+=(--memory-reservation "$MEMORY_RESERVATION")
-  [[ "$DSPARK" != on ]] || args+=(--dspark --dspark-draft-limit "$dspark_draft_limit")
+  [[ "$SPECULATOR" != dspark ]] || args+=(--dspark --dspark-draft-limit "$dspark_draft_limit")
   [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)
   [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)
   [[ "$TP2_OUTPUT_PROJECTION" != on ]] || args+=(--tp2-output-projection)

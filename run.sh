@@ -49,7 +49,7 @@ container-name characters, [A-Za-z0-9_.-].
 DeepSeek V4.1 keys (cuteafd.config documents each): RTX_GPUS, RTX_EXPERT_LAYERS,
 CONCURRENCY, HTTP_QUEUE_DEPTH, HTTP_QUEUE_WAIT_MS, POOL_TOKENS, EMBEDDING,
 KV_POOL_SIZE, HOST_CACHE_BYTES, MEMORY_RESERVATION, PREFIX_CACHE_ENTRIES,
-MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS, PREFILL_BATCH_TOKENS, DSPARK,
+MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS, PREFILL_BATCH_TOKENS, SPECULATOR (dspark|off),
 DSPARK_DRAFT_LIMIT (1..7), TP2_ATTENTION, TP2_QUERY_PROJECTION,
 TP2_OUTPUT_PROJECTION, TP2_DSPARK_EXPERTS. The former command-line spellings
 (--listen, --rtx-gpus, --concurrency, --kv-pool-size, --memory-reservation,
@@ -95,7 +95,7 @@ while [[ $# -gt 0 ]]; do
     --restart|--all|--dry-run) family_args+=("$1"); shift ;;
     -h|--help) usage; exit 0 ;;
     --dspark|--no-dspark|--tp2-*|--no-tp2-*)
-      release_die "$1 was removed: set the configuration key instead (--set DSPARK=on|off, --set TP2_<OPTION>=on|off)" ;;
+      release_die "$1 was removed: set the configuration key instead (--set SPECULATOR=dspark|off, --set TP2_<OPTION>=on|off)" ;;
     *)
       legacy="$(legacy_key "$1")" || release_die "unknown run argument: $1"
       release_die "$1 was removed: use --set $legacy=VALUE (or $legacy in the configuration)" ;;

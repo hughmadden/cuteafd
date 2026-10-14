@@ -152,7 +152,7 @@ def test_v4_rejects_removed_draft_switches_as_unknown_keys(tmp_path: Path, key: 
 def test_attention_plan_rows_reaches_only_the_coordinator(tmp_path: Path, value, config, model) -> None:
     keys = f"ATTENTION_PLAN_ROWS={value}\n" if value else ""
     if config["model_type"] == "deepseek_v41":
-        keys += ("MODEL_REVISION=\nDSPARK=off\nVISION=off\nRTX_GPUS=1\n"
+        keys += ("MODEL_REVISION=\nSPECULATOR=off\nVISION=off\nRTX_GPUS=1\n"
                  "RTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\nSPARK_1_HOST=h1\n"
                  "SPARK_1_LANE_A=10.0.0.2\n")
     result = _family_launch_result(tmp_path, config, model, keys)
@@ -2935,3 +2935,22 @@ def test_family_plan_charges_the_speculator_this_launch_serves(tmp_path, keys, e
     assert result.returncode == 0, result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     assert f"--speculator {expected}" in plan
+
+
+@pytest.mark.parametrize("value,enabled", [("dspark", True), ("off", False)])
+def test_v41_uses_canonical_speculator(tmp_path: Path, value: str, enabled: bool) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v41"},
+        "deepseek-ai/DeepSeek-V4.1-Flash", f"MODEL_REVISION=\nSPECULATOR={value}\nVISION=off\nRTX_GPUS=1\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-native" in line and "docker run -d" in line)
+    assert ("--dspark" in launch) == enabled
+
+
+@pytest.mark.parametrize("keys,error", [("DSPARK=on\n", "unknown configuration key: DSPARK"),
+    ("SPECULATOR=mtp\n", "SPECULATOR must be dspark or off for DeepSeek V4.1")])
+def test_v41_rejects_noncanonical_speculator(tmp_path: Path, keys: str, error: str) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v41"},
+        "deepseek-ai/DeepSeek-V4.1-Flash", keys)
+    assert result.returncode == 2, result.stderr
+    assert error in result.stderr
+    assert "docker run -d" not in result.stderr

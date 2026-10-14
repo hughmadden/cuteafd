@@ -654,7 +654,7 @@ spark_tp_roles=
         for option in ("--set KEY=VALUE", "--dry-run", "--wip", "--restart", "--embedding-placement"):
             self.assertIn(option, help_text)
         for key in ("RTX_GPUS", "CONCURRENCY", "KV_POOL_SIZE", "MEMORY_RESERVATION", "PREFIX_CACHE_ENTRIES",
-                    "MAX_CONTEXT_TOKENS", "MAX_OUTPUT_TOKENS", "PREFILL_BATCH_TOKENS", "DSPARK",
+                    "MAX_CONTEXT_TOKENS", "MAX_OUTPUT_TOKENS", "PREFILL_BATCH_TOKENS", "SPECULATOR",
                     "DSPARK_DRAFT_LIMIT", "TP2_ATTENTION"):
             self.assertIn(key, help_text)
 

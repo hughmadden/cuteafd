@@ -39,7 +39,7 @@ ep="$(value SPARK_EP)"
 budget="$(value SPARK_DEVICE_BUDGET_BYTES)"
 rtx="$(value RTX_GPUS)"
 layers="$(value RTX_EXPERT_LAYERS)"
-dspark="$(value DSPARK)"
+speculator="$(value SPECULATOR)"
 
 [[ "$count" == "6" ]] || fail "SPARK_COUNT must be 6, got '${count}'"
 [[ "$tp" =~ ^[0-9]+$ && "$ep" =~ ^[0-9]+$ ]] || fail "SPARK_TP/SPARK_EP must be integers, got '${tp}/${ep}'"
@@ -58,7 +58,7 @@ if (( ${#canonical} > ${#max_budget} )) ||
   fail "SPARK_DEVICE_BUDGET_BYTES ${budget} exceeds the global minimum-of-six ${max_budget}"
 fi
 [[ "$rtx" == "1" || "$rtx" == "2" ]] || fail "RTX_GPUS must be 1 or 2, got '${rtx}'"
-[[ "$dspark" == "on" ]] || fail "DSPARK must be on"
+[[ "$speculator" == "dspark" ]] || fail "SPECULATOR must be dspark"
 if [[ "$rtx" == "1" ]]; then
   # A 1-RTX arm either keeps no local routed layers (0, all 40 remote) or an
   # explicit local count in 1..=39 with a placement handoff, which is the current

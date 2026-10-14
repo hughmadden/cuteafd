@@ -420,7 +420,7 @@ RTX_EXPERT_LAYERS=auto
 HOST_CACHE_BYTES=auto
 KV_POOL_SIZE=
 MEMORY_RESERVATION=
-DSPARK=on
+SPECULATOR=dspark
 EMBEDDING=gpu
 # These topology tests exercise the text-only legacy startup contract.
 VISION=off
