@@ -56,3 +56,7 @@ def test_v41_compressor_keeps_one_load_time_unsplit_projection_recipe():
     project = text[text.index("static int32_t project("):text.index('extern "C" int32_t cuteafd_v41_compressor_project')]
     assert "cublasLtMatmulAlgoGetHeuristic" not in project
     assert "&plan.algorithm" in project
+    assert "const uint32_t alignment=16" in text
+    assert "valid(input,x,16)" in project
+    assert "valid(weight,w,16)" in project
+    assert "valid(output,o,16)" in project

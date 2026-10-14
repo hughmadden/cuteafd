@@ -57,8 +57,9 @@ cublasStatus_t create_plan(Handle* h,ProjectionPlan& plan,int n,int k,cudaDataTy
   if(status!=CUBLAS_STATUS_SUCCESS)return status;
   const size_t bytes=workspace_bytes;
   status=cublasLtMatmulPreferenceSetAttribute(preference,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&bytes,sizeof(bytes));
-  // The ABI accepts BF16-aligned buffers, not necessarily allocator-aligned ones.
-  const uint32_t alignment=2;
+  // Serving allocations and every projection row stride preserve 16-byte alignment.
+  // Requiring it keeps tensor-core plans eligible; unaligned calls fail closed.
+  const uint32_t alignment=16;
   for(auto attribute:{CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
                       CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES}) {
     if(status==CUBLAS_STATUS_SUCCESS)
@@ -210,7 +211,7 @@ static int32_t project(void* opaque,const uint16_t* input,
   if(cuda!=cudaSuccess)return cuda;
   if(device!=h->device)return cudaErrorInvalidDevice;
   const uint64_t x=uint64_t(rows)*k*2,w=uint64_t(n)*k*2,o=uint64_t(rows)*n*(ratio==2?4:2);
-  if(!valid(input,x,2)||!valid(weight,w,2)||!valid(output,o,ratio==2?4:2)||
+  if(!valid(input,x,16)||!valid(weight,w,16)||!valid(output,o,16)||
       !disjoint(input,x,output,o)||!disjoint(weight,w,output,o)||
       !disjoint(h->workspace,workspace_bytes,input,x)||!disjoint(h->workspace,workspace_bytes,weight,w)||
       !disjoint(h->workspace,workspace_bytes,output,o))return cudaErrorInvalidValue;

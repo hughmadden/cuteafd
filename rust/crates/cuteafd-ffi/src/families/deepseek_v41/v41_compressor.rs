@@ -67,6 +67,19 @@ fn buffer(b: CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
     );
     Ok(())
 }
+fn projection_alignment(
+    input: CuteafdDeviceBuffer,
+    weight: CuteafdDeviceBuffer,
+    output: CuteafdDeviceBuffer,
+) -> Result<()> {
+    for (name, buffer) in [("input", input), ("weight", weight), ("output", output)] {
+        ensure!(
+            buffer.ptr as usize % 16 == 0,
+            "compressor projection {name} must be 16-byte aligned for the canonical tensor-core plan"
+        );
+    }
+    Ok(())
+}
 impl NativeLibrary {
     /// # Safety
     /// Workspace stays on the current device, exclusively used and live through
@@ -108,7 +121,7 @@ impl NativeLibrary {
 impl V41Compressor<'_> {
     /// # Safety
     /// BF16 hidden [rows,5120], weight [32,5120], disjoint BF16 [rows,32] output
-    /// live on the handle device. Serialize use of the handle/workspace.
+    /// live on the handle device and are 16-byte aligned. Serialize handle/workspace use.
     pub unsafe fn weights_project(
         &self,
         input: CuteafdDeviceBuffer,
@@ -124,6 +137,7 @@ impl V41Compressor<'_> {
         buffer(input, rows * 10240)?;
         buffer(weight, 32 * 5120 * 2)?;
         buffer(output, rows * 64)?;
+        projection_alignment(input, weight, output)?;
         let status = unsafe {
             (self.weights_project)(
                 self.handle,
@@ -252,7 +266,7 @@ impl V41Compressor<'_> {
     }
     /// # Safety
     /// Initialized unrotated BF16 latents [rows,512], weight [128,512] and
-    /// disjoint output [rows,128] are live on the handle's device. Serialize use
+    /// disjoint output [rows,128] are 16-byte aligned on the handle's device. Serialize use
     /// with all other operations sharing the handle/workspace.
     pub unsafe fn index_project(
         &self,
@@ -266,6 +280,7 @@ impl V41Compressor<'_> {
         buffer(input, rows * 1024)?;
         buffer(weight, 128 * 512 * 2)?;
         buffer(output, rows * 256)?;
+        projection_alignment(input, weight, output)?;
         let status = unsafe {
             (self.index_project)(
                 self.handle,
@@ -285,6 +300,7 @@ impl V41Compressor<'_> {
     /// BF16 input [rows,5120] and weight [512,5120] are initialized on this
     /// device. Output is BF16 for ratio one, FP32 for ratio two. Buffers and
     /// exclusive workspace remain live through completion, with disjoint output.
+    /// Input, weight and output pointers must be 16-byte aligned.
     pub unsafe fn project(
         &self,
         input: CuteafdDeviceBuffer,
@@ -301,6 +317,7 @@ impl V41Compressor<'_> {
         buffer(input, rows * 10240)?;
         buffer(weight, 512 * 10240)?;
         buffer(output, rows * 512 * if ratio == 2 { 4 } else { 2 })?;
+        projection_alignment(input, weight, output)?;
         let status = unsafe {
             (self.project)(
                 self.handle,
@@ -366,6 +383,33 @@ impl V41Compressor<'_> {
         Ok(())
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_buffers_require_tensor_core_alignment() {
+        let aligned = CuteafdDeviceBuffer {
+            ptr: 0x1000usize as *mut c_void,
+            bytes: 10240,
+            ..CuteafdDeviceBuffer::default()
+        };
+        let unaligned = CuteafdDeviceBuffer {
+            ptr: 0x1002usize as *mut c_void,
+            ..aligned
+        };
+        assert!(projection_alignment(aligned, aligned, aligned).is_ok());
+        for buffers in [
+            (unaligned, aligned, aligned),
+            (aligned, unaligned, aligned),
+            (aligned, aligned, unaligned),
+        ] {
+            let error = projection_alignment(buffers.0, buffers.1, buffers.2).unwrap_err();
+            assert!(error.to_string().contains("16-byte aligned"));
+        }
+    }
+}
+
 impl Drop for V41Compressor<'_> {
     fn drop(&mut self) {
         let status = unsafe { (self.destroy)(self.handle) };

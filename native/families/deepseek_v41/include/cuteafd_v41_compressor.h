@@ -10,6 +10,7 @@ int32_t cuteafd_v41_compressor_destroy(void* handle);
 // BF16 [rows,5120] x BF16 [512,5120]. ratio=2: FP32 [rows,512] output;
 // ratio=1: BF16 [rows,512] output. FP32 accumulation, fixed unsplit Lt algorithm
 // selected at handle creation for canonical M16, shared by every live row count.
+// All projection input/weight/output pointers must be 16-byte aligned; no fallback.
 int32_t cuteafd_v41_compressor_project(void* handle, const uint16_t* input,
     const uint16_t* weight, void* output, int32_t rows, int32_t ratio, void* stream);
 // Shared compressor handle/workspace, serialized on the same stream.
