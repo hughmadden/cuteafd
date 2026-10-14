@@ -378,10 +378,13 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
     shutil.copy(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
+    capacity = Path("rust/crates/cuteafd-core/src/serving_capacity.rs")
+    (repo / capacity.parent).mkdir(parents=True)
+    shutil.copy(ROOT / capacity, repo / capacity)
     native_v41 = family_config.get("model_type") == "deepseek_v41"
     if native_v41:
         programs = Path("rust/crates/cuteafd-core/src/coordinator_programs.rs")
-        (repo / programs.parent).mkdir(parents=True)
+        (repo / programs.parent).mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / programs, repo / programs)
         shutil.copy(ROOT / "scripts" / "launch" / "select-release-gpus.py", repo / "scripts" / "launch")
         (repo / "scripts" / "build").mkdir(exist_ok=True)
@@ -545,7 +548,7 @@ def test_mimo_full_context_profile_respects_physical_and_logical_memory(tmp_path
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "--max-context 0" in launch
-    assert f"--max-sequences {16 if embedding == 'host' else 8}" in launch
+    assert f"--max-sequences {8 if embedding == 'host' else 16}" in launch
     assert f"--embedding-placement {embedding}" in launch
     assert "--pool-tokens 0" in launch
 
@@ -566,6 +569,44 @@ def test_family_prelaunch_plan_uses_coordinator_card_memory(tmp_path, family, bu
     for flag in ("--coordinator-gpu-budget-gib", "--coordinator-weight-budget-gib"):
         assert float(args[args.index(flag) + 1]) == expected
     assert "94.97" not in plan
+
+
+@pytest.mark.parametrize("family", ["glm5_flash", "glm5", "mimo_v2", "deepseek_v4", "qwen4", "deepseek_v41"])
+@pytest.mark.parametrize("budget,total,override,expected", [
+    ("", 98304, "", 16), ("", 32768, "", 8), ("32", 98304, "", 8),
+    ("32.001", 98304, "", 16), ("96", 32768, "", 8),
+    ("32", 98304, "config", 4), ("", 98304, "set", 4),
+])
+def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, budget, total, override, expected):
+    config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+              if family == "glm5" else {"model_type": "deepseek_v4"}
+              if family == "deepseek_v4" else {"model_type": "deepseek_v41"}
+              if family == "deepseek_v41" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    keys = (f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\n"
+            "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    if family != "deepseek_v41":
+        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
+    else:
+        keys += ("MODEL_REVISION=\nDSPARK=off\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
+                 "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
+    if override:
+        keys += f"CONCURRENCY={4 if override == 'config' else 7}\n"
+    result = _family_launch_result(tmp_path, config, model, keys, gpu_total_mib=total,
+                                   gpu_free_mib=total - 1024,
+                                   extra_args=("--set", "CONCURRENCY=4") if override == "set" else ())
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [line for line in lines if "cuteafd plan" in line and "--layout" in line]
+    assert plans, result.stderr
+    for plan in plans:
+        args = plan.split()
+        assert args.count("--concurrency") == 1
+        assert args[args.index("--concurrency") + 1] == str(expected)
+    serving = next(line for line in lines if "serve-native --snapshot" in line) if family == "deepseek_v41" else next(
+        line for line in lines if "--max-sequences" in line and "--snapshot" in line)
+    flag = "--concurrency" if family == "deepseek_v41" else "--max-sequences"
+    assert f"{flag} {expected}" in serving
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -2261,7 +2302,7 @@ def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency, gpu_t
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert ("--mimo-prefix-draft" in preflight) == warm
     assert ("--mimo-prefix-draft" in launch) == warm
-    effective = concurrency if concurrency is not None else (16 if gpu_total_mib <= 32768 else 8)
+    effective = concurrency if concurrency is not None else (8 if gpu_total_mib <= 32768 else 16)
     assert f"--concurrency {effective}" in preflight
     assert f"--max-sequences {effective}" in launch
     assert "unbound variable" not in result.stderr
@@ -2467,9 +2508,9 @@ GLMF_RTX_ENCODER_PLAN = {"placement_supported": True, "fits": True, "spark_ranks
 
 
 @pytest.mark.parametrize("keys,serve,plan", [
-    # Unset: serve-glmf takes the launcher's defaults, the plan the planner's (the same), and the
-    # plan's arguments are work/p0's.
-    ("", {"--max-sequences": "8", "--prefix-cache-entries": "20"}, {}),
+    # The resolved logical-capacity default reaches both commands explicitly.
+    ("", {"--max-sequences": "16", "--prefix-cache-entries": "20"},
+     {"--concurrency": "16", "--state-slots": "16", "--mark-lanes": "16"}),
     # C1 without entries: 8 state slots (serve-glmf's --slots), one mark lane, no marks.
     ("CONCURRENCY=1\nPREFIX_CACHE_ENTRIES=0\n", {"--max-sequences": "1", "--prefix-cache-entries": "0"},
      {"--concurrency": "1", "--state-slots": "8", "--mark-lanes": "1", "--prefix-cache-entries": "0"}),
@@ -2490,7 +2531,7 @@ def test_glmf_encoder_placement_plans_the_prefix_knobs_serving_takes(tmp_path, k
     """The encoder placement plan reserves what serve-glmf allocates for the keys a launch sets:
     the sequences (CONCURRENCY) with serve-glmf's state slots, max(--slots 8, --max-sequences), and
     its mark-arena lanes, min(--max-sequences, 64), PREFIX_CACHE_ENTRIES, PREFIX_CACHE_MARK_MIB and
-    shared replay records. Unset keys reach neither command, so the plan's arguments are unchanged."""
+    shared replay records. Effective sequences always reach the planner and server."""
     result = _family_launch_result(tmp_path, GLMF_VISION, "zai-org/GLM-5.3-Flash",
                                    "RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\nGLM5_FLASH_REPLAY_RECORDS=own\n" + keys,
                                    encoder_plan=GLMF_RTX_ENCODER_PLAN)

@@ -21,6 +21,54 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_coordinator_capacity_registry_boundary_and_invalid_inputs(self) -> None:
+        for total, budget, expected in [('98304', '', 16), ('32768', '', 8), ('98304', '32', 8),
+                                        ('98304', '32.001', 16), ('32768', '96', 8)]:
+            result = subprocess.run(['bash', '-c',
+                'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
+                'test', total, budget], cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            gib, concurrency = result.stdout.split()
+            self.assertEqual(float(gib), min(float(total) / 1024, float(budget) if budget else float('inf')))
+            self.assertEqual(int(concurrency), expected)
+        for total, budget in [('0', ''), ('NaN', ''), ('98304', 'inf'), ('98304', '0'), ('bad', '')]:
+            result = subprocess.run(['bash', '-c',
+                'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
+                'test', total, budget], cwd=ROOT, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('capacity registry', result.stderr)
+
+    def test_coordinator_capacity_registry_rejects_literal_drift(self) -> None:
+        registry = Path('rust/crates/cuteafd-core/src/serving_capacity.rs')
+        source = (ROOT / registry).read_text()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / registry).parent.mkdir(parents=True)
+            for changed in [source.replace('SMALL_CARD_DEFAULT_CONCURRENCY: u64 = 8;',
+                                            'SMALL_CARD_DEFAULT_CONCURRENCY: u64 = 4 * 2;'),
+                            source.replace('pub const LARGE_CARD_DEFAULT_CONCURRENCY: u64 = 16;', ''),
+                            source + '\npub const SMALL_CARD_DEFAULT_CONCURRENCY: u64 = 8;\n']:
+                (root / registry).write_text(changed)
+                result = subprocess.run(['bash', '-c',
+                    'source scripts/lib/release-common.sh; repo_root="$1"; release_coordinator_profile 98304',
+                    'test', str(root)], cwd=ROOT, text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('capacity registry', result.stderr)
+
+    def test_concurrency_explicitness_resets_on_every_config_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            absent = Path(temporary) / 'absent.config'
+            present = Path(temporary) / 'present.config'
+            source = (ROOT / 'cuteafd.config').read_text()
+            absent.write_text('\n'.join(line for line in source.splitlines() if not line.startswith('CONCURRENCY=')) + '\n')
+            present.write_text(absent.read_text() + 'CONCURRENCY=4\n')
+            result = subprocess.run(['bash', '-c',
+                'source scripts/lib/release-common.sh; for cfg in "$1" "$2" "$1"; do '
+                'release_load_config "$cfg"; printf "%s:%s\\n" "$RELEASE_CONCURRENCY_EXPLICIT" "$CONCURRENCY"; done',
+                'test', str(absent), str(present)], cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ['0:', '1:4', '0:'])
+
     def test_serving_state_refuses_unwritable_files_and_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

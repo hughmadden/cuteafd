@@ -8,6 +8,17 @@ use thiserror::Error;
 /// Common logical GPU pool across model families; larger pools are explicit.
 pub const DEFAULT_GPU_KV_TOKENS: u64 = 2 << 20;
 
+/// Literal registry shared with the launcher's logical GPU profile resolver.
+pub const SMALL_CARD_CONCURRENCY_THRESHOLD_BYTES: u64 = 34359738368;
+pub const SMALL_CARD_DEFAULT_CONCURRENCY: u64 = 8;
+pub const LARGE_CARD_DEFAULT_CONCURRENCY: u64 = 16;
+
+pub fn default_concurrency(logical_gpu_bytes: u64) -> u64 {
+    if logical_gpu_bytes <= SMALL_CARD_CONCURRENCY_THRESHOLD_BYTES {
+        SMALL_CARD_DEFAULT_CONCURRENCY
+    } else { LARGE_CARD_DEFAULT_CONCURRENCY }
+}
+
 /// Absolute free-memory floor for the logical 32 GiB candidate profiles.
 /// Round upward so integer-byte admission never leaves less than 2.9 GiB.
 pub const SMALL_CARD_HEADROOM_BYTES: u64 = (29 * (1u64 << 30)).div_ceil(10);
@@ -425,6 +436,14 @@ pub fn resolve_capacity_with_startup_peaks(
 mod tests {
     use super::*;
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn default_concurrency_uses_logical_capacity_not_free_memory() {
+        for (bytes, expected) in [(0, 8), (24 * GIB, 8), (32 * GIB, 8),
+            (32 * GIB + 1, 16), (96 * GIB, 16)] {
+            assert_eq!(default_concurrency(bytes), expected);
+        }
+    }
 
     fn device(id: u32, kv_unit_bytes: u64, reserved: u64) -> DeviceCosts {
         DeviceCosts {

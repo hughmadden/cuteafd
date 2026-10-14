@@ -11,6 +11,38 @@ release_die() {
   exit 2
 }
 
+# Resolve total capacity, never free memory. Rust owns the literal default rule.
+release_coordinator_profile() {
+  local registry="${repo_root:?}/rust/crates/cuteafd-core/src/serving_capacity.rs"
+  python3 - "$registry" "$1" "${2:-}" <<'PYPROFILE'
+import pathlib, re, sys
+from decimal import Decimal
+try:
+    source = pathlib.Path(sys.argv[1]).read_text()
+    def literal(name):
+        declarations = re.findall(r'^pub const ' + name + r':.*$', source, re.M)
+        if len(declarations) != 1:
+            raise ValueError(f'missing or duplicate capacity registry constant {name}')
+        match = re.fullmatch(r'pub const ' + name + r': u64 = ([0-9]+);', declarations[0])
+        if match is None:
+            raise ValueError(f'nonliteral capacity registry constant {name}')
+        return int(match.group(1))
+    threshold, small, large = (literal(name) for name in (
+        'SMALL_CARD_CONCURRENCY_THRESHOLD_BYTES', 'SMALL_CARD_DEFAULT_CONCURRENCY',
+        'LARGE_CARD_DEFAULT_CONCURRENCY'))
+    if not (0 < threshold < 2**64 and 0 < small <= large <= 0xffffffff):
+        raise ValueError('invalid capacity registry geometry')
+    physical = Decimal(sys.argv[2].strip()) * 2**20
+    budget = Decimal(sys.argv[3]) * 2**30 if sys.argv[3] else physical
+    if not all(value.is_finite() and 1 <= value < 2**64 for value in (physical, budget)):
+        raise ValueError('GPU capacity must be finite, positive and representable in bytes')
+    logical = min(physical, budget)
+    print(logical / 2**30, small if int(logical) <= threshold else large)
+except (OSError, ValueError, ArithmeticError) as error:
+    sys.exit(f'coordinator capacity registry: {error}')
+PYPROFILE
+}
+
 # The worker and coordinator must admit the same live rows, including decoder
 # replay. Fail closed if the Rust registry stops being literal declarations.
 release_v41_expert_capacity() {
@@ -858,7 +890,8 @@ release_load_config() {
   MAX_OUTPUT_TOKENS=393216
   HTTP_QUEUE_DEPTH=
   HTTP_QUEUE_WAIT_MS=25000
-  CONCURRENCY=16
+  CONCURRENCY=
+  RELEASE_CONCURRENCY_EXPLICIT=0
   PREFIX_CACHE_ENTRIES=20
   PREFILL_BATCH_TOKENS=2048
   RELEASE_PREFILL_EXPLICIT=0
@@ -920,6 +953,7 @@ release_load_config() {
       release_die "unquoted whitespace is not allowed for $key"
     fi
     printf -v "$key" '%s' "$value"
+    [[ "$key" != CONCURRENCY ]] || RELEASE_CONCURRENCY_EXPLICIT=1
     [[ "$key" != PREFILL_BATCH_TOKENS || -z "$value" ]] || RELEASE_PREFILL_EXPLICIT=1
     if [[ ( "$key" == SPARK_COUNT || "$key" == SPARK_HOSTS ) && -n "$value" ]]; then
       RELEASE_SPARK_COUNT_EXPLICIT=1
@@ -1012,10 +1046,12 @@ release_load_config() {
   [[ -z "$COORDINATOR_GPU_UUID" && -z "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
     [[ -n "$COORDINATOR_GPU_UUID" && -n "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
     release_die "COORDINATOR_GPU_UUID and COORDINATOR_GPU_PCI_BUS_ID must be set together"
-  if [[ "$mode" == stop ]]; then
-    [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || release_die "CONCURRENCY must be positive"
-  else
-    [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
+  if ((RELEASE_CONCURRENCY_EXPLICIT)); then
+    if [[ "$mode" == stop ]]; then
+      [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || release_die "CONCURRENCY must be positive"
+    else
+      [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
+    fi
   fi
   [[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] ||
     release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
