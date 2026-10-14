@@ -60,19 +60,25 @@ pub fn set(context: ServerContext) {
 /// Records a value the engine resolved at admission (the resolved onboard
 /// and KV pool), replacing every launch-time setting of that name so the
 /// card's configuration panel shows what actually served, once.
+/// Replaces every copy of `name` with one resolved record. The first copy's
+/// default is kept; a name that was not present is appended.
+fn apply_resolved(settings: &mut Vec<Setting>, name: &str, value: &str) {
+    let mut resolved = Setting { name: name.into(), value: Some(value.into()), default: None, source: "resolved".into() };
+    let mut replaced = false;
+    settings.retain_mut(|existing| {
+        if existing.name != resolved.name { return true; }
+        if replaced { return false; }
+        resolved.default = existing.default.clone();
+        *existing = resolved.clone();
+        replaced = true;
+        true
+    });
+    if !replaced { settings.push(resolved); }
+}
+
 pub fn set_resolved(name: &str, value: &str) {
     if let Ok(mut slot) = state().context.lock() {
-        let mut resolved = Setting { name: name.into(), value: Some(value.into()), default: None, source: "resolved".into() };
-        let mut replaced = false;
-        slot.settings.retain_mut(|existing| {
-            if existing.name != resolved.name { return true; }
-            if replaced { return false; }
-            resolved.default = existing.default.clone();
-            *existing = resolved.clone();
-            replaced = true;
-            true
-        });
-        if !replaced { slot.settings.push(resolved); }
+        apply_resolved(&mut slot.settings, name, value);
     }
 }
 
@@ -195,5 +201,24 @@ mod tests {
         mark_ready("0.0.0.0:8123".parse().unwrap());
         assert_eq!(loopback().as_deref(), Some("http://127.0.0.1:8123"));
         assert!(readiness_s().is_some());
+    }
+
+    #[test]
+    fn resolved_setting_replaces_every_copy_of_the_name() {
+        let mut settings = vec![
+            Setting { name: "attention-placement".into(), value: Some("auto".into()),
+                default: Some("auto".into()), source: "env".into() },
+            Setting { name: "concurrency".into(), value: Some("4".into()), default: None, source: "cli".into() },
+            Setting { name: "attention-placement".into(), value: Some("context".into()),
+                default: Some("context".into()), source: "resolved".into() },
+        ];
+        apply_resolved(&mut settings, "attention-placement", "context");
+        let placed: Vec<_> = settings.iter().filter(|s| s.name == "attention-placement").collect();
+        assert_eq!(placed.len(), 1, "{settings:?}");
+        assert_eq!((placed[0].value.as_deref(), placed[0].default.as_deref(), placed[0].source.as_str()),
+            (Some("context"), Some("auto"), "resolved"));
+        assert!(settings.iter().any(|s| s.name == "concurrency"));
+        apply_resolved(&mut settings, "pool-tokens", "1024");
+        assert_eq!(settings.iter().filter(|s| s.name == "pool-tokens").count(), 1);
     }
 }

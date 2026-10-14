@@ -147,10 +147,21 @@ fn family_of(command: &str) -> Option<&'static str> {
 /// Records a serve command's resolved options (value, default, source) for
 /// the benchmark; other commands record nothing.
 pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>) -> Result<()> {
-    let Some((name, sub)) = matches.subcommand() else { return Ok(()) };
-    let Some(family) = family_of(name) else { return Ok(()) };
+    if let Some(context) = serve_context(matches, coordinator_budget_gib)? {
+        cuteafd_bench::context::set(context);
+    }
+    Ok(())
+}
+
+/// The serve command's resolved settings, without publishing them. Tests read
+/// this directly: `capture` stores one process-wide context, so a test that
+/// called it would replace whatever another test was asserting.
+fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
+    -> Result<Option<cuteafd_bench::context::ServerContext>> {
+    let Some((name, sub)) = matches.subcommand() else { return Ok(None) };
+    let Some(family) = family_of(name) else { return Ok(None) };
     let command = crate::cli::Cli::command();
-    let Some(definition) = command.find_subcommand(name) else { return Ok(()) };
+    let Some(definition) = command.find_subcommand(name) else { return Ok(None) };
     let mut settings: Vec<Setting> = Vec::new();
     let mut snapshot = None;
     for arg in definition.get_arguments() {
@@ -206,9 +217,8 @@ pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
         default: Some(executor.attention_default().to_string()), source: "resolved".into() });
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
-    cuteafd_bench::context::set(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: Some(family.to_string()), snapshot, settings });
-    Ok(())
+    Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
+        family: Some(family.to_string()), snapshot, settings }))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
@@ -226,13 +236,6 @@ fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
 mod tests {
     use super::*;
     use clap::FromArgMatches;
-
-    /// `capture` writes one process-wide server context. Tests that read it back
-    /// hold this for the whole check so a parallel test cannot replace it mid-assert.
-    fn context_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
-    }
 
     #[test]
     fn context_load_arguments_parse_and_validate() {
@@ -268,7 +271,6 @@ mod tests {
 
     #[test]
     fn serve_options_are_captured_with_defaults_and_sources() {
-        let _guard = context_lock();
         let argv = ["cuteafd", "--coordinator-gpu-budget-gib", "32", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
             "/opt/lib.so", "--max-sequences", "2"];
         let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
@@ -295,33 +297,22 @@ mod tests {
 
     #[test]
     fn attention_placement_is_reported_once_as_the_resolved_value() {
-        let _guard = context_lock();
         let serve = |extra: &[&str]| {
             let argv = ["cuteafd", "serve-glmf", "--snapshot", "/s", "--native-lib", "/l"].into_iter()
                 .chain(extra.iter().copied()).collect::<Vec<_>>();
             crate::cli::Cli::command().try_get_matches_from(argv).unwrap()
         };
-        let placement = || cuteafd_bench::context::get().settings.into_iter()
-            .filter(|s| s.name == "attention-placement" || s.name == "CUTEAFD_ATTENTION_PLACEMENT").collect::<Vec<_>>();
-        capture(&serve(&["--split-device", "1", "--attention-placement", "context"]), None).unwrap();
-        let placed = placement();
+        let placement = |context: &cuteafd_bench::context::ServerContext| context.settings.iter()
+            .filter(|s| s.name == "attention-placement" || s.name == "CUTEAFD_ATTENTION_PLACEMENT")
+            .cloned().collect::<Vec<_>>();
+        let split = serve_context(&serve(&["--split-device", "1", "--attention-placement", "context"]), None)
+            .unwrap().expect("serve context");
+        let placed = placement(&split);
         assert_eq!(placed.len(), 1, "{placed:?}");
         assert_eq!((placed[0].value.as_deref(), placed[0].default.as_deref(), placed[0].source.as_str()),
             (Some("context"), Some("context"), "resolved"));
-        // An older capture left the launch spelling beside the resolved mode. Admission keeps one.
-        let mut stale = cuteafd_bench::context::get();
-        stale.settings.retain(|s| s.name != "attention-placement");
-        stale.settings.extend([
-            Setting { name: "attention-placement".into(), value: Some("auto".into()), default: Some("auto".into()), source: "env".into() },
-            Setting { name: "attention-placement".into(), value: Some("context".into()), default: Some("context".into()), source: "resolved".into() },
-        ]);
-        cuteafd_bench::context::set(stale);
-        cuteafd_bench::context::set_resolved("attention-placement", "context");
-        let placed = placement();
-        assert_eq!(placed.len(), 1, "{placed:?}");
-        assert_eq!(placed[0].value.as_deref(), Some("context"));
-        capture(&serve(&[]), None).unwrap();
-        let placed = placement();
+        let one = serve_context(&serve(&[]), None).unwrap().expect("serve context");
+        let placed = placement(&one);
         assert_eq!(placed.len(), 1, "{placed:?}");
         assert_eq!(placed[0].value.as_deref(), Some("heads"));
     }
