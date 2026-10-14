@@ -398,13 +398,23 @@ def test_matched_round_metrics_and_pair_hash_failure(tmp_path):
     assert request['tokens_per_step'] == 3
     assert request['ms_per_step'] == 15
     rows = []
-    for arm, token_hash in [('base', 'a'), ('candidate', 'b')]:
+    for arm, token_hashes in [('base', ['a', 'c']), ('candidate', ['b', 'c'])]:
         state = tmp_path / arm
         state.mkdir()
-        rows.append(dict(card='c', arm=arm, repeat=1, nonce_seed='seed', first_prompt_token_hash=token_hash, state=str(state), status='pass'))
+        rows.append(dict(card='c', arm=arm, repeat=1, nonce_seed='seed', first_prompt_token_hash=token_hashes[0],
+                         prompt_token_hashes=sorted(token_hashes), state=str(state), status='pass'))
     cards.validate_matched_pairs(rows, ['base', 'candidate'])
     assert all(row['status'] == 'failed' for row in rows)
     assert all((Path(row['state']) / 'exit').read_text() == '81\n' for row in rows)
+    # Concurrent admission reorders the same prompts: the first hash differs, the set does not.
+    rows = []
+    for arm, token_hashes in [('base', ['a', 'b']), ('candidate', ['b', 'a'])]:
+        state = tmp_path / ('same-' + arm)
+        state.mkdir()
+        rows.append(dict(card='c', arm=arm, repeat=1, nonce_seed='seed', first_prompt_token_hash=token_hashes[0],
+                         prompt_token_hashes=sorted(token_hashes), state=str(state), status='pass'))
+    cards.validate_matched_pairs(rows, ['base', 'candidate'])
+    assert all(row['status'] == 'pass' for row in rows)
 
 
 def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):

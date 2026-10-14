@@ -886,7 +886,9 @@ def summarize_job(job, exit_code):
     if job.get('nonce_seed'):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
         hashes = re.findall(r'prompt_token_hash\s*=\s*"?([0-9a-f]{16})', text)
-        row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[0] if hashes else None, requests=matched_requests(dest), state=str(dest))
+        # Concurrent admission reorders requests, so pairs match on the whole prompt set.
+        row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[0] if hashes else None,
+                   prompt_token_hashes=sorted(hashes), requests=matched_requests(dest), state=str(dest))
         # Prefill-only sweeps (max_tokens 1) emit no decode rounds; the prompt
         # token hash above is what matches their requests.
         prefill_only = bool(job['entry'].get('prefill_lengths')) and not job['entry'].get('levels') \
@@ -950,10 +952,10 @@ def validate_matched_pairs(rows, arm_names):
         pair = [r for r in rows if r['card'] == card and r['repeat'] == repeat]
         if {r['arm'] for r in pair} != set(arm_names):
             continue  # Not all arms have completed yet.
-        hashes = [r.get('first_prompt_token_hash') for r in pair]
+        hashes = [tuple(r.get('prompt_token_hashes') or ()) for r in pair]
         if not all(hashes) or len(set(hashes)) != 1:
             for row in pair:
-                fail(row, 'matched pair missing or mismatched first request prompt token hash', 'measurement')
+                fail(row, 'matched pair missing or mismatched prompt token hashes', 'measurement')
                 row['exit_code'] = row.get('exit_code') or 81
                 (Path(row['state']) / 'exit').write_text('81\n')
                 save(Path(row['state']) / 'result.json', row)
