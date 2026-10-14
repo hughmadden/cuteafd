@@ -234,7 +234,11 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 #                     For steady-state kernels, use the native harnesses.
 # nsys and ncu wrap the coordinator only (one of them per launch); Spark workers
 # get the other switches. Both run as the host user; they need the driver's
-# RmProfilingAdminOnly=0 and no extra capabilities.
+# RmProfilingAdminOnly=0 and no extra capabilities. The binary is resolved inside
+# the container at start, not from the host's install: /usr/local/bin/<tool> if
+# it is there, otherwise the newest versioned copy (ncu under
+# /opt/nvidia/nsight-compute/<version>/ncu; nsys also accepts
+# /usr/local/cuda/bin/nsys, then /opt/nvidia/nsight-systems/<version>/nsys).
 # Every profiled container also gets CUTEAFD_PROFILE_HOST (the physical host,
 # never the container id). PROFILE_DIR=/abs/dir is created on each host, mounted
 # at the same path and passed as CUTEAFD_PROFILE_DIR; writers name files by host
