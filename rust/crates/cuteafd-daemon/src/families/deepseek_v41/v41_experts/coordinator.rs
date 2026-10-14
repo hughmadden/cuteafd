@@ -5,11 +5,11 @@ use cuteafd_core::{
     replicated_expert_tie_seed_for, ReplicatedExpertCostModel, ReplicatedExpertScheduleConfig,
     ReplicatedExpertScheduler, ReplicatedExpertTieSeedMode, INACTIVE_REPLICATED_EXPERT_GROUP,
 };
-use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41CompactReducer};
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::{
-    expert::{SparkTopology, SparkExpertPending, SparkExperts, V41_PARTIAL_ROW_BYTES,
+    expert::{SparkTopology, SparkExpertWave, SparkExperts, V41_PARTIAL_ROW_BYTES,
         V41_ROUTED_EXPERTS},
-    ExpertProtocolV2Request, VerbsHostProtocolV2ResponsePayload,
+    ExpertProtocolV2Request,
 };
 
 /// One replicated lane's whole-expert ownership planner. Preallocated once per
@@ -167,15 +167,12 @@ impl ReplicatedGroupPlanner {
 }
 
 pub(crate) struct NativeTp4Wave<'a> {
-    transport: SparkExperts,
+    link: crate::shared::spark_intake::SparkLink<'a>,
     // Drop drains the stream before fields release any GPU allocations.
     stream: LoadStream<'a>,
-    planes: Vec<DeviceAllocation<'a>>,
-    upload_frames: Vec<VerbsHostProtocolV2ResponsePayload>,
     shared: DeviceAllocation<'a>,
     output: DeviceAllocation<'a>,
     library: &'a NativeLibrary,
-    reducer: V41CompactReducer<'a>,
     ready_rows: Option<u32>,
     local: Option<super::local::LocalExpertWave<'a>>,
     tp2: Option<Box<super::tp2_ffn::Wave<'a>>>,
@@ -215,7 +212,7 @@ fn device_request(context: &DeviceContext, layer: u32, rows: usize,
     Ok(request)
 }
 impl<'a> NativeTp4Wave<'a> {
-    pub(crate) fn spark_world(&self) -> usize { self.transport.world_size() }
+    pub(crate) fn spark_world(&self) -> usize { self.link.transport.world_size() }
     /// Explicit replicated topology of this lane, or `None` for the legacy path.
     pub(crate) fn native_topology(&self) -> Option<SparkTopology> {
         self.native.as_ref().map(ReplicatedGroupPlanner::topology)
@@ -302,7 +299,7 @@ impl<'a> NativeTp4Wave<'a> {
     }
     pub fn reset_connections(&mut self) {
         self.ready_rows = None;
-        self.transport.reset_connections();
+        self.link.transport.reset_connections();
     }
     /// Legacy TP4 upper-bound reservation (four rank planes), also sufficient
     /// for a legacy TP2 transport.
@@ -333,7 +330,7 @@ impl<'a> NativeTp4Wave<'a> {
         let capacity = transport.capacity();
         let world_size = transport.world_size();
         // V4.1's receive uploader already supports pinned-host intake.
-        let choice = crate::shared::spark_intake::choose_v41_mode(library)?;
+        let choice = crate::shared::spark_intake::choose_preferred_mode(library, crate::shared::spark_intake::IntakePreference::Pinned)?;
         tracing::info!(mode = choice.mode.name(), reason = %choice.reason,
             "V4.1 Spark intake probe (host lane uses pinned uploads)");
         ensure!(
@@ -349,28 +346,21 @@ impl<'a> NativeTp4Wave<'a> {
         // or output allocation. Legacy two-rank transports also fail here rather
         // than at their first request.
         reducer.require_rank_count(world_size as u32)?;
-        let plane_bytes = capacity as usize * V41_PARTIAL_ROW_BYTES as usize;
-        let mut planes = Vec::with_capacity(world_size);
-        for _ in 0..world_size {
-            planes.push(DeviceAllocation::new(library, plane_bytes)?);
-        }
         let native = transport
             .topology()
             .map(ReplicatedGroupPlanner::new)
             .transpose()?;
         let hidden_bytes = capacity as usize * 5120 * 2;
         Ok(Self {
-            transport,
+            link: crate::shared::spark_intake::SparkLink::from_transport(library, transport,
+                V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Pinned)?,
             stream: LoadStream {
                 library,
                 raw: library.cuda_stream_create()?,
             },
-            planes,
-            upload_frames: Vec::with_capacity(capacity as usize * world_size),
             shared: DeviceAllocation::new(library, hidden_bytes)?,
             output: DeviceAllocation::new(library, hidden_bytes)?,
             library,
-            reducer,
             ready_rows: None,
             local: None,
             tp2: None,
@@ -384,7 +374,7 @@ impl<'a> NativeTp4Wave<'a> {
     /// legacy TP4 FP8 transports; `layer` is a Spark layer for the warm-up.
     pub(crate) fn install_device_link(&mut self, peers: &[std::net::SocketAddr], capacity: usize, layer: u32,
         config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
-        if !crate::shared::spark_intake::v41_device_exchange_available(self.library)? {
+        if !crate::shared::spark_intake::preferred_device_exchange_available(self.library, crate::shared::spark_intake::IntakePreference::Pinned)? {
             return Ok(());
         }
         ensure!(self.native.is_none() && self.paired.is_none(),
@@ -525,7 +515,7 @@ impl<'a> NativeTp4Wave<'a> {
         self.synchronize()?;
         let rows = request.header.row_count;
         ensure!(
-            rows > 0 && rows <= self.transport.capacity(),
+            rows > 0 && rows <= self.link.transport.capacity(),
             "native wave exceeds capacity"
         );
         let hidden_bytes = rows as usize * 5120 * 2;
@@ -551,7 +541,7 @@ impl<'a> NativeTp4Wave<'a> {
             request,
             shared,
             self.shared.buffer,
-            self.transport.capacity(),
+            self.link.transport.capacity(),
         )?;
         unsafe { self.dispatch_ffn(request).await?.finish(shared).await }
     }
@@ -564,29 +554,24 @@ impl<'a> NativeTp4Wave<'a> {
         self.ready_rows = None;
         // Previous output or cancellation cleanup completed this wave.
         self.stream.require_complete()?;
-        // A chained reduction retains its upload frames until this point, when
-        // the completed stream proves their host-to-device copies finished.
-        self.upload_frames.clear();
         let header = &request.request().header;
         ensure!(
             header.layer_id as usize == request.binding().layer()
                 && header.row_count > 0
-                && header.row_count <= self.transport.capacity(),
+                && header.row_count <= self.link.transport.capacity(),
             "native dispatched FFN identity or rows differ"
         );
-        let capacity = self.transport.capacity();
-        let pending = self.transport.dispatch(request.request()).await?;
+        let capacity = self.link.transport.capacity();
+        let pending = self.link.dispatch(request.request())?;
         Ok(NativePendingFfn {
             pending,
             request,
             capacity,
             library: self.library,
             stream: &self.stream,
-            planes: &self.planes,
-            upload_frames: &mut self.upload_frames,
+            link: &mut self.link,
             shared: self.shared.buffer,
             output: self.output.buffer,
-            reducer: &self.reducer,
             ready_rows: &mut self.ready_rows,
             tp2: self.tp2.as_deref_mut(),
         })
@@ -598,22 +583,17 @@ impl<'a> NativeTp4Wave<'a> {
         has_shared: bool,
     ) -> Result<CuteafdDeviceBuffer> {
         let rows = request.header.row_count;
-        let library = self.library;
-        let planes = &self.planes;
-        self.transport
-            .execute(request, |rank, first_row, bytes| {
-                copy_chunk(library, planes, rank, first_row, bytes)
-            })
-            .await?;
-        reduce_planes(
-            self.library,
-            &self.reducer,
-            &self.stream,
-            &self.planes,
-            self.output.buffer,
-            has_shared.then_some(self.shared.buffer),
-            rows,
-        )?;
+        let wave = self.link.dispatch(request)?;
+        // SAFETY: this wave owns the intake planes and output until its stream drains.
+        unsafe { crate::shared::memory::chain::join(self.library, self.stream.raw)? };
+        self.link.receive(wave, rows as usize, self.stream.raw).await?;
+        // SAFETY: receive orders the same stream after all partials, and the optional
+        // shared plane was initialized by execute before dispatch.
+        unsafe {
+            self.link.reduce(if has_shared { self.shared.buffer.ptr.cast() } else { std::ptr::null() },
+                self.output.buffer.ptr.cast(), rows as usize, self.stream.raw)?;
+            crate::shared::memory::chain::finish(self.library, self.stream.raw)?;
+        }
         self.ready_rows = Some(rows);
         self.output()
     }
@@ -669,134 +649,17 @@ fn validate_shared(
     );
     Ok(())
 }
-fn copy_chunk(
-    library: &NativeLibrary,
-    planes: &[DeviceAllocation<'_>],
-    rank: usize,
-    first_row: u32,
-    bytes: &[u8],
-) -> Result<()> {
-    library.copy_h2d(chunk_destination(planes, rank, first_row, bytes.len())?, bytes)
-}
-fn chunk_destination(
-    planes: &[DeviceAllocation<'_>],
-    rank: usize,
-    first_row: u32,
-    bytes: usize,
-) -> Result<CuteafdDeviceBuffer> {
-    ensure!(rank < planes.len(), "native route rank exceeds TP plane count");
-    let offset = (first_row as usize)
-        .checked_mul(V41_PARTIAL_ROW_BYTES as usize)
-        .context("native route chunk offset overflow")?;
-    let end = offset
-        .checked_add(bytes)
-        .context("native route chunk extent overflow")?;
-    ensure!(
-        end <= planes[rank].buffer.bytes,
-        "native route chunk exceeds destination"
-    );
-    let mut destination = planes[rank].buffer;
-    destination.ptr = unsafe { destination.ptr.cast::<u8>().add(offset).cast() };
-    destination.bytes = bytes;
-    Ok(destination)
-}
-
-/// Retain received pinned frames until uploads finish. Drop also drains on
-/// cancellation or errors, before recycling their host storage.
-struct PlaneUploads<'s, 'a> {
-    library: &'a NativeLibrary,
-    stream: &'s LoadStream<'a>,
-    planes: &'s [DeviceAllocation<'a>],
-    frames: &'s mut Vec<VerbsHostProtocolV2ResponsePayload>,
-    rows: u32,
-    pending: bool,
-    /// Uploads are ordered in a stage chain but not yet complete: keep their
-    /// frames in the wave until the next dispatch observes a completed stream.
-    retain: bool,
-}
-impl PlaneUploads<'_, '_> {
-    fn copy(&mut self, rank: usize, first_row: u32, payload: VerbsHostProtocolV2ResponsePayload) -> Result<()> {
-        let bytes = payload.as_ref();
-        let destination = chunk_destination(self.planes, rank, first_row, bytes.len())?;
-        let offset = first_row as usize * V41_PARTIAL_ROW_BYTES as usize;
-        ensure!(offset + bytes.len() <= self.rows as usize * 10240,
-            "native upload exceeds live rows");
-        if payload.pinned_host_buffer().is_none() {
-            return self.library.copy_h2d(destination, bytes);
-        }
-        ensure!(self.frames.len() < self.frames.capacity(), "native retained frame capacity exhausted");
-        // Transfer ownership before enqueue, including a possible partial enqueue error.
-        self.frames.push(payload);
-        self.pending = true;
-        unsafe { self.library.copy_h2d_async(destination, self.frames.last().unwrap().as_ref(), self.stream.raw) }
-    }
-}
-impl Drop for PlaneUploads<'_, '_> {
-    fn drop(&mut self) {
-        if self.pending {
-            if let Err(error) = unsafe { self.library.cuda_stream_synchronize(self.stream.raw) } {
-                tracing::error!(%error, "draining interrupted native rank uploads");
-            }
-        }
-        if !self.retain { self.frames.clear(); }
-    }
-}
-unsafe fn enqueue_reduce_planes(reducer: &V41CompactReducer<'_>, stream: &LoadStream<'_>,
-    planes: &[DeviceAllocation<'_>], output: CuteafdDeviceBuffer,
-    shared: Option<CuteafdDeviceBuffer>, rows: u32) -> Result<()> {
-    let shared = shared.map_or(std::ptr::null(), |b| b.ptr.cast());
-    match planes.len() {
-        // The 2- and 4-plane entry points are kept bit-identical for the legacy
-        // paths; the generic N-plane entry point carries 3- and 6-rank
-        // replicated layouts (and is ordered identically for 2/4).
-        2 => unsafe { reducer.reduce_tp2(
-            std::array::from_fn(|rank| planes[rank].buffer.ptr.cast::<u16>().cast_const()),
-            shared, output.ptr.cast(), rows, stream.raw) },
-        4 => unsafe { reducer.reduce(
-            std::array::from_fn(|rank| planes[rank].buffer.ptr.cast::<u16>().cast_const()),
-            shared, output.ptr.cast(), rows, stream.raw) },
-        3 | 6 => unsafe { reducer.reduce_planes::<8>(
-            std::array::from_fn(|rank| planes.get(rank)
-                .map_or(std::ptr::null(), |plane| plane.buffer.ptr.cast::<u16>().cast_const())),
-            planes.len() as u32, shared, output.ptr.cast(), rows, stream.raw) },
-        _ => anyhow::bail!("native compact reduction requires two, three, four or six TP planes"),
-    }
-}
-fn reduce_planes(library: &NativeLibrary, reducer: &V41CompactReducer<'_>,
-    stream: &LoadStream<'_>, planes: &[DeviceAllocation<'_>], output: CuteafdDeviceBuffer,
-    shared: Option<CuteafdDeviceBuffer>, rows: u32) -> Result<()> {
-    let launched = unsafe {
-        crate::shared::memory::chain::join(library, stream.raw)
-            .and_then(|()| enqueue_reduce_planes(reducer, stream, planes, output, shared, rows))
-    };
-    if launched.is_err() { return launched.and(unsafe { library.cuda_stream_synchronize(stream.raw) }); }
-    unsafe { crate::shared::memory::chain::finish(library, stream.raw) }
-}
-/// Retain planes, upload frames, output and shared input through completion.
-async unsafe fn reduce_planes_cooperative(reducer: &V41CompactReducer<'_>,
-    stream: &LoadStream<'_>, planes: &[DeviceAllocation<'_>], output: CuteafdDeviceBuffer,
-    shared: Option<CuteafdDeviceBuffer>, rows: u32) -> Result<()> {
-    let launched = unsafe {
-        crate::shared::memory::chain::join(stream.library, stream.raw)
-            .and_then(|()| enqueue_reduce_planes(reducer, stream, planes, output, shared, rows))
-    };
-    if launched.is_err() { return launched.and(stream.wait().await); }
-    unsafe { crate::shared::memory::chain::finish_cooperative(stream).await }
-}
-
 /// Borrows every mutable reduction buffer and owns all unread response sockets.
 /// Dropping before completion leaves the wave unpublished and closes the sockets.
 pub(crate) struct NativePendingFfn<'w, 'a, 'r> {
-    pending: SparkExpertPending<'w, 'r>,
+    pending: SparkExpertWave,
     request: &'r crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
     capacity: u32,
     library: &'a NativeLibrary,
     stream: &'w LoadStream<'a>,
-    planes: &'w [DeviceAllocation<'a>],
-    upload_frames: &'w mut Vec<VerbsHostProtocolV2ResponsePayload>,
+    link: &'w mut crate::shared::spark_intake::SparkLink<'a>,
     shared: CuteafdDeviceBuffer,
     output: CuteafdDeviceBuffer,
-    reducer: &'w V41CompactReducer<'a>,
     ready_rows: &'w mut Option<u32>,
     tp2: Option<&'w mut super::tp2_ffn::Wave<'a>>,
 }
@@ -851,36 +714,24 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
         // The shared owner remains borrowed until reduction drains, so consume
         // its completed device output directly instead of copying it first.
         let shared_copy_us = 0u64;
-        let mut uploads = PlaneUploads {
-            library: self.library,
-            stream: self.stream,
-            planes: self.planes,
-            frames: self.upload_frames,
-            rows: self.request.request().header.row_count,
-            pending: false,
-            retain: false,
-        };
-        let mut upload_us = 0u64;
-        self.pending
-            .receive_owned(|rank, first_row, payload| {
-                let copy_start = std::time::Instant::now();
-                let result = uploads.copy(rank, first_row, payload);
-                upload_us += copy_start.elapsed().as_micros() as u64;
-                result
-            })
-            .await?;
-        let received_us = timing.elapsed().as_micros() as u64;
         let rows = self.request.request().header.row_count;
+        // SAFETY: shared producers have drained or published their chain dependency;
+        // all receive/reduction storage is borrowed by this pending owner.
+        unsafe { crate::shared::memory::chain::join(self.library, self.stream.raw)? };
+        self.link.receive(self.pending, rows as usize, self.stream.raw).await?;
+        let received_us = timing.elapsed().as_micros() as u64;
+        // SAFETY: the intake, shared values and output live through the stream fence.
+        unsafe { self.link.reduce(values.ptr.cast(), self.output.ptr.cast(), rows as usize, self.stream.raw)? };
         if cooperative {
-            unsafe { reduce_planes_cooperative(self.reducer, self.stream, self.planes,
-                self.output, Some(values), rows).await?; }
+            // SAFETY: the pending owner retains every input until completion or cancellation.
+            unsafe { crate::shared::memory::chain::finish_cooperative(self.stream).await? };
         } else {
-            reduce_planes(self.library, self.reducer, self.stream, self.planes,
-                self.output, Some(values), rows)?;
+            // SAFETY: the same stream owns the reduction and its inputs.
+            unsafe { crate::shared::memory::chain::finish(self.library, self.stream.raw)? };
         }
-        uploads.pending = false; // uploads and reduction completed on the same stream.
-        uploads.retain = crate::shared::memory::chain::active();
-        tracing::debug!(target: "cuteafd::timing", layer=self.request.request().header.layer_id, rows, shared_copy_us, upload_us, receive_us=received_us-shared_copy_us-upload_us, reduce_us=timing.elapsed().as_micros() as u64-received_us, "target collection");
+        tracing::debug!(target: "cuteafd::timing", layer=self.request.request().header.layer_id, rows,
+            shared_copy_us, receive_us=received_us, reduce_us=timing.elapsed().as_micros() as u64-received_us,
+            "target collection");
         *self.ready_rows = Some(rows);
         let mut values = self.output;
         values.bytes = rows as usize * 10240;
@@ -1240,189 +1091,6 @@ mod upload_tests {
             assert!(reserved >= capacity as usize * (2 * V41_PARTIAL_ROW_BYTES as usize + 2 * 10240));
         }
         Ok(())
-    }
-
-    #[test]
-    fn missing_tp_planes_reject_copy_before_pointer_arithmetic() {
-        for rank in [0, 1, 2, 4, usize::MAX] {
-            assert!(chunk_destination(&[], rank, 0, 10240).is_err());
-        }
-    }
-
-    #[test]
-    fn pageable_rank_upload_fallback_matches_sync_and_checks_bounds() -> Result<()> {
-        let Some(path) = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY") else {
-            eprintln!("skip GPU rank upload test: CUTEAFD_PLANE_UPLOAD_LIBRARY unset");
-            return Ok(());
-        };
-        let library = unsafe { NativeLibrary::load(path)? };
-        for world_size in [2, 4] {
-            check_pageable_uploads(&library, world_size)?;
-        }
-        Ok(())
-    }
-
-    fn check_pageable_uploads(library: &NativeLibrary, world_size: usize) -> Result<()> {
-        let stream = LoadStream { library, raw: library.cuda_stream_create()? };
-        let planes = (0..world_size)
-            .map(|_| DeviceAllocation::new(&library, 4096 * 10240))
-            .collect::<Result<Vec<_>>>()?;
-        let mut frames = Vec::with_capacity(4096 * world_size);
-        let shared = DeviceAllocation::new(&library, 4096 * 10240)?;
-        let output = DeviceAllocation::new(&library, 4096 * 10240)?;
-        let reducer = library.v41_compact_reducer()?;
-        let frames_address = frames.as_ptr();
-        for rows in [1u32, 6, 80, 81, 256, 1024, 4096, 6] {
-            let bytes = rows as usize * 10240;
-            let shared_bytes: Vec<u8> = (0..bytes / 2)
-                .flat_map(|_| 0x3f00u16.to_ne_bytes()).collect();
-            library.copy_h2d(shared.buffer, &shared_bytes)?;
-            let payloads: Vec<Vec<u8>> = (0..world_size).map(|rank| {
-                (0..bytes / 2).flat_map(|i| {
-                    let value = rank as f32 + 1.0 + (i % 31) as f32 / 32.0;
-                    ((value.to_bits() >> 16) as u16).to_ne_bytes()
-                }).collect()
-            }).collect();
-            for (rank, payload) in payloads.iter().enumerate() {
-                copy_chunk(&library, &planes, rank, 0, payload)?;
-            }
-            reduce_planes(&library, &reducer, &stream, &planes,
-                output.buffer, Some(shared.buffer), rows)?;
-            let mut expected = vec![0u8; bytes];
-            library.copy_d2h(&mut expected, CuteafdDeviceBuffer { bytes, ..output.buffer })?;
-            for plane in &planes { library.copy_h2d(plane.buffer, &vec![0; bytes])?; }
-            {
-                let mut uploads = PlaneUploads {
-                    library: &library, stream: &stream, planes: &planes,
-                    frames: &mut frames, rows, pending: false, retain: false,
-                };
-                for first in (0..rows).step_by(3) {
-                    let end = (first + 3).min(rows);
-                    for rank in [3, 1, 0, 2].into_iter().filter(|&rank| rank < world_size) {
-                        uploads.copy(rank, first,
-                            VerbsHostProtocolV2ResponsePayload::from_owned(payloads[rank][first as usize * 10240..end as usize * 10240].to_vec()))?;
-                    }
-                }
-                let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-                runtime.block_on(async {
-                    use std::{future::Future, task::Poll};
-                    let cancelled = {
-                        let mut work = std::pin::pin!(unsafe { reduce_planes_cooperative(&reducer, &stream,
-                            &planes, output.buffer, Some(shared.buffer), rows) });
-                        std::future::poll_fn(|cx| Poll::Ready(work.as_mut().poll(cx).is_pending())).await
-                    };
-                    stream.require_complete()?;
-                    unsafe { reduce_planes_cooperative(&reducer, &stream, &planes,
-                        output.buffer, Some(shared.buffer), rows).await?; }
-                    eprintln!("PASS cooperative TP reduction rows={rows} pending_cancel={cancelled} reuse=true");
-                    Ok::<_, anyhow::Error>(())
-                })?;
-                stream.require_complete()?;
-                uploads.pending = false;
-            }
-            let mut actual = vec![0u8; bytes];
-            library.copy_d2h(&mut actual, CuteafdDeviceBuffer { bytes, ..output.buffer })?;
-            assert_eq!(actual, expected, "rows={rows}");
-            assert_eq!(frames.as_ptr(), frames_address);
-            assert!(frames.is_empty());
-            // Pageable fallback completes synchronously, including before a later bounds error.
-            for error in [false, true] {
-                library.copy_h2d(planes[0].buffer, &vec![0; 10240])?;
-                {
-                    let mut uploads = PlaneUploads {
-                        library: &library, stream: &stream, planes: &planes,
-                        frames: &mut frames, rows: 1, pending: false, retain: false,
-                    };
-                    uploads.copy(0, 0, VerbsHostProtocolV2ResponsePayload::from_owned(payloads[0][..10240].to_vec()))?;
-                    if error {
-                        assert!(uploads.copy(world_size, 0, VerbsHostProtocolV2ResponsePayload::from_owned(payloads[0][..10240].to_vec())).is_err());
-                        assert!(uploads.copy(0, 1, VerbsHostProtocolV2ResponsePayload::from_owned(payloads[0][..10240].to_vec())).is_err());
-                    }
-                }
-                assert!(frames.is_empty());
-                let mut actual = vec![0; 10240];
-                library.copy_d2h(&mut actual, CuteafdDeviceBuffer { bytes: 10240, ..planes[0].buffer })?;
-                assert_eq!(actual, payloads[0][..10240]);
-            }
-            eprintln!("PASS TP{world_size} rows={rows}: pageable interleaved chunks/reduction exact, stable owner capacity, bounds errors");
-        }
-        Ok(())
-    }
-    #[test]
-    #[ignore = "requires four idle live Spark workers and CUDA native library"]
-    fn retained_roce_uploads_drain_before_recycling_live() -> Result<()> {
-        use cuteafd_transport::{ExpertProtocolV2RowDescriptor, ExpertProtocolV2RouteEntry,
-            ExpertV2SourceKind, ExpertV2Dtype, TcpTransportConfig};
-        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_PLANE_UPLOAD_LIBRARY")?)? };
-        let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let peers = std::env::var("CUTEAFD_LIVE_ROCE_PEERS")?.split(',')
-            .map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?
-            .try_into().map_err(|_| anyhow::anyhow!("four peers required"))?;
-        let mut client = SparkExperts::new(peers, [1,2,3,4], 4096, TcpTransportConfig { timing: false,
-            timeout: std::time::Duration::from_secs(30), max_frame_bytes: 64 << 20,
-        })?;
-        let planes: [DeviceAllocation<'_>; 4] = (0..4).map(|_| DeviceAllocation::new(&library, 4096 * 10240))
-            .collect::<Result<Vec<_>>>()?.try_into().ok().expect("four planes");
-        let mut frames = Vec::with_capacity(4096 * 4);
-        let frame_address = frames.as_ptr();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        runtime.block_on(async {
-            let mut request_id = 900_000;
-            for rows in [1u32,6,80,81,256,1024,4096,6] {
-                let mut hidden = Vec::with_capacity(rows as usize * 5280);
-                for row in 0..rows {
-                    hidden.extend((0..5120).map(|i| 0x30 + ((i+row)%8) as u8));
-                    hidden.extend([120;160]);
-                }
-                let mut request = ExpertProtocolV2Request::new(request_id, 17, 39, 5120,
-                    ExpertV2Dtype::Fp8E4m3Ue8m0K32,
-                    (0..rows).map(|r| ExpertProtocolV2RowDescriptor {
-                        row_id: r as u64, source_kind: ExpertV2SourceKind::Prefill,
-                        source_request_id: request_id, token_position: r as u64,
-                        route_offset: r*6, route_count: 6,
-                    }).collect(),
-                    (0..rows).flat_map(|r| (0..6).map(move |j| ExpertProtocolV2RouteEntry {
-                        row_index: r, expert_id: (r*7+j)%384, gate_weight: 1.0/6.0,
-                    })).collect(), hidden)?;
-                request.header.flags = cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-                for fail in [false,true,false] {
-                    request_id += 1;
-                    request.header.request_id = request_id;
-                    let mut expected: Vec<(usize,u32,Vec<u8>)> = Vec::new();
-                    {
-                        let mut uploads = PlaneUploads { library: &library, stream: &stream,
-                            planes: &planes, frames: &mut frames, rows, pending: false, retain: false };
-                        let result = client.dispatch(&request).await?.receive_owned(|rank, first, payload| {
-                            ensure!(payload.pinned_host_buffer().is_some(), "live payload is not pinned");
-                            ensure!(payload.retains_receive_slot(), "final response is not a retained receive slot");
-                            expected.push((rank, first, payload.as_ref().to_vec()));
-                            uploads.copy(rank, first, payload)?;
-                            ensure!(uploads.pending && !uploads.frames.is_empty(), "upload ownership missing");
-                            if fail { anyhow::bail!("injected failure after pinned upload enqueue"); }
-                            Ok(())
-                        }).await;
-                        assert_eq!(result.is_err(), fail);
-                        // QP teardown must not free payloads owned by an active upload.
-                        if fail { client.reset_connections(); }
-                        // Drop simulates cancellation after enqueue and must synchronize
-                        // before returning retained storage to the transport pool.
-                    }
-                    assert!(frames.is_empty());
-                    assert_eq!(frames.as_ptr(), frame_address);
-                    assert!(!expected.is_empty());
-                    if !fail {
-                        assert_eq!(expected.iter().map(|(_,_,b)| b.len()).sum::<usize>(), rows as usize * 4 * 10240);
-                    }
-                    for (rank, first, bytes) in expected {
-                        let mut actual = vec![0;bytes.len()];
-                        library.copy_d2h(&mut actual, chunk_destination(&planes, rank, first, bytes.len())?)?;
-                        assert_eq!(actual, bytes, "rows={rows} fail={fail} rank={rank}");
-                    }
-                }
-                eprintln!("PASS retained rows={rows}: real pinned frames, exact device copies, failure/reset/drop drain and recovery");
-            }
-            Ok(())
-        })
     }
 
 }
