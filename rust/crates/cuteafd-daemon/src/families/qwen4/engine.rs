@@ -1586,8 +1586,9 @@ impl<'a> Qwen4Engine<'a> {
         resource::geometry_with_grouping(&self.draft_homes(snapshot)?, self.cfg.experts, self.cfg.topk,
             DECODE_ROWS, width, resource::COPY_EXTENSION, |layer, rows| match &self.experts {
                 Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
-                Some(Experts::LocalExl3(local)) => local.resident.borrow().as_ref()
-                    .context("Qwen installed EXL3 window missing")?.1.group_rows(rows),
+                Some(Experts::LocalExl3(local)) => crate::families::deepseek_v4::local::installed_window_group_rows(
+                    &local.resident, || local.ensure(layer, self.execution_stream()), rows,
+                    |experts, rows| experts.group_rows(rows)),
                 Some(Experts::Tp2 { routed, .. }) => {
                     let routed = routed.borrow();
                     let group = routed.experts[0].group_rows(rows)?;

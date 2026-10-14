@@ -2108,8 +2108,9 @@ impl<'a> GlmfEngine<'a> {
                 }
                 match self.routed_experts(layer) {
                     Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
-                    Some(Experts::LocalExl3(local)) => local.resident.borrow().as_ref()
-                        .context("GLM Flash installed EXL3 window missing")?.1.group_rows(rows),
+                    Some(Experts::LocalExl3(local)) => crate::families::deepseek_v4::local::installed_window_group_rows(
+                        &local.resident, || local.ensure(layer, self.stream), rows,
+                        |experts, rows| experts.group_rows(rows)),
                     Some(Experts::Spark { .. }) => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
                     _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert grouping"),
                 }

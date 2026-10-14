@@ -19,6 +19,21 @@ def module(path, name):
     return result
 
 
+def test_lazy_exl3_draft_grouping_uses_the_shared_installed_window_order():
+    daemon = ROOT / "rust/crates/cuteafd-daemon/src/families"
+    for family, stream in (("qwen4", "self.execution_stream()"), ("glm5_flash", "self.stream")):
+        source = (daemon / family / "engine.rs").read_text()
+        geometry = source.split("pub(crate) fn draft_geometry(", 1)[1].split("\n    }", 1)[0]
+        assert "crate::families::deepseek_v4::local::installed_window_group_rows(" in geometry
+        assert f"&local.resident, || local.ensure(layer, {stream}), rows," in geometry
+        assert "|experts, rows| experts.group_rows(rows)" in geometry
+        assert "local.resident.borrow()" not in geometry
+    # GLM Flash already installs TP1 windows during admitted onboarding; the
+    # shared helper reuses these without changing their stream or load timing.
+    glm = (daemon / "glm5_flash/mod.rs").read_text()
+    assert glm.index("local.ensure(range.start, stream)?;") < glm.index("engine.install_local(range, experts);")
+
+
 def test_qwen_bucket_projection_registry_matches_pinned_fork():
     fork = ROOT / "third_party/sparkinfer/b12x"
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
