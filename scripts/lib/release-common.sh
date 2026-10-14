@@ -605,16 +605,95 @@ release_profile_docker_args() {
   fi
 }
 
+# Print the profiler to exec. The container calls this with the tool name only,
+# so the search is the image's own files. Tests pass a fixture root as $2.
+# ncu: /usr/local/bin/ncu, else the newest /opt/nvidia/nsight-compute/*/ncu.
+# nsys: /usr/local/bin/nsys, else /usr/local/cuda/bin/nsys, else the newest
+# /opt/nvidia/nsight-systems/*/nsys. Version names are dotted numbers, so
+# 2026.1.10 beats 2026.1.9.
+release_profile_resolve_tool() {
+  local tool="$1" root="${2-}" candidate version best="" best_version=""
+  local restore_nullglob=0
+  local -a stable=() found=()
+  case "$tool" in
+    ncu) stable=("$root/usr/local/bin/ncu") ;;
+    nsys) stable=("$root/usr/local/bin/nsys" "$root/usr/local/cuda/bin/nsys") ;;
+    *) printf 'unknown profiler %s\n' "$tool" >&2; return 127 ;;
+  esac
+  for candidate in "${stable[@]}"; do
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  shopt -q nullglob && restore_nullglob=1
+  shopt -s nullglob
+  if [[ "$tool" == ncu ]]; then
+    found=("$root"/opt/nvidia/nsight-compute/*/ncu)
+  else
+    found=("$root"/opt/nvidia/nsight-systems/*/nsys)
+  fi
+  ((restore_nullglob)) || shopt -u nullglob
+  for candidate in "${found[@]}"; do
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    version="$(basename "$(dirname "$candidate")")"
+    [[ "$version" =~ ^[0-9]+([.][0-9]+)+$ ]] || continue
+    if [[ -z "$best" ]]; then
+      best="$candidate"
+      best_version="$version"
+      continue
+    fi
+    [[ "$version" == "$best_version" ]] && continue
+    if [[ "$(printf '%s\n%s\n' "$best_version" "$version" | LC_ALL=C sort -V | tail -n 1)" == "$version" ]]; then
+      best="$candidate"
+      best_version="$version"
+    fi
+  done
+  if [[ -n "$best" ]]; then
+    printf '%s\n' "$best"
+    return 0
+  fi
+  if [[ "$tool" == ncu ]]; then
+    printf 'ncu not found: looked for /usr/local/bin/ncu and /opt/nvidia/nsight-compute/*/ncu\n' >&2
+  else
+    printf 'nsys not found: looked for /usr/local/bin/nsys, /usr/local/cuda/bin/nsys, and /opt/nvidia/nsight-systems/*/nsys\n' >&2
+  fi
+  return 127
+}
+
+# TOOL, then the profiler's arguments, then the served command. exec replaces
+# this shell so the profiler receives docker stop's SIGINT.
+release_profile_exec() {
+  local tool="$1" bin
+  shift
+  bin="$(release_profile_resolve_tool "$tool")" || exit 127
+  exec "$bin" "$@"
+}
+
+# Container command: resolve TOOL at start, then exec it with the remaining
+# arguments. The caller appends the served command after this argv.
+release_profile_container_wrapper() {
+  local tool="$1" script
+  shift
+  script="$(declare -f release_profile_resolve_tool; declare -f release_profile_exec)"
+  script+=$'\nrelease_profile_exec "$@"'
+  RELEASE_PROFILE_WRAPPER=(/bin/bash -c "$script" release-profile-resolve "$tool" "$@")
+}
+
 # Sets RELEASE_PROFILE_WRAPPER: the argv that goes between the image and the
 # served command (`docker run ... IMAGE "${RELEASE_PROFILE_WRAPPER[@]}" cuteafd
 # ...`), and RELEASE_PROFILE_WRAPPER_DOCKER_ARGS (docker arguments before the
-# image: the profiler is PID 1, and `docker stop` sends it SIGINT and waits up to
-# 300 s for the report; the cuteafd.graceful-stop label makes smoke teardown and
-# release_stop_local_container use that stop before removing), both empty unless
-# PROFILE names nsys or ncu. Coordinator only: a Spark
-# worker asked to wrap fails closed (Spark workers still get the environment
-# switches from release_profile_docker_args). Call after that helper, which has
-# validated PROFILE and PROFILE_DIR.
+# image: the profiler replaces the wrapper shell before serving, so `docker stop`
+# sends it SIGINT and waits up to 300 s for the report; the cuteafd.graceful-stop
+# label makes smoke teardown and release_stop_local_container use that stop
+# before removing), both empty unless PROFILE names nsys or ncu. Coordinator
+# only: a Spark worker asked to wrap fails closed (Spark workers still get the
+# environment switches from release_profile_docker_args). Call after that helper,
+# which has validated PROFILE and PROFILE_DIR.
+# The profiler binary is not chosen here. The host install and the image install
+# differ (the dev image has ncu at /opt/nvidia/nsight-compute/<version>/ncu, which
+# may or may not be linked from /usr/local/bin/ncu). The wrapper command resolves
+# it when the container starts.
 # PROFILE_NSYS_GPU_METRICS adds nsys GPU metrics sampling (clocks, power, DRAM
 # and SM activity): `all` samples every GPU the container sees (use this), or an
 # index list in nsys's own device order, which is not CUDA's or nvidia-smi's
@@ -640,9 +719,9 @@ release_profile_wrapper() {
     [[ -z "$kernel$count$set" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET need PROFILE=ncu"
     # Collection starts paused (nsys start/stop through docker exec open and
     # close the window); stopping the session or the container writes the report.
-    RELEASE_PROFILE_WRAPPER=(/usr/local/cuda/bin/nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node
-      --sample=none --cpuctxsw=none --start-later=true "--session-new=$RELEASE_NSYS_SESSION"
-      "--output=$dir/nsys-$host" --force-overwrite=true)
+    release_profile_container_wrapper nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
+      --sample=none --cpuctxsw=none --start-later=true "--session-new=$RELEASE_NSYS_SESSION" \
+      "--output=$dir/nsys-$host" --force-overwrite=true
     if [[ -n "$metrics" ]]; then
       [[ "$metrics" == all || "$metrics" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
         release_die "PROFILE_NSYS_GPU_METRICS must be all or an nsys GPU index list (e.g. 0 or 0,1)"
@@ -656,8 +735,8 @@ release_profile_wrapper() {
   count="${count:-20}" set="${set:-full}"
   [[ "$count" =~ ^[1-9][0-9]{0,3}$ ]] || release_die "PROFILE_NCU_COUNT must be 1..9999"
   [[ "$set" =~ ^[a-z_]+$ ]] || release_die "PROFILE_NCU_SET must be an ncu section set name (e.g. full, basic)"
-  RELEASE_PROFILE_WRAPPER=(/usr/local/bin/ncu --kernel-name "regex:$kernel" --launch-count "$count" --set "$set"
-    --graph-profiling node --target-processes all --export "$dir/ncu-$host" --force-overwrite)
+  release_profile_container_wrapper ncu --kernel-name "regex:$kernel" --launch-count "$count" --set "$set" \
+    --graph-profiling node --target-processes all --export "$dir/ncu-$host" --force-overwrite
 }
 
 # Shared key grammar for release lifecycle scripts and the family launcher.
