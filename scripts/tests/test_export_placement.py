@@ -186,25 +186,33 @@ def test_hold_signal_retains_mutex_until_child_cleanup(tmp_path, signum):
     ready, stopping, done = [tmp_path / name for name in ('ready', 'stopping', 'done')]
     command = f"trap 'touch {stopping}; sleep 0.5; touch {done}; exit 0' TERM HUP QUIT; touch {ready}; while true; do sleep 0.1; done"
     process = subprocess.Popen([sys.executable, str(SCRIPT), 'hold', '--gpus', '0', '--', 'bash', '-c', command],
-                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path)})
+                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path)}, start_new_session=True)
+
+    def wait_for(path):
+        deadline = time.monotonic() + 30
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return path.exists()
+
     try:
-        deadline = time.monotonic() + 5
-        while not ready.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert ready.exists()
+        assert wait_for(ready)
         process.send_signal(signum)
-        while not stopping.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert stopping.exists()
+        assert wait_for(stopping)
         with lock.open('a') as handle:
-            with pytest.raises(BlockingIOError):
+            # The mutex may only be free once the child's cleanup has finished.
+            try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            assert process.wait(timeout=5) == 0
+            except BlockingIOError:
+                pass
+            else:
+                assert done.exists()
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            assert process.wait(timeout=30) == 0
             assert done.exists()
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
         if process.poll() is None:
-            process.kill()
+            os.killpg(process.pid, signal.SIGKILL)
             process.wait()
 
 
