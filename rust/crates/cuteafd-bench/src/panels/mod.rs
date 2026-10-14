@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 pub mod agentic;
 pub mod common;
+pub mod context_load;
 pub mod fidelity;
 pub mod info;
 pub mod lossless;
@@ -106,6 +107,7 @@ pub struct Ctx<'a> {
     pub max_output: u64,
     /// The run's lossless case set, when the client sent one (else the shipped default).
     pub lossless_set: Option<&'a lossless::CaseSet>,
+    pub context_load: &'a context_load::Options,
 }
 
 pub trait Panel: Send + Sync {
@@ -124,7 +126,7 @@ pub trait Panel: Send + Sync {
 /// Every panel this build runs, in display order.
 pub fn catalog() -> Vec<&'static dyn Panel> {
     vec![&info::HARDWARE, &info::CONFIGURATION, &speed::DECODE_CONTENT, &speed::CONCURRENCY, &speed::DRAFT_MIX, &speed::PREFILL,
-        &speed::RETAINED, &speed::PREFIX_CACHE, &agentic::AGENTIC, &quality::STRUCTURED, &quality::NEEDLE, &quality::IFEVAL,
+        &speed::RETAINED, &speed::PREFIX_CACHE, &context_load::CONTEXT_LOAD, &agentic::AGENTIC, &quality::STRUCTURED, &quality::NEEDLE, &quality::IFEVAL,
         &fidelity::STANDARD, &fidelity::FULL, &quality::CODE, &quality::MATH, &reasoning::REASONING, &tools::TOOL_EVAL, &lossless::LOSSLESS_SET, &info::STARTUP]
 }
 

@@ -31,6 +31,8 @@ pub struct RunOptions {
     pub deadline: Option<Duration>,
     /// Cases for the `spec_lossless_set` panel (default: the server's shipped set).
     pub lossless_set: Option<crate::panels::lossless::CaseSet>,
+    pub context_lengths: Option<Vec<u64>>,
+    pub context_levels: Option<Vec<usize>>,
 }
 
 fn agent() -> ureq::Agent {
@@ -128,6 +130,8 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     if let Some(set) = &options.lossless_set {
         body["lossless_set"] = json!(crate::panels::lossless::SetRequest::of(set));
     }
+    if let Some(lengths) = &options.context_lengths { body["context_lengths"] = json!(lengths); }
+    if let Some(levels) = &options.context_levels { body["context_levels"] = json!(levels); }
     let response = authorize(agent.post(&format!("{base}/v1/bench/runs")), &options.api_key)
         .send_json(body);
     let id = match response {

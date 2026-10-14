@@ -771,10 +771,12 @@ mod warm_stream_tests {
     #[test]
     fn the_spark_transport_warm_ups_hold_their_stream_in_the_guard() {
         // The needles are joined here, so that this file's own text does not match them.
-        let created = ["let warm_stream = crate::shared::spark_intake::Warm", "Stream::new(&"].concat();
         let finished = ["warm_stream.", "finish()?;"].concat();
-        for (family, source) in [("glm5_flash", include_str!("../families/glm5_flash/mod.rs")),
-            ("mimo_v2", include_str!("../families/mimo_v2/mod.rs"))] {
+        for (family, source, library) in [
+            ("glm5_flash", include_str!("../families/glm5_flash/mod.rs"), "self.library.as_ref()"),
+            ("mimo_v2", include_str!("../families/mimo_v2/mod.rs"), "&*self.library"),
+        ] {
+            let created = ["let warm_stream = crate::shared::spark_intake::Warm", "Stream::new(", library, ")?;"].concat();
             assert_eq!((source.matches(&created).count(), source.matches(&finished).count()), (1, 1), "{family}");
             let (start, end) = (source.find(&created).unwrap(), source.find(&finished).unwrap());
             assert!(start < end, "{family}");
@@ -1124,6 +1126,10 @@ pub(crate) fn written_responses() -> bool {
 }
 
 impl<'a> SparkDeviceLink<'a> {
+    pub(crate) fn terminal_drain_copies(&self) -> Result<()> {
+        self.intake.terminal_drain_copies()
+    }
+
     /// Connects the proxy's transport (`capacity` rows of `topk` routes and
     /// `wire_row_bytes` per wave; partial rows of `row_bytes`) on `device`.
     /// Needs GPU landing (the probed intake mode must be `gpu`).

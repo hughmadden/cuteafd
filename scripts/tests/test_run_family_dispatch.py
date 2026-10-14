@@ -276,7 +276,12 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     for metadata in ("positions", "tables", "anchors"):
         assert draft.index(f"self.put(&w.{metadata}") < draft.index("input(&ids, w.h.buffer")
     transport = remote.split("    pub fn update(", 1)[1].split("    pub fn put_taps(", 1)[0]
-    assert transport.index("self.synchronize()?") < transport.index("self.draft.update_with(")
+    assert "self.synchronize()?" not in transport
+    assert "cuda_stream_synchronize" not in transport
+    final_ack = remote.split("    pub fn finish_request(", 1)[1].split("    pub fn finish_terminal(", 1)[0]
+    assert final_ack.index("self.exchange.wait(0, TAPS)") < final_ack.index("cuda_stream_synchronize")
+    release = (family / "serve.rs").read_text().split("fn release(", 1)[1].split("#[derive", 1)[0]
+    assert release.index("family.finish_request()") < release.index("cache.release(")
     assert transport.index("self.exchange.wait(0, TAPS)") < transport.index("self.exchange.push_planes(0, TAPS")
     assert transport.index("self.exchange.wait(1, TAPS)") < transport.index("self.exchange.signal(1, TAPS)")
     taps = remote.split("    pub fn tap_streams_at(", 1)[1].split("    pub fn update(", 1)[0]
@@ -284,7 +289,10 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     owner = remote.split("pub(crate) struct RemoteDflash", 1)[1].split("impl<'a>", 1)[0]
     assert owner.index("pub draft:") < owner.index("exchange:") < owner.index("stream:")
     drain = (family / "engine.rs").read_text().split("    pub(crate) fn synchronize(", 1)[1].split("    fn start(", 1)[0]
-    assert drain.index("drain_ranks(") < drain.index("drafter.finish_terminal(result.is_ok())")
+    assert "drain_ranks(" in drain
+    shutdown = (family / "engine.rs").read_text().split("    fn shutdown_submission(", 1)[1].split("    fn publish_tp2_abort(", 1)[0]
+    assert shutdown.index("ranks:") < shutdown.index("links:") < shutdown.index("copies:") < shutdown.index("graphs:")
+    assert "drafter.finish_terminal(drained)" in shutdown
     assert "synchronize_remote()" in drain
     serving = (family / "serve.rs").read_text()
     assert "drafter.require_live()?;" in serving
@@ -486,7 +494,11 @@ def test_serving_coordinator_and_workers_use_host_identity(tmp_path, wip):
     assert "HF_HOME=/hf" in coordinator
     assert "CUTEAFD_BENCH_DIR=/run/cuteafd/bench" in coordinator
     # Dashboard fidelity reuses the host's verified reference cache (no re-download).
-    assert "/.cache/cuteafd/fidelity:/tmp/cuteafd-home/.cache/cuteafd/fidelity" in coordinator
+    assert "/.cache/cuteafd/fidelity:/run/cuteafd/fidelity" in coordinator
+    assert "CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity" in coordinator
+    # Nothing may be bind-mounted under the container HOME: Docker would create
+    # root-owned parents there, and the non-root coordinator's placement handoff fails.
+    assert ":/tmp/cuteafd-home/" not in coordinator
     worker = result.stderr.split("ssh h0 release_serving_docker_args ()", 1)[1]
     assert 'id -u' in worker and 'id -g' in worker
     assert 'release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; docker run -d' in worker or ('release_serving_docker_args; cuteafd_cdi_gpu_args all' in worker and 'docker run -d' in worker)

@@ -3,7 +3,8 @@
 //! owner changes. The solver derives [`Hop`]s from the chosen [`LayerMode`]s
 //! and charges their receive buffers as fixed demands; executors follow the
 //! same list (the daemon's hop primitive, `shared::peer_split::HopLink`).
-use super::{FfnMode, LayerMode};
+use super::{FfnMode, LayerMode, Placement};
+use thiserror::Error;
 use serde::{Deserialize, Serialize};
 
 /// Which GPU holds the residual (the mHC streams, or `[T,H]`) between layers.
@@ -163,6 +164,85 @@ pub fn plan_hops(modes: &[LayerMode], spec: &HopSpec) -> Vec<Hop> {
         }
     }
     hops
+}
+
+/// Invalid runtime binding of the solver's ownership decision.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LayerPlanError {
+    #[error("layer execution needs a nonempty stack and logical GPUs 0/1")]
+    Geometry,
+    #[error("layer {layer} has invalid owner {gpu}")]
+    Owner { layer: usize, gpu: u8 },
+    #[error("runtime residual homes differ from the planner")]
+    Residual,
+    #[error("runtime residual hops differ from the planner")]
+    Hops,
+    #[error("layer {layer} attention state is bound to {actual:?}, expected {expected:?}")]
+    StateOwners { layer: usize, actual: Vec<u8>, expected: Vec<u8> },
+    #[error("layer {0} is past the execution stack")]
+    Layer(usize),
+}
+
+/// Immutable contract shared by execution, graph keys and prefix snapshots.
+/// The spec comes from the same family request that charged hop storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerExecutionPlan {
+    modes: Vec<LayerMode>,
+    hops: Vec<Hop>,
+    homes: Vec<ResidualHome>,
+    spec: HopSpec,
+}
+
+impl LayerExecutionPlan {
+    pub fn new(placement: &Placement, spec: HopSpec) -> Result<Self, LayerPlanError> {
+        if placement.layers.is_empty() || spec.entry_gpu >= 2 || spec.head_gpu >= 2
+            || spec.rows == 0 || spec.lanes == 0 {
+            return Err(LayerPlanError::Geometry);
+        }
+        let modes: Vec<_> = placement.layers.iter().map(|layer| layer.mode).collect();
+        for (layer, &mode) in modes.iter().enumerate() {
+            if let LayerMode::Whole { gpu, .. } = mode {
+                if gpu >= 2 { return Err(LayerPlanError::Owner { layer, gpu }); }
+            }
+        }
+        let mut homes = vec![ResidualHome::Owned(spec.entry_gpu)];
+        for &mode in &modes {
+            homes.push(homes.last().expect("seeded").transition(mode).home);
+        }
+        if placement.residual != homes { return Err(LayerPlanError::Residual); }
+        let hops = plan_hops(&modes, &spec);
+        if placement.hops != hops || (!hops.is_empty() && (spec.row_bytes == 0 || spec.row_bytes % 16 != 0)) {
+            return Err(LayerPlanError::Hops);
+        }
+        Ok(Self { modes, hops, homes, spec })
+    }
+
+    pub fn modes(&self) -> &[LayerMode] { &self.modes }
+    pub fn hops(&self) -> &[Hop] { &self.hops }
+    pub fn homes(&self) -> &[ResidualHome] { &self.homes }
+    pub fn spec(&self) -> HopSpec { self.spec }
+
+    pub fn mode(&self, layer: usize) -> Result<LayerMode, LayerPlanError> {
+        self.modes.get(layer).copied().ok_or(LayerPlanError::Layer(layer))
+    }
+
+    /// Whole attention's weights, KV, indexer and private state exist once,
+    /// independent of whether its FFN is split. Split modes retain both ranks;
+    /// context page parity is still handled by the context adapter.
+    pub fn attention_owners(&self, layer: usize) -> Result<Vec<u8>, LayerPlanError> {
+        Ok(match self.mode(layer)? {
+            LayerMode::Whole { gpu, .. } => vec![gpu],
+            LayerMode::HeadSplit | LayerMode::ContextSplit => vec![0, 1],
+        })
+    }
+
+    pub fn validate_state_owners(&self, layer: usize, actual: &[u8]) -> Result<(), LayerPlanError> {
+        let expected = self.attention_owners(layer)?;
+        let mut actual = actual.to_vec();
+        actual.sort_unstable();
+        if actual != expected { return Err(LayerPlanError::StateOwners { layer, actual, expected }); }
+        Ok(())
+    }
 }
 
 /// Receive-buffer bytes `hops` need on each of `gpus` GPUs: `lanes` x

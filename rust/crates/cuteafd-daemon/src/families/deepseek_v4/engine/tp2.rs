@@ -151,23 +151,73 @@ impl<'a> Engine<'a> {
         crate::shared::decode_graph::fatal_drain(home.run(|| self.publish_tp2_abort()), "V4 RTX enqueue abort");
     }
 
-    /// Both abort words precede either drain; graphs and backend owners remain live.
-    pub fn retire_tp2(&self) -> Result<()> {
-        if self.tp2.is_none() { return Ok(()); }
-        let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
-        home.run(|| {
-            self.publish_tp2_abort()?;
-            let mut failures = Vec::new();
-            for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
-                if let Err(error) = exchange.drain_compute() { failures.push(format!("{error:#}")); }
-            }
-            ensure!(failures.is_empty(), "V4 TP2 rank drainage: {}", failures.join("; "));
-            self.on(0, || { self.graphs.borrow_mut().clear(); Ok(()) })?;
-            self.on(1, || { self.peer()?.graphs.borrow_mut().clear(); Ok(()) })?;
-            self.exchange()?.finish_terminal(true);
-            self.tp2.as_ref().unwrap().routes.finish_terminal(true);
-            Ok(())
-        })
+    pub(crate) fn require_live(&self) -> Result<()> {
+        use crate::shared::peer_split::{TerminalPeerError, TerminalState};
+        let state = self.terminal.get();
+        if state != TerminalState::Active { return Err(TerminalPeerError::Closed(state).into()); }
+        if let Some(exchange) = &self.exchange { exchange.require_live()?; }
+        if let Some(tp2) = &self.tp2 { tp2.routes.require_live()?; }
+        Ok(())
+    }
+
+    pub(crate) fn shutdown_submission(&self, transports: &mut [SparkLink<'_>]) -> Result<()> {
+        use crate::shared::{experts::rtx::pair::{teardown, Teardown}, peer_split::TerminalState};
+        if self.terminal.get() == TerminalState::Drained { return Ok(()); }
+        self.terminal.set(TerminalState::Aborting);
+        let transports = RefCell::new(transports);
+        let result = teardown(&mut Teardown {
+            abort: || {
+                let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
+                home.run(|| self.publish_tp2_abort())?;
+                // The proxy cannot abort its completion waits yet. Refuse before
+                // rank drainage rather than blocking on an unprovable consumer.
+                ensure!(self.device_link.is_none(), "device Spark proxy requires terminal owner retention");
+                Ok(())
+            },
+            ranks: || {
+                let mut failures = Vec::new();
+                for rank in 0..(1 + usize::from(self.peer.is_some())) {
+                    // SAFETY: queued operands remain owned throughout shared teardown.
+                    if let Err(error) = self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) }) {
+                        failures.push(format!("rank {rank}: {error:#}"));
+                    }
+                }
+                ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+            },
+            links: || {
+                let mut failures = Vec::new();
+                for link in transports.borrow_mut().iter_mut() {
+                    if let Err(error) = link.terminal_quiesce() { failures.push(format!("{error:#}")); }
+                }
+                ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+            },
+            copies: || {
+                let mut failures = Vec::new();
+                for link in transports.borrow().iter() {
+                    if let Err(error) = link.terminal_drain_copies() { failures.push(format!("{error:#}")); }
+                }
+                ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+            },
+            graphs: || {
+                for link in transports.borrow_mut().iter_mut() { link.terminal_release()?; }
+                for rank in 0..(1 + usize::from(self.peer.is_some())) {
+                    self.on(rank, || {
+                        if rank == 0 { self.graphs.borrow_mut().clear(); }
+                        else { self.peer()?.graphs.borrow_mut().clear(); }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            },
+            finish: |drained| {
+                self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                    exchange.finish_terminal(drained);
+                }
+            },
+        });
+        crate::shared::decode_graph::fatal_drain(result, "V4 submission shutdown");
+        Ok(())
     }
 
     pub(super) fn tp2_layer(&self, layer: usize) -> bool {
@@ -516,9 +566,9 @@ mod tests {
             for local in 1..=layers {
                 for broadcast in [false, true] {
                     for lanes in [1, 2] {
-                        assert_eq!(order::check(&schedule(layers, local, lanes, false, broadcast)), Ok(()));
+                        assert_eq!(order::check_submission_faults(&schedule(layers, local, lanes, false, broadcast)), Ok(()));
                     }
-                    assert_eq!(order::check(&schedule(layers, local, 1, true, broadcast)), Ok(()));
+                    assert_eq!(order::check_submission_faults(&schedule(layers, local, 1, true, broadcast)), Ok(()));
                 }
             }
         }

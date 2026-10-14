@@ -52,6 +52,11 @@ fn runtime(case: &Case<'_>, layout: &MemoryLayout) -> anyhow::Result<Placement> 
 }
 
 fn runtime_with_tp1(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool) -> anyhow::Result<Placement> {
+    runtime_with_upload_check(case, layout, tp1_available, false)
+}
+
+fn runtime_with_upload_check(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool, check_upload: bool)
+    -> anyhow::Result<Placement> {
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
     let mut catalog = cuteafd_loader::read_expert_catalog(case.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v4",
@@ -72,7 +77,7 @@ fn runtime_with_tp1(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool)
     let gpus = layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
         .enumerate().map(|(gpu, device)| {
             let loaded: u64 = device.items.iter().filter(|i| matches!(i.category,
-                Category::Weights | Category::Embedding | Category::Drafter) || i.group == "context+modules")
+                Category::Embedding) || i.group == "context+modules")
                 .map(|i| i.bytes).sum();
             let budget = if gpu == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget };
             (budget, Baseline::Measured { free_bytes: budget - loaded })
@@ -80,14 +85,33 @@ fn runtime_with_tp1(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool)
     // The planner's EXL3 arena from the same capacity manifests serve-dsv4 reads.
     let expert_workspace = layout_expert_workspace(case, &catalog)?;
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
-        cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,
+        loaded_modes: None, cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
             &catalog, Some(case.manifest), manifest["capacities"]["prefill_rows"].as_u64().unwrap()
                 .max(manifest["capacities"]["decode_rows"].as_u64().unwrap())).ok().map(|b| [b; 2]) } else { None },
         exchange_f32: case.exchange_f32 };
-    Ok(solve(&admission::request(&cli.engine, &inputs)?)?)
+    let placement = solve(&admission::request(&cli.engine, &inputs)?)?;
+    if check_upload {
+        let modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
+        let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
+            &cfg, case.rtx, case.dspark, catalog.tensors().iter().map(|t| &t.metadata))?;
+        let loaded = weights.loaded_bytes(&modes, case.rtx)?;
+        let measured = inputs.gpus.iter().zip(loaded).map(|(&(total, baseline), bytes)| {
+            let Baseline::Measured { free_bytes } = baseline else { unreachable!() };
+            Ok((total, Baseline::Measured { free_bytes: free_bytes.checked_sub(bytes)
+                .ok_or_else(|| anyhow::anyhow!("fixture weight uploads exceed free memory"))? }))
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        let after = admission::Inputs { gpus: measured, loaded_modes: Some(&modes), ..inputs };
+        let mut request = admission::request(&cli.engine, &after)?;
+        request.pool.requested = Some(placement.pool_tokens);
+        request.pool.floor = placement.pool_tokens;
+        request.onboard = Onboard::Layers(placement.onboard_layers);
+        let checked = cuteafd_loader::placement::solve_frozen(&request, &placement)?;
+        assert_eq!(checked, placement, "pre-upload/frozen measured admission differs");
+    }
+    Ok(placement)
 }
 
 /// serve-dsv4's `local::workspace_bytes` without CUDA: the EXL3 package's
@@ -215,6 +239,29 @@ fn planner_equals_runtime_deepseek_v4_fixture_context() {
     refused.manifest = &plain;
     let (layout, _, _) = planned(&refused);
     assert!(runtime(&refused, &layout).is_err(), "explicit context without its programs");
+}
+
+#[test]
+fn preload_equals_frozen_measured_admission_after_native_uploads() {
+    use cuteafd_loader::placement::AttentionPlacement;
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = synthetic_context(dir.path());
+    for dspark in [false, true] {
+        if dspark { cuteafd_loader::plan::testing::write_v4_snapshot_with_dspark(dir.path(), 3); }
+        for rtx in [1, 2] {
+            for attention in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+                if rtx == 1 && attention == AttentionPlacement::Context { continue; }
+                for onboard in [Onboard::Auto, Onboard::Layers(2)] {
+                    let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2,
+                        context: 1_048_576, budget: 32 << 30, onboard: Some(onboard), dspark,
+                        exchange_f32: true, peer_budget: Some(30 << 30), attention: Some(attention) };
+                    let (layout, supported, hints) = planned(&case);
+                    assert!(supported, "preload fixture dspark={dspark} rtx={rtx} attention={attention:?} onboard={onboard:?}: {:?} {hints:?}", layout.notes);
+                    runtime_with_upload_check(&case, &layout, true, true).unwrap();
+                }
+            }
+        }
+    }
 }
 
 trait TapDir { fn tap_dir(self) -> Self; }
@@ -566,8 +613,11 @@ fn runtime_measured(case: &Case<'_>, fixture: &Fixture) -> anyhow::Result<Placem
     let gpus = fixture.gpus.iter().enumerate().map(|(gpu, g)| (g.total_bytes,
         Baseline::Measured { free_bytes: g.free_with_current_code(code[gpu]) })).collect();
     let expert_workspace = layout_expert_workspace(case, &catalog)?;
+    let loaded_modes = vec![if case.rtx == 2 { cuteafd_loader::placement::LayerMode::HeadSplit }
+        else { cuteafd_loader::placement::LayerMode::Whole { gpu: 0,
+            ffn: cuteafd_loader::placement::FfnMode::Owner } }; cfg.n_layers];
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
-        cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,
+        loaded_modes: Some(&loaded_modes), cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(

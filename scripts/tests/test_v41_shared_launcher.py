@@ -36,6 +36,8 @@ INTENDED = {
         "CUTEAFD_DRAFT_SURVIVAL_LENGTHS": "0",
         # shared_thermal_args: the GPU throttle sampler (#114), default on.
         "CUTEAFD_THERMAL": "on",
+        # Dashboard fidelity reads the host's shared reference cache.
+        "CUTEAFD_FIDELITY_CACHE": "/run/cuteafd/fidelity",
     },
     "worker": {
         # shared_worker_env_args: FP8 prefill form and the worker's sampler.
@@ -88,7 +90,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # when gpu-powerd runs on this host (#114).
         governor = ["/run/gpu-powerd:/run/gpu-powerd:ro"] if role == "coordinator" and os.path.isdir("/run/gpu-powerd") else []
         # The coordinator also shares the host fidelity reference cache with the dashboard.
-        fidelity = [f"<root>/hosts/{old['host']}/.cache/cuteafd/fidelity:/tmp/cuteafd-home/.cache/cuteafd/fidelity"] \
+        fidelity = [f"<root>/hosts/{old['host']}/.cache/cuteafd/fidelity:/run/cuteafd/fidelity"] \
             if role == "coordinator" else []
         assert after["mounts"] == sorted(before["mounts"] + governor + fidelity), where
         assert after["image"] == before["image"], where

@@ -34,6 +34,7 @@ pub(crate) struct HopLink<'a> {
     hops: Vec<Hop>,
     /// Receive slots per lane on each GPU (`min(hops into it, HOP_SLOTS)`).
     per_lane: [usize; 2],
+    abort: Option<[*const u32; 2]>,
 }
 
 /// A queued push whose matching wait is still owed on the destination.
@@ -77,7 +78,29 @@ impl<'a> HopLink<'a> {
                 })
             })
         };
-        Ok(Self { library, ranks, ends: [end(0)?, end(1)?], spec, hops: hops.to_vec(), per_lane })
+        Ok(Self { library, ranks, ends: [end(0)?, end(1)?], spec, hops: hops.to_vec(), per_lane, abort: None })
+    }
+
+    /// Startup-only borrowing of the routed exchange's abort words. The
+    /// engine must keep that exchange alive until every hop consumer drains.
+    pub(crate) fn attach_abort(&mut self, abort: [*const u32; 2]) -> Result<()> {
+        ensure!(abort.iter().all(|word| !word.is_null()), "hop abort words must be live");
+        self.library.peer_abort_available()?;
+        self.abort = Some(abort);
+        Ok(())
+    }
+
+    /// Serving layer executors borrow the exact same terminal owner as entry
+    /// and FFN exchanges; a legacy non-abortable hop cannot be bound to them.
+    pub(crate) fn validate_binding(&self, plan: &cuteafd_loader::placement::LayerExecutionPlan,
+        peer: &super::PeerExchange<'_>) -> Result<()> {
+        ensure!(self.spec == plan.spec() && self.hops == plan.hops(), "hop storage differs from layer plan");
+        let words = [peer.abort_word(0)?.context("rank 0 exchange is not abortable")?,
+            peer.abort_word(1)?.context("rank 1 exchange is not abortable")?];
+        ensure!(self.abort == Some(words), "hops must borrow the layer exchange's terminal owner");
+        ensure!((0..2).all(|rank| self.ranks[rank].device == peer.device(rank)
+            && self.ranks[rank].stream == peer.stream(rank)), "hop and FFN streams differ");
+        peer.require_live()
     }
 
     /// Receive bytes held on `rank` (the solver charged exactly this).
@@ -124,7 +147,11 @@ impl<'a> HopLink<'a> {
         let end = &self.ends[ticket.to];
         // SAFETY: this GPU's control words; the matching push was queued by `send`.
         on_device(self.library, self.ranks[ticket.to].device, self.ranks[0].device, || unsafe {
-            self.library.peer_wait(end.flag(ticket.flag), end.recv_state(ticket.flag), self.ranks[ticket.to].stream)
+            match self.abort {
+                Some(abort) => self.library.peer_wait_abortable(end.flag(ticket.flag), end.recv_state(ticket.flag),
+                    abort[ticket.to], self.ranks[ticket.to].stream),
+                None => self.library.peer_wait(end.flag(ticket.flag), end.recv_state(ticket.flag), self.ranks[ticket.to].stream),
+            }
         })?;
         Ok(end.recv.get(ticket.recv).context("hop receive slot")?.buffer.ptr)
     }

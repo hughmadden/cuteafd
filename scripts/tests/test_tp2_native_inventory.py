@@ -178,9 +178,10 @@ def test_remote_context_wait_is_ordered_after_cooperative_target_producer():
     family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
     remote = (family / "remote_dflash.rs").read_text()
     update = remote.split("pub fn update(&self", 1)[1].split("pub fn put_taps", 1)[0]
-    assert update.count("self.synchronize()?") == 1
+    assert "self.synchronize()?" not in update
+    assert "cuda_stream_synchronize" not in update
     ack = update.index("self.exchange.signal(1, TAPS)?")
-    assert update.index("self.synchronize()?") < ack < update.rindex("Ok(())")
+    assert update.index("self.exchange.wait(0, TAPS)?") < ack < update.rindex("Ok(())")
     event = update.index("cuda_event_record(self.target_ready.raw, self.target_peer.stream)")
     wait = update.index("cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)")
     assert update.index("self.exchange.push_planes(0, TAPS") < event < wait

@@ -1064,7 +1064,7 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
             let mut step: Vec<(&mut GlmfPlacement, usize)> = placements.iter_mut().zip(&shape)
                 .map(|(p, &rows)| (p, rows)).collect();
             let timer = Instant::now();
-            engine.verify_spec(&mut step, &tokens)?;
+            engine.bench_verify_device(&mut step, &tokens)?;
             if round >= 2 {
                 times.push(timer.elapsed().as_secs_f64());
             } else {

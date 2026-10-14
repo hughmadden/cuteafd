@@ -1310,6 +1310,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmfPeer<'a>>,
     exchange: Option<PeerExchange<'a>>,
+    terminal: Cell<crate::shared::peer_split::TerminalState>,
     tp2: Option<Tp2Experts<'a>>,
     local: Option<(std::ops::Range<usize>, Experts<'a>)>,
     /// The drafter (DFlash2 or dSpark): every step taps its target layers.
@@ -1676,6 +1677,7 @@ impl<'a> GlmfEngine<'a> {
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, mla_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
             device, context_mode, context: None, context_units: RefCell::new(Vec::new()),
+            terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
@@ -1902,6 +1904,56 @@ impl<'a> GlmfEngine<'a> {
             source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), checks: RefCell::new(Default::default()),
             interval, steps: Cell::new(0), schedule: RefCell::new(None) });
         Ok(())
+    }
+
+    pub(crate) fn require_live(&self) -> Result<()> {
+        use crate::shared::peer_split::{TerminalPeerError, TerminalState};
+        let state = self.terminal.get();
+        if state != TerminalState::Active { return Err(TerminalPeerError::Closed(state).into()); }
+        if let Some(exchange) = &self.exchange { exchange.require_live()?; }
+        if let Some(tp2) = &self.tp2 { tp2.routes.require_live()?; }
+        if let Some(drafter) = &self.drafter { drafter.require_live()?; }
+        Ok(())
+    }
+
+    fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>) -> Result<()>) -> Result<()> {
+        let mut failures = Vec::new();
+        if let Some(Experts::Spark { transports, .. }) = &self.experts {
+            for link in transports.try_borrow_mut()?.iter_mut() {
+                if let Err(error) = action(link) { failures.push(format!("{error:#}")); }
+            }
+        }
+        ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+    }
+
+    fn shutdown_submission(&self) -> Result<()> {
+        use crate::shared::{experts::rtx::pair::{teardown, Teardown}, peer_split::TerminalState};
+        if self.terminal.get() == TerminalState::Drained { return Ok(()); }
+        self.terminal.set(TerminalState::Aborting);
+        let result = teardown(&mut Teardown {
+            abort: || {
+                let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
+                home.run(|| self.publish_tp2_abort())
+            },
+            ranks: || self.synchronize(),
+            links: || self.terminal_links(|link| link.terminal_quiesce()),
+            copies: || self.terminal_links(|link| link.terminal_drain_copies()),
+            graphs: || {
+                self.terminal_links(|link| link.terminal_release())?;
+                for rank in 0..self.ranks() {
+                    self.on(rank, || { *self.graphs_of(rank).borrow_mut() = GraphBank::new(None); Ok(()) })?;
+                }
+                Ok(())
+            },
+            finish: |drained| {
+                self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                    exchange.finish_terminal(drained);
+                }
+                if let Some(drafter) = &self.drafter { drafter.finish_terminal(drained); }
+            },
+        });
+        crate::shared::decode_graph::fatal_drain(result, "GLM Flash submission shutdown"); Ok(())
     }
 
     fn publish_tp2_abort(&self) -> Result<()> {
@@ -2370,6 +2422,11 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
+    pub(crate) fn finish_request(&self) -> Result<()> {
+        if let Some(drafter) = &self.drafter { drafter.finish_request()?; }
+        Ok(())
+    }
+
     /// Drains every rank's stream.
     pub(crate) fn synchronize(&self) -> Result<()> {
         let result = drain_ranks(self.ranks() + usize::from(self.drafter.is_some()), |rank| {
@@ -2377,7 +2434,6 @@ impl<'a> GlmfEngine<'a> {
             // SAFETY: the engine owns these streams and retains all queued operands.
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })
         });
-        if let Some(drafter) = &self.drafter { drafter.finish_terminal(result.is_ok()); }
         result
     }
 
@@ -3156,6 +3212,13 @@ impl<'a> GlmfEngine<'a> {
         self.decode_step(sequences, tokens, None, true, None, None, true)?.map(|l| l.to_host(self.library)).transpose()
     }
 
+    /// Eager speculative verification for timing: complete device work without downloading logits.
+    pub(super) fn bench_verify_device(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32])
+        -> Result<()> {
+        self.decode_step(sequences, tokens, None, true, None, None, true)?;
+        self.synchronize()
+    }
+
     pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.startup_graphs }
 
     /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
@@ -3490,6 +3553,14 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || self.shutdown_submission(),
+            || self.step_inner(tables, tokens, logit_rows, on_layer, forced, trace, media))
+    }
+
+    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
@@ -3874,6 +3945,7 @@ impl<'a> GlmfEngine<'a> {
     /// executable's device bytes (free memory before the capture and after its instantiation);
     /// executables evicted past the graph budget retire until the next decode step.
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.require_live()?;
         let graphs = self.graphs_of(rank);
         let stream = self.stream_of(rank);
         let cached = graphs.borrow_mut().launch(&key).map(|graph| graph.raw);
@@ -4702,6 +4774,13 @@ impl<'a> GlmfEngine<'a> {
     /// one. Returns the logits of the last `logit_rows` rows across the lanes.
     fn step_lanes(&self, lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
         -> Result<Option<StepLogits>> {
+        crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || self.shutdown_submission(),
+            || self.step_lanes_inner(lanes, logit_rows, device, media))
+    }
+
+    fn step_lanes_inner(&self, lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
+        -> Result<Option<StepLogits>> {
         let Some(Experts::Spark { transports, runtime }) = &self.experts else {
             anyhow::bail!("pipelined prefill needs Spark experts");
         };
@@ -4939,7 +5018,7 @@ impl Drop for GlmfEngine<'_> {
     fn drop(&mut self) {
         // Every rank can still read graph operands, weights and workspaces.
         // Abort before any owner releases storage when drainage is unproved.
-        crate::shared::decode_graph::fatal_drain(self.synchronize(), "GLM Flash engine");
+        crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "GLM Flash engine");
         // SAFETY: all rank streams drained while their event and operands remained live.
         let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
         self.graphs = RefCell::new(GraphBank::new(None));
@@ -5116,7 +5195,7 @@ mod tp2_tests {
             assert!(check_tp2_lanes(lanes).is_ok());
             for local in [0..0, 1..4, 0..5, 4..5] {
                 for broadcast in [false, true] {
-                    assert_eq!(order::check(&order::glmf_tp2_fixture(5, local.clone(), lanes, broadcast, true)), Ok(()));
+                    assert_eq!(order::check_submission_faults(&order::glmf_tp2_fixture(5, local.clone(), lanes, broadcast, true)), Ok(()));
                 }
             }
         }

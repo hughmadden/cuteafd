@@ -21,6 +21,8 @@ pub struct MimoInputs<'a> {
     pub startup_probe_bytes: u64,
     pub context: u64,
     pub requested_pool: Option<u64>,
+    /// Automatic pools under a fixed onboard stop at the target (no growth to free memory).
+    pub pool_ceiling_at_target: bool,
     pub onboard: Onboard,
     /// Backbone order (including dense layers), exact whole/TP2 package costs.
     pub experts: Vec<Option<ExpertCost>>,
@@ -97,6 +99,9 @@ pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
                     }
                 }
                 _ => {}
+            }
+            if inputs.pool_ceiling_at_target && request.pool.requested.is_none() {
+                request.pool.ceiling = request.pool.target;
             }
             let placement = solve(&request)?;
             let actual = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
@@ -231,7 +236,7 @@ mod tests {
             let inputs = MimoInputs { cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvCache::Int8,
                 mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                 headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
-                requested_pool: Some(2 << 20), onboard: Onboard::Auto,
+                requested_pool: Some(2 << 20), pool_ceiling_at_target: false, onboard: Onboard::Auto,
                 experts: vec![None, Some(cost), Some(cost), Some(cost)], expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
                 tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
             let all = solve_working_set(&inputs, &local).unwrap();
@@ -293,6 +298,25 @@ mod tests {
             assert_eq!(shrunk.request.pool.floor, 0);
             assert!(solve_working_set(&MimoInputs { requested_pool: Some(1 << 20),
                 ..constrained }, &local).is_err(), "an explicit remote pool must never shrink");
+            // Fixed zero onboarding: an automatic pool is capped at the target but
+            // shrinks to what fits; an explicit pool stays strict; below the floor fails.
+            let zero = |free: u64, requested_pool: Option<u64>| solve_working_set(&MimoInputs {
+                onboard: Onboard::Layers(0), pool_ceiling_at_target: true, requested_pool, context: 256 << 10,
+                expert_workspace: 0, tp2_workspace: [0; 2],
+                gpus: vec![(96 << 30, Baseline::Measured { free_bytes: free }); ranks], ..inputs.clone() }, &local);
+            let roomy = zero(90 << 30, None).unwrap().placement.pool_tokens;
+            assert_eq!(roomy, 2 << 20, "automatic pool is capped at the target");
+            let mut free = 90u64 << 30;
+            let fitted = loop {
+                free -= 1 << 30;
+                let pool = zero(free, None).map(|s| s.placement.pool_tokens);
+                if pool.as_ref().is_ok_and(|&p| p < 2 << 20) { break (free, pool.unwrap()); }
+                assert!(pool.is_ok(), "no shrunk pool between the target and the floor");
+            };
+            assert!(fitted.1 >= 256 << 10 && fitted.1 < 2 << 20);
+            assert!(matches!(zero(fitted.0, Some(2 << 20)).err(), Some(CacheGeometryError::ResidentTensor { what, .. })
+                if what.starts_with("explicit KV pool of")), "an explicit pool stays strict (PoolDoesNotFit)");
+            assert!(zero(1 << 30, None).is_err(), "below the floor still fails");
             assert!(solve_working_set(&MimoInputs { spark_ranks: 0, onboard: Onboard::Layers(2),
                 ..inputs.clone() }, &local).is_err());
         }

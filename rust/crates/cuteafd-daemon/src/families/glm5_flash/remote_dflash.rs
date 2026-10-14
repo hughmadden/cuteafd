@@ -163,7 +163,23 @@ impl<'a> RemoteDflash<'a> {
     /// No owner is released on an unproved drain; the engine's fatal-drain
     /// boundary also retains every target graph and peer-exchange operand.
     pub fn synchronize(&self) -> Result<()> {
-        self.stream.drain()
+        self.finish_request()?;
+        self.stream.drain()?;
+        if self.exchange.terminal_state() == TerminalState::Aborting { self.update_pending.set(false); }
+        Ok(())
+    }
+
+    /// Consume the final acknowledgement before any request slot is reused.
+    pub fn finish_request(&self) -> Result<()> {
+        if self.update_pending.get() && self.exchange.terminal_state() == TerminalState::Active {
+            self.exchange.wait(0, TAPS)?;
+            self.target.device.run(|| {
+                // SAFETY: request owners remain live until this acknowledgement retires.
+                unsafe { self.draft.device.library.cuda_stream_synchronize(self.exchange.stream(0)) }
+            })?;
+            self.update_pending.set(false);
+        }
+        Ok(())
     }
 
     pub fn finish_terminal(&self, drained: bool) {
@@ -211,9 +227,6 @@ impl<'a> RemoteDflash<'a> {
         let Some((first, last)) = tap_frontier(rows)? else { return Ok(()) };
         let pitch = self.draft.cfg.taps.len() * self.draft.cfg.hidden * 2;
         self.checked(|| {
-            // Conservatively retire the paired bridge before publishing the
-            // next context wave; metadata uploads themselves are stream-ordered.
-            self.synchronize()?;
             self.draft.device.run(|| self.draft.update_with(rows, || {
                 if self.update_pending.get() { self.exchange.wait(0, TAPS)?; }
                 // SAFETY: the checked row frontier is inside both tap owners.
@@ -233,7 +246,7 @@ impl<'a> RemoteDflash<'a> {
                 self.validate_target_peer(self.target_peer)?;
                 self.stream.device.run(|| unsafe {
                     // SAFETY: both same-device streams and the reusable ordering
-                    // event survive every queued update; the preceding wave drained.
+                    // event survive every queued update; stream order protects reuse.
                     self.draft.device.library.cuda_event_record(self.target_ready.raw, self.target_peer.stream)?;
                     self.draft.device.library.cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)
                 })?;
@@ -333,7 +346,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#151: final TAPS acknowledgement remains pending until another update"]
     fn repeated_context_and_head_bridges_have_no_wait_cycle() {
         for rounds in [1, 2, 8, 32] {
             let mut schedule = Schedule::default();
@@ -342,6 +354,8 @@ mod tests {
                 // Target-only rounds still update the drafter's context.
                 if round % 3 != 1 { draft(&mut schedule); }
             }
+            schedule.wait(0, "draft", TAPS, "request boundary context readers");
+            schedule.end_request();
             assert_eq!(order::check(&schedule), Ok(()));
         }
     }

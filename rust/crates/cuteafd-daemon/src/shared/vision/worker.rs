@@ -80,8 +80,8 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
         // SAFETY: this is the selected architecture-matching native library.
         let native = unsafe { cuteafd_ffi::NativeLibrary::load(&library) }?;
         native.cuda_set_device(0)?;
-        let (free, _) = native.cuda_memory_info()?;
-        ensure!(reserved <= free as u64, "media towers need {reserved} bytes including guard, only {free} free");
+        let (free, _) = native.cuda_physical_memory_info()?;
+        require_allocatable(reserved, free as u64)?;
     }
     if let (Some(image_config), Some(audio_config)) = (vision, audio) {
         let sm = architecture(&library)?;
@@ -115,6 +115,24 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
     let image = vision.map(|config| start(config, snapshot, library.clone(), budget).map(|(server, _)| server)).transpose()?;
     let audio = audio.map(|config| start_audio(config, snapshot, library.clone(), budget).map(|(server, _)| server)).transpose()?;
     Ok((image, audio, reserved))
+}
+
+pub(crate) fn check_cuda_room(library: &Path, device: i32, required: u64) -> Result<()> {
+    // SAFETY: selected architecture-matching native library, queried before tower allocation.
+    let native = unsafe { cuteafd_ffi::NativeLibrary::load(library) }?;
+    native.cuda_set_device(device)?;
+    let (free, _) = native.cuda_physical_memory_info()?;
+    require_allocatable(required, free as u64)
+}
+
+pub(crate) fn require_allocatable(required: u64, free: u64) -> Result<()> {
+    ensure!(required <= free,
+        "media tower allocation needs {required} bytes, cudaMemGetInfo reports only {free} immediately free bytes; \
+        Linux MemAvailable includes reclaimable file cache and is not CUDA allocation headroom \
+        (host MemAvailable={:?}, Cached={:?}); free physical memory or choose another encoder owner",
+        crate::shared::memory_report::unified_available_bytes().ok(),
+        crate::shared::memory_report::cached_bytes());
+    Ok(())
 }
 
 const AUDIO_GUARD_BYTES: u64 = 1 << 30;
@@ -156,6 +174,16 @@ mod tests {
         assert!(audio_reservation(7, AUDIO_GUARD_BYTES + 6).is_err());
         assert!(audio_reservation(u64::MAX, u64::MAX).is_err());
     }
+    #[test]
+    fn tower_preflight_requires_immediately_allocatable_memory() {
+        assert!(require_allocatable(3 << 30, 3 << 30).is_ok());
+        assert!(require_allocatable(0, 0).is_ok());
+        let error = require_allocatable(3 << 30, 2 << 30).unwrap_err().to_string();
+        for text in ["cudaMemGetInfo", "immediately free", "MemAvailable", "file cache", "another encoder owner"] {
+            assert!(error.contains(text), "{error}");
+        }
+    }
+
     #[test]
     fn hash_parser_fails_closed() {
         assert_eq!(parse_plan_hash(&"ab".repeat(32)).unwrap(), [0xab; 32]);

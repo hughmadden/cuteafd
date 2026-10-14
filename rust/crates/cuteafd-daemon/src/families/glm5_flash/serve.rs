@@ -759,6 +759,7 @@ fn take_ring(free: &mut Vec<usize>, wanted: bool, misses: &mut u64) -> Option<us
 /// Gives a finished or failed sequence's units, KDA slot and drafter slot back.
 fn release(family: &GlmfPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>, kda: &mut Vec<i32>,
     slots: &mut Vec<usize>, placement: &GlmfPlacement, slot: Option<usize>) {
+    crate::shared::decode_graph::fatal_drain(family.finish_request(), "GLM Flash request acknowledgement");
     if let Err(error) = cache.release(family, &placement.units) {
         tracing::error!(%error, "releasing a GLM 5.3 Flash sequence's units");
     }
@@ -939,6 +940,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         &memory_boundaries);
     ready();
     loop {
+        engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }

@@ -819,6 +819,20 @@ from="$1"
 to="$2"
 mkdir -p "/wip/slots/$to"
 cp -a "/wip/slots/$from/coordinator" "/wip/slots/$to/coordinator"
+python3 - "/wip/slots/$to/coordinator" "$to" <<'RESEAL'
+import hashlib, json, pathlib, sys
+# A cloned role keeps its measured artifacts but was sealed for the source slot:
+# re-seal it as this slot (recording the source) so launch identity checks pass.
+d, to = pathlib.Path(sys.argv[1]), sys.argv[2]
+raw = (d / "META.json").read_bytes()
+assert hashlib.sha256(raw).hexdigest() == (d / "FINGERPRINT").read_text().strip(), "cloned role seal mismatch"
+meta = json.loads(raw)
+meta["cloned_from"] = meta.get("cloned_from") or meta["slot"]
+meta["slot"] = to
+body = json.dumps(meta, indent=2, sort_keys=True).encode() + b"\n"
+(d / "META.json").write_bytes(body)
+(d / "FINGERPRINT").write_text(hashlib.sha256(body).hexdigest() + "\n")
+RESEAL
 CONTAINER
   if ((wip_spark_leg)); then
   ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$from_slot" "$slot" <<'CONTAINER'
@@ -828,6 +842,20 @@ to="$2"
 test -d "/wip/slots/$from/spark-expert"
 mkdir -p "/wip/slots/$to"
 cp -a "/wip/slots/$from/spark-expert" "/wip/slots/$to/spark-expert"
+python3 - "/wip/slots/$to/spark-expert" "$to" <<'RESEAL'
+import hashlib, json, pathlib, sys
+# A cloned role keeps its measured artifacts but was sealed for the source slot:
+# re-seal it as this slot (recording the source) so launch identity checks pass.
+d, to = pathlib.Path(sys.argv[1]), sys.argv[2]
+raw = (d / "META.json").read_bytes()
+assert hashlib.sha256(raw).hexdigest() == (d / "FINGERPRINT").read_text().strip(), "cloned role seal mismatch"
+meta = json.loads(raw)
+meta["cloned_from"] = meta.get("cloned_from") or meta["slot"]
+meta["slot"] = to
+body = json.dumps(meta, indent=2, sort_keys=True).encode() + b"\n"
+(d / "META.json").write_bytes(body)
+(d / "FINGERPRINT").write_text(hashlib.sha256(body).hexdigest() + "\n")
+RESEAL
 CONTAINER
   fi
 fi
@@ -1335,6 +1363,20 @@ if [ ! -d "/wip/slots/$to/coordinator" ]; then
   test -d "/wip/slots/$from/coordinator"
   mkdir -p "/wip/slots/$to"
   cp -a "/wip/slots/$from/coordinator" "/wip/slots/$to/coordinator"
+python3 - "/wip/slots/$to/coordinator" "$to" <<'RESEAL'
+import hashlib, json, pathlib, sys
+# A cloned role keeps its measured artifacts but was sealed for the source slot:
+# re-seal it as this slot (recording the source) so launch identity checks pass.
+d, to = pathlib.Path(sys.argv[1]), sys.argv[2]
+raw = (d / "META.json").read_bytes()
+assert hashlib.sha256(raw).hexdigest() == (d / "FINGERPRINT").read_text().strip(), "cloned role seal mismatch"
+meta = json.loads(raw)
+meta["cloned_from"] = meta.get("cloned_from") or meta["slot"]
+meta["slot"] = to
+body = json.dumps(meta, indent=2, sort_keys=True).encode() + b"\n"
+(d / "META.json").write_bytes(body)
+(d / "FINGERPRINT").write_text(hashlib.sha256(body).hexdigest() + "\n")
+RESEAL
 fi
 CONTAINER
 elif [[ -n "$from_slot" && "$role" == coordinator ]] && ((wip_spark_leg)); then
@@ -1346,6 +1388,20 @@ if [ ! -d "/wip/slots/$to/spark-expert" ]; then
   test -d "/wip/slots/$from/spark-expert"
   mkdir -p "/wip/slots/$to"
   cp -a "/wip/slots/$from/spark-expert" "/wip/slots/$to/spark-expert"
+python3 - "/wip/slots/$to/spark-expert" "$to" <<'RESEAL'
+import hashlib, json, pathlib, sys
+# A cloned role keeps its measured artifacts but was sealed for the source slot:
+# re-seal it as this slot (recording the source) so launch identity checks pass.
+d, to = pathlib.Path(sys.argv[1]), sys.argv[2]
+raw = (d / "META.json").read_bytes()
+assert hashlib.sha256(raw).hexdigest() == (d / "FINGERPRINT").read_text().strip(), "cloned role seal mismatch"
+meta = json.loads(raw)
+meta["cloned_from"] = meta.get("cloned_from") or meta["slot"]
+meta["slot"] = to
+body = json.dumps(meta, indent=2, sort_keys=True).encode() + b"\n"
+(d / "META.json").write_bytes(body)
+(d / "FINGERPRINT").write_text(hashlib.sha256(body).hexdigest() + "\n")
+RESEAL
 fi
 CONTAINER
 fi
