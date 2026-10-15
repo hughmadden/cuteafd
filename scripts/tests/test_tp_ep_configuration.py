@@ -988,6 +988,10 @@ class BuildScopeTest(unittest.TestCase):
         native = release[release.index("# Workers bootstrap first;"):release.index("api_url=")]
         self.assertLess(native.index('echo "== starting native Spark experts =="'),
                         native.rindex("start_coordinator"))
+        readiness = native[native.index('for pid in "${pids[@]}"'):native.rindex("start_coordinator")]
+        self.assertIn("native worker bootstrap ready", readiness)
+        self.assertIn("docker logs '$remote'", readiness)
+        self.assertNotIn("/dev/tcp", readiness)
 
     def test_native_pool_policy_changes_fingerprint_and_preserves_omitted_policy(self) -> None:
         expression = next(line for line in (ROOT / "scripts/launch/run-family.sh").read_text().splitlines()

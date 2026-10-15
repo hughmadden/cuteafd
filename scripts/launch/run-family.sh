@@ -1277,7 +1277,8 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 
 for i in "${!hosts[@]}"; do
   host="${hosts[$i]}"; remote="${spark_prefix}-${host}-${EXPERT_PORT}"
-  until release_ssh "$host" "test \"\$(docker inspect -f '{{.State.Status}}' '$remote' 2>/dev/null)\" = running && timeout 1 bash -c '</dev/tcp/127.0.0.1/$EXPERT_PORT'" 2>/dev/null; do
+  # A connect-and-close probe is an invalid selection frame and kills the worker.
+  until release_ssh "$host" "test \"\$(docker inspect -f '{{.State.Status}}' '$remote' 2>/dev/null)\" = running && docker logs '$remote' 2>&1 | grep -q 'native worker bootstrap ready'" 2>/dev/null; do
     ((SECONDS < deadline)) || { release_ssh "$host" "docker logs --tail 100 '$remote'" >&2 || true; release_die "$host native expert did not become ready"; }
     sleep 1
   done
