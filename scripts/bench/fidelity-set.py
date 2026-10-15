@@ -23,7 +23,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash, validate_set
 
-FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "glm5_flash", "deepseek_v4", "glm5")
+FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5")
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -408,6 +408,36 @@ def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures
     return validate_set(manifest)
 
 
+def rebind_text_set(source, source_tokenizer, tokenizer, *, family, model, version, arm, source_sha256):
+    """Reuse pinned text, never claim its generations came from the new root."""
+    from tokenizers import Tokenizer
+    if hashlib.sha256(source.read_bytes()).hexdigest() != source_sha256:
+        raise ValueError("published text source hash mismatch")
+    manifest = json.loads(source.read_text())
+    original_set = manifest["set_sha256"]
+    # Published windows redact deployment metadata while retaining the source set id.
+    # Their immutable publication file hash, not that source id, seals these bytes.
+    manifest["set_sha256"] = set_hash(manifest)
+    validate_set(manifest)
+    if any(w.get("media") for w in manifest["windows"]):
+        raise ValueError("pinned text reuse does not support media")
+    old, new = (Tokenizer.from_file(str(path)) for path in (source_tokenizer, tokenizer))
+    used = sorted({token for w in manifest["windows"] for token in w["tokens"]})
+    if any(old.id_to_token(token) is None or old.id_to_token(token) != new.id_to_token(token) for token in used):
+        raise ValueError("pinned text token ids differ between tokenizers")
+    if any(old.decode(w["tokens"], skip_special_tokens=False) != new.decode(w["tokens"], skip_special_tokens=False)
+           for w in manifest["windows"]):
+        raise ValueError("pinned text decodes differently")
+    manifest["pinned_text_source"] = {"sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "set_sha256": original_set, "family": manifest["family"],
+        "tokenizer_sha256": hashlib.sha256(source_tokenizer.read_bytes()).hexdigest(),
+        "compatibility": "all used ids and complete decoded windows equal", "used_ids": len(used)}
+    manifest.update(family=family, model=model, checkpoint=model, version=version,
+                    reference_snapshot=arm, tokenizer_sha256=hashlib.sha256(tokenizer.read_bytes()).hexdigest())
+    manifest["set_sha256"] = set_hash(manifest)
+    return validate_set(manifest)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--family", required=True, choices=FAMILIES)
@@ -418,6 +448,9 @@ def main(argv=None):
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--tokenizer", required=True, type=pathlib.Path)
     p.add_argument("--arm-manifest", required=True, type=pathlib.Path)
+    p.add_argument("--pinned-text", type=pathlib.Path, help="reuse an existing text set without generation")
+    p.add_argument("--source-tokenizer", type=pathlib.Path, help="verify every reused token against this tokenizer")
+    p.add_argument("--source-sha256", help="immutable published windows file hash")
     p.add_argument("--recording", action="append", type=pathlib.Path, default=[])
     p.add_argument("--media-fixtures", type=pathlib.Path, help="build a separate 8-window vision panel from fixtures.json")
     p.add_argument("--file-list", type=pathlib.Path, help="JSON array of first-party repo-relative paths")
@@ -436,10 +469,18 @@ def main(argv=None):
             p.error("--file-list may contain only tracked first-party Rust, Python or CUDA files")
         if any(path.startswith("third_party/") for path in files):
             p.error("third-party sources are not part of the fidelity recipe")
-    if not a.media_fixtures and not a.legacy_reference:
+    if not a.media_fixtures and not a.legacy_reference and not a.pinned_text:
         p.error("text recipe requires --legacy-reference; use the sealed legacy window from a published manifest")
     from tokenizers import Tokenizer
-    if a.media_fixtures:
+    if a.pinned_text:
+        if not a.source_tokenizer or not a.source_sha256 or a.media_fixtures or a.recording or a.file_list or a.legacy_reference:
+            p.error("--pinned-text requires --source-tokenizer and no generation/media inputs")
+        if a.checkpoint != a.model:
+            p.error("pinned text reference checkpoint must be the requested root model")
+        manifest = rebind_text_set(a.pinned_text, a.source_tokenizer, a.tokenizer, family=a.family,
+                                  model=a.model, version=a.version, arm=json.loads(a.arm_manifest.read_text()),
+                                  source_sha256=a.source_sha256)
+    elif a.media_fixtures:
         if a.recording or a.file_list or a.legacy_reference:
             p.error("--media-fixtures cannot combine with text recipe recordings/files/legacy reference")
         manifest = build_vision_set(family=a.family, model=a.model, checkpoint=a.checkpoint, version=a.version,

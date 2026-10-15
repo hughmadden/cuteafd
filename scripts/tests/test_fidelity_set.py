@@ -97,6 +97,35 @@ def make(state, **kwargs):
         version="test1", arm=policy(), tokenizer=FakeTokenizer(), probe=state["client"], **kwargs)
 
 
+def test_rebind_text_set_checks_published_hash_and_used_tokens(tmp_path):
+    import hashlib
+    from tokenizers import Tokenizer, models
+    from fidelity_windows import canonical, set_hash
+    tokenizer = Tokenizer(models.WordLevel({"a": 0, "b": 1}, unk_token="a"))
+    old, new = tmp_path / "old.json", tmp_path / "new.json"
+    tokenizer.save(str(old))
+    tokenizer.save(str(new))
+    manifest = {"schema": "cuteafd.fidelity.set/1", "family": "qwen4", "model": "source",
+                "checkpoint": "source", "generation_arm": {"checkpoint": "source"},
+                "quick_windows": ["w"], "windows": [{"id": "w", "block": "E", "bucket": "0-2K",
+                    "tokens": [0] * 576, "roles": ["ctx"] * 576, "score_from": 64}]}
+    manifest["set_sha256"] = set_hash(manifest)
+    source = tmp_path / "windows.json"
+    source.write_bytes(canonical(manifest))
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    kwargs = dict(family="qwen3_5", model="Qwen/Qwen3.5-9B", version="test", arm={}, source_sha256=digest)
+    result = builder.rebind_text_set(source, old, new, **kwargs)
+    assert result["windows"] == manifest["windows"]
+    assert result["generation_arm"] == manifest["generation_arm"]
+    assert result["pinned_text_source"]["used_ids"] == 1
+    assert result["family"] == "qwen3_5"
+    with pytest.raises(ValueError, match="source hash"):
+        builder.rebind_text_set(source, old, new, **{**kwargs, "source_sha256": "0" * 64})
+    Tokenizer(models.WordLevel({"a": 1, "b": 0}, unk_token="a")).save(str(new))
+    with pytest.raises(ValueError, match="token ids differ"):
+        builder.rebind_text_set(source, old, new, **kwargs)
+
+
 def test_64_window_recipe_is_deterministic_and_hashed(fake_server):
     manifest = make(fake_server)
     again = make(fake_server)
