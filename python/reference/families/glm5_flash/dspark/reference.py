@@ -248,10 +248,137 @@ def greedy_picks(golden: Path, tokens: int, vocab: int) -> list[int]:
     return out
 
 
+def live_decode(drafter, evaluate, prompt, max_new_tokens, eos_tokens, *, markov=True):
+    """Exact causal full-prefix replay: no recurrent-cache crop approximation."""
+    if not prompt or max_new_tokens < 1:
+        raise ValueError("live decoding needs a nonempty prompt and positive token budget")
+    prefix = list(prompt)
+    taps, logits = evaluate(prefix, [len(prefix) - 1])
+    anchor = int(logits[0].argmax())
+    emitted, lengths = [], []
+    while len(emitted) < max_new_tokens:
+        position = len(prefix)
+        first = max(0, position - drafter.window) if drafter.window is not None else 0
+        rows = torch.arange(first, position, device=drafter.device)
+        context = drafter.context(taps[first:position], rows)
+        hidden = drafter.body(anchor, position, context)
+        proposals = (drafter.heads_(anchor, hidden)[0] if markov else
+                     F.linear(hidden, drafter.live_head).argmax(-1).tolist())
+        width = min(drafter.block, max_new_tokens - len(emitted) - 1)
+        verify_tokens = prefix + [anchor] + proposals[:width]
+        verified_taps, logits = evaluate(verify_tokens, list(range(position, position + width + 1)))
+        posterior = logits.argmax(-1).tolist()
+        accepted = 0
+        while accepted < width and proposals[accepted] == posterior[accepted]:
+            accepted += 1
+        committed = [anchor] + proposals[:accepted]
+        stop = next((i + 1 for i, token in enumerate(committed) if token in eos_tokens), len(committed))
+        committed = committed[:stop]
+        lengths.append(len(committed))
+        emitted.extend(committed)
+        prefix.extend(committed)
+        # Retain only causal target outputs of committed input rows. The next
+        # replay recomputes the complete recurrent state, including GDN state.
+        taps = verified_taps[:len(prefix)]
+        if committed[-1] in eos_tokens:
+            break
+        anchor = posterior[accepted]
+    return {"tokens": emitted, "accepted_lengths": lengths,
+            "completion_tokens": len(emitted), "spec_verify_ct": len(lengths),
+            "spec_accept_length": len(emitted) / len(lengths)}
+
+
+def run_live(args):
+    """Compare explicit Markov proposals and a bundled-style base-head chain."""
+    import hashlib
+    import importlib.util
+    from transformers import AutoTokenizer
+    root = Path(__file__).resolve().parents[5]
+    path = root / "scripts/qualify/qwen3_5/reference.py"
+    spec = importlib.util.spec_from_file_location("dense_live_reference", path)
+    reference = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reference)
+    model, fp32 = reference.load_reference(args.target)
+    from shape_invariant import install, install_eager
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+    install()
+    install_eager(modeling_qwen3_5)
+    tokenizer = AutoTokenizer.from_pretrained(args.target, local_files_only=True)
+    drafter = Drafter(args.draft, args.device, target=args.target)
+    language = model.model.language_model
+    drafter.live_head = model.lm_head.weight
+    if drafter.hidden != language.embed_tokens.weight.shape[1]:
+        raise ValueError("target language-model embedding differs from drafter")
+
+    def evaluate(tokens, positions):
+        captured, hooks = {}, []
+        def hook(layer):
+            def save(_module, _inputs, output):
+                value = output[0] if isinstance(output, tuple) else output
+                if value.dtype != torch.bfloat16 or value.ndim != 3:
+                    raise ValueError("live taps require BF16 post-block target outputs")
+                captured[layer] = value[0].detach()
+            return save
+        for layer in drafter.taps:
+            hooks.append(language.layers[layer].register_forward_hook(hook(layer)))
+        try:
+            ids = torch.tensor([tokens], dtype=torch.long, device=args.device)
+            keep = torch.tensor(positions, dtype=torch.long, device=args.device)
+            output = model(input_ids=ids, use_cache=False, logits_to_keep=keep)
+            logits = output.logits[0].float()
+            if not torch.isfinite(logits).all():
+                raise ValueError("non-finite live target logits")
+            return torch.cat([captured[layer] for layer in drafter.taps], -1), logits
+        finally:
+            for handle in hooks:
+                handle.remove()
+
+    prompts = args.prompt or [
+        "Write a Python function that returns the first n Fibonacci numbers. Explain edge cases.",
+        "A shop has 12 boxes with 8 pencils each and sells 37 pencils. How many remain?",
+        "Explain why a hash table has average constant-time lookups and give one limitation.",
+    ]
+    results = []
+    eos = model.generation_config.eos_token_id
+    eos = set(eos if isinstance(eos, list) else [eos])
+    with torch.inference_mode():
+        for prompt in prompts:
+            ids = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True,
+                                                add_generation_prompt=True, enable_thinking=True)
+            arms = {}
+            for markov in (False, True):
+                arm = "markov" if markov else "base_head"
+                arms[arm] = live_decode(drafter, evaluate, ids, args.max_new_tokens, eos, markov=markov)
+                arms[arm]["text"] = tokenizer.decode(arms[arm]["tokens"])
+                print(json.dumps({"prompt": len(results), "arm": arm, **arms[arm]}), flush=True)
+            if arms["markov"]["tokens"] != arms["base_head"]["tokens"]:
+                raise ValueError("live speculative arms differ in emitted greedy tokens")
+            results.append({"prompt": prompt, "prompt_tokens": len(ids), "arms": arms})
+    report = {"mode": "live", "thinking": True, "temperature": 0, "target_dtype": "bf16",
+              "target_revision": args.target.name, "draft_revision": args.draft.name,
+              "target_replay": "full-prefix-use_cache-false", "taps": drafter.taps,
+              "native_fp32_parameters": fp32, "torch": torch.__version__,
+              "oracle_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "base_head_semantics": "bundled-style proposals, explicit exact target replay (not spec_generate)",
+              "requests": results}
+    for arm in ("base_head", "markov"):
+        completed = sum(result["arms"][arm]["completion_tokens"] for result in results)
+        verifies = sum(result["arms"][arm]["spec_verify_ct"] for result in results)
+        report[arm] = {"completion_tokens": completed, "spec_verify_ct": verifies,
+                       "spec_accept_length": completed / verifies,
+                       "request_mean": sum(result["arms"][arm]["spec_accept_length"] for result in results) / len(results)}
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "live.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps({arm: report[arm] for arm in ("base_head", "markov")}), flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--draft", type=Path, required=True)
-    parser.add_argument("--golden", type=Path, required=True)
+    parser.add_argument("--golden", type=Path)
+    parser.add_argument("--live", action="store_true", help="greedy chat/thinking proposals with exact target replay")
+    parser.add_argument("--prompt", action="append", help="live user prompt; may repeat (default three short prompts)")
+    parser.add_argument("--max-new-tokens", type=int, default=48, help="bounded live completion length")
     parser.add_argument("--target", type=Path, help="target snapshot supplying the borrowed embedding/head")
     parser.add_argument("--streams", type=int, choices=(1, 4), default=4, help="dense=1, GLM mHC=4")
     parser.add_argument("--positions", help="anchor positions, e.g. 64:1500:16,1510")
@@ -262,6 +389,17 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--check-only", action="store_true", help="CPU header/config/golden preflight; no weights loaded")
     args = parser.parse_args()
+    if args.live:
+        if args.target is None or args.out is None or args.max_new_tokens < 1:
+            parser.error("--live requires --target, --out and a positive --max-new-tokens")
+        if args.golden or args.positions or args.score or args.check_only:
+            parser.error("--live cannot be combined with golden replay options")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        run_live(args)
+        return
+    if args.golden is None:
+        parser.error("golden replay requires --golden")
     if args.positions and args.out is None:
         parser.error("--positions requires --out")
     if args.check_only:

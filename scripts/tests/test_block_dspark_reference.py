@@ -106,6 +106,39 @@ def test_scored_logits_offset_is_not_a_target_position(tmp_path):
     assert oracle.greedy_picks(tmp_path, 6, 2) == [-1, -1, -1, 1, 0, -1]
 
 
+@pytest.mark.parametrize("wrong_proposals", [False, True])
+def test_live_replay_counts_bonus_and_discards_rejected_suffix(wrong_proposals):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from types import SimpleNamespace
+    oracle = load(ORACLE, "live_block_reference")
+    calls = []
+
+    def evaluate(tokens, positions):
+        calls.append(list(tokens))
+        logits = torch.full((len(positions), 32), -100.)
+        for row, position in enumerate(positions):
+            logits[row, tokens[position] + 1] = 1.
+        return torch.tensor(tokens)[:, None], logits
+
+    drafter = SimpleNamespace(block=3, window=None, device="cpu")
+    drafter.context = lambda taps, positions: taps
+    drafter.body = lambda anchor, position, context: anchor
+    drafter.heads_ = lambda anchor, hidden: ([anchor + 1, anchor + (9 if wrong_proposals else 2), anchor + 3], [])
+    result = oracle.live_decode(drafter, evaluate, [0, 1], 8, set())
+    assert result["tokens"] == list(range(2, 10))
+    assert sum(result["accepted_lengths"]) == 8
+    assert result["spec_accept_length"] == 8 / result["spec_verify_ct"]
+    assert result["accepted_lengths"] == ([2, 2, 2, 2] if wrong_proposals else [4, 4])
+    assert all(call[:2] == [0, 1] for call in calls)
+    stopped = oracle.live_decode(drafter, evaluate, [0, 1], 8, {4})
+    assert stopped["tokens"] == [2, 3, 4]
+    assert sum(stopped["accepted_lengths"]) == 3
+    single = oracle.live_decode(drafter, evaluate, [0, 1], 1, set())
+    assert single["tokens"] == [2]
+    assert single["spec_accept_length"] == 1
+
+
 def test_gqa_block_and_yarn_match_bundled_attention():
     torch = pytest.importorskip("torch")
     pytest.importorskip("safetensors")
