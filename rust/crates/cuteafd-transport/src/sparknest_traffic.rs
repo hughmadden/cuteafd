@@ -398,7 +398,7 @@ mod tests {
     fn socket_replacement_reconnects_with_unknown_restart_interval() {
         use std::os::unix::net::UnixListener;
         let dir =
-            std::env::temp_dir().join(format!("cuteafd-storage-restart-{}", std::process::id()));
+            std::env::temp_dir().join(format!("snr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rdma-counters.sock");
         let listener = UnixListener::bind(&path).unwrap();
