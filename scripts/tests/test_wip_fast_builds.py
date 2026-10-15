@@ -245,7 +245,7 @@ def test_capable_builds_hold_no_outer_build_lock_or_seed_gate(tmp_path, monkeypa
     config.write_text('SPARK_COUNT=4\n')
     entry = {'name': 'v41-max', 'family': 'deepseek_v41', 'config': str(config), 'sparks': ['ostrich', 'dodo', 'emu', 'kiwi']}
     arms = cards.arms_from(['cand=c:s'])
-    cards.build_arms(['cand=new'], arms, [entry], tmp_path, 'task', True)
+    cards.build_arms({'cand': 'new'}, arms, [entry], tmp_path, 'task', True)
     text = capsys.readouterr().out
     assert 'build.lock' not in text and 'wip.sh --slot s --role both' in text
     assert arms['cand']['build_slot'] is True
@@ -269,7 +269,7 @@ def test_zero_spark_card_sets_build_coordinator_only(tmp_path, monkeypatch, caps
     config.write_text('SPARK_COUNT=0\n')
     entry = {'name': 'glmf-max', 'family': 'glm5_flash', 'config': str(config), 'sparks': [], 'gpus': [0, 1]}
     arms = cards.arms_from(['cand=c:s'])
-    cards.build_arms(['cand=new'], arms, [entry], tmp_path, 'task', True)
+    cards.build_arms({'cand': 'new'}, arms, [entry], tmp_path, 'task', True)
     assert '--role coordinator' in capsys.readouterr().out
     assert arms['cand']['build_role'] == 'coordinator'
 
