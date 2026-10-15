@@ -6,6 +6,14 @@ private one-card matrices and a 0600 API key, and runs `cuteafd bench smoke`
 under `setsid` with numeric exit files. Smoke alone owns serving locks. Use a
 current CLI containing the opt-in observer/precheck hooks for probes.
 
+Fabric attribution reads each serving host's SparkNest 0.4.1 schema-1 stream.
+The launcher mounts only its dedicated `/srv/sparknest/run` directory read-only,
+when that directory already exists, and connects to `run/rdma-counters.sock`
+inside it. The stable directory mount lets the observer reconnect after the
+storage daemon replaces its socket on restart (ADR-052); it does not expose
+the parent state directory or create missing directories. Missing, restarting
+or stale sources remain unknown until fresh samples establish a new interval.
+
 ```sh
 python3 scripts/bench/wip-cards.py --interleave --repeats 3 \
   --cards v41-flash-min --arm baseline=my-base:slot --arm candidate=my-new:slot \
