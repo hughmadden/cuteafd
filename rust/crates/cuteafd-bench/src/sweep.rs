@@ -21,7 +21,7 @@ pub const TOKENS: u64 = 192;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Point {
     pub c: usize,
-    /// `levels` or `post_load` (C1 after the widest level).
+    /// `levels`, `post_load` (C1 after the widest level) or `post_load_repeat` (that C1 re-sending the levels C1's prompts).
     pub phase: String,
     pub aggregate_tok_s: f64,
     pub per_request_tok_s: f64,
@@ -95,16 +95,44 @@ fn timed(on_timed: &mut OnTimed) -> Result<()> {
     on_timed.take().map_or(Ok(()), |open| open())
 }
 
-fn measure(client: &Client, c: usize, phase: &str, on_timed: &mut OnTimed) -> Result<Point> {
-    let batch = || -> Vec<Result<Timed>> {
-        wave(client, (0..c).map(|_| plain(&format!("[{}] {}", nonce(), CONTENT[0].1), TOKENS)).collect())
+/// The exact request prompts of one C1 measurement, kept so a later point can re-send them.
+#[derive(Debug, Clone, PartialEq)]
+struct Prompts {
+    warm: Vec<String>,
+    timed: Vec<String>,
+}
+
+impl Prompts {
+    /// Fresh nonces: one distinct prompt per request of the warm-up and timed waves.
+    fn fresh(c: usize) -> Prompts {
+        let wave = || (0..c).map(|_| format!("[{}] {}", nonce(), CONTENT[0].1)).collect();
+        Prompts { warm: wave(), timed: wave() }
+    }
+}
+
+/// Measures concurrency `c`; `repeat` re-sends those prompts instead of drawing fresh ones.
+/// Returns the point and the prompts used.
+fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, on_timed: &mut OnTimed) -> Result<(Point, Prompts)> {
+    let prompts = repeat.cloned().unwrap_or_else(|| Prompts::fresh(c));
+    let batch = |texts: &[String]| -> Vec<Result<Timed>> {
+        wave(client, texts.iter().map(|text| plain(text, TOKENS)).collect())
+    };
+    // A repeat only means something if nothing came from the prefix cache.
+    let uncached = |results: Vec<Result<Timed>>| -> Result<Vec<Result<Timed>>> {
+        if repeat.is_some() {
+            if let Some(hit) = results.iter().flatten().map(|r| r.chat.timing.cached_tokens).find(|&n| n > 0) {
+                bail!("C{c} {phase}: a repeated request reported {hit} cached tokens; post_load_repeat only means \
+                    something with the prefix cache disabled (PREFIX_CACHE_ENTRIES=0)");
+            }
+        }
+        Ok(results)
     };
     // Prime each width first: graphs, workspaces and mapped tables.
-    batch().into_iter().collect::<Result<Vec<_>>>().with_context(|| format!("C{c} warm-up"))?;
+    uncached(batch(&prompts.warm))?.into_iter().collect::<Result<Vec<_>>>().with_context(|| format!("C{c} warm-up"))?;
     timed(on_timed)?;
     let mark = client.thermal_mark();
     let fabric_mark = client.fabric_mark();
-    let results = batch();
+    let results = uncached(batch(&prompts.timed))?;
     let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
     let thermal = client.thermal_since(mark);
     let errors = results.iter().filter(|r| r.is_err()).count();
@@ -114,8 +142,9 @@ fn measure(client: &Client, c: usize, phase: &str, on_timed: &mut OnTimed) -> Re
     }
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
-    Ok(Point { c, phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
-        ttft_s: median(&mut ttft), errors, thermal, fabric })
+    let point = Point { c, phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
+        ttft_s: median(&mut ttft), errors, thermal, fabric };
+    Ok((point, prompts))
 }
 
 /// Cold prefill at each length: fit tokens per filler word from two short
@@ -160,13 +189,17 @@ pub fn parse_lengths(text: &str) -> Result<Vec<u64>, String> {
 }
 
 /// Runs the sweep against `url`; `api_key` is the server's bearer key.
-pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, prefill_lengths: &[u64]) -> Result<Sweep> {
-    run_windowed(url, api_key, levels, post_load_c1, prefill_lengths, false, None)
+pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, post_load_repeat: bool,
+    prefill_lengths: &[u64]) -> Result<Sweep> {
+    run_windowed(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths, false, None)
 }
 
 /// [`run`], calling `on_timed` once just before the first timed request.
-pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, prefill_lengths: &[u64],
-    fabric: bool, mut on_timed: OnTimed) -> Result<Sweep> {
+pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
+    post_load_repeat: bool, prefill_lengths: &[u64], fabric: bool, mut on_timed: OnTimed) -> Result<Sweep> {
+    if post_load_repeat && !(post_load_c1 && levels.contains(&1)) {
+        bail!("post_load_repeat needs post_load_c1 and a levels list that includes 1 (it replays the levels C1)");
+    }
     let key = api_key.map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
     let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key).with_fabric(fabric);
     let _subscription = client.fabric_subscription();
@@ -179,11 +212,15 @@ pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
         if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("prefill".into(), window); }
     }
     let mark = client.thermal_mark();
+    let mut c1_prompts = None;
     for &c in levels {
-        sweep.points.push(measure(&client, c, "levels", &mut on_timed)?);
+        let (point, prompts) = measure(&client, c, "levels", None, &mut on_timed)?;
+        if c == 1 && post_load_repeat { c1_prompts = Some(prompts); }
+        sweep.points.push(point);
     }
     if post_load_c1 {
-        sweep.points.push(measure(&client, 1, "post_load", &mut on_timed)?);
+        let (phase, repeat) = if post_load_repeat { ("post_load_repeat", c1_prompts.as_ref()) } else { ("post_load", None) };
+        sweep.points.push(measure(&client, 1, phase, repeat, &mut on_timed)?.0);
     }
     if !levels.is_empty() || post_load_c1 {
         if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("decode".into(), window); }
@@ -212,6 +249,30 @@ mod tests {
         assert_eq!(parse_lengths("8192,32768").unwrap(), vec![8192, 32768]);
         for bad in ["", "100", "x", "2000000"] {
             assert!(parse_lengths(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn repeat_reuses_prompts_and_wide_levels_stay_fresh() {
+        let c1 = Prompts::fresh(1);
+        assert_ne!(c1.warm, c1.timed);
+        // The repeat takes the stored prompts verbatim.
+        let again = Some(&c1).cloned().unwrap();
+        assert_eq!(again, c1);
+        assert_eq!(again.warm[0].as_bytes(), c1.warm[0].as_bytes());
+        assert_eq!(again.timed[0].as_bytes(), c1.timed[0].as_bytes());
+        // Wider levels draw distinct nonces per request and per wave.
+        let wide = Prompts::fresh(16);
+        let all: std::collections::HashSet<&String> = wide.warm.iter().chain(&wide.timed).collect();
+        assert_eq!(all.len(), 32);
+        assert_ne!(Prompts::fresh(1), c1);
+    }
+
+    #[test]
+    fn repeat_needs_post_load_c1_and_level_one() {
+        for (levels, c1) in [(&[1usize, 16][..], false), (&[16][..], true)] {
+            let err = run("http://127.0.0.1:1", None, levels, c1, true, &[]).unwrap_err().to_string();
+            assert!(err.contains("post_load_repeat needs post_load_c1"), "{err}");
         }
     }
 

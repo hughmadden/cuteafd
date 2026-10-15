@@ -1625,6 +1625,8 @@ def main():
                         '(JSON [{id, prompt, nonce}]); default: the shipped scripts/bench/fixtures/spec-lossless-set-v1.json')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
+    parser.add_argument('--post-load-repeat', action='store_true', help='make that post-load C1 re-send the levels C1 prompts '
+                        '(needs PREFIX_CACHE_ENTRIES=0; the sweep fails if a repeat hits the cache)')
     parser.add_argument('--context-lengths', metavar='N,N', help='shared base contexts for context_load (256..1048576; default 32768,131072)')
     parser.add_argument('--context-levels', metavar='C,C', help='context_load concurrency levels (distinct 1..256; default 1,8,16)')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
@@ -1720,6 +1722,8 @@ def main():
             arm_overrides.setdefault(name, {}).setdefault(card, {}).update(values)
     if args.post_load_c1 and not args.levels:
         parser.error('--post-load-c1 needs --levels')
+    if args.post_load_repeat and not args.post_load_c1:
+        parser.error('--post-load-repeat needs --post-load-c1')
     levels = None
     if args.levels:
         levels = [int(x) for x in args.levels.split(',') if x.strip()]
@@ -1771,6 +1775,8 @@ def main():
             card['levels'] = levels
             if args.post_load_c1:
                 card['post_load_c1'] = True
+                if args.post_load_repeat:
+                    card['post_load_repeat'] = True
         if args.trace and card.get('family') == 'deepseek_v41' and not launcher_forwards_v41_trace(args.repo):
             raise ValueError(f"{card['name']}: this checkout's launcher does not forward SPECULATION_TRACE on the V4.1 path")
     probes, arm_probes = probe_selection(args.probe, cards, arms)
@@ -1878,7 +1884,7 @@ def main():
                     Path(job['entry']['set']['PROFILE_DIR']).mkdir(exist_ok=True)
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
-    fields = ['fabric'] + (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+    fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \

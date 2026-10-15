@@ -112,6 +112,10 @@ pub struct Entry {
     /// Re-measure C1 after the widest sweep level (post-load C1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_load_c1: Option<bool>,
+    /// Make that post-load C1 re-send the levels C1's exact prompts (needs
+    /// `PREFIX_CACHE_ENTRIES=0`: the sweep fails if a repeat hits the cache).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_load_repeat: Option<bool>,
     /// Cold prefill at these prompt lengths, in the same sweep (`[8192]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_lengths: Option<Vec<u64>>,
@@ -247,6 +251,7 @@ impl Entry {
             observer: self.observer.clone().or_else(|| defaults.observer.clone()),
             levels: self.levels.clone().or_else(|| defaults.levels.clone()),
             post_load_c1: self.post_load_c1.or(defaults.post_load_c1),
+            post_load_repeat: self.post_load_repeat.or(defaults.post_load_repeat),
             prefill_lengths: self.prefill_lengths.clone().or_else(|| defaults.prefill_lengths.clone()),
             baseline: self.baseline.or(defaults.baseline),
             window: self.window.clone().or_else(|| defaults.window.clone()),
@@ -664,6 +669,17 @@ fn save_state(path: &Path, state: &BTreeMap<String, Outcome>) -> Result<()> {
     Ok(())
 }
 
+/// `post_load_c1` runs after the widest level; `post_load_repeat` replays the levels C1.
+fn check_post_load(entry: &Entry) -> Result<()> {
+    if entry.post_load_c1 == Some(true) && entry.levels.is_none() {
+        bail!("{}: post_load_c1 needs levels (it runs after the widest one)", entry.name);
+    }
+    if entry.post_load_repeat == Some(true) && entry.post_load_c1 != Some(true) {
+        bail!("{}: post_load_repeat needs post_load_c1 (it replays the levels C1 there)", entry.name);
+    }
+    Ok(())
+}
+
 pub fn run(args: SmokeArgs) -> Result<()> {
     let matrix: Matrix = serde_json::from_str(&std::fs::read_to_string(&args.matrix)
         .with_context(|| format!("{}", args.matrix.display()))?).context("parsing the matrix")?;
@@ -698,9 +714,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
             let text = lengths.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
             crate::sweep::parse_lengths(&text).map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
         }
-        if entry.post_load_c1 == Some(true) && entry.levels.is_none() {
-            bail!("{}: post_load_c1 needs levels (it runs after the widest one)", entry.name);
-        }
+        check_post_load(&entry)?;
         if entry.window.is_some() && entry.levels.is_none() && entry.prefill_lengths.is_none() {
             bail!("{}: window needs levels or prefill_lengths (it frames the sweep's timed requests)", entry.name);
         }
@@ -725,9 +739,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} window={} lossless_set={} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
+            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} baseline={} window={} lossless_set={} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
                 e.name, e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
-                e.post_load_c1.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(),
+                e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.context_lengths, e.context_levels, e.fabric.unwrap_or(true), e.set);
         }
         return Ok(());
@@ -1008,7 +1022,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 })
             });
             let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
-                entry.post_load_c1.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true), open);
+                entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true), open);
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;
@@ -1172,6 +1186,20 @@ pub fn describe(matrix: &Matrix) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn post_load_repeat_needs_post_load_c1_and_merges() {
+        let named = |name: &str| Entry { name: name.into(), levels: Some(vec![1, 16]), ..Entry::default() };
+        let bad = Entry { post_load_repeat: Some(true), ..named("a") };
+        assert!(check_post_load(&bad).unwrap_err().to_string().contains("needs post_load_c1"));
+        let good = Entry { post_load_c1: Some(true), post_load_repeat: Some(true), ..named("a") };
+        check_post_load(&good).unwrap();
+        check_post_load(&named("a")).unwrap();
+        let defaults = Entry { post_load_repeat: Some(true), ..Entry::default() };
+        assert_eq!(Entry::default().merged(&defaults).post_load_repeat, Some(true));
+        let own = Entry { post_load_repeat: Some(false), ..Entry::default() };
+        assert_eq!(own.merged(&defaults).post_load_repeat, Some(false));
+    }
+
     use super::*;
 
     fn entry(name: &str, gpus: &[u32], sparks: &[&str], port: u16) -> Entry {
