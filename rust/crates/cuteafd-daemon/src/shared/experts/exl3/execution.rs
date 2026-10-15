@@ -977,6 +977,45 @@ mod tests {
     }
 
     #[test]
+    fn v41_local_and_tp2_exl3_freeze_all_decode_rows_before_module_load() -> Result<()> {
+        use crate::shared::experts::rtx::RtxSelectionPolicy;
+        use cuteafd_loader::placement::families::deepseek_v41::exl3_capacities;
+        for (local, tile) in [(true, [64, 256, 64, 256]), (false, [64, 128, 64, 128])] {
+            let root = tempfile::tempdir()?;
+            for capacity in [1, 16, 80, 256] {
+                let directory = root.path().join(format!("m{capacity}"));
+                std::fs::create_dir(&directory)?;
+                let recipe = if capacity == 16 { [128, 128, 128, 128] } else { tile };
+                std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+                    "capacity": capacity, "tile": recipe, "bits": [3, 4],
+                    "output_dtype": "fp32", "direct": false
+                }))?)?;
+            }
+            for maximum in [1, 16, 80, 256] {
+                let capacities = exl3_capacities(maximum, local)?;
+                let paths: Vec<_> = capacities.iter().map(|c| root.path().join(format!("m{c}"))).collect();
+                let plan = Exl3ReductionPlan::new(&paths)?;
+                for rows in 1..=maximum.min(80) as usize {
+                    let index = plan.execution_index(rows, rows, capacities.iter().map(|&c| c as usize))?;
+                    assert_eq!(capacities[index], if rows == 1 { 1 } else { 80 });
+                    let tp2_index = RtxSelectionPolicy::CanonicalDecode.execution_index(
+                        rows, rows, capacities.iter().map(|&c| c as usize),
+                        || plan.execution_index(rows, rows, capacities.iter().map(|&c| c as usize)))?;
+                    assert_eq!(tp2_index, index);
+                }
+                if maximum > 80 {
+                    assert_eq!(capacities[plan.execution_index(81, 81,
+                        capacities.iter().map(|&c| c as usize))?], 256);
+                }
+            }
+            // No compatible grouped export: refuse before any allocation or module load.
+            let narrow = [root.path().join("m1"), root.path().join("m16")];
+            assert!(Exl3ReductionPlan::new(&narrow).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn family_row_policy_admits_every_live_tail() -> Result<()> {
         use cuteafd_core::ExpertGeometry as G;
         for geometry in [G::DEEPSEEK_V41, G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO,
