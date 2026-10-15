@@ -58,6 +58,33 @@ pub fn scan(root: &Path) -> Result<Vec<Placed>> {
     Ok(placed)
 }
 
+/// Re-renders the images a published run already carries from its own
+/// `report.json`, so a card placed under an earlier fidelity rule shows the
+/// verdict the rule in force now reaches.
+///
+/// Exports are never edited after publication, so the images are what goes
+/// stale; the data they came from does not. The set re-rendered is the one the
+/// run's exports are drawn from, and only files already present are written —
+/// publishing never adds an export the run did not place — and only when the
+/// bytes differ, which keeps a report whose card is already current (and a
+/// repeated publish) from touching the tree at all.
+fn rerender(dir: &Path, report: &Report) -> Result<()> {
+    let mut names: Vec<String> = ["card.svg", "card.png", "report.svg", "report.png"]
+        .map(str::to_string).to_vec();
+    names.extend(crate::render::report::shown(report).iter().map(|id| format!("panel-{id}.svg")));
+    for name in names {
+        let path = dir.join(&name);
+        // Only files the run already has: publishing never adds an export the
+        // run did not place. `report.json` is the data, not a rendering of it.
+        if !path.is_file() {
+            continue;
+        }
+        let Some((_, bytes)) = crate::http::export(report, &name) else { continue };
+        crate::cli::write_bytes_if_changed(&path, &bytes)?;
+    }
+    Ok(())
+}
+
 fn coordinator_budget(report: &Report) -> Option<f64> {
     report.server.coordinator_budget()
 }
@@ -219,17 +246,27 @@ fn quality_cell(b: &crate::report::Baseline) -> String {
 }
 
 // Publication notes are report data; escape text and restrict links to archived reports.
+//
+// The note's stored verdict sentence leads a policy the publisher applies now:
+// a calibrated W4A4 checkpoint's fidelity is informational, so its card must
+// not open with "FAIL" just because the note was written while it failed. The
+// verdict shown is the one the report's quality reaches under the rule in
+// force now; the note keeps only its prose, its measured numbers and its links.
 fn caveat(p: &Placed) -> String {
     let Some(note) = p.report.server.setting("qualification.caveat") else { return String::new() };
-    let escaped = crate::render::svg::escape(note);
-    let mut text = escaped.strip_prefix("FAIL: not recommended.").map_or_else(|| escaped.clone(),
-        |rest| format!("<b>FAIL: not recommended.</b>{rest}"));
+    let prose = crate::render::svg::escape(crate::quality::without_verdict(note));
+    let mut text = match crate::quality::warning(&p.report) {
+        Some(verdict) if prose.is_empty() => format!("<b>{verdict}</b>"),
+        Some(verdict) => format!("<b>{verdict}</b> {prose}"),
+        None => prose,
+    };
     if let (Some(href), Some(label)) = (p.report.server.setting("qualification.caveat-link"),
         p.report.server.setting("qualification.caveat-link-label")) {
         if href.starts_with("benchmarks/") && !href.split('/').any(|part| part == "..") {
             text.push_str(&format!("<a href=\"{}\">{}</a>.", crate::render::svg::escape(href), crate::render::svg::escape(label)));
         }
     }
+    if text.is_empty() { return String::new() }
     format!("<br><sub>{text}</sub>")
 }
 
@@ -466,6 +503,12 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
         bail!("publish reports from one release at a time, or set CUTEAFD_RELEASE_ROW");
     }
     let placed = scan(root)?;
+    // The documents are rebuilt from every placed report, and so are its images:
+    // a card whose policy changed is re-rendered here whether or not its run was
+    // named on this command line, because the table that shows it is.
+    for p in &placed {
+        rerender(&root.join(&p.dir), &p.report)?;
+    }
     let release = releases.into_iter().next().or_else(|| {
         dirs.is_empty().then(|| placed.iter().find_map(report_release)).flatten()
     });
@@ -724,6 +767,11 @@ mod tests {
     #[test]
     fn publication_caveats_are_escaped_report_data_for_fit_and_no_fit() {
         let mut p = marked("with-note-min", 1, None);
+        // A card that failed its gates under the rule in force now keeps the
+        // verdict; the note only supplies the prose around it.
+        let baseline = p.report.baseline.as_mut().unwrap();
+        baseline.quality.checks.iter_mut().find(|c| c.id == "fidelity").unwrap().status = crate::report::CheckStatus::Fail;
+        baseline.quality.settle();
         let setting = |name: &str, value: &str| crate::report::Setting {
             name: name.into(), value: Some(value.into()), source: "publication".into(), ..Default::default()
         };
@@ -741,6 +789,111 @@ mod tests {
         p.report.server.configuration.settings.push(setting("qualification.no-fit", "over budget"));
         p.report.server.configuration.settings.push(setting("simulated", "5090"));
         assert!(results(&[p.clone()]).contains(&caveat(&p)));
+        // A panel a later policy reclassifies: the same note, quality that now
+        // passes, so the caption drops the verdict sentence and keeps its prose.
+        let mut ok = marked("reclassified-min", 1, None);
+        ok.report.server.configuration.settings.push(
+            setting("qualification.caveat", "FAIL: not recommended. KL 0.039, inside the calibrated quant's band."));
+        let reclassified = caveat(&ok);
+        assert!(reclassified.contains("KL 0.039, inside the calibrated quant&#39;s band."), "{reclassified}");
+        assert!(!reclassified.contains("FAIL"), "{reclassified}");
+    }
+
+    /// A checkpoint directory whose own `config.json` declares `algo` for its
+    /// routed experts: what the fidelity rule reads, never the model's name.
+    fn hub_snapshot(hub: &Path, algo: &str) -> PathBuf {
+        let path = hub.join("models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/2061e0b0");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("config.json"), serde_json::json!({"quantization_config":
+            {"quant_method": "modelopt", "quant_algo": algo, "group_size": 16, "quantized_layers":
+                {"model.language_model.layers.0.mlp.experts": {"quant_algo": algo}}}}).to_string()).unwrap();
+        path
+    }
+
+    /// The Qwen NVFP4 max card as it was published: KL 0.039 and top-1 93.7%
+    /// against a bar of 0.040 and 94.0%, stored as a failure by the rule in
+    /// force at the time, with a note that leads with that verdict.
+    fn published_qwen_card(hub: &Path, algo: &str) -> Report {
+        let mut report = crate::sample::report(true);
+        report.id = "2b1e2d3f4a5b6c7d".into();
+        report.server.model = "nvidia/Qwen3.8-Flash-Next-NVFP4".into();
+        report.server.family = Some("qwen4".into());
+        report.server.configuration.snapshot = Some(hub_snapshot(hub, algo).display().to_string());
+        report.server.configuration.settings.push(crate::report::Setting {
+            name: "qualification.caveat".into(), source: "publication".into(),
+            value: Some("FAIL: not recommended. KL > 0.04 on a calibrated quant.".into()), default: None,
+        });
+        let check = report.baseline.as_mut().unwrap().quality.checks.iter_mut()
+            .find(|c| c.id == "fidelity").unwrap();
+        check.summary = "KL 0.039 · top-1 93.7% · 1433 generated / 4096 total rows · 8 windows".into();
+        check.set("kl", 0.03866);
+        check.set("top1", 0.93719);
+        check.set("kl_max", 0.04);
+        check.set("top1_min", 0.94);
+        report
+    }
+
+    /// A repository holding one published Qwen NVFP4 max run, with the card and
+    /// panel images rendered by the rule the export was published under: the
+    /// failure the renderer used to bake in.
+    fn published_qwen_repo(root: &Path, algo: &str) -> PathBuf {
+        let report = published_qwen_card(&root.join("hub"), algo);
+        let dir = root.join("benchmarks/qwen4/2026-10-14-smoke-qwen38-nvfp4-max");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("report.json"), serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        std::fs::write(dir.join("card.svg"), crate::render::card::card_svg(&report)).unwrap();
+        std::fs::write(dir.join("report.svg"), crate::render::report::report_svg(&report)).unwrap();
+        std::fs::write(dir.join("panel-baseline.svg"), crate::render::report::panel_svg(&report, "baseline")).unwrap();
+        std::fs::write(root.join("README.md"), format!("# x\n\n{RESULTS_BEGIN}\n{RESULTS_END}\n")).unwrap();
+        let card = std::fs::read_to_string(dir.join("card.svg")).unwrap();
+        assert!(card.contains("QUALITY GATE FAILED"), "the fixture card is the stale one");
+        dir
+    }
+
+    #[test]
+    fn a_calibrated_nvfp4_card_publishes_as_informational_not_as_the_stored_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = published_qwen_repo(root.path(), "NVFP4");
+        let (readme, _, count) = publish(root.path(), &[]).unwrap();
+        assert_eq!(count, 1);
+        // The card image is re-rendered from report.json: the measured numbers
+        // stay, the verdict the rule in force now reaches replaces the stored one.
+        let card = std::fs::read_to_string(dir.join("card.svg")).unwrap();
+        assert!(card.contains("top-1 93.7% (info: calibrated W4A4)"), "{card}");
+        assert!(!card.contains("QUALITY GATE FAILED"), "{card}");
+        assert!(!card.contains("✗ KL 0.039"), "the failed mark is gone: {card}");
+        let panel = std::fs::read_to_string(dir.join("panel-baseline.svg")).unwrap();
+        assert!(!panel.contains("FIDELITY FAILURE"), "{panel}");
+        let report = std::fs::read_to_string(dir.join("report.svg")).unwrap();
+        assert!(!report.contains("QUALITY GATE FAILED"), "{report}");
+        // The README row and the caption under its image both follow.
+        let published = std::fs::read_to_string(&readme).unwrap();
+        assert!(published.contains("top-1 93.7% (info: calibrated W4A4)"), "{published}");
+        assert!(published.contains("<img src=\"benchmarks/qwen4/2026-10-14-smoke-qwen38-nvfp4-max/card.svg\""), "{published}");
+        assert!(!published.contains("FAIL: not recommended."), "{published}");
+        assert!(!published.contains("FAILED"), "{published}");
+        assert!(published.contains("KL &gt; 0.04 on a calibrated quant."), "the note keeps its prose: {published}");
+        // Publishing again changes nothing: the images are already current.
+        let card = std::fs::read_to_string(dir.join("card.svg")).unwrap();
+        publish(root.path(), &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("card.svg")).unwrap(), card);
+        assert_eq!(std::fs::read_to_string(&readme).unwrap(), published);
+    }
+
+    #[test]
+    fn a_stored_failure_the_bar_still_gates_keeps_its_verdict_everywhere() {
+        let root = tempfile::tempdir().unwrap();
+        // The same numbers from a checkpoint whose experts are weight-only: the
+        // bar stands, so every surface keeps showing the failure it was
+        // published with, byte for byte.
+        let dir = published_qwen_repo(root.path(), "W4A16_NVFP4");
+        let card = std::fs::read_to_string(dir.join("card.svg")).unwrap();
+        let (readme, _, _) = publish(root.path(), &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("card.svg")).unwrap(), card);
+        assert!(card.contains("QUALITY GATE FAILED"), "{card}");
+        let readme = std::fs::read_to_string(readme).unwrap();
+        assert!(readme.contains("<b>FAIL: not recommended.</b> KL &gt; 0.04 on a calibrated quant."), "{readme}");
+        assert!(readme.contains("⚠ **FAILED**"), "{readme}");
     }
 
     #[test]

@@ -229,7 +229,15 @@ fn png(svg: &str, file: &str) -> Response {
 }
 
 /// Every export of one run, by file name.
+///
+/// The single boundary between a report's data and a rendered file: nothing
+/// here trusts the status stored in the report, so an export written under an
+/// earlier fidelity rule (or served from a dashboard that stored one) shows the
+/// verdict the rule in force now reaches. Everything that writes or serves an
+/// image or a report goes through this, which is what keeps the surfaces from
+/// disagreeing.
 pub fn export(report: &Report, file: &str) -> Option<(&'static str, Vec<u8>)> {
+    let report = &crate::quality::under_current_rule(report);
     let (stem, extension) = file.rsplit_once('.')?;
     let svg = match stem {
         "report" => render::report::report_svg(report),
@@ -287,6 +295,9 @@ async fn run_file(State(bench): State<Arc<Bench>>, Path((id, file)): Path<(Strin
     if let Some(earlier_id) = &query.compare {
         attach_fidelity_comparison(&mut report, bench.report(earlier_id).as_ref(), earlier_id);
     }
+    // The two surfaces below render the report itself rather than one of its
+    // exports; `export` applies the same rule to everything else.
+    report = crate::quality::under_current_rule(&report);
     if let (Some(width), Some(panel)) = (query.bare, file.strip_prefix("panel-").and_then(|f| f.strip_suffix(".svg"))) {
         return svg(render::report::panel_body_svg(&report, panel, width.clamp(320.0, 2400.0)));
     }
