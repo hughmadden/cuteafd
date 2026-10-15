@@ -180,6 +180,50 @@ def test_one_starting_config_per_release_card() -> None:
         assert STARTING.match(path.name), path.name
 
 
+def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> None:
+    matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
+    assert matrix["profile"] == "smoke"
+    entries = matrix["entries"]
+    assert len(entries) == 28
+    assert len({entry["name"] for entry in entries}) == len(entries)
+    defaults = matrix["defaults"]["set"]
+    stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
+             "TP2_ATTENTION", "TP2_QUERY_PROJECTION", "TP2_OUTPUT_PROJECTION", "TP2_DSPARK_EXPERTS"}
+    assert not stale.intersection(defaults)
+    models = {}
+    ports = set()
+    for entry in entries:
+        values = {**keys(ROOT / entry["config"]), **defaults, **entry["set"]}
+        assert not stale.intersection(entry["set"])
+        assert values["POOL_TOKENS"] == "auto"
+        if entry["family"] != "deepseek_v41":
+            assert not any(re.fullmatch(r"SPARK_\d+_LANE_B", key) for key in values)
+        else:
+            for rank in range(len(entry["sparks"])):
+                assert values[f"SPARK_{rank}_LANE_B"].startswith("10.55.1.")
+        assert int(values["RTX_GPUS"]) == len(entry["gpus"])
+        assert int(values["COORDINATOR_GPU"]) == entry["gpus"][0]
+        assert int(values["SPARK_COUNT"]) == len(entry["sparks"])
+        assert len(entry["gpus"]) == (1 if entry["name"].endswith("-min") else 2)
+        for rank, host in enumerate(entry["sparks"]):
+            assert values[f"SPARK_{rank}_HOST"] == host
+            assert values[f"SPARK_{rank}_LANE_A"].startswith("10.55.0.")
+        if entry["name"] in {
+            "qwen38-exl3-min", "qwen38-exl3-max", "qwen38-nvfp4-max", "glm53f-exl3-max"
+        }:
+            assert not entry["sparks"]
+            assert values["EXPERT_BACKEND"] == "local"
+        if entry["name"] in {"glm53f-nvfp4-max", "glm53f-tr3-max", "qwen38-nvfp4-min"}:
+            assert entry["sparks"] == ["ostrich", "dodo"]
+            assert values["EXPERT_BACKEND"] == "spark"
+        for key in ("ADDR", "EXPERT_PORT"):
+            assert values[key] not in ports
+            ports.add(values[key])
+        models.setdefault(values["MODEL_ID"], set()).add(len(entry["gpus"]))
+    assert len(models) == 14
+    assert all(columns == {1, 2} for columns in models.values())
+
+
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
 def test_starting_config_has_no_private_detail_and_names_the_release_pair(path: Path) -> None:
     text = path.read_text()
