@@ -1669,6 +1669,19 @@ pub(crate) fn spark_warmup_request(cfg: &GlmNextConfig, rows: usize, layer: usiz
     spark_request(h, topk, layer, rows, routes, vec![0; rows * (if bf16 { h * 2 } else { h + h / 32 })], ExpertV2SourceKind::Prefill, bf16)
 }
 
+fn validate_attention_shares(plan: &cuteafd_loader::placement::LayerExecutionPlan,
+    shares: impl ExactSizeIterator<Item = crate::shared::placement::layers::AttentionShare>,
+    rank: usize, ranks: usize) -> Result<()> {
+    use crate::shared::placement::layers::AttentionShare;
+    ensure!(plan.modes().len() == shares.len() && rank < ranks,
+        "attention operand inventory differs from execution plan");
+    for (share, &mode) in shares.zip(plan.modes()) {
+        ensure!(share == AttentionShare::bind(mode, ranks)?[rank],
+            "attention operand share differs from execution plan on rank {rank}");
+    }
+    Ok(())
+}
+
 impl<'a> GlmfEngine<'a> {
     /// `index_cache`: the DSA index cache (`compact` needs at least one MLA layer to matter;
     /// without one there is no index cache, and the engine records `keys`). `decode_rows`: the most
@@ -1677,7 +1690,8 @@ impl<'a> GlmfEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
-        records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool) -> Result<Self> {
+        records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool,
+        execution: &cuteafd_loader::placement::LayerExecutionPlan) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let sms = library.sm_count()?;
         let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
@@ -1709,8 +1723,11 @@ impl<'a> GlmfEngine<'a> {
         let split = weights.layers.first().is_some_and(|l| l.split);
         ensure!(context_mode.is_none() || (split && index_cache == IndexCache::Compact),
             "context attention runs on a head split with the compact index cache");
-        ensure!(!split || index_cache == IndexCache::Keys || context_mode.is_some(),
-            "a head split keeps the per-token index keys (context attention: compact)");
+        validate_attention_shares(execution, weights.layers.iter().map(|layer| layer.attention_share), 0, if split { 2 } else { 1 })?;
+        ensure!(!split || index_cache == IndexCache::Keys || context_mode.is_some()
+            || weights.layers.iter().filter(|layer| layer.attention == GlmNextAttention::Mla)
+                .all(|layer| !layer.attention_share.split()),
+            "compact index cache needs context placement or whole MLA owners");
         // Under context each GPU's MLA caches hold half the units (an even pool).
         ensure!(context_mode.is_none() || (pages / UNIT_PAGES) % 2 == 0,
             "a context pool has two equal halves, not {} units", pages / UNIT_PAGES);
@@ -2527,21 +2544,25 @@ impl<'a> GlmfEngine<'a> {
     /// Attaches the head split's second GPU: `device` with `stream`, holding `layers` (every
     /// layer's rank-1 share, see `GlmfLoader::model`). Loads the programs there, allocates its
     /// caches and the exchange (four slots per prefill lane, six with the KDA output shard).
-    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmfLayer<'a>>) -> Result<()> {
+    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmfLayer<'a>>,
+        execution: &cuteafd_loader::placement::LayerExecutionPlan) -> Result<()> {
         ensure!(layers.len() == self.weights.layers.len() && layers.iter().chain(&self.weights.layers).all(|l| l.split),
             "attach_peer needs the head-split shares of every loaded layer");
         // The share programs (`glmf2_*`) exist at 64 decode rows only.
         ensure!(self.decode_rows == DECODE_ROWS,
             "a head split takes decode steps of up to {DECODE_ROWS} rows (--decode-rows {DECODE_ROWS})");
+        validate_attention_shares(execution, self.weights.layers.iter().map(|layer| layer.attention_share), 0, 2)?;
+        validate_attention_shares(execution, layers.iter().map(|layer| layer.attention_share), 1, 2)?;
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_lane_count,
             rows * self.cfg.hidden * self.partial_bytes())?;
         exchange.trace_identity("glmf-target-main");
-        // Both GPUs run the indexer: heads keeps the token keys; context the compact cache (each
-        // GPU its replicated index tails, its units' pool keys).
-        ensure!(self.index_cache == IndexCache::Keys || self.context_mode.is_some(),
-            "a head split keeps the per-token index keys (--index-cache keys)");
+        // Compact state belongs only to whole MLA owners, or to both context halves.
+        ensure!(self.index_cache == IndexCache::Keys || self.context_mode.is_some()
+            || layers.iter().chain(&self.weights.layers).filter(|layer| layer.attention == GlmNextAttention::Mla)
+                .all(|layer| !layer.attention_share.split()),
+            "compact index cache needs context placement or whole MLA owners");
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             // Its own and the shares' programs.
             self.programs.load_matching(|name| super::glmf_startup_program(name, true, self.decode_rows > DECODE_ROWS))?;

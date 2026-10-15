@@ -512,6 +512,23 @@ mod tests {
             tp2: None, items: vec![], hops: plan_hops(modes, &spec).unwrap() };
         LayerExecutionPlan::new(&placement, spec).unwrap()
     }
+    #[test]
+    fn peer_attention_shares_must_match_the_immutable_plan_before_caches_allocate() {
+        use crate::shared::placement::layers::AttentionShare;
+        for first in [0, 1] {
+            let modes = [LayerMode::HeadSplit, LayerMode::Whole { gpu: first, ffn: FfnMode::Split },
+                LayerMode::Whole { gpu: 1 - first, ffn: FfnMode::Split }];
+            let execution = plan(&modes, 2);
+            for rank in 0..2 {
+                let mut shares: Vec<_> = modes.iter().map(|&mode| AttentionShare::bind(mode, 2).unwrap()[rank]).collect();
+                validate_attention_shares(&execution, shares.iter().copied(), rank, 2).unwrap();
+                shares[1] = AttentionShare::Split;
+                assert!(validate_attention_shares(&execution, shares.iter().copied(), rank, 2).is_err());
+                assert!(validate_attention_shares(&execution, shares[..2].iter().copied(), rank, 2).is_err());
+            }
+        }
+    }
+
     impl Trace {
         fn new(modes: &[LayerMode], lanes: usize, broadcast: bool, output_shard: bool) -> Self {
             let plan = plan(modes, lanes);

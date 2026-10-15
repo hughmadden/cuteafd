@@ -204,7 +204,7 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     for required in ("RuntimeInventory::measure(", "pending_code(", "resident_weights(",
                      "admission::step_workspace_demands(", "admission::startup_graphs("):
         assert gathering.index(required) < admission
-    assert "representation, resident, router_replica_bytes, workspace, local_workspace, graphs" in gathering
+    assert "representation, resident, workspace, local_workspace, graphs" in gathering
     opening = module.split("pub fn with_engine", 1)[1]
     assert opening.index("self.admit(") < opening.index("TokenEmbedding::load(")
     assert "admitted_graphs.lifetime" in opening

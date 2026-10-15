@@ -146,8 +146,6 @@ pub struct GlmfInputs<'a> {
     pub shared_replay: bool,
     pub representation: GlmfRepresentation,
     pub resident: Vec<GlmfResidentRank>,
-    /// Exact gate weight + FP32 bias of every selected routed layer, replicated on rank 1.
-    pub router_replica_bytes: u64,
     /// Exact component-owned step rows with Spark lanes and without Sparks.
     pub workspace: Vec<GlmfBufferDemand>,
     pub local_workspace: Vec<GlmfBufferDemand>,
@@ -368,9 +366,6 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Runtime, "pending code", i.pending_code.get(rank).copied().unwrap_or(0), Basis::Calibrated));
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Embedding, "embedding", i.resident[rank].embedding, Basis::Exact));
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Weights, "target weights", i.resident[rank].weights, Basis::Exact));
-        if rank == 1 {
-            fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Weights, "router replica", i.router_replica_bytes, Basis::Exact));
-        }
         let replay = if i.shared_replay { 0 } else { g.speculative_replay_bytes - index_replay };
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "KDA state and replay",
             mul(g.active_state_per_sequence_bytes - tails, i.state_slots)? + replay, Basis::Formula));
@@ -719,8 +714,7 @@ mod tests {
             index: cache::GlmfIndexCache::Keys, kda_state_bytes: 4, shared_replay: false,
             representation: GlmfRepresentation::default(),
             resident: (0..ranks).map(|rank| GlmfResidentRank {
-                embedding: if rank == 0 { 1 << 30 } else { 0 }, weights: 5 << 30 }).collect(),
-            router_replica_bytes: 64 << 20, workspace: workspace_fixture(ranks, 3 << 30), local_workspace: workspace_fixture(ranks, 2 << 30),
+                embedding: if rank == 0 { 1 << 30 } else { 0 }, weights: (5 << 30) + if rank == 1 { 64 << 20 } else { 0 } }).collect(), workspace: workspace_fixture(ranks, 3 << 30), local_workspace: workspace_fixture(ranks, 2 << 30),
             graphs: startup_graphs(cfg, cfg.layers, 262_144, if capacity <= 34 << 30 { 1 << 20 } else { 2 << 20 },
                 8, true, ranks, 64, 188),
             experts: cfg.dense.iter().filter(|&&dense| !dense).map(|_| ExpertCost {
@@ -1571,6 +1565,72 @@ mod tests {
                 assert_eq!(placed.items, runtime.items);
                 assert_eq!(placed.layers, runtime.layers);
                 assert_eq!(placed.pool_tokens, runtime.pool_tokens);
+            }
+        }
+    }
+
+    #[test]
+    fn whole_two_rtx_planner_and_runtime_charge_every_router_replica_once() {
+        use crate::families::glm5_flash::resident::{resident_weights_placed, router_replica_bytes};
+        use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        let config = glm5_flash_config(6);
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &config, &glm5_flash_tensors(&config), None);
+        let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+        // Independent upload arithmetic: each routed layer replicates a BF16 gate
+        // matrix and an FP32 correction vector, each allocation floored at 256 bytes.
+        let routed = cfg.dense.iter().filter(|&&dense| !dense).count() as u64;
+        let routers = routed * ((cfg.experts * cfg.hidden * 2) as u64).max(256)
+            + routed * ((cfg.experts * 4) as u64).max(256);
+        assert_eq!(router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap(), routers);
+        assert!(routers > 0);
+        for first_owner in [0, 1] {
+            let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+            input.spark_ranks = 0;
+            input.attention = GlmfAttention { mode: AttentionPlacement::Layers, first_owner,
+                ..Default::default() };
+            input.index = cache::GlmfIndexCache::Compact;
+            input.resident = resident_weights_placed(&checkpoint, &cfg, cfg.layers, 2,
+                input.representation, AttentionPlacement::Layers, first_owner as usize).unwrap();
+            let mut planner = request(&input).unwrap();
+            // Inventory-only until the production executor is explicitly enabled.
+            planner.executor = ExecutorModes { family: "glm5_flash candidate", modes: &[LayerMode::HeadSplit,
+                LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+                LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true,
+                attention: AttentionPlacement::Heads };
+            let placed = solve(&planner).unwrap();
+            for rank in 0..2 {
+                let charged: u64 = placed.items[rank].iter()
+                    .filter(|item| item.group == "target weights").map(|item| item.bytes).sum();
+                assert_eq!(charged, input.resident[rank].weights);
+                assert!(charged >= routers);
+                assert!(!placed.items[rank].iter().any(|item| item.group == "router replica"),
+                    "routers are part of target weights, never an extra demand");
+            }
+            let mut runtime = planner.clone();
+            for gpu in &mut runtime.inventory.gpus {
+                let Baseline::Planned { context_bytes, loaded_bytes } = gpu.baseline else { unreachable!() };
+                gpu.baseline = Baseline::Measured { free_bytes: gpu.capacity_bytes - context_bytes - loaded_bytes };
+            }
+            let admitted = solve(&runtime).unwrap();
+            assert_eq!(placed.items, admitted.items);
+            assert_eq!(placed.layers, admitted.layers);
+            assert_eq!(placed.pool_tokens, admitted.pool_tokens);
+            // Removing only router headers from the inventory changes each rank's
+            // charge by precisely the actual replica bytes, independent of owner.
+            let mut no_router = crate::plan::Checkpoint::open(dir.path()).unwrap();
+            for tensor in &mut no_router.tensors {
+                if tensor.meta.name.contains(".mlp.gate.") {
+                    tensor.meta.byte_length = 0;
+                    tensor.meta.shape = vec![0];
+                }
+            }
+            let floor = routed * 2 * 256;
+            let without = resident_weights_placed(&no_router, &cfg, cfg.layers, 2,
+                input.representation, AttentionPlacement::Layers, first_owner as usize).unwrap();
+            for rank in 0..2 {
+                assert_eq!(input.resident[rank].weights - without[rank].weights, routers - floor);
             }
         }
     }

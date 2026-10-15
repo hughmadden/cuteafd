@@ -1636,7 +1636,6 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             pool_marks: false, index: opts.glmf_index, kda_state_bytes: 4, shared_replay: false,
             representation: opts.glmf_representation,
             resident: resident::resident_weights(&checkpoint, &cfg, cfg.layers, 2, opts.glmf_representation).unwrap(),
-            router_replica_bytes: resident::router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap(),
             workspace: glmf::step_workspace_demands(&cfg, 2, 4096, 64, shape, decode, prefill),
             local_workspace: glmf::step_workspace_demands(&cfg, 2, 4096, 64,
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
@@ -1657,7 +1656,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         if expected_rtx == 0 { assert_eq!(request.tp2_workspace, [0; 2]); }
         if peers == 0 {
             let rank_weights: Vec<_> = input.resident.iter().enumerate().map(|(rank, resident)|
-                resident.embedding + resident.weights + if rank == 1 { input.router_replica_bytes } else { 0 }
+                resident.embedding + resident.weights
                     + input.experts.iter().map(|cost| cost.half[rank].resident).sum::<u64>()).collect();
             let budget = rank_weights.iter().copied().max().unwrap() + (1 << 20);
             let local = PlanOptions { coordinator_budget_bytes: budget, ..options.clone() };

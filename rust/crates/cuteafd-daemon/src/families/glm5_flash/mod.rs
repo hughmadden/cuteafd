@@ -536,22 +536,44 @@ mod draft_cli_tests {
         for ranks in [1, 2] {
             for fp8_head in [false, true] {
                 let representation = GlmfRepresentation { fp8_head, ..Default::default() };
-                let gpu = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Gpu).unwrap();
-                let host = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Host).unwrap();
+                let gpu = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Gpu, Default::default()).unwrap();
+                let host = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Host, Default::default()).unwrap();
                 assert_eq!((gpu[0].embedding, host[0].embedding), (524_288, 0));
                 assert!(gpu[0].weights > 0);
                 assert_eq!(gpu.iter().map(|r| r.weights).collect::<Vec<_>>(), host.iter().map(|r| r.weights).collect::<Vec<_>>());
                 if ranks == 2 { assert_eq!(host[1].embedding, 0); assert!(host[1].weights > 0); }
             }
         }
+        for first_owner in [0, 1] {
+            let attention = engine::GlmfAttention { mode: cuteafd_loader::placement::AttentionPlacement::Layers,
+                first_owner, ..Default::default() };
+            let actual = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, 2,
+                Default::default(), EmbedPlacement::Gpu, attention).unwrap();
+            let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
+                &checkpoint, &cfg, cfg.layers, 2, Default::default(), attention.mode, first_owner as usize).unwrap();
+            assert_eq!(actual.iter().map(|r| (r.embedding, r.weights)).collect::<Vec<_>>(),
+                expected.iter().map(|r| (r.embedding, r.weights)).collect::<Vec<_>>());
+        }
         checkpoint.config["tie_word_embeddings"] = serde_json::json!(true);
-        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host).unwrap_err();
+        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host, Default::default()).unwrap_err();
         assert!(error.to_string().contains("tie_word_embeddings=true"));
-        assert!(runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Gpu).is_ok());
+        assert!(runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Gpu, Default::default()).is_ok());
         checkpoint.config["tie_word_embeddings"] = serde_json::json!(false);
         checkpoint.tensors[2].meta.byte_offset = 0;
-        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host).unwrap_err();
+        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host, Default::default()).unwrap_err();
         assert!(error.to_string().contains("aliases its storage"));
+    }
+
+    #[test]
+    fn served_index_cache_preserves_whole_owner_compact_state_without_changing_heads() {
+        use cuteafd_loader::placement::AttentionPlacement::{Context, Heads, Layers};
+        use engine::IndexCache::{Compact, Keys};
+        for requested in [Compact, Keys] {
+            assert_eq!(served_index_cache(requested, true, Heads), Keys);
+            assert_eq!(served_index_cache(requested, true, Context), Compact);
+            assert_eq!(served_index_cache(requested, true, Layers), requested);
+            assert_eq!(served_index_cache(requested, false, Heads), requested);
+        }
     }
 
     /// `--target-head`: unset follows the shared setting (tensor by default) and stays inert over
@@ -1223,10 +1245,10 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
 
 fn runtime_resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
     representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation,
-    embedding: crate::shared::token_io::EmbedPlacement)
+    embedding: crate::shared::token_io::EmbedPlacement, attention: engine::GlmfAttention)
     -> Result<Vec<cuteafd_loader::families::glm5_flash::resident::GlmfResidentRank>> {
-    let mut resident = cuteafd_loader::families::glm5_flash::resident::resident_weights(
-        checkpoint, cfg, layers, ranks, representation).map_err(anyhow::Error::msg)?;
+    let mut resident = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
+        checkpoint, cfg, layers, ranks, representation, attention.mode, attention.first_owner as usize).map_err(anyhow::Error::msg)?;
     if embedding == crate::shared::token_io::EmbedPlacement::Host {
         checkpoint.require_untied_embedding("model.language_model.embed_tokens.weight")?;
         resident[0].embedding = 0;
@@ -1318,10 +1340,16 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     Ok(Opened { checkpoint, fp8_checkpoint, cfg, library, experts })
 }
 
-/// The DSA index cache an engine builds for `requested`: both GPUs of a head split run the indexer,
-/// and their index tails are not built yet, so a head split keeps the token keys.
-pub(crate) fn served_index_cache(requested: engine::IndexCache, head_split: bool) -> engine::IndexCache {
-    if head_split { engine::IndexCache::Keys } else { requested }
+/// Heads on two GPUs needs token keys; context needs compact pools. Whole MLA
+/// owners can serve either cache, with compact tails only on the actual owner.
+pub(crate) fn served_index_cache(requested: engine::IndexCache, split: bool,
+    attention: cuteafd_loader::placement::AttentionPlacement) -> engine::IndexCache {
+    use cuteafd_loader::placement::AttentionPlacement;
+    match attention {
+        AttentionPlacement::Context => engine::IndexCache::Compact,
+        AttentionPlacement::Heads if split => engine::IndexCache::Keys,
+        _ => requested,
+    }
 }
 
 /// The MLA placement an engine serves (`glm5_flash::resolve_attention` over the requested mode and
@@ -1349,7 +1377,7 @@ impl Opened {
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
-        use cuteafd_loader::families::glm5_flash::resident::{router_replica_bytes, GlmfRepresentation};
+        use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
         use cuteafd_loader::serving_capacity::{glmf_step_scratch, glmf_table_pages,
             GlmfScratchOptions, GlmfStepShape};
         ensure!(args.expert_window.is_none(), "solver admission does not support diagnostic expert paging");
@@ -1369,8 +1397,7 @@ impl Opened {
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
             fp8_head: args.fp8_head, output_shard: args.kda_output_shard };
         let resident = runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
-            args.token_io.embed_placement)?;
-        let router_replica_bytes = router_replica_bytes(&headers, &self.cfg, layers).map_err(anyhow::Error::msg)?;
+            args.token_io.embed_placement, attention)?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
         let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
@@ -1442,7 +1469,7 @@ impl Opened {
             sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
-            representation, resident, router_replica_bytes, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
+            representation, resident, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_scratch, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: 0 };
         let target = placement::PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
@@ -1618,8 +1645,7 @@ impl Opened {
             Some(manifest)
         } else { None };
         let context_mode = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Context).then_some(attention);
-        let index_cache = if context_mode.is_some() { engine::IndexCache::Compact }
-            else { served_index_cache(args.index_cache, split_device.is_some()) };
+        let index_cache = served_index_cache(args.index_cache, split_device.is_some(), attention.mode);
         if let (Some(device), true, None) = (split_device, index_cache != args.index_cache, context_mode) {
             tracing::warn!(device, "--index-cache compact is single-GPU under heads; the head split keeps the token keys");
         }
@@ -1659,8 +1685,8 @@ impl Opened {
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context, prepared_draft.as_ref(), attention)?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
-        ensure!((placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context)
-            == context_mode.is_some(), "GLM Flash admission placed {} attention, the engine serves {}",
+        ensure!(placement.attention_placement == attention.mode,
+            "GLM Flash admission placed {} attention, the engine serves {}",
             placement.attention_placement, attention.mode);
         let draft_gpu = placement.movables.iter().find(|(id, _)| *id == cuteafd_loader::placement::MovableId::Drafter)
             .map_or(0, |(_, gpu)| *gpu);
@@ -1719,15 +1745,19 @@ impl Opened {
         // Header-only resident inventory uses the actual loader flags, not launcher defaults.
         if args.kda_nvfp4_gate.is_none() {
             let headers = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
-            let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights(
+            let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
                 &headers, &self.cfg, layers, 1 + usize::from(peer_stream.is_some()),
                 cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
                     kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off, fp8_head: args.fp8_head,
                     output_shard: args.kda_output_shard,
-                }).map_err(anyhow::Error::msg)?;
+                }, attention.mode, attention.first_owner as usize).map_err(anyhow::Error::msg)?;
             let actual = resident + model.norm.buffer.bytes + model.head.bytes();
+            let peer_expected = expected.get(1).map_or(0, |r| r.weights);
+            ensure!(expected[0].weights == actual as u64 && peer_expected == peer_resident as u64,
+                "GLM Flash uploaded weights differ from admission: lead {} versus {} bytes; peer {} versus {} bytes",
+                actual, expected[0].weights, peer_resident, peer_expected);
             tracing::info!(planned_lead_bytes = expected[0].weights, resident_lead_bytes = actual,
-                planned_peer_bytes = expected.get(1).map_or(0, |r| r.weights), resident_peer_bytes = peer_resident,
+                planned_peer_bytes = peer_expected, resident_peer_bytes = peer_resident,
                 "GLM Flash shared resident inventory versus uploaded operands");
         }
 
@@ -1765,7 +1795,7 @@ impl Opened {
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool)?;
+            args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool, &execution)?;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
 
@@ -1781,7 +1811,7 @@ impl Opened {
         tracing::info!(target_head = ?engine.target_head, requested = ?args.target_head, fp8_head = args.fp8_head,
             "GLM 5.3 Flash target head");
         if let Some((device, peer_stream)) = peer_stream {
-            engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
+            engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?, &execution)?;
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
                 "GLM 5.3 Flash head split over two GPUs");
         }
