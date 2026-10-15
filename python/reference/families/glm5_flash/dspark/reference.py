@@ -333,6 +333,22 @@ def run_live(args):
             for handle in hooks:
                 handle.remove()
 
+    if args.inspect_prefix:
+        fixture = json.loads(args.inspect_prefix.read_text())
+        ids = tokenizer.apply_chat_template([{"role": "user", "content": fixture["prompt"]}], tokenize=True,
+                                            add_generation_prompt=True, enable_thinking=True, return_dict=False)
+        prefix = ids + fixture["prefix"]
+        with torch.inference_mode():
+            _, logits = evaluate(prefix, [len(prefix) - 1])
+            values, indices = logits[0].topk(2)
+        report = {"generated_index": len(fixture["prefix"]), "input_tokens": len(prefix),
+                  "top2_tokens": indices.tolist(), "top2_logits": values.tolist(),
+                  "top2_margin": float(values[0] - values[1]),
+                  "base_token": fixture["base_token"], "markov_token": fixture["markov_token"]}
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "margin.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report), flush=True)
+        return
     prompts = args.prompt or [
         "Write a Python function that returns the first n Fibonacci numbers. Explain edge cases.",
         "A shop has 12 boxes with 8 pencils each and sells 37 pencils. How many remain?",
@@ -378,6 +394,7 @@ def main() -> None:
     parser.add_argument("--golden", type=Path)
     parser.add_argument("--live", action="store_true", help="greedy chat/thinking proposals with exact target replay")
     parser.add_argument("--prompt", action="append", help="live user prompt; may repeat (default three short prompts)")
+    parser.add_argument("--inspect-prefix", type=Path, help="live prompt/generated-prefix JSON for one target top-two margin")
     parser.add_argument("--max-new-tokens", type=int, default=48, help="bounded live completion length")
     parser.add_argument("--target", type=Path, help="target snapshot supplying the borrowed embedding/head")
     parser.add_argument("--streams", type=int, choices=(1, 4), default=4, help="dense=1, GLM mHC=4")
