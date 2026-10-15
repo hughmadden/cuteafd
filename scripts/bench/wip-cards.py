@@ -254,9 +254,13 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     for key in list(values):
         if re.fullmatch(r'SPARK_[0-5]_(HOST|LANE_A|LANE_B)', key):
             del values[key]
+    # Only V4.1's launcher reads a secondary rail; other families reject the key.
+    lane_b = entry.get('family') == 'deepseek_v41'
     for i, host in enumerate(hosts):
         index = HOSTS.index(host) + 1
-        values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}', f'SPARK_{i}_LANE_B': f'10.55.1.{index}'})
+        values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}'})
+        if lane_b:
+            values[f'SPARK_{i}_LANE_B'] = f'10.55.1.{index}'
     values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm.get('wip_instance', arm['instance']), INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPU=str(gpus[0]))
     run_args = ['--wip', arm['slot']]
     if 'release' in arm:
@@ -806,6 +810,18 @@ def classify(row, launched):
     return 'measurement'
 
 
+def fabric_assessment(phases):
+    """Assessment hook for timed background traffic; byte evidence stays per port."""
+    caveats = []
+    for phase in phases:
+        if not phase.get('timed'):
+            continue
+        for warning in phase.get('assessments', []):
+            if warning.startswith(('foreign traffic:', 'SparkNest traffic:', 'storage attribution unavailable:')):
+                caveats.append(f"{phase.get('name', '?')}: {warning}; rerun in a quiet window before accepting A/B")
+    return list(dict.fromkeys(caveats))
+
+
 def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
@@ -818,6 +834,7 @@ def summarize_job(job, exit_code):
     if state.exists():
         row['smoke'] = json.loads(state.read_text())
     outcome = (row.get('smoke') or {}).get(job['entry']['name']) or {}
+    row['fabric'] = list(outcome.get('fabric') or [])
     # The first real error wins: the launcher's own words, then smoke's outcome
     # (its wrapper "./run.sh exited ..." last), then checks derived below.
     found = [e for e in (first_log_error(dest, job['entry']['name']), outcome.get('error')) if e]
@@ -833,6 +850,8 @@ def summarize_job(job, exit_code):
         fail(row, f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
+        if not row['fabric']:
+            row['fabric'].extend(report.get('fabric') or [])
         present = {p['id'] for p in report.get('panels', [])} | ({'baseline'} if report.get('baseline') else set())
         missing = set(requested_panels(job['entry'].get('profile', 'smoke'))) - present
         if missing:
@@ -885,6 +904,8 @@ def summarize_job(job, exit_code):
             fail(row, f'expected one sweep.json, found {len(sweeps)}')
         else:
             sweep = json.loads(sweeps[0].read_text())
+            if not outcome.get('fabric'):
+                row['fabric'].extend(p['fabric'] for p in [*sweep.get('points', []), *sweep.get('prefill', [])] if p.get('fabric'))
             row['sweep'] = sweep.get('points', [])
             for point in row['sweep']:
                 key = 'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}"
@@ -912,16 +933,21 @@ def summarize_job(job, exit_code):
             row[key] = json.loads(path.read_text())
     if job.get('nonce_seed'):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
-        hashes = re.findall(r'prompt_token_hash\s*=\s*"?([0-9a-f]{16})', text)
-        # Concurrent admission reorders requests, so pairs match on the whole prompt set.
+        hashes = prompt_token_hashes(text)
+        # Concurrent admission reorders requests, so pairs match on the whole
+        # set of input-determined prompts; a follow-up prompt is reported but
+        # not compared.
         row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[0] if hashes else None,
-                   prompt_token_hashes=sorted(hashes), requests=matched_requests(dest), state=str(dest))
+                   prompt_token_hashes=sorted(hashes), follow_up_prompts=follow_up_prompts(text),
+                   requests=matched_requests(dest), state=str(dest))
         # Prefill-only sweeps (max_tokens 1) emit no decode rounds; the prompt
         # token hash above is what matches their requests.
         prefill_only = bool(job['entry'].get('prefill_lengths')) and not job['entry'].get('levels') \
             and job['entry'].get('profile') == 'panels:'
         if not row['requests'] and not prefill_only:
             fail(row, 'matched prompts produced no per-request console rounds')
+    row['fabric_caveats'] = fabric_assessment(row['fabric'])
+    row['ab_verdict'] = 'rerun' if row['fabric_caveats'] else 'eligible'
     row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)
     return row
@@ -943,6 +969,24 @@ def lossless_set_result(report):
     return {'status': 'pass' if last.get('gate') == 'pass' else 'fail', 'summary': last.get('summary', ''),
             'passed': last.get('passed'), 'total': last.get('total'), 'set': last.get('set'),
             'failing': [r['id'] for r in last.get('rows', []) if not r.get('pass')]}
+
+
+# A matched pair compares the prompts its inputs decide. A prompt that
+# re-renders model output (a follow-up turn, or ids taken from a response)
+# logs as an output-dependent prompt with no hash, because two engines
+# legitimately tokenize model text differently.
+MATCHED_PROMPT = re.compile(r'matched benchmark prompt.*?prompt_token_hash\s*=\s*"?([0-9a-f]{16})')
+FOLLOW_UP_PROMPT = re.compile(r'benchmark output-dependent prompt')
+
+
+def prompt_token_hashes(text):
+    """The input-determined prompt hashes of a coordinator log, in log order."""
+    return MATCHED_PROMPT.findall(text)
+
+
+def follow_up_prompts(text):
+    """Output-dependent prompts reported, which pairs do not compare."""
+    return len(FOLLOW_UP_PROMPT.findall(text))
 
 
 def matched_requests(dest):
@@ -1032,7 +1076,9 @@ def write_summary(state, rows, arms):
                    key=lambda k: (int(k.split()[1]), k))
     present = [m for m in (*SUMMARY_METRICS, *extra) if any(isinstance(r.get(m), (int, float)) for r in rows)]
     medians, paired = summary_math(rows, names, present or METRICS)
-    save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired))
+    caveats = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], caveat=c) for r in rows for c in r.get('fabric_caveats', [])]
+    save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired,
+                                    ab_verdict='rerun' if caveats else 'eligible', fabric_caveats=caveats))
     def cell(value):
         if isinstance(value, float):
             return f'{value:.4g}'
@@ -1063,6 +1109,25 @@ def write_summary(state, rows, arms):
         text += '## Results\n\n| Card | ' + ' | '.join(present) + ' |\n| --- |' + ' ---: |' * len(present) + '\n'
         for m in medians:
             text += f"| {m['card']} | " + ' | '.join(cell(m.get(k)) for k in present) + ' |\n'
+        text += '\n'
+    if caveats:
+        text += '## A/B Verdict: Rerun\n\nTimed fabric contamination or unknown attribution prevents accepting this A/B. Request correctness and raw rates remain recorded.\n\n'
+        for c in caveats:
+            text += f"- {c['card']} / {c['arm']} / r{c['repeat']}: {c['caveat']}\n"
+        text += '\n'
+    if any(r.get('fabric') for r in rows):
+        text += '## Fabric By Arm And Phase\n\nPer-port tx+rx bytes; not unique-byte fabric totals. Engine headers are ceil(bytes/MTU)*62 lower bounds; SparkNest uses per-op packets*62. Residual includes ACK/retry and sample skew. Unknown is not zero.\n\n'
+        text += '| Card | Arm | Repeat | Phase | Host / port | NIC | Engine | SparkNest | Headers est. | Residual |\n| --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |\n'
+        for r in rows:
+            for phase in r.get('fabric', []):
+                for p in phase.get('ports', []):
+                    def pair(tx, rx):
+                        a, b = p.get(tx), p.get(rx)
+                        return a + b if isinstance(a, int) and isinstance(b, int) else 'unknown'
+                    values = [pair(a,b) for a,b in [('sent_bytes','received_bytes'), ('engine_sent_bytes','engine_received_bytes'),
+                              ('sparknest_sent_bytes','sparknest_received_bytes'), ('estimated_header_sent_bytes','estimated_header_received_bytes'),
+                              ('foreign_sent_bytes','foreign_received_bytes')]]
+                    text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {cell(phase.get('name'))} | {cell(p.get('host'))} {cell(p.get('device'))}/{p.get('port')} | " + ' | '.join(map(cell, values)) + ' |\n'
         text += '\n'
     text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |\n'
     for r in rows:

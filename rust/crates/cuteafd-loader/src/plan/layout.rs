@@ -595,14 +595,16 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
     // Qwen currently executes entirely on the first coordinator GPU.
     let split = gpus == 2 && options.head_split && family != "qwen4";
     let active_gpus = if family == "qwen4" { 1 } else if split { 2 } else { 1 };
-    let automatic = options.pool_tokens.unwrap_or(0) == 0;
+    let automatic = options.pool_tokens == Some(0);
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
             capacity_bytes: if matches!(family, "deepseek_v41" | "mimo_v2") && bytes <= 32 * GIB {
                 ((bytes as u128 * 97 / 100) as u64).min(bytes.saturating_sub(
                     options.headroom_bytes.max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES)))
             } else { (if family == "deepseek_v41" && automatic { (bytes as u128 * 97 / 100) as u64 } else { bytes })
-                .saturating_sub(if matches!(family, "deepseek_v41" | "qwen4") { options.headroom_bytes.max(3 * GIB) }
+                .saturating_sub(if family == "deepseek_v41" {
+                    crate::placement::families::deepseek_v41::runtime_reserve(bytes, active_gpus, automatic)
+                } else if family == "qwen4" { options.headroom_bytes.max(3 * GIB) }
                     else if family == "deepseek_v4" { 0 } else { options.headroom_bytes }) },
             items: Vec::new(), kv_tokens: 0 })
         .collect();
@@ -850,6 +852,8 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         let graph_allowance = if family == "deepseek_v41" && options.rtx_bytes[index] <= 32 * GIB {
             // Match the qualified fixed-bank envelope reserved by measured_pool_memory.
             2 * GIB
+        } else if family == "deepseek_v41" {
+            crate::placement::families::deepseek_v41::graph_reserve(options.rtx_bytes[index], active_gpus)
         } else { costs.graph_bytes[role] };
         device.items.push(Item::new(Category::Runtime, "graph allowance", "", graph_allowance, allowance_basis));
         let workspace = v4_workspace.as_ref().and_then(|ranks| ranks.get(index)).map_or_else(
@@ -890,8 +894,6 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         v41::packed_expert_bytes(package, moe.experts as u64, model.spec().hidden as u64,
             (moe.intermediate / ranks) as u64));
     let layer_bytes = packed_layer(1).unwrap_or(source_layer_bytes);
-    let local_rank_bytes = packed_layer(active_gpus)
-        .unwrap_or(layer_bytes / active_gpus as u64);
     // V4's layers come from the placement solve below.
     let mut local_layers = if family == "deepseek_v41" {
         options.local_expert_layers.unwrap_or(0).min(model.spec().layers.len())
@@ -1153,10 +1155,10 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
             for (device, rank) in devices.iter_mut().zip(&geometry.ranks) {
                 let state_slots = options.state_slots.unwrap_or(if matches!(family, "qwen4" | "deepseek_v4" | "deepseek_v41") { concurrency }
                     else { concurrency + 2 });
-                device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
+                if family != "deepseek_v41" { device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
                     + (rank.active_state_per_sequence_bytes + if family == "deepseek_v4" { rank.pool_metadata_unit_bytes } else { 0 }) * state_slots
                     + rank.speculative_replay_bytes
-                    + rank.context_table_bytes_per_token * context_tokens, Basis::Formula));
+                    + rank.context_table_bytes_per_token * context_tokens, Basis::Formula)); }
                 if family != "deepseek_v41" && marks > 0 && rank.retained_mark_bytes > 0 {
                     device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * marks,
                         Basis::Formula));
@@ -1170,10 +1172,8 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
             }
             if family == "deepseek_v41" {
                 let prefixes = v41::prefix_arena_bytes(marks, native_layers > 0, active_gpus);
-                let retained_turns = marks.saturating_sub(2) / 2;
                 for (device, &bytes) in devices.iter_mut().zip(&prefixes) {
                     device.items.push(Item::new(Category::Prefix, "snapshot arenas", "", bytes, Basis::Formula));
-                    device.items.push(Item::new(Category::Kv, "active and retained COW tails", "", geometry.ranks[device.index as usize].persistent_unit_bytes * (concurrency + 2 * retained_turns), Basis::Formula));
                 }
                 if native_layers > 0 {
                     devices[active_gpus - 1].items.push(Item::new(Category::Drafter, "dSpark window state", "", v41::dspark_cache_bytes(concurrency, prefill_rows), Basis::Formula));
@@ -1196,22 +1196,45 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
                 };
                 let mut pool = PoolPolicy::resolve(&options.rtx_bytes, context_tokens,
                     options.pool_tokens, unit, report.spark_ranks == 0);
+                if pool.requested.is_none() {
+                    pool.floor = pool.floor.max(context_tokens.div_ceil(512) * 512 + concurrency * 512);
+                    pool.target = pool.target.max(pool.floor);
+                }
                 let tails = concurrency + 2 * (marks.saturating_sub(2) / 2);
                 pool.ceiling = ((131_072 - tails) * unit).min(pool.requested.unwrap_or(pool.target).div_ceil(unit) * unit);
-                let cost = ExpertCost { whole: Bytes2 { resident: layer_bytes, staging: 32 * MIB },
-                    half: [Bytes2 { resident: local_rank_bytes, staging: 32 * MIB }; 2],
-                    tp2: active_gpus == 2, spark_ok: true };
-                let request = families::deepseek_v41::request(inventory, pool,
-                    geometry.ranks.iter().map(|r| r.persistent_unit_bytes + r.pool_metadata_unit_bytes).collect(),
-                    vec![cost; model.spec().layers.len()], 256 * MIB,
-                    options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or(Onboard::Auto));
-                match solve(&request) {
-                    Ok(placement) => {
+                let exact = (|| -> anyhow::Result<_> {
+                    let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+                    let manifest = options.workspace_manifest.as_deref()
+                        .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+                    families::deepseek_v41::expert_inventory(&catalog, manifest, prefill_rows, active_gpus)
+                })();
+                let placement = exact.and_then(|(experts, workspace)| {
+                    let mut request = families::deepseek_v41::request(inventory, pool,
+                        geometry.ranks.iter().map(|r| r.persistent_unit_bytes + r.pool_metadata_unit_bytes).collect(),
+                        experts, workspace,
+                        options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or(Onboard::Auto));
+                    request.minimum_expert_layers = usize::from(active_gpus == 2);
+                    families::deepseek_v41::cache_demands(&mut request, &checkpoint.config,
+                        concurrency, marks.saturating_sub(2) / 2, false)?;
+                    let placement = solve(&request)?;
+                    families::deepseek_v41::validate_pool_floor(&request.pool, &placement)?;
+                    let local_bytes = request.layers.iter().zip(&placement.layers).map(|(demand, assigned)| {
+                        demand.experts.map_or(0, |cost| match assigned.experts {
+                            ExpertHome::RtxWhole { .. } => cost.whole.resident,
+                            ExpertHome::RtxTp2 => cost.half.iter().map(|c| c.resident).sum(),
+                            _ => 0,
+                        })
+                    }).sum::<u64>();
+                    Ok((placement, local_bytes))
+                });
+                match placement {
+                    Ok((placement, exact_local_bytes)) => {
                         pool_tokens = placement.pool_tokens;
                         local_layers = placement.onboard_layers;
-                        local_bytes = layer_bytes * local_layers as u64;
+                        local_bytes = exact_local_bytes;
                         for (device, items) in devices.iter_mut().zip(placement.items) {
-                            device.items.extend(items.into_iter().filter(|item| item.category != Category::Kv));
+                            device.items.extend(items);
+                            device.kv_tokens = pool_tokens;
                         }
                     }
                     Err(error) => {
@@ -1232,7 +1255,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
                 notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens, shortfall {} tokens", context_tokens - pool_tokens));
             }
             for (device, &cost) in devices.iter_mut().zip(&per_token) {
-                if cost > 0 {
+                if cost > 0 && family != "deepseek_v41" {
                     let units = pool_tokens.div_ceil(unit);
                     let rank = &geometry.ranks[device.index as usize];
                     device.items.push(Item::new(Category::Kv, "records", "",

@@ -14,6 +14,12 @@ use std::path::Path;
 /// Why a fidelity check is informational rather than gated.
 pub const CALIBRATED_W4A4: &str = "calibrated W4A4";
 
+/// The verdict sentence a report carries when its own gates failed. It is the
+/// lead of a publication note written while the panel failed, so a surface
+/// showing it derives it from the report's quality under the rule in force now
+/// rather than from the note's stored text.
+pub const NOT_RECOMMENDED: &str = "FAIL: not recommended.";
+
 /// Applies the fidelity rule to `check` in place.
 ///
 /// NVIDIA's NVFP4 exports quantize the routed experts' activations as well as
@@ -49,6 +55,30 @@ pub fn reconcile(report: &mut Report) {
         apply_fidelity(info, check);
     }
     baseline.quality.settle();
+}
+
+/// `report` as the rule in force now reads it: the same measured data, with
+/// every verdict this rule reaches. Every surface that shows a verdict renders
+/// from this, so a report written under an earlier rule cannot present a stale
+/// one, and the stored file is never edited to fix it.
+pub fn under_current_rule(report: &Report) -> Report {
+    let mut current = report.clone();
+    reconcile(&mut current);
+    current
+}
+
+/// The verdict `report`'s quality earns under the rule in force now, if any:
+/// the sentence a surface shows when the gates failed, and nothing when the
+/// same numbers are informational (a calibrated W4A4 checkpoint's fidelity) or
+/// pass.
+pub fn warning(report: &Report) -> Option<&'static str> {
+    report.quality_failed().then_some(NOT_RECOMMENDED)
+}
+
+/// `note` without a stored verdict sentence: the prose a publication note
+/// still carries once the verdict itself is taken from the report's quality.
+pub fn without_verdict(note: &str) -> &str {
+    note.strip_prefix(NOT_RECOMMENDED).map_or(note, str::trim_start)
 }
 
 /// Whether the served checkpoint declares W4A4 NVFP4 routed experts. Read from

@@ -77,6 +77,11 @@ def _recording_shims(log: Path, guard_log: Path) -> dict[str, str]:
               esac
             done
             [[ -n "$build_dir" ]] || exit 0
+            for expert_dir in v41_local_experts v41_tp2_experts v41_nvfp4_rtx_backbone v41_nvfp4_rtx_tp2; do
+              mkdir -p "$build_dir/$expert_dir"
+              printf '%s\\n' '{{}}' >"$build_dir/$expert_dir/v41_experts.json"
+              cp "$build_dir/$expert_dir/v41_experts.json" "$build_dir/$expert_dir/v41_nvfp4_experts.json"
+            done
             printf '%s\\n' "$build_dir" >>{log}
             mkdir -p "$build_dir/v41_experts" "$build_dir/v41_fp8" "$build_dir/x86-64-v4"
             printf 'native\\n' >"$build_dir/libcuteafd_native.so"

@@ -112,20 +112,80 @@ fn prompt_token_hash(ids: &[u32]) -> u64 {
     })
 }
 
+/// The evidence line for one admission. A prompt that re-renders model output
+/// differs between engines by design, so it is reported without a hash: a
+/// matched pair compares the hashes of input-determined prompts only.
+fn matched_prompt_line(probe: &ProbeRef, engine: &str, ids: &[u32]) {
+    if probe.as_ref().is_none_or(|probe| probe.input_determined()) {
+        tracing::info!(engine, prompt_tokens = ids.len(), prompt_token_hash = format_args!("{:016x}", prompt_token_hash(ids)), "matched benchmark prompt");
+    } else {
+        tracing::info!(engine, prompt_tokens = ids.len(), "benchmark output-dependent prompt");
+    }
+}
+
 #[cfg(test)]
 mod matched_prompt_tests {
+    use super::*;
+    use cuteafd_api::openai::probe::ProbeSpec;
+    use std::sync::{Arc, Mutex};
+
     #[test]
     fn hashes_token_ids_in_order() {
         assert_eq!(super::prompt_token_hash(&[]), 0xcbf2_9ce4_8422_2325);
         assert_eq!(super::prompt_token_hash(&[1, 2]), 0xc9c2_8939_c996_68c6);
         assert_ne!(super::prompt_token_hash(&[1, 2]), super::prompt_token_hash(&[2, 1]));
     }
+
+    /// The evidence line one admission writes.
+    fn evidence_line(probe: ProbeRef) -> String {
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = bytes.clone();
+        let subscriber = tracing_subscriber::fmt().with_writer(move || Buffer(writer.clone()))
+            .without_time().with_ansi(false).finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            matched_prompt_line(&probe, "test", &[1, 2, 3]);
+        }
+        let line = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        line
+    }
+
+    #[test]
+    fn an_input_determined_prompt_logs_its_token_hash() {
+        let line = evidence_line(None);
+        assert!(line.contains("matched benchmark prompt"), "{line}");
+        assert!(line.contains(&format!("prompt_token_hash={:016x}", prompt_token_hash(&[1, 2, 3]))), "{line}");
+    }
+
+    #[test]
+    fn an_output_dependent_prompt_logs_no_token_hash() {
+        let probe = Some(Probe::new(ProbeSpec { output_dependent: true, ..ProbeSpec::default() }));
+        let line = evidence_line(probe);
+        assert!(line.contains("benchmark output-dependent prompt"), "{line}");
+        assert!(!line.contains("prompt_token_hash"), "{line}");
+    }
+
+    #[test]
+    fn an_ordinary_probe_still_logs_its_token_hash() {
+        let line = evidence_line(Some(Probe::new(ProbeSpec { cold: true, ..ProbeSpec::default() })));
+        assert!(line.contains("matched benchmark prompt") && line.contains("prompt_token_hash"), "{line}");
+    }
 }
 
 pub(crate) fn admitted(probe: &ProbeRef, engine: &str, ids: &[u32], cached: usize) {
     // Matched-card evidence is opt-in; ordinary serving does no hashing/logging.
     if std::env::var("CUTEAFD_BENCH_NONCE_SEED").is_ok_and(|seed| !seed.is_empty()) {
-        tracing::info!(engine, prompt_tokens = ids.len(), prompt_token_hash = format_args!("{:016x}", prompt_token_hash(ids)), "matched benchmark prompt");
+        matched_prompt_line(probe, engine, ids);
     }
     if let Some(probe) = probe {
         probe.admitted(engine, ids, cached);

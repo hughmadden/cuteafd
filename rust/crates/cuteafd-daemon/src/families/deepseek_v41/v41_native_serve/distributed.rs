@@ -15,18 +15,15 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
     if let Some(directory)=args.placement_directory.as_deref() {
         if let Some(layers)=PlacementHandoff::<PlacementPlan>::resumed(directory)?.map(|plan| plan.rtx_expert_layers) {
-            if let memory::LocalLayers::Count(requested)=args.rtx_expert_layers {
+            if let admission::LocalLayers::Count(requested)=args.rtx_expert_layers {
                 ensure!(requested==layers,"restart layer request differs from acknowledged workers");
             }
-            args.rtx_expert_layers=memory::LocalLayers::Count(layers);
+            args.rtx_expert_layers=admission::LocalLayers::Count(layers);
         }
     }
     let minimum_expert_layers = match args.rtx_expert_layers {
-        // An explicit replicated topology always publishes/reads its actual
-        // boundary, so the reservation floor is dynamic rather than the legacy
-        // dual-RTX 20-layer default.
-        memory::LocalLayers::Auto => if args.placement_directory.is_some() || args.spark_tp.is_some() {1} else {20},
-        memory::LocalLayers::Count(count) => {
+        admission::LocalLayers::Auto => 1,
+        admission::LocalLayers::Count(count) => {
             ensure!((1..=40).contains(&count), "dual RTX expert layers must be 1..=40");
             count as usize
         }
@@ -82,28 +79,10 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         let per_lane = crate::shared::experts::rtx::pair::OwnerPair::device_bytes(&lib, capacity, true, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
     }
-    let rank_prefix_peaks = [0usize, 1].map(|rank| -> Result<Vec<usize>> {
-        let (mut resident, mut transient) = (0usize, 0usize);
-        (0..40).map(|layer| {
-            let selection = ExpertLayer::BackboneTp2 { layer, rank };
-            let budget = match format {
-                crate::families::deepseek_v41::v41_experts::ExpertFormat::Exl3 => {
-                    crate::families::deepseek_v41::v41_experts::exl3::Exl3Weights::plan(&catalog, selection)?
-                }
-                // NVFP4 uses the same ExpertWeights plan (format-aware layout).
-                crate::families::deepseek_v41::v41_experts::ExpertFormat::Nvfp4 => {
-                    ExpertWeights::plan(&lib, &catalog, selection)?
-                }
-                crate::families::deepseek_v41::v41_experts::ExpertFormat::Native => {
-                    ExpertWeights::plan(&lib, &catalog, selection)?
-                }
-            };
-            resident = resident.checked_add(budget.resident_bytes).context("TP2 resident budget overflow")?;
-            transient = transient.max(budget.peak_device_bytes()? - budget.resident_bytes);
-            resident.checked_add(transient).context("TP2 load budget overflow")
-        }).collect()
-    }).into_iter().collect::<Result<Vec<_>>>()?;
-    let prefix_peak: Vec<_> = (0..40).map(|layer| [rank_prefix_peaks[0][layer], rank_prefix_peaks[1][layer]]).collect();
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], |_| {
+        admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)
+    })?;
+    let expert_demands=admission::expert_demands(&lib,&catalog,capacity,2)?;
     let weights = BackboneLaneWeights::load_distributed_with_split(
         &lib,
         &catalog,
@@ -155,7 +134,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let table = devices[0].own(|| {
         let (_, total) = lib.cuda_memory_info()?;
         NativeRtxTensors::load_embedding(&lib, &catalog,
-            super::memory::embedding_placement(args.embedding_placement, total))
+            super::admission::embedding_placement(args.embedding_placement, total))
     })?;
     memory_checkpoint("embedding weights")?;
     let vocab = [
@@ -333,31 +312,15 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // six-rank replicated layout needs its own larger per-wave buffer count.
     let spark_ranks = args.peers.len();
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, spark_ranks)?;
-    let transport_bytes = [2 * per_lane, 2 * per_lane + 2 * wave_bytes];
-    let before_experts = [devices[0].run(|| lib.cuda_memory_info())?, devices[1].run(|| lib.cuda_memory_info())?];
-    let mut reserved_memory = before_experts;
-    for gpu in 0..2 {
-        let deferred = transport_bytes[gpu].checked_add(prefix_peak[minimum_expert_layers-1][gpu])
-            .and_then(|v| v.checked_add(memory::distributed::EXPERT_SETUP_HEADROOM))
-            .context("deferred TP2 budget overflow")?;
-        reserved_memory[gpu].0 = reserved_memory[gpu].0.checked_sub(deferred)
-            .context("minimum TP2 placement leaves no cache memory")?;
-    }
-    args.kv_pool_size = memory::planned_pool_size(&args, &reserved_memory)?;
-    let reserved_pool = memory::distributed::PoolPlan::with_replication(map, args.concurrency as usize,
-        args.max_context_tokens as usize, args.prefix_cache_entries as usize, snapshot_bytes,
-        args.kv_pool_size, args.memory_reservation, reserved_memory,args.tp2_attention)?;
-    let expert_budget = std::array::from_fn(|gpu|
-        prefix_peak[minimum_expert_layers-1][gpu] + if args.pool_tokens == Some(0) {
-            reserved_pool.unused_bytes[gpu].saturating_sub((3usize << 30) - memory::distributed::RUNTIME_HEADROOM)
-        } else { reserved_pool.unused_bytes[gpu] });
-    let expert_layers = memory::distributed::expert_layers_with_minimum(args.rtx_expert_layers,
-        &prefix_peak, expert_budget, minimum_expert_layers)?;
-    let rank_budgets = prefix_peak[expert_layers-1];
-    tracing::info!(expert_layers, expert_budget=?expert_budget, rank_peak_bytes=?rank_budgets,
-        reserved_cache_bytes=?reserved_pool.cache_bytes, transport_bytes=?transport_bytes,
-        graph_reserve_bytes=?std::array::from_fn::<_, 2, _>(|gpu| memory::graph_reserve_bytes(before_experts[gpu].1, Some(gpu))),
-        setup_headroom_bytes=memory::distributed::EXPERT_SETUP_HEADROOM, "dual RTX bottom-up expert placement");
+    let memory=admission::admission_memory(&lib,&inventory)?;
+    let deferred=[admission::EXPERT_SETUP_HEADROOM as u64,
+        (admission::EXPERT_SETUP_HEADROOM + 2*wave_bytes) as u64];
+    let pool=admission::resolve(&args,&memory,expert_demands, (2*per_lane) as u64,&deferred,minimum_expert_layers)?;
+    let expert_layers=pool.placement.onboard_layers;
+    let admitted=pool.placement.tp2.context("dual RTX admission has no routed arena")?;
+    let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub((2*per_lane) as u64) as usize);
+    tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
+        pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
     let placement_handoff=args.placement_directory.as_deref().map(|directory|
         PlacementHandoff::publish(std::path::Path::new(directory), PlacementPlan::new(args.rtx_gpus, expert_layers))).transpose()?;
     eprintln!("loading bottom {expert_layers} expert layers as TP2");
@@ -387,24 +350,23 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let mut second_transport = make_transport()?;
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
-    let memory = [devices[0].run(|| lib.cuda_memory_info())?, devices[1].run(|| lib.cuda_memory_info())?];
-    let pool = memory::distributed::PoolPlan::with_replication(map, args.concurrency as usize,
-        args.max_context_tokens as usize, args.prefix_cache_entries as usize, snapshot_bytes,
-        args.kv_pool_size, args.memory_reservation, memory,args.tp2_attention)?;
-    ensure!(pool.pages.iter().zip(reserved_pool.pages).all(|(&actual, reserved)| actual >= reserved),
-        "TP2 setup exceeded its budget and reduced the reserved KV pool");
-    tracing::info!(tp2_attention=args.tp2_attention, source_pages=?pool.pages, global_bytes=pool.global_bytes, cache_bytes=?pool.cache_bytes,
-        occupied_before=?pool.occupied_before, reservation_bytes=?pool.reservation_bytes,
-        unused_bytes=?pool.unused_bytes, desired_groups=pool.desired_groups, snapshot_slots, snapshot_bytes,
-        runtime_headroom_bytes=memory::distributed::RUNTIME_HEADROOM,
-        rtx_expert_layers=expert_layers, "dual RTX cache reservation after fixed allocations");
+    // Allocation must consume exactly the admitted pages; do not run a second
+    // sizing policy after loading conditional owners.
+    for gpu in 0..2 {
+        let (free,_) = devices[gpu].run(|| lib.cuda_memory_info())?;
+        ensure!(pool.cache_bytes[gpu] <= free,"TP2 setup exceeded shared cache admission on GPU {gpu}");
+    }
+    tracing::info!(tp2_attention=args.tp2_attention,source_pages=?pool.pages,global_bytes=pool.global_bytes,
+        cache_bytes=?pool.cache_bytes,reservation_bytes=?pool.reservation_bytes,snapshot_slots,snapshot_bytes,
+        rtx_expert_layers=expert_layers,"dual RTX cache reservation after fixed allocations");
+    let cache_bytes: [usize;2]=pool.cache_bytes.clone().try_into().map_err(|_|anyhow::anyhow!("dual cache budgets"))?;
     let token_map = cuteafd_loader::EngramTokenMap::from_file(&args.snapshot.join("tokenizer.json"))?;
     let rows = capacity as usize;
     let pipeline = unsafe { cuteafd_loader::EngramPipeline::new(&catalog, token_map, rows,
         2 * cuteafd_core::ENGRAM_LAYERS.len(), rows * 64 * 1024)? };
     let mut requests = if args.tp2_attention {
-        Requests::new_replicated(&lib,pipeline,args.concurrency as usize,pool.pages,map,pool.cache_bytes)?
-    } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,pool.cache_bytes)? };
+        Requests::new_replicated(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)?
+    } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)? };
     pass.configure_cache_replicas(requests.cache())?;
     second.configure_cache_replicas(requests.cache())?;
     requests.use_engine_pages()?;

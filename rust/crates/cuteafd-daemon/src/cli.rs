@@ -936,7 +936,7 @@ pub(crate) struct NativeServeArgs {
 
     /// Exact global KV/index byte budget (B/MB/GB/MiB/GiB), rounded down to page groups.
     #[arg(long)]
-    pub kv_pool_size: Option<crate::families::deepseek_v41::v41_native_serve::memory::ByteSize>,
+    pub kv_pool_size: Option<crate::shared::memory::budget::ByteSize>,
 
     /// Aggregate logical KV tokens; 0 selects planner admission. Omit to keep
     /// the existing V4.1 pool policy. Cannot be combined with --kv-pool-size.
@@ -945,11 +945,11 @@ pub(crate) struct NativeServeArgs {
 
     /// Total device occupancy ceiling (% or B/MB/GB/MiB/GiB); sizes KV after fixed allocations.
     #[arg(long)]
-    pub memory_reservation: Option<crate::families::deepseek_v41::v41_native_serve::memory::Reservation>,
+    pub memory_reservation: Option<crate::shared::memory::budget::Reservation>,
 
     /// Complete bottom-up RTX routed layers: auto fills available memory, or 0..40.
     #[arg(long, default_value = "auto")]
-    pub rtx_expert_layers: crate::families::deepseek_v41::v41_native_serve::memory::LocalLayers,
+    pub rtx_expert_layers: crate::shared::memory::budget::LocalLayers,
 
     /// Use paired H128 EXL3 ownership; requires paired AOT packages on all four Spark peers.
     #[arg(long)]

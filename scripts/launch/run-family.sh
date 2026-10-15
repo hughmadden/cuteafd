@@ -112,6 +112,8 @@ _spark_slot_keys() {
   done
 }
 # Keys every non-V4.1 launch path reads, plus the keys only that family reads.
+# WIP_INSTANCE and WIP_ROOT are the shared `--wip` slot staging root (the
+# start_coordinator block below passes both to every rank's staging script).
 _family_allowed_keys() {
   cat <<'EOF'
 VISION
@@ -130,6 +132,7 @@ EXPERT_BACKEND
 COORDINATOR_DOCKER_INFERENCE
 COORDINATOR_DOCKER_DEV
 WIP_INSTANCE
+WIP_ROOT
 SPECULATOR
 EMBEDDING
 COORDINATOR_GPUS
@@ -1450,6 +1453,9 @@ wip_layout="" wip_mount_args=() wip_worker_args=""
 if [[ -n "$wip_slot" ]]; then
   [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "invalid WIP slot name: $wip_slot" >&2; exit 2; }
   WIP_INSTANCE="${WIP_INSTANCE:-$(get WIP_INSTANCE)}"
+  # The WIP root the slot was staged under: the environment wins, else the
+  # config (as V4.1's release_load_config reads it), else the default layout.
+  WIP_ROOT="${WIP_ROOT:-$(get WIP_ROOT)}"
   release_wip_slot_instance "$wip_slot"
   release_wip_serving_layout "$instance"
   wip_coordinator_container="$(release_wip_container coordinator)"

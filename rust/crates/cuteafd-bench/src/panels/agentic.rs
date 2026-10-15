@@ -4,7 +4,7 @@
 //! planted bugs), thinking on, reasoning echoed back, until it answers without
 //! tool calls or 12 turns pass. Per turn: TTFT, emitted tok/s, cache hits;
 //! the session's success is the task's tests passing.
-use super::common::table;
+use super::common::{self, table};
 use super::{Ctx, Panel, Rates};
 use crate::report::ServerInfo;
 use anyhow::Result;
@@ -251,7 +251,10 @@ impl Panel for Agentic {
             ctx.progress.step(turn as f64 / MAX_TURNS as f64, format!("{task} · turn {}", turn + 1));
             let body = json!({"messages": messages, "tools": tools(), "tool_choice": "auto", "temperature": 0,
                 "max_tokens": 8192u64.min(ctx.max_output), "reasoning_effort": "high"});
-            let chat = ctx.client.chat(body, None)?;
+            // After the first turn the history holds the model's own reasoning,
+            // calls and the tool results they chose: the prompt is
+            // model-determined and differs between arms by design.
+            let chat = ctx.client.chat(body, (turn > 0).then(common::output_dependent))?;
             let t = &chat.timing;
             let valid = chat.tool_calls.iter().filter(|c| serde_json::from_str::<Value>(c["function"]["arguments"]
                 .as_str().unwrap_or("")).is_ok()).count();

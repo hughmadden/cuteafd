@@ -30,6 +30,12 @@ pub struct ProbeSpec {
     /// Token ids to run instead of tokenizing the rendered prompt.
     #[serde(default)]
     pub prompt_ids: Option<Vec<u32>>,
+    /// The prompt re-renders text an earlier response produced (a follow-up
+    /// turn, or a reuse of generated ids), so its token ids are
+    /// model-determined: two engines legitimately tokenize it differently and
+    /// the request carries no matched-prompt evidence.
+    #[serde(default)]
+    pub output_dependent: bool,
     /// Already-expanded native image spans, verified against prepared sources by the engine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<ProbeMedia>,
@@ -296,6 +302,14 @@ impl Probe {
         self.positions.as_ref().is_none_or(|set| set.contains(&position))
     }
 
+    /// Whether this request's prompt is decided by the client's input, so that
+    /// two engines must run the same prompt token ids. Only such a prompt is
+    /// matched-pair evidence: one that re-renders model output differs by
+    /// design and is reported without a token hash.
+    pub fn input_determined(&self) -> bool {
+        !self.spec.output_dependent
+    }
+
     fn with(&self, f: impl FnOnce(&mut ProbeRecord)) {
         if let Ok(mut record) = self.record.lock() {
             f(&mut record);
@@ -510,7 +524,7 @@ mod tests {
             "{{\"start\":2,\"len\":4,\"kind\":\"image\",\"key\":\"{}\",\"grid\":[1,4,4]}}", "ab".repeat(32)));
         let spec = ProbeSpec { media: vec![media], ..Default::default() };
         assert_eq!(serde_json::to_string(&spec).unwrap(), format!(concat!(
-            "{{\"cold\":false,\"no_speculation\":false,\"prompt_ids\":null,\"media\":[",
+            "{{\"cold\":false,\"no_speculation\":false,\"prompt_ids\":null,\"output_dependent\":false,\"media\":[",
             "{{\"start\":2,\"len\":4,\"kind\":\"image\",\"key\":\"{}\",\"grid\":[1,4,4]}}],",
             "\"score_from\":null,\"verify_rows\":null,\"score_path\":null,\"dump_rows\":null,",
             "\"record_first\":false,\"record_rows\":0,\"top_k\":0,\"want\":{{}}}}"), "ab".repeat(32)));
@@ -751,5 +765,16 @@ mod tests {
         let record = probe.record();
         assert_eq!((record.prompt_ids.len(), record.cached_tokens, record.generated.as_slice(), record.cold),
             (3, 2, &[5u32][..], true));
+    }
+
+    #[test]
+    fn output_dependent_marks_a_follow_up_prompt() {
+        use super::*;
+        // A spec that does not set the flag stays input-determined.
+        let spec: ProbeSpec = serde_json::from_str("{\"cold\":true}").unwrap();
+        assert!(!spec.output_dependent && Probe::new(spec).input_determined());
+        let (id, probe) = registry().register(ProbeSpec { output_dependent: true, ..ProbeSpec::default() });
+        let claimed = registry().claim(&id).expect("registered");
+        assert!(Arc::ptr_eq(&probe, &claimed) && !claimed.input_determined());
     }
 }

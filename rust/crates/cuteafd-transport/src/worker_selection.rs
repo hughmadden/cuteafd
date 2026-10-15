@@ -407,6 +407,7 @@ pub fn receive_worker_selection(stream: &TcpStream, rank: usize, timeout: Durati
     stream.set_write_timeout(Some(timeout))?;
     let value: serde_json::Value = read(stream)?;
     if value["message"] == "fabric_traffic" {
+            crate::traffic::control_phase(&value);
         write(&mut stream.try_clone()?, &serde_json::json!({"message": "fabric_traffic", "sample": crate::traffic::local()}))?;
         return Err(crate::traffic::TrafficProbeOnly.into());
     }
@@ -649,6 +650,26 @@ mod tests {
         let companion = InstalledExpertVariant::from_piecewise_queries(16,
             ExpertTrafficContract::ExactGrouping, |_| Ok(16)).unwrap();
         assert!(report.with_bf16_variants(vec![companion]).is_err());
+    }
+
+    /// An NVFP4 package's workers install one FP8 family of tiles and report no
+    /// BF16 siblings, while the checkpoint's Spark wire is BF16 (the workers
+    /// quantize the activations themselves). The report must answer that
+    /// package's own wire form from the variants it did install, so a planner
+    /// pricing a BF16 request is not left without a grouping.
+    #[test]
+    fn nvfp4_report_without_bf16_siblings_answers_the_bf16_wire() {
+        let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
+        let variants = [1, 16, 80, 4096].into_iter().map(|capacity|
+            InstalledExpertVariant::from_piecewise_queries(capacity, ExpertTrafficContract::ExactGrouping,
+                |rows| Ok(if capacity <= 16 { 16 }
+                    else if capacity == 80 || (1..=80).contains(&rows) { 64 } else { 128 })).unwrap()).collect();
+        let report = InstalledExpertGrouping::new(loaded, 0, 128, ExpertGroupingSelector::Fp8Nearest, variants).unwrap();
+        assert!(report.bf16_variants.is_none() && report.validate().is_ok());
+        for (rows, expected) in [(1, 16), (16, 16), (17, 64), (80, 64), (81, 128), (128, 128)] {
+            assert_eq!(report.group_rows(rows).unwrap(), expected, "fp8 rows {rows}");
+            assert_eq!(report.group_rows_for_input(rows, true).unwrap(), expected, "bf16 rows {rows}");
+        }
     }
 
     #[test]

@@ -1940,6 +1940,10 @@ impl Opened {
         let warmed = engine::configured_prefill_lanes(true, layers == self.cfg.layers, transports.len());
         let warm_rows = args.expert_rows();
         let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote.start, self.checkpoint.spark_input_is_bf16())?;
+        // Connect every warmed rank now and publish its installed expert
+        // grouping: the draft planner prices the workers before any wave opens a
+        // session, and the warm-up below then reuses these sessions.
+        for link in &mut transports[..warmed] { link.bootstrap(&warm)?; }
         let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());

@@ -732,6 +732,23 @@ def test_a_key_the_family_never_reads_fails_before_launch(tmp_path, family, extr
     assert "docker run -d" not in result.stderr
 
 
+def test_the_wip_slot_root_a_card_config_names_launches_every_family(tmp_path):
+    # The card harness launches each card from a generated config that names the
+    # WIP root it staged, and the shared `--wip` staging hands that root to every
+    # rank's staging script. A family whose allowed set omits it dies before any
+    # container runs ("unused configuration key: WIP_ROOT"), so the key must be
+    # accepted here and must reach the ranks.
+    root = tmp_path / "home" / ".cache" / "cuteafd" / "builds" / "wip-test"
+    result = _family_launch_result(
+        tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+        f"SPECULATOR=off\nVISION=off\nAUDIO=off\nWIP_ROOT={root}\n",
+        extra_args=("--wip", "slot-test"))
+    assert result.returncode == 0, result.stderr
+    assert "unused configuration key" not in result.stderr
+    stages = [line for line in result.stderr.splitlines() if line.startswith("ssh h0 bash -s -- slot-test")]
+    assert any(str(root) in line for line in stages), "\n".join(stages)
+
+
 def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/mimo_v2/mod.rs").read_text()
     timing = "let timing = cuteafd_transport::protocol_v2_timing_from_env();"

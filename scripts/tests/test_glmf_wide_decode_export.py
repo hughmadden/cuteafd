@@ -306,8 +306,8 @@ def test_glmf_w8_state_is_orthogonal_and_canonical(exporter):
     for cap, mode in ((64, "decode"), (128, "decode"), (4096, "prefill")):
         params, kw = calls[f"kda_w8_s16_m{cap}"]
         expected = {"max_rows": cap, "fp8_only": mode, "state_dtype": "bfloat16", "state_rounding": "window"}
-        if mode == "decode":
-            expected["decode_recipe"] = "w8a16"
         assert params == kw == expected
-        assert "decode_recipe" not in calls[f"kda_w8_m{cap}"][1]
+        # Decode and prefill differ only in their row capacity: one canonical FP8 route per
+        # load covers the whole decode range, so no recipe key selects a second one.
+        assert "decode_recipe" not in params
     assert calls["kda_w8_s16t_m4096"][1]["state_rounding"] == "tile"

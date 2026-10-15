@@ -1,5 +1,6 @@
 //! A representative report for render tests and page development.
 use crate::report::*;
+use std::path::{Path, PathBuf};
 
 pub fn report(failed: bool) -> Report {
     let gpu = |index: u32, used: bool| Gpu { index, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition".into(),
@@ -251,6 +252,49 @@ mod tests {
             assert!(card.contains(r#"width="1200" height="675""#));
         }
     }
+}
+
+/// A checkpoint directory whose own `config.json` declares `algo` for its
+/// routed experts — what the fidelity rule reads, and all it reads: the model
+/// name or the directory it sits in never decides the class.
+pub fn nvfp4_snapshot(hub: &Path, algo: &str) -> PathBuf {
+    let path = hub.join("models--nvidia--Qwen3.8-Flash-Next-NVFP4").join("snapshots").join("2061e0b0");
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("config.json"), serde_json::json!({"quantization_config": {
+        "quant_method": "modelopt", "quant_algo": algo, "group_size": 16,
+        "quantized_layers": {"model.language_model.layers.0.mlp.experts": {"quant_algo": algo}}}})
+        .to_string()).unwrap();
+    path
+}
+
+/// The Qwen NVFP4 max card as it was published: KL 0.039 and top-1 93.7%
+/// against a bar of 0.040 and 94.0%, stored as a failure by the rule in force
+/// then, and a caption note that leads with that verdict. `failing` — a check
+/// id, or `""` for none — is the gate left failing beside it, which is what
+/// keeps such a card failing once the fidelity check is reclassified.
+pub fn qwen_nvfp4_max(hub: &Path, algo: &str, failing: &str) -> Report {
+    let mut report = report(true);
+    report.id = "2b1e2d3f4a5b6c7d".into();
+    report.server.model = "nvidia/Qwen3.8-Flash-Next-NVFP4".into();
+    report.server.family = Some("qwen4".into());
+    report.server.configuration.snapshot = Some(nvfp4_snapshot(hub, algo).display().to_string());
+    report.server.configuration.settings.push(Setting { name: "qualification.caveat".into(),
+        source: "publication".into(), value: Some("FAIL: not recommended. KL > 0.04 on a calibrated quant.".into()),
+        default: None });
+    let baseline = report.baseline.as_mut().unwrap();
+    let fidelity = baseline.quality.checks.iter_mut().find(|check| check.id == "fidelity").unwrap();
+    fidelity.summary = "KL 0.039 · top-1 93.7% · 1433 generated / 4096 total rows".into();
+    fidelity.set("kl", 0.03866);
+    fidelity.set("top1", 0.93719);
+    fidelity.set("kl_max", 0.04);
+    fidelity.set("top1_min", 0.94);
+    if !failing.is_empty() {
+        let check = baseline.quality.checks.iter_mut().find(|check| check.id == failing)
+            .unwrap_or_else(|| panic!("no check {failing}"));
+        check.status = CheckStatus::Fail;
+    }
+    baseline.quality.settle();
+    report
 }
 
 /// A report with synthetic passes of every measurement panel (render work).

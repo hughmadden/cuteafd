@@ -52,7 +52,10 @@ const GLM_BF16_SKINNY_ROWS: usize = 0;
 const QWEN_WIDE_SKINNY_ROWS: usize = 24;
 const QWEN_MEDIUM_SKINNY_ROWS: usize = 64;
 const QWEN_SMALL_SKINNY_ROWS: usize = 160;
-const FP8_PROJECTION_SKINNY_ROWS: usize = 16;
+/// No FP8 decode projection crosses an arithmetic route below its capacity (the fork's
+/// `FP8_DECODE_ROWS`): one thin 16-row GEMV tile and a multi-tile GEMV over the same
+/// `(warps, groups)` cover every decode bucket, and the W8A16 GEMM takes rows past it.
+const FP8_PROJECTION_SKINNY_ROWS: usize = 64;
 const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "gdn.in_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
     ProjectionThreshold { name: "gdn.out_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
@@ -105,6 +108,31 @@ pub(crate) const FP8_HEAD_ROWS: usize = 16;
 pub(crate) fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)> {
     (0..rows).step_by(FP8_HEAD_ROWS).map(move |first| (first, FP8_HEAD_ROWS.min(rows - first)))
 }
+
+/// The wave a Spark transport is bootstrapped with at start-up: `rows` zero
+/// rows in the checkpoint's own Spark input form (`bf16` for an NVFP4 expert
+/// package, whose workers quantize, else the E4M3/UE8M0 K32 wire). It is the
+/// widest wave any serving step dispatches — a rank's session rings are sized
+/// by the request that opens them — so bootstrapping with it connects every
+/// rank and publishes its installed expert grouping before the draft planner
+/// prices the workers, and no later wave has to reconnect. Nothing is
+/// dispatched with it, so the layer id is inert.
+pub(crate) fn spark_bootstrap_request(cfg: &Qwen4Config, rows: usize, bf16: bool) -> Result<ExpertProtocolV2Request> {
+    let (h, topk) = (cfg.hidden, cfg.topk);
+    let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
+        row_index: (i / topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.0,
+    }).collect();
+    let (dtype, row_bytes) = if bf16 { (ExpertV2Dtype::Bf16, 2 * h) } else { (ExpertV2Dtype::Fp8E4m3Ue8m0K32, h + h / 32) };
+    let mut request = ExpertProtocolV2Request::new(1, 17, 0, h as u32, dtype,
+        (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
+            token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
+        }).collect(),
+        routes, vec![0; rows * row_bytes])?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
+}
+
 /// Rows a speculative step records per GDN layer (the fork's `REPLAY_ROWS`).
 pub(crate) const REPLAY_ROWS: usize = 64;
 /// Target rows a sequence may hold for its MTP canonical history before the
@@ -1257,7 +1285,7 @@ impl<'a> Qwen4Engine<'a> {
             "Qwen Spark-free dual execution requires TP2 halves at every routed layer");
         ensure!(placement.layers.iter().map(|layer| layer.mode).eq(modes.iter().copied()),
             "Qwen executor attention owners disagree with placement");
-        let hops = cuteafd_loader::placement::plan_hops(&modes, &spec);
+        let hops = cuteafd_loader::placement::plan_hops(&modes, &spec)?;
         ensure!(placement.hops == hops && hops.len() == 2, "Qwen placement must charge cutover and exit");
         let _scope = self.gdn_banks[0].device.enter()?;
         for bank in &self.gdn_banks {

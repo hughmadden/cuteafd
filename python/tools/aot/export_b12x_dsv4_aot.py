@@ -350,7 +350,7 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                                       (prefill_rows, "prefill", "s16", "window"),
                                       (prefill_rows, "prefill", "s16t", "tile")):
         params = {"max_rows": rows, "fp8_only": mode, "state_dtype": "bfloat16",
-                  "state_rounding": rounding, **({"decode_recipe": "w8a16"} if mode == "decode" else {})}
+                  "state_rounding": rounding}
         out.append((f"kda_w8_{tag}_m{rows}", "kda", params,
                     lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
     out.append(("kda_commit_s16", "kda_commit", {"state_dtype": "bfloat16"},
@@ -399,9 +399,9 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
          lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, state_dtype="bfloat16", state_rounding="window",
                                          seq_ctas=8, decode_tiles=True)),
         (f"kda_w8_s16_m{r}", "kda", {"max_rows": r, "fp8_only": "decode", "state_dtype": "bfloat16",
-                                     "state_rounding": "window", "decode_recipe": "w8a16"},
+                                     "state_rounding": "window"},
          lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8_only="decode", state_dtype="bfloat16",
-                                         state_rounding="window", decode_recipe="w8a16")),
+                                         state_rounding="window")),
         (f"mla_producer_m{r}", "mla_producer", {"max_rows": r, "fp8_only": "decode"},
          lambda: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only="decode")),
         (f"o_m{r}", "o", {"max_rows": r, "fp8_only": "decode"},

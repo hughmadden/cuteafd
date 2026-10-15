@@ -158,6 +158,25 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                         'TRITON_CACHE_DIR', 'TORCHINDUCTOR_CACHE_DIR']:
                 self.assertTrue(env[key].startswith('/tmp/cuteafd-home'))
 
+    def test_storage_run_mount_is_optional_readonly_and_host_local(self) -> None:
+        for present in (True, False):
+            result = subprocess.run(['bash', '-c', r"""
+set -euo pipefail
+source scripts/lib/release-common.sh
+# Simulate the dedicated directory, even while its socket is absent on restart.
+body=$(declare -f release_serving_docker_args)
+body=${body/\[\[ -d \/srv\/sparknest\/run \]\]/$TEST_RUN_DIR}
+eval "$body"
+release_serving_docker_args
+printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
+"""], cwd=ROOT, capture_output=True, env={**os.environ,'TEST_RUN_DIR': 'true' if present else 'false'})
+            self.assertEqual(result.returncode,0,result.stderr)
+            args=result.stdout.decode().rstrip('\0').split('\0')
+            mount='type=bind,src=/srv/sparknest/run,dst=/srv/sparknest/run,readonly'
+            self.assertEqual(mount in args,present)
+            self.assertNotIn('type=bind,src=/srv/sparknest,dst=/srv/sparknest,readonly',args)
+            self.assertFalse(any('rdma-counters.sock' in arg for arg in args))
+
     def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
         for source in [v41_source(), FAMILY.read_text()]:
             self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args)', source)

@@ -289,7 +289,9 @@ mod tests {
     /// Shares the process-wide throttle ring, so it is the only test here that touches it.
     #[test]
     fn stream_falls_back_to_nvml_and_returns() {
-        let dir = std::env::temp_dir().join(format!("cuteafd-thermal-{}", std::process::id()));
+        // /tmp, not temp_dir(): a Unix socket path is capped near 108 bytes and a
+        // deep TMPDIR (as the CPU gate sets) exceeds it.
+        let dir = std::path::Path::new("/tmp").join(format!("cuteafd-thermal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("stream.sock");
         let config = Config { socket: socket.clone(), visible: Some("GPU-bbbb".into()),

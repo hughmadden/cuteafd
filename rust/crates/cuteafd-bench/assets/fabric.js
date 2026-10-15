@@ -5,7 +5,8 @@ const NS = 'http://www.w3.org/2000/svg';
 const series = [
   { name: 'NIC', key: 'nic', dash: '' },
   { name: 'Engine', key: 'engine', dash: '8 3' },
-  { name: 'Foreign', key: 'foreign', dash: '2 3' },
+  { name: 'Foreign / retry residual', key: 'foreign', dash: '2 3' },
+  { name: 'SparkNest', key: 'sparknest', dash: '10 3 2 3' },
 ];
 const histories = new Map();
 let run, sequence = 0;
@@ -27,7 +28,12 @@ function point(port, index) {
   const max = (a, b) => Number.isFinite(a) && Number.isFinite(b) ? Math.max(a, b) : null;
   return { index, port, nic: max(port.xmit_gbps, port.rcv_gbps),
     engine: max(rate(port.engine_sent_bytes), rate(port.engine_received_bytes)),
+    sparknest: max(rate(port.sparknest_sent_bytes), rate(port.sparknest_received_bytes)),
     foreign: max(rate(port.foreign_sent_bytes), rate(port.foreign_received_bytes)) };
+}
+function rateHeaders(p) {
+  return Number.isFinite(p.estimated_header_sent_bytes) && Number.isFinite(p.estimated_header_received_bytes) && p.seconds > 0
+    ? Math.max(p.estimated_header_sent_bytes, p.estimated_header_received_bytes) * 8 / p.seconds / 1e9 : null;
 }
 function draw(container, key, history) {
   const last = history.at(-1), port = last.port;
@@ -46,7 +52,7 @@ function draw(container, key, history) {
   const plot = document.createElement('div'); plot.className = 'fabric-plot';
   const svg = document.createElementNS(NS, 'svg');
   svg.setAttribute('viewBox', '0 0 620 180'); svg.setAttribute('role', 'img');
-  svg.setAttribute('aria-label', `${key}: NIC, engine and foreign traffic, in Gb/s. Autoscaled to observed traffic; link capacity is labeled separately.`);
+  svg.setAttribute('aria-label', `${key}: NIC, engine, SparkNest and foreign residual traffic, in Gb/s. Autoscaled to observed traffic; link capacity is labeled separately.`);
   plot.append(svg);
   const observed = Math.max(...history.flatMap(p => series.map(s => p[s.key] || 0)));
   const ceiling = observed > 0 ? observed * 1.15 : 1;
@@ -91,13 +97,13 @@ function draw(container, key, history) {
     const i = Math.max(0, Math.min(history.length - 1, Math.round((px - 46) / 560 * Math.max(history.length - 1, 1))));
     const p = history[i];
     crosshair.setAttribute('d', `M${x(i)} 12 V148`); crosshair.setAttribute('visibility', 'visible');
-    tooltip.textContent = `Sample ${p.index}: NIC ${fmt(p.nic)}, engine ${fmt(p.engine)}, foreign ${fmt(p.foreign)} Gb/s; wait ${fmt(p.port.xmit_wait_ticks_per_s)} ticks/s`;
+    tooltip.textContent = `Sample ${p.index}: NIC ${fmt(p.nic)}, engine ${fmt(p.engine)}, SparkNest ${fmt(p.sparknest)}, foreign ${fmt(p.foreign)} Gb/s; storage ${p.port.sparknest_status || "unknown"}; residual ${p.port.residual_kind || "unattributed"}; headers estimate ${fmt(rateHeaders(p.port))} Gb/s (engine: ceil(bytes/MTU)*62 lower bound; SparkNest: per-op packets*62); wait ${fmt(p.port.xmit_wait_ticks_per_s)} ticks/s`;
     tooltip.hidden = false;
   });
   hit.addEventListener('pointerleave', () => { tooltip.hidden = true; crosshair.setAttribute('visibility', 'hidden'); });
   section.append(plot);
   const details = document.createElement('details');
-  details.innerHTML = `<summary>Data table · W: wait ticks · C: CNP · max(tx, rx), not duplex sum</summary><div class="fabric-table"><table><thead><tr><th>Sample</th><th>NIC Gb/s</th><th>Engine Gb/s</th><th>Foreign Gb/s</th><th>Utilization</th><th>Wait ticks/s</th><th>Idle ticks/s</th><th>CNP</th></tr></thead><tbody>${history.map((p) => `<tr><td>${esc(p.index)}</td><td>${fmt(p.nic)}</td><td>${fmt(p.engine)}</td><td>${fmt(p.foreign)}</td><td>${fmt(Number.isFinite(p.port.utilization) ? p.port.utilization * 100 : null)}%</td><td>${fmt(p.port.xmit_wait_ticks_per_s)}</td><td>${fmt(p.port.idle_xmit_wait_ticks_per_s)}</td><td>${cnp(p.port.counters) ?? 'unavailable'}</td></tr>`).join('')}</tbody></table></div>`;
+  details.innerHTML = `<summary>Data table · W: wait ticks · C: CNP · max(tx, rx), not duplex sum</summary><div class="fabric-table"><table><thead><tr><th>Sample</th><th>NIC Gb/s</th><th>Engine Gb/s</th><th>SparkNest Gb/s</th><th>Foreign Gb/s</th><th>Headers Gb/s (engine lower bound)</th><th>Storage status</th><th>Utilization</th><th>Wait ticks/s</th><th>Idle ticks/s</th><th>CNP</th></tr></thead><tbody>${history.map((p) => `<tr><td>${esc(p.index)}</td><td>${fmt(p.nic)}</td><td>${fmt(p.engine)}</td><td>${fmt(p.sparknest)}</td><td>${fmt(p.foreign)}</td><td>${fmt(rateHeaders(p.port))}</td><td>${esc(p.port.sparknest_status || "unknown")}</td><td>${fmt(Number.isFinite(p.port.utilization) ? p.port.utilization * 100 : null)}%</td><td>${fmt(p.port.xmit_wait_ticks_per_s)}</td><td>${fmt(p.port.idle_xmit_wait_ticks_per_s)}</td><td>${cnp(p.port.counters) ?? 'unavailable'}</td></tr>`).join('')}</tbody></table></div>`;
   section.append(details); container.append(section);
 }
 function render() {
@@ -155,7 +161,7 @@ window.CuteFabric = {
       if (!seen.has(key)) {
         history.push({ index: sequence, port: { ...history.at(-1).port, state: 'unavailable',
           utilization: null, counters: {}, xmit_wait_ticks_per_s: null, idle_xmit_wait_ticks_per_s: null },
-          nic: null, engine: null, foreign: null });
+          nic: null, engine: null, sparknest: null, foreign: null });
         if (history.length > 60) history.shift();
       }
     }

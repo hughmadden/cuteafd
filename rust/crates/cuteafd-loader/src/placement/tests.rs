@@ -21,15 +21,18 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false,
             experts: Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: GIB / 4 }, half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
             modes: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }).collect(),
+        pool_bounded: Vec::new(),
         pool_overhead: vec![UNIT; gpus],
         fixed: Vec::new(),
         movables: Vec::new(),
         expert_workspace: GIB / 4,
         tp2_workspace: [0; 2],
         onboard,
+        minimum_expert_layers: 0,
         expert_gpus: gpus,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new(), ..LayerPolicy::default() },
-        hops: HopSpec::default(),
+        hops: HopSpec { row_bytes: 0, rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0,
+            terminal: if gpus == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } },
         executor: V4_HEADS,
     }
 }
@@ -63,6 +66,16 @@ fn one_gpu_runs_whole_layers_and_shrinks_the_pool_before_failing() {
     assert!(placement.layers.iter().all(|l| l.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }));
     assert_eq!(placement.pool_tokens, 12 * GIB / UNIT * 256);
     assert_eq!(placement.onboard_layers, 0);
+}
+
+#[test]
+fn spark_auto_pool_can_shrink_below_context_but_v41_refuses_it() {
+    let req = request(1, GIB, 40, 4, Onboard::Auto);
+    let placement = solve(&req).unwrap();
+    assert_eq!(placement.pool_tokens, 65_536);
+    assert!(placement.pool_tokens < req.pool.floor);
+    assert!(matches!(families::deepseek_v41::validate_pool_floor(&req.pool, &placement),
+        Err(PlacementError::BelowFloor { pool: 65_536, floor: 131_072, .. })));
 }
 
 #[test]
@@ -169,7 +182,7 @@ const W1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
 const S0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Split };
 const S1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Split };
 /// V4/V4.1-sized mHC hop: `[4096,4,4096]` BF16 per lane slot = 128 MiB.
-const MHC: HopSpec = HopSpec { row_bytes: 4 * 4096 * 2, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0 };
+const MHC: HopSpec = HopSpec { row_bytes: 4 * 4096 * 2, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
 const ANY: ExecutorModes = ExecutorModes { family: "test", modes: &[LayerMode::HeadSplit, W0, W1, S0, S1], hops: true, attention: AttentionPlacement::Heads };
 
 #[test]
@@ -194,7 +207,7 @@ fn residual_transitions_follow_the_section_3_table() {
 fn layer_ranges_hop_once_per_boundary_and_back_to_the_head() {
     // V4.1: layers 0-19 on GPU0, 20-39 on GPU1, head on GPU0.
     let modes: Vec<_> = (0..40).map(|l| if l < 20 { W0 } else { W1 }).collect();
-    let hops = plan_hops(&modes, &MHC);
+    let hops = plan_hops(&modes, &MHC).unwrap();
     assert_eq!(hops.iter().map(|h| (h.at, h.from, h.to, h.kind)).collect::<Vec<_>>(), [
         (HopPoint::BeforeLayer(20), 0, 1, HopKind::Boundary),
         (HopPoint::Exit, 1, 0, HopKind::Boundary),
@@ -202,7 +215,7 @@ fn layer_ranges_hop_once_per_boundary_and_back_to_the_head() {
     // One receive pair per lane on each GPU: 2 lanes x 1 hop x 128 MiB.
     assert_eq!(hop_buffer_bytes(&hops, &MHC, 2), Some(vec![256 << 20, 256 << 20]));
     // Head on GPU1 with the last range: no exit hop.
-    let tail = plan_hops(&modes, &HopSpec { head_gpu: 1, ..MHC });
+    let tail = plan_hops(&modes, &HopSpec { head_gpu: 1, ..MHC }).unwrap();
     assert_eq!(tail.len(), 1);
     assert_eq!(hop_buffer_bytes(&tail, &MHC, 2), Some(vec![0, 256 << 20]));
 }
@@ -210,7 +223,7 @@ fn layer_ranges_hop_once_per_boundary_and_back_to_the_head() {
 #[test]
 fn head_split_stacks_only_hop_at_entry_and_charge_nothing() {
     // Today's V4/GLM/MiMo head split: the embedding broadcast lands in the step input.
-    let hops = plan_hops(&[LayerMode::HeadSplit; 61], &MHC);
+    let hops = plan_hops(&[LayerMode::HeadSplit; 61], &HopSpec { terminal: TerminalHome::Replicated, ..MHC }).unwrap();
     assert_eq!(hops.len(), 1);
     assert_eq!((hops[0].at, hops[0].kind, hops[0].charged()), (HopPoint::Entry, HopKind::Broadcast, false));
     assert_eq!(hop_buffer_bytes(&hops, &MHC, 2), Some(vec![0, 0]));
@@ -220,14 +233,14 @@ fn head_split_stacks_only_hop_at_entry_and_charge_nothing() {
 fn mixed_split_and_whole_layers_broadcast_into_split_ffns() {
     // GLM Flash's mixed policy: KDA head split, DSA layers whole on alternating GPUs with a split FFN.
     let modes = [LayerMode::HeadSplit, S0, LayerMode::HeadSplit, S1, LayerMode::HeadSplit];
-    let hops = plan_hops(&modes, &MHC);
+    let hops = plan_hops(&modes, &HopSpec { terminal: TerminalHome::Replicated, ..MHC }).unwrap();
     assert_eq!(hops.iter().map(|h| (h.at, h.from, h.to)).collect::<Vec<_>>(), [
         (HopPoint::Entry, 0, 1), (HopPoint::AfterAttention(1), 0, 1), (HopPoint::AfterAttention(3), 1, 0),
     ]);
     // Each GPU receives one charged hop per lane.
     assert_eq!(hop_buffer_bytes(&hops, &MHC, 2), Some(vec![256 << 20, 256 << 20]));
     // Many hops into one GPU alternate between two slots per lane.
-    let many = plan_hops(&[S0, S0, S0, S0], &MHC);
+    let many = plan_hops(&[S0, S0, S0, S0], &HopSpec { terminal: TerminalHome::Replicated, ..MHC }).unwrap();
     assert_eq!(many.len(), 4);
     assert_eq!(hop_buffer_bytes(&many, &MHC, 2), Some(vec![0, 512 << 20]));
 }
@@ -251,7 +264,7 @@ fn placement_records_residual_homes_and_charges_hops_as_fixed_demands() {
     assert!(ranges.summary().ends_with("; 2 residual hops"));
     // The hop buffers come out of the pool: 256 MiB = 64 units of 4 MiB fewer.
     let mut split = req.clone();
-    split.hops = HopSpec::default();
+    split.hops = HopSpec { row_bytes: 0, rows: 0, lanes: 0, ..req.hops };
     assert_eq!(solve(&split).unwrap().pool_tokens - ranges.pool_tokens, 64 * 256);
     // Today's V4 request: head split, the residual replicated after layer 0, nothing charged.
     let v4 = solve(&request(2, 44 * GIB, 4, 4, Onboard::Auto)).unwrap();
@@ -277,6 +290,7 @@ fn executors_refuse_modes_they_cannot_run_at_plan_time() {
     assert!(solve(&req).unwrap().layers.iter().all(|l| l.mode == LayerMode::HeadSplit));
     // An executor without hop points refuses modes that need them (ranges need a boundary hop).
     let mut req = request(2, 44 * GIB, 4, 4, Onboard::Layers(0));
+    req.hops.terminal = TerminalHome::AttentionOwner;
     req.executor = ExecutorModes { family: "nohops", modes: &[W0, W1], hops: false, attention: AttentionPlacement::Heads };
     req.policy.default = vec![W0];
     req.layers[3].modes = vec![W1];
@@ -285,6 +299,7 @@ fn executors_refuse_modes_they_cannot_run_at_plan_time() {
     // Without peer access, GPU1-owned and split layers are not executable at all.
     let mut req = request(2, 44 * GIB, 4, 4, Onboard::Auto);
     req.inventory.peer_access = false;
+    req.hops.terminal = TerminalHome::AttentionOwner;
     req.executor = ANY;
     req.policy.default = vec![S1, W1, W0];
     for layer in &mut req.layers { layer.modes = vec![S1, W1, W0]; }
@@ -524,6 +539,7 @@ fn layers_selector_supports_gqa_gdn_owner_reduction_and_prefers_split() {
     req.executor = ExecutorModes { family: "both", modes: &[W0, W1, S0, S1], hops: true, attention: AttentionPlacement::Heads };
     for layer in &mut req.layers { layer.modes = vec![W0, W1, S0, S1]; }
     assert_eq!(req.executor.whole_mode(0), Some(S0));
+    req.hops.terminal = TerminalHome::Replicated;
     assert_eq!(solve(&req).unwrap().layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S0, S1, S1]);
     // A kind with no owner-capable layer kernels stays split even though
     // other kinds in the same executor support whole ownership.
@@ -560,7 +576,7 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         req.pool.unit_rows = 64;
         req.fixed = fixed.into_iter().enumerate().map(|(gpu, bytes)| Demand::new(gpu as u8, Category::Workspace,
             "P2 fixed", bytes + if nvfp4 { 8_685_388_318 } else { 0 }, Basis::Estimated)).collect();
-        req.hops = HopSpec { row_bytes: 12_288, rows: 4096, lanes: 4, entry_gpu: 0, head_gpu: 0 };
+        req.hops = HopSpec { row_bytes: 12_288, rows: 4096, lanes: 4, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
         req.attention_placement = Some(AttentionPlacement::Heads);
         let heads = solve(&req).unwrap();
         print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Heads, &heads);
@@ -643,7 +659,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
             partial_row_bytes: if dim == 4096 { 32_896 } else { 65_792 },
             candidate_row_bytes: if dim == 4096 { 4_096 } else { 8_192 },
             compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
-        req.hops = HopSpec { row_bytes: 4 * dim * 2 + 16, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0 };
+        req.hops = HopSpec { row_bytes: 4 * dim * 2 + 16, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
         let half = (half * GIB as f64) as u64;
         let state_unit = (state * GIB as f64 / count as f64) as u64;
         for (i, layer) in req.layers.iter_mut().enumerate() {
@@ -687,7 +703,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
     req.context_buffers = ContextBuffers { staging_unit_bytes: 256 * 528 + 64 * 132, staging_unit_rows: 256,
         query_row_bytes: 32_768, partial_row_bytes: 32_896, candidate_row_bytes: 4_096,
         compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
-    req.hops = HopSpec { row_bytes: 32_784, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0 };
+    req.hops = HopSpec { row_bytes: 32_784, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
     for (i, layer) in req.layers.iter_mut().enumerate() {
         let mla = i % 4 == 3;
         layer.kind = if mla { AttentionClass::Mla } else { AttentionClass::Kda };
@@ -752,6 +768,7 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
     for executor in families::EXECUTORS {
         let mut req = request(2, 20 * GIB, 2, 4, Onboard::Auto);
         req.executor = executor;
+        req.hops.terminal = if executor.runs(LayerMode::HeadSplit) { TerminalHome::Replicated } else { TerminalHome::AttentionOwner };
         for layer in &mut req.layers {
             layer.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1, W0, W1];
             layer.kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
@@ -885,6 +902,7 @@ fn per_kind_attention_policy_is_strict_only_on_peer_tp2() {
     req.layers[0].kind = AttentionClass::Mla;
     assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })));
     req.inventory.peer_access = false;
+    req.hops.terminal = TerminalHome::AttentionOwner;
     assert!(solve(&req).is_ok(), "no-peer layout retains the legacy single-device policy");
     req.inventory.peer_access = true;
     req.policy.attention.push(req.policy.attention[0]);
@@ -1211,7 +1229,7 @@ fn frozen_owned_admission_does_not_rechoose_after_measured_rank_balance_changes(
     req.executor = CONTEXT;
     req.attention_placement = Some(AttentionPlacement::Layers);
     req.pool_overhead = vec![0; 2];
-    req.hops = MHC;
+    req.hops = HopSpec { terminal: TerminalHome::Replicated, ..MHC };
     for layer in &mut req.layers {
         layer.experts = None;
         layer.modes = vec![LayerMode::HeadSplit, S0, S1];
@@ -1242,4 +1260,137 @@ fn frozen_owned_admission_does_not_rechoose_after_measured_rank_balance_changes(
     invalid = original.clone();
     invalid.layers[0].mode = LayerMode::HeadSplit;
     assert!(matches!(solve_frozen(&req, &invalid), Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn terminal_home_is_explicit_and_validated_for_every_final_mode() {
+    use ResidualHome::{Owned, Replicated};
+    for mode in [LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1] {
+        let replicated = HopSpec { terminal: TerminalHome::Replicated, ..MHC };
+        let head = HopSpec { terminal: TerminalHome::Head, ..MHC };
+        assert_eq!(residual_homes(&[mode], &replicated).unwrap().last(), Some(&Replicated));
+        assert_eq!(residual_homes(&[mode], &head).unwrap().last(), Some(&Owned(0)));
+        assert_eq!(plan_hops(&[mode], &head), plan_hops(&[mode], &replicated),
+            "a head-only terminal post needs no extra residual publication");
+        assert!(matches!(residual_homes(&[mode], &MHC), Err(LayerPlanError::Terminal { .. })));
+    }
+    assert_eq!(residual_homes(&[W0, W1], &MHC).unwrap().last(), Some(&Owned(1)));
+    assert!(matches!(residual_homes(&[W1], &HopSpec { terminal: TerminalHome::Head, ..MHC }),
+        Err(LayerPlanError::Terminal { .. })));
+    assert!(matches!(residual_homes(&[W0], &HopSpec { terminal: TerminalHome::Replicated, ..MHC }),
+        Err(LayerPlanError::Terminal { .. })));
+    let mut req = request(2, 44 * GIB, 4, 4, Onboard::Layers(0));
+    req.hops = HopSpec { terminal: TerminalHome::Head, ..MHC };
+    let mut p = solve(&req).unwrap();
+    assert_eq!(p.residual.last(), Some(&Owned(0)));
+    assert!(p.residual[1..p.residual.len() - 1].iter().all(|home| *home == Replicated));
+    LayerExecutionPlan::new(&p, req.hops).unwrap();
+    let replicated = HopSpec { terminal: TerminalHome::Replicated, ..req.hops };
+    assert_eq!(LayerExecutionPlan::new(&p, replicated), Err(LayerPlanError::Residual));
+    p.residual.last_mut().map(|home| *home = Replicated);
+    assert_eq!(LayerExecutionPlan::new(&p, req.hops), Err(LayerPlanError::Residual));
+    req.hops.head_gpu = 2;
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+    let mut one = request(1, 44 * GIB, 4, 4, Onboard::Layers(0));
+    one.hops.terminal = TerminalHome::Replicated;
+    assert!(matches!(solve(&one), Err(PlacementError::Inventory(_))));
+    one.hops.terminal = TerminalHome::Head;
+    let p = solve(&one).unwrap();
+    assert!(p.residual.iter().all(|home| *home == Owned(0)));
+}
+
+#[test]
+fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
+    for fixed in [false, true] {
+        for (free, expected) in [(65, 3), (75, 4), (85, 5), (100, 7)] {
+            let mut req = request(1, free, 0, 4, if fixed { Onboard::Layers(0) } else { Onboard::Auto });
+            req.pool = PoolPolicy { requested: None, target: 100, floor: 1, ceiling: 100, unit_rows: 1 };
+            req.pool_overhead = vec![10];
+            req.pool_bounded = vec![BoundedDemand { gpu: 0, category: Category::Kv,
+                group: "bounded table".into(), bytes_per_unit: 5, offset_units: 2, cap_units: 6, basis: Basis::Formula }];
+            let p = solve(&req).unwrap();
+            assert_eq!(p.pool_tokens, expected);
+            assert_eq!(p.items[0].iter().map(|i| i.bytes).sum::<u64>(), expected * 10 + (expected + 2).min(6) * 5);
+            req.pool.requested = Some(expected + 1);
+            assert!(solve(&req).is_err());
+        }
+    }
+    let mut req = request(1, 200, 1, 4, Onboard::Auto);
+    req.pool = PoolPolicy { requested: Some(5), target: 5, floor: 5, ceiling: 5, unit_rows: 1 };
+    req.pool_overhead = vec![10];
+    req.expert_workspace = 0;
+    req.layers[0].experts.as_mut().unwrap().whole = Bytes2 { resident: 121, staging: 0 };
+    req.pool_bounded = vec![BoundedDemand { gpu: 0, category: Category::Kv,
+        group: "table".into(), bytes_per_unit: 5, offset_units: 2, cap_units: 6, basis: Basis::Formula }];
+    assert_eq!(solve(&req).unwrap().onboard_layers, 0);
+    req.layers[0].experts.as_mut().unwrap().whole.resident = 120;
+    assert_eq!(solve(&req).unwrap().onboard_layers, 1);
+}
+
+#[test]
+fn bounded_only_pool_and_invalid_demands_are_checked() {
+    let mut req = request(1, 49, 0, 4, Onboard::Auto);
+    req.pool = PoolPolicy { requested: None, target: 100, floor: 1, ceiling: 100, unit_rows: 1 };
+    req.pool_overhead = vec![0];
+    req.pool_bounded = vec![BoundedDemand { gpu: 0, category: Category::Kv, group: "table".into(),
+        bytes_per_unit: 10, offset_units: 0, cap_units: 5, basis: Basis::Formula }];
+    assert_eq!(solve(&req).unwrap().pool_tokens, 4);
+    req.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 50 };
+    assert_eq!(solve(&req).unwrap().pool_tokens, 100);
+    req.pool_bounded[0].gpu = 1;
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+    req.pool_bounded[0].gpu = 0;
+    req.pool_bounded[0].bytes_per_unit = u64::MAX;
+    assert!(req.pool_bounded[0].bytes(2).is_err());
+    req.pool_bounded[0].bytes_per_unit = 1;
+    req.pool_bounded[0].offset_units = u64::MAX;
+    assert_eq!(req.pool_bounded[0].bytes(1).unwrap(), 5);
+}
+
+#[test]
+fn compulsory_prefix_reserves_exact_costs_before_an_automatic_pool() {
+    for gpus in [1, 2] {
+        let mut req = request(gpus, 10 * GIB, 12, 4, Onboard::Auto);
+        req.minimum_expert_layers = 4;
+        let placement = solve(&req).unwrap();
+        assert!(placement.onboard_layers >= 4);
+        assert!(placement.pool_tokens < req.pool.target);
+        assert_eq!(placement.expert_ranges.iter().map(|r| r.layers).sum::<usize>(), 4);
+        // A split prefix must balance the two owners, not all land on GPU0.
+        if gpus == 2 {
+            assert_eq!(placement.expert_ranges.iter().map(|r| r.layers).collect::<Vec<_>>(), [2, 2]);
+        }
+        req.pool.requested = Some(req.pool.target);
+        assert!(solve(&req).is_err());
+        req.pool.requested = None;
+        req.pool.floor = req.pool.target;
+        let below_floor = solve(&req).unwrap();
+        assert!(below_floor.pool_tokens < req.pool.floor);
+        assert!(matches!(families::deepseek_v41::validate_pool_floor(&req.pool, &below_floor),
+            Err(PlacementError::BelowFloor { .. })));
+        req.pool.floor = 131_072;
+        req.onboard = Onboard::Layers(3);
+        assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+        req.onboard = Onboard::Auto;
+        req.minimum_expert_layers = 13;
+        assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+    }
+}
+
+#[test]
+fn compulsory_prefix_fails_when_even_the_weights_do_not_fit() {
+    let mut req = request(1, GIB, 2, 4, Onboard::Auto);
+    req.minimum_expert_layers = 1;
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 1, placed: 0 })));
+}
+
+#[test]
+fn pool_ceiling_is_strict_for_automatic_and_explicit_pools() {
+    let mut req = request(1, 32 * GIB, 0, 4, Onboard::Auto);
+    req.pool.floor = 0;
+    req.pool.ceiling = 512;
+    req.pool.target = 1024;
+    assert_eq!(solve(&req).unwrap().pool_tokens,512);
+    req.pool.requested = Some(1024);
+    assert!(matches!(solve(&req),Err(PlacementError::PoolDoesNotFit {..})));
 }

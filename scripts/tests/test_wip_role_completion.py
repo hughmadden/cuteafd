@@ -216,6 +216,7 @@ def test_wip_programs_stage_current_table_or_empty_even_after_previous_opt_in(tm
     for name in ('cuteafd', 'libcuteafd_native.so', 'V41_EXPERT_AOT.json',
                  'V41_EXPERT_TP_AOT.json', 'V41_FP8_AOT.json'):
         (output / name).write_text('artifact')
+    (output / 'V41_EXPERT_WORKSPACES').mkdir()
     (output / 'PROGRAMS.json').write_text('stale table')
     env = {key: value for key, value in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
     env.update(role=role, build_dir=str(build), output_dir=str(output),
@@ -298,6 +299,7 @@ def test_finalizer_retains_checked_programs_and_frozen_transformers_identity(tmp
     (output / 'PROGRAMS.json').write_text('{"schema":1,"programs":[]}')
     sums = ''.join(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n'
                    for path in sorted(output.iterdir()))
+    (output / 'V41_EXPERT_WORKSPACES').mkdir()
     (output / 'ARTIFACT_SHA256SUMS').write_text(sums)
     script = (ROOT / 'scripts/build/finalize-wip-slot.sh').read_text().replace('/wip/', str(tmp_path / 'wip') + '/')
     command = ['bash', '-c', script, 'finalize', str(source), role, 'WP9', str(output), 'base', 'sha256:base']
@@ -351,3 +353,55 @@ def test_zero_spark_expert_role_still_refused():
     result = _wip_dry_run('--role', 'expert', '--config', str(config))
     assert result.returncode != 0
     assert 'no active Spark hosts' in result.stderr
+
+
+@pytest.mark.parametrize("script_name,source_var", [
+    ("build-wip-artifacts.sh", "build_dir"),
+    ("build-release-artifacts.sh", "build_root"),
+])
+@pytest.mark.parametrize("coordinator,nvfp4", [(True, True), (True, False), (False, True)])
+def test_v41_exact_workspace_manifests_survive_artifact_staging(tmp_path, script_name, source_var, coordinator, nvfp4):
+    text = (ROOT / "scripts/build" / script_name).read_text()
+    start = text.index("# Keep planner workspace inputs identical")
+    end = text.index("\nfi\n", start) + len("\nfi\n")
+    block = text[start:end]
+    build = tmp_path / "build"
+    output = tmp_path / "output"
+    staged = output / "V41_EXPERT_WORKSPACES"
+    staged.mkdir(parents=True)
+    (staged / "stale.json").write_text("stale")
+    expected = {}
+    for role, native_dir in [("rtx_backbone", "v41_local_experts"), ("rtx_tp2", "v41_tp2_experts")]:
+        for fmt, directory, name in [("mxfp4", native_dir, "v41_experts.json"),
+                                     ("nvfp4", "v41_nvfp4_" + role, "v41_nvfp4_experts.json")]:
+            if fmt == "nvfp4" and not nvfp4:
+                continue
+            path = build / "native" / directory / name
+            path.parent.mkdir(parents=True)
+            payload = json.dumps({"role": role, "format": fmt, "variants": [{"core_scratch_nbytes": 1234567}]}).encode()
+            path.write_bytes(payload)
+            if coordinator:
+                expected[f"{fmt}_{role}.json"] = payload
+    env = {**os.environ, source_var: str(build), "output_dir": str(output),
+           "coordinator_aot": "ON" if coordinator else "OFF", "nvfp4_aot": "ON" if nvfp4 else "OFF",
+           "CUTEAFD_RELEASE_NVFP4_AOT": "ON" if nvfp4 else "OFF"}
+    result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + block], env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert {p.name: p.read_bytes() for p in staged.iterdir()} == expected
+    if coordinator:
+        (build / "native/v41_local_experts/v41_experts.json").unlink()
+        result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + block], env=env,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode != 0  # A linked role cannot silently lose its exact workspace contract.
+
+
+def test_v41_workspace_manifests_reach_sealed_slots_and_release_images():
+    finalize = (ROOT / "scripts/build/finalize-wip-slot.sh").read_text()
+    assert 'cp -a "$build_output/V41_EXPERT_WORKSPACES" "$incoming/workspace/.cuteafd-wip/V41_EXPERT_WORKSPACES"' in finalize
+    docker = (ROOT / "docker/Dockerfile.release").read_text()
+    assert "COPY .cuteafd-release-image/V41_EXPERT_WORKSPACES /opt/cuteafd/share/V41_EXPERT_WORKSPACES" in docker
+    wip = (ROOT / "scripts/build/build-wip-artifacts.sh").read_text()
+    assert "find bin-variants lib-variants V41_EXPERT_WORKSPACES -type f" in wip
+    release = (ROOT / "build.sh").read_text()
+    assert 'find coordinator/V41_EXPERT_WORKSPACES spark-expert/V41_EXPERT_WORKSPACES -type f' in release
