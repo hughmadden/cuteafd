@@ -11,6 +11,41 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 ORACLE = ROOT / "python/reference/families/glm5_flash/dspark/reference.py"
 GOLDEN = ROOT / "python/reference/families/qwen3_5/golden.py"
+GLM_GOLDEN = ROOT / "python/reference/families/glm5_flash/golden.py"
+
+
+def test_glm_golden_every_constructed_layer_enters_eval():
+    tree = ast.parse(GLM_GOLDEN.read_text())
+    allocations = [node for node in ast.walk(tree)
+                   if isinstance(node, ast.Assign) and any(
+                       isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+                       and child.func.attr == "to_empty" for child in ast.walk(node))]
+    assert len(allocations) == 2  # pinned-window and legacy prompt runners
+    for node in allocations:
+        assert isinstance(node.value, ast.Call)
+        assert isinstance(node.value.func, ast.Attribute)
+        assert node.value.func.attr == "eval"
+
+
+def test_glm_golden_eval_recurses_to_attention_on_cpu():
+    torch = pytest.importorskip("torch")
+    tree = ast.parse(GLM_GOLDEN.read_text())
+    allocations = [node for node in ast.walk(tree)
+                   if isinstance(node, ast.Assign) and any(
+                       isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+                       and child.func.attr == "to_empty" for child in ast.walk(node))]
+
+    class Layer(torch.nn.Sequential):
+        def to_empty(self, *, device):
+            return self  # exercise runner mode transitions without requiring CUDA
+
+    assert len(allocations) == 2
+    for allocation in allocations:
+        layer = Layer(torch.nn.Sequential(torch.nn.Dropout(0.1)))
+        assert all(module.training for module in layer.modules())
+        scope = {"layer": layer}
+        exec(compile(ast.Module(body=[allocation], type_ignores=[]), str(GLM_GOLDEN), "exec"), scope)
+        assert all(not module.training for module in scope["layer"].modules())
 
 
 def load(path, name):
