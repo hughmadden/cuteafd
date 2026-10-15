@@ -1321,6 +1321,7 @@ pub(crate) struct GlmfEngine<'a> {
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     tp2: Option<Tp2Experts<'a>>,
     local: Option<(std::ops::Range<usize>, Experts<'a>)>,
+    expert_routing: Option<crate::shared::placement::layers::ExpertRouting>,
     /// The drafter (DFlash2 or dSpark): every step taps its target layers.
     pub drafter: Option<super::dspark::Drafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
@@ -1691,7 +1692,7 @@ impl<'a> GlmfEngine<'a> {
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
-            experts: None, tp2: None, local: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
+            experts: None, tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
@@ -1890,7 +1891,7 @@ impl<'a> GlmfEngine<'a> {
         let layers = ranks[0].layers();
         ensure!(!layers.is_empty() && layers == ranks[1].layers() && layers.end <= self.weights.layers.len()
             && self.weights.layers[layers.clone()].iter().all(|l| !l.dense), "invalid GLM Flash TP2 routed range");
-        ensure!(self.tp2.is_none() && self.decode_workspace.borrow().is_none()
+        ensure!(self.expert_routing.is_none() && self.tp2.is_none() && self.decode_workspace.borrow().is_none()
             && self.lane_workspaces.borrow().is_empty() && peer.decode_workspace.borrow().is_none()
             && peer.lane_workspaces.borrow().is_empty(), "install TP2 before step workspace allocation");
         for (rank, r) in ranks.iter().enumerate() {
@@ -2066,17 +2067,58 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    pub(crate) fn install_local(&mut self, range: std::ops::Range<usize>, experts: Experts<'a>) {
+    pub(crate) fn install_local(&mut self, range: std::ops::Range<usize>, experts: Experts<'a>) -> Result<()> {
+        ensure!(self.expert_routing.is_none() && self.local.is_none(), "install local experts before binding homes");
+        ensure!(matches!(experts, Experts::Local(_) | Experts::LocalExl3(_)), "local expert backend required");
         self.local = Some((range, experts));
+        Ok(())
+    }
+
+    /// Freeze installed expert coverage against admission before any graph or step.
+    pub(crate) fn bind_expert_homes(&mut self, placement: &cuteafd_loader::placement::Placement,
+        spark_layers: &[usize], skip: bool) -> Result<()> {
+        use crate::shared::placement::layers::{BackendLayers, ExpertRouting};
+        use cuteafd_loader::placement::ExpertHome;
+        ensure!(self.expert_routing.is_none(), "expert homes already bound");
+        let dense: Vec<_> = self.weights.layers.iter().map(|layer| layer.dense).collect();
+        let routes = if skip {
+            ensure!((dense.iter().all(|&dense| dense) || matches!(self.experts, Some(Experts::Skip)))
+                && self.tp2.is_none() && self.local.is_none(),
+                "skip experts must not coexist with executing backends");
+            ExpertRouting::skipped(&dense)
+        } else {
+            let local: Vec<_> = self.local.as_ref().map_or_else(Vec::new, |(range, _)| range.clone().collect());
+            let tp2: Vec<_> = self.tp2.as_ref().map_or_else(Vec::new, |tp2| tp2.layers.clone().collect());
+            ensure!(spark_layers.is_empty() == !matches!(self.experts, Some(Experts::Spark { .. })),
+                "Spark transport coverage differs from selected worker layers");
+            ExpertRouting::bind(&placement.layers, &dense, &[
+                BackendLayers { home: ExpertHome::RtxWhole { gpu: 0 }, layers: &local },
+                BackendLayers { home: ExpertHome::RtxTp2, layers: &tp2 },
+                BackendLayers { home: ExpertHome::Spark, layers: spark_layers },
+            ])?
+        };
+        self.expert_routing = Some(routes);
+        Ok(())
     }
 
     fn routed_experts(&self, layer: usize) -> Option<&Experts<'a>> {
-        self.local.as_ref().filter(|(range, _)| range.contains(&layer)).map(|(_, e)| e)
-            .or(self.experts.as_ref())
+        use crate::shared::placement::layers::ExpertRoute;
+        use cuteafd_loader::placement::ExpertHome;
+        match self.expert_routing.as_ref()?.route(layer)? {
+            ExpertRoute::Backend(ExpertHome::RtxWhole { gpu: 0 }) => self.local.as_ref().map(|(_, e)| e),
+            ExpertRoute::Backend(ExpertHome::Spark) | ExpertRoute::Skipped => self.experts.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn local_layer(&self, layer: usize) -> bool {
+        matches!(self.routed_experts(layer), Some(Experts::Local(_) | Experts::LocalExl3(_)))
     }
 
     fn tp2_layer(&self, layer: usize) -> bool {
-        self.tp2.as_ref().is_some_and(|t| t.layers.contains(&layer))
+        use crate::shared::placement::layers::ExpertRoute;
+        self.expert_routing.as_ref().and_then(|routes| routes.route(layer))
+            == Some(ExpertRoute::Backend(cuteafd_loader::placement::ExpertHome::RtxTp2))
     }
 
     /// Bind the actual admitted TP1/TP2/Spark homes, not catalog availability.
@@ -2324,8 +2366,11 @@ impl<'a> GlmfEngine<'a> {
         self.dense_nvfp4 = Some(dense);
     }
 
-    pub fn set_experts(&mut self, experts: Experts<'a>) {
+    pub fn set_experts(&mut self, experts: Experts<'a>) -> Result<()> {
+        ensure!(self.expert_routing.is_none() && self.experts.is_none(), "install Spark/skip backend before binding homes");
+        ensure!(matches!(experts, Experts::Spark { .. } | Experts::Skip), "Spark or skip backend required");
         self.experts = Some(experts);
+        Ok(())
     }
 
     pub fn experts(&self) -> Option<&Experts<'a>> {
@@ -4901,7 +4946,7 @@ impl<'a> GlmfEngine<'a> {
                 let w = &workspaces[lane];
                 let w1 = peer_workspaces.as_ref().map(|peers| peers.get(lane)).transpose()?;
                 if layers[layer].dense || self.tp2_layer(layer)
-                    || self.local.as_ref().is_some_and(|(range, _)| range.contains(&layer)) {
+                    || self.local_layer(layer) {
                     // A local post may wait behind a previous lane's Spark FFN on the peer stream.
                     // Land that wave before queuing any blocking local meet.
                     if let Some((previous, wave)) = inflight.take() {
@@ -4912,7 +4957,7 @@ impl<'a> GlmfEngine<'a> {
                 }
                 let next = units.get(index + 1).copied();
                 let local = layers[layer].dense || self.tp2_layer(layer)
-                    || self.local.as_ref().is_some_and(|(range, _)| range.contains(&layer));
+                    || self.local_layer(layer);
                 let early_next = local && next.is_some_and(|(_, next_lane)| next_lane != lane);
                 let local_post = || -> Result<()> {
                     peer_next(unit)?;
@@ -4921,7 +4966,7 @@ impl<'a> GlmfEngine<'a> {
                 };
                 if layers[layer].dense {
                     local_post()?;
-                } else if self.local.as_ref().is_some_and(|(range, _)| range.contains(&layer)) {
+                } else if self.local_layer(layer) {
                     self.moe_experts(w, layer, &layers[layer], count_of(lane), rows_of(lane), cap, false, w1)?;
                     local_post()?;
                 } else if self.tp2_layer(layer) {
@@ -4932,6 +4977,8 @@ impl<'a> GlmfEngine<'a> {
                     let t = lanes[lane].0.kv_slots.len();
                     let shared = || self.ffn(w, &layers[layer], self.cfg.moe_intermediate, cap, w.shared.buffer.ptr,
                         rows_of(lane));
+                    ensure!(matches!(self.routed_experts(layer), Some(Experts::Spark { .. })),
+                        "layer {layer} is not bound to a Spark backend");
                     let wave = self.spark_dispatch(w, layer, t, false, &mut transports[lane], shared)?;
                     peer_next(unit)?;
                     if let Some((previous, wave)) = inflight.take() {
