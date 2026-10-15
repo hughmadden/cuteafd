@@ -212,7 +212,7 @@ pub(crate) trait LayerKernels {
     fn ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<()>;
 }
 
-trait LayerProtocol {
+pub(crate) trait LayerProtocol {
     type Ticket;
     fn require_live(&self) -> Result<()>;
     fn push_entry(&self, from: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()>;
@@ -395,7 +395,7 @@ fn pipeline_attention(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, 
     Ok(owner)
 }
 
-fn layer_pipeline_with<K: PipelineKernels>(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+pub(crate) fn layer_pipeline_with<K: PipelineKernels>(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
     plan: &LayerExecutionPlan, exchange: &impl LayerProtocol,
     order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
     cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes,

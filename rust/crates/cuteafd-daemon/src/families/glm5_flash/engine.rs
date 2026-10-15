@@ -72,6 +72,8 @@ type Dev<'a> = DeviceAllocation<'a>;
 
 #[path = "engine/context.rs"]
 mod context;
+#[path = "engine/layers.rs"]
+mod layers;
 pub(crate) use cuteafd_loader::placement::families::glm5_flash::GlmfAttention;
 
 pub(crate) const PAGE_ROWS: usize = 64;
@@ -1332,6 +1334,9 @@ pub(crate) struct GlmfEngine<'a> {
     context: Option<context::GlmfContextSplit<'a>>,
     /// Per prefill lane and rank: this step's context gather and commit counts.
     context_units: RefCell<context::ContextUnits>,
+    // Hop consumers retire before the exchange whose terminal words they borrow.
+    layer_execution: Option<layers::Execution<'a>>,
+    layer_waves: RefCell<Vec<Option<SparkExpertWave>>>,
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmfPeer<'a>>,
     exchange: Option<PeerExchange<'a>>,
@@ -1707,6 +1712,7 @@ impl<'a> GlmfEngine<'a> {
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
             device, context_mode, context: None, context_units: RefCell::new(Vec::new()),
+            layer_execution: None, layer_waves: RefCell::new(Vec::new()),
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
@@ -1970,6 +1976,7 @@ impl<'a> GlmfEngine<'a> {
             copies: || self.terminal_links(|link| link.terminal_drain_copies()),
             graphs: || {
                 self.terminal_links(|link| link.terminal_release())?;
+                self.layer_waves.borrow_mut().clear();
                 for rank in 0..self.ranks() {
                     self.on(rank, || { *self.graphs_of(rank).borrow_mut() = GraphBank::new(None); Ok(()) })?;
                 }
@@ -3705,12 +3712,13 @@ impl<'a> GlmfEngine<'a> {
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
-        crate::shared::experts::rtx::pair::submit(
+        crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || self.shutdown_submission(),
-            || self.step_inner(tables, tokens, logit_rows, on_layer, forced, trace, media))
+            |scope| self.step_inner(scope, tables, tokens, logit_rows, on_layer, forced, trace, media))
     }
 
-    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
+    fn step_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+        tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
@@ -3742,6 +3750,12 @@ impl<'a> GlmfEngine<'a> {
         self.inject_media(w, tables, media)?;
         if media.is_some_and(|m| !m.spans().is_empty()) { self.put(&w.ids, tokens)?; }
         let rows = Scalar::I32(t as i32);
+        if self.layer_execution.is_some() {
+            ensure!(on_layer.is_none() && forced.is_none() && trace.is_none() && tables.segments.is_empty(),
+                "per-layer execution needs unpacked rows without tracing or teacher forcing");
+            return self.layer_step(scope, w, w1.context("per-layer peer workspace")?,
+                tables, tables1, t, logit_rows, graphed);
+        }
         if graphed {
             let result = self.decode_graphed(w, w1, tables, tables1, t, rows, logit_rows);
             self.finish_route_checks()?;
@@ -4420,7 +4434,8 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn mla_on(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables, trace: Option<&std::path::Path>) -> Result<()> {
-        if self.context.is_some() {
+        if self.context.is_some() && self.layer_execution.as_ref().is_none_or(|execution|
+            execution.plan.mode(index).is_ok_and(|mode| mode == cuteafd_loader::placement::LayerMode::ContextSplit)) {
             if tables.decode {
                 return self.context_decode_attention(rank, w, index, layer, rows, cap, tables);
             }
@@ -4930,13 +4945,17 @@ impl<'a> GlmfEngine<'a> {
     /// one. Returns the logits of the last `logit_rows` rows across the lanes.
     fn step_lanes(&self, lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
         -> Result<Option<StepLogits>> {
-        crate::shared::experts::rtx::pair::submit(
+        crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || self.shutdown_submission(),
-            || self.step_lanes_inner(lanes, logit_rows, device, media))
+            |scope| self.step_lanes_inner(scope, lanes, logit_rows, device, media))
     }
 
-    fn step_lanes_inner(&self, lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
+    fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+        lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
         -> Result<Option<StepLogits>> {
+        if self.layer_execution.is_some() {
+            return self.layer_steps(scope, lanes, logit_rows, device, media);
+        }
         let Some(Experts::Spark { transports, runtime }) = &self.experts else {
             anyhow::bail!("pipelined prefill needs Spark experts");
         };

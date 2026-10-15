@@ -1736,6 +1736,9 @@ impl Opened {
                 "GLM 5.3 Flash head split over two GPUs");
         }
         engine.validate_attention_homes(&execution)?;
+        if attention.mode == cuteafd_loader::placement::AttentionPlacement::Layers {
+            engine.bind_layer_execution(execution)?;
+        }
         if let Some(manifest) = &context_manifest {
             // The solver charged selected partial scratch and full-extent staging.
             engine.attach_context(args.max_context, manifest)?;
