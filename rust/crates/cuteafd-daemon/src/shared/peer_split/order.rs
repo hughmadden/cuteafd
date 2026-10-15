@@ -18,7 +18,7 @@
 //! producing that result. The hop primitive splits send from land so the
 //! executor can place the land after those pushes (for V4's P1 cycle, after
 //! the next lane's attention all-reduce push).
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 /// A flag both GPUs agree on: which exchange and which slot (or hop index).
@@ -80,9 +80,43 @@ impl fmt::Display for Deadlock {
     }
 }
 
-/// Runs `schedule` with each wait on GPU `g` consuming the next push on the
-/// same flag from the other GPU (the device-side sequences), and each stream
-/// in order. Ok only when both streams drain and every publication is consumed.
+/// Native publication sequences belong to an exchange slot, not a destination.
+/// DIRECT can publish several distinct lane buffers before any wait, but those
+/// waits must consume destinations in publication order. Buffer reuse remains
+/// forbidden until that destination's earlier publication has been consumed.
+#[derive(Default)]
+struct Publications {
+    fifo: [HashMap<(&'static str, usize), VecDeque<usize>>; 2],
+    outstanding: [HashSet<Flag>; 2],
+}
+
+impl Publications {
+    /// False means a wait's next native sequence has not been published yet.
+    fn advance(&mut self, gpu: usize, op: Op) -> Result<bool, String> {
+        match op {
+            Op::Push(flag) => {
+                if !self.outstanding[gpu].insert(flag) {
+                    return Err("unconsumed slot reuse".into());
+                }
+                self.fifo[gpu].entry((flag.exchange, flag.slot)).or_default().push_back(flag.target);
+            }
+            Op::Wait(flag) => {
+                let fifo = self.fifo[1 - gpu].entry((flag.exchange, flag.slot)).or_default();
+                let Some(&target) = fifo.front() else { return Ok(false) };
+                if target != flag.target {
+                    return Err(format!("crossed destination wait: expected target {target}, got {}", flag.target));
+                }
+                fifo.pop_front();
+                self.outstanding[1 - gpu].remove(&flag);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Runs `schedule` with each wait consuming the next per-slot sequence from
+/// the other GPU, including its destination identity, and each stream in order.
+/// Ok only when both streams drain and every publication is consumed.
 pub(crate) fn check(schedule: &Schedule) -> Result<(), Deadlock> {
     let mut start = [0; 2];
     for &end in &schedule.requests {
@@ -100,30 +134,19 @@ pub(crate) fn check(schedule: &Schedule) -> Result<(), Deadlock> {
 /// only on this retired-engine path, never on a healthy request boundary.
 pub(crate) fn check_terminal(schedule: &Schedule, aborted: bool) -> Result<(), Deadlock> {
     let mut at = [0usize; 2];
-    // Pushes published by GPU g per flag, and waits GPU g has consumed per flag.
-    let mut pushed: [HashMap<Flag, usize>; 2] = Default::default();
-    let mut waited: [HashMap<Flag, usize>; 2] = Default::default();
+    let mut publications = Publications::default();
     loop {
         let mut progressed = false;
         for gpu in 0..2 {
             while let Some((op, _)) = schedule.streams[gpu].get(at[gpu]) {
-                match *op {
-                    Op::Push(flag) => {
-                        let published = pushed[gpu].entry(flag).or_default();
-                        let consumed = waited[1 - gpu].get(&flag).copied().unwrap_or(0);
-                        if *published != consumed && !aborted {
-                            return Err(Deadlock { blocked: [0, 1].map(|rank| {
-                                if rank == gpu { Some(format!("unconsumed slot reuse: {}", schedule.streams[gpu][at[gpu]].1)) }
-                                else { schedule.streams[rank].get(at[rank]).map(|(_, label)| label.clone()) }
-                            }) });
-                        }
-                        *published += 1;
-                    }
-                    Op::Wait(flag) => {
-                        let have = pushed[1 - gpu].get(&flag).copied().unwrap_or(0);
-                        let used = waited[gpu].entry(flag).or_default();
-                        if *used >= have && !aborted { break; }
-                        *used += 1;
+                if !aborted {
+                    match publications.advance(gpu, *op) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(reason) => return Err(Deadlock { blocked: [0, 1].map(|rank| {
+                            if rank == gpu { Some(format!("{reason}: {}", schedule.streams[gpu][at[gpu]].1)) }
+                            else { schedule.streams[rank].get(at[rank]).map(|(_, label)| label.clone()) }
+                        }) }),
                     }
                 }
                 at[gpu] += 1;
@@ -135,10 +158,9 @@ pub(crate) fn check_terminal(schedule: &Schedule, aborted: bool) -> Result<(), D
         if done {
             if !aborted {
                 for gpu in 0..2 {
-                    if let Some((flag, count)) = pushed[gpu].iter().find(|(flag, count)|
-                        waited[1 - gpu].get(flag).copied().unwrap_or(0) != **count) {
+                    if let Some(flag) = publications.outstanding[gpu].iter().next() {
                         return Err(Deadlock { blocked: [0, 1].map(|rank| {
-                            (rank == gpu).then(|| format!("unconsumed publication: {flag:?} generation {count}"))
+                            (rank == gpu).then(|| format!("unconsumed publication: {flag:?}"))
                         }) });
                     }
                 }
@@ -283,6 +305,37 @@ mod tests {
         assert_eq!(check(&distinct), Ok(()));
         distinct.streams[1].pop();
         assert!(check(&distinct).is_err());
+    }
+
+    #[test]
+    fn direct_waits_cannot_cross_destination_sequences() {
+        for producer in 0..2 {
+            for crossed_after in 0..3 {
+                let mut s = Schedule::default();
+                for target in 0..4 {
+                    s.push_to(producer, "main", super::super::DIRECT, target, "publish lane");
+                }
+                let mut targets: Vec<_> = (0..4).collect();
+                targets.swap(crossed_after, crossed_after + 1);
+                for target in targets {
+                    s.wait_for(1 - producer, "main", super::super::DIRECT, target, "consume wrong lane");
+                }
+                let error = check(&s).unwrap_err();
+                assert!(error.blocked[1 - producer].as_ref().unwrap().contains("crossed destination wait"));
+            }
+        }
+    }
+
+    #[test]
+    fn destination_can_be_reused_after_its_fifo_wait() {
+        let mut s = Schedule::default();
+        for _ in 0..3 {
+            for target in 0..2 {
+                s.push_to(0, "main", super::super::DIRECT, target, "publish lane");
+                s.wait_for(1, "main", super::super::DIRECT, target, "consume lane");
+            }
+        }
+        assert_eq!(check_submission_faults(&s), Ok(()));
     }
 
     const MAIN: &str = "main";
