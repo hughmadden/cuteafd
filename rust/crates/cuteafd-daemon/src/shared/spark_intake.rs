@@ -788,6 +788,50 @@ mod warm_stream_tests {
             assert!(!source.contains(&["(warm_", "stream)"].concat()), "{family}: a raw warm-up stream call");
         }
     }
+
+    /// Every family that builds a Spark transport bootstraps it with a request
+    /// at install, so each rank's persistent session is open and its immutable
+    /// installed expert grouping is published before anything plans against the
+    /// workers. Qwen 4's draft planner reads the grouping that early, and a
+    /// transport that had never opened a session answered "worker rank 0 did
+    /// not report installed expert grouping" instead of launching.
+    ///
+    /// The request argument is load-bearing: the request that opens a rank's
+    /// session sizes its registered rings, so the bootstrap must hand over the
+    /// widest wave the family dispatches (its own start-up warm-up's request).
+    #[test]
+    fn every_spark_family_bootstraps_its_transport_with_a_wave_request() {
+        // The needles are joined here, so this file's own text does not match them.
+        let link = ["SparkLink::", "new("].concat();
+        let open = [".boot", "strap(&"].concat();
+        for (family, source) in [
+            ("deepseek_v4", include_str!("../families/deepseek_v4/mod.rs")),
+            ("glm5", include_str!("../families/glm5/mod.rs")),
+            ("glm5_flash", include_str!("../families/glm5_flash/mod.rs")),
+            ("mimo_v2", include_str!("../families/mimo_v2/mod.rs")),
+            ("qwen4", include_str!("../families/qwen4/mod.rs")),
+        ] {
+            let transport = source.find(&link).unwrap_or_else(|| panic!("{family}: no Spark transport"));
+            let bootstrap = source.find(&open)
+                .unwrap_or_else(|| panic!("{family}: the Spark transport is never bootstrapped"));
+            assert!(bootstrap > transport, "{family}: the bootstrap precedes the transport it opens");
+        }
+        // The argument-less form is the shape that leaves every session
+        // unopened; it must not come back.
+        let bare = [".boot", "strap()"].concat();
+        for source in [
+            include_str!("../families/deepseek_v4/mod.rs"),
+            include_str!("../families/deepseek_v4/engine.rs"),
+            include_str!("../families/glm5/mod.rs"),
+            include_str!("../families/glm5/engine.rs"),
+            include_str!("../families/glm5_flash/mod.rs"),
+            include_str!("../families/mimo_v2/mod.rs"),
+            include_str!("../families/qwen4/mod.rs"),
+            include_str!("../families/qwen4/engine.rs"),
+        ] {
+            assert!(!source.contains(&bare), "a Spark transport is bootstrapped without a wave request");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -966,6 +1010,20 @@ impl<'a> SparkLink<'a> {
 
     pub(crate) fn world_size(&self) -> usize {
         self.transport.world_size()
+    }
+
+    /// Completes every rank's persistent bootstrap without dispatching a wave,
+    /// so the workers' immutable installed grouping is readable before the
+    /// first request and the rings its widest wave needs are already
+    /// registered. Every Spark family calls this once, right after
+    /// [`Self::enable_terminal_ownership`] and before anything plans against
+    /// the transport; dispatch then reuses the open sessions.
+    ///
+    /// `request` must be the widest wave the family dispatches (the one its
+    /// start-up warm-up sends): it sizes every rank's registered rings, and a
+    /// later wider request would have to retire and reconnect them.
+    pub(crate) fn bootstrap(&mut self, request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<()> {
+        self.transport.bootstrap(request)
     }
 
     /// Must precede connection/bootstrap so a temporary failed endpoint can

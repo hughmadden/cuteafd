@@ -105,6 +105,31 @@ pub(crate) const FP8_HEAD_ROWS: usize = 16;
 pub(crate) fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)> {
     (0..rows).step_by(FP8_HEAD_ROWS).map(move |first| (first, FP8_HEAD_ROWS.min(rows - first)))
 }
+
+/// The wave a Spark transport is bootstrapped with at start-up: `rows` zero
+/// rows in the checkpoint's own Spark input form (`bf16` for an NVFP4 expert
+/// package, whose workers quantize, else the E4M3/UE8M0 K32 wire). It is the
+/// widest wave any serving step dispatches — a rank's session rings are sized
+/// by the request that opens them — so bootstrapping with it connects every
+/// rank and publishes its installed expert grouping before the draft planner
+/// prices the workers, and no later wave has to reconnect. Nothing is
+/// dispatched with it, so the layer id is inert.
+pub(crate) fn spark_bootstrap_request(cfg: &Qwen4Config, rows: usize, bf16: bool) -> Result<ExpertProtocolV2Request> {
+    let (h, topk) = (cfg.hidden, cfg.topk);
+    let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
+        row_index: (i / topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.0,
+    }).collect();
+    let (dtype, row_bytes) = if bf16 { (ExpertV2Dtype::Bf16, 2 * h) } else { (ExpertV2Dtype::Fp8E4m3Ue8m0K32, h + h / 32) };
+    let mut request = ExpertProtocolV2Request::new(1, 17, 0, h as u32, dtype,
+        (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
+            token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
+        }).collect(),
+        routes, vec![0; rows * row_bytes])?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
+}
+
 /// Rows a speculative step records per GDN layer (the fork's `REPLAY_ROWS`).
 pub(crate) const REPLAY_ROWS: usize = 64;
 /// Target rows a sequence may hold for its MTP canonical history before the

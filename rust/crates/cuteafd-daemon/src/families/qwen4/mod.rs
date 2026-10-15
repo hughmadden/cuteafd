@@ -599,6 +599,12 @@ impl Opened {
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
         transport.enable_terminal_ownership(self.library.clone())?;
+        // Connect every rank and publish its installed expert grouping now, with
+        // the widest wave this transport can carry: the draft planner prices the
+        // workers before any serving step opens a session, and the sessions this
+        // opens are the ones every step after it reuses.
+        transport.bootstrap(&engine::spark_bootstrap_request(&self.cfg, args.prefill_rows,
+            self.checkpoint.spark_input_is_bf16())?)?;
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime, mtp }))

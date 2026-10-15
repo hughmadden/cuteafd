@@ -82,10 +82,51 @@ impl LocalTp4Client {
 
     pub(crate) fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
         let reports = self.expert_grouping.iter().enumerate().map(|(rank, report)|
-            report.clone().with_context(|| format!("worker rank {rank} did not report installed expert grouping")))
+            report.clone().with_context(|| match self.sessions[rank].is_some() {
+                // A session reported nothing: an older worker's handshake.
+                true => format!("worker rank {rank} did not report installed expert grouping"),
+                // No session ever ran, so no worker was asked. Name the cause
+                // instead of blaming a rank that never spoke.
+                false => format!("rank {rank} has no live Spark session, so its installed expert grouping was never \
+                    reported; bootstrap the transport (or dispatch a wave) before planning against it"),
+            }))
             .collect::<Result<Vec<_>>>()?;
         crate::worker_selection::InstalledExpertGrouping::validate_ranks(&reports)?;
         Ok(reports)
+    }
+
+    /// Connects every rank's persistent session with `request` — which sizes
+    /// the registered rings, so it must be the widest wave this transport will
+    /// ever dispatch — and returns once each worker's immutable installed
+    /// grouping has been published. Only the control bootstrap runs: nothing is
+    /// dispatched and no worker sees the request's rows. A planner can read
+    /// [`Self::installed_grouping`] afterwards without a wave having to open a
+    /// session first, and the waves that follow reuse these sessions.
+    pub(crate) fn bootstrap(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+        for rank in 0..self.peers.len() {
+            if self.sessions[rank].is_none() {
+                self.drain_retired()?;
+                self.open_session(rank, request, self.landing[rank], true)?;
+            }
+        }
+        self.installed_grouping()?;
+        Ok(())
+    }
+
+    /// Opens `rank`'s session with `request` (which sizes the registered rings)
+    /// and retains the grouping its bootstrap reported.
+    fn open_session(&mut self, rank: usize, request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
+        egress: bool) -> Result<()> {
+        let flow_label = self.flows.label(rank, self.peers[rank])?;
+        // Only the compact-BF16 wire caps a session's rings by capacity; every
+        // other family's rings are the request's own wire extents.
+        let capacity = self.capacity.filter(|_| cuteafd_core::expert_geometry().family() == Some("v41")
+            && request.header.flags & crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0);
+        self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
+            self.peers[rank], &self.config, request, landing,
+            if egress { self.egress.as_ref() } else { None },
+            self.write[rank], self.terminal_owner.clone(), flow_label, capacity)?);
+        self.retain_grouping(rank)
     }
 
     fn retain_grouping(&mut self, rank: usize) -> Result<()> {
@@ -191,11 +232,7 @@ impl LocalTp4Client {
             }
             if self.sessions[rank].is_none() {
                 self.drain_retired()?;
-                let flow_label = self.flows.label(rank, self.peers[rank])?;
-                self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
-                    self.peers[rank], &self.config, request, None, None, self.write[rank], self.terminal_owner.clone(),
-                    flow_label, self.capacity.filter(|_| cuteafd_core::expert_geometry().family() == Some("v41")
-                        && request.header.flags & crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0))?);
+                self.open_session(rank, request, None, false)?;
             }
             let session = self.sessions[rank].as_mut().unwrap();
             anyhow::ensure!(session.write_mode, "rank {rank} session is not in write mode");
@@ -260,20 +297,7 @@ impl LocalTp4Client {
             }
             if self.sessions[rank].is_none() {
                 self.drain_retired()?;
-                let flow_label = self.flows.label(rank, self.peers[rank])?;
-                self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
-                    self.peers[rank],
-                    &self.config,
-                    request,
-                    self.landing[rank],
-                    self.egress.as_ref(),
-                    self.write[rank],
-                    self.terminal_owner.clone(),
-                    flow_label,
-                    self.capacity.filter(|_| cuteafd_core::expert_geometry().family() == Some("v41")
-                        && request.header.flags & crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0),
-                )?);
-                self.retain_grouping(rank)?;
+                self.open_session(rank, request, self.landing[rank], true)?;
             }
         }
         if self.expert_grouping.iter().any(Option::is_some) { self.installed_grouping()?; }
@@ -534,6 +558,22 @@ mod tests {
         let error = format!("{error:#}");
         assert!(error.contains("expert endpoint") && error.contains("419495936") && error.contains("302120960"));
         assert!(!error.contains("control plane closed"));
+        Ok(())
+    }
+
+    /// A transport whose sessions were never opened has no report to give, and
+    /// the error says so: it names the missing bootstrap instead of blaming a
+    /// rank whose worker was never asked (which is what a planner reading the
+    /// grouping before any session looks like).
+    #[test]
+    fn grouping_without_a_bootstrap_names_the_missing_session() -> Result<()> {
+        let peers = ["127.0.0.1:19451".parse()?, "127.0.0.1:19452".parse()?];
+        let client = LocalTp4Client::new_tp2(peers, TcpTransportConfig::default());
+        assert!(client.sessions.iter().all(Option::is_none));
+        let error = format!("{:#}", client.installed_grouping().unwrap_err());
+        assert!(error.contains("rank 0 has no live Spark session"), "{error}");
+        assert!(error.contains("bootstrap the transport"), "{error}");
+        assert!(!error.contains("did not report installed expert grouping"), "{error}");
         Ok(())
     }
 

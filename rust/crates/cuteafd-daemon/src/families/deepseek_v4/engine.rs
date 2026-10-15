@@ -1802,16 +1802,24 @@ impl<'a> Engine<'a> {
         self.device_link.as_ref().map_or(Ok(()), |link| link.check())
     }
 
-    /// Connects every Spark rank and registers full-size buffers with one
-    /// prefill-sized request of zero rows, so the first real request does not
-    /// pay for connection setup (about 0.6 s).
-    pub fn warm_transport(&self, transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
+    /// The widest wave this engine ever dispatches: a prefill-sized request of
+    /// zero rows. It sizes a Spark session's registered buffers, so the
+    /// transport bootstrap uses it too.
+    pub fn warm_request(&self) -> Result<ExpertProtocolV2Request> {
         let (rows, h, experts, topk) = (self.prefill_rows, self.cfg.dim, self.cfg.n_routed_experts, self.cfg.n_activated_experts);
         let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
             row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
         }).collect();
-        let request = self.expert_request(self.cfg.n_layers - 1, rows, routes, vec![0u8; rows * (h + h / 32)].into(),
-            ExpertV2SourceKind::Prefill)?;
+        self.expert_request(self.cfg.n_layers - 1, rows, routes, vec![0u8; rows * (h + h / 32)].into(),
+            ExpertV2SourceKind::Prefill)
+    }
+
+    /// Connects every Spark rank and registers full-size buffers with one
+    /// prefill-sized request of zero rows, so the first real request does not
+    /// pay for connection setup (about 0.6 s).
+    pub fn warm_transport(&self, transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
+        let rows = self.prefill_rows;
+        let request = self.warm_request()?;
         let wave = transport.dispatch(&request)?;
         runtime.block_on(transport.receive(wave, rows, self.stream))?;
         self.sync()

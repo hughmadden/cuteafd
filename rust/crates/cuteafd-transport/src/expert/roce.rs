@@ -157,6 +157,22 @@ impl SparkExperts {
     pub fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
         self.clients.installed_grouping()
     }
+    /// Completes every rank's persistent bootstrap without dispatching a wave,
+    /// so [`Self::installed_grouping`] answers before the first request and the
+    /// rings every later request needs are already registered. Call it after
+    /// [`Self::enable_terminal_ownership`]; the sessions stay open for the
+    /// waves that follow.
+    ///
+    /// `request` sizes the registered rings, so it must be the widest wave this
+    /// transport will dispatch — the same one its start-up warm-up sends. Only
+    /// the control bootstrap reaches a worker; the rows are never sent.
+    pub fn bootstrap(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+        ensure!(!self.wave_open, "cannot bootstrap a Spark transport with a wave in flight");
+        ensure!(request.header.row_count <= self.capacity,
+            "Spark bootstrap request of {} rows exceeds the transport's {}-row capacity",
+            request.header.row_count, self.capacity);
+        self.clients.bootstrap(request)
+    }
     /// Topology this transport was bound to, if any.
     pub fn topology(&self) -> Option<SparkTopology> {
         self.topology
