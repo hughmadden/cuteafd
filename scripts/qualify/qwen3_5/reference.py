@@ -41,10 +41,12 @@ def reference_identity(snapshot):
         if not (snapshot / shard).is_file():
             raise ValueError(f"missing shard: {shard}")
     # Bind the gate-site decision to the executable reference, not a config alias.
-    gated_source = inspect.getsource(reference.Qwen3_5RMSNormGated.forward)
+    gated_source = inspect.getsource(reference.Qwen3_5RMSNormGated)
     attention_source = inspect.getsource(reference.Qwen3_5Attention.forward)
     source = Path(reference.__file__).read_bytes()
-    if ("silu" not in gated_source or "sigmoid(gate)" not in attention_source
+    if ('self.activation = "silu"' not in gated_source
+            or 'ACT2FN[self.activation](gate.to(torch.float32))' not in gated_source
+            or "sigmoid(gate)" not in attention_source
             or b"output_gate_type" in source):
         raise ValueError("reference gate implementation changed; reconcile before running")
     if text_config.get("output_gate_type", "swish") not in ("swish", "silu"):

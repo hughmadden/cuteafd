@@ -103,7 +103,8 @@ def main():
     install()
     install_eager(reference)
     import platform
-    provenance = dict(platform={"machine": platform.machine(), "gpu": torch.cuda.get_device_name(0),
+    import tokenizers
+    provenance = dict(tokenizers=tokenizers.__version__, platform={"machine": platform.machine(), "gpu": torch.cuda.get_device_name(0),
                                 "capability": list(torch.cuda.get_device_capability(0))},
                       reference="transformers.Qwen3_5ForConditionalGeneration",
                       transformers=transformers.__version__, torch=torch.__version__,
