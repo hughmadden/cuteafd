@@ -148,7 +148,9 @@ v41_fp8_head_args=()
                     self.assertTrue(all(len(tail) == 16 for tail in tails), tails)
                     self.assertTrue(all(tail[7:11] == ['4', '0', '4', '1'] for tail in tails))
                     ready = [i for i, (tool, args) in enumerate(events)
-                             if tool == 'ssh' and any('timeout 1' in arg for arg in args)]
+                             if tool == 'ssh' and any('native worker bootstrap ready' in arg for arg in args)]
+                    self.assertFalse(any('/dev/tcp' in arg for tool, args in events
+                                         if tool == 'ssh' for arg in args))
                     coordinator = next(i for i, (tool, args) in enumerate(events)
                                        if tool == 'docker' and 'serve-native' in args)
                     self.assertEqual(len(ready), 4)

@@ -178,7 +178,10 @@ if tool == "docker":
             dst.mkdir(parents=True, exist_ok=True)
             (dst / "verify-sparkinfer-source.py").write_text("print('ok')\n")
         sys.exit(0)
-    if args and args[0] in ("info", "top", "pull", "rm", "stop", "logs", "ps"):
+    if args and args[0] == "logs":
+        print("native worker bootstrap ready")
+        sys.exit(0)
+    if args and args[0] in ("info", "top", "pull", "rm", "stop", "ps"):
         sys.exit(0)
     sys.exit(0)
 sys.exit(0)
