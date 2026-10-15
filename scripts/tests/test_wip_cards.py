@@ -620,6 +620,7 @@ def test_explicit_nonce_overrides_auto_and_inherited(entry, tmp_path, monkeypatc
     args = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--arm', 'base=b:s',
             '--state', str(state), '--nonce-seed', 'explicit seed', '--dry-run']
     args += ['--interleave', '--matched-prompts', '--arm', 'candidate=c:s'] if matched else ['--matrix']
+    args += ['--probe', 'v41-min:', '--probe', 'base:v41-min:fabric']
     monkeypatch.setenv('CUTEAFD_BENCH_NONCE_SEED', 'inherited')
     monkeypatch.setattr(sys, 'argv', args)
     assert cards.main() == 0
@@ -1468,9 +1469,23 @@ def test_fabric_probe_card_selector(entry, tmp_path):
 def test_fabric_probe_arm_selector(entry, tmp_path):
     probes, scoped = cards.probe_selection(['v41-min:', 'on:v41-min:fabric'], [entry], {'off': {}, 'on': {}})
     for arm, enabled in [('off', False), ('on', True)]:
-        selected = scoped.get(arm, {}).get('v41-min', probes['v41-min'])
+        selected = probes['v41-min'] | scoped.get(arm, {}).get('v41-min', set())
         job = cards.generate(entry, arm, dict(instance=arm, slot='s'), tmp_path,
                              tmp_path / 'key', {}, selected, None, 1)
         assert job['entry']['fabric'] is enabled
     with pytest.raises(ValueError, match='probe arm'):
         cards.probe_selection(['missing:v41-min:fabric'], [entry], {'on': {}})
+
+
+def test_arm_probe_preserves_card_defaults(entry, tmp_path, monkeypatch):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[{**entry, 'probes': ['console']}])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--interleave', '--repeats', '1', '--arm', 'off=b:s', '--arm', 'on=c:s',
+        '--probe', 'on:v41-min:fabric', '--state', str(state), '--dry-run'])
+    assert cards.main() == 0
+    jobs = json.loads((state / 'plan.json').read_text())['jobs']
+    assert all(set(job['probes']) == {'console', 'fabric'} for job in jobs)
+    assert all('observer' in job['entry'] for job in jobs)
