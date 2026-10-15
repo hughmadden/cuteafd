@@ -1110,28 +1110,11 @@ impl Opened {
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
         let timing = cuteafd_transport::protocol_v2_timing_from_env();
-        let link = || -> Result<crate::shared::spark_intake::SparkLink<'_>> {
-            let mut link=crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
-            u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
-            link.enable_terminal_ownership(self.library.clone())?;
-            Ok(link)
-        };
-        crate::shared::memory_report::release_load_staging(&self.library);
-        let mut transport = link()?;
-        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, Flash 2 / Pro 3 by default,
-        // 1 keeps it serial):
-        // one more transport per earlier row lane.
-        ensure!(lanes > 0, "MiMo selected transport lanes must be positive");
-        let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;
-        tracing::info!(lanes, "MiMo prefill lanes");
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        // Connect every rank and register full-size buffers now: the first
-        // request otherwise pays seconds of connection setup.
-        let started = Instant::now();
-        // The first request sizes the registered rings: the widest one first
-        // (BF16 rows when prefill sends them), then a one-row BF16 request
-        // when decode does, so a rank without the BF16 package fails here.
+        // The widest wave this family dispatches, built before the links so each
+        // can be bootstrapped with it (see `link` below). The first request
+        // sizes the registered rings: the widest one is `warmups[0]` (BF16 rows
+        // when prefill sends them), then a one-row BF16 request when decode
+        // does, so a rank without the BF16 package fails here.
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let warm = |rows: usize, bf16: bool| -> Result<cuteafd_transport::ExpertProtocolV2Request> {
             let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
@@ -1154,6 +1137,29 @@ impl Opened {
         if args.expert_input.bf16(true) && !args.expert_input.bf16(false) {
             warmups.push(warm(1, true)?);
         }
+        let link = || -> Result<crate::shared::spark_intake::SparkLink<'_>> {
+            let mut link=crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+            u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing,
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+            link.enable_terminal_ownership(self.library.clone())?;
+            // Connect every rank now and publish its installed expert grouping
+            // with the widest wave (the warm-up's own request, so the sessions
+            // it opens are the ones every later wave reuses).
+            link.bootstrap(&warmups[0])?;
+            Ok(link)
+        };
+        crate::shared::memory_report::release_load_staging(&self.library);
+        let mut transport = link()?;
+        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, Flash 2 / Pro 3 by default,
+        // 1 keeps it serial):
+        // one more transport per earlier row lane.
+        ensure!(lanes > 0, "MiMo selected transport lanes must be positive");
+        let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;
+        tracing::info!(lanes, "MiMo prefill lanes");
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        // Connect every rank and register full-size buffers now: the first
+        // request otherwise pays seconds of connection setup.
+        let started = Instant::now();
         // Drained and destroyed on every way out, before the transports drop.
         let warm_stream = crate::shared::spark_intake::WarmStream::new(&*self.library)?;
         for request in &warmups {

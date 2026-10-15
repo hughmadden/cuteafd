@@ -505,19 +505,6 @@ impl Opened {
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
         let row_bytes = self.cfg.hidden * 2;
         crate::shared::memory_report::release_load_staging(&self.library);
-        let mut transport = selected_peers.map(|peers| -> Result<SparkLink<'_>> {
-            let (peers, executors) = ranks(peers)?;
-            SparkLink::new(&self.library, &peers, &executors, 4096, config.clone(), row_bytes)
-        }).transpose()?;
-        // One transport thread per prefill lane (their waves fly beside each other's).
-        let mut lanes = match selected_peers {
-            Some(peers) => (0..prefill_lanes).filter(|_| prefill_lanes > 1).map(|_| {
-                let (peers, executors) = ranks(peers)?;
-                SparkLane::new(&self.library, peers, executors, 4096, config.clone(), row_bytes)
-            }).collect::<Result<Vec<_>>>()?,
-            None => Vec::new(),
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
         let (rows, h, topk, experts, layer) =
@@ -539,6 +526,24 @@ impl Opened {
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
+        let mut transport = selected_peers.map(|peers| -> Result<SparkLink<'_>> {
+            let (peers, executors) = ranks(peers)?;
+            let mut link = SparkLink::new(&self.library, &peers, &executors, 4096, config.clone(), row_bytes)?;
+            // The bootstrap opens every rank before any wave does, so the
+            // installed grouping is readable from here on. The warm-up below
+            // then reuses these sessions.
+            link.bootstrap(&warm()?)?;
+            Ok(link)
+        }).transpose()?;
+        // One transport thread per prefill lane (their waves fly beside each other's).
+        let mut lanes = match selected_peers {
+            Some(peers) => (0..prefill_lanes).filter(|_| prefill_lanes > 1).map(|_| {
+                let (peers, executors) = ranks(peers)?;
+                SparkLane::new(&self.library, peers, executors, 4096, config.clone(), row_bytes)
+            }).collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let started = Instant::now();
         if let Some(transport) = transport.as_mut() {
             let request = warm()?;
