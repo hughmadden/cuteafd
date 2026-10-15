@@ -1,4 +1,5 @@
 //! Dense Qwen qualification entry point. Execution remains fail-closed until the executor qualifies.
+mod programs;
 mod weights;
 use anyhow::{bail, Result};
 use std::path::PathBuf;
