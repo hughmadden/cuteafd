@@ -713,3 +713,41 @@ not in that path at all; they agree with each other on every printed statistic a
 | KDA M=1 old-TMA vs new-GEMV, 16 cases | replay bitwise; 7.1e-05 rel. L2 in FP32 |
 | GLM Flash golden + p0 fidelity compare | prefill logits byte-identical to p0; decode statistics identical; 0.038 KL vs the reference |
 | `spec_lossless_set` v1 (strict, DFlash2 on vs off) | 10/10 lossless |
+
+## 11. Rebase onto `work/p0` (`231f6caa`)
+
+`work/p0` advanced to `231f6caa`, which pins SparkInfer `20b0dcd7` (#216's canonical FC2
+partitions at RTX TP2 geometries). This branch now sits on that base.
+
+The fork needed no merge: `20b0dcd7` is an ancestor of this branch's fork commit `5f32f49c`
+(the branch merges it at `e9a8450b`), and fork `master` is already at `5f32f49c`. So the
+rebase only had the engine's pin text to resolve:
+
+- `One FP8 decode projection route per program` no longer touches the pin. Keeping its
+  original bump would have taken the gitlink back to `b0c81048`, a revision that predates
+  #216, while the rest of the tree is `work/p0`'s.
+- `Bump SparkInfer to the requalified FP8 GEMV tile split` carries the bump
+  `20b0dcd7 -> 5f32f49c` in both the gitlink and `third_party/sparkinfer.lock.json`. That is
+  a fast-forward inside the fork, so #216's work stays in the tree.
+
+`git range-diff e123753b..b4335826 rebase-210-base..duel/ds-210`: commits 2, 4 and 5 are
+byte-identical; commits 1 and 3 differ only in those two pin paths. The pinned-source audit
+is clean against `5f32f49c` -- all six audited files OK, `_fp8_weights.py`
+`0x87405e097e17662f`.
+
+### CPU gates on the rebased tree (engine `8c8bf685`, fork `5f32f49c`)
+
+| gate | result |
+| --- | --- |
+| `cargo test --workspace -j 16 --locked --no-fail-fast` (host, `build.lock` held while compiling, no ids skipped) | 58 binaries, **3079 passed, 0 failed, 228 ignored** |
+| `pytest -q scripts/tests` (host) | **3020 passed, 18 skipped, 305 subtests passed, 0 failed** (552.48 s) |
+| `compare-sm-exports.py --sms 188,170`, full scope | 196 groups, 2254 programs: **2246 identical, 8 cubin-bytes, 0 failed**; verdict-level diff against the pre-rebase run: **none** |
+
+The GPU gates above were not repeated, because the rebase changed no FP8 GEMV file. The fork
+is untouched at `5f32f49c`; the two engine files the base also touched
+(`glm5_flash/engine.rs`, `qwen4/engine.rs`) differ from the gated tree only by the base's own
+one-line `cuda_physical_memory_info` -> `cuda_allocatable_memory_info` rename; and the base's
+one FP8 GEMV file change (`native/shared/cuda/fp8_gemv.cu`, #100's native W8A8 wide pass) is
+the engine's native fallback route for skinny steps and draft heads -- a different route from
+the b12x decode projections the 172 cases drive through `require_b12x`, and one the suite
+never loads.
