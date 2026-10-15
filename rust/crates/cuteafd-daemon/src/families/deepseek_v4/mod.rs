@@ -583,6 +583,9 @@ pub(crate) fn with_engine<T>(
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
+        let (graphs0, graphs1, captures) = engine.graph_inventory();
+        tracing::info!(graphs0, graphs1, captures, units = engine.shape.units,
+            classes = metadata::c4_width_classes(engine.shape.units).len(), "V4 decode graph inventory");
         let _coverage_session = engine.graph_coverage.session();
         body(&engine, &mut transports, &runtime)
     })();
