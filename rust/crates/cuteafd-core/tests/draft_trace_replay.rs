@@ -71,7 +71,7 @@ fn replay_recorded_trace() {
             let mine = priced.clone().select_drafted_within(shared, &candidates, width, usize::MAX, n).unwrap();
             let rule = survival.clone().select_drafted_within(shared, &candidates, width, usize::MAX, n).unwrap();
             if let (Some(mine), Some(rule)) = (mine, rule) {
-                let calibrated: Vec<Vec<f64>> = candidates.iter().map(|c| priced.probabilities(*c)).collect();
+                let calibrated: Vec<Vec<f64>> = candidates.iter().map(|c| priced.probabilities(candidates.len(), *c)).collect();
                 let line = serde_json::json!({"index": index, "requests": ids.len(), "shared": shared,
                     "priced": mine.lengths, "survival": rule.lengths, "recorded": recorded,
                     "recorded_chosen": requests.iter().map(|q| q["chosen_rows"].as_u64().map(|v| v as usize - 1)).collect::<Vec<_>>(),

@@ -164,11 +164,11 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
                     "requests_up_to": if requests == 16 { None } else { Some(requests) },
                     "warm": policy.warm(shared, requests), "engaged": policy.engaged(shared, requests),
                     "timed_rounds": timed, "relative_error": error,
-                    "cost": policy.cost_snapshot(shared, requests).to_json(&labels)})
+                    "cost": policy.cost_snapshot(shared, requests).to_json(&labels),
+                    "platt": policy.calibration(requests)})
             }).collect::<Vec<_>>()),
         })
     };
-    let calibration = policy.calibration();
     let reliability: Vec<_> = (0..stats.position_reached.len()).map(|p| serde_json::json!({
         "position": p + 1,
         "reached": stats.position_reached[p],
@@ -176,8 +176,6 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
             stats.position_confidence[p] / stats.position_reached[p] as f64 } else { 0. },
         "mean_raw_confidence": if stats.position_reached[p] > 0 {
             stats.position_raw_confidence[p] / stats.position_reached[p] as f64 } else { 0. },
-        "logit_slope": calibration[p].0,
-        "logit_offset": calibration[p].1,
         "accept_rate": if stats.position_reached[p] > 0 {
             stats.position_accepted[p] as f64 / stats.position_reached[p] as f64 } else { 0. },
     })).collect();
@@ -295,8 +293,11 @@ mod tests {
         // The copied request adds none: exactly request 1's evidence alone.
         assert_eq!(copy.stats().position_reached, solo.stats().position_reached);
         assert_eq!(copy.stats().position_accepted, solo.stats().position_accepted);
-        assert_eq!(copy.calibration(), solo.calibration());
-        assert_ne!(control.calibration(), solo.calibration());
+        assert_eq!(copy.calibration(2), solo.calibration(1));
+        assert_ne!(control.calibration(2), solo.calibration(1));
+        let cold = DraftPolicy::new(placement(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
+        assert_eq!(copy.calibration(1), cold.calibration(1));
+        assert_eq!(control.calibration(1), cold.calibration(1));
         // Cold policies have no selected prediction.
         assert_eq!((control.stats().predicted_rounds, copy.stats().predicted_rounds), (0, 0));
         // A mixed draft pass teaches its measured, one-request drafter extent.

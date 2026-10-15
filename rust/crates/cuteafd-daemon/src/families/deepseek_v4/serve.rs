@@ -449,7 +449,7 @@ fn speculative_step(
         shared.prior(&a.drafts, &resource::DraftEvidence::History(&rates), 0)
     }).collect();
     let copies: Vec<_> = active.iter().zip(&drafts).zip(&limits).zip(&mut priors)
-        .map(|(((a, draft), &limit), prior)| resource::copy_continuation(&shared.policy, a.ticket.id(),
+        .map(|(((a, draft), &limit), prior)| resource::copy_continuation(&shared.policy, active.len(), a.ticket.id(),
             &a.history, draft, prior, limit, a.job.sampling.is_greedy())).collect();
     let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
         resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: a.drafts.cold() }).collect();

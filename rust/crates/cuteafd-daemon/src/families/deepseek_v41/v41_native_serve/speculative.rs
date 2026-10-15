@@ -252,22 +252,22 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             self.published = Some(Instant::now());
         }
     }
-    /// Choose and apply the lane's draft width for requests that will draft,
-    /// given as (identity, remaining output budget).
-    fn apply_width(&mut self, lane: usize, chain: usize, active: &[(u64, usize)]) -> Result<usize> {
+    /// Choose a width using every verifier request; nonparticipants have zero
+    /// draft room. The neural pass still contains only participating requests.
+    fn apply_width(&mut self, lane: usize, chain: usize, requests: &[(u64, usize)]) -> Result<usize> {
         let maximum = self.draft_width;
         let limit = self.draft_limit;
         let width = match &mut self.policy {
             Some(policy) => {
-                let requests: Vec<_> = active.iter()
-                    .map(|&(id, remaining)| (id, (remaining - 1).min(limit))).collect();
+                let requests: Vec<_> = requests.iter()
+                    .map(|&(id, room)| (id, room.min(limit))).collect();
                 policy.choose_width(self.lanes[lane].shared, &requests)
             }
             None => maximum,
         };
         self.chains[chain].set_width(width)?;
         self.lanes[lane].width = width;
-        self.lanes[lane].drafted_requests = active.len();
+        self.lanes[lane].drafted_requests = requests.iter().filter(|r| r.1 > 0).count();
         Ok(width)
     }
     pub fn release(&mut self, id: u64) -> Result<()> {
@@ -506,12 +506,12 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         result
     }
 
-    pub fn calibrated_confidence(&self, id: u64, extent: usize) -> Result<Option<Vec<f64>>> {
+    pub fn calibrated_confidence(&self, requests: usize, id: u64, extent: usize) -> Result<Option<Vec<f64>>> {
         let Some(policy) = self.policy.as_ref().filter(|_| !self.fixed) else { return Ok(None); };
         let logits = self.confidence_trace.get(&id).context("missing neural draft confidence")?;
         ensure!(extent <= logits.len(), "neural confidence extent mismatch");
         let prior: Vec<_> = logits[..extent].iter().map(|&x| sigmoid(x)).collect();
-        Ok(Some(policy.probabilities(cuteafd_core::DraftCandidate { id, confidence: &prior })))
+        Ok(Some(policy.probabilities(requests, cuteafd_core::DraftCandidate { id, confidence: &prior })))
     }
 
     /// Copied continuation uses the same raw prior and observation as other families.
@@ -579,7 +579,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0;
             return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
         }
-        let widths: Vec<_> = active.iter().map(|(_, (id, _, _, remaining))| (*id, *remaining)).collect();
+        let widths: Vec<_> = inputs.iter().map(|&(id, _, end, remaining)|
+            (id, if end >= 2 { remaining.saturating_sub(1) } else { 0 })).collect();
         self.apply_width(lane, lane, &widths)?;
         let count = active.len();
         let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
@@ -631,7 +632,8 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
         let mut outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
         if active.is_empty() { self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0; return Ok(outputs); }
-        let widths: Vec<_> = active.iter().map(|(_, (id, _, _, remaining))| (*id, *remaining)).collect();
+        let widths: Vec<_> = inputs.iter().map(|&(id, _, end, remaining)|
+            (id, if end >= 2 { remaining.saturating_sub(1) } else { 0 })).collect();
         let width = self.apply_width(lane, 0, &widths)?;
         let count = active.len();
         let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
