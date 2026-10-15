@@ -476,27 +476,27 @@ def resolve_launchers(arms, arm_repos, builds, global_repo, state, task, dry):
         if name in explicit:
             raise ValueError('duplicate --arm-repo mapping: ' + name)
         explicit[name] = Path(path).expanduser()
-    built = dict(item.split('=', 1) for item in builds)
-    if set(explicit) & set(built):
-        raise ValueError('--arm-repo refuses --build arms (their source checkout is the launcher): ' + ', '.join(sorted(set(explicit) & set(built))))
+    if set(explicit) & set(builds):
+        raise ValueError('--arm-repo refuses --build arms (their source checkout is the launcher): ' + ', '.join(sorted(set(explicit) & set(builds))))
     for name, arm in arms.items():
-        if name in built:
+        if name in builds:
+            # The commit pinned by resolve_builds, never a ref resolved again here.
             repo = Path.home() / '.cache/cuteafd/builds' / task / ('source-' + name)
-            wanted = subprocess.run(['git', '-C', str(REPO), 'rev-parse', built[name] + '^{commit}'], capture_output=True, text=True, timeout=60).stdout.strip() or None
+            wanted = builds[name]
         elif name in explicit:
             repo, wanted = explicit[name], None
         else:
             arm['repo'], arm['repo_commit'] = str(global_repo), git_head(global_repo)
             continue
-        if not (dry and name in built):
+        if not (dry and name in builds):
             if not (repo / 'run.sh').is_file():
                 raise ValueError(f'{name}: launcher {repo} has no run.sh')
             head = git_head(repo)
             if (repo / '.git').exists() is False or head is None:
                 raise ValueError(f'{name}: launcher {repo} is not a git checkout')
             if wanted and head != wanted:
-                raise ValueError(f'{name}: source checkout {repo} is at {head[:12]}, not its built revision {built[name]} ({wanted[:12]})')
-        arm['repo'], arm['repo_commit'] = str(repo), (git_head(repo) if not (dry and name in built) else wanted)
+                raise ValueError(f'{name}: source checkout {repo} is at {head[:12]}, not its built revision {wanted[:12]}')
+        arm['repo'], arm['repo_commit'] = str(repo), (git_head(repo) if not (dry and name in builds) else wanted)
     return arms
 
 
@@ -1520,10 +1520,22 @@ def seed_lanes(seed, dry):
     return addr, addr
 
 
-def build_arms(items, arms, cards, state, task, dry, seed=DEFAULT_SEED):
-    scopes = build_scopes(cards)
+def resolve_builds(items):
+    """Pins every --build ARM=REV to a commit once, before any build runs: a symbolic
+    ref that moves during hours of builds must not disagree with the revision that was
+    built or with the launcher checkout the launcher phase checks it against (#315)."""
+    builds = {}
     for item in items:
         name, revision = item.split('=', 1)
+        if name in builds:
+            raise ValueError('duplicate --build arm ' + name)
+        builds[name] = run(['git', '-C', str(REPO), 'rev-parse', revision + '^{commit}']).stdout.strip()
+    return builds
+
+
+def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
+    scopes = build_scopes(cards)
+    for name, revision in builds.items():
         if name not in arms:
             raise ValueError('unknown build arm ' + name)
         arm = arms[name]
@@ -1592,9 +1604,8 @@ def build_arms(items, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         if not dry and (source / '.git').exists():
             # A rerun of this task (e.g. after a failed build) reuses the checkout of the same commit.
             head = run(['git', '-C', str(source), 'rev-parse', 'HEAD']).stdout.strip()
-            wanted = run(['git', '-C', str(REPO), 'rev-parse', revision + '^{commit}']).stdout.strip()
             dirty = run(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).stdout.strip()
-            if head != wanted or dirty:
+            if head != revision or dirty:
                 raise ValueError(f'{source} holds {head[:12]}{" (dirty)" if dirty else ""}, not {revision}; remove it or use a new --task')
             prepare = []
         commands = [
@@ -1714,7 +1725,9 @@ def main():
     if args.build_only and (not args.build or args.cleanup):
         parser.error('--build-only requires --build and refuses --cleanup')
     arms = arms_from(args.arm, args.arm_release)
-    shared_wip(arms, args.arm_wip, args.build, args.parallel)
+    # Pin each --build ref once, before any build or launcher check reads it again.
+    builds = resolve_builds(args.build)
+    shared_wip(arms, args.arm_wip, builds, args.parallel)
     if args.nonce_seed is not None and (not args.nonce_seed or '\n' in args.nonce_seed or '\r' in args.nonce_seed):
         parser.error('--nonce-seed must be non-empty and single-line')
     if not arms:
@@ -1852,14 +1865,14 @@ def main():
                 raise ValueError('invalid Spark count')
             variant['sparks'] = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
             build_cards.append(variant)
-    build_arms(args.build, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
+    build_arms(builds, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
     if args.build_only:
         save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': []})
         return 0
-    resolve_launchers(arms, args.arm_repo, args.build, args.repo, state, args.task, args.dry_run)
+    resolve_launchers(arms, args.arm_repo, builds, args.repo, state, args.task, args.dry_run)
     if args.trace:
         for name, arm in arms.items():
-            if args.dry_run and name in dict(x.split('=', 1) for x in args.build):
+            if args.dry_run and name in builds:
                 continue
             for card in cards:
                 if card.get('family') == 'deepseek_v41' and not launcher_forwards_v41_trace(Path(arm['repo'])):

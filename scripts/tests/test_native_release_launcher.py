@@ -254,9 +254,13 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
                     runs = mode in ['auto', 'heads'] or (family, mode) in [
                         ('glm5', 'context'), ('glm5_flash', 'context'), ('deepseek_v4', 'context'), ('qwen4', 'layers')]
                     runs = runs or (family, mode, bool(wip_slot)) == ('deepseek_v4', 'layers', True)
+                    # GLM 5.3 and GLM Flash layers are under qualification: WIP slots only.
+                    runs = runs or (mode == 'layers' and family in ['glm5', 'glm5_flash'] and bool(wip_slot))
                     self.assertEqual(result.returncode == 0, runs, result.stderr)
                     if (family, mode) == ('deepseek_v4', 'layers') and not runs:
                         self.assertIn('dev-only executor', result.stderr)
+                    elif mode == 'layers' and family in ['glm5', 'glm5_flash'] and not runs:
+                        self.assertIn('under qualification', result.stderr)
                     elif mode in ['context', 'layers'] and not runs:
                         self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)
 
