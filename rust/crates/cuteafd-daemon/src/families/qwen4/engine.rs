@@ -24,6 +24,7 @@ use super::weights::{Qwen4Head, Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::HostAllocation;
+use crate::shared::qwen::{GdnBank, LayerStateMap, REPLAY_ROWS};
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
 use std::rc::Rc;
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
@@ -133,19 +134,9 @@ pub(crate) fn spark_bootstrap_request(cfg: &Qwen4Config, rows: usize, bf16: bool
     Ok(request)
 }
 
-/// Rows a speculative step records per GDN layer (the fork's `REPLAY_ROWS`).
-pub(crate) const REPLAY_ROWS: usize = 64;
 /// Target rows a sequence may hold for its MTP canonical history before the
 /// next draft step (the MTP stash, per state slot).
 pub(crate) const MTP_PENDING_ROWS: usize = 64;
-
-/// Bytes of one GDN layer's replay record (`gdn_replay_layout` in the fork):
-/// normalized keys and values, decay and beta, and the conv inputs.
-fn gdn_replay_bytes(cfg: &Qwen4Config) -> usize {
-    let (kh, vh, d) = (cfg.gdn_key_heads, cfg.gdn_value_heads, cfg.gdn_head_dim);
-    let bytes = REPLAY_ROWS * (kh * d * 4 + vh * d * 4 + vh * 2 * 4 + cfg.gdn_conv_width() * 2);
-    bytes.div_ceil(1024) * 1024
-}
 
 /// Routed experts on this GPU from the TP1 package. All layers stay resident
 /// unless an explicit diagnostic paging window was requested.
@@ -708,87 +699,11 @@ pub(crate) enum MtpSource {
     Buffer(*mut c_void),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LayerStateHome {
-    owner: usize,
-    gdn_ordinal: Option<usize>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct LayerStateMap {
-    layers: Vec<LayerStateHome>,
-    gdn_layers: Vec<usize>,
-}
-
-impl LayerStateMap {
-    fn new(kinds: &[Qwen4Attention], owners: &[usize], devices: usize) -> Result<Self> {
-        ensure!(devices > 0 && kinds.len() == owners.len(), "invalid Qwen layer ownership map");
-        let mut gdn_layers = vec![0; devices];
-        let mut layers = Vec::with_capacity(kinds.len());
-        for (&kind, &owner) in kinds.iter().zip(owners) {
-            ensure!(owner < devices, "Qwen layer owner {owner} outside {devices} devices");
-            let gdn_ordinal = if kind == Qwen4Attention::Gdn {
-                let ordinal = gdn_layers[owner];
-                gdn_layers[owner] += 1;
-                Some(ordinal)
-            } else { None };
-            layers.push(LayerStateHome { owner, gdn_ordinal });
-        }
-        Ok(Self { layers, gdn_layers })
-    }
-}
-
 fn validate_layer_owners(owners: &[usize], devices: usize) -> Result<()> {
     ensure!(!owners.is_empty() && matches!(devices, 1 | 2), "invalid Qwen attention owners");
     ensure!(owners.iter().all(|&owner| owner < devices), "Qwen attention owner out of range");
     if devices == 1 { return Ok(()); }
     cuteafd_loader::placement::families::qwen4::check_dual_layer_owners(owners)
-}
-
-/// Compact recurrent pools on one owner. Global layer ids never index these directly.
-struct GdnBank<'a> {
-    library: &'a NativeLibrary,
-    programs: &'a Programs<'a>,
-    stream: *mut c_void,
-    layers: usize,
-    conv: Option<Dev<'a>>,
-    state: Option<Dev<'a>>,
-    replay: Option<Dev<'a>>,
-    commit_tables: Dev<'a>,
-}
-
-impl<'a> GdnBank<'a> {
-    fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, stream: *mut c_void,
-        cfg: &Qwen4Config, layers: usize, slots: usize) -> Result<Self> {
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
-            library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
-            Ok(allocation)
-        };
-        let (conv, state, replay) = if layers > 0 {
-            (Some(zeroed(layers * slots * Qwen4Engine::conv_slot_bytes(cfg))?),
-             Some(zeroed(layers * slots * Qwen4Engine::state_slot_bytes(cfg))?),
-             Some(zeroed(layers * gdn_replay_bytes(cfg))?))
-        } else { (None, None, None) };
-        Ok(Self { library, programs, stream, layers, conv, state, replay,
-            commit_tables: zeroed(3 * DECODE_ROWS * 4)? })
-    }
-
-    fn commit(&self, table: &[i32], sequences: usize, slots: usize) -> Result<()> {
-        // SAFETY: this bank owns the stream; its previous table readers retire before upload.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer {
-            bytes: std::mem::size_of_val(table), ..self.commit_tables.buffer }, bytes_of(table))?;
-        if let (Some(conv), Some(state), Some(replay)) = (&self.conv, &self.state, &self.replay) {
-            let program = self.programs.program("qwen4_gdn_commit", &["state", "conv_state", "replay", "tables"])?;
-            let scalars = [sequences, self.layers, slots].map(|n| i32::try_from(n).map(Scalar::I32));
-            let scalars = scalars.into_iter().collect::<std::result::Result<Vec<_>, _>>()?;
-            // SAFETY: the live owner-local pools match the compact layer/slot geometry.
-            unsafe { program.launch(&[state.buffer.ptr, conv.buffer.ptr, replay.buffer.ptr,
-                self.commit_tables.buffer.ptr], &scalars, self.stream)? };
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1218,7 +1133,7 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         let gdn_banks = ranks.iter().enumerate().map(|(owner, &(device, programs, stream))|
-            device.own(|| GdnBank::new(library, programs, stream, &cfg, state_map.gdn_layers[owner], slots)))
+            device.own(|| GdnBank::new(library, programs, stream, cfg.gdn_geometry(), state_map.gdn_layers[owner], slots, "qwen4_gdn_commit")))
             .collect::<Result<Vec<_>>>()?;
         ensure!(weights.head.allocations().iter().all(|a| a.device.id == home.id)
             && weights.mixer.iter().all(|a| a.device.id == home.id), "Qwen head must stay on owner zero");
@@ -1774,14 +1689,6 @@ impl<'a> Qwen4Engine<'a> {
         ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
     }
 
-    fn conv_slot_bytes(cfg: &Qwen4Config) -> usize {
-        (cfg.conv_kernel - 1) * cfg.gdn_conv_width() * 2
-    }
-
-    fn state_slot_bytes(cfg: &Qwen4Config) -> usize {
-        cfg.gdn_value_heads * cfg.gdn_head_dim * cfg.gdn_head_dim * 4
-    }
-
     /// `bytes` at `offset` inside `pool`.
     fn region(pool: &Dev<'_>, offset: usize, bytes: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
         debug_assert!(offset + bytes <= pool.buffer.bytes);
@@ -1797,14 +1704,10 @@ impl<'a> Qwen4Engine<'a> {
     /// GDN layer, PLE conv state).
     pub(crate) fn slot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
         let mut regions = Vec::new();
-        let (conv, state) = (Self::conv_slot_bytes(&self.cfg), Self::state_slot_bytes(&self.cfg));
         for layer in &self.state_map.layers {
             if let Some(ord) = layer.gdn_ordinal {
                 let bank = &self.gdn_banks[layer.owner];
-                if let (Some(c), Some(s)) = (&bank.conv, &bank.state) {
-                    regions.push(Self::region(c, (ord * self.slots + slot) * conv, conv));
-                    regions.push(Self::region(s, (ord * self.slots + slot) * state, state));
-                }
+                regions.extend(bank.slot_regions(ord, slot));
             }
         }
         if let Some(ple) = &self.ple_state {
@@ -1826,12 +1729,7 @@ impl<'a> Qwen4Engine<'a> {
         let layer = self.state_map.layers.get(index).context("GDN global layer out of range")?;
         let ord = layer.gdn_ordinal.context("GDN layer without a state pool")?;
         let bank = &self.gdn_banks[layer.owner];
-        let (Some(c), Some(s), Some(r)) = (&bank.conv, &bank.state, &bank.replay) else {
-            anyhow::bail!("GDN layer without state pools")
-        };
-        Ok([Self::region(c, ord * self.slots * Self::conv_slot_bytes(&self.cfg), 0).ptr,
-            Self::region(s, ord * self.slots * Self::state_slot_bytes(&self.cfg), 0).ptr,
-            Self::region(r, ord * gdn_replay_bytes(&self.cfg), 0).ptr])
+        bank.pools(ord)
     }
 
     /// Zeroes a sequence's state (before its first step).
@@ -2227,7 +2125,7 @@ impl<'a> Qwen4Engine<'a> {
         unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
         let i32s = |v: usize| -> Result<Scalar> { Ok(Scalar::I32(i32::try_from(v)?)) };
         for bank in &self.gdn_banks {
-            bank.device.run(|| bank.commit(&table, n, self.slots))?;
+            bank.device.run(|| bank.commit(&table, n))?;
         }
         if let (Some(state), Some(replay)) = (&self.ple_state, &self.ple_replay) {
             let bank = self.gdn_banks.iter().find(|bank| bank.device.id == state.device.id)
