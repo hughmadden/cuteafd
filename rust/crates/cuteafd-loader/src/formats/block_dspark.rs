@@ -29,6 +29,99 @@ pub enum DsparkRope {
     },
 }
 
+/// Immutable draft-only rotary inputs. The legacy 64-wide default route
+/// computes its frequencies in the kernel instead of consuming this table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DsparkRotaryPlan {
+    pub inv_freq: Vec<f32>,
+    pub attention_factor: f32,
+}
+
+impl DsparkRope {
+    pub fn plan(&self, head_dim: usize) -> Result<DsparkRotaryPlan, DsparkConfigError> {
+        use DsparkConfigError::Unsupported;
+        if head_dim == 0 || head_dim % 2 != 0 {
+            return Err(Unsupported(
+                "rotary head dimension must be positive and even".into(),
+            ));
+        }
+        let (theta, yarn) = match *self {
+            Self::Default { rope_theta } => (rope_theta, None),
+            Self::Yarn {
+                rope_theta,
+                factor,
+                original_max_position_embeddings,
+                beta_fast,
+                beta_slow,
+            } => {
+                if !factor.is_finite()
+                    || factor < 1.0
+                    || original_max_position_embeddings == 0
+                    || !beta_fast.is_finite()
+                    || !beta_slow.is_finite()
+                    || beta_fast <= beta_slow
+                    || beta_slow <= 0.0
+                {
+                    return Err(Unsupported("invalid YaRN rotary parameters".into()));
+                }
+                (
+                    rope_theta,
+                    Some((
+                        factor,
+                        original_max_position_embeddings,
+                        beta_fast,
+                        beta_slow,
+                    )),
+                )
+            }
+        };
+        if !theta.is_finite() || theta <= 1.0 || !(theta as f32).is_finite() {
+            return Err(Unsupported(
+                "rotary theta must be finite and greater than one in FP32".into(),
+            ));
+        }
+        let attention_factor =
+            yarn.map_or(1.0, |(factor, _, _, _)| (1.0 + 0.1 * factor.ln()) as f32);
+        let correction = yarn.map(|(_, original, fast, slow)| {
+            let dimension = |rotations: f64| {
+                head_dim as f64 * (original as f64 / (rotations * 2.0 * std::f64::consts::PI)).ln()
+                    / (2.0 * theta.ln())
+            };
+            let low = dimension(fast).floor().max(0.0) as f32;
+            let mut high = dimension(slow).ceil().min((head_dim - 1) as f64) as f32;
+            if low == high {
+                high += 0.001;
+            }
+            (low, high)
+        });
+        let inv_freq = (0..head_dim / 2)
+            .map(|i| {
+                // Preserve the reference's FP32 operation boundaries, including
+                // interpolation before blending (not division of extrapolation).
+                let frequency = (theta as f32).powf((2 * i) as f32 / head_dim as f32);
+                let extrapolation = 1.0f32 / frequency;
+                match (yarn, correction) {
+                    (Some((factor, _, _, _)), Some((low, high))) => {
+                        let weight = 1.0 - ((i as f32 - low) / (high - low)).clamp(0.0, 1.0);
+                        let interpolation = 1.0f32 / (factor as f32 * frequency);
+                        interpolation * (1.0 - weight) + extrapolation * weight
+                    }
+                    _ => extrapolation,
+                }
+            })
+            .collect::<Vec<_>>();
+        if !attention_factor.is_finite() || inv_freq.iter().any(|x| !x.is_finite() || *x <= 0.0) {
+            return Err(Unsupported(
+                "rotary plan is not representable in FP32".into(),
+            ));
+        }
+        Ok(DsparkRotaryPlan {
+            inv_freq,
+            attention_factor,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockDsparkConfig {
     pub hidden: usize,
@@ -236,6 +329,119 @@ mod tests {
             "markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,
             "confidence_head_with_markov":true,"num_target_layers":64,
             "dflash_config":{"projector_type":"dspark","mask_token_id":248077,"target_layer_ids":[4,16,28,40,52]}})
+    }
+
+    #[test]
+    fn immutable_yarn_plan_uses_reference_fp32_blending() {
+        let c = BlockDsparkConfig::from_json(&qwen()).unwrap();
+        let plan = c.rope.plan(c.head_dim).unwrap();
+        assert_eq!(plan.inv_freq.len(), 64);
+        assert!((plan.attention_factor - (1.0f64 + 0.1 * 32.0f64.ln()) as f32).abs() < 1e-7);
+        assert_eq!(plan.inv_freq[0], 1.0);
+        // Checkpoint correction dimensions floor/ceil to [14, 29].
+        for i in [0usize, 14, 20, 29, 63] {
+            let frequency = 10_000_000f32.powf((2 * i) as f32 / 128.0);
+            let weight = 1.0 - ((i as f32 - 14.0) / 15.0).clamp(0.0, 1.0);
+            let expected = (1.0 / (32.0 * frequency)) * (1.0 - weight) + (1.0 / frequency) * weight;
+            assert_eq!(plan.inv_freq[i], expected, "frequency {i}");
+        }
+        // Pinned Qwen3RotaryEmbedding CPU FP32 table, full checkpoint geometry.
+        let reference_bits = [
+            1065353216u32,
+            1061618021,
+            1058714411,
+            1055949884,
+            1052440603,
+            1049712609,
+            1046607925,
+            1043310893,
+            1040747895,
+            1037323628,
+            1034226006,
+            1031818025,
+            1028093503,
+            1025183233,
+            1022431607,
+            1018121107,
+            1014872157,
+            1010211608,
+            1006802083,
+            1002002126,
+            998397281,
+            993346669,
+            989370984,
+            984051384,
+            979118631,
+            973860955,
+            967379848,
+            960192872,
+            950929914,
+            934311859,
+            931737090,
+            928335622,
+            925223776,
+            922804734,
+            919101633,
+            916177998,
+            913452258,
+            909918774,
+            907171966,
+            904103724,
+            900783954,
+            898203279,
+            894813249,
+            891694265,
+            889269675,
+            885577321,
+            882646980,
+            879934230,
+            876392641,
+            873639533,
+            870583494,
+            867256108,
+            864669514,
+            861290950,
+            858164812,
+            855734661,
+            852053079,
+            849116016,
+            846416285,
+            842866572,
+            840107150,
+            837063342,
+            833728324,
+            831135798,
+        ];
+        for (&actual, expected) in plan.inv_freq.iter().zip(reference_bits) {
+            assert!(
+                actual.to_bits().abs_diff(expected) <= 2,
+                "frequency {actual} vs {}",
+                f32::from_bits(expected)
+            );
+        }
+        assert_eq!(plan, c.rope.plan(c.head_dim).unwrap());
+        assert!(plan.inv_freq.windows(2).all(|p| p[0] > p[1]));
+    }
+
+    #[test]
+    fn rotary_plan_rejects_invalid_direct_construction() {
+        assert!(DsparkRope::Default {
+            rope_theta: f64::NAN
+        }
+        .plan(128)
+        .is_err());
+        assert!(DsparkRope::Default {
+            rope_theta: 10000.0
+        }
+        .plan(127)
+        .is_err());
+        let plan = DsparkRope::Default {
+            rope_theta: 10000.0,
+        }
+        .plan(64)
+        .unwrap();
+        assert_eq!(plan.attention_factor, 1.0);
+        assert_eq!(plan.inv_freq[0], 1.0);
     }
 
     #[test]
