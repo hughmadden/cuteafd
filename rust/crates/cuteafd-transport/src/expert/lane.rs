@@ -165,7 +165,8 @@ mod tests {
     #[test]
     fn topology_lane_preserves_rank_contract_and_refuses_canonical_requests() -> Result<()> {
         let topology = SparkTopology::NATIVE_TP3_EP1;
-        let peers = vec!["127.0.0.1:1".parse()?; 3];
+        let peers = (1..=3).map(|port| format!("127.0.0.1:{port}").parse())
+            .collect::<std::result::Result<Vec<SocketAddr>, _>>()?;
         let config = TcpTransportConfig { timing: false, timeout: Duration::from_secs(1), max_frame_bytes: 64 << 20 };
         // SAFETY: no landing buffers are installed.
         let mut lane = unsafe { SparkExpertLane::spawn_topology_with_landing(topology, peers.clone(), 1, config.clone(), None)? };

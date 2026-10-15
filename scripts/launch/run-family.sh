@@ -743,10 +743,12 @@ expert_format=native
 model_is_nvfp4="$(jq -r '.quantization_config.moe_quant_algo // empty' "$hf_home/$snapshot_rel/config.json" 2>/dev/null || true)"
 [[ "$model_is_nvfp4" == "NVFP4" ]] && expert_format=nvfp4
 # Replicated groups require native experts; NVFP4 supports pure TP3/4/6.
-# EXL3 uses implicit disjoint groups. Reject other modes before service changes.
+# Compact EXL3 TP3EP1 retains compressed shards. Reject other modes early.
 if ((topology_explicit)); then
-  [[ "$model_is_exl3" != true ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires the native official checkpoint; EXL3 is not supported"
+  if [[ "$model_is_exl3" == true ]]; then
+    [[ "$EXPERT_FORMAT" == exl3 && "$spark_tp" == 3 && "$spark_ep" == 1 && "$EXL3_PAIRED_TP4" == off ]] ||
+      release_die "explicit EXL3 topology requires compact TP3EP1 with disjoint packages"
+  fi
   if [[ "$model_is_nvfp4" == "NVFP4" ]]; then
     [[ "$spark_ep" == 1 && ( "$spark_tp" == 3 || "$spark_tp" == 4 || "$spark_tp" == 6 ) ]] ||
       release_die "NVFP4 supports pure SPARK_TP=3/4/6 SPARK_EP=1, not replicated groups"
@@ -764,7 +766,9 @@ fi
 # Auto placement must not pick an RTX boundary so low that the remote Spark
 # weights cannot fit the device budget. The floor is derived from the actual
 # budget and the resolved TP degree, not a hardcoded 20.
-if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto ]]; then
+# These tensor-window constants describe native weights, not compressed shards.
+# EXL3 admission comes from the checkpoint-aware planner and package proofs.
+if ((topology_explicit)) && [[ "$model_is_exl3" != true && "$RTX_EXPERT_LAYERS" == auto ]]; then
   remote_capacity=$((SPARK_DEVICE_BUDGET_BYTES / $(release_spark_layer_bytes "$spark_tp" "$expert_format")))
   ((remote_capacity > 40)) && remote_capacity=40
   topology_min_layers=$((40 - remote_capacity))
@@ -810,7 +814,7 @@ fi
 # launch-feasibility claim. An auto dual boundary is published by the
 # coordinator and re-checked after plan.json is read below.
 spark_admission="not-applicable"
-if ((topology_explicit)); then
+if ((topology_explicit)) && [[ "$model_is_exl3" != true ]]; then
   if [[ "$spark_first_layer" == runtime-plan ]]; then
     spark_admission="PENDING (coordinator placement plan not yet published; weight-only check uses the real dynamic boundary)"
   else
@@ -869,14 +873,20 @@ fi
 SPARK_COUNT="$selected_count"
 PREFILL_BATCH_TOKENS="$(jq -er '.prefill_rows' <<<"$count_plan")"
 # Native non-TP4 counts require the explicit ownership transport contract.
-if [[ "$model_is_exl3" != true && "$SPARK_COUNT" != 4 && "$SPARK_COUNT" != 0 && "$topology_explicit" == 0 ]]; then
-  SPARK_TP="$SPARK_COUNT" SPARK_EP=1
+if ((topology_explicit == 0)); then
+  if [[ "$model_is_exl3" == true && "$SPARK_COUNT" == 3 ]]; then
+    # Compact compressed TP3 uses the same ownership contract on both ends.
+    SPARK_TP=3 SPARK_EP=1
+  elif [[ "$model_is_exl3" != true && "$SPARK_COUNT" != 4 && "$SPARK_COUNT" != 0 ]]; then
+    SPARK_TP="$SPARK_COUNT" SPARK_EP=1
+  fi
 fi
 release_validate_spark_topology
 topology_explicit=0; release_spark_topology_explicit && topology_explicit=1
 spark_tp="$(release_spark_tp)"; spark_ep="$(release_spark_ep)"
 spark_tp_roles_required=""
-if ((topology_explicit)) && [[ "$spark_tp" != 4 ]]; then spark_tp_roles_required="tp$spark_tp"; fi
+# Compressed TP3 proves its own rank/capacity packages below, not native roles.
+if ((topology_explicit)) && [[ "$model_is_exl3" != true && "$spark_tp" != 4 ]]; then spark_tp_roles_required="tp$spark_tp"; fi
 [[ -n "$POOL_TOKENS" || -n "$KV_POOL_SIZE" ]] || POOL_TOKENS=auto
 
 expert_capacity="$(release_v41_expert_capacity "$PREFILL_BATCH_TOKENS")" ||
@@ -962,7 +972,7 @@ REMOTE
 )" || release_die "Spark host preflight failed on $host (see the messages above)"
   if [[ "$model_is_exl3" == true ]]; then
     identity="$(release_exl3_package_identity "$sparkinfer_commit" <<<"$spark_manifest")"
-    if release_spark_compact_active || [[ "$SPARK_COUNT" == 6 ]]; then
+    if release_spark_compact_active || [[ "$SPARK_COUNT" == 6 || ( "$spark_tp" == 3 && "$spark_ep" == 1 ) ]]; then
       [[ "$identity" != paired:* ]] ||
         release_die "SPARK_COUNT=$SPARK_COUNT requires disjoint EXL3 packages, not paired TP4"
       release_validate_exl3_compact_variants "$expert_capacity" "$exl3_family_tag" "$SPARK_COUNT" <<<"$spark_manifest"
@@ -1251,7 +1261,7 @@ if [[ -n "$placement_directory" ]]; then
     | select(.spark_first_layer == ([.rtx_expert_layers, 39] | min))
     | .spark_first_layer' <<<"$placement_plan")" || release_die "invalid coordinator placement plan"
   echo "  runtime placement: RTX GPUs $(jq -r '.rtx_gpus' <<<"$placement_plan"), RTX layers $(jq -r '.rtx_expert_layers' <<<"$placement_plan"); Spark first layer $spark_first_layer"
-  if ((topology_explicit)); then
+  if ((topology_explicit)) && [[ "$model_is_exl3" != true ]]; then
     # Re-check against the boundary the coordinator actually published; this is
     # the dynamic value, not the auto placeholder.
     spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES" "$expert_format")"

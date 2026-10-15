@@ -1433,6 +1433,15 @@ release_validate_spark_topology() {
 
   [[ "$SPARK_COUNT" =~ ^[1-8]$ ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..8"
+  if [[ "$EXPERT_FORMAT" == exl3 ]]; then
+    [[ "$SPARK_TP" == 3 && "$SPARK_EP" == 1 && "$SPARK_COUNT" == 3 ]] ||
+      release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native except compact EXL3 TP3EP1"
+    [[ "$EXL3_PAIRED_TP4" == off ]] ||
+      release_die "compact EXL3 TP3EP1 requires EXL3_PAIRED_TP4=off"
+    [[ "$SPARKINFER_EXL3" != disable ]] ||
+      release_die "compact EXL3 TP3EP1 requires SPARKINFER_EXL3=auto or force"
+    return 0
+  fi
   [[ "$EXPERT_FORMAT" == native ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native"
   [[ "$EXL3_PAIRED_TP4" == off ]] ||

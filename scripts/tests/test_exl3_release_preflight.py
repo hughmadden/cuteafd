@@ -142,6 +142,24 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
         self.assertNotEqual(result.stdout.split('release identity: ')[1],
                             four.stdout.split('release identity: ')[1])
 
+    def test_compact_tp3_normalizes_topology_and_keeps_compressed_proofs(self):
+        for explicit in (False, True):
+            extra = ('--set', 'SPARK_TP=3', '--set', 'SPARK_EP=1') if explicit else ()
+            result, calls = self.launch(spark_count=3, paired=False, extra=extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('Spark ranks: 3;', result.stdout)
+            self.assertIn('Spark EXL3 package: disjoint:', result.stdout)
+            self.assertNotIn('Spark image must advertise V41 expert role:', result.stdout)
+            fixed, _ = self.launch(spark_count=3, paired=False,
+                                   extra=(*extra, '--set', 'RTX_EXPERT_LAYERS=20'))
+            self.assertEqual(fixed.returncode, 0, fixed.stderr)
+            self.assertNotIn('unsupported Spark weight format', fixed.stderr)
+            for kwargs, message in (({'legacy': True}, 'lacks required TP3'),
+                                    ({'paired': True}, 'requires disjoint EXL3 packages')):
+                failed, _ = self.launch(spark_count=3, **{'paired': False, **kwargs}, extra=extra)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn(message, failed.stderr)
+
     def test_six_rank_disjoint_package_admission_is_exact_and_fail_fast(self):
         result, calls = self.launch(spark_count=6, paired=False)
         self.assertEqual(result.returncode, 0, result.stderr)
