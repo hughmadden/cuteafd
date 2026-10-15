@@ -1,5 +1,4 @@
 //! Shared startup admission protocols.
-pub(crate) mod handoff;
 pub(crate) mod layers;
 
 use anyhow::{ensure, Context, Result};
@@ -210,6 +209,44 @@ mod tests {
             assert_eq!(assignment.slices[0].first, (rank % 2) as u32 * 1024);
             assert_eq!(assignment.slices[0].stored_width, 1024);
             assert_eq!(assignment.slices, plan.assignments[rank % 2].slices);
+        }
+        check_reports(&plan)
+    }
+
+    #[test]
+    fn v41_native_and_modelopt_headers_reconcile_all_worker_owners() -> Result<()> {
+        use cuteafd_loader::plan::testing::{write_v41_snapshot, write_v41_nvfp4_snapshot};
+        for nvfp4 in [false, true] {
+            let root = tempfile::tempdir()?;
+            if nvfp4 { write_v41_nvfp4_snapshot(root.path()); } else { write_v41_snapshot(root.path()); }
+            let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+            let working = SparkWorkingSet { spark_layers: vec![17, 39], spark_ranks: 4,
+                prefill_lanes: 2, ..Default::default() };
+            let mut model = fixture_model();
+            if nvfp4 { model.endpoints.iter_mut().for_each(|e| e.ingress = SparkIngress::Bf16); }
+            let plan = SparkAdmission::plan(root.path(), ExpertGeometry::DEEPSEEK_V41, Some(&catalog),
+                &working, 4, None, cuteafd_loader::V41Exl3Partition::Disjoint, model)?;
+            assert_eq!(plan.selection.layers(), [17, 39]);
+            assert!(plan.assignments.iter().all(|a| a.resident_bytes > 0 && a.slices.len() == 2));
+            check_reports(&plan)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v41_deliberate_paired_tp4_reconciles_checkpoint_layout() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_v41_exl3_snapshot(root.path(), 4);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let working = SparkWorkingSet { spark_layers: vec![17, 39], spark_ranks: 4,
+            prefill_lanes: 2, ..Default::default() };
+        let partition = cuteafd_loader::V41Exl3Partition::PairedTp4;
+        let plan = SparkAdmission::plan(root.path(), ExpertGeometry::DEEPSEEK_V41, Some(&catalog),
+            &working, 4, None, partition, fixture_model())?;
+        for (rank, assignment) in plan.assignments.iter().enumerate() {
+            let expected = catalog.exl3().unwrap().residency_with_layout(
+                cuteafd_loader::V41Exl3Layer::Backbone(17), 4, rank, partition)?;
+            assert_eq!(assignment.resident_bytes, 2 * expected.device_arena_layout()?.1 as u64);
         }
         check_reports(&plan)
     }

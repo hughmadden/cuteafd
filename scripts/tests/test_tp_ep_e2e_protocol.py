@@ -42,15 +42,15 @@ def _row(index: int, text: str) -> dict:
 
 def _identity(tp: int) -> dict:
     topology = ["--spark-tp", str(tp), "--spark-ep", str(4 // tp)]
-    workers = [["expertd-native", "--rdma-endpoints", "2", "--rank", str(rank), "--world", "4", "--capacity", "4096",
-                "--device-budget-bytes", "107374182400", "--first-layer", "11"] + topology
+    workers = [["expertd-native", "--rank", str(rank), "--world", "4",
+                "--device-budget-bytes", "107374182400"] + topology
                for rank in range(4)]
     base = dict(source_commit="abc", source_artifact="manifest:1", model="deepseek-ai/DeepSeek-V4.1-Flash",
                 revision="dba1be0a", rtx_gpus=2, requested_rtx_expert_layers="auto",
                 resolved_rtx_expert_layers=11, spark_first_layer=11,
                 spark_count=4, concurrency=16, max_context_tokens=1048576, max_output_tokens=393216,
                 kv_pool="default", prefix_cache_entries=20, prefill_batch_tokens=2048,
-                worker_capacity=4096,
+                worker_capacity=2048,
                 dspark="on", dspark_draft_limit=7, spark_device_budget_bytes=107374182400, power_caps_watts=400,
                 source_snapshots={"daemon": "d1", "native": "n1"},
                 expert_tp_manifests={"spark": {"tp_degree": 4, "intermediate": 576,
@@ -58,7 +58,9 @@ def _identity(tp: int) -> dict:
                 coordinator_argv=["serve-native", "--rtx-gpus", "2", "--prefill-batch-tokens", "2048",
                                   "--concurrency", "16", "--prefix-cache-entries", "20",
                                   "--max-context-tokens", "1048576", "--max-output-tokens", "393216", "--dspark"] + topology,
-                worker_argv=workers)
+                worker_argv=workers,
+                worker_admissions=[dict(rank=rank, capacity=2048, compiled_capacity=4096,
+                    layer_ids=list(range(11, 40)), selection_digest="a" * 64) for rank in range(4)])
     base.update(spark_tp=tp, spark_ep=4 // tp, spark_artifact_roles=["spark"] if tp == 4 else ["spark_tp2"],
                 release_identity_full=f"fp-tp{tp}")
     if tp == 2:
@@ -449,8 +451,8 @@ def test_resolved_actual_boundary_mismatch_fails() -> None:
     candidate = _arm(2)
     candidate["startup_metadata"]["resolved_rtx_expert_layers"] = 12
     candidate["startup_metadata"]["spark_first_layer"] = 12
-    for argv in candidate["startup_metadata"]["worker_argv"]:
-        argv[argv.index("--first-layer") + 1] = "12"
+    for report in candidate["startup_metadata"]["worker_admissions"]:
+        report["layer_ids"] = list(range(12, 40))
     report = mod.compare_arms(_arm(4), candidate)
     assert report["gate_result"] == "FAIL"
     assert "resolved_rtx_expert_layers" in report["identity"]["mismatched_fields"]
@@ -475,11 +477,11 @@ def test_explicit_rtx_expert_layers_argument_must_match_resolved() -> None:
 def test_spark_first_layer_must_equal_min_resolved_39() -> None:
     candidate = _arm(2)
     candidate["startup_metadata"]["spark_first_layer"] = 5
-    for argv in candidate["startup_metadata"]["worker_argv"]:
-        argv[argv.index("--first-layer") + 1] = "5"
+    for report in candidate["startup_metadata"]["worker_admissions"]:
+        report["layer_ids"] = list(range(5, 40))
     report = mod.compare_arms(_arm(4), candidate)
     assert report["gate_result"] == "FAIL"
-    assert any("min(resolved_rtx_expert_layers, 39)" in failure for failure in report["tier_a_failures"])
+    assert any("resolved_rtx_expert_layers=" in failure for failure in report["tier_a_failures"])
 
 
 def test_duplicate_rank_argv_fails() -> None:
@@ -496,30 +498,50 @@ def test_duplicate_rank_argv_fails() -> None:
 def test_capacity_below_prefill_bound_fails() -> None:
     candidate = _arm(2)
     candidate["startup_metadata"]["worker_capacity"] = 1024
-    for argv in candidate["startup_metadata"]["worker_argv"]:
-        argv[argv.index("--capacity") + 1] = "1024"
+    for report in candidate["startup_metadata"]["worker_admissions"]:
+        report["capacity"] = 1024
     report = mod.compare_arms(_arm(4), candidate)
     assert report["gate_result"] == "FAIL"
-    assert any("below the 4096 required" in failure for failure in report["tier_a_failures"])
+    assert any("differs from the 2048 required" in failure for failure in report["tier_a_failures"])
 
 
 def test_unsupported_capacity_fails() -> None:
     candidate = _arm(2)
     candidate["startup_metadata"]["worker_capacity"] = 128
-    for argv in candidate["startup_metadata"]["worker_argv"]:
-        argv[argv.index("--capacity") + 1] = "128"
+    for report in candidate["startup_metadata"]["worker_admissions"]:
+        report["capacity"] = 128
     report = mod.compare_arms(_arm(4), candidate)
     assert report["gate_result"] == "FAIL"
     assert any("not one of" in failure for failure in report["tier_a_failures"])
 
 
-def test_capacity_flag_value_must_match_metadata() -> None:
+def test_installed_capacity_must_match_metadata() -> None:
     candidate = _arm(2)
-    argv = candidate["startup_metadata"]["worker_argv"][0]
-    argv[argv.index("--capacity") + 1] = "1024"
+    candidate["startup_metadata"]["worker_admissions"][0]["capacity"] = 1024
     report = mod.compare_arms(_arm(4), candidate)
     assert report["gate_result"] == "FAIL"
-    assert any("--capacity=1024" in failure for failure in report["tier_a_failures"])
+    assert any("admitted capacity=1024" in failure for failure in report["tier_a_failures"])
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "sparse-hole", "reordered", "compiled", "digest"])
+def test_installed_worker_admission_fails_closed(mutation) -> None:
+    candidate = _arm(2)
+    reports = candidate["startup_metadata"]["worker_admissions"]
+    if mutation == "missing":
+        candidate["startup_metadata"].pop("worker_admissions")
+    elif mutation == "duplicate":
+        reports[1] = copy.deepcopy(reports[0])
+    elif mutation == "sparse-hole":
+        reports[0]["layer_ids"].remove(17)
+    elif mutation == "reordered":
+        reports[0]["layer_ids"].reverse()
+    elif mutation == "compiled":
+        reports[0]["compiled_capacity"] = 1024
+    else:
+        reports[0]["selection_digest"] = "missing"
+    report = mod.compare_arms(_arm(4), candidate)
+    assert report["gate_result"] == "FAIL"
+    assert report["tier_a_failures"]
 
 
 CANONICAL_CODE = (

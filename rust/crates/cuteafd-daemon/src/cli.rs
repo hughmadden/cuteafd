@@ -491,17 +491,6 @@ pub(crate) struct NativeExpertDaemonArgs {
     pub(crate) audio_encoder_plan_hash: Option<String>,
     #[arg(long)]
     pub(crate) audio_encoder_revision: Option<String>,
-    /// First resident backbone layer; use 20 when both RTX GPUs host the encoder.
-    /// Checked against the checkpoint's layer count at startup.
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..256))]
-    pub(crate) first_layer: u32,
-    /// Last resident backbone layer (inclusive); defaults to the model's last
-    /// layer. A partial range serves a subset of layers, for bring-up and probes.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(0..256))]
-    pub(crate) last_layer: Option<u32>,
-    /// Wait for the coordinator's solved layer selection before allocating experts.
-    #[arg(long)]
-    pub(crate) placement_handshake: bool,
     /// Official local snapshot directory, including all shard headers.
     #[arg(long)]
     pub(crate) snapshot: PathBuf,
@@ -530,19 +519,9 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Number of replicated expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
     #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
     pub(crate) spark_ep: Option<u8>,
-    #[arg(long, default_value_t = 16)]
-    pub(crate) capacity: u32,
     /// Total device bytes allowed for resident weights, loading and execution.
     #[arg(long)]
     pub(crate) device_budget_bytes: usize,
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
-    pub(crate) max_frame_bytes: usize,
-    /// Persistent decode/prefill endpoints per selected Spark rank, from the family's working set.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-    pub(crate) rdma_endpoints: u32,
-    /// Admit wide BF16 input for an optional BF16-input package (mandatory for NVFP4 automatically).
-    #[arg(long)]
-    pub(crate) bf16_ingress: bool,
     #[arg(long, default_value = "0.0.0.0:9100")]
     pub(crate) listen: String,
 }
@@ -812,16 +791,16 @@ mod tests {
     }
 
     #[test]
-    fn expert_endpoint_geometry_is_required_and_nonzero() {
+    fn worker_geometry_is_supplied_by_coordinator_not_launch_flags() {
         use clap::Parser;
         let base = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--device-budget-bytes", "1000", "--rank", "0"];
-        assert!(Cli::try_parse_from(base).is_err());
-        assert!(Cli::try_parse_from(base.into_iter().chain(["--rdma-endpoints", "0"])).is_err());
-        for endpoints in ["1", "2", "4"] {
-            let cli = Cli::try_parse_from(base.into_iter().chain(["--rdma-endpoints", endpoints])).unwrap();
-            let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
-            assert_eq!(args.rdma_endpoints.to_string(), endpoints);
+        assert!(Cli::try_parse_from(base).is_ok());
+        for flag in ["--rdma-endpoints", "--capacity", "--first-layer", "--last-layer", "--max-frame-bytes"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain([flag, "1"])).is_err());
+        }
+        for flag in ["--bf16-ingress", "--placement-handshake"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain([flag])).is_err());
         }
     }
 
@@ -831,7 +810,7 @@ mod tests {
         let serve = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"];
         let expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
-            "--device-budget-bytes", "1000", "--rdma-endpoints", "2", "--rank", "0", "--world", "4"];
+            "--device-budget-bytes", "1000", "--rank", "0", "--world", "4"];
         // Absent keys preserve the legacy launch vector exactly.
         for base in [&serve[..], &expert[..]] {
             let cli = Cli::try_parse_from(base).unwrap();
@@ -866,7 +845,7 @@ mod tests {
         }
         // Whole-expert Qwen TP1 must reach the worker's family validation.
         let one = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
-            "--device-budget-bytes", "1000", "--rdma-endpoints", "2", "--rank", "0", "--world"];
+            "--device-budget-bytes", "1000", "--rank", "0", "--world"];
         let cli = Cli::try_parse_from(one.into_iter().chain(["1"])).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (0, 1));
@@ -883,7 +862,7 @@ mod tests {
         // Pure TP6EP1 is a real shard family on both processes. Five is not a
         // family and stays rejected even though it is inside the numeric range.
         let six_expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib",
-            "/native.so", "--device-budget-bytes", "1000", "--rdma-endpoints", "2", "--rank", "5", "--world", "6"];
+            "/native.so", "--device-budget-bytes", "1000", "--rank", "5", "--world", "6"];
         for command in [&serve[..], &six_expert[..]] {
             let cli = Cli::try_parse_from(command.iter().copied()
                 .chain(["--spark-tp", "6", "--spark-ep", "1"])).unwrap();
@@ -915,9 +894,6 @@ pub(crate) struct NativeServeArgs {
     /// Force one RTX or the distributed two-RTX layout (automatic launcher selection is pending).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
     pub rtx_gpus: u32,
-    /// Private startup handoff directory supplied by the release launcher.
-    #[arg(long, hide = true)]
-    pub placement_directory: Option<std::path::PathBuf>,
     /// Experimental TP2 attention with replicated KV; requires two RTX GPUs.
     #[arg(long)]
     pub tp2_attention: bool,

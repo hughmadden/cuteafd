@@ -130,7 +130,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
 
     def test_v41_placement_uses_writable_serving_home(self) -> None:
         source = v41_source()
-        self.assertIn('placement_directory=/tmp/cuteafd-home/placement', source)
+        self.assertNotIn('--placement-directory', source)
         self.assertNotIn('placement_directory=/run/cuteafd-placement', source)
 
     def test_serving_identity_is_evaluated_on_each_host(self) -> None:
@@ -702,7 +702,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
         script = v41_source()
         self.assertIn('RUST_LOG=${RUST_LOG:-info}', script)
         self.assertIn('--rtx-gpus "$RELEASE_RTX_GPUS"', script)
-        self.assertIn('--first-layer "$first_layer"', script)
+        self.assertNotIn('--first-layer', script)
         self.assertIn('CUDA_VISIBLE_DEVICES=$gpu_uuid_csv', script)
         self.assertIn("trap cleanup EXIT", script)
 

@@ -128,9 +128,6 @@ pub(crate) struct EngineArgs {
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long)]
     pub peers: Option<String>,
-    /// Select the solver's exact Spark layer set before worker expert allocation.
-    #[arg(long, requires = "peers")]
-    pub placement_handshake: bool,
     /// Run the routed experts on this GPU: EXL3 checkpoints through the
     /// coordinator `exl3-glmf-k<tiers>/rtx-tp1` package, FP8 ones through the
     /// TP1 `fp8-glmf` package. `--experts-snapshot` names another checkpoint
@@ -854,14 +851,6 @@ mod draft_cli_tests {
             assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
                 "--prefill-lanes", lanes]).is_err());
         }
-    }
-
-    #[test]
-    fn worker_placement_handshake_is_opt_in_and_requires_peers() {
-        assert!(!parse(&[]).placement_handshake);
-        assert!(parse(&["--peers", "127.0.0.1:19441", "--placement-handshake"]).placement_handshake);
-        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
-            "--placement-handshake"]).is_err());
     }
 
     #[test]
@@ -1720,7 +1709,7 @@ impl Opened {
             ensure!(rtx_layers == working.rtx_layers,
                 "GLM Flash runtime RTX selection disagrees with admitted working set");
         }
-        if args.placement_handshake {
+        if args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }

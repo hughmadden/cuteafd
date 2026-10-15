@@ -13,12 +13,11 @@ use std::{
 fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
     selection: &cuteafd_transport::worker_selection::WorkerSelection,
     first_routed: usize, layers: usize) -> Result<()> {
-    let allowed = config.launched_layers(layers)?;
     let selected = selection.layers();
-    ensure!(selected.iter().all(|&layer| layer >= first_routed && allowed.contains(&layer)),
-        "solved worker selection is outside launched resident range");
-    config.selected_layers = Some(selected);
-    if let Some(model) = selection.model() {
+    ensure!(selected.iter().all(|&layer| layer >= first_routed && layer < layers),
+        "solved worker selection is outside checkpoint routed layers");
+    {
+        let model = selection.model().context("worker selection requires typed model admission")?;
         model.validate(selection.geometry())?;
         config.capacity = model.capacity;
         config.max_frame_bytes = model.rings.max_frame_bytes;
@@ -27,6 +26,7 @@ fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
             !matches!(endpoint.ingress, cuteafd_core::SparkIngress::Fp8K32));
         config.model_admission = Some(model.clone());
     }
+    config.selected_layers = Some(selected);
     Ok(())
 }
 
@@ -41,34 +41,36 @@ mod selection_tests {
         std::fs::write(dir.path().join("model.safetensors.index.json"), "{}").unwrap();
         let geometry = cuteafd_core::ExpertGeometry::MIMO_V26_PRO;
         let identity = WorkerIdentity::from_snapshot(dir.path(), geometry, 6, None).unwrap();
-        // Every backend consumes the same exact selected IDs within launch bounds.
+        // Every backend consumes the same exact selected IDs within checkpoint bounds.
         let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
-            snapshot: dir.path().into(), rank: 0, world: 6, first_layer: 1, last_layer: None,
-            placement_handshake: true, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
+            snapshot: dir.path().into(), rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
             rdma_endpoints: 3, topology: None, native_spark_tp2: false, bf16_ingress: false };
-        let selection = WorkerSelection::new(identity.clone(), &(13..70).collect::<Vec<_>>()).unwrap();
-        apply_worker_selection(&mut config, &selection, 1, 70).unwrap();
-        assert_eq!(config.resident_layers(70).unwrap(), (13..70).collect::<Vec<_>>());
-        assert_eq!(config.selection(13).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 13, rank: 0, world: 6 });
-        let disjoint = WorkerSelection::new(identity.clone(), &[13, 15]).unwrap();
-        apply_worker_selection(&mut config, &disjoint, 1, 70).unwrap();
-        assert_eq!(config.resident_layers(70).unwrap(), vec![13, 15]);
-        let before = WorkerSelection::new(identity.clone(), &[0]).unwrap();
-        assert!(apply_worker_selection(&mut config, &before, 1, 70).is_err());
         let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80, compiled_capacity: 80,
             endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 80,
                 ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 } }],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 32 << 20, depth: 2,
                 slot_bytes: 1 << 20, alignment: 4096 } };
-        let sealed = selection.with_model(model.clone()).unwrap();
+        let selection = WorkerSelection::new(identity.clone(), &(13..70).collect::<Vec<_>>()).unwrap()
+            .with_model(model.clone()).unwrap();
+        apply_worker_selection(&mut config, &selection, 1, 70).unwrap();
+        assert_eq!(config.resident_layers(70).unwrap(), (13..70).collect::<Vec<_>>());
+        assert_eq!(config.selection(13).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 13, rank: 0, world: 6 });
+        let disjoint = WorkerSelection::new(identity.clone(), &[13, 15]).unwrap().with_model(model.clone()).unwrap();
+        apply_worker_selection(&mut config, &disjoint, 1, 70).unwrap();
+        assert_eq!(config.resident_layers(70).unwrap(), vec![13, 15]);
+        let before = WorkerSelection::new(identity.clone(), &[0]).unwrap().with_model(model.clone()).unwrap();
+        assert!(apply_worker_selection(&mut config, &before, 1, 70).is_err());
+        let untyped = WorkerSelection::new(identity.clone(), &[13]).unwrap();
+        assert!(apply_worker_selection(&mut config, &untyped, 1, 70).is_err());
+        let sealed = selection;
         apply_worker_selection(&mut config, &sealed, 1, 70).unwrap();
         assert_eq!(config.capacity, 80);
         assert_eq!(config.max_frame_bytes, 32 << 20);
         assert_eq!(config.rdma_endpoints, 1);
         assert!(config.bf16_ingress);
         assert_eq!(config.model_admission, Some(model.clone()));
-        let mut covered = model;
+        let mut covered = model.clone();
         covered.capacity = 2048;
         covered.compiled_capacity = 4096;
         covered.endpoints[0].capacity = 2048;
@@ -76,7 +78,7 @@ mod selection_tests {
         apply_worker_selection(&mut config, &covered, 1, 70).unwrap();
         assert_eq!(config.capacity, 2048);
         assert_eq!(config.compiled_capacity().unwrap(), 4096);
-        let empty = WorkerSelection::new(identity, &[]).unwrap();
+        let empty = WorkerSelection::new(identity, &[]).unwrap().with_model(model).unwrap();
         apply_worker_selection(&mut config, &empty, 1, 70).unwrap();
         assert!(config.resident_layers(70).unwrap().is_empty());
     }
@@ -151,10 +153,6 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         config.rank < config.world && (1..=8).contains(&config.world),
         "native rank must be below the launched Spark world"
     );
-    ensure!(
-        (1..=4096).contains(&config.capacity),
-        "unsupported native capacity"
-    );
     // The checkpoint fixes the process expert geometry before the native
     // library loads, so its helpers and every wire size agree with it.
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&config.snapshot)?;
@@ -168,17 +166,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     config.topology = crate::shared::spark_topology::for_checkpoint(
         config.topology, config.world, v41 && catalog.exl3().is_some());
     let geometry = catalog.routed_experts().geometry()?;
-    config.bf16_ingress |= inventory.spark_input_is_bf16();
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
         && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;
-    let minimum_frame = 128 + geometry.row_bytes() as usize + 40 + geometry.topk as usize * 12;
-    ensure!(
-        (minimum_frame..=64 * 1024 * 1024).contains(&config.max_frame_bytes),
-        "invalid native frame budget"
-    );
     // The vision owner loads in this process/device's primary CUDA context,
     // never beside expertd in a second process. Charge it before expert admission.
     let (_encoder, _audio_encoder, reserved) = crate::shared::vision::worker::start_encoders(
@@ -188,7 +180,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         .context("media reservation exceeds Spark budget")?;
     // Media may be admitted first, but expert allocation waits for the one
     // coordinator-authoritative selection. Bootstrap-ready is not weights-ready.
-    let mut bootstrap = if config.placement_handshake {
+    let (listener, mut stream, selection) = {
         let listener = TcpListener::bind(listen)?;
         listener.set_nonblocking(true)?;
         tracing::info!(rank = config.rank, world = config.world, "native worker bootstrap ready");
@@ -223,7 +215,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         };
         if selection.ranges().is_empty() {
             let installed = (|| -> Result<_> {
-                let report = if selection.model().is_some() {
+                let report = {
                     // SAFETY: the library remains loaded until sampling completes; replay retains only data.
                     let library = unsafe { NativeLibrary::load(&config.library) }?;
                     library.release_sync_h2d_staging()?;
@@ -231,7 +223,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     Some(cuteafd_core::ModelAdmissionResponse { rank: u32::try_from(config.rank)?,
                         resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0)?,
                         mapped_ring_bytes: 0, host_exchange_bytes: 0, row_indices_bytes: 0 })
-                } else { None };
+                };
                 cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, report)
             })();
             let installed = match installed {
@@ -242,16 +234,16 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 }
             };
             installed.acknowledge(&mut stream)?;
-            tracing::info!(rank = config.rank, layer_ids = ?installed.selection().layers(),
+            tracing::info!(rank = config.rank, world = config.world, layer_ids = ?installed.selection().layers(),
                 layers = 0, resident_bytes = 0, "native empty expert worker ready");
             return run_empty_selection(listener, config.rank, &installed);
         }
-        Some((listener, stream, selection))
-    } else { None };
+        (listener, stream, selection)
+    };
     // Every endpoint shares the sealed finite allowance, fixed before loading.
-    let ring_budget = Some(worker_ring_budget(&config, geometry)?);
+    let ring_budget = worker_ring_budget(&config, geometry)?;
     tracing::info!(rdma_endpoints = config.rdma_endpoints, bf16_ingress = config.bf16_ingress,
-        ring_budget_bytes = ring_budget.as_ref().unwrap().limit(), "Spark ring admission policy");
+        ring_budget_bytes = ring_budget.limit(), "Spark ring admission policy");
     // SAFETY: this owner keeps the library loaded through weights/execution Drop.
     let library = unsafe { NativeLibrary::load(&config.library) }?;
     // Remove upload transients left by media before taking the retained baseline.
@@ -265,9 +257,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let (weights, remaining) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {
-            if let Some((_, stream, _)) = bootstrap.as_mut() {
-                let _ = cuteafd_transport::worker_selection::reject_worker_selection(stream, &error);
-            }
+            let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             return Err(error);
         }
     };
@@ -283,9 +273,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let mut execution = match allocated {
         Ok(execution) => execution,
         Err(error) => {
-            if let Some((_, stream, _)) = bootstrap.as_mut() {
-                let _ = cuteafd_transport::worker_selection::reject_worker_selection(stream, &error);
-            }
+            let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             return Err(error);
         }
     };
@@ -306,16 +294,17 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         &config,
         "execution and exchange allocated",
         None,
-        ring_budget_log.as_ref().map(|budget| (budget.used(), budget.peak())),
+        Some((ring_budget_log.used(), ring_budget_log.peak())),
     );
-    let (listener, worker_selection) = if let Some((listener, mut stream, selection)) = bootstrap.take() {
+    let worker_selection = {
         if weights.layer_ids()? != selection.layers() {
             let error = anyhow::anyhow!("loaded worker layers do not match the solved selection");
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             return Err(error);
         }
         let reported = (|| -> Result<_> {
-            let report = if let Some(model) = selection.model() {
+            let report = {
+                let model = selection.model().context("worker selection requires typed model admission")?;
                 weights.validate_ingress(&library, model)?;
                 let (resident_bytes, slices) = weights.loaded_residency(&library, config.compiled_capacity()?)?;
                 let runtime = measured_worker_runtime(&library, &baseline, resident_bytes)?;
@@ -328,7 +317,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     host_exchange_bytes: u64::try_from(host_exchange_bytes)?,
                     row_indices_bytes: u64::try_from(row_indices.capacity().checked_mul(std::mem::size_of::<u32>())
                         .context("worker row index extent overflow")?)? })
-            } else { None };
+            };
             cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, report)
         })();
         let installed = match reported {
@@ -339,10 +328,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             }
         };
         installed.acknowledge(&mut stream)?;
-        tracing::info!(rank = config.rank, layer_ids = ?weights.layer_ids()?, layers = weights.len(),
+        tracing::info!(rank = config.rank, world = config.world, layer_ids = ?weights.layer_ids()?, layers = weights.len(),
             selection_digest = %installed.selection().digest()?, "coordinator-selected worker weights ready");
-        (listener, Some(installed))
-    } else { (TcpListener::bind(listen)?, None) };
+        installed
+    };
     listener.set_nonblocking(true)?;
     let (admit, incoming) = mpsc::sync_channel(2);
     let stop = Arc::new(AtomicBool::new(false));
@@ -352,15 +341,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // the process environment per connection or per poll.
     let protocol_v2_timing = cuteafd_transport::protocol_v2_timing_from_env();
     let worker_rank = config.rank;
-    let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
-        &config.snapshot, geometry, config.world, config.topology)?;
     let resident = weights.layer_ids()?;
     ensure!(resident == config.resident_layers(geometry.layers as usize)?, "loaded worker IDs differ from selected IDs");
     ensure!(weights.len() == resident.len(), "worker loaded range differs from grouping report");
-    let loaded = match &worker_selection {
-        Some(installed) => installed.selection().clone(),
-        None => cuteafd_transport::worker_selection::WorkerSelection::new(identity, &resident)?,
-    };
+    let loaded = worker_selection.selection().clone();
     let expert_grouping = execution.installed_grouping(loaded, worker_rank)?;
     thread::Builder::new()
         .name("v41-roce-bootstrap".into())
@@ -368,21 +352,14 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             while !stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let admitted = match &ring_budget {
-                            Some(budget) => LocalVerbsExpertConnection::accept_with_grouping(
-                                stream,
-                                max_frame_bytes,
-                                protocol_v2_timing,
-                                Arc::clone(budget),
-                                worker_selection.as_ref(),
-                                expert_grouping.as_ref(),
-                            ),
-                            None => LocalVerbsExpertConnection::accept(
-                                stream,
-                                max_frame_bytes,
-                                protocol_v2_timing,
-                            ),
-                        };
+                        let admitted = LocalVerbsExpertConnection::accept_with_grouping(
+                            stream,
+                            max_frame_bytes,
+                            protocol_v2_timing,
+                            Arc::clone(&ring_budget),
+                            Some(&worker_selection),
+                            expert_grouping.as_ref(),
+                        );
                         match admitted {
                             Ok(connection) => {
                                 if admit.try_send(connection).is_err() {
@@ -467,7 +444,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 &config,
                 "connection owned after accept",
                 Some(connections.len()),
-                ring_budget_log.as_ref().map(|budget| (budget.used(), budget.peak())),
+                Some((ring_budget_log.used(), ring_budget_log.peak())),
             );
         } else if let Ok(connection) = incoming.try_recv() {
             progressed = true;
@@ -479,7 +456,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     &config,
                     "connection owned after accept",
                     Some(connections.len()),
-                    ring_budget_log.as_ref().map(|budget| (budget.used(), budget.peak())),
+                    Some((ring_budget_log.used(), ring_budget_log.peak())),
                 );
             } else {
                 tracing::warn!("native RoCE active connection limit reached");
@@ -573,7 +550,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                             &config,
                             "steady state sample after first post-admission request",
                             Some(connections.len()),
-                            ring_budget_log.as_ref().map(|budget| (budget.used(), budget.peak())),
+                            Some((ring_budget_log.used(), ring_budget_log.peak())),
                         );
                         pending_steady_log = false;
                     }

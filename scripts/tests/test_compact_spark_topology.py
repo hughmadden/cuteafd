@@ -221,13 +221,13 @@ release_stop_wip_containers
         for world in (2, 3):
             with self.subTest(world=world):
                 result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; docker() { printf "%s\\n" "$@"; }\n' +
-                    remote.replace(' >/dev/null', ''), 'test', 'image', 'name', '1', '4096',
-                    '107374182400', '19441', 'snapshot', 'fingerprint', '3', str(world)],
+                    remote.replace(' >/dev/null', ''), 'test', 'image', 'name', '1',
+                    '107374182400', '19441', 'snapshot', 'fingerprint', str(world), '0', str(world), '1'],
                     cwd=ROOT, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 arguments = result.stdout.splitlines()
                 self.assertEqual(arguments[arguments.index('--world') + 1], str(world))
-                self.assertEqual(arguments[arguments.index('--first-layer') + 1], '3')
+                self.assertNotIn('--first-layer', arguments)
                 # A legacy world-2/3 launch carries no explicit topology flags.
                 self.assertNotIn('--spark-tp', arguments)
                 self.assertNotIn('--spark-ep', arguments)

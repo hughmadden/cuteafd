@@ -800,25 +800,8 @@ mapfile -t release_gpu_pci < <(jq -r '.gpus[].pci' <<<"$gpu_selection")
 gpu_uuid_csv="$(IFS=,; echo "${release_gpu_uuids[*]}")"
 gpu_index_csv="$(IFS=,; echo "${release_gpu_indices[*]}")"
 gpu_pci_csv="$(IFS=,; echo "${release_gpu_pci[*]}")"
-spark_first_layer="$(release_spark_first_layer "$RELEASE_RTX_GPUS" "$RTX_EXPERT_LAYERS")"
-# Auto placement is resolved from live GPU memory, including on one RTX.
-# Do not admit or start workers against a guessed local/remote boundary.
-if [[ "$RTX_EXPERT_LAYERS" == auto ]] ||
-   { ((RELEASE_RTX_GPUS == 1)) && [[ "$RTX_EXPERT_LAYERS" != 0 ]]; }; then
-  spark_first_layer=runtime-plan
-fi
-# Admission against the resolved boundary. Weight-only is all the launcher can
-# know before the expert service reports its workspace; a pass is not a
-# launch-feasibility claim. An auto dual boundary is published by the
-# coordinator and re-checked after plan.json is read below.
-spark_admission="not-applicable"
-if ((topology_explicit)) && [[ "$model_is_exl3" != true ]]; then
-  if [[ "$spark_first_layer" == runtime-plan ]]; then
-    spark_admission="PENDING (coordinator placement plan not yet published; weight-only check uses the real dynamic boundary)"
-  else
-    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES" "$expert_format")"
-  fi
-fi
+# The runtime solver, not launch-time estimates, selects and admits Spark owners.
+spark_admission="coordinator-authoritative typed admission"
 cuteafd_cdi_gpu_args "$gpu_uuid_csv" || exit 2
 
 sparkinfer_commit="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
@@ -1059,7 +1042,7 @@ else
   for lane in "${lanes[@]}"; do peer_addresses+=("$lane:$EXPERT_PORT"); done
   peers="$(IFS=,; echo "${peer_addresses[*]}")"
 fi
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$spark_first_layer" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -1079,7 +1062,7 @@ if ((dry_run)); then
   echo "  TP2 attention/query/output/draft experts: $TP2_ATTENTION/$TP2_QUERY_PROJECTION/$TP2_OUTPUT_PROJECTION/$TP2_DSPARK_EXPERTS"
   echo "  Spark ranks: $SPARK_COUNT; hosts: $(release_hosts_csv)"
   echo "  Spark peers: $peers"
-  echo "  Spark first routed layer: $spark_first_layer"
+  echo "  Spark owners: coordinator-authoritative typed admission"
   if ((topology_explicit)); then
     echo "  Spark topology: TP=$spark_tp EP=$spark_ep (group=rank/TP, tp_rank=rank%TP; no dummy ranks)"
     while read -r global_rank group_index tp_rank; do
@@ -1125,15 +1108,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-placement_directory=
-# Start the coordinator first whenever it can retain routed experts. Its live
-# memory plan tells every worker which layers to skip; local expert loading can
-# then overlap remote loading. Explicit all-remote single-RTX launches need no
-# handoff. Planning uses only the local device and never connects to a worker.
-if ((RELEASE_RTX_GPUS == 2)) || [[ "$RTX_EXPERT_LAYERS" != 0 ]]; then
-  placement_directory=/tmp/cuteafd-home/placement
-fi
-
+# Workers bootstrap first; the coordinator selects exact owners over TCP.
 # Optional RDMA tuning values travel to both roles only when the operator sets
 # them, so a multi-homed six-rank launch can pin the rail without changing any
 # default. Values were format-checked above by release_validate_verbs_device_map.
@@ -1221,7 +1196,6 @@ fi
 if ((topology_explicit)); then
   args+=(--spark-tp "$spark_tp" --spark-ep "$spark_ep")
 fi
-[[ -z "$placement_directory" ]] || args+=(--placement-directory "$placement_directory")
 release_serving_docker_args
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
@@ -1236,41 +1210,13 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "$
   -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
 }
 deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
-if [[ -n "$placement_directory" ]]; then
-  start_coordinator
-  until placement_plan="$(docker exec "$coordinator" cat "$placement_directory/plan.json" 2>/dev/null)"; do
-    [[ "$(docker inspect -f '{{.State.Status}}' "$coordinator" 2>/dev/null)" == running ]] || { docker logs --tail 100 "$coordinator" >&2 || true; release_die "coordinator exited before placement publication"; }
-    ((SECONDS < deadline)) || release_die "timed out waiting for coordinator placement"
-    sleep 1
-  done
-  # A failed P2P startup probe may reduce a selected two-GPU layout to one.
-  # Never accept an expansion beyond the GPUs admitted by this launch.
-  spark_first_layer="$(jq -er --argjson gpus "$RELEASE_RTX_GPUS" --arg requested "$RTX_EXPERT_LAYERS" '
-    select(.version == 1)
-    | select((.rtx_gpus | type) == "number" and (.rtx_gpus == 1 or .rtx_gpus == 2) and .rtx_gpus <= $gpus)
-    | select((.nonce | type) == "string" and (.nonce | length) > 0)
-    | select((.rtx_expert_layers | type) == "number")
-    | select(.rtx_expert_layers == (.rtx_expert_layers | floor) and .rtx_expert_layers >= 0 and .rtx_expert_layers <= 40)
-    | select(.rtx_expert_layers > 0 or .rtx_gpus == 1)
-    | select($requested == "auto" or .rtx_expert_layers == ($requested | tonumber))
-    | select(.spark_first_layer == ([.rtx_expert_layers, 39] | min))
-    | .spark_first_layer' <<<"$placement_plan")" || release_die "invalid coordinator placement plan"
-  echo "  runtime placement: RTX GPUs $(jq -r '.rtx_gpus' <<<"$placement_plan"), RTX layers $(jq -r '.rtx_expert_layers' <<<"$placement_plan"); Spark first layer $spark_first_layer"
-  if ((topology_explicit)) && [[ "$model_is_exl3" != true ]]; then
-    # Re-check against the boundary the coordinator actually published; this is
-    # the dynamic value, not the auto placeholder.
-    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES" "$expert_format")"
-    echo "  runtime Spark weight admission (workspace/staging NOT accounted): $spark_admission"
-  fi
-fi
-
 echo "== starting native Spark experts =="
 pids=()
 for i in "${!hosts[@]}"; do
   host="${hosts[$i]}"; remote="${spark_prefix}-${host}-${EXPERT_PORT}"
   # ssh joins its arguments into one remote command line, which drops empty
   # arguments and shifts every later position; quote each one explicitly.
-  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$expert_capacity" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_first_layer" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
+  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
   if ((encoder_rank >= 0)); then
     remote_args+=("$encoder_rank" "$encoder_port" "$encoder_hash" "$RELEASE_MODEL_REVISION")
   fi
@@ -1280,21 +1226,20 @@ for i in "${!hosts[@]}"; do
   remote_args+=(--profile-args ${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"} "${shared_worker_env_args[@]}")
   release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args; bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
-image="$1"; name="$2"; rank="$3"; capacity="$4"; budget="$5"; port="$6"; snapshot_rel="$7"; fingerprint="$8"; first_layer="$9"; world="${10}"
-# Defaults keep a legacy invocation (ten positional arguments) valid.
-topology_explicit="${11:-0}"; topology_tp="${12:-}"; topology_ep="${13:-}"
+image="$1"; name="$2"; rank="$3"; budget="$4"; port="$5"; snapshot_rel="$6"; fingerprint="$7"; world="$8"
+topology_explicit="$9"; topology_tp="${10}"; topology_ep="${11}"
 topology_args=()
 [[ "$topology_explicit" != 1 ]] || topology_args=(--spark-tp "$topology_tp" --spark-ep "$topology_ep")
 # Optional RDMA tuning, forwarded only when the operator set it.
-rdma_env="${14:-}"; ib_port="${15:-}"; execution_lanes="${16:-}"
+rdma_env="${12:-}"; ib_port="${13:-}"; execution_lanes="${14:-}"
 # The operator's RUST_LOG reaches the worker too (a quoted heredoc does not
 # see the caller's environment).
-rust_log="${17:-info}"
-wip_slot="${18:-__none__}"
+rust_log="${15:-info}"
+wip_slot="${16:-__none__}"
 wip_layout_slot="$wip_slot"
 encoder_args=()
-if [[ "$rank" == "${19:--1}" ]]; then
-  encoder_args=(--encoder --encoder-listen "0.0.0.0:${20}" --encoder-plan-hash "${21}" --encoder-revision "${22}" --encoder-max-tokens 1024)
+if [[ "$rank" == "${17:--1}" ]]; then
+  encoder_args=(--encoder --encoder-listen "0.0.0.0:${18}" --encoder-plan-hash "${19}" --encoder-revision "${20}" --encoder-max-tokens 1024)
 fi
 wip_args=()
 if [[ "$wip_slot" != __none__ ]]; then
@@ -1324,7 +1269,7 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # positional argument, so the worker argument contract is unchanged.
 release_serving_docker_args
 cuteafd_cdi_gpu_args all || exit 2
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$image" cuteafd expertd-native --snapshot "/hf/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --rdma-endpoints 2 --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$image" cuteafd expertd-native --snapshot "/hf/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done
@@ -1338,14 +1283,7 @@ for i in "${!hosts[@]}"; do
   done
 done
 
-# Acknowledge the published boundary for every handoff launch, including the
-# single-RTX explicit-topology case the coordinator now publishes. Only a launch
-# with no handoff starts the coordinator at this point.
-if [[ -n "$placement_directory" ]]; then
-  docker exec "$coordinator" sh -c 'cp "$1/plan.json" "$1/.ready-pending" && mv "$1/.ready-pending" "$1/ready.json"' sh "$placement_directory"
-else
-  start_coordinator
-fi
+start_coordinator
 api_url="http://127.0.0.1:${ADDR##*:}"
 until curl -fsS "$api_url/health" >/dev/null 2>&1 &&
   release_api_advertises_native_model "$api_url" "$RELEASE_NATIVE_API_MODEL_ID"; do
@@ -1497,17 +1435,10 @@ if [[ "$family" == qwen4 ]]; then
   qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
   read -r qwen_exl3 qwen_nvfp4 qwen_mtp <<<"$qwen_features"
 fi
-layer_args="--first-layer $first_layer"
-[[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"
 # Docker options only the Spark expert workers take (their environment and mounts).
 spark_worker_env=""
 # Options only the Spark expert workers take.
 spark_worker_args=""
-placement_handshake=0
-if [[ ( "$family" == mimo_v2 || "$family" == glm5_flash ) && "${CUTEAFD_PLACEMENT_HANDSHAKE:-0}" == 1 ]]; then
-  placement_handshake=1
-  layer_args+=" --placement-handshake"
-fi
 # Snapshot of a model id (and optional revision) inside the containers.
 snapshot_of() {
   local id="$1" rev="$2" dir="$hub/models--${1//\//--}"
@@ -2248,20 +2179,15 @@ fi
 # the Spark world size. Forward the resolved lane policy to the coordinator.
 lane_env_args=()
 case "$family" in
-  deepseek_v4) rdma_endpoints=2 ;;
+  deepseek_v4) ;;
   glm5)
     selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"
     [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
     if [[ "$ranks" == 0 ]]; then
       selected_lanes=1
-      rdma_endpoints=0
-    else
-      rdma_endpoints=$((1 + (selected_lanes > 1 ? selected_lanes : 0)))
     fi
     lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes") ;;
   glm5_flash)
-    rdma_endpoints="${prefill_lanes:-2}"
-    if [[ "${CUTEAFD_GLMF_PREFILL_LANES:-}" == 1 ]]; then rdma_endpoints=1; fi
     [[ -z "${CUTEAFD_GLMF_PREFILL_LANES:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_PREFILL_LANES=$CUTEAFD_GLMF_PREFILL_LANES")
     # Planner and server must offer the same conditional drafter homes.
     # Explicit config overrides the legacy process-wide diagnostic switch.
@@ -2270,16 +2196,13 @@ case "$family" in
       off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
       "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
     esac ;;
-  qwen4) rdma_endpoints=1 ;;
+  qwen4) ;;
   mimo_v2)
     hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); t=c.get("text_config", c); print(t.get("hidden_size", 4096 if t.get("model_type") == "mimo_v2_flash" else 6144))' "$root/snapshots/$revision/config.json")"
     selected_lanes="${CUTEAFD_MIMO_PREFILL_LANES:-$([[ "$hidden" == 4096 ]] && printf 2 || printf 3)}"
     [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_MIMO_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
     lane_env_args+=(-e "CUTEAFD_MIMO_PREFILL_LANES=$selected_lanes")
-    rdma_endpoints="$selected_lanes"
-    # BF16-decode fits the wider FP8 prefill ring; only full BF16 changes
-    # the maximum ingress frame. NVFP4 is detected by the worker itself.
-    [[ "$expert_input" != bf16 ]] || spark_worker_args+=" --bf16-ingress" ;;
+;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
 if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
@@ -2607,7 +2530,7 @@ for ((rank = 0; rank < ranks; rank++)); do
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info ${shared_worker_env_args[*]}$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/hf/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
-    --rank $rank --world $ranks --rdma-endpoints $rdma_endpoints --capacity 4096 --device-budget-bytes $budget $layer_args$spark_worker_args \
+    --rank $rank --world $ranks --device-budget-bytes $budget $spark_worker_args \
     --listen 0.0.0.0:$port $encoder_args >/dev/null" &
 done
 wait
@@ -2615,8 +2538,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   # A placement worker bootstraps after media admission and waits for the
   # coordinator solve before expert weights load.
-  ready_marker='worker ready'
-  ((placement_handshake == 0)) || ready_marker='worker bootstrap ready'
+  ready_marker='worker bootstrap ready'
   ready_deadline=$((SECONDS + 900))
   until ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1 | grep -q '$ready_marker'"; do
     ((SECONDS < ready_deadline)) || { echo "$host readiness timed out" >&2; exit 1; }
@@ -2644,7 +2566,6 @@ fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")
-((placement_handshake == 0 || ranks == 0)) || peer_args+=(--placement-handshake)
 shared_api_state "$coordinator_image" "${instance:-default}"
 family_args+=("${api_args[@]}")
 shared_profile_args

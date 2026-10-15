@@ -7,6 +7,91 @@ pub(super) const RUNTIME_HEADROOM: usize = 2 << 30;
 pub(super) const EXPERT_SETUP_HEADROOM: usize = 64 << 20;
 const SMALL_CARD_SAMPLE_MARGIN: usize = 32 << 20;
 
+fn spark_partition(paired_profile: Option<&crate::families::deepseek_v41::v41_experts::paired::PairedProfile>) -> cuteafd_loader::V41Exl3Partition {
+    if paired_profile.is_some() { cuteafd_loader::V41Exl3Partition::PairedTp4 }
+    else { cuteafd_loader::V41Exl3Partition::Disjoint }
+}
+
+fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool, device_endpoints: usize)
+    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    use cuteafd_core::{SparkEndpoint, SparkIngress};
+    ensure!(device_endpoints <= 2 && (!bf16 || device_endpoints == 0),
+        "invalid V4.1 device endpoint set");
+    let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+    let mut endpoints = vec![SparkEndpoint { capacity, ingress }; 2];
+    endpoints.extend(std::iter::repeat_n(SparkEndpoint { capacity: capacity.min(80), ingress }, device_endpoints));
+    let model = cuteafd_transport::worker_selection::ModelAdmission {
+        capacity, compiled_capacity, endpoints,
+        rings: crate::shared::placement::spark_rings(64 << 20)?,
+    };
+    model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
+    Ok(model)
+}
+
+pub(super) fn select_sparks(args: &crate::cli::NativeServeArgs,
+    catalog: &cuteafd_loader::OfficialV41Catalog, local_layers: usize,
+    capacity: u32, compiled_capacity: u32,
+    topology: Option<cuteafd_transport::expert::SparkTopology>,
+    paired_profile: Option<&crate::families::deepseek_v41::v41_experts::paired::PairedProfile>,
+    device_endpoints: usize) -> Result<()> {
+    let geometry = catalog.routed_experts().geometry()?;
+    ensure!(local_layers <= geometry.layers as usize, "V4.1 local boundary exceeds checkpoint");
+    if args.peers.is_empty() {
+        ensure!(local_layers == geometry.layers as usize, "V4.1 remote layers require Spark peers");
+        return Ok(());
+    }
+    let working = SparkWorkingSet { spark_layers: (local_layers..geometry.layers as usize).collect(),
+        rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: 2 };
+    crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
+        &working, args.peers.len(), topology, spark_partition(paired_profile),
+        spark_model(capacity, compiled_capacity, catalog.nvfp4().is_some(), device_endpoints)?)?
+        .select(&args.peers)
+}
+
+#[cfg(test)]
+mod spark_tests {
+    use super::*;
+
+    #[test]
+    fn resolved_paired_profile_not_cli_bit_controls_partition() {
+        use clap::Parser;
+        for cli_enabled in [false, true] {
+            let mut argv = vec!["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+            if cli_enabled { argv.push("--exl3-paired-tp4"); }
+            let crate::cli::Commands::ServeNative(args) = crate::cli::Cli::try_parse_from(argv).unwrap().command
+                else { panic!("expected serve-native") };
+            assert_eq!(args.exl3_paired_tp4, cli_enabled);
+            let profile = if cli_enabled { None } else {
+                Some(serde_json::from_value::<crate::families::deepseek_v41::v41_experts::paired::PairedProfile>(
+                    serde_json::json!({"schema":"cuteafd.exl3-paired-cost.v1",
+                        "layers": vec![vec![serde_json::json!({"weight":[1,1],"per_row":[0,0]});384];40]})).unwrap())
+            };
+            assert_eq!(spark_partition(profile.as_ref()), if cli_enabled {
+                cuteafd_loader::V41Exl3Partition::Disjoint
+            } else { cuteafd_loader::V41Exl3Partition::PairedTp4 });
+        }
+    }
+
+    #[test]
+    fn endpoint_contract_covers_both_regular_and_each_device_lane() -> Result<()> {
+        for (live, compiled) in [(256, 256), (2048, 4096), (4096, 4096)] {
+            for device in 0..=2 {
+                let model = spark_model(live, compiled, false, device)?;
+                assert_eq!((model.capacity, model.compiled_capacity), (live, compiled));
+                assert_eq!(model.endpoints.len(), 2 + device);
+                assert!(model.endpoints[..2].iter().all(|e| e.capacity == live));
+                assert!(model.endpoints[2..].iter().all(|e| e.capacity == 80));
+                assert!(model.endpoints.iter().all(|e| e.ingress == cuteafd_core::SparkIngress::Fp8K32));
+            }
+            assert!(spark_model(live, compiled, true, 0)?.endpoints.iter()
+                .all(|e| e.ingress == cuteafd_core::SparkIngress::Bf16));
+            assert!(spark_model(live, compiled, true, 1).is_err());
+        }
+        assert!(spark_model(4096, 2048, false, 0).is_err());
+        Ok(())
+    }
+}
+
 pub(super) fn graph_reserve_bytes(total: usize, dual_gpu: Option<usize>) -> usize {
     assert!(dual_gpu.is_none_or(|gpu| gpu < 2));
     families::deepseek_v41::graph_reserve(total as u64, if dual_gpu.is_some() { 2 } else { 1 })

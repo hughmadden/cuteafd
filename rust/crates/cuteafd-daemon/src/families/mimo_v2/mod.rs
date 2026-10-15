@@ -32,9 +32,6 @@ pub(crate) struct EngineArgs {
     /// Checkpoint snapshot (XiaomiMiMo/MiMo-V2-Flash).
     #[arg(long)]
     pub snapshot: PathBuf,
-    /// Send the solved Spark layer set before opt-in workers allocate experts.
-    #[arg(long)]
-    pub placement_handshake: bool,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -859,7 +856,7 @@ impl Opened {
         let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
         let args = &resolved;
-        if args.placement_handshake {
+        if args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker admission needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,

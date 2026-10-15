@@ -395,7 +395,7 @@ pub(super) fn load_exl3<'a>(
             <= config.device_budget,
         "compressed EXL3 weights and workspace exceed device budget"
     );
-    tracing::info!(rank=config.rank, world=config.world, first_layer=config.first_layer,
+    tracing::info!(rank=config.rank, world=config.world, layer_ids=?config.resident_layers(catalog.routed_experts().layers)?,
         layer_count=plans.len(), resident_bytes=resident, workspace_bytes=workspace,
         device_budget_bytes=config.device_budget, schedule=config.exl3_schedule.name(),
         "EXL3 Spark residency plan");

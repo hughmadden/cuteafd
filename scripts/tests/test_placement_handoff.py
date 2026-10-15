@@ -30,7 +30,7 @@ else:
 class PlacementHandoffTest(unittest.TestCase):
     def run_startup(self, gpus, plan, options=(), spark_count=4, local_layers="auto", encoder=None):
         source=(ROOT/'scripts/launch/run-family.sh').read_text()
-        block=source[source.index('placement_directory='):source.index('api_url=')]
+        block=source[source.index('# Workers bootstrap first;'):source.index('api_url=')]
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/'plan').write_text(json.dumps(plan))
             for name in ['docker','ssh','nest']:
@@ -121,9 +121,9 @@ v41_fp8_head_args=()
     def worker_tail(args):
         """Worker values after `--` in a worker-start ssh invocation.
 
-        run.sh passes image, remote, rank, capacity, budget, port, snapshot,
-        fingerprint, first_layer, world, explicit_topology, tp, ep and then
-        three optional RDMA env values. Index from the `--` separator so the
+        run.sh passes image, remote, rank, budget, port, snapshot,
+        fingerprint, world, explicit_topology, tp, ep and then
+        optional RDMA environment values. Index from the `--` separator so the
         optional tail does not shift the assertions.
         """
         tail = args[args.index('--') + 1:]
@@ -135,37 +135,30 @@ v41_fp8_head_args=()
             tail = tail[:tail.index('--profile-args')]
         return tail
 
-    def test_dual_starts_coordinator_then_correct_workers_then_acknowledges(self):
-        for layers in [1,17,20,40]:
-            with self.subTest(layers=layers):
-                result,events=self.run_startup(2,dict(version=1,rtx_gpus=2,nonce='fresh',rtx_expert_layers=layers,spark_first_layer=min(layers,39)))
-                self.assertEqual(result.returncode,0,result.stderr)
-                self.assertEqual(events[0][0],'docker')
-                self.assertEqual(events[0][1][0],'run')
-                self.assertIn(f'seccomp={ROOT}/docker/seccomp-code-bench.json',events[0][1])
-                self.assertIn('--placement-directory',events[0][1])
-                starts=[args for tool,args in events if tool=='ssh' and '-s' in args]
-                self.assertEqual(len(starts),4)
-                tails=[self.worker_tail(args) for args in starts]
-                self.assertTrue(all(len(tail)==18 for tail in tails),tails)
-                # first_layer, world, then the legacy topology tail.
-                self.assertTrue(all(tail[8]==str(min(layers,39)) and tail[9]=='4' for tail in tails))
-                self.assertTrue(all(tail[10:13]==['0','4','1'] for tail in tails))
-                ack=[i for i,(tool,args) in enumerate(events) if tool=='docker' and args[:3]==['exec','coordinator','sh']]
-                self.assertEqual(len(ack),1)
-                ready=[i for i,(tool,args) in enumerate(events) if tool=='ssh' and any('timeout 1' in a for a in args)]
-                self.assertEqual(len(ready),4)
-                self.assertGreater(ack[0],max(ready))
-
-    def test_unavailable_p2p_accepts_single_gpu_fallback_before_worker_handoff(self):
-        for layers in [0, 5]:
-            with self.subTest(layers=layers):
-                result, events = self.run_startup(2, dict(version=1, rtx_gpus=1,
-                    nonce='fresh', rtx_expert_layers=layers, spark_first_layer=layers))
-                self.assertEqual(result.returncode, 0, result.stderr)
-                starts = [args for tool, args in events if tool == 'ssh' and '-s' in args]
-                self.assertEqual(len(starts), 4)
-                self.assertTrue(all(self.worker_tail(args)[8] == str(layers) for args in starts))
+    def test_every_layout_starts_bootstrap_workers_before_coordinator(self):
+        for gpus in (1, 2):
+            for local_layers in ("auto", "0", "5", "40"):
+                with self.subTest(gpus=gpus, local_layers=local_layers):
+                    result, events = self.run_startup(gpus, {}, local_layers=local_layers)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    starts = [(i, args) for i, (tool, args) in enumerate(events)
+                              if tool == 'ssh' and '-s' in args]
+                    self.assertEqual(len(starts), 4)
+                    tails = [self.worker_tail(args) for _, args in starts]
+                    self.assertTrue(all(len(tail) == 16 for tail in tails), tails)
+                    self.assertTrue(all(tail[7:11] == ['4', '0', '4', '1'] for tail in tails))
+                    ready = [i for i, (tool, args) in enumerate(events)
+                             if tool == 'ssh' and any('timeout 1' in arg for arg in args)]
+                    coordinator = next(i for i, (tool, args) in enumerate(events)
+                                       if tool == 'docker' and 'serve-native' in args)
+                    self.assertEqual(len(ready), 4)
+                    self.assertLess(max(i for i, _ in starts), min(ready))
+                    self.assertLess(max(ready), coordinator)
+                    argv = events[coordinator][1]
+                    self.assertIn(f'seccomp={ROOT}/docker/seccomp-code-bench.json', argv)
+                    self.assertNotIn('--placement-directory', argv)
+                    self.assertFalse(any('plan.json' in ' '.join(args) or 'ready.json' in ' '.join(args)
+                                         for _, args in events))
 
     def test_spark_vision_plan_reaches_only_selected_encoder_rank(self):
         encoder=dict(encoder=dict(kind=dict(kind='spark',rank=2)),encoder_plan_hash='ab'*32)
@@ -179,9 +172,9 @@ v41_fp8_head_args=()
         self.assertEqual(coordinator[coordinator.index('--encoder-plan-hash')+1],'ab'*32)
         tails=[self.worker_tail(args) for tool,args in events if tool=='ssh' and '-s' in args]
         self.assertEqual(len(tails),4)
-        self.assertTrue(all(tail[18:]==['2','19541','ab'*32,
+        self.assertTrue(all(tail[16:]==['2','19541','ab'*32,
             '0123456789012345678901234567890123456789'] for tail in tails))
-        self.assertIn('if [[ "$rank" == "${19:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
+        self.assertIn('if [[ "$rank" == "${17:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
 
     def test_compact_starts_exactly_two_workers_and_passes_ceiling(self):
         result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce="fresh",rtx_expert_layers=0,spark_first_layer=0),spark_count=2)
@@ -189,9 +182,9 @@ v41_fp8_head_args=()
         starts=[args for tool,args in events if tool=='ssh' and '-s' in args]
         self.assertEqual(len(starts),2)
         tails=[self.worker_tail(args) for args in starts]
-        self.assertTrue(all(tail[8]=='0' and tail[9]=='2' for tail in tails))
+        self.assertTrue(all(tail[7]=='2' for tail in tails))
         # Legacy geometry tail: explicit flag off, TP=SPARK_COUNT, EP=1.
-        self.assertTrue(all(tail[10:13]==['0','2','1'] for tail in tails))
+        self.assertTrue(all(tail[8:11]==['0','2','1'] for tail in tails))
         coordinator=next(args for tool,args in events if tool=='docker' and args[0]=='run')
         self.assertEqual(coordinator[coordinator.index('--peers')+1], '10.55.0.1:19441,10.55.0.2:19441')
         self.assertEqual(coordinator[coordinator.index('--memory-reservation')+1], '32GiB')
@@ -240,64 +233,16 @@ v41_fp8_head_args=()
             with self.subTest(enabled=enabled):
                 result,events=self.run_startup(2,dict(version=1,rtx_gpus=2,nonce='fresh',rtx_expert_layers=20,spark_first_layer=20),enabled)
                 self.assertEqual(result.returncode,0,result.stderr)
-                args=events[0][1]
+                args=next(args for tool,args in events if tool=='docker' and 'serve-native' in args)
                 for option,flag in zip(options,flags):
                     self.assertEqual(flag in args,option in enabled)
 
-    def test_invalid_boundary_never_starts_workers(self):
-        result,events=self.run_startup(2,dict(version=1,rtx_gpus=2,nonce='fresh',rtx_expert_layers=17,spark_first_layer=20))
-        self.assertNotEqual(result.returncode,0)
-        # Pin the intended rejection so a fixture/scope error cannot satisfy the
-        # nonzero exit by accident.
-        self.assertIn('invalid coordinator placement plan',result.stderr)
-        self.assertFalse(any(tool=='ssh' for tool,_ in events))
-
-    def test_single_all_remote_keeps_worker_first_startup_without_handoff(self):
-        result,events=self.run_startup(1,{},local_layers="0")
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(events[0][0],'ssh')
-        runs=[args for tool,args in events if tool=='docker' and args[0]=='run']
-        self.assertEqual(len(runs),1)
-        self.assertNotIn('--placement-directory',runs[0])
-        self.assertFalse(any(tool=='docker' and args[0]=='exec' for tool,args in events))
-
-    def test_single_auto_publishes_live_boundary_before_workers(self):
-        # Auto may resolve to no local experts under a small memory ceiling,
-        # or keep any number of layers. Workers must use the actual plan.
-        for layers in [0,5,39,40]:
-            with self.subTest(layers=layers):
-                result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce='fresh',
-                    rtx_expert_layers=layers,spark_first_layer=min(layers,39)))
-                self.assertEqual(result.returncode,0,result.stderr)
-                self.assertEqual(events[0][0],'docker')
-                self.assertEqual(events[0][1][0],'run')
-                self.assertIn('--placement-directory',events[0][1])
-                starts=[args for tool,args in events if tool=='ssh' and '-s' in args]
-                self.assertEqual(len(starts),4)
-                self.assertTrue(all(self.worker_tail(args)[8]==str(min(layers,39)) for args in starts))
-                ack=[i for i,(tool,args) in enumerate(events) if tool=='docker'
-                    and args[:3]==['exec','coordinator','sh']]
-                ready=[i for i,(tool,args) in enumerate(events) if tool=='ssh'
-                    and any('timeout 1' in a for a in args)]
-                self.assertEqual(len(ack),1)
-                self.assertEqual(len(ready),4)
-                self.assertGreater(ack[0],max(ready))
-
-    def test_single_explicit_boundary_is_handed_off_without_topology_flags(self):
-        for layers in [1,5,40]:
-            with self.subTest(layers=layers):
-                result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce='fresh',
-                    rtx_expert_layers=layers,spark_first_layer=min(layers,39)),local_layers=str(layers))
-                self.assertEqual(result.returncode,0,result.stderr)
-                self.assertEqual(events[0][0],'docker')
-                starts=[args for tool,args in events if tool=='ssh' and '-s' in args]
-                self.assertTrue(all(self.worker_tail(args)[8]==str(min(layers,39)) for args in starts))
-
-    def test_explicit_boundary_must_match_the_requested_count(self):
-        result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce='fresh',
-            rtx_expert_layers=4,spark_first_layer=4),local_layers='5')
-        self.assertNotEqual(result.returncode,0)
-        self.assertIn('invalid coordinator placement plan',result.stderr)
-        self.assertFalse(any(tool=='ssh' for tool,_ in events))
+    def test_filesystem_plan_is_not_a_startup_input(self):
+        # A stale/invalid filesystem payload is ignored; the daemon validates
+        # checkpoint identity, ownership and model geometry over TCP instead.
+        result, events = self.run_startup(1, {"version": -1}, local_layers='5')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len([args for tool, args in events if tool == 'ssh' and '-s' in args]), 4)
+        self.assertFalse(any(tool == 'docker' and args[0] == 'exec' for tool, args in events))
 
 if __name__=='__main__':unittest.main()

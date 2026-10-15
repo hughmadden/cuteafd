@@ -393,7 +393,7 @@ class LauncherTopologyTest(unittest.TestCase):
     def run_startup(self, *, gpus, plan, topology_explicit, spark_tp, spark_ep, spark_count, hosts,
                     extra_env=None, extra_setup=""):
         source = (ROOT / "scripts/launch/run-family.sh").read_text()
-        block = source[source.index("placement_directory="):source.index("api_url=")]
+        block = source[source.index("# Workers bootstrap first;"):source.index("api_url=")]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "plan").write_text(json.dumps(plan))
@@ -591,7 +591,7 @@ v41_fp8_head_args=()
         self.assertEqual(result.returncode, 0, result.stderr)
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
-        self.assertEqual([args[-10] for args in starts], ["12"] * 6)
+        self.assertTrue(all("--first-layer" not in args for args in starts))
         self.assertEqual([args[-9] for args in starts], ["6"] * 6)
         self.assertEqual([args[-8:-5] for args in starts], [["1", "2", "3"]] * 6)
 
@@ -611,7 +611,7 @@ v41_fp8_head_args=()
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         coordinator = next(args for tool, args in events if tool == "docker" and args[0] == "run")
-        self.assertIn("--placement-directory", coordinator)
+        self.assertNotIn("--placement-directory", coordinator)
         self.assertEqual(coordinator[coordinator.index("--rtx-gpus") + 1], "1")
         self.assertEqual(coordinator[coordinator.index("--rtx-expert-layers") + 1], "5")
         self.assertEqual(coordinator[coordinator.index("--spark-tp") + 1], "6")
@@ -620,12 +620,12 @@ v41_fp8_head_args=()
         self.assertEqual(len(starts), 6)
         # Worker positional tail: ... first_layer world topology explicit,tp,ep
         for args in starts:
-            self.assertEqual(args[-10], "5", args)
+            self.assertEqual(args[args.index("--") + 1 + 7], str(len(starts)), args)
             self.assertEqual(args[-9], "6")
             self.assertEqual(args[-8:-5], ["1", "6", "1"])
         # The boundary is acknowledged after the workers start.
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
-        self.assertTrue(any("ready.json" in " ".join(a) for a in acks), acks)
+        self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
 
     def test_single_rtx_tp3_local_five_publishes_and_hands_off(self) -> None:
         # The v10 native TP3xEP1 profile: one RTX with 5 local routed layers and
@@ -643,18 +643,18 @@ v41_fp8_head_args=()
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         coordinator = next(args for tool, args in events if tool == "docker" and args[0] == "run")
-        self.assertIn("--placement-directory", coordinator)
+        self.assertNotIn("--placement-directory", coordinator)
         self.assertEqual(coordinator[coordinator.index("--rtx-expert-layers") + 1], "5")
         self.assertEqual(coordinator[coordinator.index("--spark-tp") + 1], "3")
         self.assertEqual(coordinator[coordinator.index("--spark-ep") + 1], "1")
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 3)
         for args in starts:
-            self.assertEqual(args[-10], "5", args)
+            self.assertEqual(args[args.index("--") + 1 + 7], str(len(starts)), args)
             self.assertEqual(args[-9], "3")
             self.assertEqual(args[-8:-5], ["1", "3", "1"])
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
-        self.assertTrue(any("ready.json" in " ".join(a) for a in acks), acks)
+        self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
 
     def test_single_rtx_all_remote_keeps_the_legacy_no_handoff_launch(self) -> None:
         # RTX_EXPERT_LAYERS=0 has no local boundary to publish on one RTX.
@@ -674,35 +674,17 @@ v41_fp8_head_args=()
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         for args in starts:
-            self.assertEqual(args[-10], "0", args)
+            self.assertEqual(args[-9], "6", args)
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
 
-    def test_single_rtx_invalid_or_missing_plan_fails_closed(self) -> None:
-        # A published boundary the launcher cannot trust must stop the launch;
-        # it must never start workers at a guessed layer.
-        for plan in (
-            dict(version=1, rtx_gpus=1, nonce="fresh", rtx_expert_layers=0, spark_first_layer=0),
-            dict(version=1, rtx_gpus=2, nonce="fresh", rtx_expert_layers=5, spark_first_layer=5),
-            dict(version=1, rtx_gpus=1, nonce="fresh", rtx_expert_layers=5, spark_first_layer=9),
-        ):
-            with self.subTest(plan=plan):
-                result, events = self.run_startup(
-                    gpus=1,
-                    plan=plan,
-                    topology_explicit=1,
-                    spark_tp=6,
-                    spark_ep=1,
-                    spark_count=6,
-                    hosts=["a", "b", "c", "d", "e", "f"],
-                    extra_setup="RTX_EXPERT_LAYERS=5\n",
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("placement plan", result.stderr)
-                self.assertFalse(
-                    [args for tool, args in events if tool == "ssh" and "-s" in args],
-                    "no worker may start from an untrusted plan",
-                )
+    def test_filesystem_boundary_is_not_used_by_launcher(self) -> None:
+        result, events = self.run_startup(
+            gpus=1, plan={"version": -1}, topology_explicit=1,
+            spark_tp=6, spark_ep=1, spark_count=6, hosts=["a", "b", "c", "d", "e", "f"],
+            extra_setup="RTX_EXPERT_LAYERS=5\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("plan.json" in " ".join(args) for _, args in events))
 
     def test_worker_remote_block_emits_flags_only_when_explicit(self) -> None:
         source = (ROOT / "scripts/launch/run-family.sh").read_text()
@@ -710,8 +692,8 @@ v41_fp8_head_args=()
         remote = remote.split("\nREMOTE", 1)[0].replace(" >/dev/null", "")
         harness = 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; docker() { printf "%s\\n" "$@"; }\n' + remote
         explicit = subprocess.run(
-            ["bash", "-euc", harness, "test", "image", "name", "1", "4096",
-             "107374182400", "19441", "snapshot", "fingerprint", "3", "4", "1", "2", "2"],
+            ["bash", "-euc", harness, "test", "image", "name", "1",
+             "107374182400", "19441", "snapshot", "fingerprint", "4", "1", "2", "2"],
             cwd=ROOT, text=True, capture_output=True,
         )
         self.assertEqual(explicit.returncode, 0, explicit.stderr)
@@ -720,12 +702,14 @@ v41_fp8_head_args=()
         self.assertEqual(arguments[arguments.index("--spark-ep") + 1], "2")
         self.assertEqual(arguments[arguments.index("--rank") + 1], "1")
         self.assertEqual(arguments[arguments.index("--world") + 1], "4")
-        self.assertEqual(arguments[arguments.index("--first-layer") + 1], "3")
+        self.assertNotIn("--first-layer", arguments)
+        self.assertNotIn("--capacity", arguments)
+        self.assertNotIn("--rdma-endpoints", arguments)
 
         # Legacy invocation: ten positional arguments, no topology flags.
         legacy = subprocess.run(
-            ["bash", "-euc", harness, "test", "image", "name", "1", "4096",
-             "107374182400", "19441", "snapshot", "fingerprint", "3", "4"],
+            ["bash", "-euc", harness, "test", "image", "name", "1",
+             "107374182400", "19441", "snapshot", "fingerprint", "4", "0", "4", "1"],
             cwd=ROOT, text=True, capture_output=True,
         )
         self.assertEqual(legacy.returncode, 0, legacy.stderr)
@@ -996,15 +980,14 @@ class BuildScopeTest(unittest.TestCase):
         self.assertIn("io.cuteafd.spark_tp_roles", dockerfile)
         self.assertIn("V41_EXPERT_TP_AOT.json", dockerfile)
 
-    def test_run_sh_accepts_actual_placement_gpus_and_opens_single_rtx_handoff(self) -> None:
+    def test_run_sh_uses_network_admission_without_filesystem_handoff(self) -> None:
         release = (ROOT / "scripts/launch/run-family.sh").read_text()
-        self.assertIn('--argjson gpus "$RELEASE_RTX_GPUS"', release)
-        self.assertIn("(.rtx_gpus == 1 or .rtx_gpus == 2) and .rtx_gpus <= $gpus", release)
-        self.assertIn(".rtx_expert_layers > 0 or .rtx_gpus == 1", release)
-        self.assertIn("handoff", release)
-        # The boundary acknowledgement must not be gated on the RTX count alone.
-        self.assertIn('if [[ -n "$placement_directory" ]]; then', release)
-        self.assertNotIn("((RELEASE_RTX_GPUS == 2)); then\n  docker exec \"$coordinator\" sh -c 'cp", release)
+        self.assertNotIn("--placement-directory", release)
+        self.assertNotIn("ready.json", release)
+        self.assertNotIn("plan.json", release)
+        native = release[release.index("# Workers bootstrap first;"):release.index("api_url=")]
+        self.assertLess(native.index('echo "== starting native Spark experts =="'),
+                        native.rindex("start_coordinator"))
 
     def test_native_pool_policy_changes_fingerprint_and_preserves_omitted_policy(self) -> None:
         expression = next(line for line in (ROOT / "scripts/launch/run-family.sh").read_text().splitlines()
@@ -1161,14 +1144,17 @@ OPS_GPU_UUIDS = (
 ANSI_READY_LINE = (
     "\x1b[2m2026-09-20T07:13:46.765350Z\x1b[0m \x1b[32m INFO\x1b[0m "
     "\x1b[2mcuteafd::v41_experts::service::local\x1b[0m\x1b[2m:\x1b[0m "
-    "native local RoCE expert worker ready "
+    "native worker bootstrap ready "
     "\x1b[3mrank\x1b[0m\x1b[2m=\x1b[0m{rank} "
     "\x1b[3mworld\x1b[0m\x1b[2m=\x1b[0m4 "
     "\x1b[3mcapacity\x1b[0m\x1b[2m=\x1b[0m4096 "
     "\x1b[3mlayer_ids\x1b[0m\x1b[2m=\x1b[0m[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] "
     "\x1b[3mlayers\x1b[0m\x1b[2m=\x1b[0m20\n"
 )
-ANSI_READY_LINES = "".join(ANSI_READY_LINE.format(rank=rank) for rank in range(4))
+ANSI_READY_LINES = "".join(
+    ANSI_READY_LINE.format(rank=rank) + ANSI_READY_LINE.format(rank=rank).replace(
+        "native worker bootstrap ready", "coordinator-selected worker weights ready")
+    for rank in range(4))
 
 
 class CandidateLauncherTest(unittest.TestCase):
@@ -1190,7 +1176,7 @@ class CandidateLauncherTest(unittest.TestCase):
             self.assertIn(flag, coordinator, flag)
         self.assertIn("--spark-tp 2", coordinator)
         self.assertIn("--spark-ep 2", coordinator)
-        self.assertIn("--placement-directory", coordinator)
+        self.assertNotIn("--placement-directory", coordinator)
         # CUTEAFD_NATIVE_LIB must be present before the container and match --native-lib.
         self.assertIn("-e CUTEAFD_NATIVE_LIB=/scratch/coord-native/libcuteafd_native.so", coordinator)
         self.assertIn("-e CUTEAFD_WIP_RUNTIME_ROOT=/scratch/candidate/run", coordinator)
@@ -1212,19 +1198,19 @@ class CandidateLauncherTest(unittest.TestCase):
         )
         self.assertIn(f"coordinator_cuda_visible_devices={OPS_GPU_UUIDS}", result.stdout)
         self.assertIn("--native-lib /scratch/coord-native/libcuteafd_native.so", coordinator)
-        self.assertIn("expert_capacity=4096", result.stdout)
+        self.assertIn("worker_geometry=coordinator-selected typed model admission", result.stdout)
         # Plan handshake before any worker, worker readiness before ack, gate last.
         order = [line for line in lines if line.startswith("STEP")]
-        self.assertLess(order.index("STEP coordinator-start"), order.index("STEP expert-start rank=0"))
-        self.assertLess(order.index("STEP expert-start rank=0"), order.index("STEP worker-ready"))
-        self.assertLess(order.index("STEP worker-ready"), order.index("STEP plan-ack"))
-        self.assertLess(order.index("STEP plan-ack"), order.index("STEP readiness-gate"))
+        self.assertLess(order.index("STEP worker-bootstrap-ready"), order.index("STEP coordinator-start"))
+        self.assertLess(order.index("STEP expert-start rank=0"), order.index("STEP worker-bootstrap-ready"))
+        self.assertLess(order.index("STEP coordinator-start"), order.index("STEP worker-admission-ready"))
+        self.assertLess(order.index("STEP worker-admission-ready"), order.index("STEP readiness-gate"))
         experts = [line for line in lines if line.startswith("CMD expert-")]
         self.assertEqual(len(experts), 4)
         for rank, line in enumerate(experts):
             self.assertIn(f"--rank {rank}", line)
             self.assertIn("--world 4", line)
-            self.assertIn(f"--rank {rank} --world 4 --rdma-endpoints 2 --spark-tp 2 --spark-ep 2", line)
+            self.assertIn(f"--rank {rank} --world 4 --spark-tp 2 --spark-ep 2", line)
             self.assertIn("-e CUTEAFD_NATIVE_LIB=/scratch/candidate/libcuteafd_native.so", line)
             self.assertIn("-e RUST_LOG=info", line)
             self.assertIn("--native-lib /scratch/candidate/libcuteafd_native.so", line)
@@ -1268,16 +1254,16 @@ class CandidateLauncherTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
         self.assertIn("topology tp=3 ep=2 world=6", lines)
-        self.assertIn("first_layer=0", lines)
+        self.assertIn("ownership=coordinator-selected exact layer IDs", lines)
         self.assertNotIn("STEP plan-read", lines)
         experts = [line for line in lines if line.startswith("CMD expert-")]
         self.assertEqual(len(experts), 6)
         self.assertIn("rhea", [line for line in experts if "--rank 4" in line][0])
         self.assertIn("moa", [line for line in experts if "--rank 5" in line][0])
-        self.assertTrue(all("--world 6 --rdma-endpoints 2 --spark-tp 3 --spark-ep 2" in line for line in experts))
+        self.assertTrue(all("--world 6 --spark-tp 3 --spark-ep 2" in line for line in experts))
         order = [line for line in lines if line.startswith("STEP")]
-        self.assertLess(order.index("STEP expert-start rank=5"), order.index("STEP worker-ready"))
-        self.assertLess(order.index("STEP worker-ready"), order.index("STEP coordinator-start"))
+        self.assertLess(order.index("STEP expert-start rank=5"), order.index("STEP worker-bootstrap-ready"))
+        self.assertLess(order.index("STEP worker-bootstrap-ready"), order.index("STEP coordinator-start"))
 
     def test_plan_supports_the_tp4_reference_arm(self) -> None:
         result = self.plan(EXAMPLES / "tp4ep1-explicit-native.config")
@@ -1285,7 +1271,7 @@ class CandidateLauncherTest(unittest.TestCase):
         self.assertIn("topology tp=4 ep=1 world=4", result.stdout.splitlines())
         # No tp4 extra role: the reference arm runs without a role manifest.
         provider = next(line for line in result.stdout.splitlines() if line.startswith("CMD expert-0:"))
-        self.assertIn("--world 4 --rdma-endpoints 2 --spark-tp 4 --spark-ep 1", provider)
+        self.assertIn("--world 4 --spark-tp 4 --spark-ep 1", provider)
 
     def test_default_config_without_explicit_topology_is_rejected(self) -> None:
         result = self.plan(CONFIG)
@@ -1347,9 +1333,9 @@ class CandidateLauncherTest(unittest.TestCase):
                            "STUB_LOG_FULL": self.READY_PREFIX + ANSI_READY_LINES},
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("worker ready", result.stdout)
+            self.assertIn("worker bootstrap ready", result.stdout)
             self.assertIn("candidate ready", result.stdout)
-            self.assertLess(result.stdout.index("worker ready"), result.stdout.index("candidate ready"))
+            self.assertLess(result.stdout.index("worker installed ready"), result.stdout.index("candidate ready"))
 
     def test_stale_worker_log_before_offset_does_not_satisfy_ready(self) -> None:
         # The readiness bytes precede the pre-start offset, so the current-epoch
@@ -1370,16 +1356,15 @@ class CandidateLauncherTest(unittest.TestCase):
     def test_wrong_rank_and_split_line_do_not_satisfy_ready(self) -> None:
         wrong_rank = ANSI_READY_LINE.format(rank=10)  # rank=10 must not match rank=1
         split_line = (
-            "\x1b[2m cuteafd: native local RoCE expert worker ready\x1b[0m\n"
+            "\x1b[2m cuteafd: native worker bootstrap ready\x1b[0m\n"
             "\x1b[3mrank\x1b[0m\x1b[2m=\x1b[0m1 \x1b[3mworld\x1b[0m\x1b[2m=\x1b[0m4 "
             "\x1b[3mlayer_ids\x1b[0m\x1b[2m=\x1b[0m[20, 21]\n"
         )
         full = ANSI_READY_LINES
-        hole = full.replace("20, 21, 22,", "20, 22,")
-        extra = full.replace("38, 39]", "38, 39, 40]")
-        reordered = full.replace("20, 21,", "21, 20,")
+        no_bootstrap = full.replace("native worker bootstrap ready", "old worker ready")
+        no_install = full.replace("coordinator-selected worker weights ready", "old worker ready")
         for name, body in (("wrong-rank", wrong_rank), ("split-line", split_line),
-                           ("missing-id", hole), ("extra-id", extra), ("reordered", reordered)):
+                           ("no-bootstrap", no_bootstrap), ("no-installed-admission", no_install)):
             with self.subTest(name=name):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
@@ -1417,25 +1402,24 @@ class CandidateLauncherTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("exited before reporting ready", result.stderr)
 
-    def test_stale_placement_directory_is_refused(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            result = self.candidate(
-                root, "start", "--config", str(EXAMPLES / "tp2ep2-native.config"),
-                "--host-artifact-root", str(root), "--run-id", "stale-run", scenario="stale",
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("placement directory already exists", result.stderr)
+    def test_obsolete_worker_and_filesystem_flags_are_rejected(self) -> None:
+        for flag, value in (("--first-layer", "20"), ("--capacity", "4096"),
+                            ("--placement-root", "/unused"), ("--restart", None)):
+            with self.subTest(flag=flag):
+                args = (flag,) if value is None else (flag, value)
+                result = self.plan(EXAMPLES / "tp2ep2-native.config", *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unknown candidate launcher argument", result.stderr)
 
-    def test_coordinator_child_exit_fails_before_workers(self) -> None:
+    def test_coordinator_child_exit_fails_during_admission(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             result = self.candidate(
                 root, "start", "--config", str(EXAMPLES / "tp2ep2-native.config"),
-                "--host-artifact-root", str(root), "--run-id", "child-run", scenario="child-exit",
+                "--host-artifact-root", str(root), "--run-id", "child-run", scenario="child-exit", env_extra={"STUB_LOG_FULL": ANSI_READY_LINES},
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("exited before publishing placement", result.stderr)
+            self.assertIn("exited during typed admission", result.stderr)
 
     def test_stop_reports_unreachable_hosts_as_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
