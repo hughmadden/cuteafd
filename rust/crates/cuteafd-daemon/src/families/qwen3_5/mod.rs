@@ -1,4 +1,5 @@
-//! Dense Qwen qualification entry point. Execution remains fail-closed until AOT exists.
+//! Dense Qwen qualification entry point. Execution remains fail-closed until the executor qualifies.
+mod weights;
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 use cuteafd_loader::families::qwen3_5::Qwen35Checkpoint;
