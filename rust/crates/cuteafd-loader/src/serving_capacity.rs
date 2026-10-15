@@ -194,6 +194,23 @@ pub enum CacheGeometryError {
     },
 }
 
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PoolContextError {
+    #[error("explicit context {context} > admitted pool supports {pool}; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change")]
+    Explicit { context: usize, pool: usize },
+    #[error("admitted pool {pool} cannot hold one request plus its safety margin")]
+    TooSmall { pool: usize },
+}
+
+/// Resolve the serving extent before sizing pool-dependent startup inventories.
+pub fn pool_context(context: usize, automatic: bool, pool: usize, unit: usize) -> Result<usize, PoolContextError> {
+    if context <= pool { return Ok(context); }
+    if !automatic { return Err(PoolContextError::Explicit { context, pool }); }
+    let supported = pool.saturating_sub(unit.max(64));
+    if supported == 0 { return Err(PoolContextError::TooSmall { pool }); }
+    Ok(supported)
+}
+
 /// Shared scalar/WMMA draft-attention arena. WMMA capacity partitions are
 /// sized for one sequence; the scalar floor admits 128-key chunks for up to
 /// 16 queries and 1024 resident keys, including the new block. Dim64 retains

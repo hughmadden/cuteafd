@@ -423,7 +423,7 @@ impl Opened {
             spark_ranks, skip_routed_experts: args.skip_routed_experts,
             prefill_rows: args.prefill_rows as u64,
             prefill_lanes: prefill_lanes as u64,
-            max_context: args.max_context as u64, scratch: Some([scratch(true)?, scratch(false)?]),
+            max_context: args.max_context as u64, automatic_context, scratch: Some([scratch(true)?, scratch(false)?]),
             drafter_bytes, drafter_staging, pending_code,
             experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()),
             expert_workspace: 0, tp2_workspace, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
