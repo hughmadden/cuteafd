@@ -1,7 +1,7 @@
 pub mod coordinator_programs;
 pub mod expert_geometry;
 pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy,
-    SparkEndpoint, SparkIngress, SparkRings};
+    ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress, SparkRings, SparkRuntimeInventory, SparkSlice};
 mod draft_policy;
 pub use draft_policy::{
     draft_expected_tokens, DraftAction, DraftCandidate, DraftCostSnapshot, DraftPolicy, DraftPolicyError, DraftPolicyStats,

@@ -3436,11 +3436,33 @@ struct VerbsHostProtocolV2RecvReady {
     request_id: u64,
 }
 
+/// Once attached to native memory, credit returns only after confirmed teardown.
+#[derive(Default)]
+struct EndpointCredits {
+    rings: Option<RingReservation>,
+}
+
+impl EndpointCredits {
+    fn retire(&mut self, cleanup: impl FnOnce() -> Result<()>) -> Result<()> {
+        cleanup()?;
+        self.rings.take();
+        Ok(())
+    }
+}
+
+impl Drop for EndpointCredits {
+    fn drop(&mut self) {
+        // A failed quiesce retains registered memory, so keep its charge too.
+        std::mem::forget(self.rings.take());
+    }
+}
+
 struct NativeRdmaEndpoint {
     library: Arc<NativeLibrary>,
     info: CuteafdRdmaRcEndpointInfo,
     terminal_owner: Option<Arc<AtomicBool>>,
     traffic: Arc<crate::traffic::WireCounter>,
+    credits: EndpointCredits,
 }
 
 impl NativeRdmaEndpoint {
@@ -3561,7 +3583,7 @@ impl NativeRdmaEndpoint {
             send_frame_bytes, recv_frame_bytes, send_span, recv_span,
             queue_depth, queue_depth, max_sge, host_buffer_flags,
         )?;
-        Ok(Self { library, info, terminal_owner: None,
+        Ok(Self { library, info, terminal_owner: None, credits: EndpointCredits::default(),
             traffic: crate::traffic::register(&rdma_device.device, rdma_device.port, "", c_char_array_to_string(&info.gid_hex), info.active_mtu) })
     }
 
@@ -3766,19 +3788,20 @@ impl NativeRdmaEndpoint {
 
 impl Drop for NativeRdmaEndpoint {
     fn drop(&mut self) {
-        if !self.info.handle.is_null() {
-            if self.terminal_owner.is_some() {
-                if let Err(error) = self.terminal_quiesce() {
-                    // The native endpoint still owns the registered rings;
-                    // the witness keeps external GPU landing owners alive.
-                    // Keep its library loaded while that endpoint is retained.
-                    std::mem::forget(self.library.clone());
-                    tracing::error!(%error,"retaining terminal RDMA endpoint after failed QP destruction");
-                    return;
-                }
+        let needs_quiesce = self.terminal_owner.is_some() || self.credits.rings.is_some();
+        let mut credits = std::mem::take(&mut self.credits);
+        let result = credits.retire(|| {
+            if !self.info.handle.is_null() {
+                if needs_quiesce { self.terminal_quiesce()?; }
+                self.library.rdma_rc_endpoint_destroy(self.info.handle)?;
+                self.info.handle = std::ptr::null_mut();
             }
-            let _ = self.library.rdma_rc_endpoint_destroy(self.info.handle);
-            self.info.handle = std::ptr::null_mut();
+            Ok(())
+        });
+        if let Err(error) = result {
+            // Registered memory (and its admission credit) is still live.
+            std::mem::forget(self.library.clone());
+            tracing::error!(%error, "retaining terminal RDMA endpoint and credit after failed teardown");
         }
     }
 }

@@ -22,6 +22,57 @@ pub enum SparkIngress {
     Bf16Decode { rows: u32 },
 }
 
+/// Header-derived resident slice. EXL3 counts retain gate/up/down tier geometry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkSlice {
+    pub layer: u32,
+    pub first: u32,
+    pub width: u32,
+    /// Physical kernel width, including checkpoint-format block padding.
+    pub stored_width: u32,
+    pub tiers: Vec<u32>,
+    pub projection_counts: Vec<[u32; 3]>,
+}
+
+/// Shared runtime sample, measured on the device that owns the allocations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSample {
+    pub device: i32,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// Device use outside this process's tracked allocations, including modules.
+    pub context_bytes: u64,
+    /// Program module growth measured between the two runtime samples.
+    pub module_bytes: u64,
+    pub sms: u32,
+    pub arch: String,
+    pub driver: String,
+}
+
+/// Measurements made by the Spark owner, not coordinator-architecture estimates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkRuntimeInventory {
+    pub sample: RuntimeSample,
+    /// All retained native/AOT device workspace, including worker intake.
+    pub workspace_bytes: u64,
+    /// Retained native/AOT pinned scratch, excluding endpoint rings and exchange.
+    pub pinned_workspace_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAdmissionResponse {
+    pub rank: u32,
+    pub resident_bytes: u64,
+    pub slices: Vec<SparkSlice>,
+    pub runtime: SparkRuntimeInventory,
+    pub mapped_ring_bytes: u64,
+    pub host_exchange_bytes: u64,
+    pub row_indices_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SparkRings {

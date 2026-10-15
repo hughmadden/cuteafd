@@ -111,6 +111,134 @@ impl SparkWorkingSet {
     }
 }
 
+/// One rank's header-derived contract. Workspace is deliberately absent:
+/// the worker's architecture owns that measurement, not the coordinator build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparkAssignment {
+    pub rank: u32,
+    pub resident_bytes: u64,
+    pub slices: Vec<cuteafd_core::SparkSlice>,
+    pub io: SparkIoBytes,
+}
+
+/// Selected storage policy; runtime validates its installed package against
+/// this same layout before allocating. Native shards may be replicated groups.
+#[derive(Debug, Clone, Copy)]
+pub enum SparkResidentLayout {
+    Exl3 { world: usize, rank: usize, partition: crate::V41Exl3Partition },
+    Fp8 { world: usize, rank: usize, slicing: crate::formats::fp8_experts::Slicing },
+    Native { world: usize, rank: usize, stored_width: usize },
+}
+
+impl SparkAssignment {
+    pub fn from_catalog(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
+        rank: usize, layout: SparkResidentLayout, endpoints: &[cuteafd_core::SparkEndpoint],
+        rings: cuteafd_core::SparkRings) -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        let geometry = catalog.routed_experts().geometry()?;
+        let io = working.rank_endpoints_io(rank, geometry, endpoints, rings)?;
+        let mut assignment = Self { rank: u32::try_from(rank)?, resident_bytes: 0, slices: vec![], io };
+        if !working.selected_ranks().contains(&rank) { return Ok(assignment); }
+        ensure!(working.spark_layers.windows(2).all(|pair| pair[0] < pair[1]),
+            "Spark layers must be sorted and unique");
+        for &layer in &working.spark_layers {
+            ensure!(layer >= catalog.routed_experts().first_layer && layer < geometry.layers as usize,
+                "Spark layer {layer} is outside routed checkpoint headers");
+            let mut slice = cuteafd_core::SparkSlice { layer: u32::try_from(layer)?, first: 0,
+                width: 0, stored_width: 0, tiers: vec![], projection_counts: vec![] };
+            let resident = match layout {
+                SparkResidentLayout::Exl3 { world, rank, partition } => {
+                    let manifest = catalog.exl3().context("Spark EXL3 layout needs checkpoint trellis headers")?;
+                    let plan = manifest.residency_with_layout(crate::V41Exl3Layer::Backbone(layer), world, rank, partition)?;
+                    slice.first = u32::try_from(plan.intermediate_start)?;
+                    slice.width = u32::try_from(plan.intermediate)?;
+                    slice.stored_width = slice.width;
+                    slice.tiers = plan.tiers.iter().map(|&tier| u32::try_from(tier)).collect::<Result<_, _>>()?;
+                    slice.projection_counts = plan.projection_counts.iter().map(|counts| {
+                        Ok([u32::try_from(counts[0])?, u32::try_from(counts[1])?, u32::try_from(counts[2])?])
+                    }).collect::<Result<_, std::num::TryFromIntError>>()?;
+                    plan.device_arena_layout()?.1 as u64
+                }
+                SparkResidentLayout::Fp8 { world, rank, slicing } => {
+                    let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?;
+                    tensors.validate_layer(layer)?;
+                    let (first, width) = tensors.rank_range_with(world, rank, slicing)?;
+                    slice.first = u32::try_from(first)?;
+                    slice.width = u32::try_from(width)?;
+                    slice.stored_width = u32::try_from(tensors.rank_width(world, rank, slicing)?)?;
+                    (tensors.weight_read_bytes_with(world, rank, slicing)? as u64)
+                        .checked_mul(tensors.shape().experts as u64).context("Spark FP8 resident overflow")?
+                }
+                SparkResidentLayout::Native { world, rank, stored_width } => {
+                    use crate::V41ExpertSelection;
+                    ensure!(catalog.exl3().is_none() && catalog.fp8().is_none(),
+                        "Spark native layout cannot convert compressed checkpoint headers");
+                    let width = if world == 1 {
+                        ensure!(rank == 0, "single-rank native shard must have rank 0");
+                        geometry.intermediate as usize
+                    } else {
+                        crate::families::deepseek_v41::v41_expert_staging::V41BackboneTpGeometry::new(
+                            geometry.intermediate as usize, geometry.hidden as usize, world, rank)?.intermediate_size()
+                    };
+                    ensure!(stored_width >= width && stored_width % 32 == 0,
+                        "Spark native installed width {stored_width} cannot store logical width {width}");
+                    // Check every retained expert's tensor headers, not just config geometry.
+                    for expert in 0..geometry.experts as usize {
+                        let selected = if world == 1 { V41ExpertSelection::BackboneFull { layer, expert } }
+                            else { V41ExpertSelection::BackboneTp { layer, expert, world, rank } };
+                        let header_width = if catalog.nvfp4().is_some() {
+                            catalog.nvfp4_expert_staging(selected)?.intermediate_size()
+                        } else {
+                            catalog.expert_staging(selected)?.intermediate_size()
+                        };
+                        ensure!(header_width == width, "Spark native header width {header_width}, expected {width}");
+                    }
+                    slice.first = u32::try_from(rank * width)?;
+                    slice.width = u32::try_from(width)?;
+                    slice.stored_width = u32::try_from(stored_width)?;
+                    super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
+                        slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
+                }
+            };
+            assignment.resident_bytes = assignment.resident_bytes.checked_add(resident)
+                .context("Spark resident sum overflow")?;
+            assignment.slices.push(slice);
+        }
+        Ok(assignment)
+    }
+
+    pub fn validate(&self, report: &cuteafd_core::ModelAdmissionResponse) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        let rank = self.rank;
+        ensure!(report.rank == rank, "Spark rank {rank}: response rank {} differs", report.rank);
+        ensure!(report.resident_bytes == self.resident_bytes,
+            "Spark rank {rank}: resident bytes {}, expected {}", report.resident_bytes, self.resident_bytes);
+        ensure!(report.slices == self.slices, "Spark rank {rank}: header resident/slice geometry differs");
+        for (field, actual, expected) in [
+            ("mapped rings", report.mapped_ring_bytes, self.io.mapped_rings),
+            ("host exchange", report.host_exchange_bytes, self.io.host_exchange),
+            ("row indices", report.row_indices_bytes, self.io.row_indices),
+        ] {
+            ensure!(actual == expected, "Spark rank {rank}: {field} bytes {actual}, expected {expected}");
+        }
+        let runtime = &report.runtime;
+        let sample = &runtime.sample;
+        ensure!(matches!(sample.arch.as_str(), "sm_120" | "sm_121") && sample.sms > 0
+            && !sample.driver.is_empty(), "Spark rank {rank}: missing measured runtime architecture");
+        ensure!(sample.total_bytes > 0 && sample.free_bytes <= sample.total_bytes
+            && sample.context_bytes <= sample.total_bytes,
+            "Spark rank {rank}: invalid measured runtime inventory");
+        ensure!(runtime.workspace_bytes >= self.io.intake,
+            "Spark rank {rank}: measured workspace {} omits intake {}",
+            runtime.workspace_bytes, self.io.intake);
+        [report.resident_bytes, runtime.workspace_bytes, runtime.pinned_workspace_bytes,
+            report.mapped_ring_bytes, report.host_exchange_bytes, report.row_indices_bytes]
+            .into_iter().try_fold(0u64, |sum, bytes| sum.checked_add(bytes))
+            .ok_or_else(|| anyhow::anyhow!("Spark rank {rank}: retained byte total overflow"))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SparkRingGeometry {
     pub max_frame_bytes: usize,
@@ -133,6 +261,144 @@ pub struct SparkIoBytes {
 mod tests {
     use super::*;
     use cuteafd_core::memory_layout::{Basis, Category};
+
+    #[test]
+    fn header_assignment_uses_installed_native_width_and_rejects_missing_headers() {
+        use crate::plan::testing::{write_v41_snapshot, write_v41_nvfp4_snapshot};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        for nvfp4 in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            if nvfp4 { write_v41_nvfp4_snapshot(dir.path()); } else { write_v41_snapshot(dir.path()); }
+            let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+            let working = SparkWorkingSet { spark_layers: vec![0], spark_ranks: 4,
+                prefill_lanes: 1, ..Default::default() };
+            let endpoints = [SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 }];
+            let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+            for stored_width in [576, 640] {
+                let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
+                    SparkResidentLayout::Native { world: 4, rank: 3, stored_width }, &endpoints, rings).unwrap();
+                assert_eq!((assignment.slices[0].first, assignment.slices[0].width, assignment.slices[0].stored_width),
+                    (1728, 576, stored_width as u32));
+                assert_eq!(assignment.resident_bytes, super::super::families::deepseek_v41::resident_bytes(
+                    5120, stored_width as u64, 384, nvfp4).unwrap());
+            }
+            for stored_width in [544, 577] {
+                assert!(SparkAssignment::from_catalog(&catalog, &working, 3,
+                    SparkResidentLayout::Native { world: 4, rank: 3, stored_width }, &endpoints, rings).is_err());
+            }
+            // Config geometry alone must not admit an expert with a missing projection.
+            let index_path = dir.path().join("model.safetensors.index.json");
+            let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+            let weights = index["weight_map"].as_object_mut().unwrap();
+            let name = weights.keys().find(|key| key.starts_with("layers.0.ffn.experts.383.w2.")).unwrap().clone();
+            weights.remove(&name);
+            std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+            let result = crate::read_expert_catalog(dir.path()).and_then(|catalog| SparkAssignment::from_catalog(
+                &catalog, &working, 3, SparkResidentLayout::Native { world: 4, rank: 3, stored_width: 640 }, &endpoints, rings));
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn header_assignment_uses_exl3_projection_counts_and_padded_arena() {
+        use crate::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let dir = tempfile::tempdir().unwrap();
+        let (tensors, _) = qwen4_exl3(1, 4);
+        write_snapshot(dir.path(), &qwen4_config(1), &tensors, None);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let working = SparkWorkingSet { spark_layers: vec![0], spark_ranks: 4,
+            prefill_lanes: 1, ..Default::default() };
+        let endpoints = [SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 }];
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
+            SparkResidentLayout::Exl3 { world: 4, rank: 3, partition: crate::V41Exl3Partition::Disjoint },
+            &endpoints, rings).unwrap();
+        let plan = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(0), 4, 3).unwrap();
+        assert_eq!(assignment.resident_bytes, plan.device_arena_layout().unwrap().1 as u64);
+        assert!(assignment.resident_bytes > plan.bytes() as u64);
+        assert_eq!((assignment.slices[0].first, assignment.slices[0].width), (512, 128));
+        assert_eq!(assignment.slices[0].tiers, plan.tiers.iter().map(|&tier| tier as u32).collect::<Vec<_>>());
+        assert_eq!(assignment.slices[0].projection_counts,
+            plan.projection_counts.iter().map(|row| row.map(|count| count as u32)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn header_assignment_preserves_exact_and_padded_fp8_family_slices() {
+        use crate::formats::fp8_experts::Slicing;
+        use crate::plan::testing::{fp8, mxfp4, mimo_flash_config, write_snapshot};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        for packed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = mimo_flash_config();
+            config["n_routed_experts"] = 2.into();
+            config["num_experts_per_tok"] = 1.into();
+            let mut tensors = Vec::new();
+            for expert in 0..2 {
+                for (name, rows, cols) in [("gate", 2048, 4096), ("up", 2048, 4096), ("down", 4096, 2048)] {
+                    let prefix = format!("model.layers.1.mlp.experts.{expert}.{name}_proj");
+                    tensors.extend(if packed { mxfp4(&prefix, rows, cols) } else { fp8(&prefix, rows, cols, None) });
+                }
+            }
+            write_snapshot(dir.path(), &config, &tensors, None);
+            let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+            let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
+                prefill_lanes: 1, ..Default::default() };
+            let endpoints = [SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32 }];
+            let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+            let exact = SparkAssignment::from_catalog(&catalog, &working, 5,
+                SparkResidentLayout::Fp8 { world: 6, rank: 5, slicing: Slicing::Blocks(128) }, &endpoints, rings).unwrap();
+            let padded = SparkAssignment::from_catalog(&catalog, &working, 5,
+                SparkResidentLayout::Fp8 { world: 6, rank: 5, slicing: Slicing::Padded }, &endpoints, rings).unwrap();
+            assert_eq!((exact.slices[0].first, exact.slices[0].width, exact.slices[0].stored_width), (1792, 256, 256));
+            assert_eq!(padded.slices[0].stored_width, 384);
+            assert!(exact.resident_bytes < padded.resident_bytes);
+            assert_eq!(exact.io, padded.io);
+            let empty = SparkAssignment::from_catalog(&catalog, &working, 6,
+                SparkResidentLayout::Fp8 { world: 6, rank: 6, slicing: Slicing::Padded }, &[], rings).unwrap();
+            assert_eq!(empty.resident_bytes, 0);
+            assert!(empty.slices.is_empty());
+            assert_eq!(empty.io, SparkIoBytes::default());
+        }
+    }
+
+    #[test]
+    fn assignment_reconciles_exact_bytes_and_worker_architecture() {
+        use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkRuntimeInventory, SparkSlice};
+        let assignment = SparkAssignment { rank: 2, resident_bytes: 1 << 30,
+            slices: vec![SparkSlice { layer: 3, first: 768, width: 384, stored_width: 384,
+                tiers: vec![2, 3], projection_counts: vec![[10, 11, 12], [12, 11, 10]] }],
+            io: SparkIoBytes { intake: 100, host_exchange: 200, row_indices: 400, mapped_rings: 800 } };
+        let report = ModelAdmissionResponse { rank: 2, resident_bytes: assignment.resident_bytes,
+            slices: assignment.slices.clone(), mapped_ring_bytes: 800, host_exchange_bytes: 200,
+            row_indices_bytes: 400, runtime: SparkRuntimeInventory {
+                sample: RuntimeSample { device: 0, total_bytes: 121 << 30, free_bytes: 100 << 30,
+                    context_bytes: 1 << 30, module_bytes: 1 << 20, sms: 48,
+                    arch: "sm_121".into(), driver: "test".into() },
+                workspace_bytes: 100, pinned_workspace_bytes: 0 } };
+        assignment.validate(&report).unwrap();
+        for field in 0..11 {
+            let mut invalid = report.clone();
+            match field {
+                0 => invalid.rank = 3,
+                1 => invalid.resident_bytes += 1,
+                2 => invalid.slices[0].projection_counts[0][1] += 1,
+                3 => invalid.slices[0].stored_width += 128,
+                4 => invalid.mapped_ring_bytes += 1,
+                5 => invalid.host_exchange_bytes += 1,
+                6 => invalid.row_indices_bytes += 1,
+                7 => invalid.runtime.sample.arch = "sm_90".into(),
+                8 => invalid.runtime.sample.free_bytes = invalid.runtime.sample.total_bytes + 1,
+                9 => invalid.runtime.workspace_bytes = 99,
+                _ => invalid.runtime.pinned_workspace_bytes = u64::MAX,
+            }
+            assert!(assignment.validate(&invalid).is_err(), "field {field}");
+        }
+        // Workspace belongs to the worker: no SM120 estimate is substituted.
+        let mut larger = report;
+        larger.runtime.workspace_bytes = 1 << 30;
+        assignment.validate(&larger).unwrap();
+    }
 
     #[test]
     fn endpoint_io_sums_rings_but_shares_owner_buffers() {

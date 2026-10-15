@@ -74,10 +74,9 @@ impl RingBudget {
     }
 }
 
-/// RAII credit for one accepted session's mapped rings. The reservation is held
-/// for the whole lifetime of [`LocalVerbsExpertConnection`], including while the
-/// connection sits in an admission channel, and is released exactly once when
-/// the connection (or a failed admission) is dropped.
+/// Pending mapped-ring credit. After native allocation this moves into the
+/// endpoint, where confirmed teardown releases it. Failed quiesce retains both
+/// registered memory and its credit, including across retained response owners.
 pub struct RingReservation {
     budget: Arc<RingBudget>,
     bytes: usize,
@@ -112,10 +111,6 @@ pub struct LocalVerbsExpertConnection {
     liveness_polls: u8,
     /// Startup-resolved diagnostics flag; see `protocol_v2_timing_from_env`.
     timing: bool,
-    /// Mapped-ring reservation held until this connection is dropped. Declared
-    /// after the endpoint so its registered memory is destroyed before the budget
-    /// credit is returned to the shared budget.
-    ring_reservation: Option<RingReservation>,
     // EOF acknowledges teardown only after native rings and their credit are released.
     stream: TcpStream,
 }
@@ -216,10 +211,7 @@ impl LocalVerbsExpertConnection {
         let path =
             verbs_host_native_library_path().context("native RoCE library not configured")?;
         let library = Arc::new(unsafe { NativeLibrary::load(&path) }?);
-        let mut connection =
-            Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, grouping)?;
-        connection.ring_reservation = Some(reservation);
-        Ok(connection)
+        Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, grouping, Some(reservation))
     }
 
     /// Negotiated wire ring geometry from the persistent handshake, as
@@ -332,7 +324,7 @@ impl LocalVerbsExpertConnection {
         timing: bool,
     ) -> Result<Self> {
         let (request_ring, response_ring) = Self::validated_rings(&start)?;
-        Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, None)
+        Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, None, None)
     }
 
     fn initialize_with_rings(
@@ -343,9 +335,10 @@ impl LocalVerbsExpertConnection {
         response_ring: VerbsHostRdmaRing,
         timing: bool,
         grouping: Option<&crate::worker_selection::InstalledExpertGrouping>,
+        reservation: Option<RingReservation>,
     ) -> Result<Self> {
         let rdma_device = verbs_host_rdma_device_for_stream(&stream)?;
-        let endpoint = NativeRdmaEndpoint::create_from_wire_bytes_mapped_on_device(
+        let mut endpoint = NativeRdmaEndpoint::create_from_wire_bytes_mapped_on_device(
             Arc::clone(&library),
             "server",
             start.request_capacity_wire_bytes,
@@ -355,6 +348,7 @@ impl LocalVerbsExpertConnection {
             next_local_psn("server"),
             rdma_device.as_ref(),
         )?;
+        endpoint.credits.rings = reservation;
         let request_recv_view = endpoint.recv_buffer_view()?;
         let response_send_view = endpoint.send_buffer_view()?;
         validate_mapped_endpoint_buffer_view(
@@ -442,7 +436,6 @@ impl LocalVerbsExpertConnection {
             next_liveness: Instant::now(),
             liveness_polls: 0,
             timing,
-            ring_reservation: None,
         })
     }
 
@@ -789,6 +782,42 @@ fn ensure_peer_open(stream: &TcpStream) -> Result<()> {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn failed_quiesce_drop_keeps_registered_ring_credit_charged() -> Result<()> {
+        let budget = RingBudget::new(100);
+        let mut credits = EndpointCredits { rings: Some(budget.reserve(100)?) };
+        let mut destroyed = false;
+        assert!(credits.retire(|| {
+            anyhow::ensure!(false, "simulated failed QP quiesce");
+            destroyed = true;
+            Ok(())
+        }).is_err());
+        assert!(!destroyed);
+        drop(credits);
+        assert_eq!(budget.used(), 100);
+        assert!(budget.reserve(1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn retained_endpoint_owns_credit_until_successful_teardown() -> Result<()> {
+        struct Owner(EndpointCredits);
+        impl Drop for Owner {
+            fn drop(&mut self) { self.0.retire(|| Ok(())).unwrap(); }
+        }
+        let budget = RingBudget::new(100);
+        let endpoint = Arc::new(Owner(EndpointCredits { rings: Some(budget.reserve(100)?) }));
+        let retained_response = Arc::clone(&endpoint);
+        drop(endpoint);
+        assert_eq!(budget.used(), 100);
+        drop(retained_response);
+        assert_eq!(budget.used(), 0);
+        let pending = budget.reserve(100)?;
+        drop(pending);
+        assert_eq!(budget.used(), 0);
+        Ok(())
+    }
 
     #[test]
     fn write_mode_error_response_sets_error_flag_without_losing_request_identity() {
