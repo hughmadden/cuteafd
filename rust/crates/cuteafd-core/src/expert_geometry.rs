@@ -3,6 +3,54 @@
 //! process-wide value fixed at startup; it defaults to DeepSeek V4.1 so every
 //! V4.1 path (and its tests) behaves exactly as before.
 use std::sync::OnceLock;
+use serde::{Deserialize, Serialize};
+
+/// One persistent coordinator-to-Spark connection, resolved before allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkEndpoint {
+    pub capacity: u32,
+    pub ingress: SparkIngress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SparkIngress {
+    Fp8K32,
+    Bf16,
+    /// Decode rows are unquantized; prefill uses FP8 K32 on the same QP.
+    Bf16Decode { rows: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkRings {
+    pub max_frame_bytes: usize,
+    pub depth: usize,
+    pub slot_bytes: usize,
+    pub alignment: usize,
+}
+
+impl SparkEndpoint {
+    pub fn wire_bytes(self, geometry: ExpertGeometry) -> Option<(usize, usize)> {
+        if !(1..=4096).contains(&self.capacity) { return None; }
+        let (request, response) = geometry.compact_wire_bytes(self.capacity,
+            self.ingress == SparkIngress::Bf16)?;
+        let request = match self.ingress {
+            SparkIngress::Bf16Decode { rows } => {
+                if rows == 0 || rows > self.capacity { return None; }
+                request.max(geometry.compact_wire_bytes(rows, true)?.0)
+            }
+            _ => request,
+        };
+        Some((request, response))
+    }
+
+    pub fn ring_bytes(self, geometry: ExpertGeometry, rings: SparkRings) -> Option<usize> {
+        let (request, response) = self.wire_bytes(geometry)?;
+        geometry.ring_bytes_for_wire(request, response, rings, 1)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExpertGeometry {
@@ -50,10 +98,17 @@ impl ExpertGeometry {
     /// Persistent request/response mapped rings, shared by admission and planning.
     pub fn compact_ring_bytes(&self, capacity: u32, max_frame: usize, depth: usize,
         slot: usize, alignment: usize, endpoints: usize, bf16: bool) -> Option<usize> {
-        if !(1..=8).contains(&depth) || slot == 0 || alignment == 0 || endpoints == 0 { return None; }
         let (request, response) = self.compact_wire_bytes(capacity, bf16)?;
-        if request > max_frame || response > max_frame { return None; }
-        let align = |bytes: usize| bytes.max(slot).min(max_frame).checked_add(alignment - 1)
+        self.ring_bytes_for_wire(request, response, SparkRings {
+            max_frame_bytes: max_frame, depth, slot_bytes: slot, alignment }, endpoints)
+    }
+
+    fn ring_bytes_for_wire(&self, request: usize, response: usize, rings: SparkRings,
+        endpoints: usize) -> Option<usize> {
+        let SparkRings { max_frame_bytes, depth, slot_bytes, alignment } = rings;
+        if !(1..=8).contains(&depth) || slot_bytes == 0 || alignment == 0 || endpoints == 0 { return None; }
+        if request > max_frame_bytes || response > max_frame_bytes { return None; }
+        let align = |bytes: usize| bytes.max(slot_bytes).min(max_frame_bytes).checked_add(alignment - 1)
             .map(|bytes| bytes / alignment * alignment);
         align(request)?.checked_add(align(response)?)?.checked_mul(depth)?.checked_mul(endpoints)
     }

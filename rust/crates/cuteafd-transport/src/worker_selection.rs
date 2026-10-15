@@ -64,6 +64,37 @@ pub struct WorkerSelection {
     version: u32,
     identity: WorkerIdentity,
     ranges: Vec<LayerRange>,
+    model: Option<ModelAdmission>,
+}
+
+/// The same immutable placement seal also fixes every persistent endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAdmission {
+    pub capacity: u32,
+    pub endpoints: Vec<cuteafd_core::SparkEndpoint>,
+    pub rings: cuteafd_core::SparkRings,
+}
+
+impl ModelAdmission {
+    pub fn validate(&self, geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
+        ensure!((1..=4096).contains(&self.capacity), "invalid ModelAdmission capacity");
+        ensure!(!self.endpoints.is_empty() && self.endpoints.len() <= 8,
+            "ModelAdmission requires 1..=8 endpoints");
+        for (endpoint, spec) in self.endpoints.iter().enumerate() {
+            ensure!(spec.capacity <= self.capacity && spec.ring_bytes(geometry, self.rings).is_some(),
+                "invalid ModelAdmission endpoint {endpoint} capacity/ingress/ring geometry");
+        }
+        self.ring_bytes(geometry)?;
+        Ok(())
+    }
+
+    pub fn ring_bytes(&self, geometry: cuteafd_core::ExpertGeometry) -> Result<usize> {
+        self.endpoints.iter().try_fold(0usize, |total, endpoint| {
+            total.checked_add(endpoint.ring_bytes(geometry, self.rings)
+                .context("invalid ModelAdmission endpoint")?).context("ModelAdmission ring overflow")
+        })
+    }
 }
 
 impl WorkerSelection {
@@ -75,13 +106,23 @@ impl WorkerSelection {
             if let Some(range) = ranges.last_mut().filter(|range| range.end == layer) { range.end = layer.checked_add(1).context("worker layer overflow")?; }
             else { ranges.push(LayerRange { first: layer, end: layer.checked_add(1).context("worker layer overflow")? }); }
         }
-        let selection = Self { version: VERSION, identity, ranges };
+        let selection = Self { version: VERSION, identity, ranges, model: None };
         selection.validate()?;
         Ok(selection)
     }
 
     pub fn ranges(&self) -> &[LayerRange] { &self.ranges }
     pub fn identity(&self) -> &WorkerIdentity { &self.identity }
+    pub fn model(&self) -> Option<&ModelAdmission> { self.model.as_ref() }
+    pub fn with_model(mut self, model: ModelAdmission) -> Result<Self> {
+        self.model = Some(model);
+        self.validate()?;
+        Ok(self)
+    }
+    pub fn geometry(&self) -> cuteafd_core::ExpertGeometry {
+        let [hidden, experts, topk, intermediate, layers] = self.identity.geometry;
+        cuteafd_core::ExpertGeometry { hidden, experts, topk, intermediate, layers }
+    }
     pub fn digest(&self) -> Result<String> { Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?))) }
 
     fn validate(&self) -> Result<()> {
@@ -98,6 +139,7 @@ impl WorkerSelection {
             "worker layer range is outside checkpoint");
         ensure!(self.ranges.windows(2).all(|pair| pair[0].end < pair[1].first),
             "worker ranges must be sorted, disjoint and coalesced");
+        if let Some(model) = &self.model { model.validate(self.geometry())?; }
         Ok(())
     }
 

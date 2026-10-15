@@ -28,6 +28,36 @@ pub struct SparkWorkingSet {
 }
 
 impl SparkWorkingSet {
+    /// Endpoint rings are summed; one GPU owner shares intake and exchange
+    /// across all its QPs, so those allocations are maxima, not lane sums.
+    pub fn rank_endpoints_io(&self, rank: usize, geometry: ExpertGeometry,
+        endpoints: &[cuteafd_core::SparkEndpoint], rings: cuteafd_core::SparkRings)
+        -> Result<SparkIoBytes, PlacementError> {
+        if !self.selected_ranks().contains(&rank) { return Ok(SparkIoBytes::default()); }
+        if endpoints.is_empty() || endpoints.len() > 8 {
+            return Err(PlacementError::Inventory("selected Spark needs 1..=8 endpoints"));
+        }
+        let mut bytes = SparkIoBytes::default();
+        for endpoint in endpoints {
+            let ring = SparkRingGeometry { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
+                slot_bytes: rings.slot_bytes, alignment: rings.alignment, endpoints: 1 };
+            let bf16 = endpoint.ingress == cuteafd_core::SparkIngress::Bf16;
+            let io = self.rank_io(rank, geometry, endpoint.capacity, bf16, ring)?;
+            bytes.intake = bytes.intake.max(io.intake);
+            if let cuteafd_core::SparkIngress::Bf16Decode { rows } = endpoint.ingress {
+                let decode = self.rank_io(rank, geometry, rows, true, ring)?;
+                bytes.intake = bytes.intake.max(decode.intake);
+            }
+            bytes.host_exchange = bytes.host_exchange.max(io.host_exchange);
+            bytes.row_indices = bytes.row_indices.max(io.row_indices);
+            let mapped = endpoint.ring_bytes(geometry, rings)
+                .ok_or(PlacementError::Inventory("invalid Spark endpoint ring geometry"))? as u64;
+            bytes.mapped_rings = bytes.mapped_rings.checked_add(mapped)
+                .ok_or(PlacementError::Overflow("Spark endpoint rings"))?;
+        }
+        Ok(bytes)
+    }
+
     pub fn includes(&self, component: WorkingSetComponent) -> bool {
         match component {
             WorkingSetComponent::Always => true,
@@ -103,6 +133,31 @@ pub struct SparkIoBytes {
 mod tests {
     use super::*;
     use cuteafd_core::memory_layout::{Basis, Category};
+
+    #[test]
+    fn endpoint_io_sums_rings_but_shares_owner_buffers() {
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let set = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 6,
+            prefill_lanes: 3, ..Default::default() };
+        let geometry = ExpertGeometry::MIMO_V26_PRO;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+            slot_bytes: 8 << 20, alignment: 4096 };
+        let main = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 } };
+        let lane = SparkEndpoint { capacity: 1024, ingress: SparkIngress::Fp8K32 };
+        let io = set.rank_endpoints_io(0, geometry, &[main, lane], rings).unwrap();
+        assert_eq!(io.mapped_rings, (main.ring_bytes(geometry, rings).unwrap()
+            + lane.ring_bytes(geometry, rings).unwrap()) as u64);
+        let full_fp8 = set.rank_io(0, geometry, 4096, false, two_endpoints()).unwrap();
+        assert_eq!(io.intake, full_fp8.intake);
+        assert_eq!(io.host_exchange, full_fp8.host_exchange);
+        assert_eq!(io.row_indices, full_fp8.row_indices);
+        assert!(main.ring_bytes(geometry, rings).unwrap()
+            < SparkEndpoint { ingress: SparkIngress::Bf16, ..main }.ring_bytes(geometry, rings).unwrap());
+        assert!(set.rank_endpoints_io(0, geometry, &[], rings).is_err());
+        assert!(set.rank_endpoints_io(0, geometry, &[SparkEndpoint {
+            ingress: SparkIngress::Bf16Decode { rows: 4097 }, ..main }], rings).is_err());
+        assert_eq!(set.rank_endpoints_io(6, geometry, &[], rings).unwrap(), SparkIoBytes::default());
+    }
 
     fn two_endpoints() -> SparkRingGeometry {
         SparkRingGeometry { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
