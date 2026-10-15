@@ -368,12 +368,16 @@ mod tests {
         assert!(Decoder::default().push(&h).is_err());
         assert!(Decoder::default().push(&[0, 0, 0, 0]).is_err());
     }
+    fn short_socket_dir(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new().prefix(prefix).tempdir_in("/tmp").unwrap()
+    }
     #[test]
     fn local_stream_disconnect_stale_reconnect_and_suspend() {
         use std::os::unix::net::UnixListener;
-        let dir = std::env::temp_dir().join(format!("cuteafd-storage-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("counters.sock");
+        // /tmp, not temp_dir(): a Unix socket path is capped near 108 bytes and a
+        // deep TMPDIR exceeds it. The directory is removed on drop.
+        let dir = short_socket_dir("sn-");
+        let path = dir.path().join("counters.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let source = SparkNest::new(&path);
         assert_eq!(source.sample().status, "waiting");
@@ -392,15 +396,12 @@ mod tests {
         drop(next);
         assert_eq!(source.sample().status, "unavailable");
         source.suspend();
-        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn socket_replacement_reconnects_with_unknown_restart_interval() {
         use std::os::unix::net::UnixListener;
-        let dir =
-            std::env::temp_dir().join(format!("snr-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("rdma-counters.sock");
+        let dir = short_socket_dir("snr-");
+        let path = dir.path().join("rdma-counters.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let source = SparkNest::new(&path);
         assert_eq!(source.sample().status, "waiting");
@@ -424,7 +425,6 @@ mod tests {
         assert_eq!(new.status, "available");
         assert_ne!(old.incarnation, new.incarnation);
         source.suspend();
-        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn malformed_port_and_counter_timestamp_are_rejected() {
@@ -447,10 +447,8 @@ mod tests {
         assert!(d.push(&reset).is_err());
 
         use std::os::unix::net::UnixListener;
-        let dir =
-            std::env::temp_dir().join(format!("cuteafd-storage-silent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("counters.sock");
+        let dir = short_socket_dir("sns-");
+        let path = dir.path().join("counters.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let source = SparkNest::new(&path);
         assert_eq!(source.sample().status, "waiting");
@@ -458,7 +456,6 @@ mod tests {
         source.state.lock().unwrap().connected = Some(Instant::now() - Duration::from_secs(4));
         assert_eq!(source.sample().status, "stale");
         assert!(source.state.lock().unwrap().stream.is_none());
-        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn missing_source_is_unknown_and_suspend_clears_state() {
