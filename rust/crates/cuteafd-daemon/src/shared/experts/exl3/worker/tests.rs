@@ -88,6 +88,52 @@ fn exl3_worker_rank_bounds_include_tp1() -> Result<()> {
     Ok(())
 }
 
+fn sparse_layout(layer: cuteafd_loader::V41Exl3Layer) -> cuteafd_loader::V41Exl3Residency {
+    cuteafd_loader::V41Exl3Residency {
+        layer, world: 4, rank: 3, layout: cuteafd_loader::V41Exl3Partition::Disjoint,
+        intermediate_start: 1536, experts: 256, intermediate: 512, tiers: vec![4],
+        projection_counts: vec![[256; 3]], buffers: vec![], loads: vec![],
+    }
+}
+
+#[test]
+fn exl3_worker_sparse_owner_ids_preserve_absolute_request_mapping() -> Result<()> {
+    use cuteafd_loader::V41Exl3Layer::Backbone;
+    let layouts = [sparse_layout(Backbone(13)), sparse_layout(Backbone(15))];
+    let ids = Exl3Worker::resident_layers(&layouts)?;
+    assert_eq!(ids, [13, 15]);
+    Exl3Worker::validate_layer(&ids, 0, 13)?;
+    Exl3Worker::validate_layer(&ids, 1, 15)?;
+    for (index, requested) in [(0, 14), (1, 14), (1, 13), (2, 15)] {
+        assert!(Exl3Worker::validate_layer(&ids, index, requested).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn exl3_worker_sparse_owners_reject_invalid_ids_and_geometry() {
+    use cuteafd_loader::V41Exl3Layer::{Backbone, Dspark};
+    assert!(Exl3Worker::resident_layers(std::iter::empty()).is_err());
+    for layers in [[Backbone(13), Backbone(13)], [Backbone(15), Backbone(13)],
+        [Backbone(13), Dspark(0)]] {
+        assert!(Exl3Worker::resident_layers(&layers.map(sparse_layout)).is_err());
+    }
+    for change in 0..7 {
+        let mut layouts = [sparse_layout(Backbone(13)), sparse_layout(Backbone(15))];
+        let second = &mut layouts[1];
+        match change {
+            0 => second.rank = 2,
+            1 => second.world = 6,
+            2 => second.layout = cuteafd_loader::V41Exl3Partition::PairedTp4,
+            3 => second.intermediate_start = 1024,
+            4 => second.intermediate = 384,
+            5 => second.experts = 128,
+            _ => second.tiers = vec![3, 4],
+        }
+        assert!(Exl3Worker::resident_layers(&layouts).is_err());
+    }
+}
+
 #[test]
 fn exl3_worker_host_path_switch() -> Result<()> {
     assert_eq!(HostPath::parse(None)?, HostPath::Async);

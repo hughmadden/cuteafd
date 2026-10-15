@@ -1728,13 +1728,16 @@ impl Opened {
                     experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
                     intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? } };
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
-            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
-                source, geometry, peers.len(), None)?;
-            let selection = cuteafd_transport::worker_selection::WorkerSelection::new(identity, &spark_layers)?;
-            cuteafd_transport::worker_selection::select_worker_layers(&peers, &selection,
-                std::time::Duration::from_secs(1200))?;
-            tracing::info!(layers = ?spark_layers, digest = %selection.digest()?,
-                "GLM Flash Spark solved layer set acknowledged before lanes");
+            let capacity = u32::try_from(args.expert_rows())?;
+            let ingress = if self.checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
+                else { cuteafd_core::SparkIngress::Fp8K32 };
+            let model = cuteafd_transport::worker_selection::ModelAdmission {
+                capacity, compiled_capacity: capacity,
+                endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress }; args.prefill_lanes],
+                rings: crate::shared::placement::spark_rings(64 << 20)?,
+            };
+            crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
+                &working, peers.len(), None, cuteafd_loader::V41Exl3Partition::Disjoint, model)?.select(&peers)?;
         }
         let execution = cuteafd_loader::placement::LayerExecutionPlan::new(&placement,
             cuteafd_loader::placement::HopSpec {
