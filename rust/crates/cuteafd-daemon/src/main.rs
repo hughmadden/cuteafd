@@ -211,6 +211,7 @@ async fn run() -> Result<()> {
         Commands::ServeMimo(args) => families::mimo_v2::serve::run_serve(args).await,
         Commands::GlmfGolden(args) => families::glm5_flash::run_golden(args).await,
         Commands::Qwen4Golden(args) => families::qwen4::run_golden(args).await,
+        Commands::Qwen35Golden(args) => families::qwen3_5::run_golden(args).await,
         Commands::ServeQwen4(args) => families::qwen4::serve::run_serve(args).await,
         Commands::ServeGlmf(args) => families::glm5_flash::serve::run_serve(args).await,
         Commands::ServeGlm(args) => families::glm5::serve::run_serve(args).await,

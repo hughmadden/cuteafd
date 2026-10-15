@@ -752,6 +752,14 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         }
     }
     report.encoder_plan_hash = format!("{:x}", hash.finalize());
+    if family.runtime() == RuntimeStatus::Planned {
+        report.fits = false;
+        report.placement_supported = false;
+        report.hints.push(Hint {
+            what: "planned family has no executable serving admission in this build".into(),
+            how: "The component bytes are a checkpoint inventory, not a serving-fit result; implement and gate the runtime first.".into(),
+        });
+    }
     report.spec = Some(spec.clone());
     Ok(report)
 }
@@ -761,6 +769,11 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
 /// own tensors (plus every expert, local-only) against its budget.
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
     routed_operands: &BTreeMap<String, QuantOperand>) {
+    if spec.moe.is_none() {
+        report.placement = ExpertPlacement::Local;
+        report.spark_ranks = 0;
+        report.min_spark_ranks = Some(0);
+    }
     let bytes_of = |owner: Owner| -> u64 {
         report.components.iter().filter(|c| c.owner == owner && !matches!(c.component, Component::Vision | Component::Audio)).map(|c| c.bytes).sum()
     };
