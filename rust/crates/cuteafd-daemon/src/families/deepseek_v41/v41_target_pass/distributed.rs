@@ -23,7 +23,9 @@ fn trace_query_component(query: &crate::families::deepseek_v41::v41_attention_qu
 }
 
 
-pub(crate) struct DistributedTargetPass<'w, 'a> {
+pub(crate) type DistributedTargetPass<'w, 'a> = Pass<'a, PlacedResources<'w, 'a>>;
+
+pub(crate) struct PlacedResources<'w, 'a> {
     map: CachePlacement,
     embedding: DeviceOwner<'a, TargetEmbeddingWave<'w, 'a>>,
     lanes: [DeviceOwner<'a, BackboneLane<'w, 'a>>; 2],
@@ -35,16 +37,9 @@ pub(crate) struct DistributedTargetPass<'w, 'a> {
     transfers: [DirectInputHop<'a>; 2],
     suffix_stream: DeviceOwner<'a, crate::shared::memory::LoadStream<'a>>,
     timeout: Duration,
-    state: State,
     capture_routes: bool,
     route_capture: Vec<Vec<[u32; 6]>>,
-    /// Device-side stage ordering across both GPUs (see `v41_memory::chain`),
-    /// used for verification passes only.
-    chain: Option<crate::shared::memory::chain::StageChain<'a>>,
     verification: bool,
-    /// The next verification pass may run device-ordered (see `set_device_order`).
-    device_order: bool,
-    sampled: Option<crate::families::deepseek_v41::v41_target_head::SampledTargetRows>,
     #[cfg(test)]
     trace: bool,
     #[cfg(test)]
@@ -80,12 +75,12 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
-    pub fn bind_execution_plan(&self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
+    pub fn bind_execution_plan(&mut self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
         use cuteafd_loader::placement::{HopKind, HopPoint, LayerExecutionPlan};
         let plan = LayerExecutionPlan::new(placement,
             cuteafd_loader::placement::families::deepseek_v41::execution_hops(2))?;
         let map = CachePlacement::from_execution_plan(&plan)?;
-        ensure!(map == self.map, "distributed target differs from admitted ownership");
+        ensure!(map == self.resources.map, "distributed target differs from admitted ownership");
         for hop in plan.hops() {
             let HopPoint::BeforeLayer(layer) = hop.at else {
                 anyhow::bail!("V4.1 block transfer requires an adjacent-layer hop")
@@ -95,10 +90,15 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 && map.attention(layer)? == usize::from(hop.to),
                 "V4.1 block transfer differs from admitted hop");
         }
+        for (gpu, transfer) in self.resources.transfers.iter_mut().enumerate() {
+            let hops: Vec<_> = plan.hops().iter().filter(|hop| usize::from(hop.to) == gpu).copied().collect();
+            transfer.bind(&hops, plan.spec())?;
+        }
+        self.resources.map = map;
         Ok(())
     }
     pub fn enable_dual_attention(&mut self)->Result<()> {
-        for lane in &mut self.lanes {
+        for lane in &mut self.resources.lanes {
             let device=lane.device;
             let peer=crate::shared::memory::device::Device { library:device.library,id:1-device.id };
             let budget=lane.dual_attention_bytes()?;
@@ -107,11 +107,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         Ok(())
     }
     pub fn configure_cache_replicas(&mut self,bank:&crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>)->Result<()> {
-        bank.configure_producer_replicas(&mut self.execution.producers.windows,
-            &mut self.execution.producers.sources)
+        bank.configure_producer_replicas(&mut self.resources.execution.producers.windows,
+            &mut self.resources.execution.producers.sources)
     }
     pub fn encoder_device(&self) -> Result<crate::shared::memory::device::Device<'a>> {
-        Ok(self.lanes[self.map.attention(19)?].device)
+        Ok(self.resources.lanes[self.resources.map.attention(19)?].device)
     }
     pub fn new(
         map: CachePlacement,
@@ -175,65 +175,65 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             lanes[map.attention(layer)?].reserve_route_capture(layer..layer + 1, 4096)?;
         }
         Ok(Self {
-            map,
-            embedding,
-            lanes,
-            indices,
-            execution,
-            engram,
-            head,
-            taps,
-            transfers,
-            suffix_stream,
-            timeout,
+            resources: PlacedResources {
+                map,
+                embedding,
+                lanes,
+                indices,
+                execution,
+                engram,
+                head,
+                taps,
+                transfers,
+                suffix_stream,
+                timeout,
+                capture_routes: false,
+                route_capture: (0..40).map(|_| Vec::with_capacity(4096)).collect(),
+                verification: false,
+                #[cfg(test)]
+                trace: false,
+                #[cfg(test)]
+                trace_records: Vec::new(),
+                #[cfg(test)]
+                trace_queries,
+                #[cfg(test)]
+                observed_layer: None,
+                #[cfg(test)]
+                trace_buffers,
+            },
             state: State::Idle,
-            capture_routes: false,
-            route_capture: (0..40).map(|_| Vec::with_capacity(4096)).collect(),
             chain,
-            verification: false,
             device_order: true,
             sampled: None,
-            #[cfg(test)]
-            trace: false,
-            #[cfg(test)]
-            trace_records: Vec::new(),
-            #[cfg(test)]
-            trace_queries,
-            #[cfg(test)]
-            observed_layer: None,
-            #[cfg(test)]
-            trace_buffers,
         })
     }
     pub fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
         ensure!(!enabled || self.state == State::Idle,
             "cannot reset route capture during a target pass");
-        for lane in &mut self.lanes {
+        for lane in &mut self.resources.lanes {
             let device = lane.device;
             device.run(|| { lane.set_route_capture(enabled); Ok(()) })?;
         }
-        self.capture_routes = enabled;
+        self.resources.capture_routes = enabled;
         if enabled {
             // Match the single-GPU pass: adaptive row changes must retain the
             // index projection and selection graphs on both owning devices.
-            for index in self.indices.iter_mut().flatten() {
+            for index in self.resources.indices.iter_mut().flatten() {
                 index.get_mut().enable_small_graph_shapes();
             }
-            for rows in &mut self.route_capture { rows.clear(); }
+            for rows in &mut self.resources.route_capture { rows.clear(); }
         }
         Ok(())
     }
-    pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { &self.route_capture }
+    pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { &self.resources.route_capture }
     /// Host FFN stage split of the last captured pass, summed over both GPUs.
     pub fn captured_ffn_split(&self) -> crate::families::deepseek_v41::v41_backbone_lane::FfnSplit {
         let mut split = crate::families::deepseek_v41::v41_backbone_lane::FfnSplit::default();
-        for lane in &self.lanes { split.add(&lane.captured_ffn_split()); }
+        for lane in &self.resources.lanes { split.add(&lane.captured_ffn_split()); }
         split
     }
     /// The next `execute` is a verification pass (consumed by that call).
-    pub(crate) fn mark_verification(&mut self) { self.verification = true; }
-    /// The next pass may run device-ordered (`CUTEAFD_V41_DEVICE`); reset after it.
-    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
+    pub(crate) fn mark_verification(&mut self) { self.resources.verification = true; }
     /// Device-select the rows of a completed non-greedy verification pass.
     /// # Safety
     /// The pass completed with `greedy = false` and its head is unconsumed.
@@ -241,7 +241,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         requests: &[crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest], masks: Option<&[u32]>,
         mask_words: usize, ordered_rows: bool) -> Result<()> {
         self.sampled = None;
-        let rows = unsafe { self.head.sample(requests, masks, mask_words, ordered_rows).await? };
+        let rows = unsafe { self.resources.head.sample(requests, masks, mask_words, ordered_rows).await? };
         self.sampled = Some(rows);
         Ok(())
     }
@@ -250,7 +250,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     }
     pub(crate) async fn download_sampled(&mut self, rows: &crate::families::deepseek_v41::v41_target_head::SampledTargetRows,
         selection: &[usize]) -> Result<Vec<u8>> {
-        self.head.download_sampled(rows, selection).await
+        self.resources.head.download_sampled(rows, selection).await
     }
     /// Device time per layer between FFN finishes on the same GPU. The first
     /// layer after a GPU handoff is timed from its input's arrival (one clock
@@ -258,25 +258,25 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     pub fn captured_layer_us(&self) -> Vec<Option<f64>> {
         (0..40usize).map(|layer| {
             let previous = layer.checked_sub(1)?;
-            let (a, b) = (self.map.attention(previous).ok()?, self.map.attention(layer).ok()?);
-            let lane = &self.lanes[b];
+            let (a, b) = (self.resources.map.attention(previous).ok()?, self.resources.map.attention(layer).ok()?);
+            let lane = &self.resources.lanes[b];
             let clock = lane.layer_clock();
             lane.device.run(|| Ok(if a == b { clock.between(previous, layer) }
                 else { clock.since_entry(layer) })).ok().flatten()
         }).collect()
     }
     pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
-        for lane in &mut self.lanes {
+        for lane in &mut self.resources.lanes {
             let device = lane.device;
             device.run(|| lane.get_mut().install_attention_plan(plan))?;
         }
         Ok(())
     }
     pub fn set_attention_decode(&mut self, decode: bool) {
-        for lane in &mut self.lanes { lane.get_mut().set_attention_decode(decode); }
+        for lane in &mut self.resources.lanes { lane.get_mut().set_attention_decode(decode); }
     }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
-        for lane in &mut self.lanes {
+        for lane in &mut self.resources.lanes {
             let device = lane.device;
             device.run(|| lane.get_mut().reserve_sparse_decode_rows(rows))?;
         }
@@ -284,14 +284,14 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     }
     async unsafe fn advance(&mut self, layer: usize) -> Result<()> {
         ensure!((1..40).contains(&layer), "invalid distributed next layer");
-        let source = self.map.attention(layer - 1)?;
-        let destination = self.map.attention(layer)?;
+        let source = self.resources.map.attention(layer - 1)?;
+        let destination = self.resources.map.attention(layer)?;
         if source == destination {
-            let lane = &mut self.lanes[destination];
+            let lane = &mut self.resources.lanes[destination];
             let device = lane.device;
             device.run(|| lane.advance())
         } else {
-            let [left, right] = &mut self.lanes;
+            let [left, right] = &mut self.resources.lanes;
             let (source, destination_lane) = if source == 0 {
                 (left, right)
             } else {
@@ -301,7 +301,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             unsafe {
                 destination_lane
                     .get_mut()
-                    .import_previous_cooperative(&output, &mut self.transfers[destination])
+                    .import_previous_cooperative(&output, &mut self.resources.transfers[destination])
                     .await
             }
         }
@@ -323,31 +323,24 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     ) -> Result<()> {
         // Verification passes run with device-ordered stages. Peer-projection
         // modes (TP2 attention/query/output, all opt-in) keep host drains.
-        let verification = std::mem::replace(&mut self.verification, false);
+        let verification = std::mem::replace(&mut self.resources.verification, false);
         self.set_attention_decode(verification);
-        let chained = verification && !self.lanes.iter().any(|lane| lane.uses_peer_projection());
-        if let Some(chain) = &self.chain {
-            chain.set_device_order(std::mem::replace(&mut self.device_order, true));
-        }
-        let Some(handle) = self.chain.as_ref().filter(|_| chained).map(|chain| chain.handle()) else {
+        let chained = verification && !self.resources.lanes.iter().any(|lane| lane.uses_peer_projection());
+        let Some(handle) = self.begin_chain(chained)? else {
             return unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
                 suffix, encoder, greedy).await };
         };
-        self.chain.as_ref().unwrap().drain()?;
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
             requests, batch, transport, placement, selected, suffix, encoder, greedy)) }).await;
-        let drained = if crate::shared::memory::chain::device_enabled() {
-            self.chain.as_ref().unwrap().drain_bounded(std::time::Duration::from_secs(60)).map_err(|error|
-                error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
-        } else { self.chain.as_ref().unwrap().drain() };
+        let drained = self.drain_chain();
         let result = result.and(drained).and_then(|()| transport.get().check_device());
-        if result.is_ok() && self.capture_routes && crate::shared::memory::chain::device_enabled() {
+        if result.is_ok() && self.resources.capture_routes && crate::shared::memory::chain::device_enabled() {
             // Device-ordered local layers left their routes in the routers' rings.
-            for gpu in 0..self.lanes.len() {
-                let device = self.lanes[gpu].device;
-                let lane = &mut self.lanes[gpu];
+            for gpu in 0..self.resources.lanes.len() {
+                let device = self.resources.lanes[gpu].device;
+                let lane = &mut self.resources.lanes[gpu];
                 for layer in device.run(|| lane.get_mut().drain_route_ring())? {
-                    self.route_capture[layer].clone_from(&self.lanes[gpu].captured_routes()[layer]);
+                    self.resources.route_capture[layer].clone_from(&self.resources.lanes[gpu].captured_routes()[layer]);
                 }
             }
         }
@@ -422,7 +415,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             "reserved stage differs"
         );
         ensure!(
-            transport.device.id == self.map.attention(20)? as i32,
+            transport.device.id == self.resources.map.attention(20)? as i32,
             "decoder transport reduction GPU differs"
         );
         ensure!(
@@ -441,8 +434,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             completed: false,
         };
         let mut guard = guard;
-        self.execution.restart_for(stage);
-        for index in self.indices.iter_mut().flatten() {
+        self.resources.execution.restart_for(stage);
+        for index in self.resources.indices.iter_mut().flatten() {
             let device = index.device;
             device.run(|| {
                 if stage == CacheStage::Replay {
@@ -453,11 +446,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             })?;
         }
         if !stage.is_encoder() {
-            self.taps.begin(guard.batch.cache()?)?;
+            self.resources.taps.begin(guard.batch.cache()?)?;
         }
         let first = stage.windows().start;
-        let gpu = self.map.attention(first)?;
-        let device = self.lanes[gpu].device;
+        let gpu = self.resources.map.attention(first)?;
+        let device = self.resources.lanes[gpu].device;
         if stage == CacheStage::Replay {
             let encoder = encoder.context("distributed replay requires retained encoder suffix")?;
             ensure!(
@@ -465,26 +458,26 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 "distributed replay suffix rows differ"
             );
             if encoder.residual.device_id == device.id {
-                device.run(|| self.lanes[gpu].restart_decoder(encoder))?;
+                device.run(|| self.resources.lanes[gpu].restart_decoder(encoder))?;
             } else {
                 unsafe {
-                    self.lanes[gpu]
+                    self.resources.lanes[gpu]
                         .get_mut()
-                        .import_previous_cooperative(encoder, &mut self.transfers[gpu])
+                        .import_previous_cooperative(encoder, &mut self.resources.transfers[gpu])
                         .await?;
                 }
             }
             device
-                .future(unsafe { self.lanes[gpu].get_mut().begin_prepared_cooperative() })
+                .future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() })
                 .await?;
         } else {
-            device.run(|| self.lanes[gpu].restart())?;
+            device.run(|| self.resources.lanes[gpu].restart())?;
             let text = requests.with_requests(|r| r.text_embedding_input(guard.batch))?;
             if let Some((tokens, positions)) = text {
                 device
                     .future(unsafe {
-                        self.lanes[gpu].get_mut().begin_tokens_cooperative(
-                            self.embedding.get_mut(),
+                        self.resources.lanes[gpu].get_mut().begin_tokens_cooperative(
+                            self.resources.embedding.get_mut(),
                             tokens,
                             &positions,
                         )
@@ -496,32 +489,22 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                         device.run(|| {
                             r.begin_input(
                                 guard.batch,
-                                self.embedding.get_mut(),
-                                self.lanes[gpu].get_mut(),
+                                self.resources.embedding.get_mut(),
+                                self.resources.lanes[gpu].get_mut(),
                             )
                         })
                     })?;
                 }
             }
         }
-        for layer in stage.windows() {
+        layer_schedule!(stage; layer, first; {
             if let Some(flow) = &flow {
                 flow.permit.wait_predecessor(layer).await;
                 ensure!((flow.keep_running)(), "client disconnected");
             }
-            let gpu = self.map.attention(layer)?;
-            let device = self.lanes[gpu].device;
-            if layer != first && crate::shared::memory::chain::deferred() {
-                // The previous layer's attention stages uploaded from host staging
-                // this layer rewrites: wait until they ran (the GPU still has that
-                // layer's FFN queued, so it does not idle while this one is queued).
-                if crate::shared::memory::chain::staging_fence() {
-                    crate::shared::memory::chain::fence_wait(device.library, (layer - 1) % 2).await?;
-                }
-                // Let the other lane queue its layer too: lanes interleave per layer
-                // as they did when every layer waited on the host.
-                tokio::task::yield_now().await;
-            }
+            let gpu = self.resources.map.attention(layer)?;
+            let device = self.resources.lanes[gpu].device;
+        }; device.library; {
             if layer != first {
                 unsafe {
                     self.advance(layer).await?;
@@ -530,13 +513,13 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     let started = Instant::now();
                     loop {
                         let gathered = requests.with_requests(|r| {
-                            r.poll_engram_gather(guard.batch, &self.lanes[gpu])
+                            r.poll_engram_gather(guard.batch, &self.resources.lanes[gpu])
                         })?;
                         match gathered {
                             cuteafd_loader::EngramGatherPoll::Ready(lease) => {
                                 unsafe {
-                                    self.engram
-                                        .apply(&mut self.lanes[gpu], &lease.view()?)
+                                    self.resources.engram
+                                        .apply(&mut self.resources.lanes[gpu], &lease.view()?)
                                         .await?;
                                 }
                                 break;
@@ -547,7 +530,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                             cuteafd_loader::EngramGatherPoll::Pending => {}
                         }
                         ensure!(
-                            started.elapsed() < self.timeout,
+                            started.elapsed() < self.resources.timeout,
                             "distributed Engram gather timed out at layer {layer}"
                         );
                         // A millisecond sleep here stalled the whole pass whenever
@@ -556,30 +539,30 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     }
                 }
                 if layer >= 37 {
-                    let input = self.lanes[gpu].prepared_input()?;
+                    let input = self.resources.lanes[gpu].prepared_input()?;
                     device
                         .future(unsafe {
-                            self.taps
+                            self.resources.taps
                                 .get_mut()
                                 .capture_cooperative(guard.batch.cache()?, &input)
                         })
                         .await?;
                 }
                 device
-                    .future(unsafe { self.lanes[gpu].get_mut().begin_prepared_cooperative() })
+                    .future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() })
                     .await?;
             }
             #[cfg(test)]
-            let trace_stream = self.lanes[gpu].trace_stream();
+            let trace_stream = self.resources.lanes[gpu].trace_stream();
             #[cfg(test)]
-            if self.trace && std::env::var_os("CUTEAFD_TRACE_QUERY").is_some() {
-                let query = self.lanes[gpu].query_output()?;
+            if self.resources.trace && std::env::var_os("CUTEAFD_TRACE_QUERY").is_some() {
+                let query = self.resources.lanes[gpu].query_output()?;
                 let position = query.tokens()?[0];
                 ensure!(position as usize + query.rows <= 16, "query trace extent exceeded");
                 let (captured, width) = trace_query_component(&query)?;
                 let mut bytes = query.rows * width;
                 let offset = ((layer + 20) * 16 + position as usize) * 131072;
-                let buffer = self.trace_queries[gpu].buffer;
+                let buffer = self.resources.trace_queries[gpu].buffer;
                 let destination = cuteafd_ffi::CuteafdDeviceBuffer {
                     ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, bytes, ..buffer
                 };
@@ -594,7 +577,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                         query.normalized_rank, extra, trace_stream) })?;
                     bytes += extra;
                 }
-                self.trace_records.push((position, layer + 120, bytes));
+                self.resources.trace_records.push((position, layer + 120, bytes));
                 if std::env::var("CUTEAFD_QUERY_COMPONENT").as_deref() == Ok("qb_pair") {
                     let qb_scratch=query.qb_scratch.context("full query-B trace scratch absent")?;
                     let bytes = qb_scratch.bytes;
@@ -605,20 +588,20 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     };
                     device.run(|| unsafe { device.library.copy_d2d_async(destination,
                         qb_scratch, bytes, trace_stream) })?;
-                    self.trace_records.push((position, layer + 160, bytes));
+                    self.resources.trace_records.push((position, layer + 160, bytes));
                 }
             }
             let index = if [2, 8, 14, 20, 24, 28, 32, 36].contains(&layer) {
-                self.indices[gpu].as_mut()
+                self.resources.indices[gpu].as_mut()
             } else {
                 None
             };
             let mut production = unsafe {
                 requests.with_requests(|r| {
-                    self.execution.enqueue_production(
+                    self.resources.execution.enqueue_production(
                         r.cache(),
                         guard.batch.cache()?,
-                        &self.lanes[gpu],
+                        &self.resources.lanes[gpu],
                         index,
                     )
                 })?
@@ -636,14 +619,14 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             }
             drop(production);
             #[cfg(test)]
-            if self.trace && std::env::var_os("CUTEAFD_TRACE_QUERY").is_some() {
-                let query = self.lanes[gpu].query_output()?;
+            if self.resources.trace && std::env::var_os("CUTEAFD_TRACE_QUERY").is_some() {
+                let query = self.resources.lanes[gpu].query_output()?;
                 let position = query.tokens()?[0];
                 ensure!(position as usize + query.rows <= 16, "query trace extent exceeded");
                 let (captured, width) = trace_query_component(&query)?;
                 let mut bytes = query.rows * width;
                 let offset = (layer * 16 + position as usize) * 131072;
-                let buffer = self.trace_queries[gpu].buffer;
+                let buffer = self.resources.trace_queries[gpu].buffer;
                 let destination = cuteafd_ffi::CuteafdDeviceBuffer {
                     ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, bytes, ..buffer
                 };
@@ -658,26 +641,26 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                         query.normalized_rank, extra, trace_stream) })?;
                     bytes += extra;
                 }
-                self.trace_records.push((position, layer + 80, bytes));
+                self.resources.trace_records.push((position, layer + 80, bytes));
             }
             let prepared = unsafe {
                 requests.with_requests(|r| {
-                    self.execution.prepare_layer(
+                    self.resources.execution.prepare_layer(
                         r.cache(),
                         guard.batch.cache()?,
-                        &mut self.lanes[gpu],
-                        self.indices[gpu].as_ref().map(DeviceOwner::get),
+                        &mut self.resources.lanes[gpu],
+                        self.resources.indices[gpu].as_ref().map(DeviceOwner::get),
                     )
                 })?
             };
             #[cfg(test)]
-            let prepared = if self.trace && std::env::var_os("CUTEAFD_TRACE_FFN").is_some()
+            let prepared = if self.resources.trace && std::env::var_os("CUTEAFD_TRACE_FFN").is_some()
                 && std::env::var("CUTEAFD_TRACE_LAYER").ok().map_or(true,
                     |value| value.split(',').any(|v| v.parse::<usize>().ok() == Some(layer))) {
                 let (prepared, record) = unsafe {
-                    prepared.trace_ffn_input(self.trace_buffers[gpu].buffer, trace_stream).await?
+                    prepared.trace_ffn_input(self.resources.trace_buffers[gpu].buffer, trace_stream).await?
                 };
-                self.trace_records.push(record);
+                self.resources.trace_records.push(record);
                 prepared
             } else { prepared };
             let completed = unsafe {
@@ -686,15 +669,15 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     .await?
             };
             unsafe {
-                self.execution
-                    .complete_layer(guard.batch.cache()?, &mut self.lanes[gpu], completed)
+                self.resources.execution
+                    .complete_layer(guard.batch.cache()?, &mut self.resources.lanes[gpu], completed)
                     .await?;
             }
-            if self.capture_routes {
-                self.route_capture[layer].clone_from(&self.lanes[gpu].captured_routes()[layer]);
+            if self.resources.capture_routes {
+                self.resources.route_capture[layer].clone_from(&self.resources.lanes[gpu].captured_routes()[layer]);
                 if tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG) {
                     let mut seen = [false; 384];
-                    for &expert in self.route_capture[layer].iter().flatten() {
+                    for &expert in self.resources.route_capture[layer].iter().flatten() {
                         if let Some(value) = seen.get_mut(expert as usize) { *value = true; }
                     }
                     tracing::debug!(target: "cuteafd::timing", layer, rows,
@@ -703,11 +686,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 }
             }
             #[cfg(test)]
-            if let Some(progress) = &self.observed_layer { progress.set(layer + 1); }
+            if let Some(progress) = &self.resources.observed_layer { progress.set(layer + 1); }
             #[cfg(test)]
-            if self.trace && std::env::var("CUTEAFD_TRACE_LAYER").ok()
+            if self.resources.trace && std::env::var("CUTEAFD_TRACE_LAYER").ok()
                 .map_or(true, |value| value.split(',').any(|v| v.parse::<usize>().ok() == Some(layer))) {
-                let output = self.lanes[gpu].output()?;
+                let output = self.resources.lanes[gpu].output()?;
                 let captured = if std::env::var_os("CUTEAFD_TRACE_PRE").is_some() {
                     output.pre
                 } else { output.residual };
@@ -715,7 +698,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 let paired = std::env::var_os("CUTEAFD_TRACE_FFN").is_some();
                 let offset = ((layer + if paired { 20 } else { 0 }) * 16 + position as usize) * 40976;
                 ensure!(position as usize + output.tokens.len() <= 16, "trace extent exceeded");
-                let buffer = self.trace_buffers[gpu].buffer;
+                let buffer = self.resources.trace_buffers[gpu].buffer;
                 ensure!(offset + captured.bytes <= buffer.bytes, "trace buffer exceeded");
                 let destination = cuteafd_ffi::CuteafdDeviceBuffer {
                     ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() },
@@ -724,7 +707,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 // Queue behind this producer and before its next overwrite. No
                 // host wait is added between layers; read back after the run.
                 device.run(|| unsafe { device.library.copy_d2d_async(destination, captured, captured.bytes,
-                    self.lanes[gpu].trace_stream()) })?;
+                    self.resources.lanes[gpu].trace_stream()) })?;
                 let mut captured_bytes = captured.bytes;
                 if std::env::var_os("CUTEAFD_TRACE_PRE").is_none() {
                     let destination = cuteafd_ffi::CuteafdDeviceBuffer {
@@ -732,10 +715,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                         bytes: output.pre.bytes, ..buffer
                     };
                     device.run(|| unsafe { device.library.copy_d2d_async(destination, output.pre,
-                        output.pre.bytes, self.lanes[gpu].trace_stream()) })?;
+                        output.pre.bytes, self.resources.lanes[gpu].trace_stream()) })?;
                     captured_bytes += output.pre.bytes;
                 }
-                self.trace_records.push((position, layer + if paired { 40 } else { 0 }, captured_bytes));
+                self.resources.trace_records.push((position, layer + if paired { 40 } else { 0 }, captured_bytes));
             }
             if reserved {
                 unsafe {
@@ -746,21 +729,21 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     flow.permit.publish(layer);
                 }
             }
-        }
+        });
         if stage.is_encoder() {
-            let gpu = self.map.attention(19)?;
-            let device = self.lanes[gpu].device;
+            let gpu = self.resources.map.attention(19)?;
+            let device = self.resources.lanes[gpu].device;
             if let Some(flow) = &flow {
                 flow.permit.wait_commit_turn().await;
                 ensure!((flow.keep_running)(), "client disconnected");
                 let mut suffix = flow.suffix.borrow_mut();
                 ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");
-                let output = self.lanes[gpu].output()?;
+                let output = self.resources.lanes[gpu].output()?;
                 device
                     .future(unsafe {
                         suffix
                             .get_mut()
-                            .capture_cooperative(&output, &self.suffix_stream)
+                            .capture_cooperative(&output, &self.resources.suffix_stream)
                     })
                     .await?;
             } else {
@@ -768,12 +751,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     .as_mut()
                     .context("distributed encoder suffix owner missing")?;
                 ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");
-                let output = self.lanes[gpu].output()?;
+                let output = self.resources.lanes[gpu].output()?;
                 device
                     .future(unsafe {
                         suffix
                             .get_mut()
-                            .capture_cooperative(&output, &self.suffix_stream)
+                            .capture_cooperative(&output, &self.resources.suffix_stream)
                     })
                     .await?;
             }
@@ -781,17 +764,17 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 unsafe {
                     self.advance(20).await?;
                 }
-                let gpu = self.map.attention(20)?;
-                let device = self.lanes[gpu].device;
+                let gpu = self.resources.map.attention(20)?;
+                let device = self.resources.lanes[gpu].device;
                 device
-                    .future(unsafe { self.lanes[gpu].get_mut().begin_prepared_cooperative() })
+                    .future(unsafe { self.resources.lanes[gpu].get_mut().begin_prepared_cooperative() })
                     .await?;
                 let mut production = unsafe {
                     requests.with_requests(|r| {
-                        self.execution.enqueue_production(
+                        self.resources.execution.enqueue_production(
                             r.cache(),
                             guard.batch.cache()?,
-                            &self.lanes[gpu],
+                            &self.resources.lanes[gpu],
                             None,
                         )
                     })?
@@ -809,14 +792,14 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     tokio::task::yield_now().await;
                 }
                 drop(production);
-                self.execution.finish_decoder_source(guard.batch.cache()?)?;
+                self.resources.execution.finish_decoder_source(guard.batch.cache()?)?;
             }
             self.state = State::Encoded(id);
         } else {
-            self.taps.output(guard.batch.cache()?)?;
-            let gpu = self.map.attention(39)?;
-            let output = self.lanes[gpu].output()?;
-            unsafe { self.head.execute_block_with_greedy(&output, selected, greedy).await?; }
+            self.resources.taps.output(guard.batch.cache()?)?;
+            let gpu = self.resources.map.attention(39)?;
+            let output = self.resources.lanes[gpu].output()?;
+            unsafe { self.resources.head.execute_block_with_greedy(&output, selected, greedy).await?; }
             self.state = State::Ready(id);
         }
         guard.completed = true;
@@ -830,34 +813,34 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     ) -> Result<()> {
         unsafe {
             requests.with_requests(|r| {
-                self.execution
+                self.resources.execution
                     .enqueue_encoder_publication(r.cache(), batch.cache()?, layer)
             })?;
         }
-        while !self.execution.poll_encoder_publication()? {
+        while !self.resources.execution.poll_encoder_publication()? {
             tokio::task::yield_now().await;
         }
         requests
             .borrow_mut()
-            .finish_distributed_encoder_publication(batch, &mut self.execution)
+            .finish_distributed_encoder_publication(batch, &mut self.resources.execution)
     }
     pub fn output(&self, batch: &RequestBatch) -> Result<DistributedTargetLogits<'_>> {
         self.state.ready(batch.cache()?.identity())?;
-        self.head.output()
+        self.resources.head.output()
     }
     /// Download selected head rows for sampling or constrained token selection.
     /// Rows index the compact head output, not the original request batch.
     pub async fn download_logits(&mut self, batch: &RequestBatch, rows: &[usize]) -> Result<Vec<u8>> {
         self.state.ready(batch.cache()?.identity())?;
-        self.head.download_rows(rows).await
+        self.resources.head.download_rows(rows).await
     }
     pub fn greedy_output(&mut self, batch: &RequestBatch) -> Result<Vec<(u32, f32)>> {
         self.state.ready(batch.cache()?.identity())?;
-        Ok(self.head.greedy_output()?.to_vec())
+        Ok(self.resources.head.greedy_output()?.to_vec())
     }
     pub fn taps(&self, batch: &RequestBatch) -> Result<TargetTaps<'_>> {
         self.state.ready(batch.cache()?.identity())?;
-        self.taps.output(batch.cache()?)
+        self.resources.taps.output(batch.cache()?)
     }
     pub fn enqueue_cache_commit(
         &mut self,
@@ -872,12 +855,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         );
         requests.validate_acceptance(batch, accepted)?;
         unsafe {
-            self.execution
+            self.resources.execution
                 .enqueue_cache_commit(requests.cache(), batch.cache()?, accepted)
         }
     }
     pub fn poll_cache_commit(&self) -> Result<bool> {
-        self.execution.poll_cache_commit()
+        self.resources.execution.poll_cache_commit()
     }
     pub fn commit(
         &mut self,
@@ -891,32 +874,32 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             "distributed pass incomplete"
         );
         self.state = State::Running;
-        self.taps.reset();
-        requests.commit_distributed(batch, &mut self.execution, accepted)?;
+        self.resources.taps.reset();
+        requests.commit_distributed(batch, &mut self.resources.execution, accepted)?;
         self.state = State::Idle;
         Ok(())
     }
     pub fn abort_cache_commit(&mut self, requests: &mut Requests<'a>) -> Result<()> {
-        requests.abort_distributed_cache_commit(&mut self.execution)
+        requests.abort_distributed_cache_commit(&mut self.resources.execution)
     }
     /// Execution and output consumers must be dropped before discarding. Any
     /// queued cache commit must first be completed or explicitly aborted.
     pub fn discard(&mut self, batch: &mut RequestBatch) -> Result<()> {
         batch.cancel();
-        self.taps.reset();
+        self.resources.taps.reset();
         self.state = State::Running;
-        for lane in &mut self.lanes {
+        for lane in &mut self.resources.lanes {
             let device = lane.device;
             device.run(|| {
                 lane.invalidate();
                 Ok(())
             })?;
         }
-        for index in self.indices.iter_mut().flatten() {
+        for index in self.resources.indices.iter_mut().flatten() {
             let device = index.device;
             device.run(|| index.restart())?;
         }
-        self.execution.restart_for(CacheStage::Full);
+        self.resources.execution.restart_for(CacheStage::Full);
         self.state = State::Idle;
         Ok(())
     }
@@ -1154,7 +1137,7 @@ mod tests {
         .enumerate()
         {
             pass.set_route_capture(true)?;
-            let route_capacities: Vec<_> = pass.route_capture.iter().map(Vec::capacity).collect();
+            let route_capacities: Vec<_> = pass.resources.route_capture.iter().map(Vec::capacity).collect();
             eprintln!(
                 "executing distributed full pass step={step} rows={}",
                 tokens.len()
@@ -1184,7 +1167,7 @@ mod tests {
             ensure!(pass.captured_routes().len() == 40, "distributed route history has missing layers");
             for (layer, routes) in pass.captured_routes().iter().enumerate() {
                 ensure!(routes.len() == tokens.len(), "distributed route row count differs at layer {layer}");
-                ensure!(routes == &pass.lanes[pass.map.attention(layer)?].captured_routes()[layer],
+                ensure!(routes == &pass.resources.lanes[pass.resources.map.attention(layer)?].captured_routes()[layer],
                     "distributed route history differs from its GPU owner");
                 ensure!(routes.iter().all(|row| row.iter().enumerate().all(|(i, id)|
                     *id < 384 && !row[..i].contains(id))), "invalid captured top-six routes at layer {layer}");
@@ -1257,7 +1240,7 @@ mod tests {
                 true,
             )
         })?;
-        let expected = pass.head.greedy_output()?.to_vec();
+        let expected = pass.resources.head.greedy_output()?.to_vec();
         pass.discard(&mut baseline_batch)?;
         requests.release(baseline)?;
         let lease = requests.admit(0, 92001)?;
@@ -1391,7 +1374,7 @@ mod tests {
             let mut reference: [Option<Vec<u8>>; 2] = [None, None];
             for concurrent in [false, true, true, true, true] {
                 let progress = std::rc::Rc::new(std::cell::Cell::new(0));
-                pass.observed_layer = Some(progress.clone());
+                pass.resources.observed_layer = Some(progress.clone());
                 let leases = [requests.admit(0, 94000)?, requests.admit(1, 94001)?];
                 for (lease, count) in leases.into_iter().zip(counts) { requests.begin_encoder(lease, count as u64)?; }
                 let mut batches = leases.into_iter().zip(counts).map(|(lease, count)| requests.reserve_encoder(&[
@@ -1443,7 +1426,7 @@ mod tests {
                 }
             }
             eprintln!("PASS independent encoder cache leases: sequential and concurrent residuals exact");
-            pass.observed_layer = None;
+            pass.resources.observed_layer = None;
         }
         for (case, chunks) in [
             vec![&prompt[..3], &prompt[3..]],
@@ -1458,8 +1441,8 @@ mod tests {
             let mut expected_trace = Vec::new();
             for interleaved in [false, true] {
                 let tracing = std::env::var_os("CUTEAFD_TRACE_ENCODER").is_some();
-                pass.trace = tracing;
-                other.trace = tracing;
+                pass.resources.trace = tracing;
+                other.resources.trace = tracing;
                 let lease = requests.admit(0, 93000 + case as u64)?;
                 requests.begin_encoder(lease, 7)?;
                 let mut suffix = devices[map.attention(19)?]
@@ -1502,23 +1485,23 @@ mod tests {
                         pass.commit(&mut requests, &mut batch, &[chunk.len() as u32])?;
                     }
                 }
-                pass.trace = false;
-                other.trace = false;
+                pass.resources.trace = false;
+                other.resources.trace = false;
                 let mut trace = Vec::new();
                 if tracing {
                     for lane in [&mut pass, &mut other] {
                         for gpu in 0..2 {
                             devices[gpu].run(|| unsafe {
-                                lib.cuda_stream_synchronize(lane.lanes[gpu].trace_stream())
+                                lib.cuda_stream_synchronize(lane.resources.lanes[gpu].trace_stream())
                             })?;
                         }
-                        for (position, layer, bytes) in lane.trace_records.drain(..) {
+                        for (position, layer, bytes) in lane.resources.trace_records.drain(..) {
                             let gpu = map.attention(layer % 40)?;
                             let (buffer, offset) = if layer >= 80 {
-                                (lane.trace_queries[gpu].buffer, ((if layer >= 160 { layer - 120 } else if layer >= 120 { layer - 100 } else { layer - 80 }) * 16 + position as usize) * 131072)
+                                (lane.resources.trace_queries[gpu].buffer, ((if layer >= 160 { layer - 120 } else if layer >= 120 { layer - 100 } else { layer - 80 }) * 16 + position as usize) * 131072)
                             } else {
                                 let stored_layer = if layer >= 40 { layer - 20 } else { layer };
-                                (lane.trace_buffers[gpu].buffer, (stored_layer * 16 + position as usize) * 40976)
+                                (lane.resources.trace_buffers[gpu].buffer, (stored_layer * 16 + position as usize) * 40976)
                             };
                             let source = cuteafd_ffi::CuteafdDeviceBuffer {
                                 ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, bytes, ..buffer
@@ -1609,7 +1592,7 @@ mod tests {
                         true,
                     )
                 })?;
-                let next = pass.head.greedy_output()?.to_vec();
+                let next = pass.resources.head.greedy_output()?.to_vec();
                 if let Some(expected) = expected_case {
                     assert_eq!(
                         next[0], expected,

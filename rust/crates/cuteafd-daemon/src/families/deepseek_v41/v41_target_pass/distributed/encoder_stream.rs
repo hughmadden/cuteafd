@@ -57,7 +57,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             "distributed encoder lane still in use"
         );
         ensure!(
-            self.map == other.map,
+            self.resources.map == other.resources.map,
             "distributed encoder lane placement differs"
         );
         let requests = RefCell::new(requests);

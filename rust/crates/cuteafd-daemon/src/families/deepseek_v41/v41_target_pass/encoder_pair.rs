@@ -27,18 +27,18 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         guard.requests.validate(batch)?;
         ensure!(batch.cache()?.is_reserved(), "reserved encoder requires a reserved chunk");
         self.state.begin()?;
-        self.execution.restart_for(CacheStage::Encoder);
-        self.lane.restart()?; self.index.restart()?; self.taps.reset();
-        unsafe { guard.requests.begin_input(batch, &mut self.embedding, &mut self.lane)?; }
+        self.resources.execution.restart_for(CacheStage::Encoder);
+        self.resources.lane.restart()?; self.resources.index.restart()?; self.resources.taps.reset();
+        unsafe { guard.requests.begin_input(batch, &mut self.resources.embedding, &mut self.resources.lane)?; }
         {
             let requests = RefCell::new(&mut *guard.requests);
             unsafe { self.execute_encoder_chunk(&requests, batch, transport, None).await?; }
         }
-        suffix.capture(&self.lane.output()?)?;
-        self.lane.advance()?;
+        suffix.capture(&self.resources.lane.output()?)?;
+        self.resources.lane.advance()?;
         unsafe {
-            self.lane.begin_prepared()?;
-            guard.requests.publish_encoder_boundary(batch, &mut self.execution, &self.lane)?;
+            self.resources.lane.begin_prepared()?;
+            guard.requests.publish_encoder_boundary(batch, &mut self.resources.execution, &self.resources.lane)?;
         }
         self.state = State::Encoded(batch.cache()?.identity());
         guard.complete = true;
@@ -61,9 +61,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             guard.requests.validate(batch)?;
             ensure!(batch.cache()?.is_reserved(), "encoder pair requires reserved chunks");
             pass.state.begin()?;
-            pass.execution.restart_for(CacheStage::Encoder);
-            pass.lane.restart()?; pass.index.restart()?; pass.taps.reset();
-            unsafe { guard.requests.begin_input(batch, &mut pass.embedding, &mut pass.lane)?; }
+            pass.resources.execution.restart_for(CacheStage::Encoder);
+            pass.resources.lane.restart()?; pass.resources.index.restart()?; pass.resources.taps.reset();
+            unsafe { guard.requests.begin_input(batch, &mut pass.resources.embedding, &mut pass.resources.lane)?; }
         }
         {
             // These futures are polled on the CUDA owner. Cache borrows are
@@ -79,11 +79,11 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             )?;
         }
         for (pass, batch) in [(&mut *self, &mut **first), (&mut *other, &mut **second)] {
-            suffix.capture(&pass.lane.output()?)?;
-            pass.lane.advance()?;
+            suffix.capture(&pass.resources.lane.output()?)?;
+            pass.resources.lane.advance()?;
             unsafe {
-                pass.lane.begin_prepared()?;
-                guard.requests.publish_encoder_boundary(batch, &mut pass.execution, &pass.lane)?;
+                pass.resources.lane.begin_prepared()?;
+                guard.requests.publish_encoder_boundary(batch, &mut pass.resources.execution, &pass.resources.lane)?;
             }
             pass.state = State::Encoded(batch.cache()?.identity());
         }
@@ -102,12 +102,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             if let Some(permit) = permit { permit.wait_predecessor(layer).await; }
             unsafe { self.prepare_encoder_query(requests, batch, layer).await?; }
             let prepared = unsafe { requests.borrow_mut().prepare_encoder_layer(batch,
-                &mut self.execution, &mut self.lane, &mut self.index)? };
+                &mut self.resources.execution, &mut self.resources.lane, &mut self.resources.index)? };
             // prepare_encoder_layer finishes the attention readers and publishes
             // this layer's window/source before releasing the cache borrow.
             if let Some(permit) = permit { permit.publish(layer); }
             let done = unsafe { prepared.execute(transport, 0, batch.image_mask()).await? };
-            unsafe { self.execution.complete_layer(batch.cache()?, &mut self.lane, done)?; }
+            unsafe { self.resources.execution.complete_layer(batch.cache()?, &mut self.resources.lane, done)?; }
         }
         Ok(())
     }
@@ -116,18 +116,18 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     async unsafe fn prepare_encoder_query(&mut self, requests: &RefCell<&mut Requests<'a>>,
         batch: &mut RequestBatch, layer: usize) -> Result<()> {
         if layer == 0 { return Ok(()); }
-        self.lane.advance()?;
+        self.resources.lane.advance()?;
         if let Some(gate) = [1, 14].iter().position(|&l| l == layer) {
             let start = Instant::now();
             loop {
-                let ready = unsafe { requests.borrow().poll_engram(batch, &mut self.upload,
-                    &mut self.gates[gate], &mut self.lane)? };
+                let ready = unsafe { requests.borrow().poll_engram(batch, &mut self.resources.upload,
+                    &mut self.resources.gates[gate], &mut self.resources.lane)? };
                 if ready { break; }
-                ensure!(start.elapsed() < self.engram_timeout, "paired engram gather timed out");
+                ensure!(start.elapsed() < self.resources.engram_timeout, "paired engram gather timed out");
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
-        unsafe { self.lane.begin_prepared()?; }
+        unsafe { self.resources.lane.begin_prepared()?; }
         Ok(())
     }
 

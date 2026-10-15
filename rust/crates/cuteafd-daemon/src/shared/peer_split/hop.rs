@@ -22,13 +22,14 @@ use crate::shared::memory::DeviceAllocation;
 use crate::shared::memory::device::{Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::placement::{hop_buffer_bytes, Hop, HopSpec, HOP_SLOTS};
+use cuteafd_loader::placement::{hop_buffer_bytes, Hop, HopSpec, HopStorage, HOP_SLOTS};
 use std::ffi::c_void;
 
 /// One directed transfer stream per request lane. No intermediate device or
 /// host buffer is needed: copies land in the destination's existing inputs.
 pub(crate) struct DirectInputHop<'a> {
     source: Device<'a>,
+    contract: Option<HopSpec>,
     destination: Stream<'a>,
     /// Device-ordered passes: an SM copy on the
     /// destination GPU ordered by the stage chain, with no host wait.
@@ -46,10 +47,18 @@ impl<'a> DirectInputHop<'a> {
             .then(|| destination.run(|| destination.library.v41_peer_copy())).transpose()?;
         Ok(Self {
             source,
+            contract: None,
             destination: Stream::new(destination)?,
             sm,
         })
     }
+    /// Admission binds geometry once; destination inputs remain family-owned.
+    pub fn bind(&mut self, hops: &[Hop], spec: HopSpec) -> Result<()> {
+        validate_direct_input_contract(self.source.id, self.destination.device.id, hops, spec)?;
+        self.contract = Some(spec);
+        Ok(())
+    }
+
     pub fn destination(&self) -> Device<'a> { self.destination.device }
 
     #[cfg(test)]
@@ -73,6 +82,13 @@ impl<'a> DirectInputHop<'a> {
                     && s.bytes <= d.bytes),
             "block transfer devices or extents differ"
         );
+        if let Some(spec) = self.contract {
+            let bytes = sources.iter().try_fold(0usize, |sum, source| sum.checked_add(source.bytes))
+                .context("direct-input hop extent overflow")?;
+            let row_bytes = usize::try_from(spec.row_bytes)?;
+            ensure!(bytes > 0 && bytes % row_bytes == 0 && (bytes / row_bytes) as u64 <= spec.rows,
+                "direct-input hop exceeds admitted row geometry");
+        }
         let device = self.destination.device;
         if let Some(sm) = self.sm.as_ref().filter(|_| crate::shared::memory::chain::deferred()) {
             // The SM copy follows the chain head (the producers on the source
@@ -107,6 +123,16 @@ impl<'a> DirectInputHop<'a> {
         // Stream::wait retains and drains the stream on failure/cancellation.
         self.destination.wait().await
     }
+}
+
+fn validate_direct_input_contract(source: i32, destination: i32, hops: &[Hop], spec: HopSpec) -> Result<()> {
+    ensure!(spec.storage == HopStorage::DirectInput && spec.row_bytes > 0 && spec.row_bytes % 16 == 0
+        && spec.rows > 0 && spec.lanes > 0 && source != destination,
+        "invalid direct-input hop contract");
+    ensure!(hops.iter().all(|hop| hop.storage == spec.storage && hop.row_bytes == spec.row_bytes
+        && i32::from(hop.from) == source && i32::from(hop.to) == destination),
+        "direct-input hop endpoints or storage differ from admission");
+    Ok(())
 }
 
 /// Both GPUs' hop receive slots and control words.
@@ -249,6 +275,28 @@ impl<'a> HopLink<'a> {
 mod cuda_tests {
     use super::*;
     use cuteafd_loader::placement::{plan_hops, FfnMode, LayerMode};
+
+    #[test]
+    fn direct_input_binding_rejects_receive_storage_and_wrong_endpoints() -> Result<()> {
+        let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+        let modes: Vec<_> = (0..40).map(|layer| LayerMode::Whole {
+            gpu: u8::from(layer >= 20), ffn: FfnMode::Owner,
+        }).collect();
+        let hops = plan_hops(&modes, &spec)?;
+        validate_direct_input_contract(0, 1, &hops, spec)?;
+        validate_direct_input_contract(1, 0, &[], spec)?;
+        assert!(validate_direct_input_contract(1, 0, &hops, spec).is_err());
+        assert!(validate_direct_input_contract(0, 0, &[], spec).is_err());
+        for bad in [HopSpec { storage: HopStorage::ReceiveSlots, ..spec },
+            HopSpec { row_bytes: 0, ..spec }, HopSpec { row_bytes: 17, ..spec },
+            HopSpec { rows: 0, ..spec }, HopSpec { lanes: 0, ..spec }] {
+            assert!(validate_direct_input_contract(0, 1, &hops, bad).is_err());
+        }
+        let mut bad = hops;
+        bad[0].storage = HopStorage::ReceiveSlots;
+        assert!(validate_direct_input_contract(0, 1, &bad, spec).is_err());
+        Ok(())
+    }
 
     /// Layer ranges 0-1 on GPU0, 2-3 on GPU1, head on GPU0: one boundary hop
     /// each way per lane, landing byte-exact, with receive bytes equal to the

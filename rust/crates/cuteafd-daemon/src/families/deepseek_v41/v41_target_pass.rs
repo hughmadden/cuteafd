@@ -11,6 +11,25 @@ use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
 use crate::families::deepseek_v41::v41_target_head::{SampledTargetRows, TargetHeadWave, TargetLogits, TargetSamplingRowRequest};
 use anyhow::{ensure, Context, Result};
 use std::time::{Duration, Instant};
+// Expand scheduling around concrete layer bodies: receive/FFN futures keep
+// their original types and lexical borrows, including the direct C1 path.
+macro_rules! layer_schedule {
+    ($stage:expr; $layer:ident, $first:ident; { $($setup:tt)* }; $library:expr; $body:block) => {{
+        let range = $stage.windows();
+        let $first = range.start;
+        for $layer in range {
+            $($setup)*
+            if $layer != $first && crate::shared::memory::chain::deferred() {
+                if crate::shared::memory::chain::staging_fence() {
+                    crate::shared::memory::chain::fence_wait($library, ($layer - 1) % 2).await?;
+                }
+                tokio::task::yield_now().await;
+            }
+            $body
+        }
+    }};
+}
+
 mod taps;
 mod distributed;
 pub(crate) use distributed::DistributedTargetPass;
@@ -114,7 +133,17 @@ impl Drop for BatchGuard<'_> {
 /// Each alternating wave owns a separate instance; immutable weights are shared.
 /// The CUDA-owning executor must poll this owner on one thread. Transport remains
 /// external so a scheduler can assign a separate connection set to each wave.
-pub(crate) struct TargetPass<'w, 'a> {
+pub(crate) struct Pass<'a, R> {
+    resources: R,
+    state: State,
+    sampled: Option<SampledTargetRows>,
+    chain: Option<crate::shared::memory::chain::StageChain<'a>>,
+    device_order: bool,
+}
+
+pub(crate) type TargetPass<'w, 'a> = Pass<'a, SingleResources<'w, 'a>>;
+
+pub(crate) struct SingleResources<'w, 'a> {
     embedding: TargetEmbeddingWave<'w, 'a>,
     lane: BackboneLane<'w, 'a>,
     index: IndexLane<'w, 'a>,
@@ -124,14 +153,29 @@ pub(crate) struct TargetPass<'w, 'a> {
     head: TargetHeadWave<'w, 'a>,
     taps: TargetTapWave<'a>,
     engram_timeout: Duration,
-    state: State,
-    /// Per-row selections from the last [`HeadTerminal::Sampled`] pass. `None`
-    /// for every other terminal.
-    sampled: Option<SampledTargetRows>,
-    /// Device-side stage ordering for this pass owner (see `v41_memory::chain`).
-    chain: Option<crate::shared::memory::chain::StageChain<'a>>,
-    /// The next verification pass may run device-ordered (see `set_device_order`).
-    device_order: bool,
+}
+
+impl<'a, R> Pass<'a, R> {
+    /// Select ordering once per pass, before borrowing its concrete resources.
+    fn begin_chain(&mut self, enabled: bool) -> Result<Option<crate::shared::memory::chain::ChainHandle<'a>>> {
+        if let Some(chain) = &self.chain {
+            chain.set_device_order(std::mem::replace(&mut self.device_order, true));
+        }
+        let Some(chain) = self.chain.as_ref().filter(|_| enabled) else { return Ok(None) };
+        // Cancellation may have left work queued on this owner.
+        chain.drain()?;
+        Ok(Some(chain.handle()))
+    }
+
+    fn drain_chain(&self) -> Result<()> {
+        let chain = self.chain.as_ref().context("target pass chain absent")?;
+        if crate::shared::memory::chain::device_enabled() {
+            chain.drain_bounded(Duration::from_secs(60)).map_err(|error|
+                error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
+        } else { chain.drain() }
+    }
+
+    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
     pub fn bind_execution_plan(&self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
@@ -142,26 +186,24 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             "single RTX execution differs from admitted ownership");
         Ok(())
     }
-    /// The next pass may run device-ordered (`CUTEAFD_V41_DEVICE`); reset after it.
-    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
     pub fn set_route_capture(&mut self, enabled: bool) {
-        self.lane.set_route_capture(enabled);
-        if enabled { self.index.enable_small_graph_shapes(); }
+        self.resources.lane.set_route_capture(enabled);
+        if enabled { self.resources.index.enable_small_graph_shapes(); }
     }
-    pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { self.lane.captured_routes() }
+    pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { self.resources.lane.captured_routes() }
     /// Host FFN stage split of the last captured pass.
-    pub fn captured_ffn_split(&self) -> crate::families::deepseek_v41::v41_backbone_lane::FfnSplit { self.lane.captured_ffn_split() }
+    pub fn captured_ffn_split(&self) -> crate::families::deepseek_v41::v41_backbone_lane::FfnSplit { self.resources.lane.captured_ffn_split() }
     /// Device time per layer (FFN finish to FFN finish) of the last captured
     /// pass; layer 0 has no predecessor.
     pub fn captured_layer_us(&self) -> Vec<Option<f64>> {
-        self.lane.layer_clock().read()
+        self.resources.lane.layer_clock().read()
     }
     pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
-        self.lane.install_attention_plan(plan)
+        self.resources.lane.install_attention_plan(plan)
     }
-    pub fn set_attention_decode(&mut self, decode: bool) { self.lane.set_attention_decode(decode); }
+    pub fn set_attention_decode(&mut self, decode: bool) { self.resources.lane.set_attention_decode(decode); }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
-        self.lane.reserve_sparse_decode_rows(rows)
+        self.resources.lane.reserve_sparse_decode_rows(rows)
     }
     pub fn new(
         embedding: TargetEmbeddingWave<'w, 'a>,
@@ -182,15 +224,17 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let chain = crate::shared::memory::chain::enabled()
             .then(|| crate::shared::memory::chain::StageChain::new(upload.library())).transpose()?;
         Ok(Self {
-            embedding,
-            lane,
-            index,
-            execution,
-            upload,
-            gates,
-            head,
-            taps,
-            engram_timeout,
+            resources: SingleResources {
+                embedding,
+                lane,
+                index,
+                execution,
+                upload,
+                gates,
+                head,
+                taps,
+                engram_timeout,
+            },
             state: State::Idle,
             sampled: None,
             chain,
@@ -213,7 +257,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         self.set_attention_decode(false);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "ordinary target execute requires full phase");
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Regular).await?; }
-        self.head.output()
+        self.resources.head.output()
     }
     /// Full-logit decode uses the same fixed attention as device-scored verification.
     /// # Safety
@@ -223,7 +267,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         self.set_attention_decode(true);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "decode target execute requires full phase");
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Regular).await?; }
-        self.head.output()
+        self.resources.head.output()
     }
     /// Execute one full verification while allowing unrelated request commits
     /// during remote waits. The caller owns disjoint leases and drains queued
@@ -235,14 +279,14 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         self.set_attention_decode(true);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "shared target execute requires full phase");
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Regular).await?; }
-        self.head.output()
+        self.resources.head.output()
     }
     pub async unsafe fn execute_greedy(&mut self, requests: &Requests<'a>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize]) -> Result<Vec<(u32, f32)>> {
         self.set_attention_decode(true);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "greedy target execute requires full phase");
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Greedy).await?; }
-        self.head.greedy_output()
+        self.resources.head.greedy_output()
     }
     pub async unsafe fn execute_shared_greedy(&mut self,
         requests: &std::cell::RefCell<&mut Requests<'a>>, batch: &mut RequestBatch,
@@ -250,7 +294,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         self.set_attention_decode(true);
         ensure!(batch.cache()?.stage() == CacheStage::Full, "shared greedy target execute requires full phase");
         unsafe { self.execute_phase(requests, batch, transport, placement, selected, None, None, HeadTerminal::Greedy).await?; }
-        self.head.greedy_output()
+        self.resources.head.greedy_output()
     }
     /// Run one verification pass and select every row on the device with the
     /// v4.1 target-sampler. The caller names the per-row parameters and, for
@@ -288,7 +332,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// Download full logits for a subset of the sampled rows, in the same order.
     pub async fn download_sampled_rows(&mut self, rows: &SampledTargetRows,
         selection: &[usize]) -> Result<Vec<u8>> {
-        self.head.download_sampled_rows(rows, selection).await
+        self.resources.head.download_sampled_rows(rows, selection).await
     }
     pub async unsafe fn execute_encoder(&mut self, requests: &Requests<'a>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, suffix: &mut EncoderSuffix<'a>) -> Result<()> {
@@ -350,7 +394,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             )
             .await?;
         }
-        self.head.output()
+        self.resources.head.output()
     }
     async unsafe fn execute_phase(&mut self, requests: &impl RequestAccess<'a>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize],
@@ -363,27 +407,19 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let step_sample = if verification && tracing::enabled!(target: "cuteafd::target_step", tracing::Level::DEBUG) {
             Some((batch.cache()?.positions().len(), std::time::Instant::now()))
         } else { None };
-        if let Some(chain) = &self.chain {
-            chain.set_device_order(std::mem::replace(&mut self.device_order, true));
-        }
-        let Some(handle) = self.chain.as_ref().filter(|_| verification).map(|chain| chain.handle()) else {
+        let Some(handle) = self.begin_chain(verification)? else {
             return unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
                 suffix, encoder, terminal).await };
         };
-        // A cancelled earlier pass may have left chained work queued.
-        self.chain.as_ref().unwrap().drain()?;
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_phase_inner(
             requests, batch, transport, placement, selected, suffix, encoder, terminal)) }).await;
         // Every consumer after the pass (commit, dSpark, logits downloads) is
         // unscoped, so the chained work must be complete before returning.
-        let drained = if crate::shared::memory::chain::device_enabled() {
-            self.chain.as_ref().unwrap().drain_bounded(std::time::Duration::from_secs(60)).map_err(|error|
-                error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
-        } else { self.chain.as_ref().unwrap().drain() };
+        let drained = self.drain_chain();
         let result = result.and(drained).and_then(|()| transport.check_device());
         if result.is_ok() && crate::shared::memory::chain::device_enabled() {
             // Device-ordered local layers left their captured routes in the router's ring.
-            self.lane.drain_route_ring()?;
+            self.resources.lane.drain_route_ring()?;
         }
         if let Some((rows, started)) = step_sample {
             tracing::debug!(target: "cuteafd::target_step", rows,
@@ -428,41 +464,33 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             completed: false,
         };
         if !stage.is_encoder() {
-            self.taps.begin(guard.batch.cache()?)?;
+            self.resources.taps.begin(guard.batch.cache()?)?;
         }
-        self.execution.restart_for(stage);
+        self.resources.execution.restart_for(stage);
         if stage == CacheStage::Replay {
             let encoder = encoder.context("missing retained encoder suffix")?;
             ensure!(encoder.tokens == guard.batch.cache()?.positions(), "encoder suffix/replay row order differs");
-            self.lane.restart_decoder(encoder)?;
-            self.index.restart_decoder()?;
-            unsafe { if requests.cooperative_completion() { self.lane.begin_prepared_cooperative().await?; }
-                    else { self.lane.begin_prepared()?; } }
+            self.resources.lane.restart_decoder(encoder)?;
+            self.resources.index.restart_decoder()?;
+            unsafe { if requests.cooperative_completion() { self.resources.lane.begin_prepared_cooperative().await?; }
+                    else { self.resources.lane.begin_prepared()?; } }
         } else {
-            self.lane.restart()?;
-            self.index.restart()?;
+            self.resources.lane.restart()?;
+            self.resources.index.restart()?;
             let text = if requests.cooperative_completion() {
                 requests.with_requests(|requests| requests.text_embedding_input(guard.batch))?
             } else { None };
             if let Some((tokens, positions)) = text {
-                unsafe { self.lane.begin_tokens_cooperative(&mut self.embedding, tokens, &positions).await?; }
+                unsafe { self.resources.lane.begin_tokens_cooperative(&mut self.resources.embedding, tokens, &positions).await?; }
             } else {
-                unsafe { requests.with_requests(|requests| requests.begin_input(guard.batch, &mut self.embedding, &mut self.lane))?; }
+                unsafe { requests.with_requests(|requests| requests.begin_input(guard.batch, &mut self.resources.embedding, &mut self.resources.lane))?; }
             }
         }
-        for layer in stage.windows() {
-            if layer != stage.windows().start && crate::shared::memory::chain::deferred() {
-                // See the distributed pass: the previous layer's attention uploads ran.
-                if crate::shared::memory::chain::staging_fence() {
-                    crate::shared::memory::chain::fence_wait(self.upload.library(), (layer - 1) % 2).await?;
-                }
-                // Let the other lane queue its layer too: lanes interleave per layer
-                // as they did when every layer waited on the host.
-                tokio::task::yield_now().await;
-            }
-            if layer != stage.windows().start {
+        layer_schedule!(stage; layer, first; {}; self.resources.upload.library(); {
+
+            if layer != first {
                 let prepare_timing = Instant::now();
-                self.lane.advance()?;
+                self.resources.lane.advance()?;
                 let advance_us = prepare_timing.elapsed().as_micros() as u64;
                 if let Some(gate) = [1, 14].iter().position(|&l| l == layer) {
                     let start = Instant::now();
@@ -471,34 +499,34 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                     // uses the same queued form instead of draining the chain.
                     if requests.cooperative_completion() || crate::shared::memory::chain::active() {
                         loop {
-                            let gathered = requests.with_requests(|requests| requests.poll_engram_gather(guard.batch, &self.lane))?;
+                            let gathered = requests.with_requests(|requests| requests.poll_engram_gather(guard.batch, &self.resources.lane))?;
                             match gathered {
                                 cuteafd_loader::EngramGatherPoll::Ready(lease) => {
-                                    let rows = self.upload.upload_cooperative(&lease.view()?).await?;
-                                    unsafe { self.lane.apply_engram_cooperative(&mut self.gates[gate], &rows).await?; }
+                                    let rows = self.resources.upload.upload_cooperative(&lease.view()?).await?;
+                                    unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
                                     break;
                                 }
                                 cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
                                 cuteafd_loader::EngramGatherPoll::Pending => {}
                             }
-                            ensure!(start.elapsed() < self.engram_timeout, "target engram gather timed out at layer {layer}");
+                            ensure!(start.elapsed() < self.resources.engram_timeout, "target engram gather timed out at layer {layer}");
                             // The gather normally lands within microseconds of this
                             // point; a millisecond sleep would stall the whole pass.
                             tokio::task::yield_now().await;
                         }
                     } else {
                         // The direct engram gate uses legacy-stream copies.
-                        crate::shared::memory::chain::settle(self.upload.library())?;
+                        crate::shared::memory::chain::settle(self.resources.upload.library())?;
                         while !unsafe {
                         requests.with_requests(|requests| requests.poll_engram(
                             guard.batch,
-                            &mut self.upload,
-                            &mut self.gates[gate],
-                            &mut self.lane,
+                            &mut self.resources.upload,
+                            &mut self.resources.gates[gate],
+                            &mut self.resources.lane,
                         ))?
                     } {
                         ensure!(
-                            start.elapsed() < self.engram_timeout,
+                            start.elapsed() < self.resources.engram_timeout,
                             "target engram gather timed out at layer {layer}"
                         );
                         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -508,80 +536,80 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 if layer >= 37 {
                     unsafe {
                         if requests.cooperative_completion() {
-                            self.taps.capture_cooperative(guard.batch.cache()?, &self.lane.prepared_input()?).await?;
-                        } else { self.taps.capture(guard.batch.cache()?, &self.lane.prepared_input()?)?; }
+                            self.resources.taps.capture_cooperative(guard.batch.cache()?, &self.resources.lane.prepared_input()?).await?;
+                        } else { self.resources.taps.capture(guard.batch.cache()?, &self.resources.lane.prepared_input()?)?; }
                     }
                 }
                 let tapped_us = prepare_timing.elapsed().as_micros() as u64;
                 unsafe {
-                    if requests.cooperative_completion() { self.lane.begin_prepared_cooperative().await?; }
-                    else { self.lane.begin_prepared()?; }
+                    if requests.cooperative_completion() { self.resources.lane.begin_prepared_cooperative().await?; }
+                    else { self.resources.lane.begin_prepared()?; }
                 }
                 tracing::debug!(target: "cuteafd::timing", layer, rows, advance_us, engram_us, taps_us=tapped_us-advance_us-engram_us, begin_us=prepare_timing.elapsed().as_micros() as u64-tapped_us, "target layer preparation");
             }
             unsafe {
                 let cooperative = requests.cooperative_completion();
                 if cooperative {
-                    let mut production = requests.with_requests(|requests| self.execution.enqueue_production_and_index(
-                        requests.cache(), guard.batch.cache()?, &self.lane, &mut self.index))?;
+                    let mut production = requests.with_requests(|requests| self.resources.execution.enqueue_production_and_index(
+                        requests.cache(), guard.batch.cache()?, &self.resources.lane, &mut self.resources.index))?;
                     while !requests.with_requests(|requests| production.poll(requests.cache(), guard.batch.cache()?))? {
                         tokio::task::yield_now().await;
                     }
                 }
                 let prepared = requests.with_requests(|requests| {
                     if cooperative {
-                        self.execution.prepare_layer_cooperative(requests.cache(), guard.batch.cache()?,
-                            &mut self.lane, &mut self.index)
+                        self.resources.execution.prepare_layer_cooperative(requests.cache(), guard.batch.cache()?,
+                            &mut self.resources.lane, &mut self.resources.index)
                     } else {
-                        self.execution.prepare_layer(requests.cache(), guard.batch.cache()?,
-                            &mut self.lane, &mut self.index)
+                        self.resources.execution.prepare_layer(requests.cache(), guard.batch.cache()?,
+                            &mut self.resources.lane, &mut self.resources.index)
                     }
                 })?;
                 // No RefCell guard or bank reference survives into this await.
                 let completed = prepared.execute(transport, placement, guard.batch.image_mask()).await?;
                 if cooperative {
-                    self.execution.complete_layer_cooperative(guard.batch.cache()?, &mut self.lane, completed).await?;
-                } else { self.execution.complete_layer(guard.batch.cache()?, &mut self.lane, completed)?; }
+                    self.resources.execution.complete_layer_cooperative(guard.batch.cache()?, &mut self.resources.lane, completed).await?;
+                } else { self.resources.execution.complete_layer(guard.batch.cache()?, &mut self.resources.lane, completed)?; }
             }
             if let Some(directory) = &activation_trace {
-                self.lane.trace_output(directory)?;
+                self.resources.lane.trace_output(directory)?;
             }
-        }
+        });
         if stage.is_encoder() {
             suffix
                 .as_mut()
                 .context("missing encoder retention owner")?
-                .capture(&self.lane.output()?)?;
+                .capture(&self.resources.lane.output()?)?;
             if stage == CacheStage::Encoder {
-                self.lane.advance()?;
+                self.resources.lane.advance()?;
                 unsafe {
-                    if requests.cooperative_completion() { self.lane.begin_prepared_cooperative().await?; }
-                    else { self.lane.begin_prepared()?; }
-                    requests.with_requests(|requests| self.execution.produce_decoder_source(
+                    if requests.cooperative_completion() { self.resources.lane.begin_prepared_cooperative().await?; }
+                    else { self.resources.lane.begin_prepared()?; }
+                    requests.with_requests(|requests| self.resources.execution.produce_decoder_source(
                         requests.cache(),
                         guard.batch.cache()?,
-                        &self.lane,
+                        &self.resources.lane,
                     ))?;
                 }
             }
             self.state = State::Encoded(id);
         } else {
-            self.taps.output(guard.batch.cache()?)?;
-            let output = self.lane.output()?;
+            self.resources.taps.output(guard.batch.cache()?)?;
+            let output = self.resources.lane.output()?;
             match terminal {
                 HeadTerminal::Greedy => {
-                    unsafe { self.head.execute_block_greedy(&output, selected, requests.cooperative_completion()).await?; }
+                    unsafe { self.resources.head.execute_block_greedy(&output, selected, requests.cooperative_completion()).await?; }
                 }
                 HeadTerminal::Regular => {
                     if requests.cooperative_completion() {
-                        unsafe { self.head.execute_block_cooperative(&output, selected).await?; }
+                        unsafe { self.resources.head.execute_block_cooperative(&output, selected).await?; }
                     } else {
-                        unsafe { self.head.execute_block(&output, selected)?; }
+                        unsafe { self.resources.head.execute_block(&output, selected)?; }
                     }
                 }
                 HeadTerminal::Sampled { requests: rows, masks, mask_words, ordered_rows } => {
                     let sampled = unsafe {
-                        self.head
+                        self.resources.head
                             .execute_block_sampled(&output, selected, rows, masks, mask_words,
                                 ordered_rows, requests.cooperative_completion())
                             .await?
@@ -596,15 +624,15 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
     pub fn output(&self, batch: &RequestBatch) -> Result<TargetLogits<'_>> {
         self.state.ready(batch.cache()?.identity())?;
-        self.head.output()
+        self.resources.head.output()
     }
     pub async fn download_logits(&mut self, batch: &RequestBatch, rows: &[usize]) -> Result<Vec<u8>> {
         self.state.ready(batch.cache()?.identity())?;
-        self.head.download_rows(rows).await
+        self.resources.head.download_rows(rows).await
     }
     pub fn taps(&self, batch: &RequestBatch) -> Result<TargetTaps<'_>> {
         self.state.ready(batch.cache()?.identity())?;
-        self.taps.output(batch.cache()?)
+        self.resources.taps.output(batch.cache()?)
     }
     /// The scheduler samples/validates logits before publishing accepted input
     /// prefixes. A failed commit consumes this pass; discard before reuse.
@@ -613,11 +641,11 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let id = batch.cache()?.identity();
         self.state.ready(id)?;
         requests.validate_acceptance(batch, accepted)?;
-        unsafe { self.execution.enqueue_cache_commit(requests.cache(), batch.cache()?, accepted) }
+        unsafe { self.resources.execution.enqueue_cache_commit(requests.cache(), batch.cache()?, accepted) }
     }
-    pub fn poll_cache_commit(&self) -> Result<bool> { self.execution.poll_cache_commit() }
+    pub fn poll_cache_commit(&self) -> Result<bool> { self.resources.execution.poll_cache_commit() }
     pub fn abort_cache_commit(&mut self, requests: &mut Requests<'a>) -> Result<()> {
-        requests.abort_cache_commit(&mut self.execution)
+        requests.abort_cache_commit(&mut self.resources.execution)
     }
     pub fn commit(
         &mut self,
@@ -628,8 +656,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let id = batch.cache()?.identity();
         ensure!(self.state == State::Ready(id) || self.state == State::Encoded(id), "target commit phase incomplete");
         self.state = State::Running;
-        self.taps.reset();
-        requests.commit(batch, &mut self.execution, accepted)?;
+        self.resources.taps.reset();
+        requests.commit(batch, &mut self.resources.execution, accepted)?;
         self.state = State::Idle;
         Ok(())
     }
@@ -654,12 +682,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         requests.validate_acceptance(batch, accepted)?;
         proposal.validate_commit(id, windows, leases, accepted)?;
         self.state = State::Running;
-        self.taps.reset();
+        self.resources.taps.reset();
         let result = (|| -> Result<()> {
             unsafe {
                 proposal.commit(id, windows, leases, accepted)?;
             }
-            requests.commit(batch, &mut self.execution, accepted)
+            requests.commit(batch, &mut self.resources.execution, accepted)
         })();
         if let Err(error) = result {
             requests.revoke_batch(batch);
@@ -682,11 +710,11 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     pub fn discard(&mut self, batch: &mut RequestBatch) -> Result<()> {
         self.sampled = None;
         batch.cancel();
-        self.taps.reset();
+        self.resources.taps.reset();
         self.state = State::Running;
-        self.lane.restart()?;
-        self.index.restart()?;
-        self.execution.restart();
+        self.resources.lane.restart()?;
+        self.resources.index.restart()?;
+        self.resources.execution.restart();
         self.state = State::Idle;
         Ok(())
     }
@@ -695,6 +723,112 @@ impl<'w, 'a> TargetPass<'w, 'a> {
 #[cfg(test)]
 mod tests {
     use super::State;
+    fn cpu_library() -> &'static cuteafd_ffi::NativeLibrary {
+        unreachable!("CPU schedules do not enter a device chain")
+    }
+
+    #[test]
+    fn concrete_topologies_share_stage_order_without_receive_dispatch() -> anyhow::Result<()> {
+        use super::CacheStage;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        for stage in [CacheStage::Full, CacheStage::Encoder, CacheStage::EncoderReplay, CacheStage::Replay] {
+            let rows = runtime.block_on(async {
+                let mut visited = Vec::new();
+                layer_schedule!(stage; layer, first; {
+                    visited.push((layer, "owner"));
+                }; cpu_library(); {
+                    if layer != first { visited.push((layer, "advance")); }
+                    visited.push((layer, "receive"));
+                    visited.push((layer, "complete"));
+                });
+                anyhow::Ok(visited)
+            })?;
+            let mut expected = Vec::new();
+            for layer in stage.windows() {
+                expected.push((layer, "owner"));
+                if layer != stage.windows().start { expected.push((layer, "advance")); }
+                expected.push((layer, "receive"));
+                expected.push((layer, "complete"));
+            }
+            assert_eq!(rows, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn placed_lane_interleavings_drain_owner_reduce_and_direct_hops() -> anyhow::Result<()> {
+        use crate::shared::peer_split::order::{check, host::{check_host, HostSchedule}};
+        use super::CacheStage;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        for stage in [CacheStage::Full, CacheStage::Encoder, CacheStage::EncoderReplay, CacheStage::Replay] {
+            // Record the real scheduler's layer order, then interleave independent
+            // lanes at its await boundaries. Each direct-input copy and owner
+            // reduction queues its producer before its destination wait.
+            let layers = runtime.block_on(async {
+                let mut layers = Vec::new();
+                layer_schedule!(stage; layer, first; {}; cpu_library(); {
+                    layers.push((layer, first));
+                });
+                anyhow::Ok(layers)
+            })?;
+            for placed in [false, true] {
+                for leading in 0..2 {
+                    for chunk in [1, 2, 7, 20, 40] {
+                        let mut schedule = HostSchedule::default();
+                        let mut next = [0; 2];
+                        while next.iter().any(|&at| at < layers.len()) {
+                            for lane in [leading, 1 - leading] {
+                                for _ in 0..chunk {
+                                    let Some(&(layer, first)) = layers.get(next[lane]) else { break };
+                                    next[lane] += 1;
+                                    let owner = usize::from(placed && layer >= 20);
+                                    if placed && layer == 20 {
+                                        // Replay imports the retained encoder suffix before
+                                        // its first layer; full passes advance across L19/20.
+                                        assert!(layer != first || stage == CacheStage::Replay);
+                                        schedule.push_to(0, "direct-input", 0, lane, "residual and pre ready");
+                                        schedule.wait_for(1, "direct-input", 0, lane, "land block inputs");
+                                        schedule.sync(1, "direct-input copy complete");
+                                    }
+                                    if placed {
+                                        schedule.push_to(1 - owner, "owner-reduce", layer, lane, "remote expert partial ready");
+                                        schedule.wait_for(owner, "owner-reduce", layer, lane, "owner consumes remote partial");
+                                        schedule.sync(owner, "owner reduction complete");
+                                    }
+                                }
+                            }
+                        }
+                        assert_eq!(check(&schedule.streams()), Ok(()),
+                            "stage={stage:?} placed={placed} leading={leading} chunk={chunk}");
+                        assert_eq!(check_host(&schedule), Ok(()),
+                            "stage={stage:?} placed={placed} leading={leading} chunk={chunk}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pass_lifecycle_is_independent_of_concrete_resources() -> anyhow::Result<()> {
+        struct CpuResources;
+        let mut pass = super::Pass {
+            resources: CpuResources,
+            state: State::Idle,
+            sampled: None,
+            chain: None,
+            device_order: false,
+        };
+        assert!(pass.begin_chain(false)?.is_none());
+        assert!(pass.begin_chain(true)?.is_none());
+        assert!(pass.drain_chain().is_err());
+        pass.state.begin()?;
+        assert!(pass.state.begin().is_err());
+        pass.set_device_order(true);
+        assert!(pass.device_order);
+        Ok(())
+    }
+
     #[test]
     fn incomplete_foreign_and_consumed_passes_cannot_publish() {
         let mut state = State::default();
