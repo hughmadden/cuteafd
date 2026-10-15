@@ -395,6 +395,38 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn socket_replacement_reconnects_with_unknown_restart_interval() {
+        use std::os::unix::net::UnixListener;
+        let dir =
+            std::env::temp_dir().join(format!("cuteafd-storage-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rdma-counters.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let source = SparkNest::new(&path);
+        assert_eq!(source.sample().status, "waiting");
+        let (mut writer, _) = listener.accept().unwrap();
+        writer.write_all(&hello(1)).unwrap();
+        writer.write_all(&counters(1)).unwrap();
+        let old = source.sample();
+        assert_eq!(old.status, "available");
+        drop(writer);
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(source.sample().status, "unavailable");
+        assert_eq!(source.sample().status, "absent");
+        let listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(source.sample().status, "waiting");
+        let (mut writer, _) = listener.accept().unwrap();
+        // Even reused producer identifiers cannot bridge the disconnected interval.
+        writer.write_all(&hello(1)).unwrap();
+        writer.write_all(&counters(1)).unwrap();
+        let new = source.sample();
+        assert_eq!(new.status, "available");
+        assert_ne!(old.incarnation, new.incarnation);
+        source.suspend();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn malformed_port_and_counter_timestamp_are_rejected() {
         let mut d = Decoder::default();
         d.push(&hello(1)).unwrap();

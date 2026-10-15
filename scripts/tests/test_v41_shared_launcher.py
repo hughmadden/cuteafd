@@ -14,7 +14,6 @@ import json
 import os
 from pathlib import Path
 import sys
-import stat
 
 import pytest
 
@@ -91,9 +90,9 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The coordinator also shares the host fidelity reference cache with the dashboard.
         fidelity = [f"<root>/hosts/{old['host']}/.cache/cuteafd/fidelity:/run/cuteafd/fidelity"] \
             if role == "coordinator" else []
-        socket = Path("/srv/sparknest/rdma-counters.sock")
-        storage = [f"mount:type=bind,src={socket},dst={socket},readonly"] \
-            if socket.exists() and stat.S_ISSOCK(socket.stat().st_mode) else []
+        storage_run = Path("/srv/sparknest/run")
+        storage = [f"mount:type=bind,src={storage_run},dst={storage_run},readonly"] \
+            if storage_run.is_dir() else []
         assert after["mounts"] == sorted(before["mounts"] + governor + fidelity + storage), where
         assert after["image"] == before["image"], where
         added = {key: value for key, value in after["env"].items() if key not in before["env"]}

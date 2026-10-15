@@ -306,7 +306,7 @@ fn demand() -> &'static Demand {
 fn sparknest() -> &'static Arc<crate::sparknest_traffic::SparkNest> {
     static SOURCE: OnceLock<Arc<crate::sparknest_traffic::SparkNest>> = OnceLock::new();
     SOURCE.get_or_init(|| {
-        let source = Arc::new(crate::sparknest_traffic::SparkNest::new("/srv/sparknest/rdma-counters.sock"));
+        let source = Arc::new(crate::sparknest_traffic::SparkNest::new("/srv/sparknest/run/rdma-counters.sock"));
         add_source(source.clone());
         source
     })
