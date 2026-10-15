@@ -655,7 +655,8 @@ mod tests {
         let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
         let variants = [1, 16, 80, 4096].into_iter().map(|capacity|
             InstalledExpertVariant::from_piecewise_queries(capacity, ExpertTrafficContract::ExactGrouping,
-                |rows| Ok(if capacity <= 16 { 16 } else if (1..=80).contains(&rows) { 64 } else { 128 })).unwrap()).collect();
+                |rows| Ok(if capacity <= 16 { 16 }
+                    else if capacity == 80 || (1..=80).contains(&rows) { 64 } else { 128 })).unwrap()).collect();
         let report = InstalledExpertGrouping::new(loaded, 0, 128, ExpertGroupingSelector::Fp8Nearest, variants).unwrap();
         assert!(report.bf16_variants.is_none() && report.validate().is_ok());
         for (rows, expected) in [(1, 16), (16, 16), (17, 64), (80, 64), (81, 128), (128, 128)] {
