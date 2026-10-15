@@ -307,6 +307,33 @@ window.cuteafdAuthenticatedFetch = (path, init = {}) => {
   if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
   return fetch(path, { ...init, headers });
 };
+const fabricHealth = document.createElement('div');
+fabricHealth.className = 'note';
+fabricHealth.style.cssText = 'padding:0 16px 10px;overflow-wrap:anywhere';
+$('#top').append(fabricHealth);
+async function pollFabricHealth() {
+  if (!document.hidden && S.connected) {
+    try {
+      const response = await window.cuteafdAuthenticatedFetch('/v1/fabric', { signal: AbortSignal.timeout(2500) });
+      if (!response.ok) throw new Error('fabric unavailable');
+      const snapshot = await response.json();
+      const lines = Object.entries(snapshot.hosts || {}).map(([name, host]) => {
+        const ports = (host.ports || []).map(p => {
+          const h = p.health_since_start;
+          const verdict = h?.verdict === 'ok' ? 'OK' : h?.verdict || 'unknown';
+          return `${p.device}/${p.port} ${p.state || 'unknown'} ${p.link_gbps ?? '?'} Gb/s MTU ${p.mtu ?? '?'}: ${verdict} - ${(h?.reasons || ['no continuous observation']).join('; ')}`;
+        });
+        const verdict = host.health_since_start === 'ok' ? 'OK' : host.health_since_start || 'unknown';
+        return `${name}: ${verdict} since observation start; ${ports.join(' | ') || 'no port evidence'}; pause not collected`;
+      });
+      fabricHealth.replaceChildren(...(lines.length ? lines : ['Fabric unknown: awaiting host observations']).map(text => {
+        const line = document.createElement('div'); line.textContent = text; return line;
+      }));
+    } catch (_) { fabricHealth.textContent = 'Fabric unknown: observation unavailable'; }
+  } else { fabricHealth.textContent = 'Fabric unknown: observation paused while hidden or disconnected'; }
+  setTimeout(pollFabricHealth, 2000);
+}
+setTimeout(pollFabricHealth, 2000);
 async function connect() {
   try {
     const headers = new Headers();

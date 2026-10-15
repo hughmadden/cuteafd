@@ -6,6 +6,7 @@ use std::time::Duration;
 pub mod bond;
 mod capabilities;
 pub mod fabric;
+pub mod fabric_health;
 pub mod traffic;
 mod sparknest_traffic;
 

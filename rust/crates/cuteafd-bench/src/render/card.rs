@@ -106,10 +106,11 @@ pub fn card_svg(report: &Report) -> String {
         let capped = power.gpus.iter().map(|gpu| gpu.cap_seconds).fold(0.0, f64::max);
         options.insert(0, format!("POWER-CAPPED {}", seconds(capped)));
     }
-    // Only two chip rows fit above the footer. Keep overflow in the full report.
+    let health = crate::fabric::health_header(&r.fabric);
+    // Reserve the second option row for health evidence when available.
     let omitted = |items: &[String]| {
         let mut probe = Doc::new(WIDTH, HEIGHT);
-        chips(&mut probe, &t, pad, 572.0, WIDTH - 2.0 * pad, items, t.series[2]) > 46.0
+        chips(&mut probe, &t, pad, 572.0, WIDTH - 2.0 * pad, items, t.series[2]) > if health.is_some() { 22.0 } else { 46.0 }
     };
     let total = options.len();
     while omitted(&options) {
@@ -127,6 +128,9 @@ pub fn card_svg(report: &Report) -> String {
         }
     }
     chips(&mut doc, &t, pad, 572.0, WIDTH - 2.0 * pad, &options, t.series[2]);
+    if let Some(health) = health {
+        doc.text(pad, 614.0, Font::new(12.0, t.ink2), &fit(&health, 12.0, WIDTH - 2.0 * pad));
+    }
     let b = &r.server.build;
     let mut build = format!("build {}", b.label());
     if let Some(remote) = &b.remote {

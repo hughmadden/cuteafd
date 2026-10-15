@@ -817,8 +817,9 @@ def fabric_assessment(phases):
         if not phase.get('timed'):
             continue
         for warning in phase.get('assessments', []):
-            if warning.startswith(('foreign traffic:', 'SparkNest traffic:', 'storage attribution unavailable:')):
-                caveats.append(f"{phase.get('name', '?')}: {warning}; rerun in a quiet window before accepting A/B")
+            if warning.startswith(('foreign traffic:', 'SparkNest traffic:', 'storage attribution unavailable:', 'fabric health:')):
+                action = 'investigate fabric health and rerun' if warning.startswith('fabric health:') else 'rerun in a quiet window'
+                caveats.append(f"{phase.get('name', '?')}: {warning}; {action} before accepting A/B")
     return list(dict.fromkeys(caveats))
 
 

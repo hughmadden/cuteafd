@@ -70,7 +70,7 @@ pub fn report_svg(report: &Report) -> String {
     let header = if fabric_header.is_some() { 142.0 } else { 124.0 };
     let fabric_rows: Vec<_> = report.fabric.iter().flat_map(|phase| phase.ports.iter().map(move |p| (phase, p))).collect();
     let caveats = crate::fabric::caveats(&report.fabric);
-    let fabric_height = caveats.len() as f64 * 18.0 + if fabric_rows.is_empty() { 0.0 } else { 58.0 + fabric_rows.len() as f64 * 18.0 };
+    let fabric_height = caveats.len() as f64 * 18.0 + if fabric_rows.is_empty() { 0.0 } else { 58.0 + fabric_rows.len() as f64 * 72.0 };
     let footer = 64.0 + fabric_height;
     let total = header + banner + heights.iter().map(|h| h + gap).sum::<f64>() + footer;
     let mut doc = Doc::new(w, total);
@@ -129,6 +129,14 @@ pub fn report_svg(report: &Report) -> String {
                 pair(p.sparknest_sent_bytes,p.sparknest_received_bytes), pair(p.estimated_header_sent_bytes,p.estimated_header_received_bytes),
                 pair(p.foreign_sent_bytes,p.foreign_received_bytes));
             doc.text(24.0, y + 12.0, Font::new(10.0, t.ink2), &fit(&line, 10.0, w - 48.0));
+            y += 18.0;
+            let detail = p.health.as_ref().map(|h| h.line()).unwrap_or_else(|| "unknown: no continuous observation".into());
+            doc.text(24.0, y + 12.0, Font::new(10.0, t.ink2), &fit(&format!("Health: {detail}"), 10.0, w - 48.0));
+            y += 18.0;
+            let since = p.health_since_start.as_ref().map(|h| h.line()).unwrap_or_else(|| "unknown: no continuous observation".into());
+            doc.text(24.0, y + 12.0, Font::new(10.0, t.ink2), &fit(&format!("Since observation start: {since}"), 10.0, w - 48.0));
+            y += 18.0;
+            doc.text(24.0, y + 12.0, Font::new(10.0, t.ink2), &format!("Link {:?} Gb/s; MTU {:?}; pause not collected; overlapping events are not lost bytes", p.link_gbps, p.mtu));
             y += 18.0;
         }
         y += 10.0;
