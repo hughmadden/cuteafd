@@ -171,7 +171,7 @@ mod tests {
         std::fs::write(dir.join("report.json"),
             serde_json::to_string(&nvfp4_card(&root.join("hub"), experts("NVFP4"))).unwrap()).unwrap();
         let placed = crate::publish::scan(root).unwrap();
-        let html = crate::publish::results(&placed);
+        let html = crate::publish::results(&placed, &crate::publish::one_row_of(&placed[0])).unwrap();
         assert!(html.contains("top-1 93.7% (info: calibrated W4A4)"), "{html}");
         assert!(!html.contains("FAILED"), "{html}");
         assert!(!crate::publish::index(&placed).contains("quality gate failed"));

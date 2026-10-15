@@ -1,0 +1,19 @@
+{
+  "schema": "cuteafd.bench.matrix/1",
+  "cells": [
+    {"family": "deepseek_v41", "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "deepseek_v41", "checkpoint": "nvidia/DeepSeek-V4.1-Flash-NVFP4", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "deepseek_v4", "checkpoint": "deepseek-ai/DeepSeek-V4-Flash-0731", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "deepseek_v4", "checkpoint": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "glm5", "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "glm5", "checkpoint": "nvidia/GLM-5.3-NVFP4", "5090": "simulated-5090", "1rtx": {"status": "held", "reason": "the cards on this layout are v2.0.0-rc3, and the W4A4 expert path costs +13% per verify row versus rc3 (#233)"}, "2rtx": {"status": "held", "reason": "the cards on this layout are v2.0.0-rc3, and the W4A4 expert path costs +13% per verify row versus rc3 (#233)"}},
+    {"family": "glm5_flash", "checkpoint": "zai-org/GLM-5.3-Flash", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "glm5_flash", "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "glm5_flash", "checkpoint": "nvidia/GLM-5.3-Flash-NVFP4", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "glm5_flash", "checkpoint": "brandonmusic/GLM-5.3-Flash-tr3-4bpw", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "mimo_v2", "checkpoint": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "mimo_v2", "checkpoint": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "qwen4", "checkpoint": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
+    {"family": "qwen4", "checkpoint": "nvidia/Qwen3.8-Flash-Next-NVFP4", "5090": "simulated-5090", "1rtx": {"status": "held", "reason": "the only min card is v2.0.0-rc3, from before the Spark transports bootstrapped at install (#251)"}, "2rtx": "current"}
+  ]
+}

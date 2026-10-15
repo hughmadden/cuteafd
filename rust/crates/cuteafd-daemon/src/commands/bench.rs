@@ -93,6 +93,11 @@ pub(crate) struct PublishArgs {
     /// Repository root (holds README.md and benchmarks/).
     #[arg(long, default_value = ".")]
     pub(crate) root: PathBuf,
+    /// The published matrix: which checkpoint is current in each reference
+    /// column, and why a cell publishes nothing else. Defaults to
+    /// `<root>/benchmarks/current-matrix.json`.
+    #[arg(long)]
+    pub(crate) matrix: Option<PathBuf>,
     /// Report directories just placed (checked); every placed report is indexed.
     pub(crate) dirs: Vec<PathBuf>,
 }
@@ -107,7 +112,10 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             }
         }
         Some(BenchAction::Publish(publish)) => {
-            let (readme, index, count) = cuteafd_bench::publish::publish(&publish.root, &publish.dirs)?;
+            let matrix = publish.matrix.map_or_else(
+                || publish.root.join(cuteafd_bench::publish::MATRIX_FILE), |path| path);
+            let (readme, index, count) =
+                cuteafd_bench::publish::publish(&publish.root, &publish.dirs, &matrix)?;
             eprintln!("{count} reports: updated {} and {}", readme.display(), index.display());
             Ok(())
         }

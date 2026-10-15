@@ -275,6 +275,12 @@ before → after tables with conditions.
   Re-run a family's rows after changes that target that family's code (or a
   shared hot path that plausibly moves it); skip irrelevant changes,
   staleness is fine.
+- `benchmarks/current-matrix.json` is the table's input: one row per
+  family × checkpoint, each cell `current`, `simulated-5090` (the 5090
+  column's memory-capped simulation, replaced by a real card when one
+  exists), or `held`/`pending`/`na` with the reason it renders. A row
+  leaves the table by leaving the matrix; its reports stay in
+  `benchmarks/` and the index.
 - Other profiles run only when specifically requested: their exports
   (`report.svg` + `report.json` from `cuteafd bench`, the same runner as
   the dashboard) go to `benchmarks/<family>/<date>-<profile>-<hardware>/`

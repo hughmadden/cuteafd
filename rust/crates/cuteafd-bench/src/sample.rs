@@ -107,7 +107,7 @@ mod tests {
         assert!((report.baseline.as_ref().unwrap().card.concurrent_at(8).unwrap().aggregate_tok_s - 171.12859).abs() < 0.001);
         assert!(render::card::card_svg(&report).contains(">171</text>"));
         let placed = crate::publish::Placed { dir: "benchmarks/history/card".into(), report };
-        assert!(crate::publish::results(&[placed]).contains("C8: 171"));
+        assert!(crate::publish::results(&[placed.clone()], &crate::publish::one_row_of(&placed)).unwrap().contains("C8: 171"));
     }
 
     #[test]
@@ -124,35 +124,52 @@ mod tests {
     #[test]
     fn scaling_card_snapshots_cover_pro_small_and_missing_points() {
         let dir = std::env::var_os("CUTEAFD_BENCH_SAMPLE_DIR").map(std::path::PathBuf::from);
-        for case in ["pro", "32gb", "missing"] {
+        // The axis is the measured sweep: four levels on a PRO 6000, three under a
+        // 32 GiB cap, and only the levels a report with gaps (or a single point)
+        // actually ran. An unmeasured C is neither a point nor a label.
+        for (case, dropped) in [("pro", &[][..]), ("32gb", &[][..]), ("missing", &[4, 8][..]),
+            ("c1c8", &[4, 16][..]), ("c1", &[4, 8, 16][..]), ("none", &[1, 4, 8, 16][..])] {
             let mut report = super::report(false);
             if case == "32gb" { report.server.hardware.gpus[0].memory_mib = Some(32 * 1024); }
-            if case == "missing" { report.baseline.as_mut().unwrap().card.concurrency.retain(|p| p.width != 4 && p.width != 8); }
+            if !dropped.is_empty() {
+                report.baseline.as_mut().unwrap().card.concurrency.retain(|point| !dropped.contains(&point.width));
+            }
+            let baseline = report.baseline.as_ref().unwrap();
+            let measured: Vec<usize> = report.server.card_levels().iter().copied()
+                .filter(|width| baseline.card.concurrent_at(*width).is_some()).collect();
             let card = render::card::card_svg(&report);
             let panel = render::report::panel_svg(&report, "baseline");
             assert!(card.contains(r#"<line x1="428" y1="352" x2="712" y2="352""#));
             assert!(card.contains("DECODE SCALING") && panel.contains("DECODE SCALING"));
             assert!(card.contains(r#"x="800" y="246""#));
             let points = |svg: &str| svg.matches("<circle ").count();
-            let expected = match case { "pro" => 4, "32gb" => 3, _ => 2 };
-            assert_eq!(points(&card), expected, "{case}");
-            assert_eq!(points(&panel), expected, "{case}");
-            assert_eq!(card.contains(">C16</text>"), case != "32gb");
-            assert_eq!(card.contains(">960</text>"), case != "missing");
-            if case != "missing" {
+            assert_eq!(points(&card), measured.len(), "{case}");
+            assert_eq!(points(&panel), measured.len(), "{case}");
+            for level in report.server.card_levels() {
+                assert_eq!(card.contains(&format!(">C{level}</text>")), measured.contains(level), "{case} label C{level}");
+            }
+            // A lone measured level is centred rather than divided by zero; two span the axis.
+            if measured.len() == 1 {
+                assert!(card.contains(r#"<circle cx="570""#), "{case}");
+            }
+            if measured.len() == 2 {
+                assert!(card.contains(r#"<circle cx="444""#) && card.contains(r#"<circle cx="696""#), "{case}");
+            }
+            if let Some(third) = baseline.card.concurrent_at(8) {
                 assert!(card.contains(r##"r="6.5" fill="#d66086""##));
                 // Median is 118, deliberately not the aggregate / width (120).
-                assert!(card.contains("aggregate tok/s · 118/stream at C8"));
+                assert!(card.contains(&format!("aggregate tok/s · {}/stream at C8",
+                    render::rate(third.per_stream_median_tok_s))));
                 assert!(!card.contains("120/stream"));
             } else {
                 assert!(card.contains("C8 not measured"));
-                assert!(!card.contains("r=\"6.5\""));
+                assert!(!card.contains(r#"r="6.5""#));
             }
             let placed = crate::publish::Placed { dir: "benchmarks/sample/card".into(), report: report.clone() };
-            let readme = crate::publish::results(&[placed]);
-            assert!(readme.contains("C1: 187"));
-            assert_eq!(readme.contains("C4: 640"), case != "missing");
-            assert_eq!(readme.contains("C16: 1,280"), case != "32gb");
+            let readme = crate::publish::results(&[placed.clone()], &crate::publish::one_row_of(&placed)).unwrap();
+            for level in report.server.card_levels() {
+                assert_eq!(readme.contains(&format!("C{level}: ")), measured.contains(level), "{case} table C{level}");
+            }
             if let Some(dir) = &dir {
                 std::fs::create_dir_all(dir).unwrap();
                 std::fs::write(dir.join(format!("card-{case}.svg")), &card).unwrap();
@@ -160,7 +177,6 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn cap_flag_requires_measurement_and_footer_does_not_overlap_chips() {
         use crate::report::{Power, PowerGpu, Setting};
