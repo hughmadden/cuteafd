@@ -854,7 +854,7 @@ mod tests {
         }
         // The worker world range also admits the six-rank layouts.
         let cli = Cli::try_parse_from(["cuteafd", "expertd-native", "--snapshot", "/model",
-            "--native-lib", "/native.so", "--device-budget-bytes", "1000", "--rdma-endpoints", "2",
+            "--native-lib", "/native.so", "--device-budget-bytes", "1000",
             "--rank", "5", "--world", "6"]).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (5, 6));
