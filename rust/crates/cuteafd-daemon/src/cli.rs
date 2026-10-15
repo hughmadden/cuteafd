@@ -663,6 +663,25 @@ mod tests {
     }
 
     #[test]
+    fn qwen4_golden_saves_prefill_or_decode_logits() {
+        use clap::Parser;
+        let base = ["cuteafd", "qwen4-golden", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--golden", "/golden"];
+        let super::Commands::Qwen4Golden(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--nll", "--save-logits", "/rows"])).unwrap().command else {
+            panic!("expected Qwen 3.8 Flash Next golden");
+        };
+        assert!(args.nll);
+        assert_eq!(args.save_logits.as_deref(), Some(std::path::Path::new("/rows")));
+        // Without --nll the decode/verify rows past --prefill are saved.
+        let super::Commands::Qwen4Golden(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--prefill", "512", "--step-rows", "8", "--save-logits", "/rows"])).unwrap().command else {
+            panic!("expected Qwen 3.8 Flash Next golden");
+        };
+        assert!(!args.nll && args.save_logits.is_some() && args.prefill == Some(512));
+    }
+
+    #[test]
     fn dsv4_attention_plan_rows_default_auto_and_accept_a_row_count() {
         use clap::Parser;
         let base = ["cuteafd", "dsv4-golden", "--snapshot", "/model", "--native-lib", "/native.so", "--golden", "/golden"];
