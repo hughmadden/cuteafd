@@ -831,8 +831,10 @@ impl<'a> Engine<'a> {
         }
         let tokens: Vec<u32> = rows.iter().map(|(_, token)| *token).collect();
         let steps: Vec<(&Placement, usize)> = rows.iter().map(|(p, _)| (&**p, p.len)).collect();
-        let tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
-        let step = LaneStep { tables: &tables, tokens: &tokens, units: &[] };
+        let mut tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
+        tables.pad_c4_geometry(self.shape.units)?;
+        let tables = &tables;
+        let step = LaneStep { tables, tokens: &tokens, units: &[] };
         let transports = match transport {
             Some(transport) => std::slice::from_mut(transport),
             None => &mut [],
@@ -875,8 +877,10 @@ impl<'a> Engine<'a> {
                 "verify of {} rows at {} outside the context", tokens.len(), placement.len);
         }
         let spans: Vec<(&Placement, usize, usize)> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
-        let tables = metadata::verify_step(&spans, &self.shape, self.cfg.index_topk, self.c128_width)?;
-        let step = LaneStep { tables: &tables, tokens: &tokens, units: &[] };
+        let mut tables = metadata::verify_step(&spans, &self.shape, self.cfg.index_topk, self.c128_width)?;
+        tables.pad_c4_geometry(self.shape.units)?;
+        let tables = &tables;
+        let step = LaneStep { tables, tokens: &tokens, units: &[] };
         let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
@@ -1994,6 +1998,15 @@ impl<'a> Engine<'a> {
         } else { run()?; }
         self.profile.borrow_mut().add(Phase::Experts, timer);
         Ok(())
+    }
+
+    /// Decode graphs held per rank, and the captures served so far. Every C4 layer key takes a
+    /// geometry class from `metadata::c4_width_classes`, so the inventory is bounded by the
+    /// layer, row, lane and class counts rather than by the context length.
+    pub fn graph_inventory(&self) -> (usize, usize, usize) {
+        (self.graphs.borrow().len(),
+            self.peer.as_ref().map_or(0, |peer| peer.graphs.borrow().len()),
+            self.graph_captures.get())
     }
 
     /// Every local-expert row shape is captured at startup, without executing

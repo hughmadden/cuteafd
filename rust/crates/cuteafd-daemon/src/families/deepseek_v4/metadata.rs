@@ -110,9 +110,64 @@ impl C4Shard {
     }
 }
 
+impl StepTables {
+    /// Pin the C4 page table to one geometry class: `width == stride == class`, every row kept
+    /// and padded with its own last live page. Only a decode-shaped table carries one table per
+    /// row; prefill/context tables keep the shared-row layout [`C4Shard`] shards.
+    ///
+    /// A row's padding columns sit past `c4_visible` (index rows), so the scorer reads zero
+    /// rows from them, exactly as the pre-existing stride padding past a row's live pages did.
+    pub(crate) fn pad_c4_geometry(&mut self, units: usize) -> anyhow::Result<()> {
+        if !self.decode { return Ok(()); }
+        let class = c4_width_class(self.c4_table_width, units);
+        anyhow::ensure!(self.c4_table_width <= units && self.c4_table_stride <= units,
+            "C4 table of {}x{} exceeds the pool's {units} pages", self.c4_table_width, self.c4_table_stride);
+        anyhow::ensure!(self.c4_page_table.len() == self.rows * self.c4_table_stride,
+            "C4 page table is not {} rows of {}", self.rows, self.c4_table_stride);
+        if self.c4_table_width == class && self.c4_table_stride == class { return Ok(()); }
+        let stride = self.c4_table_stride.max(1);
+        let mut table = Vec::with_capacity(self.rows * class);
+        for row in 0..self.rows {
+            let live = &self.c4_page_table[row * stride..][..stride];
+            table.extend_from_slice(live);
+            let last = live.last().copied().unwrap_or(0);
+            table.resize((row + 1) * class, last);
+        }
+        self.c4_page_table = table;
+        self.c4_table_width = class;
+        self.c4_table_stride = class;
+        Ok(())
+    }
+}
+
 /// Scratch C4 pages per GPU under `context`, past its local units: non-owner compressor rows of
 /// one decode/verify step write distinct rows there (`context_scratch_units` at 64 decode rows).
 pub(crate) const C4_SCRATCH_UNITS: usize = 1;
+
+/// The geometry class a live C4 page count belongs to: its next power of two, clamped to the
+/// pool's page count. The indexer's page-table width is a baked launch scalar (its chunk loop
+/// runs `ceil(width / supertile_pages)` times), and a decode step's live page count grows with
+/// the position, so an unclassed width makes every position a distinct captured graph. Classes
+/// bound that space; rounding up only adds page-table columns the scorer masks, because each
+/// row's visibility (`c4_visible`, in index rows) is unchanged.
+pub(crate) fn c4_width_class(width: usize, units: usize) -> usize {
+    width.max(1).next_power_of_two().min(units.max(1))
+}
+
+/// Every class [`c4_width_class`] can return for a pool of `units` pages, ascending.
+pub(crate) fn c4_width_classes(units: usize) -> Vec<usize> {
+    let units = units.max(1);
+    let mut classes = vec![1usize];
+    while let Some(&last) = classes.last() {
+        match last.checked_mul(2) {
+            Some(next) if next <= units => classes.push(next),
+            _ => break,
+        }
+    }
+    // A clamped class (a pool that is not a power of two) is its own class.
+    if classes.last().copied() != Some(units) { classes.push(units); }
+    classes
+}
 
 /// Tables for a prefill chunk of one sequence: rows are positions
 /// `start..start + tokens`; the caches already hold `start` tokens. The first
@@ -510,6 +565,69 @@ mod tests {
         assert_eq!(dec.c4_tables[1].1, vec![seq.state as i32]);
         assert_eq!(compressed_page_bytes(4), 37_440);
         assert_eq!(compressed_page_bytes(128), 1_728);
+        Ok(())
+    }
+
+    #[test]
+    fn c4_width_classes_are_powers_of_two_clamped_to_the_pool() {
+        assert_eq!(c4_width_classes(1), vec![1]);
+        assert_eq!(c4_width_classes(64), vec![1, 2, 4, 8, 16, 32, 64]);
+        assert_eq!(c4_width_classes(48), vec![1, 2, 4, 8, 16, 32, 48]);
+        assert_eq!(c4_width_class(0, 64), 1);
+        assert_eq!((c4_width_class(1, 64), c4_width_class(2, 64), c4_width_class(3, 64)), (1, 2, 4));
+        assert_eq!(c4_width_class(65, 64), 64);
+        assert_eq!(c4_width_class(20, 64), 32);
+        assert_eq!(c4_width_class(1 << 40, 48), 48);
+        // A decode at any position of a pool lands on one of the pool's classes.
+        let units = 16 * 1024 / SOURCE_PAGE_TOKENS;
+        for visible4 in 0usize..=(16 * 1024 / 4) {
+            let pages = visible4.div_ceil(compressed_page_rows(4));
+            let class = c4_width_class(pages, units);
+            assert!(c4_width_classes(units).contains(&class));
+            assert!(class >= pages.max(1) && class <= units);
+        }
+    }
+
+    #[test]
+    fn c4_geometry_padding_pins_width_and_stride_to_one_class() -> anyhow::Result<()> {
+        let shape = PoolShape::new(2, 4096, 64);
+        let a = super::super::pool::Placement::new(0, (0..48).collect());
+        let b = super::super::pool::Placement::new(1, (16..56).collect());
+        // Position 2047 is visible 512 index rows: 8 pages. Position 95: one page.
+        let mut tables = decode_step(&[(&a, 2047), (&b, 95)], &shape, 512, 1024)?;
+        assert_eq!((tables.c4_table_width, tables.c4_table_stride), (8, 48));
+        let (visible, indexed) = (tables.c4_visible.clone(), tables.c4_indexed_lengths.clone());
+        tables.pad_c4_geometry(shape.units)?;
+        assert_eq!((tables.c4_table_width, tables.c4_table_stride), (8, 8));
+        assert_eq!(tables.c4_page_table, (0..8).chain(16..24).collect::<Vec<_>>());
+        assert_eq!((tables.c4_visible.clone(), tables.c4_indexed_lengths.clone()), (visible, indexed));
+        // Padding is idempotent, and both ranks accept it as a shard.
+        let padded = tables.clone();
+        tables.pad_c4_geometry(shape.units)?;
+        assert_eq!(tables.c4_page_table, padded.c4_page_table);
+        for rank in 0..2 {
+            let shard = c4_context_tables(&tables, rank, shape.units)?;
+            assert_eq!(shard.c4_page_table.len(), tables.rows * shard.c4_table_stride);
+            assert_eq!(shard.c4_table_stride, 4);
+        }
+        // A verify of the same rows reaches the same geometry, and a prefill table is untouched.
+        let mut verify = verify_step(&[(&a, 2047, 1), (&b, 95, 1)], &shape, 512, 1024)?;
+        assert_eq!((verify.c4_table_width, verify.c4_table_stride), (8, 48));
+        verify.pad_c4_geometry(shape.units)?;
+        assert_eq!((verify.c4_table_width, verify.c4_table_stride), (8, 8));
+        assert_eq!(verify.c4_page_table, padded.c4_page_table);
+        let prefill = prefill_step(&a, &shape, 0, 300, 512, 1024)?;
+        let mut untouched = prefill.clone();
+        untouched.pad_c4_geometry(shape.units)?;
+        assert_eq!((untouched.c4_table_width, untouched.c4_table_stride, untouched.c4_page_table.len()),
+            (prefill.c4_table_width, prefill.c4_table_stride, prefill.c4_page_table.len()));
+        // A pool whose page count is not a power of two clamps the class.
+        let odd = PoolShape::new(2, 4096, 40);
+        let wide = super::super::pool::Placement::new(0, (0..40).collect());
+        let mut tables = decode_step(&[(&wide, 40 * SOURCE_PAGE_TOKENS - 2)], &odd, 512, 1024)?;
+        assert_eq!(tables.c4_table_width, 40);
+        tables.pad_c4_geometry(odd.units)?;
+        assert_eq!((tables.c4_table_width, tables.c4_table_stride), (40, 40));
         Ok(())
     }
 }
