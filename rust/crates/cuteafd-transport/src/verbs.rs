@@ -3063,6 +3063,7 @@ fn handle_verbs_host_protocol_v2_connection(
         }
         let message = control_message(&value)?;
         if message == "fabric_traffic" {
+            crate::traffic::control_phase(&value);
             write_control(&mut stream, &serde_json::json!({"message": "fabric_traffic", "sample": crate::traffic::local()}))?;
             return Ok(());
         }
@@ -3561,7 +3562,7 @@ impl NativeRdmaEndpoint {
             queue_depth, queue_depth, max_sge, host_buffer_flags,
         )?;
         Ok(Self { library, info, terminal_owner: None,
-            traffic: crate::traffic::register(&rdma_device.device, rdma_device.port, "", c_char_array_to_string(&info.gid_hex)) })
+            traffic: crate::traffic::register(&rdma_device.device, rdma_device.port, "", c_char_array_to_string(&info.gid_hex), info.active_mtu) })
     }
 
     fn send_buffer_view(&self) -> Result<CuteafdRdmaRcEndpointBufferView> {

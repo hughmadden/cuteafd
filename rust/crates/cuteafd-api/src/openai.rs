@@ -300,6 +300,11 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/v1/stats", get(stats_route))
         .route("/v1/thermal", get(thermal_route))
         .route("/v1/fabric", get(|| async { Json(cuteafd_transport::traffic::subscribed_snapshot()) }))
+        .route("/v1/fabric/phase", post(|Json(phase): Json<cuteafd_transport::traffic::PhaseLog>| async move {
+            if phase.name.len() > 128 || phase.ports.len() > 256 { return StatusCode::BAD_REQUEST; }
+            let _ = tokio::task::spawn_blocking(move || cuteafd_transport::traffic::publish_phase(phase)).await;
+            StatusCode::NO_CONTENT
+        }).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)))
         .route("/v1/chat/completions", post(chat));
     // With the gateway mounted, its listing (OpenAI and Anthropic fields,
     // official aliases) owns /v1/models; the served model's entry keeps the
