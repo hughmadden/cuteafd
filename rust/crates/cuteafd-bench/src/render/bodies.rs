@@ -63,20 +63,27 @@ fn row(doc: &mut Doc, theme: &Theme, x: f64, y: f64, w: f64, label: &str, value:
 /// Coordinates use the approved card's chart box; panels scale the same geometry.
 pub fn decode_scaling(doc: &mut Doc, theme: &Theme, report: &Report, x: f64, y: f64, width: f64, scale: f64) {
     let Some(baseline) = &report.baseline else { return };
-    let levels = report.server.card_levels();
-    let points: Vec<_> = levels.iter().filter_map(|width| baseline.card.concurrent_at(*width))
+    // The axis is the sweep the report actually ran: a level with no valid
+    // aggregate has no point, and is not labelled either.
+    let points: Vec<_> = report.server.card_levels().iter().filter_map(|width| baseline.card.concurrent_at(*width))
         .filter(|point| point.aggregate_tok_s.is_finite() && point.aggregate_tok_s >= 0.0).collect();
+    let measured: Vec<usize> = points.iter().map(|point| point.width).collect();
     let top = y + 36.0 * scale;
     let bottom = y + 106.0 * scale;
     doc.text(x, y, Font::new(15.0 * scale, theme.muted).spacing(3.0 * scale).weight(600), "DECODE SCALING");
     doc.line(x, bottom, x + width, bottom, theme.line2, 1.0);
     let max = points.iter().map(|point| point.aggregate_tok_s).fold(1.0f64, f64::max) * 1.08;
     let px = |level: usize| {
-        let index = levels.iter().position(|width| *width == level).unwrap_or(0);
-        x + 16.0 * scale + (width - 32.0 * scale) * index as f64 / (levels.len() - 1) as f64
+        let index = measured.iter().position(|width| *width == level).unwrap_or(0);
+        if measured.len() > 1 {
+            x + 16.0 * scale + (width - 32.0 * scale) * index as f64 / (measured.len() - 1) as f64
+        } else {
+            // One measured level (or none): the point stands alone, centred.
+            x + width / 2.0
+        }
     };
     let py = |value: f64| bottom - (bottom - top) * value / max;
-    for level in levels {
+    for level in &measured {
         doc.text(px(*level), bottom + 17.0 * scale,
             Font::new(12.0 * scale, if *level == 8 { theme.ink } else { theme.muted })
                 .weight(if *level == 8 { 700 } else { 400 }).anchor(Anchor::Middle), &format!("C{level}"));

@@ -1,17 +1,22 @@
-//! `cuteafd bench publish`: the root README's results table (the basic
-//! profile per family, checkpoint and reference hardware) and the
+//! `cuteafd bench publish`: the root README's results table (the published
+//! matrix, each cell resolved to one accepted report) and the
 //! `benchmarks/README.md` index, both rebuilt from the `report.json` files
 //! under `benchmarks/<family>/<date>-<profile>-<hardware>/`.
 use crate::render::{rate, seconds};
 use crate::report::{CheckStatus, Report};
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub const RESULTS_BEGIN: &str = "<!-- results:begin -->";
 pub const RESULTS_END: &str = "<!-- results:end -->";
 pub const INDEX_BEGIN: &str = "<!-- reports:begin -->";
 pub const INDEX_END: &str = "<!-- reports:end -->";
+
+/// The published matrix, relative to the repository root (`--matrix` overrides).
+pub const MATRIX_FILE: &str = "benchmarks/current-matrix.json";
+pub const MATRIX_SCHEMA: &str = "cuteafd.bench.matrix/1";
 
 /// A report placed for publication.
 #[derive(Debug, Clone)]
@@ -56,6 +61,217 @@ pub fn scan(root: &Path) -> Result<Vec<Placed>> {
     }
     placed.sort_by(|a, b| b.report.created.cmp(&a.report.created).then(a.dir.cmp(&b.dir)));
     Ok(placed)
+}
+
+/// The reference columns of the published table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Column {
+    /// One RTX 5090 with the fewest Sparks the checkpoint fits.
+    Rtx5090,
+    /// One RTX PRO 6000 with the fewest Sparks the checkpoint fits.
+    OneRtx,
+    /// Two RTX PRO 6000 with four or six Sparks (or none, when the GPUs hold it).
+    TwoRtx,
+}
+
+impl Column {
+    pub const ALL: [Column; 3] = [Column::Rtx5090, Column::OneRtx, Column::TwoRtx];
+
+    /// The matrix key.
+    fn key(self) -> &'static str {
+        match self { Column::Rtx5090 => "5090", Column::OneRtx => "1rtx", Column::TwoRtx => "2rtx" }
+    }
+
+    /// The README heading.
+    fn title(self) -> &'static str {
+        match self { Column::Rtx5090 => "5090", Column::OneRtx => "1× RTX", Column::TwoRtx => "2× RTX" }
+    }
+
+    /// The reference layout a labelled smoke directory carries for this column.
+    fn reference(self) -> Option<u8> {
+        match self { Column::Rtx5090 => None, Column::OneRtx => Some(1), Column::TwoRtx => Some(2) }
+    }
+}
+
+/// What the matrix says about one cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// The column's own reference hardware.
+    Current,
+    /// The 5090 column: a real card when one exists, else the memory-capped
+    /// simulation of it.
+    Simulated5090,
+    /// Measured, withheld from the table; the cell renders its reason.
+    Held,
+    /// Not measured yet; the cell renders its reason.
+    Pending,
+    /// No such layout for this checkpoint; the cell renders its reason.
+    Na,
+}
+
+/// One cell of the matrix.
+#[derive(Debug, Clone)]
+pub struct Cell {
+    pub status: Status,
+    /// Rendered by `held`, `pending` and `na` cells; empty otherwise.
+    pub reason: String,
+}
+
+impl Cell {
+    pub fn current() -> Self {
+        Cell { status: Status::Current, reason: String::new() }
+    }
+
+    pub fn simulated_5090() -> Self {
+        Cell { status: Status::Simulated5090, reason: String::new() }
+    }
+
+    pub fn held(reason: impl Into<String>) -> Self {
+        Cell { status: Status::Held, reason: reason.into() }
+    }
+
+    pub fn pending(reason: impl Into<String>) -> Self {
+        Cell { status: Status::Pending, reason: reason.into() }
+    }
+
+    pub fn na(reason: impl Into<String>) -> Self {
+        Cell { status: Status::Na, reason: reason.into() }
+    }
+}
+
+/// A family × checkpoint row with one cell per reference column.
+#[derive(Debug, Clone)]
+pub struct MatrixRow {
+    pub family: String,
+    pub checkpoint: String,
+    pub cells: [Cell; 3],
+}
+
+impl MatrixRow {
+    pub fn new(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Self {
+        MatrixRow { family: family.into(), checkpoint: checkpoint.into(), cells }
+    }
+}
+
+/// `benchmarks/current-matrix.json`: which checkpoint the README publishes in
+/// each reference column, and why a cell publishes nothing.
+///
+/// The table is this matrix resolved against the accepted reports on disk, not
+/// "whatever is newest under `benchmarks/`": a newer report on an archived
+/// layout, a card from an earlier release, or a simulation where no real card
+/// exists cannot take a cell the matrix gives to another card. Every row keeps
+/// at least one measured cell, because the checkpoint and quant that name the
+/// row are report data.
+#[derive(Debug, Clone)]
+pub struct Matrix {
+    pub rows: Vec<MatrixRow>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMatrix {
+    schema: String,
+    cells: Vec<RawRow>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRow {
+    family: String,
+    checkpoint: String,
+    #[serde(rename = "5090")]
+    rtx_5090: RawCell,
+    #[serde(rename = "1rtx")]
+    one_rtx: RawCell,
+    #[serde(rename = "2rtx")]
+    two_rtx: RawCell,
+}
+
+#[derive(Debug)]
+struct RawCell {
+    status: String,
+    reason: Option<String>,
+}
+
+/// A cell is its status (`"current"`), or a status with the reason it renders.
+impl<'de> Deserialize<'de> for RawCell {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Spec {
+            status: String,
+            #[serde(default)]
+            reason: Option<String>,
+        }
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(status) => Ok(RawCell { status, reason: None }),
+            other => {
+                let spec: Spec = serde_json::from_value(other).map_err(serde::de::Error::custom)?;
+                Ok(RawCell { status: spec.status, reason: spec.reason })
+            }
+        }
+    }
+}
+
+impl Matrix {
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("{} (the published matrix: \
+            which checkpoint is current in each reference column)", path.display()))?;
+        Self::parse(&text).with_context(|| format!("{}", path.display()))
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        let raw: RawMatrix = serde_json::from_str(text)?;
+        if raw.schema != MATRIX_SCHEMA {
+            bail!("matrix schema is {:?}, expected {:?}", raw.schema, MATRIX_SCHEMA);
+        }
+        let mut rows: Vec<MatrixRow> = Vec::new();
+        for row in raw.cells {
+            if row.family.trim().is_empty() || row.checkpoint.trim().is_empty() {
+                bail!("every matrix cell needs a family and a checkpoint");
+            }
+            if rows.iter().any(|seen| seen.family == row.family && seen.checkpoint == row.checkpoint) {
+                bail!("{}/{} is listed twice", row.family, row.checkpoint);
+            }
+            let raw = [row.rtx_5090, row.one_rtx, row.two_rtx];
+            let mut cells = Vec::with_capacity(3);
+            for (column, raw) in Column::ALL.iter().zip(raw) {
+                cells.push(cell(*column, raw, &row.family, &row.checkpoint)?);
+            }
+            rows.push(MatrixRow::new(&row.family, &row.checkpoint,
+                cells.try_into().map_err(|_| anyhow::anyhow!("three cells per row"))?));
+        }
+        Ok(Matrix { rows })
+    }
+}
+
+fn cell(column: Column, raw: RawCell, family: &str, checkpoint: &str) -> Result<Cell> {
+    let status = match raw.status.as_str() {
+        "current" => Status::Current,
+        "simulated-5090" if column == Column::Rtx5090 => Status::Simulated5090,
+        "simulated-5090" => bail!("{family}/{checkpoint} {}: simulated-5090 is the 5090 column's fallback",
+            column.key()),
+        "held" => Status::Held,
+        "pending" => Status::Pending,
+        "na" => Status::Na,
+        other => bail!("{family}/{checkpoint} {}: unknown status {other:?} \
+            (current, simulated-5090, held, pending, na)", column.key()),
+    };
+    let reason = raw.reason.unwrap_or_default();
+    let renders = matches!(status, Status::Held | Status::Pending | Status::Na);
+    if renders && reason.trim().is_empty() {
+        bail!("{family}/{checkpoint} {}: {:?} renders its reason, and it is empty", column.key(), raw.status);
+    }
+    if !renders && !reason.is_empty() {
+        bail!("{family}/{checkpoint} {}: {:?} takes no reason", column.key(), raw.status);
+    }
+    Ok(Cell { status, reason })
+}
+
+/// A one-row matrix: the table and page renderers' test scaffolding.
+#[cfg(test)]
+pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
+    Matrix { rows: vec![MatrixRow::new(family, checkpoint, cells)] }
 }
 
 /// Re-renders the images a published run already carries from its own
@@ -107,10 +323,8 @@ fn short_hardware(report: &Report) -> String {
     } else {
         format!("{}× RTX", hw.used_gpus())
     };
-    if !report.server.simulated_5090() {
-        if let Some(gib) = coordinator_budget(report) {
-            out.push_str(&format!(" ({gib} GiB budget)"));
-        }
+    if let Some(gib) = coordinator_budget(report) {
+        out.push_str(&format!(" ({gib} GiB budget)"));
     }
     if !hw.sparks.is_empty() {
         out.push_str(&format!(" + {}× Spark", hw.sparks.len()));
@@ -134,11 +348,6 @@ fn link(dir: &Path, file: &str) -> String {
 /// Family display order.
 const FAMILIES: [&str; 6] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"];
 
-fn layout_label(p: &Placed) -> Option<&str> {
-    p.dir.file_name()?.to_str()?.rsplit_once(&p.report.server.hardware.slug())
-        .map(|(_, label)| without_release_candidate(label.trim_start_matches('-'))).filter(|label| !label.is_empty())
-}
-
 fn without_release_candidate(name: &str) -> &str {
     name.rsplit_once("-rc").filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
         .map_or(name, |(name, _)| name)
@@ -152,97 +361,112 @@ fn reference_layout(p: &Placed) -> Option<u8> {
     else { None }
 }
 
-fn basic_groups(placed: &[Placed]) -> BTreeMap<(usize, String, String), Vec<&Placed>> {
-    // The newest basic-profile report per family, checkpoint and hardware (`placed`
-    // is newest first), on the reference layouts (one or two RTX, Sparks or none).
-    // A qualified replacement can retire a checkpoint from current cards without
-    // deleting its historical reports or removing it from the benchmark index.
-    let superseded: Vec<_> = placed.iter().filter(|p| {
-        p.report.baseline.as_ref().is_some_and(|b| b.quality.status == CheckStatus::Pass)
-            && matches!(p.report.profile.as_str(), "smoke" | "share")
-    }).flat_map(|p| p.report.server.configuration.settings.iter()
-        .filter(|s| s.name == "supersedes-checkpoint")
-        .filter_map(|s| s.value.as_ref())
-        .filter(|name| name.as_str() != p.report.server.checkpoint())
-        .map(|name| (p.report.server.family.clone(), name.clone()))).collect();
-    let mut newest: BTreeMap<(usize, String, String, String), &Placed> = BTreeMap::new();
-    for p in placed {
-        let r = &p.report;
-        if (r.baseline.is_none() && !(r.no_fit_reason().is_some() && r.server.column_5090()))
-            || !matches!(r.profile.as_str(), "smoke" | "share")
-            || !(1..=2).contains(&r.server.hardware.used_gpus()) {
-            continue;
-        }
-        if superseded.iter().any(|(family, name)| *family == r.server.family && *name == r.server.checkpoint()) {
-            continue;
-        }
-        let family = r.server.family.clone().unwrap_or_else(|| "unknown".into());
-        let order = FAMILIES.iter().position(|f| *f == family).unwrap_or(FAMILIES.len());
-        let mut hardware = format!("{}-{}", if r.server.simulated_5090() { "sim5090" }
-            else if r.server.column_5090() { "5090" } else { "pro" }, r.server.hardware.slug());
-        if let Some(gib) = coordinator_budget(r) {
-            hardware.push_str(&format!("-budget{gib}"));
-        }
-        // Keep labelled extra layouts even when they use the reference hardware.
-        if let Some(label) = layout_label(p) {
-            hardware.push('-');
-            hardware.push_str(label);
-        }
-        newest.entry((order, family, checkpoint(r), hardware)).and_modify(|current| {
-            if (p.report.created.as_str(), &p.dir) > (current.report.created.as_str(), &current.dir) { *current = p; }
-        }).or_insert(p);
-    }
-    let mut groups: BTreeMap<(usize, String, String), Vec<&Placed>> = BTreeMap::new();
-    for ((order, family, name, _), p) in newest {
-        groups.entry((order, family, name)).or_default().push(p);
-    }
-    groups
+/// Whether a report may fill a cell: the basic profile, measured, or a planner
+/// rejection of the 5090 card (which is a result in its own right).
+fn accepted(report: &Report) -> bool {
+    matches!(report.profile.as_str(), "smoke" | "share")
+        && (report.baseline.is_some() || (report.no_fit_reason().is_some() && report.server.column_5090()))
 }
 
-/// The newest basic-profile report per family, checkpoint and reference hardware.
-fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
-    let size = |p: &Placed| (p.report.server.hardware.used_gpus(), p.report.server.hardware.sparks.len());
+fn newest<'a>(items: impl IntoIterator<Item = &'a Placed>) -> Option<&'a Placed> {
+    items.into_iter().max_by(|a, b| a.report.created.cmp(&b.report.created).then(a.dir.cmp(&b.dir)))
+}
+
+/// The card a measured cell publishes: the newest accepted report on the
+/// column's hardware, preferring the layout the column is defined by.
+///
+/// That layout (`-min` on one RTX, `-max` on two) is the cell; another layout of
+/// the same checkpoint — an archived one, a vision variant, a legacy GPU count —
+/// never displaces it. The 5090 cell takes a real card when one exists and the
+/// memory-capped simulation otherwise (only when the matrix asks for one).
+fn card_for<'a>(placed: &'a [Placed], row: &MatrixRow, column: Column, simulation: bool) -> Option<&'a Placed> {
+    let candidates = |real_only: bool| -> Vec<&'a Placed> {
+        placed.iter().filter(|p| {
+            let report = &p.report;
+            let in_column = match column {
+                Column::Rtx5090 => report.server.column_5090(),
+                Column::OneRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 1,
+                Column::TwoRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 2,
+            };
+            accepted(report) && in_column
+                && report.server.family.as_deref().unwrap_or("unknown") == row.family
+                && report.server.checkpoint() == row.checkpoint
+                && (!real_only || !report.server.simulated_5090())
+        }).collect()
+    };
+    if column == Column::Rtx5090 {
+        // A real measurement always replaces the memory-only simulation, even an older one.
+        let real = newest(candidates(true));
+        if real.is_some() || !simulation {
+            return real;
+        }
+        return newest(candidates(false));
+    }
+    let reports = candidates(true);
+    if let Some(reference) = column.reference() {
+        if reports.iter().any(|p| reference_layout(p) == Some(reference)) {
+            return newest(reports.into_iter().filter(|p| reference_layout(p) == Some(reference)));
+        }
+    }
+    // No reference marker: the column's extreme Spark count on its GPU count.
+    let sparks = |p: &&Placed| p.report.server.hardware.sparks.len();
+    let extreme = if column == Column::OneRtx {
+        reports.iter().map(sparks).min()
+    } else {
+        reports.iter().map(sparks).max()
+    }?;
+    newest(reports.into_iter().filter(|p| p.report.server.hardware.sparks.len() == extreme))
+}
+
+/// A matrix row resolved against the reports on disk.
+pub struct Row<'a> {
+    pub family: String,
+    /// `GLM-5.3-NVFP4 (nvfp4-g16)`: the checkpoint and its routed-expert format.
+    pub label: String,
+    pub cells: [Resolved<'a>; 3],
+}
+
+/// What one cell publishes.
+pub enum Resolved<'a> {
+    /// The card the matrix gives this cell.
+    Card(&'a Placed),
+    /// A measured cell with no accepted report: `results` refuses to publish it.
+    Missing,
+    Held(String),
+    Pending(String),
+    Na(String),
+}
+
+/// Resolves every matrix row against `placed`, in matrix order. Fails when a
+/// measured cell has no accepted report, or a row has nothing to name it with.
+pub fn select<'a>(placed: &'a [Placed], matrix: &Matrix) -> Result<Vec<Row<'a>>> {
     let mut rows = Vec::new();
-    for ((_, family, name), reports) in basic_groups(placed) {
-        // Real measurements always replace memory-only simulations, even older ones.
-        fn newest_of(items: Vec<&Placed>) -> Option<&Placed> {
-            items.into_iter().max_by(|a, b|
-                a.report.created.cmp(&b.report.created).then(a.dir.cmp(&b.dir)))
+    for row in &matrix.rows {
+        let cells: [Resolved<'_>; 3] = std::array::from_fn(|i| {
+            let (column, cell) = (Column::ALL[i], &row.cells[i]);
+            match cell.status {
+                Status::Current | Status::Simulated5090 =>
+                    card_for(placed, row, column, cell.status == Status::Simulated5090)
+                        .map_or(Resolved::Missing, Resolved::Card),
+                Status::Held => Resolved::Held(cell.reason.clone()),
+                Status::Pending => Resolved::Pending(cell.reason.clone()),
+                Status::Na => Resolved::Na(cell.reason.clone()),
+            }
+        });
+        for (column, cell) in Column::ALL.iter().zip(&cells) {
+            if matches!(cell, Resolved::Missing) {
+                bail!("{}/{}: the matrix publishes a {} card, but no accepted report for it is \
+                    under benchmarks/", row.family, row.checkpoint, column.title());
+            }
         }
-        let real = newest_of(reports.iter().copied().filter(|p|
-            p.report.server.column_5090() && !p.report.server.simulated_5090()).collect());
-        let simulated = newest_of(reports.iter().copied().filter(|p|
-            p.report.server.simulated_5090()).collect());
-        if let Some(p) = real.or(simulated) {
-            rows.push((family.clone(), name.clone(), 0, p));
-        }
-        let pro: Vec<_> = reports.into_iter().filter(|p| !p.report.server.column_5090()).collect();
-        let one: Vec<_> = pro.iter().copied().filter(|p| size(p).0 == 1).collect();
-        let minimum = if one.iter().any(|p| reference_layout(p) == Some(1)) {
-            newest_of(one.iter().copied().filter(|p| reference_layout(p) == Some(1)).collect())
-        } else {
-            one.iter().map(|p| size(p).1).min().and_then(|count|
-                newest_of(one.iter().copied().filter(|p| size(p).1 == count).collect()))
+        let Some(label) = cells.iter().find_map(|cell| match cell {
+            Resolved::Card(p) => Some(checkpoint(&p.report)), _ => None }) else {
+            bail!("{}/{}: no cell publishes a report; drop the row or measure one",
+                row.family, row.checkpoint);
         };
-        if let Some(p) = minimum {
-            rows.push((family.clone(), name.clone(), 1, p));
-        }
-        let two: Vec<_> = pro.iter().copied().filter(|p| size(p).0 == 2).collect();
-        let maximum = if two.iter().any(|p| reference_layout(p) == Some(2)) {
-            newest_of(two.iter().copied().filter(|p| reference_layout(p) == Some(2)).collect())
-        } else {
-            two.iter().map(|p| size(p).1).max().and_then(|count|
-                newest_of(two.iter().copied().filter(|p| size(p).1 == count).collect()))
-        };
-        if let Some(p) = maximum {
-            rows.push((family, name, 2, p));
-        }
+        rows.push(Row { family: row.family.clone(), label, cells });
     }
-    rows
-}
-
-fn column_name(class: u8) -> &'static str {
-    match class { 0 => "5090", 1 => "1× RTX", _ => "2× RTX" }
+    Ok(rows)
 }
 
 fn quality_cell(b: &crate::report::Baseline) -> String {
@@ -278,29 +502,14 @@ fn caveat(p: &Placed) -> String {
     format!("<br><sub>{text}</sub>")
 }
 
-/// The root README's results: one row per checkpoint (model and quant linking to
-/// its family page, then its three reference-column cards, each linking to the
-/// card SVG), then the same rows as a compact table.
-pub fn results(placed: &[Placed]) -> String {
-    let rows = reference_rows(placed);
-    if rows.is_empty() {
-        return "_Pending the first published run._\n".into();
-    }
-    // One row per checkpoint: the model and quant (linking to its family page),
-    // then the 5090, one-RTX and two-RTX cards, each linking to the card itself.
-    let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
-    let mut i = 0;
-    while i < rows.len() {
-        let (family, name, _, first) = &rows[i];
-        let mut cells = [None, None, None];
-        while i < rows.len() && rows[i].0 == *family && rows[i].1 == *name {
-            cells[rows[i].2 as usize] = Some(rows[i].3);
-            i += 1;
-        }
-        let card = |p: Option<&Placed>, column: u8| p.map_or(format!("<td width=\"27%\" align=\"center\">{}</td>",
-            if column == 0 { "pending Hugh (TJ-T-3)" }
-            else if column == 2 && family == "qwen4" { "n/a: fits one RTX (no two-GPU split for Qwen)" }
-            else { "—" }), |p| {
+/// A cell that publishes a status instead of a card; the reason is escaped data.
+fn status_cell(label: &str, reason: &str) -> String {
+    format!("<td width=\"27%\" valign=\"top\">{label}<br><sub>{}</sub></td>", crate::render::svg::escape(reason))
+}
+
+fn grid_cell(cell: &Resolved) -> String {
+    match cell {
+        Resolved::Card(p) => {
             if let Some(reason) = p.report.no_fit_reason() {
                 return format!("<td width=\"27%\" valign=\"top\"><a href=\"{}\">doesn't fit 1× 5090 (32 GB) + {} Sparks</a>\
                     <br><sub>{}</sub>{}</td>", link(&p.dir, "report.json"), p.report.server.hardware.sparks.len(),
@@ -310,70 +519,97 @@ pub fn results(placed: &[Placed]) -> String {
             format!("<td width=\"27%\" valign=\"top\"><a href=\"{svg}\"><img src=\"{svg}\" alt=\"{} on {}\"></a>\
                 <br><sub>{}</sub>{}</td>", p.report.server.checkpoint(), p.report.server.hardware_line(),
                 short_hardware(&p.report), caveat(p))
-        });
-        out.push_str(&format!("<tr>\n<td width=\"19%\" valign=\"top\"><a href=\"docs/models/{family}.md\"><b>{}</b></a>\
-            <br><sub>{}</sub><br><sub>{}</sub></td>\n{}\n{}\n{}\n</tr>\n", family_title(family),
-            first.report.server.checkpoint(),
-            name.rsplit_once(" (").map_or("", |(_, quant)| quant.trim_end_matches(')')),
-            card(cells[0], 0), card(cells[1], 1), card(cells[2], 2)));
+        }
+        Resolved::Held(reason) => status_cell("held", reason),
+        Resolved::Pending(reason) => status_cell("pending", reason),
+        Resolved::Na(reason) => status_cell("n/a", reason),
+        Resolved::Missing => unreachable!("select() refuses a missing cell"),
+    }
+}
+
+/// One compact-table row: the same data as the cell's card, or why it has none.
+fn table_row(row: &Row, column: Column, cell: &Resolved) -> String {
+    let head = format!("| [{}](docs/models/{}.md) | {} | ", family_title(&row.family), row.family, row.label);
+    match cell {
+        Resolved::Held(reason) => format!("{head}— ({}) | — | — | — | — | — | — | — | held: {} | — |\n",
+            column.title(), reason.replace('|', "\\|")),
+        Resolved::Card(p) => {
+            let r = &p.report;
+            if let Some(reason) = r.no_fit_reason() {
+                return format!("{head}{} ({}) | — | — | — | — | — | — | — | doesn't fit: {} | [planner report]({}) |\n",
+                    short_hardware(r), column.title(), reason.replace('|', "\\|"), link(&p.dir, "report.json"));
+            }
+            let b = r.baseline.as_ref().expect("accepted");
+            let decode = |content: &str| b.card.decode_of(content).map_or("—".into(), |d| rate(d.tok_s));
+            let concurrent = r.server.card_levels().iter().filter_map(|width| b.card.concurrent_at(*width))
+                .map(|c| format!("C{}: {}", c.width, rate(c.aggregate_tok_s))).collect::<Vec<_>>().join(" · ");
+            let concurrent = if concurrent.is_empty() { "—".into() } else { concurrent };
+            let (prefill, ttft) = b.card.prefill.as_ref()
+                .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
+            let hardware = r.server.setting("qualification.hardware-label").map(str::to_string)
+                .unwrap_or_else(|| format!("{} ({})", short_hardware(r), column.title()));
+            format!("{head}{hardware} | {} | {} | {concurrent} | {} | {} | {prefill} | {ttft} | {} | \
+                [{} · {}]({}) |\n", r.capacity().compact(), decode("code"), decode("prose"),
+                decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
+                link(&p.dir, "report.svg"))
+        }
+        Resolved::Pending(_) | Resolved::Na(_) | Resolved::Missing => String::new(),
+    }
+}
+
+/// The root README's results: one row per checkpoint of the published matrix
+/// (the checkpoint and quant linking to its family page, then its three
+/// reference-column cards, each linking to the card SVG), then the same rows as
+/// a compact table.
+pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
+    let rows = select(placed, matrix)?;
+    if rows.is_empty() {
+        return Ok("_Pending the first published run._\n".into());
+    }
+    let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
+    for row in &rows {
+        // select() proved the row names a report; the checkpoint and quant that
+        // name the row are that report's data, not the matrix's.
+        let first = row.cells.iter().find_map(|cell| match cell {
+            Resolved::Card(p) => Some(p), _ => None }).expect("select() names a report");
+        let quant = row.label.rsplit_once(" (").map_or("", |(_, quant)| quant.trim_end_matches(')'));
+        out.push_str(&format!("<tr>\n<td width=\"19%\" valign=\"top\"><a href=\"docs/models/{}.md\"><b>{}</b></a>\
+            <br><sub>{}</sub><br><sub>{quant}</sub></td>\n", row.family, family_title(&row.family),
+            first.report.server.checkpoint()));
+        for cell in &row.cells {
+            out.push_str(&grid_cell(cell));
+            out.push('\n');
+        }
+        out.push_str("</tr>\n");
     }
     out.push_str("</table>\n\n");
     out.push_str("| Family | Checkpoint | Hardware | KV / req | C1 code | Concurrent code (aggregate) | prose | JSON | 8K prefill | TTFT | Quality | Report |\n");
     out.push_str("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
-    let mut table_rows = rows.clone();
-    for ((_, family, name), reports) in basic_groups(placed) {
-        for p in reports {
-            let current_build = rows.iter().filter(|row| row.0 == family && row.1 == name).any(|row| {
-                let current = &row.3.report.server.build;
-                let extra = &p.report.server.build;
-                if current.release.is_some() { extra.release == current.release }
-                else if current.commit.is_some() { extra.commit == current.commit }
-                else { crate::render::date(&p.report.created) == crate::render::date(&row.3.report.created) }
-            });
-            // Keep current supplementary cards; older layouts remain in the archive index.
-            if current_build && !p.report.server.column_5090() && !rows.iter().any(|row| row.3.dir == p.dir) {
-                table_rows.push((family.clone(), name.clone(), 3, p));
-            }
+    for row in &rows {
+        for (column, cell) in Column::ALL.iter().zip(&row.cells) {
+            out.push_str(&table_row(row, *column, cell));
         }
-    }
-    table_rows.sort_by_key(|(family, name, class, p)|
-        (FAMILIES.iter().position(|f| *f == family).unwrap_or(FAMILIES.len()), name.clone(), *class, p.dir.clone()));
-    for (family, name, class, p) in &table_rows {
-        let r = &p.report;
-        let label = if *class == 3 { layout_label(p).unwrap_or("extra layout") }
-            else { column_name(*class) };
-        if let Some(reason) = r.no_fit_reason() {
-            out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {} ({}) | — | — | — | — | — | — | — | doesn't fit: {} | [planner report]({}) |\n",
-                family_title(family), short_hardware(r), column_name(*class), reason.replace('|', "\\|"), link(&p.dir, "report.json")));
-            continue;
-        }
-        let b = r.baseline.as_ref().expect("filtered");
-        let decode = |content: &str| b.card.decode_of(content).map_or("—".into(), |d| rate(d.tok_s));
-        let concurrent = r.server.card_levels().iter().filter_map(|width| b.card.concurrent_at(*width))
-            .map(|c| format!("C{}: {}", c.width, rate(c.aggregate_tok_s))).collect::<Vec<_>>().join(" · ");
-        let concurrent = if concurrent.is_empty() { "—".into() } else { concurrent };
-        let (prefill, ttft) = b.card.prefill.as_ref()
-            .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
-        let hardware = r.server.setting("qualification.hardware-label").map(str::to_string)
-            .unwrap_or_else(|| format!("{} ({label})", short_hardware(r)));
-        out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {hardware} | {} | {} | {concurrent} | {} | {} | {prefill} | {ttft} | {} | \
-            [{} · {}]({}) |\n", family_title(family), r.capacity().compact(), decode("code"), decode("prose"),
-            decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
-            link(&p.dir, "report.svg")));
     }
     out.push_str("\ntok/s; C1 decode and concurrent code aggregate with thinking off (C1/C4/C8/C16 on PRO 6000; through C8 at ≤32 GiB, within server admission), \
         8K prefill cold. Quality: logit fidelity against the family golden \
-        reference, prefix-cache restore exactness, lossless speculation. Simulated 5090 reports cap RTX PRO 6000 memory only; \
+        reference, prefix-cache restore exactness, lossless speculation. Every row is \
+        `benchmarks/current-matrix.json` resolved against the reports under `benchmarks/`; a held or \
+        pending cell renders why it has no card. Simulated 5090 reports cap RTX PRO 6000 memory only; \
         SM count (188 vs 170), L2, clocks and power are not emulated. Their speed is indicative and likely optimistic.\n");
-    out
+    Ok(out)
 }
 
-/// A family page's basic-eval cell: its cards (paths relative to `docs/models/`).
-pub fn family_cards(placed: &[Placed], family: &str) -> String {
-    reference_rows(placed).into_iter().filter(|(f, ..)| f == family).map(|(_, name, class, p)| {
-        format!("<a href=\"../../{}\"><img src=\"../../{}\" width=\"360\" alt=\"{name} ({})\"></a>",
-            link(&p.dir, "report.svg"), link(&p.dir, "card.svg"), column_name(class))
-    }).collect::<Vec<_>>().join(" ")
+/// A family page's basic-eval cell: the cards of `family` the matrix publishes
+/// among `published` (paths relative to `docs/models/`).
+pub fn family_cards(rows: &[Row], published: &BTreeSet<PathBuf>, family: &str) -> String {
+    rows.iter().filter(|row| row.family == family)
+        .flat_map(|row| Column::ALL.iter().zip(&row.cells).map(move |(column, cell)| (row, column, cell)))
+        .filter_map(|(row, column, cell)| match cell {
+            Resolved::Card(p) if published.contains(&p.dir) => Some(format!(
+                "<a href=\"../../{}\"><img src=\"../../{}\" width=\"360\" alt=\"{} ({})\"></a>",
+                link(&p.dir, "report.svg"), link(&p.dir, "card.svg"), row.label, column.title())),
+            _ => None,
+        }).collect::<Vec<_>>().join(" ")
 }
 
 /// The benchmarks/README.md index: per family, newest first.
@@ -450,28 +686,31 @@ fn changelog_cards(text: &str, release: &str, date: &str, cards: &str) -> Result
 
 /// Only the published release's cards update the family changelogs.
 /// CUTEAFD_RELEASE_ROW remains an explicit override for manually placed reports.
-fn family_pages(root: &Path, placed: &[Placed], release: Option<&str>) -> Result<()> {
+fn family_pages(root: &Path, placed: &[Placed], matrix: &Matrix, release: Option<&str>) -> Result<()> {
     let override_row = std::env::var("CUTEAFD_RELEASE_ROW").ok();
-    family_pages_with_row(root, placed, release, override_row.as_deref())
+    family_pages_with_row(root, placed, matrix, release, override_row.as_deref())
 }
 
-fn family_pages_with_row(root: &Path, placed: &[Placed], release: Option<&str>, override_row: Option<&str>) -> Result<()> {
+fn family_pages_with_row(root: &Path, placed: &[Placed], matrix: &Matrix, release: Option<&str>,
+    override_row: Option<&str>) -> Result<()> {
     let Some(row) = override_row.or(release) else { return Ok(()) };
     let normalized_row = release_row(row);
     let selected = release.or(normalized_row.as_deref());
-    let current: Vec<_> = placed.iter().filter(|p| {
+    let current: BTreeSet<PathBuf> = placed.iter().filter(|p| {
         selected.is_some() && report_release(p).as_deref() == selected
             || (override_row.is_some() && report_release(p).is_none())
-    }).cloned().collect();
+    }).map(|p| p.dir.clone()).collect();
+    // One resolution for every page: the matrix decides every card.
+    let rows = select(placed, matrix)?;
     for family in FAMILIES {
         let path = root.join("docs/models").join(format!("{family}.md"));
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let newest = current.iter().filter(|p| p.report.server.family.as_deref() == Some(family)
+        let newest = newest(placed.iter().filter(|p| current.contains(&p.dir)
+            && p.report.server.family.as_deref() == Some(family)
             && matches!(p.report.profile.as_str(), "smoke" | "share")
-            && (p.report.baseline.is_some() || p.report.no_fit_reason().is_some()))
-            .max_by(|a, b| a.report.created.cmp(&b.report.created).then(a.dir.cmp(&b.dir)));
+            && (p.report.baseline.is_some() || p.report.no_fit_reason().is_some())));
         let Some(newest) = newest else { continue };
-        let cards = family_cards(&current, family);
+        let cards = family_cards(&rows, &current, family);
         if cards.is_empty() { continue; }
         let out = changelog_cards(&text, row, &crate::render::date(&newest.report.created), &cards)?;
         crate::cli::write_if_changed(&path, &out)?;
@@ -484,7 +723,7 @@ const INDEX_HEADER: &str = "# Benchmarks\n\nReports from `cuteafd bench` (profil
     rebuilds this index and the root README's table.\n\n";
 
 /// Checks `dirs` are placed for publication and rebuilds both documents.
-pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize)> {
+pub fn publish(root: &Path, dirs: &[PathBuf], matrix_path: &Path) -> Result<(PathBuf, PathBuf, usize)> {
     let mut releases = std::collections::BTreeSet::new();
     for dir in dirs {
         let absolute = if dir.is_absolute() { dir.clone() } else { std::env::current_dir()?.join(dir) };
@@ -510,6 +749,9 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
     if releases.len() > 1 && std::env::var("CUTEAFD_RELEASE_ROW").is_err() {
         bail!("publish reports from one release at a time, or set CUTEAFD_RELEASE_ROW");
     }
+    // The matrix is the published set, and it is read before anything is
+    // written: a cell the tree cannot fill fails without touching a document.
+    let matrix = Matrix::load(matrix_path)?;
     let placed = scan(root)?;
     // The documents are rebuilt from every placed report, and so are its images:
     // a card whose policy changed is re-rendered here whether or not its run was
@@ -522,82 +764,389 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
     });
     let readme = root.join("README.md");
     let text = std::fs::read_to_string(&readme).with_context(|| format!("{}", readme.display()))?;
-    crate::cli::write_if_changed(&readme, &splice(&text, RESULTS_BEGIN, RESULTS_END, &results(&placed))?)?;
+    crate::cli::write_if_changed(&readme, &splice(&text, RESULTS_BEGIN, RESULTS_END, &results(&placed, &matrix)?)?)?;
     let index_path = root.join("benchmarks/README.md");
     std::fs::create_dir_all(root.join("benchmarks"))?;
     let current = std::fs::read_to_string(&index_path)
         .unwrap_or_else(|_| format!("{INDEX_HEADER}{INDEX_BEGIN}\n{INDEX_END}\n"));
     crate::cli::write_if_changed(&index_path, &splice(&current, INDEX_BEGIN, INDEX_END, &index(&placed))?)?;
-    family_pages(root, &placed, release.as_deref())?;
+    family_pages(root, &placed, &matrix, release.as_deref())?;
     Ok((readme, index_path, placed.len()))
+}
+
+/// A one-row matrix for a single report: `current` in the column it fills,
+/// `pending` elsewhere. Test scaffolding, so a renderer test need not restate a
+/// whole matrix to see one cell.
+#[cfg(test)]
+pub fn one_row_of(placed: &Placed) -> Matrix {
+    let report = &placed.report;
+    let cell = |column: Column| {
+        let in_column = match column {
+            Column::Rtx5090 => report.server.column_5090(),
+            Column::OneRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 1,
+            Column::TwoRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 2,
+        };
+        if !in_column { return Cell::pending("not measured on this hardware") }
+        if report.server.simulated_5090() { Cell::simulated_5090() } else { Cell::current() }
+    };
+    let cells = [cell(Column::Rtx5090), cell(Column::OneRtx), cell(Column::TwoRtx)];
+    Matrix { rows: vec![MatrixRow::new(report.server.family.as_deref().unwrap_or("unknown"),
+        &report.server.checkpoint(), cells)] }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn qwen_local_minimum_is_not_displaced_by_legacy_budget_or_simulation() {
-        let placed = |id: &str, sparks: usize, budget: Option<&str>| {
-            let mut report = crate::sample::report(false);
-            report.id = id.into();
-            report.server.family = Some("qwen4".into());
-            report.server.model = "org/Qwen3.8-EXL3".into();
-            report.server.configuration.snapshot = None;
-            report.server.configuration.quant[1].formats = vec!["exl3-k4".into(), "exl3-k5".into()];
-            report.server.hardware.sparks.truncate(sparks);
-            if let Some(value) = budget {
-                report.server.configuration.settings.push(crate::report::Setting {
-                    name: "coordinator-gpu-budget-gib".into(), value: Some(value.into()),
-                    default: None, source: "cli".into(),
-                });
-            }
-            Placed { dir: PathBuf::from(format!("benchmarks/qwen4/{id}")), report }
-        };
-        let legacy = placed("legacy", 4, None);
-        let maximum = placed("maximum", 0, None);
-        let unbudgeted = placed("unbudgeted", 1, None);
-        let minimum = placed("minimum", 1, Some("32"));
-        let mut simulated = placed("simulated", 1, Some("31.8"));
-        simulated.report.server.configuration.settings.push(crate::report::Setting {
-            name: "simulated".into(), value: Some("5090".into()), default: None, source: "publication".into(),
+    /// A publication marker: cell selection reads report data, never a directory name.
+    fn marker(p: &mut Placed, name: &str, value: &str) {
+        p.report.server.configuration.settings.push(crate::report::Setting {
+            name: name.into(), value: Some(value.into()), default: None, source: "publication".into(),
         });
-        let reports = vec![unbudgeted, minimum, maximum, legacy];
-        let with_simulation = [vec![simulated], reports.clone()].concat();
-        assert_eq!(reference_rows(&with_simulation)[1].3.report.id, "maximum");
-        let rows = reference_rows(&reports);
-        assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].2, rows[0].3.report.id.as_str()), (1, "maximum"));
-        assert!(short_hardware(&reports[1].report).contains("32 GiB budget"));
-        assert!(crate::render::card::card_svg(&reports[1].report).contains("32 GiB budget"));
-        let html = results(&reports);
-        assert!(!html.contains("benchmarks/qwen4/minimum/card.svg"));
-        assert!(html.contains("benchmarks/qwen4/maximum/card.svg"));
-        assert!(html.contains("n/a: fits one RTX (no two-GPU split for Qwen)"));
-        let v2 = vec![with_simulation[0].clone(), reports[2].clone()];
-        let rows = reference_rows(&v2);
-        assert_eq!(rows.iter().map(|r| (r.2, r.3.report.id.as_str())).collect::<Vec<_>>(),
-            vec![(0, "simulated"), (1, "maximum")]);
-        assert!(!html.contains("benchmarks/qwen4/legacy/card.svg"));
-        // Historical one-GPU layouts never become a two-GPU maximum.
-        let legacy_rows = reference_rows(&reports[2..]);
-        assert_eq!((legacy_rows[0].2, legacy_rows[0].3.report.id.as_str()), (1, "maximum"));
-        assert_eq!(legacy_rows.len(), 1, "one-RTX legacy layouts do not populate the two-RTX column");
     }
 
-    fn marked(id: &str, gpus: usize, marker: Option<(&str, &str)>) -> Placed {
+    /// A DeepSeek V4.1 card on `gpus` RTX with an optional marker.
+    fn marked(id: &str, gpus: usize, mark: Option<(&str, &str)>) -> Placed {
         let mut report = crate::sample::report(false);
         report.id = id.into();
         let gpu = report.server.hardware.gpus[0].clone();
         report.server.hardware.gpus = (0..gpus).map(|i| {
             let mut g = gpu.clone(); g.index = i as u32; g.used = true; g
         }).collect();
-        if let Some((name, value)) = marker {
+        let mut placed = Placed { dir: PathBuf::from(format!("benchmarks/deepseek_v41/{id}")), report };
+        if let Some((name, value)) = mark {
+            marker(&mut placed, name, value);
+        }
+        placed
+    }
+
+    /// A Qwen card on `gpus` RTX and `sparks` Sparks, placed under its own directory.
+    fn qwen(id: &str, gpus: usize, sparks: usize, budget: Option<&str>) -> Placed {
+        let mut report = crate::sample::report(false);
+        report.id = id.into();
+        let gpu = report.server.hardware.gpus[0].clone();
+        report.server.hardware.gpus = (0..gpus).map(|i| {
+            let mut g = gpu.clone(); g.index = i as u32; g.used = true; g
+        }).collect();
+        report.server.family = Some("qwen4".into());
+        report.server.model = "org/Qwen3.8-EXL3".into();
+        report.server.configuration.snapshot = None;
+        report.server.configuration.quant[1].formats = vec!["exl3-k4".into(), "exl3-k5".into()];
+        report.server.hardware.sparks.truncate(sparks);
+        if let Some(value) = budget {
             report.server.configuration.settings.push(crate::report::Setting {
-                name: name.into(), value: Some(value.into()), default: None, source: "publication".into(),
+                name: "coordinator-gpu-budget-gib".into(), value: Some(value.into()),
+                default: None, source: "cli".into(),
             });
         }
-        Placed { dir: PathBuf::from(format!("benchmarks/deepseek_v41/{id}")), report }
+        Placed { dir: PathBuf::from(format!("benchmarks/qwen4/{id}")), report }
+    }
+
+    /// The same card under a labelled directory (the smoke matrix entry name).
+    fn labelled(mut p: Placed, label: &str) -> Placed {
+        p.dir = crate::cli::labeled_dir(Path::new(""), &p.report, Some(label));
+        p
+    }
+
+    /// The card each cell publishes, as report ids (empty for a status cell).
+    fn cards<'a>(row: &'a Row<'a>) -> Vec<Option<&'a str>> {
+        row.cells.iter().map(|cell| match cell {
+            Resolved::Card(p) => Some(p.report.id.as_str()), _ => None }).collect()
+    }
+
+    /// No real RTX 5090 exists yet, so the 5090 cell has no card in these fixtures.
+    fn v41() -> [Cell; 3] {
+        [Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")]
+    }
+
+    fn v41_row(cells: [Cell; 3]) -> Matrix {
+        one_row("deepseek_v41", "deepseek-ai/DeepSeek-V4.1-Flash", cells)
+    }
+
+    #[test]
+    fn the_matrix_decides_every_cell_and_the_newest_accepted_report_fills_it() {
+        let mut older = marked("older", 1, None);
+        older.report.created = "2026-10-01T00:00:00Z".into();
+        let mut newer = marked("newer", 1, None);
+        newer.report.created = "2026-10-10T00:00:00Z".into();
+        let reports = vec![newer, older, marked("sim", 1, Some(("simulated", "5090"))), marked("two", 2, None)];
+        let matrix = v41_row([Cell::simulated_5090(), Cell::current(), Cell::current()]);
+        let rows = select(&reports, &matrix).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cards(&rows[0]), vec![Some("sim"), Some("newer"), Some("two")]);
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains("<th>5090</th><th>1× RTX</th><th>2× RTX</th>"));
+        assert_eq!(html.matches("<img src=").count(), 3);
+        // A cell the matrix gives to another card does not publish this one.
+        assert!(!html.contains("older/card.svg"));
+        assert!(index(&reports).contains("older/report.svg"));
+        // An empty matrix publishes nothing, and says so.
+        assert_eq!(results(&reports, &Matrix { rows: Vec::new() }).unwrap(), "_Pending the first published run._\n");
+    }
+
+    #[test]
+    fn a_measured_cell_without_a_report_refuses_to_publish() {
+        let reports = vec![marked("one", 1, None)];
+        let matrix = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::current()]);
+        let error = results(&reports, &matrix).unwrap_err().to_string();
+        assert!(error.contains("no accepted report"), "{error}");
+        assert!(error.contains("2× RTX"), "{error}");
+        // Pending and n/a are the ways to say a cell has no card.
+        let matrix = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::na("no two-GPU split")]);
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains("pending<br><sub>no 5090 card yet</sub>"), "{html}");
+        assert!(html.contains("n/a<br><sub>no two-GPU split</sub>"), "{html}");
+        assert!(!html.contains("pending Hugh"), "{html}");
+        assert_eq!(html.matches("<img src=").count(), 1);
+        // A row with no measured cell has nothing to name it.
+        let matrix = v41_row([Cell::pending("a"), Cell::pending("b"), Cell::pending("c")]);
+        assert!(results(&reports, &matrix).unwrap_err().to_string().contains("no cell publishes a report"));
+    }
+
+    #[test]
+    fn held_cells_render_their_reason_and_keep_a_compact_row() {
+        let reports = vec![marked("sim", 1, Some(("simulated", "5090"))), marked("one", 1, None), marked("two", 2, None)];
+        let held = "W4A4 small-M path costs 13% per verify row vs the rc3 W4A16 card (#233)";
+        let matrix = v41_row([Cell::simulated_5090(), Cell::held(held), Cell::current()]);
+        let html = results(&reports, &matrix).unwrap();
+        let (grid, table) = html.split_once("</table>").unwrap();
+        assert!(grid.contains(&format!("held<br><sub>{held}</sub>")), "{grid}");
+        assert!(!grid.contains("one/card.svg"), "a held cell publishes no card");
+        // The 5090 cell of the same row still publishes: holding is per cell.
+        assert!(grid.contains("sim/card.svg"));
+        assert_eq!(html.matches("<img src=").count(), 2);
+        let row = table.lines().find(|line| line.contains("held: ")).unwrap();
+        assert!(row.contains(&format!("| — (1× RTX) | — | — | — | — | — | — | — | held: {held} | — |")), "{row}");
+        assert!(!table.contains("one/report.svg"), "{table}");
+        // Escaped, and pipe-escaped for the table, like every other cell.
+        let matrix = v41_row([Cell::simulated_5090(), Cell::held("weights < layout | over budget"), Cell::current()]);
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains("weights &lt; layout | over budget"), "{html}");
+        assert!(html.contains("held: weights < layout \\| over budget"), "{html}");
+    }
+
+    #[test]
+    fn archived_layouts_never_leak_into_the_table() {
+        // The reference-layout card is the cell; a newer report of another layout
+        // stays in the index and out of the table.
+        let reference = labelled(marked("reference", 1, None), "v41-mxfp4-min-rc3");
+        let mut archived = labelled(marked("archived", 1, None), "v41-mxfp4-vision");
+        archived.report.created = "2026-10-11T00:00:00Z".into();
+        archived.report.server.hardware.sparks.push(archived.report.server.hardware.sparks[0].clone());
+        let matrix = v41_row(v41());
+        let reports = vec![archived.clone(), reference.clone()];
+        let rows = select(&reports, &matrix).unwrap();
+        assert_eq!(cards(&rows[0])[1], Some("reference"));
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains(&link(&reference.dir, "card.svg")), "{html}");
+        assert!(!html.contains("vision"), "a supplementary layout never reaches the table");
+        assert!(!html.contains(&link(&archived.dir, "report.svg")), "and no supplementary row does either");
+        let published: BTreeSet<PathBuf> = reports.iter().map(|p| p.dir.clone()).collect();
+        let cards = family_cards(&rows, &published, "deepseek_v41");
+        assert!(cards.contains(&link(&reference.dir, "card.svg")));
+        assert!(!cards.contains("vision"));
+        // History stays in the index.
+        assert!(index(&reports).contains("v41-mxfp4-vision/report.svg"));
+    }
+
+    #[test]
+    fn the_reference_layout_wins_each_column() {
+        let one = labelled(marked("one", 1, None), "model-min");
+        let two = labelled(marked("two", 2, None), "model-rc2");
+        let matrix = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::current()]);
+        assert_eq!(reference_layout(&one), Some(1));
+        assert_eq!(reference_layout(&two), None);
+        let placed = [one.clone(), two.clone()];
+        let rows = select(&placed, &matrix).unwrap();
+        assert_eq!(cards(&rows[0]), vec![None, Some("one"), Some("two")]);
+        assert_eq!(results(&[one.clone(), two.clone()], &matrix).unwrap().matches("<img src=").count(), 2);
+        // Without a reference marker the column's extreme Spark count decides.
+        let fewer = labelled(marked("fewer", 1, None), "model");
+        let mut more = labelled(marked("more", 2, None), "model");
+        more.report.server.hardware.sparks.push(more.report.server.hardware.sparks[0].clone());
+        more.report.created = "2026-10-11T00:00:00Z".into();
+        let placed = [more.clone(), fewer.clone()];
+        let rows = select(&placed, &matrix).unwrap();
+        assert_eq!(cards(&rows[0]), vec![None, Some("fewer"), Some("more")]);
+        // The marker is per column: a one-GPU layout marked -max fills the one-RTX cell.
+        let historical = labelled(marked("historical", 1, None), "model-max");
+        assert_eq!(reference_layout(&historical), Some(2));
+        let one_column = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")]);
+        assert_eq!(cards(&select(&[historical], &one_column).unwrap()[0])[1], Some("historical"));
+    }
+
+    #[test]
+    fn a_simulated_5090_card_yields_to_a_real_one_however_old() {
+        let mut sim = marked("sim", 1, Some(("simulated", "5090")));
+        sim.report.created = "2026-10-09T00:00:00Z".into();
+        let mut real = marked("real", 1, Some(("hardware.class", "5090")));
+        real.report.created = "2026-10-08T00:00:00Z".into();
+        let matrix = v41_row([Cell::simulated_5090(), Cell::pending("no one-RTX card"), Cell::pending("no two-RTX card")]);
+        let placed = [sim.clone(), real.clone()];
+        let rows = select(&placed, &matrix).unwrap();
+        assert_eq!(cards(&rows[0])[0], Some("real"));
+        assert!(!results(&[sim.clone(), real], &matrix).unwrap().contains("sim/card.svg"));
+        assert!(index(&[sim.clone()]).contains("sim/report.svg"), "history remains in the index");
+        // With no real card the newest simulation fills the cell.
+        let mut newer = marked("newer-sim", 1, Some(("simulated", "5090")));
+        newer.report.created = "2026-10-10T00:00:00Z".into();
+        assert_eq!(cards(&select(&[sim.clone(), newer], &matrix).unwrap()[0])[0], Some("newer-sim"));
+        // `current` on the 5090 column wants a real card, not a simulation.
+        let matrix = v41_row([Cell::current(), Cell::pending("no one-RTX card"), Cell::pending("no two-RTX card")]);
+        assert!(select(&[sim], &matrix).is_err());
+    }
+
+    #[test]
+    fn no_fit_cards_publish_their_rejection() {
+        let mut rejection = marked("no-fit-sim5090", 1, Some(("simulated", "5090")));
+        rejection.report.status = crate::report::RunStatus::Failed;
+        rejection.report.baseline = None;
+        marker(&mut rejection, "qualification.no-fit", "rtx0 weights < layout | over budget");
+        let matrix = v41_row([Cell::simulated_5090(), Cell::pending("no one-RTX card"), Cell::pending("no two-RTX card")]);
+        let html = results(&[rejection.clone()], &matrix).unwrap();
+        assert!(html.contains("doesn't fit 1× 5090 (32 GB) + 4 Sparks"));
+        assert!(html.contains("weights &lt; layout"));
+        assert!(html.contains("layout \\| over budget"));
+        assert!(html.contains("no-fit-sim5090/report.json"));
+        let card = crate::render::card::card_svg(&rejection.report);
+        assert!(card.contains("Doesn&#39;t fit"));
+        assert!(!card.contains("tok/s"));
+        let report = crate::render::report::report_svg(&rejection.report);
+        assert!(report.contains("Doesn&#39;t fit"));
+        assert!(!crate::render::report::shown(&rejection.report).contains(&"baseline".into()));
+        assert!(index(&[rejection.clone()]).contains("no-fit-sim5090/report.svg"));
+        // A failed run with neither a measurement nor the planner's reason fills no cell.
+        let mut unmarked = rejection;
+        unmarked.report.server.configuration.settings.retain(|s| s.name != "qualification.no-fit");
+        assert!(select(&[unmarked], &matrix).is_err());
+    }
+
+    #[test]
+    fn a_retired_checkpoint_leaves_the_matrix_but_not_the_index() {
+        // A qualified replacement retires a checkpoint by dropping it from the
+        // matrix; its reports stay under benchmarks/ and in the index.
+        let mut old = crate::sample::report(false);
+        old.server.family = Some("mimo_v2".into());
+        old.server.configuration.snapshot = None;
+        old.server.model = "XiaomiMiMo/MiMo-V2-Flash".into();
+        let mut replacement = old.clone();
+        replacement.server.model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into();
+        let placed = vec![
+            Placed { dir: "benchmarks/mimo_v2/new".into(), report: replacement },
+            Placed { dir: "benchmarks/mimo_v2/old".into(), report: old },
+            Placed { dir: "benchmarks/qwen4/other".into(), report: {
+                let mut other = crate::sample::report(false);
+                other.server.family = Some("qwen4".into());
+                other
+            } },
+        ];
+        let matrix = Matrix { rows: vec![MatrixRow::new("mimo_v2", "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+            [Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")])] };
+        let rows = select(&placed, &matrix).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows.iter().any(|row| row.label.contains("MiMo-V2-Flash")));
+        let published: BTreeSet<PathBuf> = placed.iter().map(|p| p.dir.clone()).collect();
+        let cards = family_cards(&rows, &published, "mimo_v2");
+        assert!(cards.contains("/new/card.svg"));
+        assert!(!cards.contains("/old/card.svg"));
+        assert!(index(&placed).contains("MiMo-V2-Flash"));
+        assert!(index(&placed).contains("MiMo-V2.6-Flash-MOPD"));
+        assert!(index(&placed).contains("qwen4"));
+    }
+
+    #[test]
+    fn matrix_minimum_beats_extra_layout_and_archived_extras_stay_in_the_index() {
+        let minimum = labelled(qwen("uuid-min", 1, 2, None), "qwen38-exl3-min");
+        let mut extra = labelled(qwen("uuid-extra", 1, 0, None), "qwen38-exl3-nospark-vision");
+        extra.report.created = "2026-10-10T00:00:00Z".into();
+        let matrix = one_row("qwen4", "org/Qwen3.8-EXL3",
+            [Cell::pending("no 5090 card yet"), Cell::current(), Cell::na("fits one RTX; no two-GPU split")]);
+        let reports = vec![extra.clone(), minimum.clone()];
+        let rows = select(&reports, &matrix).unwrap();
+        assert_eq!(cards(&rows[0])[1], Some("uuid-min"));
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains(&link(&minimum.dir, "card.svg")));
+        assert!(!html.contains(&link(&extra.dir, "card.svg")), "an extra layout is not the cell");
+        assert!(!html.contains("nospark-vision"), "and it is not a supplementary row either");
+        assert!(index(&reports).contains("nospark-vision/report.svg"));
+    }
+
+    #[test]
+    fn qwen_local_minimum_is_not_displaced_by_legacy_budget_or_simulation() {
+        let minimum = qwen("minimum", 1, 1, Some("32"));
+        let mut simulated = qwen("simulated", 1, 1, Some("31.8"));
+        marker(&mut simulated, "simulated", "5090");
+        let matrix = one_row("qwen4", "org/Qwen3.8-EXL3",
+            [Cell::simulated_5090(), Cell::current(), Cell::na("fits one RTX (no two-GPU split for Qwen)")]);
+        let reports = vec![simulated, minimum.clone(), qwen("maximum", 1, 0, None), qwen("legacy", 1, 4, None)];
+        let rows = select(&reports, &matrix).unwrap();
+        // The memory cap fills the 5090 cell; a legacy 4-Spark layout never does.
+        assert_eq!(cards(&rows[0]), vec![Some("simulated"), Some("maximum"), None]);
+        assert!(short_hardware(&minimum.report).contains("32 GiB budget"));
+        assert!(crate::render::card::card_svg(&minimum.report).contains("32 GiB budget"));
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains("benchmarks/qwen4/maximum/card.svg"));
+        assert!(html.contains("n/a<br><sub>fits one RTX (no two-GPU split for Qwen)</sub>"), "{html}");
+        assert!(!html.contains("benchmarks/qwen4/legacy/card.svg"));
+        // A two-GPU card is not a one-RTX cell, whatever the matrix says.
+        let matrix = one_row("qwen4", "org/Qwen3.8-EXL3",
+            [Cell::pending("no 5090 card yet"), Cell::na("no one-RTX split for Qwen"),
+                Cell::current()]);
+        let reports = vec![qwen("legacy-two", 2, 4, None), qwen("max-two", 2, 0, None)];
+        assert_eq!(cards(&select(&reports, &matrix).unwrap()[0]), vec![None, None, Some("legacy-two")]);
+    }
+
+    #[test]
+    fn matrix_files_are_validated_before_use() {
+        let row = r#"{"family":"glm5","checkpoint":"nvidia/GLM-5.3-NVFP4","5090":"simulated-5090","1rtx":"current","2rtx":"current"}"#;
+        let held = r##"{"family":"glm5","checkpoint":"nvidia/GLM-5.3-NVFP4","5090":"simulated-5090","1rtx":{"status":"held","reason":"#233: +13% per verify row"},"2rtx":"current"}"##;
+        let held_cell = r##""1rtx":{"status":"held","reason":"#233: +13% per verify row"}"##;
+        let doc = |cells: &str| format!(r#"{{"schema":"{MATRIX_SCHEMA}","cells":[{cells}]}}"#);
+        let error = |text: String| Matrix::parse(&text).unwrap_err().to_string();
+        let swap = |to: &str| doc(&held.replace(held_cell, to));
+        assert_eq!(Matrix::parse(&doc(row)).unwrap().rows.len(), 1);
+        let matrix = Matrix::parse(&doc(held)).unwrap();
+        assert_eq!(matrix.rows[0].cells[1].status, Status::Held);
+        assert_eq!(matrix.rows[0].cells[1].reason, "#233: +13% per verify row");
+        assert_eq!(matrix.rows[0].cells[0].status, Status::Simulated5090);
+        assert!(Matrix::parse(&doc("")).unwrap().rows.is_empty());
+        assert!(error(format!(r#"{{"schema":"cuteafd.bench.matrix/2","cells":[{row}]}}"#)).contains("schema"));
+        assert!(error(doc(&format!("{row},{row}"))).contains("twice"));
+        assert!(error(format!(r#"{{"schema":"{MATRIX_SCHEMA}","cells":[{row}],"extra":1}}"#)).contains("unknown field"));
+        assert!(error(swap(r#""1rtx":"held""#)).contains("renders its reason"));
+        assert!(error(swap(r#""1rtx":"maybe""#)).contains("unknown status"));
+        assert!(error(swap(r#""1rtx":{"status":"held"}"#)).contains("renders its reason"));
+        assert!(error(swap(r#""1rtx":{"status":"held","reason":"   "}"#)).contains("renders its reason"));
+        assert!(error(swap(r#""1rtx":{"status":"held","reason":"x","extra":1}"#)).contains("unknown field"));
+        assert!(error(swap(r#""1rtx":{"status":"current","reason":"x"}"#)).contains("takes no reason"));
+        assert!(error(doc(&held.replace(r#""family":"glm5""#, r#""family":"""#))).contains("family and a checkpoint"));
+        // simulated-5090 is the 5090 column's fallback only.
+        assert!(error(doc(&row.replace(r#""2rtx":"current""#, r#""2rtx":"simulated-5090""#))).contains("5090 column"));
+        assert!(error(doc(&row.replace(r#""5090":"simulated-5090""#, r#""5090":"current","reason":"x""#)))
+            .contains("unknown field"));
+        // A matrix that is not where the publisher looks is an error, not a default.
+        let root = tempfile::tempdir().unwrap();
+        assert!(Matrix::load(&root.path().join("absent.json")).is_err());
+        assert!(Matrix::load(root.path()).is_err());
+    }
+
+    /// Writes `benchmarks/current-matrix.json` from rows: the real file, re-parsed by the real loader.
+    fn write_matrix(root: &Path, rows: &[MatrixRow]) -> PathBuf {
+        let path = root.join(MATRIX_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = |cell: &Cell| match cell.status {
+            Status::Current => serde_json::json!("current"),
+            Status::Simulated5090 => serde_json::json!("simulated-5090"),
+            status => serde_json::json!({"status": match status {
+                Status::Held => "held", Status::Pending => "pending", _ => "na" }, "reason": cell.reason}),
+        };
+        let cells: Vec<_> = rows.iter().map(|row| serde_json::json!({
+            "family": row.family, "checkpoint": row.checkpoint,
+            "5090": raw(&row.cells[0]), "1rtx": raw(&row.cells[1]), "2rtx": raw(&row.cells[2]),
+        })).collect();
+        std::fs::write(&path, serde_json::to_string_pretty(&serde_json::json!({
+            "schema": MATRIX_SCHEMA, "cells": cells })).unwrap()).unwrap();
+        path
     }
 
     #[test]
@@ -617,159 +1166,20 @@ mod tests {
     }
 
     #[test]
-    fn three_columns_use_markers_not_memory_layout() {
-        let reports = vec![marked("sim", 1, Some(("simulated", "5090"))),
-            marked("one", 1, None), marked("two", 2, None)];
-        let rows = reference_rows(&reports);
-        assert_eq!(rows.iter().map(|r| (r.2, r.3.report.id.as_str())).collect::<Vec<_>>(),
-            vec![(0, "sim"), (1, "one"), (2, "two")]);
-        let html = results(&reports);
-        assert!(html.contains("<th>5090</th><th>1× RTX</th><th>2× RTX</th>"));
-        assert_eq!(html.matches("<img src=").count(), 3);
-        assert!(results(&reports[1..]).contains("pending Hugh (TJ-T-3)"));
-    }
-
-    #[test]
-    fn real_5090_supersedes_even_newer_simulation_but_history_remains() {
-        let mut sim = marked("sim", 1, Some(("simulated", "5090")));
-        sim.report.created = "2026-10-09T00:00:00Z".into();
-        let mut real = marked("real", 1, Some(("hardware.class", "5090")));
-        real.report.created = "2026-10-08T00:00:00Z".into();
-        let reports = vec![sim, real, marked("one", 1, None)];
-        assert_eq!(reference_rows(&reports)[0].3.report.id, "real");
-        assert!(!results(&reports).contains("/sim/card.svg"));
-        assert!(index(&reports).contains("/sim/report.svg"));
-    }
-
-    #[test]
-    fn no_fit_has_no_performance_and_real_5090_replaces_it() {
-        let mut rejection = marked("no-fit-sim5090", 1, Some(("simulated", "5090")));
-        rejection.report.status = crate::report::RunStatus::Failed;
-        rejection.report.baseline = None;
-        rejection.report.server.configuration.settings.push(crate::report::Setting {
-            name: "qualification.no-fit".into(), value: Some("rtx0 weights < layout | over budget".into()),
-            default: None, source: "planner".into(),
-        });
-        let html = results(&[rejection.clone()]);
-        assert!(html.contains("doesn't fit 1× 5090 (32 GB) + 4 Sparks"));
-        assert!(html.contains("weights &lt; layout"));
-        assert!(html.contains("layout \\| over budget"));
-        assert!(html.contains("no-fit-sim5090/report.json"));
-        let card = crate::render::card::card_svg(&rejection.report);
-        assert!(card.contains("Doesn&#39;t fit"));
-        assert!(!card.contains("tok/s"));
-        let report = crate::render::report::report_svg(&rejection.report);
-        assert!(report.contains("Doesn&#39;t fit"));
-        assert!(!crate::render::report::shown(&rejection.report).contains(&"baseline".into()));
-        let mut real = marked("real", 1, Some(("hardware.class", "5090")));
-        real.report.created = "2026-10-01T00:00:00Z".into();
-        let reports = vec![rejection, real];
-        assert_eq!(reference_rows(&reports)[0].3.report.id, "real");
-        assert!(index(&reports).contains("no-fit-sim5090/report.svg"));
-        let mut unmarked = reports[0].clone();
-        unmarked.report.status = crate::report::RunStatus::Done;
-        assert!(reference_rows(&[unmarked]).is_empty());
-    }
-
-    #[test]
-    fn qualified_replacement_retires_cards_but_keeps_history() {
-        let mut old = crate::sample::report(false);
-        old.server.family = Some("mimo_v2".into());
-        old.server.configuration.snapshot = None;
-        old.server.model = "XiaomiMiMo/MiMo-V2-Flash".into();
-        let mut replacement = old.clone();
-        replacement.server.model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD".into();
-        replacement.server.configuration.settings.push(crate::report::Setting {
-            name: "supersedes-checkpoint".into(), value: Some(old.server.checkpoint()),
-            default: None, source: "publication".into(),
-        });
-        let mut other_family = old.clone();
-        other_family.server.family = Some("qwen4".into());
-        let mut placed = vec![
-            Placed { dir: "benchmarks/mimo_v2/new".into(), report: replacement },
-            Placed { dir: "benchmarks/mimo_v2/old".into(), report: old },
-            Placed { dir: "benchmarks/qwen4/other".into(), report: other_family },
-        ];
-        let rows = reference_rows(&placed);
-        assert_eq!(rows.len(), 2);
-        assert!(!rows.iter().any(|(family, _, _, p)| family == "mimo_v2"
-            && p.report.server.checkpoint() == "XiaomiMiMo/MiMo-V2-Flash"));
-        assert!(family_cards(&placed, "mimo_v2").contains("/new/card.svg"));
-        assert!(!family_cards(&placed, "mimo_v2").contains("/old/card.svg"));
-        assert!(index(&placed).contains("MiMo-V2-Flash"));
-        assert!(index(&placed).contains("MiMo-V2.6-Flash-MOPD"));
-        // A failed or non-basic replacement never hides a previous qualified result.
-        placed[0].report.baseline.as_mut().unwrap().quality.status = CheckStatus::Fail;
-        assert_eq!(reference_rows(&placed).len(), 3);
-        placed[0].report.baseline.as_mut().unwrap().quality.status = CheckStatus::Pass;
-        placed[0].report.profile = "decode".into();
-        assert_eq!(reference_rows(&placed).len(), 2);
-        assert!(reference_rows(&placed).iter().any(|(family, _, _, p)| family == "mimo_v2"
-            && p.report.server.checkpoint() == "XiaomiMiMo/MiMo-V2-Flash"));
-    }
-
-    #[test]
-    fn matrix_minimum_beats_extra_layout_and_extras_keep_labelled_rows() {
-        let mut minimum = marked("uuid-min", 1, None);
-        minimum.report.server.family = Some("qwen4".into());
-        minimum.report.server.hardware.sparks.truncate(2);
-        minimum.dir = crate::cli::labeled_dir(Path::new("."), &minimum.report, Some("qwen38-exl3-min"));
-        let mut extra = minimum.clone();
-        extra.report.id = "uuid-extra".into();
-        extra.report.created = "2026-10-10T00:00:00Z".into();
-        extra.report.server.hardware.sparks.clear();
-        extra.dir = crate::cli::labeled_dir(Path::new("."), &extra.report, Some("qwen38-exl3-nospark-vision"));
-        let mut max = marked("uuid-max", 2, None);
-        max.report.server.family = Some("qwen4".into());
-        max.dir = crate::cli::labeled_dir(Path::new("."), &max.report, Some("qwen38-exl3-max"));
-        let mut extra_two = max.clone();
-        extra_two.report.server.hardware.sparks.push(extra_two.report.server.hardware.sparks[0].clone());
-        extra_two.dir = crate::cli::labeled_dir(Path::new("."), &extra_two.report, Some("qwen38-exl3-extra"));
-        let reports = vec![extra.clone(), minimum.clone(), extra_two.clone(), max.clone()];
-        let rows = reference_rows(&reports);
-        assert_eq!(rows.iter().map(|r| r.3.report.id.as_str()).collect::<Vec<_>>(), vec!["uuid-min", "uuid-max"]);
-        let html = results(&reports);
-        let (grid, table) = html.split_once("</table>").unwrap();
-        assert!(grid.contains(&link(&minimum.dir, "card.svg")));
-        assert!(grid.contains(&link(&max.dir, "card.svg")));
-        assert!(!grid.contains(&link(&extra.dir, "card.svg")));
-        assert!(!grid.contains(&link(&extra_two.dir, "card.svg")));
-        assert!(table.contains("(qwen38-exl3-nospark-vision)"));
-        assert!(table.contains(&link(&extra.dir, "report.svg")));
-        assert!(table.contains(&link(&extra_two.dir, "report.svg")));
-        let cards = family_cards(&reports, "qwen4");
-        assert!(cards.contains(&link(&minimum.dir, "card.svg")));
-        assert!(!cards.contains(&link(&extra.dir, "card.svg")));
-
-        // An extra on identical hardware must not deduplicate away the reference.
-        let mut same_hw = minimum.clone();
-        same_hw.report.id = "uuid-same-hw".into();
-        same_hw.dir = crate::cli::labeled_dir(Path::new("."), &same_hw.report, Some("qwen38-exl3-vision"));
-        let html = results(&[same_hw.clone(), minimum]);
-        assert!(html.contains("(qwen38-exl3-vision)"));
-        assert!(html.contains(&link(&same_hw.dir, "report.svg")));
-    }
-
-    #[test]
     fn release_candidates_share_card_identity_and_newest_wins() {
-        let mut old = marked("older", 1, None);
-        old.dir = crate::cli::labeled_dir(Path::new("."), &old.report, Some("model-min"));
-        let mut rc2 = old.clone();
+        let old = labelled(marked("older", 1, None), "model-min");
+        let mut rc2 = labelled(marked("rc2", 1, None), "model-min-rc2");
         rc2.report.created = "2026-10-10T00:00:00Z".into();
-        rc2.dir = crate::cli::labeled_dir(Path::new("."), &rc2.report, Some("model-min-rc2"));
-        let mut rc3 = rc2.clone();
-        rc3.report.id = "newest".into();
+        let mut rc3 = labelled(marked("rc3", 1, None), "model-min-rc3");
         rc3.report.created = "2026-10-11T00:00:00Z".into();
-        rc3.dir = crate::cli::labeled_dir(Path::new("."), &rc3.report, Some("model-min-rc3"));
         assert_eq!(reference_layout(&rc3), Some(1));
-        assert_eq!(layout_label(&rc3), Some("model-min"));
-        let reports = [old, rc2, rc3.clone()];
-        let rows = reference_rows(&reports);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].3.report.id, "newest");
-        assert_eq!(basic_groups(&[rc3]).values().next().unwrap().len(), 1);
         assert_eq!(without_release_candidate("model-max-rc3"), "model-max");
         assert_eq!(without_release_candidate("model-min-rcfoo"), "model-min-rcfoo");
+        let matches = without_release_candidate(rc3.dir.file_name().unwrap().to_str().unwrap());
+        assert_eq!(matches, without_release_candidate(rc2.dir.file_name().unwrap().to_str().unwrap()));
+        let placed = [old, rc2, rc3];
+        let rows = select(&placed, &v41_row(v41())).unwrap();
+        assert_eq!(cards(&rows[0])[1], Some("rc3"));
     }
 
     #[test]
@@ -789,14 +1199,15 @@ mod tests {
             setting("qualification.caveat-link-label", "vision <on>"),
         ]);
         assert_eq!(caveat(&p), "<br><sub><b>FAIL: not recommended.</b> KL &gt; 0.06. With vision: <a href=\"benchmarks/qwen4/vision/report.svg\">vision &lt;on&gt;</a>.</sub>");
-        assert!(results(&[p.clone()]).contains(&caveat(&p)));
+        assert!(results(&[p.clone()], &v41_row(v41())).unwrap().contains(&caveat(&p)));
         p.report.server.configuration.settings.iter_mut().find(|s| s.name == "qualification.caveat-link").unwrap().value = Some("javascript:bad".into());
         assert!(!caveat(&p).contains("href="));
         p.report.baseline = None;
         p.report.status = crate::report::RunStatus::Failed;
-        p.report.server.configuration.settings.push(setting("qualification.no-fit", "over budget"));
-        p.report.server.configuration.settings.push(setting("simulated", "5090"));
-        assert!(results(&[p.clone()]).contains(&caveat(&p)));
+        marker(&mut p, "qualification.no-fit", "over budget");
+        marker(&mut p, "simulated", "5090");
+        let matrix = v41_row([Cell::simulated_5090(), Cell::pending("no one-RTX card"), Cell::pending("no two-RTX card")]);
+        assert!(results(&[p.clone()], &matrix).unwrap().contains(&caveat(&p)));
         // A panel a later policy reclassifies: the same note, quality that now
         // passes, so the caption drops the verdict sentence and keeps its prose.
         let mut ok = marked("reclassified-min", 1, None);
@@ -846,12 +1257,18 @@ mod tests {
         (dir, placed)
     }
 
+    /// The matrix for `published_qwen_repo`: its one run uses one RTX.
+    fn qwen_matrix(root: &Path) -> PathBuf {
+        write_matrix(root, &[MatrixRow::new("qwen4", "nvidia/Qwen3.8-Flash-Next-NVFP4",
+            [Cell::pending("no 5090 card"), Cell::current(), Cell::pending("no two-RTX card")])])
+    }
+
     #[test]
     fn a_calibrated_nvfp4_card_publishes_as_informational_not_as_the_stored_failure() {
         let root = tempfile::tempdir().unwrap();
         let (dir, placed) = published_qwen_repo(root.path(), "NVFP4", "");
         let fixture = tree(&dir);
-        let (readme, _, count) = publish(root.path(), &[]).unwrap();
+        let (readme, _, count) = publish(root.path(), &[], &qwen_matrix(root.path())).unwrap();
         assert_eq!(count, 1);
         // The card image is re-rendered from report.json: the measured numbers
         // stay, the verdict the rule in force now reaches replaces the stored one.
@@ -881,7 +1298,7 @@ mod tests {
         // included: the exports this run placed are the ones it keeps, byte for
         // byte, `report.json` first among them.
         let before = tree(&dir);
-        publish(root.path(), &[]).unwrap();
+        publish(root.path(), &[], &qwen_matrix(root.path())).unwrap();
         assert_eq!(tree(&dir), before, "a repeat publish rewrote the run");
         for name in placed {
             assert!(before.contains_key(&name), "the fixture never placed {name}");
@@ -898,7 +1315,7 @@ mod tests {
     fn a_failing_gate_beside_a_reclassified_fidelity_check(failing: &str, title: &str, mark: &str) {
         let root = tempfile::tempdir().unwrap();
         let (dir, _) = published_qwen_repo(root.path(), "NVFP4", failing);
-        let (readme, _, count) = publish(root.path(), &[]).unwrap();
+        let (readme, _, count) = publish(root.path(), &[], &qwen_matrix(root.path())).unwrap();
         assert_eq!(count, 1);
         // The aggregate: the fidelity check is informational, the gate is not.
         let stored: Report = serde_json::from_str(&std::fs::read_to_string(dir.join("report.json")).unwrap()).unwrap();
@@ -968,7 +1385,7 @@ mod tests {
         let card = dir.join("card.svg");
         let stale = std::fs::read(&card).unwrap();
         std::fs::set_permissions(&card, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let error = publish(root.path(), &[]).unwrap_err();
+        let error = publish(root.path(), &[], &qwen_matrix(root.path())).unwrap_err();
         assert!(format!("{error:#}").contains("card.svg"), "{error:#}");
         assert_eq!(std::fs::read(&card).unwrap(), stale, "the stale card was left un-replaced");
     }
@@ -982,7 +1399,7 @@ mod tests {
         let (dir, placed) = published_qwen_repo(root.path(), "W4A16_NVFP4", "");
         let before = tree(&dir);
         let card = std::fs::read_to_string(dir.join("card.svg")).unwrap();
-        let (readme, _, _) = publish(root.path(), &[]).unwrap();
+        let (readme, _, _) = publish(root.path(), &[], &qwen_matrix(root.path())).unwrap();
         assert_eq!(tree(&dir), before, "a card the bar still fails is already current");
         for name in ["report.json", "card.png", "report.png"] {
             assert_eq!(std::fs::read(dir.join(name)).unwrap(), before[name], "{name} was rewritten");
@@ -995,46 +1412,10 @@ mod tests {
     }
 
     #[test]
-    fn supplementary_cards_belong_to_the_current_release() {
-        let mut current = marked("current", 1, None);
-        current.report.server.build.release = Some("v2.0.0-rc3".into());
-        current.dir = crate::cli::labeled_dir(Path::new("."), &current.report, Some("model-min-rc3"));
-        let mut extra = current.clone();
-        extra.dir = crate::cli::labeled_dir(Path::new("."), &extra.report, Some("model-vision-rc3"));
-        let mut old = extra.clone();
-        old.report.server.build.release = Some("v2.0.0-rc2".into());
-        old.dir = crate::cli::labeled_dir(Path::new("."), &old.report, Some("model-vision-rc2"));
-        let reports = [current, extra.clone(), old.clone()];
-        let html = results(&reports);
-        assert!(html.contains(&link(&extra.dir, "report.svg")));
-        assert!(!html.contains(&link(&old.dir, "report.svg")));
-        assert!(index(&reports).contains("model-vision-rc2/report.svg"));
-        let mut labelled = extra;
-        labelled.report.server.configuration.settings.push(crate::report::Setting {
-            name: "qualification.hardware-label".into(), value: Some("vision on RTX0, fixed pool".into()),
-            source: "publication".into(), ..Default::default()
-        });
-        assert!(results(&[labelled]).contains("| vision on RTX0, fixed pool |"));
-    }
-
-    #[test]
-    fn reference_marker_fallback_is_per_gpu_column() {
-        let mut one = marked("one", 1, None);
-        let mut two = marked("two", 2, None);
-        one.dir = crate::cli::labeled_dir(Path::new("."), &one.report, Some("model-min"));
-        two.dir = crate::cli::labeled_dir(Path::new("."), &two.report, Some("model-rc2"));
-        let check = |reports: &[Placed]| {
-            assert_eq!(reference_rows(reports).iter().map(|r| (r.2, r.3.report.id.as_str()))
-                .collect::<Vec<_>>(), vec![(1, "one"), (2, "two")]);
-            assert_eq!(results(reports).matches("<img src=").count(), 2);
-        };
-        check(&[one.clone(), two.clone()]);
-        one.dir = crate::cli::labeled_dir(Path::new("."), &one.report, Some("model-rc2"));
-        two.dir = crate::cli::labeled_dir(Path::new("."), &two.report, Some("model-max"));
-        check(&[one.clone(), two]);
-        // Historical Qwen maxima used one GPU; they remain in the one-RTX column.
-        one.dir = crate::cli::labeled_dir(Path::new("."), &one.report, Some("model-max"));
-        assert_eq!(reference_rows(&[one])[0].2, 1);
+    fn publication_rows_carry_a_hardware_label() {
+        let mut labelled_row = marked("labelled-min", 1, None);
+        marker(&mut labelled_row, "qualification.hardware-label", "vision on RTX0, fixed pool");
+        assert!(results(&[labelled_row], &v41_row(v41())).unwrap().contains("| vision on RTX0, fixed pool |"));
     }
 
     #[test]
@@ -1061,7 +1442,9 @@ mod tests {
             new.created = "2026-10-10T00:00:00Z".into();
             let dir = crate::cli::labeled_dir(root.path(), &new, Some("new-min"));
             crate::cli::write_exports(&new, &dir, &["json".into()]).unwrap();
-            publish(root.path(), &[dir]).unwrap();
+            let matrix = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
+                "deepseek-ai/DeepSeek-V4.1-Flash", [Cell::pending("no 5090 card yet"), Cell::current(), Cell::current()])]);
+            publish(root.path(), &[dir], &matrix).unwrap();
             let page = std::fs::read_to_string(&page_path).unwrap();
             assert!(page.contains(v0), "{page}");
             assert!(page.contains(v1), "{page}");
@@ -1070,7 +1453,7 @@ mod tests {
             assert!(!row.contains("old-max"), "{row}");
             assert_eq!(page.matches("| v2 |").count(), 1);
             if !existing { assert!(page.find(v1).unwrap() < page.find(row).unwrap()); }
-            publish(root.path(), &[]).unwrap();
+            publish(root.path(), &[], &matrix).unwrap();
             assert_eq!(std::fs::read_to_string(page_path).unwrap(), page);
         }
     }
@@ -1088,14 +1471,15 @@ mod tests {
             let mut old = marked("old-max", 2, None);
             old.report.server.build.release = Some("v1.0.0".into());
             let reports = [current, old];
-            family_pages_with_row(root.path(), &reports, Some("v2"), Some(row)).unwrap();
+            let matrix = v41_row([Cell::pending("no 5090 card yet"), Cell::current(), Cell::current()]);
+            family_pages_with_row(root.path(), &reports, &matrix, Some("v2"), Some(row)).unwrap();
             let page = std::fs::read_to_string(&path).unwrap();
             let target = page.lines().find(|line| line.starts_with(&format!("| {row} |"))).unwrap();
             assert!(target.contains("current-min/card.svg"), "{target}");
             assert!(!target.contains("old-max"), "{target}");
             assert!(page.contains(old_row));
             if row != "custom-row" {
-                family_pages_with_row(root.path(), &reports, None, Some(row)).unwrap();
+                family_pages_with_row(root.path(), &reports, &matrix, None, Some(row)).unwrap();
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), page);
             }
         }
@@ -1130,14 +1514,19 @@ mod tests {
             let dir = if r.id == "older" { dir.with_file_name("2026-10-01-smoke-deepseek-v4-1-flash-1rtx-4spark") } else { dir };
             crate::cli::write_exports(r, &dir, &["json".into(), "svg".into()]).unwrap();
         }
+        let matrix = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
+            "deepseek-ai/DeepSeek-V4.1-Flash", v41())]);
         let dir = root.path().join("benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark");
-        let (readme, index, count) = publish(root.path(), &[dir]).unwrap();
+        let (readme, index, count) = publish(root.path(), &[dir], &matrix).unwrap();
         assert_eq!(count, 2);
         let readme = std::fs::read_to_string(readme).unwrap();
         assert!(readme.contains("<img src=\"benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/card.svg\""), "{readme}");
-        // One row per checkpoint × hardware: the newest wins.
+        // One row per checkpoint: the newest accepted report fills it.
         assert_eq!(readme.matches("| DeepSeek-V4.1-Flash (mxfp4) |").count(), 1, "{readme}");
-        assert!(super::family_cards(&scan(root.path()).unwrap(), "deepseek_v41").contains("../../benchmarks/"));
+        let placed = scan(root.path()).unwrap();
+        let published: BTreeSet<PathBuf> = placed.iter().map(|p| p.dir.clone()).collect();
+        let rows = select(&placed, &Matrix::load(&matrix).unwrap()).unwrap();
+        assert!(family_cards(&rows, &published, "deepseek_v41").contains("../../benchmarks/"));
         let page = std::fs::read_to_string(root.path().join("docs/models/deepseek_v41.md")).unwrap();
         assert!(page.contains("| v0 | 2026-10-02 | First release | <a href=\"../../benchmarks/"), "{page}");
         assert!(readme.contains("benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/report.svg"));
@@ -1147,11 +1536,16 @@ mod tests {
         assert!(first < index.find("2026-10-01").unwrap(), "newest first");
         assert!(index.contains("⚠ quality gate failed"));
         // Idempotent.
-        let again = publish(root.path(), &[]).unwrap();
-        assert_eq!(std::fs::read_to_string(again.0).unwrap(), readme);
+        assert_eq!(std::fs::read_to_string(publish(root.path(), &[], &matrix).unwrap().0).unwrap(), readme);
         // Misplaced reports are refused.
         let stray = root.path().join("elsewhere");
         crate::cli::write_exports(&ok, &stray, &["json".into()]).unwrap();
-        assert!(publish(root.path(), &[stray]).is_err());
+        assert!(publish(root.path(), &[stray], &matrix).is_err());
+        // And so is a cell the tree cannot fill, without writing a document.
+        let before = std::fs::read_to_string(root.path().join("README.md")).unwrap();
+        let missing = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
+            "deepseek-ai/DeepSeek-V4.1-Flash", [Cell::current(), Cell::current(), Cell::current()])]);
+        assert!(publish(root.path(), &[], &missing).is_err());
+        assert_eq!(std::fs::read_to_string(root.path().join("README.md")).unwrap(), before);
     }
 }
