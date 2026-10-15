@@ -353,6 +353,21 @@ for release_family in "${release_family_list[@]}"; do
   done
 done
 install -m 0644 "$build_root/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
+# Keep planner workspace inputs identical to the linked coordinator exports.
+rm -rf "$output_dir/V41_EXPERT_WORKSPACES"
+mkdir -p "$output_dir/V41_EXPERT_WORKSPACES"
+if [[ "$coordinator_aot" == ON ]]; then
+  for expert_role in rtx_backbone rtx_tp2; do
+    expert_dir=v41_local_experts
+    [[ "$expert_role" != rtx_tp2 ]] || expert_dir=v41_tp2_experts
+    install -m 0644 "$build_root/native/$expert_dir/v41_experts.json" \
+      "$output_dir/V41_EXPERT_WORKSPACES/mxfp4_${expert_role}.json"
+    if [[ "${CUTEAFD_RELEASE_NVFP4_AOT:-ON}" == ON ]]; then
+      install -m 0644 "$build_root/native/v41_nvfp4_$expert_role/v41_nvfp4_experts.json" \
+        "$output_dir/V41_EXPERT_WORKSPACES/nvfp4_${expert_role}.json"
+    fi
+  done
+fi
 # Always write the built-role manifest, including the empty-role default, so
 # the release Dockerfile can COPY it unconditionally. Every listed role is
 # derived from the AOT export manifest CMake actually produced.

@@ -197,7 +197,7 @@ wip_phase_mark() {
 # ~/.cache/cuteafd/native-store/<arch>, by hardlink, so instances share them.
 native_store_root="${CUTEAFD_WIP_NATIVE_STORE:-$(dirname "$build_dir")/../cache/native-store}"
 native_store_root="$(realpath -m "$native_store_root")"
-native_items=(libcuteafd_native.so lib-variants PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json exl3 fp8)
+native_items=(libcuteafd_native.so lib-variants PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json V41_EXPERT_WORKSPACES exl3 fp8)
 wip_native_key() {
   {
     printf 'schema 1\nrole %s\narch %s %s\n' "$role" "$cuda_arch" "$(uname -m)"
@@ -385,6 +385,21 @@ for wip_family in "${wip_fp8_list[@]}"; do
   done
 done
 install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
+# Keep planner workspace inputs identical to the linked coordinator exports.
+rm -rf "$output_dir/V41_EXPERT_WORKSPACES"
+mkdir -p "$output_dir/V41_EXPERT_WORKSPACES"
+if [[ "$coordinator_aot" == ON ]]; then
+  for expert_role in rtx_backbone rtx_tp2; do
+    expert_dir=v41_local_experts
+    [[ "$expert_role" != rtx_tp2 ]] || expert_dir=v41_tp2_experts
+    install -m 0644 "$build_dir/native/$expert_dir/v41_experts.json" \
+      "$output_dir/V41_EXPERT_WORKSPACES/mxfp4_${expert_role}.json"
+    if [[ "$nvfp4_aot" == ON ]]; then
+      install -m 0644 "$build_dir/native/v41_nvfp4_$expert_role/v41_nvfp4_experts.json" \
+        "$output_dir/V41_EXPERT_WORKSPACES/nvfp4_${expert_role}.json"
+    fi
+  done
+fi
 # Always emit the built-role manifest (empty for the legacy default). Roles are
 # derived from the AOT export manifests CMake actually produced and bound to the
 # built library hash, so a stale/partial export cannot advertise a role.
@@ -455,6 +470,6 @@ fi
 (
   cd "$output_dir"
   sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json PROGRAMS.json \
-    $(find bin-variants lib-variants -type f | LC_ALL=C sort) >ARTIFACT_SHA256SUMS
+    $(find bin-variants lib-variants V41_EXPERT_WORKSPACES -type f | LC_ALL=C sort) >ARTIFACT_SHA256SUMS
   sha256sum -c ARTIFACT_SHA256SUMS
 )
