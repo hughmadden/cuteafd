@@ -75,6 +75,32 @@ impl GdnLayout {
     }
 }
 
+/// Exact prefix marks retain global state order while packing each owner's arena.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MarkLayout {
+    pub(crate) owners: Vec<(i32, usize)>,
+    /// Owner arena, byte offset, byte length, in global state-region order.
+    pub(crate) regions: Vec<(usize, usize, usize)>,
+    pub(crate) bytes: usize,
+}
+
+impl MarkLayout {
+    pub(crate) fn new(regions: &[(i32, usize)]) -> Result<Self> {
+        let mut layout = Self { owners: Vec::new(), regions: Vec::new(), bytes: 0 };
+        for &(device, bytes) in regions {
+            let owner = layout.owners.iter().position(|&(id, _)| id == device).unwrap_or_else(|| {
+                layout.owners.push((device, 0));
+                layout.owners.len() - 1
+            });
+            let offset = layout.owners[owner].1;
+            layout.owners[owner].1 = offset.checked_add(bytes).context("Qwen owner mark size overflow")?;
+            layout.bytes = layout.bytes.checked_add(bytes).context("Qwen logical mark size overflow")?;
+            layout.regions.push((owner, offset, bytes));
+        }
+        Ok(layout)
+    }
+}
+
 /// Compact pools on one owner; global layer ids never index them directly.
 /// The enclosing engine drains its streams before releasing this bank.
 pub(crate) struct GdnBank<'a> {
