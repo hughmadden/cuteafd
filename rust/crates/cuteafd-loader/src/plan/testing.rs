@@ -531,3 +531,74 @@ fn v4_block(cfg: &crate::families::deepseek_v4::DeepseekV4Config, prefix: &str, 
     }
     out
 }
+
+/// The fixed official V4.1 header contract over sparse payloads, split into its
+/// 48 required shard names. This never reads HF_HOME or allocates tensor data.
+pub fn write_v41_snapshot(dir: &Path) {
+    write_v41_snapshot_format(dir, false);
+}
+
+/// ModelOpt's calibrated W4A4 expert headers with the official non-expert tensors.
+pub fn write_v41_nvfp4_snapshot(dir: &Path) {
+    write_v41_snapshot_format(dir, true);
+}
+
+fn write_v41_snapshot_format(dir: &Path, nvfp4: bool) {
+    let mut config: Value = serde_json::from_str(include_str!(
+        "../families/deepseek_v41/official-v41-config.json")).unwrap();
+    if nvfp4 {
+        let layers: serde_json::Map<String, Value> = (0..40).map(|layer|
+            (format!("layers.{layer}.ffn.experts"), json!({"group_size":16,"quant_algo":"NVFP4"}))).collect();
+        config["quantization_config"] = json!({
+            "quant_method":"fp8", "quant_algo":"MIXED_PRECISION", "moe_quant_algo":"NVFP4",
+            "expert_dtype":"fp4", "activation_scheme":"dynamic", "group_size":16,
+            "scale_fmt":"ue8m0", "weight_block_size":[32,32], "kv_cache_quant_algo":null,
+            "ignore":["*.attn.*","*.ffn.shared_experts.*","head","mtp.*"],
+            "producer":{"name":"modelopt","version":"fixture"}, "quantized_layers":layers,
+            "config_groups":{"group_0":{"targets":["Linear"],
+                "weights":{"dynamic":false,"group_size":16,"num_bits":4,"type":"float"},
+                "input_activations":{"dynamic":false,"group_size":16,"num_bits":4,"type":"float"}}}
+        });
+    }
+    let templates: Vec<Value> = serde_json::from_str(include_str!(
+        "../families/deepseek_v41/official-v41-tensors.json")).unwrap();
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut shards: Vec<Vec<Tensor>> = vec![vec![]; 48];
+    let mut weight_map = serde_json::Map::new();
+    let mut index = 0;
+    for template in templates {
+        let mut names = vec![template["pattern"].as_str().unwrap().to_owned()];
+        for axis in template["axes"].as_array().unwrap() {
+            names = names.into_iter().flat_map(|name| axis.as_array().unwrap().iter()
+                .map(move |i| name.replacen("{}", &i.to_string(), 1))).collect();
+        }
+        let dtype = match template["dtype"].as_str().unwrap() {
+            "BF16" => "BF16", "F32" => "F32", "I8" => "I8",
+            "F8_E4M3" => "F8_E4M3", "F8_E8M0" => "F8_E8M0",
+            other => panic!("unexpected official dtype {other}"),
+        };
+        let shape = template["shape"].as_array().unwrap().iter()
+            .map(|n| n.as_u64().unwrap() as usize).collect::<Vec<_>>();
+        for name in names {
+            let tensors = if nvfp4 && name.starts_with("layers.") && name.contains(".ffn.experts.") {
+                if name.ends_with(".scale") { continue; }
+                let prefix = name.strip_suffix(".weight").expect("official expert weight");
+                let (n,k) = if prefix.ends_with(".w2") { (5120,2304) } else { (2304,5120) };
+                self::nvfp4(prefix,n,k)
+            } else { vec![(name,dtype,shape.clone())] };
+            for tensor in tensors {
+                let shard = index % 48;
+                weight_map.insert(tensor.0.clone(), json!(format!("model-{:05}-of-00048.safetensors", shard + 1)));
+                shards[shard].push(tensor);
+                index += 1;
+            }
+        }
+    }
+    assert_eq!(index, 96085 + if nvfp4 { 40*384*3*2 } else { 0 });
+    for (shard, tensors) in shards.iter().enumerate() {
+        write_safetensors(&dir.join(format!("model-{:05}-of-00048.safetensors", shard + 1)), tensors);
+    }
+    fs::write(dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&json!({"weight_map":weight_map})).unwrap()).unwrap();
+}

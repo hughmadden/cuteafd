@@ -50,6 +50,8 @@ pub struct PlacementRequest {
     /// Per-unit pool bytes each KV-owning GPU charges beside its layers'
     /// records (unit metadata, lane page tables), indexed by GPU.
     pub pool_overhead: Vec<u64>,
+    /// Pool-indexed allocations that grow linearly to a fixed capacity.
+    pub pool_bounded: Vec<BoundedDemand>,
     /// Non-layer items charged before the pool, per GPU.
     pub fixed: Vec<Demand>,
     /// Mandatory items the solver places on an allowed GPU (drafter, encoders).
@@ -63,6 +65,8 @@ pub struct PlacementRequest {
     pub onboard: Onboard,
     /// GPUs (from GPU0) whose executors can hold whole routed layers.
     pub expert_gpus: usize,
+    /// Compulsory routed prefix admitted before an automatic pool.
+    pub minimum_expert_layers: usize,
     pub policy: LayerPolicy,
     /// What one residual hop moves, for the hops the chosen modes imply.
     pub hops: HopSpec,
@@ -273,6 +277,28 @@ pub struct LayerPolicy {
 impl LayerPolicy {
     pub fn preference(&self, kind: AttentionClass) -> &[LayerMode] {
         self.by_kind.iter().find(|(k, _)| *k == kind).map_or(&self.default, |(_, modes)| modes)
+    }
+}
+
+/// A pool-indexed allocation: `(units + offset_units).min(cap_units)` entries.
+/// Use this for bounded page tables or fixed-capacity staging, not a maximum
+/// table charged at every pool size. Offsets include private reserved units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedDemand {
+    pub gpu: u8,
+    pub category: Category,
+    pub group: String,
+    pub bytes_per_unit: u64,
+    pub offset_units: u64,
+    pub cap_units: u64,
+    pub basis: Basis,
+}
+
+impl BoundedDemand {
+    pub fn bytes(&self, units: u64) -> Result<u64, PlacementError> {
+        units.saturating_add(self.offset_units).min(self.cap_units)
+            .checked_mul(self.bytes_per_unit)
+            .ok_or(PlacementError::Overflow("bounded pool demand"))
     }
 }
 

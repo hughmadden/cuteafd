@@ -121,7 +121,8 @@ impl<'a> OwnerReduce<'a> {
             (1..=4096).contains(&capacity),
             "invalid owner reduction capacity"
         );
-        Ok(capacity as usize * geometry.hidden as usize * (geometry.topk as usize * 4 + 2))
+        Ok(usize::try_from(cuteafd_loader::placement::families::deepseek_v41::owner_workspace(
+            capacity as u64, geometry.hidden as u64, geometry.topk as u64)?)?)
     }
 
     pub(crate) fn new(

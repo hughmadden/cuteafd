@@ -8,7 +8,7 @@ mod distributed;
 pub(crate) mod scores;
 use scores::RetainedScores;
 pub(crate) mod prefix;
-pub(crate) mod memory;
+mod admission;
 use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
 use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
 use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
@@ -286,7 +286,7 @@ fn worker(
     // fits. Explicit all-remote single-RTX launches do not need a handoff.
     if let Some(directory) = args.placement_directory.as_deref() {
         ensure!(
-            args.rtx_gpus == 2 || args.rtx_expert_layers != memory::LocalLayers::Count(0),
+            args.rtx_gpus == 2 || args.rtx_expert_layers != admission::LocalLayers::Count(0),
             "placement handoff requires --rtx-gpus 2 or single-RTX auto/local expert placement"
         );
         // The handoff directory must name a real path, not an empty string.
@@ -363,10 +363,13 @@ fn worker(
          a native three-rank group must pass --spark-tp 3 --spark-ep 1"
     );
     let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
-    memory::admit_startup(&lib, &catalog, &args)?;
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], |_| {
+        admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some(), catalog.exl3().is_some())
+    })?;
+    admission::admit_startup(&lib, &catalog, &args)?;
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
-    if small_card { memory::startup_phase(&lib, "v41/startup", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/startup", device_total)?; }
     let weights = BackboneLaneWeights::load(
         &lib,
         &catalog,
@@ -386,7 +389,7 @@ fn worker(
         16 * 1024 * 1024,
     )?;
     let table = NativeRtxTensors::load_embedding(&lib, &catalog,
-        memory::embedding_placement(args.embedding_placement, device_total))?;
+        admission::embedding_placement(args.embedding_placement, device_total))?;
     eprintln!(
         "native target backbone/index/embedding weights loaded in {:.3}s",
         start.elapsed().as_secs_f64()
@@ -394,7 +397,7 @@ fn worker(
     let embedding =
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
-    if small_card { memory::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?; }
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
         args.attention_plan_rows)?;
@@ -414,7 +417,7 @@ fn worker(
         BackboneExecution::workspace_bytes(&lib, capacity)?,
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:backbone-lanes");
-    if small_card { memory::startup_phase(&lib, "v41/workspace:backbone-lanes", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/workspace:backbone-lanes", device_total)?; }
     let map = cuteafd_loader::EngramTokenMap::from_file(&&args.snapshot.join("tokenizer.json"))?;
     // Both Engram layers retain their staging leases until consumed. Reserve
     // both layers for both active lanes so the second lane can gather early.
@@ -431,7 +434,7 @@ fn worker(
     ];
     let upload = EngramDeviceRows::new(&lib, rows, EngramDeviceRows::device_bytes(rows)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/engram");
-    if small_card { memory::startup_phase(&lib, "v41/engram", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/engram", device_total)?; }
     let vocabulary = VocabularyHead::load(
         &lib,
         &catalog,
@@ -446,7 +449,7 @@ fn worker(
     )?;
     let head = head_weights.wave(&vocabulary, cuteafd_core::V41_VERIFY_ROWS, TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:head");
-    if small_card { memory::startup_phase(&lib, "v41/weights:head", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/weights:head", device_total)?; }
     let mut pass = TargetPass::new(
         embedding,
         lane,
@@ -463,7 +466,7 @@ fn worker(
         Duration::from_secs(120),
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:target-pass");
-    if small_card { memory::startup_phase(&lib, "v41/workspace:target-pass", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/workspace:target-pass", device_total)?; }
     let protocol_v2_timing = protocol_v2_timing();
     // Every replicated layout reserves its exact physical rank plane count; the
     // legacy 4-rank forecast is no longer reused for six ranks.
@@ -472,7 +475,7 @@ fn worker(
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
     if let Some(profile) = &paired_profile { transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
-    if small_card { memory::startup_phase(&lib, "v41/transport", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
     let mut prefill_pass = TargetPass::new(
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?,
         BackboneLane::new(&weights, capacity, BackboneLane::workspace_bytes(&lib, capacity)?.into_iter().sum())?,
@@ -486,12 +489,12 @@ fn worker(
         Duration::from_secs(120),
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-pass");
-    if small_card { memory::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?; }
     let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
     if let Some(profile) = &paired_profile { prefill_transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
-    if small_card { memory::startup_phase(&lib, "v41/transport", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
     pass.install_attention_plan(attention_plan)?;
     prefill_pass.install_attention_plan(attention_plan)?;
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
@@ -522,7 +525,7 @@ fn worker(
     tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
         "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
     cuteafd_ffi::memory_ledger::relabel_other("v41/drafter");
-    if small_card { memory::startup_phase(&lib, "v41/drafter", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/drafter", device_total)?; }
     let vision_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
     let dspark_bytes = draft_free_before.saturating_sub(vision_free_before);
     let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
@@ -531,7 +534,7 @@ fn worker(
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     cuteafd_ffi::memory_ledger::relabel_other("v41/vision");
-    if small_card { memory::startup_phase(&lib, "v41/vision", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/vision", device_total)?; }
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else {
         (args.prefix_cache_entries as usize).checked_mul(2).and_then(|n| n.checked_add(2))
             .context("snapshot slot count overflow")?
@@ -542,44 +545,21 @@ fn worker(
     let snapshot_bytes = prefix::Arenas::device_bytes(snapshot_slots, draft.is_some());
     tracing::info!(snapshot_slots, snapshot_bytes, "snapshot arenas reserved before serving");
     cuteafd_ffi::memory_ledger::relabel_other("v41/prefix-snapshots");
-    if small_card { memory::startup_phase(&lib, "v41/prefix-snapshots", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/prefix-snapshots", device_total)?; }
     // Size after vision, both lanes, transports and optional draft allocations are live.
-    let (free, total) = if small_card { memory::measured_pool_memory(&lib)? } else { lib.cuda_memory_info()? };
-    let reservation = args.memory_reservation;
-    // Exact local placement is admitted before the automatic pool consumes its
-    // space. Use the same header-derived resident/workspace/staging bound as
-    // the post-pool loader; automatic placement remains pool-first.
-    let fixed_local_peak = if let memory::LocalLayers::Count(count) = args.rtx_expert_layers {
-        if count == 0 { 0 } else {
-            use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave, exl3::Exl3Weights};
-            let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp1");
-            let workspace = if catalog.exl3().is_some() { LocalExpertWave::exl3_device_bytes(&directory, aot_capacity)? }
-                else { LocalExpertWave::device_bytes_for(&lib, aot_capacity, catalog.nvfp4().is_some())? };
-            let budgets = (0..count).map(|layer| {
-                let selection = ExpertLayer::BackboneFull { layer };
-                if catalog.exl3().is_some() { Exl3Weights::plan(&catalog, selection) }
-                else { ExpertWeights::plan(&lib, &catalog, selection) }
-            }).collect::<Result<Vec<_>>>()?;
-            let resident = budgets.iter().try_fold(0usize, |sum, budget| sum.checked_add(budget.resident_bytes).context("local resident overflow"))?;
-            resident.checked_add(workspace.checked_mul(2).context("local workspace overflow")?)
-                .and_then(|bytes| bytes.checked_add(budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)))
-                .context("local loading peak overflow")?
-        }
-    } else { 0 };
-    let pool_free = free.checked_sub(fixed_local_peak).context("exact local expert placement leaves no pool memory")?;
-    args.kv_pool_size = memory::planned_pool_size(&args, &[(pool_free, total)])?;
-    let pool = memory::PoolPlan::new(args.concurrency as usize, args.max_context_tokens as usize,
-        args.prefix_cache_entries as usize, snapshot_bytes, args.kv_pool_size, reservation, free, total)?;
-    tracing::info!(retained_turn_limit=args.prefix_cache_entries, prompt_snapshot_limit=args.prefix_cache_entries, source_pages=?pool.pages, global_bytes=pool.global_bytes,
-        cache_bytes=pool.cache_bytes, device_occupied_bytes=pool.occupied_before,
-        dspark_bytes, vision_bytes, snapshot_bytes,
-        pool_tokens=pool.pages[0].saturating_sub(args.concurrency as usize + 2 * args.prefix_cache_entries as usize) * 512,
-        projected_free_bytes=free.saturating_sub(pool.cache_bytes),
-        reservation_bytes=pool.reservation_bytes, runtime_headroom_bytes=pool.runtime_headroom_bytes,
-        "native KV pool reservation");
-    let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes)?;
+    let experts = if args.rtx_expert_layers == admission::LocalLayers::Count(0) { Vec::new() }
+        else { admission::expert_demands(&lib, &catalog, aot_capacity, 1)? };
+    let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
+    let memory = admission::admission_memory(&lib, &inventory)?;
+    let (free, _) = memory[0];
+    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0)?;
+    tracing::info!(source_pages=?pool.pages,global_bytes=pool.global_bytes,cache_bytes=?pool.cache_bytes,
+        pool_tokens=pool.placement.pool_tokens,local_layers=pool.placement.onboard_layers,
+        projected_free_bytes=free.saturating_sub(pool.cache_bytes[0]),reservation_bytes=?pool.reservation_bytes,
+        "shared V4.1 cache and expert admission");
+    let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
-    if small_card { memory::startup_phase(&lib, "v41/kv", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/kv", device_total)?; }
     requests.use_engine_pages()?;
     let mut local_layers = 0usize;
     // Published only on the single-RTX path; the 2-RTX distributed worker owns
@@ -587,8 +567,8 @@ fn worker(
     // launch unpublished, which the launcher treats as a failure.
     let mut placement_handoff: Option<PlacementHandoff<PlacementPlan>> = None;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv-prefix-install");
-    if small_card { memory::startup_phase(&lib, "v41/kv-prefix-install", device_total)?; }
-    if args.rtx_expert_layers != memory::LocalLayers::Count(0) {
+    if small_card { admission::startup_phase(&lib, "v41/kv-prefix-install", device_total)?; }
+    if args.rtx_expert_layers != admission::LocalLayers::Count(0) {
         use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
         let local_started = Instant::now();
         use crate::families::deepseek_v41::v41_experts::exl3::Exl3Weights;
@@ -603,16 +583,12 @@ fn worker(
             if compressed { Exl3Weights::plan(&catalog, selection) }
             else { ExpertWeights::plan(&lib, &catalog, selection) }
         }).collect::<Result<Vec<_>>>()?;
-        let (free, total) = lib.cuda_memory_info()?;
-        let free = if args.pool_tokens == Some(0) { free.saturating_sub((3usize << 30) - memory::RUNTIME_HEADROOM) }
-            else { free };
-        let plan = memory::LocalLayerPlan::new(args.rtx_expert_layers, &budgets,
-            per_lane.checked_mul(2).context("local lane budget overflow")?, free, total, pool.reservation_bytes)?;
-        local_layers = plan.layers;
-        tracing::info!(layers=plan.layers, resident_bytes=plan.resident_bytes,
-            workspace_bytes=plan.workspace_bytes, peak_bytes=plan.peak_bytes,
-            graph_reserve_bytes=plan.graph_reserve_bytes,
-            "bottom-up RTX expert placement");
+        local_layers = pool.placement.onboard_layers;
+        let admitted = pool.placement.expert_ranges[0];
+        let expected = budgets.iter().take(local_layers).map(|b| b.resident_bytes).sum::<usize>()
+            + if local_layers>0 {per_lane*2 + budgets.iter().take(local_layers).map(|b|b.device_staging_bytes).max().unwrap_or(0)} else {0};
+        ensure!(expected as u64 <= admitted.peak_bytes,"runtime local owners exceed shared admission");
+        tracing::info!(layers=local_layers,peak_bytes=admitted.peak_bytes,"shared RTX expert placement");
         // Publish the resolved boundary before anything waits on it. On 1 RTX the
         // 2-RTX distributed path never ran, so without this the launcher cannot
         // know the real first remote layer and must start every worker at 0,
@@ -624,9 +600,10 @@ fn worker(
                 std::path::Path::new(directory),
                 PlacementPlan::new(args.rtx_gpus, local_layers),
             )?);
-        }        if plan.layers > 0 && compressed {
-            let mut loaded = Vec::with_capacity(plan.layers);
-            for layer in 0..plan.layers {
+        }
+        if local_layers > 0 && compressed {
+            let mut loaded = Vec::with_capacity(local_layers);
+            for layer in 0..local_layers {
                 loaded.push(Exl3Weights::load(&lib, &catalog, ExpertLayer::BackboneFull { layer },
                     budgets[layer].peak_device_bytes()?)?);
             }
@@ -635,9 +612,9 @@ fn worker(
                 &exl3_directory, aot_capacity, per_lane)? })?;
             prefill_transport.install_local(unsafe { LocalExpertWave::new_exl3(&lib, weights,
                 &exl3_directory, aot_capacity, per_lane)? })?;
-        } else if plan.layers > 0 {
-            let mut loaded = Vec::with_capacity(plan.layers);
-            for layer in 0..plan.layers {
+        } else if local_layers > 0 {
+            let mut loaded = Vec::with_capacity(local_layers);
+            for layer in 0..local_layers {
                 loaded.push(ExpertWeights::load(&lib, &catalog, ExpertLayer::BackboneFull { layer },
                     budgets[layer].peak_device_bytes()?)?);
             }
@@ -645,7 +622,7 @@ fn worker(
             transport.install_local(LocalExpertWave::new(&lib, weights.clone(), aot_capacity, per_lane)?)?;
             prefill_transport.install_local(LocalExpertWave::new(&lib, weights, aot_capacity, per_lane)?)?;
         }
-        tracing::info!(layers=plan.layers, elapsed_ms=local_started.elapsed().as_millis(),
+        tracing::info!(layers=local_layers, elapsed_ms=local_started.elapsed().as_millis(),
             "local RTX experts ready");
     }
     // The launcher has already started the workers at the published boundary and
@@ -665,13 +642,13 @@ fn worker(
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;
     cuteafd_ffi::memory_ledger::relabel_other("v41/local-experts");
-    if small_card { memory::startup_phase(&lib, "v41/local-experts", device_total)?; }
+    if small_card { admission::startup_phase(&lib, "v41/local-experts", device_total)?; }
     crate::shared::memory_report::release_load_staging(&lib);
     tracing::info!(rtx_layers=local_layers, first_remote_dispatch_layer=local_layers,
         remote_dispatch_layers=40-local_layers, spark_world=args.peers.len(),
         spark_topology=?topology.map(|t| (t.tp(), t.ep())),
-        device_occupied_bytes=occupied, device_budget_bytes=pool.reservation_bytes,
-        runtime_headroom_bytes=pool.runtime_headroom_bytes, "native serving residency ready");
+        device_occupied_bytes=occupied, device_budget_bytes=?pool.reservation_bytes,
+        runtime_headroom_bytes=admission::RUNTIME_HEADROOM, "native serving residency ready");
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -337,6 +337,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
     }).collect();
     let cards: Vec<_> = inputs.gpus.iter().map(|g| g.0).collect();
     Ok(PlacementRequest {
+        pool_bounded: Vec::new(),
         attention_placement: None,
         layers_first_gpu: 0,
         context_buffers: context_buffers(cfg, inputs.max_context, inputs.prefill_rows, inputs.prefill_lanes,
@@ -349,6 +350,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         layers, pool_overhead, fixed, movables: Vec::new(),
         expert_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.expert_workspace } else { 0 },
         tp2_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.tp2_workspace } else { [0; 2] },
+        minimum_expert_layers: 0,
         onboard: inputs.onboard, expert_gpus: usize::from(!inputs.experts.is_empty()),
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }], by_kind: Vec::new(), ..LayerPolicy::default() },
         hops: HopSpec { row_bytes: cfg.hidden as u64 * 2, rows: inputs.prefill_rows.max(DECODE_ROWS),

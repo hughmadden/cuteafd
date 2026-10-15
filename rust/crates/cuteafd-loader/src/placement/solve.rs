@@ -134,6 +134,9 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     if request.layers_first_gpu > 1 { return Err(PlacementError::Inventory("layers first GPU must be 0 or 1")); }
     if request.pool.unit_rows == 0 { return Err(PlacementError::Inventory("zero pool unit rows")); }
     if request.pool_overhead.len() != gpus { return Err(PlacementError::Inventory("pool overhead per GPU")); }
+    if request.pool_bounded.iter().any(|d| usize::from(d.gpu) >= gpus) {
+        return Err(PlacementError::Inventory("bounded pool demand on an absent GPU"));
+    }
     if request.fixed.iter().any(|d| usize::from(d.gpu) >= gpus)
         || request.movables.iter().any(|m| m.allowed.is_empty() || m.allowed.iter().any(|&g| usize::from(g) >= gpus)) {
         return Err(PlacementError::Inventory("demand on an absent GPU"));
@@ -364,13 +367,45 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         }
         (fixed, _) => fixed,
     };
+    if request.minimum_expert_layers > routed || fixed_layers.is_some_and(|n| n < request.minimum_expert_layers) {
+        return Err(PlacementError::Inventory("invalid mandatory expert prefix"));
+    }
     let experts_first = matches!(request.onboard, Onboard::ExpertsFirst { .. });
     let (units, ranges, homes, tp2_range) = match fixed_layers {
         // Pool first: reserve the target, then fill each GPU's arena in order.
         None => {
-            let fit = pool_fit(&available, &used, &arenas, &unit_bytes);
+            let fit = if request.minimum_expert_layers == 0 {
+                pool_fit(request, &available, &used, &arenas, &unit_bytes)
+            } else {
+                let count = request.minimum_expert_layers;
+                let end = nth_moe_end(request, first_moe, count);
+                let splits: Vec<_> = if tp2 || gpus == 1 || request.expert_gpus < 2 {
+                    vec![count]
+                } else { (0..=count).rev().collect() };
+                let mut best = None;
+                let mut most = 0;
+                for on_first in splits {
+                    let mut mandatory = arenas.clone();
+                    let caps = [if request.expert_gpus > 0 { on_first } else { 0 },
+                        if gpus == 2 { count - on_first } else { 0 }];
+                    let (_, homes, next, _) = place_experts(request, &available, &used, &mut mandatory,
+                        first_moe, end, &caps)?;
+                    let placed = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)).count();
+                    most = most.max(placed);
+                    if next >= end && placed >= count {
+                        let fit = pool_fit(request, &available, &used, &mandatory, &unit_bytes);
+                        best = Some(best.map_or(fit, |prior: u64| prior.max(fit)));
+                    }
+                }
+                best.ok_or(PlacementError::ExpertLayers { requested: count, placed: most })?
+            };
             let units = pool_units(request, if context { fit / 2 * 2 } else { fit })?;
-            let used = with_pool(&used, &unit_bytes, units)?;
+            if units.saturating_mul(request.pool.unit_rows) < request.pool.floor {
+                let tokens = units.saturating_mul(request.pool.unit_rows);
+                return Err(PlacementError::BelowFloor {pool:tokens,floor:request.pool.floor,layers:0,
+                    short:request.pool.floor - tokens});
+            }
+            let used = with_pool(request, &used, &unit_bytes, units)?;
             let caps = [if request.expert_gpus > 0 { usize::MAX } else { 0 }, if request.expert_gpus > 1 { usize::MAX } else { 0 }];
             let (ranges, homes, _, tp2_range) = place_experts(request, &available, &used, &mut arenas, first_moe,
                 request.layers.len(), &caps)?;
@@ -391,7 +426,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 let placed = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)).count();
                 most = most.max(placed);
                 if next < end || placed < n { continue; }
-                let fit = pool_fit(&available, &used, &trial, &unit_bytes);
+                let fit = pool_fit(request, &available, &used, &trial, &unit_bytes);
                 if best.as_ref().is_none_or(|(units, ..)| fit > *units) { best = Some((fit, ranges, homes, tp2_range)); }
             }
             let Some((fit, ranges, homes, tp2_range)) = best else {
@@ -429,6 +464,10 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     }
     let onboard_layers = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)).count();
 
+    if onboard_layers < request.minimum_expert_layers {
+        return Err(PlacementError::ExpertLayers { requested: request.minimum_expert_layers, placed: onboard_layers });
+    }
+
     // Charged items: pool records and expert arenas.
     let pool_tokens = units.checked_mul(request.pool.unit_rows).ok_or(Overflow("pool tokens"))?;
     for gpu in 0..gpus {
@@ -446,6 +485,10 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 format!("resident routed layers {}..{}", range.first, range.first + range.layers),
                 "local", range.peak_bytes, Basis::Formula));
         }
+    }
+    for demand in &request.pool_bounded {
+        items[usize::from(demand.gpu)].push(Item::new(demand.category, demand.group.clone(), "",
+            demand.bytes(units)?, demand.basis));
     }
     let homes = request.layers.iter().zip(homes)
         .map(|(layer, home)| if layer.experts.is_none() { ExpertHome::Dense } else { home }).collect::<Vec<_>>();
@@ -587,8 +630,9 @@ fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> 
                 }
             }
         }
-        let fit = (0..request.inventory.gpus.len()).filter(|&g| pool_bytes[g] > 0).map(|g|
-            request.inventory.gpus[g].available().saturating_sub(base[g]) / pool_bytes[g]).min().unwrap_or(u64::MAX);
+        let available = request.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
+        let fit = pool_fit(request, &available, &base[..available.len()],
+            &vec![Arena::default(); available.len()], &pool_bytes);
         let score = (owned[0].max(owned[1]), std::cmp::Reverse(fit), k);
         if best.as_ref().is_none_or(|(old, _)| score < *old) { best = Some((score, k)); }
     }
@@ -662,7 +706,7 @@ fn conditional_movable(request: &PlacementRequest, movable: &Movable, available:
                 what: format!("{:?}, {}", movable.id, describe(&demands, charged, &[])) });
             continue;
         }
-        let fit = pool_fit(available, &trial_used, &trial_arenas, unit_bytes);
+        let fit = pool_fit(request, available, &trial_used, &trial_arenas, unit_bytes);
         let fit = if context { fit / 2 * 2 } else { fit };
         let required = request.pool.requested.map_or(request.pool.floor, |n| n.max(request.pool.floor))
             .div_ceil(request.pool.unit_rows);
@@ -686,19 +730,39 @@ fn conditional_movable(request: &PlacementRequest, movable: &Movable, available:
 }
 
 /// Whole units every KV-owning GPU holds beside what is charged and its arena.
-fn pool_fit(available: &[u64], used: &[u64], arenas: &[Arena], unit_bytes: &[u64]) -> u64 {
-    (0..available.len()).filter(|&gpu| unit_bytes[gpu] > 0)
+fn pool_fit(request: &PlacementRequest, available: &[u64], used: &[u64], arenas: &[Arena], unit_bytes: &[u64]) -> u64 {
+    let upper = (0..available.len()).filter(|&gpu| unit_bytes[gpu] > 0)
         .map(|gpu| available[gpu].saturating_sub(used[gpu] + arenas[gpu].peak) / unit_bytes[gpu])
-        .min().unwrap_or(u64::MAX)
+        .min().unwrap_or(u64::MAX);
+    if request.pool_bounded.is_empty() { return upper; }
+    let fits = |units| (0..available.len()).all(|gpu| {
+        let bounded = request.pool_bounded.iter().filter(|d| usize::from(d.gpu) == gpu)
+            .try_fold(0u64, |sum, d| sum.checked_add(d.bytes(units).ok()?));
+        bounded.and_then(|b| unit_bytes[gpu].checked_mul(units)?.checked_add(b))
+            .is_some_and(|bytes| bytes <= available[gpu].saturating_sub(used[gpu] + arenas[gpu].peak))
+    });
+    let (mut lo, mut hi) = (0, upper);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2 + (hi - lo) % 2;
+        if fits(mid) { lo = mid; } else { hi = mid - 1; }
+    }
+    lo
 }
 
-fn with_pool(used: &[u64], unit_bytes: &[u64], units: u64) -> Result<Vec<u64>, PlacementError> {
-    used.iter().zip(unit_bytes).map(|(&used, &unit)| unit.checked_mul(units).and_then(|b| b.checked_add(used))
-        .ok_or(PlacementError::Overflow("pool bytes"))).collect()
+fn with_pool(request: &PlacementRequest, used: &[u64], unit_bytes: &[u64], units: u64) -> Result<Vec<u64>, PlacementError> {
+    used.iter().zip(unit_bytes).enumerate().map(|(gpu, (&used, &unit))| {
+        let mut bytes = unit.checked_mul(units).and_then(|b| b.checked_add(used))
+            .ok_or(PlacementError::Overflow("pool bytes"))?;
+        for demand in request.pool_bounded.iter().filter(|d| usize::from(d.gpu) == gpu) {
+            bytes = bytes.checked_add(demand.bytes(units)?).ok_or(PlacementError::Overflow("pool bytes"))?;
+        }
+        Ok(bytes)
+    }).collect()
 }
 
 /// Automatic pools stop at the target; an explicit pool is strict.
 fn pool_units(request: &PlacementRequest, fit: u64) -> Result<u64, PlacementError> {
+    let fit = fit.min(request.pool.ceiling_units());
     let wanted = request.pool.wanted_units();
     match request.pool.requested {
         Some(requested) if wanted > fit => Err(PlacementError::PoolDoesNotFit { requested,
