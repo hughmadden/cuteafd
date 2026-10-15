@@ -121,8 +121,8 @@ impl NativeWorkspace {
     }
 }
 
-/// V4.1 keeps the existing FirstCapacity dispatch; this only enumerates
-/// retained scratch specializations, not a new numerical selection policy.
+/// Enumerate retained scratch specializations independently of numerical
+/// dispatch: MXFP4 uses its admitted reduction plan; EXL3/NVFP4 keep FirstCapacity.
 pub fn expert_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
     use anyhow::{ensure, Context};
     ensure!((1..=4096).contains(&rows), "invalid V4.1 expert capacity");

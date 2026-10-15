@@ -20,7 +20,7 @@ pub(crate) struct ExpertReductionPlan {
 }
 
 impl ExpertReductionPlan {
-    pub(crate) fn new<S: Eq>(variants: &[(usize, S)]) -> anyhow::Result<Self> {
+    pub(crate) fn new<S: Eq + std::fmt::Debug>(variants: &[(usize, S)]) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         let canonical = &variants
             .iter()
@@ -44,7 +44,7 @@ impl ExpertReductionPlan {
             .collect();
         decode.sort_unstable();
         ensure!(decode.last().is_some_and(|&(capacity, _)| capacity >= maximum.min(80)),
-            "expert package has no export covering {} decode rows with canonical m1 reduction; export a matching capacity",
+            "expert package has no export covering {} decode rows with canonical m1 reduction {canonical:?}; admitted capacity/recipes: {variants:?}; export a matching capacity",
             maximum.min(80));
         Ok(Self { decode })
     }
@@ -56,10 +56,13 @@ impl ExpertReductionPlan {
     ) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         let variants = infos.into_iter().map(|info| {
-            let recipe = library.native_expert_reduction(&info)?;
+            let recipe = library.native_expert_reduction(&info).with_context(|| {
+                format!("native MXFP4 role {} m{} reduction export", info.role, info.capacity_rows)
+            })?;
             if info.capacity_rows <= 80 {
                 ensure!(recipe.plane_fold == 1 && recipe.implementation == 1,
-                    "native decode requires ordered FP32 slice planes, not atomic/hybrid arithmetic");
+                    "native MXFP4 role {} m{} decode requires ordered FP32 slice planes, got {recipe:?}",
+                    info.role, info.capacity_rows);
             }
             Ok((info.capacity_rows as usize, recipe))
         }).collect::<anyhow::Result<Vec<_>>>()?;

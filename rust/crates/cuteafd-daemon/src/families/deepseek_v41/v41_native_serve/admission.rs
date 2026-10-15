@@ -667,6 +667,25 @@ pub(super) fn preload(
     exl3: bool,
 ) -> Result<()> {
     use super::*;
+    if !nvfp4 && !exl3 {
+        let capacity = if ranks == 1 {
+            cuteafd_core::coordinator_programs::v41_aot_rows(rows).context("expert capacity")?
+        } else {
+            rows
+        };
+        let infos = families::deepseek_v41::expert_capacities(capacity as u64, ranks == 1)?
+            .into_iter()
+            .map(|capacity| {
+                match ranks {
+                    1 => lib.v41_local_expert_info(capacity as u32),
+                    2 => lib.v41_tp2_expert_info(capacity as u32),
+                    _ => anyhow::bail!("invalid V4.1 expert owners"),
+                }
+                .with_context(|| format!("V4.1 MXFP4 {ranks}-GPU m{capacity} export"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        crate::shared::experts::ExpertReductionPlan::native(lib, infos)?;
+    }
     if ranks == 1 {
         BackboneLane::workspace_bytes(lib, rows)?;
     } else {

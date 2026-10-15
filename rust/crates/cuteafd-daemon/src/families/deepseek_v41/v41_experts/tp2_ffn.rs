@@ -55,6 +55,11 @@ pub(crate) fn load_routed_weights<'a>(
         .map(OwnerWeights::Exl3));
     }
     let nvfp4 = catalog.nvfp4().is_some();
+    let selection = if nvfp4 {
+        RtxSelectionPolicy::FirstCapacity
+    } else {
+        RtxSelectionPolicy::CanonicalDecode
+    };
     let reducer = devices[0].run(|| devices[0].library.v41_tp2_expert_reducer())?;
     let output = if nvfp4 || !reducer.supports_route_sums() {
         NativeOutputPolicy::KernelPlanes
