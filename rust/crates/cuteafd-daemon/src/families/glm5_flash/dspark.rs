@@ -47,46 +47,6 @@ type Dev<'a> = DeviceAllocation<'a>;
 /// Most sequences one draft step takes (the Markov kernel's limit).
 pub(crate) const MAX_SEQUENCES: usize = 32;
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct RawLayers {
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    rms_norm_eps: f64,
-    sliding_window: Option<usize>,
-    #[serde(default)]
-    layer_types: Vec<String>,
-    vocab_size: usize,
-    hidden_act: String,
-    rope_parameters: RawRope,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct RawRope {
-    rope_theta: f64,
-    rope_type: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct RawConfig {
-    speculators_model_type: String,
-    transformer_layer_config: RawLayers,
-    aux_hidden_state_layer_ids: Vec<usize>,
-    block_size: usize,
-    mask_token_id: u32,
-    draft_vocab_size: usize,
-    markov_rank: usize,
-    markov_head_type: String,
-    sample_from_anchor: bool,
-    enable_confidence_head: bool,
-    confidence_head_with_markov: bool,
-    #[serde(default)]
-    sliding_window_non_causal: bool,
-}
-
 /// Whether `snapshot` holds a Speculators dSpark checkpoint.
 pub(crate) fn is_dspark(snapshot: &Path) -> Result<bool> {
     let path = snapshot.join("config.json");
@@ -120,40 +80,19 @@ pub(crate) struct DsparkConfig {
 
 impl DsparkConfig {
     pub fn read(snapshot: &Path) -> Result<Self> {
-        let raw: RawConfig = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)
-            .context("parsing the dSpark config.json")?;
-        let t = &raw.transformer_layer_config;
-        ensure!(raw.speculators_model_type == "dspark", "not a dSpark checkpoint");
-        ensure!(t.head_dim == 64 && t.num_key_value_heads > 0 && t.num_attention_heads % t.num_key_value_heads == 0
-            && t.num_attention_heads / t.num_key_value_heads * raw.block_size <= 32,
-            "dSpark kernels take 64-wide heads and at most 32 queries per kv head and block (got {} heads, {} kv, \
-             block {})", t.num_attention_heads, t.num_key_value_heads, raw.block_size);
-        ensure!(raw.markov_head_type == "vanilla" && raw.markov_rank == 256 && raw.sample_from_anchor
-            && raw.enable_confidence_head && raw.confidence_head_with_markov,
-            "dSpark kernels take a vanilla rank-256 Markov head, sample_from_anchor and a Markov confidence head");
-        ensure!(raw.draft_vocab_size == t.vocab_size, "reduced dSpark draft vocabularies (d2t maps) are not supported");
-        ensure!(t.hidden_act == "silu" && t.rope_parameters.rope_type == "default", "dSpark layers: SiLU, default RoPE");
-        let sliding = !t.layer_types.is_empty() && t.layer_types.iter().all(|k| k == "sliding_attention");
-        ensure!(sliding && t.sliding_window == Some(RING),
-            "dSpark layers must all slide over a {RING}-entry window (the ring), got {:?} / {:?}", t.layer_types,
-            t.sliding_window);
-        ensure!(raw.aux_hidden_state_layer_ids.iter().all(|&l| l >= 1), "aux layer id 0 (the embedding) is not tapped");
-        Ok(Self {
-            hidden: t.hidden_size,
-            intermediate: t.intermediate_size,
-            layers: t.num_hidden_layers,
-            heads: t.num_attention_heads,
-            kv_heads: t.num_key_value_heads,
-            head_dim: t.head_dim,
-            eps: t.rms_norm_eps as f32,
-            theta: t.rope_parameters.rope_theta as f32,
-            block: raw.block_size,
-            mask_token: raw.mask_token_id,
-            rank: raw.markov_rank,
-            taps: raw.aux_hidden_state_layer_ids.iter().map(|&l| l - 1).collect(),
-            vocab: t.vocab_size,
-            causal: !raw.sliding_window_non_causal,
-        })
+        use cuteafd_loader::formats::block_dspark::{BlockDsparkConfig, DsparkRope};
+        let cfg = BlockDsparkConfig::read(snapshot)?;
+        ensure!(cfg.head_dim == 64 && cfg.heads / cfg.kv_heads * cfg.block <= 32,
+            "dSpark kernels take 64-wide heads and at most 32 queries per kv head and block");
+        ensure!(cfg.rank == 256, "dSpark kernels take a vanilla rank-256 Markov head");
+        let DsparkRope::Default { rope_theta } = cfg.rope else {
+            anyhow::bail!("GLM dSpark export requires default RoPE");
+        };
+        ensure!(cfg.window == Some(RING), "GLM dSpark export requires a {RING}-entry sliding window");
+        Ok(Self { hidden: cfg.hidden, intermediate: cfg.intermediate, layers: cfg.layers,
+            heads: cfg.heads, kv_heads: cfg.kv_heads, head_dim: cfg.head_dim,
+            eps: cfg.eps as f32, theta: rope_theta as f32, block: cfg.block,
+            mask_token: cfg.mask_token, rank: cfg.rank, taps: cfg.taps, vocab: cfg.vocab, causal: cfg.causal })
     }
 
     /// Drafted tokens per draft step (every block row predicts one).
