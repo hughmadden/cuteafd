@@ -113,6 +113,9 @@ v41_fp8_head_args=()
             if spark_count == 2:
                 setup+='MEMORY_RESERVATION=32GiB\nKV_POOL_SIZE=2GiB\npeers=10.55.0.1:19441,10.55.0.2:19441\n'
             setup+=''.join(f'\nTP2_{option}=on\n' for option in options)
+            handoff = {"kind": "runtime", "directory": "/tmp/cuteafd-home/placement"} if gpus == 2 or local_layers != "0" else {"kind": "fixed", "spark_first_layer": 0}
+            count_plan = {**(encoder or {}), "placement_handoff": handoff}
+            setup += "\ncount_plan=" + __import__("shlex").quote(json.dumps(count_plan)) + "\n"
             result=subprocess.run(['bash','-c',setup+block,'test',str(gpus)],env=env,cwd=ROOT,capture_output=True,text=True,timeout=10)
             events=[json.loads(line) for line in (root/'events').read_text().splitlines()]
             return result,events

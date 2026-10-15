@@ -130,7 +130,9 @@ class NativeReleaseLauncherTest(unittest.TestCase):
 
     def test_v41_placement_uses_writable_serving_home(self) -> None:
         source = v41_source()
-        self.assertIn('placement_directory=/tmp/cuteafd-home/placement', source)
+        self.assertIn(".placement_handoff.directory", source)
+        deployment = (ROOT / 'rust/crates/cuteafd-loader/src/plan/deployment.rs').read_text()
+        self.assertIn('directory: "/tmp/cuteafd-home/placement"', deployment)
         self.assertNotIn('placement_directory=/run/cuteafd-placement', source)
 
     def test_serving_identity_is_evaluated_on_each_host(self) -> None:

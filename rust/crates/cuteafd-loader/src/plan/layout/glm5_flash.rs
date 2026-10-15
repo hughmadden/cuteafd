@@ -187,6 +187,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut selected = None;
     match admitted {
         Ok((placed, working)) => {
+            report.solver_placement = Some(placed.clone());
             pool = placed.pool_tokens;
             selected = Some(working);
             for (device, items) in devices.iter_mut().zip(&placed.items) {
