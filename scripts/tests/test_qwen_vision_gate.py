@@ -57,14 +57,17 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     cutoff = next(keyword.value for keyword in route.keywords if keyword.arg == "max_skinny_rows")
     assert ast.literal_eval(cutoff) == rust("GLM_BF16_SKINNY_ROWS") == 0
     fp8 = (fork / "integration/cuteafd/_fp8_weights.py").read_text()
-    assert int(re.search(r"FP8_GEMV_ROWS = (\d+)", fp8).group(1)) == rust("FP8_PROJECTION_SKINNY_ROWS")
+    # One canonical reduction per load at every width: the thin tile the decode programs run at
+    # C1 is FP8_GEMV_ROWS, the capacity a multi-tile GEMV over the same warps/groups covers is
+    # FP8_DECODE_ROWS, and the registered arithmetic crossover is that capacity (not the tile).
+    assert int(re.search(r"FP8_DECODE_ROWS = (\d+)", fp8).group(1)) == rust("FP8_PROJECTION_SKINNY_ROWS")
     assert "self.inner = glm_projection(n, k)" in fp8
     fp8_ast = ast.parse(fp8)
     projection_class = next(n for n in fp8_ast.body if isinstance(n, ast.ClassDef) and n.name == "Fp8Projection")
     init = next(n for n in projection_class.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
     defaults = {arg.arg: ast.literal_eval(default) for arg, default in zip(init.args.kwonlyargs, init.args.kw_defaults)
                 if arg.arg in ("gemv_rows", "wide_rows")}
-    assert defaults["gemv_rows"] == rust("FP8_PROJECTION_SKINNY_ROWS")
+    assert defaults["gemv_rows"] == int(re.search(r"FP8_GEMV_ROWS = (\d+)", fp8).group(1))
     assert defaults["wide_rows"] == 0
     for filename, contracts in {
         "qwen4_gdn.py": ("self.in_proj = projection(p, g.hidden, self.fp8)", "self.o_proj = projection(g.hidden, v, self.fp8)"),

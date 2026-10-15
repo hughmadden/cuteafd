@@ -84,8 +84,12 @@ pub(crate) const WIDE_DECODE_ROWS: usize = 128;
 const PREFILL_CAP: &str = "m4096";
 /// Selected-slot row width of the sparse MLA programs (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
-/// Most decode rows the FP8 GEMVs take (the programs' FP8_ROWS).
-const FP8_ROWS: i32 = 16;
+/// Most rows every FP8 decode projection is canonical to (the fork's
+/// `FP8_DECODE_ROWS`): one thin 16-row GEMV tile and a multi-tile GEMV over the
+/// same `(warps, groups)`, so a row's K reduction does not move with the batch
+/// width. Rows past it take the TMA GEMM, whose K order differs -- for the `_m64`
+/// programs that is the prefill route, for the `_m128` programs rows 65 to 128.
+const FP8_DECODE_ROWS: i32 = 64;
 /// FP8 latent record bytes (512 E4M3 + 4 FP32 group scales).
 pub(crate) const RECORD_BYTES: usize = 528;
 
@@ -1405,20 +1409,22 @@ use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, Projectio
 pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, decode_strides, serving_graph_shapes, serving_graph_reserve};
 #[allow(unused_imports)]
 use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, graph_reserve_bytes, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
-// Inclusive arithmetic crossovers audited against the pinned AOT exporter.
-// Full/half-head shapes share these thresholds; MoE projections use real rows.
+// Inclusive arithmetic crossovers audited against the pinned AOT exporter: an FP8 decode
+// projection has none below its capacity (`FP8_DECODE_ROWS`), where the row-invariant GEMV
+// hands over to the W8A16 GEMM. Full/half-head shapes share these thresholds; MoE
+// projections use real rows.
 const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "index.iq[4096,1536].bf16", skinny_rows: 0 },
     ProjectionThreshold { name: "index.ik[288,4096].bf16", skinny_rows: 0 },
     ProjectionThreshold { name: "kda.in[24896|12576,4096].bf16", skinny_rows: 0 },
     ProjectionThreshold { name: "kda.out[4096,8192|4096].bf16", skinny_rows: 0 },
-    ProjectionThreshold { name: "kda.in.out.fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "kda.half.in.out.fp8.wide", skinny_rows: 32 },
-    ProjectionThreshold { name: "mla.qkv_a[2048,4096].fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "mla.q_b[16384|8192,1536].fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "mla.out[4096,16384|8192].fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "dense.gate_up[24576|12288,4096].fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "dense.down[4096,12288|6144].fp8", skinny_rows: 16 },
+    ProjectionThreshold { name: "kda.in.out.fp8", skinny_rows: FP8_DECODE_ROWS as usize },
+    ProjectionThreshold { name: "kda.half.in.out.fp8", skinny_rows: FP8_DECODE_ROWS as usize },
+    ProjectionThreshold { name: "mla.qkv_a[2048,4096].fp8", skinny_rows: FP8_DECODE_ROWS as usize },
+    ProjectionThreshold { name: "mla.q_b[16384|8192,1536].fp8", skinny_rows: FP8_DECODE_ROWS as usize },
+    ProjectionThreshold { name: "mla.out[4096,16384|8192].fp8", skinny_rows: FP8_DECODE_ROWS as usize },
+    ProjectionThreshold { name: "dense.gate_up[24576|12288,4096].fp8", skinny_rows: FP8_DECODE_ROWS as usize },
+    ProjectionThreshold { name: "dense.down[4096,12288|6144].fp8", skinny_rows: FP8_DECODE_ROWS as usize },
 ];
 
 // `--decode-rows 128`: a step of 65 to 128 rows runs the `_m128` programs. They keep the `_m64`
@@ -4175,8 +4181,9 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// KDA over the layer's only (FP8, per-row x 128-K, K-major scales) in/out
-    /// projections: `kda_w8_{cap}`. Decode rows up to 32 on half heads (16 on full heads) run the FP8 GEMV, wider
-    /// verify steps W8A16; prefill runs W8A8 on the `--fp8-prefill kda-*` bits, else W8A16. `rows_at`: the
+    /// projections: `kda_w8_{cap}`. Decode rows up to `FP8_DECODE_ROWS` (the program's canonical
+    /// GEMV capacity, full and half heads alike) run the FP8 GEMV, wider verify steps W8A16;
+    /// prefill runs W8A8 on the `--fp8-prefill kda-*` bits, else W8A16. `rows_at`: the
     /// rows' input, state slots, sequence starts and output.
     #[allow(clippy::too_many_arguments)]
     fn kda_w8(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar,
@@ -4188,9 +4195,7 @@ impl<'a> GlmfEngine<'a> {
             ("a_log", layer.ptr("a_log")?), ("dt_bias", layer.ptr("dt_bias")?), ("o_norm", layer.ptr("o_norm")?),
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_kscale", layer.ptr("w_o_kscale")?), ("conv_state", conv_state),
             ("state", state), ("slots", slots), ("seq_first", seq_first), ("out", out)];
-        let mut scalars = vec![rows, Scalar::I32(if decode {
-            if layer.split { 32 } else { FP8_ROWS }
-        } else { self.fp8_prefill.kda_bits })];
+        let mut scalars = vec![rows, Scalar::I32(if decode { FP8_DECODE_ROWS } else { self.fp8_prefill.kda_bits })];
         if decode {
             pointers.push(("replay", replay));
             scalars.push(Scalar::I32(i32::from(spec)));
@@ -4206,13 +4211,13 @@ impl<'a> GlmfEngine<'a> {
         self.run_on(rank, layer.split, &name, &pointers, &scalars)
     }
 
-    /// `[rows, fp8]`: the decode programs' `fp8_rows` (16 when the layer has
+    /// `[rows, fp8]`: the decode programs' `fp8_rows` (`FP8_DECODE_ROWS` when the layer has
     /// the FP8 copy, else 0), or the prefill programs' `fp8` switch (1: rows
     /// past the skinny GEMV run the block-FP8 GEMMs).
     fn fp8_scalars(&self, rows: Scalar, decode: bool, fp8: bool) -> Vec<Scalar> {
         vec![rows, Scalar::I32(match (fp8, decode) {
             (false, _) => 0,
-            (true, true) => FP8_ROWS,
+            (true, true) => FP8_DECODE_ROWS,
             (true, false) => 1,
         })]
     }
@@ -5267,11 +5272,11 @@ mod prefill_lane_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
-            // 0a27858b opts W8/S16 decode into canonical W8A16; mixed defaults stay unchanged.
-            ("integration/cuteafd/glmf.py", 0x6a8b_4bde_c8ae_1ce0_u64),
+            // canon-fp8-decode: the threshold is the programs' capacity, not the thin tile.
+            ("integration/cuteafd/glmf.py", 0x9293_d116_a183_8b50_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
-            ("integration/cuteafd/_fp8_weights.py", 0x9f8c_fcd2_54c6_4033),
+            ("integration/cuteafd/_fp8_weights.py", 0x8740_5e09_7e17_662f),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
@@ -5286,7 +5291,7 @@ mod prefill_lane_tests {
             assert_eq!(hash, expected, "re-audit GLM decode projection thresholds after {path} source drift");
         }
         assert_eq!(super::DECODE_PROJECTION_THRESHOLDS.iter().map(|p| p.skinny_rows).collect::<Vec<_>>(),
-            [0, 0, 0, 0, 16, 32, 16, 16, 16, 16, 16]);
+            [0, 0, 0, 0, 64, 64, 64, 64, 64, 64, 64]);
         // The 64-row sets, and with the wide programs the speculative set ending at the verify budget (127 on
         // 170 SMs, 128 on 188, 99 on 132), pass at every serving width; the `_m128` programs add only
         // their capacity (`WIDE_DECODE_THRESHOLDS`).
@@ -5301,21 +5306,23 @@ mod prefill_lane_tests {
                 super::check_decode_thresholds(&buckets, sequences, true).unwrap();
             }
         }
-        // BF16 no longer crosses arithmetic routes at M8/M9; FP8 M16/M17 and M32/M33 still do.
-        super::check_bucket_thresholds(&[1, 4, 16], super::DECODE_PROJECTION_THRESHOLDS).unwrap();
-        let error = super::check_bucket_thresholds(&[1, 4, 8, 32], super::DECODE_PROJECTION_THRESHOLDS)
+        // No FP8 projection crosses an arithmetic route inside the decode range: every bucket set
+        // up to a step of the programs' 64 rows passes (BF16 crossed none at M8/M9 either).
+        super::check_bucket_thresholds(&[1, 4, 16, 64], super::DECODE_PROJECTION_THRESHOLDS).unwrap();
+        super::check_bucket_thresholds(&[1, 4, 8, 16, 64], super::DECODE_PROJECTION_THRESHOLDS).unwrap();
+        super::check_bucket_thresholds(&[2, 4, 8, 16, 32, 64, 128], super::DECODE_PROJECTION_THRESHOLDS)
+            .unwrap();
+        // Past the capacity a padded step would move rows across the W8A16 handover at 64 rows,
+        // for the `_m128` programs and the canonical GEMV alike.
+        let error = super::check_bucket_thresholds(&[32, 72], super::DECODE_PROJECTION_THRESHOLDS)
             .unwrap_err().to_string();
         assert!(error.contains("kda.in.out.fp8"), "{error}");
-        let error = super::check_bucket_thresholds(&[1, 4, 8, 16, 64], super::DECODE_PROJECTION_THRESHOLDS)
-            .unwrap_err().to_string();
-        assert!(error.contains("kda.half.in.out.fp8.wide"), "{error}");
-        // A set that pads a step of up to 64 rows into the `_m128` programs is refused.
         let error = super::check_bucket_thresholds(&[32, 72], super::WIDE_DECODE_THRESHOLDS).unwrap_err().to_string();
         assert!(error.contains("m64|m128"), "{error}");
         let crossing = super::DecodeBuckets { plain: super::PLAIN_DECODE_BUCKETS.to_vec(),
             spec: vec![2, 4, 8, 16, 32, 72, 127] };
         let error = super::check_decode_thresholds(&crossing, 16, true).unwrap_err().to_string();
-        assert!(error.contains("m64|m128"), "{error}");
+        assert!(error.contains("kda.in.out.fp8"), "{error}");
     }
 
     #[test]

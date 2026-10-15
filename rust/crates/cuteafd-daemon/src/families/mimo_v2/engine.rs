@@ -171,13 +171,12 @@ pub(super) fn attention_workspace_geometry(rank: usize, ranks: usize, decode: bo
         rank, ranks, decode, all_target_layers_split)
 }
 
-/// Most rows the FP8 LM head program takes (MmaFp8Gemv's M tile).
-pub(crate) const FP8_ROWS: i32 = 16;
-
-/// Most rows a decode program reads the E4M3 qkv / o / dense FFN copies for
-/// (sparkinfer `MIMO_FP8_ROWS`: one 16-row GEMV tile up to 16 rows, two above),
-/// so DFlash verify steps of up to 32 rows stay off the BF16 projections.
-pub(crate) const FP8_DECODE_ROWS: i32 = 32;
+/// Most rows a decode program reads the E4M3 qkv / o / dense FFN copies for (sparkinfer
+/// `FP8_DECODE_ROWS`: one thin 16-row GEMV tile and a multi-tile GEMV over the same
+/// `(warps, groups)` above it, so a row's K reduction never moves with the batch width).
+/// It is the decode programs' whole row capacity (`DECODE_ROWS`), so every verify step stays
+/// on the canonical FP8 route.
+pub(crate) const FP8_DECODE_ROWS: i32 = 64;
 
 /// Most rows of one sequence an MTP drafting pass takes (older true rows
 /// catch up in passes of their own first).
