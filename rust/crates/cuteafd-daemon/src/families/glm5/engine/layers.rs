@@ -44,7 +44,7 @@ impl<'a> GlmEngine<'a> {
 
     pub(crate) fn bind_layer_execution(&mut self, placement: &Placement) -> Result<()> {
         ensure!(self.layers_kv() && !self.context_kv() && self.layer_execution.is_none(), "whole attention binding");
-        let spec = cuteafd_loader::placement::HopSpec { row_bytes: self.cfg.hidden as u64 * 2,
+        let spec = cuteafd_loader::placement::HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots, row_bytes: self.cfg.hidden as u64 * 2,
             rows: self.prefill_rows.max(DECODE_ROWS) as u64, lanes: self.prefill_lanes as u64,
             entry_gpu: 0, head_gpu: 0, terminal: cuteafd_loader::placement::TerminalHome::Replicated };
         cuteafd_loader::placement::validate_layer_pipeline_lanes(spec.lanes, self.prefill_lanes)?;
@@ -348,7 +348,7 @@ mod tests {
             // Each four-layer group reuses its full indexer's owner.
             let modes: Vec<_> = (0..12).map(|layer| LayerMode::Whole {
                 gpu: first ^ ((layer / 4) % 2) as u8, ffn: FfnMode::Split }).collect();
-            let spec = HopSpec { row_bytes: 32, rows: 8, lanes: lanes as u64,
+            let spec = HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots, row_bytes: 32, rows: 8, lanes: lanes as u64,
                 entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
             let placement = Placement { pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]),
                 attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![],
