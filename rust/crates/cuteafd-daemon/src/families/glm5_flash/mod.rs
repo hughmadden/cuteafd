@@ -1888,8 +1888,9 @@ impl Opened {
             let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
             let first = (0..layers).find(|&layer| !self.cfg.dense[layer]).unwrap_or(layers);
             let resident = range.clone().unwrap_or_else(|| if args.expert_window.is_some() { 0..0 } else { first..layers });
+            let layer_ids: Vec<_> = resident.collect();
             let started = Instant::now();
-            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, resident, 1, 0,
+            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, &layer_ids, 1, 0,
                 args.expert_rows(), budget)
                 .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
                     or --expert-window N for diagnostic paging")?;

@@ -983,9 +983,10 @@ impl Opened {
             } else if preflight.placement.onboard_layers > 0 {
                 let range = preflight.placement.expert_ranges[0];
                 let tensors = self.catalog.as_ref().and_then(|catalog| catalog.fp8()).context("MiMo expert headers")?;
+                let layer_ids: Vec<_> = (range.first..range.first + range.layers).collect();
                 let local = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors,
                     preflight.expert_directory.as_deref().context("MiMo expert package")?,
-                    range.first..range.first + range.layers, 1, 0, args.prefill_rows.max(engine::DECODE_ROWS),
+                    &layer_ids, 1, 0, args.prefill_rows.max(engine::DECODE_ROWS),
                     range.peak_bytes as usize)?;
                 engine.set_rtx_local(local);
             }
@@ -1092,13 +1093,13 @@ impl Opened {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             if let Some(window) = args.expert_window {
-                let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
+                let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, &[], 1, 0,
                     engine::expert_capacity(args.prefill_rows), local_budget)?;
                 return Ok(Some(engine::Experts::Streamed { experts: std::cell::RefCell::new(experts), tensors, window }));
             }
             let started = Instant::now();
             let local = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
-                moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, engine::expert_capacity(args.prefill_rows),
+                &moe_layers, 1, 0, engine::expert_capacity(args.prefill_rows),
                 local_budget)?;
             tracing::info!(layers = moe_layers.len(), elapsed_ms = started.elapsed().as_millis() as u64,
                 "MiMo FP8 experts resident on this GPU");
