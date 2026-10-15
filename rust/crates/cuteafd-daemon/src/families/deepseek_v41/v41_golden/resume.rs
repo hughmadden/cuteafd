@@ -21,8 +21,10 @@ enum Requests {
 const IMAGE_BYTES: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 8, 14, 14, 6, 0, 1, 246, 0, 250, 253, 142, 150, 138, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
 const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGMIDg4GAAH2APr9jpaKAAAAAElFTkSuQmCC";
 
-/// Serve `prompt` once and collect what its probe recorded.
-fn run(queue: &Requests, prompt: &[u32], rows: usize, cold: bool,
+/// Serve `prompt` once and collect what its probe recorded. `output_dependent`
+/// marks a prompt that extends the model's own generated tokens: matched A/B
+/// pairs compare only input-determined prompts.
+fn run(queue: &Requests, prompt: &[u32], rows: usize, cold: bool, output_dependent: bool,
     image: bool, cold_steps: Vec<cuteafd_api::openai::probe::ProbeColdStep>) -> Result<Run> {
     let dump = tempdir()?;
     let mut spec = ProbeSpec {
@@ -34,6 +36,7 @@ fn run(queue: &Requests, prompt: &[u32], rows: usize, cold: bool,
         cold_steps,
         dump_rows: Some(dump.join("rows")),
         top_k: 1,
+        output_dependent,
         ..ProbeSpec::default()
     };
     if let Requests::Remote(client) = queue {
@@ -178,10 +181,10 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
                 prompt[0] = namespace as u32;
                 if image { prompt[8] = cuteafd_loader::V41_IMAGE_TOKEN_ID; }
                 let label = format!("resume P={p} {}", if image { "image" } else { "text" });
-                let first = run(&queue, &prompt, rows, false, image, Vec::new())?;
-                let cold = run(&queue, &prompt, rows, true, image, Vec::new())?;
+                let first = run(&queue, &prompt, rows, false, false, image, Vec::new())?;
+                let cold = run(&queue, &prompt, rows, true, false, image, Vec::new())?;
                 cold_evidence(&mut cases, &first, "prompt", &cold, "prompt", &format!("{label} cold same-chunk"))?;
-                let repeat = run(&queue, &prompt, rows, false, image, Vec::new())?;
+                let repeat = run(&queue, &prompt, rows, false, false, image, Vec::new())?;
                 ensure!(repeat.cached == first.record.prompt_ids.len(), "{label}: prompt cache miss");
                 exact(&mut cases, &first, "prompt", &repeat, "restore", &format!("{label} prompt restore"))?;
                 exact(&mut cases, &first, "prompt", &repeat, "prompt", &format!("{label} prompt remains restored"))?;
@@ -199,19 +202,19 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
                 turn.extend(&first.generated[..turn_end - prompt_end]);
                 let mut next = turn.clone();
                 next.extend(&tokens[p..p + 37]);
-                let cached = run(&queue, &next, rows, false, image, Vec::new())?;
+                let cached = run(&queue, &next, rows, false, true, image, Vec::new())?;
                 ensure!(cached.cached == turn_end, "{label}: did not reuse turn frontier {turn_end}");
                 exact(&mut cases, &first, "turn", &cached, "restore", &format!("{label} turn restore"))?;
                 let mut steps = vec![ProbeColdStep { end: prompt_end, decode: false }];
                 steps.extend((prompt_end + 1..=turn_end).map(|end| ProbeColdStep { end, decode: true }));
                 steps.push(ProbeColdStep { end: turn_end + 37, decode: false });
-                let cold_turn = run(&queue, &next, rows, true, image, steps)?;
+                let cold_turn = run(&queue, &next, rows, true, true, image, steps)?;
                 cold_evidence(&mut cases, &first, "turn", &cold_turn, "checkpoint", &format!("{label} turn vs cold same-shape"))?;
                 cold_evidence(&mut cases, &cached, "prompt", &cold_turn, "prompt", &format!("{label} continuation vs cold same-shape"))?;
 
                 let mut long = turn;
                 long.extend(&tokens[p..p + 160]);
-                let continued = run(&queue, &long, rows, false, image, Vec::new())?;
+                let continued = run(&queue, &long, rows, false, true, image, Vec::new())?;
                 ensure!(continued.cached >= turn_end, "{label}: encoder continuation missed turn snapshot");
                 println!("{label}: long continuation cached {}/{} PASS", continued.cached, continued.record.prompt_ids.len());
 
@@ -222,9 +225,9 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
                         let mut other = prompt.clone();
                         // Pressure leaves must not themselves hit a previous case's host bank.
                         other[0] = (namespace + n + 1) as u32;
-                        run(&queue, &other, 2, false, image, Vec::new())?;
+                        run(&queue, &other, 2, false, false, image, Vec::new())?;
                     }
-                    let promoted = run(&queue, &prompt, rows, false, image, Vec::new())?;
+                    let promoted = run(&queue, &prompt, rows, false, false, image, Vec::new())?;
                     ensure!(promoted.record.provenance.as_ref().and_then(|v| v.get("prefix_restore"))
                         .and_then(|v| v.get("host")).and_then(|v| v.as_bool()) == Some(true),
                         "{label}: expected a host promotion, not a device hit or cold miss: {:?}",
@@ -235,8 +238,8 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
                 if !image {
                     let mut branch = prompt[..p - 37].to_vec();
                     branch.extend(&tokens[p + 1..p + 1 + 64]);
-                    let partial = run(&queue, &branch, rows, false, false, Vec::new())?;
-                    let cold = run(&queue, &branch, rows, true, false, Vec::new())?;
+                    let partial = run(&queue, &branch, rows, false, false, false, Vec::new())?;
+                    let cold = run(&queue, &branch, rows, true, false, false, Vec::new())?;
                     let (kl, top1, n) = compare(&cold, &partial);
                     ensure!(n > 0, "{label}: approximate replay recorded no rows");
                     cases.push(serde_json::json!({"name": format!("{label} approximate replay"),
