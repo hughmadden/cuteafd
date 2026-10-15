@@ -29,6 +29,11 @@ pub const GLM_REVISION: &str = "581cdf3b5ee5a63dd5a7726b9d33ea16cf105b0d";
 pub const GLM_CONFIG: &str = "glm5-v2_20261006_exl3k4_bf16root";
 pub const V4PRO_REVISION: &str = "5528730649150b8d8753e052f001f203b36ca12f";
 pub const V4PRO_CONFIG: &str = "deepseek_v4-v2_20261005_v4pro";
+pub const QWEN_DENSE_REVISION: &str = "5242b6006b22b488d71b6695fb449221baeb54ff";
+pub const QWEN35_9B_CONFIG: &str = "qwen35-9b-v1_20261015_bf16";
+pub const QWEN35_9B_MANIFEST_SHA256: &str = "205f00fb9267c6a3c6db0324f8263ac61163cd237e926d8f7ffc49df0a01d8b3";
+pub const QWEN38_27B_CONFIG: &str = "qwen38-27b-v1_20261015_bf16";
+pub const QWEN38_27B_MANIFEST_SHA256: &str = "4b1ba4f3eea0557c7f985f0bf0ad7b6fdcc89f74b87033fae08eedef0c7c5d57";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -234,6 +239,8 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         let expected = match (commit, config) {
             (FLASH_REVISION, FLASH_CONFIG) => Some(FLASH_MANIFEST_SHA256),
             (MIMO_PRO_REVISION, MIMO_PRO_CONFIG) => Some(MIMO_PRO_MANIFEST_SHA256),
+            (QWEN_DENSE_REVISION, QWEN35_9B_CONFIG) => Some(QWEN35_9B_MANIFEST_SHA256),
+            (QWEN_DENSE_REVISION, QWEN38_27B_CONFIG) => Some(QWEN38_27B_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),

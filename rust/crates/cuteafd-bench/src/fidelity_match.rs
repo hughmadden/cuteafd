@@ -20,6 +20,8 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "zai-org/GLM-5.3-BF16", siblings: &["zai-org/GLM-5.3", "zai-org/GLM-5.3-BF16"], revision: dataset::GLM_REVISION, config: dataset::GLM_CONFIG },
     Publication { root: "zai-org/GLM-5.3-Flash-BF16", siblings: &["zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"], revision: dataset::GLMF_REVISION, config: dataset::GLMF_CONFIG },
     Publication { root: "Qwen/Qwen3.8-Flash-Next", siblings: &["Qwen/Qwen3.8-Flash-Next", "Qwen/Qwen3.8-Flash-Next-FP8"], revision: dataset::QWEN_REVISION, config: dataset::QWEN_CONFIG },
+    Publication { root: "Qwen/Qwen3.5-9B", siblings: &["Qwen/Qwen3.5-9B"], revision: dataset::QWEN_DENSE_REVISION, config: dataset::QWEN35_9B_CONFIG },
+    Publication { root: "Qwen/Qwen3.8-27B", siblings: &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"], revision: dataset::QWEN_DENSE_REVISION, config: dataset::QWEN38_27B_CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4.1-Flash", siblings: &["deepseek-ai/DeepSeek-V4.1-Flash"], revision: dataset::REVISION, config: dataset::CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4-Flash-0731", siblings: &["deepseek-ai/DeepSeek-V4-Flash-0731"], revision: dataset::V4FLASH_REVISION, config: dataset::V4FLASH_CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4-Pro-0813", siblings: &["deepseek-ai/DeepSeek-V4-Pro-0813"], revision: dataset::V4PRO_REVISION, config: dataset::V4PRO_CONFIG },
@@ -27,7 +29,8 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", siblings: &["XiaomiMiMo/MiMo-V2.6-Pro-MOPD"], revision: dataset::MIMO_PRO_REVISION, config: dataset::MIMO_PRO_CONFIG },
 ];
 
-/// Official precision identities can exist before their datasets are published.
+/// Official precision identities can exist before their datasets are published
+/// (now every entry here has a PUBLICATIONS row; the table stays separate).
 /// An instruct root's pretraining ancestry is not a precision upgrade.
 pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("Qwen/Qwen3.5-9B", &["Qwen/Qwen3.5-9B"]),
@@ -258,9 +261,16 @@ mod tests {
         assert_eq!(result.reference_root, root);
         assert_eq!(result.resolved_chain, vec![vec![root.to_string()]]);
         add(tmp.path(), "Qwen/Qwen3.5-9B", "base_model: Qwen/Qwen3.5-9B-Base");
-        let error = resolve_in("Qwen/Qwen3.5-9B", None, tmp.path()).unwrap_err().to_string();
-        assert!(error.contains("no published fidelity dataset"), "{error}");
-        assert!(!error.contains("9B-Base"));
+        let r = resolve_in("Qwen/Qwen3.5-9B", None, tmp.path()).unwrap();
+        assert_eq!(r.reference_root, "Qwen/Qwen3.5-9B");
+        assert_eq!(r.config, dataset::QWEN35_9B_CONFIG);
+        assert_eq!(r.revision, dataset::QWEN_DENSE_REVISION);
+        assert_eq!(r.resolved_chain, vec![vec!["Qwen/Qwen3.5-9B".to_string()]]);
+        let r = resolve_in("Qwen/Qwen3.8-27B-FP8", None, tmp.path()).unwrap();
+        assert_eq!((r.reference_root.as_str(), r.config.as_str()), ("Qwen/Qwen3.8-27B", dataset::QWEN38_27B_CONFIG));
+        for (root, siblings) in OFFICIAL_ROOTS {
+            assert!(official(root).is_some_and(|p| p.root == *root && p.siblings == *siblings), "{root}");
+        }
         assert_eq!(official_root("Qwen/Qwen3.8-27B-FP8"), Some("Qwen/Qwen3.8-27B"));
         assert_eq!(official_root("Qwen/Qwen3.5-9B-FP8"), None);
     }
