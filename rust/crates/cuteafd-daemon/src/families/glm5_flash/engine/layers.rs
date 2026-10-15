@@ -502,7 +502,8 @@ mod tests {
     struct Lane<'a> { trace: &'a Trace, lane: usize }
 
     fn plan(modes: &[LayerMode], lanes: usize) -> LayerExecutionPlan {
-        let spec = HopSpec { row_bytes: 32, rows: 8, lanes: lanes as u64, entry_gpu: 0,
+        let spec = HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,
+            row_bytes: 32, rows: 8, lanes: lanes as u64, entry_gpu: 0,
             head_gpu: 0, terminal: TerminalHome::Replicated };
         let placement = Placement { pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]), attention_placement: AttentionPlacement::Layers,
             attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0,

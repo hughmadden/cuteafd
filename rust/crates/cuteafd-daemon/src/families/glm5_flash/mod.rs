@@ -1738,6 +1738,7 @@ impl Opened {
         }
         let execution = cuteafd_loader::placement::LayerExecutionPlan::new(&placement,
             cuteafd_loader::placement::HopSpec {
+                storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,
                 row_bytes: 4 * self.cfg.hidden as u64 * 2,
                 rows: args.prefill_rows.max(args.decode_rows) as u64,
                 lanes: working.prefill_lanes,
