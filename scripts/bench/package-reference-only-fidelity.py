@@ -160,6 +160,11 @@ def package(source, out, config, tokenizer_path, license_path):
         print(f'packaged {config}/{wid}', flush=True)
     provenance = {k: meta[k] for k in ('snapshot_identity', 'source_pin', 'platform', 'tokenizers', 'torch',
                                       'transformers', 'attention', 'mtp', 'use_cache', 'gates', 'native_fp32_parameters')}
+    if digest(source / 'platform.json') != inventory['platform.json']['sha256']:
+        raise ValueError('sealed runtime provenance differs')
+    runtime = read('platform.json')
+    provenance['runtime'] = {k: runtime[k] for k in ('image', 'image_sha256', 'compute_capability',
+                                                   'tokenizers_wheel_sha256', 'dependency_install')}
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference_only', qualifies=True,
                          engine_parity=False, qualification_scope='reference-only qualified; no paired engine calibration or precision-default verdict',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],

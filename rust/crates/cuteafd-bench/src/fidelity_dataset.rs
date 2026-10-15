@@ -351,7 +351,8 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
     if qualification["kind"] == "reference_only" {
         let proof = &qualification["prefix_qualification"];
         let provenance = &qualification["reference_provenance"];
-        ensure!(qualification["engine_parity"] == false && qualification["reference_validation"]["passed"] == true
+        ensure!(qualification["schema"] == "cuteafd.fidelity.qualification/1"
+            && qualification["engine_parity"] == false && qualification["reference_validation"]["passed"] == true
             && qualification["reference_validation"]["engine_parity"] == false
             && qualification["reference_validation"]["set_sha256"] == manifest["set_sha256"],
             "invalid reference-only validation");
@@ -790,7 +791,7 @@ mod tests {
         let identity = json!({"checkpoint":"Qwen/Qwen3.5-9B", "snapshot_revision":"a".repeat(40),
             "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
         let manifest = json!({"set_sha256":"set", "vocab":248320, "root_checkpoint":{"id":"Qwen/Qwen3.5-9B", "revision":"a".repeat(40)}});
-        let qualification = json!({"kind":"reference_only", "qualifies":true, "engine_parity":false,
+        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference_only", "qualifies":true, "engine_parity":false,
             "set_sha256":"set", "nll":1.2, "scored_tokens":32768,
             "reference_validation":{"passed":true, "engine_parity":false, "set_sha256":"set",
                 "scored_tokens":32768,"nll":1.2,"golden_seal_sha256":"d".repeat(64),"full_seal_sha256":"e".repeat(64)},
