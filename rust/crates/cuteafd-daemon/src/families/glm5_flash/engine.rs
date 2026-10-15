@@ -379,13 +379,11 @@ fn lane_setting() -> (bool, bool) {
     (setting.as_ref().map_or(true, |v| v != "1"), setting.as_ref().is_ok_and(|v| v == "subset"))
 }
 
-/// Whether an engine over `layers` of `total` with `experts` prefills in `lanes` Spark lanes (as
-/// [`GlmfEngine::prefill_capacity`] finds once it exists): lanes on, every layer resident (or a
-/// subset with `subset`) and a Spark transport per lane.
-pub(crate) fn prefill_pipelines(layers: usize, total: usize, experts: Option<&Experts<'_>>, lanes: usize) -> bool {
-    let (on, subset) = lane_setting();
-    on && (layers == total || subset)
-        && matches!(experts, Some(Experts::Spark { transports, .. }) if transports.borrow().len() >= lanes)
+/// Lane scheduling is independent of the expert home. Only a Spark backend needs one
+/// transport per lane; local and TP2 work is serialized on the owning streams.
+fn prefill_pipeline_available(on: bool, complete: bool, subset: bool, lanes: usize,
+    transports: Option<usize>) -> bool {
+    on && (complete || subset) && lanes > 0 && transports.is_none_or(|count| count >= lanes)
 }
 
 /// Routed experts on this GPU from the TP1 package. All layers stay resident
@@ -1520,13 +1518,13 @@ fn workspace_reserve_bytes(tracked: u64, lanes: usize, drafter: bool) -> u64 {
 }
 
 /// The prefill lanes a serving engine creates before readiness: `lanes` (`--prefill-lanes`) when
-/// Spark prefill runs in lanes (`CUTEAFD_GLMF_PREFILL_LANES=1` turns them off, `subset` keeps them
+/// prefill runs in lanes (`CUTEAFD_GLMF_PREFILL_LANES=1` turns them off, `subset` keeps them
 /// with a `--layers` subset), else one serial workspace.
-fn prefill_workspace_count(spark: bool, complete: bool, value: Option<&str>, lanes: usize) -> usize {
-    if spark && value != Some("1") && (complete || value == Some("subset")) { lanes } else { 1 }
+fn prefill_workspace_count(complete: bool, value: Option<&str>, lanes: usize) -> usize {
+    if prefill_pipeline_available(value != Some("1"), complete, value == Some("subset"), lanes, None) { lanes } else { 1 }
 }
-pub(crate) fn configured_prefill_lanes(spark: bool, complete: bool, lanes: usize) -> usize {
-    prefill_workspace_count(spark, complete, std::env::var("CUTEAFD_GLMF_PREFILL_LANES").ok().as_deref(), lanes)
+pub(crate) fn configured_prefill_lanes(complete: bool, lanes: usize) -> usize {
+    prefill_workspace_count(complete, std::env::var("CUTEAFD_GLMF_PREFILL_LANES").ok().as_deref(), lanes)
 }
 
 fn startup_graph_policy(graphs: Option<&str>, startup: Option<&str>) -> bool {
@@ -3264,11 +3262,15 @@ impl<'a> GlmfEngine<'a> {
         Ok((0..tokens).step_by(per_lane).map(|first| per_lane.min(tokens - first)).collect())
     }
 
-    /// Whether prefill runs as Spark lanes (a transport per lane, every layer resident).
+    /// Whether prefill runs in admitted lanes (a transport per lane only for Spark homes).
     /// CUTEAFD_GLMF_PREFILL_LANES=1 keeps the serial one-workspace prefill (A/B runs).
     fn pipelined(&self) -> bool {
-        self.lanes && (self.weights.layers.len() == self.cfg.layers || self.subset_lanes) && matches!(&self.experts,
-            Some(Experts::Spark { transports, .. }) if transports.borrow().len() >= self.prefill_lane_count)
+        let transports = match &self.experts {
+            Some(Experts::Spark { transports, .. }) => Some(transports.borrow().len()),
+            _ => None,
+        };
+        prefill_pipeline_available(self.lanes, self.weights.layers.len() == self.cfg.layers,
+            self.subset_lanes, self.prefill_lane_count, transports)
     }
 
     /// Longest chunk one prefill call takes: a lane of `prefill_rows` rows
@@ -4986,8 +4988,17 @@ impl<'a> GlmfEngine<'a> {
         unsafe { transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
     }
 
-    /// Pipelined Spark prefill of consecutive-row lanes of one sequence (each
-    /// with its own workspace and transport). Units (layer, lane) run
+    fn spark_land_lane(&self, w: &Workspace<'_>, rows: usize, lane: usize, wave: SparkExpertWave) -> Result<()> {
+        let Some(Experts::Spark { transports, runtime }) = &self.experts else {
+            anyhow::bail!("Spark completion without its installed backend");
+        };
+        let mut transports = transports.borrow_mut();
+        let transport = transports.get_mut(lane).context("Spark completion lane")?;
+        runtime.block_on(self.spark_land(w, rows, transport, wave))
+    }
+
+    /// Pipelined prefill of consecutive-row lanes of one sequence (each
+    /// with its own workspace and, for Spark homes only, transport). Units (layer, lane) run
     /// layer-major: a lane's attention needs its own previous layer posted and
     /// the previous lane's same layer done, which stream order gives (KDA
     /// state and conv windows, MLA records and DSA token/pool keys all pass
@@ -5008,11 +5019,9 @@ impl<'a> GlmfEngine<'a> {
         if self.layer_execution.is_some() {
             return self.layer_steps(scope, lanes, logit_rows, device, media);
         }
-        let Some(Experts::Spark { transports, runtime }) = &self.experts else {
-            anyhow::bail!("pipelined prefill needs Spark experts");
-        };
-        let mut transports = transports.borrow_mut();
-        ensure!(transports.len() >= lanes.len(), "{} lanes need as many Spark transports", lanes.len());
+        if let Some(Experts::Spark { transports, .. }) = &self.experts {
+            ensure!(transports.borrow().len() >= lanes.len(), "{} lanes need as many Spark transports", lanes.len());
+        }
         let workspaces = self.prefill_lanes_of(0, lanes.len())?;
         let total: usize = lanes.iter().map(|(t, _)| t.kv_slots.len()).sum();
         ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
@@ -5038,6 +5047,7 @@ impl<'a> GlmfEngine<'a> {
         }
         self.prepare_route_checks(&lanes.iter().map(|(t, _)| t.kv_slots.len()).collect::<Vec<_>>())?;
         let layers = &self.weights.layers;
+        let local_layer = |layer| self.local_layer(layer) || matches!(self.routed_experts(layer), Some(Experts::Skip));
         let cap = "m4096";
         let rows_of = |lane: usize| Scalar::I32(lanes[lane].0.kv_slots.len() as i32);
         let count_of = |lane: usize| lanes[lane].0.kv_slots.len();
@@ -5109,71 +5119,69 @@ impl<'a> GlmfEngine<'a> {
             Ok(())
         };
         let units: Vec<(usize, usize)> = (0..layers.len()).flat_map(|l| (0..lanes.len()).map(move |k| (l, k))).collect();
-        runtime.block_on(async {
-            let mut inflight: Option<((usize, usize), SparkExpertWave)> = None;
-            attention(units[0])?;
-            for (index, &unit) in units.iter().enumerate() {
-                let (layer, lane) = unit;
-                let w = &workspaces[lane];
-                let w1 = peer_workspaces.as_ref().map(|peers| peers.get(lane)).transpose()?;
-                if layers[layer].dense || self.tp2_layer(layer)
-                    || self.local_layer(layer) {
-                    // A local post may wait behind a previous lane's Spark FFN on the peer stream.
-                    // Land that wave before queuing any blocking local meet.
-                    if let Some((previous, wave)) = inflight.take() {
-                        let t = lanes[previous.1].0.kv_slots.len();
-                        self.spark_land(&workspaces[previous.1], t, &mut transports[previous.1], wave).await?;
-                        post(previous)?;
-                    }
-                }
-                let next = units.get(index + 1).copied();
-                let local = layers[layer].dense || self.tp2_layer(layer)
-                    || self.local_layer(layer);
-                let early_next = local && next.is_some_and(|(_, next_lane)| next_lane != lane);
-                let local_post = || -> Result<()> {
-                    peer_next(unit)?;
-                    if early_next { attention(next.context("independent next unit")?)?; }
-                    post(unit)
-                };
-                if layers[layer].dense {
-                    local_post()?;
-                } else if self.local_layer(layer) {
-                    self.moe_experts(w, layer, &layers[layer], count_of(lane), rows_of(lane), cap, false, w1)?;
-                    local_post()?;
-                } else if self.tp2_layer(layer) {
-                    self.tp2_pair(layer, lane, w, w1, count_of(lane), rows_of(lane), cap)?;
-                    self.tp2_publish(layer, lane, count_of(lane), w1)?;
-                    local_post()?;
-                } else {
-                    let t = lanes[lane].0.kv_slots.len();
-                    let shared = || self.ffn(w, &layers[layer], self.cfg.moe_intermediate, cap, w.shared.buffer.ptr,
-                        rows_of(lane));
-                    ensure!(matches!(self.routed_experts(layer), Some(Experts::Spark { .. })),
-                        "layer {layer} is not bound to a Spark backend");
-                    let wave = self.spark_dispatch(w, layer, t, false, &mut transports[lane], shared)?;
-                    peer_next(unit)?;
-                    if let Some((previous, wave)) = inflight.take() {
-                        let t = lanes[previous.1].0.kv_slots.len();
-                        self.spark_land(&workspaces[previous.1], t, &mut transports[previous.1], wave).await?;
-                        post(previous)?;
-                    }
-                    inflight = Some((unit, wave));
-                }
-                let next = units.get(index + 1).copied();
-                // The next unit reads this unit's post when both are on one lane.
-                if next.is_none_or(|(_, next_lane)| next_lane == lane) {
-                    if let Some((current, wave)) = inflight.take() {
-                        let t = lanes[current.1].0.kv_slots.len();
-                        self.spark_land(&workspaces[current.1], t, &mut transports[current.1], wave).await?;
-                        post(current)?;
-                    }
-                }
-                if !early_next {
-                    if let Some(next) = next { attention(next)?; }
+        let mut inflight: Option<((usize, usize), SparkExpertWave)> = None;
+        attention(units[0])?;
+        for (index, &unit) in units.iter().enumerate() {
+            let (layer, lane) = unit;
+            let w = &workspaces[lane];
+            let w1 = peer_workspaces.as_ref().map(|peers| peers.get(lane)).transpose()?;
+            if layers[layer].dense || self.tp2_layer(layer)
+                || local_layer(layer) {
+                // A local post may wait behind a previous lane's Spark FFN on the peer stream.
+                // Land that wave before queuing any blocking local meet.
+                if let Some((previous, wave)) = inflight.take() {
+                    let t = lanes[previous.1].0.kv_slots.len();
+                    self.spark_land_lane(&workspaces[previous.1], t, previous.1, wave)?;
+                    post(previous)?;
                 }
             }
-            anyhow::Ok(())
-        })?;
+            let next = units.get(index + 1).copied();
+            let local = layers[layer].dense || self.tp2_layer(layer)
+                || local_layer(layer);
+            let early_next = local && next.is_some_and(|(_, next_lane)| next_lane != lane);
+            let local_post = || -> Result<()> {
+                peer_next(unit)?;
+                if early_next { attention(next.context("independent next unit")?)?; }
+                post(unit)
+            };
+            if layers[layer].dense {
+                local_post()?;
+            } else if local_layer(layer) {
+                self.moe_experts(w, layer, &layers[layer], count_of(lane), rows_of(lane), cap, false, w1)?;
+                local_post()?;
+            } else if self.tp2_layer(layer) {
+                self.tp2_pair(layer, lane, w, w1, count_of(lane), rows_of(lane), cap)?;
+                self.tp2_publish(layer, lane, count_of(lane), w1)?;
+                local_post()?;
+            } else {
+                let t = lanes[lane].0.kv_slots.len();
+                let shared = || self.ffn(w, &layers[layer], self.cfg.moe_intermediate, cap, w.shared.buffer.ptr,
+                    rows_of(lane));
+                let Some(Experts::Spark { transports, .. }) = self.routed_experts(layer) else {
+                    anyhow::bail!("layer {layer} is not bound to a Spark backend");
+                };
+                let wave = self.spark_dispatch(w, layer, t, false, &mut transports.borrow_mut()[lane], shared)?;
+                peer_next(unit)?;
+                if let Some((previous, wave)) = inflight.take() {
+                    let t = lanes[previous.1].0.kv_slots.len();
+                    self.spark_land_lane(&workspaces[previous.1], t, previous.1, wave)?;
+                    post(previous)?;
+                }
+                inflight = Some((unit, wave));
+            }
+            let next = units.get(index + 1).copied();
+            // The next unit reads this unit's post when both are on one lane.
+            if next.is_none_or(|(_, next_lane)| next_lane == lane) {
+                if let Some((current, wave)) = inflight.take() {
+                    let t = lanes[current.1].0.kv_slots.len();
+                    self.spark_land_lane(&workspaces[current.1], t, current.1, wave)?;
+                    post(current)?;
+                }
+            }
+            if !early_next {
+                if let Some(next) = next { attention(next)?; }
+            }
+        }
         // All lane producers are queued before a terminal wait can block the
         // peer stream (in particular the next lane's fused TP2 publication).
         if let Some(peers) = &peer_workspaces {
@@ -5699,12 +5707,18 @@ mod prefill_lane_tests {
         assert!(super::startup_graph_policy(Some("1"), Some("1")));
         assert!(!super::startup_graph_policy(Some("0"), None));
         assert!(!super::startup_graph_policy(None, Some("0")));
-        assert_eq!(super::prefill_workspace_count(true, true, None, 2), 2);
-        assert_eq!(super::prefill_workspace_count(true, true, None, 4), 4);
-        assert_eq!(super::prefill_workspace_count(true, true, Some("1"), 4), 1);
-        assert_eq!(super::prefill_workspace_count(true, false, None, 2), 1);
-        assert_eq!(super::prefill_workspace_count(true, false, Some("subset"), 2), 2);
-        assert_eq!(super::prefill_workspace_count(false, true, None, 2), 1);
+        assert_eq!(super::prefill_workspace_count(true, None, 2), 2);
+        assert_eq!(super::prefill_workspace_count(true, None, 4), 4);
+        assert_eq!(super::prefill_workspace_count(true, Some("1"), 4), 1);
+        assert_eq!(super::prefill_workspace_count(false, None, 2), 1);
+        assert_eq!(super::prefill_workspace_count(false, Some("subset"), 2), 2);
+        for transports in [None, Some(2), Some(4)] {
+            assert!(super::prefill_pipeline_available(true, true, false, 2, transports));
+        }
+        assert!(!super::prefill_pipeline_available(true, true, false, 2, Some(1)));
+        assert!(!super::prefill_pipeline_available(false, true, false, 2, None));
+        assert!(!super::prefill_pipeline_available(true, false, false, 2, None));
+        assert!(super::prefill_pipeline_available(true, false, true, 2, None));
     }
 
     #[test]
@@ -6517,7 +6531,7 @@ mod spark_warmup_tests {
         for lanes in 1..=MAX_PREFILL_LANES {
             for (setting, complete) in [(None, true), (Some("1"), true), (None, false), (Some("subset"), false),
                 (Some("subset"), true)] {
-                let warmed = prefill_workspace_count(true, complete, setting, lanes);
+                let warmed = prefill_workspace_count(complete, setting, lanes);
                 // `lane_setting`: lanes run unless set to 1, over every layer or a subset with `subset`.
                 let pipelined = setting != Some("1") && (complete || setting == Some("subset"));
                 assert_eq!(warmed, if pipelined { lanes } else { 1 }, "{lanes} lanes, {setting:?}, {complete}");

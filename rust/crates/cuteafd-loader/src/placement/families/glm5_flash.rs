@@ -536,7 +536,7 @@ impl GlmfWorkingSetExt for GlmfWorkingSet {
         }
         let spark_layers = routed[n..].to_vec();
         let spark_ranks = if spark_layers.is_empty() { 0 } else { i.spark_ranks };
-        let prefill_lanes = if spark_ranks == 0 { 1 } else { i.prefill_lanes };
+        let prefill_lanes = i.prefill_lanes;
         if prefill_lanes == 0 || (i.attention.mode == AttentionPlacement::Layers
             && super::super::validate_layer_pipeline_lanes(prefill_lanes, prefill_lanes as usize).is_err()) {
             return Err(PlacementError::Inventory("GLM Flash layers executor needs one or two admitted prefill lanes"));
@@ -887,7 +887,7 @@ mod tests {
             assert_eq!(p.onboard_layers, expected);
             let spark = expected < planned.experts.len();
             assert_eq!(working.spark_ranks, if spark { 4 } else { 0 });
-            assert_eq!(working.prefill_lanes, if spark { 2 } else { 1 });
+            assert_eq!(working.prefill_lanes, 2);
             assert_eq!(working.spark_layers, if spark { vec![2, 3] } else { vec![] });
             let mut measured = planned.clone();
             for rank in 0..2 {
@@ -924,7 +924,7 @@ mod tests {
         let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
         assert_eq!(placed.onboard_layers, input.experts.len());
         assert!(working.spark_layers.is_empty());
-        assert_eq!((working.spark_ranks, working.prefill_lanes), (0, 1));
+        assert_eq!((working.spark_ranks, working.prefill_lanes), (0, 2));
         assert!(placed.items[0].iter().all(|d| d.group != "Spark intake"));
         input.onboard = Onboard::Layers(1);
         assert!(solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).is_err());
@@ -948,6 +948,37 @@ mod tests {
             assert_eq!(graphs, prior.1);
             assert_eq!((working.spark_ranks, working.prefill_lanes), (0, 1));
             assert!(working.spark_layers.is_empty());
+        }
+    }
+
+    #[test]
+    fn local_and_tp2_candidates_preserve_every_admitted_lane_without_spark_costs() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for ranks in [1, 2] {
+            let mut input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
+            input.spark_ranks = 0;
+            input.graphs = GraphSet::budget(&vec![64 << 20; ranks]);
+            input.requested_pool = Some(2 << 20);
+            for lanes in [1, 2] {
+                input.prefill_lanes = lanes;
+                let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+                assert_eq!((working.spark_ranks, working.prefill_lanes), (0, lanes));
+                assert_eq!(working.rtx_layers, vec![1, 2, 3]);
+                assert!(working.spark_layers.is_empty());
+                working.validate(&placed).unwrap();
+                let request = request_for_working_set(&input, &working).unwrap();
+                assert_eq!(request.hops.lanes, lanes);
+                for rank in 0..ranks {
+                    let charged = |name: &str| request.fixed.iter().filter(|d| d.gpu as usize == rank && d.group == name)
+                        .map(|d| d.bytes).sum::<u64>();
+                    assert_eq!(charged("Spark intake"), 0);
+                    assert_eq!(charged("steps"), input.local_workspace[rank].demand.bytes);
+                    if ranks == 2 {
+                        assert_eq!(charged("peer exchange"), glmf_graphs::peer_exchange_bytes(lanes, 4096, 4096, 2,
+                            input.representation.kda_fp8 && input.representation.output_shard));
+                    }
+                }
+            }
         }
     }
 
@@ -1479,7 +1510,7 @@ mod tests {
             input.prefill_lanes = lanes;
             assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, lanes);
         }
-        assert_eq!(GlmfWorkingSet::candidate(&input, input.experts.len()).unwrap().prefill_lanes, 1);
+        assert_eq!(GlmfWorkingSet::candidate(&input, input.experts.len()).unwrap().prefill_lanes, 2);
     }
 
     #[test]

@@ -331,7 +331,19 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     assert "tensors, &package, tp2_layers, args.expert_rows(), budgets" in body
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
     assert "solve_working_set_with_graphs(" in admission
-    assert "let local_workspace = workspaces(false, 1);" in admission
+    assert "let local_workspace = workspaces(false, lanes);" in admission
+    assert "configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes)" in admission
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// Longest chunk", 1)[0]
+    assert "prefill_pipeline_available(" in pipeline and "_ => None" in pipeline
+    lane_step = engine.split("    fn step_lanes_inner(", 1)[1].split("    ///", 1)[0]
+    assert "pipelined prefill needs Spark experts" not in lane_step
+    assert "self.spark_land_lane(" in lane_step
+    assert "Some(Experts::Skip)" in lane_step
+    layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
+    assert "step_workspace(&ExpertPlacement::Local, lanes)" in layout
+    assert "local_workspace = Some(estimate(lanes))" in layout
+
     assert "admission::step_workspace_demands(" in admission
     normalization = body.split("let mut selected_args = args.clone();", 1)[1].split("let args = &selected_args;", 1)[0]
     assert "if " not in normalization, "zero-peer exchanges must also use admitted effective lanes"

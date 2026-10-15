@@ -70,7 +70,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 index == crate::serving_capacity::GlmfIndexCache::Compact,
                 ranks == 2, representation, options.glmf_prefill_expanded, available.is_some() && (ranks == 2 || catalog.fp8().is_some()), options.glmf_kda_fp32_partials, state));
         let mut workspace = step_workspace(&report.placement, lanes);
-        let mut local_workspace = step_workspace(&ExpertPlacement::Local, 1);
+        let mut local_workspace = step_workspace(&ExpertPlacement::Local, lanes);
         if (workspace.is_none() || local_workspace.is_none()) && manifest.is_some() {
             anyhow::bail!("GLM Flash program manifest lacks the requested step scratch geometry");
         }
@@ -81,7 +81,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 (if ranks == 1 { gib(268) } else { gib(472) }) * (lanes * rows).max(8192) / 8192,
                 Basis::Calibrated)).collect();
             workspace = Some(estimate(lanes));
-            local_workspace = Some(estimate(1));
+            local_workspace = Some(estimate(lanes));
         }
         let mut workspace = workspace.unwrap();
         let mut local_workspace = local_workspace.unwrap();

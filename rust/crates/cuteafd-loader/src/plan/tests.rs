@@ -1638,7 +1638,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             resident: resident::resident_weights(&checkpoint, &cfg, cfg.layers, 2, opts.glmf_representation).unwrap(),
             router_replica_bytes: resident::router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap(),
             workspace: glmf::step_workspace_demands(&cfg, 2, 4096, 64, shape, decode, prefill),
-            local_workspace: glmf::step_workspace_demands(&cfg, 1, 4096, 64,
+            local_workspace: glmf::step_workspace_demands(&cfg, 2, 4096, 64,
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
             graphs: placement::GraphSet::budget(&[64 << 20; 2]), experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
@@ -1648,7 +1648,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         assert_eq!(working.rtx_layers.len(), expected_rtx);
         assert_eq!(placed.onboard_layers, expected_rtx);
         let spark = !working.spark_layers.is_empty();
-        assert_eq!((working.spark_ranks, working.prefill_lanes), if spark { (4, 2) } else { (0, 1) });
+        assert_eq!((working.spark_ranks, working.prefill_lanes), if spark { (4, 2) } else { (0, 2) });
         let mut admitted = input.clone();
         admitted.graphs = graphs;
         let request = glmf::request_for_working_set(&admitted, &working).unwrap();

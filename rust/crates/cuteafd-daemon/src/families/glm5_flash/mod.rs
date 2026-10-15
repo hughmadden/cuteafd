@@ -1372,7 +1372,7 @@ impl Opened {
             args.token_io.embed_placement)?;
         let router_replica_bytes = router_replica_bytes(&headers, &self.cfg, layers).map_err(anyhow::Error::msg)?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
-        let lanes = engine::configured_prefill_lanes(spark_ranks > 0, layers == self.cfg.layers, args.prefill_lanes);
+        let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
         let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
         let scratch = GlmfScratchOptions { split, kda_w8: representation.kda_fp8,
             kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
@@ -1391,7 +1391,7 @@ impl Opened {
         let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
             args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
         let workspace = workspaces(spark_ranks > 0, lanes);
-        let local_workspace = workspaces(false, 1);
+        let local_workspace = workspaces(false, lanes);
         let mut experts = self.experts.as_ref().map(|c| admission::expert_costs(c, split)).transpose()?.unwrap_or_default();
         experts.truncate(self.cfg.dense[..layers].iter().filter(|&&d| !d).count());
         if args.skip_experts { for cost in &mut experts { cost.whole = Default::default(); cost.half = Default::default(); } }
@@ -1757,7 +1757,7 @@ impl Opened {
             let tp2 = !args.skip_experts && placement.tp2.is_some();
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None, settings)
                 .with_experts(local, spark, tp2);
-            let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
+            let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
         } else { None };
         let records = early_workspaces.as_ref().map(|w| w.prefill_scratch()
@@ -1999,7 +1999,7 @@ impl Opened {
         // prompt would reconnect four ranks mid-prefill, and the first request would open transport 0.
         // Every transport a prefill runs on (transport 0 also carries decode, verify and serial chunks)
         // is warmed with `expert_rows` rows, the most any of its waves carries.
-        let warmed = engine::configured_prefill_lanes(true, served == self.cfg.layers, transports.len());
+        let warmed = engine::configured_prefill_lanes(served == self.cfg.layers, transports.len());
         let warm_rows = args.expert_rows();
         let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
         // Connect every warmed rank now and publish its installed expert
