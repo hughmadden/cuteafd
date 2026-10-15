@@ -59,7 +59,7 @@ struct Owners {
     compressor: Option<Vec<u8>>,
 }
 
-struct Bindings<'e, 'a> {
+struct Bindings<'e, 'a, 'c> {
     engine: &'e GlmfEngine<'a>,
     work: [&'e Workspace<'a>; 2],
     tables: [&'e StepTables; 2],
@@ -68,6 +68,8 @@ struct Bindings<'e, 'a> {
     rows: usize,
     graphed: bool,
     tap: (usize, usize, usize),
+    on_layer: Option<&'c mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+    prepared: Cell<Option<usize>>,
 }
 
 #[derive(Clone, Copy)]
@@ -129,27 +131,29 @@ impl<'a> GlmfEngine<'a> {
         }).collect()
     }
 
-    fn layer_pipeline(&self, scope: &SubmissionScope<'_>, bindings: &mut [Bindings<'_, 'a>]) -> Result<()> {
+    fn layer_pipeline(&self, scope: &SubmissionScope<'_>, bindings: &mut [Bindings<'_, 'a, '_>]) -> Result<()> {
         let execution = self.layer_execution.as_ref().context("per-layer execution binding")?;
         let rows = bindings.iter().map(|binding| binding.rows).collect::<Vec<_>>();
         execution.hops.validate_binding(&execution.plan, self.exchange()?)?;
         let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None) };
         attention::layer_pipeline_with(scope, &execution.plan, &exchange,
             LaneOrder::OrderedChunks, &rows, bindings)?;
-        for binding in bindings.iter() { binding.finish()?; }
+        for binding in bindings.iter_mut() { binding.finish()?; }
         self.finish_route_checks()
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn layer_step(&self, scope: &SubmissionScope<'_>, w: &Workspace<'a>, w1: &Workspace<'a>,
-        tables: &StepTables, tables1: &StepTables, rows: usize, logit_rows: usize, graphed: bool)
+        tables: &StepTables, tables1: &StepTables, rows: usize, logit_rows: usize, graphed: bool,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>)
         -> Result<Option<DeviceLogits>> {
+        ensure!(!graphed || on_layer.is_none(), "layer callbacks must run outside capture");
         if graphed {
             self.release_retired_graphs()?;
             if self.embedding.device_gather() { self.gather_streams(w, rows)?; }
         }
         let mut bindings = [Bindings { engine: self, work: [w, w1], tables: [tables, tables1],
-            owners: self.layer_owners(), lane: 0, rows, graphed,
+            owners: self.layer_owners(), lane: 0, rows, graphed, on_layer, prepared: Cell::new(None),
             tap: (rows.saturating_sub(crate::families::glm5::dflash::TAP_ROWS),
                 rows.min(crate::families::glm5::dflash::TAP_ROWS), 0) }];
         self.layer_pipeline(scope, &mut bindings)?;
@@ -187,7 +191,7 @@ impl<'a> GlmfEngine<'a> {
             let n = first + rows - tap_start;
             bindings.push(Bindings { engine: self, work: [w, peers.get(lane)?],
                 tables: [&ranked[lane][0], &ranked[lane][1]], owners: self.layer_owners(),
-                lane, rows, graphed: false, tap: (tap_start - first, n,
+                lane, rows, graphed: false, on_layer: None, prepared: Cell::new(None), tap: (tap_start - first, n,
                     tap_start.saturating_sub(total - total.min(crate::families::glm5::dflash::TAP_ROWS))) });
             first += rows;
         }
@@ -229,7 +233,7 @@ fn segments(owner: Option<usize>, mut segment: impl FnMut(usize, bool) -> Result
     Ok(())
 }
 
-impl Bindings<'_, '_> {
+impl Bindings<'_, '_, '_> {
     fn cap(&self) -> &'static str { if self.tables[0].decode { decode_cap(self.rows) } else { PREFILL_CAP } }
 
     fn layer(&self, rank: usize, layer: usize) -> &GlmfLayer<'_> {
@@ -250,13 +254,13 @@ impl Bindings<'_, '_> {
         let layer = self.layer(rank, index);
         let rows = Scalar::I32(self.rows as i32);
         let body = || {
-            if let Some(previous) = index.checked_sub(1) {
+            if let Some(previous) = index.checked_sub(1).filter(|_| self.prepared.get() != Some(index)) {
                 if rank == 0 {
                     let out = e.meet_ffn(w, previous, self.lane, e.weights.layers.len(), self.rows)?;
                     e.post_pre_on(0, w, out, 1, layer, "attn", "input_norm", rows, self.cap())?;
                     self.tap(previous)?;
                 } else { e.peer_post(previous, self.lane, w, self.rows, self.cap())?; }
-            } else if active { e.pre_on(rank, w, &w.streams[0], layer, rows)?; }
+            } else if index == 0 && active { e.pre_on(rank, w, &w.streams[0], layer, rows)?; }
             if !active { return Ok(()); }
             e.attention(rank, w, index, layer, rows, self.cap(), self.tables[rank], None)?;
             let attended = if layer.attention_share.split() { self.meet(rank, index)? } else { w.delta.buffer.ptr };
@@ -285,7 +289,27 @@ impl Bindings<'_, '_> {
         w.sum_ptr()
     }
 
-    fn finish(&self) -> Result<()> {
+    fn completed_layer(&mut self, index: usize) -> Result<()> {
+        let Some(on_layer) = self.on_layer.as_mut() else { return Ok(()) };
+        let e = self.engine;
+        let rank = match e.layer_execution.as_ref().context("layer execution")?.plan.mode(index)? {
+            LayerMode::Whole { gpu, .. } => usize::from(gpu),
+            _ => 0,
+        };
+        let buffer = self.work[rank].streams[0].buffer;
+        let bytes = self.rows * HC * e.cfg.hidden * 2;
+        ensure!(bytes <= buffer.bytes, "completed layer rows exceed residual storage");
+        e.on(rank, || {
+            // SAFETY: both FFN joins (or the terminal copy) precede this owner
+            // stream wait. The callback borrows only downloaded residual bytes.
+            unsafe { e.library.cuda_stream_synchronize(e.stream_of(rank))?; }
+            let mut residual = vec![0; bytes];
+            e.library.copy_d2h(&mut residual, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
+            on_layer(index, &residual)
+        })
+    }
+
+    fn finish(&mut self) -> Result<()> {
         let e = self.engine;
         let w = self.work[0];
         let last = e.weights.layers.len() - 1;
@@ -295,11 +319,12 @@ impl Bindings<'_, '_> {
             self.tap(last)
         };
         if self.graphed { e.replay(GraphKey::new(last + 1, self.rows, self.tables[0]), body)?; } else { body()?; }
-        e.replicate_terminal(w, self.work[1], 0, self.rows)
+        e.replicate_terminal(w, self.work[1], 0, self.rows)?;
+        self.completed_layer(last)
     }
 }
 
-impl LayerKernels for Bindings<'_, '_> {
+impl LayerKernels for Bindings<'_, '_, '_> {
     fn pack(&mut self, hop: Hop) -> Result<*const c_void> {
         let stream = if matches!(hop.at, HopPoint::AfterAttention(_)) { 1 } else { 0 };
         Ok(self.work[usize::from(hop.from)].streams[stream].buffer.ptr)
@@ -348,7 +373,7 @@ impl LayerKernels for Bindings<'_, '_> {
     }
 }
 
-impl PipelineKernels for Bindings<'_, '_> {
+impl PipelineKernels for Bindings<'_, '_, '_> {
     type FfnTicket = Ticket;
     fn state_owners(&self, layer: usize) -> Result<AttentionStateOwners<'_>> {
         let owners = self.owners.get(layer).context("allocated layer state")?;
@@ -433,7 +458,19 @@ impl PipelineKernels for Bindings<'_, '_> {
         e.exchange_push(e.exchange()?, "main", 1, slot(index, true, self.lane),
             GlmfEngine::peer_ffn_out(self.work[1], self.layer(1, index))?, self.rows * e.cfg.hidden * 2)?;
         crate::shared::console::layer_mark(index);
-        e.probe_mark(index)
+        e.probe_mark(index)?;
+        if self.on_layer.is_some() && index + 1 < e.weights.layers.len() {
+            // Materialize the normal fused boundary early for diagnostics.
+            // Both rank joins must precede any callback host synchronization.
+            let out = e.meet_ffn(self.work[0], index, self.lane, e.weights.layers.len(), self.rows)?;
+            e.post_pre_on(0, self.work[0], out, 1, self.layer(0, index + 1),
+                "attn", "input_norm", Scalar::I32(self.rows as i32), self.cap())?;
+            e.peer_post(index, self.lane, self.work[1], self.rows, self.cap())?;
+            self.tap(index)?;
+            self.prepared.set(Some(index + 1));
+            self.completed_layer(index)?;
+        }
+        Ok(())
     }
 }
 #[cfg(test)]
@@ -460,6 +497,8 @@ mod tests {
         fail: Option<(usize, bool)>,
         calls: Cell<usize>,
         pending: Cell<usize>,
+        diagnostics: bool,
+        completed: RefCell<Vec<(usize, usize, usize)>>,
     }
     struct Lane<'a> { trace: &'a Trace, lane: usize }
 
@@ -479,7 +518,8 @@ mod tests {
             Self { state: (0..modes.len()).map(|layer| plan.attention_owners(layer).unwrap()).collect(),
                 plan, schedule: RefCell::new(Default::default()), owners: RefCell::new(TestSubmission::new(None)),
                 backends: (0..modes.len()).map(|i| [Backend::Dense, Backend::Local, Backend::Tp2, Backend::Spark][i % 4]).collect(),
-                lane: Cell::new(0), broadcast, output_shard, fail: None, calls: Cell::new(0), pending: Cell::new(0) }
+                lane: Cell::new(0), broadcast, output_shard, fail: None, calls: Cell::new(0), pending: Cell::new(0),
+                diagnostics: false, completed: RefCell::new(Vec::new()) }
         }
         fn callback(&self) -> Result<()> {
             self.owners.borrow().require_live()?;
@@ -502,7 +542,25 @@ mod tests {
             self.queue(|s| s.wait(0, "main", slot(last, true, lane), "final FFN"))?;
             let target = 100 + lane;
             self.queue(|s| s.push_to(0, "main", DIRECT, target, "terminal residual"))?;
-            self.queue(|s| s.wait_for(1, "main", DIRECT, target, "terminal residual"))
+            self.queue(|s| s.wait_for(1, "main", DIRECT, target, "terminal residual"))?;
+            if self.diagnostics { self.completed_layer(last, lane)?; }
+            Ok(())
+        }
+        fn join(&self, layer: usize, lane: usize) -> Result<()> {
+            let at = slot(layer, true, lane);
+            self.queue(|s| s.push(0, "main", at, "previous FFN"))?;
+            for rank in 0..2 { self.queue(|s| s.wait(rank, "main", at, "previous FFN"))?; }
+            Ok(())
+        }
+        fn completed_layer(&self, layer: usize, lane: usize) -> Result<()> {
+            let owner = match self.plan.mode(layer)? {
+                LayerMode::Whole { gpu, .. } => usize::from(gpu),
+                _ => 0,
+            };
+            self.queue(|s| s.sync(owner, "completed-layer callback"))?;
+            self.callback()?;
+            self.completed.borrow_mut().push((layer, lane, owner));
+            Ok(())
         }
         fn run(&self, lanes: usize) -> Result<()> {
             let mut kernels: Vec<_> = (0..lanes).map(|lane| Lane { trace: self, lane }).collect();
@@ -568,7 +626,7 @@ mod tests {
     impl Lane<'_> {
         fn segment(&self, layer: usize, owner: Option<usize>) -> Result<()> {
             segments(owner, |rank, active| {
-                if layer > 0 {
+                if layer > 0 && !self.trace.diagnostics {
                     let previous = slot(layer - 1, true, self.lane);
                     if rank == 0 { self.trace.queue(|s| s.push(0, "main", previous, "previous FFN"))?; }
                     self.trace.queue(|s| s.wait(rank, "main", previous, "previous FFN"))?;
@@ -612,7 +670,12 @@ mod tests {
             self.trace.callback()?;
             assert_eq!((ticket.layer, ticket.lane), (layer, self.lane));
             if ticket.spark { self.trace.pending.set(self.trace.pending.get() & !(1 << self.lane)); }
-            self.trace.queue(|s| s.push(1, "main", slot(layer, true, self.lane), "peer FFN"))
+            self.trace.queue(|s| s.push(1, "main", slot(layer, true, self.lane), "peer FFN"))?;
+            if self.trace.diagnostics && layer + 1 < self.trace.plan.modes().len() {
+                self.trace.join(layer, self.lane)?;
+                self.trace.completed_layer(layer, self.lane)?;
+            }
+            Ok(())
         }
     }
 
@@ -638,6 +701,33 @@ mod tests {
                 HostOp::Queue { label, .. } if label == "peer FFN")).count(), lanes * trace.plan.modes().len());
         }}}}
     }
+    #[test]
+    fn completed_layer_callbacks_drain_at_each_actual_owner() {
+        for first in 0..2 {
+            let mut trace = Trace::new(&modes(first), 1, true, true);
+            trace.diagnostics = true;
+            trace.run(1).unwrap();
+            check_host(&trace.schedule.borrow()).unwrap();
+            let expected: Vec<_> = (0..trace.plan.modes().len()).map(|layer| {
+                let owner = match trace.plan.mode(layer).unwrap() {
+                    LayerMode::Whole { gpu, .. } => usize::from(gpu),
+                    _ => 0,
+                };
+                (layer, 0, owner)
+            }).collect();
+            assert_eq!(*trace.completed.borrow(), expected);
+            for at in 0..trace.calls.get() { for panic in [false, true] {
+                let mut fault = Trace::new(&modes(first), 1, true, true);
+                fault.diagnostics = true;
+                fault.fail = Some((at, panic));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fault.run(1)));
+                assert!(result.is_err() || result.unwrap().is_err());
+                fault.owners.borrow().verify_retired().unwrap();
+                assert!(fault.run(1).is_err());
+            }}
+        }
+    }
+
     #[test]
     fn adapter_faults_retire_retained_waves_and_reject_replay() {
         for first in 0..2 {

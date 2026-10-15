@@ -3751,10 +3751,10 @@ impl<'a> GlmfEngine<'a> {
         if media.is_some_and(|m| !m.spans().is_empty()) { self.put(&w.ids, tokens)?; }
         let rows = Scalar::I32(t as i32);
         if self.layer_execution.is_some() {
-            ensure!(on_layer.is_none() && forced.is_none() && trace.is_none() && tables.segments.is_empty(),
+            ensure!(forced.is_none() && trace.is_none() && tables.segments.is_empty(),
                 "per-layer execution needs unpacked rows without tracing or teacher forcing");
             return self.layer_step(scope, w, w1.context("per-layer peer workspace")?,
-                tables, tables1, t, logit_rows, graphed);
+                tables, tables1, t, logit_rows, graphed, on_layer);
         }
         if graphed {
             let result = self.decode_graphed(w, w1, tables, tables1, t, rows, logit_rows);
