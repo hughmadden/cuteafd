@@ -123,6 +123,46 @@ pub fn spark_worlds(package: &str, intermediate: usize) -> Vec<usize> {
     TRANSPORT_WORLDS.into_iter().filter(|&world| spark_recipe(package, intermediate, world).is_ok()).collect()
 }
 
+/// Validate every routed operand against its checkpoint family and derive one
+/// qualified storage recipe without inspecting any installed package tree.
+pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize) -> anyhow::Result<SparkRecipe> {
+    use anyhow::{ensure, Context};
+    let family = super::family::detect(checkpoint).context("Spark admission: unsupported checkpoint family")?;
+    let model = family.open(checkpoint)?;
+    let intermediate = model.spec().moe.as_ref().context("Spark admission: checkpoint has no routed experts")?.intermediate;
+    let modelopt = crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config)?;
+    let required = super::files::required_tensors(checkpoint, super::files::ReadRole::Spark { rank: 0, world })?;
+    let tensors = checkpoint.tensors.iter().filter(|tensor| required.contains(&tensor.meta.name))
+        .cloned().collect::<Vec<_>>();
+    let present = tensors.iter().map(|tensor| tensor.meta.name.as_str()).collect::<std::collections::BTreeSet<_>>();
+    for name in &required {
+        ensure!(present.contains(name.as_str()), "Spark admission: missing routed expert tensor header {name}");
+    }
+    let groups = super::format::group_by_stem(&tensors);
+    ensure!(!groups.is_empty(), "Spark admission: missing routed expert tensor headers");
+    let mut selected = None;
+    for (stem, members) in groups {
+        let member = members.values().next().context("Spark admission: empty routed operand")?;
+        let role = family.classify(model.spec(), &member.meta.name)
+            .context("Spark admission: routed operand lost its family role")?;
+        let mut operand = super::format::detect(&members)?;
+        if let Some(modelopt) = &modelopt {
+            modelopt.check(&stem, &operand).map_err(anyhow::Error::msg)
+                .with_context(|| format!("Spark admission tensor {stem}"))?;
+        }
+        model.accepts(&role, &stem, &mut operand).map_err(anyhow::Error::msg)
+            .with_context(|| format!("Spark admission tensor {stem}"))?;
+        let contract = model.experts(&operand)
+            .with_context(|| format!("Spark admission tensor {stem}: no package for {}", operand.label()))?;
+        let recipe = spark_recipe(&contract.package, intermediate, world)
+            .with_context(|| format!("Spark admission tensor {stem}"))?;
+        ensure!(selected.as_ref().is_none_or(|previous| previous == &recipe),
+            "Spark admission tensor {stem}: routed formats require conflicting Spark recipes");
+        selected = Some(recipe);
+    }
+    selected.context("Spark admission: missing routed expert storage recipe")
+}
+
 /// Qualified recipes only: optional installation checks cannot widen this set.
 /// TP5 support is added per format only after its hardware gate passes.
 pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<SparkRecipe, SparkRecipeRefusal> {
@@ -173,6 +213,63 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_recipes_follow_headers_without_installed_packages() {
+        use super::super::{testing as fixture, Checkpoint};
+        let mut cases = vec![
+            (fixture::mimo_flash_config(), fixture::mimo_flash_tensors(), "mimo:fp8", 2048, 6),
+            (fixture::mimo_flash_mopd_config(), fixture::mimo_flash_mopd_tensors(), "mimof:fp8", 2048, 4),
+            (fixture::mimo_pro_config(), fixture::mimo_pro_tensors(), "mimop:fp8", 2048, 6),
+            (fixture::glm5_config(), fixture::glm5_tensors(|name, n, k| fixture::fp8(name, n, k, None)), "glm:fp8", 2048, 6),
+            (fixture::glm5_config(), fixture::glm5_tensors(|name, n, k| fixture::exl3(name, n, k, 4)), "glm:exl3-k45", 2048, 4),
+        ];
+        let config = fixture::glm5_flash_config(2);
+        cases.push((config.clone(), fixture::glm5_flash_tensors(&config), "glmf:fp8", 2048, 6));
+        let prefix = "model.language_model.layers.0.mlp.experts.0";
+        let tensors = [("gate_proj", 640, 2560), ("up_proj", 640, 2560), ("down_proj", 2560, 640)]
+            .into_iter().flat_map(|(projection, n, k)| fixture::exl3(&format!("{prefix}.{projection}"), n, k, 4)).collect();
+        cases.push((fixture::qwen4_config(1), tensors, "qwen4:exl3-k45", 640, 3));
+        for (config, tensors, package, intermediate, world) in cases {
+            let root = tempfile::tempdir().unwrap();
+            fixture::write_snapshot(root.path(), &config, &tensors, None);
+            let checkpoint = Checkpoint::open(root.path()).unwrap();
+            assert_eq!(checkpoint_spark_recipe(&checkpoint, world).unwrap(),
+                spark_recipe(package, intermediate, world).unwrap(), "{package}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_recipes_refuse_missing_or_malformed_headers_and_unqualified_worlds() {
+        use super::super::{testing as fixture, Checkpoint};
+        let root = tempfile::tempdir().unwrap();
+        fixture::write_snapshot(root.path(), &fixture::mimo_flash_config(), &fixture::mimo_flash_tensors(), None);
+        let mut checkpoint = Checkpoint::open(root.path()).unwrap();
+        assert!(format!("{:#}", checkpoint_spark_recipe(&checkpoint, 3).unwrap_err()).contains("missing Spark package recipe"));
+        let index = checkpoint.tensors.iter().position(|tensor| tensor.meta.name.contains(".experts.")
+            && tensor.meta.name.ends_with("weight_scale_inv")).unwrap();
+        let removed = checkpoint.tensors.remove(index);
+        let error = format!("{:#}", checkpoint_spark_recipe(&checkpoint, 4).unwrap_err());
+        assert!(error.contains("missing routed expert tensor header") && error.contains(&removed.meta.name), "{error}");
+        checkpoint.tensors.insert(index, removed);
+        checkpoint.tensors[index].meta.shape = vec![1, 1];
+        assert!(checkpoint_spark_recipe(&checkpoint, 4).is_err());
+        checkpoint.tensors.clear();
+        assert!(checkpoint_spark_recipe(&checkpoint, 4).is_err());
+    }
+
+    #[test]
+    fn checkpoint_recipes_refuse_conflicting_storage_layouts() {
+        use super::super::{testing as fixture, Checkpoint};
+        let root = tempfile::tempdir().unwrap();
+        let tensors = fixture::glm5_tensors(|name, n, k| {
+            if name.ends_with("down_proj") { fixture::exl3(name, n, k, 4) }
+            else { fixture::fp8(name, n, k, None) }
+        });
+        fixture::write_snapshot(root.path(), &fixture::glm5_config(), &tensors, None);
+        let error = format!("{:#}", checkpoint_spark_recipe(&Checkpoint::open(root.path()).unwrap(), 4).unwrap_err());
+        assert!(error.contains("conflicting Spark recipes"), "{error}");
+    }
 
     #[test]
     fn recipes_preserve_exact_tp6_and_legacy_nvfp4() {
