@@ -933,10 +933,13 @@ def summarize_job(job, exit_code):
             row[key] = json.loads(path.read_text())
     if job.get('nonce_seed'):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
-        hashes = re.findall(r'prompt_token_hash\s*=\s*"?([0-9a-f]{16})', text)
-        # Concurrent admission reorders requests, so pairs match on the whole prompt set.
+        hashes = prompt_token_hashes(text)
+        # Concurrent admission reorders requests, so pairs match on the whole
+        # set of input-determined prompts; a follow-up prompt is reported but
+        # not compared.
         row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[0] if hashes else None,
-                   prompt_token_hashes=sorted(hashes), requests=matched_requests(dest), state=str(dest))
+                   prompt_token_hashes=sorted(hashes), follow_up_prompts=follow_up_prompts(text),
+                   requests=matched_requests(dest), state=str(dest))
         # Prefill-only sweeps (max_tokens 1) emit no decode rounds; the prompt
         # token hash above is what matches their requests.
         prefill_only = bool(job['entry'].get('prefill_lengths')) and not job['entry'].get('levels') \
@@ -966,6 +969,24 @@ def lossless_set_result(report):
     return {'status': 'pass' if last.get('gate') == 'pass' else 'fail', 'summary': last.get('summary', ''),
             'passed': last.get('passed'), 'total': last.get('total'), 'set': last.get('set'),
             'failing': [r['id'] for r in last.get('rows', []) if not r.get('pass')]}
+
+
+# A matched pair compares the prompts its inputs decide. A prompt that
+# re-renders model output (a follow-up turn, or ids taken from a response)
+# logs as an output-dependent prompt with no hash, because two engines
+# legitimately tokenize model text differently.
+MATCHED_PROMPT = re.compile(r'matched benchmark prompt.*?prompt_token_hash\s*=\s*"?([0-9a-f]{16})')
+FOLLOW_UP_PROMPT = re.compile(r'benchmark output-dependent prompt')
+
+
+def prompt_token_hashes(text):
+    """The input-determined prompt hashes of a coordinator log, in log order."""
+    return MATCHED_PROMPT.findall(text)
+
+
+def follow_up_prompts(text):
+    """Output-dependent prompts reported, which pairs do not compare."""
+    return len(FOLLOW_UP_PROMPT.findall(text))
 
 
 def matched_requests(dest):

@@ -1,6 +1,6 @@
 //! Decode concurrency over one retained long prefix, not repeated cold prefills.
 use super::{
-    common::{self, aggregate, median, table, wave},
+    common::{self, aggregate, median, table},
     Ctx, Panel, Rates,
 };
 use crate::{
@@ -110,6 +110,7 @@ fn occupancy(client: &Client) -> Value {
 
 /// Observe pool use without adding stats reads to the request hot path. The
 /// condition variable ends the sampler immediately when the wave completes.
+/// The wave runs a retained base, which re-renders the model's own answer.
 fn measured_wave(client: &Client, bodies: Vec<Value>) -> (Vec<Result<common::Timed>>, Vec<Value>) {
     let done = Arc::new((Mutex::new(false), Condvar::new()));
     std::thread::scope(|scope| {
@@ -130,7 +131,7 @@ fn measured_wave(client: &Client, bodies: Vec<Value>) -> (Vec<Result<common::Tim
             }
             samples
         });
-        let results = wave(client, bodies);
+        let results = common::wave_output_dependent(client, bodies);
         *done.0.lock().unwrap() = true;
         done.1.notify_all();
         (results, observer.join().unwrap_or_default())
@@ -299,7 +300,10 @@ impl Panel for ContextLoad {
                         .map(|i| request(&retained, &run, phase, c, i, output))
                         .collect()
                 };
-                let warm = wave(ctx.client, bodies("warm"));
+                // Every request of a retained-base batch re-renders the
+                // model's own answer: model-determined, so not comparable
+                // between arms.
+                let warm = common::wave_output_dependent(ctx.client, bodies("warm"));
                 let warm_errors: Vec<_> = warm
                     .iter()
                     .filter_map(|r| r.as_ref().err().map(|e| format!("{e:#}")))
