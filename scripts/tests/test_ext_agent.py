@@ -6,6 +6,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -112,18 +113,21 @@ def cli(tmp_path, monkeypatch):
         pytest.skip('tmux is required for the external driver integration tests')
     # A private socket namespace: the tests never see, stop or race a tmux server
     # they did not start, including the one a live worker may be using.
+    # The socket lives in a short directory: a Unix socket path is capped near
+    # 108 bytes, which a deep pytest basetemp exceeds.
+    sock_dir = Path(tempfile.mkdtemp(prefix='ext-', dir='/tmp'))
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
     wrapper = bin_dir / 'tmux'
     wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(shutil.which('tmux')) +
-                       ' -S ' + shlex.quote(str(tmp_path / 'tmux.sock')) + ' "$@"\n')
+                       ' -S ' + shlex.quote(str(sock_dir / 'tmux.sock')) + ' "$@"\n')
     wrapper.chmod(0o755)
     fake = tmp_path / 'fake-cli'
     fake.write_text(FAKE)
     fake.chmod(0o755)
     run_root = tmp_path / 'runs'
     monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
-    monkeypatch.setenv('TMUX_TMPDIR', str(tmp_path))
+    monkeypatch.setenv('TMUX_TMPDIR', str(sock_dir))
     # -S names the private socket; dropping an inherited TMUX keeps nothing else
     # inside this test pointing at a server it does not own.
     monkeypatch.delenv('TMUX', raising=False)
@@ -147,6 +151,7 @@ def cli(tmp_path, monkeypatch):
             call('stop', meta.parent.name)
     finally:
         subprocess.run(['tmux', 'kill-server'], capture_output=True, timeout=10)
+        shutil.rmtree(sock_dir, ignore_errors=True)
 
 
 @pytest.mark.parametrize('tool', ['grok', 'agy'])
