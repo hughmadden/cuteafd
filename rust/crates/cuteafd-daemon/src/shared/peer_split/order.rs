@@ -237,6 +237,12 @@ pub(crate) fn glmf_tp2_fixture(layers: usize, local: std::ops::Range<usize>, lan
         s.wait(0, "main", 4 * lane + 2 * (layer % 2) + 1, "FFN wait");
         if !early { if let Some((l, k)) = next { attn(&mut s, 0, l, k); } }
     }
+    // All lanes' FFN producers precede the terminal peer waits. Each payload
+    // is rank 0's already-rounded mHC output, in the existing lane workspace.
+    for lane in 0..lanes {
+        s.push_to(0, "main", super::DIRECT, lane, "terminal residual push after mHC");
+        s.wait_for(1, "main", super::DIRECT, lane, "terminal residual wait");
+    }
     s
 }
 
@@ -415,6 +421,31 @@ mod tests {
             }
         }
         assert!(check(&glmf_tp2_fixture(6, 0..6, 2, true, false)).is_err());
+    }
+
+    #[test]
+    fn glmf_terminal_replication_drains_across_lanes_and_request_boundaries() {
+        // Four lanes remain legal for Spark-only; mixed TP2 admits at most two.
+        for lanes in 1..=4 {
+            let ranges = if lanes <= 2 { vec![0..0, 0..5, 1..4, 4..5] } else { vec![0..0] };
+            for local in ranges {
+                let request = glmf_tp2_fixture(5, local, lanes, true, true);
+                assert_eq!(check_submission_faults(&request), Ok(()));
+                let mut repeated = Schedule::default();
+                for _ in 0..3 {
+                    for (stream, next) in repeated.streams.iter_mut().zip(&request.streams) {
+                        stream.extend(next.iter().cloned());
+                    }
+                    repeated.end_request();
+                }
+                assert_eq!(check(&repeated), Ok(()));
+                for rank in 0..2 {
+                    let mut missing = request.clone();
+                    missing.streams[rank].pop();
+                    assert!(check(&missing).is_err(), "missing terminal rank {rank} operation");
+                }
+            }
+        }
     }
 
     fn glmf_remote_draft_round(s: &mut Schedule, reused: bool, input_ack_before_head: bool) {

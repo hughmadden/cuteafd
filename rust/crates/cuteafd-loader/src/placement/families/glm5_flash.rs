@@ -530,8 +530,12 @@ impl GlmfWorkingSetExt for GlmfWorkingSet {
         }
         let spark_layers = routed[n..].to_vec();
         let spark_ranks = if spark_layers.is_empty() { 0 } else { i.spark_ranks };
-        Ok(Self { rtx_layers: routed[..n].to_vec(), spark_layers, spark_ranks,
-            prefill_lanes: if spark_ranks == 0 { 1 } else { i.prefill_lanes } })
+        let prefill_lanes = if spark_ranks == 0 { 1 } else { i.prefill_lanes };
+        if prefill_lanes == 0 || (i.attention.mode == AttentionPlacement::Layers
+            && super::super::validate_layer_pipeline_lanes(prefill_lanes, prefill_lanes as usize).is_err()) {
+            return Err(PlacementError::Inventory("GLM Flash layers executor needs one or two admitted prefill lanes"));
+        }
+        Ok(Self { rtx_layers: routed[..n].to_vec(), spark_layers, spark_ranks, prefill_lanes })
     }
 
     fn validate(&self, placed: &Placement) -> Result<(), PlacementError> {
@@ -1387,6 +1391,24 @@ mod tests {
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
             input.sequences as usize, true, 1, 64, 188);
         assert_eq!(graphs.ranks, expected.ranks);
+    }
+
+    #[test]
+    fn layers_admission_rejects_four_lanes_without_changing_the_spark_only_path() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.prefill_lanes = 4;
+        for mode in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+            input.attention.mode = mode;
+            assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, 4);
+        }
+        input.attention.mode = AttentionPlacement::Layers;
+        assert!(GlmfWorkingSet::candidate(&input, 0).is_err());
+        for lanes in [1, 2] {
+            input.prefill_lanes = lanes;
+            assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, lanes);
+        }
+        assert_eq!(GlmfWorkingSet::candidate(&input, input.experts.len()).unwrap().prefill_lanes, 1);
     }
 
     #[test]

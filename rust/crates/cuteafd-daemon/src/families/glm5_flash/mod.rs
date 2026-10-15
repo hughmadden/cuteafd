@@ -1647,11 +1647,20 @@ impl Opened {
             tracing::info!(layers = ?spark_layers, digest = %selection.digest()?,
                 "GLM Flash Spark solved layer set acknowledged before lanes");
         }
+        let execution = cuteafd_loader::placement::LayerExecutionPlan::new(&placement,
+            cuteafd_loader::placement::HopSpec {
+                row_bytes: 4 * self.cfg.hidden as u64 * 2,
+                rows: args.prefill_rows.max(args.decode_rows) as u64,
+                lanes: working.prefill_lanes,
+                entry_gpu: 0, head_gpu: 0,
+                terminal: if peer_stream.is_some() { cuteafd_loader::placement::TerminalHome::Replicated }
+                    else { cuteafd_loader::placement::TerminalHome::AttentionOwner },
+            })?;
         let source = self.embed_source()?;
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
             args.token_io.embed_placement, || {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                loader.model(&self.cfg, layers)
+                loader.model(&self.cfg, &execution)
             })?;
         probe("target-weights")?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
@@ -1726,6 +1735,7 @@ impl Opened {
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
                 "GLM 5.3 Flash head split over two GPUs");
         }
+        engine.validate_attention_homes(&execution)?;
         if let Some(manifest) = &context_manifest {
             // The solver charged selected partial scratch and full-extent staging.
             engine.attach_context(args.max_context, manifest)?;

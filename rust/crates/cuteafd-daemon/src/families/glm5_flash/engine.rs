@@ -1136,6 +1136,16 @@ pub(crate) struct PagedLayer {
     pub pools: cuteafd_ffi::CuteafdDeviceBuffer,
 }
 
+/// Compact tails and speculative records are packed over this rank's resident
+/// MLA layers, not their global ordinal in the backbone.
+fn local_mla_ordinals(layers: impl IntoIterator<Item = (GlmNextAttention,
+    crate::shared::placement::layers::AttentionShare)>) -> Vec<Option<usize>> {
+    let mut next = 0;
+    layers.into_iter().map(|(kind, share)| {
+        (kind == GlmNextAttention::Mla && share.present()).then(|| { let ordinal = next; next += 1; ordinal })
+    }).collect()
+}
+
 /// One GPU's caches. Per MLA layer (None for KDA): the latent record pool and its DSA index
 /// cache. Every KDA layer's pools back to back: FP32 or BF16 recurrent state `[layers, slots,
 /// heads, 128, 128]`, BF16 conv state `[layers, slots, 3, 3D]` and the speculative replay records
@@ -1148,6 +1158,7 @@ pub(crate) struct PagedLayer {
 /// pool-cache page within its sequence.
 struct Caches<'a> {
     kv: Vec<Option<Dev<'a>>>,
+    mla_ordinal: Vec<Option<usize>>,
     index: Vec<Option<IndexLayer<'a>>>,
     kda_state: Dev<'a>,
     kda_conv: Dev<'a>,
@@ -1189,6 +1200,13 @@ impl<'a> Caches<'a> {
         for layer in layers {
             match layer.attention {
                 GlmNextAttention::Mla => {
+                    ensure!(layer.has("w_uk") == layer.attention_share.present(),
+                        "MLA cache residency disagrees with uploaded attention weights");
+                    if !layer.attention_share.present() {
+                        kv.push(None);
+                        index.push(None);
+                        continue;
+                    }
                     kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?));
                     index.push(Some(IndexLayer {
                         keys: if keys { Some(zeroed(pages * PAGE_ROWS * KEY_BYTES)?) } else { None },
@@ -1220,7 +1238,8 @@ impl<'a> Caches<'a> {
                 (own.buffer, RecordsOwner::Own { _records: own })
             }
         };
-        Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * state)?,
+        let mla_ordinal = local_mla_ordinals(layers.iter().map(|layer| (layer.attention, layer.attention_share)));
+        Ok(Self { kv, index, mla_ordinal, kda_state: zeroed(kda_layers * slots * state)?,
             kda_conv: zeroed(kda_layers * slots * conv)?,
             kda_replay, _kda_replay_owner: owner, index_tails,
             commit_tables: zeroed(3 * decode_rows * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
@@ -1293,8 +1312,6 @@ pub(crate) struct GlmfEngine<'a> {
     replay_rows: std::cell::Cell<usize>,
     /// Per layer: its index among the KDA layers (None for MLA).
     kda_ordinal: Vec<Option<usize>>,
-    /// Per layer: its index among the MLA layers (None for KDA).
-    mla_ordinal: Vec<Option<usize>>,
     /// The DSA index cache the caches were built for.
     pub index_cache: IndexCache,
     /// Prefix mark arena slots the KV admission reserved on the layout above, which the prefix
@@ -1657,9 +1674,11 @@ impl<'a> GlmfEngine<'a> {
                 count - 1
             })).collect()
         };
-        let (kda_ordinal, mla_ordinal) = (ordinals(GlmNextAttention::Kda), ordinals(GlmNextAttention::Mla));
+        let kda_ordinal = ordinals(GlmNextAttention::Kda);
         // No MLA layer, no index cache: the compact one has nothing to hold.
-        let index_cache = if mla_ordinal.iter().flatten().next().is_some() { index_cache } else { IndexCache::Keys };
+        let index_cache = if weights.layers.iter().any(|layer| layer.attention == GlmNextAttention::Mla) {
+            index_cache
+        } else { IndexCache::Keys };
         // A head split's shares hold half the KDA heads (and their state).
         let split = weights.layers.first().is_some_and(|l| l.split);
         ensure!(context_mode.is_none() || (split && index_cache == IndexCache::Compact),
@@ -1686,7 +1705,7 @@ impl<'a> GlmfEngine<'a> {
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
-            kda_ordinal, mla_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
+            kda_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
             device, context_mode, context: None, context_units: RefCell::new(Vec::new()),
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
@@ -2101,6 +2120,63 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
+    /// Validate allocated attention state, not just requested owners, before
+    /// any capture. Prefix snapshots enumerate these same cache allocations.
+    pub(crate) fn validate_attention_homes(&self, plan: &cuteafd_loader::placement::LayerExecutionPlan) -> Result<()> {
+        use crate::shared::placement::layers::AttentionShare;
+        ensure!(plan.modes().len() == self.weights.layers.len(), "attention binding layer count differs from admission");
+        ensure!(plan.spec().lanes == self.prefill_lane_count as u64,
+            "runtime prefill lane inventory differs from admission");
+        let ranks: Vec<_> = std::iter::once((&self.weights.layers, &self.caches))
+            .chain(self.peer.iter().map(|peer| (&peer.layers, &peer.caches))).collect();
+        if ranks.len() == 2 && plan.modes().iter().any(|mode|
+            matches!(mode, cuteafd_loader::placement::LayerMode::Whole { .. })) {
+            cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes, self.prefill_lane_count)?;
+        }
+        for (index, &mode) in plan.modes().iter().enumerate() {
+            let shares = AttentionShare::bind(mode, ranks.len())?;
+            let mut weights = Vec::new();
+            let mut kv = Vec::new();
+            let mut indexer = Vec::new();
+            for (rank, (layers, caches)) in ranks.iter().enumerate() {
+                let layer = &layers[index];
+                ensure!(layer.attention_share == shares[rank], "attention share differs from admission at layer {index} rank {rank}");
+                let operands: &[&str] = match layer.attention {
+                    GlmNextAttention::Mla => &["q_a_norm", "kv_a_norm", "w_uk", "w_uv", "w_qkv_a_fp8",
+                        "w_qkv_a_scale", "w_q_b_fp8", "w_q_b_scale", "w_o_fp8", "w_o_scale", "w_iq", "w_ik",
+                        "k_norm_w", "k_norm_b", "ape"],
+                    GlmNextAttention::Kda => &["w_fg", "conv_w", "a_log", "dt_bias", "o_norm"],
+                };
+                ensure!(operands.iter().all(|name| layer.has(name) == shares[rank].present()),
+                    "attention operands differ from admission at layer {index} rank {rank}");
+                if shares[rank].present() { weights.push(rank as u8); }
+                match layer.attention {
+                    GlmNextAttention::Mla => {
+                        if caches.kv[index].is_some() { kv.push(rank as u8); }
+                        if caches.index[index].is_some() { indexer.push(rank as u8); }
+                        ensure!(caches.mla_ordinal[index].is_some() == shares[rank].present(),
+                            "compact index ordinal differs from admission at layer {index} rank {rank}");
+                    }
+                    GlmNextAttention::Kda => {
+                        let projections: &[&str] = if layer.has("w_in_fp8") {
+                            &["w_in_fp8", "w_in_kscale", "w_o_fp8", "w_o_kscale"]
+                        } else { &["w_in", "w_o"] };
+                        ensure!(projections.iter().all(|name| layer.has(name)),
+                            "KDA projections missing at layer {index} rank {rank}");
+                        ensure!(shares[rank].present() && caches.kda_heads > 0, "KDA state missing on rank {rank}");
+                        kv.push(rank as u8);
+                    }
+                }
+            }
+            plan.validate_state_owners(index, &weights)?;
+            plan.validate_state_owners(index, &kv)?;
+            if self.weights.layers[index].attention == GlmNextAttention::Mla {
+                plan.validate_state_owners(index, &indexer)?;
+            }
+        }
+        Ok(())
+    }
+
     fn routed_experts(&self, layer: usize) -> Option<&Experts<'a>> {
         use crate::shared::placement::layers::ExpertRoute;
         use cuteafd_loader::placement::ExpertHome;
@@ -2198,9 +2274,26 @@ impl<'a> GlmfEngine<'a> {
         exchange.wait(rank, slot)
     }
 
+    fn record_direct(&self, rank: usize, target: *mut c_void, push: bool) {
+        let Some(tp2) = &self.tp2 else { return };
+        let mut recorded = tp2.schedule.borrow_mut();
+        let Some(schedule) = recorded.as_mut() else { return };
+        let label = format!("gpu{rank} direct {}", if push { "push" } else { "wait" });
+        if push { schedule.push_to(rank, "main", DIRECT, target as usize, label); }
+        else { schedule.wait_for(rank, "main", DIRECT, target as usize, label); }
+    }
+
     fn exchange_direct(&self, source: *mut c_void, target: *mut c_void, bytes: usize) -> Result<()> {
-        self.record_exchange(0, "main", DIRECT, true);
+        self.record_direct(0, target, true);
         self.exchange()?.push_to(0, DIRECT, source, target, bytes)
+    }
+
+    fn replicate_terminal(&self, w: &Workspace<'_>, w1: &Workspace<'_>, current: usize, rows: usize) -> Result<()> {
+        let destination = w1.streams[current].buffer;
+        self.record_direct(0, destination.ptr, true);
+        self.record_direct(1, destination.ptr, false);
+        crate::shared::peer_split::attention::replicate_terminal(self.exchange()?, w.streams[current].buffer,
+            destination, rows * HC * self.cfg.hidden * 2)
     }
 
     fn prepare_route_checks(&self, rows: &[usize]) -> Result<()> {
@@ -2614,7 +2707,7 @@ impl<'a> GlmfEngine<'a> {
         let layers = self.kda_ordinal.iter().flatten().count().max(1);
         let caches = self.caches_of(rank);
         let mut out = Vec::new();
-        let tails = caches.index_tails.as_ref().map(|(tails, _)| (tails, self.mla_ordinal.iter().flatten().count()));
+        let tails = caches.index_tails.as_ref().map(|(tails, _)| (tails, caches.mla_ordinal.iter().flatten().count()));
         for (pool, layers) in [(&caches.kda_state, layers), (&caches.kda_conv, layers)].into_iter().chain(tails) {
             let per = pool.buffer.bytes / layers / self.slots;
             for layer in 0..layers {
@@ -2727,7 +2820,7 @@ impl<'a> GlmfEngine<'a> {
             let program = match &caches.index_tails {
                 Some((tails, records)) => {
                     pointers.extend([("tails", tails.buffer.ptr), ("index_replay", records.buffer.ptr)]);
-                    scalars.push(Scalar::I32(self.mla_ordinal.iter().flatten().count() as i32));
+                    scalars.push(Scalar::I32(caches.mla_ordinal.iter().flatten().count() as i32));
                     self.kda_state.compact_commit_program()
                 }
                 None => self.kda_state.commit_program(),
@@ -3433,12 +3526,12 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn precise_attention(&self, layer: &GlmfLayer<'_>) -> bool {
-        self.kda_fp32_partials && layer.split &&
+        self.kda_fp32_partials && layer.attention_share.split() &&
             layer.attention == GlmNextAttention::Kda && layer.has("w_in_fp8")
     }
 
     fn output_shard_attention(&self, layer: &GlmfLayer<'_>) -> bool {
-        self.kda_output_shard && layer.split &&
+        self.kda_output_shard && layer.attention_share.split() &&
             layer.attention == GlmNextAttention::Kda && layer.has("w_in_fp8")
     }
 
@@ -3549,7 +3642,8 @@ impl<'a> GlmfEngine<'a> {
         let layer = &peer.layers[index];
         let (h, rows) = (self.cfg.hidden, Scalar::I32(t as i32));
         if index == 0 {
-            self.exchange_wait(exchange, "main", 1, DIRECT)?;
+            self.record_direct(1, w1.streams[0].buffer.ptr, false);
+            exchange.wait(1, DIRECT)?;
             self.pre_on(1, w1, &w1.streams[0], layer, rows)?;
         }
         self.attention(1, w1, index, layer, rows, cap, tables, None)?;
@@ -3772,6 +3866,7 @@ impl<'a> GlmfEngine<'a> {
             crate::shared::console::layer_mark(index);
             self.probe_mark(index)?;
         }
+        if let Some(w1) = w1 { self.replicate_terminal(w, w1, cur, t)?; }
         self.finish_route_checks()?;
         if layers.len() < self.cfg.layers {
             self.synchronize()?;
@@ -3872,6 +3967,10 @@ impl<'a> GlmfEngine<'a> {
                     self.moe_front(w, index, layer, t, rows, cap, &[Span { first: 0, rows: t }])
                 }
             })?;
+            // Outside capture: every replay queues its matching peer landing.
+            if index == layers.len() {
+                if let Some(w1) = w1 { self.replicate_terminal(w, w1, 0, t)?; }
+            }
             if let Some(w1) = w1 {
                 // Rank 1's segments: layer 0 with rank 0's first, then each next one before the
                 // host waits in this layer's expert exchange.
@@ -4161,6 +4260,7 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn attention(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables, trace: Option<&std::path::Path>) -> Result<()> {
+        ensure!(layer.attention_share.present(), "attention layer {index} is not resident on rank {rank}");
         match layer.attention {
             // The chunked recurrence above 64 rows holds one sequence: a packed prefill runs the
             // layer once per sequence, over its rows (one span: the whole step).
@@ -4222,7 +4322,7 @@ impl<'a> GlmfEngine<'a> {
             ensure!(!spec, "speculative steps are decode-shaped");
         }
         pointers.push(("scratch", w.scratch.buffer.ptr));
-        self.run_on(rank, layer.split, &self.kda_state.program(cap), &pointers, &scalars)
+        self.run_on(rank, layer.attention_share.split(), &self.kda_state.program(cap), &pointers, &scalars)
     }
 
     /// KDA over the layer's only (FP8, per-row x 128-K, K-major scales) in/out
@@ -4253,7 +4353,7 @@ impl<'a> GlmfEngine<'a> {
         let expanded = if self.kda_prefill_expanded && !is_decode(cap) { "_expanded" } else { "" };
         let name = if self.kda_state == KdaState::F32 { format!("kda_w8{dtype}{expanded}_{cap}") }
             else { self.kda_state.w8_program(cap) };
-        self.run_on(rank, layer.split, &name, &pointers, &scalars)
+        self.run_on(rank, layer.attention_share.split(), &name, &pointers, &scalars)
     }
 
     /// `[rows, fp8]`: the decode programs' `fp8_rows` (`FP8_DECODE_ROWS` when the layer has
@@ -4353,7 +4453,7 @@ impl<'a> GlmfEngine<'a> {
             ("w_q_b_fp8", layer.ptr("w_q_b_fp8")?), ("w_q_b_scale", layer.ptr("w_q_b_scale")?)];
         pointers.extend([("w_uk", layer.ptr("w_uk")?), ("kv_cache", cache), ("query", w.query.buffer.ptr),
             ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run_on(rank, layer.split, &format!("mla_producer_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
+        self.run_on(rank, layer.attention_share.split(), &format!("mla_producer_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
     }
 
     /// One sequence part's DSA index producer on `rank` (per-token keys, or the compact cache's
@@ -4379,7 +4479,7 @@ impl<'a> GlmfEngine<'a> {
                 ("scratch", w.scratch.buffer.ptr)], &[rows]),
             (None, Some((tails, records))) => {
                 // This MLA layer's tails `[slots, TAIL_BYTES]` and speculative key | gate record.
-                let ordinal = self.mla_ordinal[index].context("MLA layer without an ordinal")?;
+                let ordinal = caches.mla_ordinal[index].context("MLA layer without an ordinal")?;
                 let recorded = replay_rows_of(cap);
                 ensure!(!tables.spec || t <= recorded, "a speculative step of {t} rows exceeds the replay record");
                 // SAFETY: ordinal < MLA layers and the records hold `decode_rows` >= `recorded` rows per
@@ -4413,7 +4513,7 @@ impl<'a> GlmfEngine<'a> {
         let pointers = [("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?),
             ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
-        self.run_on(rank, layer.split, &format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
+        self.run_on(rank, layer.attention_share.split(), &format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
     }
 
     /// The head split's MLA of layer `index` on `rank` over the record and pool-key buffers given
@@ -4425,7 +4525,7 @@ impl<'a> GlmfEngine<'a> {
         let t = tables.positions.len();
         let trace = trace.filter(|_| rank == 0);
         let caches = self.caches_of(rank);
-        let heads = self.cfg.heads / if layer.split { 2 } else { 1 };
+        let heads = self.cfg.heads / if layer.attention_share.split() { 2 } else { 1 };
         // These scratch layouts are diagnostic-only and match the pinned AOT
         // decode programs. Stop at the first MLA layer; later layers' inputs
         // already differ and cannot identify the original numerical cause.
@@ -4433,7 +4533,7 @@ impl<'a> GlmfEngine<'a> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let (cache, pool_cache) = (cache.ptr, pool_buffer.ptr);
         let decode = tables.decode;
-        let split = layer.split;
+        let split = layer.attention_share.split();
         self.mla_producer_into(rank, w, layer, rows, cap, decode, cache)?;
         if let Some(dir) = trace {
             let qkv_width = self.cfg.q_lora_rank + self.cfg.kv_lora_rank;
@@ -5003,6 +5103,13 @@ impl<'a> GlmfEngine<'a> {
             }
             anyhow::Ok(())
         })?;
+        // All lane producers are queued before a terminal wait can block the
+        // peer stream (in particular the next lane's fused TP2 publication).
+        if let Some(peers) = &peer_workspaces {
+            for (lane, w) in workspaces.iter().enumerate() {
+                self.replicate_terminal(w, peers.get(lane)?, 0, count_of(lane))?;
+            }
+        }
         self.finish_route_checks()?;
         if logit_rows == 0 {
             self.synchronize()?;
@@ -5108,6 +5215,20 @@ pub(crate) fn check_tp2_lanes(lanes: usize) -> Result<()> {
 #[cfg(test)]
 mod tp2_tests {
     use super::*;
+    #[test]
+    fn compact_index_ordinals_pack_only_owner_local_mla_layers() {
+        use crate::shared::placement::layers::AttentionShare::{Absent, Split, Whole};
+        use GlmNextAttention::{Kda, Mla};
+        let kinds = [Kda, Mla, Kda, Mla, Mla, Kda];
+        assert_eq!(local_mla_ordinals(kinds.into_iter().zip([Split, Whole, Split, Absent, Whole, Split])),
+            vec![None, Some(0), None, None, Some(1), None]);
+        assert_eq!(local_mla_ordinals(kinds.into_iter().zip([Split, Absent, Split, Whole, Absent, Split])),
+            vec![None, None, None, Some(0), None, None]);
+        assert_eq!(local_mla_ordinals(kinds.into_iter().zip([Split; 6])),
+            vec![None, Some(0), None, Some(1), Some(2), None]);
+        assert!(local_mla_ordinals([(Mla, Absent)]).iter().all(Option::is_none));
+    }
+
     use crate::shared::peer_split::order;
 
     #[test]

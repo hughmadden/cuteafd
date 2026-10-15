@@ -4,6 +4,33 @@
 use cuteafd_loader::placement::{ExpertHome, LayerAssignment};
 use thiserror::Error;
 
+/// Attention residency is independent of a layer's FFN width. A whole DSA
+/// owner runs full-width attention while both ranks retain their FFN shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttentionShare {
+    Absent,
+    Whole,
+    Split,
+}
+
+impl AttentionShare {
+    pub fn bind(mode: cuteafd_loader::placement::LayerMode, ranks: usize) -> Result<Vec<Self>, BindingError> {
+        use cuteafd_loader::placement::LayerMode;
+        match mode {
+            LayerMode::HeadSplit | LayerMode::ContextSplit if ranks == 2 => Ok(vec![Self::Split; ranks]),
+            LayerMode::Whole { gpu, .. } if (1..=2).contains(&ranks) && usize::from(gpu) < ranks => {
+                let mut shares = vec![Self::Absent; ranks];
+                shares[usize::from(gpu)] = Self::Whole;
+                Ok(shares)
+            }
+            _ => Err(BindingError::Attention { mode, ranks }),
+        }
+    }
+
+    pub fn present(self) -> bool { self != Self::Absent }
+    pub fn split(self) -> bool { self == Self::Split }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpertRoute {
     Dense,
@@ -19,6 +46,8 @@ pub(crate) struct BackendLayers<'a> {
 
 #[derive(Debug, PartialEq, Eq, Error)]
 pub(crate) enum BindingError {
+    #[error("attention mode {mode:?} cannot bind to {ranks} ranks")]
+    Attention { mode: cuteafd_loader::placement::LayerMode, ranks: usize },
     #[error("expert binding needs matching nonempty layer and dense inventories")]
     Geometry,
     #[error("backend {home:?} binds layer {layer} outside the routed inventory")]
@@ -70,6 +99,28 @@ impl ExpertRouting {
 mod tests {
     use super::*;
     use cuteafd_loader::placement::LayerMode;
+
+    #[test]
+    fn whole_attention_residency_is_independent_of_split_ffns() {
+        use cuteafd_loader::placement::FfnMode;
+        for ffn in [FfnMode::Split, FfnMode::Owner] {
+            for gpu in 0..2 {
+                let shares = AttentionShare::bind(LayerMode::Whole { gpu, ffn }, 2).unwrap();
+                assert_eq!(shares[usize::from(gpu)], AttentionShare::Whole);
+                assert_eq!(shares[usize::from(1 - gpu)], AttentionShare::Absent);
+                assert!(shares.iter().all(|share| !share.split()));
+            }
+        }
+        for mode in [LayerMode::HeadSplit, LayerMode::ContextSplit] {
+            assert_eq!(AttentionShare::bind(mode, 2).unwrap(), vec![AttentionShare::Split; 2]);
+            assert!(AttentionShare::bind(mode, 1).is_err());
+        }
+        for ranks in [0, 3] {
+            assert!(AttentionShare::bind(LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, ranks).is_err());
+        }
+        assert!(AttentionShare::bind(LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }, 1).is_err());
+        assert!(AttentionShare::bind(LayerMode::Whole { gpu: 2, ffn: FfnMode::Split }, 2).is_err());
+    }
 
     fn assignments(homes: &[ExpertHome]) -> Vec<LayerAssignment> {
         homes.iter().map(|&experts| LayerAssignment { mode: LayerMode::HeadSplit, experts }).collect()
