@@ -38,10 +38,20 @@ pub(crate) fn resolve(
     Ok(Some(topology))
 }
 
-/// Replicated groups require native experts. NVFP4 additionally supports pure
-/// TP3/TP4/TP6; EXL3 keeps its implicit disjoint layout. Reject unsupported
-/// formats before allocation, transport connection or readiness publication.
-pub(crate) fn require_native(
+/// Compact V4.1 EXL3 TP3 always uses the existing EP1 ownership contract,
+/// including direct CLI and golden callers that omit explicit topology flags.
+pub(crate) fn for_checkpoint(
+    topology: Option<SparkTopology>,
+    world: usize,
+    v41_exl3: bool,
+) -> Option<SparkTopology> {
+    topology.or_else(|| (v41_exl3 && world == 3).then_some(SparkTopology::NATIVE_TP3_EP1))
+}
+
+/// Replicated groups require native experts. NVFP4 supports pure TP3/TP4/TP6;
+/// compact EXL3 supports TP3EP1 with its compressed shards and FP8 input intact.
+/// Reject unsupported formats before allocation or readiness publication.
+pub(crate) fn require_supported(
     topology: Option<SparkTopology>,
     catalog: &OfficialV41Catalog,
 ) -> Result<()> {
@@ -49,10 +59,15 @@ pub(crate) fn require_native(
         return Ok(());
     };
     ensure!(
-        catalog.exl3().is_none() && (catalog.nvfp4().is_none()
-            || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))),
-        "explicit SPARK_TP/SPARK_EP {}x{} requires native experts or pure \
-         NVFP4 TP3/TP4/TP6; EXL3 uses its implicit disjoint layout",
+        if catalog.exl3().is_some() {
+            topology == SparkTopology::NATIVE_TP3_EP1
+                && catalog.routed_experts().geometry()?.family() == Some("v41")
+        } else {
+            catalog.nvfp4().is_none()
+                || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))
+        },
+        "SPARK_TP/SPARK_EP {}x{} requires native experts, pure NVFP4 TP3/TP4/TP6, \
+         or compact EXL3 TP3EP1",
         topology.tp(),
         topology.ep()
     );
@@ -96,6 +111,21 @@ mod tests {
         assert_eq!(resolve(None, None, 4, "serve-native").unwrap(), None);
         // The world count is irrelevant to the legacy path.
         assert_eq!(resolve(None, None, 2, "expertd-native").unwrap(), None);
+    }
+
+    #[test]
+    fn compact_exl3_tp3_is_always_the_same_ep1_topology() {
+        let tp3 = Some(SparkTopology::NATIVE_TP3_EP1);
+        assert_eq!(for_checkpoint(None, 3, true), tp3);
+        assert_eq!(for_checkpoint(tp3, 3, true), tp3);
+        assert_eq!(for_checkpoint(None, 3, false), None);
+        for world in [0, 1, 2, 4, 6] {
+            assert_eq!(for_checkpoint(None, world, true), None);
+        }
+        for rank in 0..3 {
+            assert_eq!(tp3.unwrap().executor_id(rank).unwrap(), 7 + rank as u64);
+            assert_eq!(tp3.unwrap().group(rank).unwrap(), 0);
+        }
     }
 
     #[test]

@@ -42,6 +42,40 @@ fn reference(fixture: &Path, aot: &Path, capacity: usize) -> Result<Vec<Vec<u8>>
 }
 
 #[test]
+fn compact_tp3_ownership_preserves_fp8_routes_and_rejects_canonical_frames() -> Result<()> {
+    let topology = SparkTopology::NATIVE_TP3_EP1;
+    let mut owned = ExpertProtocolV2Request::new(91, 17, 0, 5120,
+        ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        vec![ExpertProtocolV2RowDescriptor { row_id: 0, source_kind: ExpertV2SourceKind::Prefill,
+            source_request_id: 1, token_position: 0, route_offset: 0, route_count: 6 }],
+        (0..6).map(|expert| ExpertProtocolV2RouteEntry {
+            row_index: 0, expert_id: expert * 61, gate_weight: (expert + 1) as f32 / 32.0,
+        }).collect(), vec![0x5a; 5280])?;
+    owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    let canonical_frame = owned.encode()?;
+    let canonical = BackboneRequest::parse(&canonical_frame, 1)?;
+    let (mut ids, mut weights) = ([0; 6], [0.0; 6]);
+    copy_routes(&canonical, None, false, 0, &mut ids, &mut weights, &mut [])?;
+    let expected = (ids, weights.map(f32::to_bits));
+    assert!(copy_routes(&canonical, Some(topology), false, 0,
+        &mut ids, &mut weights, &mut []).is_err());
+    owned.with_native_group_owners(&[0; 384], topology)?;
+    let frame = owned.encode()?;
+    let request = BackboneRequest::parse_native_group(&frame, 1, topology)?;
+    assert_eq!(request.hidden(), canonical.hidden());
+    for rank in 0..3 {
+        copy_routes(&request, Some(topology), false, rank, &mut ids, &mut weights, &mut [])?;
+        assert_eq!((ids, weights.map(f32::to_bits)), expected);
+        assert_eq!(topology.executor_id(rank)?, 7 + rank as u64);
+    }
+    assert!(copy_routes(&request, None, false, 0, &mut ids, &mut weights, &mut []).is_err());
+    assert!(copy_routes(&request, Some(topology), true, 0, &mut ids, &mut weights, &mut []).is_err());
+    assert!(copy_routes(&request, Some(SparkTopology::NATIVE_TP3_EP2), false, 0,
+        &mut ids, &mut weights, &mut []).is_err());
+    Ok(())
+}
+
+#[test]
 fn exl3_worker_rank_bounds_include_tp1() -> Result<()> {
     for world in 1..=8 {
         for rank in 0..world {

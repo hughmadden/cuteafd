@@ -47,19 +47,23 @@ impl<'a> Weights<'a> {
                 execution.install_worker_timing(config.rank)?;
                 Execution::Full(execution)
             }
-            Self::Exl3(weights) => Execution::Exl3(Exl3Worker::new(
-                library,
-                weights.clone(),
-                &config.exl3_directory_for(
-                    weights
-                        .first()
-                        .map(|weight| weight.layout.tiers.as_slice())
-                        .unwrap_or(&[]),
-                ),
-                config.capacity,
-                remaining,
-                config.exl3_schedule,
-            )?),
+            Self::Exl3(weights) => {
+                let mut execution = Exl3Worker::new(
+                    library,
+                    weights.clone(),
+                    &config.exl3_directory_for(
+                        weights
+                            .first()
+                            .map(|weight| weight.layout.tiers.as_slice())
+                            .unwrap_or(&[]),
+                    ),
+                    config.capacity,
+                    remaining,
+                    config.exl3_schedule,
+                )?;
+                execution.install_topology(config.topology)?;
+                Execution::Exl3(execution)
+            }
             Self::Fp8(experts) => {
                 ensure!(fp8_worker_workspace(config)? <= remaining,
                     "FP8 worker workspace exceeds the device budget");
@@ -269,7 +273,7 @@ pub(super) fn load_exl3<'a>(
         .map(|layer| {
             Exl3Weights::plan_with_layout(
                 catalog,
-                config.selection(layer)?,
+                config.exl3_selection(layer)?,
                 partition,
             )
         })
@@ -303,7 +307,7 @@ pub(super) fn load_exl3<'a>(
         let weight = Exl3Weights::load_with_layout(
             library,
             catalog,
-            config.selection(layer)?,
+            config.exl3_selection(layer)?,
             remaining,
             partition,
         )?;

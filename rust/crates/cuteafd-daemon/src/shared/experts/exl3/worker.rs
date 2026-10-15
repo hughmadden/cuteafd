@@ -9,7 +9,7 @@ use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_transport::{
-    expert::BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
+    expert::{BackboneRequest, SparkTopology}, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
     ExpertV2Dtype, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
 };
 use std::{io::Write, path::Path, rc::Rc};
@@ -108,6 +108,20 @@ impl Drop for RouteDump {
     }
 }
 
+fn copy_routes(request: &BackboneRequest<'_>, topology: Option<SparkTopology>, paired: bool,
+    rank: usize, ids: &mut [i32], weights: &mut [f32], ownership: &mut [i32]) -> Result<()> {
+    match (topology, request.is_native_group(), paired) {
+        (Some(topology), true, false) => {
+            ensure!(topology == SparkTopology::NATIVE_TP3_EP1,
+                "compact EXL3 ownership requires TP3EP1");
+            request.copy_native_group_routes_into(ids, weights, 0)
+        }
+        (None, false, true) => request.copy_paired_routes_into(ids, weights, rank, ownership),
+        (None, false, false) => request.copy_routes_into(ids, weights),
+        _ => anyhow::bail!("EXL3 request ownership differs from admitted topology"),
+    }
+}
+
 pub(crate) struct Exl3Worker<'a> {
     // Drain the stream before dropping kernels, weights or input allocations.
     stream: LoadStream<'a>,
@@ -127,6 +141,7 @@ pub(crate) struct Exl3Worker<'a> {
     staging: HostAllocation<'a>,
     weights_offset: usize,
     paired: bool,
+    topology: Option<SparkTopology>,
     host_path: HostPath,
     route_dump: Option<RouteDump>,
     ownership_words: usize,
@@ -292,6 +307,7 @@ impl<'a> Exl3Worker<'a> {
             staging,
             weights_offset,
             paired: ownership_words > 0,
+            topology: None,
             host_path,
             route_dump,
             ownership_words,
@@ -301,6 +317,18 @@ impl<'a> Exl3Worker<'a> {
             layer: 0,
             executor_id,
         })
+    }
+
+    pub(crate) fn install_topology(&mut self, topology: Option<SparkTopology>) -> Result<()> {
+        ensure!(self.topology.is_none(), "EXL3 topology already installed");
+        if let Some(topology) = topology {
+            ensure!(!self.paired && topology == SparkTopology::NATIVE_TP3_EP1,
+                "compact EXL3 ownership requires disjoint TP3EP1 artifacts");
+            ensure!((0..3).any(|rank| topology.executor_id(rank).ok() == Some(self.executor_id)),
+                "EXL3 topology differs from loaded shard identity");
+        }
+        self.topology = topology;
+        Ok(())
     }
 
     pub(crate) fn is_paired(&self) -> bool { self.paired }
@@ -395,14 +423,10 @@ impl<'a> Exl3Worker<'a> {
         );
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
         let routes = request.rows() as usize * Self::topk();
-        let (paired, rank) = (self.paired, self.executor_id.saturating_sub(1) as usize);
+        let (paired, rank, topology) = (self.paired, self.executor_id.saturating_sub(1) as usize, self.topology);
         {
             let (ids, ownership, weights) = self.staged(routes);
-            if paired {
-                request.copy_paired_routes_into(ids, weights, rank, ownership)?;
-            } else {
-                request.copy_routes_into(ids, weights)?;
-            }
+            copy_routes(request, topology, paired, rank, ids, weights, ownership)?;
         }
         ensure!(
             cfg!(target_endian = "little"),

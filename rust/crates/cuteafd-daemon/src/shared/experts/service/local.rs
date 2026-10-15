@@ -103,6 +103,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         cuteafd_loader::read_expert_catalog(&config.snapshot)?
     };
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+    config.topology = crate::shared::spark_topology::for_checkpoint(
+        config.topology, config.world, v41 && catalog.exl3().is_some());
     let geometry = catalog.routed_experts().geometry()?;
     config.bf16_ingress |= inventory.spark_input_is_bf16();
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
@@ -310,7 +312,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // logical intermediate this worker actually loaded. A captured log can then
     // be hashed and checked against the declared topology, instead of trusting a
     // hand-written value; the role comes from the same selection the loader used.
-    let loaded = config.selection(config.first_layer)?;
+    let loaded = if catalog.exl3().is_some() {
+        config.exl3_selection(config.first_layer)?
+    } else {
+        config.selection(config.first_layer)?
+    };
     tracing::info!(
         rank = config.rank,
         world = config.world,

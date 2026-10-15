@@ -53,7 +53,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     )?;
     // Reject an explicit non-native checkpoint before any expert allocation,
     // KV reservation or readiness publication.
-    crate::shared::spark_topology::require_native(topology, &catalog)?;
+    let topology = crate::shared::spark_topology::for_checkpoint(
+        topology, args.peers.len(), catalog.exl3().is_some());
+    crate::shared::spark_topology::require_supported(topology, &catalog)?;
     if let Some(topology) = topology {
         // Fail before weights are loaded when the library cannot reduce this
         // physical-rank count.

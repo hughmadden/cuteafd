@@ -255,14 +255,6 @@ fn spark_transport(
             cuteafd_transport::expert::v41_spark_executor_id(2, 0)?,
             cuteafd_transport::expert::v41_spark_executor_id(2, 1)?,
         ], capacity, config),
-        // The implicit three-rank EXL3 group answers in the TP3EP1 namespace
-        // (7..=9) but keeps the canonical non-ownership frame contract, so it
-        // must not be built through `new_topology`.
-        3 => SparkExperts::new_ranks(peers, &[
-            cuteafd_transport::expert::v41_spark_executor_id(3, 0)?,
-            cuteafd_transport::expert::v41_spark_executor_id(3, 1)?,
-            cuteafd_transport::expert::v41_spark_executor_id(3, 2)?,
-        ], capacity, config),
         4 => SparkExperts::new(peers.try_into().expect("four peers"), [1, 2, 3, 4], capacity, config),
         6 => {
             let ids = (0..6).map(|rank| cuteafd_transport::expert::v41_spark_executor_id(6, rank))
@@ -270,7 +262,7 @@ fn spark_transport(
             SparkExperts::new_ranks(peers, &ids, capacity, config)
         }
         _ => anyhow::bail!(
-            "the legacy non-topology transport takes two, three, four or six Spark peers; \
+            "the non-topology transport takes two, four or six Spark peers; \
              replicated layouts must pass --spark-tp/--spark-ep"
         ),
     }
@@ -344,9 +336,11 @@ fn worker(
         args.peers.len(),
         "serve-native",
     )?;
-    // Explicit replicated groups are native-only and are rejected here, before
-    // any expert weight is allocated or readiness published.
-    crate::shared::spark_topology::require_native(topology, &catalog)?;
+    // Bind compact EXL3 to the same ownership contract on coordinator and workers
+    // before expert allocation or readiness publication.
+    let topology = crate::shared::spark_topology::for_checkpoint(
+        topology, args.peers.len(), catalog.exl3().is_some());
+    crate::shared::spark_topology::require_supported(topology, &catalog)?;
     if let Some(topology) = topology {
         // Fail before any CUDA allocation or readiness publication when the
         // library cannot reduce this physical-rank count.
