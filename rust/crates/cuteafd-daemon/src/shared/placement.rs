@@ -106,6 +106,116 @@ mod tests {
             mapped_ring_bytes: 0, host_exchange_bytes: 0, row_indices_bytes: 0 }
     }
 
+    fn fixture_model() -> ModelAdmission {
+        ModelAdmission { capacity: 80, compiled_capacity: 80,
+            endpoints: vec![SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 },
+                SparkEndpoint { capacity: 16, ingress: SparkIngress::Fp8K32 }],
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 2, slot_bytes: 1 << 20, alignment: 4096 } }
+    }
+
+    fn check_reports(plan: &SparkAdmission) -> Result<()> {
+        let reports = plan.assignments.iter().map(|assignment| {
+            let mut report = idle_report(assignment.rank);
+            report.resident_bytes = assignment.resident_bytes;
+            report.slices = assignment.slices.clone();
+            report.runtime.workspace_bytes = assignment.io.intake;
+            report.mapped_ring_bytes = assignment.io.mapped_rings;
+            report.host_exchange_bytes = assignment.io.host_exchange;
+            report.row_indices_bytes = assignment.io.row_indices;
+            report
+        }).collect::<Vec<_>>();
+        plan.reconcile(&reports)?;
+        for field in 0..6 {
+            let mut changed = reports.clone();
+            let report = &mut changed[0];
+            match field {
+                0 => report.resident_bytes += 1,
+                1 => report.slices[0].stored_width += 128,
+                2 => report.mapped_ring_bytes += 1,
+                3 => report.host_exchange_bytes += 1,
+                4 => report.row_indices_bytes += 1,
+                _ => report.runtime.workspace_bytes = plan.assignments[0].io.intake - 1,
+            }
+            assert!(plan.reconcile(&changed).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_spark_plan_uses_checkpoint_exact_widths_and_all_endpoints() -> Result<()> {
+        use cuteafd_loader::plan::testing::{fp8, mimo_flash_config, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let mut config = mimo_flash_config();
+        config["n_routed_experts"] = 2.into();
+        config["num_experts_per_tok"] = 1.into();
+        let mut tensors = Vec::new();
+        for expert in 0..2 {
+            for (name, rows, cols) in [("gate", 2048, 4096), ("up", 2048, 4096), ("down", 4096, 2048)] {
+                tensors.extend(fp8(&format!("model.layers.1.mlp.experts.{expert}.{name}_proj"), rows, cols, None));
+            }
+        }
+        write_snapshot(root.path(), &config, &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let geometry = catalog.routed_experts().geometry()?;
+        let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
+            ..Default::default() };
+        let plan = SparkAdmission::plan(root.path(), geometry, Some(&catalog), &working, 6, None,
+            cuteafd_loader::V41Exl3Partition::Disjoint, fixture_model())?;
+        assert_eq!(plan.selection.layers(), [1]);
+        assert_eq!(plan.assignments.iter().map(|rank| rank.slices[0].stored_width).collect::<Vec<_>>(),
+            [384, 384, 384, 384, 256, 256]);
+        for assignment in &plan.assignments {
+            assert!(assignment.resident_bytes > 0 && assignment.io.mapped_rings > 0);
+            assert_eq!(assignment.io.mapped_rings, fixture_model().ring_bytes(geometry)? as u64);
+        }
+        check_reports(&plan)
+    }
+
+    #[test]
+    fn exl3_spark_plan_preserves_sparse_absolute_ids_and_tier_counts() -> Result<()> {
+        use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(3, 4);
+        write_snapshot(root.path(), &qwen4_config(3), &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let working = SparkWorkingSet { spark_layers: vec![0, 2], rtx_layers: vec![1], spark_ranks: 3,
+            prefill_lanes: 1 };
+        let plan = SparkAdmission::plan(root.path(), catalog.routed_experts().geometry()?, Some(&catalog),
+            &working, 3, None, cuteafd_loader::V41Exl3Partition::Disjoint, fixture_model())?;
+        assert_eq!(plan.selection.layers(), [0, 2]);
+        for (rank, assignment) in plan.assignments.iter().enumerate() {
+            assert_eq!(assignment.slices.iter().map(|slice| slice.layer).collect::<Vec<_>>(), [0, 2]);
+            let expected = catalog.exl3().unwrap().residency(cuteafd_loader::V41Exl3Layer::Backbone(0), 3, rank)?;
+            assert_eq!(assignment.resident_bytes, 2 * expected.device_arena_layout()?.1 as u64);
+            assert_eq!(assignment.slices[0].tiers, expected.tiers.iter().map(|&tier| tier as u32).collect::<Vec<_>>());
+            assert!(!assignment.slices[0].projection_counts.is_empty());
+        }
+        assert!(SparkAdmission::plan(root.path(), catalog.routed_experts().geometry()?, Some(&catalog),
+            &working, 3, None, cuteafd_loader::V41Exl3Partition::PairedTp4, fixture_model()).is_err());
+        check_reports(&plan)
+    }
+
+    #[test]
+    fn native_spark_plan_maps_physical_ranks_to_replicated_tp_shards() -> Result<()> {
+        use cuteafd_loader::plan::testing::write_v4_snapshot;
+        let root = tempfile::tempdir()?;
+        write_v4_snapshot(root.path());
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let geometry = catalog.routed_experts().geometry()?;
+        let working = SparkWorkingSet { spark_layers: vec![1, 3], spark_ranks: 6,
+            prefill_lanes: 1, ..Default::default() };
+        let plan = SparkAdmission::plan(root.path(), geometry, Some(&catalog), &working, 6,
+            Some(SparkTopology::new(2, 3)?), cuteafd_loader::V41Exl3Partition::Disjoint, fixture_model())?;
+        for rank in 0..6 {
+            let assignment = &plan.assignments[rank];
+            assert_eq!(assignment.rank, rank as u32);
+            assert_eq!(assignment.slices[0].first, (rank % 2) as u32 * 1024);
+            assert_eq!(assignment.slices[0].stored_width, 1024);
+            assert_eq!(assignment.slices, plan.assignments[rank % 2].slices);
+        }
+        check_reports(&plan)
+    }
+
     #[test]
     fn empty_spark_admission_needs_no_storage_recipe_and_reconciles_every_rank() -> Result<()> {
         let plan = idle_plan()?;

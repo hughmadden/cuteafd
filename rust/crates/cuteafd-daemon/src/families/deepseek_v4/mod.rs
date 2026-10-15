@@ -341,6 +341,18 @@ pub(crate) fn with_engine<T>(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
     let prefill_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
+    let skip = args.skip_routed_experts;
+    let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
+        .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+    if skip {
+        tracing::warn!("--skip-routed-experts: MoE layers run the shared expert alone (outputs do not match the model)");
+    } else {
+        ensure!(matches!(peers.len(), 2 | 3 | 4 | 6), "DeepSeek V4 serves 2, 3, 4 or 6 Spark ranks, got {}", peers.len());
+        loaded.library.v41_compact_reducer()?.require_rank_count(peers.len() as u32)?;
+    }
+    // Resolve once: the admitted endpoint set and the constructed links must agree.
+    let device_exchange = !skip && crate::shared::spark_intake::device_exchange_enabled()
+        && crate::shared::spark_intake::device_exchange_available(&loaded.library)?;
     // Select and freeze owners before the first weight upload. Header-derived
     // uploads are explicit demands, so the owner chooser sees their true costs.
     let placement = {
@@ -402,6 +414,20 @@ pub(crate) fn with_engine<T>(
         let placement = cuteafd_loader::placement::solve(&request)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
         check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
+        if !skip {
+            use cuteafd_loader::placement::{ExpertHome, SparkWorkingSet};
+            let working = SparkWorkingSet {
+                spark_layers: placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                    (home.experts == ExpertHome::Spark).then_some(layer)).collect(),
+                rtx_layers: placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                    matches!(home.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer)).collect(),
+                spark_ranks: peers.len(), prefill_lanes: engine::PREFILL_LANES as u64,
+            };
+            crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
+                loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
+                peers.len(), None, cuteafd_loader::V41Exl3Partition::Disjoint,
+                admission::spark_model(decode_rows, device_exchange)?)?.select(&peers)?;
+        }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let started = Instant::now();
         let loader = weights::WeightLoader {
@@ -464,15 +490,6 @@ pub(crate) fn with_engine<T>(
         pool::PoolShape::context_units(pool::PoolShape::units_for(usize::try_from(placement.pool_tokens)?,
             args.max_sequences), context_mode.is_some()),
     );
-    let skip = args.skip_routed_experts;
-    let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
-        .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-    if skip {
-        tracing::warn!("--skip-routed-experts: MoE layers run the shared expert alone (outputs do not match the model)");
-    } else {
-        ensure!(matches!(peers.len(), 2 | 3 | 4 | 6), "DeepSeek V4 serves 2, 3, 4 or 6 Spark ranks, got {}", peers.len());
-        loaded.library.v41_compact_reducer()?.require_rank_count(peers.len() as u32)?;
-    }
     let mut engine = engine::Engine::new(engine::EngineParts {
         library: &loaded.library,
         programs: &programs,
@@ -574,8 +591,7 @@ pub(crate) fn with_engine<T>(
             } else { installed = Some(reports); }
         }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-        if crate::shared::spark_intake::device_exchange_enabled() && !skip
-            && crate::shared::spark_intake::device_exchange_available(&loaded.library)? {
+        if device_exchange {
             let started = Instant::now();
             engine.attach_device_link(&peers, &executors,
                 TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;

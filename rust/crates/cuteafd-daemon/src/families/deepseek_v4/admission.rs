@@ -32,6 +32,40 @@ pub(crate) struct Inputs<'a> {
     pub exchange_f32: bool,
 }
 
+#[cfg(test)]
+mod spark_tests {
+    #[test]
+    fn v4_spark_endpoints_match_prefill_links_and_optional_decode_link() -> anyhow::Result<()> {
+        for decode_rows in [16, 64, 80] {
+            for device in [false, true] {
+                let model = super::spark_model(decode_rows, device)?;
+                model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
+                assert_eq!((model.capacity, model.compiled_capacity), (4096, 4096));
+                assert_eq!(model.endpoints.len(), super::super::engine::PREFILL_LANES + usize::from(device));
+                assert!(model.endpoints[..super::super::engine::PREFILL_LANES].iter()
+                    .all(|endpoint| endpoint.capacity == 4096));
+                if device { assert_eq!(model.endpoints.last().unwrap().capacity, decode_rows as u32); }
+                assert!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn spark_model(decode_rows: usize, device_exchange: bool)
+    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    use cuteafd_core::{SparkEndpoint, SparkIngress};
+    let mut endpoints = vec![SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32 };
+        super::engine::PREFILL_LANES];
+    if device_exchange {
+        endpoints.push(SparkEndpoint { capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 });
+    }
+    Ok(cuteafd_transport::worker_selection::ModelAdmission {
+        capacity: 4096, compiled_capacity: 4096, endpoints,
+        rings: crate::shared::placement::spark_rings(64 << 20)?,
+    })
+}
+
 pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<PlacementRequest> {
     let gpus = inputs.gpus.len();
     let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
