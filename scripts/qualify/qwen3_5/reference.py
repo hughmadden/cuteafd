@@ -29,6 +29,59 @@ The same input tokens should give the same next-token distribution.
 """
 
 
+def reference_identity(snapshot):
+    """Check the checkpoint and executable gate sites without changing target math."""
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as reference
+    config = json.loads((snapshot / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    if config.get("quantization_config") or text_config.get("quantization_config"):
+        raise ValueError("BF16 fidelity root required, not a quantized checkpoint")
+    index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+    for shard in set(index["weight_map"].values()):
+        if not (snapshot / shard).is_file():
+            raise ValueError(f"missing shard: {shard}")
+    # Bind the gate-site decision to the executable reference, not a config alias.
+    gated_source = inspect.getsource(reference.Qwen3_5RMSNormGated)
+    attention_source = inspect.getsource(reference.Qwen3_5Attention.forward)
+    source = Path(reference.__file__).read_bytes()
+    if ('self.activation = "silu"' not in gated_source
+            or 'ACT2FN[self.activation](gate.to(torch.float32))' not in gated_source
+            or "sigmoid(gate)" not in attention_source
+            or b"output_gate_type" in source):
+        raise ValueError("reference gate implementation changed; reconcile before running")
+    if text_config.get("output_gate_type", "swish") not in ("swish", "silu"):
+        raise ValueError("unreconciled output_gate_type")
+    return config, text_config, index, source
+
+
+def load_reference(snapshot):
+    """Load the official BF16 target while preserving its native FP32 tensors."""
+    import torch
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as reference
+    _, _, index, _ = reference_identity(snapshot)
+    # MTP tensors are not used by the Transformers target implementation.
+    model = reference.Qwen3_5ForConditionalGeneration.from_pretrained(
+        snapshot, dtype=torch.bfloat16, attn_implementation="eager",
+        local_files_only=True)
+    # HF's dtype=BF16 casts even native FP32 GDN parameters in 5.13.0.
+    # Reload only these tiny tensors at their checkpoint dtype before moving.
+    from safetensors import safe_open
+    fp32_parameters = []
+    for shard in sorted(set(index["weight_map"].values())):
+        with safe_open(snapshot / shard, framework="pt", device="cpu") as weights:
+            for name in weights.keys():
+                if weights.get_slice(name).get_dtype() != "F32":
+                    continue
+                if not name.endswith((".linear_attn.A_log", ".linear_attn.norm.weight")):
+                    raise ValueError(f"unreconciled native FP32 tensor: {name}")
+                parameter = model.get_parameter(name)
+                parameter.data = weights.get_tensor(name)
+                fp32_parameters.append(name)
+    model = model.to(device="cuda:0").eval()
+    assert all(model.get_parameter(name).dtype == torch.float32 for name in fp32_parameters)
+    return model, sorted(fp32_parameters)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
@@ -45,23 +98,7 @@ def main():
     from tokenizers import Tokenizer
     from transformers.models.qwen3_5 import modeling_qwen3_5 as reference
 
-    config = json.loads((args.snapshot / "config.json").read_text())
-    text_config = config.get("text_config", config)
-    if config.get("quantization_config") or text_config.get("quantization_config"):
-        raise ValueError("BF16 fidelity root required, not a quantized checkpoint")
-    index = json.loads((args.snapshot / "model.safetensors.index.json").read_text())
-    for shard in set(index["weight_map"].values()):
-        if not (args.snapshot / shard).is_file():
-            raise ValueError(f"missing shard: {shard}")
-    # Bind the gate-site decision to the executable reference, not a config alias.
-    gated_source = inspect.getsource(reference.Qwen3_5RMSNormGated.forward)
-    attention_source = inspect.getsource(reference.Qwen3_5Attention.forward)
-    source = Path(reference.__file__).read_bytes()
-    if ("silu" not in gated_source or "sigmoid(gate)" not in attention_source
-            or b"output_gate_type" in source):
-        raise ValueError("reference gate implementation changed; reconcile before running")
-    if text_config.get("output_gate_type", "swish") not in ("swish", "silu"):
-        raise ValueError("unreconciled output_gate_type")
+    config, text_config, index, source = reference_identity(args.snapshot)
     tokenizer = Tokenizer.from_file(str(args.snapshot / "tokenizer.json"))
     text = args.text_file.read_text() if args.text_file else DEFAULT_TEXT
     tokens = tokenizer.encode(text, add_special_tokens=False).ids[:args.max_tokens]
@@ -76,26 +113,7 @@ def main():
     torch.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    # MTP tensors are not used by the Transformers target implementation.
-    model = reference.Qwen3_5ForConditionalGeneration.from_pretrained(
-        args.snapshot, dtype=torch.bfloat16, attn_implementation="eager",
-        local_files_only=True)
-    # HF's dtype=BF16 casts even native FP32 GDN parameters in 5.13.0.
-    # Reload only these tiny tensors at their checkpoint dtype before moving.
-    from safetensors import safe_open
-    fp32_parameters = []
-    for shard in sorted(set(index["weight_map"].values())):
-        with safe_open(args.snapshot / shard, framework="pt", device="cpu") as weights:
-            for name in weights.keys():
-                if weights.get_slice(name).get_dtype() != "F32":
-                    continue
-                if not name.endswith((".linear_attn.A_log", ".linear_attn.norm.weight")):
-                    raise ValueError(f"unreconciled native FP32 tensor: {name}")
-                parameter = model.get_parameter(name)
-                parameter.data = weights.get_tensor(name)
-                fp32_parameters.append(name)
-    model = model.to(device="cuda:0").eval()
-    assert all(model.get_parameter(name).dtype == torch.float32 for name in fp32_parameters)
+    model, fp32_parameters = load_reference(args.snapshot)
     hooks = []
     def capture(layer_id):
         def save(_module, _inputs, output):
