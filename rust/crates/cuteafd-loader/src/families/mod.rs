@@ -6,3 +6,5 @@ pub mod glm5;
 pub mod glm5_flash;
 pub mod mimo_v2;
 pub mod qwen4;
+pub mod qwen;
+pub mod qwen3_5;

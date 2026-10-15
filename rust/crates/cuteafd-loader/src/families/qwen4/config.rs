@@ -8,11 +8,8 @@ use crate::plan::checkpoint::read_json;
 
 /// A layer's attention: Gated DeltaNet (linear, recurrent state) or gated GQA
 /// with the QSA block indexer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Qwen4Attention {
-    Gdn,
-    Full,
-}
+pub use crate::families::qwen::HybridAttention as Qwen4Attention;
+use crate::families::qwen::{GdnGeometry, GdnOutputGate};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen4Config {
@@ -137,12 +134,18 @@ impl Qwen4Config {
 
     /// Short-conv channels of a GDN layer (`[q; k; v]`).
     pub fn gdn_conv_width(&self) -> usize {
-        (2 * self.gdn_key_heads + self.gdn_value_heads) * self.gdn_head_dim
+        self.gdn_geometry().conv_width()
     }
 
     /// GDN value width (heads x dim).
     pub fn gdn_value_width(&self) -> usize {
-        self.gdn_value_heads * self.gdn_head_dim
+        self.gdn_geometry().value_width()
+    }
+
+    pub fn gdn_geometry(&self) -> GdnGeometry {
+        GdnGeometry { key_heads: self.gdn_key_heads, value_heads: self.gdn_value_heads,
+            key_dim: self.gdn_head_dim, value_dim: self.gdn_head_dim, conv_kernel: self.conv_kernel,
+            output_gate: GdnOutputGate::Sigmoid }
     }
 
     /// Rows of a full-attention layer's packed in-projection.
