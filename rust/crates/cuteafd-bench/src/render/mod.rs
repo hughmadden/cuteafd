@@ -73,4 +73,24 @@ mod tests {
         assert_eq!(super::seconds(0.4), "400 ms");
         assert_eq!(super::seconds(125.0), "2m 05s");
     }
+    #[test]
+    fn health_footer_keeps_rates_and_pause_in_card_and_report() {
+        let mut report = crate::sample::full_report();
+        let h = cuteafd_transport::fabric_health::Health {
+            verdict: cuteafd_transport::fabric_health::Verdict::Ok,
+            loss_events_per_gb: Some(60.0), adapter_retransmits_per_gb: Some(1.0),
+            sequence_events_per_gb: Some(59.0), reasons: vec!["ECN and CNP observed".into()],
+            ..Default::default()
+        };
+        report.fabric = vec![crate::fabric::Phase { name: "decode".into(), timed: true,
+            ports: vec![crate::fabric::Port { host: "coordinator".into(), device: "nic".into(), port: 1,
+                health: Some(h.clone()), health_since_start: Some(h), mtu: Some(9000), ..Default::default() }], ..Default::default() }];
+        let card = super::card::card_svg(&report);
+        assert!(card.contains("Fabric OK: peak loss 60.0 / retransmit 1.0"));
+        assert!(card.contains("pause not collected"));
+        let report = super::report::report_svg(&report);
+        assert!(report.contains("loss 60.0 / sequence 59.0 / retransmit 1.0"));
+        assert!(report.contains("Since observation start") && report.contains("MTU 9000"));
+    }
+
 }
