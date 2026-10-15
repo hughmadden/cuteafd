@@ -543,6 +543,7 @@ impl Bench {
             let mut r = report.lock().expect("report lock");
             r.fabric.extend(baseline.iter().flat_map(|b| b.fabric.iter().cloned()));
             r.baseline = baseline.clone();
+            progress.finish_baseline();
         }
         Self::record_power(&client, run_mark, report);
         self.emit(json!({"type": "report", "run": active.id, "report": report.lock().expect("report lock").clone()}));
@@ -661,6 +662,22 @@ impl Bench {
         STATE.get_or_init(|| Mutex::new(Plan::default()))
     }
 
+    /// Fold a pass's partial into the shared report. A baseline partial never replaces the
+    /// final baseline: the ticker can deliver one after `run_plan` installed the result.
+    /// Call with the report lock held, so the check and the write are atomic against the install.
+    fn apply_partial(r: &mut Report, progress: &Progress, panel: &str, partial: &Value) {
+        if panel == "baseline" {
+            if progress.baseline_final() {
+                return;
+            }
+            if let Ok(b) = serde_json::from_value::<Baseline>(partial.clone()) {
+                r.baseline = Some(b);
+            }
+        } else if let Some(p) = r.panels.iter_mut().find(|p| p.id == panel) {
+            p.partial = Some(partial.clone());
+        }
+    }
+
     /// Once a second while a run is active: progress, ETA, the live strip, partial results.
     fn tick(&self, report: &Arc<Mutex<Report>>, progress: &Progress, done: &AtomicBool, base: &str, fabric: bool) {
         let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
@@ -723,13 +740,7 @@ impl Bench {
                 revision = state.revision;
                 if let Some(partial) = state.partial {
                     if let Ok(mut r) = report.lock() {
-                        if plan.panel == "baseline" {
-                            if let Ok(b) = serde_json::from_value::<Baseline>(partial.clone()) {
-                                r.baseline = Some(b);
-                            }
-                        } else if let Some(p) = r.panels.iter_mut().find(|p| p.id == plan.panel) {
-                            p.partial = Some(partial.clone());
-                        }
+                        Self::apply_partial(&mut r, progress, &plan.panel, &partial);
                     }
                     self.emit(json!({"type": "partial", "run": plan.run, "panel": plan.panel, "value": partial}));
                 }
@@ -744,6 +755,23 @@ mod tests {
     use super::panel_eta_s;
 
     fn close(a: f64, b: f64) -> bool { (a - b).abs() < 1e-6 }
+
+    #[test]
+    fn stale_baseline_partial_never_replaces_final_baseline() {
+        let mut report = crate::sample::report(false);
+        let final_checks = report.baseline.as_ref().unwrap().quality.checks.len();
+        let mut stale = report.baseline.clone().unwrap();
+        stale.quality.checks.truncate(final_checks - 1);
+        let partial = serde_json::to_value(&stale).unwrap();
+        let progress = crate::panels::Progress::default();
+        // Before the install a partial applies; after it, a late partial is dropped.
+        super::Bench::apply_partial(&mut report, &progress, "baseline", &partial);
+        assert_eq!(report.baseline.as_ref().unwrap().quality.checks.len(), final_checks - 1);
+        report.baseline = Some(serde_json::from_value(serde_json::to_value(crate::sample::report(false).baseline).unwrap()).unwrap());
+        progress.finish_baseline();
+        super::Bench::apply_partial(&mut report, &progress, "baseline", &partial);
+        assert_eq!(report.baseline.as_ref().unwrap().quality.checks.len(), final_checks);
+    }
 
     #[test]
     fn internal_token_is_private_full_length_and_only_active() {
