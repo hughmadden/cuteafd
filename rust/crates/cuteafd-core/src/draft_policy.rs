@@ -2647,6 +2647,22 @@ mod tests {
     }
 
     #[test]
+    fn c16_evidence_cannot_warm_or_reprice_a_cold_c1() {
+        let mut swept = DraftPolicy::seeded(placement(5), seed()).unwrap();
+        let cold = swept.clone();
+        let mut token = 0;
+        for round in 0..100 {
+            truth_round(&mut swept, &physics(), &mut token, 16 * (1 + round % 4), 16, 0., 0.);
+        }
+        assert_eq!(swept.cost_snapshot(false, 1), cold.cost_snapshot(false, 1));
+        assert_eq!(swept.prediction_health(false, 1), cold.prediction_health(false, 1));
+        assert!(!swept.warm(false, 1));
+        assert!(!swept.engaged(false, 1));
+        let candidates = [DraftCandidate { id: 100, confidence: &[0.9; 5] }];
+        assert_eq!(swept.select(false, &candidates, 5), cold.clone().select(false, &candidates, 5));
+    }
+
+    #[test]
     fn c1_costs_survive_a_c16_phase_while_physics_and_history_are_shared() {
         let mut policy = DraftPolicy::seeded(placement(5), seed()).unwrap();
         let mut token = 0;
