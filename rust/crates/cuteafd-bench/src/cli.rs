@@ -4,7 +4,7 @@
 use crate::report::{Report, RunStatus};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -100,12 +100,8 @@ pub fn write_exports(report: &Report, dir: &Path, kinds: &[String]) -> Result<Ve
         files.push("card.png".to_string());
     }
     for file in files {
-        let bytes = if file.ends_with(".png") {
-            let svg = crate::http::export(report, &file.replace(".png", ".svg")).context("export")?.1;
-            crate::render::png::png(&String::from_utf8_lossy(&svg), 1.0)?
-        } else {
-            crate::http::export(report, &file).with_context(|| format!("no export {file}"))?.1
-        };
+        let bytes = crate::http::export(report, &file).with_context(|| format!("exporting {file}"))?
+            .with_context(|| format!("no export {file}"))?.1;
         let path = dir.join(&file);
         std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
         written.push(path);
@@ -170,6 +166,10 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
         },
     };
     let dir = options.out.clone().unwrap_or_else(|| labeled_dir(&options.root, &report, options.label.as_deref()));
+    // The report this returns is read the way every surface reads it, so the
+    // run's own gate check and a run recovered from the local store after the
+    // server went away cannot carry a verdict the data no longer earns.
+    let report = crate::quality::under_current_rule(&report);
     let written = write_exports(&report, &dir, &options.export)?;
     if !options.quiet {
         for path in &written {
@@ -282,11 +282,16 @@ pub fn cancel(url: &str, api_key: &Option<String>) -> Result<()> {
 
 /// Writes `text` to `path` only when it changed.
 pub fn write_if_changed(path: &Path, text: &str) -> Result<bool> {
-    if std::fs::read_to_string(path).ok().as_deref() == Some(text) {
+    write_bytes_if_changed(path, text.as_bytes())
+}
+
+/// Writes `bytes` to `path` only when they changed, so re-rendering a file
+/// that is already current leaves it untouched.
+pub fn write_bytes_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if std::fs::read(path).ok().as_deref() == Some(bytes) {
         return Ok(false);
     }
-    let mut file = std::fs::File::create(path).with_context(|| format!("writing {}", path.display()))?;
-    file.write_all(text.as_bytes())?;
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
 }
 

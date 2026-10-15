@@ -531,3 +531,132 @@ fn v4_block(cfg: &crate::families::deepseek_v4::DeepseekV4Config, prefix: &str, 
     }
     out
 }
+
+/// The fixed official V4.1 header contract over sparse payloads, split into its
+/// 48 required shard names. This never reads HF_HOME or allocates tensor data.
+pub fn write_v41_snapshot(dir: &Path) {
+    write_v41_snapshot_format(dir, false, None);
+}
+
+/// ModelOpt's calibrated W4A4 expert headers with the official non-expert tensors.
+pub fn write_v41_nvfp4_snapshot(dir: &Path) {
+    write_v41_snapshot_format(dir, true, None);
+}
+
+/// Raw routed-only EXL3 publication, with source-precision draft experts.
+pub fn write_v41_exl3_snapshot(dir: &Path, bits: usize) {
+    assert!((2..=5).contains(&bits));
+    write_v41_snapshot_format(dir, false, Some(bits));
+}
+
+/// Bounded synthetic published allocation inputs, not performance estimates.
+pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
+    let share = dir.join("share");
+    fs::create_dir_all(share.join("V41_EXPERT_WORKSPACES")).unwrap();
+    let programs = share.join("PROGRAMS.json");
+    fs::write(&programs, b"{}").unwrap();
+    for ranks in [1, 2] {
+        let role = if ranks == 1 { "rtx_backbone" } else { "rtx_tp2" };
+        for format in ["mxfp4", "nvfp4"] {
+            let manifest = json!({"role":role, "geometry":{"hidden":5120,
+                "intermediate":2304/ranks,"kernel_intermediate":2304/ranks,
+                "experts":384,"topk":6}, "variants":([1,16,80,256,1024,4096].map(|c|
+                    json!({"capacity_rows":c,"core_scratch_nbytes":if c==16 {99999}else{c*7}})))});
+            fs::write(share.join("V41_EXPERT_WORKSPACES").join(format!("{format}_{role}.json")),
+                serde_json::to_vec(&manifest).unwrap()).unwrap();
+        }
+        for bits in 2..=5 {
+            let tiers = if bits == 5 { "45".to_owned() } else { format!("{bits}{}", bits+1) };
+            for capacity in [1,16,80,256,1024,4096] {
+                let path = share.join("exl3").join(format!("exl3-k{tiers}"))
+                    .join(format!("rtx-tp{ranks}")).join(format!("m{capacity}"));
+                fs::create_dir_all(&path).unwrap();
+                fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+                    "capacity":capacity,"hidden":5120,"experts":384,
+                    "intermediate":2304/ranks,"top_k":6,"input_format":"e4m3_k32",
+                    "trellis_lut":{"bytes":32},"buffers":{
+                        "scratch":{"allocation":"scratch","dtype":"f32","bytes":capacity*7,
+                            "zero_on_create":false}}})).unwrap()).unwrap();
+            }
+        }
+    }
+    let variants = [(5120,1152),(1152,5120)].into_iter().flat_map(|(k,n)|
+        [1,16,80,256,1024,4096].map(|c| json!({"capacity":c,"input_dim":k,
+            "output_dim":n,"scratch_bytes":c+1}))).collect::<Vec<_>>();
+    fs::write(share.join("V41_FP8_AOT.json"), serde_json::to_vec(&json!({"variants":variants})).unwrap()).unwrap();
+    programs
+}
+
+fn write_v41_snapshot_format(dir: &Path, nvfp4: bool, exl3_bits: Option<usize>) {
+    let mut config: Value = serde_json::from_str(include_str!(
+        "../families/deepseek_v41/official-v41-config.json")).unwrap();
+    if nvfp4 {
+        let layers: serde_json::Map<String, Value> = (0..40).map(|layer|
+            (format!("layers.{layer}.ffn.experts"), json!({"group_size":16,"quant_algo":"NVFP4"}))).collect();
+        config["quantization_config"] = json!({
+            "quant_method":"fp8", "quant_algo":"MIXED_PRECISION", "moe_quant_algo":"NVFP4",
+            "expert_dtype":"fp4", "activation_scheme":"dynamic", "group_size":16,
+            "scale_fmt":"ue8m0", "weight_block_size":[32,32], "kv_cache_quant_algo":null,
+            "ignore":["*.attn.*","*.ffn.shared_experts.*","head","mtp.*"],
+            "producer":{"name":"modelopt","version":"fixture"}, "quantized_layers":layers,
+            "config_groups":{"group_0":{"targets":["Linear"],
+                "weights":{"dynamic":false,"group_size":16,"num_bits":4,"type":"float"},
+                "input_activations":{"dynamic":false,"group_size":16,"num_bits":4,"type":"float"}}}
+        });
+    }
+    if let Some(bits) = exl3_bits {
+        let native = config["quantization_config"].clone();
+        config["quantization_config"] = json!({"quant_method":"exl3","bits":bits,
+            "codebook":"mcg","mtp_experts":"source","mtp_experts_start_layer":40,
+            "weight_block_size":[32,32],"non_routed_quantization":{
+                "quant_method":"deepseek_v4_fp8","fmt":"e4m3",
+                "activation_scheme":native["activation_scheme"],"scale_fmt":native["scale_fmt"],
+                "weight_block_size":native["weight_block_size"],"expert_dtype":"fp4"}});
+    }
+    let templates: Vec<Value> = serde_json::from_str(include_str!(
+        "../families/deepseek_v41/official-v41-tensors.json")).unwrap();
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut shards: Vec<Vec<Tensor>> = vec![vec![]; 48];
+    let mut weight_map = serde_json::Map::new();
+    let mut index = 0;
+    for template in templates {
+        let mut names = vec![template["pattern"].as_str().unwrap().to_owned()];
+        for axis in template["axes"].as_array().unwrap() {
+            names = names.into_iter().flat_map(|name| axis.as_array().unwrap().iter()
+                .map(move |i| name.replacen("{}", &i.to_string(), 1))).collect();
+        }
+        let dtype = match template["dtype"].as_str().unwrap() {
+            "BF16" => "BF16", "F32" => "F32", "I8" => "I8",
+            "F8_E4M3" => "F8_E4M3", "F8_E8M0" => "F8_E8M0",
+            other => panic!("unexpected official dtype {other}"),
+        };
+        let shape = template["shape"].as_array().unwrap().iter()
+            .map(|n| n.as_u64().unwrap() as usize).collect::<Vec<_>>();
+        for name in names {
+            let tensors = if let Some(bits) = exl3_bits.filter(|_| name.starts_with("layers.") && name.contains(".ffn.experts.")) {
+                if name.ends_with(".scale") { continue; }
+                let prefix = name.strip_suffix(".weight").expect("official expert weight");
+                let (n,k) = if prefix.ends_with(".w2") { (5120,2304) } else { (2304,5120) };
+                exl3(prefix,n,k,bits)
+            } else if nvfp4 && name.starts_with("layers.") && name.contains(".ffn.experts.") {
+                if name.ends_with(".scale") { continue; }
+                let prefix = name.strip_suffix(".weight").expect("official expert weight");
+                let (n,k) = if prefix.ends_with(".w2") { (5120,2304) } else { (2304,5120) };
+                self::nvfp4(prefix,n,k)
+            } else { vec![(name,dtype,shape.clone())] };
+            for tensor in tensors {
+                let shard = index % 48;
+                weight_map.insert(tensor.0.clone(), json!(format!("model-{:05}-of-00048.safetensors", shard + 1)));
+                shards[shard].push(tensor);
+                index += 1;
+            }
+        }
+    }
+    assert_eq!(index, 96085 + if nvfp4 || exl3_bits.is_some() { 40*384*3*2 } else { 0 });
+    for (shard, tensors) in shards.iter().enumerate() {
+        write_safetensors(&dir.join(format!("model-{:05}-of-00048.safetensors", shard + 1)), tensors);
+    }
+    fs::write(dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&json!({"weight_map":weight_map})).unwrap()).unwrap();
+}

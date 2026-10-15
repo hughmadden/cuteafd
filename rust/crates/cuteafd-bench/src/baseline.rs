@@ -334,7 +334,9 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let reference = probed(client, plain(&turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
     let mut ids = turn.prompt_ids.clone();
     ids.extend(&turn.generated[..turn.generated.len().saturating_sub(1)]);
-    let again = probed(client, plain("cache probe", 2), ProbeSpec { prompt_ids: Some(ids), ..rows(2) })?;
+    // The turn's own generated ids are the prompt, so it is not comparable between arms.
+    let again = probed(client, plain("cache probe", 2),
+        ProbeSpec { prompt_ids: Some(ids), output_dependent: true, ..rows(2) })?;
     let cold = probed(client, plain(&turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
     let verdict = Restores::judge(&first, &restored, &turn, &reference, &again, &cold);
     check.set("prompt_tokens", restored.prompt_ids.len() as u64);
@@ -712,7 +714,9 @@ fn template(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     body["messages"] = history;
     body["max_tokens"] = json!(1);
     body.as_object_mut().expect("object").remove("tool_choice");
-    let second = run.client.chat(body, Some(ProbeSpec::default()))?;
+    // The turn re-renders the model's own reasoning and call, so its prompt is
+    // not comparable between arms.
+    let second = run.client.chat(body, Some(common::output_dependent()))?;
     let (Some(a), Some(b)) = (first.probe.as_ref(), second.probe.as_ref()) else {
         anyhow::bail!("no probe records");
     };

@@ -303,13 +303,17 @@ impl Panel for PrefixCache {
             history.push(json!({"role": "user", "content": format!("Question {turn}: {} Answer in three sentences.",
                 filler(turn as u64 * 77, 120))}));
             let body = json!({"messages": history, "max_tokens": 64, "temperature": 0, "thinking": {"type": "disabled"}});
+            // From turn 2 the history carries the model's own answers, so the
+            // prompt is model-determined and differs between arms by design.
+            let derived = turn > 1;
             let fabric_mark = ctx.client.fabric_mark();
-            let chat = ctx.client.chat(body.clone(), None)?;
+            let chat = ctx.client.chat(body.clone(), derived.then(common::output_dependent))?;
             let fabric = ctx.client.fabric_since(fabric_mark, &format!("prefix_cache/{turn}/cached"), true);
             let mut cold_body = body.clone();
             cold_body["max_tokens"] = json!(1);
             let fabric_mark = ctx.client.fabric_mark();
-            let cold = ctx.client.chat(cold_body, Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
+            let cold = ctx.client.chat(cold_body,
+                Some(ProbeSpec { cold: true, output_dependent: derived, ..ProbeSpec::default() }))?;
             let supported = cold.probe.as_ref().is_some_and(|r| r.engine.is_some());
             turns.push(json!({"turn": turn, "prompt_tokens": chat.timing.prompt_tokens,
                 "cached_tokens": chat.timing.cached_tokens, "ttft_s": chat.timing.ttft_s,

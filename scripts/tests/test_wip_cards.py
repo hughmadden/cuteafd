@@ -446,14 +446,57 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
     def job(entry):
         state = tmp_path / entry['name']
         (state / 'smoke' / 'logs').mkdir(parents=True)
-        (state / 'smoke' / 'logs' / 'x.coordinator.log').write_text('prompt_token_hash="73b4ebf8f4958775"\n')
+        (state / 'smoke' / 'logs' / 'x.coordinator.log').write_text(
+            '2026-10-14T17:13:52.242369Z  INFO cuteafd::shared::probe: matched benchmark prompt engine="d" '
+            'prompt_tokens=8192 prompt_token_hash="73b4ebf8f4958775"\n'
+            '2026-10-14T17:13:53.242369Z  INFO cuteafd::shared::probe: benchmark output-dependent prompt engine="d" '
+            'prompt_tokens=439\n')
         (state / 'reports' / entry['name']).mkdir(parents=True)
         (state / 'reports' / entry['name'] / 'sweep.json').write_text(json.dumps({'points': [], 'prefill': []}))
         return dict(card='c', arm='a', repeat=1, simulated=False, state=str(state), nonce_seed='s', entry=entry)
     prefill = cards.summarize_job(job(dict(name='p', profile='panels:', prefill_lengths=[8192], set={}, sparks=[])), 0)
     assert prefill['status'] == 'pass' and prefill['first_prompt_token_hash'] == '73b4ebf8f4958775'
+    # The follow-up prompt is counted, not compared: it has no hash of its own.
+    assert prefill['prompt_token_hashes'] == ['73b4ebf8f4958775'] and prefill['follow_up_prompts'] == 1
     decode = cards.summarize_job(job(dict(name='d', profile='panels:', levels=[1, 16], set={}, sparks=[])), 0)
     assert decode['status'] == 'failed' and 'per-request console rounds' in decode['error']
+
+
+def _coordinator_log(deterministic, follow_up_tokens):
+    """A coordinator log: input-determined prompts with hashes, then the
+    chat-template check's second turn, which re-renders the model's own
+    reasoning and tool call and so differs between arms by design."""
+    lines = [f'2026-10-14T17:13:52.242369Z  INFO cuteafd::shared::probe: matched benchmark prompt engine="deepseek_v41" '
+             f'prompt_tokens={tokens} prompt_token_hash={hash_}' for tokens, hash_ in deterministic]
+    lines.append('2026-10-14T17:13:53.242369Z  INFO cuteafd::shared::probe: benchmark output-dependent prompt '
+                 f'engine="deepseek_v41" prompt_tokens={follow_up_tokens}')
+    return '\n'.join(lines) + '\n'
+
+
+def _matched_row(directory, arm, text):
+    """The match evidence `summarize_job` keeps for one arm's log."""
+    hashes = cards.prompt_token_hashes(text)
+    directory.mkdir(parents=True, exist_ok=True)
+    return dict(card='c', arm=arm, repeat=1, nonce_seed='seed', follow_up_prompts=cards.follow_up_prompts(text),
+                first_prompt_token_hash=hashes[0], prompt_token_hashes=sorted(hashes), state=str(directory), status='pass')
+
+
+def test_matched_pair_ignores_the_follow_up_prompt_and_still_gates_the_rest(tmp_path):
+    # The template check's second turn re-renders the model's own reasoning and
+    # tool call, so its prompt differs between arms by design; every other
+    # prompt of the pair still has to match.
+    prompts = [(48, '1111111111111111'), (437, '2222222222222222'), (1217, '3333333333333333')]
+    logs = {'base': _coordinator_log(prompts, 439), 'candidate': _coordinator_log(prompts, 420)}
+    assert all(cards.follow_up_prompts(text) == 1 for text in logs.values())
+    rows = [_matched_row(tmp_path / 'match' / arm, arm, text) for arm, text in logs.items()]
+    cards.validate_matched_pairs(rows, ['base', 'candidate'])
+    assert all(row['status'] == 'pass' for row in rows)
+    # One differing input-determined prompt still fails the pair.
+    logs['candidate'] = _coordinator_log(prompts[:2] + [(1217, '4444444444444444')], 420)
+    rows = [_matched_row(tmp_path / 'mismatch' / arm, arm, text) for arm, text in logs.items()]
+    cards.validate_matched_pairs(rows, ['base', 'candidate'])
+    assert all(row['status'] == 'failed' for row in rows)
+    assert all((Path(row['state']) / 'exit').read_text() == '81\n' for row in rows)
 
 
 def test_cleanup_foreign_root_refused(tmp_path, monkeypatch):
@@ -642,7 +685,8 @@ def test_explicit_nonce_overrides_auto_and_inherited(entry, tmp_path, monkeypatc
         report.write_text(json.dumps({'baseline': {'quality': {'checks': [], 'status': 'pass'}}}))
         logs = dest / 'smoke' / 'logs'
         logs.mkdir(parents=True)
-        (logs / 'one.coordinator.log').write_text('prompt_token_hash=0123456789abcdef')
+        (logs / 'one.coordinator.log').write_text('matched benchmark prompt engine="d" prompt_tokens=48 '
+            'prompt_token_hash=0123456789abcdef')
         (dest / 'console-frames.jsonl').write_text(json.dumps({'ev': [{'e': 'round', 't0': 0, 't1': 10, 'req': [[1, 4, 4, 2, 3, 0, 0]]}]}) + '\n')
         row = cards.summarize_job(job, 0)
         assert row['status'] == 'pass' and row['first_prompt_token_hash'] == '0123456789abcdef'

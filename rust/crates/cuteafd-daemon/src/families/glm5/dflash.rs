@@ -46,10 +46,6 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const RING: usize = 2048;
 /// Tapped rows one target step keeps (a prefill chunk's tail, or a verify step).
 pub(crate) const TAP_ROWS: usize = RING;
-/// Historical skinny-row limit, kept for the older MiMo compatibility path.
-/// Immutable GLM drafters use the arbitrary-row native W8A16 entrypoint.
-pub(crate) const FP8_ROWS: usize = 128;
-
 #[derive(Debug, Clone, serde::Deserialize)]
 struct RawConfig {
     hidden_size: usize,

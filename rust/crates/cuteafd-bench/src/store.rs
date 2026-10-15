@@ -33,6 +33,17 @@ pub struct RunRow {
     pub quality_failed: bool,
 }
 
+impl RunRow {
+    /// The row with the verdict its stored report earns under the rule in force
+    /// now. `stored` is the verdict the run was saved with, kept for a report
+    /// this build cannot parse.
+    fn with_current_verdict(mut self, text: &str, stored: bool) -> Self {
+        self.quality_failed = serde_json::from_str::<Report>(text)
+            .map_or(stored, |report| crate::quality::under_current_rule(&report).quality_failed());
+        self
+    }
+}
+
 impl Store {
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -71,6 +82,10 @@ impl Store {
     }
 
     pub fn save(&self, report: &Report) -> Result<()> {
+        // The verdict is stored as the record of what this run was measured
+        // as; a listing re-derives it from the report under the rule in force
+        // then, so the column is only the fallback for a report that will not
+        // parse.
         let status = serde_json::to_value(report.status)?.as_str().unwrap_or("unknown").to_string();
         self.connection.execute(
             "INSERT INTO runs (id, created, fingerprint, profile, status, model, hardware, quality_failed, report)
@@ -88,14 +103,26 @@ impl Store {
         text.map(|t| serde_json::from_str(&t).context("stored report")).transpose()
     }
 
+    /// The run records, newest first.
+    ///
+    /// The row's verdict is derived here, from the report's own measured data
+    /// under the rule in force now, never from the status the run was stored
+    /// with: the dashboard lists this (the warning mark on a failed quality
+    /// gate) beside the run it renders, and a run measured before its
+    /// checkpoint was reclassified must not be the one surface still calling it
+    /// a failure. A report that will not parse keeps the verdict it was saved
+    /// with.
     pub fn list(&self, limit: usize) -> Result<Vec<RunRow>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, created, fingerprint, profile, status, model, hardware, quality_failed FROM runs
+            "SELECT id, created, fingerprint, profile, status, model, hardware, quality_failed, report FROM runs
              ORDER BY created DESC LIMIT ?1")?;
-        let rows = statement.query_map(params![limit as i64], |row| Ok(RunRow {
-            id: row.get(0)?, created: row.get(1)?, fingerprint: row.get(2)?, profile: row.get(3)?,
-            status: row.get(4)?, model: row.get(5)?, hardware: row.get(6)?, quality_failed: row.get::<_, i64>(7)? != 0,
-        }))?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            let record = RunRow { id: row.get(0)?, created: row.get(1)?, fingerprint: row.get(2)?, profile: row.get(3)?,
+                status: row.get(4)?, model: row.get(5)?, hardware: row.get(6)?,
+                quality_failed: row.get::<_, i64>(7)? != 0 };
+            let stored = record.quality_failed;
+            Ok(record.with_current_verdict(&row.get::<_, String>(8)?, stored))
+        })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -135,6 +162,34 @@ mod tests {
             status: RunStatus::Done, profile: "share".into(), plan: vec![],
             server: ServerInfo { model: "m".into(), ..ServerInfo::default() }, fingerprint: fingerprint.into(),
             baseline: None, panels: vec![], fabric: vec![], error: None }
+    }
+
+    /// The listing beside the dashboard's rendered run derives the verdict the
+    /// same way the render itself does: a stored failure of a checkpoint the
+    /// rule in force now calls informational is not listed as a failure, the
+    /// same numbers from a checkpoint the bar still gates are, and a calibrated
+    /// checkpoint with a gate the bar still fails stays a failure.
+    #[test]
+    fn a_listed_run_reads_its_verdict_under_the_rule_in_force_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for (id, algo, failing) in [("nvfp4", "NVFP4", ""), ("weight_only", "W4A16_NVFP4", ""),
+            ("cache", "NVFP4", "cache_exact"), ("spec", "NVFP4", "spec_lossless")] {
+            // Each run owns its checkpoint directory: the rule reads the config
+            // beside the run, not one a later run overwrote.
+            let mut report = crate::sample::qwen_nvfp4_max(&dir.path().join(id), algo, failing);
+            report.id = id.into();
+            assert!(report.quality_failed(), "the run was stored as a failure");
+            store.save(&report).unwrap();
+        }
+        let rows = store.list(10).unwrap();
+        let row = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
+        assert!(!row("nvfp4").quality_failed);
+        assert!(row("weight_only").quality_failed);
+        // A failure beside the reclassified check is still a failure.
+        assert!(row("cache").quality_failed);
+        assert!(row("spec").quality_failed);
+        assert_eq!(rows.len(), 4);
     }
 
     #[test]

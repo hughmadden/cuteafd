@@ -1119,6 +1119,7 @@ done
 docker cp "$coordinator_container:/opt/cuteafd/lib/exl3" "$repo_root/dist/coordinator/exl3"
 docker cp "$coordinator_container:/opt/cuteafd/lib/fp8" "$repo_root/dist/coordinator/fp8"
 docker cp "$coordinator_container:/opt/cuteafd/share/V41_EXPERT_AOT.json" "$repo_root/dist/coordinator/V41_EXPERT_AOT.json"
+docker cp "$coordinator_container:/opt/cuteafd/share/V41_EXPERT_WORKSPACES" "$repo_root/dist/coordinator/V41_EXPERT_WORKSPACES"
 docker cp "$coordinator_container:/opt/cuteafd/share/V41_EXPERT_TP_AOT.json" "$repo_root/dist/coordinator/V41_EXPERT_TP_AOT.json"
 docker cp "$coordinator_container:/opt/cuteafd/share/V41_FP8_AOT.json" "$repo_root/dist/coordinator/V41_FP8_AOT.json"
 docker cp \
@@ -1159,6 +1160,7 @@ docker cp "$container:/opt/cuteafd/lib/libcuteafd_native.so" "$destination/libcu
 docker cp "$container:/opt/cuteafd/lib/exl3" "$destination/exl3"
 docker cp "$container:/opt/cuteafd/lib/fp8" "$destination/fp8"
 docker cp "$container:/opt/cuteafd/share/V41_EXPERT_AOT.json" "$destination/V41_EXPERT_AOT.json"
+docker cp "$container:/opt/cuteafd/share/V41_EXPERT_WORKSPACES" "$destination/V41_EXPERT_WORKSPACES"
 docker cp "$container:/opt/cuteafd/share/V41_EXPERT_TP_AOT.json" "$destination/V41_EXPERT_TP_AOT.json"
 docker cp "$container:/opt/cuteafd/share/V41_FP8_AOT.json" "$destination/V41_FP8_AOT.json"
 docker cp \
@@ -1246,6 +1248,7 @@ done
     spark-expert/XGRAMMAR_PROVENANCE.json \
     spark-expert/XGRAMMAR_LICENSE \
     spark-expert/XGRAMMAR_SHA256SUMS \
+    $(find coordinator/V41_EXPERT_WORKSPACES spark-expert/V41_EXPERT_WORKSPACES -type f | LC_ALL=C sort) \
     "${dist_exl3_manifests[@]}" \
     "${dist_source_manifest[@]}" >SHA256SUMS
   sha256sum -c SHA256SUMS
