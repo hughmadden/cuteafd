@@ -1049,9 +1049,10 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         if sweeping {
             let sweep = run_sweep()?;
             std::fs::write(dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
-            outcome.fabric.extend(sweep.points.iter().filter_map(|p| p.fabric.as_ref())
+            report.fabric.extend(sweep.points.iter().filter_map(|p| p.fabric.as_ref())
                 .chain(sweep.prefill.iter().filter_map(|p| p.fabric.as_ref()))
                 .filter_map(|p| serde_json::from_value::<crate::fabric::Phase>(p.clone()).ok()));
+            crate::cli::write_exports(&report, &dir, &options.export)?;
             outcome.sweep = Some(sweep);
         }
         Ok(Some(report))
