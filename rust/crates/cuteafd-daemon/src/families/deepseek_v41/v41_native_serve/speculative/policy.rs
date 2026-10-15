@@ -293,8 +293,11 @@ mod tests {
         // The copied request adds none: exactly request 1's evidence alone.
         assert_eq!(copy.stats().position_reached, solo.stats().position_reached);
         assert_eq!(copy.stats().position_accepted, solo.stats().position_accepted);
-        assert_eq!(copy.calibration(1), solo.calibration(1));
-        assert_ne!(control.calibration(1), solo.calibration(1));
+        assert_eq!(copy.calibration(2), solo.calibration(1));
+        assert_ne!(control.calibration(2), solo.calibration(1));
+        let cold = DraftPolicy::new(placement(), cuteafd_core::PolicySeed::weak(7), false).unwrap();
+        assert_eq!(copy.calibration(1), cold.calibration(1));
+        assert_eq!(control.calibration(1), cold.calibration(1));
         // Cold policies have no selected prediction.
         assert_eq!((control.stats().predicted_rounds, copy.stats().predicted_rounds), (0, 0));
         // A mixed draft pass teaches its measured, one-request drafter extent.

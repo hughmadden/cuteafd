@@ -364,14 +364,16 @@ mod tests {
             request(4, 3, 3, DraftSource::Copy, Some(Evidence::History(&prior)), None),
         ];
         let routes = routes(18);
-        let before = policy.calibration(1);
+        let before = policy.calibration(requests.len());
+        let c1_before = policy.calibration(1);
         let mut round = record(&requests, &routes, Some(DraftPass { width: 5, requests: Some(3) }));
         round.predicted = None;
         observe(&mut policy, &round).unwrap();
         assert_eq!(policy.stats().position_reached[..4], [2, 2, 1, 0]);
         assert_eq!(policy.stats().position_accepted[..4], [2, 2, 0, 0]);
-        assert_ne!(policy.calibration(1)[0], before[0]);
-        assert_eq!(policy.calibration(1)[3], before[3]);
+        assert_ne!(policy.calibration(requests.len())[0], before[0]);
+        assert_eq!(policy.calibration(requests.len())[3], before[3]);
+        assert_eq!(policy.calibration(1), c1_before);
     }
 
     #[test]
