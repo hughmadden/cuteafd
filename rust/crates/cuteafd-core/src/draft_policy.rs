@@ -21,8 +21,7 @@
 //!   row group. Fitted on the class's summed layer times, which separates the
 //!   classes even when their traffic moves together;
 //! * per round, a residual for everything else (embedding and untimed layers,
-//!   attention, vocabulary head, sampling, commit): one intercept plus a shrunk
-//!   offset per concurrency bucket;
+//!   attention, vocabulary head, sampling, commit): an intercept and row price per concurrency bucket;
 //! * per draft pass, `D + E * requests + wide * (F + G * requests)`.
 //!
 //! Every coefficient is fitted online from the lane's own timings, with
@@ -70,7 +69,7 @@ const PRIOR_SAMPLES: f64 = 0.01;
 pub const MAX_RESOURCE_CLASSES: usize = 4;
 /// Smoothing of a seeded policy's relative prediction error.
 const ERROR_RATE: f64 = 0.1;
-/// Concurrency buckets of the round-residual offsets and drafter costs.
+/// Independent evidence regimes for resource costs and confidence calibration.
 pub const CONCURRENCY_BUCKETS: usize = 4;
 /// C1, C2-4, C5-8 and C9+.
 pub fn draft_concurrency_bucket(requests: usize) -> usize {
@@ -279,10 +278,8 @@ const ROUND_DECAY: f64 = 0.98;
 /// Layer-timed rounds each class fit needs before the policy engages; layer
 /// times may be sampled on a cadence, the physical priors carry the rest.
 const WARM_CLASS_SAMPLES: u64 = 4;
-/// Rounds of prior that hold a concurrency bucket's residual at the pooled
-/// one: the bucket keeps `n / (n + BUCKET_PRIOR_ROUNDS)` of its own mean's
-/// deviation from the pooled residual. A bucket forgets only when it is
-/// observed, so a long C16 phase cannot erase what C1 rounds taught.
+/// Prior rounds shrinking a regime's mean residual correction toward its
+/// seeded line. Only observations in that concurrency bucket update it.
 const BUCKET_PRIOR_ROUNDS: f64 = 4.;
 /// Within one round shape, wall time varies by about a quarter (V4.1 traces:
 /// CV 0.26-0.28). The relative Huber guard starts from that scale, so the
@@ -396,8 +393,8 @@ pub struct DraftCostSnapshot {
     /// Per class: µs per layer, µs per MB, µs per layer and verified row,
     /// samples, relative residual scale.
     pub layers: Vec<[f64; 5]>,
-    /// Round residual: pooled intercept µs, µs per verified row, this
-    /// bucket's offset µs, its effective rounds, relative scale.
+    /// Bucket-local round residual: intercept µs, µs per verified row,
+    /// shrunk correction µs, effective rounds, relative scale.
     pub round: [f64; 5],
     /// Draft pass: intercept µs, µs per request, wide extra µs, wide extra µs
     /// per request, samples, relative residual scale.
@@ -427,38 +424,37 @@ impl DraftCostSnapshot {
 /// Megabytes of expert traffic per resource class.
 type ClassBytes = [f64; MAX_RESOURCE_CLASSES];
 
-/// The lane's cost model: per resource class `layers * a + c * MB`, one round
-/// residual with a shrunk offset per concurrency bucket, and the draft pass
-/// per concurrency bucket.
+/// Independent concurrency-bucket costs: resource-class layer/traffic/row
+/// prices, a round residual line with a shrunk correction, and the draft pass.
 #[derive(Clone, Debug)]
 struct CostModel {
     /// Per class, x = [layers, MB, layers * rows], fitted on the class's
     /// summed layer time.
-    class: Vec<Fit<3>>,
+    class: [Vec<Fit<3>>; CONCURRENCY_BUCKETS],
     /// Per bucket: forgotten weighted moments of the round residual against
     /// [1, rows]: (Σw, Σw·rows, Σw·rows², Σw·y, Σw·rows·y).
     residuals: [[f64; 5]; CONCURRENCY_BUCKETS],
     /// Seed residual intercept and µs per row, and the prior weight in rounds.
     residual_prior: ([f64; 2], f64),
-    /// Pooled residual intercept and µs per row over every round, and each
-    /// bucket's shrunk offset from it.
-    residual: ([f64; 2], [f64; CONCURRENCY_BUCKETS]),
+    /// Per bucket: residual intercept and µs per row, plus its shrunk
+    /// mean correction. No other bucket contributes evidence.
+    residual: [([f64; 2], f64); CONCURRENCY_BUCKETS],
     /// Relative residual scale of the whole round, for the Huber guard.
-    round_scale: f64,
+    round_scale: [f64; CONCURRENCY_BUCKETS],
     /// Per bucket, x = [1, requests, wide, wide * requests].
     draft: Vec<Fit<4>>,
     /// Per bucket [narrow, wide] draft passes observed.
     draft_samples: [[u64; 2]; CONCURRENCY_BUCKETS],
     /// Priced layers per class.
     layers_in: Vec<usize>,
-    rounds: u64,
+    rounds: [u64; CONCURRENCY_BUCKETS],
 }
 
 impl CostModel {
     fn new(geometry: &PolicyGeometry, priced: &[Priced], seed: &PolicySeed) -> Self {
         let layers_in: Vec<usize> = (0..geometry.classes.len())
             .map(|c| priced.iter().filter(|p| p.class == c).count()).collect();
-        let class = geometry.classes.iter().enumerate().map(|(c, class)| {
+        let class: Vec<_> = geometry.classes.iter().enumerate().map(|(c, class)| {
             let layers = layers_in[c] as f64;
             // One row's traffic: every timed layer reads top-k slices.
             let one_row: f64 = priced.iter().filter(|p| p.class == c)
@@ -475,54 +471,49 @@ impl CostModel {
             [n / seed.draft[0].max(1.).powi(2), n / seed.draft[1].max(1.).powi(2), PRIOR_SAMPLES / 400f64.powi(2),
                 PRIOR_SAMPLES / 50f64.powi(2)]);
         Self {
-            class,
+            class: std::array::from_fn(|_| class.clone()),
             residuals: [[0.; 5]; CONCURRENCY_BUCKETS],
             residual_prior: ([seed.round[0], seed.round[1]], n),
-            residual: ([seed.round[0], seed.round[1]], [0.; CONCURRENCY_BUCKETS]),
-            round_scale: INITIAL_RELATIVE_SCALE,
+            residual: [([seed.round[0], seed.round[1]], 0.); CONCURRENCY_BUCKETS],
+            round_scale: [INITIAL_RELATIVE_SCALE; CONCURRENCY_BUCKETS],
             draft: vec![draft; CONCURRENCY_BUCKETS],
             draft_samples: [[0; 2]; CONCURRENCY_BUCKETS],
-            layers_in, rounds: 0,
+            layers_in, rounds: [0; CONCURRENCY_BUCKETS],
         }
     }
-    /// The pooled residual `r0 + s * rows` is fitted on every round (and the
-    /// seed), `s` nonnegative; each bucket keeps `n / (n + BUCKET_PRIOR_ROUNDS)`
-    /// of its own mean deviation from it. A bucket without evidence is the pool.
-    fn solve_residual(&mut self) {
+    /// Fit only this concurrency regime. A cold regime retains its seed;
+    /// wide-round timings must not change a single-request row price.
+    fn solve_residual(&mut self, bucket: usize) {
         let ([r0, s0], prior_weight) = self.residual_prior;
-        let total = |i: usize| self.residuals.iter().map(|m| m[i]).sum::<f64>();
-        let (w, x, xx, y, xy) = (total(0), total(1), total(2), total(3), total(4));
+        let [w, x, xx, y, xy] = self.residuals[bucket];
         // Ridge toward the seed: intercept weight `prior_weight` rounds, row
         // price weight `prior_weight` rounds at the mean row count.
         let mean_rows = if w > 0. { x / w } else { 1. };
         let (pi, ps) = (prior_weight, prior_weight * mean_rows.max(1.).powi(2));
         let a = [[w + pi, x], [x, xx + ps]];
         let b = [y + pi * r0, xy + ps * s0];
-        let pooled = match solve_linear(a, b) {
+        let line = match solve_linear(a, b) {
             Some([intercept, slope]) if slope >= 0. => [intercept, slope],
-            _ => [(y + pi * r0 + ps * 0.) / (w + pi), 0.],
+            _ => [(y + pi * r0) / (w + pi), 0.],
         };
-        // Per bucket: the shrunk mean deviation of its rounds from the pooled
-        // line. A bucket without evidence is the pool.
-        let offsets = self.residuals.map(|m| if m[0] > 0. {
-            (m[3] - pooled[0] * m[0] - pooled[1] * m[1]) / (m[0] + BUCKET_PRIOR_ROUNDS) } else { 0. });
-        self.residual = (pooled, offsets);
+        let offset = if w > 0. { (y - line[0] * w - line[1] * x) / (w + BUCKET_PRIOR_ROUNDS) } else { 0. };
+        self.residual[bucket] = (line, offset);
     }
-    fn layers_us(&self, rows: f64, megabytes: ClassBytes) -> f64 {
-        self.class.iter().enumerate().filter(|&(c, _)| self.layers_in[c] > 0)
+    fn layers_us(&self, bucket: usize, rows: f64, megabytes: ClassBytes) -> f64 {
+        self.class[bucket].iter().enumerate().filter(|&(c, _)| self.layers_in[c] > 0)
             .map(|(c, fit)| fit.predict(&[self.layers_in[c] as f64, megabytes[c], self.layers_in[c] as f64 * rows])).sum()
     }
     fn residual_us(&self, bucket: usize, rows: f64) -> f64 {
-        (self.residual.0[0] + self.residual.0[1] * rows + self.residual.1[bucket]).max(0.)
+        (self.residual[bucket].0[0] + self.residual[bucket].0[1] * rows + self.residual[bucket].1).max(0.)
     }
     /// Predicted µs of the verify round, without the draft pass.
     fn predict(&self, bucket: usize, rows: f64, megabytes: ClassBytes) -> f64 {
-        self.layers_us(rows, megabytes) + self.residual_us(bucket, rows)
+        self.layers_us(bucket, rows, megabytes) + self.residual_us(bucket, rows)
     }
     /// Marginal µs of one more row that brings `megabytes` of new traffic.
     fn marginal(&self, bucket: usize, rows: f64, megabytes: ClassBytes) -> f64 {
         self.residual_us(bucket, rows + 1.) - self.residual_us(bucket, rows)
-            + self.class.iter().enumerate()
+            + self.class[bucket].iter().enumerate()
                 .map(|(c, fit)| fit.theta[1] * megabytes[c] + fit.theta[2] * self.layers_in[c] as f64).sum::<f64>()
     }
     /// Predicted µs of the draft pass.
@@ -532,9 +523,9 @@ impl CostModel {
         self.draft[bucket].predict(&[1., requests, wide, wide * requests])
     }
     /// The class and residual fits have seen enough fully timed rounds.
-    fn warm(&self) -> bool {
-        self.rounds >= WARM_ROUND_SAMPLES
-            && self.class.iter().zip(&self.layers_in).all(|(fit, &n)| n == 0 || fit.samples >= WARM_CLASS_SAMPLES)
+    fn warm(&self, bucket: usize) -> bool {
+        self.rounds[bucket] >= WARM_ROUND_SAMPLES
+            && self.class[bucket].iter().zip(&self.layers_in).all(|(fit, &n)| n == 0 || fit.samples >= WARM_CLASS_SAMPLES)
     }
     fn widths_warm(&self, bucket: usize) -> bool {
         self.draft_samples[bucket].iter().all(|&n| n >= WARM_WIDTH_SAMPLES)
@@ -547,20 +538,20 @@ impl CostModel {
         // The guard is relative to the whole round: a residual is small next
         // to the layer time it sits beside.
         let predicted = self.predict(bucket, rows, megabytes);
-        let weight = Fit::<1>::weigh(&mut self.round_scale, predicted, verify_us);
+        let weight = Fit::<1>::weigh(&mut self.round_scale[bucket], predicted, verify_us);
         if let Some(class_us) = class_us {
-            for (c, fit) in self.class.iter_mut().enumerate() {
+            for (c, fit) in self.class[bucket].iter_mut().enumerate() {
                 let layers = self.layers_in[c] as f64;
                 if layers > 0. { fit.observe([layers, megabytes[c], layers * rows], class_us[c]); }
             }
         }
-        let residual = verify_us - self.layers_us(rows, megabytes);
+        let residual = verify_us - self.layers_us(bucket, rows, megabytes);
         let m = &mut self.residuals[bucket];
         for (moment, value) in m.iter_mut().zip([1., rows, rows * rows, residual, rows * residual]) {
             *moment = ROUND_DECAY * *moment + weight * value;
         }
-        self.solve_residual();
-        self.rounds += 1;
+        self.solve_residual(bucket);
+        self.rounds[bucket] += 1;
     }
     fn observe_draft(&mut self, bucket: usize, requests: f64, wide: bool, elapsed: f64) {
         let flag = f64::from(u8::from(wide));
@@ -570,9 +561,9 @@ impl CostModel {
     fn snapshot(&self, bucket: usize) -> DraftCostSnapshot {
         let draft = &self.draft[bucket];
         DraftCostSnapshot {
-            layers: self.class.iter().map(|f| [f.theta[0], f.theta[1], f.theta[2], f.samples as f64, f.scale]).collect(),
-            round: [self.residual.0[0], self.residual.0[1], self.residual.1[bucket], self.residuals[bucket][0],
-                self.round_scale],
+            layers: self.class[bucket].iter().map(|f| [f.theta[0], f.theta[1], f.theta[2], f.samples as f64, f.scale]).collect(),
+            round: [self.residual[bucket].0[0], self.residual[bucket].0[1], self.residual[bucket].1, self.residuals[bucket][0],
+                self.round_scale[bucket]],
             draft: [draft.theta[0], draft.theta[1], draft.theta[2], draft.theta[3], draft.samples as f64, draft.scale],
             bucket,
         }
@@ -724,7 +715,41 @@ impl DraftPolicyStats {
     }
 }
 
-/// Whole-policy state: route history, cost fit, and statistics.
+/// Confidence evidence observed at one verifier concurrency, including each
+/// request's short memory so a live request changing regimes cannot leak it.
+#[derive(Clone, Debug)]
+struct Confidence {
+    /// Per-position Platt calibration of the drafter's confidence. Confidence
+    /// is conditional on earlier positions being accepted, and its reliability
+    /// varies by position: past the drafter's native block it saturates near
+    /// 0.99 whatever the content, so a slope as well as an offset is needed.
+    /// Each position is refitted online from the outcomes of the rounds that
+    /// reached it.
+    calibration: Vec<Platt>,
+    reached: Vec<u64>,
+    /// Per request, short-memory calibrated confidence per drafted position.
+    recent: BTreeMap<u64, Vec<Option<f64>>>,
+    /// Per request, decayed (accepted, reached) counts per position. Past the
+    /// drafter's native block its confidence carries no content signal, so a
+    /// request's own recent outcomes there (long accepted runs in code, short
+    /// ones in prose) are the only request-specific evidence.
+    outcomes: BTreeMap<u64, Vec<(f64, f64)>>,
+    /// Long-memory mean raw confidence per position, for requests without
+    /// recent evidence at that position.
+    raw_mean: Vec<f64>,
+    /// Native-head and copy-tail priors remain separate within the regime.
+    pooled: [Platt; 2],
+}
+
+impl Confidence {
+    fn new(positions: usize) -> Self {
+        Self { calibration: vec![Platt::new(); positions], reached: vec![0; positions],
+            recent: BTreeMap::new(), outcomes: BTreeMap::new(), raw_mean: vec![0.9; positions],
+            pooled: [Platt::new(); 2] }
+    }
+}
+
+/// Whole-policy state: route history, concurrency-local evidence, and statistics.
 #[derive(Clone, Debug)]
 pub struct DraftPolicy {
     geometry: PolicyGeometry,
@@ -738,24 +763,8 @@ pub struct DraftPolicy {
     history: BTreeMap<u64, VecDeque<Box<[u16]>>>,
     /// Expected new expert groups per layer contributed by a token whose routes
     /// are not yet known (short histories), from observed novelty.
-    novelty: Vec<f64>,
-    /// Per-position Platt calibration of the drafter's confidence. Confidence
-    /// is conditional on earlier positions being accepted, and its reliability
-    /// varies by position: past the drafter's native block it saturates near
-    /// 0.99 whatever the content, so a slope as well as an offset is needed.
-    /// Each position is refitted online from the outcomes of the rounds that
-    /// reached it.
-    calibration: Vec<Platt>,
-    /// Per request, short-memory calibrated confidence per drafted position.
-    recent: BTreeMap<u64, Vec<Option<f64>>>,
-    /// Per request, decayed (accepted, reached) counts per position. Past the
-    /// drafter's native block its confidence carries no content signal, so a
-    /// request's own recent outcomes there (long accepted runs in code, short
-    /// ones in prose) are the only request-specific evidence.
-    outcomes: BTreeMap<u64, Vec<(f64, f64)>>,
-    /// Long-memory mean raw confidence per position, for requests without
-    /// recent evidence at that position.
-    raw_mean: Vec<f64>,
+    novelty: [Vec<f64>; CONCURRENCY_BUCKETS],
+    confidence: [Confidence; CONCURRENCY_BUCKETS],
     /// Draft passes since each width (narrow, wide) last ran, per bucket.
     since_width: [[u64; 2]; CONCURRENCY_BUCKETS],
     stats: DraftPolicyStats,
@@ -777,16 +786,12 @@ pub struct DraftPolicy {
     /// Per concurrency bucket: timed rounds and smoothed relative error of
     /// the out-of-sample round prediction.
     timed: [(u64, f64); CONCURRENCY_BUCKETS],
-    /// All buckets together: what engages a bucket that has not been timed yet.
-    pooled_timed: (u64, f64),
     engaged: [bool; CONCURRENCY_BUCKETS],
     /// Verify drafts while their calibrated survival is at least one half,
     /// instead of pricing each row (opt-in comparison rule).
     survival_lengths: bool,
     /// Bucket and regime of the latest selection, for traces.
     selected_cell: Option<(usize, bool)>,
-    /// Native head and constant copy-tail evidence must not train one another.
-    pooled: [Platt; 2],
     action_age: BTreeMap<(usize, usize), u64>,
     /// Outstanding extent per request; independent lanes may share a regime.
     selected_requests: BTreeMap<u64, usize>,
@@ -819,21 +824,17 @@ impl DraftPolicy {
         Self {
             cost: CostModel::new(&geometry, &priced, &seed),
             timed: [(0, 1.); CONCURRENCY_BUCKETS],
-            pooled_timed: (0, 1.),
             engaged: [false; CONCURRENCY_BUCKETS],
             survival_lengths: false, selected_cell: None,
             since_width: [[0; 2]; CONCURRENCY_BUCKETS],
             selected_requests: BTreeMap::new(),
             selected_rows: BTreeMap::new(),
             selected_draft_room: BTreeMap::new(), skipped: BTreeMap::new(),
-            pooled: [Platt::new(); 2],
             action_age: BTreeMap::new(),
             seed, priced, fixed,
             history: BTreeMap::new(),
-            novelty: vec![2.5; geometry.layers.len()],
-            calibration: vec![Platt::new(); positions],
-            recent: BTreeMap::new(), outcomes: BTreeMap::new(),
-            raw_mean: vec![0.9; positions],
+            novelty: std::array::from_fn(|_| vec![2.5; geometry.layers.len()]),
+            confidence: std::array::from_fn(|_| Confidence::new(positions)),
             stats: DraftPolicyStats::new(positions),
             counts: vec![0; WINDOWS * geometry.layers.len() * usize::from(geometry.experts)],
             unknown_groups: vec![0.; WINDOWS * geometry.layers.len()], dynamic_grouping,
@@ -880,8 +881,8 @@ impl DraftPolicy {
     pub fn cost_snapshot(&self, _shared: bool, requests: usize) -> DraftCostSnapshot {
         self.cost.snapshot(draft_concurrency_bucket(requests))
     }
-    pub fn warm(&self, _shared: bool, _requests: usize) -> bool {
-        self.cost.warm()
+    pub fn warm(&self, _shared: bool, requests: usize) -> bool {
+        self.cost.warm(draft_concurrency_bucket(requests))
     }
     pub fn engaged(&self, _shared: bool, requests: usize) -> bool {
         self.engaged[draft_concurrency_bucket(requests)]
@@ -913,37 +914,41 @@ impl DraftPolicy {
         self.selected_rows.remove(&id);
         self.selected_draft_room.remove(&id);
         self.skipped.remove(&id);
-        self.recent.remove(&id);
-        self.outcomes.remove(&id);
+        for confidence in &mut self.confidence {
+            confidence.recent.remove(&id);
+            confidence.outcomes.remove(&id);
+        }
     }
     /// Draft widths the drafter can switch between.
     pub fn widths(&self) -> &[usize] {
         &self.geometry.widths
     }
     /// Learned (slope, offset) on the raw logit, per draft position.
-    pub fn calibration(&self) -> Vec<(f64, f64)> {
-        self.calibration.iter().map(|platt| (platt.theta[0], platt.theta[1])).collect()
+    pub fn calibration(&self, requests: usize) -> Vec<(f64, f64)> {
+        self.confidence[draft_concurrency_bucket(requests)].calibration.iter().map(|platt| (platt.theta[0], platt.theta[1])).collect()
     }
-    fn calibrated(&self, position: usize, probability: f64) -> f64 {
-        if self.stats.position_reached[position] < POOLED_BELOW {
-            return self.pooled[usize::from(position >= *self.geometry.widths.last().unwrap())].apply(probability);
+    fn calibrated(&self, bucket: usize, position: usize, probability: f64) -> f64 {
+        let confidence = &self.confidence[bucket];
+        if confidence.reached[position] < POOLED_BELOW {
+            return confidence.pooled[usize::from(position >= *self.geometry.widths.last().unwrap())].apply(probability);
         }
-        self.calibration[position].apply(probability)
+        confidence.calibration[position].apply(probability)
     }
     /// Acceptance probability of `position` for request `id`: the calibrated
     /// confidence inside the native block, and past it the request's own
     /// recent outcomes shrunk toward that calibrated rate.
-    fn request_probability(&self, id: u64, position: usize, calibrated: f64) -> f64 {
+    fn request_probability(&self, bucket: usize, id: u64, position: usize, calibrated: f64) -> f64 {
         if position < self.native_confidence_positions { return calibrated; }
-        let (hits, trials) = self.outcomes.get(&id).map_or((0., 0.), |o| o[position]);
+        let (hits, trials) = self.confidence[bucket].outcomes.get(&id).map_or((0., 0.), |o| o[position]);
         (hits + OUTCOME_PRIOR * calibrated) / (trials + OUTCOME_PRIOR)
     }
 
     /// Conditional acceptance used for one request, exposed for opt-in decision
     /// diagnostics. This does not advance calibration or route history.
-    pub fn probabilities(&self, candidate: DraftCandidate<'_>) -> Vec<f64> {
+    pub fn probabilities(&self, requests: usize, candidate: DraftCandidate<'_>) -> Vec<f64> {
+        let bucket = draft_concurrency_bucket(requests);
         candidate.confidence.iter().enumerate().take(self.geometry.max_positions)
-            .map(|(position, &p)| self.request_probability(candidate.id, position, self.calibrated(position, p)))
+            .map(|(position, &p)| self.request_probability(bucket, candidate.id, position, self.calibrated(bucket, position, p)))
             .collect()
     }
 
@@ -969,6 +974,7 @@ impl DraftPolicy {
     /// Forecast expert megabytes per resource class of explicit lengths,
     /// for diagnostics and traces. Does not touch the fits.
     pub fn forecast_megabytes(&mut self, ids: &[u64], lengths: &[usize]) -> Vec<f64> {
+        let bucket = draft_concurrency_bucket(ids.len());
         if ids.len() != lengths.len()
             || ids.len().saturating_add(lengths.iter().sum::<usize>()) > self.geometry.verify_capacity() {
             return vec![f64::NAN; self.geometry.classes.len()];
@@ -977,7 +983,7 @@ impl DraftPolicy {
         self.use_grouping(ids.len() + lengths.iter().sum::<usize>());
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
-            for row in 0..=length { add_bytes(&mut megabytes, self.add_row(id, row, index)); }
+            for row in 0..=length { add_bytes(&mut megabytes, self.add_row(bucket, id, row, index)); }
         }
         megabytes[..self.geometry.classes.len()].to_vec()
     }
@@ -988,7 +994,7 @@ impl DraftPolicy {
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
             for row in 0..=length {
-                add_bytes(&mut megabytes, self.add_row(id, row, index));
+                add_bytes(&mut megabytes, self.add_row(bucket, id, row, index));
             }
         }
         let draft = if width == 0 { 0. } else {
@@ -1041,7 +1047,7 @@ impl DraftPolicy {
         for (c, &n) in candidates.iter().zip(lengths) {
             let mut product = 1.;
             for (position, &p) in c.confidence.iter().enumerate().take(n) {
-                product *= self.request_probability(c.id, position, self.calibrated(position, p));
+                product *= self.request_probability(bucket, c.id, position, self.calibrated(bucket, position, p));
                 expected += product;
             }
         }
@@ -1090,7 +1096,7 @@ impl DraftPolicy {
         let cumulative: Vec<Vec<f64>> = candidates.iter().map(|c| {
             let mut product = 1.;
             c.confidence.iter().enumerate().map(|(position, &p)| {
-                product *= self.request_probability(c.id, position, self.calibrated(position, p));
+                product *= self.request_probability(bucket, c.id, position, self.calibrated(bucket, position, p));
                 product
             }).collect()
         }).collect();
@@ -1117,8 +1123,9 @@ impl DraftPolicy {
 
     /// Choose the draft width for the lane's next round from each request's
     /// recent calibrated confidence. `requests` are (identity, most drafts the
-    /// request can use). Both widths are scored by the same length selector,
-    /// each charged its own predicted draft pass; the better expected ratio
+    /// request can use), including every verifier anchor with zero room for
+    /// nonparticipants. Both widths use that verifier concurrency bucket and
+    /// price only participating requests; the better expected ratio
     /// wins, ties going to the narrow width.
     pub fn choose_width(&mut self, shared: bool, requests: &[(u64, usize)]) -> usize {
         let (narrow, wide) = self.geometry.narrow_wide();
@@ -1137,16 +1144,17 @@ impl DraftPolicy {
         let mut best: Option<(usize, f64)> = None;
         for width in [narrow, wide] {
             let cumulative: Vec<Vec<f64>> = requests.iter().map(|&(id, available)| {
-                let recent = self.recent.get(&id);
+                let recent = self.confidence[bucket].recent.get(&id);
                 let mut product = 1.;
                 (0..width.min(available)).map(|position| {
                     let p = recent.and_then(|r| r[position])
-                        .unwrap_or_else(|| self.calibrated(position, self.raw_mean[position]));
-                    product *= self.request_probability(id, position, p);
+                        .unwrap_or_else(|| self.calibrated(bucket, position, self.confidence[bucket].raw_mean[position]));
+                    product *= self.request_probability(bucket, id, position, p);
                     product
                 }).collect()
             }).collect();
-            let draft = self.cost.draft_us(bucket, ids.len() as f64, width > narrow);
+            let drafted = requests.iter().filter(|r| r.1 > 0).count();
+            let draft = self.cost.draft_us(bucket, drafted as f64, width > narrow);
             if let Some((_, narrow_ratio)) = best.filter(|_| width > narrow) {
                 // Exact pruning: no wide shape beats every expected token over
                 // the anchors-only time with the wide pass.
@@ -1205,12 +1213,12 @@ impl DraftPolicy {
         let mut best: Option<(usize, f64)> = None;
         for (index, action) in actions.iter().enumerate() {
             let cumulative: Vec<Vec<f64>> = requests.iter().enumerate().map(|(request, &(id, _))| {
-                let recent = self.recent.get(&id);
+                let recent = self.confidence[bucket].recent.get(&id);
                 let mut product = 1.;
                 (0..action.width.min(room(index, request))).map(|position| {
                     let p = recent.and_then(|r| r[position])
-                        .unwrap_or_else(|| self.calibrated(position, self.raw_mean[position]));
-                    product *= self.request_probability(id, position, p);
+                        .unwrap_or_else(|| self.calibrated(bucket, position, self.confidence[bucket].raw_mean[position]));
+                    product *= self.request_probability(bucket, id, position, p);
                     product
                 }).collect()
             }).collect();
@@ -1276,7 +1284,7 @@ impl DraftPolicy {
         self.use_grouping(ids.len());
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, &id) in ids.iter().enumerate() {
-            add_bytes(&mut megabytes, self.add_row(id, 0, index));
+            add_bytes(&mut megabytes, self.add_row(bucket, id, 0, index));
         }
         let mut rows = ids.len();
         let mut lengths = vec![0usize; ids.len()];
@@ -1292,7 +1300,7 @@ impl DraftPolicy {
             for (index, _, id) in overdue {
                 if rows >= max_rows { break; }
                 if self.use_grouping(rows + 1) { megabytes = self.counted_megabytes(); }
-                add_bytes(&mut megabytes, self.add_row(id, 1, index));
+                add_bytes(&mut megabytes, self.add_row(bucket, id, 1, index));
                 lengths[index] = 1;
                 rows += 1;
                 expected += cumulative[index][0];
@@ -1317,7 +1325,7 @@ impl DraftPolicy {
             for (index, &id) in ids.iter().enumerate() {
                 let next = lengths[index] + 1;
                 if next > cumulative[index].len() { continue; }
-                let delta = self.peek_row(id, next);
+                let delta = self.peek_row(bucket, id, next);
                 let candidate_expected = expected + cumulative[index][next - 1];
                 // Exact: the shape's price grows by the new traffic's price.
                 let candidate_time = time + self.cost.marginal(bucket, rows as f64, delta);
@@ -1329,7 +1337,7 @@ impl DraftPolicy {
             let Some((index, candidate_expected, candidate_time)) = choice else { break };
             lengths[index] += 1;
             rows += 1;
-            add_bytes(&mut megabytes, self.add_row(ids[index], lengths[index], index));
+            add_bytes(&mut megabytes, self.add_row(bucket, ids[index], lengths[index], index));
             expected = candidate_expected;
             time = candidate_time;
             // Prefer the longer shape on an exact tie.
@@ -1376,7 +1384,7 @@ impl DraftPolicy {
         self.use_grouping(ids.len() + lengths.iter().sum::<usize>());
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
-            for row in 0..=length { add_bytes(&mut megabytes, self.add_row(id, row, index)); }
+            for row in 0..=length { add_bytes(&mut megabytes, self.add_row(bucket, id, row, index)); }
         }
         let rows = ids.len() + lengths.iter().sum::<usize>();
         self.cost.predict(bucket, rows as f64, megabytes) + draft_us
@@ -1433,8 +1441,8 @@ impl DraftPolicy {
 
     /// Megabytes of new weight traffic per class if row `row` of `id` joined
     /// the current shape, averaged over the forecast windows.
-    fn peek_row(&self, id: u64, row: usize) -> ClassBytes {
-        if self.saturated { return self.peek_row_counts(id, row); }
+    fn peek_row(&self, bucket: usize, id: u64, row: usize) -> ClassBytes {
+        if self.saturated { return self.peek_row_counts(bucket, id, row); }
         let topk = usize::from(self.geometry.topk);
         let words = usize::from(self.geometry.experts).div_ceil(64);
         let layers = self.geometry.layers.len();
@@ -1451,18 +1459,18 @@ impl DraftPolicy {
                             .filter(|&&e| occupied[usize::from(e) >> 6] >> (e & 63) & 1 == 0).count() as f64
                     }
                     None if row == 0 => topk as f64,
-                    None => self.novelty[priced.layer],
+                    None => self.novelty[bucket][priced.layer],
                 };
                 total[priced.class] += groups * priced.slice_bytes;
             }
         }
         let total = total.map(|bytes| bytes / WINDOWS as f64 / 1e6);
-        debug_assert_eq!(total, self.peek_row_counts(id, row));
+        debug_assert_eq!(total, self.peek_row_counts(bucket, id, row));
         total
     }
 
     /// The count-table forecast `peek_row` must equal.
-    fn peek_row_counts(&self, id: u64, row: usize) -> ClassBytes {
+    fn peek_row_counts(&self, bucket: usize, id: u64, row: usize) -> ClassBytes {
         let topk = usize::from(self.geometry.topk);
         let mut total = [0.; MAX_RESOURCE_CLASSES];
         for window in 0..WINDOWS {
@@ -1473,7 +1481,7 @@ impl DraftPolicy {
                         .filter(|&&e| self.counts[self.count_index(window, priced.layer, e)] % u16::from(priced.group_rows) == 0)
                         .count() as f64,
                     None if row == 0 => topk as f64,
-                    None => self.novelty[priced.layer],
+                    None => self.novelty[bucket][priced.layer],
                 };
                 total[priced.class] += groups * priced.slice_bytes;
             }
@@ -1481,15 +1489,15 @@ impl DraftPolicy {
         total.map(|bytes| bytes / WINDOWS as f64 / 1e6)
     }
 
-    fn add_row(&mut self, id: u64, row: usize, _request: usize) -> ClassBytes {
-        let delta = self.peek_row(id, row);
+    fn add_row(&mut self, bucket: usize, id: u64, row: usize, _request: usize) -> ClassBytes {
+        let delta = self.peek_row(bucket, id, row);
         let topk = usize::from(self.geometry.topk);
         for window in 0..WINDOWS {
             let Some(token) = self.history.get(&id).and_then(|h| h.get(window + row)) else {
                 if self.dynamic_grouping {
                     for priced in &self.priced {
                         self.unknown_groups[window * self.geometry.layers.len() + priced.layer] +=
-                            if row == 0 { topk as f64 } else { self.novelty[priced.layer] };
+                            if row == 0 { topk as f64 } else { self.novelty[bucket][priced.layer] };
                     }
                 }
                 continue;
@@ -1565,23 +1573,14 @@ impl DraftPolicy {
             let predicted = self.cost.predict(bucket, rows as f64, megabytes)
                 + if drafted { self.cost.draft_us(bucket, drafted_requests, round.wide) } else { 0. };
             let relative = ((round.total_us - predicted) / round.total_us.max(1.)).abs().min(1.);
-            // A running mean over the first rounds, then exponential smoothing.
-            for (count, error) in [&mut self.timed[bucket], &mut self.pooled_timed] {
-                *count += 1;
-                *error += (relative - *error) * (1. / *count as f64).max(ERROR_RATE);
-            }
+            // Evidence, forgetting, and engagement are local to this regime.
+            let (count, error) = &mut self.timed[bucket];
+            *count += 1;
+            *error += (relative - *error) * (1. / *count as f64).max(ERROR_RATE);
             self.cost.observe_round(bucket, rows as f64, megabytes, complete.then_some(&class_us[..]),
                 round.total_us - draft_us);
-            // A bucket engages on its own prediction health once it has
-            // evidence, and on the pooled health before that.
-            let (pooled_count, pooled_error) = self.pooled_timed;
-            let warm = self.cost.warm();
-            for bucket in 0..CONCURRENCY_BUCKETS {
-                let (local_count, local_error) = self.timed[bucket];
-                let local_weight = local_count as f64 / (local_count as f64 + WARM_ROUND_SAMPLES as f64);
-                let error = local_weight * local_error + (1. - local_weight) * pooled_error;
-                self.engaged[bucket] |= warm && pooled_count >= self.seed.warm_rounds && error <= self.seed.warm_error;
-            }
+            self.engaged[bucket] |= self.cost.warm(bucket) && *count >= self.seed.warm_rounds
+                && *error <= self.seed.warm_error;
         }
         if drafted {
             let wide = usize::from(round.wide);
@@ -1608,7 +1607,7 @@ impl DraftPolicy {
                         let novel = token[layer * topk..][..topk].iter()
                             .filter(|e| !history.iter().take(3).any(|t| t[layer * topk..][..topk].contains(e)))
                             .count();
-                        self.novelty[layer] = 0.995 * self.novelty[layer] + 0.005 * novel as f64;
+                        self.novelty[bucket][layer] = 0.995 * self.novelty[bucket][layer] + 0.005 * novel as f64;
                     }
                 }
                 history.push_front(token);
@@ -1623,14 +1622,14 @@ impl DraftPolicy {
                     let age = self.skipped.entry(request.id).or_default();
                     *age = age.saturating_add(1);
                 }
-                if let Some(recent) = self.recent.get_mut(&request.id) {
+                if let Some(recent) = self.confidence[bucket].recent.get_mut(&request.id) {
                     for (position, value) in recent.iter_mut().enumerate() {
-                        let pooled = self.pooled[usize::from(position >= *self.geometry.widths.last().unwrap())]
-                            .apply(self.raw_mean[position]);
+                        let pooled = self.confidence[bucket].pooled[usize::from(position >= *self.geometry.widths.last().unwrap())]
+                            .apply(self.confidence[bucket].raw_mean[position]);
                         if let Some(value) = value { *value += SKIP_FORGET_RATE * (pooled - *value); }
                     }
                 }
-                if let Some(counts) = self.outcomes.get_mut(&request.id) {
+                if let Some(counts) = self.confidence[bucket].outcomes.get_mut(&request.id) {
                     for count in counts { count.0 *= OUTCOME_DECAY; count.1 *= OUTCOME_DECAY; }
                 }
             } else {
@@ -1645,29 +1644,30 @@ impl DraftPolicy {
                 // request's short-memory estimate used to choose the next
                 // round's width, whether or not the position was verified.
                 let calibrated: Vec<f64> = confidence.iter().enumerate().take(positions)
-                    .map(|(position, &raw)| self.calibrated(position, raw)).collect();
-                let recent = self.recent.entry(request.id).or_insert_with(|| vec![None; positions]);
+                    .map(|(position, &raw)| self.calibrated(bucket, position, raw)).collect();
+                let recent = self.confidence[bucket].recent.entry(request.id).or_insert_with(|| vec![None; positions]);
                 for ((position, &raw), calibrated) in confidence.iter().enumerate().take(positions).zip(calibrated) {
                     recent[position] = Some(match recent[position] {
                         Some(previous) => previous + RECENT_RATE * (calibrated - previous),
                         None => calibrated,
                     });
-                    self.raw_mean[position] += 0.02 * (raw - self.raw_mean[position]);
+                    self.confidence[bucket].raw_mean[position] += 0.02 * (raw - self.confidence[bucket].raw_mean[position]);
                 }
                 // Only positions whose predecessors were all accepted carry
                 // evidence about the conditional acceptance probability.
                 let reached = drafts.min(confidence.len()).min(accepted + 1).min(positions);
                 for position in 0..reached {
                     let outcome = f64::from(u8::from(position < accepted));
-                    let calibrated = self.calibrated(position, confidence[position]);
+                    let calibrated = self.calibrated(bucket, position, confidence[position]);
+                    self.confidence[bucket].reached[position] += 1;
                     self.stats.position_reached[position] += 1;
                     self.stats.position_confidence[position] += calibrated;
                     self.stats.position_raw_confidence[position] += confidence[position];
                     self.stats.position_accepted[position] += u64::from(position < accepted);
-                    self.calibration[position].observe(confidence[position], outcome);
-                    self.pooled[usize::from(position >= *self.geometry.widths.last().unwrap())].observe(confidence[position], outcome);
+                    self.confidence[bucket].calibration[position].observe(confidence[position], outcome);
+                    self.confidence[bucket].pooled[usize::from(position >= *self.geometry.widths.last().unwrap())].observe(confidence[position], outcome);
                 }
-                let counts = self.outcomes.entry(request.id).or_insert_with(|| vec![(0., 0.); positions]);
+                let counts = self.confidence[bucket].outcomes.entry(request.id).or_insert_with(|| vec![(0., 0.); positions]);
                 for count in counts.iter_mut() { count.0 *= OUTCOME_DECAY; count.1 *= OUTCOME_DECAY; }
                 for position in 0..reached {
                     counts[position].0 += f64::from(u8::from(position < accepted));
@@ -2005,8 +2005,8 @@ mod tests {
             }
         }
         policy.clear_counts();
-        let first = policy.add_row(1, 0, 0);
-        let second = policy.add_row(2, 0, 1);
+        let first = policy.add_row(0, 1, 0, 0);
+        let second = policy.add_row(0, 2, 0, 1);
         assert!(first[1] > 0.);
         assert_eq!(second[1], 0.);
     }
@@ -2048,7 +2048,7 @@ mod tests {
             if round == 600 {
                 // Position 6 has been reached ~460 times: already close.
                 assert!(policy.stats().position_reached[5] < 520);
-                assert!((policy.calibrated(5, 0.95) - 0.8).abs() < 0.05, "{:?}", policy.calibration());
+                assert!((policy.calibrated(0, 5, 0.95) - 0.8).abs() < 0.05, "{:?}", policy.calibration(1));
             }
             let truth = [0.95, 0.95, 0.95, 0.95, 0.95, 0.8, 0.8];
             let accepted = truth.iter().take_while(|&&p| uniform() < p).count();
@@ -2056,8 +2056,8 @@ mod tests {
             policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
                 layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         }
-        assert!((policy.calibrated(0, 0.95) - 0.95).abs() < 0.02, "{:?}", policy.calibration());
-        assert!((policy.calibrated(5, 0.95) - 0.8).abs() < 0.03, "{:?}", policy.calibration());
+        assert!((policy.calibrated(0, 0, 0.95) - 0.95).abs() < 0.02, "{:?}", policy.calibration(1));
+        assert!((policy.calibrated(0, 5, 0.95) - 0.8).abs() < 0.03, "{:?}", policy.calibration(1));
         // Reliability stats report the calibrated confidence the policy used.
         let stats = policy.stats();
         let mean = stats.position_confidence[5] / stats.position_reached[5] as f64;
@@ -2118,15 +2118,15 @@ mod tests {
         let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(7), false).unwrap();
         let mut token = 0;
         for _ in 0..400 { width_round(&mut policy, &mut token, 99, 5, 6, 6, &[0.9; 5]); }
-        policy.recent.insert(1, vec![Some(0.01); 9]);
-        policy.pooled[1].theta = [0., -4.];
-        let head = policy.pooled[0].apply(policy.raw_mean[0]);
-        let tail = policy.pooled[1].apply(policy.raw_mean[7]);
-        let before = policy.recent[&1].clone();
+        policy.confidence[0].recent.insert(1, vec![Some(0.01); 9]);
+        policy.confidence[0].pooled[1].theta = [0., -4.];
+        let head = policy.confidence[0].pooled[0].apply(policy.confidence[0].raw_mean[0]);
+        let tail = policy.confidence[0].pooled[1].apply(policy.confidence[0].raw_mean[7]);
+        let before = policy.confidence[0].recent[&1].clone();
         width_round(&mut policy, &mut token, 1, 5, 1, 1, &[]);
-        assert!((policy.recent[&1][0].unwrap() - (0.01 + SKIP_FORGET_RATE * (head - 0.01))).abs() < 1e-12);
-        assert!((policy.recent[&1][7].unwrap() - (0.01 + SKIP_FORGET_RATE * (tail - 0.01))).abs() < 1e-12);
-        assert_ne!(before, policy.recent[&1]);
+        assert!((policy.confidence[0].recent[&1][0].unwrap() - (0.01 + SKIP_FORGET_RATE * (head - 0.01))).abs() < 1e-12);
+        assert!((policy.confidence[0].recent[&1][7].unwrap() - (0.01 + SKIP_FORGET_RATE * (tail - 0.01))).abs() < 1e-12);
+        assert_ne!(before, policy.confidence[0].recent[&1]);
         assert!(!policy.skipped.contains_key(&1), "unselected rounds do not create exploration obligations");
     }
 
@@ -2166,6 +2166,7 @@ mod tests {
         let mut token = 0;
         for _ in 0..400 { width_round(&mut policy, &mut token, 99, 5, 6, 6, &[0.9; 5]); }
         for id in 1..=3 { policy.skipped.insert(id, REQUEST_EXPLORE_SKIPS + id); }
+        policy.engaged[1] = true;
         let candidates = [DraftCandidate { id: 1, confidence: &[0.001; 5] },
             DraftCandidate { id: 2, confidence: &[0.001; 5] }, DraftCandidate { id: 3, confidence: &[] }];
         let selected = policy.select_within(false, &candidates, 5, 4).unwrap().unwrap();
@@ -2263,6 +2264,7 @@ mod tests {
         let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let mut token = 0;
         for _ in 0..400 { width_round(&mut policy, &mut token, 99, 5, 6, 6, &[0.99; 5]); }
+        policy.engaged[1] = true;
         let requests = [(1, 5), (2, 5)];
         let actions = [DraftAction { width: 0, draft_us: 0. },
             DraftAction { width: 3, draft_us: 1e12 }, DraftAction { width: 5, draft_us: 1e12 }];
@@ -2290,6 +2292,7 @@ mod tests {
         let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         let mut token = 0;
         for _ in 0..400 { width_round(&mut policy, &mut token, 99, 5, 6, 6, &[0.99; 5]); }
+        policy.engaged[1] = true;
         let requests = [(1, 5), (2, 5), (3, 5), (4, 5)];
         let actions = [DraftAction { width: 0, draft_us: 0. },
             DraftAction { width: 3, draft_us: policy.draft_cost_drafted(false, 4, 4, 3) },
@@ -2306,7 +2309,7 @@ mod tests {
             let cumulative: Vec<Vec<_>> = masks[index].iter().map(|&room| {
                 let mut product = 1.;
                 (0..room.min(action.width)).map(|position| {
-                    product *= policy.calibrated(position, policy.raw_mean[position]);
+                    product *= policy.calibrated(1, position, policy.confidence[1].raw_mean[position]);
                     product
                 }).collect()
             }).collect();
@@ -2325,12 +2328,12 @@ mod tests {
         let mut geometry = placement(5);
         geometry.widths = vec![3, 5];
         let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
-        policy.outcomes.insert(1, vec![(0., 10.); 7]);
-        assert!(policy.request_probability(1, 3, 0.9) < 0.9);
+        policy.confidence[0].outcomes.insert(1, vec![(0., 10.); 7]);
+        assert!(policy.request_probability(0, 1, 3, 0.9) < 0.9);
         policy.set_native_confidence_positions(5).unwrap();
-        assert_eq!(policy.request_probability(1, 3, 0.9), 0.9);
-        assert_eq!(policy.request_probability(1, 4, 0.9), 0.9);
-        assert!(policy.request_probability(1, 5, 0.9) < 0.9);
+        assert_eq!(policy.request_probability(0, 1, 3, 0.9), 0.9);
+        assert_eq!(policy.request_probability(0, 1, 4, 0.9), 0.9);
+        assert!(policy.request_probability(0, 1, 5, 0.9) < 0.9);
         assert_eq!(policy.restarted(false).native_confidence_positions, 5);
         assert!(policy.set_native_confidence_positions(0).is_err());
         assert!(policy.set_native_confidence_positions(8).is_err());
@@ -2554,7 +2557,7 @@ mod tests {
                 transcript.real("relative_error", error);
             }
         }
-        for (slope, offset) in policy.calibration() { transcript.real("slope", slope); transcript.real("offset", offset); }
+        for (slope, offset) in policy.calibration(1) { transcript.real("slope", slope); transcript.real("offset", offset); }
         let stats = policy.stats();
         for value in [stats.rounds, stats.selected_rounds, stats.verified_rows, stats.verified_drafts,
             stats.accepted_drafts, stats.emitted_requests, stats.predicted_rounds] { transcript.word("stat", value); }
@@ -2581,7 +2584,7 @@ mod tests {
         if let (Some(dump), Some(path)) = (&transcript.dump, std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP")) {
             std::fs::write(path, dump).unwrap();
         }
-        assert_eq!((transcript.records, transcript.hash), (39_563, 16_572_013_245_602_254_188));
+        assert_eq!((transcript.records, transcript.hash), (39_389, 4_805_264_383_091_156_835));
     }
 
     fn seed() -> PolicySeed {
@@ -2647,6 +2650,84 @@ mod tests {
     }
 
     #[test]
+    fn mixed_c16_width_uses_verifier_bucket_and_prices_one_drafter() {
+        let geometry = v41(|l| l < 5, |_| 4e6, vec![3, 7]);
+        let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(7), false).unwrap();
+        let requests: Vec<_> = (1..=16).map(|id| (id, if id == 1 { 7 } else { 0 })).collect();
+        let observed: Vec<_> = requests.iter().map(|&(id, room)| ObservedDraftRequest {
+            id, rows: if room > 0 { 4 } else { 1 }, accepted: 1,
+            confidence: if room > 0 { Some(&[0.9; 3]) } else { None } }).collect();
+        for _ in 0..8 {
+            policy.observe(DraftRoundObservation { shared: false, requests: &observed,
+                routes: &vec![1; 40 * 19 * 6], layer_us: &[Some(2000.); 40], total_us: 90_000.,
+                draft_us: 1200., drafted_requests: Some(1), wide: false, predicted_us: None }).unwrap();
+        }
+        assert_eq!(policy.cost.draft_samples[3], [8, 0]);
+        assert_eq!(policy.cost.draft_samples[0], [0, 0]);
+        assert_eq!(policy.prediction_health(false, 16).0, 8);
+        assert_eq!(policy.prediction_health(false, 1), (0, 1.));
+        // Only C9+ needs a wide warm-up pass; a borrowed C1 cell picks narrow.
+        assert_eq!(policy.choose_width(false, &requests), 7);
+        assert_eq!(policy.choose_width(false, &[(1, 7)]), 3);
+
+        // With identical confidence, the wide pass pays for one participant
+        // but not sixteen. Nonparticipants still contribute verifier anchors.
+        policy.engaged[3] = true;
+        policy.cost.draft_samples[3] = [8, 8];
+        policy.since_width[3] = [0, 0];
+        policy.confidence[3] = Confidence::new(7);
+        for class in &mut policy.cost.class[3] { class.theta = [0.; 3]; }
+        policy.cost.residual[3] = ([10_000., 0.], 0.);
+        policy.cost.draft[3].theta = [100., 10., 0., 1000.];
+        assert_eq!(policy.choose_width(false, &requests), 7);
+        assert_eq!(policy.choose_width(false, &[(1, 7)]), 3);
+    }
+
+    #[test]
+    fn c16_then_c1_replay_matches_a_c1_only_policy() {
+        let mut cold = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
+        let mut swept = cold.clone();
+        let confidence = [0.85; 7];
+        let mut token = 0;
+        for _ in 0..100 {
+            let requests: Vec<_> = (0..16).map(|id| ObservedDraftRequest {
+                id: 100 + id, rows: 8, accepted: 8, confidence: Some(&confidence) }).collect();
+            swept.observe(DraftRoundObservation { shared: false, requests: &requests,
+                routes: &vec![1; 40 * 128 * 6], layer_us: &[Some(4000.); 40], total_us: 180_000.,
+                draft_us: 6000., drafted_requests: Some(16), wide: true, predicted_us: None }).unwrap();
+        }
+        let wide_before = swept.cost_snapshot(false, 16);
+        for policy in [&mut cold, &mut swept] {
+            for id in 100..116 { policy.release(id); }
+        }
+        let mut priced = 0;
+        for round in 0..120 {
+            let candidates = [DraftCandidate { id: 1, confidence: &confidence }];
+            assert_eq!(cold.calibration(1), swept.calibration(1));
+            assert_eq!(cold.probabilities(1, candidates[0]), swept.probabilities(1, candidates[0]));
+            assert_eq!(cold.choose_width(false, &[(1, 7)]), swept.choose_width(false, &[(1, 7)]));
+            let left = cold.select(false, &candidates, 7).unwrap();
+            let right = swept.select(false, &candidates, 7).unwrap();
+            assert_eq!(left, right, "C1 round {round}");
+            priced += usize::from(left.is_some());
+            let accepted = 1 + round % 6;
+            let requests = [ObservedDraftRequest { id: 1, rows: 8, accepted, confidence: Some(&confidence) }];
+            let routes = flat(&(0..40).map(|l| (0..8).map(|r| token_routes(token + r, 24)[l]).collect())
+                .collect::<Vec<_>>());
+            let observation = DraftRoundObservation { shared: false, requests: &requests, routes: &routes,
+                layer_us: &[Some(1000.); 40], total_us: 50_000., draft_us: 3000.,
+                drafted_requests: Some(1), wide: true, predicted_us: None };
+            cold.observe(observation).unwrap();
+            swept.observe(observation).unwrap();
+            token += accepted as u64;
+            assert_eq!(cold.cost_snapshot(false, 1), swept.cost_snapshot(false, 1));
+            assert_eq!(cold.forecast_megabytes(&[999], &[5]), swept.forecast_megabytes(&[999], &[5]));
+        }
+        assert!(priced > 0, "replay must reach priced C1 depth decisions");
+        assert_eq!(swept.cost_snapshot(false, 16), wide_before, "C1 cannot overwrite wide evidence either");
+    }
+
+    #[test]
     fn c16_evidence_cannot_warm_or_reprice_a_cold_c1() {
         let mut swept = DraftPolicy::seeded(placement(5), seed()).unwrap();
         let cold = swept.clone();
@@ -2663,7 +2744,7 @@ mod tests {
     }
 
     #[test]
-    fn c1_costs_survive_a_c16_phase_while_physics_and_history_are_shared() {
+    fn c1_costs_survive_a_c16_phase_while_request_routes_follow_the_request() {
         let mut policy = DraftPolicy::seeded(placement(5), seed()).unwrap();
         let mut token = 0;
         // C1 has its own fixed surcharge (attention split, exchange latency)
@@ -2678,19 +2759,21 @@ mod tests {
         let after = policy.cost_snapshot(false, 1);
         // The C1 evidence is untouched by C16 rounds: it forgets only when C1 is observed.
         assert_eq!(before.round[3], after.round[3]);
-        assert_ne!(before.layers, after.layers);
+        assert_eq!(before, after);
         assert_ne!(history, policy.history[&1]);
-        assert_eq!(policy.prediction_health(false, 1), fresh.clone().prediction_health(false, 1));
+        assert_eq!(policy.prediction_health(false, 1), fresh.prediction_health(false, 1));
+        // A fresh request has identical C1 evidence on both arms, including
+        // its empty route history. Compare before any new C1 training.
+        let candidate = [DraftCandidate { id: 999, confidence: &[0.9; 5] }];
+        let old = fresh.clone().select(false, &candidate, 5).unwrap().unwrap();
+        let swept = policy.select(false, &candidate, 5).unwrap().unwrap();
+        assert_eq!(old, swept);
         // C1 total predictions stay accurate after the wide phase.
         for rows in [2usize, 6] {
             let predicted = policy.predict(false, &[1], &[rows - 1], 5).unwrap() - policy.draft_cost(false, 1, 5);
             let actual = truth_round(&mut policy, &physics(), &mut token, rows, 1, 0., 6000.);
             assert!((predicted - actual).abs() / actual < 0.06, "{rows}: {predicted} vs {actual}");
         }
-        let candidate = [DraftCandidate { id: 1, confidence: &[0.9; 5] }];
-        let old = fresh.clone().select(false, &candidate, 5).unwrap().unwrap();
-        let swept = policy.select(false, &candidate, 5).unwrap().unwrap();
-        assert!(old.lengths[0].abs_diff(swept.lengths[0]) <= 1, "{old:?} {swept:?}");
     }
 
     #[test]
@@ -2762,38 +2845,38 @@ mod tests {
         let mut policy = DraftPolicy::new(placement(8), PolicySeed::weak(7), false).unwrap();
         let (truth, mut token) = (truth(), 0);
         for round in 0..400 { let rows = 1 + round % 8; run_round(&mut policy, &truth, &mut token, rows, rows, None); }
-        let fit = policy.cost_snapshot(false, 4);
+        let fit = policy.cost_snapshot(false, 1);
         let [local, remote] = [fit.layers[0][1], fit.layers[1][1]];
         assert!(local < 2.5 && remote > 4., "local {local} remote {remote} µs/MB");
     }
 
     #[test]
-    fn sparse_buckets_shrink_to_the_pooled_residual() {
+    fn sparse_buckets_keep_their_seed_and_only_learn_their_own_residual() {
         let mut policy = DraftPolicy::seeded(placement(5), seed()).unwrap();
         let (truth, mut token) = (physics(), 0);
         for round in 0..400 { truth_round(&mut policy, &truth, &mut token, 8 * (1 + round % 6), 8, 0., 0.); }
-        // C1 and C9+ have no evidence: they take the pooled residual exactly.
+        // C1 and C9+ have no evidence: retain their seed, not C8's fit.
         // Residual at the bucket's own shape: two rows at C1, 24 at C8.
         let residual = |p: &DraftPolicy, requests: usize| { let f = p.cost_snapshot(false, requests);
             f.round[0] + if requests == 1 { 2. } else { 24. } * f.round[1] + f.round[2] };
         let c8 = residual(&policy, 8);
         for requests in [1, 16] {
             let fit = policy.cost_snapshot(false, requests);
-            assert_eq!(fit.round[2], 0., "{requests}");
+            assert_eq!(fit.round, [seed().round[0], seed().round[1], 0., 0., INITIAL_RELATIVE_SCALE], "{requests}");
+            assert!(!policy.engaged(false, requests));
         }
+        let c8_before = policy.cost_snapshot(false, 8);
         assert!((residual(&policy, 1) - (truth.round[0] + truth.round[2])).abs() < 0.1 * c8);
         // C1 rounds carry 8 ms more: two rounds move C1 part of the way
-        // (shrinkage), sixty move it all the way, and C8 barely moves.
+        // (shrinkage), sixty move it all the way, and C8 stays unchanged.
         let c1 = residual(&policy, 1);
         for _ in 0..2 { truth_round(&mut policy, &truth, &mut token, 2, 1, 0., 8000.); }
         let early = residual(&policy, 1) - c1;
         for _ in 0..60 { truth_round(&mut policy, &truth, &mut token, 2, 1, 0., 8000.); }
-        // C1 rounds also pull the pool, which C8's offset then corrects: the
-        // C1 round prediction approaches the truth and C8's stays put.
         let c1_truth = truth.round[0] + truth.round[2] + 8000.;
         assert!(early > 1000. && early < 5000., "early C1 shift {early}");
         assert!((residual(&policy, 1) - c1_truth).abs() < 0.15 * c1_truth, "C1 residual {}", residual(&policy, 1));
-        assert!((residual(&policy, 8) - c8).abs() < 1500., "C8 moved {}", residual(&policy, 8) - c8);
+        assert_eq!(policy.cost_snapshot(false, 8), c8_before);
     }
 
     /// The decision rule is the old one: given the same prices, forward
@@ -2806,6 +2889,7 @@ mod tests {
         for round in 0..300 { run_round(&mut policy, &truth, &mut token, 1 + round % 8, 1 + round % 8, None); }
         // Route histories for requests 2-4 (request 1 has the warm-up's).
         for id in 2..=4 { for _ in 0..8 { truth_round_id(&mut policy, &truth, &mut token, id); } }
+        policy.engaged[1] = true;
         let mut mix = Mix(0xdec1de);
         for case in 0..200 {
             let requests = 1 + mix.below(4) as usize;
@@ -2882,11 +2966,12 @@ mod tests {
         policy.set_survival_lengths(true);
         let (truth, mut token) = (truth(), 0);
         for round in 0..300 { run_round(&mut policy, &truth, &mut token, 1 + round % 6, 1 + round % 6, None); }
+        policy.engaged[1] = true;
         let candidates = [DraftCandidate { id: 1, confidence: &[0.95, 0.9, 0.7, 0.9, 0.9] },
             DraftCandidate { id: 2, confidence: &[0.4, 0.99, 0.99, 0.99, 0.99] }];
         let survival = |p: &DraftPolicy, c: &DraftCandidate<'_>| {
             let mut product = 1.;
-            p.probabilities(*c).iter().take_while(|&&q| { product *= q; product >= 0.5 }).count()
+            p.probabilities(candidates.len(), *c).iter().take_while(|&&q| { product *= q; product >= 0.5 }).count()
         };
         let expected: Vec<_> = candidates.iter().map(|c| survival(&policy, c)).collect();
         let selection = policy.select(false, &candidates, 5).unwrap().unwrap();
@@ -2920,32 +3005,37 @@ mod tests {
     }
 
     #[test]
-    fn calibration_is_shared_across_buckets_but_native_and_tail_pools_are_separate() {
+    fn calibration_is_concurrency_local_and_native_and_tail_pools_are_separate() {
         let mut geometry = placement(5);
         geometry.max_positions = 8;
         let mut policy = DraftPolicy::new(geometry, PolicySeed::weak(8), false).unwrap();
-        let initial = policy.calibration();
-        let native_pool = policy.pooled[0].theta;
-        // Only tail position seven is reached with a miss; native positions accept.
+        let initial = policy.calibration(1);
+        let native_pool = policy.confidence[3].pooled[0].theta;
         let confidence = [0.9; 8];
+        let cold_request = policy.probabilities(1, DraftCandidate { id: 15, confidence: &confidence });
+        // Only tail position seven is reached with a miss; native positions accept.
         let requests: Vec<_> = (0..16).map(|id| ObservedDraftRequest {
             id, rows: 9, accepted: 8, confidence: Some(&confidence) }).collect();
         policy.observe(DraftRoundObservation { shared: false, requests: &requests,
             routes: &vec![1; 40 * 144 * 6], layer_us: &[None; 40], total_us: f64::NAN,
             draft_us: f64::NAN, drafted_requests: None, wide: false, predicted_us: None }).unwrap();
-        assert_ne!(initial, policy.calibration());
-        assert_ne!(native_pool, policy.pooled[0].theta);
-        assert_ne!(policy.pooled[0].theta, policy.pooled[1].theta);
-        let native_after = policy.pooled[0].theta;
-        let probability = policy.probabilities(DraftCandidate { id: 99, confidence: &[0.9] })[0];
+        assert_eq!(initial, policy.calibration(1));
+        assert_eq!(cold_request, policy.probabilities(1, DraftCandidate { id: 15, confidence: &confidence }));
+        assert!(!policy.confidence[0].recent.contains_key(&15));
+        assert!(!policy.confidence[0].outcomes.contains_key(&15));
+        assert_ne!(initial, policy.calibration(16));
+        assert_ne!(native_pool, policy.confidence[3].pooled[0].theta);
+        assert_ne!(policy.confidence[3].pooled[0].theta, policy.confidence[3].pooled[1].theta);
+        let native_after = policy.confidence[3].pooled[0].theta;
+        let probability = policy.probabilities(16, DraftCandidate { id: 99, confidence: &[0.9] })[0];
         // Training only the tail cannot move a cold native position's prior.
-        for _ in 0..16 { policy.pooled[1].observe(0.9, 0.); }
-        assert_eq!(native_after, policy.pooled[0].theta);
-        assert_eq!(probability, policy.probabilities(DraftCandidate { id: 99, confidence: &[0.9] })[0]);
+        for _ in 0..16 { policy.confidence[3].pooled[1].observe(0.9, 0.); }
+        assert_eq!(native_after, policy.confidence[3].pooled[0].theta);
+        assert_eq!(probability, policy.probabilities(16, DraftCandidate { id: 99, confidence: &[0.9] })[0]);
         assert!(policy.history.contains_key(&15));
-        assert!(policy.recent.contains_key(&15));
+        assert!(policy.confidence[3].recent.contains_key(&15));
         policy.release(15);
-        assert!(!policy.history.contains_key(&15) && !policy.recent.contains_key(&15));
+        assert!(!policy.history.contains_key(&15) && !policy.confidence[3].recent.contains_key(&15));
     }
 
     #[test]

@@ -1042,7 +1042,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         let mut priors = priors;
         let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
             .map(|(((a, d), &limit), prior)| match (shared.as_ref(), d.as_ref()) {
-                (Some(shared), Some(d)) if policy.fixed.is_none() => resource::copy_continuation(&shared.policy,
+                (Some(shared), Some(d)) if policy.fixed.is_none() => resource::copy_continuation(&shared.policy, active.len(),
                     a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
                 _ => None,
             }).collect();

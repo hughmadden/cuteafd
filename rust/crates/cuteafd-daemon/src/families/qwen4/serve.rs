@@ -1020,7 +1020,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             .map(|(((a, proposal), &limit), prior)| {
                 prior.truncate(proposal.len());
                 shared.as_ref().filter(|_| !matches!(drafts, Drafts::Mtp { fixed: true, .. }))
-                    .and_then(|shared| resource::copy_continuation(shared, a.ticket.id(), &a.history,
+                    .and_then(|shared| resource::copy_continuation(shared, active.len(), a.ticket.id(), &a.history,
                         proposal, prior, limit, a.job.sampling.is_greedy()))
             }).collect();
         if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0 && !matches!(drafts, Drafts::Mtp { fixed: true, .. })) {

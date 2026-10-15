@@ -60,9 +60,9 @@ mod tests {
 
     fn assert_fits(left: &DraftPolicy, right: &DraftPolicy) {
         assert_eq!(left.stats(), right.stats());
-        assert_eq!(left.calibration(), right.calibration());
         assert_eq!(left.selected_cell(), right.selected_cell());
         for requests in [1, 4, 8, 16] {
+            assert_eq!(left.calibration(requests), right.calibration(requests));
             assert_eq!(left.cost_snapshot(false, requests), right.cost_snapshot(false, requests));
             assert_eq!(left.prediction_health(false, requests), right.prediction_health(false, requests));
             assert_eq!(left.engaged(false, requests), right.engaged(false, requests));
@@ -267,9 +267,9 @@ mod tests {
                     histories.entry(request.id).or_default().observe(proposed, request.accepted - 1);
                 }
                 let confidence = priors[verified.iter().position(|r| r.id == request.id).unwrap()].as_deref().unwrap_or(&[]);
-                let probabilities = legacy.policy.probabilities(DraftCandidate { id: request.id, confidence });
-                assert_eq!(probabilities, shared.policy.probabilities(DraftCandidate { id: request.id, confidence }));
-                assert_eq!(probabilities, installed.policy.probabilities(DraftCandidate { id: request.id, confidence }));
+                let probabilities = legacy.policy.probabilities(verified.len(), DraftCandidate { id: request.id, confidence });
+                assert_eq!(probabilities, shared.policy.probabilities(verified.len(), DraftCandidate { id: request.id, confidence }));
+                assert_eq!(probabilities, installed.policy.probabilities(verified.len(), DraftCandidate { id: request.id, confidence }));
             }
         }
         assert!(selected > 0);

@@ -1473,7 +1473,7 @@ fn extend_inputs<'a, C: DraftChain<'a>>(draft: &mut DraftRuntime<'_, 'a, C>, act
         let room = (request.job.max_tokens - request.generated).saturating_sub(1)
             .min(input.len() - 1 + crate::shared::draft::copy::COPY_EXTENSION);
         if input.len() <= 1 { continue; }
-        let Some(calibrated) = draft.calibrated_confidence(request.id(), input.len() - 1)? else { continue; };
+        let Some(calibrated) = draft.calibrated_confidence(members.len(), request.id(), input.len() - 1)? else { continue; };
         if let Some(copy) = crate::shared::draft::copy::continuation(&request.tokens, &input[1..], &calibrated,
             room, request.job.sampling.is_greedy() && !crate::shared::probe::no_speculation(&request.job.probe)) {
             draft.extend_confidence(request.id(), copy.neural, copy.tokens.len() - copy.neural)?;

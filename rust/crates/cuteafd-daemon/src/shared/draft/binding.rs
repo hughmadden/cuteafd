@@ -187,7 +187,7 @@ fn selection_trace_value(policy: &DraftPolicy, candidates: &[cuteafd_core::Draft
     serde_json::json!({"type": "draft_selection", "round": policy.stats().rounds,
         "requests": candidates.iter().zip(lengths).map(|(&candidate, &length)| serde_json::json!({
             "id": candidate.id, "raw_confidence": candidate.confidence,
-            "calibrated_confidence": policy.probabilities(candidate), "selected_drafts": length
+            "calibrated_confidence": policy.probabilities(candidates.len(), candidate), "selected_drafts": length
         })).collect::<Vec<_>>(), "width": width, "drafted_requests": drafted_requests, "max_rows": max_rows})
 }
 
@@ -220,7 +220,7 @@ fn round_trace_value(policy: &DraftPolicy, record: &RoundRecord<'_>) -> serde_js
     }).collect();
     let requests: Vec<_> = record.requests.iter().map(|request| {
         let raw = request.evidence.and_then(|e| e.prior());
-        let calibrated = raw.map(|confidence| policy.probabilities(cuteafd_core::DraftCandidate { id: request.id, confidence }));
+        let calibrated = raw.map(|confidence| policy.probabilities(record.requests.len(), cuteafd_core::DraftCandidate { id: request.id, confidence }));
         serde_json::json!({"id": request.id, "chosen_rows": policy.selected_rows(request.id), "verified_rows": request.rows,
             "accepted_rows": request.accepted, "source": format!("{:?}", request.source),
             "censor": request.censor.map(|reason| format!("{reason:?}")),
@@ -364,14 +364,14 @@ mod tests {
             request(4, 3, 3, DraftSource::Copy, Some(Evidence::History(&prior)), None),
         ];
         let routes = routes(18);
-        let before = policy.calibration();
+        let before = policy.calibration(1);
         let mut round = record(&requests, &routes, Some(DraftPass { width: 5, requests: Some(3) }));
         round.predicted = None;
         observe(&mut policy, &round).unwrap();
         assert_eq!(policy.stats().position_reached[..4], [2, 2, 1, 0]);
         assert_eq!(policy.stats().position_accepted[..4], [2, 2, 0, 0]);
-        assert_ne!(policy.calibration()[0], before[0]);
-        assert_eq!(policy.calibration()[3], before[3]);
+        assert_ne!(policy.calibration(1)[0], before[0]);
+        assert_eq!(policy.calibration(1)[3], before[3]);
     }
 
     #[test]
@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(value["megabytes"], serde_json::json!([4., 4.]));
         let request = &value["requests"][0];
         assert_eq!(request["raw_confidence"], serde_json::json!(p));
-        assert_eq!(request["calibrated_confidence"], serde_json::json!(policy.probabilities(candidates[0])));
+        assert_eq!(request["calibrated_confidence"], serde_json::json!(policy.probabilities(candidates.len(), candidates[0])));
         assert_eq!(request["chosen_rows"], selection.lengths[0] + 1);
         assert_eq!(request["verified_rows"], 3);
         assert_eq!(request["accepted_rows"], 2);
