@@ -344,7 +344,7 @@ def run_live(args):
     with torch.inference_mode():
         for prompt in prompts:
             ids = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True,
-                                                add_generation_prompt=True, enable_thinking=True)
+                                                add_generation_prompt=True, enable_thinking=True, return_dict=False)
             arms = {}
             for markov in (False, True):
                 arm = "markov" if markov else "base_head"

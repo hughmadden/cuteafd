@@ -64,6 +64,17 @@ def test_dense_tap_argument_keeps_projector_order():
             golden.parse_tap_layers(value)
 
 
+def test_live_chat_template_explicitly_requests_token_ids():
+    source = ast.parse(ORACLE.read_text())
+    calls = [node for node in ast.walk(source) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute) and node.func.attr == "apply_chat_template"]
+    assert len(calls) == 1
+    kwargs = {keyword.arg: ast.literal_eval(keyword.value) for keyword in calls[0].keywords}
+    assert kwargs["return_dict"] is False
+    assert kwargs["tokenize"] is True
+    assert kwargs["enable_thinking"] is True
+
+
 def test_reference_does_not_use_inherited_spec_generate():
     source = ast.parse(ORACLE.read_text())
     assert not any(isinstance(node, ast.Attribute) and node.attr == "spec_generate"
