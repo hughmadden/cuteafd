@@ -12,6 +12,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use anyhow::{Context, Result};
 use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -220,12 +221,19 @@ fn svg(body: String) -> Response {
     ([(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
 }
 
-fn png(svg: &str, file: &str) -> Response {
-    match render::png::png(svg, 1.0) {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "image/png".to_string()),
-            (header::CONTENT_DISPOSITION, format!("inline; filename=\"{file}\""))], bytes).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
-    }
+fn png(body: Vec<u8>, file: &str) -> Response {
+    ([(header::CONTENT_TYPE, "image/png".to_string()),
+        (header::CONTENT_DISPOSITION, format!("inline; filename=\"{file}\""))], body).into_response()
+}
+
+/// The SVG as PNG bytes, or why it could not be rasterized.
+///
+/// A failure here is an error naming the file, never a missing export: a caller
+/// that writes a run's images can tell "this run places no such export" from
+/// "the redraw failed", and must not keep the stale image a failed redraw was
+/// replacing.
+fn rasterize(svg: &str, file: &str) -> Result<Vec<u8>> {
+    render::png::png(svg, 1.0).with_context(|| format!("rasterizing {file}"))
 }
 
 /// Every export of one run, by file name.
@@ -236,21 +244,24 @@ fn png(svg: &str, file: &str) -> Response {
 /// verdict the rule in force now reaches. Everything that writes or serves an
 /// image or a report goes through this, which is what keeps the surfaces from
 /// disagreeing.
-pub fn export(report: &Report, file: &str) -> Option<(&'static str, Vec<u8>)> {
+///
+/// `Ok(None)` is a name this run has no export for. A renderer that fails is
+/// the `Err` arm instead, so no caller can mistake it for an absent file.
+pub fn export(report: &Report, file: &str) -> Result<Option<(&'static str, Vec<u8>)>> {
     let report = &crate::quality::under_current_rule(report);
-    let (stem, extension) = file.rsplit_once('.')?;
+    let Some((stem, extension)) = file.rsplit_once('.') else { return Ok(None) };
     let svg = match stem {
         "report" => render::report::report_svg(report),
         "card" => render::card::card_svg(report),
         _ if stem.starts_with("panel-") => render::report::panel_svg(report, &stem["panel-".len()..]),
-        _ => return None,
+        _ => return Ok(None),
     };
-    match extension {
+    Ok(match extension {
         "svg" => Some(("image/svg+xml", svg.into_bytes())),
-        "png" => render::png::png(&svg, 1.0).ok().map(|bytes| ("image/png", bytes)),
-        "json" if stem == "report" => serde_json::to_vec_pretty(report).ok().map(|b| ("application/json", b)),
+        "png" => Some(("image/png", rasterize(&svg, file)?)),
+        "json" if stem == "report" => Some(("application/json", serde_json::to_vec_pretty(report)?)),
         _ => None,
-    }
+    })
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -305,17 +316,12 @@ async fn run_file(State(bench): State<Arc<Bench>>, Path((id, file)): Path<(Strin
         return ([(header::CONTENT_TYPE, "application/json")], serde_json::to_string_pretty(&report)
             .unwrap_or_default()).into_response();
     }
-    if file.ends_with(".png") {
-        let svg_name = file.replace(".png", ".svg");
-        return match export(&report, &svg_name) {
-            Some((_, bytes)) => png(&String::from_utf8_lossy(&bytes), &file),
-            None => not_found("export"),
-        };
-    }
     match export(&report, &file) {
-        Some((_, bytes)) if file.ends_with(".svg") => svg(String::from_utf8_lossy(&bytes).into_owned()),
-        Some((kind, bytes)) => ([(header::CONTENT_TYPE, kind)], bytes).into_response(),
-        None => not_found("export"),
+        Ok(Some((_, bytes))) if file.ends_with(".svg") => svg(String::from_utf8_lossy(&bytes).into_owned()),
+        Ok(Some((_, bytes))) if file.ends_with(".png") => png(bytes, &file),
+        Ok(Some((kind, bytes))) => ([(header::CONTENT_TYPE, kind)], bytes).into_response(),
+        Ok(None) => not_found("export"),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
     }
 }
 
@@ -415,20 +421,28 @@ pub fn mount(router: Router, bench: Arc<Bench>) -> Router {
 mod tests {
     use super::*;
 
-    /// A store holding one measured run of a checkpoint whose own `config.json`
-    /// declares `algo` for its routed experts. The run's fidelity check is the
-    /// failure the export was stored with.
-    fn stored_run(algo: &str) -> (tempfile::TempDir, Arc<Bench>, Report) {
+    /// A stored Qwen NVFP4 max run whose own `config.json` declares `algo` for
+    /// its routed experts, with `failing` (a check id, or `""`) left failing
+    /// beside the fidelity check: the failure the export was stored with.
+    fn stored_run(algo: &str, failing: &str) -> (tempfile::TempDir, Arc<Bench>, Report) {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = dir.path().join("models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/2061e0b0");
-        std::fs::create_dir_all(&snapshot).unwrap();
-        std::fs::write(snapshot.join("config.json"), json!({"quantization_config": {"quant_method": "modelopt",
-            "quant_algo": algo, "group_size": 16, "quantized_layers":
-            {"model.language_model.layers.0.mlp.experts": {"quant_algo": algo}}}}).to_string()).unwrap();
-        let mut report = crate::sample::report(true);
-        report.server.model = "nvidia/Qwen3.8-Flash-Next-NVFP4".into();
-        report.server.configuration.snapshot = Some(snapshot.display().to_string());
+        let report = crate::sample::qwen_nvfp4_max(dir.path(), algo, failing);
         (dir, Bench::new(crate::store::Store::memory().unwrap()), report)
+    }
+
+    /// `/v1/bench/runs/<id>`, the response the dashboard renders a run's verdict
+    /// from, for a run imported exactly as it was stored.
+    async fn served_run(algo: &str, failing: &str) -> Report {
+        use tower::ServiceExt;
+        let (_hub, bench, report) = stored_run(algo, failing);
+        bench.set_api_key(cuteafd_api::openai::auth::ApiKey::new("k").unwrap());
+        let id = bench.import(report).unwrap();
+        let request = axum::http::Request::get(format!("/v1/bench/runs/{id}"))
+            .header("Authorization", "bearer k").body(Body::empty()).unwrap();
+        let response = routes(bench).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     /// The dashboard renders a run's verdict (scary mode, the failing checks,
@@ -438,23 +452,51 @@ mod tests {
     #[tokio::test]
     async fn the_dashboard_reads_a_stored_run_under_the_rule_in_force_now() {
         use crate::report::CheckStatus;
-        use tower::ServiceExt;
         for (algo, expected) in [("NVFP4", CheckStatus::Info), ("W4A16_NVFP4", CheckStatus::Fail)] {
-            let (_hub, bench, report) = stored_run(algo);
-            bench.set_api_key(cuteafd_api::openai::auth::ApiKey::new("k").unwrap());
-            let id = bench.import(report).unwrap();
-            let request = axum::http::Request::get(format!("/v1/bench/runs/{id}"))
-                .header("Authorization", "bearer k").body(Body::empty()).unwrap();
-            let response = routes(bench).oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
-            let served: Report = serde_json::from_slice(&bytes).unwrap();
+            let served = served_run(algo, "").await;
             let check = served.baseline.as_ref().unwrap().quality.checks.iter()
                 .find(|c| c.id == "fidelity").unwrap();
             assert_eq!(check.status, expected, "{algo}");
             assert_eq!(check.note.as_deref(), (expected == CheckStatus::Info)
                 .then_some(crate::quality::CALIBRATED_W4A4), "{algo}");
         }
+    }
+
+    /// A gate still failing beside the reclassified fidelity check reaches the
+    /// run view as a failure: the informational check is information, not a
+    /// verdict, and the failing one keeps its name.
+    #[tokio::test]
+    async fn the_run_view_keeps_a_failing_gate_beside_a_reclassified_fidelity_check() {
+        use crate::report::CheckStatus;
+        for (failing, title) in [("cache_exact", "Prefix-cache restore"), ("spec_lossless", "Speculation lossless")] {
+            let served = served_run("NVFP4", failing).await;
+            let baseline = served.baseline.as_ref().unwrap();
+            assert_eq!(baseline.quality.status, CheckStatus::Fail, "{failing}");
+            assert!(served.quality_failed(), "{failing}");
+            let check = |id: &str| baseline.quality.checks.iter().find(|check| check.id == id).unwrap();
+            assert_eq!(check("fidelity").status, CheckStatus::Info, "{failing}");
+            assert_eq!(check(failing).status, CheckStatus::Fail, "{failing}");
+            let line = crate::render::bodies::quality_line(baseline);
+            assert_eq!(line, format!("failed: {title}"), "{failing}");
+            assert!(baseline.quality.badge().contains("top-1 93.7% (info: calibrated W4A4)"), "{failing}");
+        }
+    }
+
+    /// A rasterization failure is an error naming the file, never an absent
+    /// export: a publisher re-rendering a run's images must be able to tell a
+    /// failure from a file the run does not have, or it keeps a stale image.
+    #[test]
+    fn a_failed_rasterization_is_an_error_not_a_missing_export() {
+        let error = rasterize("<svg", "card.png").unwrap_err();
+        assert!(format!("{error:#}").contains("rasterizing card.png"), "{error:#}");
+        let report = crate::sample::report(false);
+        // The same call for an export the run has: the arm a stale PNG hid in.
+        let (kind, bytes) = export(&report, "card.png").unwrap().expect("card.png renders");
+        assert_eq!(kind, "image/png");
+        assert_eq!(&bytes[..4], b"\x89PNG", "the rasterized card is a PNG");
+        // A name this run has no export for is the absent arm, not an error.
+        assert!(export(&report, "notes.txt").unwrap().is_none());
+        assert!(export(&report, "thumbnail.svg").unwrap().is_none());
     }
 
     #[tokio::test]

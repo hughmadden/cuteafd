@@ -100,12 +100,8 @@ pub fn write_exports(report: &Report, dir: &Path, kinds: &[String]) -> Result<Ve
         files.push("card.png".to_string());
     }
     for file in files {
-        let bytes = if file.ends_with(".png") {
-            let svg = crate::http::export(report, &file.replace(".png", ".svg")).context("export")?.1;
-            crate::render::png::png(&String::from_utf8_lossy(&svg), 1.0)?
-        } else {
-            crate::http::export(report, &file).with_context(|| format!("no export {file}"))?.1
-        };
+        let bytes = crate::http::export(report, &file).with_context(|| format!("exporting {file}"))?
+            .with_context(|| format!("no export {file}"))?.1;
         let path = dir.join(&file);
         std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
         written.push(path);

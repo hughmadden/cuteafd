@@ -164,30 +164,21 @@ mod tests {
             baseline: None, panels: vec![], fabric: vec![], error: None }
     }
 
-    /// A checkpoint directory whose own `config.json` declares `algo` for its
-    /// routed experts.
-    fn snapshot(root: &Path, algo: &str) -> String {
-        let path = root.join(format!("models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/{algo}"));
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("config.json"), serde_json::json!({"quantization_config":
-            {"quant_method": "modelopt", "quant_algo": algo, "group_size": 16, "quantized_layers":
-                {"model.language_model.layers.0.mlp.experts": {"quant_algo": algo}}}}).to_string()).unwrap();
-        path.display().to_string()
-    }
-
     /// The listing beside the dashboard's rendered run derives the verdict the
     /// same way the render itself does: a stored failure of a checkpoint the
-    /// rule in force now calls informational is not listed as a failure, and
-    /// the same numbers from a checkpoint the bar still gates are.
+    /// rule in force now calls informational is not listed as a failure, the
+    /// same numbers from a checkpoint the bar still gates are, and a calibrated
+    /// checkpoint with a gate the bar still fails stays a failure.
     #[test]
     fn a_listed_run_reads_its_verdict_under_the_rule_in_force_now() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        for (id, algo) in [("nvfp4", "NVFP4"), ("weight_only", "W4A16_NVFP4")] {
-            let mut report = crate::sample::report(true);
+        for (id, algo, failing) in [("nvfp4", "NVFP4", ""), ("weight_only", "W4A16_NVFP4", ""),
+            ("cache", "NVFP4", "cache_exact"), ("spec", "NVFP4", "spec_lossless")] {
+            // Each run owns its checkpoint directory: the rule reads the config
+            // beside the run, not one a later run overwrote.
+            let mut report = crate::sample::qwen_nvfp4_max(&dir.path().join(id), algo, failing);
             report.id = id.into();
-            report.server.model = "nvidia/Qwen3.8-Flash-Next-NVFP4".into();
-            report.server.configuration.snapshot = Some(snapshot(dir.path(), algo));
             assert!(report.quality_failed(), "the run was stored as a failure");
             store.save(&report).unwrap();
         }
@@ -195,7 +186,10 @@ mod tests {
         let row = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
         assert!(!row("nvfp4").quality_failed);
         assert!(row("weight_only").quality_failed);
-        assert_eq!(rows.len(), 2);
+        // A failure beside the reclassified check is still a failure.
+        assert!(row("cache").quality_failed);
+        assert!(row("spec").quality_failed);
+        assert_eq!(rows.len(), 4);
     }
 
     #[test]
