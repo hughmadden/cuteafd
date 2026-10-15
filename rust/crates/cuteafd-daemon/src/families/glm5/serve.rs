@@ -803,7 +803,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }).collect();
         let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
             .map(|(((a, draft), &limit), prior)| match (&shared, draft) {
-                (Some(shared), Some(d)) if policy.fixed.is_none() => resource::copy_continuation(&shared.policy,
+                (Some(shared), Some(d)) if policy.fixed.is_none() => resource::copy_continuation(&shared.policy, active.len(),
                     a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
                 _ => None,
             }).collect();

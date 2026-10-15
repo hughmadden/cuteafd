@@ -293,10 +293,10 @@ pub(crate) fn prior(prior: &Prior, history: &DraftHistory, evidence: &DraftEvide
 
 /// Qualify a history continuation using this policy's calibrated probabilities.
 /// Copied positions use the shared raw tail prior instead of neural evidence.
-pub(crate) fn copy_continuation(policy: &DraftPolicy, id: u64, history: &[u32], drafted: &[u32],
+pub(crate) fn copy_continuation(policy: &DraftPolicy, requests: usize, id: u64, history: &[u32], drafted: &[u32],
     prior: &mut Vec<f64>, room: usize, greedy: bool) -> Option<crate::shared::draft::copy::Continuation> {
     prior.truncate(drafted.len());
-    let calibrated = policy.probabilities(DraftCandidate { id, confidence: prior });
+    let calibrated = policy.probabilities(requests, DraftCandidate { id, confidence: prior });
     let continuation = crate::shared::draft::copy::continuation(history, drafted, &calibrated, room, greedy)?;
     prior.truncate(continuation.neural);
     prior.extend((0..continuation.tokens.len() - continuation.neural).map(crate::shared::draft::copy::tail_prior));
@@ -400,7 +400,7 @@ pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'
     let cores: Vec<_> = candidates.iter().map(|c| DraftCandidate { id: c.id,
         confidence: &c.prior[..c.prior.len().min(c.limit).min(policy.geometry().max_positions)] }).collect();
     let requests: Vec<_> = cores.iter().enumerate().map(|(i, c)| {
-        let probabilities = policy.probabilities(*c);
+        let probabilities = policy.probabilities(cores.len(), *c);
         let cold_request = candidates[i].cold;
         let others = candidates.len() + selection.lengths.iter().sum::<usize>() - selection.lengths[i];
         let available = c.confidence.len().min(max_rows.saturating_sub(others));
@@ -417,7 +417,7 @@ pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'
     let cost = policy.cost_snapshot(false, candidates.len());
     serde_json::json!({"engaged": policy.engaged(false, candidates.len()), "requests": requests,
         "chosen": selection.lengths, "predicted_us": selection.predicted, "drafted_requests": drafted_requests,
-        "platt": policy.calibration(),
+        "platt": policy.calibration(candidates.len()),
         "position_reached": policy.stats().position_reached,
         "cost": {"layers": cost.layers, "round": cost.round, "draft": cost.draft}})
 }
@@ -513,12 +513,10 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
         "effective_gb_per_s": if c[1] > 0. { 1000. / c[1] } else { f64::INFINITY },
         "us_per_layer_row": c[2], "samples": c[3], "relative_scale": c[4],
     })).collect();
-    let calibration = policy.calibration();
     let reliability: Vec<_> = (0..stats.position_reached.len()).map(|p| serde_json::json!({
         "position": p + 1, "reached": stats.position_reached[p],
         "mean_confidence": if stats.position_reached[p] > 0 {
             stats.position_confidence[p] / stats.position_reached[p] as f64 } else { 0. },
-        "logit_slope": calibration[p].0, "logit_offset": calibration[p].1,
         "accept_rate": if stats.position_reached[p] > 0 {
             stats.position_accepted[p] as f64 / stats.position_reached[p] as f64 } else { 0. },
     })).collect();
@@ -528,7 +526,8 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
         serde_json::json!({"requests_from": match requests { 1 => 1, 4 => 2, 8 => 5, _ => 9 },
             "requests_up_to": if requests == 16 { None } else { Some(requests) },
             "warm": policy.warm(false, requests), "engaged": policy.engaged(false, requests),
-            "timed_rounds": timed, "relative_error": error, "cost": fit.to_json(&labels)})
+            "timed_rounds": timed, "relative_error": error, "cost": fit.to_json(&labels),
+            "platt": policy.calibration(requests)})
     }).collect();
     let value = serde_json::json!({
         "mode": if policy.survival_lengths() { "survival" } else { "shared" },
@@ -973,7 +972,7 @@ mod tests {
         history.extend(50..100);
         history.extend([1, 2, 3, 4]);
         let mut prior = vec![0.99, 0.99, 0.99, 0.01, 0.01, 0.01, 0.01];
-        let copy = copy_continuation(&policy, 1, &history, &neural, &mut prior, 39, true).unwrap();
+        let copy = copy_continuation(&policy, 1, 1, &history, &neural, &mut prior, 39, true).unwrap();
         assert_eq!(copy.neural, 3);
         assert_eq!(&copy.tokens[..4], &[20, 21, 22, 50]);
         assert_eq!(prior.len(), copy.tokens.len());

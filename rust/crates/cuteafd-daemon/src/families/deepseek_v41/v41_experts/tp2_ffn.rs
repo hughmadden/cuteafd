@@ -23,8 +23,8 @@ pub(crate) fn load_routed_weights<'a>(
     budgets: [usize; 2],
     package: &std::path::Path,
 ) -> Result<[OwnerWeights<'a>; 2]> {
-    let selection = RtxSelectionPolicy::FirstCapacity;
     if catalog.exl3().is_some() {
+        let selection = RtxSelectionPolicy::CanonicalDecode;
         let workspace = Exl3Tp2::workspace_bytes_for_selection(
             package,
             5120,

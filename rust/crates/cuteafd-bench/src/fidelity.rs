@@ -219,9 +219,13 @@ pub fn verdict(run: &Run) -> Verdict {
         }
     }
     generated.records.clear();
-    let label = (run.tier == crate::fidelity_dataset::STANDARD_TIER).then(||
-        run.dataset.as_ref().and_then(|d| d["standard_subset"]["mode"].as_str())
-            .unwrap_or("standard-v2").to_string());
+    let label = if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
+        Some("reference-only qualified; common policy floor, not engine calibration".into())
+    } else {
+        (run.tier == crate::fidelity_dataset::STANDARD_TIER).then(||
+            run.dataset.as_ref().and_then(|d| d["standard_subset"]["mode"].as_str())
+                .unwrap_or("standard-v2").to_string())
+    };
     Verdict { pass: reasons.is_empty(), generated, top1_min, kl_max, confident_top1_min, top3_min, reasons, label }
 }
 
@@ -267,6 +271,9 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
         "margins must be positive and finite");
     ensure!(bootstrap >= 100, "at least 100 bootstrap replicates required");
     for run in [a, b] {
+        ensure!(run.kl_kind != "reference-only-top1024-plus-tail"
+            && !run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified"),
+            "reference-only qualified datasets lack paired engine calibration");
         if let Some(dataset) = &run.dataset {
             crate::fidelity_dataset::ensure_valid_publication(
                 dataset["repository"].as_str().unwrap_or(""),
@@ -474,6 +481,19 @@ mod tests {
         let restored: Run = serde_json::from_value(saved).unwrap();
         assert_eq!(restored.standard_balance, current.standard_balance);
         assert!(compare(&legacy, &restored, 0.005, 0.005, 100, 1).unwrap().pass);
+    }
+
+    #[test]
+    fn reference_only_scores_are_not_paired_calibration() {
+        for tier in ["quick", "full", crate::fidelity_dataset::STANDARD_TIER] {
+            let mut scored = run(8, 512);
+            scored.tier = tier.into();
+            scored.kl_kind = "reference-only-top1024-plus-tail".into();
+            scored.dataset = Some(serde_json::json!({"qualification":"reference-only qualified"}));
+            assert!(verdict(&scored).label.unwrap().contains("common policy floor"));
+            assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).unwrap_err()
+                .to_string().contains("lack paired engine calibration"));
+        }
     }
 
     #[test]

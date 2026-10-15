@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a family golden subcommand from sealed WIP slots on raptor's RTX GPUs.
 
-  scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4 \\
+  scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4|qwen35\\
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
       [--arm-env A:KEY=VALUE] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] -- GOLDEN ARGS...
@@ -52,7 +52,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 'glmf': 'glmf-golden',
-               'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden'}
+               'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden', 'qwen35': 'qwen35-golden'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')

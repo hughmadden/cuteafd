@@ -552,8 +552,9 @@ impl Opened {
             let resident = if args.expert_window.is_some() { 0..0 } else {
                 0..layers + usize::from(mtp && !mixed_mtp)
             };
+            let layer_ids: Vec<_> = resident.collect();
             let started = Instant::now();
-            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, resident, 1, 0,
+            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, &layer_ids, 1, 0,
                 args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
                 .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
                     or --expert-window N for diagnostic paging")?;
@@ -565,7 +566,7 @@ impl Opened {
                 let directory = crate::shared::experts::fp8::package_directory(&args.native_lib, 1, draft.format());
                 let (free, _) = self.library.cuda_memory_info()?;
                 Some(crate::shared::experts::fp8::Fp8Experts::load(&self.library, &draft, &directory,
-                    layers..layers + 1, 1, 0, args.prefill_rows,
+                    &[layers], 1, 0, args.prefill_rows,
                     free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
                     .context("loading the separate resident Qwen MTP expert package")?)
             } else { None };
@@ -633,7 +634,7 @@ impl Opened {
             let draft = tensors.for_layer(layer)?;
             let directory = crate::shared::experts::fp8::package_directory(&args.native_lib, 1, draft.format());
             let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, &draft, &directory,
-                layer..layer + 1, 1, 0, args.prefill_rows, budget)?;
+                &[layer], 1, 0, args.prefill_rows, budget)?;
             ensure!(!experts.wire_input(), "coordinator-local MTP FP8 package must take BF16 rows");
             engine::MtpExperts::Fp8(experts)
         };

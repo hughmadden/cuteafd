@@ -235,7 +235,8 @@ pub(super) fn load_fp8<'a>(
     // admit their peak above, rather than subtracting both lifetimes here.
     let actual_budget = fp8_resident_budget(library.cuda_memory_info()?.0, resident, peak.serve_peak);
     let budget = budget.min(actual_budget);
-    let experts = Fp8Experts::load_with_bf16(library, tensors, &directory, bf16.as_deref(), layers,
+    let layer_ids: Vec<_> = layers.collect();
+    let experts = Fp8Experts::load_with_bf16(library, tensors, &directory, bf16.as_deref(), &layer_ids,
         config.world, config.rank, config.capacity as usize, budget)?;
     if let Some(bf16) = bf16 {
         tracing::info!(package = %bf16.display(), "FP8 experts also take BF16 rows");

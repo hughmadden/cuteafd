@@ -458,6 +458,48 @@ def tp_role_problems(host, slot, role, nvfp4, contents):
     return []
 
 
+def git_head(repo):
+    result = subprocess.run(['git', '-C', str(repo), 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=60)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def resolve_launchers(arms, arm_repos, builds, global_repo, state, task, dry):
+    """Gives every arm the launcher checkout that serves it (recorded in the plan as
+    arm['repo'] and arm['repo_commit']): a --build arm its own <builds>/<task>/source-<arm>
+    (which must be at the built revision), any other arm its --arm-repo ARM=PATH, else the
+    global --repo. Explicit and built launchers must be git checkouts holding run.sh."""
+    explicit = {}
+    for item in arm_repos:
+        name, _, path = item.partition('=')
+        if name not in arms or not path:
+            raise ValueError('invalid --arm-repo mapping: ' + item)
+        if name in explicit:
+            raise ValueError('duplicate --arm-repo mapping: ' + name)
+        explicit[name] = Path(path).expanduser()
+    built = dict(item.split('=', 1) for item in builds)
+    if set(explicit) & set(built):
+        raise ValueError('--arm-repo refuses --build arms (their source checkout is the launcher): ' + ', '.join(sorted(set(explicit) & set(built))))
+    for name, arm in arms.items():
+        if name in built:
+            repo = Path.home() / '.cache/cuteafd/builds' / task / ('source-' + name)
+            wanted = subprocess.run(['git', '-C', str(REPO), 'rev-parse', built[name] + '^{commit}'], capture_output=True, text=True, timeout=60).stdout.strip() or None
+        elif name in explicit:
+            repo, wanted = explicit[name], None
+        else:
+            arm['repo'], arm['repo_commit'] = str(global_repo), git_head(global_repo)
+            continue
+        if not (dry and name in built):
+            if not (repo / 'run.sh').is_file():
+                raise ValueError(f'{name}: launcher {repo} has no run.sh')
+            head = git_head(repo)
+            if (repo / '.git').exists() is False or head is None:
+                raise ValueError(f'{name}: launcher {repo} is not a git checkout')
+            if wanted and head != wanted:
+                raise ValueError(f'{name}: source checkout {repo} is at {head[:12]}, not its built revision {built[name]} ({wanted[:12]})')
+        arm['repo'], arm['repo_commit'] = str(repo), (git_head(repo) if not (dry and name in built) else wanted)
+    return arms
+
+
 def smoke_command(binary, repo, job):
     dest = Path(job['state'])
     return [binary, 'bench', 'smoke', '--matrix', str(dest / 'matrix.json'), '--repo', str(repo), '--state', str(dest / 'smoke'), '--out-root', str(dest / 'reports'), '--parallel', '1']
@@ -828,6 +870,7 @@ def summarize_job(job, exit_code):
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
     row.update(exit_code=exit_code, status='failed' if exit_code else 'pass')
     if 'artifacts' in job: row['artifacts'] = job['artifacts']
+    if 'launcher' in job: row['launcher'] = job['launcher']
     reports = list((dest / 'reports').glob('**/report.json'))
     if job.get('grouped'):
         reports = [path for path in reports if path.parent.name.endswith('-' + job['entry']['name'])]
@@ -1614,7 +1657,9 @@ def main():
     parser.add_argument('--parallel', type=int, default=1)
     parser.add_argument('--task', default='cards-' + time.strftime('%Y%m%d-%H%M%S'))
     parser.add_argument('--state', type=Path)
-    parser.add_argument('--repo', type=Path, default=REPO)
+    parser.add_argument('--repo', type=Path, default=REPO, help='launcher checkout for arms that are neither --build nor --arm-repo')
+    parser.add_argument('--arm-repo', action='append', default=[], metavar='ARM=PATH', help='launcher checkout serving this non-built arm '
+                        '(a reused slot names its matching source); --build arms serve through their own source-ARM checkout')
     parser.add_argument('--binary', default='cuteafd')
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
     parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:CARD:KEY=VALUE', help='arm-specific setting, overriding --set')
@@ -1777,8 +1822,6 @@ def main():
                 card['post_load_c1'] = True
                 if args.post_load_repeat:
                     card['post_load_repeat'] = True
-        if args.trace and card.get('family') == 'deepseek_v41' and not launcher_forwards_v41_trace(args.repo):
-            raise ValueError(f"{card['name']}: this checkout's launcher does not forward SPECULATION_TRACE on the V4.1 path")
     probes, arm_probes = probe_selection(args.probe, cards, arms)
     expected = {card['name']: card.get('expected_pool') for card in cards}
     for item in args.expect_pool:
@@ -1813,6 +1856,14 @@ def main():
     if args.build_only:
         save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': []})
         return 0
+    resolve_launchers(arms, args.arm_repo, args.build, args.repo, state, args.task, args.dry_run)
+    if args.trace:
+        for name, arm in arms.items():
+            if args.dry_run and name in dict(x.split('=', 1) for x in args.build):
+                continue
+            for card in cards:
+                if card.get('family') == 'deepseek_v41' and not launcher_forwards_v41_trace(Path(arm['repo'])):
+                    raise ValueError(f"{card['name']}: arm {name}'s launcher {arm['repo']} does not forward SPECULATION_TRACE on the V4.1 path")
     key_file = state / 'api-key'
     if not key_file.exists():
         fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1826,6 +1877,7 @@ def main():
     jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
+        job['launcher'] = dict(repo=arms[job['arm']]['repo'], commit=arms[job['arm']]['repo_commit'])
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
         save(Path(job['state']) / 'job.json', {**job, 'probes': sorted(job['probes'])})
     parallel_safe(jobs, args.parallel)
@@ -1850,13 +1902,13 @@ def main():
     save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': [{**j, 'probes': sorted(j['probes'])} for j in jobs]})
     if args.dry_run:
         if groups and len(groups[0]) > 1:
-            cmd = smoke_command(args.binary, args.repo, dict(state=str(state / 'parallel-smoke')))
+            cmd = smoke_command(args.binary, arms[jobs[0]['arm']]['repo'], dict(state=str(state / 'parallel-smoke')))
             cmd[-1] = str(args.parallel)
             prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(args.nonce_seed) + ' ') if args.nonce_seed is not None else ''
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # grouped smoke scheduler; numeric exits per card')
             return 0
         for job in jobs:
-            cmd = smoke_command(args.binary, args.repo, job)
+            cmd = smoke_command(args.binary, job['launcher']['repo'], job)
             prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(job['nonce_seed']) + ' ') if job.get('nonce_seed') else ''
             print('# settings ' + job['arm'] + '/' + job['card'] + ': ' + json.dumps(job['entry']['set'], sort_keys=True))
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # numeric exit -> ' + job['state'] + '/exit')
@@ -1889,8 +1941,8 @@ def main():
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \
         (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else [])
-    for job in jobs[:1]:
-        binary_supports(args.binary, args.repo, job, fields)
+    for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
+        binary_supports(args.binary, job['launcher']['repo'], job, fields)
     # Everything checkable without hardware, before any queue ticket.
     problems = []
     for job in jobs:
@@ -1935,7 +1987,7 @@ def main():
         job_env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
         if job.get('nonce_seed'):
             job_env['CUTEAFD_BENCH_NONCE_SEED'] = job['nonce_seed']
-        process = detached(smoke_command(args.binary, args.repo, job), dest / 'driver.log', exit_file, job_env)
+        process = detached(smoke_command(args.binary, job['launcher']['repo'], job), dest / 'driver.log', exit_file, job_env)
         rc = process.wait()
         code = int(exit_file.read_text()) if exit_file.exists() else (rc if rc >= 0 else 128 - rc)
         exit_file.write_text(str(code) + '\n')
@@ -1961,7 +2013,7 @@ def main():
                 rows.append(row)
             write_summary(state, rows, arms)
             return 1
-        command = smoke_command(args.binary, args.repo, dict(state=str(group_root)))
+        command = smoke_command(args.binary, arms[jobs[0]['arm']]['repo'], dict(state=str(group_root)))
         command[-1] = str(args.parallel)
         process = detached(command, group_root / 'driver.log', group_root / 'exit', env)
         rc = process.wait()

@@ -230,7 +230,10 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             revision: dataset_identity.as_ref().and_then(|d| d["revision"].as_str()).unwrap_or("").into(),
             config: dataset_identity.as_ref().and_then(|d| d["config"].as_str()).unwrap_or("").into() });
     }
-    if let Some(selection) = &mut selection { selection.text_checkpoint = Some(reference.checkpoint.clone()); }
+    if let Some(selection) = &mut selection {
+        selection.text_checkpoint = Some(dataset_identity.as_ref().and_then(|d| d["text_checkpoint"].as_str())
+            .unwrap_or(&reference.checkpoint).to_owned());
+    }
     let standard = args.tier == "standard";
     let admitted = model_record["full_prefill_logits"] == true;
     let windows = if standard {
@@ -281,7 +284,9 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
         Run { schema: "cuteafd.fidelity.run/2".into(), arm: args.arm.clone(), checkpoint: model.into(),
             set_sha256: if reference.set_sha256.is_empty() { digest.clone() } else { reference.set_sha256.clone() },
             reference_sha256: digest.clone(), tier: if standard { crate::fidelity_dataset::STANDARD_TIER.into() } else { args.tier.clone() }, path_shape: shape,
-            kl_kind: if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
+            kl_kind: if dataset_identity.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
+                "reference-only-top1024-plus-tail"
+            } else if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
                 else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
             dataset: dataset_identity.clone(), reference_selection: selection.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows, engine, settings,
             seconds: started.elapsed().as_secs_f64(), score, floor_top1: reference.expect.top1_min,

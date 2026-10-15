@@ -88,7 +88,8 @@ impl<'a> Fp8MoeTp2<'a> {
             plan.workspace_bytes);
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let completion = RankCompletion::new(Event::new(device)?);
-        let experts = device.own(|| Fp8Experts::load(device.library, tensors, &plan.directory, layers.clone(),
+        let layer_ids: Vec<_> = layers.clone().collect();
+        let experts = device.own(|| Fp8Experts::load(device.library, tensors, &plan.directory, &layer_ids,
             2, rank, max_rows, budget - plan.output_bytes))?;
         ensure!(experts.resident_bytes() == resident && experts.scratch_bytes() == plan.scratch_bytes,
             "FP8 MoE TP2 static allocation plan disagrees with runtime");
@@ -122,8 +123,9 @@ impl<'a> Fp8MoeTp2<'a> {
             return Ok(ranks);
         }
         let completions = [RankCompletion::new(Event::new(devices[0])?), RankCompletion::new(Event::new(devices[1])?)];
+        let layer_ids: Vec<_> = layers.clone().collect();
         let experts = Fp8Experts::load_pair(devices, tensors, [&plans[0].directory, &plans[1].directory],
-            plans.each_ref().map(|p| p.slicing), layers.clone(), max_rows,
+            plans.each_ref().map(|p| p.slicing), &layer_ids, max_rows,
             [budgets[0] - plans[0].output_bytes, budgets[1] - plans[1].output_bytes])?;
         let make = |rank: usize, completion, experts: DeviceOwner<'a, Fp8Experts<'a>>| -> Result<Self> {
             ensure!(experts.resident_bytes() == plans[rank].resident_layer_bytes * layers.len()

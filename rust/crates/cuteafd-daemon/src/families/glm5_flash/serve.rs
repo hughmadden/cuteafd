@@ -1333,7 +1333,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut shared_priors)
             .map(|(((a, draft), &limit), prior)| match (&shared, draft) {
                 (Some(shared), Some(d)) if policy.fixed.is_none() =>
-                    super::draft_binding::copy_continuation(&shared.policy, a.ticket.id(), &a.history,
+                    super::draft_binding::copy_continuation(&shared.policy, active.len(), a.ticket.id(), &a.history,
                         &d.tokens, prior, limit, a.job.sampling.is_greedy()),
                 _ => None,
             }).collect();

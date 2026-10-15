@@ -82,7 +82,7 @@ def test_busy_kakapo_falls_back_only_under_serving_host_lock(tmp_path):
             handle.close()
 
 
-@pytest.mark.parametrize('kind,cores,expected', [('raptor', 64, 16), ('remote', 24, 24)])
+@pytest.mark.parametrize('kind,cores,expected', [('raptor', 64, 16), ('remote', 20, 8), ('remote', 4, 4)])
 def test_export_budget(kind, cores, expected, monkeypatch):
     monkeypatch.setattr(os, 'cpu_count', lambda: cores)
     monkeypatch.delenv('CUTEAFD_EXPORT_JOBS', raising=False)
@@ -90,7 +90,7 @@ def test_export_budget(kind, cores, expected, monkeypatch):
     monkeypatch.setenv('CUTEAFD_EXPORT_HOST_CLASS', kind)
     assert export.export_jobs() == expected
     monkeypatch.setenv('CARGO_BUILD_JOBS', '7')
-    assert export.export_jobs() == 7
+    assert export.export_jobs() == expected
     monkeypatch.setenv('CUTEAFD_EXPORT_JOBS', '3')
     assert export.export_jobs() == 3
     monkeypatch.setenv('CUTEAFD_EXPORT_JOBS', '0')
