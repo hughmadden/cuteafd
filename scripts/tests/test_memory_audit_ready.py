@@ -171,6 +171,14 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
     assert categories.get("workspace", 0) == 0
 
 
+def test_glmf_kda_only_pool_backing_uses_the_planners_prefix_scope():
+    source = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    allocation = source.split("let pool_mark_backing = if pool_mark_unit_bytes > 0 {", 1)[1].split("} else { None };", 1)[0]
+    assert 'scope("prefix/KDA-only pool marks")' in allocation.split("Some(zeroed(", 1)[0]
+    assert 'pool_pages.checked_mul(pool_mark_unit_bytes)' in allocation
+    assert memory_audit.category("prefix/KDA-only pool marks") == "prefix"
+
+
 def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
     root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/shared/experts/rtx"
     for name in ["native.rs", "exl3.rs"]:

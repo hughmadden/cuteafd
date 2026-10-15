@@ -577,7 +577,7 @@ mod tests {
     fn placement(modes: &[LayerMode]) -> Placement {
         use cuteafd_loader::placement::{plan_hops, ExpertHome, HopSpec, LayerAssignment};
         Placement {
-            pool_tokens: 0, attention_placement: cuteafd_loader::placement::AttentionPlacement::Layers,
+            pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]), attention_placement: cuteafd_loader::placement::AttentionPlacement::Layers,
             attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0,
             layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
             movables: vec![], expert_ranges: vec![], residual: vec![], tp2: None, items: vec![],

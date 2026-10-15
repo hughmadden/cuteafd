@@ -1148,6 +1148,12 @@ fn local_mla_ordinals(layers: impl IntoIterator<Item = (GlmNextAttention,
     }).collect()
 }
 
+/// Zero resident MLA layers have no compact tails, and no zero-layer divisor.
+fn compact_index_extents(index: IndexCache, mla_layers: usize, slots: usize, rows: usize) -> Option<(usize, usize)> {
+    (index == IndexCache::Compact && mla_layers > 0)
+        .then(|| (mla_layers * slots * TAIL_BYTES, mla_layers * rows * KEY_BYTES))
+}
+
 /// One GPU's caches. Per MLA layer (None for KDA): the latent record pool and its DSA index
 /// cache. Every KDA layer's pools back to back: FP32 or BF16 recurrent state `[layers, slots,
 /// heads, 128, 128]`, BF16 conv state `[layers, slots, 3, 3D]` and the speculative replay records
@@ -1171,6 +1177,10 @@ struct Caches<'a> {
     index_tails: Option<(Dev<'a>, Dev<'a>)>,
     commit_tables: Dev<'a>,
     pool_logical: Dev<'a>,
+    pool_marks: bool,
+    /// KDA-only owners retain a full recurrent mark beside every logical unit.
+    pool_mark_backing: Option<Dev<'a>>,
+    pool_mark_unit_bytes: usize,
     /// KDA heads of this GPU.
     kda_heads: usize,
 }
@@ -1190,7 +1200,7 @@ impl<'a> Caches<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(library: &'a NativeLibrary, cfg: &GlmNextConfig, layers: &[GlmfLayer<'_>], pages: usize, pool_pages: usize,
         slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
-        records: Option<PrefillScratch<'a>>) -> Result<Self> {
+        records: Option<PrefillScratch<'a>>, pool_marks: bool) -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -1198,7 +1208,7 @@ impl<'a> Caches<'a> {
         };
         let (state, conv, replay) = kda_layer_bytes(cfg, kda_heads, kda_state, decode_rows);
         let keys = index_cache == IndexCache::Keys;
-        let (mut kv, mut index, mut kda_layers, mut mla_layers) = (Vec::new(), Vec::new(), 0, 0);
+        let (mut kv, mut index, mut kda_layers, mut mla_layers) = (Vec::new(), Vec::new(), 0usize, 0usize);
         for layer in layers {
             match layer.attention {
                 GlmNextAttention::Mla => {
@@ -1223,9 +1233,19 @@ impl<'a> Caches<'a> {
                 }
             }
         }
-        let index_tails = if keys || mla_layers == 0 { None } else {
-            Some((zeroed(mla_layers * slots * TAIL_BYTES)?, zeroed(mla_layers * decode_rows * KEY_BYTES)?))
+        let index_tails = compact_index_extents(index_cache, mla_layers, slots, decode_rows)
+            .map(|(tails, replay)| -> Result<_> { Ok((zeroed(tails)?, zeroed(replay)?)) }).transpose()?;
+        let mark_geometry = cuteafd_loader::serving_capacity::RankCacheGeometry {
+            persistent_unit_bytes: (mla_layers * (UNIT_ROWS * (RECORD_BYTES + if keys { KEY_BYTES } else { 0 })
+                + PAGE_ROWS * 132)) as u64,
+            retained_mark_bytes: kda_layers.checked_mul(state + conv).context("KDA mark size overflow")? as u64,
+            ..Default::default()
         };
+        let pool_mark_unit_bytes = usize::try_from(mark_geometry.glmf_pool_mark_backing_unit_bytes(pool_marks))?;
+        let pool_mark_backing = if pool_mark_unit_bytes > 0 {
+            let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix/KDA-only pool marks");
+            Some(zeroed(pool_pages.checked_mul(pool_mark_unit_bytes).context("KDA pool backing overflow")?)?)
+        } else { None };
         let replay = kda_layers * replay;
         let (kda_replay, owner) = match records {
             Some(PrefillScratch(temps)) => {
@@ -1244,7 +1264,8 @@ impl<'a> Caches<'a> {
         Ok(Self { kv, index, mla_ordinal, kda_state: zeroed(kda_layers * slots * state)?,
             kda_conv: zeroed(kda_layers * slots * conv)?,
             kda_replay, _kda_replay_owner: owner, index_tails,
-            commit_tables: zeroed(3 * decode_rows * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
+            commit_tables: zeroed(3 * decode_rows * 4)?, pool_logical: zeroed(pool_pages * 4)?,
+            pool_marks, pool_mark_backing, pool_mark_unit_bytes, kda_heads })
     }
 }
 
@@ -1656,7 +1677,7 @@ impl<'a> GlmfEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
-        records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>) -> Result<Self> {
+        records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let sms = library.sm_count()?;
         let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
@@ -1701,7 +1722,7 @@ impl<'a> GlmfEngine<'a> {
         let replay_records = if records.is_some() { ReplayRecords::Shared } else { ReplayRecords::Own };
         let local = if context_mode.is_some() { 2 } else { 1 };
         let caches = Caches::new(library, &cfg, &weights.layers, pages / local, pool_pages / local, slots, kda_heads,
-            index_cache, kda_state, decode_rows, records)?;
+            index_cache, kda_state, decode_rows, records, pool_marks)?;
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
@@ -1827,12 +1848,12 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    /// One-GPU real-row byte gate; plain steps restore the complete persistent state. With the wide
+    /// All-owner real-row byte gate; plain steps restore the complete persistent state. With the wide
     /// programs the speculative steps also pad 65 rows and the verify budget less one into the
     /// budget's bucket (65 -> 127 and 126 -> 127 on an RTX 5090).
     pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
-        ensure!(self.ranks() == 1 && self.use_graphs && self.startup_graphs,
-            "padding check needs one GPU, graphs and CUTEAFD_GLMF_STARTUP_GRAPHS=1");
+        ensure!(self.use_graphs && self.startup_graphs,
+            "padding check needs graphs and CUTEAFD_GLMF_STARTUP_GRAPHS=1");
         let mut spec_rows = vec![3, 9, 17, 33];
         if self.verify_rows > DECODE_ROWS {
             spec_rows.extend([DECODE_ROWS + 1, self.verify_rows - 1]);
@@ -1841,28 +1862,33 @@ impl<'a> GlmfEngine<'a> {
         ensure!(tokens.len() >= needed && self.max_context >= needed, "padding check needs {needed} tokens of context");
         let mut placement = GlmfPlacement::new(vec![0], 0);
         self.prefill_device(&mut placement, &tokens[..32])?;
-        let caches = self.caches_of(0);
-        // Every persistent byte a step can write: KDA state, conv state and replay records, the
-        // compact index cache's tails and records, and the paged MLA records, keys and pools.
-        let mut buffers = vec![caches.kda_state.buffer, caches.kda_conv.buffer, caches.kda_replay];
-        if let Some((tails, records)) = &caches.index_tails {
-            buffers.extend([tails.buffer, records.buffer]);
-        }
-        for layer in self.paged_buffers() {
-            buffers.extend([layer.records, layer.pools]);
-            buffers.extend(layer.keys);
+        // Every persistent byte a step can write, on every attention owner.
+        let mut buffers = Vec::new();
+        for rank in 0..self.ranks() {
+            let caches = self.caches_of(rank);
+            let mut local = vec![caches.kda_state.buffer, caches.kda_conv.buffer, caches.kda_replay];
+            if let Some((tails, records)) = &caches.index_tails {
+                local.extend([tails.buffer, records.buffer]);
+            }
+            for layer in self.paged_buffers_on(rank) {
+                local.extend([layer.records, layer.pools]);
+                local.extend(layer.keys);
+            }
+            buffers.extend(local.into_iter().map(|buffer| (rank, buffer)));
         }
         let snapshot = || -> Result<Vec<Vec<u8>>> {
             self.synchronize()?;
-            buffers.iter().map(|&buffer| {
+            buffers.iter().map(|&(rank, buffer)| self.on(rank, || {
                 let mut bytes = vec![0; buffer.bytes];
                 self.library.copy_d2h(&mut bytes, buffer)?;
                 Ok(bytes)
-            }).collect()
+            })).collect()
         };
         let restore = |state: &[Vec<u8>]| -> Result<()> {
             self.synchronize()?;
-            for (&buffer, bytes) in buffers.iter().zip(state) { self.library.copy_h2d(buffer, bytes)?; }
+            for (&(rank, buffer), bytes) in buffers.iter().zip(state) {
+                self.on(rank, || self.library.copy_h2d(buffer, bytes))?;
+            }
             Ok(())
         };
         let original = placement.clone();
@@ -2508,7 +2534,8 @@ impl<'a> GlmfEngine<'a> {
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let local = if self.context_mode.is_some() { 2 } else { 1 };
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages / local, self.pool_pages / local,
-                self.slots, self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None)?;
+                self.slots, self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None,
+                self.caches.pool_marks)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphBank::new(self.graphs.borrow().budget())), l2: None })
@@ -2727,6 +2754,15 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         out
+    }
+
+    /// Dedicated pool-mark storage on a KDA-only owner, sized and charged per logical unit.
+    pub(crate) fn pool_mark_unit(&self, rank: usize, unit: u32) -> Result<Option<cuteafd_ffi::CuteafdDeviceBuffer>> {
+        let caches = self.caches_of(rank);
+        caches.pool_mark_backing.as_ref().map(|backing| {
+            let offset = (unit as usize).checked_mul(caches.pool_mark_unit_bytes).context("KDA mark offset overflow")?;
+            crate::shared::prefix::view(backing.buffer, offset, caches.pool_mark_unit_bytes)
+        }).transpose()
     }
 
     /// Every MLA layer's paged buffers: latent records (528 B per row), indexer token keys
@@ -5234,6 +5270,15 @@ pub(crate) fn check_tp2_lanes(lanes: usize) -> Result<()> {
 #[cfg(test)]
 mod tp2_tests {
     use super::*;
+    #[test]
+    fn kda_only_owner_has_no_compact_index_storage() {
+        for index in [IndexCache::Keys, IndexCache::Compact] {
+            assert_eq!(compact_index_extents(index, 0, 8, 64), None);
+        }
+        assert_eq!(compact_index_extents(IndexCache::Compact, 2, 8, 64),
+            Some((2 * 8 * TAIL_BYTES, 2 * 64 * KEY_BYTES)));
+    }
+
     #[test]
     fn compact_index_ordinals_pack_only_owner_local_mla_layers() {
         use crate::shared::placement::layers::AttentionShare::{Absent, Split, Whole};

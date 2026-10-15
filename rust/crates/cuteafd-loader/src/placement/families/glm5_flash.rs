@@ -381,7 +381,8 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Prefix, "marks", mul(g.retained_mark_bytes, i.mark_slots)?, Basis::Formula));
         } else {
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Prefix, "reserved units",
-                (g.persistent_unit_bytes + g.pool_metadata_unit_bytes) * cache::GLMF_POOL_MARK_RESERVED_UNITS, Basis::Formula));
+                (g.persistent_unit_bytes + g.pool_metadata_unit_bytes
+                    + g.glmf_pool_mark_backing_unit_bytes(i.pool_marks)) * cache::GLMF_POOL_MARK_RESERVED_UNITS, Basis::Formula));
         }
         fixed.extend(i.graphs.items(rank).into_iter().map(|item|
             GlmfBufferDemand::new(GlmfComponent::Always, gpu, item.category, &item.group, item.bytes, item.basis)));
@@ -425,7 +426,12 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
             capacity_bytes, headroom_bytes: i.headroom_bytes, baseline }).collect(), spark_ranks: working.spark_ranks, peer_access: ranks == 2 },
         pool: PoolPolicy::resolve(&i.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), i.max_context,
             i.requested_pool, geometry.logical_unit_rows, working.spark_ranks == 0),
-        pool_bounded: Vec::new(),
+        pool_bounded: geometry.ranks.iter().enumerate().filter_map(|(rank, g)| {
+            let bytes = g.glmf_pool_mark_backing_unit_bytes(i.pool_marks);
+            (bytes > 0).then(|| BoundedDemand { gpu: rank as u8, category: Category::Prefix,
+                group: format!("KDA-only pool marks ({bytes} bytes/unit)"), bytes_per_unit: bytes,
+                offset_units: 0, cap_units: u64::MAX, basis: Basis::Formula })
+        }).collect(),
         layers, pool_overhead: geometry.ranks.iter().map(|g| g.pool_metadata_unit_bytes).collect(), fixed,
         movables,
         expert_workspace: if working.includes(GlmfComponent::RtxExperts) { i.expert_workspace } else { 0 },
@@ -727,6 +733,59 @@ mod tests {
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30,
             drafter_scratch: vec![0; ranks], drafter_bridge: None, requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
+        }
+    }
+
+    #[test]
+    fn kda_only_pool_backing_is_named_and_limits_automatic_capacity() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        for first in [0, 1] {
+            let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+            input.attention = GlmfAttention { mode: AttentionPlacement::Layers, first_owner: first,
+                ..Default::default() };
+            input.index = cache::GlmfIndexCache::Compact;
+            input.pool_marks = true;
+            let mut req = request(&input).unwrap();
+            let geometry = cache::glm_flash_placed_cache_geometry_rows(&cfg, 2, 2, input.index, 4, 64,
+                AttentionPlacement::Layers, first as usize).unwrap();
+            let bytes = geometry.ranks[1 - first as usize].retained_mark_bytes;
+            assert_eq!(req.pool_bounded.len(), 1);
+            let backing = &req.pool_bounded[0];
+            assert_eq!((backing.gpu, backing.bytes_per_unit), (1 - first, bytes));
+            assert!(backing.group.contains(&format!("{bytes} bytes/unit")));
+            assert_eq!(backing.bytes(17).unwrap(), 17 * bytes);
+            let reserved = req.fixed.iter().find(|d| d.gpu == 1 - first && d.group == "reserved units").unwrap();
+            assert_eq!(reserved.bytes, bytes + 4);
+            // Exercise admission alone: the public Whole executor intentionally remains refused.
+            req.attention_placement = Some(AttentionPlacement::Heads);
+            req.pool.floor = 256;
+            req.pool.target = 2 << 20;
+            req.pool.ceiling = 2 << 20;
+            // Leave exactly 64 units on the KDA-only owner, far below the
+            // 8192-unit ceiling. Its next complete state mark must not fit.
+            let probe = solve(&req).unwrap();
+            let owner = (1 - first) as usize;
+            let rank = &probe.pool_limits.0[owner];
+            let unit_bytes = rank.demands.iter().map(|d| d.bytes_per_unit).sum::<u64>();
+            let budget = 64 * unit_bytes;
+            let free = req.inventory.gpus[owner].available() - (rank.available_bytes - budget);
+            req.inventory.gpus[owner].baseline = Baseline::Measured { free_bytes: free + req.inventory.gpus[owner].headroom_bytes };
+            let bounded = solve(&req).unwrap();
+            let limit = &bounded.pool_limits.0[owner];
+            assert_eq!(bounded.pool_tokens, 64 * 256);
+            assert_eq!(limit.max_units, 64);
+            assert_eq!(limit.available_bytes, budget);
+            assert!(65 * unit_bytes > limit.available_bytes);
+            assert!(bounded.pool_limits.0[first as usize].max_units > 64);
+            assert!(limit.demands.iter().any(|d| d.group.contains("KDA-only pool marks")
+                && d.bytes_per_unit == bytes));
+            req.pool_bounded.clear();
+            let unbounded = solve(&req).unwrap();
+            assert!(bounded.pool_tokens < unbounded.pool_tokens);
+            assert!(bounded.items[(1 - first) as usize].iter().any(|d|
+                d.group.contains("KDA-only pool marks") && d.bytes == bytes * bounded.pool_tokens / 256));
+            input.pool_marks = false;
+            assert!(request(&input).unwrap().pool_bounded.is_empty());
         }
     }
 
