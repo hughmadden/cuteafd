@@ -23,6 +23,22 @@ def qualification_reference():
     return module
 
 
+def verify_reference_source(source):
+    """Require the imported implementation to be the locked submodule source."""
+    path = ROOT / "scripts/build/verify-transformers-source.py"
+    spec = importlib.util.spec_from_file_location("transformers_source_lock", path)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    pinned = ROOT / "third_party/transformers"
+    lock = verifier.verify(pinned, ROOT / "third_party/transformers.lock.json")
+    expected = hashlib.sha256((pinned / "src/transformers/models/qwen3_5/modeling_qwen3_5.py").read_bytes()).hexdigest()
+    actual = hashlib.sha256(source).hexdigest()
+    if actual != expected:
+        raise ValueError(f"imported Qwen reference differs from pinned source: {actual} != {expected}")
+    return {"revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"],
+            "modeling_sha256": actual}
+
+
 def run_windows(args, model, identity, provenance):
     import numpy as np
     import torch
@@ -64,6 +80,7 @@ def main():
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--windows", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--check-only", action="store_true", help="CPU-only snapshot/source preflight")
     args = parser.parse_args()
     import torch
     import transformers
@@ -74,6 +91,10 @@ def main():
     identity = verify_snapshot(manifest, args.snapshot)
     qualification = qualification_reference()
     _, _, _, source = qualification.reference_identity(args.snapshot)
+    source_pin = verify_reference_source(source)
+    if args.check_only:
+        print(json.dumps({"preflight": "ok", "snapshot_identity": identity, "source_pin": source_pin}))
+        return
     torch.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -86,7 +107,7 @@ def main():
                                 "capability": list(torch.cuda.get_device_capability(0))},
                       reference="transformers.Qwen3_5ForConditionalGeneration",
                       transformers=transformers.__version__, torch=torch.__version__,
-                      reference_sha256=hashlib.sha256(source).hexdigest(),
+                      reference_sha256=hashlib.sha256(source).hexdigest(), source_pin=source_pin,
                       qualification_sha256=hashlib.sha256(Path(qualification.__file__).read_bytes()).hexdigest(),
                       golden_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                       native_fp32_parameters=fp32, dtype="bf16", mtp=False, use_cache=False,

@@ -23,6 +23,18 @@ converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
 
 
+def test_dense_golden_requires_pinned_imported_source():
+    spec = importlib.util.spec_from_file_location("dense_golden", ROOT / "python/reference/families/qwen3_5/golden.py")
+    golden = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(golden)
+    source = (ROOT / "third_party/transformers/src/transformers/models/qwen3_5/modeling_qwen3_5.py").read_bytes()
+    pin = golden.verify_reference_source(source)
+    assert pin["revision"] == json.loads((ROOT / "third_party/transformers.lock.json").read_text())["revision"]
+    assert pin["modeling_sha256"] == hashlib.sha256(source).hexdigest()
+    with pytest.raises(ValueError, match="differs from pinned source"):
+        golden.verify_reference_source(source + b"\n# drift\n")
+
+
 def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     spec = importlib.util.spec_from_file_location("validate_dataset", ROOT / "scripts/bench/validate-fidelity-dataset.py")
     validator = importlib.util.module_from_spec(spec)
