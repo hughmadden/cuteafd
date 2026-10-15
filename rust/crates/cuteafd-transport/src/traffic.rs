@@ -32,6 +32,16 @@ pub struct EngineSample {
     pub receives_writes: bool,
     pub sent_bytes: u64,
     pub received_bytes: u64,
+    #[serde(default)]
+    pub path_mtu: Option<u32>,
+    #[serde(default)]
+    pub ops_sent: Option<u64>,
+    #[serde(default)]
+    pub ops_received: Option<u64>,
+    #[serde(default)]
+    pub packets_sent: Option<u64>,
+    #[serde(default)]
+    pub packets_received: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -51,6 +61,11 @@ pub struct HostSample {
 pub struct SourceSample {
     pub incarnation: String,
     pub counters: Vec<EngineSample>,
+    /// Empty for historical sources; unavailable samples never imply zero.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub mono_ns: Option<u64>,
 }
 
 /// A third producer supplies cumulative bytes keyed by device/port/peer. Sampling
@@ -58,6 +73,7 @@ pub struct SourceSample {
 pub trait TrafficSource: Send + Sync {
     fn name(&self) -> &'static str;
     fn sample(&self) -> SourceSample;
+    fn suspend(&self) {}
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -94,6 +110,7 @@ struct WireBytes {
 pub(crate) struct WireCounter {
     device: String,
     port: u32,
+    path_mtu: Option<u32>,
     peer: OnceLock<String>,
     local_gid: String,
     receives_writes: AtomicBool,
@@ -112,7 +129,7 @@ impl WireCounter {
         EngineSample { device: self.device.clone(), port: self.port, peer: self.peer.get().cloned().unwrap_or_default(),
             receives_writes: self.receives_writes.load(Ordering::Relaxed),
             local_gid: self.local_gid.clone(), written_sent_bytes: self.bytes.written.load(Ordering::Relaxed),
-            sent_bytes: self.bytes.sent.load(Ordering::Relaxed), received_bytes: self.bytes.received.load(Ordering::Relaxed) }
+            sent_bytes: self.bytes.sent.load(Ordering::Relaxed), received_bytes: self.bytes.received.load(Ordering::Relaxed), path_mtu: self.path_mtu, ..Default::default() }
     }
 }
 
@@ -128,8 +145,8 @@ fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(|| Mutex::new(Registry::default()))
 }
 
-pub(crate) fn register(device: &str, port: u32, peer: &str, local_gid: String) -> Arc<WireCounter> {
-    let counter = Arc::new(WireCounter { device: device.into(), port, peer: { let p = OnceLock::new(); if !peer.is_empty() { let _ = p.set(peer.into()); } p },
+pub(crate) fn register(device: &str, port: u32, peer: &str, local_gid: String, mtu: u32) -> Arc<WireCounter> {
+    let counter = Arc::new(WireCounter { device: device.into(), port, path_mtu: (1..=5).contains(&mtu).then(|| 128u32 << mtu), peer: { let p = OnceLock::new(); if !peer.is_empty() { let _ = p.set(peer.into()); } p },
         local_gid, receives_writes: AtomicBool::new(false), bytes: WireBytes::default() });
     registry().lock().unwrap().counters.push(counter.clone());
     counter
@@ -190,6 +207,64 @@ pub fn read_ports(root: &Path) -> Vec<PortSample> {
     result
 }
 
+/// Completed phase evidence travels over the existing bounded control channel.
+/// It is emitted off-path, once per host/phase, never per inference request.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PhaseLog {
+    pub name: String,
+    pub timed: bool,
+    pub ports: Vec<serde_json::Value>,
+}
+pub fn log_phase(phase: &PhaseLog) {
+    if phase.name.len() > 128 || phase.ports.len() > 256 { return; }
+    let summary = phase.ports.iter().filter_map(|p| {
+        let pair = |tx: &str, rx: &str| p[tx].as_u64().zip(p[rx].as_u64()).map(|(a,b)| a.saturating_add(b));
+        Some(serde_json::json!({"device": p["device"].as_str()?.chars().take(64).collect::<String>(),
+            "port": p["port"].as_u64()?, "seconds": p["seconds"].as_f64(),
+            "nic_bytes": pair("sent_bytes","received_bytes"), "engine_bytes": pair("engine_sent_bytes","engine_received_bytes"),
+            "sparknest_bytes": pair("sparknest_sent_bytes","sparknest_received_bytes"),
+            "headers_est_bytes": pair("estimated_header_sent_bytes","estimated_header_received_bytes"),
+            "residual_bytes": pair("foreign_sent_bytes","foreign_received_bytes")}))
+    }).collect::<Vec<_>>();
+    tracing::info!(target: "cuteafd::fabric", phase = %phase.name, timed = phase.timed,
+        attribution = %serde_json::json!(summary), "fabric phase bytes (tx+rx per port; estimated headers, residual includes retries)");
+}
+pub fn control_phase(value: &serde_json::Value) {
+    if let Some(phase) = value.get("phase_log").and_then(|v| serde_json::from_value::<PhaseLog>(v.clone()).ok()) {
+        log_phase(&phase);
+    }
+}
+pub fn publish_phase(phase: PhaseLog) {
+    if phase.name.len() > 128 || phase.ports.len() > 256 { return; }
+    let local = PhaseLog { ports: phase.ports.iter().filter(|p| p["host"] == "coordinator").cloned().collect(), ..phase.clone() };
+    log_phase(&local);
+    let peers = registry().lock().unwrap().peers.clone();
+    std::thread::scope(|scope| {
+        for peer in peers {
+            let selected = PhaseLog { ports: phase.ports.iter().filter(|p| p["host"].as_str() == Some(&peer.to_string())).cloned().collect(), ..phase.clone() };
+            if selected.ports.is_empty() { continue; }
+            scope.spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                let timeout = Duration::from_millis(150);
+                let send = || -> std::io::Result<()> {
+                    let mut stream = TcpStream::connect_timeout(&peer, timeout)?;
+                    stream.set_write_timeout(Some(timeout))?;
+                    stream.set_read_timeout(Some(timeout))?;
+                    let bytes = serde_json::to_vec(&serde_json::json!({"message":"fabric_traffic", "phase_log": selected}))?;
+                    if bytes.len() > 64 * 1024 { return Ok(()); }
+                    stream.write_all(&bytes)?; stream.write_all(b"\n")?;
+                    // Consume the reply before closing: a broken write on an
+                    // expert's control path must not be mistaken for wire failure.
+                    let mut reply = String::new();
+                    BufReader::new(std::io::Read::take(stream, 1 << 20)).read_line(&mut reply)?;
+                    Ok(())
+                };
+                if let Err(error) = send() { tracing::debug!(target:"cuteafd::fabric", %peer, %error, "phase log delivery unavailable"); }
+            });
+        }
+    });
+}
+
 fn read_peer(peer: SocketAddr) -> Result<HostSample, TrafficError> {
     use std::io::{BufRead, BufReader, Write};
     let timeout = Duration::from_millis(150);
@@ -228,7 +303,18 @@ fn demand() -> &'static Demand {
     static DEMAND: OnceLock<Demand> = OnceLock::new();
     DEMAND.get_or_init(Demand::default)
 }
+fn sparknest() -> &'static Arc<crate::sparknest_traffic::SparkNest> {
+    static SOURCE: OnceLock<Arc<crate::sparknest_traffic::SparkNest>> = OnceLock::new();
+    SOURCE.get_or_init(|| {
+        let source = Arc::new(crate::sparknest_traffic::SparkNest::new("/srv/sparknest/rdma-counters.sock"));
+        add_source(source.clone());
+        source
+    })
+}
+/// Startup status checks only the local socket path, without subscribing.
+pub fn storage_status() -> &'static str { if sparknest().present() { "socket-present" } else { "absent" } }
 pub fn renew() {
+    let _ = sparknest();
     demand().renew(Instant::now());
     start();
 }
@@ -257,6 +343,7 @@ fn start() {
                     let mut until = demand.until.lock().unwrap();
                     while !Demand::active(*until, Instant::now()) {
                         latest().lock().unwrap().hosts.clear();
+                        for source in &registry().lock().unwrap().sources { source.suspend(); }
                         previous = None;
                         idle.clear();
                         until = demand.wake.wait(until).unwrap();
@@ -337,7 +424,7 @@ mod tests {
     }
     #[test]
     fn wire_counter_is_cumulative_and_directional() {
-        let counter = WireCounter { device: "nic".into(), port: 1, peer: OnceLock::from("peer".to_string()),
+        let counter = WireCounter { device: "nic".into(), port: 1, path_mtu: Some(4096), peer: OnceLock::from("peer".to_string()),
             local_gid: "local".into(), receives_writes: AtomicBool::new(false), bytes: WireBytes::default() };
         counter.sent(128); counter.sent(4096); counter.written(72); counter.received(64);
         assert_eq!(counter.sample().sent_bytes, 4296);

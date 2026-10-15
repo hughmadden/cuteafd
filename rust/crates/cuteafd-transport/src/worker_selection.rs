@@ -407,6 +407,7 @@ pub fn receive_worker_selection(stream: &TcpStream, rank: usize, timeout: Durati
     stream.set_write_timeout(Some(timeout))?;
     let value: serde_json::Value = read(stream)?;
     if value["message"] == "fabric_traffic" {
+            crate::traffic::control_phase(&value);
         write(&mut stream.try_clone()?, &serde_json::json!({"message": "fabric_traffic", "sample": crate::traffic::local()}))?;
         return Err(crate::traffic::TrafficProbeOnly.into());
     }

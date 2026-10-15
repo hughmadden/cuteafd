@@ -158,6 +158,23 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                         'TRITON_CACHE_DIR', 'TORCHINDUCTOR_CACHE_DIR']:
                 self.assertTrue(env[key].startswith('/tmp/cuteafd-home'))
 
+    def test_storage_socket_mount_is_optional_readonly_and_host_local(self) -> None:
+        for present in (True, False):
+            result = subprocess.run(['bash', '-c', r"""
+set -euo pipefail
+source scripts/lib/release-common.sh
+# Simulate the local host's socket without touching the actual daemon.
+body=$(declare -f release_serving_docker_args)
+body=${body/\[\[ -S \/srv\/sparknest\/rdma-counters.sock \]\]/$TEST_SOCKET}
+eval "$body"
+release_serving_docker_args
+printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
+"""], cwd=ROOT, capture_output=True, env={**os.environ,'TEST_SOCKET': 'true' if present else 'false'})
+            self.assertEqual(result.returncode,0,result.stderr)
+            args=result.stdout.decode().rstrip('\0').split('\0')
+            mount='type=bind,src=/srv/sparknest/rdma-counters.sock,dst=/srv/sparknest/rdma-counters.sock,readonly'
+            self.assertEqual(mount in args,present)
+
     def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
         for source in [v41_source(), FAMILY.read_text()]:
             self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args)', source)

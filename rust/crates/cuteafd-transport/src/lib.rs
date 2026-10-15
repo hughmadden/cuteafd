@@ -7,6 +7,7 @@ pub mod bond;
 mod capabilities;
 pub mod fabric;
 pub mod traffic;
+mod sparknest_traffic;
 
 /// A failed expert wire is terminal for a serving process. Never clear this on
 /// a new request: other lanes may still own queued work from the failed pass.

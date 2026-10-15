@@ -189,7 +189,9 @@ impl Client {
             let fresh = !after.hosts.is_empty() && after.hosts.values().all(|h| !h.incarnation.is_empty() && h.sampled_s > 0.0)
                 && after.hosts.values().any(|h| !h.ports.is_empty()) && before.hosts.iter().all(|(name, b)| after.hosts.get(name)
                 .is_none_or(|a| a.incarnation != b.incarnation || a.sampled_s > b.sampled_s));
-            if fresh { return Some(after); }
+            let storage_ready = after.hosts.values().all(|h| h.sources.get("sparknest")
+                .is_none_or(|s| !matches!(s.status.as_str(), "waiting" | "stale")));
+            if fresh && storage_ready { return Some(after); }
             if Instant::now() >= deadline { return None; }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -198,7 +200,14 @@ impl Client {
     pub fn fabric_since(&self, before: Option<cuteafd_transport::traffic::Snapshot>, name: &str, timed: bool)
         -> Option<crate::fabric::Phase> {
         let phase = crate::fabric::interval(name, timed, &before?, &self.fabric_mark()?);
-        (!phase.ports.is_empty()).then_some(phase)
+        if phase.ports.is_empty() { return None; }
+        // Logging runs after timing and remains best-effort for older servers.
+        if let Ok(value) = serde_json::to_value(&phase) {
+            let request = self.authorize(self.agent.post(&format!("{}/v1/fabric/phase", self.base)))
+                .timeout(Duration::from_secs(2));
+            let _ = request.send_json(value);
+        }
+        Some(phase)
     }
 
     pub fn stats(&self) -> Result<Value> {
