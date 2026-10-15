@@ -8,8 +8,8 @@ use cuteafd_core::memory_layout::{Basis, Category};
 /// `context` (PLAN.md "v3 attention placement without latent replication", GLM Flash DSA):
 /// projections head-split, every 256-token allocation unit of the MLA records and pool keys on
 /// one GPU (logical unit `u` on GPU `u % 2`), decode/verify exchanging q / candidates / partials
-/// and merging by LSE, prefill gathering the history into a staging view. `layers` remains
-/// inventory only (no executor).
+/// and merging by LSE, prefill gathering the history into a staging view. Explicit `layers`
+/// gives complete MLA attention and caches to alternating owners, keeping KDA and FFNs split.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlmfAttention {
     pub mode: AttentionPlacement,
@@ -33,7 +33,7 @@ pub fn context_program_list() -> String {
 }
 
 /// The `context` programs of a build and their scratch (`lookup`: name -> scratch bytes), or None
-/// when it lacks any of them (a chosen `context` then fails closed; `heads` is the only executor).
+/// when it lacks any of them (a chosen `context` then fails closed).
 /// Needs the head split's compact commit too.
 pub fn context_programs<'n>(names: impl IntoIterator<Item = &'n str> + Clone,
     lookup: impl Fn(&str) -> Option<u64>) -> Option<GlmfAttention> {
@@ -58,7 +58,7 @@ pub fn manifest_context(manifest: &serde_json::Value) -> Option<GlmfAttention> {
 /// against the build's `context` programs. Auto is `context` on two GPUs, as `ExecutorModes::check_attention`
 /// records for this family; without the context programs that placement cannot run, so a chosen
 /// `context` fails closed naming the programs rather than silently serving heads with replicated
-/// KV. One GPU and an explicit `heads` stay heads; `layers` (no executor) is refused.
+/// KV. One GPU and an explicit `heads` stay heads; `layers` is explicit on two GPUs only.
 pub fn resolve_attention(requested: Option<AttentionPlacement>, gpus: usize, programs: Option<GlmfAttention>)
     -> Result<GlmfAttention, PlacementError> {
     let heads = GlmfAttention { mode: AttentionPlacement::Heads, ..programs.unwrap_or_default() };
@@ -69,8 +69,7 @@ pub fn resolve_attention(requested: Option<AttentionPlacement>, gpus: usize, pro
     match requested {
         Some(AttentionPlacement::Heads) => Ok(heads),
         Some(mode) if gpus != 2 => refuse(mode, "requires two coordinator GPUs with peer access"),
-        Some(AttentionPlacement::Layers) => refuse(AttentionPlacement::Layers,
-            "executor not implemented; heads and context are qualified"),
+        Some(AttentionPlacement::Layers) => Ok(GlmfAttention { mode: AttentionPlacement::Layers, ..heads }),
         Some(AttentionPlacement::Context) => programs.map(context).map_or_else(missing, Ok),
         None if gpus == 2 => programs.map(context).map_or_else(missing, Ok),
         None => Ok(heads),
@@ -811,8 +810,7 @@ mod tests {
             assert_eq!(backing.bytes(17).unwrap(), 17 * bytes);
             let reserved = req.fixed.iter().find(|d| d.gpu == 1 - first && d.group == "reserved units").unwrap();
             assert_eq!(reserved.bytes, bytes + 4);
-            // Exercise admission alone: the public Whole executor intentionally remains refused.
-            req.attention_placement = Some(AttentionPlacement::Heads);
+            // Keep the owned cache geometry pinned while probing its exact byte limit.
             req.pool.floor = 256;
             req.pool.target = 2 << 20;
             req.pool.ceiling = 2 << 20;
@@ -1596,17 +1594,8 @@ mod tests {
             for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
                 input.index = cache::GlmfIndexCache::Compact;
                 input.attention.mode = mode;
-                let mut req = request(&input).unwrap();
-                if mode == AttentionPlacement::Layers {
-                    assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })), "owned layers remain fail-closed");
-                } else {
-                    assert_eq!(solve(&req).unwrap().attention_placement, AttentionPlacement::Context);
-                }
-                // A test-only executor proves planner accounting without claiming
-                // these modes are qualified or available to serving.
-                req.executor = ExecutorModes { family: "glm5_flash candidate", modes: &[LayerMode::HeadSplit,
-                    LayerMode::ContextSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
-                    LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true, attention: AttentionPlacement::Heads };
+                let req = request(&input).unwrap();
+                assert_eq!(solve(&req).unwrap().attention_placement, mode);
                 let placed = solve(&req).unwrap();
                 assert_eq!(placed.pool_tokens, 2 << 20);
                 assert_eq!(replicated_mla_bytes(&cfg, input.index, &placed).unwrap(), 0);
@@ -1637,11 +1626,6 @@ mod tests {
 
     fn owner_candidate(input: &GlmfInputs<'_>, measured: bool) -> (Placement, GraphSet, GlmfWorkingSet) {
         let mut req = request(input).unwrap();
-        // Keep public admission fail-closed until explicit Layers is enabled.
-        req.executor = ExecutorModes { family: "glm5_flash candidate", modes: &[LayerMode::HeadSplit,
-            LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
-            LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true,
-            attention: AttentionPlacement::Heads };
         if measured {
             for gpu in &mut req.inventory.gpus {
                 let Baseline::Planned { context_bytes, loaded_bytes } = gpu.baseline else { unreachable!() };
@@ -1688,6 +1672,17 @@ mod tests {
             assert_eq!(planned.0.layers, measured.0.layers);
             assert_eq!(planned.0.pool_tokens, 2 << 20);
             assert_eq!(planned.0.movables, [(MovableId::Drafter, 0)]);
+            let selected = solve_attention_working_set_with_graphs(&input, Some(&alternate.resident),
+                2 << 20, false, 188, true).unwrap();
+            assert_eq!(selected.0, planned.0);
+            let mut measured_input = input.clone();
+            for (capacity, baseline) in &mut measured_input.gpus {
+                let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
+                *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
+            }
+            let runtime = solve_attention_working_set_with_graphs(&measured_input, Some(&alternate.resident),
+                2 << 20, false, 188, true).unwrap();
+            assert_eq!(selected.0, runtime.0);
             let resident = if expected == 0 { &input.resident } else { &alternate.resident };
             for rank in 0..2 {
                 let bytes: u64 = planned.0.items[rank].iter().filter(|i| i.group == "target weights")
@@ -1777,12 +1772,7 @@ mod tests {
             input.index = cache::GlmfIndexCache::Compact;
             input.resident = resident_weights_placed(&checkpoint, &cfg, cfg.layers, 2,
                 input.representation, AttentionPlacement::Layers, first_owner as usize).unwrap();
-            let mut planner = request(&input).unwrap();
-            // Inventory-only until the production executor is explicitly enabled.
-            planner.executor = ExecutorModes { family: "glm5_flash candidate", modes: &[LayerMode::HeadSplit,
-                LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
-                LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true,
-                attention: AttentionPlacement::Heads };
+            let planner = request(&input).unwrap();
             let placed = solve(&planner).unwrap();
             for rank in 0..2 {
                 let charged: u64 = placed.items[rank].iter()
@@ -1843,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn glm5_flash_resolves_context_where_the_build_carries_it_and_refuses_owned_layers() {
+    fn glm5_flash_resolves_context_by_default_and_layers_only_when_explicit() {
         let programs = Some(GlmfAttention { mode: AttentionPlacement::Context, topk_scratch: 7, partial_scratch: 9,
             ..Default::default() });
         use AttentionPlacement::{Context, Heads, Layers};
@@ -1861,17 +1851,41 @@ mod tests {
                 "{requested:?}: {error}");
             assert!(error.to_string().contains("glmf_dsa_candidate_merge"), "{error}");
         }
-        for (mode, gpus, programs) in [(Context, 1, programs), (Layers, 2, programs)] {
+        for (mode, gpus, programs) in [(Context, 1, programs), (Layers, 1, programs)] {
             assert!(matches!(resolve_attention(Some(mode), gpus, programs), Err(PlacementError::AttentionPlacement { .. })));
         }
-        // The executor runs context, not owned layers; heads stays explicit.
+        // Explicit layers does not need the context programs and never changes auto.
+        for programs in [programs, None] {
+            assert_eq!(resolve_attention(Some(Layers), 2, programs).unwrap().mode, Layers);
+        }
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut req = request(&inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES)).unwrap();
         assert!(req.layers.iter().filter(|l| l.kind == AttentionClass::Kda).all(|l| l.kv_unit.unit_bytes_context.is_none()));
         assert!(req.layers.iter().filter(|l| l.kind == AttentionClass::Dsa).all(|l| l.kv_unit.unit_bytes_context.is_some()));
         assert_eq!(solve(&req).unwrap().attention_placement, Heads);
         req.attention_placement = Some(Layers);
-        assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })));
+        let placed = solve(&req).unwrap();
+        assert_eq!(placed.attention_placement, Layers);
+        assert!(placed.layers.iter().zip(&cfg.attention).all(|(layer, kind)|
+            if *kind == GlmNextAttention::Kda { layer.mode == LayerMode::HeadSplit } else {
+                matches!(layer.mode, LayerMode::Whole { ffn: FfnMode::Split, .. })
+            }));
+    }
+
+    #[test]
+    fn explicit_layers_keep_the_context_default_and_single_rank_owner_executor() {
+        let executor = super::super::GLM5_FLASH;
+        assert_eq!(executor.attention_default(), AttentionPlacement::Context);
+        assert_eq!(executor.check_attention(Some(AttentionPlacement::Layers), 2, true).unwrap(), AttentionPlacement::Layers);
+        assert!(executor.check_attention(Some(AttentionPlacement::Layers), 1, false).is_err());
+        for gpu in 0..2 {
+            assert!(executor.runs(LayerMode::Whole { gpu, ffn: FfnMode::Split }));
+        }
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let one = inputs(&cfg, 1, inventory::PRO_TOTAL_BYTES);
+        let placed = solve(&request(&one).unwrap()).unwrap();
+        assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }));
+        executor.check(&placed).unwrap();
     }
 
     #[test]

@@ -50,8 +50,8 @@ pub(crate) struct EngineArgs {
     /// MLA attention over the two GPUs of a head split: auto (context where this build carries its
     /// programs), context (records and pool keys by 256-token unit on one GPU each, a q /
     /// candidate / partial exchange per MLA layer, the compact index cache), or heads (replicated
-    /// latent and token keys, head-split attention). KDA layers are always head-split; owned MLA
-    /// layers (`layers`) have no executor yet.
+    /// latent and token keys, head-split attention), or explicit layers (complete MLA operands
+    /// and caches on alternating owners, split FFNs). KDA layers are always head-split.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto")]
     pub attention_placement: String,
     /// Run only the first N layers (layers 0-2 are the dense ones).
@@ -493,13 +493,16 @@ mod draft_cli_tests {
                 check_options(&args).unwrap();
             }
         }
-        // context runs on a head split (#57); one GPU, owned layers and unknown modes are refused.
+        // context and explicit owned layers need two GPUs; unknown modes are refused.
         let mut args = parse(&["--attention-placement", "context"]);
         args.split_device = Some(1);
         check_options(&args).unwrap();
         args.prefix_marks = prefix::PrefixMarks::Pool;
         assert!(check_options(&args).unwrap_err().to_string().contains("prefix marks"));
-        for (mode, peers) in [("context", &[false][..]), ("layers", &[false, true]), ("unknown", &[false, true])] {
+        let mut layers = parse(&["--attention-placement", "layers"]);
+        layers.split_device = Some(1);
+        check_options(&layers).unwrap();
+        for (mode, peers) in [("context", &[false][..]), ("layers", &[false]), ("unknown", &[false, true])] {
             for &peer in peers {
                 let mut args = parse(&["--attention-placement", mode]);
                 args.split_device = peer.then_some(1);

@@ -311,7 +311,7 @@ fn executors_refuse_modes_they_cannot_run_at_plan_time() {
     assert_eq!(families::DEEPSEEK_V4.check(&handed),
         Err(PlacementError::UnsupportedMode { family: "deepseek_v4", layer: 1, mode: S1 }));
     assert!(families::DEEPSEEK_V41.runs(W1) && !families::QWEN4.runs(LayerMode::HeadSplit));
-    assert_eq!(families::executor("glm5_flash").map(|e| e.hops), Some(false));
+    assert_eq!(families::executor("glm5_flash").map(|e| e.hops), Some(true));
 }
 
 fn tp2_request(free: [u64; 2], onboard: Onboard) -> PlacementRequest {

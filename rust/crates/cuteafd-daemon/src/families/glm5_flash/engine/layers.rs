@@ -1,5 +1,4 @@
-//! GLM bindings for the shared per-layer executor. Admission stays fail-closed
-//! until the sparse inventory and both-owner fidelity gates are qualified.
+//! GLM bindings for explicit per-layer execution; Context remains the default.
 use super::*;
 use crate::shared::experts::rtx::pair::SubmissionScope;
 use crate::shared::peer_split::{attention::{self, AttentionStateOwners, LaneOrder, LayerKernels, PipelineKernels},
@@ -525,6 +524,21 @@ mod tests {
                 shares[1] = AttentionShare::Split;
                 assert!(validate_attention_shares(&execution, shares.iter().copied(), rank, 2).is_err());
                 assert!(validate_attention_shares(&execution, shares[..2].iter().copied(), rank, 2).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_whole_ffn_and_mixed_context_refuse_before_cache_allocation() {
+        use crate::shared::placement::layers::AttentionShare;
+        for modes in [
+            vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, LayerMode::HeadSplit],
+            vec![LayerMode::ContextSplit, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }],
+        ] {
+            let execution = plan(&modes, 2);
+            for rank in 0..2 {
+                let shares = modes.iter().map(|&mode| AttentionShare::bind(mode, 2).unwrap()[rank]);
+                assert!(validate_attention_shares(&execution, shares, rank, 2).is_err());
             }
         }
     }

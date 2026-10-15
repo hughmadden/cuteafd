@@ -25,7 +25,8 @@
 //! `r * N / 2 ..` (their in-projection, conv, gate, decay and state rows, q_b rows, W_UK / W_UV
 //! heads and o_proj columns) and the matching half of the dense and shared-expert intermediate;
 //! every rank the mHC weights, norms, the replicated low-rank KDA gates (`f_a`, `g_a`), the MLA
-//! latent projection (`q_a | kv_a`) and the DSA indexer; rank 0 the router. A ModelOpt NVFP4
+//! latent projection (`q_a | kv_a`), DSA indexer and router. Under explicit `layers`, MLA
+//! operands and caches reside only on their selected owner. A ModelOpt NVFP4
 //! dense MLP stays whole on rank 0 (its package has no half geometry).
 //! With `kda_output_shard`, the output projection instead splits live token rows:
 //! each rank owns one full FP8 `[H, D]` matrix and consumes complete gathered

@@ -37,8 +37,10 @@
 //! records and the DSA indexer are computed on both (identical bits), and the partials meet
 //! over peer memory (`shared::peer_split`): each GPU pushes its partial, waits for the
 //! other's and adds the two (the same bits in either order), so both residual streams stay
-//! identical. Router, routed experts, LM head and drafter stay on rank 0; rank 1 is queued a
-//! layer ahead of rank 0's expert exchange.
+//! identical. Routers are resident on both ranks; routed experts follow admitted local/TP2/Spark
+//! homes. The LM head stays on rank 0; the drafter follows its admitted movable placement.
+//! Explicit per-layer placement keeps KDA/FFNs split and assigns each MLA layer
+//! (complete operands, KV and index state) to one owner with BF16 residual handoff.
 use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphStats};
 use super::packing;
 use super::weights::{GlmfLayer, GlmfWeights};
@@ -1685,6 +1687,13 @@ fn validate_attention_shares(plan: &cuteafd_loader::placement::LayerExecutionPla
     shares: impl ExactSizeIterator<Item = crate::shared::placement::layers::AttentionShare>,
     rank: usize, ranks: usize) -> Result<()> {
     use crate::shared::placement::layers::AttentionShare;
+    use cuteafd_loader::placement::{FfnMode, LayerMode};
+    ensure!(ranks == 1 || !plan.modes().iter().any(|mode|
+        matches!(mode, LayerMode::Whole { ffn: FfnMode::Owner, .. })),
+        "GLM Flash two-rank layers retain split FFNs");
+    ensure!(!plan.modes().contains(&LayerMode::ContextSplit) || !plan.modes().iter().any(|mode|
+        matches!(mode, LayerMode::Whole { .. })),
+        "GLM mixed context execution requires per-layer paging tables");
     ensure!(plan.modes().len() == shares.len() && rank < ranks,
         "attention operand inventory differs from execution plan");
     for (share, &mode) in shares.zip(plan.modes()) {
