@@ -145,11 +145,9 @@ mod tests {
     fn fp8_spark_plan_uses_checkpoint_exact_widths_and_all_endpoints() -> Result<()> {
         use cuteafd_loader::plan::testing::{fp8, mimo_flash_config, write_snapshot};
         let root = tempfile::tempdir()?;
-        let mut config = mimo_flash_config();
-        config["n_routed_experts"] = 2.into();
-        config["num_experts_per_tok"] = 1.into();
+        let config = mimo_flash_config();
         let mut tensors = Vec::new();
-        for expert in 0..2 {
+        for expert in 0..256 {
             for (name, rows, cols) in [("gate", 2048, 4096), ("up", 2048, 4096), ("down", 4096, 2048)] {
                 tensors.extend(fp8(&format!("model.layers.1.mlp.experts.{expert}.{name}_proj"), rows, cols, None));
             }
