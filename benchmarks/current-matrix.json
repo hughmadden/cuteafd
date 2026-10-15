@@ -14,6 +14,6 @@
     {"family": "mimo_v2", "checkpoint": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
     {"family": "mimo_v2", "checkpoint": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
     {"family": "qwen4", "checkpoint": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "qwen4", "checkpoint": "nvidia/Qwen3.8-Flash-Next-NVFP4", "5090": "simulated-5090", "1rtx": {"status": "held", "reason": "the only min card is v2.0.0-rc3, from before the Spark transports bootstrapped at install (#251)"}, "2rtx": "current"}
+    {"family": "qwen4", "checkpoint": "nvidia/Qwen3.8-Flash-Next-NVFP4", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"}
   ]
 }
