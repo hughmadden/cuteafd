@@ -169,7 +169,7 @@ pub(super) fn run_local(args: &ExpertProbeArgs, catalog: &OfficialV41Catalog, wi
     for rank in 0..tp {
         let (free, _) = library.cuda_memory_info()?;
         let started = Instant::now();
-        let experts = Fp8Experts::load(&library, tensors, &directory, args.layer..args.layer + 1, tp, rank, rows,
+        let experts = Fp8Experts::load(&library, tensors, &directory, &[args.layer], tp, rank, rows,
             free.saturating_sub(2 << 30))?;
         eprintln!("rank {rank}/{tp} resident in {:.1} s", started.elapsed().as_secs_f64());
         // A BF16-input (coordinator) package takes the wire rows' exact BF16 values.

@@ -40,6 +40,12 @@ fn installed_variants(module: &Fp8MoeModule)
 /// Parallel readers per layer load.
 const READERS: usize = 16;
 
+fn validate_layer_ids(layers: &[usize]) -> Result<()> {
+    ensure!(layers.windows(2).all(|pair| pair[0] < pair[1]),
+        "FP8 expert layer IDs must be sorted and unique");
+    Ok(())
+}
+
 /// Admit the whole resident expert allocation before allocating any weights or
 /// scratch. Callers keep worker/step and prefix-cache reservations out of `budget`.
 fn resident_admission(layer_bytes: usize, layers: usize, primary_scratch: usize, bf16_scratch: Option<usize>,
@@ -255,7 +261,7 @@ impl<'a> Fp8Experts<'a> {
     /// Loads the package at `directory` and layers `layers` of the slice
     /// `rank` of `tp`, with scratch for `capacity` rows.
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
-        layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
+        layers: &[usize], tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         Self::load_with_bf16(library, tensors, directory, None, layers, tp, rank, capacity, budget)
     }
@@ -263,15 +269,15 @@ impl<'a> Fp8Experts<'a> {
     /// Loads an optional BF16-input sibling over the same weights. Validate
     /// both packages and admit their maximum scratch before allocating weights.
     pub fn load_with_bf16(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
-        bf16_directory: Option<&Path>, layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize,
+        bf16_directory: Option<&Path>, layers: &[usize], tp: usize, rank: usize, capacity: usize,
         budget: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        let mut experts = Self::prepare(library, tensors, directory, bf16_directory, layers.clone(), tp,
+        let mut experts = Self::prepare(library, tensors, directory, bf16_directory, layers, tp,
             rank, capacity, budget)?;
         let slicing = if directory.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("-w")) {
             Slicing::Blocks(128)
         } else { Slicing::Padded };
-        experts.layers = layers.map(|layer| {
+        experts.layers = layers.iter().copied().map(|layer| {
             let started = std::time::Instant::now();
             let loaded = Fp8Layer::load_with(library, tensors, layer, tp, rank, slicing)?;
             tracing::info!(layer, tp, rank, elapsed_ms = started.elapsed().as_millis() as u64,
@@ -282,15 +288,16 @@ impl<'a> Fp8Experts<'a> {
     }
 
     fn prepare(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
-        bf16_directory: Option<&Path>, layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize,
+        bf16_directory: Option<&Path>, layers: &[usize], tp: usize, rank: usize, capacity: usize,
         budget: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
+        validate_layer_ids(layers)?;
         // `tp<n>-w<width>` layouts store each rank's own whole 128-row blocks (see `exact_layout`).
         let slicing = match directory.file_name().and_then(|n| n.to_str()).and_then(|n| n.split_once("-w")) {
             Some(_) => Slicing::Blocks(128),
             None => Slicing::Padded,
         };
-        for layer in layers.clone() {
+        for &layer in layers {
             tensors.validate_layer(layer)?;
         }
         // SAFETY: a trusted package for the current device; the owner drains
@@ -341,7 +348,7 @@ impl<'a> Fp8Experts<'a> {
     /// Bounded P4 double banks: each checkpoint projection is read once, then
     /// both GPUs take their own row/column window from the same pinned bytes.
     pub fn load_pair(devices: [crate::shared::memory::device::Device<'a>; 2], tensors: &Fp8ExpertTensors,
-        directories: [&Path; 2], slicing: [Slicing; 2], layers: std::ops::Range<usize>, capacity: usize,
+        directories: [&Path; 2], slicing: [Slicing; 2], layers: &[usize], capacity: usize,
         budgets: [usize; 2]) -> Result<[crate::shared::memory::device::DeviceOwner<'a, Self>; 2]> {
         use super::paired_load::{self, Fences};
         use crate::shared::memory::device::Device;
@@ -352,11 +359,11 @@ impl<'a> Fp8Experts<'a> {
         ensure!(slicing[0] == slicing[1], "FP8 paired ranks disagree on slicing");
         let mut owners = [
             devices[0].own(|| Self::prepare(devices[0].library, tensors, directories[0], None,
-                layers.clone(), 2, 0, capacity, budgets[0]))?,
+                layers, 2, 0, capacity, budgets[0]))?,
             devices[1].own(|| Self::prepare(devices[1].library, tensors, directories[1], None,
-                layers.clone(), 2, 1, capacity, budgets[1]))?,
+                layers, 2, 1, capacity, budgets[1]))?,
         ];
-        for layer in layers.clone() {
+        for &layer in layers {
             for rank in 0..2 {
                 devices[rank].run(|| {
                     let mut regions = Vec::with_capacity(6);
@@ -425,7 +432,7 @@ impl<'a> Fp8Experts<'a> {
         }
 
         let mut group = 0;
-        for (index, layer) in layers.enumerate() {
+        for (index, &layer) in layers.iter().enumerate() {
             let layer_started = std::time::Instant::now();
             let mut storage_bytes_read = 0;
             let mut read_seconds = 0.;
@@ -585,6 +592,16 @@ mod tests {
     use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
 
     #[test]
+    fn exact_layer_ids_are_ordered_unique_and_may_be_sparse_or_empty() {
+        for layers in [&[][..], &[13][..], &[13, 15, 20][..]] {
+            super::validate_layer_ids(layers).unwrap();
+        }
+        for layers in [&[13, 13][..], &[15, 13][..], &[13, 20, 15][..]] {
+            assert!(super::validate_layer_ids(layers).is_err());
+        }
+    }
+
+    #[test]
     fn package_family_includes_format_without_changing_existing_families() {
         use cuteafd_loader::formats::fp8_experts::ExpertFormat;
         assert_eq!(super::package_family(Some("mimo"), ExpertFormat::Mxfp4), "mimof");
@@ -649,7 +666,7 @@ mod tests {
             .and_then(|resident| Ok(resident + metadata.scratch_for(1)?.max(256))));
         let [left, right] = budgets;
         let owners = Fp8Experts::load_pair(devices, &tensors, [&layouts[0].0, &layouts[1].0],
-            layouts.each_ref().map(|layout| layout.1), layer..layer + 1, 1, [left?, right?])?;
+            layouts.each_ref().map(|layout| layout.1), &[layer], 1, [left?, right?])?;
         for rank in 0..2 {
             for (slot, projection) in Fp8Projection::ALL.into_iter().enumerate() {
                 let sizes = tensors.slice_bytes_with(projection, 2, rank, layouts[rank].1)?;
