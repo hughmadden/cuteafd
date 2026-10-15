@@ -10,6 +10,8 @@ pub struct Phase {
     pub timed: bool,
     pub ports: Vec<Port>,
     pub assessments: Vec<String>,
+    #[serde(default)]
+    pub health: BTreeMap<String, cuteafd_transport::fabric_health::Verdict>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -19,6 +21,12 @@ pub struct Port {
     pub port: u32,
     pub state: Option<String>,
     pub link_gbps: Option<f64>,
+    #[serde(default)]
+    pub mtu: Option<u32>,
+    #[serde(default)]
+    pub health: Option<cuteafd_transport::fabric_health::Health>,
+    #[serde(default)]
+    pub health_since_start: Option<cuteafd_transport::fabric_health::Health>,
     pub seconds: f64,
     /// Actual host-local observation window; phase edges are sampled at 1 Hz.
     pub sampled_start_s: f64,
@@ -129,16 +137,37 @@ fn engine_headers(host: &HostSample, device: &str, port: u32, bytes: Option<u64>
 /// Machine-readable caveats gate interpretation, not request correctness.
 pub fn caveats(phases: &[Phase]) -> Vec<String> {
     phases.iter().filter(|p| p.timed).flat_map(|p| p.assessments.iter()
-        .filter(|a| a.starts_with("foreign traffic:") || a.starts_with("SparkNest traffic:") || a.starts_with("storage attribution unavailable:"))
-        .map(|a| format!("{}: {a}; rerun in a quiet window before accepting A/B", p.name))).collect()
+        .filter(|a| a.starts_with("foreign traffic:") || a.starts_with("SparkNest traffic:") || a.starts_with("storage attribution unavailable:") || a.starts_with("fabric health:"))
+        .map(|a| format!("{}: {a}; {} before accepting A/B", p.name,
+            if a.starts_with("fabric health:") { "investigate fabric health and rerun" } else { "rerun in a quiet window" }))).collect()
 }
 
 pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) -> Phase {
     let mut phase = Phase { name: name.into(), timed, ..Default::default() };
+    // Keep disappeared/restarted/nonadvancing hosts and ports as explicit unknown
+    // health evidence instead of silently dropping them from host verdicts.
+    for host in before.hosts.keys().chain(after.hosts.keys()).collect::<BTreeSet<_>>() {
+        let b = before.hosts.get(host); let a = after.hosts.get(host);
+        let ports: BTreeSet<_> = b.into_iter().chain(a).flat_map(|h| h.ports.iter())
+            .map(|p| (p.device.as_str(), p.port)).collect();
+        for (device, number) in ports {
+            let old = b.and_then(|h| h.ports.iter().find(|p| p.device == device && p.port == number));
+            let new = a.and_then(|h| h.ports.iter().find(|p| p.device == device && p.port == number));
+            let continuous = b.zip(a).is_some_and(|(b,a)| a.incarnation == b.incarnation && a.observation_started_s == b.observation_started_s
+                && a.sampled_s > b.sampled_s && (a.sampled_s - b.sampled_s).is_finite());
+            if continuous && old.is_some() && new.is_some() { continue; }
+            let sample = new.or(old).unwrap();
+            let mut health = cuteafd_transport::fabric_health::evaluate(sample, sample, 0.0);
+            health.reasons = vec!["missing/restarted host or port, or nonadvancing observation".into()];
+            phase.ports.push(Port { host: host.clone(), device: device.into(), port: number,
+                state: new.and_then(|p| p.state.clone()), link_gbps: new.and_then(|p| p.link_gbps),
+                mtu: new.and_then(|p| p.mtu), health: Some(health), ..Default::default() });
+        }
+    }
     for (host, a) in &after.hosts {
         let Some(b) = before.hosts.get(host) else { continue };
         let seconds = a.sampled_s - b.sampled_s;
-        if a.incarnation != b.incarnation || seconds <= 0.0 || !seconds.is_finite() { continue; }
+        if a.incarnation != b.incarnation || a.observation_started_s != b.observation_started_s || seconds <= 0.0 || !seconds.is_finite() { continue; }
         for port in &a.ports {
             let Some(old) = b.ports.iter().find(|p| p.device == port.device && p.port == port.port) else { continue };
             let counters: BTreeMap<_, _> = port.counters.iter().filter_map(|(key, value)|
@@ -208,6 +237,10 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
             let foreign_sent_bytes = sent_bytes.zip(sources).zip(engine_sent_bytes).map(|((n, (tx, _)), engine)| n.saturating_sub(engine).saturating_sub(tx).saturating_sub(estimated_header_sent_bytes.unwrap_or(0)));
             let foreign_received_bytes = received_bytes.zip(sources).zip(engine_received_bytes).map(|((n, (_, rx)), engine)| n.saturating_sub(engine).saturating_sub(rx).saturating_sub(estimated_header_received_bytes.unwrap_or(0)));
             let label = format!("{host} {}/{}", port.device, port.port);
+            let health = cuteafd_transport::fabric_health::evaluate(old, port, seconds);
+            if timed && health.verdict == cuteafd_transport::fabric_health::Verdict::Warn {
+                for reason in &health.reasons { phase.assessments.push(format!("fabric health: {label}: {reason}")); }
+            }
             // Protocol bytes exclude Ethernet/IP/RDMA overhead. Require both
             // 5% of NIC traffic and 1 Gb/s to avoid calling headers foreign work.
             let foreign = foreign_sent_bytes.unwrap_or(0).saturating_add(foreign_received_bytes.unwrap_or(0));
@@ -241,6 +274,7 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
                 "unattributed/retry overhead"
             } else { "unattributed (headers/ACK/skew or foreign)" }.into();
             phase.ports.push(Port { host: host.clone(), device: port.device.clone(), port: port.port,
+                mtu: port.mtu, health: Some(health), health_since_start: port.health_since_start.clone(),
                 sampled_start_s: b.sampled_s, sampled_end_s: a.sampled_s, state: port.state.clone(), link_gbps: port.link_gbps, seconds, sent_bytes, received_bytes,
                 engine_sent_bytes, engine_received_bytes, foreign_sent_bytes, foreign_received_bytes,
                 sparknest_sent_bytes, sparknest_received_bytes, sparknest_status, residual_kind,
@@ -250,7 +284,23 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
                 idle_xmit_wait_ticks_per_s: port.idle_xmit_wait_ticks_per_s, peers });
         }
     }
+    for host in before.hosts.keys().chain(after.hosts.keys()) {
+        phase.health.insert(host.clone(), cuteafd_transport::fabric_health::verdict(phase.ports.iter()
+            .filter(|p| &p.host == host).filter_map(|p| p.health.as_ref())));
+    }
     phase
+}
+
+pub fn health_header(phases: &[Phase]) -> Option<String> {
+    let states: Vec<_> = phases.iter().filter(|p| p.timed).flat_map(|p| &p.ports).filter_map(|p| p.health.as_ref()).collect();
+    if states.is_empty() && phases.iter().all(|p| p.health.is_empty()) { return None; }
+    let host_states: Vec<_> = phases.iter().filter(|p| p.timed).flat_map(|p| p.health.values())
+        .map(|v| cuteafd_transport::fabric_health::Health { verdict: *v, ..Default::default() }).collect();
+    let verdict = cuteafd_transport::fabric_health::verdict(states.iter().copied().chain(host_states.iter()));
+    let peak = |f: fn(&cuteafd_transport::fabric_health::Health) -> Option<f64>| states.iter().filter_map(|h| f(h)).reduce(f64::max)
+        .map(|n| format!("{n:.1}")).unwrap_or_else(|| "unknown".into());
+    Some(format!("Fabric {}: peak loss {} / retransmit {} events/GB; pause not collected; reasons in report", verdict.label(),
+        peak(|h| h.loss_events_per_gb), peak(|h| h.adapter_retransmits_per_gb)))
 }
 
 pub fn header(phases: &[Phase]) -> Option<String> {
@@ -282,7 +332,7 @@ mod tests {
             incarnation: "one".into(), sampled_s: time,
             ports: vec![PortSample { device: "nic".into(), port: 1, link_gbps: Some(100.0), state: Some("4: ACTIVE".into()),
                 counters: BTreeMap::from([("port_xmit_data".into(), nic), ("port_rcv_data".into(), nic),
-                    ("rp_cnp_handled".into(), nic)]), idle_xmit_wait_ticks_per_s: None }],
+                    ("rp_cnp_handled".into(), nic)]), idle_xmit_wait_ticks_per_s: None, ..Default::default() }],
             engine: vec![EngineSample { device: "nic".into(), port: 1, peer: "peer".into(),
                 sent_bytes: engine, received_bytes: engine, ..Default::default() }], ..Default::default()
         })]) }
@@ -381,11 +431,48 @@ mod tests {
     #[test]
     fn stale_reset_restart_and_missing_are_not_traffic() {
         let before = snapshot(1.0, 500, 500);
-        assert!(interval("x", true, &before, &before).ports.is_empty());
+        let stale = interval("x", true, &before, &before);
+        assert_eq!(stale.ports[0].health.as_ref().unwrap().verdict, cuteafd_transport::fabric_health::Verdict::Unknown);
+        assert_eq!(stale.ports[0].sent_bytes, None);
         let mut after = snapshot(2.0, 100, 600);
         let phase = interval("x", true, &before, &after);
         assert_eq!(phase.ports[0].sent_bytes, None);
         after.hosts.get_mut("spark").unwrap().incarnation = "two".into();
-        assert!(interval("x", true, &before, &after).ports.is_empty());
+        assert_eq!(interval("x", true, &before, &after).ports[0].sent_bytes, None);
     }
+    #[test]
+    fn health_evidence_survives_reports_and_only_timed_warnings_gate() {
+        let mut before = snapshot(1.0, 0, 0);
+        let mut after = snapshot(2.0, 5_000_000_000, 0);
+        for (snapshot, marks, loss) in [(&mut before, 0, 0), (&mut after, 300_000, 600)] {
+            let p = &mut snapshot.hosts.get_mut("spark").unwrap().ports[0];
+            for key in ["out_of_sequence", "packet_seq_err", "roce_adp_retrans", "local_ack_timeout_err", "rnr_nak_retry_err"] {
+                p.counters.insert(format!("hw_counters/{key}"), if key == "out_of_sequence" { loss } else { 0 });
+            }
+            p.counters.insert("hw_counters/np_ecn_marked_roce_packets".into(), marks);
+        }
+        let phase = interval("decode", true, &before, &after);
+        assert_eq!(phase.health["spark"], cuteafd_transport::fabric_health::Verdict::Ok);
+        let json = serde_json::to_value(&phase).unwrap();
+        assert_eq!(json["ports"][0]["health"]["sequence_events_per_gb"], 60.0);
+        assert_eq!(json["ports"][0]["health"]["adapter_retransmits_per_gb"], 0.0);
+        assert!(health_header(&[phase]).unwrap().contains("60.0"));
+        after.hosts.get_mut("spark").unwrap().ports[0].counters.insert("hw_counters/np_ecn_marked_roce_packets".into(), 0);
+        let phase = interval("decode", true, &before, &after);
+        assert_eq!(phase.health["spark"], cuteafd_transport::fabric_health::Verdict::Warn);
+        assert!(caveats(&[phase]).iter().any(|s| s.contains("investigate fabric health")));
+        assert!(caveats(&[interval("warmup", false, &before, &after)]).is_empty());
+    }
+    #[test]
+    fn disappeared_or_restarted_evidence_is_unknown() {
+        let before = snapshot(1.0, 0, 0);
+        let mut after = snapshot(2.0, 100, 0);
+        after.hosts.get_mut("spark").unwrap().incarnation = "restart".into();
+        for phase in [interval("x", true, &before, &after), interval("x", true, &before, &Snapshot::default())] {
+            assert_eq!(phase.health["spark"], cuteafd_transport::fabric_health::Verdict::Unknown);
+            assert_eq!(phase.ports[0].sent_bytes, None);
+            assert!(health_header(&[phase]).unwrap().contains("unknown"));
+        }
+    }
+
 }

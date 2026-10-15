@@ -331,6 +331,18 @@ mod tests {
     }
 
     #[test]
+    fn fabric_health_poll_is_authenticated_bounded_and_visibility_gated() {
+        assert!(PAGE.contains("cuteafdAuthenticatedFetch('/v1/fabric'"));
+        assert!(PAGE.contains("!document.hidden && S.connected"));
+        assert!(PAGE.contains("AbortSignal.timeout(2500)"));
+        assert!(PAGE.contains("setTimeout(pollFabricHealth, 2000)"));
+        assert!(!PAGE.contains("setInterval(pollFabricHealth"));
+        assert!(PAGE.contains("health_since_start") && PAGE.contains("since observation start"));
+        assert!(PAGE.contains("pause not collected"));
+        assert!(PAGE.contains("line.textContent = text"));
+    }
+
+    #[test]
     fn bench_text_toggles_text_and_a_disabled_hub_stays_off() {
         let hub = ConsoleHub::new(false);
         assert!(!hub.text_enabled());

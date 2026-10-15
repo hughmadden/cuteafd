@@ -17,6 +17,10 @@ const cnp = (c) => {
   return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
 };
 const fmt = (value) => Number.isFinite(value) ? value.toFixed(2) : 'unavailable';
+function healthLine(h) {
+  const verdict = h?.verdict === 'ok' ? 'OK' : h?.verdict || 'unknown';
+  return `${verdict}: ${(h?.reasons || ['no continuous observation']).join('; ')}; pause ${h?.pause || 'not collected'}`;
+}
 function mark(name, attrs, parent) {
   const node = document.createElementNS(NS, name);
   for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
@@ -38,7 +42,11 @@ function rateHeaders(p) {
 function draw(container, key, history) {
   const last = history.at(-1), port = last.port;
   const section = document.createElement('section'); section.className = 'fabric-port';
-  section.innerHTML = `<h4>${esc(key)} <small>${esc(port.state || '')} · ${fmt(port.link_gbps)} Gb/s link</small></h4>`;
+  section.innerHTML = `<h4>${esc(key)} <small>${esc(port.state || '')} · ${fmt(port.link_gbps)} Gb/s link · MTU ${esc(port.mtu ?? "unknown")}</small></h4>`;
+  for (const [label, h] of [['Phase', port.health], ['Since observation start', port.health_since_start]]) {
+    const line = document.createElement('p'); line.className = 'note';
+    line.textContent = `${label}: ${healthLine(h)}`; section.append(line);
+  }
   const legend = document.createElement('div'); legend.className = 'fabric-legend';
   series.forEach((s, i) => {
     const label = document.createElement('span');
@@ -125,6 +133,12 @@ function render() {
     const heading = document.createElement('h4');
     heading.textContent = host === 'coordinator' ? 'Coordinator' : rank(host) !== Number.MAX_SAFE_INTEGER ? `Rank ${rank(host)} · ${host}` : host;
     group.append(heading);
+    const priority = ['warn', 'unknown', 'unproven', 'ok', 'idle'];
+    const evidence = ports.map(([, history]) => history.at(-1).port.health);
+    const verdict = priority.find(v => evidence.some(h => (h?.verdict || 'unknown') === v)) || 'unknown';
+    const status = document.createElement('p'); status.className = 'note';
+    status.textContent = `Fabric ${verdict === 'ok' ? 'OK' : verdict}: ` + [...new Set(evidence.flatMap(h => h?.reasons || ['no continuous observation']))].join('; ');
+    group.append(status);
     const grid = document.createElement('div'); grid.className = 'fabric-host-ports';
     let down = 0, idle = 0;
     ports.sort(([, a], [, b]) => a.at(-1).port.device.localeCompare(b.at(-1).port.device, undefined, { numeric: true })
@@ -160,7 +174,7 @@ window.CuteFabric = {
     for (const [key, history] of histories) {
       if (!seen.has(key)) {
         history.push({ index: sequence, port: { ...history.at(-1).port, state: 'unavailable',
-          utilization: null, counters: {}, xmit_wait_ticks_per_s: null, idle_xmit_wait_ticks_per_s: null },
+          health: null, health_since_start: null, utilization: null, counters: {}, xmit_wait_ticks_per_s: null, idle_xmit_wait_ticks_per_s: null },
           nic: null, engine: null, sparknest: null, foreign: null });
         if (history.length > 60) history.shift();
       }

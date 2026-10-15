@@ -817,8 +817,9 @@ def fabric_assessment(phases):
         if not phase.get('timed'):
             continue
         for warning in phase.get('assessments', []):
-            if warning.startswith(('foreign traffic:', 'SparkNest traffic:', 'storage attribution unavailable:')):
-                caveats.append(f"{phase.get('name', '?')}: {warning}; rerun in a quiet window before accepting A/B")
+            if warning.startswith(('foreign traffic:', 'SparkNest traffic:', 'storage attribution unavailable:', 'fabric health:')):
+                action = 'investigate fabric health and rerun' if warning.startswith('fabric health:') else 'rerun in a quiet window'
+                caveats.append(f"{phase.get('name', '?')}: {warning}; {action} before accepting A/B")
     return list(dict.fromkeys(caveats))
 
 
@@ -1111,7 +1112,7 @@ def write_summary(state, rows, arms):
             text += f"| {m['card']} | " + ' | '.join(cell(m.get(k)) for k in present) + ' |\n'
         text += '\n'
     if caveats:
-        text += '## A/B Verdict: Rerun\n\nTimed fabric contamination or unknown attribution prevents accepting this A/B. Request correctness and raw rates remain recorded.\n\n'
+        text += '## A/B Verdict: Rerun\n\nTimed unhealthy fabric, contamination or unknown attribution prevents accepting this A/B. Request correctness and raw rates remain recorded.\n\n'
         for c in caveats:
             text += f"- {c['card']} / {c['arm']} / r{c['repeat']}: {c['caveat']}\n"
         text += '\n'
@@ -1128,7 +1129,17 @@ def write_summary(state, rows, arms):
                               ('sparknest_sent_bytes','sparknest_received_bytes'), ('estimated_header_sent_bytes','estimated_header_received_bytes'),
                               ('foreign_sent_bytes','foreign_received_bytes')]]
                     text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {cell(phase.get('name'))} | {cell(p.get('host'))} {cell(p.get('device'))}/{p.get('port')} | " + ' | '.join(map(cell, values)) + ' |\n'
-        text += '\n'
+        text += '\n### Fabric Health By Arm And Phase\n\n| Card | Arm | Phase | Host / port | Verdict | Loss events/GB | Sequence events/GB | Adapter retransmits/GB | Reason |\n| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |\n'
+        for r in rows:
+            for phase in r.get('fabric', []):
+                for p in phase.get('ports', []):
+                    h = p.get('health') or {}
+                    values = [r['card'], r['arm'], phase.get('name'), f"{p.get('host')} {p.get('device')}/{p.get('port')}",
+                              h.get('verdict', 'unknown'), h.get('loss_events_per_gb', 'unknown'),
+                              h.get('sequence_events_per_gb', 'unknown'), h.get('adapter_retransmits_per_gb', 'unknown'),
+                              '; '.join(h.get('reasons') or ['no continuous observation'])]
+                    text += '| ' + ' | '.join(map(cell, values)) + ' |\n'
+        text += '\nPause: not collected. Loss signals overlap; they are not lost packets or retransmitted bytes.\n\n'
     text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |\n'
     for r in rows:
         trace = r.get('trace') or {}

@@ -13,6 +13,13 @@ pub struct PortSample {
     pub port: u32,
     pub state: Option<String>,
     pub link_gbps: Option<f64>,
+    #[serde(default)]
+    pub mtu: Option<u32>,
+    /// Advances on an observed counter reset, disappearance or link change.
+    #[serde(default)]
+    pub counter_epoch: u64,
+    #[serde(default)]
+    pub health_since_start: Option<crate::fabric_health::Health>,
     /// Missing or unreadable counters are absent, not zero.
     pub counters: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,6 +57,11 @@ pub struct HostSample {
     pub incarnation: String,
     /// Seconds on this host's monotonic clock, never compared across hosts.
     pub sampled_s: f64,
+    /// Start of the continuous demand-driven observation window, host-local.
+    #[serde(default)]
+    pub observation_started_s: Option<f64>,
+    #[serde(default)]
+    pub health_since_start: Option<crate::fabric_health::Verdict>,
     pub ports: Vec<PortSample>,
     pub engine: Vec<EngineSample>,
     /// Future producers (e.g. storage) use the same cumulative byte shape.
@@ -176,6 +188,9 @@ pub fn local() -> HostSample {
 
 /// Read every port and every numeric counter; unsupported files simply disappear.
 pub fn read_ports(root: &Path) -> Vec<PortSample> {
+    read_ports_with_net(root, Path::new("/sys/class/net"))
+}
+fn read_ports_with_net(root: &Path, net_root: &Path) -> Vec<PortSample> {
     let mut result = Vec::new();
     let Ok(devices) = std::fs::read_dir(root) else { return result };
     for device in devices.flatten() {
@@ -200,7 +215,16 @@ pub fn read_ports(root: &Path) -> Vec<PortSample> {
                 state: std::fs::read_to_string(path.join("state")).ok().map(|s| s.trim().into()),
                 link_gbps: std::fs::read_to_string(path.join("rate")).ok()
                     .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0),
-                counters, idle_xmit_wait_ticks_per_s: None });
+                mtu: std::fs::read_dir(path.join("gid_attrs/ndevs")).ok().and_then(|entries| {
+                    let mtus: BTreeSet<u32> = entries.flatten().filter_map(|entry| {
+                        let name = std::fs::read_to_string(entry.path()).ok()?;
+                        let name = name.trim();
+                        if name.is_empty() || name.contains('/') || name == "." || name == ".." { return None; }
+                        std::fs::read_to_string(net_root.join(name).join("mtu")).ok()?.trim().parse().ok()
+                    }).filter(|n| *n > 0).collect();
+                    (mtus.len() == 1).then(|| *mtus.first().unwrap())
+                }),
+                counters, ..Default::default() });
         }
     }
     result.sort_by(|a, b| (&a.device, a.port).cmp(&(&b.device, b.port)));
@@ -337,6 +361,7 @@ fn start() {
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
             let mut previous: Option<HostSample> = None;
             let mut idle = BTreeMap::new();
+            let mut health_window = crate::fabric_health::Window::default();
             loop {
                 {
                     let demand = demand();
@@ -346,6 +371,7 @@ fn start() {
                         for source in &registry().lock().unwrap().sources { source.suspend(); }
                         previous = None;
                         idle.clear();
+                        health_window = crate::fabric_health::Window::default();
                         until = demand.wake.wait(until).unwrap();
                     }
                 }
@@ -357,7 +383,7 @@ fn start() {
                 let mut local = HostSample { incarnation: incarnation.clone(), sampled_s: 0.0,
                     ports: read_ports(Path::new("/sys/class/infiniband")),
                     engine: counters.iter().map(|counter| counter.sample()).collect(),
-                    sources: sources.iter().map(|s| (s.name().into(), s.sample())).collect() };
+                    sources: sources.iter().map(|s| (s.name().into(), s.sample())).collect(), ..Default::default() };
                 local.sampled_s = clock.elapsed().as_secs_f64();
                 if let Some(before) = previous.as_ref() {
                     // Freeze the first quiet interval per port as its idle reference.
@@ -379,6 +405,9 @@ fn start() {
                         port.idle_xmit_wait_ticks_per_s = idle.get(&key).copied();
                     }
                 }
+                local.observation_started_s = Some(health_window.update(local.sampled_s, &mut local.ports));
+                local.health_since_start = Some(crate::fabric_health::verdict(local.ports.iter()
+                    .filter_map(|p| p.health_since_start.as_ref())));
                 previous = Some(local.clone());
                 // Publish local before remote reads: a peer probe must never wait on another probe.
                 latest().lock().unwrap().hosts.insert("coordinator".into(), local);
@@ -410,7 +439,12 @@ mod tests {
         std::fs::create_dir_all(port.join("hw_counters")).unwrap();
         std::fs::write(port.join("hw_counters/port_xmit_data"), "456").unwrap();
         std::fs::write(port.join("rate"), "200 Gb/sec (4X HDR)").unwrap();
-        let ports = read_ports(&root);
+        std::fs::create_dir_all(port.join("gid_attrs/ndevs")).unwrap();
+        std::fs::write(port.join("gid_attrs/ndevs/0"), "net0\n").unwrap();
+        std::fs::create_dir_all(root.join("net/net0")).unwrap();
+        std::fs::write(root.join("net/net0/mtu"), "9000\n").unwrap();
+        let ports = read_ports_with_net(&root, &root.join("net"));
+        assert_eq!(ports[0].mtu, Some(9000));
         assert_eq!(ports[0].counters["port_xmit_data"], 492);
         assert_eq!(ports[0].counters["hw_counters/port_xmit_data"], 1824);
         assert!(!ports[0].counters.contains_key("port_rcv_data"));
