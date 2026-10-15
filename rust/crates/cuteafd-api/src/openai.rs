@@ -299,6 +299,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/health", get(health))
         .route("/v1/stats", get(stats_route))
         .route("/v1/thermal", get(thermal_route))
+        .route("/v1/fabric", get(|| async { Json(cuteafd_transport::traffic::subscribed_snapshot()) }))
         .route("/v1/chat/completions", post(chat));
     // With the gateway mounted, its listing (OpenAI and Anthropic fields,
     // official aliases) owns /v1/models; the served model's entry keeps the

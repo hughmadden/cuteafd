@@ -620,6 +620,7 @@ def test_explicit_nonce_overrides_auto_and_inherited(entry, tmp_path, monkeypatc
     args = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--arm', 'base=b:s',
             '--state', str(state), '--nonce-seed', 'explicit seed', '--dry-run']
     args += ['--interleave', '--matched-prompts', '--arm', 'candidate=c:s'] if matched else ['--matrix']
+    args += ['--probe', 'v41-min:', '--probe', 'base:v41-min:fabric']
     monkeypatch.setenv('CUTEAFD_BENCH_NONCE_SEED', 'inherited')
     monkeypatch.setattr(sys, 'argv', args)
     assert cards.main() == 0
@@ -694,6 +695,7 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     monkeypatch.setattr(sys, 'argv', args)
     monkeypatch.setenv('CUTEAFD_BENCH_NONCE_SEED', 'inherited')
     monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
     monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='artifacts')))
     seen = []
     def detached(cmd, log, exit_file, env):
@@ -752,6 +754,7 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
         argv.append('--dry-run')
     monkeypatch.setattr(sys, 'argv', argv)
     monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
     monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(
         dict(image='release', image_id='sha256:abc', repo_digests=['digest']) if 'release' in arm
         else dict(slot='s', seal_sha256='seal', artifact_manifest_sha256='artifacts')))
@@ -1451,3 +1454,38 @@ def test_exact_state_golden_runs_against_the_live_server_at_sweep_end(entry, tmp
     with pytest.raises(ValueError, match='--exact-state uses the measurement window'):
         cards.generate({**entry, 'levels': [1]}, 'b', dict(instance='q', slot='s'), tmp_path, tmp_path / 'key',
                        {'PROFILE': 'nsys'}, set(), None, 1, exact_state=golden)
+
+
+def test_fabric_probe_card_selector(entry, tmp_path):
+    probes, scoped = cards.probe_selection(['v41-min:console,fabric'], [entry], {'a': {}, 'b': {}})
+    assert not scoped
+    assert probes['v41-min'] == {'console', 'fabric'}
+    for arm in ('a', 'b'):
+        job = cards.generate(entry, arm, dict(instance=arm, slot='s'), tmp_path,
+                             tmp_path / 'key', {}, probes['v41-min'], None, 1)
+        assert job['entry']['fabric'] is True
+
+
+def test_fabric_probe_arm_selector(entry, tmp_path):
+    probes, scoped = cards.probe_selection(['v41-min:', 'on:v41-min:fabric'], [entry], {'off': {}, 'on': {}})
+    for arm, enabled in [('off', False), ('on', True)]:
+        selected = probes['v41-min'] | scoped.get(arm, {}).get('v41-min', set())
+        job = cards.generate(entry, arm, dict(instance=arm, slot='s'), tmp_path,
+                             tmp_path / 'key', {}, selected, None, 1)
+        assert job['entry']['fabric'] is enabled
+    with pytest.raises(ValueError, match='probe arm'):
+        cards.probe_selection(['missing:v41-min:fabric'], [entry], {'on': {}})
+
+
+def test_arm_probe_preserves_card_defaults(entry, tmp_path, monkeypatch):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[{**entry, 'probes': ['console']}])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--interleave', '--repeats', '1', '--arm', 'off=b:s', '--arm', 'on=c:s',
+        '--probe', 'on:v41-min:fabric', '--state', str(state), '--dry-run'])
+    assert cards.main() == 0
+    jobs = json.loads((state / 'plan.json').read_text())['jobs']
+    assert all(set(job['probes']) == {'console', 'fabric'} for job in jobs)
+    assert all('observer' in job['entry'] for job in jobs)

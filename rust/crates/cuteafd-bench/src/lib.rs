@@ -10,6 +10,7 @@ pub mod baseline;
 pub mod cli;
 pub mod client;
 pub mod context;
+pub mod fabric;
 pub mod fidelity;
 pub mod fidelity_cli;
 pub mod fidelity_dataset;

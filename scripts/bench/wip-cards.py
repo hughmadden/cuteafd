@@ -191,9 +191,36 @@ def overrides_from(items):
     return overrides
 
 
+def probe_selection(items, cards, arms):
+    probes = {card['name']: set(card.get('probes', [])) | {'fabric'} for card in cards}
+    scoped = {}
+    for item in items:
+        selector = item.split(':')
+        if len(selector) == 2:
+            card, values = selector
+            arm = None
+        elif len(selector) == 3:
+            arm, card, values = selector
+            if arm not in arms:
+                raise ValueError('probe arm must be selected')
+        else:
+            raise ValueError('probe needs CARD:probes or ARM:CARD:probes')
+        if card not in probes:
+            raise ValueError('probe card must be selected')
+        values = set(filter(None, values.split(',')))
+        if not values <= {'image', 'memory', 'console', 'fabric'}:
+            raise ValueError('unknown probe')
+        if arm is None:
+            probes[card] = values
+        else:
+            scoped.setdefault(arm, {})[card] = values
+    return probes, scoped
+
+
 def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None):
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'))
+    entry['fabric'] = 'fabric' in probes
     values = config(entry['config'])
     values.update(entry.pop('set', {}))
     simulated = values.pop('BENCH_SIMULATED', '') or 'sim5090' in entry['name'] or 'sim-5090' in entry['name']
@@ -1515,7 +1542,7 @@ def main():
     parser.add_argument('--binary', default='cuteafd')
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
     parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:CARD:KEY=VALUE', help='arm-specific setting, overriding --set')
-    parser.add_argument('--probe', action='append', default=[], metavar='CARD:image,memory,console')
+    parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,memory,console,fabric')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
     parser.add_argument('--lossless-set', type=Path, metavar='FILE', help='case file for the spec_lossless_set panel '
@@ -1670,13 +1697,8 @@ def main():
                 card['post_load_c1'] = True
         if args.trace and card.get('family') == 'deepseek_v41' and not launcher_forwards_v41_trace(args.repo):
             raise ValueError(f"{card['name']}: this checkout's launcher does not forward SPECULATION_TRACE on the V4.1 path")
-    probes = {card['name']: set(card.get('probes', [])) for card in cards}
+    probes, arm_probes = probe_selection(args.probe, cards, arms)
     expected = {card['name']: card.get('expected_pool') for card in cards}
-    for item in args.probe:
-        name, values = item.split(':', 1)
-        probes[name] = set(values.split(','))
-        if not probes[name] <= {'image', 'memory', 'console'}:
-            raise ValueError('unknown probe')
     for item in args.expect_pool:
         name, value = item.split('=', 1)
         expected[name] = int(value)
@@ -1719,7 +1741,7 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']], expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
@@ -1780,7 +1802,7 @@ def main():
                     Path(job['entry']['set']['PROFILE_DIR']).mkdir(exist_ok=True)
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
-    fields = (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+    fields = ['fabric'] + (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \

@@ -66,7 +66,8 @@ pub fn report_svg(report: &Report) -> String {
     let heights: Vec<f64> = rows.iter().map(|row| row.iter()
         .map(|cell| view.framed_height(cell.width, &cell.id)).fold(0.0, f64::max)).collect();
     let banner = if t.scary || report.no_fit_reason().is_some() { 52.0 } else { 0.0 };
-    let header = 124.0;
+    let fabric_header = crate::fabric::header(&report.fabric);
+    let header = if fabric_header.is_some() { 142.0 } else { 124.0 };
     let footer = 64.0;
     let total = header + banner + heights.iter().map(|h| h + gap).sum::<f64>() + footer;
     let mut doc = Doc::new(w, total);
@@ -93,6 +94,9 @@ pub fn report_svg(report: &Report) -> String {
     }
     doc.text(w - 24.0, 108.0, Font::new(10.5, t.muted).anchor(Anchor::End),
         &format!("fingerprint {}", r.fingerprint));
+    if let Some(line) = fabric_header {
+        doc.text(x, 127.0, Font::new(11.5, t.ink2), &fit(&line, 11.5, w - 48.0));
+    }
     let mut y = header;
     if let Some(reason) = r.no_fit_reason() {
         doc.rect(20.0, y, w - 40.0, 44.0, 8.0, t.panel2);

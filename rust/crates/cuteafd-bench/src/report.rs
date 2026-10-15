@@ -45,6 +45,8 @@ pub struct Report {
     pub panels: Vec<PanelResult>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fabric: Vec<crate::fabric::Phase>,
 }
 
 impl Report {
@@ -539,6 +541,9 @@ pub struct Baseline {
     /// GPU throttle report over the whole baseline run (`/v1/thermal`; absent without one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thermal: Option<Value>,
+    /// Timed measurements only; warm-ups and quality probes are not attributed here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fabric: Vec<crate::fabric::Phase>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

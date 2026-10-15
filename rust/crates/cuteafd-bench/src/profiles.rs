@@ -9,9 +9,13 @@ pub struct Profile {
     pub title: String,
     pub description: String,
     pub panels: Vec<PlannedPanel>,
+    #[serde(default = "fabric_default")]
+    pub fabric: bool,
     #[serde(default)]
     pub builtin: bool,
 }
+
+fn fabric_default() -> bool { true }
 
 fn planned(ids: &[&str]) -> Vec<PlannedPanel> {
     ids.iter().map(|id| PlannedPanel { id: id.to_string(), passes: 1 }).collect()
@@ -23,7 +27,7 @@ const QUALITY: [&str; 7] = ["tool_eval", "structured", "ifeval", "code", "math",
 /// The built-in profiles, in dialog order.
 pub fn builtin() -> Vec<Profile> {
     let p = |name: &str, title: &str, description: &str, ids: &[&str]| Profile {
-        name: name.into(), title: title.into(), description: description.into(), panels: planned(ids), builtin: true };
+        name: name.into(), title: title.into(), description: description.into(), panels: planned(ids), fabric: true, builtin: true };
     vec![
         p("share", "Share card", "The baseline only: basic card and quick quality, exported as the share card.", &[]),
         p("smoke", "Release smoke",
@@ -101,6 +105,15 @@ pub fn parse_passes(text: &str) -> Result<Vec<(String, u32)>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_profiles_collect_fabric_unless_explicitly_disabled() {
+        let mut value = serde_json::json!({"name": "mine", "title": "Mine", "description": "", "panels": []});
+        assert!(serde_json::from_value::<Profile>(value.clone()).unwrap().fabric);
+        value["fabric"] = serde_json::json!(false);
+        assert!(!serde_json::from_value::<Profile>(value).unwrap().fabric);
+        assert!(builtin().iter().all(|p| p.fabric));
+    }
 
     #[test]
     fn builtin_profiles_are_unique_and_resolve() {

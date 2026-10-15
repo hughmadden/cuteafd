@@ -395,6 +395,7 @@ fn run_fanout_phase(
             native.cuda_stream_synchronize(std::ptr::null_mut())?;
         }
         for (ring, slot) in rings.iter_mut().zip(received) {
+            ring.record_received_bytes(header_bytes + peer_payload_bytes);
             ring.release_recv_slot(slot.sequence)?;
         }
     }
@@ -519,6 +520,7 @@ fn run_timeline_server(args: &BenchRdmaRingArgs, transport: &TcpTransportConfig)
         if queue.is_empty() {
             let wait_started = Instant::now();
             let (slot, stats) = ring.wait_recv_slot_with_stats()?;
+            ring.record_received_bytes(request_bytes);
             let received_at = Instant::now();
             let queued = decode_timeline_request(
                 slot,
@@ -551,6 +553,7 @@ fn run_timeline_server(args: &BenchRdmaRingArgs, transport: &TcpTransportConfig)
                 }
                 break;
             };
+            ring.record_received_bytes(request_bytes);
             let received_at = Instant::now();
             let sequence = processed + queue.len();
             let queued = decode_timeline_request(
@@ -814,6 +817,7 @@ fn run_timeline_client_phase(
 
         let wait_started = Instant::now();
         let (slot, stats) = ring.wait_recv_slot_with_stats()?;
+        ring.record_received_bytes(response_bytes);
         if measured {
             measurements.cq.record(stats);
             measurements
@@ -1180,6 +1184,7 @@ fn run_server(args: &BenchRdmaRingArgs, transport: &TcpTransportConfig) -> Resul
     let started = Instant::now();
     for _ in 0..total {
         let received = ring.wait_recv_slot()?;
+        ring.record_received_bytes(args.slot_bytes);
         let send = ring.reserve_send_slot()?;
         if let Some(native) = &native {
             unsafe {
@@ -1317,6 +1322,7 @@ fn run_client_phase(
             sent += 1;
         }
         let slot = ring.wait_recv_slot()?;
+        ring.record_received_bytes(slot_bytes);
         let mut marker_bytes = [0_u8; std::mem::size_of::<u64>()];
         unsafe {
             std::ptr::copy_nonoverlapping(

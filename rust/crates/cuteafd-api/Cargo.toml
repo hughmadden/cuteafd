@@ -21,6 +21,7 @@ async-stream.workspace = true
 axum.workspace = true
 futures.workspace = true
 cuteafd-core = { path = "../cuteafd-core" }
+cuteafd-transport = { path = "../cuteafd-transport" }
 cuteafd-loader = { path = "../cuteafd-loader" }
 sha2.workspace = true
 serde.workspace = true

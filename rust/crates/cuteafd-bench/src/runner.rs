@@ -24,6 +24,8 @@ pub struct RunRequest {
     /// A built-in or saved profile name.
     #[serde(default)]
     pub profile: Option<String>,
+    #[serde(default)]
+    pub fabric: Option<bool>,
     /// Explicit panels (a custom run); overrides the profile's list.
     #[serde(default)]
     pub panels: Option<Vec<String>>,
@@ -398,6 +400,8 @@ impl Bench {
             }
             (None, None) => ("share".to_string(), Vec::new()),
         };
+        let fabric = request.fabric.unwrap_or_else(|| request.panels.is_none()
+            && self.profiles().iter().any(|p| p.name == name && p.fabric));
         let passes: Vec<(String, u32)> = request.passes.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let (plan, dropped) = profiles::resolve(&planned, &passes);
         let skip_baseline = request.panels.is_some() && request.baseline == Some(false);
@@ -418,6 +422,7 @@ impl Bench {
             panels: plan.iter().map(|p| PanelResult { id: p.id.clone(),
                 title: panels::find(&p.id).map_or(p.id.clone(), |panel| panel.title().to_string()),
                 ..PanelResult::default() }).collect(),
+            fabric: Vec::new(),
             error: (!dropped.is_empty()).then(|| format!("panels not in this build: {}", dropped.join(", "))),
         }));
         // Publish the starting run before its id can reach a polling client.
@@ -427,7 +432,7 @@ impl Bench {
         // clients), so its console text is allowed until it retires.
         let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, context_load);
+            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, context_load, fabric);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -442,7 +447,7 @@ impl Bench {
 
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, plan: Vec<PlannedPanel>,
         report: Arc<Mutex<Report>>, text: Option<BenchText>, skip_baseline: bool,
-        lossless_set: Option<panels::lossless::CaseSet>, context_load: panels::context_load::Options) {
+        lossless_set: Option<panels::lossless::CaseSet>, context_load: panels::context_load::Options, fabric: bool) {
         let id = active.id.clone();
         let progress = Progress::default();
         let done = Arc::new(AtomicBool::new(false));
@@ -450,9 +455,9 @@ impl Bench {
             let (bench, progress, done, report, base) = (self.clone(), progress.clone(), done.clone(), report.clone(),
                 base.clone());
             std::thread::Builder::new().name("cuteafd-bench-tick".into())
-                .spawn(move || bench.tick(&report, &progress, &done, &base)).ok()
+                .spawn(move || bench.tick(&report, &progress, &done, &base, fabric)).ok()
         };
-        let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref(), &context_load);
+        let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref(), &context_load, fabric);
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
@@ -492,9 +497,9 @@ impl Bench {
     }
 
     fn run_plan(&self, active: &ActiveRun, base: &str, report: &Arc<Mutex<Report>>, progress: &Progress,
-        plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>, context_load: &panels::context_load::Options)
+        plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>, context_load: &panels::context_load::Options, fabric: bool)
         -> anyhow::Result<()> {
-        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned());
+        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
         let record = client.discover()?;
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let max_output = record["max_output_tokens"].as_u64().unwrap_or(4096);
@@ -516,7 +521,7 @@ impl Bench {
             + if baseline.is_none() && !skip_baseline { crate::baseline::estimate_s(&rates, &info) } else { 0.0 };
         let total = remaining.max(1.0);
         let baseline = match baseline {
-            Some(b) => Some(b),
+            Some(mut b) => { b.fabric.clear(); Some(b) },
             // Explicit panels alone: no basic card, no quick quality.
             None if skip_baseline => None,
             None => {
@@ -534,7 +539,11 @@ impl Bench {
                 Some(b)
             }
         };
-        report.lock().expect("report lock").baseline = baseline.clone();
+        {
+            let mut r = report.lock().expect("report lock");
+            r.fabric.extend(baseline.iter().flat_map(|b| b.fabric.iter().cloned()));
+            r.baseline = baseline.clone();
+        }
         Self::record_power(&client, run_mark, report);
         self.emit(json!({"type": "report", "run": active.id, "report": report.lock().expect("report lock").clone()}));
         let history = self.store(|s| s.reports_for(&fingerprint, 50)).unwrap_or_default();
@@ -564,7 +573,9 @@ impl Bench {
                     history: &earlier, max_context, max_output, lossless_set, context_load };
                 let table_before = panels::common::mapped_counters(&client);
                 let thermal_mark = client.thermal_mark();
+                let fabric_mark = client.fabric_mark();
                 let outcome = panel.run(&ctx);
+                let fabric = client.fabric_since(fabric_mark, &format!("{}/pass{pass}", panel.id()), false);
                 let thermal = client.thermal_since(thermal_mark);
                 let table_after = panels::common::mapped_counters(&client);
                 remaining -= estimate;
@@ -576,6 +587,24 @@ impl Bench {
                             value["mapped_tables"] = json!(tables);
                             value["mapped_tables_scope"] = json!("whole panel pass, including panel-internal priming");
                         }
+                        if let Some(phase) = fabric {
+                            value["fabric"] = json!(phase);
+                            r.fabric.push(phase);
+                        }
+                        fn collect_fabric(value: &Value, phases: &mut Vec<crate::fabric::Phase>) {
+                            match value {
+                                Value::Object(fields) => for (key, value) in fields {
+                                    if key == "fabric" || key.ends_with("_fabric") {
+                                        if let Ok(phase) = serde_json::from_value::<crate::fabric::Phase>(value.clone()) {
+                                            if phase.timed { phases.push(phase); }
+                                        }
+                                    } else { collect_fabric(value, phases); }
+                                },
+                                Value::Array(values) => for value in values { collect_fabric(value, phases); },
+                                _ => {}
+                            }
+                        }
+                        collect_fabric(&value, &mut r.fabric);
                         // GPU throttle report over the whole pass (panel-internal warm-ups included).
                         if let (Some(thermal), true) = (thermal, value.is_object()) { value["thermal"] = thermal; }
                         r.panels[index].passes.push(value);
@@ -633,10 +662,12 @@ impl Bench {
     }
 
     /// Once a second while a run is active: progress, ETA, the live strip, partial results.
-    fn tick(&self, report: &Arc<Mutex<Report>>, progress: &Progress, done: &AtomicBool, base: &str) {
-        let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned());
+    fn tick(&self, report: &Arc<Mutex<Report>>, progress: &Progress, done: &AtomicBool, base: &str, fabric: bool) {
+        let stats_client = Client::new(base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
         let mut last: Option<(Instant, f64)> = None;
         let mut revision = u64::MAX;
+        let mut fabric_before = None;
+        cuteafd_transport::traffic::background_priority();
         while !done.load(Ordering::Relaxed) {
             let state = progress.get();
             let plan = self.plan_state().lock().map(|s| s.clone()).unwrap_or_default();
@@ -664,6 +695,18 @@ impl Bench {
                     let t = &stats["totals"];
                     Some(t["requests_admitted"].as_u64()?.saturating_sub(t["requests_retired"].as_u64()?))
                 });
+            }
+            if fabric {
+                if let Some(after) = stats_client.fabric() {
+                    if let Some(before) = fabric_before.as_ref() {
+                        let interval = crate::fabric::interval(&plan.panel, false, before, &after);
+                        self.emit(json!({"type": "fabric", "run": plan.run, "interval": interval}));
+                    }
+                    fabric_before = Some(after);
+                } else {
+                    self.emit(json!({"type": "fabric", "run": plan.run, "interval": {"ports": []}}));
+                    fabric_before = None;
+                }
             }
             let title = if plan.panel == "baseline" { "Basic card + quick quality".to_string() }
                 else { panels::find(&plan.panel).map_or(plan.panel.clone(), |p| p.title().to_string()) };

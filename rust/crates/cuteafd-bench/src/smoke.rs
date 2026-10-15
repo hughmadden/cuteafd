@@ -94,6 +94,9 @@ pub struct Entry {
     /// A profile name, or `panels:a,b` for those panels alone.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Collect fabric telemetry; release cards enable it unless explicitly disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric: Option<bool>,
     /// Optional argv hooks, run only while smoke owns this card's locks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precheck: Option<Hook>,
@@ -238,6 +241,7 @@ impl Entry {
             run_timeout_s: self.run_timeout_s.or(defaults.run_timeout_s),
             exclusive: self.exclusive.or(defaults.exclusive),
             profile: self.profile.clone().or_else(|| defaults.profile.clone()),
+            fabric: self.fabric.or(defaults.fabric),
             precheck: self.precheck.clone().or_else(|| defaults.precheck.clone()),
             prelaunch: self.prelaunch.clone().or_else(|| defaults.prelaunch.clone()),
             observer: self.observer.clone().or_else(|| defaults.observer.clone()),
@@ -715,10 +719,10 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} window={} lossless_set={} context_lengths={:?} context_levels={:?} set={:?}",
+            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} window={} lossless_set={} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
                 e.name, e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(),
-                e.lossless_set.as_deref().unwrap_or("default"), e.context_lengths, e.context_levels, e.set);
+                e.lossless_set.as_deref().unwrap_or("default"), e.context_lengths, e.context_levels, e.fabric.unwrap_or(true), e.set);
         }
         return Ok(());
     }
@@ -983,7 +987,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 })
             });
             let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
-                entry.post_load_c1.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), open);
+                entry.post_load_c1.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true), open);
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;
@@ -998,7 +1002,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             outcome.sweep = Some(sweep);
             return Ok(None);
         }
-        let options = crate::cli::RunOptions { url: url.clone(), profile, panels, passes: vec![], baseline: entry.baseline,
+        let options = crate::cli::RunOptions { url: url.clone(), profile, panels, passes: vec![], baseline: entry.baseline, fabric: Some(entry.fabric.unwrap_or(true)),
             export: vec!["svg".into(), "card".into(), "json".into()], out: None, label: Some(entry.name.clone()),
             root: out_root.to_path_buf(),
             api_key: api_key.clone(), quiet: true,

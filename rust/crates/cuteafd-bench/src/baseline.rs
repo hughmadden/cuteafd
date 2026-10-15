@@ -143,7 +143,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let mut run = Run {
         client, info, progress, max_context,
         baseline: Baseline { fingerprint: fingerprint.into(), run_id: run_id.into(), created: now_rfc3339(),
-            card: BasicCard { capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0, thermal: None },
+            card: BasicCard { capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0, thermal: None, fabric: vec![] },
     };
     // Warm-up: first-use workspaces, graphs and tables (untimed), and a two-point
     // fit of tokens per filler word for the prefill case.
@@ -160,8 +160,12 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     // C1 decode per content type.
     for (i, (content, prompt)) in CONTENT.iter().enumerate() {
         run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
+        let fabric_mark = client.fabric_mark();
         let chat = client.chat(plain(&format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
             .with_context(|| format!("{content} decode"))?;
+        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/{content}/c1"), true) {
+            run.baseline.fabric.push(phase);
+        }
         if *content == "code" {
             run.baseline.card.concurrency.push(concurrent_rate(vec![common::Timed { sent: 0.0, chat: chat.clone() }],
                 run.baseline.card.warmup_s.unwrap_or_default()));
@@ -180,8 +184,12 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
             .with_context(|| format!("C{width} code warm-up"))?;
         let warmup_s = warmup.elapsed().as_secs_f64();
         client.check()?;
+        let fabric_mark = client.fabric_mark();
         let batch = speed::code_batch(client, width, SWEEP_TOKENS).into_iter().collect::<Result<Vec<_>>>()
             .with_context(|| format!("C{width} code decode"))?;
+        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/code/c{width}"), true) {
+            run.baseline.fabric.push(phase);
+        }
         run.baseline.card.concurrency.push(concurrent_rate(batch, warmup_s));
         run.publish();
     }
@@ -206,7 +214,9 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     // still performs its full prefill and normal snapshot work.
     client.chat(plain(&text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
         .context("8K prefill route warm-up")?;
+    let fabric_mark = client.fabric_mark();
     let chat = client.chat(plain(&text, 1), None).context("8K prefill")?;
+    if let Some(phase) = client.fabric_since(fabric_mark, "prefill/8k", true) { run.baseline.fabric.push(phase); }
     let t = chat.timing.clone();
     anyhow::ensure!(t.cached_tokens == 0, "8K cold prefill reused {} cached tokens", t.cached_tokens);
     run.baseline.card.prefill = Some(PrefillRate { prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(),

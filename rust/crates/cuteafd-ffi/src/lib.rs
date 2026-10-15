@@ -7703,3 +7703,15 @@ mod tests {
         result
     }
 }
+
+/// Lower the calling telemetry thread's CPU priority without changing the process.
+/// Unsupported platforms retain their normal scheduler priority.
+pub fn background_thread_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" { fn setpriority(which: i32, who: u32, priority: i32) -> i32; }
+        // SAFETY: Linux PRIO_PROCESS with who=0 addresses only the calling thread;
+        // lowering its priority needs no privilege and owns no borrowed memory.
+        let _ = unsafe { setpriority(0, 0, 10) };
+    }
+}
