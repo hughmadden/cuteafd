@@ -90,7 +90,10 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The coordinator also shares the host fidelity reference cache with the dashboard.
         fidelity = [f"<root>/hosts/{old['host']}/.cache/cuteafd/fidelity:/run/cuteafd/fidelity"] \
             if role == "coordinator" else []
-        assert after["mounts"] == sorted(before["mounts"] + governor + fidelity), where
+        storage_run = Path("/srv/sparknest/run")
+        storage = [f"mount:type=bind,src={storage_run},dst={storage_run},readonly"] \
+            if storage_run.is_dir() else []
+        assert after["mounts"] == sorted(before["mounts"] + governor + fidelity + storage), where
         assert after["image"] == before["image"], where
         added = {key: value for key, value in after["env"].items() if key not in before["env"]}
         assert added == INTENDED[role], where
@@ -187,6 +190,20 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         assert result["containers"][0]["argv"].count(f"CUTEAFD_V41_FP8_HEAD={value}") == 1
     for worker in result["containers"][1:]:
         assert "CUTEAFD_V41_FP8_HEAD" not in parse_run(worker["argv"])["env"]
+
+
+def test_v41_rejects_kv_cache_as_an_unused_key(tmp_root, monkeypatch) -> None:
+    """V4.1 has no KV-precision flag. KV_CACHE is a hard error before any container."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        return capture_module.append_config(original(name, directory), "KV_CACHE=fp8\n")
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    with pytest.raises(RuntimeError, match=r"unused configuration key: KV_CACHE"):
+        capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
 
 
 def test_v41_fp8_head_key_rejects_bad_values_and_env_conflicts(tmp_root, monkeypatch) -> None:

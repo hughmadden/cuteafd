@@ -4,11 +4,11 @@
 # lock. Slot 0 is the historical ~/.cache/cuteafd/build.lock, so wip.sh,
 # build.sh and older flock callers still serialize against it.
 #   scripts/build/build-slot.sh cargo test --workspace --no-run --locked
-# CUTEAFD_BUILD_SLOTS (default 3) and CUTEAFD_BUILD_SLOT_WAIT seconds
+# CUTEAFD_BUILD_SLOTS (default 5) and CUTEAFD_BUILD_SLOT_WAIT seconds
 # (default 7200) override; exit 75 when no slot frees up in time.
 set -uo pipefail
 
-slots="${CUTEAFD_BUILD_SLOTS:-3}"
+slots="${CUTEAFD_BUILD_SLOTS:-5}"
 wait_s="${CUTEAFD_BUILD_SLOT_WAIT:-7200}"
 dir="${CUTEAFD_LOCK_DIR:-$HOME/.cache/cuteafd}"
 (($# > 0)) || { echo "usage: $0 COMMAND [ARGS...]" >&2; exit 2; }

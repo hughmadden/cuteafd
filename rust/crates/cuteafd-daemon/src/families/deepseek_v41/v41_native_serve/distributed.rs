@@ -4,7 +4,7 @@ use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
 use crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution;
 use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
 use crate::families::deepseek_v41::v41_engram::placement::{PlacedEngram, PlacedEngramWeights};
-use crate::families::deepseek_v41::v41_experts::{tp2::RankWeights, tp2_ffn, ExpertLayer, ExpertWeights};
+use crate::families::deepseek_v41::v41_experts::{tp2_ffn, ExpertLayer, ExpertWeights};
 use crate::shared::memory::device::Device;
 use crate::families::deepseek_v41::v41_target_head::distributed_target::DistributedTargetHead;
 use crate::families::deepseek_v41::v41_target_pass::{DistributedTargetPass, TargetTapWave};
@@ -14,7 +14,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
     if let Some(directory)=args.placement_directory.as_deref() {
-        if let Some(layers)=super::placement::StartupPlacement::resumed_layers(directory)? {
+        if let Some(layers)=PlacementHandoff::<PlacementPlan>::resumed(directory)?.map(|plan| plan.rtx_expert_layers) {
             if let memory::LocalLayers::Count(requested)=args.rtx_expert_layers {
                 ensure!(requested==layers,"restart layer request differs from acknowledged workers");
             }
@@ -76,10 +76,10 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
     let exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp2");
     if compressed {
-        let per_lane = crate::families::deepseek_v41::v41_experts::tp2::ExpertWave::exl3_device_bytes(&exl3_directory, capacity)?;
+        let per_lane = crate::shared::experts::rtx::pair::OwnerPair::exl3_device_bytes(&exl3_directory, capacity, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "EXL3 TP2 expert workspace plan");
     } else if format.is_nvfp4() {
-        let per_lane = crate::families::deepseek_v41::v41_experts::tp2::ExpertWave::nvfp4_device_bytes(&lib, capacity)?;
+        let per_lane = crate::shared::experts::rtx::pair::OwnerPair::device_bytes(&lib, capacity, true, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
     }
     let rank_prefix_peaks = [0usize, 1].map(|rank| -> Result<Vec<usize>> {
@@ -359,23 +359,10 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         graph_reserve_bytes=?std::array::from_fn::<_, 2, _>(|gpu| memory::graph_reserve_bytes(before_experts[gpu].1, Some(gpu))),
         setup_headroom_bytes=memory::distributed::EXPERT_SETUP_HEADROOM, "dual RTX bottom-up expert placement");
     let placement_handoff=args.placement_directory.as_deref().map(|directory|
-        super::placement::StartupPlacement::publish(directory, args.rtx_gpus, expert_layers)).transpose()?;
+        PlacementHandoff::publish(std::path::Path::new(directory), PlacementPlan::new(args.rtx_gpus, expert_layers))).transpose()?;
     eprintln!("loading bottom {expert_layers} expert layers as TP2");
-    let routed = match format {
-        crate::families::deepseek_v41::v41_experts::ExpertFormat::Exl3 => {
-            RankWeights::load_exl3_pair(devices, &catalog, expert_layers, rank_budgets, &exl3_directory)?
-                .map(Rc::new)
-        }
-        // The format-aware ExpertWeights loader covers NVFP4 as well.
-        crate::families::deepseek_v41::v41_experts::ExpertFormat::Nvfp4 => [
-            Rc::new(RankWeights::load(devices[0], &catalog, expert_layers, rank_budgets[0])?),
-            Rc::new(RankWeights::load(devices[1], &catalog, expert_layers, rank_budgets[1])?),
-        ],
-        crate::families::deepseek_v41::v41_experts::ExpertFormat::Native => [
-            Rc::new(RankWeights::load(devices[0], &catalog, expert_layers, rank_budgets[0])?),
-            Rc::new(RankWeights::load(devices[1], &catalog, expert_layers, rank_budgets[1])?),
-        ],
-    };
+    let routed = tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
+        rank_budgets, &exl3_directory)?;
     if let Some(handoff)=placement_handoff {
         handoff.wait_ready(Duration::from_secs(900))?;
     }

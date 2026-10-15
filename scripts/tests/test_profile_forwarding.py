@@ -18,12 +18,31 @@ def _helper(*args):
 
 
 def _wrapper(*args):
+    # NUL-separated: the container script is one argv element and contains newlines.
     script = ('source scripts/lib/release-common.sh; release_profile_wrapper "$@"; '
-              'printf "W %s\\n" ${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"}; '
-              'printf "D %s\\n" ${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}"}')
+              'printf "W:%s\\0" ${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"}; '
+              'printf "D:%s\\0" ${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}"}')
     out = subprocess.run(['bash', '-c', script, 'test', *args], cwd=ROOT, capture_output=True, text=True)
-    lines = out.stdout.splitlines()
-    return out, [l[2:] for l in lines if l.startswith('W ') and l[2:]], [l[2:] for l in lines if l.startswith('D ') and l[2:]]
+
+    def take(prefix):
+        return [item[len(prefix):] for item in out.stdout.split('\0')
+                if item.startswith(prefix) and len(item) > len(prefix)]
+
+    return out, take('W:'), take('D:')
+
+
+def _install(root: Path, relative: str) -> Path:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('#!/bin/sh\nprintf "%s\\n" "$0" "$@"\n')
+    path.chmod(0o755)
+    return path
+
+
+def _resolve(tool, root: Path):
+    script = 'source scripts/lib/release-common.sh; release_profile_resolve_tool "$1" "$2"'
+    return subprocess.run(['bash', '-c', script, 'test', tool, str(root)],
+                          cwd=ROOT, capture_output=True, text=True)
 
 
 def test_helper_maps_switches_host_and_directory():
@@ -56,7 +75,9 @@ def test_nsys_wraps_the_coordinator_paused_into_profile_dir():
     assert 'CUTEAFD_DRAFT_TIMING=1' in out.stdout and 'nsys' not in out.stdout
     out, wrapper, docker = _wrapper('nsys,draft-timing', '/data/prof', 'raptor', 'coordinator')
     assert out.returncode == 0, out.stderr
-    assert wrapper[:2] == ['/usr/local/cuda/bin/nsys', 'profile']
+    assert wrapper[:2] == ['/bin/bash', '-c']
+    assert wrapper[3:6] == ['release-profile-resolve', 'nsys', 'profile']
+    assert 'release_profile_resolve_tool "$tool"' in wrapper[2]
     for flag in ('--trace=cuda,nvtx,osrt', '--cuda-graph-trace=node', '--sample=none', '--cpuctxsw=none',
                  '--start-later=true', '--session-new=cuteafd-profile', '--output=/data/prof/nsys-raptor'):
         assert flag in wrapper
@@ -86,12 +107,14 @@ def test_nsys_gpu_metrics_fails_closed(args, message):
 def test_ncu_wraps_with_filter_count_and_set():
     out, wrapper, _ = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm|moe', '', '')
     assert out.returncode == 0, out.stderr
-    assert wrapper[0] == '/usr/local/bin/ncu'
-    joined = ' '.join(wrapper)
+    assert wrapper[:2] == ['/bin/bash', '-c']
+    assert wrapper[3:5] == ['release-profile-resolve', 'ncu']
+    assert wrapper[0] != '/usr/local/bin/ncu'
+    joined = ' '.join(wrapper[4:])
     for part in ('--kernel-name regex:gemm|moe', '--launch-count 20', '--set full', '--export /data/prof/ncu-raptor'):
         assert part in joined
     out, wrapper, _ = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm', '5', 'basic')
-    assert '--launch-count 5 --set basic' in ' '.join(wrapper)
+    assert '--launch-count 5 --set basic' in ' '.join(wrapper[4:])
 
 
 @pytest.mark.parametrize('args,message', [
@@ -107,6 +130,88 @@ def test_ncu_wraps_with_filter_count_and_set():
 def test_wrapper_refuses_bad_values(args, message):
     out, wrapper, _ = _wrapper(*args)
     assert out.returncode != 0 and message in out.stderr, out.stderr
+
+
+def test_resolve_tool_uses_the_stated_layouts(tmp_path):
+    out, ncu_wrapper, _ = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm')
+    assert out.returncode == 0, out.stderr
+    out, nsys_wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0, out.stderr
+    for wrapper in (ncu_wrapper, nsys_wrapper):
+        assert 'release_profile_resolve_tool "$tool"' in wrapper[2]
+        assert wrapper[2].rstrip().endswith('release_profile_exec "$@"')
+
+    stable = tmp_path / 'stable'
+    _install(stable, 'usr/local/bin/ncu')
+    _install(stable, 'opt/nvidia/nsight-compute/2026.9.9/ncu')
+    found = _resolve('ncu', stable)
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.strip() == str(stable / 'usr/local/bin/ncu')
+
+    versioned = tmp_path / 'versioned'
+    _install(versioned, 'opt/nvidia/nsight-compute/2026.1.9/ncu')
+    _install(versioned, 'opt/nvidia/nsight-compute/2026.1.10/ncu')
+    _install(versioned, 'opt/nvidia/nsight-compute/2025.4/ncu')
+    found = _resolve('ncu', versioned)
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.strip() == str(versioned / 'opt/nvidia/nsight-compute/2026.1.10/ncu')
+
+    missing = _resolve('ncu', tmp_path / 'empty')
+    assert missing.returncode == 127
+    assert missing.stdout == ''
+    assert 'ncu not found: looked for /usr/local/bin/ncu and /opt/nvidia/nsight-compute/*/ncu' in missing.stderr
+
+    nsys_bin = tmp_path / 'nsys-bin'
+    _install(nsys_bin, 'usr/local/bin/nsys')
+    _install(nsys_bin, 'usr/local/cuda/bin/nsys')
+    _install(nsys_bin, 'opt/nvidia/nsight-systems/2026.9/nsys')
+    found = _resolve('nsys', nsys_bin)
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.strip() == str(nsys_bin / 'usr/local/bin/nsys')
+
+    nsys_cuda = tmp_path / 'nsys-cuda'
+    _install(nsys_cuda, 'usr/local/cuda/bin/nsys')
+    _install(nsys_cuda, 'opt/nvidia/nsight-systems/2026.9/nsys')
+    found = _resolve('nsys', nsys_cuda)
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.strip() == str(nsys_cuda / 'usr/local/cuda/bin/nsys')
+
+    nsys_ver = tmp_path / 'nsys-ver'
+    _install(nsys_ver, 'opt/nvidia/nsight-systems/2026.1.9/nsys')
+    _install(nsys_ver, 'opt/nvidia/nsight-systems/2026.1.10/nsys')
+    found = _resolve('nsys', nsys_ver)
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.strip() == str(nsys_ver / 'opt/nvidia/nsight-systems/2026.1.10/nsys')
+
+    missing = _resolve('nsys', tmp_path / 'no-nsys')
+    assert missing.returncode == 127
+    assert missing.stdout == ''
+    assert 'nsys not found: looked for /usr/local/bin/nsys, /usr/local/cuda/bin/nsys, and /opt/nvidia/nsight-systems/*/nsys' in missing.stderr
+
+
+def test_profile_exec_replaces_the_shell_with_the_resolved_binary(tmp_path):
+    binary = _install(tmp_path, 'fake-ncu')
+    script = '''
+source scripts/lib/release-common.sh
+fake=$1
+shift
+release_profile_resolve_tool() { printf "%s\\n" "$fake"; }
+release_profile_exec "$@"
+'''
+    result = subprocess.run(['bash', '-c', script, 'test', str(binary), 'ncu', '--set', 'full', 'cuteafd', 'serve'],
+                            cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(binary), '--set', 'full', 'cuteafd', 'serve']
+    missing = '''
+source scripts/lib/release-common.sh
+release_profile_resolve_tool() { printf "ncu not found: looked for /usr/local/bin/ncu\\n" >&2; return 127; }
+release_profile_exec "$@"
+'''
+    result = subprocess.run(['bash', '-c', missing, 'test', 'ncu', 'cuteafd'],
+                            cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 127
+    assert result.stdout == ''
+    assert 'ncu not found: looked for /usr/local/bin/ncu' in result.stderr
 
 
 @pytest.mark.parametrize('profile,directory,message', [
@@ -146,14 +251,20 @@ def test_family_launch_wraps_only_the_coordinator_under_nsys(tmp_path):
                                    f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=nsys,expert-timing\nPROFILE_DIR={prof}\n')
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    coordinator = next(line for line in lines if 'cuteafd serve-glmf' in line)
     workers = [line for line in lines if 'cuteafd expertd-native' in line]
     assert workers
-    image, served = coordinator.split(' /usr/local/cuda/bin/nsys profile ', 1)
-    assert '--stop-signal SIGINT' in image and 'cuteafd.graceful-stop=1' in image
-    assert f'--output={prof}/nsys-{HOST}' in served and served.index('--force-overwrite=true') < served.index('cuteafd serve-glmf')
+    text = result.stderr
+    marker = 'cuteafd serve-glmf'
+    assert text.count(marker) == 1
+    start = text.rfind('docker ', 0, text.index(marker))
+    coordinator_cmd = text[start:text.index('\n', text.index(marker))]
+    assert '--stop-signal SIGINT' in coordinator_cmd and 'cuteafd.graceful-stop=1' in coordinator_cmd
+    assert 'release_profile_exec' in coordinator_cmd and ' nsys profile ' in coordinator_cmd
+    assert f'--output={prof}/nsys-{HOST}' in coordinator_cmd
+    assert coordinator_cmd.index('--force-overwrite=true') < coordinator_cmd.index(marker)
     for worker in workers:
-        assert 'bin/nsys' not in worker and 'graceful-stop' not in worker and 'CUTEAFD_EXPERT_TIMING=1' in worker
+        assert 'release_profile' not in worker and 'bin/nsys' not in worker
+        assert 'graceful-stop' not in worker and 'CUTEAFD_EXPERT_TIMING=1' in worker
 
 
 def test_family_launch_ncu_without_filter_fails_closed(tmp_path):

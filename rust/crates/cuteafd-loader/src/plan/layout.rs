@@ -316,7 +316,7 @@ pub struct FamilyCosts {
     pub spark_workspace_bytes: u64,
     /// RDMA rings per Spark rank (every coordinator endpoint).
     pub spark_ring_bytes: u64,
-    /// Host memory charged by CUDA on GB10 after checkpoint caches are dropped.
+    /// Non-reclaimable host memory charged beside CUDA allocations on GB10.
     pub spark_host_bytes: u64,
 }
 
@@ -533,13 +533,14 @@ mod draft_prefix_tests {
 }
 
 /// Lays out `report` (a `plan` of the checkpoint) on the inventory.
-pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
+pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &super::PlanInput,
     options: &LayoutOptions) -> MemoryLayout {
-    layout_with_weight_budget(report, model, checkpoint, options, u64::MAX)
+    layout_with_weight_budget(report, model, input, options, u64::MAX)
 }
 
 pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn super::FamilyModel,
-    checkpoint: &super::Checkpoint, options: &LayoutOptions, weight_budget: u64) -> MemoryLayout {
+    input: &super::PlanInput, options: &LayoutOptions, weight_budget: u64) -> MemoryLayout {
+    let checkpoint = input.checkpoint();
     let family_name = report.family.clone().unwrap_or_else(|| "unknown".into());
     let family = family_name.as_str();
     let discovered_native_layers = match model.spec().speculator.as_ref() {
@@ -568,17 +569,17 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
     let checkpoint_context = report.cache_requirements.as_ref().and_then(|r| r.checkpoint_max_context_tokens).unwrap_or(0);
     let context_tokens = resolved_context(family, options.context_tokens, checkpoint_context, workspace_manifest.as_ref());
     if family == "glm5_flash" {
-        return glm5_flash::layout(report, model, checkpoint, options, workspace_manifest.as_ref(),
+        return glm5_flash::layout(report, model, input, options, workspace_manifest.as_ref(),
             prefill_rows, concurrency, context_tokens, weight_budget);
     }
     let target_pool_tokens = options.target_pool_tokens.max(context_tokens);
     if family == "mimo_v2" {
-        return mimo::layout(report, model, checkpoint, options, prefill_rows, concurrency,
+        return mimo::layout(report, model, input, options, prefill_rows, concurrency,
             context_tokens, workspace_manifest.as_ref());
     }
     if family == "qwen4" && options.rtx_bytes.len() == 2 && options.head_split
         && report.placement == ExpertPlacement::Local {
-        return qwen_dual::layout(report, model, checkpoint, options, prefill_rows, concurrency,
+        return qwen_dual::layout(report, model, input, options, prefill_rows, concurrency,
             context_tokens, cache_native_layers > 0, workspace_manifest.as_ref());
     }
     let conversions = load_conversions(family, checkpoint);
@@ -655,7 +656,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
     // else checkpoint bytes per component under the family's conversions.
     let v41_weights = if family == "deepseek_v41" { v41::resident_weights(checkpoint, active_gpus, native_layers > 0) } else { None };
     let qwen_exl3 = if family == "qwen4" {
-        qwen_exl3_arenas(checkpoint, native_layers > 0)
+        qwen_exl3_arenas(input, native_layers > 0)
     } else { None };
     if let Some(ranks) = &v41_weights {
         for (device, items) in devices.iter_mut().zip(ranks) {
@@ -780,7 +781,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
             devices[0].items.push(Item::new(Category::Experts, "native MTP experts", "native", native_experts, Basis::Exact));
         }
     }
-    let exl3_workspace = expert_workspace(report, model, checkpoint, options.workspace_manifest.as_deref(), prefill_rows);
+    let exl3_workspace = expert_workspace(report, model, input, options.workspace_manifest.as_deref(), prefill_rows);
     if exl3_workspace.is_none() && report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"))
         && (family == "deepseek_v4" || (family == "qwen4"
             && (report.placement == ExpertPlacement::Local || native_layers > 0))) {
@@ -994,7 +995,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
     // same request serve-dsv4 resolves at runtime.
     let mut pool_tokens = 0;
     if family == "deepseek_v4" {
-        let solved = deepseek_v4_placement(report, checkpoint, options, &devices[..active_gpus],
+        let solved = deepseek_v4_placement(report, input, options, &devices[..active_gpus],
             V4PlanShape { prefill_rows, decode_rows, concurrency, context_tokens, native_layers,
                 cache_native_layers, exl3_workspace, workspace: v4_workspace.clone(),
                 manifest: workspace_manifest.clone() });
@@ -1052,7 +1053,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         }
     }
     if family == "glm5" {
-        match glm5_placement(report, checkpoint, options, &devices[..active_gpus], workspace_manifest.as_ref(),
+        match glm5_placement(report, input, options, &devices[..active_gpus], workspace_manifest.as_ref(),
             prefill_rows, context_tokens) {
             Ok((placement, working)) => {
                 // The solver resolved auto against this build's programs.
@@ -1083,8 +1084,17 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
             }
             Err(error) => {
                 report.placement_supported = false;
+                // A failure can come from a different mode than the static
+                // pre-solve default: auto resolves to the family default
+                // (context on two peers) against the manifest, not the
+                // plan-time constant. Report the placement actually attempted
+                // instead of the stale pre-solve value (issue #202).
+                report.attention_placement = glm5_attempted_attention(report.requested_attention, active_gpus);
+                if let Some(note) = notes.iter_mut().find(|n| n.starts_with("attention placement ")) {
+                    *note = format!("attention placement {}", report.attention_placement);
+                }
                 let what = format!("GLM placement: {error:#}");
-                report.hints.push(super::Hint { what: what.clone(), how: "Use supported heads attention and an admissible pool/local expert request; supply matching program and drafter headers.".into() });
+                report.hints.push(super::Hint { what: what.clone(), how: glm5_failure_hint(report.attention_placement) });
                 notes.push(what);
             }
         }
@@ -1100,7 +1110,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
             resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &[per_token * target], options,
                 &mut notes);
         }
-        match qwen_placement(checkpoint, report, options, &mut devices[0], workspace_manifest.as_ref(),
+        match qwen_placement(input, report, options, &mut devices[0], workspace_manifest.as_ref(),
             QwenPlanShape { prefill_rows, concurrency, context_tokens, mtp: cache_native_layers > 0 }) {
             Ok(tokens) => pool_tokens = tokens,
             Err(error) => {
@@ -1374,9 +1384,10 @@ struct QwenPlanShape {
 /// (`qwen_admission`), its startup graph set and the largest pool both fit
 /// beside, over what the planner already laid out (context, weights, embedding,
 /// head, drafter, resident experts and their package scratch, encoder).
-fn qwen_placement(checkpoint: &super::Checkpoint, report: &PlanReport, options: &LayoutOptions,
+fn qwen_placement(input: &super::PlanInput, report: &PlanReport, options: &LayoutOptions,
     device: &mut DeviceLayout, manifest: Option<&serde_json::Value>, shape: QwenPlanShape) -> anyhow::Result<u64> {
     use crate::serving_capacity::qwen_graphs::*;
+    let checkpoint = input.checkpoint();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
     let mtp = shape.mtp && cfg.mtp_layers > 0;
     let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
@@ -1390,7 +1401,7 @@ fn qwen_placement(checkpoint: &super::Checkpoint, report: &PlanReport, options: 
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| ((cfg.ple_dim / cfg.ple_rows().max(1)) as u64
             * if t.meta.dtype == cuteafd_core::DType::F8E4M3 { 1 } else { 2 }, t.meta.dtype == cuteafd_core::DType::F8E4M3));
-    for (package, bytes) in qwen_package_scratch(checkpoint, report, options.workspace_manifest.as_deref(),
+    for (package, bytes) in qwen_package_scratch(input, report, options.workspace_manifest.as_deref(),
         shape.prefill_rows, mtp) {
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
@@ -1414,10 +1425,10 @@ fn qwen_placement(checkpoint: &super::Checkpoint, report: &PlanReport, options: 
 
 /// Package scratch of Qwen's resident FP8/NVFP4 experts (`Fp8Experts::load`): one scratch per package
 /// the backbone and the mixed-format MTP layer load, at the prefill rows' capacity.
-fn qwen_package_scratch(checkpoint: &super::Checkpoint, report: &PlanReport, workspace_manifest: Option<&std::path::Path>,
+fn qwen_package_scratch(input: &super::PlanInput, report: &PlanReport, workspace_manifest: Option<&std::path::Path>,
     prefill_rows: u64, mtp: bool) -> Vec<(String, u64)> {
     let local = report.placement == ExpertPlacement::Local;
-    let Ok(catalog) = crate::read_expert_catalog(&checkpoint.snapshot) else { return Vec::new() };
+    let Ok(catalog) = input.expert_catalog() else { return Vec::new() };
     let Some(tensors) = catalog.fp8() else { return Vec::new() };
     let lib = crate::placement::inventory::image_lib(workspace_manifest);
     let layers = catalog.routed_experts().layers;
@@ -1436,10 +1447,38 @@ fn qwen_package_scratch(checkpoint: &super::Checkpoint, report: &PlanReport, wor
 }
 
 /// GLM's shared admission over header-derived coordinator storage.
-fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: &LayoutOptions,
+/// The attention placement GLM 5.3's solve attempts: the requested mode, or
+/// the family default for auto (context on a two-GPU peer pair, heads
+/// otherwise).
+fn glm5_attempted_attention(requested: Option<crate::placement::AttentionPlacement>, gpus: usize)
+    -> crate::placement::AttentionPlacement {
+    requested.unwrap_or(if gpus == 2 { crate::placement::AttentionPlacement::Context }
+        else { crate::placement::AttentionPlacement::Heads })
+}
+
+/// Why GLM 5.3's solve failed and what to change, naming the attempted mode,
+/// so a failure never points at a placement that was not tried (issue #202).
+fn glm5_failure_hint(mode: crate::placement::AttentionPlacement) -> String {
+    use crate::placement::AttentionPlacement;
+    let rebuild = "supply a PROGRAMS.json carrying the glm_* context-split kernels \
+        (rebuild the GLM 5.3 coordinator programs) so placement context can run";
+    match mode {
+        AttentionPlacement::Heads => format!("GLM 5.3 cannot admit this request with attention \
+            placement heads: heads replicates the MLA latent and DSA index on both GPUs, so a pool \
+            past the device budget does not fit. Use an admissible --pool-tokens, drop local RTX \
+            experts, or {rebuild}."),
+        AttentionPlacement::Context => format!("GLM 5.3 cannot admit this request with attention \
+            placement context: {rebuild}, or request `heads` explicitly."),
+        AttentionPlacement::Layers => "GLM 5.3 has no layers attention executor; \
+            use heads or context.".into(),
+    }
+}
+
+fn glm5_placement(report: &PlanReport, input: &super::PlanInput, options: &LayoutOptions,
     devices: &[DeviceLayout], manifest: Option<&serde_json::Value>, rows: u64, context: u64)
     -> anyhow::Result<(crate::placement::Placement, crate::placement::families::glm5::GlmWorkingSet)> {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
+    let checkpoint = input.checkpoint();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
     let lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
@@ -1465,7 +1504,7 @@ fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: 
     let exchange_f32 = glm::local_exchange_f32()?;
     let manifest_path = options.workspace_manifest.as_deref().unwrap_or_else(||
         std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
-    let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+    let catalog = input.expert_catalog()?;
     let local = glm::select_local_inventory(&catalog, manifest_path, cfg.layers, devices.len(),
         rows, lanes, exchange_f32, onboard, false)?;
     let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
@@ -1498,12 +1537,13 @@ struct V4PlanShape {
 /// request serve-dsv4 solves, with each GPU's planned charges (context,
 /// modules and the weights laid out so far) as the baseline. The devices'
 /// capacities become `rtx_bytes - reserve` so `free_bytes` matches.
-fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
+fn deepseek_v4_placement(report: &PlanReport, input: &super::PlanInput,
     options: &LayoutOptions, devices: &[DeviceLayout], shape: V4PlanShape)
     -> anyhow::Result<(crate::placement::Placement, Vec<u64>)> {
     use crate::placement::{families::deepseek_v4 as v4, Baseline, Onboard};
+    let checkpoint = input.checkpoint();
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, shape.cache_native_layers)?;
-    let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+    let catalog = input.expert_catalog()?;
     let routed = *catalog.routed_experts();
     let (experts, draft) = v4::expert_costs(&catalog, shape.native_layers)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
@@ -1547,9 +1587,9 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
     Ok((crate::placement::solve(&request)?, reserves))
 }
 
-fn qwen_exl3_arenas(checkpoint: &super::Checkpoint, mtp: bool) -> Option<(u64, u64)> {
+fn qwen_exl3_arenas(input: &super::PlanInput, mtp: bool) -> Option<(u64, u64)> {
     use crate::V41Exl3Layer;
-    let catalog = crate::read_expert_catalog(&checkpoint.snapshot).ok()?;
+    let catalog = input.expert_catalog().ok()?;
     let shape = catalog.routed_experts();
     let manifest = catalog.exl3()?;
     let bytes = |layer| -> Option<u64> {
@@ -1565,12 +1605,12 @@ fn qwen_exl3_arenas(checkpoint: &super::Checkpoint, mtp: bool) -> Option<(u64, u
 /// Local EXL3 arenas from the same capacity manifests used by the loader.
 /// An exported PROGRAMS.json can have its expert JSON tree alongside it;
 /// in an image the standard tree lives in ../lib/exl3 instead.
-fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
+fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyModel, input: &super::PlanInput,
     manifest: Option<&std::path::Path>, rows: u64) -> Option<u64> {
     if !report.experts.as_ref()?.package.contains("exl3") { return None; }
     // Display labels name the checkpoint tier; the decoder can include an
     // adjacent tier too (Pro K2 uses its k23 package). Read the catalog contract.
-    let catalog = crate::read_expert_catalog(&checkpoint.snapshot).ok()?;
+    let catalog = input.expert_catalog().ok()?;
     let tiers = catalog.exl3()?.decoder_tiers().iter().map(usize::to_string).collect::<String>();
     let family = match report.family.as_deref()? {
         "qwen4" => "qwen4",
@@ -1707,7 +1747,17 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
         gpus: rtx.iter().enumerate().map(|(i,d)| EncoderGpuBudget { free_bytes: d.free_bytes().max(0) as u64, kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
         sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}",d.index), idle: false,
             expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(), free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
-    let placement = encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas);
+    let mut placement = encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas);
+    // Launch starts a Spark worker only for an expert rank and attaches the
+    // encoder to that worker. No expert package means no worker to host it.
+    let vision_only_spark = matches!(&placement.kind, EncoderKind::Off)
+        && matches!(report.vision, super::MediaMode::Spark(_))
+        && sparks.is_empty()
+        && placement.reason == "requested Spark encoder/replicas unavailable";
+    if vision_only_spark {
+        placement.reason = "vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS".into();
+        placement.shortfall = 0;
+    }
     let add = |d: &mut DeviceLayout| {
         d.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", placement.weights, Basis::Formula));
         let spark_overhead = if hardware.v41 && d.kind == DeviceKind::Spark {
@@ -1725,10 +1775,13 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
         }
         EncoderKind::Off if matches!(report.vision, super::MediaMode::Rtx(_) | super::MediaMode::Spark(_)) => {
             report.placement_supported = false;
-            report.hints.push(super::Hint {
-                what: format!("requested vision placement unavailable: {}", placement.reason),
-                how: format!("Select an available encoder device with tower/scratch/KV headroom (shortfall {} bytes), or explicitly use --vision=off.", placement.shortfall),
-            });
+            let (what, how) = if vision_only_spark {
+                (placement.reason.clone(), "Place the tower on an RTX with VISION=rtx, or keep expert layers on Sparks with RTX_EXPERT_LAYERS.".into())
+            } else {
+                (format!("requested vision placement unavailable: {}", placement.reason),
+                    format!("Select an available encoder device with tower/scratch/KV headroom (shortfall {} bytes), or explicitly use --vision=off.", placement.shortfall))
+            };
+            report.hints.push(super::Hint { what, how });
         }
         EncoderKind::Off => {
             if let Some(c) = report.components.iter_mut().find(|c| c.component == Component::Vision)

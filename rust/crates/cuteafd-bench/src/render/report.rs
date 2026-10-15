@@ -66,8 +66,12 @@ pub fn report_svg(report: &Report) -> String {
     let heights: Vec<f64> = rows.iter().map(|row| row.iter()
         .map(|cell| view.framed_height(cell.width, &cell.id)).fold(0.0, f64::max)).collect();
     let banner = if t.scary || report.no_fit_reason().is_some() { 52.0 } else { 0.0 };
-    let header = 124.0;
-    let footer = 64.0;
+    let fabric_header = crate::fabric::header(&report.fabric);
+    let header = if fabric_header.is_some() { 142.0 } else { 124.0 };
+    let fabric_rows: Vec<_> = report.fabric.iter().flat_map(|phase| phase.ports.iter().map(move |p| (phase, p))).collect();
+    let caveats = crate::fabric::caveats(&report.fabric);
+    let fabric_height = caveats.len() as f64 * 18.0 + if fabric_rows.is_empty() { 0.0 } else { 58.0 + fabric_rows.len() as f64 * 18.0 };
+    let footer = 64.0 + fabric_height;
     let total = header + banner + heights.iter().map(|h| h + gap).sum::<f64>() + footer;
     let mut doc = Doc::new(w, total);
     doc.defs(&t.defs());
@@ -93,6 +97,9 @@ pub fn report_svg(report: &Report) -> String {
     }
     doc.text(w - 24.0, 108.0, Font::new(10.5, t.muted).anchor(Anchor::End),
         &format!("fingerprint {}", r.fingerprint));
+    if let Some(line) = fabric_header {
+        doc.text(x, 127.0, Font::new(11.5, t.ink2), &fit(&line, 11.5, w - 48.0));
+    }
     let mut y = header;
     if let Some(reason) = r.no_fit_reason() {
         doc.rect(20.0, y, w - 40.0, 44.0, 8.0, t.panel2);
@@ -110,6 +117,25 @@ pub fn report_svg(report: &Report) -> String {
                 bodies::failed(report, &cell.id));
         }
         y += height + gap;
+    }
+    if !fabric_rows.is_empty() {
+        doc.text(24.0, y + 18.0, Font::new(13.0, t.ink).weight(600), "Fabric phase attribution (tx+rx GB per port; ACK/retry/skew remain residual)");
+        doc.text(24.0, y + 34.0, Font::new(10.0, t.ink2), "NIC / engine / SparkNest / headers / residual. Engine headers: ceil(bytes/MTU)*62 lower bound; SparkNest: packets*62.");
+        y += 48.0;
+        for (phase, p) in fabric_rows {
+            let pair = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a,b)| format!("{:.3}", a.saturating_add(b) as f64 / 1e9)).unwrap_or_else(|| "unknown".into());
+            let line = format!("{} {} {}/{}: {} / {} / {} / {} / {}", phase.name, p.host, p.device, p.port,
+                pair(p.sent_bytes,p.received_bytes), pair(p.engine_sent_bytes,p.engine_received_bytes),
+                pair(p.sparknest_sent_bytes,p.sparknest_received_bytes), pair(p.estimated_header_sent_bytes,p.estimated_header_received_bytes),
+                pair(p.foreign_sent_bytes,p.foreign_received_bytes));
+            doc.text(24.0, y + 12.0, Font::new(10.0, t.ink2), &fit(&line, 10.0, w - 48.0));
+            y += 18.0;
+        }
+        y += 10.0;
+    }
+    for caveat in caveats {
+        doc.text(24.0, y + 12.0, Font::new(10.0, t.ink2), &fit(&format!("A/B caveat: {caveat}"), 10.0, w - 48.0));
+        y += 18.0;
     }
     // Footer: build provenance and run identity.
     let b = &r.server.build;

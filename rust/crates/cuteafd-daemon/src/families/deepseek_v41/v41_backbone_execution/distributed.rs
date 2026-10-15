@@ -368,7 +368,7 @@ mod tests {
     use crate::families::deepseek_v41::v41_backbone_cache::CacheWork;
     use crate::families::deepseek_v41::v41_backbone_lane::BackboneLaneWeights;
     use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
-    use crate::families::deepseek_v41::v41_experts::{tp2::RankWeights, tp2_ffn};
+    use crate::families::deepseek_v41::v41_experts::tp2_ffn;
     use crate::families::deepseek_v41::v41_index_lane::IndexLaneWeights;
     use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
     use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, expert::SparkExperts};
@@ -493,10 +493,10 @@ mod tests {
             BackboneCache::new(&lib, 1, pages, BackboneCache::device_bytes(1, pages)?)?;
         let lease = bank.begin_request(0, 1)?;
         let single_lease = single_bank.begin_request(0, 1)?;
-        let routed = [
-            Rc::new(RankWeights::load(devices[0], &catalog, 1, 4_000_000_000)?),
-            Rc::new(RankWeights::load(devices[1], &catalog, 1, 4_000_000_000)?),
-        ];
+        let routed = tp2_ffn::load_routed_weights(
+            devices, &catalog, 1, 16, [4_000_000_000; 2],
+            std::path::Path::new(&std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default()),
+        )?;
         let shared = [
             Rc::new(vec![SharedWeights::load(
                 devices[0],

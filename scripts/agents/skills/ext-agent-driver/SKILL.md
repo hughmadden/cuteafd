@@ -19,9 +19,9 @@ text with `--text`. It does not require a Python package install.
 
 ```sh
 python3 scripts/agents/ext-agent.py start TASK --tool grok --effort high \
-  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief
+  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief --auto-approve
 python3 scripts/agents/ext-agent.py start TASK --tool agy --model gemini-4-argon-high \
-  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief
+  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief --auto-approve
 python3 scripts/agents/ext-agent.py wait TASK --until idle --timeout 600
 python3 scripts/agents/ext-agent.py status TASK --lines 30
 python3 scripts/agents/ext-agent.py transcript TASK --since-last
@@ -37,22 +37,27 @@ python3 scripts/agents/ext-agent.py prune --older-than 24
 `EXT_AGENT_RUNS` selects the private run store (default `~/.cache/ext-agent`).
 Names use letters, digits, underscores and hyphens. A run name is never reused:
 choose a new name to preserve transcripts. `EXT_AGENT_GROK` / `EXT_AGENT_AGY`
-can override the executable path. Preamble and brief are optional; omitting
-both starts at the idle prompt without sending a task. `start` may return
-`starting` with `ready_timeout`; the detached supervisor continues, so wait or
-inspect instead of starting a duplicate. The driver sets auto-approval and
-accepts directory trust for the explicitly selected cwd; only use a trusted
-worktree. It cannot log in for you.
+can override the executable path. Preamble and brief are optional files,
+combined in that order; omitting both starts at the idle prompt without sending
+a task. `start` may return `starting` with `ready_timeout`; the detached
+supervisor continues, so wait or inspect instead of starting a duplicate.
+Without `--auto-approve` the CLI keeps its own approval behavior and a
+directory-trust prompt surfaces at once as `asking`; `--auto-approve`
+explicitly enables the CLI's approval bypass and accepts directory trust for
+the selected cwd. This project authorizes that mode for our drivers, so pass
+`--auto-approve` with a trusted worktree. It is not authority to widen scope,
+merge, push or change defaults. It cannot log in for you.
 
 Multiline messages use bracketed paste followed by Enter. A send while busy
 is queued by the CLI; it is not guaranteed to alter the currently executing
 tool call. `submitted` confirms visible echo or a growing queue counter, not
 that the worker obeyed. On `submission unconfirmed`, inspect screen and
 transcript before resending: the turn may already be queued. Interrupt sends
-Escape; after interrupt, wait for idle before sending a replacement. Stop
-kills the pane and its process descendants and the supervisor. It cannot undo
-already executed commands or stop detached remote work; the worker must clean
-up its hardware/container jobs through the project's tools before stop.
+Ctrl+C for Grok and Escape for Antigravity; after interrupt, wait for idle
+before sending a replacement. Stop kills the pane and its process descendants
+and the supervisor. It cannot undo already executed commands or stop detached
+remote work; the worker must clean up its hardware/container jobs through the
+project's tools before stop.
 
 ## Resume after a restart
 
@@ -71,8 +76,15 @@ Use the same `EXT_AGENT_RUNS`, task name and original brief. The transcript
 cursor is shared by successive driver processes; full `transcript TASK` can
 recover earlier context without advancing it. Tell `main` you adopted the
 run, inspect whether it is busy/asking/error/idle, then continue the normal
-loop. Do not repeat already queued messages, recreate jobs or assume the task
-failed because the old driver disappeared. After stopping a finished run,
+loop. Before steering an adopted run, verify that its launch command in
+`events.jsonl` names the intended real CLI executable: a test killed mid-suite
+can leave fake executable and run-root overrides in the tmux server's
+environment, and a coordinator restarted inside that server inherits them.
+Tests must never use the default tmux server; a launch command that names a
+fake path means the run is not the worker you think it is, so replace it with
+a fresh run from a clean environment. Do not repeat already queued messages,
+recreate jobs or assume the task failed because the old driver disappeared.
+After stopping a finished run,
 `prune` archives exited directories under `<runs>/archive/`, removing them
 from `list` while retaining evidence. `--older-than H` is an age in hours;
 omitting it archives all fully stopped exited runs. Active runs are untouched.
@@ -81,8 +93,12 @@ omitting it archives all fully stopped exited runs. Active runs are untouched.
 
 1. Start once, then SendMessage to `main`: tool/model, run name, worktree and
    brief. State whether ready or still starting.
-2. Block with `wait --until idle --timeout 600 --progress-interval 300` in a
-   background Bash call. Never write your own watcher; use wait with
+2. Block with `wait --until idle --timeout 600 --progress-interval 300` as a
+   foreground Bash call (`timeout` parameter about 70 s longer than the wait's
+   `--timeout`). Never use `run_in_background` for the wait: a background call
+   ends your turn, and every turn end wakes `main` with an empty notification
+   (TJ, 2026-10-14). Keep your turn open and loop foreground waits; message
+   `main` only for the trigger list. Never write your own watcher; use wait with
    `--progress-interval`. It emits progress JSON lines only when new output
    arrived: state, quiet time, context_pct, recent_tools and up to five distinct
    notable transcript markers (160 characters each). The final line is the
@@ -97,7 +113,7 @@ omitting it archives all fully stopped exited runs. Active runs are untouched.
 3. Every progress event means: summarize only the new increment in 1-2 lines
    in the driver log (message `main` only for the trigger list below), then
    immediately continue waiting: the task is not done. The CLI's wait keeps
-   blocking after progress; consume the next event from that same background
+   blocking after progress; consume the next event from that same wait
    call, never start a duplicate watcher. Only idle (then inspect deliverables),
    asking, or error ends the normal work cycle; exited is an error unless
    completion was already validated. If a timeout ends the process while busy,
@@ -195,4 +211,4 @@ The driver should spend most of its time blocked in wait, not deliberating.
 
 ## Stay reachable
 
-Always block with: `wait NAME --until idle --progress-interval 60 --return-on-progress --timeout 300 --until-context 75 --until-quiet 300`. With --return-on-progress you take one turn per 60 s progress period while the worker is producing (TJ, 2026-10-14: study mode; lengthen later). You run a turn only when this command exits; progress lines do not wake you. The wait also returns when the worker's context reaches 75% (nudge it to write the deliverable) or it has written nothing for 5 minutes (inspect the screen). A wait returns at least every 5 minutes even if the worker is still busy, so you see messages from main, which can't reach you while you're blocked. On a timeout, summarize the increment in 1–2 lines and wait again; it isn't a failure.
+Always block with: `wait NAME --until idle --progress-interval 60 --return-on-progress --timeout 300 --until-context 75 --until-quiet 300`. With --return-on-progress you take one turn per 60 s progress period while the worker is producing (TJ, 2026-10-14: study mode; lengthen later). You run a turn only when this command exits; progress lines do not wake you. The wait also returns when the worker's context crosses 75% during that wait (nudge it to write the deliverable; a worker already above 75% does not re-wake you, so later waits block normally) or it has written nothing for 5 minutes (inspect the screen). A wait returns at least every 5 minutes even if the worker is still busy, so you see messages from main, which can't reach you while you're blocked. On a timeout, summarize the increment in 1–2 lines and wait again; it isn't a failure.

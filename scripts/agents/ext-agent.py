@@ -81,6 +81,7 @@ class Adapter:
     asking = r'(?i)\b(?:allow|approve|permission required|confirm|choose an option|waiting for (?:your|user))\b'
     tools = r'^\s*(?:[◆○●]\s*(?:Ran|Running|Read|Edit|Write|Search)|\$\s|(?:Bash|Read|Edit|Write|Search)\()'
     trust_key = 'Enter'
+    interrupt_key = 'Escape'
 
     def state(self, text, meta):
         lines = [line.rstrip() for line in text.splitlines() if line.strip()]
@@ -88,8 +89,12 @@ class Adapter:
         if (re.search(r'^[\s]*[⠁-⣿]', '\n'.join(lines[-5:]), re.M) or
                 re.search(self.busy, '\n'.join(lines[-2:])) or
                 re.search(r'\b[1-9][0-9]* queued\b|edit queued messages', '\n'.join(lines[-2:])) or
+                # Grok shows its prompt while a background command runs.
+                re.search(r'\b[1-9][0-9]* commands? still running\b', '\n'.join(lines[-4:])) or
                 re.search(r'^[\s⠀-⣿]*(?:Waiting for response|Thinking|Working|Responding|Running command|Loading)[^\n]*', '\n'.join(lines[-3:]), re.M)):
             return 'busy'
+        if 'Do you trust the contents' in body:
+            return 'asking'
         # Only inspect the current turn, not old questions/errors in scrollback.
         marker = message_marker(meta.get('last_message', ''))
         if marker:
@@ -115,9 +120,12 @@ class Adapter:
 
 class Grok(Adapter):
     trust_key = 'y'
+    interrupt_key = 'C-c'
 
     def command(self, meta):
-        cmd = [meta['executable'], '--always-approve', '--minimal', '--no-alt-screen', '--cwd', meta['cwd']]
+        cmd = [meta['executable'], '--minimal', '--no-alt-screen', '--cwd', meta['cwd']]
+        if meta.get('auto_approve'):
+            cmd += ['--always-approve']
         if meta.get('model'):
             cmd += ['--model', meta['model']]
         if meta.get('effort'):
@@ -127,7 +135,9 @@ class Grok(Adapter):
 
 class Agy(Adapter):
     def command(self, meta):
-        cmd = [meta['executable'], '--dangerously-skip-permissions', '--add-dir', meta['cwd']]
+        cmd = [meta['executable'], '--add-dir', meta['cwd']]
+        if meta.get('auto_approve'):
+            cmd += ['--dangerously-skip-permissions']
         if meta.get('model'):
             cmd += ['--model', meta['model']]
         elif meta.get('effort'):
@@ -324,7 +334,7 @@ def supervise(path):
             changed = fingerprint != meta.get('screen_hash') or size != meta.get('raw_size')
             if changed:
                 meta = save(path, screen_hash=fingerprint, raw_size=size, last_output_at=time.time())
-            if 'Do you trust the contents' in text and not trust_sent:
+            if 'Do you trust the contents' in text and meta.get('auto_approve') and not trust_sent:
                 tmux('send-keys', '-t', meta['pane'], adapter.trust_key)
                 trust_sent = True
                 event(path, 'trust', cwd=meta['cwd'])
@@ -394,6 +404,7 @@ def start(args):
     now = time.time()
     meta = {'name': args.name, 'tool': args.tool, 'session': 'ext-' + args.name,
             'cwd': cwd, 'model': args.model, 'effort': args.effort,
+            'auto_approve': args.auto_approve,
             'executable': os.environ.get('EXT_AGENT_' + args.tool.upper(), args.tool),
             'brief': '\n\n'.join(pieces), 'created_at': now, 'last_output_at': now,
             'state': 'starting', 'quiet_seconds': args.quiet_seconds,
@@ -406,7 +417,7 @@ def start(args):
     deadline = time.monotonic() + args.ready_timeout
     while time.monotonic() < deadline:
         meta = read_meta(path)
-        if meta['state'] in ('idle', 'asking', 'error', 'exited') and (not pieces or meta.get('submitted_at') or meta['state'] in ('error', 'exited')):
+        if meta['state'] in ('idle', 'asking', 'error', 'exited') and (not pieces or meta.get('submitted_at') or meta['state'] in ('asking', 'error', 'exited')):
             return snapshot(path)
         if meta.get('submitted_at'):
             return snapshot(path)
@@ -418,7 +429,12 @@ def start(args):
 
 def wait(args):
     path = directory(args.name)
-    initial = snapshot(path)['state']
+    first = snapshot(path)
+    initial = first['state']
+    # Edge-triggered: a worker already past the threshold when the wait starts
+    # was reported by an earlier wait, so only a fresh crossing wakes the driver.
+    start_usage = first['context_usage']
+    context_armed = not (start_usage and args.until_context and start_usage['percent'] >= args.until_context)
     if args.progress_interval < 0:
         raise ValueError('progress interval must be nonnegative')
     deadline = time.monotonic() + args.timeout
@@ -459,7 +475,9 @@ def wait(args):
             return result
         # Wake the driver when it has something to act on, not only on a timer.
         usage = result['context_usage']
-        if args.until_context and usage and usage['percent'] >= args.until_context:
+        if usage and args.until_context and usage['percent'] < args.until_context:
+            context_armed = True
+        if context_armed and args.until_context and usage and usage['percent'] >= args.until_context:
             result['woke'] = 'context'
             return result
         if args.until_quiet and result['state'] == 'busy' and result['seconds_since_output'] >= args.until_quiet:
@@ -535,6 +553,8 @@ def parser():
             c.add_argument('--cwd', default=os.getcwd())
             c.add_argument('--brief')
             c.add_argument('--preamble')
+            c.add_argument('--auto-approve', action='store_true',
+                           help='explicitly allow CLI auto-approval and directory trust for this run')
             c.add_argument('--ready-timeout', type=float, default=60)
             c.add_argument('--quiet-seconds', type=float, default=300)
             c.add_argument('--max-retries', type=int, default=4)
@@ -548,7 +568,7 @@ def parser():
             c.add_argument('--until', choices=('idle', 'asking', 'error', 'exited', 'any'), default='idle')
             c.add_argument('--timeout', type=float, default=600)
             c.add_argument('--progress-interval', type=float, default=0, metavar='S', help='emit progress JSON lines on new output every S seconds')
-            c.add_argument('--until-context', type=float, default=0, metavar='PCT', help='also return once the worker context fill reaches PCT percent')
+            c.add_argument('--until-context', type=float, default=0, metavar='PCT', help='also return when the worker context fill crosses PCT percent during this wait')
             c.add_argument('--return-on-progress', action='store_true', help='return after the first progress event (one driver turn per period)')
             c.add_argument('--until-quiet', type=float, default=0, metavar='S', help='also return if a busy worker writes nothing for S seconds')
         if command == 'transcript':
@@ -586,7 +606,7 @@ def main():
             elif args.command == 'transcript':
                 result = transcript(path, args.since_last)
             elif args.command == 'interrupt':
-                tmux('send-keys', '-t', meta['pane'], 'Escape')
+                tmux('send-keys', '-t', meta['pane'], ADAPTERS[meta['tool']].interrupt_key)
                 event(path, 'interrupt')
                 result = {'interrupted': True}
             elif args.command == 'stop':

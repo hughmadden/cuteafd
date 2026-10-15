@@ -3,8 +3,13 @@
 These files are **opt-in, standalone `--config` files**. They overlay the
 launcher defaults in `scripts/lib/release-common.sh` (DeepSeek V4.1) and
 `scripts/launch/run-family.sh` (every other family); every key they do not
-name keeps its default. They are never selected automatically and they do not
-change `cuteafd.config`, the release images or the default serving selection.
+name keeps its default. A key the launched family never reads is a hard error
+(`unused configuration key`, exit 2). `KV_CACHE` is KV precision for Qwen
+(`bf16|fp8`, default `fp8`, forwarded as `--kv-cache`) and MiMo (`int8|bf16`;
+unset omits the flag and the daemon default `int8` applies). Other families
+have no KV-precision choice, so they reject `KV_CACHE`. The files are never
+selected automatically and they do not change `cuteafd.config`, the release
+images or the default serving selection.
 
 Select one explicitly:
 

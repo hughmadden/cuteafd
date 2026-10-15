@@ -30,7 +30,8 @@ host="$1" staging="$2" key="$3" env_file="$4" image="$5" layers="$6"
 NO_TURN=75
 fqdn="${CUTEAFD_EXPORT_HOST_ADDR:-$host}"
 ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o "HostKeyAlias=$host" "$fqdn")
-area="/mnt/sparknest/build-cache/export/$key"
+run_id="$$-$(date +%s%N)"
+area="/mnt/sparknest/build-cache/export/$key-$run_id"
 archive="/mnt/sparknest/build-cache/wip-native/x86_64/coordinator-120/$key.tar.zst"
 started=$SECONDS
 
@@ -58,27 +59,79 @@ if [[ ! -f "$archive" ]]; then
   timeout 900 nest replicate --hosts "$host" --wait "$area" >/dev/null
   echo "export-remote: staged source on $host in $((SECONDS - started))s"
   set +e
-  timeout --kill-after=30 7200 "${ssh_host[@]}" bash -s -- "$area" "$image" "$key" "$archive" <<'REMOTE'
+  timeout --kill-after=30 7200 "${ssh_host[@]}" bash -s -- "$area" "$image" "$key" "$archive" "${CUTEAFD_REMOTE_EXPORT_SLOTS:-}" <<'REMOTE'
 set -euo pipefail
-area="$1" image="$2" key="$3" archive="$4"
+area="$1" image="$2" key="$3" archive="$4" slots="${5:-}"
+NO_TURN=75
+cores="$(nproc)"
+memory_mib="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
+if [[ -z "$slots" ]]; then
+  slots=$((cores / 12))
+  ((memory_mib / 24576 >= slots)) || slots=$((memory_mib / 24576))
+  ((slots > 0)) || slots=1
+fi
+[[ "$slots" =~ ^[1-9][0-9]*$ ]] || exit 2
+mkdir -p "$HOME/.cache/cuteafd/builds"
+mkdir -p "$HOME/.cache/cuteafd"
+export_slot=
+for ((slot = 0; slot < slots; slot++)); do
+  exec {slot_fd}>>"$HOME/.cache/cuteafd/export.build.$slot.lock"
+  if flock -n "$slot_fd"; then export_slot="$slot"; break; fi
+  exec {slot_fd}>&-
+done
+[[ -n "$export_slot" ]] || { echo "export-remote: all $slots export slots busy"; exit "$NO_TURN"; }
 NO_TURN=75
 smi=/usr/lib/wsl/lib/nvidia-smi
 [[ -x "$smi" ]] || smi=nvidia-smi
-root="$HOME/.cache/cuteafd/builds/export-$key"
-rm -rf "$root"; mkdir -p "$root/src" "$root/build" "$root/output" "$root/home"
+root="$(mktemp -d "$HOME/.cache/cuteafd/builds/export-$key.XXXXXXXX")"
+container="cuteafd-export-$(basename "$root")"
+reservation="$(basename "$root")"
+ledger="$HOME/.cache/cuteafd/export-reservations.json"
+cleanup_export() {
+    trap '' TERM HUP INT QUIT
+  local names
+  # Keep the slot and reservation until a successful query proves absence.
+  while true; do
+    if names="$(timeout 30 docker ps -a --filter "name=^/$container$" --format '{{.Names}}')"; then
+      if [[ -z "$names" ]]; then break; fi
+      if timeout 30 docker rm -f "$container" >/dev/null; then
+        if names="$(timeout 30 docker ps -a --filter "name=^/$container$" --format '{{.Names}}')" && [[ -z "$names" ]]; then break; fi
+      fi
+    fi
+    echo "Remote export cleanup unconfirmed; retaining reservation" >&2
+    sleep 60
+  done
+  [[ ! -f "$root/src/scripts/build/export-placement.py" ]] ||
+    python3 "$root/src/scripts/build/export-placement.py" release --ledger "$ledger" --reservation "$reservation"
+  rm -rf "$root"
+}
+trap cleanup_export EXIT
+trap 'exit 143' TERM HUP INT QUIT
+mkdir -p "$HOME/.cache/cuteafd/export-workers"
+mkdir -p "$root/src" "$root/build" "$root/output" "$root/home"
 zstd -d -q <"$area/source.tar.zst" | tar -C "$root/src" -xf -
 placement="$root/src/scripts/build/export-placement.py"
 python3 "$root/src/scripts/build/assert-build-filesystem.py" "$root"
 grep -Eq "name:[[:space:]]*\"?all\"?[[:space:]]*\$" /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null ||
   { echo "export-remote: no CDI device nvidia.com/gpu=all on $(hostname); run: sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml" >&2; exit 2; }
-read -r cap jobs baseline < <(python3 "$placement" admit --smi "$smi" --gpu 0) || exit "$NO_TURN"
+read -r cap jobs baseline ram < <(python3 "$placement" reserve --ledger "$ledger" --reservation "$reservation" --owner "$$" --smi "$smi" --gpu 0 --max-cap-mib "$((24576 / slots))" --max-jobs "$((cores / slots))") || exit "$NO_TURN"
+((jobs <= cores / slots)) || jobs=$((cores / slots))
+((jobs > 0)) || jobs=1
+# Split the admitted context budget between Ninja exporters and EXL3 variants.
+variant_jobs=$((jobs / 2))
+((variant_jobs > 0)) || variant_jobs=1
+ninja_jobs=$((jobs - variant_jobs))
+((ninja_jobs > 0)) || ninja_jobs=1
+echo "export-remote: slot $export_slot/$slots"
 echo "export-remote: admitted cap ${cap} MiB, ${jobs} jobs, device ${baseline} MiB in use"
+# WSL reports only total device use. Watch the bounded aggregate budget,
+# not an individual cap that would count a sibling export as ours.
 status=0
-python3 "$placement" watch --smi "$smi" --gpu 0 --cap-mib "$cap" --baseline-mib "$baseline" -- \
-  docker run --rm --device nvidia.com/gpu=all --user "$(id -u):$(id -g)" \
-    -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" -e "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" \
-    --env-file "$area/scope.env" -e CUTEAFD_WIP_NATIVE_STORE=/wip/build/native-store \
-    -v "$root/src:/wip/source" -v "$root/build:/wip/build" -v "$root/output:/wip/output" -v "$root/home:/wip/home" \
+python3 "$placement" watch --smi "$smi" --gpu 0 --cap-mib "$cap" --ledger "$ledger" --reservation "$reservation" -- \
+  docker run --rm --memory "${ram}m" --memory-swap "${ram}m" --device nvidia.com/gpu=all --user "$(id -u):$(id -g)" --name "$container" \
+    -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" -e "CMAKE_BUILD_PARALLEL_LEVEL=$ninja_jobs" -e "CUTEAFD_EXPORT_JOBS=$variant_jobs" -e CUTEAFD_EXPORT_WORKER_RAM_MIB=4096 -e CUTEAFD_EXPORT_HOST_CLASS=remote -e CUTEAFD_EXPORT_HOST_SLOT_DIR=/export-slots -e "CUTEAFD_EXPORT_HOST_WORKERS=$cores" \
+    --env-file "$area/scope.env" -e "CMAKE_BUILD_PARALLEL_LEVEL=$ninja_jobs" -e "CUTEAFD_EXPORT_JOBS=$variant_jobs" -e CUTEAFD_WIP_NATIVE_STORE=/wip/build/native-store \
+    -v "$HOME/.cache/cuteafd/export-workers:/export-slots" -v "$root/src:/wip/source" -v "$root/build:/wip/build" -v "$root/output:/wip/output" -v "$root/home:/wip/home" \
     "$image" /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator export || status=$?
 if ((status == 0)); then
@@ -95,7 +148,6 @@ if ((status == 0)); then
     status="$NO_TURN"
   fi
 fi
-rm -rf "$root"
 exit "$status"
 REMOTE
   status=$?

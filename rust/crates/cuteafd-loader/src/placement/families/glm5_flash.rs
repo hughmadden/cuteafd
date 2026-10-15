@@ -23,8 +23,18 @@ pub const CONTEXT_PROGRAMS: [&str; 6] = ["glmf_scored_index_topk_decode_m64", "g
     "glmf_lse_combine2", "glmf_paged_staging_gather_kv", "glmf_paged_staging_gather_index",
     "glmf_index_expand_owned"];
 
+/// The `context` programs (beside the split partials), for the fail-closed
+/// reason when a build's manifest lacks them (issue #202).
+pub fn context_program_list() -> String {
+    let mut names: Vec<String> = CONTEXT_PROGRAMS.iter().map(|n| (*n).to_string()).collect();
+    names.extend(["glmf2_kda_commit_c", "glmf_index_producer_c_m64", "glmf_index_producer_c_m4096",
+        "glmf_sparse_mla_partial_h0_s*_m64", "glmf_sparse_mla_partial_h32_s*_m64"].map(str::to_string));
+    names.join(", ")
+}
+
 /// The `context` programs of a build and their scratch (`lookup`: name -> scratch bytes), or None
-/// when it lacks any of them (auto then stays `heads`). Needs the head split's compact commit too.
+/// when it lacks any of them (a chosen `context` then fails closed; `heads` is the only executor).
+/// Needs the head split's compact commit too.
 pub fn context_programs<'n>(names: impl IntoIterator<Item = &'n str> + Clone,
     lookup: impl Fn(&str) -> Option<u64>) -> Option<GlmfAttention> {
     let partial = |begin: u64| names.clone().into_iter()
@@ -45,21 +55,24 @@ pub fn manifest_context(manifest: &serde_json::Value) -> Option<GlmfAttention> {
 }
 
 /// The MLA placement a GLM Flash engine on `gpus` GPUs serves: `requested` (None: auto), checked
-/// against the build's `context` programs. Auto is `context` on two GPUs where the build carries
-/// them, else `heads`; an explicit `context` without them, or `layers` (no executor), is refused.
+/// against the build's `context` programs. Auto is `context` on two GPUs, as `ExecutorModes::check_attention`
+/// records for this family; without the context programs that placement cannot run, so a chosen
+/// `context` fails closed naming the programs rather than silently serving heads with replicated
+/// KV. One GPU and an explicit `heads` stay heads; `layers` (no executor) is refused.
 pub fn resolve_attention(requested: Option<AttentionPlacement>, gpus: usize, programs: Option<GlmfAttention>)
     -> Result<GlmfAttention, PlacementError> {
     let heads = GlmfAttention { mode: AttentionPlacement::Heads, ..programs.unwrap_or_default() };
     let refuse = |mode, reason| Err(PlacementError::AttentionPlacement { family: "glm5_flash", mode, reason });
+    let context = |p: GlmfAttention| GlmfAttention { mode: AttentionPlacement::Context, ..p };
+    let missing = || Err(PlacementError::MissingContextPrograms { family: "glm5_flash",
+        programs: context_program_list() });
     match requested {
         Some(AttentionPlacement::Heads) => Ok(heads),
         Some(mode) if gpus != 2 => refuse(mode, "requires two coordinator GPUs with peer access"),
         Some(AttentionPlacement::Layers) => refuse(AttentionPlacement::Layers,
             "executor not implemented; heads and context are qualified"),
-        Some(AttentionPlacement::Context) => programs.map(|p| GlmfAttention { mode: AttentionPlacement::Context, ..p })
-            .map_or_else(|| refuse(AttentionPlacement::Context,
-                "this build lacks the context programs (CUTEAFD_CONTEXT_SPLIT_AOT)"), Ok),
-        None if gpus == 2 => Ok(programs.map_or(heads, |p| GlmfAttention { mode: AttentionPlacement::Context, ..p })),
+        Some(AttentionPlacement::Context) => programs.map(context).map_or_else(missing, Ok),
+        None if gpus == 2 => programs.map(context).map_or_else(missing, Ok),
         None => Ok(heads),
     }
 }
@@ -422,7 +435,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
             vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }, by_kind: vec![],
             ownership: LayerOwnership::Alternating, ..LayerPolicy::default() },
         hops: HopSpec { row_bytes: 4 * i.cfg.hidden as u64 * 2, rows: i.prefill_rows.max(i.decode_rows),
-            lanes: working.prefill_lanes, entry_gpu: 0, head_gpu: 0 }, executor: super::GLM5_FLASH,
+            lanes: working.prefill_lanes, entry_gpu: 0, head_gpu: 0, terminal: if ranks == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } }, executor: super::GLM5_FLASH,
     })
 }
 
@@ -1465,11 +1478,20 @@ mod tests {
             ..Default::default() });
         use AttentionPlacement::{Context, Heads, Layers};
         assert_eq!(resolve_attention(None, 2, programs).unwrap().mode, Context);
-        assert_eq!(resolve_attention(None, 2, None).unwrap().mode, Heads);
         assert_eq!(resolve_attention(None, 1, programs).unwrap().mode, Heads);
         assert_eq!(resolve_attention(Some(Heads), 2, programs).unwrap().mode, Heads);
+        assert_eq!(resolve_attention(None, 1, None).unwrap().mode, Heads);
+        assert_eq!(resolve_attention(Some(Heads), 2, None).unwrap().mode, Heads);
         assert_eq!(resolve_attention(Some(Context), 2, programs).unwrap().topk_scratch, 7);
-        for (mode, gpus, programs) in [(Context, 2, None), (Context, 1, programs), (Layers, 2, programs)] {
+        // Auto is context on two GPUs, so a build without the programs fails closed, as an
+        // explicit context does (issue #202); heads and one GPU still resolve.
+        for (requested, gpus, programs) in [(None, 2, None), (Some(Context), 2, None)] {
+            let error = resolve_attention(requested, gpus, programs).unwrap_err();
+            assert!(matches!(error, PlacementError::MissingContextPrograms { family: "glm5_flash", .. }),
+                "{requested:?}: {error}");
+            assert!(error.to_string().contains("glmf_dsa_candidate_merge"), "{error}");
+        }
+        for (mode, gpus, programs) in [(Context, 1, programs), (Layers, 2, programs)] {
             assert!(matches!(resolve_attention(Some(mode), gpus, programs), Err(PlacementError::AttentionPlacement { .. })));
         }
         // The executor runs context, not owned layers; heads stays explicit.

@@ -102,6 +102,16 @@ def main() -> int:
     # Docker creates missing mount parents as root. Bind a host-owned home first
     # so Cargo can write its lock/config alongside the separately mounted inputs.
     bind_directory(host_home, container_home)
+    # Worker admission is host-wide even with input/compiler caches disabled.
+    workers = root / 'export-workers'
+    try:
+        nvme_cache(workers)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        # Coordination remains host-wide when input caches fall back.
+        workers = Path(args.build_root).parent / 'export-workers'
+    bind_directory(workers, Path('/export-slots'))
+    argv.extend(['-e', 'CUTEAFD_EXPORT_HOST_SLOT_DIR=/export-slots',
+                 '-e', f'CUTEAFD_EXPORT_HOST_WORKERS={os.cpu_count() or 1}'])
     directory(host_home / "cargo")
     # Cargo binaries remain image-owned; only its downloadable inputs are shared.
     argv.extend(["-e", f"CARGO_HOME={container_home / 'cargo'}"])

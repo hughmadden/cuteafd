@@ -530,6 +530,11 @@ release_serving_docker_args() {
     -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
     -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
     -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor)
+  # ADR-052's dedicated directory survives socket replacement on daemon restart.
+  # Never create it here: absent storage stays unknown without root-owned state.
+  if [[ -d /srv/sparknest/run ]]; then
+    RELEASE_SERVING_ARGS+=(--mount type=bind,src=/srv/sparknest/run,dst=/srv/sparknest/run,readonly)
+  fi
   # Docker's numeric --user otherwise drops groups used by host access checks.
   for group in "${groups[@]}"; do
     [[ "$group" == "$primary_group" ]] || RELEASE_SERVING_ARGS+=(--group-add "$group")
@@ -605,16 +610,95 @@ release_profile_docker_args() {
   fi
 }
 
+# Print the profiler to exec. The container calls this with the tool name only,
+# so the search is the image's own files. Tests pass a fixture root as $2.
+# ncu: /usr/local/bin/ncu, else the newest /opt/nvidia/nsight-compute/*/ncu.
+# nsys: /usr/local/bin/nsys, else /usr/local/cuda/bin/nsys, else the newest
+# /opt/nvidia/nsight-systems/*/nsys. Version names are dotted numbers, so
+# 2026.1.10 beats 2026.1.9.
+release_profile_resolve_tool() {
+  local tool="$1" root="${2-}" candidate version best="" best_version=""
+  local restore_nullglob=0
+  local -a stable=() found=()
+  case "$tool" in
+    ncu) stable=("$root/usr/local/bin/ncu") ;;
+    nsys) stable=("$root/usr/local/bin/nsys" "$root/usr/local/cuda/bin/nsys") ;;
+    *) printf 'unknown profiler %s\n' "$tool" >&2; return 127 ;;
+  esac
+  for candidate in "${stable[@]}"; do
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  shopt -q nullglob && restore_nullglob=1
+  shopt -s nullglob
+  if [[ "$tool" == ncu ]]; then
+    found=("$root"/opt/nvidia/nsight-compute/*/ncu)
+  else
+    found=("$root"/opt/nvidia/nsight-systems/*/nsys)
+  fi
+  ((restore_nullglob)) || shopt -u nullglob
+  for candidate in "${found[@]}"; do
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    version="$(basename "$(dirname "$candidate")")"
+    [[ "$version" =~ ^[0-9]+([.][0-9]+)+$ ]] || continue
+    if [[ -z "$best" ]]; then
+      best="$candidate"
+      best_version="$version"
+      continue
+    fi
+    [[ "$version" == "$best_version" ]] && continue
+    if [[ "$(printf '%s\n%s\n' "$best_version" "$version" | LC_ALL=C sort -V | tail -n 1)" == "$version" ]]; then
+      best="$candidate"
+      best_version="$version"
+    fi
+  done
+  if [[ -n "$best" ]]; then
+    printf '%s\n' "$best"
+    return 0
+  fi
+  if [[ "$tool" == ncu ]]; then
+    printf 'ncu not found: looked for /usr/local/bin/ncu and /opt/nvidia/nsight-compute/*/ncu\n' >&2
+  else
+    printf 'nsys not found: looked for /usr/local/bin/nsys, /usr/local/cuda/bin/nsys, and /opt/nvidia/nsight-systems/*/nsys\n' >&2
+  fi
+  return 127
+}
+
+# TOOL, then the profiler's arguments, then the served command. exec replaces
+# this shell so the profiler receives docker stop's SIGINT.
+release_profile_exec() {
+  local tool="$1" bin
+  shift
+  bin="$(release_profile_resolve_tool "$tool")" || exit 127
+  exec "$bin" "$@"
+}
+
+# Container command: resolve TOOL at start, then exec it with the remaining
+# arguments. The caller appends the served command after this argv.
+release_profile_container_wrapper() {
+  local tool="$1" script
+  shift
+  script="$(declare -f release_profile_resolve_tool; declare -f release_profile_exec)"
+  script+=$'\nrelease_profile_exec "$@"'
+  RELEASE_PROFILE_WRAPPER=(/bin/bash -c "$script" release-profile-resolve "$tool" "$@")
+}
+
 # Sets RELEASE_PROFILE_WRAPPER: the argv that goes between the image and the
 # served command (`docker run ... IMAGE "${RELEASE_PROFILE_WRAPPER[@]}" cuteafd
 # ...`), and RELEASE_PROFILE_WRAPPER_DOCKER_ARGS (docker arguments before the
-# image: the profiler is PID 1, and `docker stop` sends it SIGINT and waits up to
-# 300 s for the report; the cuteafd.graceful-stop label makes smoke teardown and
-# release_stop_local_container use that stop before removing), both empty unless
-# PROFILE names nsys or ncu. Coordinator only: a Spark
-# worker asked to wrap fails closed (Spark workers still get the environment
-# switches from release_profile_docker_args). Call after that helper, which has
-# validated PROFILE and PROFILE_DIR.
+# image: the profiler replaces the wrapper shell before serving, so `docker stop`
+# sends it SIGINT and waits up to 300 s for the report; the cuteafd.graceful-stop
+# label makes smoke teardown and release_stop_local_container use that stop
+# before removing), both empty unless PROFILE names nsys or ncu. Coordinator
+# only: a Spark worker asked to wrap fails closed (Spark workers still get the
+# environment switches from release_profile_docker_args). Call after that helper,
+# which has validated PROFILE and PROFILE_DIR.
+# The profiler binary is not chosen here. The host install and the image install
+# differ (the dev image has ncu at /opt/nvidia/nsight-compute/<version>/ncu, which
+# may or may not be linked from /usr/local/bin/ncu). The wrapper command resolves
+# it when the container starts.
 # PROFILE_NSYS_GPU_METRICS adds nsys GPU metrics sampling (clocks, power, DRAM
 # and SM activity): `all` samples every GPU the container sees (use this), or an
 # index list in nsys's own device order, which is not CUDA's or nvidia-smi's
@@ -640,9 +724,9 @@ release_profile_wrapper() {
     [[ -z "$kernel$count$set" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET need PROFILE=ncu"
     # Collection starts paused (nsys start/stop through docker exec open and
     # close the window); stopping the session or the container writes the report.
-    RELEASE_PROFILE_WRAPPER=(/usr/local/cuda/bin/nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node
-      --sample=none --cpuctxsw=none --start-later=true "--session-new=$RELEASE_NSYS_SESSION"
-      "--output=$dir/nsys-$host" --force-overwrite=true)
+    release_profile_container_wrapper nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
+      --sample=none --cpuctxsw=none --start-later=true "--session-new=$RELEASE_NSYS_SESSION" \
+      "--output=$dir/nsys-$host" --force-overwrite=true
     if [[ -n "$metrics" ]]; then
       [[ "$metrics" == all || "$metrics" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
         release_die "PROFILE_NSYS_GPU_METRICS must be all or an nsys GPU index list (e.g. 0 or 0,1)"
@@ -656,8 +740,8 @@ release_profile_wrapper() {
   count="${count:-20}" set="${set:-full}"
   [[ "$count" =~ ^[1-9][0-9]{0,3}$ ]] || release_die "PROFILE_NCU_COUNT must be 1..9999"
   [[ "$set" =~ ^[a-z_]+$ ]] || release_die "PROFILE_NCU_SET must be an ncu section set name (e.g. full, basic)"
-  RELEASE_PROFILE_WRAPPER=(/usr/local/bin/ncu --kernel-name "regex:$kernel" --launch-count "$count" --set "$set"
-    --graph-profiling node --target-processes all --export "$dir/ncu-$host" --force-overwrite)
+  release_profile_container_wrapper ncu --kernel-name "regex:$kernel" --launch-count "$count" --set "$set" \
+    --graph-profiling node --target-processes all --export "$dir/ncu-$host" --force-overwrite
 }
 
 # Shared key grammar for release lifecycle scripts and the family launcher.
@@ -669,7 +753,7 @@ release_known_key() {
     FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|API_KEY_FILE|ENABLE_BENCH|USAGE|GATEWAY) return 0 ;;
     GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
-    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|KV_FORMAT|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
+    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|EXL3_PAIRED_TP4|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;
     GLM5_FLASH_DRAFT_LINEAR) return 0 ;;
@@ -685,7 +769,7 @@ release_known_key() {
     GLM5_FLASH_VERIFY_POLICY|GLM5_FLASH_SPEC_TAU|GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NSYS_GPU_METRICS) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -919,6 +1003,8 @@ release_load_config() {
   PROFILE_NSYS_GPU_METRICS=
   ADDR=0.0.0.0:8000
   EXPERT_PORT=19441
+  CUTEAFD_EXPORT_HOST=oliver
+  WIP_BUILD_SEED=kakapo
   COORDINATOR_DOCKER_DEV=cuteafd-coordinator-dev
   COORDINATOR_DOCKER_INFERENCE=cuteafd-coordinator
   SPARK_EXPERT_DOCKER_DEV=cuteafd-spark-expert-dev

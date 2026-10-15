@@ -280,7 +280,8 @@ def run(args):
         def cuda_memory():
             free=C.c_size_t();total=C.c_size_t()
             check(cudart.cudaMemGetInfo(C.byref(free),C.byref(total)))
-            return dict(free=free.value,total=total.value)
+            return dict(free=free.value,total=total.value,
+                        cuda_free_scope="raw cudaMemGetInfo; GB10 under-reports reclaimable page cache")
         result["steady_memory_before"]=cuda_memory()
         for repeat in range(3):
             for tokens in reversed(args.tokens) if repeat%2 else args.tokens:

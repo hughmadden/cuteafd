@@ -4,8 +4,9 @@ use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
 use crate::families::glm5_flash::{GlmNextConfig, resident};
 
 pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    checkpoint: &super::super::Checkpoint, options: &LayoutOptions, manifest: Option<&serde_json::Value>,
+    input: &super::super::PlanInput, options: &LayoutOptions, manifest: Option<&serde_json::Value>,
     rows: u64, sequences: u64, context: u64, weight_budget: u64) -> MemoryLayout {
+    let checkpoint = input.checkpoint();
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };
     let mut devices: Vec<_> = options.rtx_bytes.iter().take(ranks).enumerate().map(|(rank, &bytes)| DeviceLayout {
@@ -34,8 +35,8 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }
         let representation = options.glmf_representation;
         let state = options.glmf_kda_state;
-        anyhow::ensure!(state == crate::serving_capacity::GlmfKdaState::F32 || (!representation.kda_fp8 && ranks == 1),
-            "BF16 KDA state needs BF16 projections (--kda-fp8 off) on one GPU; W8+S16 needs a new export");
+        anyhow::ensure!(state == crate::serving_capacity::GlmfKdaState::F32 || ranks == 1,
+            "BF16 KDA state needs one GPU; head-split BF16 state is not yet qualified");
         notes.push(format!("KDA projections: {}, state: {state:?}; shared target/draft head: {}",
             if representation.kda_fp8 { "FP8" } else { "BF16" }, if representation.fp8_head { "FP8" } else { "BF16" }));
         let mut resident = resident::resident_weights(checkpoint, &cfg, cfg.layers, ranks, representation)
@@ -47,7 +48,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             notes.push("embedding placement: host (single pinned mapped copy)".into());
         }
         let router = if ranks == 2 { resident::router_replica_bytes(checkpoint, &cfg, cfg.layers).map_err(anyhow::Error::msg)? } else { 0 };
-        let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+        let catalog = input.expert_catalog()?;
         let shape = catalog.routed_experts();
         let onboard = options.onboard.or_else(|| options.local_expert_layers.map(|n| Onboard::Layers(n.saturating_sub(shape.first_layer))))
             .unwrap_or_else(glmf::default_onboard);
@@ -197,10 +198,17 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             report.placement_supported = false;
             report.fits = false;
             let reason = format!("GLM Flash pool-first placement: {error:#}");
-            report.hints.push(super::super::Hint {
-                what: reason.clone(),
-                how: "Change the reported pool, replay-records or placement constraint.".into(),
-            });
+            // `context` is the two-GPU default, so an absent program manifest fails the solve
+            // before any pool or replay constraint applies: point at the programs to rebuild
+            // rather than at the pool (issue #202).
+            let how = if matches!(error.downcast_ref::<placement::PlacementError>(),
+                Some(placement::PlacementError::MissingContextPrograms { .. })) {
+                "Rebuild the GLM Flash coordinator programs with the context-split kernels \
+                    (CUTEAFD_CONTEXT_SPLIT_AOT), or request `heads` explicitly.".into()
+            } else {
+                "Change the reported pool, replay-records or placement constraint.".into()
+            };
+            report.hints.push(super::super::Hint { what: reason.clone(), how });
             notes.push(reason);
         }
     }

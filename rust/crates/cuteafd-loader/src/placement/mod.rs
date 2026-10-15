@@ -30,7 +30,7 @@ mod tests;
 
 pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
-pub use residual::{hop_buffer_bytes, plan_hops, Hop, HopKind, HopPoint, HopSpec, LayerExecutionPlan, LayerPlanError, ResidualHome, Transition, HOP_SLOTS};
+pub use residual::{hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, LayerExecutionPlan, LayerPlanError, ResidualHome, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
 
@@ -501,6 +501,8 @@ pub enum PlacementError {
     UnsupportedHop { family: &'static str, hop: Hop },
     #[error("{family} cannot run attention placement {mode}: {reason}")]
     AttentionPlacement { family: &'static str, mode: AttentionPlacement, reason: &'static str },
+    #[error("{family} attention placement context needs the context-split programs ({programs}); this build's programs manifest lacks at least one of them — export the context-split kernels or request `heads`")]
+    MissingContextPrograms { family: &'static str, programs: String },
     #[error("placement arithmetic overflows: {0}")]
     Overflow(&'static str),
 }

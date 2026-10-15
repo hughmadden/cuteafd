@@ -711,6 +711,11 @@ fn workspace_options(
         prefill_output, fp8_output, |name| Ok(programs.spec(name)?.scratch.get("scratch").copied().unwrap_or(0)))
 }
 
+fn local_package_manifest(directory: &std::path::Path) -> Result<serde_json::Value> {
+    cuteafd_loader::placement::families::mimo_v2::package_manifest(directory, None)?
+        .with_context(|| format!("MiMo local package {} needs manifest.json in its package root", directory.display()))
+}
+
 fn local_expert_reservations(
     opened: &super::Opened,
     args: &super::EngineArgs,
@@ -769,7 +774,7 @@ fn local_expert_reservations(
         MemoryReservation {
             name: "experts.local_scratch".into(),
             bytes: {
-                let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+                let manifest = local_package_manifest(&directory)?;
                 let capacity = super::engine::expert_capacity(args.prefill_rows);
                 let bytes = cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", capacity as u64)
                     .context("MiMo local package lacks tp1 scratch at selected capacity")?;
@@ -830,6 +835,22 @@ pub(super) fn workspace_native_scratch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_admission_reads_manifest_from_sealed_package_root() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("tp1");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("libcuteafd_fp8moe.so"), b"layout fixture").unwrap();
+        let manifest = serde_json::json!({"layouts": {"tp1": {"scratch": 4096}}});
+        std::fs::write(root.path().join("manifest.json"), manifest.to_string()).unwrap();
+        assert_eq!(super::local_package_manifest(&directory).unwrap(), manifest);
+        std::fs::remove_file(root.path().join("manifest.json")).unwrap();
+        let error = super::local_package_manifest(&directory).unwrap_err().to_string();
+        assert!(error.contains("manifest.json in its package root"));
+        std::fs::write(root.path().join("manifest.json"), b"invalid JSON").unwrap();
+        assert!(super::local_package_manifest(&directory).is_err());
+    }
+
     #[test]
     fn prefill_lane_defaults_follow_family_and_preserve_explicit_overrides() {
         for (family, default) in [("mimo", 2), ("mimo2", 2), ("mimof", 2), ("mimof2", 2), ("mimop", 3), ("mimop2", 3)] {

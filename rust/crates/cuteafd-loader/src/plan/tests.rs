@@ -2,6 +2,7 @@ use super::testing::*;
 use super::*;
 use crate::formats::exl3_storage::Exl3StorageSource;
 use crate::families::mimo_v2::{MimoAttention, MimoV2Config};
+use crate::placement::AttentionPlacement;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -355,7 +356,10 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
         let options = layout::LayoutOptions { rtx_bytes: cards.clone(), context_tokens: 65536,
             pool_tokens: pool, prefill_rows: 4096, prefill_lanes: 3,
             glm5_drafter_disabled: true, ..Default::default() };
-        let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()), ..Default::default() }).unwrap();
+        // No manifest here: auto resolves context on two GPUs and now fails
+        // closed without its programs (#202), so request heads explicitly.
+        let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()),
+            attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..Default::default() }).unwrap();
         assert!(report.executable(), "{}", render(&report));
         let memory = report.memory_layout.unwrap();
         let gpus = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
@@ -400,7 +404,8 @@ fn glm5_attention_auto_requires_complete_context_programs() {
     names.extend(glm::CONTEXT_PROGRAMS.map(str::to_string));
     names.extend(["glm_sparse_mla_partial_h0_s1_m64", "glm_sparse_mla_partial_h32_s1_m64"].map(str::to_string));
     let path = dir.path().join("PROGRAMS.json");
-    // Both partials and every primitive are required; no manifest must also stay heads.
+    // Both partials and every primitive are required; auto (context) and an
+    // explicit context fail closed without them, while heads always runs.
     let missing = std::iter::once(None).chain(names.iter().filter(|name|
         glm::CONTEXT_PROGRAMS.contains(&name.as_str()) || name.starts_with("glm_sparse_mla_partial_"))
         .map(|name| Some(name.as_str()))).chain([Some("no-manifest")]);
@@ -416,33 +421,84 @@ fn glm5_attention_auto_requires_complete_context_programs() {
                 workspace_manifest: Some(if omitted == Some("no-manifest") { dir.path().join("absent.json") }
                     else { path.clone() }), ..Default::default()
             }), ..sparks(4) };
-            let expected = if gpus == 2 && omitted.is_none() { AttentionPlacement::Context }
-                else { AttentionPlacement::Heads };
             let auto = plan(dir.path(), &options).unwrap();
-            assert!(auto.executable(), "omitted {omitted:?}: {}", render(&auto));
-            assert_eq!(auto.attention_placement, expected, "omitted {omitted:?}, gpus {gpus}");
-            let explicit = plan(dir.path(), &PlanOptions {
-                attention_placement: Some(expected), ..options.clone()
+            let heads = plan(dir.path(), &PlanOptions {
+                attention_placement: Some(AttentionPlacement::Heads), ..options.clone()
             }).unwrap();
-            assert_eq!(auto.memory_layout, explicit.memory_layout);
-            assert_eq!(auto.placement_supported, explicit.placement_supported);
+            // Heads runs whatever the manifest holds.
+            assert!(heads.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(&heads));
+            assert_eq!(heads.attention_placement, AttentionPlacement::Heads);
             let context = plan(dir.path(), &PlanOptions {
-                attention_placement: Some(AttentionPlacement::Context), ..options
+                attention_placement: Some(AttentionPlacement::Context), ..options.clone()
             }).unwrap();
-            if expected == AttentionPlacement::Context {
-                assert!(context.executable(), "{}", render(&context));
+            if gpus == 1 {
+                // One GPU is always heads; an explicit context is refused at plan time.
+                assert!(auto.executable(), "omitted {omitted:?}: {}", render(&auto));
+                assert_eq!(auto.attention_placement, AttentionPlacement::Heads);
+                assert_eq!(auto.memory_layout, heads.memory_layout);
+                assert!(context.config_error.as_deref().is_some_and(|error| error.contains("context")),
+                    "omitted {omitted:?}: {}", render(&context));
+            } else if omitted.is_none() {
+                // The manifest carries every program: auto and context agree.
+                assert!(auto.executable() && context.executable(), "{}", render(&auto));
+                assert_eq!(auto.attention_placement, AttentionPlacement::Context);
+                assert_eq!(auto.memory_layout, context.memory_layout);
             } else {
-                assert!(!context.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(&context));
-                if gpus == 2 {
-                    assert!(!context.placement_supported);
-                    assert!(context.memory_layout.unwrap().notes.iter().any(|note|
-                        note.contains("cannot run layer 0 as ContextSplit")));
-                } else {
-                    assert!(context.config_error.unwrap().contains("context"));
+                // The manifest lacks a context program: auto (context) and an
+                // explicit context fail closed, naming the programs to rebuild,
+                // instead of silently downgrading to heads (#202).
+                for report in [&auto, &context] {
+                    assert!(!report.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(report));
+                    assert!(!report.placement_supported);
+                    assert_eq!(report.attention_placement, AttentionPlacement::Context);
+                    assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note|
+                        note.contains("context-split programs") && note.contains("glm_dsa_candidate_merge")),
+                        "omitted {omitted:?}, gpus {gpus}: {}", render(report));
                 }
+                assert_eq!(auto.memory_layout, context.memory_layout);
             }
         }
     }
+}
+
+#[test]
+fn glm5_heads_pool_refusal_reports_heads_not_context() {
+    use crate::placement::AttentionPlacement;
+    let config = glm5_config();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&config).unwrap();
+    let dir = snapshot(config, &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    // A manifest without the context programs plus an explicit heads request:
+    // the heads solve refuses a pool past the device budget, and the report must
+    // name heads (the mode actually attempted), never context (#202).
+    let mut names = Vec::new();
+    for (capacity, mode) in [("m64", "decode"), ("m4096", "prefill")] {
+        for prefix in ["glm", "glm2"] {
+            let divisor = if prefix == "glm2" { 2 } else { 1 };
+            names.extend([format!("{prefix}_producer_{capacity}"),
+                format!("{prefix}_sparse_mla_{mode}_{capacity}"), format!("{prefix}_o_{capacity}"),
+                format!("{prefix}_ffn_i{}_{capacity}", cfg.moe_intermediate / divisor),
+                format!("{prefix}_ffn_i{}_{capacity}", cfg.dense_intermediate / divisor)]);
+        }
+        names.extend([format!("glm_index_producer_{capacity}"), format!("glm_index_topk_{mode}_{capacity}")]);
+    }
+    let programs: Vec<_> = names.iter().map(|name|
+        json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 4096}})).collect();
+    std::fs::write(dir.path().join("PROGRAMS.json"),
+        json!({"capacities": {"max_context": 1_048_576}, "programs": programs}).to_string()).unwrap();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
+        context_tokens: 1_048_576, pool_tokens: Some(1 << 40), glm5_drafter_disabled: true,
+        workspace_manifest: Some(dir.path().join("PROGRAMS.json")), ..Default::default()
+    }), attention_placement: Some(AttentionPlacement::Heads), ..sparks(0) };
+    let report = plan(dir.path(), &options).unwrap();
+    assert!(!report.executable(), "{}", render(&report));
+    assert!(!report.placement_supported, "{}", render(&report));
+    assert_eq!(report.attention_placement, AttentionPlacement::Heads);
+    let notes = &report.memory_layout.as_ref().unwrap().notes;
+    assert!(notes.iter().any(|note| note == "attention placement heads"), "{}", render(&report));
+    assert!(!notes.iter().any(|note| note.contains("placement context")), "{}", render(&report));
+    let hint = report.hints.iter().find(|hint| hint.what.contains("GLM placement")).unwrap();
+    assert!(hint.how.contains("heads") && !hint.how.contains("Use supported heads attention"), "{}", hint.how);
 }
 
 #[test]
@@ -1459,7 +1515,8 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     };
     let mut s16 = manifest.clone();
     for (name, bytes) in [("glmf_kda_s16_m64", 10_526_720), ("glmf_kda_s16_m4096", 782_236_672),
-        ("glmf_kda_s16t_m4096", 782_236_672)] {
+        ("glmf_kda_s16t_m4096", 782_236_672), ("glmf_kda_w8_s16_m64", 10_526_720),
+        ("glmf_kda_w8_s16_m4096", 782_236_672), ("glmf_kda_w8_s16t_m4096", 782_236_672)] {
         s16["programs"].as_array_mut().unwrap().push(json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes}}));
     }
     let s16_path = dir.path().join("S16.json");
@@ -1472,7 +1529,18 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
         .filter(|i| i.category == Category::Kv && i.group != "MLA pools").map(|i| i.bytes).sum::<u64>();
     assert!(state_bytes(&f32) > state_bytes(&bf16));
     assert_eq!(state_bytes(&bf16), state_bytes(&tile));
-    assert!(planned(GlmfKdaState::Bf16, true, &s16_path).notes.iter().any(|n| n.contains("W8+S16")));
+    let w8_s16 = planned(GlmfKdaState::Bf16, true, &s16_path);
+    assert!(!w8_s16.devices[0].items.is_empty(), "{:?}", w8_s16.notes);
+    assert_eq!(state_bytes(&w8_s16), state_bytes(&bf16));
+    let weights = |m: &cuteafd_core::memory_layout::MemoryLayout| m.devices[0].items.iter()
+        .filter(|i| i.category == Category::Weights).map(|i| i.bytes).sum::<u64>();
+    assert!(weights(&w8_s16) < weights(&bf16));
+    let mut missing_s16 = s16.clone();
+    missing_s16["programs"].as_array_mut().unwrap().retain(|p| p["name"] != "glmf_kda_w8_s16_m4096");
+    let missing_s16_path = dir.path().join("MISSING-W8-S16.json");
+    std::fs::write(&missing_s16_path, missing_s16.to_string()).unwrap();
+    assert!(planned(GlmfKdaState::Bf16, true, &missing_s16_path).notes.iter()
+        .any(|n| n.contains("lacks the requested step scratch")));
     let mut missing = s16.clone();
     missing["programs"].as_array_mut().unwrap().retain(|p| p["name"] != "glmf_kda_w8_m4096");
     let missing_path = dir.path().join("MISSING-W8.json");
@@ -1550,6 +1618,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         spark: true, partial_bytes: 2, output_shard: false, full_prefill_logits: false,
         table_pages, table_pool_pages };
     // Configured peers with all RTX, mixed, all Spark, then the zero-peer CLI default of two lanes.
+    // Heads is requested: a two-GPU build whose manifest lacks the context programs refuses
+    // `context` (the default there, #202), and this fixture plans heads' working set.
     for (peers, onboard, expected_rtx) in [(4, Onboard::Auto, 3), (4, Onboard::Layers(1), 1),
         (4, Onboard::Layers(0), 0), (0, Onboard::Auto, 3)] {
         let options = PlanOptions { layout: Some(layout::LayoutOptions {
@@ -1559,7 +1629,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             glmf_drafter_disabled: true, glmf_prefill_expanded: false,
             glmf_representation: resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false },
             graph_budget_bytes: Some(64 << 20),
-            workspace_manifest: Some(path.clone()), ..Default::default() }), ..sparks(peers) };
+            workspace_manifest: Some(path.clone()), ..Default::default() }),
+            attention_placement: Some(AttentionPlacement::Heads), ..sparks(peers) };
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
@@ -1814,10 +1885,11 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                             rtx_bytes: vec![24 << 30; gpus], context_tokens: 131_072,
                             target_pool_tokens: 16_777_216, glmf_index: index, glmf_decode_rows: rows, glmf_pool_marks: pool_marks,
                             glmf_shared_replay: shared, state_slots: Some(8), ..Default::default()
-                        }), ..sparks(2) };
+                        }), attention_placement: Some(AttentionPlacement::Heads), ..sparks(2) };
                         let report = plan(dir.path(), &options).unwrap();
-                        // Two GPUs without context programs serve heads, which keeps the token keys
-                        // (as the runtime's served index cache); shared replay is single-GPU.
+                        // Heads is requested: two GPUs with no programs manifest refuse `context`
+                        // (the default there, #202). Heads keeps the token keys, as the runtime's
+                        // served index cache; shared replay is single-GPU.
                         if gpus == 2 && shared { assert!(!report.placement_supported); continue; }
                         let memory = report.memory_layout.unwrap();
                         let served_index = if gpus == 2 { GlmfIndexCache::Keys } else { index };
@@ -1922,7 +1994,7 @@ fn glm5_flash_spark_count_refusal_preserves_pool_and_replay_constraints() {
         drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30; gpus],
         context_tokens: 131_072, glmf_shared_replay: true,
         pool_tokens: Some(pool), ..Default::default()
-    }), ..sparks(4) };
+    }), attention_placement: Some(AttentionPlacement::Heads), ..sparks(4) };
     let supported = plan_spark_count(dir.path(), &options(1, 524_288), 4, Some(4)).unwrap();
     assert!(supported.executable(), "{supported:?}");
     assert_eq!(supported.memory_layout.unwrap().pool_tokens, 524_288);
@@ -1939,6 +2011,53 @@ fn glm5_flash_spark_count_refusal_preserves_pool_and_replay_constraints() {
     assert!(!reasons.contains("checkpoint tensors or required package artifacts unavailable"), "{reasons}");
 }
 
+/// Auto is `context` on a two-GPU GLM Flash pair, so a build whose manifest lacks the context
+/// programs fails closed naming them (never silently serving heads with replicated KV); an
+/// explicit `heads` request still plans (issue #202).
+#[test]
+fn glm5_flash_two_gpu_auto_without_context_programs_fails_closed() {
+    use crate::placement::AttentionPlacement;
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
+    // The exported step programs only: this build carries no context programs.
+    let programs: Vec<Value> = [("glmf_mhc_pre", 26_214_400u64), ("glmf_index_producer_m64", 561_152),
+        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+        ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152),
+        ("glmf_sparse_mla_decode_m64", 8_404_992), ("glmf_ffn_i2048_m64", 786_432),
+        ("glmf_ffn_i12288_m64", 4_718_592), ("glmf_index_producer_m4096", 35_913_728),
+        ("glmf_index_topk_prefill_m4096", 558_007_296), ("glmf_mhc_post_pre_m4096", 26_214_400),
+        ("glmf_kda_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448),
+        ("glmf_o_m4096", 203_423_744), ("glmf_sparse_mla_prefill_m4096", 1_048_576),
+        ("glmf_ffn_i2048_m4096", 67_633_152), ("glmf_ffn_i12288_m4096", 353_894_400)].into_iter()
+        .map(|(name, bytes)| json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
+    let manifest = json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131_072},
+        "programs": programs});
+    let path = dir.path().join("PROGRAMS.json");
+    std::fs::write(&path, manifest.to_string()).unwrap();
+    let options = |attention| PlanOptions { layout: Some(layout::LayoutOptions { drafter_bytes: 256 << 20,
+        rtx_bytes: vec![96 << 30; 2], context_tokens: 131_072, head_split: true,
+        prefill_rows: 4096, prefill_lanes: 2, workspace_manifest: Some(path.clone()),
+        // The fixture manifest is the plain program set: no W8 KDA, no expanded prefill, no
+        // sharded output.
+        glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
+            kda_fp8: false, fp8_head: false, output_shard: false }, glmf_prefill_expanded: false,
+        ..Default::default() }),
+        attention_placement: attention, ..sparks(4) };
+    let heads = plan(dir.path(), &options(Some(AttentionPlacement::Heads))).unwrap();
+    assert!(heads.placement_supported && heads.executable(), "{}", render(&heads));
+    assert_eq!(heads.attention_placement, AttentionPlacement::Heads);
+    for report in [plan(dir.path(), &options(None)).unwrap(),
+        plan(dir.path(), &options(Some(AttentionPlacement::Context))).unwrap()] {
+        assert!(!report.executable() && !report.placement_supported, "{}", render(&report));
+        assert_eq!(report.attention_placement, AttentionPlacement::Context);
+        let notes = &report.memory_layout.as_ref().unwrap().notes;
+        assert!(notes.iter().any(|note| note.contains("context-split programs")
+            && note.contains("glmf_dsa_candidate_merge")), "{}", render(&report));
+        let hint = report.hints.iter().find(|hint| hint.what.contains("GLM Flash pool-first placement")).unwrap();
+        assert!(hint.how.contains("CUTEAFD_CONTEXT_SPLIT_AOT") && hint.how.contains("heads"), "{}", hint.how);
+    }
+}
+
 /// A GLM 5.3 Flash graph budget is kept as the engine's KV admission keeps it: the budget itself on one
 /// GPU with Spark experts and an automatic pool (measured), else the budget or the graph allowance,
 /// whichever is larger, on every GPU (a head split, a fixed pool, local experts: planned).
@@ -1950,7 +2069,8 @@ fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
     // local experts) and a budget of `mib` MiB.
     let graphs = |gpus: usize, pool: Option<u64>, ranks: usize, mib: u64| -> Vec<(String, u64)> {
         let options = PlanOptions { layout: Some(layout::LayoutOptions { drafter_bytes: 256 << 20, rtx_bytes: vec![96 << 30; gpus],
-            pool_tokens: pool, graph_budget_bytes: Some(mib << 20), ..Default::default() }), ..sparks(ranks) };
+            pool_tokens: pool, graph_budget_bytes: Some(mib << 20), ..Default::default() }),
+            attention_placement: Some(AttentionPlacement::Heads), ..sparks(ranks) };
         let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| d.items.iter()
             .filter(|i| i.group.starts_with("graph")).map(|i| (i.group.clone(), i.bytes))).collect()
@@ -1982,7 +2102,8 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
         draft_sequences:8, draft_context_slots:Some(8), glmf_drafter_snapshot:Some(draft.path().into()),
         context_tokens:131_072, ..Default::default() };
     let run = |options: &layout::LayoutOptions| {
-        let report = plan(dir.path(), &PlanOptions { layout:Some(options.clone()), ..sparks(4) }).unwrap();
+        let report = plan(dir.path(), &PlanOptions { layout:Some(options.clone()),
+            attention_placement: Some(AttentionPlacement::Heads), ..sparks(4) }).unwrap();
         assert!(report.placement_supported, "{:?}", report.memory_layout.as_ref().unwrap().notes);
         report.memory_layout.unwrap()
     };
@@ -2038,16 +2159,27 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     // The shared solver cannot admit this historical A_log-only checkpoint.
     // Preserve the old snapshot/hash as provenance, but require a named refusal
     // instead of manufacturing resident weights and an executable layout.
+    // The reference plans predate GLM Flash's recorded `context` default: the request
+    // resolves to heads on one GPU and context on two, which the refused plan reports
+    // (#202), so the two-GPU rows compare against the mode now requested.
     for (name, report) in actual.as_object().unwrap() {
-        assert_eq!(report["attention_placement"], expected[name]["attention_placement"]);
+        let requested = if name == "min" { json!("heads") } else { json!("context") };
+        assert_eq!(report["attention_placement"], requested);
         assert_eq!(report["cache_requirements"], expected[name]["cache_requirements"]);
         assert_eq!(report["placement_supported"], json!(false));
         let memory = &report["memory_layout"];
         assert_eq!(memory["pool_tokens"], json!(0));
         assert!(memory["devices"].as_array().unwrap().iter().all(|device|
             device["kind"] == json!("rtx") && device["items"].as_array().unwrap().is_empty()));
-        assert!(memory["notes"].as_array().unwrap().iter().any(|note|
-            note.as_str().unwrap().contains("resident operand missing: model.language_model.embed_tokens.weight")));
+        let notes = memory["notes"].as_array().unwrap();
+        let named = |text: &str| notes.iter().any(|note| note.as_str().unwrap().contains(text));
+        if name == "min" {
+            assert!(named("resident operand missing: model.language_model.embed_tokens.weight"));
+        } else {
+            // Two GPUs request `context`, which this build's manifest cannot serve: the refusal
+            // names the missing context programs before the missing-operand check (#202).
+            assert!(named("context-split programs"));
+        }
     }
     // Complete-header solver/working-set tests check the admitted inventory and
     // exact Spark I/O; this fixture remains the unchanged historical reference.
@@ -2797,6 +2929,63 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
     assert!(!rendered.contains("MiMo key-0"));
 }
 
+/// Explicit VISION=spark on a GLM Flash layout whose routed experts never
+/// open a Spark worker. The launcher attaches the encoder to an expert rank,
+/// so the planner refuses instead of inventing a vision-only worker.
+#[test]
+fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
+    use super::encoder::EncoderKind;
+    let mut cfg = glm5_flash_config(2);
+    cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
+        "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
+        "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
+        "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+    let tensors: Vec<_> = super::families::glm::glm_flash_vision_tensors().into_iter()
+        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)).collect();
+    let dir = snapshot_tp(cfg, &tensors, Some(4));
+    let base = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30; 2], pool_tokens: Some(32768), ..Default::default()
+    }), ..sparks(4) };
+    let sentence = "vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS";
+    for vision in [MediaMode::Spark(None), MediaMode::Spark(Some(0))] {
+        let report = plan(dir.path(), &PlanOptions { vision, ..base.clone() }).unwrap();
+        assert!(!report.placement_supported, "{vision:?}");
+        assert!(!report.executable(), "{vision:?}");
+        let encoder = report.encoder.as_ref().unwrap();
+        assert_eq!(encoder.kind, EncoderKind::Off, "{vision:?}");
+        assert_eq!(encoder.reason, sentence, "{vision:?}");
+        assert_eq!(encoder.shortfall, 0, "{vision:?}");
+        assert_eq!(encoder.admitted_bytes(), 0);
+        assert_eq!(report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).count(), 0);
+        assert!(report.hints.iter().any(|hint| hint.what == sentence), "{:?}", report.hints);
+        assert_ne!(component(&report, Component::Vision).status, Status::Disabled);
+        assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note| note.contains(sentence)));
+    }
+    // Automatic vision still falls back onto the last RTX.
+    let auto = plan(dir.path(), &base).unwrap();
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 1 });
+    assert!(auto.hints.iter().all(|hint| hint.what != sentence));
+
+    let explicit = plan_spark_count(dir.path(), &PlanOptions {
+        vision: MediaMode::Spark(None), ..base.clone()
+    }, 4, Some(4)).unwrap();
+    assert!(!explicit.executable());
+    assert!(explicit.spark_count_warning.is_none());
+    let refusal = &explicit.hints.last().unwrap().what;
+    assert!(refusal.contains(sentence), "{refusal}");
+    assert!(refusal.contains("Spark count 4 refused:"), "{refusal}");
+    assert!(refusal.contains("counts that work: []"), "{refusal}");
+
+    // An unspecified count must not adopt a vision-only Spark either.
+    let open = plan_spark_count(dir.path(), &PlanOptions {
+        vision: MediaMode::Spark(None), ..base
+    }, 4, None).unwrap();
+    assert!(!open.executable());
+    assert!(open.spark_count_warning.is_none());
+    assert!(open.hints.last().unwrap().what.contains("counts that work: []"));
+}
+
 #[test]
 fn explicit_encoder_failure_and_small_pool_admission() {
     use super::encoder::EncoderKind;
@@ -2892,10 +3081,12 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     assert_eq!(marks(&plan(dir.path(), &none).unwrap().memory_layout.unwrap()), 0);
     // `--prefix-cache-entries` and `--prefix-cache-mark-mib` size it as they size the server's:
     // 1,971 MiB holds 14 marks at 5 sequences and 6 entries, one or two GPUs (each its half of
-    // every mark under a head split, which keeps the token keys planned here); no entries, none.
+    // every mark under a head split, which keeps the token keys planned here; heads is requested,
+    // since a two-GPU build with no manifest refuses `context`, #202); no entries, none.
     let knobs = |rtx: usize, entries: u64| PlanOptions { layout: Some(layout::LayoutOptions { drafter_bytes: 256 << 20,
         rtx_bytes: vec![96 << 30; rtx], concurrency: 5, pool_tokens: Some(0), mimo_prefix_entries: entries,
-        mimo_prefix_mark_bytes: 1971 << 20, ..Default::default() }), ..sparks(4) };
+        mimo_prefix_mark_bytes: 1971 << 20, ..Default::default() }),
+        attention_placement: Some(AttentionPlacement::Heads), ..sparks(4) };
     assert_eq!(cuteafd_core::prefix::mark_slots_for(5, 6, rank.retained_mark_bytes, 1971 << 20), 14);
     let one = plan(dir.path(), &knobs(1, 6)).unwrap().memory_layout.unwrap();
     assert_eq!(marks(&one), 14 * rank.retained_mark_bytes);
@@ -2970,7 +3161,11 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
             // No context programs here; Qwen with Spark experts also keeps its single-owner default.
             let peer = gpus == 2 && auto.family.as_deref() != Some("qwen4");
-            let default = if !peer || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) {
+            // GLM 5.3 and GLM Flash auto resolve `context` on two peers, which the absent
+            // manifest cannot run: the solve fails closed naming the programs (#202).
+            let default = if matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) && peer {
+                AttentionPlacement::Context
+            } else if !peer || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) {
                 AttentionPlacement::Heads
             } else { executor.attention };
             assert_eq!(auto.attention_placement, default);
@@ -2985,7 +3180,8 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }
             if auto.family.as_deref() == Some("glm5") {
                 assert!(auto.memory_layout.is_some(), "{}", render(&auto));
-                assert!(auto.placement_supported, "{}", render(&auto));
+                // Supported on one GPU (heads); two-GPU auto fails closed without the programs.
+                assert_eq!(auto.placement_supported, !peer, "{}", render(&auto));
             }
             let explicit_default = plan(dir.path(), &PlanOptions {
                 attention_placement: Some(default), ..options.clone()

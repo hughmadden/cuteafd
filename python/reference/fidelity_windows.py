@@ -280,7 +280,7 @@ def log_reference_cuda_memory(cuda, label):
 
 
 def admit_reference_memory(cuda, required_peak_bytes, *, margin_bytes=4 * 2**30):
-    """GB10 shares physical memory: neither CUDA nor host availability alone suffices."""
+    """GB10 reclaims page cache; discrete devices retain CUDA free admission."""
     cuda.synchronize()
     free, _ = cuda.mem_get_info()
     info = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
@@ -288,7 +288,8 @@ def admit_reference_memory(cuda, required_peak_bytes, *, margin_bytes=4 * 2**30)
     required = required_peak_bytes + margin_bytes
     print(f"reference admission CUDA_free={free / 2**30:.3f}GiB host_available={host / 2**30:.3f}GiB "
           f"required={required / 2**30:.3f}GiB RSS={rss_bytes() / 2**30:.3f}GiB", flush=True)
-    if min(free, host) < required:
+    available = host if cuda.get_device_capability() == (12, 1) else free
+    if available < required:
         raise RuntimeError("reference unified CUDA/host admission failed before allocation")
 
 

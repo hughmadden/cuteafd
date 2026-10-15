@@ -550,6 +550,12 @@ pub(crate) fn with_engine<T>(
             loaded.cfg.dim * 2))
             .collect::<Result<Vec<_>>>()?;
         for transport in &mut transports { transport.enable_terminal_ownership(loaded.library.clone())?; }
+        // Every rank's persistent bootstrap runs before the warm-up wave does,
+        // so the workers' installed grouping is readable at any later point.
+        // Each lane's session is sized by the same prefill-sized request the
+        // warm-up below dispatches.
+        let warm = engine.warm_request()?;
+        for transport in &mut transports { transport.bootstrap(&warm)?; }
         crate::shared::memory_report::release_load_staging(&loaded.library);
         let started = Instant::now();
         let identity = if skip { None } else { Some(cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
@@ -577,6 +583,7 @@ pub(crate) fn with_engine<T>(
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
+        let _coverage_session = engine.graph_coverage.session();
         body(&engine, &mut transports, &runtime)
     })();
     crate::shared::decode_graph::fatal_drain(engine.shutdown_submission(&mut transports), "V4 RTX engine retirement");

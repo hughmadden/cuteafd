@@ -175,8 +175,9 @@ def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
     root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/shared/experts/rtx"
     for name in ["native.rs", "exl3.rs"]:
         source = (root / name).read_text()
-        assert 'format!("experts/TP2 expert layer halves {}..{}", layers.start, layers.end)' in source
-        parent = source.split("pub(crate) fn load_pair(", 1)[1]
+        parent = source.split("pub(crate) fn load_pair_weights(", 1)[1]
+        assert '"experts/TP2 expert layer halves {}..{}"' in parent
+        assert "layers.start, layers.end" in parent
         assert 'scope_owned(&label)' in parent.split("synchronized_load::load_pair", 1)[0]
         parallel = parent.split("synchronized_load::load_pair", 1)[1]
         assert 'scope_owned(&label)' in parallel.split("Ok(vec![", 1)[0]
@@ -191,3 +192,13 @@ def test_fp8_tp2_pair_scopes_its_bf16_output_with_the_expert_arena():
     assert scope in pair.split("Fp8Experts::load_pair", 1)[0]
     assert pair.index(scope) < pair.index("Allocation::new(devices[rank], plans[rank].output_bytes)")
     assert memory_audit.category("experts/TP2 FP8 expert layer halves") == "experts"
+
+
+def test_raw_cuda_audit_labels_gb10_reclaimable_cache(capsys):
+    scope = "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache; host MemAvailable is allocatable headroom"
+    report = {"stage": "ready", "devices": [{"device": 0, "tracked": 0, "peak": 0,
+        "cuda_memory_scope": scope, "scopes": {}}], "host": {"MemAvailable": 45 * 2**30}}
+    memory_audit.render("spark.log", memory_audit.summarize(report))
+    output = capsys.readouterr().out
+    assert scope in output
+    assert "MemAvailable 45.00" in output

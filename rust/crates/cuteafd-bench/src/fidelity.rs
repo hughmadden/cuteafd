@@ -235,12 +235,20 @@ fn comparison_settings(server: &serde_json::Value) -> Result<serde_json::Value> 
     let mut normalized = server.clone();
     ensure!(normalized.is_object(), "missing server settings");
     if let Some(settings) = normalized.get_mut("settings") {
-        let mut names = std::collections::BTreeSet::new();
+        // A name stored twice is one setting when both copies carry the same value
+        // (older servers listed a launch spelling and the resolved mode). Differing
+        // values are a conflict: there is no rule for which copy served.
+        let mut seen = BTreeMap::new();
         let mut fixed = BTreeMap::new();
         for setting in settings.as_array().context("server settings must be an array")? {
             let name = setting.get("name").and_then(|v| v.as_str()).context("setting name missing")?;
-            ensure!(!name.is_empty() && names.insert(name), "empty or duplicate server setting {name}");
+            ensure!(!name.is_empty(), "empty server setting name");
             let value = setting.get("value").context("setting value missing")?;
+            if let Some(previous) = seen.get(name) {
+                ensure!(previous == value, "server setting {name} has conflicting values {previous} and {value}");
+                continue;
+            }
+            seen.insert(name.to_owned(), value.clone());
             // Only precision switches may differ; scheduling, layout and unknown knobs stay fixed.
             // GLM 5.3 Flash's kda-state (its KDA recurrent state's storage) and target-head (the
             // target LM head's GEMM) change numerics only.
@@ -563,10 +571,14 @@ mod tests {
         a = b.clone();
         a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": "CUTEAFD_UNKNOWN_FP8", "value": "on"}));
         assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+        a = b.clone();
+        a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": "concurrency", "value": "1"}));
+        assert!(compare(&a, &a, 0.005, 0.005, 100, 1).unwrap().pass, "same value is one setting");
         for name in ["concurrency", "CUTEAFD_V41_FP8_HEAD"] {
             a = b.clone();
-            a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": name, "value": "1"}));
-            assert!(compare(&a, &a, 0.005, 0.005, 100, 1).is_err());
+            a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": name, "value": "other"}));
+            let error = compare(&a, &a, 0.005, 0.005, 100, 1).unwrap_err().to_string();
+            assert!(error.contains("conflicting values") && error.contains(name), "{error}");
         }
         a = b.clone(); a.settings["settings"][0].as_object_mut().unwrap().remove("value");
         assert!(compare(&a, &a, 0.005, 0.005, 100, 1).is_err());
@@ -629,13 +641,35 @@ mod tests {
         a.settings["settings"][0]["value"] = serde_json::json!("16");
         let error = compare(&a, &b, 0.005, 0.005, 100, 1).unwrap_err().to_string();
         assert!(error.contains("different nonprecision server settings"), "{error}");
-        // The precision settings themselves still need a value, once.
+        // The precision settings themselves still need a value, and two different values conflict.
         a = with("bf16", "exact");
         a.settings["settings"][2].as_object_mut().unwrap().remove("value");
         assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
         a = with("bf16", "exact");
         a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": "kda-state", "value": "f32"}));
         assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+    }
+
+    #[test]
+    fn pairing_accepts_glm_flash_attention_placement_when_both_forms_match() {
+        // A GLM 5.3 Flash report from before the server kept one resolved record:
+        // the env launch spelling and the resolved mode, under one name.
+        let mut baseline = run(3, 8);
+        baseline.settings = serde_json::json!({"model": "checkpoint", "family": "glm5_flash", "settings": [
+            {"name": "concurrency", "value": "4", "source": "cli"},
+            {"name": "index-cache", "value": "keys", "source": "default"},
+            {"name": "kda-state", "value": "f32", "source": "default"},
+            {"name": "target-head", "value": "exact", "source": "default"},
+            {"name": "attention-placement", "value": "context", "source": "env", "default": "auto"},
+            {"name": "attention-placement", "value": "context", "source": "resolved", "default": "context"}]});
+        assert!(compare(&baseline, &baseline, 0.005, 0.005, 100, 1).unwrap().pass);
+        let mut once = baseline.clone();
+        once.settings["settings"].as_array_mut().unwrap().retain(|s| s["source"] != "env");
+        assert!(compare(&once, &baseline, 0.005, 0.005, 100, 1).unwrap().pass, "one resolved record pairs with both forms");
+        let mut conflict = baseline.clone();
+        conflict.settings["settings"][4]["value"] = serde_json::json!("auto");
+        let error = compare(&conflict, &baseline, 0.005, 0.005, 100, 1).unwrap_err().to_string();
+        assert!(error.contains("attention-placement") && error.contains("conflicting values"), "{error}");
     }
 
     #[test]

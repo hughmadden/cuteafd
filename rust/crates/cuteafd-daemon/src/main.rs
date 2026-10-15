@@ -191,6 +191,7 @@ async fn run() -> Result<()> {
         }
         Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeGlmf(_)
         | Commands::ServeGlm(_) | Commands::ServeDsv4(_) => {
+            tracing::info!(target: "cuteafd::fabric", source = "sparknest", status = cuteafd_transport::traffic::storage_status(), "local storage traffic source");
             shared::memory_report::monitor("coordinator", std::time::Duration::from_secs(10));
             shared::thermal::monitor("coordinator");
         }

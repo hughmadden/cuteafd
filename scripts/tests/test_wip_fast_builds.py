@@ -138,7 +138,7 @@ def test_finalize_records_key_and_phases(tmp_path):
 
 def _wip_coordinator(tmp_path, hit):
     text = (ROOT / 'wip.sh').read_text()
-    helpers = text[text.index('wip_hwlock() {'):text.index('\n}\n', text.index('wip_hwlock() {')) + 3]
+    helpers = ''
     helpers += text[text.index('# Native/AOT outputs are cached by input key'):text.index('build_expert() (')]
     tools = tmp_path / 'tools'
     tools.mkdir()
@@ -161,11 +161,10 @@ sync_local_source() {{ :; }}
 release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
-# The fair turn only (off-queue modes: test_wip_coordinator_export_modes.py).
-CUTEAFD_WIP_COORDINATOR_EXPORT=turn
+CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
+CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
-    result = subprocess.run(['bash', '-c', setup + helpers + '\nbuild_coordinator'], capture_output=True, text=True,
+    result = subprocess.run(['bash', '-c', setup + helpers + '\nwip_capped_export() { printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator'], capture_output=True, text=True,
                             env={**os.environ, 'HOME': str(tmp_path / 'home'), 'PATH': f'{tools}:{os.environ["PATH"]}',
                                  'TRACE': str(trace)})
     assert result.returncode == 0, result.stderr
@@ -180,10 +179,11 @@ def test_native_cache_hit_takes_no_gpu_turn(tmp_path):
     assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
 
 
-def test_native_cache_miss_queues_for_the_gpu(tmp_path):
+def test_native_cache_miss_probes_capped_without_queueing(tmp_path):
     stdout, lines = _wip_coordinator(tmp_path, hit=False)
-    assert 'queueing for gpu1' in stdout
-    assert any(line.startswith('turn ') and 'hwlock.py --locks gpu1' in line for line in lines)
+    assert 'done by capped' in stdout
+    assert 'capped' in lines
+    assert not any('hwlock.py --locks gpu1' in line for line in lines)
 
 
 def test_native_store_moves_entries_between_instance_and_host_store(tmp_path):
@@ -274,25 +274,11 @@ def test_zero_spark_card_sets_build_coordinator_only(tmp_path, monkeypatch, caps
     assert arms['cand']['build_role'] == 'coordinator'
 
 
-def test_seed_lease_holds_the_real_flock_until_released(tmp_path):
-    """The lease runs through the real hwlock queue: the flock is held while the
-    leg runs and free again after release."""
+def test_seed_uses_only_owner_aware_build_resource():
     text = (ROOT / 'wip.sh').read_text()
-    helpers = text[text.index('wip_hwlock() {'):text.index('\n}\n', text.index('wip_hwlock() {')) + 3]
-    helpers += text[text.index("# The seed Spark's lock: rhea, moa and the out-of-pool build seed kakapo"):text.index('build_coordinator() {')]
-    locks = tmp_path / 'locks'
-    locks.mkdir()
-    probe = 'import fcntl,sys; f=open(sys.argv[1],"a"); fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)'
-    command = helpers + f'''
-repo_root={str(ROOT)!r}
-wip_seed_lease_acquire moa
-[[ "$CUTEAFD_WIP_SEED_LEASE" == moa ]]
-if python3 -c {probe!r} {str(locks / 'moa.lock')!r} 2>/dev/null; then echo free-while-held; fi
-wip_seed_lease_release
-python3 -c {probe!r} {str(locks / 'moa.lock')!r} && echo free-after
-[[ "$(wip_seed_lock rhea) $(wip_seed_lock ostrich) $(wip_seed_lock kakapo)" == "rhea sparks kakapo" ]]
-'''
-    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + command], capture_output=True, text=True, timeout=60,
-                            env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks), 'TMPDIR': str(tmp_path)})
-    assert result.returncode == 0, result.stderr
-    assert 'free-while-held' not in result.stdout and 'free-after' in result.stdout
+    assert 'wip_seed_lease_' not in text
+    assert 'wip_build_resource_acquire' in text
+    helpers = text[text.index('wip_seed_lock() {'):text.index('\n}\n', text.index('wip_seed_lock() {')) + 3]
+    result = subprocess.run(['bash', '-c', helpers + '\nwip_seed_lock rhea; wip_seed_lock ostrich; wip_seed_lock kakapo'],
+                            capture_output=True, text=True, timeout=5)
+    assert result.stdout.split() == ['rhea', 'sparks', 'kakapo']

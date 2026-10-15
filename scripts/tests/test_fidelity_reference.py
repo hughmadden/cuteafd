@@ -1215,17 +1215,19 @@ def test_streamed_partial_layer_cannot_replace_complete_pointer(tmp_path, monkey
     assert store.read(store.root)[0] == 0
 
 
+@pytest.mark.parametrize("capability", [(12, 1), (12, 0)])
 @pytest.mark.parametrize("cuda_free,host_available", [(8, 32), (32, 8), (32, 32)])
-def test_unified_admission_checks_both_cuda_and_host(monkeypatch, cuda_free, host_available):
+def test_unified_admission_uses_reclaimable_host_availability(monkeypatch, cuda_free, host_available, capability):
     from pathlib import Path
     from types import SimpleNamespace
     import fidelity_windows as fw
-    cuda = SimpleNamespace(synchronize=lambda: None, mem_get_info=lambda: (cuda_free * 2**30, 64 * 2**30))
+    cuda = SimpleNamespace(synchronize=lambda: None, mem_get_info=lambda: (cuda_free * 2**30, 64 * 2**30),
+                           get_device_capability=lambda: capability)
     original = Path.read_text
     monkeypatch.setattr(Path, "read_text", lambda p, *a, **kw:
                         f"MemAvailable: {host_available * 2**20} kB\n" if str(p) == "/proc/meminfo"
                         else original(p, *a, **kw))
-    if min(cuda_free, host_available) < 20:
+    if (host_available if capability == (12, 1) else cuda_free) < 20:
         with pytest.raises(RuntimeError, match="before allocation"):
             fw.admit_reference_memory(cuda, 16 * 2**30)
     else:

@@ -33,15 +33,17 @@ pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", 
 /// by context (heads for the projections, KV pages owned by parity; K3).
 /// `context` is its recorded default (K3, TJ: GLM 5.3 must not replicate KV; pool first
 /// is not C1-gated): at max it admits 2,097,152 tokens against heads' 1,321,216, C8 1.015x,
-/// 8K prefill 1.027x, C1 0.965x (2026-10-11). A build without the context programs keeps
-/// `heads` (`glm5::request`); heads stays an explicit option.
+/// 8K prefill 1.027x, C1 0.965x (2026-10-11). A build without the context programs
+/// fails a chosen `context` closed (`glm5::solve_working_set`, #202); `heads` stays an
+/// explicit option.
 pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Context };
 /// GLM Flash: every layer split over two GPUs; its MLA layers by heads (latent replicated) or by
 /// context (projections head-split, 256-token units owned by parity; #57), KDA always by heads.
 /// `context` is the recorded default on two GPUs (TJ: no context-scaling KV replicated; pool
-/// first) where the build carries its programs (`glm5_flash::resolve_attention`); `heads` stays
-/// an explicit option. Owned MLA layers (`layers`) have no executor yet.
+/// first); a build without its programs fails a chosen `context` closed
+/// (`glm5_flash::resolve_attention`, #202), and `heads` stays an explicit option. Owned MLA
+/// layers (`layers`) have no executor yet.
 pub const GLM5_FLASH: ExecutorModes = ExecutorModes { family: "glm5_flash",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Context };
 /// MiMo: `attach_peer` requires every layer split.

@@ -315,42 +315,60 @@ fn v41_equality(exl3: bool) -> Result<()> {
         Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
     )?;
     let diagnostic_layer = std::env::var("CUTEAFD_TP2_FIXTURE_LAYER")
-        .ok().map(|value| value.parse::<usize>()).transpose()?.unwrap_or(0);
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(0);
     let capacity = std::env::var("CUTEAFD_TP2_FIXTURE_CAPACITY")
-        .ok().map(|value| value.parse::<usize>()).transpose()?.unwrap_or(256);
-    ensure!(diagnostic_layer < 40 && (1..=4096).contains(&capacity), "invalid V4.1 fixture layer/capacity");
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(256);
+    ensure!(
+        diagnostic_layer < 40 && (1..=4096).contains(&capacity),
+        "invalid V4.1 fixture layer/capacity"
+    );
     let input = inputs(devices, capacity)?;
     let package = PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default());
-    let weights = if exl3 && diagnostic_layer != 0 {
-        let mut pair = Vec::with_capacity(2);
-        for rank in 0..2 {
-            let weight = devices[rank].run(|| Exl3Weights::load(
-                devices[rank].library, &catalog,
-                ExpertLayer::BackboneTp2 { layer: diagnostic_layer, rank },
-                8_000_000_000,
-            ))?;
-            pair.push(RankWeights {
-                device: devices[rank],
-                weights: ManuallyDrop::new(RankStorage::Exl3 {
-                    weights: Rc::new(vec![weight]), directory: package.clone(),
-                }),
-            });
-        }
-        pair.try_into().ok().expect("two diagnostic ranks")
-    } else if exl3 {
-        RankWeights::load_exl3_pair(devices, &catalog, 1, [8_000_000_000; 2], &package)?
+    let weights = if exl3 {
+        Exl3Tp2::load_pair_weights(
+            devices,
+            &catalog,
+            cuteafd_core::expert_geometry(),
+            [&package; 2],
+            diagnostic_layer..diagnostic_layer + 1,
+            capacity,
+            [8_000_000_000; 2],
+            RtxSelectionPolicy::FirstCapacity,
+        )?
+        .map(OwnerWeights::Exl3)
     } else {
-        [
-            RankWeights::load(devices[0], &catalog, 1, 8_000_000_000)?,
-            RankWeights::load(devices[1], &catalog, 1, 8_000_000_000)?,
-        ]
-    }
-    .map(Rc::new);
-    let mut waves = [
-        RankWave::new(weights[0].clone(), capacity as u32)?,
-        RankWave::new(weights[1].clone(), capacity as u32)?,
-    ];
-    let mut full_wave = ExpertWave::new(weights, capacity as u32)?;
+        NativeTp2::load_pair_weights(
+            devices,
+            &catalog,
+            diagnostic_layer..diagnostic_layer + 1,
+            capacity,
+            [8_000_000_000; 2],
+            RtxSelectionPolicy::FirstCapacity,
+            NativeOutputPolicy::TokenSums,
+        )?
+        .map(OwnerWeights::Native)
+    };
+    let mut waves = weights
+        .iter()
+        .map(|weight| -> Result<Box<dyn RtxExpertLayer + '_>> {
+            Ok(match weight {
+                OwnerWeights::Native(weight) => Box::new(weight.execution()?),
+                OwnerWeights::Exl3(weight) => Box::new(weight.execution()?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut full_wave = OwnerPair::new(
+        weights,
+        capacity as u32,
+        cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        false,
+    )?;
     let mut shared: [Box<dyn RtxExpertLayer + '_>; 2] = if exl3 {
         let [a, b] = Exl3Tp2::load_pair(
             devices,
@@ -385,31 +403,41 @@ fn v41_equality(exl3: bool) -> Result<()> {
         Allocation::new(devices[0], capacity * 5120 * 4)?,
         Allocation::new(devices[1], capacity * 5120 * 4)?,
     ];
-    let mut reduction = PeerReduction::new(devices[1], devices[0], capacity as u32)?;
+    let mut reduction = OwnerReduce::new(
+        devices,
+        Combine::OwnerReduce { owner: 0 },
+        capacity as u32,
+        cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+    )?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     let mut failed_atomic = Vec::new();
     let mut row_counts = vec![1, 3, 16, 80, 255, 256, 512, 1024, 2048, 4096];
     row_counts.retain(|&rows| rows <= capacity);
-    if !row_counts.contains(&capacity) { row_counts.push(capacity); }
+    if !row_counts.contains(&capacity) {
+        row_counts.push(capacity);
+    }
     for rows in row_counts {
         let mut shared_values = [Vec::new(), Vec::new()];
         for rank in 0..2 {
             let (buffers, stream) = &input[rank];
             // SAFETY: the fixture owns all inputs/outputs and drains each producer before inspection.
-            let layout = unsafe {
+            unsafe {
                 waves[rank].enqueue(
-                    0,
-                    rows as u32,
-                    buffers[0].buffer,
-                    buffers[1].buffer,
-                    buffers[2].buffer,
-                    stream,
-                )?
-            };
-            waves[rank].stream.drain()?;
+                    diagnostic_layer,
+                    rows,
+                    ExpertInput::Fp8K32(buffers[0].buffer.ptr),
+                    Routes {
+                        ids: buffers[1].buffer.ptr,
+                        weights: buffers[2].buffer.ptr,
+                    },
+                    stream.raw,
+                    &mut || {},
+                )?;
+            }
+            stream.drain()?;
             ensure!(
-                layout == Tp2RoutedLayout::Fp32Tokens,
-                "set CUTEAFD_TP2_TOKEN_SUMS=1 for rank equality"
+                waves[rank].partial_layout(rows)? == PartialLayout::Tokens,
+                "rank equality requires FP32 token sums"
             );
             // SAFETY: identical rank-local inputs, exclusive fixture stream and workspace.
             unsafe {
@@ -426,7 +454,16 @@ fn v41_equality(exl3: bool) -> Result<()> {
                 )?;
             }
             stream.drain()?;
-            let reference = host(devices[rank], waves[rank].output.buffer, rows * 5120 * 4)?;
+            let reference = host(
+                devices[rank],
+                CuteafdDeviceBuffer {
+                    ptr: waves[rank].output(),
+                    bytes: rows * 5120 * 4,
+                    device_id: rank as i32,
+                    flags: 0,
+                },
+                rows * 5120 * 4,
+            )?;
             let source = CuteafdDeviceBuffer {
                 ptr: shared[rank].output(),
                 bytes: rows * 5120 * 4,
@@ -439,7 +476,10 @@ fn v41_equality(exl3: bool) -> Result<()> {
                 if let Ok(directory) = std::env::var("CUTEAFD_TP2_FIXTURE_OUTPUT") {
                     let directory = Path::new(&directory);
                     std::fs::create_dir_all(directory)?;
-                    std::fs::write(directory.join(format!("v41-exl3-r{rows}-rank{rank}.f32")), &actual)?;
+                    std::fs::write(
+                        directory.join(format!("v41-exl3-r{rows}-rank{rank}.f32")),
+                        &actual,
+                    )?;
                 }
             }
             let (max_abs, rel_l2) = errors(&reference, &actual);
@@ -464,26 +504,31 @@ fn v41_equality(exl3: bool) -> Result<()> {
                 &input[0].1,
                 &input[1].1,
                 rows as u32,
-                Tp2RoutedLayout::Fp32Tokens,
+                PartialDtype::F32,
+                PartialLayout::Tokens,
             )
         })?;
         let actual = host(devices[0], output, rows * 5120 * 2)?;
         if exl3 {
             if let Ok(directory) = std::env::var("CUTEAFD_TP2_FIXTURE_OUTPUT") {
-                std::fs::write(Path::new(&directory).join(format!("v41-exl3-r{rows}-owner.bf16")), &actual)?;
+                std::fs::write(
+                    Path::new(&directory).join(format!("v41-exl3-r{rows}-owner.bf16")),
+                    &actual,
+                )?;
             }
         }
         let make_inputs = || {
-            std::array::from_fn(|rank| RankInputs {
-                wire: input[rank].0[0].buffer,
+            std::array::from_fn(|rank| OwnerInputs {
+                input: input[rank].0[0].buffer,
                 ids: input[rank].0[1].buffer,
-                routing: input[rank].0[2].buffer,
+                weights: input[rank].0[2].buffer,
                 producer: &input[rank].1,
             })
         };
         // SAFETY: the fixture retains identical inputs through this independent expert wave.
-        let reference =
-            runtime.block_on(unsafe { full_wave.execute(0, rows as u32, 0, make_inputs()) })?;
+        let reference = runtime.block_on(unsafe {
+            full_wave.execute(diagnostic_layer, rows as u32, 0, make_inputs())
+        })?;
         let expected = host(devices[0], reference, rows * 5120 * 2)?;
         let identical = expected == actual;
         eprintln!(
@@ -494,16 +539,8 @@ fn v41_equality(exl3: bool) -> Result<()> {
             ensure!(identical, "V4.1 owner reduction mismatch");
         } else {
             let production_values = [
-                host(
-                    devices[0],
-                    full_wave.ranks[0].output.buffer,
-                    rows * 5120 * 4,
-                )?,
-                host(
-                    devices[1],
-                    full_wave.ranks[1].output.buffer,
-                    rows * 5120 * 4,
-                )?,
+                host(devices[0], full_wave.rank_output(0), rows * 5120 * 4)?,
+                host(devices[1], full_wave.rank_output(1), rows * 5120 * 4)?,
             ];
             let sum_shared = fp32_sum(&shared_values);
             let sum_production = fp32_sum(&production_values);
@@ -532,20 +569,13 @@ fn v41_equality(exl3: bool) -> Result<()> {
             // hard gates, and three self transitions supply a loose sanity ceiling.
             for repeat in 0..3 {
                 // SAFETY: retain identical input owners through each production run.
-                let next = runtime
-                    .block_on(unsafe { full_wave.execute(0, rows as u32, 0, make_inputs()) })?;
+                let next = runtime.block_on(unsafe {
+                    full_wave.execute(diagnostic_layer, rows as u32, 0, make_inputs())
+                })?;
                 let next_bf16 = host(devices[0], next, rows * 5120 * 2)?;
                 let next_values = [
-                    host(
-                        devices[0],
-                        full_wave.ranks[0].output.buffer,
-                        rows * 5120 * 4,
-                    )?,
-                    host(
-                        devices[1],
-                        full_wave.ranks[1].output.buffer,
-                        rows * 5120 * 4,
-                    )?,
+                    host(devices[0], full_wave.rank_output(0), rows * 5120 * 4)?,
+                    host(devices[1], full_wave.rank_output(1), rows * 5120 * 4)?,
                 ];
                 let next_sum = fp32_sum(&next_values);
                 ensure!(

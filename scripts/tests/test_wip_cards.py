@@ -65,6 +65,14 @@ def test_matrix_private_key_and_complete_lanes(entry, tmp_path):
     assert job['simulated']
 
 
+def test_secondary_rail_only_for_v41(entry, tmp_path):
+    # Only V4.1's launcher reads SPARK_i_LANE_B; other families reject unused keys.
+    entry = dict(entry, name='glm-min', family='glm5')
+    e = json.loads((Path(make(entry, tmp_path)['state']) / 'matrix.json').read_text())['entries'][0]
+    assert e['set']['SPARK_2_LANE_A'] == '10.55.0.3'
+    assert not any(key.endswith('_LANE_B') for key in e['set'])
+
+
 @pytest.mark.parametrize('source', ['config', 'set', 'override'])
 def test_glm_ring_expectation_is_observer_only(entry, tmp_path, source):
     entry['observer'] = dict(argv=['python3', 'ring-observer.py'], timeout_s=300)
@@ -367,6 +375,21 @@ def test_requested_panels_preflight_and_report(entry, tmp_path):
     assert cards.summarize_job(job, 0)['status'] == 'pass'
 
 
+
+def test_summary_reads_c8_from_the_concurrency_sweep(entry, tmp_path):
+    job = make(entry, tmp_path)
+    report_dir = Path(job['state']) / 'reports' / 'one'
+    report_dir.mkdir(parents=True)
+    card = {'decode': [{'content': 'code', 'tok_s': 48.0}], 'prefill': {'tok_s': 2700.0},
+            'concurrency': [{'width': 4, 'aggregate_tok_s': 70.0}, {'width': 8, 'aggregate_tok_s': 90.5},
+                            {'width': 16, 'aggregate_tok_s': 114.0}]}
+    (report_dir / 'report.json').write_text(json.dumps({'baseline': {'card': card}}))
+    row = cards.summarize_job(job, 0)
+    assert (row['C1'], row['C8'], row['8K']) == (48.0, 90.5, 2700.0)
+    card['concurrency'] = [{'width': 4, 'aggregate_tok_s': 70.0}]
+    (report_dir / 'report.json').write_text(json.dumps({'baseline': {'card': card}}))
+    assert cards.summarize_job(job, 0)['C8'] is None
+
 def test_instance_hash_within_run_limit(entry, tmp_path):
     job = make({**entry, 'name': 'very-long-card-name-' * 5}, tmp_path, instance='long-' + 'a' * 35)
     instance = job['entry']['set']['INSTANCE']
@@ -508,8 +531,7 @@ def _wip_function(name, end):
     text = (ROOT / 'wip.sh').read_text()
     start = text.index(name)
     helpers = text[text.index('# Native/AOT outputs are cached by input key'):text.index('build_coordinator() {')]
-    return text[text.index('wip_hwlock() {'):text.index('\n}\n', text.index('wip_hwlock() {')) + 3] + \
-        helpers + text[start:text.index(end, start)]
+    return helpers + text[start:text.index(end, start)]
 
 
 def _trace_tools(tmp_path, extra=None):
@@ -529,7 +551,7 @@ def _trace_tools(tmp_path, extra=None):
     return tools
 
 
-def test_spark_leg_holds_one_seed_turn_for_its_whole_duration(tmp_path):
+def test_spark_leg_does_not_reacquire_its_parent_resource(tmp_path):
     function = _wip_function('build_expert() (', '\nwip_build_coordinator=0') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
@@ -547,19 +569,14 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert rust'))
-    turn = next(i for i, line in enumerate(lines) if line.startswith('turn '))
+    assert not any(line.startswith('turn ') for line in lines)
     native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert native') and not line.startswith('turn '))
-    end = lines.index('end', turn)
     finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
-    assert 'scripts/hw/hwlock.py --locks rhea --wait 1800 --' in lines[turn]
-    # One fair turn on the seed covers the whole Spark leg (Cargo, export,
-    # finalize): Spark CPU work never overlaps cards serving from that host.
-    assert turn < rust < native < finalize < end
-    assert sum(line.startswith('turn ') for line in lines) == 1
+    assert rust < native < finalize
     assert not any(line.startswith('flock') for line in lines)
 
 
-def test_coordinator_export_runs_under_a_held_turn_and_rust_under_none(tmp_path):
+def test_coordinator_export_probes_after_rust_without_queued_turn(tmp_path):
     function = _wip_function('build_coordinator() {', '\nbuild_expert() (') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     trace = tmp_path / 'trace'
@@ -569,19 +586,18 @@ sync_local_source() {{ :; }}
 release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
-# The fair turn as the only mode (off-queue modes: test_wip_coordinator_export_modes.py).
-CUTEAFD_WIP_COORDINATOR_EXPORT=turn
+CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
+CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
     modes = _wip_function('wip_coordinator_export_modes() {', '\n# wip_remote_export:')
-    subprocess.run(['bash', '-c', setup + modes + function + '\nbuild_coordinator'], check=True,
+    subprocess.run(['bash', '-c', setup + modes + function + '\nwip_capped_export() { printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator'], check=True,
                    env={**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))
-    turn = next(i for i, line in enumerate(lines) if line.startswith('turn '))
-    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native') and not line.startswith('turn '))
-    assert 'scripts/hw/hwlock.py --locks gpu1 --wait 1800 --' in lines[turn]
-    assert rust < turn < native < lines.index('end', turn)
+    capped = lines.index('capped')
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native'))
+    assert rust < capped < native
+    assert not any('hwlock.py --locks gpu1' in line for line in lines)
     assert all('CUTEAFD_WIP_EXPORT_LOCKS=off' in line for line in lines if 'build-wip-artifacts.sh' in line)
     wip = (ROOT / 'wip.sh').read_text()
     assert '/wip-export-gpu.lock' not in wip
@@ -596,27 +612,11 @@ def test_split_native_phase_requires_matching_rust_source_and_cache_mode():
     assert '[[ "$phase" != rust ]] || exit 0' in text
 
 
-def test_native_export_lock_only_after_cargo(tmp_path):
+def test_native_export_has_no_in_container_lock_compatibility():
     text = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    start = text.index('export_lock_fds=()')
-    end = text.index("printf '%s'", start)
-    phase = text[start:end]
-    phase = phase[:phase.index('cmake \\\n')] + 'printf "export\\n" >> "$TRACE"\n' + phase[phase.index('for export_lock_fd in'):]
-    tools = tmp_path / 'tools'
-    tools.mkdir()
-    mock = tools / 'flock'
-    mock.write_text('#!/bin/sh\nprintf "flock %s\\n" "$*" >> "$TRACE"\n')
-    mock.chmod(0o755)
-    trace = tmp_path / 'trace'
-    env = {**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace), 'CUTEAFD_WIP_EXPORT_LOCK_FILES': str(tmp_path / 'gpu1.lock')}
-    subprocess.run(['bash', '-c', phase], env={**env, 'CUTEAFD_WIP_EXPORT_LOCKS': 'on'}, check=True)
-    assert trace.read_text().splitlines()[0].startswith('flock -w 1800')
-    assert trace.read_text().splitlines()[1] == 'export'
-    assert trace.read_text().splitlines()[2].startswith('flock -u')
-    trace.unlink()
-    subprocess.run(['bash', '-c', phase], env={**env, 'CUTEAFD_WIP_EXPORT_LOCKS': 'off'}, check=True)
-    assert trace.read_text() == 'export\n'
-    assert text.index('cuteafd_host_isa_cargo_build ') < start
+    assert 'export_lock_fds' not in text
+    assert 'flock -w 1800' not in text
+    assert 'Hardware admission and lifetime are owned by wip.sh' in text
 
 
 @pytest.mark.parametrize('matched', [False, True])
@@ -628,6 +628,7 @@ def test_explicit_nonce_overrides_auto_and_inherited(entry, tmp_path, monkeypatc
     args = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--arm', 'base=b:s',
             '--state', str(state), '--nonce-seed', 'explicit seed', '--dry-run']
     args += ['--interleave', '--matched-prompts', '--arm', 'candidate=c:s'] if matched else ['--matrix']
+    args += ['--probe', 'v41-min:', '--probe', 'base:v41-min:fabric']
     monkeypatch.setenv('CUTEAFD_BENCH_NONCE_SEED', 'inherited')
     monkeypatch.setattr(sys, 'argv', args)
     assert cards.main() == 0
@@ -702,6 +703,7 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     monkeypatch.setattr(sys, 'argv', args)
     monkeypatch.setenv('CUTEAFD_BENCH_NONCE_SEED', 'inherited')
     monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
     monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='artifacts')))
     seen = []
     def detached(cmd, log, exit_file, env):
@@ -760,6 +762,7 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
         argv.append('--dry-run')
     monkeypatch.setattr(sys, 'argv', argv)
     monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
     monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(
         dict(image='release', image_id='sha256:abc', repo_digests=['digest']) if 'release' in arm
         else dict(slot='s', seal_sha256='seal', artifact_manifest_sha256='artifacts')))
@@ -1459,3 +1462,64 @@ def test_exact_state_golden_runs_against_the_live_server_at_sweep_end(entry, tmp
     with pytest.raises(ValueError, match='--exact-state uses the measurement window'):
         cards.generate({**entry, 'levels': [1]}, 'b', dict(instance='q', slot='s'), tmp_path, tmp_path / 'key',
                        {'PROFILE': 'nsys'}, set(), None, 1, exact_state=golden)
+
+
+def test_fabric_probe_card_selector(entry, tmp_path):
+    probes, scoped = cards.probe_selection(['v41-min:console,fabric'], [entry], {'a': {}, 'b': {}})
+    assert not scoped
+    assert probes['v41-min'] == {'console', 'fabric'}
+    for arm in ('a', 'b'):
+        job = cards.generate(entry, arm, dict(instance=arm, slot='s'), tmp_path,
+                             tmp_path / 'key', {}, probes['v41-min'], None, 1)
+        assert job['entry']['fabric'] is True
+
+
+def test_fabric_probe_arm_selector(entry, tmp_path):
+    probes, scoped = cards.probe_selection(['v41-min:', 'on:v41-min:fabric'], [entry], {'off': {}, 'on': {}})
+    for arm, enabled in [('off', False), ('on', True)]:
+        selected = probes['v41-min'] | scoped.get(arm, {}).get('v41-min', set())
+        job = cards.generate(entry, arm, dict(instance=arm, slot='s'), tmp_path,
+                             tmp_path / 'key', {}, selected, None, 1)
+        assert job['entry']['fabric'] is enabled
+    with pytest.raises(ValueError, match='probe arm'):
+        cards.probe_selection(['missing:v41-min:fabric'], [entry], {'on': {}})
+
+
+def test_arm_probe_preserves_card_defaults(entry, tmp_path, monkeypatch):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[{**entry, 'probes': ['console']}])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--interleave', '--repeats', '1', '--arm', 'off=b:s', '--arm', 'on=c:s',
+        '--probe', 'on:v41-min:fabric', '--state', str(state), '--dry-run'])
+    assert cards.main() == 0
+    jobs = json.loads((state / 'plan.json').read_text())['jobs']
+    assert all(set(job['probes']) == {'console', 'fabric'} for job in jobs)
+    assert all('observer' in job['entry'] for job in jobs)
+
+
+def test_fabric_assessment_timed_contamination_and_unknown():
+    phases = [dict(name='warmup', timed=False, assessments=['SparkNest traffic: x']),
+              dict(name='decode', timed=True, assessments=['SparkNest traffic: x', 'foreign traffic: x',
+                                                          'storage attribution unavailable: x', 'xmit_wait rising above idle: x'])]
+    caveats = cards.fabric_assessment(phases)
+    assert len(caveats) == 3
+    assert all('decode:' in c and 'rerun' in c for c in caveats)
+    assert cards.fabric_assessment([]) == []
+
+
+def test_summary_retains_fabric_and_requires_rerun(tmp_path):
+    rows = [dict(card='c', arm=arm, repeat=1, simulated=False, status='pass', C1=10,
+                 fabric=[dict(name='decode', timed=True, ports=[dict(host='coordinator',device='nic',port=1,
+                     sent_bytes=100,received_bytes=100,engine_sent_bytes=40,engine_received_bytes=40,
+                     sparknest_sent_bytes=50,sparknest_received_bytes=50)])],
+                 fabric_caveats=['decode: SparkNest traffic: rerun'] if arm == 'candidate' else [])
+            for arm in ['base','candidate']]
+    cards.write_summary(tmp_path, rows, {'base': {}, 'candidate': {}})
+    data = json.loads((tmp_path/'summary.json').read_text())
+    assert data['ab_verdict'] == 'rerun'
+    assert data['rows'][1]['fabric'][0]['ports'][0]['sparknest_sent_bytes'] == 50
+    text = (tmp_path/'summary.md').read_text()
+    assert 'A/B Verdict: Rerun' in text and 'Fabric By Arm And Phase' in text
+    assert 'SparkNest' in text and 'unknown' in text

@@ -145,13 +145,11 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
   sparknest), so its CPU load never skews a serving card; rhea and
   moa serve cards too, so wait for an idle one without holding locks; never
   wrap `wip.sh` in a Spark lock yourself.
-- **Page cache:** GB10 doesn't reclaim it, and a full one OOMs expert
-  packing. The launchers already drop Spark caches through `nest
-  drop-caches` (SparkNest's installed setuid helper, no approval needed), so
-  stock card runs need nothing extra. When an agent must evict outside the
-  launcher, `agent-sudo -n` can't (that needs TJ's live approval). Use
-  unprivileged `posix_fadvise(DONTNEED)` on the checkpoint files and their
-  local sparknest objects, then gate on `MemAvailable`.
+- **Page cache:** GB10 CUDA allocations reclaim Linux page cache. Keep caches
+  warm for serving; SM121 admission uses `MemAvailable` bounded by cgroup
+  hard-limit headroom, not raw `cudaMemGetInfo` (which under-reports reclaimable
+  cache). Discrete RTX uses CUDA free. Cache eviction belongs only to deliberate
+  cold-read benchmarks.
 - **Briefs:** point at `scripts/agents/codex-preamble.md` in an up-to-date
   checkout. The main checkout can lag; a stale copy cost one agent a v1-era
   rule set.
@@ -283,12 +281,17 @@ Use the interactive stdlib driver for a worker that needs steering or answers:
 
 ```sh
 python3 scripts/agents/ext-agent.py start TASK --tool grok --effort high \
-  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief
+  --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief --auto-approve
 python3 scripts/agents/ext-agent.py wait TASK --until idle --timeout 600
 python3 scripts/agents/ext-agent.py transcript TASK --since-last
 python3 scripts/agents/ext-agent.py send TASK 'One concise correction.'
 python3 scripts/agents/ext-agent.py stop TASK
 ```
+
+`--auto-approve` is explicit: without it the CLI keeps its own approval
+behavior and a directory-trust prompt surfaces as `asking` for the driver to
+answer. Our drivers pass it in a trusted worktree; it authorizes approvals
+inside that worktree, not merges, pushes or scope changes.
 
 Give the DeepSeek driver agent
 `scripts/agents/skills/ext-agent-driver/SKILL.md` and the worker's brief.
@@ -296,6 +299,7 @@ The worker cannot SendMessage; its driver reports milestones, unresolved
 questions and validated results to the orchestrator. `wait` blocks instead
 of agent-side polling. `idle` is an available input prompt, not proof the
 task is done. Busy sends are queued; inspect the answer to verify steering.
+`interrupt` uses each CLI's own key: Ctrl+C for Grok, Escape for Antigravity.
 Runs and transcripts live in `EXT_AGENT_RUNS` (default `~/.cache/ext-agent`).
 Antigravity 503s have bounded automatic backoff; state and retry evidence
 are exposed in JSON. Python 3, tmux and authenticated CLIs are required.

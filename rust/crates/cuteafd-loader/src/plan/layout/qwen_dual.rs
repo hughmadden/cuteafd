@@ -6,8 +6,9 @@ use crate::families::qwen4::{resident::checkpoint_resident_bytes, Qwen4Config};
 use crate::serving_capacity::qwen_graphs::QwenAdmissionInputs;
 
 pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    checkpoint: &super::super::Checkpoint, options: &LayoutOptions, rows: u64, concurrency: u64,
+    input: &super::super::PlanInput, options: &LayoutOptions, rows: u64, concurrency: u64,
     context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> MemoryLayout {
+    let checkpoint = input.checkpoint();
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &capacity)| {
         let arch = crate::placement::ArchContext::for_device("sm_120", capacity);
         let modules = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &["qwen4"]).module_bytes())
@@ -29,7 +30,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let mut reserved = options.clone();
         reserved.pool_tokens = Some(options.pool_tokens.filter(|&n| n > 0).unwrap_or_else(||
             crate::placement::PoolPolicy::resolve(&options.rtx_bytes, context, None, 256, true).target));
-        match apply(checkpoint, &reserved, &mut media, rows, concurrency, context, mtp, manifest) {
+        match apply(input, &reserved, &mut media, rows, concurrency, context, mtp, manifest) {
             Ok(_) => {
                 resolve_encoder(checkpoint, report, model, &mut media, &mut [], &[0; 2], options, &mut notes);
                 for (device, admitted) in devices.iter_mut().zip(media) {
@@ -40,7 +41,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             Err(error) => { report.placement_supported = false; notes.push(format!("Qwen media admission: {error:#}")); }
         }
     }
-    let pool_tokens = match apply(checkpoint, options, &mut devices, rows, concurrency, context, mtp, manifest) {
+    let pool_tokens = match apply(input, options, &mut devices, rows, concurrency, context, mtp, manifest) {
         Ok(placement) => { notes.push(format!("placement: {}", placement.summary())); placement.pool_tokens },
         Err(error) => {
             report.placement_supported = false;
@@ -53,8 +54,9 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, devices: &mut [DeviceLayout],
+fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut [DeviceLayout],
     rows: u64, concurrency: u64, context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> Result<Placement> {
+    let checkpoint = input.checkpoint();
     let cfg = Qwen4Config::from_hf(&checkpoint.config)?;
     let mtp = mtp && cfg.mtp_layers > 0;
     let selected = options.qwen_representation;
@@ -66,7 +68,7 @@ fn apply(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, devices
     let owner_manifests = [0, 1].map(|rank| selected_manifests.as_ref().map(|m| &m[rank]));
     let manifest = owner_manifests[0];
     let resident = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp, selected)?;
-    let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+    let catalog = input.expert_catalog()?;
     let costs = qwen4::dual_expert_costs(&catalog, cfg.layers)?;
     let lib = crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).join("libcuteafd_native.so");
     let packages = qwen4::dual_packages(&catalog, &lib)?;

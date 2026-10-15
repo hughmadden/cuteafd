@@ -1,10 +1,94 @@
 //! One serving lane's TP2 encoder FFN, including peer inputs and final addition.
-use super::tp2::{ExpertWave, RankInputs, RankWeights};
-use crate::families::deepseek_v41::v41_backbone_shared::tp2::{Wave as SharedWave, Weights as SharedWeights};
+use crate::families::deepseek_v41::v41_backbone_shared::tp2::{
+    Wave as SharedWave, Weights as SharedWeights,
+};
+use crate::shared::experts::rtx::{
+    exl3::Exl3Tp2,
+    native::{NativeOutputPolicy, NativeTp2},
+    pair::{OwnerInputs, OwnerPair, OwnerWeights},
+    RtxSelectionPolicy,
+};
 use crate::shared::memory::device::{Allocation, Device, Stream};
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Bf16Add};
 use std::rc::Rc;
+
+/// Weight-only budgets have already been admitted separately from every lane's
+/// workspace by the family placement request. Shared loading rechecks peak usage.
+pub(crate) fn load_routed_weights<'a>(
+    devices: [Device<'a>; 2],
+    catalog: &cuteafd_loader::OfficialV41Catalog,
+    layers: usize,
+    capacity: u32,
+    budgets: [usize; 2],
+    package: &std::path::Path,
+) -> Result<[OwnerWeights<'a>; 2]> {
+    let selection = RtxSelectionPolicy::FirstCapacity;
+    if catalog.exl3().is_some() {
+        let workspace = Exl3Tp2::workspace_bytes_for_selection(
+            package,
+            5120,
+            capacity as usize,
+            cuteafd_core::Exl3RowPolicy::Nearest,
+            selection,
+        )?;
+        let budgets = budgets
+            .map(|budget| {
+                budget
+                    .checked_add(workspace)
+                    .ok_or_else(|| anyhow::anyhow!("TP2 EXL3 load budget overflow"))
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("two TP2 budgets"))?;
+        return Ok(Exl3Tp2::load_pair_weights(
+            devices,
+            catalog,
+            cuteafd_core::expert_geometry(),
+            [package; 2],
+            0..layers,
+            capacity as usize,
+            budgets,
+            selection,
+        )?
+        .map(OwnerWeights::Exl3));
+    }
+    let nvfp4 = catalog.nvfp4().is_some();
+    let reducer = devices[0].run(|| devices[0].library.v41_tp2_expert_reducer())?;
+    let output = if nvfp4 || !reducer.supports_route_sums() {
+        NativeOutputPolicy::KernelPlanes
+    } else {
+        NativeOutputPolicy::TokenSums
+    };
+    let workspace = NativeTp2::workspace_bytes_for_format(
+        devices[0].library,
+        capacity as usize,
+        selection,
+        output,
+        nvfp4,
+    )?;
+    let budgets = budgets
+        .map(|budget| {
+            budget
+                .checked_add(workspace)
+                .ok_or_else(|| anyhow::anyhow!("TP2 native load budget overflow"))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("two TP2 budgets"))?;
+    Ok(NativeTp2::load_pair_weights(
+        devices,
+        catalog,
+        0..layers,
+        capacity as usize,
+        budgets,
+        selection,
+        output,
+    )?
+    .map(OwnerWeights::Native))
+}
 
 struct PeerInputs<'a> {
     values: Allocation<'a>,
@@ -37,7 +121,7 @@ pub(crate) struct Wave<'a> {
     streams: [Stream<'a>; 2],
     peers: [PeerInputs<'a>; 2],
     shared: SharedWave<'a>,
-    routed: ExpertWave<'a>,
+    routed: OwnerPair<'a>,
     output: [Allocation<'a>; 2],
     add: V41Bf16Add<'a>,
     /// SM peer copies per destination GPU for device-ordered passes.
@@ -48,42 +132,68 @@ pub(crate) struct Wave<'a> {
 /// Copies `bytes` from `source` (the other GPU) into `destination` on
 /// `stream`: an SM copy ordered by events under a device-ordered pass (no
 /// copy-engine queue held behind an event), else a copy-engine peer copy.
-unsafe fn peer_copy(stream: &Stream<'_>, sm: Option<&cuteafd_ffi::V41PeerCopy<'_>>, destination: CuteafdDeviceBuffer,
-    source: CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
+unsafe fn peer_copy(
+    stream: &Stream<'_>,
+    sm: Option<&cuteafd_ffi::V41PeerCopy<'_>>,
+    destination: CuteafdDeviceBuffer,
+    source: CuteafdDeviceBuffer,
+    bytes: usize,
+) -> Result<()> {
     match sm.filter(|_| crate::shared::memory::chain::deferred()) {
         Some(sm) => unsafe { sm.launch(destination, source, bytes, stream.raw) },
-        None => unsafe { stream.device.library.copy_peer_async(destination, source, bytes, stream.raw) },
+        None => unsafe {
+            stream
+                .device
+                .library
+                .copy_peer_async(destination, source, bytes, stream.raw)
+        },
     }
 }
 impl<'a> Wave<'a> {
-    pub fn exl3_device_bytes(directory: &std::path::Path, library: &cuteafd_ffi::NativeLibrary,
-        capacity: u32) -> Result<usize> {
-        ExpertWave::exl3_device_bytes(directory, capacity)?
-            .checked_add(SharedWave::device_bytes(library, capacity)?)
-            .and_then(|bytes| bytes.checked_add(capacity as usize * (10240 + 5280 + 24 + 24 + 10240)))
-            .ok_or_else(|| anyhow::anyhow!("TP2 EXL3 FFN workspace overflow"))
+    pub fn exl3_device_bytes(
+        directory: &std::path::Path,
+        library: &cuteafd_ffi::NativeLibrary,
+        capacity: u32,
+    ) -> Result<usize> {
+        OwnerPair::exl3_device_bytes(
+            directory,
+            capacity,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        )?
+        .checked_add(SharedWave::device_bytes(library, capacity)?)
+        .and_then(|bytes| bytes.checked_add(capacity as usize * (10240 + 5280 + 24 + 24 + 10240)))
+        .ok_or_else(|| anyhow::anyhow!("TP2 EXL3 FFN workspace overflow"))
     }
     /// Per GPU, per lane for the W4A4 NVFP4 family.
-    pub fn nvfp4_device_bytes(library: &cuteafd_ffi::NativeLibrary, capacity: u32) -> Result<usize> {
-        ExpertWave::nvfp4_device_bytes(library, capacity)?
-            .checked_add(SharedWave::device_bytes(library, capacity)?)
-            .and_then(|bytes| {
-                bytes.checked_add(capacity as usize * (10240 + 5280 + 24 + 24 + 10240))
-            })
-            .ok_or_else(|| anyhow::anyhow!("TP2 NVFP4 FFN workspace overflow"))
+    pub fn nvfp4_device_bytes(
+        library: &cuteafd_ffi::NativeLibrary,
+        capacity: u32,
+    ) -> Result<usize> {
+        OwnerPair::device_bytes(
+            library,
+            capacity,
+            true,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        )?
+        .checked_add(SharedWave::device_bytes(library, capacity)?)
+        .and_then(|bytes| bytes.checked_add(capacity as usize * (10240 + 5280 + 24 + 24 + 10240)))
+        .ok_or_else(|| anyhow::anyhow!("TP2 NVFP4 FFN workspace overflow"))
     }
     /// Per GPU, per lane. Includes both expert workspaces, peer inputs, and
     /// final output; weights, CUDA modules/streams, and headroom are separate.
     pub fn device_bytes(library: &cuteafd_ffi::NativeLibrary, capacity: u32) -> Result<usize> {
-        ExpertWave::device_bytes(library, capacity)?
-            .checked_add(SharedWave::device_bytes(library, capacity)?)
-            .and_then(|bytes| {
-                bytes.checked_add(capacity as usize * (10240 + 5280 + 24 + 24 + 10240))
-            })
-            .ok_or_else(|| anyhow::anyhow!("TP2 FFN workspace overflow"))
+        OwnerPair::device_bytes(
+            library,
+            capacity,
+            false,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+        )?
+        .checked_add(SharedWave::device_bytes(library, capacity)?)
+        .and_then(|bytes| bytes.checked_add(capacity as usize * (10240 + 5280 + 24 + 24 + 10240)))
+        .ok_or_else(|| anyhow::anyhow!("TP2 FFN workspace overflow"))
     }
     pub fn new(
-        routed: [Rc<RankWeights<'a>>; 2],
+        routed: [OwnerWeights<'a>; 2],
         shared: [Rc<Vec<SharedWeights<'a>>>; 2],
         layers: usize,
         capacity: u32,
@@ -101,7 +211,8 @@ impl<'a> Wave<'a> {
         );
         for rank in 0..2 {
             ensure!(
-                routed[rank].layers() >= layers
+                routed[rank].layers().start == 0
+                    && routed[rank].layers().end >= layers
                     && shared[rank].len() >= layers
                     && shared[rank][0].device().id == devices[rank].id
                     && std::ptr::eq(shared[rank][0].device().library, devices[rank].library),
@@ -118,15 +229,26 @@ impl<'a> Wave<'a> {
                 PeerInputs::new(devices[1], capacity)?,
             ],
             shared: SharedWave::new(shared, capacity)?,
-            routed: ExpertWave::new(routed, capacity)?,
+            routed: OwnerPair::new(
+                routed,
+                capacity,
+                cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+                std::env::var_os("CUTEAFD_TP2_TIMING").is_some(),
+            )?,
             output: [
                 Allocation::new(devices[0], capacity as usize * 10240)?,
                 Allocation::new(devices[1], capacity as usize * 10240)?,
             ],
             add: devices[0].library.v41_bf16_add()?,
-            sm: [0, 1].map(|rank| crate::shared::memory::chain::device_enabled()
-                .then(|| devices[rank].run(|| devices[rank].library.v41_peer_copy())).transpose())
-                .into_iter().collect::<Result<Vec<_>>>()?.try_into()
+            sm: [0, 1]
+                .map(|rank| {
+                    crate::shared::memory::chain::device_enabled()
+                        .then(|| devices[rank].run(|| devices[rank].library.v41_peer_copy()))
+                        .transpose()
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+                .try_into()
                 .map_err(|_| anyhow::anyhow!("two TP2 peer copiers"))?,
             layers,
             capacity,
@@ -154,15 +276,23 @@ impl<'a> Wave<'a> {
         rows: u32,
         values: CuteafdDeviceBuffer,
     ) -> Result<CuteafdDeviceBuffer> {
-        unsafe { self.execute_shared_on(layer, rows, values, values.device_id as usize).await }
+        unsafe {
+            self.execute_shared_on(layer, rows, values, values.device_id as usize)
+                .await
+        }
     }
 
     /// Same input lifetime as `execute_shared`; select the reduction owner so
     /// Spark collection can remain on its transport GPU for encoder layers too.
     /// # Safety
     /// Input storage remains complete, immutable and live through completion or drain.
-    pub async unsafe fn execute_shared_on(&mut self, layer: usize, rows: u32,
-        values: CuteafdDeviceBuffer, destination: usize) -> Result<CuteafdDeviceBuffer> {
+    pub async unsafe fn execute_shared_on(
+        &mut self,
+        layer: usize,
+        rows: u32,
+        values: CuteafdDeviceBuffer,
+        destination: usize,
+    ) -> Result<CuteafdDeviceBuffer> {
         ensure!(
             self.contains_shared(layer)
                 && destination < 2
@@ -191,7 +321,9 @@ impl<'a> Wave<'a> {
         }
         let peer = self.peers[remote].values.buffer;
         let sm = self.sm[remote].as_ref();
-        upload.device.run(|| unsafe { peer_copy(upload, sm, peer, values, rows as usize * 10240) })?;
+        upload
+            .device
+            .run(|| unsafe { peer_copy(upload, sm, peer, values, rows as usize * 10240) })?;
         let mut inputs = [values; 2];
         inputs[remote] = peer;
         let output = unsafe {
@@ -213,10 +345,19 @@ impl<'a> Wave<'a> {
     /// lane-owned scratch. Stream::wait drains this copy on cancellation.
     /// # Safety
     /// Source storage remains immutable and live until the transfer completes or drains.
-    pub async unsafe fn return_result(&mut self, source: CuteafdDeviceBuffer,
-        destination: usize, rows: u32) -> Result<CuteafdDeviceBuffer> {
-        ensure!(destination < 2 && rows > 0 && rows <= self.capacity
-            && source.bytes >= rows as usize * 10240, "invalid TP2 result transfer");
+    pub async unsafe fn return_result(
+        &mut self,
+        source: CuteafdDeviceBuffer,
+        destination: usize,
+        rows: u32,
+    ) -> Result<CuteafdDeviceBuffer> {
+        ensure!(
+            destination < 2
+                && rows > 0
+                && rows <= self.capacity
+                && source.bytes >= rows as usize * 10240,
+            "invalid TP2 result transfer"
+        );
         if !crate::shared::memory::chain::deferred() {
             crate::shared::memory::chain::settle(self.streams[0].device.library)?;
         }
@@ -286,7 +427,9 @@ impl<'a> Wave<'a> {
         let sm = self.sm[remote].as_ref();
         upload.device.run(|| {
             for ((source, destination), width) in inputs.into_iter().zip(peer).zip(widths) {
-                unsafe { peer_copy(upload, sm, destination, source, rows as usize * width)?; }
+                unsafe {
+                    peer_copy(upload, sm, destination, source, rows as usize * width)?;
+                }
             }
             Ok(())
         })?;
@@ -303,10 +446,10 @@ impl<'a> Wave<'a> {
                     layer,
                     rows,
                     local,
-                    std::array::from_fn(|rank| RankInputs {
-                        wire: ranks[rank][routed_input],
+                    std::array::from_fn(|rank| OwnerInputs {
+                        input: ranks[rank][routed_input],
                         ids: ranks[rank][2],
-                        routing: ranks[rank][3],
+                        weights: ranks[rank][3],
                         producer: &self.streams[rank],
                     }),
                 )
@@ -346,7 +489,8 @@ mod tests {
     #[test]
     #[ignore = "requires combined TP2 CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, two GPUs"]
     fn real_tp2_ffn_broadcast_and_combine_independent_lanes() -> Result<()> {
-        let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let lib =
+            unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let catalog = cuteafd_loader::read_official_v41_catalog(
             cuteafd_loader::OFFICIAL_V41_MODEL_ID,
             std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
@@ -362,10 +506,14 @@ mod tests {
                 id: 1,
             },
         ];
-        let routed = [
-            Rc::new(RankWeights::load(devices[0], &catalog, 1, 4_000_000_000)?),
-            Rc::new(RankWeights::load(devices[1], &catalog, 1, 4_000_000_000)?),
-        ];
+        let routed = load_routed_weights(
+            devices,
+            &catalog,
+            1,
+            16,
+            [4_000_000_000; 2],
+            std::path::Path::new(&std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default()),
+        )?;
         let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = [0, 1]
             .map(|rank| {
                 (0..40)
@@ -389,7 +537,12 @@ mod tests {
             Wave::new(routed.clone(), shared.clone(), 1, 16)?,
             Wave::new(routed.clone(), shared.clone(), 1, 16)?,
         ];
-        let mut reference_routed = ExpertWave::new(routed, 16)?;
+        let mut reference_routed = OwnerPair::new(
+            routed,
+            16,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+            std::env::var_os("CUTEAFD_TP2_TIMING").is_some(),
+        )?;
         let mut reference_shared = SharedWave::new(shared, 16)?;
         let inputs = [
             PeerInputs::new(devices[0], 16)?,
@@ -452,8 +605,16 @@ mod tests {
                         Ok(())
                     })?;
                     let returned = runtime.block_on(async {
-                        let peer = unsafe { lanes[local].execute_shared_on(layer, rows,
-                            inputs[local].values.buffer, 1-local).await? };
+                        let peer = unsafe {
+                            lanes[local]
+                                .execute_shared_on(
+                                    layer,
+                                    rows,
+                                    inputs[local].values.buffer,
+                                    1 - local,
+                                )
+                                .await?
+                        };
                         unsafe { lanes[local].return_result(peer, local, rows).await }
                     })?;
                     devices[local].run(|| {
@@ -461,7 +622,10 @@ mod tests {
                         let mut right = vec![0; expected.bytes];
                         lib.copy_d2h(&mut left, returned)?;
                         lib.copy_d2h(&mut right, expected)?;
-                        ensure!(left == right, "peer-owned shared reduction and return differs");
+                        ensure!(
+                            left == right,
+                            "peer-owned shared reduction and return differs"
+                        );
                         Ok(())
                     })?;
                     assert_eq!(lib.cuda_get_device()?, 0);
@@ -544,10 +708,10 @@ mod tests {
                         0,
                         rows,
                         0,
-                        std::array::from_fn(|rank| RankInputs {
-                            wire: reference_inputs[rank].wire.buffer,
+                        std::array::from_fn(|rank| OwnerInputs {
+                            input: reference_inputs[rank].wire.buffer,
                             ids: reference_inputs[rank].ids.buffer,
-                            routing: reference_inputs[rank].routing.buffer,
+                            weights: reference_inputs[rank].routing.buffer,
                             producer: &producers[rank],
                         }),
                     )

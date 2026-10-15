@@ -370,6 +370,14 @@ impl V41CompactReducer<'_> {
         Ok(())
     }
 
+    /// Shared Spark intake always uses the N-plane ABI, even at two/four ranks.
+    /// Reject a legacy-only library before allocating its landing planes.
+    pub fn require_plane_reduction(&self, ranks: u32) -> Result<()> {
+        ensure!(v41_rank_count_supported(ranks), "unsupported physical rank count {ranks}; expected 1 through 8");
+        ensure!(self.reduce_planes.is_some(), "native N-plane compact BF16 reduction unavailable; rebuild the native library");
+        Ok(())
+    }
+
     /// The physical-rank counts this loaded library can reduce, in ascending
     /// order. Useful for startup logging and fallback rejection.
     pub fn available_rank_counts(&self) -> Vec<u32> {
@@ -1139,12 +1147,20 @@ mod tests {
         for ranks in reducer.available_rank_counts() {
             assert!(v41_rank_count_supported(ranks));
             assert!(reducer.require_rank_count(ranks).is_ok());
+            assert!(reducer.require_plane_reduction(ranks).is_ok());
         }
+        assert!(reducer.require_plane_reduction(0).is_err());
+        assert!(reducer.require_plane_reduction(9).is_err());
         // The current build must expose every count through the eight-slot path.
         assert!(
             (1..=8).all(|ranks| reducer.supports_rank_count(ranks)),
             "current library is missing the N-plane compact reducer"
         );
+        let legacy = V41CompactReducer { reduce_planes: None, ..reducer };
+        for ranks in [2, 4] {
+            assert!(legacy.require_plane_reduction(ranks).is_err(),
+                "shared intake must reject legacy-only libraries before allocation");
+        }
         Ok(())
     }
 
@@ -1533,6 +1549,14 @@ impl NativeLibrary {
     }
 }
 impl V41Tp2ExpertReducer<'_> {
+    /// The installed owner-reduction symbols have a fixed hidden/top-k ABI.
+    /// Reject unsupported geometry before allocating or launching an owner path.
+    pub fn require_owner_geometry(geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
+        ensure!(geometry.hidden == 5120 && geometry.topk == 6,
+            "native owner reduction requires hidden=5120, topk=6; got hidden={}, topk={}",
+            geometry.hidden, geometry.topk);
+        Ok(())
+    }
     pub fn supports_route_sums(&self) -> bool { self.sum_routes.is_some() }
     pub fn supports_geometry_route_sums(&self) -> bool { self.sum_routes_geometry.is_some() }
     /// FP32 route sums in route order, with no intermediate rounding.

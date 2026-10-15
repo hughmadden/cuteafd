@@ -71,7 +71,7 @@ pub fn report(failed: bool) -> Report {
             capacity: Some(Capacity { kv_tokens: Some(14_710_000), kv_pages: Some(28_728),
                 kv_format: Some("FP4 compressed (CSA/HCA) + FP8 window".into()), max_requests: Some(16),
                 max_context: Some(1 << 20), max_output: Some(393_216), host_cache_bytes: Some(64 << 30) }) },
-        quality, seconds: 151.0, thermal: None,
+        quality, seconds: 151.0, thermal: None, fabric: vec![],
     };
     Report {
         schema: SCHEMA.into(), id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
@@ -86,7 +86,7 @@ pub fn report(failed: bool) -> Report {
         fingerprint: "3f9a2c41d07be5a1".into(), baseline: Some(baseline),
         panels: vec![PanelResult { id: "hardware".into(), title: "Hardware".into(), status: PanelStatus::Done,
             passes: vec![serde_json::json!({})], ..PanelResult::default() }],
-        error: None,
+        error: None, fabric: vec![],
     }
 }
 
@@ -108,6 +108,17 @@ mod tests {
         assert!(render::card::card_svg(&report).contains(">171</text>"));
         let placed = crate::publish::Placed { dir: "benchmarks/history/card".into(), report };
         assert!(crate::publish::results(&[placed]).contains("C8: 171"));
+    }
+
+    #[test]
+    fn a_published_card_renders_unchanged_under_the_fidelity_rule() {
+        let report: crate::report::Report = serde_json::from_str(include_str!(
+            "../../../../benchmarks/mimo_v2/2026-10-09-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min-rc3/report.json")).unwrap();
+        let before = render::card::card_svg(&report);
+        let mut reconciled = report.clone();
+        crate::quality::reconcile(&mut reconciled);
+        assert_eq!(reconciled.baseline.as_ref().unwrap().quality.status, report.baseline.as_ref().unwrap().quality.status);
+        assert_eq!(render::card::card_svg(&reconciled), before);
     }
 
     #[test]

@@ -405,7 +405,13 @@ fn read<T: serde::de::DeserializeOwned>(stream: &TcpStream) -> Result<T> {
 pub fn receive_worker_selection(stream: &TcpStream, rank: usize, timeout: Duration) -> Result<WorkerSelection> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let start: Start = read(stream)?;
+    let value: serde_json::Value = read(stream)?;
+    if value["message"] == "fabric_traffic" {
+            crate::traffic::control_phase(&value);
+        write(&mut stream.try_clone()?, &serde_json::json!({"message": "fabric_traffic", "sample": crate::traffic::local()}))?;
+        return Err(crate::traffic::TrafficProbeOnly.into());
+    }
+    let start: Start = serde_json::from_value(value)?;
     ensure!(start.message == "worker_selection_start", "worker requires coordinator placement handshake");
     ensure!(start.rank == rank && rank < start.selection.identity.world as usize, "worker selection rank mismatch");
     start.selection.validate()?;
@@ -488,6 +494,7 @@ pub fn select_worker_layers(peers: &[SocketAddr], selection: &WorkerSelection, t
         if let Some(previous) = seals.get(&peer) { ensure!(previous == &digest, "worker peer placement changed concurrently"); }
     }
     for &peer in peers { seals.insert(peer, digest.clone()); }
+    crate::traffic::observe_peers(peers);
     Ok(())
 }
 
@@ -645,6 +652,26 @@ mod tests {
         assert!(report.with_bf16_variants(vec![companion]).is_err());
     }
 
+    /// An NVFP4 package's workers install one FP8 family of tiles and report no
+    /// BF16 siblings, while the checkpoint's Spark wire is BF16 (the workers
+    /// quantize the activations themselves). The report must answer that
+    /// package's own wire form from the variants it did install, so a planner
+    /// pricing a BF16 request is not left without a grouping.
+    #[test]
+    fn nvfp4_report_without_bf16_siblings_answers_the_bf16_wire() {
+        let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
+        let variants = [1, 16, 80, 4096].into_iter().map(|capacity|
+            InstalledExpertVariant::from_piecewise_queries(capacity, ExpertTrafficContract::ExactGrouping,
+                |rows| Ok(if capacity <= 16 { 16 }
+                    else if capacity == 80 || (1..=80).contains(&rows) { 64 } else { 128 })).unwrap()).collect();
+        let report = InstalledExpertGrouping::new(loaded, 0, 128, ExpertGroupingSelector::Fp8Nearest, variants).unwrap();
+        assert!(report.bf16_variants.is_none() && report.validate().is_ok());
+        for (rows, expected) in [(1, 16), (16, 16), (17, 64), (80, 64), (81, 128), (128, 128)] {
+            assert_eq!(report.group_rows(rows).unwrap(), expected, "fp8 rows {rows}");
+            assert_eq!(report.group_rows_for_input(rows, true).unwrap(), expected, "bf16 rows {rows}");
+        }
+    }
+
     #[test]
     fn nvfp4_installed_bound_admits_without_claiming_an_exact_tile() {
         let loaded = WorkerSelection::new(identity(), &[13]).unwrap();
@@ -690,6 +717,18 @@ mod tests {
         let (server, _) = listener.accept().unwrap();
         client.write_all(&vec![b' '; CONTROL_LIMIT + 1]).unwrap();
         assert!(receive_worker_selection(&server, 0, Duration::from_secs(3)).is_err());
+    }
+    #[test]
+    fn fabric_control_is_served_without_worker_or_native_admission() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        write(&mut client, &serde_json::json!({"message": "fabric_traffic"})).unwrap();
+        let error = receive_worker_selection(&server, 0, Duration::from_secs(3)).unwrap_err();
+        assert!(error.is::<crate::traffic::TrafficProbeOnly>());
+        let reply: serde_json::Value = read(&client).unwrap();
+        assert_eq!(reply["message"], "fabric_traffic");
+        assert!(reply["sample"].is_object());
     }
     #[test]
     fn worker_selection_control_checks_exact_ack_and_reconnect() {

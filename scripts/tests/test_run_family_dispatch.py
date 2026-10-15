@@ -560,7 +560,8 @@ def test_family_prelaunch_plan_uses_coordinator_card_memory(tmp_path, family, bu
         tmp_path, ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
                    if family == "glm5" else {"model_type": "deepseek_v4"}
                    if family == "deepseek_v4" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family]), "test/model",
-        f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nGLM5_FLASH_FP8_MODEL_ID=off\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+        + ("GLM5_FLASH_FP8_MODEL_ID=off\n" if family == "glm5_flash" else ""),
         gpu_total_mib=total, gpu_free_mib=total)
     assert result.returncode == 0, result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
@@ -585,9 +586,9 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
     model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
     keys = (f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\n"
             "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
-    if family != "deepseek_v41":
+    if family == "glm5_flash":
         keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
-    else:
+    elif family == "deepseek_v41":
         keys += ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
                  "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
     if override:
@@ -650,20 +651,102 @@ def test_qwen_startup_graph_default_is_owned_by_engine(tmp_path, setting, expect
 
 
 @pytest.mark.parametrize("setting,expected", [("", "fp8"), ("bf16", "bf16"), ("fp8", "fp8")])
-def test_qwen_kv_format_is_explicit_and_fp8_default(tmp_path, setting, expected):
-    keys = "" if not setting else f"KV_FORMAT={setting}\n"
+def test_qwen_kv_cache_is_explicit_and_fp8_default(tmp_path, setting, expected):
+    keys = "" if not setting else f"KV_CACHE={setting}\n"
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/qwen", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen4 --snapshot" in line)
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans
     assert f"--kv-cache {expected}" in launch
-    assert "--kv-format" not in launch
+    assert all(f"--kv-cache {expected}" in line for line in plans)
+    assert "--kv-format" not in result.stderr
 
 
-def test_qwen_invalid_kv_format_fails_before_launch(tmp_path):
-    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/qwen", "KV_FORMAT=int8\n")
-    assert result.returncode != 0
-    assert "KV_FORMAT must be bf16 or fp8" in result.stderr
+def test_qwen_invalid_kv_cache_fails_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/qwen", "KV_CACHE=int8\n")
+    assert result.returncode == 2, result.stderr
+    assert "KV_CACHE must be bf16 or fp8" in result.stderr
     assert "serve-qwen4 --snapshot" not in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+def test_kv_format_is_an_unknown_key(tmp_path):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/qwen", "KV_FORMAT=fp8\n")
+    assert result.returncode == 2, result.stderr
+    assert "unknown configuration key: KV_FORMAT" in result.stderr
+    assert "deprecated" not in result.stderr and "was removed" not in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("setting,expected", [("", None), ("int8", "int8"), ("bf16", "bf16")])
+def test_mimo_kv_cache_omits_the_flag_unless_set(tmp_path, setting, expected):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = "SPECULATOR=off\n" + ("" if not setting else f"KV_CACHE={setting}\n")
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans and all("--kv-cache" not in line for line in plans)
+    if expected is None:
+        assert "--kv-cache" not in launch
+    else:
+        assert f"--kv-cache {expected}" in launch
+
+
+def test_mimo_invalid_kv_cache_fails_before_launch(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo", "SPECULATOR=off\nKV_CACHE=fp8\n")
+    assert result.returncode == 2, result.stderr
+    assert "KV_CACHE must be int8 or bf16" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("family,extra,unused", [
+    ("qwen4", "MIMO_FP8_HEAD=on\n", "MIMO_FP8_HEAD"),
+    ("mimo_flash", "QWEN_FP8_DECODE=on\n", "QWEN_FP8_DECODE"),
+    ("glm5", "KV_CACHE=fp8\n", "KV_CACHE"),
+    ("glm5_flash", "KV_CACHE=fp8\n", "KV_CACHE"),
+    ("deepseek_v4", "KV_CACHE=bf16\n", "KV_CACHE"),
+    ("deepseek_v41", "KV_CACHE=fp8\n", "KV_CACHE"),
+])
+def test_a_key_the_family_never_reads_fails_before_launch(tmp_path, family, extra, unused):
+    configs = {
+        "qwen4": SPLIT_CONFIGS["qwen4"],
+        "mimo_flash": {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+        "glm5": {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3},
+        "glm5_flash": SPLIT_CONFIGS["glm5_flash"],
+        "deepseek_v4": {"model_type": "deepseek_v4"},
+        "deepseek_v41": {"model_type": "deepseek_v41"},
+    }
+    model = {"glm5": "zai-org/GLM-5.3", "deepseek_v41": "deepseek-ai/DeepSeek-V4.1-Flash"}.get(family, "test/model")
+    keys = "SPECULATOR=off\n" + extra
+    if family == "glm5_flash":
+        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
+    if family == "deepseek_v41":
+        keys += ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
+                 "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
+    result = _family_launch_result(tmp_path, configs[family], model, keys)
+    assert result.returncode == 2, result.stderr
+    assert f"unused configuration key: {unused}" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+def test_the_wip_slot_root_a_card_config_names_launches_every_family(tmp_path):
+    # The card harness launches each card from a generated config that names the
+    # WIP root it staged, and the shared `--wip` staging hands that root to every
+    # rank's staging script. A family whose allowed set omits it dies before any
+    # container runs ("unused configuration key: WIP_ROOT"), so the key must be
+    # accepted here and must reach the ranks.
+    root = tmp_path / "home" / ".cache" / "cuteafd" / "builds" / "wip-test"
+    result = _family_launch_result(
+        tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+        f"SPECULATOR=off\nVISION=off\nAUDIO=off\nWIP_ROOT={root}\n",
+        extra_args=("--wip", "slot-test"))
+    assert result.returncode == 0, result.stderr
+    assert "unused configuration key" not in result.stderr
+    stages = [line for line in result.stderr.splitlines() if line.startswith("ssh h0 bash -s -- slot-test")]
+    assert any(str(root) in line for line in stages), "\n".join(stages)
 
 
 def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
@@ -696,7 +779,8 @@ def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, con
     fixture = {"num_hidden_layers": 4, "layer_types": ["linear_attention"] * 4,
         "mlp_layer_types": ["dense"] * dense_layers + ["sparse"] * (4 - dense_layers), **config}
     result = _family_launch_result(tmp_path, fixture, "test/model",
-        "EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n" + keys,
+        "EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+        + ("GLM5_FLASH_FP8_MODEL_ID=off\n" if config["model_type"] == "glm5_next" else "") + keys,
         extra_env=env)
     assert result.returncode == 0, result.stderr
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -1078,9 +1162,14 @@ def test_glmf_serving_head_has_no_arithmetic_selection(tmp_path, value):
     keys = "" if value is None else f"GLM5_FLASH_DRAFT_HEAD={value}\n"
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
                                   "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
-    assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    assert "--draft-head" not in launch, launch
+    if value is None:
+        assert result.returncode == 0, result.stderr
+        launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+        assert "--draft-head" not in launch, launch
+        return
+    assert result.returncode == 2, result.stderr
+    assert "unused configuration key: GLM5_FLASH_DRAFT_HEAD" in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("TARGET_HEAD=tensor\n", "tensor"),
@@ -1298,9 +1387,10 @@ def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, 
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_KDA_STATE=f32\n", None),
                                              ("GLM5_FLASH_KDA_STATE=bf16\n", "bf16"),
                                              ("GLM5_FLASH_KDA_STATE=bf16-tile\n", "bf16-tile")])
-def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, forwarded):
+@pytest.mark.parametrize("projection", ("off", "row128", "channel"))
+def test_glmf_kda_state_is_forwarded_with_either_kda_storage(tmp_path, keys, forwarded, projection):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\n" + keys)
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_KDA_FP8={projection}\n" + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     if forwarded is None:
@@ -1310,7 +1400,6 @@ def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, f
 
 
 @pytest.mark.parametrize("keys,message", [
-    ("RTX_GPUS=1\nGLM5_FLASH_KDA_STATE=bf16\n", "GLM5_FLASH_KDA_FP8=off"),
     ("RTX_GPUS=2\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=bf16\n", "without a head split"),
     ("RTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=fp16\n", "GLM5_FLASH_KDA_STATE must be"),
 ])
@@ -1756,8 +1845,10 @@ SPLIT_CONFIGS = {
 ])
 @pytest.mark.parametrize("setting", ["", "FULL_PREFILL_LOGITS=off\n", "FULL_PREFILL_LOGITS=on\n"])
 def test_full_prefill_logits_is_one_shared_opt_in(tmp_path, family_config, setting):
-    result = _family_launch_result(tmp_path, family_config, "test/model",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nSPECULATOR=off\n" + setting)
+    keys = "SPECULATOR=off\n" + setting
+    if family_config.get("model_type") == "glm5_next":
+        keys = "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys
+    result = _family_launch_result(tmp_path, family_config, "test/model", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
     assert launch.count("--full-prefill-logits") == int("=on" in setting)
@@ -1850,9 +1941,11 @@ def test_dual_maps_encoder_owner_to_visible_device(tmp_path: Path, family: str,
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 0,
             "encoder_plan_hash": "ab" * 32,
             "encoder": {"kind": {"kind": "rtx", "gpu": encoder_owner}, "replicas": []}}
-    result = _family_launch_result(tmp_path, config, "test/model",
-                                  f"COORDINATOR_GPUS={owners}\nSPARK_COUNT=0\nEXPERT_BACKEND=local\n"
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nSPECULATOR=off\nVISION=auto\nAUDIO=off\n", encoder_plan=plan)
+    keys = (f"COORDINATOR_GPUS={owners}\nSPARK_COUNT=0\nEXPERT_BACKEND=local\n"
+            "SPECULATOR=off\nVISION=auto\nAUDIO=off\n")
+    if family == "glm5_flash":
+        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
+    result = _family_launch_result(tmp_path, config, "test/model", keys, encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     serve = {"qwen4": "serve-qwen4", "glm5_flash": "serve-glmf",
              "mimo_flash": "serve-mimo", "mimo_pro": "serve-mimo"}[family]
@@ -2739,23 +2832,18 @@ def test_invalid_rdma_device_map_fails_before_workers_launch(tmp_path):
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
-def test_no_nest_launch_needs_no_sudo_page_cache_drop(tmp_path):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", with_nest=False)
+@pytest.mark.parametrize("with_nest", [False, True])
+def test_spark_launch_preserves_page_cache(tmp_path, with_nest):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", with_nest=with_nest)
     assert result.returncode == 0, result.stderr
     assert "drop_caches" not in result.stderr
-    assert "fadvise(DONTNEED)" in result.stdout
+    assert "drop-caches" not in result.stderr
 
 
-def test_spark_page_caches_drop_over_ssh_without_nest_when_opted_in(tmp_path):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", with_nest=False,
-                                   extra_env={"CUTEAFD_GLOBAL_PAGE_CACHE_DROP": "1"})
-    assert result.returncode == 0, result.stderr
-    lines = result.stderr.splitlines()
-    drops = [i for i, line in enumerate(lines) if line.startswith("ssh -n h0 ") and "drop_caches" in line]
-    assert len(drops) == 2, result.stderr  # before the workers start and once they are resident
-    worker = next(i for i, line in enumerate(lines) if "docker run -d --name cuteafd-spark-expert-" in line)
-    assert drops[0] < worker < drops[1]
-    assert "could not drop" not in result.stderr
+def test_serving_source_has_no_page_cache_drop():
+    source = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert "drop-caches" not in source
+    assert "drop_caches" not in source
 
 
 @pytest.mark.parametrize("keys,mode", [("", None), ("RDMA_BOND_BALANCE=off\n", None),
@@ -2875,7 +2963,9 @@ def test_explicit_audio_without_tower_refuses(tmp_path, mode):
 @pytest.mark.parametrize("context", [None, 65536])
 def test_generic_family_checkpoint_context_default_and_override(tmp_path, family, context):
     config = SPLIT_CONFIGS.get(family, {"model_type": "glm_moe_dsa" if family == "glm5" else "deepseek_v4", "num_hidden_layers": 2, "first_k_dense_replace": 1})
-    keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=test/model\n"
+    keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    if family == "glm5_flash":
+        keys += "GLM5_FLASH_FP8_MODEL_ID=test/model\n"
     if context is not None:
         keys += f"MAX_CONTEXT_TOKENS={context}\n"
     result = _family_launch_result(tmp_path, config, "test/model", keys)

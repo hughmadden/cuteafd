@@ -170,7 +170,8 @@ impl LocalVerbsExpertConnection {
         let start = match Self::read_persistent_start(&stream, max_frame_bytes, selection) {
             Ok(start) => start,
             Err(error) => {
-                if !error.is::<crate::worker_selection::WorkerSelectionOnly>() && !error.is::<FlowProbesOnly>() {
+                if !error.is::<crate::worker_selection::WorkerSelectionOnly>() && !error.is::<FlowProbesOnly>()
+                    && !error.is::<crate::traffic::TrafficProbeOnly>() {
                     let mut stream = stream;
                     let _ = crate::worker_selection::reject_worker_selection(&mut stream, &error);
                 }
@@ -244,6 +245,13 @@ impl LocalVerbsExpertConnection {
         configure_control_stream(stream, default_control_timeout())?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut value = read_control_value(&mut reader)?;
+        if value["message"] == "fabric_traffic" {
+            crate::traffic::control_phase(&value);
+            write_control(&mut stream.try_clone()?, &serde_json::json!({
+                "message": "fabric_traffic", "sample": crate::traffic::local()
+            }))?;
+            return Err(crate::traffic::TrafficProbeOnly.into());
+        }
         if flows::is_flow_probe_start(&value) {
             // A coordinator measuring which bond member a flow label reaches:
             // serve its probes, and admit a session only if one follows.
@@ -517,6 +525,7 @@ impl LocalVerbsExpertConnection {
             )?;
             let resize_ms = 0.0_f64;
             let copy_request_ms = 0.0_f64;
+            endpoint.traffic.received(request_wire_bytes);
             let mut post_recv_ms = 0.0_f64;
             let parse_started = timing_enabled.then(Instant::now);
             let request =

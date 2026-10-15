@@ -17,10 +17,10 @@ before → after tables with conditions.
   with the full command line visible. Never put ncu (or anything else) under
   sudo inside a wrapper script or interpreter (`sudo python …`, `sudo bash …`):
   the approver can't see what it runs and will flag or deny it.
-- Lock order: when a run needs both locks, take `sparks.lock` first, then
-  `gpu1.lock` (as `~/.cache/cuteafd/builds/tp2/locked2.sh` does); never hold
-  one while waiting on the other in the opposite order — that deadlocks the
-  cluster. Every lock wait and run has a timeout.
+- Canonical lock order: `sparks.lock` -> `gpu0.lock` -> `gpu1.lock` ->
+  `rhea.lock` -> `moa.lock` -> `kakapo.lock`. Never acquire an earlier lock
+  while holding a later one. Coordinator exports skip all GPU probes while
+  a seed lease is live. Every lock wait and run has a timeout.
 - Waiting costs tokens, sleeping doesn't: start a long run as one background
   command that blocks until it finishes (a lock wait or a loop sleeping ≥60 s)
   and let its completion wake you. Don't poll status or tail logs in between;
@@ -110,22 +110,33 @@ before → after tables with conditions.
   Cargo cache that has seen filesystem errors.
 - Initialize submodules recursively at their pinned commits in every fresh
   worktree before building or testing. Compile through
-  `scripts/build/build-slot.sh CMD` (three niced -j16 slots; slot 0 is
+  `scripts/build/build-slot.sh CMD` (five niced -j16 slots; slot 0 is
   `build.lock`, which wip.sh and build.sh take), held only while compiling.
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
-  release images. Slots isolate artifacts, not GPUs or ports: serialize
-  builds and performance runs, one model served at a time per GPU.
+  release images. Slots isolate artifacts, not GPUs or ports: CPU builds
+  use five counting slots; kakapo uses counting leases, serving-host seeds
+  remain exclusive. Serialize performance runs, one model per GPU.
   `~/.cache/cuteafd/{gpu1,sparks}.lock` (flock) are the hardware mutexes;
   hold one only around the run that needs it and stop its containers before
   releasing it, so the next task finds a clean device.
+- Coordinator export placement: `auto` probes a free capped raptor GPU
+  without waiting, then oliver (config `CUTEAFD_EXPORT_HOST`, environment
+  override wins), with bounded remote retry and no queued GPU-turn fallback.
+  Independent EXL3 variants use bounded spawned workers; all exporters share
+  host-wide CPU/context admission. Raptor Ninja CPU jobs are independent of
+  a shared weighted GPU budget (640 MiB/context plus 2048 MiB per EXL3
+  sizing worker), with the same 12 GiB watchdog cap. GB10 RAM admission uses `MemAvailable`:
+  CUDA allocations reclaim clean file cache; `MemFree` and cudaMemGetInfo
+  under-report usable unified memory. Remote exports reserve aggregate GPU
+  and host RAM before container creation and release only after it stops.
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
   Kernel changes go to `../sparkinfer-glmrt` master, quantizer changes to
   `../GPTQModel` main; push there first, then bump pin and lock here.
-  A SparkInfer bump also needs
-  `scripts/build/build-dev-images.sh` (shared dev images on the coordinator
-  and every Spark rank, then `./wip.sh --recreate`); `wip.sh` and `run.sh
-  --wip` refuse a stale dev image and say so.
+  Dev images are toolchain-only and pin-independent: a SparkInfer bump
+  needs only a new WIP slot build. Rebuild them with
+  `scripts/build/build-dev-images.sh` only when the toolchain changes;
+  `wip.sh` and `run.sh --wip` refuse a stale dev image and say so.
 - Kernels: CuTe-DSL/Triton AOT exports from the b12x fork are the default;
   hand CUDA only where measured to pay. SM120 and SM121 are both targets.
 - Run CUDA/PyTorch checks inside the matching architecture's container.
@@ -331,7 +342,11 @@ facts recorded somewhere for agents working on it.
   10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the
   first four is the qualified V4.1 default until a six-rank layout wins.
 - `kakapo` (GB10, 172.22.2.7): build seed only, never serves; 10 GbE, no
-  RoCE. Its sealed slots reach the Sparks through sparknest; `kakapo.lock`.
+  RoCE. Its sealed slots reach the Sparks through sparknest. Three counting
+  build leases (20 threads / 121 GiB), shared `kakapo.lock` umbrella plus
+  exclusive `kakapo.build.N.lock`, exclude legacy exclusive users. Full or
+  unavailable kakapo may fall back to idle rhea/moa under their exclusive
+  hardware locks. Independent instances share host-wide exporter worker slots.
 - Fabric: Sparks have two RoCE ports at 200 Gb/s each on separate
   subnets (rail A 10.55.0.x, rail B 10.55.1.x); raptor has one 400 Gb/s
   port carrying both rail subnets. The switch is being raised from 100G to

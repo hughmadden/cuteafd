@@ -56,6 +56,9 @@ pub(crate) struct RunArgs {
     /// full) or saved profile. The baseline always runs first (once per server).
     #[arg(long, conflicts_with = "panels")]
     pub(crate) profile: Option<String>,
+    /// Collect leased fabric samples (profiles enable this by default).
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) fabric: Option<bool>,
     /// Explicit panels instead of a profile, e.g. tool_eval,prefill.
     #[arg(long, value_delimiter = ',')]
     pub(crate) panels: Option<Vec<String>>,
@@ -111,7 +114,10 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
         Some(BenchAction::Smoke(smoke)) => cuteafd_bench::smoke::run(smoke),
         Some(BenchAction::Cancel { url, api_key }) => cuteafd_bench::cli::cancel(&url, &api_key),
         Some(BenchAction::Export { json, out, root, export }) => {
-            let report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
+            let mut report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
+            // Re-render under the rule in force now (an nvidia NVFP4 card's
+            // absolute fidelity is informational, not a gate).
+            cuteafd_bench::quality::reconcile(&mut report);
             let out = out.unwrap_or_else(|| cuteafd_bench::cli::default_dir(&root, &report));
             for path in cuteafd_bench::cli::write_exports(&report, &out, &export)? {
                 eprintln!("wrote {}", path.display());
@@ -126,7 +132,7 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             };
             let lossless_set = run.lossless_set.as_deref().map(cuteafd_bench::panels::lossless::CaseSet::load).transpose()?;
             let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
-                passes, baseline: None, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
+                passes, baseline: None, fabric: run.fabric, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
                 lossless_set, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
                 context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)? };
             let (report, dir) = cuteafd_bench::cli::run(&options)?;
@@ -147,10 +153,21 @@ fn family_of(command: &str) -> Option<&'static str> {
 /// Records a serve command's resolved options (value, default, source) for
 /// the benchmark; other commands record nothing.
 pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>) -> Result<()> {
-    let Some((name, sub)) = matches.subcommand() else { return Ok(()) };
-    let Some(family) = family_of(name) else { return Ok(()) };
+    if let Some(context) = serve_context(matches, coordinator_budget_gib)? {
+        cuteafd_bench::context::set(context);
+    }
+    Ok(())
+}
+
+/// The serve command's resolved settings, without publishing them. Tests read
+/// this directly: `capture` stores one process-wide context, so a test that
+/// called it would replace whatever another test was asserting.
+fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
+    -> Result<Option<cuteafd_bench::context::ServerContext>> {
+    let Some((name, sub)) = matches.subcommand() else { return Ok(None) };
+    let Some(family) = family_of(name) else { return Ok(None) };
     let command = crate::cli::Cli::command();
-    let Some(definition) = command.find_subcommand(name) else { return Ok(()) };
+    let Some(definition) = command.find_subcommand(name) else { return Ok(None) };
     let mut settings: Vec<Setting> = Vec::new();
     let mut snapshot = None;
     for arg in definition.get_arguments() {
@@ -192,16 +209,22 @@ pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
         settings.push(Setting { name: "coordinator-gpu-budget-gib".into(), value: Some(gib.to_string()),
             default: None, source: "cli".into() });
     }
-    let requested = std::env::var("CUTEAFD_ATTENTION_PLACEMENT").unwrap_or_else(|_| "auto".into());
+    // The parsed flag already applies CUTEAFD_ATTENTION_PLACEMENT (cli over env over
+    // default). Report that resolution once; the launch spelling is the same option.
+    let requested = sub.try_get_one::<String>("attention_placement").ok().flatten().map(String::as_str)
+        .map(str::to_owned)
+        .or_else(|| std::env::var("CUTEAFD_ATTENTION_PLACEMENT").ok())
+        .unwrap_or_else(|| "auto".into());
     // Reject an unrunnable placement before loading CUDA or starting workers.
     let mode = attention_mode(family, sub, &requested)?;
     let executor = cuteafd_loader::placement::families::executor(family).expect("serve family executor");
+    settings.retain(|setting| setting.name != "attention-placement");
     settings.push(Setting { name: "attention-placement".into(), value: Some(mode.to_string()),
         default: Some(executor.attention_default().to_string()), source: "resolved".into() });
-    settings.extend(cuteafd_bench::context::env_settings());
-    cuteafd_bench::context::set(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: Some(family.to_string()), snapshot, settings });
-    Ok(())
+    settings.extend(cuteafd_bench::context::env_settings().into_iter()
+        .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
+    Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
+        family: Some(family.to_string()), snapshot, settings }))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
@@ -276,5 +299,27 @@ mod tests {
         assert_eq!(output.source, "default");
         assert!(!output.differs());
         assert!(!context.settings.iter().any(|s| s.name == "no-copy-drafts"));
+    }
+
+    #[test]
+    fn attention_placement_is_reported_once_as_the_resolved_value() {
+        let serve = |extra: &[&str]| {
+            let argv = ["cuteafd", "serve-glmf", "--snapshot", "/s", "--native-lib", "/l"].into_iter()
+                .chain(extra.iter().copied()).collect::<Vec<_>>();
+            crate::cli::Cli::command().try_get_matches_from(argv).unwrap()
+        };
+        let placement = |context: &cuteafd_bench::context::ServerContext| context.settings.iter()
+            .filter(|s| s.name == "attention-placement" || s.name == "CUTEAFD_ATTENTION_PLACEMENT")
+            .cloned().collect::<Vec<_>>();
+        let split = serve_context(&serve(&["--split-device", "1", "--attention-placement", "context"]), None)
+            .unwrap().expect("serve context");
+        let placed = placement(&split);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!((placed[0].value.as_deref(), placed[0].default.as_deref(), placed[0].source.as_str()),
+            (Some("context"), Some("context"), "resolved"));
+        let one = serve_context(&serve(&[]), None).unwrap().expect("serve context");
+        let placed = placement(&one);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!(placed[0].value.as_deref(), Some("heads"));
     }
 }

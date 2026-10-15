@@ -204,13 +204,10 @@ v41_fp8_head_args=()
         # No hosts: never `nest drop-caches` without --host (that drops every host's cache).
         self.assertFalse(any(tool=='nest' for tool,_ in events))
 
-    def test_spark_launch_drops_only_its_hosts_page_caches(self):
+    def test_spark_launch_preserves_page_caches(self):
         result,events=self.run_startup(2,dict(version=1,rtx_gpus=2,nonce='fresh',rtx_expert_layers=20,spark_first_layer=20))
         self.assertEqual(result.returncode,0,result.stderr)
-        drops=[args for tool,args in events if tool=='nest']
-        self.assertEqual(len(drops),1,events)
-        self.assertEqual(drops[0][0],'drop-caches')
-        self.assertTrue(all(a=='--host' for a in drops[0][1::2]),drops)
+        self.assertFalse(any(tool=='nest' for tool,_ in events),events)
 
     def test_cli_tp2_overrides_and_invalid_config(self):
         """The former --tp2-* flags are configuration keys: run.sh --set reaches the

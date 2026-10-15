@@ -94,6 +94,9 @@ pub struct Entry {
     /// A profile name, or `panels:a,b` for those panels alone.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Collect fabric telemetry; release cards enable it unless explicitly disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric: Option<bool>,
     /// Optional argv hooks, run only while smoke owns this card's locks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precheck: Option<Hook>,
@@ -238,6 +241,7 @@ impl Entry {
             run_timeout_s: self.run_timeout_s.or(defaults.run_timeout_s),
             exclusive: self.exclusive.or(defaults.exclusive),
             profile: self.profile.clone().or_else(|| defaults.profile.clone()),
+            fabric: self.fabric.or(defaults.fabric),
             precheck: self.precheck.clone().or_else(|| defaults.precheck.clone()),
             prelaunch: self.prelaunch.clone().or_else(|| defaults.prelaunch.clone()),
             observer: self.observer.clone().or_else(|| defaults.observer.clone()),
@@ -297,6 +301,12 @@ pub struct Outcome {
     /// The client-side sweep, when the entry asked for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep: Option<crate::sweep::Sweep>,
+    #[serde(default)]
+    pub fabric: Vec<crate::fabric::Phase>,
+    #[serde(default)]
+    pub fabric_caveats: Vec<String>,
+    #[serde(default)]
+    pub ab_verdict: String,
 }
 
 fn expand(path: &str) -> PathBuf {
@@ -715,10 +725,10 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} window={} lossless_set={} context_lengths={:?} context_levels={:?} set={:?}",
+            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} window={} lossless_set={} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
                 e.name, e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(),
-                e.lossless_set.as_deref().unwrap_or("default"), e.context_lengths, e.context_levels, e.set);
+                e.lossless_set.as_deref().unwrap_or("default"), e.context_lengths, e.context_levels, e.fabric.unwrap_or(true), e.set);
         }
         return Ok(());
     }
@@ -801,6 +811,21 @@ fn summary(entries: &[Entry], state: &BTreeMap<String, Outcome>, build: &str, se
             opt(o.launch_s, crate::render::seconds), opt(o.code_tok_s, crate::render::rate),
             opt(o.prefill_tok_s, crate::render::rate), o.quality.clone().unwrap_or_default(),
             o.dir.clone().unwrap_or_default()));
+    }
+    for e in entries {
+        if let Some(o) = state.get(&e.name) {
+            for phase in &o.fabric {
+                out.push_str(&format!("\nFabric {} / {} ({}): NIC / engine / SparkNest / headers estimate (engine lower bound) / residual bytes (tx+rx per host; ACK/retry/skew remain residual)\n", e.name, phase.name, if phase.timed { "timed" } else { "envelope" }));
+                for p in &phase.ports {
+                    let pair = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a,b)| a.saturating_add(b).to_string()).unwrap_or_else(|| "unknown".into());
+                    out.push_str(&format!("- {} {}/{}: {} / {} / {} / {} / {}\n", p.host, p.device, p.port,
+                        pair(p.sent_bytes,p.received_bytes), pair(p.engine_sent_bytes,p.engine_received_bytes),
+                        pair(p.sparknest_sent_bytes,p.sparknest_received_bytes), pair(p.estimated_header_sent_bytes,p.estimated_header_received_bytes),
+                        pair(p.foreign_sent_bytes,p.foreign_received_bytes)));
+                }
+            }
+            for caveat in &o.fabric_caveats { out.push_str(&format!("\nA/B caveat {}: {caveat}\n",e.name)); }
+        }
     }
     out
 }
@@ -983,7 +1008,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 })
             });
             let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
-                entry.post_load_c1.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), open);
+                entry.post_load_c1.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true), open);
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;
@@ -995,10 +1020,13 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
             outcome.dir = Some(dir.display().to_string());
+            outcome.fabric.extend(sweep.points.iter().filter_map(|p| p.fabric.as_ref())
+                .chain(sweep.prefill.iter().filter_map(|p| p.fabric.as_ref()))
+                .filter_map(|p| serde_json::from_value::<crate::fabric::Phase>(p.clone()).ok()));
             outcome.sweep = Some(sweep);
             return Ok(None);
         }
-        let options = crate::cli::RunOptions { url: url.clone(), profile, panels, passes: vec![], baseline: entry.baseline,
+        let options = crate::cli::RunOptions { url: url.clone(), profile, panels, passes: vec![], baseline: entry.baseline, fabric: Some(entry.fabric.unwrap_or(true)),
             export: vec!["svg".into(), "card".into(), "json".into()], out: None, label: Some(entry.name.clone()),
             root: out_root.to_path_buf(),
             api_key: api_key.clone(), quiet: true,
@@ -1021,6 +1049,10 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         if sweeping {
             let sweep = run_sweep()?;
             std::fs::write(dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
+            report.fabric.extend(sweep.points.iter().filter_map(|p| p.fabric.as_ref())
+                .chain(sweep.prefill.iter().filter_map(|p| p.fabric.as_ref()))
+                .filter_map(|p| serde_json::from_value::<crate::fabric::Phase>(p.clone()).ok()));
+            crate::cli::write_exports(&report, &dir, &options.export)?;
             outcome.sweep = Some(sweep);
         }
         Ok(Some(report))
@@ -1071,6 +1103,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                     let _ = std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap_or_default());
                 }
             }
+            outcome.fabric.extend(report.fabric.iter().cloned());
             outcome.readiness_s = report.server.readiness_s;
             if let Some(b) = &report.baseline {
                 outcome.code_tok_s = b.card.decode_of("code").map(|d| d.tok_s);
@@ -1112,6 +1145,9 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             teardown(entry, &config, &mut log);
         }
     }
+    outcome.fabric_caveats = crate::fabric::caveats(&outcome.fabric);
+    outcome.ab_verdict = if outcome.fabric_caveats.is_empty() { "eligible" } else { "rerun" }.into();
+    for caveat in &outcome.fabric_caveats { let _ = writeln!(log, "fabric A/B caveat: {caveat}"); }
     outcome.total_s = Some(started.elapsed().as_secs_f64());
     outcome.finished = crate::report::now_rfc3339();
     outcome

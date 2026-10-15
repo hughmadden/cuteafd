@@ -299,6 +299,12 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/health", get(health))
         .route("/v1/stats", get(stats_route))
         .route("/v1/thermal", get(thermal_route))
+        .route("/v1/fabric", get(|| async { Json(cuteafd_transport::traffic::subscribed_snapshot()) }))
+        .route("/v1/fabric/phase", post(|Json(phase): Json<cuteafd_transport::traffic::PhaseLog>| async move {
+            if phase.name.len() > 128 || phase.ports.len() > 256 { return StatusCode::BAD_REQUEST; }
+            let _ = tokio::task::spawn_blocking(move || cuteafd_transport::traffic::publish_phase(phase)).await;
+            StatusCode::NO_CONTENT
+        }).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)))
         .route("/v1/chat/completions", post(chat));
     // With the gateway mounted, its listing (OpenAI and Anthropic fields,
     // official aliases) owns /v1/models; the served model's entry keeps the
@@ -341,7 +347,9 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
 }
 /// GPU throttle report over `[from, to]` seconds on the report clock (`now_s` in the reply).
 /// Without `from`, the reply carries only the current readings and the clock, so a client can
-/// mark a phase's start and later ask for exactly that interval.
+/// mark a phase's start and later ask for exactly that interval. `current.queried_s` is when
+/// those readings were read; each GPU's `sampled_s` is the time of the sample they came from
+/// (`null` when that GPU has no sample yet). Window bounds stay on `now_s`.
 #[derive(serde::Deserialize)]
 struct ThermalWindow { from: Option<f64>, to: Option<f64> }
 async fn thermal_route(axum::extract::Query(q): axum::extract::Query<ThermalWindow>) -> Json<Value> {

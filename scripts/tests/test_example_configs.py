@@ -196,6 +196,11 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
         values = {**keys(ROOT / entry["config"]), **defaults, **entry["set"]}
         assert not stale.intersection(entry["set"])
         assert values["POOL_TOKENS"] == "auto"
+        if entry["family"] != "deepseek_v41":
+            assert not any(re.fullmatch(r"SPARK_\d+_LANE_B", key) for key in values)
+        else:
+            for rank in range(len(entry["sparks"])):
+                assert values[f"SPARK_{rank}_LANE_B"].startswith("10.55.1.")
         assert int(values["RTX_GPUS"]) == len(entry["gpus"])
         assert int(values["COORDINATOR_GPU"]) == entry["gpus"][0]
         assert int(values["SPARK_COUNT"]) == len(entry["sparks"])

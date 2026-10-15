@@ -134,7 +134,7 @@ mod tests {
         Report { schema: SCHEMA.into(), id: id.into(), created: created.into(), finished: None,
             status: RunStatus::Done, profile: "share".into(), plan: vec![],
             server: ServerInfo { model: "m".into(), ..ServerInfo::default() }, fingerprint: fingerprint.into(),
-            baseline: None, panels: vec![], error: None }
+            baseline: None, panels: vec![], fabric: vec![], error: None }
     }
 
     #[test]
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(store.list(10).unwrap().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["c", "b", "a"]);
         assert_eq!(store.load("c").unwrap().unwrap().status, RunStatus::Cancelled);
         assert_eq!(store.reports_for("f1", 10).unwrap().len(), 2);
-        let profile = Profile { name: "mine".into(), title: "Mine".into(), description: String::new(),
+        let profile = Profile { fabric: false, name: "mine".into(), title: "Mine".into(), description: String::new(),
             panels: vec![], builtin: false };
         store.save_profile(&profile).unwrap();
         assert_eq!(store.profiles().unwrap(), vec![profile]);

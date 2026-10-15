@@ -157,6 +157,22 @@ impl SparkExperts {
     pub fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
         self.clients.installed_grouping()
     }
+    /// Completes every rank's persistent bootstrap without dispatching a wave,
+    /// so [`Self::installed_grouping`] answers before the first request and the
+    /// rings every later request needs are already registered. Call it after
+    /// [`Self::enable_terminal_ownership`]; the sessions stay open for the
+    /// waves that follow.
+    ///
+    /// `request` sizes the registered rings, so it must be the widest wave this
+    /// transport will dispatch — the same one its start-up warm-up sends. Only
+    /// the control bootstrap reaches a worker; the rows are never sent.
+    pub fn bootstrap(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+        ensure!(!self.wave_open, "cannot bootstrap a Spark transport with a wave in flight");
+        ensure!(request.header.row_count <= self.capacity,
+            "Spark bootstrap request of {} rows exceeds the transport's {}-row capacity",
+            request.header.row_count, self.capacity);
+        self.clients.bootstrap(request)
+    }
     /// Topology this transport was bound to, if any.
     pub fn topology(&self) -> Option<SparkTopology> {
         self.topology
@@ -323,11 +339,50 @@ impl SparkExperts {
     /// [`Self::receive_wave`] handing the sink each payload's owner, as
     /// [`SparkExpertPending::receive_owned`] does: a retained receive slot must
     /// be released before this transport's next dispatch.
-    pub async fn receive_wave_owned<F>(&mut self, mut wave: SparkExpertWave, sink: F) -> Result<WaveReceipt>
+    pub async fn receive_wave_owned<F>(&mut self, mut wave: SparkExpertWave, mut sink: F) -> Result<WaveReceipt>
     where
         F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
     {
-        let result = drain(&mut self.clients, &mut wave.receiver, wave.poll_quantum, sink).await;
+        // Keep the polling loop in this owned receive future: decode previously
+        // lost ~3% when an extra drain future sat on this hot path. All shared
+        // Spark intakes use this path, including device-landing receipts.
+        let mut receipt = WaveReceipt::default();
+        let mut quantum = std::time::Instant::now();
+        let mut first_wait = true;
+        let result = loop {
+            let polled = self.clients.poll(|chunk| {
+                if chunk.landed {
+                    let rank = wave.receiver.push_landed(&chunk)?;
+                    ensure!(rank == chunk.stream_id, "native executor identity does not match its RoCE peer");
+                    receipt.landed |= 1 << rank;
+                    return Ok(());
+                }
+                let mut location = None;
+                wave.receiver.push_rdma(&chunk, |rank, start, _bytes| {
+                    ensure!(rank == chunk.stream_id,
+                        "native executor identity does not match its RoCE peer");
+                    location = Some((rank, start));
+                    Ok(())
+                })?;
+                let (rank, start) = location.expect("validated chunk has a location");
+                sink(rank, start, chunk.partial_output_payload)
+            });
+            match polled {
+                Err(error) => break Err(error),
+                Ok(true) => break if wave.receiver.complete() { Ok(receipt) }
+                    else { Err(anyhow::anyhow!("native TP RoCE response coverage is incomplete")) },
+                Ok(false) => {}
+            }
+            // Let another lane run at the first wait; later polls keep this
+            // wave's existing decode/prefill quantum. Ready responses never yield.
+            if first_wait || quantum.elapsed() >= wave.poll_quantum {
+                first_wait = false;
+                tokio::task::yield_now().await;
+                quantum = std::time::Instant::now();
+            } else {
+                std::hint::spin_loop();
+            }
+        };
         if let Err(error) = &result {
             crate::health::record_failure(format!("expert receive failed: {error:#}"));
             self.reset_connections();
@@ -406,9 +461,9 @@ impl SparkExpertPending<'_, '_> {
     where
         F: FnMut(usize, u32, crate::VerbsHostProtocolV2ResponsePayload) -> Result<()>,
     {
-        // Kept inline rather than shared with `drain`: this is V4.1's decode
-        // hot path, and routing it through the generic helper measured ~3%
-        // slower at C1 (p2 153.5 -> p4 148.4 tok/s).
+        // Borrowed legacy callers retain their inline loop. Shared intake uses
+        // receive_wave_owned's inline loop; neither adds a separate drain future
+        // (that extra future previously cost ~3% at C1, 153.5 -> 148.4 tok/s).
         let mut quantum = std::time::Instant::now();
         let mut first_wait = true;
         loop {
@@ -444,62 +499,6 @@ impl SparkExpertPending<'_, '_> {
         Ok(())
     }
 }
-/// Polls `clients` until `receiver` has every row, handing each payload to `sink`.
-async fn drain<F>(
-    clients: &mut LocalTp4Client,
-    receiver: &mut V41Tp4ChunkReceiver,
-    poll_quantum: std::time::Duration,
-    mut sink: F,
-) -> Result<WaveReceipt>
-where
-    F: FnMut(usize, u32, crate::VerbsHostProtocolV2ResponsePayload) -> Result<()>,
-{
-    let mut receipt = WaveReceipt::default();
-    // Give the other execution lane its first opportunity as soon as this
-    // wave must wait. A 250us initial spin can consume an entire small-row
-    // FFN and serialize two otherwise independent decode stacks. Subsequent
-    // decode polls yield after every unsuccessful poll so short GPU completions
-    // on the peer lane are not delayed by host-side receive spinning.
-    // Prefill/mixed waves retain 250us. Ready responses never yield.
-    let mut quantum = std::time::Instant::now();
-    let mut first_wait = true;
-    loop {
-        if clients.poll(|chunk| {
-            if chunk.landed {
-                let rank = receiver.push_landed(&chunk)?;
-                ensure!(rank == chunk.stream_id, "native executor identity does not match its RoCE peer");
-                receipt.landed |= 1 << rank;
-                return Ok(());
-            }
-            let mut location = None;
-            receiver.push_rdma(&chunk, |rank, start, _bytes| {
-                ensure!(
-                    rank == chunk.stream_id,
-                    "native executor identity does not match its RoCE peer"
-                );
-                location = Some((rank, start));
-                Ok(())
-            })?;
-            let (rank, start) = location.expect("validated chunk has a location");
-            sink(rank, start, chunk.partial_output_payload)
-        })? {
-            break;
-        }
-        if first_wait || quantum.elapsed() >= poll_quantum {
-            first_wait = false;
-            tokio::task::yield_now().await;
-            quantum = std::time::Instant::now();
-        } else {
-            std::hint::spin_loop();
-        }
-    }
-    ensure!(
-        receiver.complete(),
-        "native TP RoCE response coverage is incomplete"
-    );
-    Ok(receipt)
-}
-
 impl Drop for SparkExpertPending<'_, '_> {
     fn drop(&mut self) {
         if !self.complete {

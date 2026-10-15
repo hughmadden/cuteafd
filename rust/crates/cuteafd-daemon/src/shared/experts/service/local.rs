@@ -67,6 +67,7 @@ fn run_empty_selection(listener: TcpListener, rank: usize,
             cuteafd_transport::worker_selection::acknowledge_worker_selection(&mut stream, rank, selection)
         })();
         if let Err(error) = result {
+            if error.is::<cuteafd_transport::traffic::TrafficProbeOnly>() { continue; }
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             tracing::warn!(%error, "empty worker rejects expert traffic or changed selection");
         }
@@ -133,16 +134,20 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         listener.set_nonblocking(true)?;
         tracing::info!(rank = config.rank, world = config.world, "native worker bootstrap ready");
         let deadline = Instant::now() + Duration::from_secs(1200);
-        let mut stream = loop {
+        let (mut stream, selection) = loop {
             ensure!(Instant::now() < deadline, "coordinator worker selection timed out");
             match listener.accept() {
-                Ok((stream, _)) => break stream,
+                Ok((stream, _)) => match cuteafd_transport::worker_selection::receive_worker_selection(
+                    &stream, config.rank, deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(30))) {
+                    Ok(selection) => break (stream, selection),
+                    Err(error) if error.is::<cuteafd_transport::traffic::TrafficProbeOnly>() => continue,
+                    Err(error) => return Err(error),
+                },
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(100)),
                 Err(error) => return Err(error.into()),
             }
         };
         let selected = (|| -> Result<_> {
-            let selection = cuteafd_transport::worker_selection::receive_worker_selection(&stream, config.rank, Duration::from_secs(1200))?;
             let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
                 &config.snapshot, geometry, config.world, config.topology)?;
             selection.validate_for(&identity)?;
@@ -183,13 +188,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // to the largest projection (hundreds of MB of unified memory on GB10);
     // requests stage far smaller rows, so drop it and let them regrow it.
     let released = library.release_sync_h2d_staging()?;
-    // CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps the checkpoint pages cached.
-    let cached_before = crate::shared::memory_report::cached_bytes();
-    let advised = if std::env::var("CUTEAFD_SPARK_DROP_PAGE_CACHE").is_ok_and(|v| v == "0") { 0 }
-        else { cuteafd_loader::page_cache::drop_snapshot_pages(&config.snapshot) };
-    tracing::info!(released_bytes = released, page_cache_advised_bytes = advised, cached_before,
-        cached_after = crate::shared::memory_report::cached_bytes(),
-        "released load-time pinned upload staging and checkpoint page cache");
+    tracing::info!(released_bytes = released, "released load-time pinned upload staging");
     let allocated = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
         weights.execution(&library, &config, remaining)
@@ -285,6 +284,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                             Err(error) if error.is::<cuteafd_transport::worker_selection::WorkerSelectionOnly>() => {
                                 tracing::debug!("acknowledged unchanged worker selection")
                             }
+                            Err(error) if error.is::<cuteafd_transport::traffic::TrafficProbeOnly>() => {}
                             Err(error) if error.is::<cuteafd_transport::FlowProbesOnly>() => {
                                 tracing::debug!("served RDMA flow probes")
                             }

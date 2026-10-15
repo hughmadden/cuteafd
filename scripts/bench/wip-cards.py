@@ -191,9 +191,36 @@ def overrides_from(items):
     return overrides
 
 
+def probe_selection(items, cards, arms):
+    probes = {card['name']: set(card.get('probes', [])) | {'fabric'} for card in cards}
+    scoped = {}
+    for item in items:
+        selector = item.split(':')
+        if len(selector) == 2:
+            card, values = selector
+            arm = None
+        elif len(selector) == 3:
+            arm, card, values = selector
+            if arm not in arms:
+                raise ValueError('probe arm must be selected')
+        else:
+            raise ValueError('probe needs CARD:probes or ARM:CARD:probes')
+        if card not in probes:
+            raise ValueError('probe card must be selected')
+        values = set(filter(None, values.split(',')))
+        if not values <= {'image', 'memory', 'console', 'fabric'}:
+            raise ValueError('unknown probe')
+        if arm is None:
+            probes[card] = values
+        else:
+            scoped.setdefault(arm, {})[card] = values
+    return probes, scoped
+
+
 def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None):
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'))
+    entry['fabric'] = 'fabric' in probes
     values = config(entry['config'])
     values.update(entry.pop('set', {}))
     simulated = values.pop('BENCH_SIMULATED', '') or 'sim5090' in entry['name'] or 'sim-5090' in entry['name']
@@ -227,9 +254,13 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     for key in list(values):
         if re.fullmatch(r'SPARK_[0-5]_(HOST|LANE_A|LANE_B)', key):
             del values[key]
+    # Only V4.1's launcher reads a secondary rail; other families reject the key.
+    lane_b = entry.get('family') == 'deepseek_v41'
     for i, host in enumerate(hosts):
         index = HOSTS.index(host) + 1
-        values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}', f'SPARK_{i}_LANE_B': f'10.55.1.{index}'})
+        values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}'})
+        if lane_b:
+            values[f'SPARK_{i}_LANE_B'] = f'10.55.1.{index}'
     values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm.get('wip_instance', arm['instance']), INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPU=str(gpus[0]))
     run_args = ['--wip', arm['slot']]
     if 'release' in arm:
@@ -779,6 +810,18 @@ def classify(row, launched):
     return 'measurement'
 
 
+def fabric_assessment(phases):
+    """Assessment hook for timed background traffic; byte evidence stays per port."""
+    caveats = []
+    for phase in phases:
+        if not phase.get('timed'):
+            continue
+        for warning in phase.get('assessments', []):
+            if warning.startswith(('foreign traffic:', 'SparkNest traffic:', 'storage attribution unavailable:')):
+                caveats.append(f"{phase.get('name', '?')}: {warning}; rerun in a quiet window before accepting A/B")
+    return list(dict.fromkeys(caveats))
+
+
 def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
@@ -791,6 +834,7 @@ def summarize_job(job, exit_code):
     if state.exists():
         row['smoke'] = json.loads(state.read_text())
     outcome = (row.get('smoke') or {}).get(job['entry']['name']) or {}
+    row['fabric'] = list(outcome.get('fabric') or [])
     # The first real error wins: the launcher's own words, then smoke's outcome
     # (its wrapper "./run.sh exited ..." last), then checks derived below.
     found = [e for e in (first_log_error(dest, job['entry']['name']), outcome.get('error')) if e]
@@ -806,6 +850,8 @@ def summarize_job(job, exit_code):
         fail(row, f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
+        if not row['fabric']:
+            row['fabric'].extend(report.get('fabric') or [])
         present = {p['id'] for p in report.get('panels', [])} | ({'baseline'} if report.get('baseline') else set())
         missing = set(requested_panels(job['entry'].get('profile', 'smoke'))) - present
         if missing:
@@ -815,7 +861,7 @@ def summarize_job(job, exit_code):
         quality = baseline.get('quality') or {}
         checks = quality.get('checks', [])
         fidelity = next((c for c in checks if c['id'] == 'fidelity'), {})
-        row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=(card.get('concurrent') or {}).get('aggregate_tok_s'), **{'8K': (card.get('prefill') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] in ('cache_exact', 'cache')), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
+        row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=next((c['aggregate_tok_s'] for c in card.get('concurrency', []) if c['width'] == 8), None), **{'8K': (card.get('prefill') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] in ('cache_exact', 'cache')), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
         # Report/panel statuses serialize as 'failed'; Rust CheckStatus as 'fail'.
         failed = {'fail', 'failed'}
         bad = [c['id'] + (': ' + c['summary'] if c.get('summary') else '') for c in checks if c.get('status') in failed]
@@ -858,6 +904,8 @@ def summarize_job(job, exit_code):
             fail(row, f'expected one sweep.json, found {len(sweeps)}')
         else:
             sweep = json.loads(sweeps[0].read_text())
+            if not outcome.get('fabric'):
+                row['fabric'].extend(p['fabric'] for p in [*sweep.get('points', []), *sweep.get('prefill', [])] if p.get('fabric'))
             row['sweep'] = sweep.get('points', [])
             for point in row['sweep']:
                 key = 'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}"
@@ -895,6 +943,8 @@ def summarize_job(job, exit_code):
             and job['entry'].get('profile') == 'panels:'
         if not row['requests'] and not prefill_only:
             fail(row, 'matched prompts produced no per-request console rounds')
+    row['fabric_caveats'] = fabric_assessment(row['fabric'])
+    row['ab_verdict'] = 'rerun' if row['fabric_caveats'] else 'eligible'
     row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)
     return row
@@ -1005,7 +1055,9 @@ def write_summary(state, rows, arms):
                    key=lambda k: (int(k.split()[1]), k))
     present = [m for m in (*SUMMARY_METRICS, *extra) if any(isinstance(r.get(m), (int, float)) for r in rows)]
     medians, paired = summary_math(rows, names, present or METRICS)
-    save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired))
+    caveats = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], caveat=c) for r in rows for c in r.get('fabric_caveats', [])]
+    save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired,
+                                    ab_verdict='rerun' if caveats else 'eligible', fabric_caveats=caveats))
     def cell(value):
         if isinstance(value, float):
             return f'{value:.4g}'
@@ -1036,6 +1088,25 @@ def write_summary(state, rows, arms):
         text += '## Results\n\n| Card | ' + ' | '.join(present) + ' |\n| --- |' + ' ---: |' * len(present) + '\n'
         for m in medians:
             text += f"| {m['card']} | " + ' | '.join(cell(m.get(k)) for k in present) + ' |\n'
+        text += '\n'
+    if caveats:
+        text += '## A/B Verdict: Rerun\n\nTimed fabric contamination or unknown attribution prevents accepting this A/B. Request correctness and raw rates remain recorded.\n\n'
+        for c in caveats:
+            text += f"- {c['card']} / {c['arm']} / r{c['repeat']}: {c['caveat']}\n"
+        text += '\n'
+    if any(r.get('fabric') for r in rows):
+        text += '## Fabric By Arm And Phase\n\nPer-port tx+rx bytes; not unique-byte fabric totals. Engine headers are ceil(bytes/MTU)*62 lower bounds; SparkNest uses per-op packets*62. Residual includes ACK/retry and sample skew. Unknown is not zero.\n\n'
+        text += '| Card | Arm | Repeat | Phase | Host / port | NIC | Engine | SparkNest | Headers est. | Residual |\n| --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |\n'
+        for r in rows:
+            for phase in r.get('fabric', []):
+                for p in phase.get('ports', []):
+                    def pair(tx, rx):
+                        a, b = p.get(tx), p.get(rx)
+                        return a + b if isinstance(a, int) and isinstance(b, int) else 'unknown'
+                    values = [pair(a,b) for a,b in [('sent_bytes','received_bytes'), ('engine_sent_bytes','engine_received_bytes'),
+                              ('sparknest_sent_bytes','sparknest_received_bytes'), ('estimated_header_sent_bytes','estimated_header_received_bytes'),
+                              ('foreign_sent_bytes','foreign_received_bytes')]]
+                    text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {cell(phase.get('name'))} | {cell(p.get('host'))} {cell(p.get('device'))}/{p.get('port')} | " + ' | '.join(map(cell, values)) + ' |\n'
         text += '\n'
     text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |\n'
     for r in rows:
@@ -1318,7 +1389,7 @@ def build_lock_mode(revision):
     native = run(['git', '-C', str(REPO), 'show', revision + ':scripts/build/build-wip-artifacts.sh']).stdout
     # Native-phase sources lock only their export: on the host under a held fair
     # turn (CUTEAFD_WIP_HOST_EXPORT_TURN) or, older, through a mounted lock file.
-    if 'CUTEAFD_WIP_EXPORT_LOCKS' in text and ('CUTEAFD_WIP_HOST_EXPORT_TURN' in text or 'CUTEAFD_WIP_EXPORT_LOCK_FILES' in native):
+    if 'CUTEAFD_WIP_EXPORT_LOCKS' in text and ('wip_capped_export()' in text or 'CUTEAFD_WIP_HOST_EXPORT_TURN' in text or 'CUTEAFD_WIP_EXPORT_LOCK_FILES' in native):
         return 'native-phase'
     return 'legacy-full-build'
 
@@ -1515,7 +1586,7 @@ def main():
     parser.add_argument('--binary', default='cuteafd')
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
     parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:CARD:KEY=VALUE', help='arm-specific setting, overriding --set')
-    parser.add_argument('--probe', action='append', default=[], metavar='CARD:image,memory,console')
+    parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,memory,console,fabric')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
     parser.add_argument('--lossless-set', type=Path, metavar='FILE', help='case file for the spec_lossless_set panel '
@@ -1670,13 +1741,8 @@ def main():
                 card['post_load_c1'] = True
         if args.trace and card.get('family') == 'deepseek_v41' and not launcher_forwards_v41_trace(args.repo):
             raise ValueError(f"{card['name']}: this checkout's launcher does not forward SPECULATION_TRACE on the V4.1 path")
-    probes = {card['name']: set(card.get('probes', [])) for card in cards}
+    probes, arm_probes = probe_selection(args.probe, cards, arms)
     expected = {card['name']: card.get('expected_pool') for card in cards}
-    for item in args.probe:
-        name, values = item.split(':', 1)
-        probes[name] = set(values.split(','))
-        if not probes[name] <= {'image', 'memory', 'console'}:
-            raise ValueError('unknown probe')
     for item in args.expect_pool:
         name, value = item.split('=', 1)
         expected[name] = int(value)
@@ -1719,7 +1785,7 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']], expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
@@ -1780,7 +1846,7 @@ def main():
                     Path(job['entry']['set']['PROFILE_DIR']).mkdir(exist_ok=True)
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
-    fields = (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+    fields = ['fabric'] + (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \

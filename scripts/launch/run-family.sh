@@ -61,13 +61,16 @@ if ((${#cfg_overrides[@]})); then
   config="$merged_path"
 fi
 # Plain KEY=VALUE lines; the launch reads only the keys below.
-declare -A cfg
+declare -A cfg cfg_file=()
 while IFS='=' read -r key value; do
   release_known_key "$key" || release_die "unknown configuration key: $key"
   cfg[$key]="$value"
+  # Only keys the file (or a launch override) set. Later expansion writes
+  # SPARK_<rank>_* into cfg without the operator having named them.
+  [[ -z "$value" ]] || cfg_file[$key]=1
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
-[[ -z "${SPARK_COUNT:-}" ]] || cfg[SPARK_COUNT]="$SPARK_COUNT"
-[[ -z "${SPARK_HOSTS:-}" ]] || cfg[SPARK_HOSTS]="$SPARK_HOSTS"
+[[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
+[[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
 # Owner-indexed plans name entry/head first; CDI exposes physical device order.
 dual_owner_media_device() {
@@ -85,6 +88,283 @@ key() {
   if [[ -n "${cfg[$1]:-}" ]]; then printf '%s' "${cfg[$1]}"
   elif [[ -n "${cfg[$2]:-}" ]]; then echo "warning: config key $2 is deprecated; use $1" >&2; printf '%s' "${cfg[$2]}"
   else printf '%s' "${3:-}"; fi
+}
+# A configuration key this family's launch path never reads is a hard error.
+# Unknown names already die at parse ("unknown configuration key"). The allowed
+# set is static: the keys that path reads (get/key/cfg, or, for DeepSeek V4.1,
+# the variables its loader and launch read). Empty values are not keys.
+release_reject_unused_keys() {
+  local family="$1"
+  shift
+  local -A allowed=()
+  local key
+  for key in "$@"; do allowed[$key]=1; done
+  local -a unused=()
+  for key in "${!cfg_file[@]}"; do
+    [[ -n "${allowed[$key]:-}" ]] || unused+=("$key")
+  done
+  ((${#unused[@]} == 0)) || release_die "unused configuration key: $(printf '%s\n' "${unused[@]}" | sort | paste -sd' ' -)"
+}
+_spark_slot_keys() {
+  local rank suffix
+  for rank in 0 1 2 3 4 5 6 7; do
+    for suffix in "$@"; do printf 'SPARK_%s_%s\n' "$rank" "$suffix"; done
+  done
+}
+# Keys every non-V4.1 launch path reads, plus the keys only that family reads.
+# WIP_INSTANCE and WIP_ROOT are the shared `--wip` slot staging root (the
+# start_coordinator block below passes both to every rank's staging script).
+_family_allowed_keys() {
+  cat <<'EOF'
+VISION
+AUDIO
+VISION_REPLICAS
+COORDINATOR_GPU_BUDGET_GIB
+RDMA_BOND_BALANCE
+HOST_ISA
+ATTENTION_PLACEMENT
+INSTANCE
+MODEL_ID
+MODEL_REVISION
+SPARK_COUNT
+SPARK_HOSTS
+EXPERT_BACKEND
+COORDINATOR_DOCKER_INFERENCE
+COORDINATOR_DOCKER_DEV
+WIP_INSTANCE
+WIP_ROOT
+SPECULATOR
+EMBEDDING
+COORDINATOR_GPUS
+COORDINATOR_GPU
+CONCURRENCY
+CHAT_TEMPLATE_FROM
+FULL_PREFILL_LOGITS
+SPECULATOR_DRAFTS
+DECODE_SHARE
+EXPERT_INPUT
+SERVED_MODEL_ID
+SPARK_EXPERT_DOCKER_INFERENCE
+SPARK_EXPERT_DOCKER_DEV
+EXPERT_PORT
+ADDR
+SPARK_DEVICE_BUDGET_BYTES
+RTX_GPUS
+COORDINATOR_SPLIT
+COORDINATOR_SPLIT_GPU
+POOL_TOKENS
+PREFIX_CACHE_ENTRIES
+HOST_CACHE_BYTES
+MAX_CONTEXT_TOKENS
+PREFILL_BATCH_TOKENS
+RTX_EXPERT_LAYERS
+MAX_OUTPUT_TOKENS
+PROBE_DUMP_ROOT
+DRAFT_SURVIVAL_LENGTHS
+SPECULATION_TRACE
+TARGET_HEAD
+SPARK_INTAKE
+CONSOLE_TEXT
+FP8_EXPERT_PREFILL
+ATTENTION_PLAN_ROWS
+THERMAL
+PROFILE
+PROFILE_DIR
+PROFILE_NCU_KERNEL
+PROFILE_NCU_COUNT
+PROFILE_NCU_SET
+PROFILE_NSYS_GPU_METRICS
+API_KEY_FILE
+ENABLE_BENCH
+USAGE
+GATEWAY
+EOF
+  _spark_slot_keys HOST LANE_A
+  case "$1" in
+    deepseek_v4)
+      cat <<'EOF'
+RTX_EXPERT_PEER
+SPECULATOR_MODEL_ID
+SPECULATOR_MODEL_REVISION
+EOF
+      ;;
+    glm5)
+      cat <<'EOF'
+RTX_EXPERT_PEER
+L2_PREFETCH
+FP8_SCALES
+SPECULATOR_FP8
+DRAFT_CONTEXT_SLOTS
+DRAFT_SEQUENCES
+SPECULATOR_MODEL_ID
+SPECULATOR_MODEL_REVISION
+EOF
+      ;;
+    glm5_flash)
+      cat <<'EOF'
+L2_PREFETCH
+FP8_SCALES
+SPECULATOR_FP8
+DRAFT_CONTEXT_SLOTS
+DRAFT_SEQUENCES
+SPECULATOR_MODEL_ID
+SPECULATOR_MODEL_REVISION
+MEDIA_CACHE_BYTES
+PREFIX_CACHE_MARK_MIB
+GLM5_FLASH_FP8_MODEL_ID
+GLMF_FP8_MODEL_ID
+GLM5_FLASH_FP8_MODEL_REVISION
+GLMF_FP8_MODEL_REVISION
+GLM5_FLASH_KDA_FP8
+GLMF_KDA_FP8
+GLM5_FLASH_KDA_SPLIT
+GLM5_FLASH_INDEX_CACHE
+GLM5_FLASH_PREFILL_LANES
+GLM5_FLASH_PREFILL_LANE_ROWS
+GLM5_FLASH_HEADROOM_GIB
+GLM5_FLASH_GRAPH_BUDGET_MIB
+GLM5_FLASH_FP8_HEAD
+GLMF_FP8_HEAD
+GLM5_FLASH_DRAFT_LINEAR
+GLM5_FLASH_TARGET_HEAD
+GLM5_FLASH_FP8_PREFILL
+GLMF_FP8_PREFILL
+GLM5_FLASH_EXL3_WORKER_PATH
+GLM5_FLASH_EXL3_ROUTE_DUMP
+GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS
+GLM5_FLASH_KDA_STATE
+GLM5_FLASH_EXL3_SCHEDULE
+GLM5_FLASH_PREFIX_MARKS
+GLM5_FLASH_REPLAY_RECORDS
+GLM5_FLASH_DECODE_ROWS
+GLM5_FLASH_PREFILL_BATCH
+GLM5_FLASH_VERIFY_POLICY
+GLM5_FLASH_ROUTE_RING_CHECK
+GLM5_FLASH_REMOTE_DRAFTER
+GLM5_FLASH_SPEC_TAU
+EOF
+      ;;
+    mimo_v2)
+      cat <<'EOF'
+MIMO_WEIGHT_POLICY
+MIMO_FP8_HEAD
+MIMO_FP8_O_PROJ
+SPECULATOR_MODEL_ID
+SPECULATOR_MODEL_REVISION
+SPECULATOR_DEPTH
+MEDIA_CACHE_BYTES
+HTTP_QUEUE_DEPTH
+HTTP_QUEUE_WAIT_MS
+MIMO_PREFIX_DRAFT
+MIMO_SNAPSHOT_WAIT
+MIMO_HOST_CACHE
+MIMO_PREFILL_CHUNK_S
+PREFIX_CACHE_MARK_MIB
+PREFIX_PARTIAL
+KV_CACHE
+DECODE_GRAPHS
+RTX_EXPERT_PEER
+L2_PREFETCH
+FP8_SCALES
+DRAFT_CONTEXT_SLOTS
+DRAFT_SEQUENCES
+SPECULATOR_FP8
+EOF
+      ;;
+    qwen4)
+      cat <<'EOF'
+KV_CACHE
+QWEN_FP8_DECODE
+QWEN_FP8_HEAD
+QWEN_STARTUP_GRAPHS
+SPECULATOR_DEPTH
+SPECULATOR_FP8
+MEDIA_CACHE_BYTES
+L2_PREFETCH
+FP8_SCALES
+EOF
+      ;;
+  esac
+}
+# DeepSeek V4.1 reads shell variables after release_load_config, not get().
+_v41_allowed_keys() {
+  cat <<'EOF'
+ADDR
+API_KEY_FILE
+ATTENTION_PLACEMENT
+ATTENTION_PLAN_ROWS
+AUDIO
+CONCURRENCY
+CONSOLE_TEXT
+COORDINATOR_DOCKER_DEV
+COORDINATOR_DOCKER_INFERENCE
+COORDINATOR_GPU
+COORDINATOR_GPU_BUDGET_GIB
+COORDINATOR_GPU_HEADROOM_GIB
+COORDINATOR_GPU_PCI_BUS_ID
+COORDINATOR_GPU_UUID
+DRAFT_SURVIVAL_LENGTHS
+DSPARK_DRAFT_LIMIT
+DSPARK_DRAFT_POLICY
+EMBEDDING
+ENABLE_BENCH
+EXL3_PAIRED_TP4
+EXPERT_FORMAT
+EXPERT_PORT
+FP8_EXPERT_PREFILL
+GATEWAY
+HOST_CACHE_BYTES
+HOST_ISA
+HTTP_QUEUE_DEPTH
+HTTP_QUEUE_WAIT_MS
+INSTANCE
+KV_POOL_SIZE
+KV_POOL_TOKENS
+MAX_CONTEXT_TOKENS
+MAX_OUTPUT_TOKENS
+MEMORY_RESERVATION
+MODEL_ID
+MODEL_REVISION
+MODEL_VARIANT
+POOL_TOKENS
+PREFILL_BATCH_TOKENS
+PREFIX_CACHE_ENTRIES
+PROBE_DUMP_ROOT
+PROFILE
+PROFILE_DIR
+PROFILE_NCU_COUNT
+PROFILE_NCU_KERNEL
+PROFILE_NCU_SET
+PROFILE_NSYS_GPU_METRICS
+RDMA_BOND_BALANCE
+RTX_EXPERT_LAYERS
+RTX_GPUS
+SPARK_COUNT
+SPARK_DEVICE_BUDGET_BYTES
+SPARK_EP
+SPARK_EXPERT_DOCKER_DEV
+SPARK_EXPERT_DOCKER_INFERENCE
+SPARK_HOSTS
+SPARK_REDUCTION_MIN_ROWS
+SPARK_TP
+SPARKINFER_EXL3
+SPECULATION_TRACE
+SPECULATOR
+SPARK_INTAKE
+TARGET_HEAD
+THERMAL
+TP2_ATTENTION
+TP2_DSPARK_EXPERTS
+TP2_OUTPUT_PROJECTION
+TP2_QUERY_PROJECTION
+USAGE
+V41_FP8_HEAD
+VISION
+VISION_REPLICAS
+WIP_INSTANCE
+WIP_ROOT
+EOF
+  _spark_slot_keys HOST LANE_A LANE_B
 }
 vision="$(get VISION auto)"
 audio="$(get AUDIO auto)"
@@ -234,7 +514,11 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 #                     For steady-state kernels, use the native harnesses.
 # nsys and ncu wrap the coordinator only (one of them per launch); Spark workers
 # get the other switches. Both run as the host user; they need the driver's
-# RmProfilingAdminOnly=0 and no extra capabilities.
+# RmProfilingAdminOnly=0 and no extra capabilities. The binary is resolved inside
+# the container at start, not from the host's install: /usr/local/bin/<tool> if
+# it is there, otherwise the newest versioned copy (ncu under
+# /opt/nvidia/nsight-compute/<version>/ncu; nsys also accepts
+# /usr/local/cuda/bin/nsys, then /opt/nvidia/nsight-systems/<version>/nsys).
 # Every profiled container also gets CUTEAFD_PROFILE_HOST (the physical host,
 # never the container id). PROFILE_DIR=/abs/dir is created on each host, mounted
 # at the same path and passed as CUTEAFD_PROFILE_DIR; writers name files by host
@@ -570,6 +854,7 @@ count_args+=(--embedding-placement "$EMBEDDING")
 count_prefill=0
 ((RELEASE_PREFILL_EXPLICIT == 0)) || count_prefill="$PREFILL_BATCH_TOKENS"
 [[ "$SPECULATOR" != off ]] || count_args+=(--native-mtp-layers 0)
+release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
   "${count_command[@]}" plan "/hf/$snapshot_rel" --vision "$VISION" --audio off \
   --json --layout --require-ready "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
@@ -702,7 +987,7 @@ if [[ -n "$spark_tp_roles_required" ]]; then
     if [[ -n "${wip_slot:-}" ]]; then
       # Slots overlay a toolchain image: its label cannot describe their exports.
       advertised_roles="$(release_ssh -o ConnectTimeout=10 "$host" \
-        "if docker container inspect '$wip_spark_container' >/dev/null 2>&1; then docker exec -i '$wip_spark_container' python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; else WIP_SLOTS=\"\$(r=${WIP_ROOT:-}; i=${WIP_INSTANCE:-}; echo \"\${r:-\$HOME/.cache/cuteafd/builds/wip\${i:+-\$i}}\")/slots\" python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; fi" <<'PY'
+        "if [ \"\$(docker container inspect -f '{{.State.Running}}' '$wip_spark_container' 2>/dev/null)\" = true ]; then docker exec -i '$wip_spark_container' python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; else WIP_SLOTS=\"\$(r=${WIP_ROOT:-}; i=${WIP_INSTANCE:-}; echo \"\${r:-\$HOME/.cache/cuteafd/builds/wip\${i:+-\$i}}\")/slots\" python3 - '$wip_slot' '${expert_format:-native}' '$spark_tp_roles_required'; fi" <<'PY'
 import hashlib
 import json
 import os
@@ -849,7 +1134,7 @@ fi
 rdma_env_args=("${bond_args[@]}")
 # Optional V4.1 coordinator switches from the operator's environment, forwarded only when set.
 # (CONSOLE_TEXT and THERMAL are configuration keys, as for every family.)
-for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_TP2_TOKEN_SUMS CUTEAFD_V41_DEVICE CUTEAFD_V41_DEVICE_LANES CUTEAFD_SPARK_WRITE CUTEAFD_V41_FP8_HEAD CUTEAFD_V41_STAGING_FENCE; do
+for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_V41_DEVICE CUTEAFD_V41_DEVICE_LANES CUTEAFD_SPARK_WRITE CUTEAFD_V41_FP8_HEAD CUTEAFD_V41_STAGING_FENCE; do
   # The V41_FP8_HEAD key (validated above) takes the place of its environment spelling.
   [[ "$switch_name" != CUTEAFD_V41_FP8_HEAD || ${#v41_fp8_head_args[@]} == 0 ]] || continue
   [[ -z "${!switch_name:-}" ]] || rdma_env_args+=(-e "$switch_name=${!switch_name}")
@@ -1048,14 +1333,6 @@ for i in "${!hosts[@]}"; do
   done
 done
 
-# Loading leaves checkpoint pages cached on every Spark (sparknest passthrough), and GB10
-# CUDA allocations do not reclaim page cache: drop it once every rank is resident.
-# CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
-if ((${#hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] && command -v nest >/dev/null; then
-  drop_hosts=(); for host in "${hosts[@]}"; do drop_hosts+=(--host "$host"); done
-  nest drop-caches "${drop_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
-fi
-
 # Acknowledge the published boundary for every handoff launch, including the
 # single-RTX explicit-topology case the coordinator now publishes. Only a launch
 # with no handoff starts the coordinator at this point.
@@ -1176,6 +1453,9 @@ wip_layout="" wip_mount_args=() wip_worker_args=""
 if [[ -n "$wip_slot" ]]; then
   [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "invalid WIP slot name: $wip_slot" >&2; exit 2; }
   WIP_INSTANCE="${WIP_INSTANCE:-$(get WIP_INSTANCE)}"
+  # The WIP root the slot was staged under: the environment wins, else the
+  # config (as V4.1's release_load_config reads it), else the default layout.
+  WIP_ROOT="${WIP_ROOT:-$(get WIP_ROOT)}"
   release_wip_slot_instance "$wip_slot"
   release_wip_serving_layout "$instance"
   wip_coordinator_container="$(release_wip_container coordinator)"
@@ -1202,8 +1482,8 @@ qwen_exl3=0
 qwen_nvfp4=0
 qwen_mtp=0
 if [[ "$family" == qwen4 ]]; then
-  kv_format="$(get KV_FORMAT fp8)"
-  case "$kv_format" in bf16|fp8) ;; *) release_die "KV_FORMAT must be bf16 or fp8" ;; esac
+  kv_cache="$(get KV_CACHE fp8)"
+  case "$kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   # NVFP4: a ModelOpt publication with 4-bit weight groups (nvidia/Qwen3.8-Flash-Next-NVFP4).
   qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
   read -r qwen_exl3 qwen_nvfp4 qwen_mtp <<<"$qwen_features"
@@ -1425,8 +1705,13 @@ if [[ $family == mimo_v2 ]]; then
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
-  # dims; SWA rings stay BF16) or bf16.
-  [[ -z "$(get KV_CACHE)" ]] || family_args+=(--kv-cache "$(get KV_CACHE)")
+  # dims; SWA rings stay BF16) or bf16. Unset omits --kv-cache so the daemon default (int8) applies.
+  mimo_kv="$(get KV_CACHE)"
+  case "$mimo_kv" in
+    "") ;;
+    int8|bf16) family_args+=(--kv-cache "$mimo_kv") ;;
+    *) release_die "KV_CACHE must be int8 or bf16" ;;
+  esac
   # DECODE_GRAPHS=on: decode/verify steps replay per-layer CUDA graph segments captured at startup
   # (default off: neutral against the host-driven Spark exchange, 0.4-1.2 GiB of graphs).
   case "$(get DECODE_GRAPHS)" in
@@ -1449,7 +1734,7 @@ fi
 # resident E4M3 copy; QWEN_FP8_HEAD=on|off does the same for the head target and
 # MTP share. Unset keeps the engine defaults.
 if [[ $family == qwen4 ]]; then
-  family_args+=(--kv-cache "$kv_format")
+  family_args+=(--kv-cache "$kv_cache")
   for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
     mode="$(get "QWEN_${key%%:*}")"
     case "$mode" in
@@ -1823,13 +2108,13 @@ if [[ $family == glm5_flash ]]; then
   # GLM5_FLASH_KDA_STATE: the KDA recurrent state, f32 (default) or bf16: half the state and
   # prefix-mark bytes, computed in FP32 and rounded after every decode/verify/commit row and at
   # each chunked-prefill window end (bf16-tile: after every 16-row prefill tile). It runs the
-  # BF16-projection KDA programs on one GPU (GLM5_FLASH_KDA_FP8=off, no head split).
+  # BF16 or single-copy FP8 KDA projections on one GPU (no head split).
   kda_state="$(get GLM5_FLASH_KDA_STATE f32)"
   case "$kda_state" in
     ""|f32) ;;
     bf16|bf16-tile)
-      if [[ $kda_fp8 != off || $head_split != 0 ]]; then
-        echo "GLM5_FLASH_KDA_STATE=$kda_state runs the BF16-projection KDA programs on one GPU; set GLM5_FLASH_KDA_FP8=off without a head split" >&2
+      if [[ $head_split != 0 ]]; then
+        echo "GLM5_FLASH_KDA_STATE=$kda_state runs on one GPU, without a head split" >&2
         exit 2
       fi
       family_args+=(--kda-state "$kda_state") ;;
@@ -2070,7 +2355,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--decode-rows 128)
   fi
   if [[ "$family" == qwen4 ]]; then
-    plan_draft_args+=(--kv-cache "$kv_format")
+    plan_draft_args+=(--kv-cache "$kv_cache")
     for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
       case "$(get "QWEN_${key%%:*}")" in
         on) plan_draft_args+=("${key#*:}" true) ;;
@@ -2091,6 +2376,7 @@ audio_encoder_hash=""
       plan_draft_args+=("$flag" "$value")
     fi
   done
+  release_reject_unused_keys "$family" $(_family_allowed_keys "$family")
   # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
   plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout --require-ready \
@@ -2245,27 +2531,6 @@ if [[ -n "$device_map" ]]; then
   device_map_env="-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map"
   device_map_args=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map")
 fi
-# SparkNest cache management stays available when installed. Without it the
-# workers advise their checkpoint pages after loading; global sudo cache drops
-# are an explicit operator opt-in, never required infrastructure.
-spark_hosts=()
-spark_host_names=()
-for ((rank = 0; rank < ranks; rank++)); do
-  spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")")
-  spark_host_names+=("$(get "SPARK_${rank}_HOST")")
-done
-drop_spark_caches() {
-  if command -v nest >/dev/null; then nest drop-caches "${spark_hosts[@]}" >/dev/null; return; fi
-  if [[ "${CUTEAFD_GLOBAL_PAGE_CACHE_DROP:-0}" != 1 ]]; then
-    echo "SparkNest absent: workers use checkpoint fadvise(DONTNEED); no global cache drop."
-    return 0
-  fi
-  local host failed=0
-  for host in "${spark_host_names[@]}"; do
-    ssh -n "$host" 'sync; echo 1 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null' || failed=1
-  done
-  return "$failed"
-}
 if [[ -n "$wip_slot" ]]; then
   # The slot must exist everywhere before anything starts, and the development images must
   # carry the SparkInfer revision this checkout pins.
@@ -2310,7 +2575,6 @@ STAGE
       { echo "$host: WIP slot $wip_slot is not staged (build it with ./wip.sh --slot $wip_slot)" >&2; exit 1; }
   done
 fi
-((ranks == 0)) || drop_spark_caches || echo "warning: could not drop Spark page caches" >&2
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   lane="$(get "SPARK_${rank}_LANE_A")"
@@ -2367,12 +2631,6 @@ print(matches[0])')"
     audio_backend="$backend"
   done
   family_args+=(--audio-encoder-backend "$audio_backend")
-fi
-# Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
-# workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
-# cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
-if ((ranks > 0 && ${#spark_hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]]; then
-  drop_spark_caches || echo "warning: could not drop Spark page caches after loading" >&2
 fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
