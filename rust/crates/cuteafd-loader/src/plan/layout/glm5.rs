@@ -4,9 +4,17 @@ use crate::plan::Checkpoint;
 use cuteafd_core::DType;
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 pub(super) fn resident(checkpoint: &Checkpoint, ranks: usize) -> anyhow::Result<Vec<Vec<(String, String, u64)>>> {
+    resident_owned(checkpoint, ranks, None)
+}
+
+pub(super) fn resident_owned(checkpoint: &Checkpoint, ranks: usize, owners: Option<&[u8]>)
+    -> anyhow::Result<Vec<Vec<(String, String, u64)>>> {
     anyhow::ensure!((1..=2).contains(&ranks), "GLM coordinator ranks");
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
+    anyhow::ensure!(owners.is_none_or(|owners| ranks == 2 && owners.len() == cfg.layers
+        && owners.iter().all(|&owner| owner < 2)), "GLM attention owner inventory");
     let tensors: BTreeMap<_, _> = checkpoint.tensors.iter().map(|t| (t.meta.name.as_str(), &t.meta)).collect();
     let tensor = |name: &str| tensors.get(name).copied().ok_or_else(|| anyhow::anyhow!("missing GLM operand {name}"));
     let mut groups = vec![BTreeMap::<(String, String), u64>::new(); ranks];
@@ -29,37 +37,42 @@ pub(super) fn resident(checkpoint: &Checkpoint, ranks: usize) -> anyhow::Result<
             Ok((t.shape[0] as u64 * t.shape[1] as u64, (t.shape[0] as u64).div_ceil(128) * (t.shape[1] as u64).div_ceil(128) * 4))
         };
         for rank in 0..ranks {
-            for name in [format!("{p}.input_layernorm.weight"), format!("{p}.post_attention_layernorm.weight"),
-                format!("{attn}.q_a_layernorm.weight"), format!("{attn}.kv_a_layernorm.weight")] {
+            for name in [format!("{p}.input_layernorm.weight"), format!("{p}.post_attention_layernorm.weight")] {
                 put(rank, "norm", "bf16", tensor(&name)?.byte_length);
             }
-            put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, qkv_rows * h * if bf16 { 2 } else { 1 });
-            if !bf16 {
-                let grid = qkv.iter().map(|n| projection(n).map(|(_, s)| s)).sum::<anyhow::Result<u64>>()?;
-                put(rank, "attention", "fp8-scale", grid);
-                put(rank, "attention", "fp8-scale", qkv_rows * h.div_ceil(128) * 4);
-            }
-            for name in [format!("{attn}.q_b_proj.weight"), format!("{attn}.o_proj.weight")] {
-                let (values, scales) = projection(&name)?;
-                put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values / ranks as u64 * if bf16 { 2 } else { 1 });
-                if !bf16 { put(rank, "attention", "fp8-scale", scales / ranks as u64); }
-            }
-            for width in [cfg.qk_nope_head_dim, cfg.v_head_dim] {
-                let values = cfg.heads as u64 / ranks as u64 * cfg.kv_lora_rank as u64 * width as u64;
-                put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values * if bf16 { 2 } else { 1 });
-                if !bf16 { put(rank, "attention", "fp8-scale", values / 64 * 4); }
-            }
-            if cfg.indexers[layer] == GlmIndexer::Full {
-                let name = format!("{attn}.indexer.wq_b.weight");
-                let index_bf16 = native && tensor(&name)?.dtype == DType::Bf16;
-                let (values, scales) = projection(&name)?;
-                put(rank, "indexer", if index_bf16 { "bf16" } else { "fp8" }, values * if index_bf16 { 2 } else { 1 });
-                if !index_bf16 { put(rank, "indexer", "fp8-scale", scales); }
-                let ik = ["wk.weight", "weights_proj.weight"].into_iter().map(|suffix| tensor(&format!("{attn}.indexer.{suffix}"))
-                    .map(|t| t.shape.iter().product::<usize>() as u64 * 2)).sum::<anyhow::Result<u64>>()?;
-                put(rank, "indexer", "bf16", ik);
-                for suffix in ["k_norm.weight", "k_norm.bias"] {
-                    put(rank, "indexer", "bf16", tensor(&format!("{attn}.indexer.{suffix}"))?.byte_length);
+            if owners.is_none_or(|owners| owners[layer] as usize == rank) {
+                let attention_ranks = if owners.is_some() { 1 } else { ranks };
+                for name in [format!("{attn}.q_a_layernorm.weight"), format!("{attn}.kv_a_layernorm.weight")] {
+                    put(rank, "norm", "bf16", tensor(&name)?.byte_length);
+                }
+                put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, qkv_rows * h * if bf16 { 2 } else { 1 });
+                if !bf16 {
+                    let grid = qkv.iter().map(|n| projection(n).map(|(_, s)| s)).sum::<anyhow::Result<u64>>()?;
+                    put(rank, "attention", "fp8-scale", grid);
+                    put(rank, "attention", "fp8-scale", qkv_rows * h.div_ceil(128) * 4);
+                }
+                for name in [format!("{attn}.q_b_proj.weight"), format!("{attn}.o_proj.weight")] {
+                    let (values, scales) = projection(&name)?;
+                    put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values / attention_ranks as u64 * if bf16 { 2 } else { 1 });
+                    if !bf16 { put(rank, "attention", "fp8-scale", scales / attention_ranks as u64); }
+                }
+                for width in [cfg.qk_nope_head_dim, cfg.v_head_dim] {
+                    let values = cfg.heads as u64 / attention_ranks as u64 * cfg.kv_lora_rank as u64 * width as u64;
+                    put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values * if bf16 { 2 } else { 1 });
+                    if !bf16 { put(rank, "attention", "fp8-scale", values / 64 * 4); }
+                }
+                if cfg.indexers[layer] == GlmIndexer::Full {
+                    let name = format!("{attn}.indexer.wq_b.weight");
+                    let index_bf16 = native && tensor(&name)?.dtype == DType::Bf16;
+                    let (values, scales) = projection(&name)?;
+                    put(rank, "indexer", if index_bf16 { "bf16" } else { "fp8" }, values * if index_bf16 { 2 } else { 1 });
+                    if !index_bf16 { put(rank, "indexer", "fp8-scale", scales); }
+                    let ik = ["wk.weight", "weights_proj.weight"].into_iter().map(|suffix| tensor(&format!("{attn}.indexer.{suffix}"))
+                        .map(|t| t.shape.iter().product::<usize>() as u64 * 2)).sum::<anyhow::Result<u64>>()?;
+                    put(rank, "indexer", "bf16", ik);
+                    for suffix in ["k_norm.weight", "k_norm.bias"] {
+                        put(rank, "indexer", "bf16", tensor(&format!("{attn}.indexer.{suffix}"))?.byte_length);
+                    }
                 }
             }
             let dense = layer < cfg.first_moe_layer;
@@ -124,4 +137,27 @@ mod tests {
         assert!(scales(&two[0]) > 2 * 64 * 512 * (192 + 256) / 2 / 64 * 4);
         assert_eq!(scales(&two[0]), scales(&two[1]));
     }
+    #[test]
+    fn owned_attention_residency_is_not_replicated_and_ffns_remain_split() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let one = resident(&checkpoint, 1).unwrap();
+        let heads = resident(&checkpoint, 2).unwrap();
+        let owners = crate::placement::families::glm5::attention_owners(
+            &GlmDsaConfig::from_hf(&checkpoint.config).unwrap(), 2).unwrap();
+        let owned = resident_owned(&checkpoint, 2, Some(&owners)).unwrap();
+        let bytes = |rank: &Vec<(String, String, u64)>, group: &str| rank.iter()
+            .filter(|(g, _, _)| g == group).map(|(_, _, b)| *b).sum::<u64>();
+        for group in ["attention", "indexer"] {
+            assert_eq!(owned.iter().map(|rank| bytes(rank, group)).sum::<u64>(), bytes(&one[0], group));
+        }
+        for rank in 0..2 {
+            for group in ["dense", "shared_expert", "router", "lm_head", "embedding"] {
+                assert_eq!(bytes(&owned[rank], group), bytes(&heads[rank], group));
+            }
+        }
+        assert!(resident_owned(&checkpoint, 2, Some(&[])).is_err());
+    }
+
 }

@@ -16,7 +16,9 @@
 //! them): tail copies run on each GPU's stream, and the host tier is off. Under `context`
 //! (K3) each page lives once, page id `i` on GPU `i & 1` at local page `i >> 1`
 //! ([`PageOwners::Parity`]): tail copies run on the owner, and the host tier stores each page
-//! once from its owner through a copy engine with both GPUs' pools registered.
+//! once from its owner through a copy engine with both GPUs' pools registered. Under `layers`,
+//! each logical page consists of disjoint owner-local layer records across both GPUs; tail
+//! copies and the host tier preserve all those segments without replicating any layer.
 use super::engine::{GlmEngine, GlmPlacement, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_BYTES};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::prefix::view;
@@ -48,10 +50,10 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
         Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)? })
     }
 
-    /// Host bytes of one page: one rank's layers (every GPU's are identical under heads, and
-    /// under context a page lives on one GPU).
+    /// Host bytes of one logical page: one complete layer set, replicated under heads,
+    /// parity-owned under context, or split into disjoint owner-local layer segments.
     pub fn page_bytes(&self) -> usize {
-        self.paged.iter().filter(|(rank, _, _)| *rank == 0)
+        self.paged.iter().filter(|(rank, _, _)| self.engine.layers_kv() || *rank == 0)
             .map(|(_, _, index)| PAGE_ROWS * RECORD_BYTES + index.map_or(0, |_| INDEX_PAGE_BYTES)).sum()
     }
 
@@ -141,8 +143,10 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
 
     fn drain(&self) -> Result<(), BoxError> {
         for rank in 0..self.engine.ranks() {
-            // SAFETY: the engine owns these streams.
-            unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank))? };
+            // SAFETY: the engine owns these rank-local streams and their storage.
+            self.engine.on(rank, || unsafe {
+                self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank))
+            })?;
         }
         Ok(())
     }
@@ -155,7 +159,7 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
         let (owner, page) = self.locate(page);
         let record_page = PAGE_ROWS * RECORD_BYTES;
         let mut out = Vec::new();
-        for &(_, records, index) in self.paged.iter().filter(|(rank, _, _)| *rank == owner) {
+        for &(_, records, index) in self.paged.iter().filter(|(rank, _, _)| self.engine.layers_kv() || *rank == owner) {
             out.push(DeviceRange { addr: records.ptr as u64 + (page * record_page) as u64, bytes: record_page });
             if let Some(index) = index {
                 out.push(DeviceRange { addr: index.ptr as u64 + (page * INDEX_PAGE_BYTES) as u64, bytes: INDEX_PAGE_BYTES });
@@ -219,7 +223,7 @@ fn prefill_digest(engine: &GlmEngine<'_>, placement: &mut GlmPlacement, tokens: 
 fn download(engine: &GlmEngine<'_>, addr: u64, bytes: usize, template: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
     // SAFETY: the engine owns this stream; draining it retires every write to the range.
     for rank in 0..engine.ranks() {
-        unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))? };
+        engine.on(rank, || unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank)) })?;
     }
     let mut out = vec![0u8; bytes];
     engine.library.copy_d2h(&mut out, CuteafdDeviceBuffer { ptr: addr as *mut std::ffi::c_void, bytes, ..template })?;

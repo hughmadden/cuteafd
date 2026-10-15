@@ -261,7 +261,7 @@ impl<'a> GlmEngine<'a> {
         Ok(())
     }
 
-    fn tp2_rank(
+    pub(super) fn tp2_rank(
         &self,
         pair: &Pair<'_>,
         rank: usize,

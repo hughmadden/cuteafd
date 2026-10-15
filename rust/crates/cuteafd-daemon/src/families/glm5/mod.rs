@@ -333,11 +333,17 @@ impl Opened {
         let draft_file = args.draft.as_deref().map(dflash::prefetch);
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+            .map_err(anyhow::Error::msg)?;
+        ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Layers) || devices.len() == 2,
+            "GLM layers attention requires two coordinator GPUs");
+        let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
+            .then(|| cuteafd_loader::placement::families::glm5::attention_owners(&self.cfg, layers)).transpose()?;
         let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, owners.as_deref()) })?;
         let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
             + model.head.buffer.bytes;
         let peer_bytes: usize = shares.iter().flatten().map(|l| l.bytes()).sum();
@@ -355,8 +361,12 @@ impl Opened {
         inventory.record("glm5", &gpus.iter().map(|(_, b)| match b {
             Baseline::Measured { free_bytes } => *free_bytes, _ => unreachable!(),
         }).collect::<Vec<_>>());
-        let scratch = |decode| glm::step_scratch(&self.cfg, devices.len() == 2, decode,
-            |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)));
+        let scratch = |decode| -> Result<_> {
+            let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
+            let mut scratch = glm::step_scratch(&self.cfg, devices.len() == 2, decode, lookup)?;
+            if owners.is_some() { scratch.programs = scratch.programs.max(glm::step_scratch(&self.cfg, false, decode, lookup)?.programs); }
+            Ok(scratch)
+        };
         let drafter_bytes = args.draft.as_deref().map(|snapshot| glm::drafter_bytes(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             self.library.sm_count()? as u64, args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
@@ -385,6 +395,7 @@ impl Opened {
             context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
         }
         let prefill_lanes = glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize;
+        let prefill_lanes = if owners.is_some() { prefill_lanes.min(2) } else { prefill_lanes };
         let exchange_f32 = glm::local_exchange_f32()?;
         let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),
             args.prefill_rows as u64, prefill_lanes as u64, exchange_f32, args.rtx_expert_layers,
@@ -418,8 +429,6 @@ impl Opened {
             expert_workspace: 0, tp2_workspace, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
             onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
                 else { args.rtx_expert_layers }, full_prefill_logits: args.full_prefill_logits, context };
-        let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
-            .map_err(anyhow::Error::msg)?;
         let (placement, working) = glm::solve_working_set(&inputs, serial_workspace, requested)?;
         let prefill_lanes = usize::try_from(working.spark.prefill_lanes)?;
         let selected_peers = if working.spark.spark_ranks > 0 { args.peers.as_deref() } else { None };
@@ -446,6 +455,7 @@ impl Opened {
             if let Some(range) = &tp2_range { loader.peer_routers(&mut peer_layers, range.clone())?; }
             engine.attach_peer(device, stream, peer_layers)?;
         }
+        if owners.is_some() { engine.bind_layer_execution(&placement)?; }
         if let Some(range) = tp2_range {
             let local = local.as_ref().context("TP2 placement without local package inventory")?;
             let devices = [crate::shared::memory::device::Device { library: &self.library, id: args.device },

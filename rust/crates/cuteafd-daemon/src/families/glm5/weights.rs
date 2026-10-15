@@ -31,10 +31,12 @@ pub(crate) struct GlmLayer<'a> {
     pub dense: bool,
     pub full_indexer: bool,
     pub mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics,
-    /// One GPU's share of a head split: q_b, kv_b and o_proj cover its heads
-    /// (o_proj gives a partial sum), the dense / shared-expert MLP its slice of
-    /// the intermediate (a partial sum); it runs the split (`glm2`) programs.
+    /// Dense/shared FFNs cover this GPU's intermediate slice (`glm2` programs).
     pub split: bool,
+    /// q_b, kv_b and o_proj cover this GPU's heads, producing a partial sum.
+    pub attention_split: bool,
+    /// Whole attention and its cache exist only on this rank when present.
+    pub attention_owner: Option<u8>,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
@@ -557,17 +559,10 @@ impl<'a> GlmLoader<'a> {
         Ok(out)
     }
 
-    /// Layer `layer`, one share per rank of this loader's head split (one
-    /// element without a split): rank `r` takes heads `r * heads / ranks ..`
-    /// (their q_b rows, kv_b heads and o_proj columns) and the matching slice
-    /// of the dense or shared-expert intermediate; every rank the replicated
-    /// latent projection (q_a | kv_a), its norms and the DSA indexer; rank 0
-    /// the router.
-    fn layer(&self, cfg: &GlmDsaConfig, layer: usize,
-        checkpoint: &cuteafd_loader::plan::checkpoint::Checkpoint) -> Result<Vec<GlmLayer<'a>>> {
+    fn attention_operands(&self, cfg: &GlmDsaConfig, layer: usize)
+        -> Result<Vec<HashMap<&'static str, DeviceAllocation<'a>>>> {
         let ranks = self.ranks();
         let p = format!("model.layers.{layer}");
-        let dense = layer < cfg.first_moe_layer;
         let full_indexer = cfg.indexers[layer] == GlmIndexer::Full;
         let mut ops: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
         let put = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, key: &'static str,
@@ -592,8 +587,6 @@ impl<'a> GlmLoader<'a> {
             ensure!(!(shape.len() == 2 && dtype == DType::F8E4M3), "{name}: replicated operands are not FP8");
             Ok(bytes)
         };
-        put(&mut ops, "input_norm", self.replicated(ranks, || raw(&format!("{p}.input_layernorm.weight")))?);
-        put(&mut ops, "post_norm", self.replicated(ranks, || raw(&format!("{p}.post_attention_layernorm.weight")))?);
         let qkv_a = [format!("{p}.self_attn.q_a_proj.weight"), format!("{p}.self_attn.kv_a_proj_with_mqa.weight")];
         let attention = [&qkv_a[..], &[format!("{p}.self_attn.q_b_proj.weight"),
             format!("{p}.self_attn.kv_b_proj.weight"), format!("{p}.self_attn.o_proj.weight")]].concat();
@@ -662,6 +655,54 @@ impl<'a> GlmLoader<'a> {
             put(&mut ops, "k_norm_w", self.replicated(ranks, || raw(&format!("{p}.self_attn.indexer.k_norm.weight")))?);
             put(&mut ops, "k_norm_b", self.replicated(ranks, || raw(&format!("{p}.self_attn.indexer.k_norm.bias")))?);
         }
+        Ok(ops)
+    }
+
+    /// FFNs are rank-split; attention is either head-split with replicated
+    /// latent/indexer operands or loaded whole on `owner`. Residual norms stay
+    /// replicated and routers live on rank 0 until local TP2 admission.
+    fn layer(&self, cfg: &GlmDsaConfig, layer: usize,
+        checkpoint: &cuteafd_loader::plan::checkpoint::Checkpoint, owner: Option<u8>) -> Result<Vec<GlmLayer<'a>>> {
+        let ranks = self.ranks();
+        let p = format!("model.layers.{layer}");
+        let dense = layer < cfg.first_moe_layer;
+        let full_indexer = cfg.indexers[layer] == GlmIndexer::Full;
+        let mut ops: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
+        let put = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, key: &'static str,
+            parts: Vec<DeviceAllocation<'a>>| {
+            for (map, part) in ops.iter_mut().zip(parts) {
+                map.insert(key, part);
+            }
+        };
+        // The checkpoint's E4M3 bytes and FP32 scale grid: the only copy (per rank's slice).
+        let with_fp8 = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, name: &'static str,
+            parts: &[String], axis: Axis| -> Result<()> {
+            let (w8_name, scale_name, _) = fp8_operand_names(name);
+            let split = if ranks > 1 { self.fp8_split(parts, axis, ranks)? } else { vec![self.fp8(parts)?] };
+            for (map, (w8, scale)) in ops.iter_mut().zip(split) {
+                map.insert(w8_name, w8);
+                map.insert(scale_name, scale);
+            }
+            Ok(())
+        };
+        let raw = |name: &str| -> Result<Vec<u8>> {
+            let (bytes, dtype, shape) = self.raw(name)?;
+            ensure!(!(shape.len() == 2 && dtype == DType::F8E4M3), "{name}: replicated operands are not FP8");
+            Ok(bytes)
+        };
+        put(&mut ops, "input_norm", self.replicated(ranks, || raw(&format!("{p}.input_layernorm.weight")))?);
+        put(&mut ops, "post_norm", self.replicated(ranks, || raw(&format!("{p}.post_attention_layernorm.weight")))?);
+        let attention = if let Some(owner) = owner {
+            let (device, stream) = if owner == 0 { (self.device, self.stream) }
+                else { let peer = self.peers.get(usize::from(owner) - 1).context("attention owner")?; (peer.device, peer.stream) };
+            let local = GlmLoader { library: self.library, catalog: self.catalog, device, stream, peers: Vec::new() };
+            let mut maps = self.on_rank(usize::from(owner), |_| local.attention_operands(cfg, layer))?;
+            ops[usize::from(owner)].extend(maps.pop().context("whole attention operands")?);
+            None
+        } else { Some(self.attention_operands(cfg, layer)?) };
+        if let Some(attention) = attention {
+            for (ops, attention) in ops.iter_mut().zip(attention) { ops.extend(attention); }
+        }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         let mlp_numerics = checkpoint.module_numerics(&format!("{mlp}.gate_proj"))?;
         for projection in ["up_proj", "down_proj"] {
@@ -694,18 +735,21 @@ impl<'a> GlmLoader<'a> {
                 && operands.contains_key("w_down_tscale")),
                 "{mlp}: declared W8A8 needs native per-tensor activation scales");
         }
-        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1, operands }).collect())
+        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner, operands }).collect())
     }
 
     /// Layers `0..layers` (all of them unless the caller stops early): rank 0's
     /// weights (its layer shares, the norm and head) and with a head split the
     /// other rank's layer shares.
     #[allow(clippy::type_complexity)]
-    pub fn model(&self, cfg: &GlmDsaConfig, layers: usize) -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+    pub fn model(&self, cfg: &GlmDsaConfig, layers: usize, owners: Option<&[u8]>)
+        -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+        ensure!(owners.is_none_or(|o| o.len() == layers && self.ranks() == 2 && o.iter().all(|&r| r < 2)),
+            "whole attention needs one owner per layer and two ranks");
         let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())?;
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
-            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer, &checkpoint)?) {
+            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer, &checkpoint, owners.map(|o| o[layer]))?) {
                 share.push(part);
             }
         }

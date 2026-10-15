@@ -668,7 +668,13 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         }
     }
     let exact = if family == "glm5" {
-        match glm5::resident(checkpoint, if split { 2 } else { 1 }) {
+        match (|| -> anyhow::Result<_> {
+            let owners = (report.requested_attention == Some(crate::placement::AttentionPlacement::Layers)).then(|| {
+                let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
+                Ok::<_, anyhow::Error>(crate::placement::families::glm5::attention_owners(&cfg, cfg.layers)?)
+            }).transpose()?;
+            glm5::resident_owned(checkpoint, if split { 2 } else { 1 }, owners.as_deref())
+        })() {
             Ok(resident) => Some(resident),
             Err(error) => {
                 report.placement_supported = false;
@@ -1497,8 +1503,9 @@ fn glm5_failure_hint(mode: crate::placement::AttentionPlacement) -> String {
             experts, or {rebuild}."),
         AttentionPlacement::Context => format!("GLM 5.3 cannot admit this request with attention \
             placement context: {rebuild}, or request `heads` explicitly."),
-        AttentionPlacement::Layers => "GLM 5.3 has no layers attention executor; \
-            use heads or context.".into(),
+        AttentionPlacement::Layers => "GLM 5.3 cannot admit this request with attention \
+            placement layers: use two peer-accessible GPUs, one or two prefill lanes, whole-width \
+            glm_* attention programs and split glm2_* FFN programs, and an admissible pool budget.".into(),
     }
 }
 
@@ -1509,8 +1516,9 @@ fn glm5_placement(report: &PlanReport, input: &super::PlanInput, options: &Layou
     let checkpoint = input.checkpoint();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
-    let lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
+    let mut lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
         else { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 });
+    if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) { lanes = lanes.min(2); }
     let (draft, draft_staging) = if options.glm5_drafter_disabled { (0, 0) }
         else if options.drafter_bytes > 0 { (options.drafter_bytes, 0) }
         else {
@@ -1525,7 +1533,14 @@ fn glm5_placement(report: &PlanReport, input: &super::PlanInput, options: &Layou
                 options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as u64,
                 options.glm5_draft_bf16)?, glm::drafter_staging(&snapshot, slots, sequences, options.glm5_draft_bf16)?)
         };
-    let scratch = manifest.map(|m| glm::manifest_scratch(&cfg, devices.len() == 2, m)).transpose()?;
+    let scratch = manifest.map(|m| -> anyhow::Result<_> {
+        let mut scratch = glm::manifest_scratch(&cfg, devices.len() == 2, m)?;
+        if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
+            let whole = glm::manifest_scratch(&cfg, false, m)?;
+            for i in 0..2 { scratch[i].programs = scratch[i].programs.max(whole[i].programs); }
+        }
+        Ok(scratch)
+    }).transpose()?;
     let gpus = devices.iter().zip(&options.rtx_bytes).map(|(d, &capacity)| (capacity,
         Baseline::Planned { context_bytes: 0, loaded_bytes: d.used_bytes() })).collect();
     let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);

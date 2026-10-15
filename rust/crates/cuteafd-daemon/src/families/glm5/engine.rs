@@ -27,7 +27,7 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::glm5::GlmDsaConfig;
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use std::cell::{Cell, RefCell};
-use cuteafd_loader::serving_capacity::{glm_decode_row_bucket, glm_decode_row_buckets,
+use cuteafd_loader::serving_capacity::{glm_decode_row_bucket,
     glm_decode_table_width, glm_decode_table_widths, GLM_SHORT_ROW_BUCKETS};
 use std::ffi::c_void;
 use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, PartialDtype, ExchangeDtype, RtxExpertLayer};
@@ -35,6 +35,7 @@ use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, PartialDtype,
 #[path = "engine/context.rs"]
 mod context;
 mod tp2;
+mod layers;
 pub(crate) use cuteafd_loader::placement::families::glm5::GlmContext;
 
 type Dev<'a> = DeviceAllocation<'a>;
@@ -327,6 +328,7 @@ pub(crate) struct GlmEngine<'a> {
     /// pools then hold half the page ids), and once the peer is attached, its buffers and
     /// exchange (dropped before the head split's exchange, whose abort words it borrows).
     context_mode: Option<GlmContext>,
+    layer_execution: Option<layers::Execution<'a>>,
     context: Option<context::GlmContextSplit<'a>>,
     /// Per prefill lane (decode: lane 0) and rank: this step's context tables.
     context_units: RefCell<Vec<[context::ContextUnit; 2]>>,
@@ -350,9 +352,12 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
         Ok(allocation)
     };
     // One page past the pool is the scratch page padded decode rows write.
-    let kv = (0..layers.len()).map(|_| zeroed((pages + 1) * RECORD_PAGE_BYTES)).collect::<Result<Vec<_>>>()?;
+    let owns = |layer: &GlmLayer<'_>| layer.attention_owner.is_none_or(|owner| {
+        layer.range("q_a_norm").is_some() && owner < 2
+    });
+    let kv = layers.iter().map(|layer| zeroed(if owns(layer) { (pages + 1) * RECORD_PAGE_BYTES } else { 256 })).collect::<Result<Vec<_>>>()?;
     let index = layers.iter()
-        .map(|l| l.full_indexer.then(|| zeroed((pages + 1) * INDEX_PAGE_BYTES)).transpose())
+        .map(|l| (owns(l) && l.full_indexer).then(|| zeroed((pages + 1) * INDEX_PAGE_BYTES)).transpose())
         .collect::<Result<Vec<_>>>()?;
     // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq.
     let dim = cfg.qk_rope_head_dim;
@@ -387,7 +392,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { quantize_grid, device, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None,
+        Ok(Self { quantize_grid, device, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes,
@@ -434,7 +439,9 @@ impl<'a> GlmEngine<'a> {
             (1, Some(peer)) => (&peer.kv, &peer.index),
             _ => (&self.kv, &self.index),
         };
-        kv.iter().zip(index).map(|(kv, index)| (kv.buffer, index.as_ref().map(|i| i.buffer))).collect()
+        let layers = if rank == 1 { &self.peer.as_ref().unwrap().layers } else { &self.weights.layers };
+        kv.iter().zip(index).zip(layers).filter(|(_, layer)| layer.range("q_a_norm").is_some())
+            .map(|((kv, index), _)| (kv.buffer, index.as_ref().map(|i| i.buffer))).collect()
     }
 
     /// GPUs this engine runs on: 2 under a head split.
@@ -515,7 +522,7 @@ impl<'a> GlmEngine<'a> {
 
     /// `name` (a `glm_*` program) for `layer`: its head-split share's (`glm2_*`) when split.
     fn program(layer: &GlmLayer<'_>, name: &str) -> String {
-        match (layer.split, name.strip_prefix("glm_")) {
+        match (if name.starts_with("glm_ffn_") { layer.split } else { layer.attention_split }, name.strip_prefix("glm_")) {
             (true, Some(rest)) => format!("glm2_{rest}"),
             _ => name.to_string(),
         }
@@ -596,7 +603,8 @@ impl<'a> GlmEngine<'a> {
         // A head split's layers (all of them) run its share's programs.
         let (prefix, moe, dense) = if split { ("glm2", moe / 2, dense / 2) } else { ("glm", moe, dense) };
         // Every layer of a head split runs its share's heads on both GPUs.
-        let heads = if split { heads / 2 } else { heads };
+        let whole = self.weights.layers.iter().any(|layer| layer.attention_owner.is_some());
+        let heads = if split && !whole { heads / 2 } else { heads };
         for name in [format!("glm_index_producer_{cap}"), format!("{prefix}_producer_{cap}"),
             format!("{prefix}_sparse_mla_{mode}_{cap}"), format!("{prefix}_o_{cap}"), format!("{prefix}_ffn_i{moe}_{cap}"),
             format!("{prefix}_ffn_i{dense}_{cap}")] {
@@ -616,6 +624,11 @@ impl<'a> GlmEngine<'a> {
         }
         for name in optional {
             scratch = scratch.max(self.scratch(&name).unwrap_or(0));
+        }
+        if whole {
+            let extra = cuteafd_loader::placement::families::glm5::step_scratch(&self.cfg, false, decode,
+                |name| self.scratch(name).ok().map(|n| n as u64))?;
+            scratch = scratch.max(extra.programs as usize);
         }
         let head_workspace = self.alloc(if lead { VOCABULARY_HEAD_WORKSPACE } else { 256 })?;
         let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
@@ -857,16 +870,39 @@ impl<'a> GlmEngine<'a> {
         let started = std::time::Instant::now();
         let free = |rank: usize| self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free as i64));
         let before: Vec<i64> = (0..self.ranks()).map(free).collect::<Result<_>>()?;
+        let owned = if self.layers_kv() {
+            let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
+            let tp2: Vec<_> = (0..owners.len()).map(|layer| self.tp2_layer(layer)).collect();
+            Some(cuteafd_loader::serving_capacity::glm_graphs::glm_owned_startup_graphs(
+                self.max_context, self.pages, &owners, &tp2).map_err(anyhow::Error::msg)?)
+        } else { None };
+        let shapes = owned.as_ref().map(|startup| startup.keys.clone()).unwrap_or_else(||
+            cuteafd_loader::serving_capacity::glm_graphs::glm_graph_shapes(self.max_context, self.pages));
         self.graphs_warming.set(true);
-        for width in self.table_width_buckets() {
-            for &bucket in glm_decode_row_buckets(width) {
-                let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(),
-                    page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
-                    lengths: Vec::new(), exchange_rows: 1 };
-                self.pad_rows(&mut tables, bucket);
-                let experts = experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime));
-                self.step(&tables, &vec![0; bucket], bucket, experts, None)?;
+        for shape in &shapes {
+            let (width, bucket) = (shape.table_width, shape.rows);
+            let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(),
+                page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
+                lengths: Vec::new(), exchange_rows: 1 };
+            self.pad_rows(&mut tables, bucket);
+            let experts = experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime));
+            self.step(&tables, &vec![0; bucket], bucket, experts, None)?;
+        }
+        if let Some(startup) = &owned {
+            let execution = self.layer_execution.as_ref().context("GLM layer execution")?;
+            for rank in 0..2 {
+                let graphs = if rank == 0 { self.graphs.borrow() } else { self.peer()?.graphs.borrow() };
+                ensure!(graphs.len() as u64 == startup.inventory.ranks[rank].executables,
+                    "GLM rank {rank} captured {} graphs, GraphSet expected {}", graphs.len(), startup.inventory.ranks[rank].executables);
+                for shape in &startup.keys {
+                    for segment in execution.segments.iter().filter(|segment| segment.rank == rank) {
+                        ensure!(graphs.contains_key(&GraphKey { layer: segment.phase.key(segment.layer), rows: shape.rows,
+                            table_width: shape.table_width, table_stride: shape.table_width, previous: Previous::First, head: false }),
+                            "GLM startup capture missing from GraphSet: {segment:?} {shape:?}");
+                    }
+                }
             }
+            tracing::info!(inventory = ?startup.inventory, "GLM owned startup GraphSet captured");
         }
         // SAFETY: both ranks' streams are live; nothing else is queued.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
@@ -887,15 +923,15 @@ impl<'a> GlmEngine<'a> {
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
-        crate::shared::experts::rtx::pair::submit(
+        crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || {
                 crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM submission shutdown");
                 Ok(())
             },
-            || self.step_inner(tables, tokens, logit_rows, experts, on_layer))
+            |scope| self.step_inner(scope, tables, tokens, logit_rows, experts, on_layer))
     }
 
-    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
+    fn step_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
@@ -924,6 +960,11 @@ impl<'a> GlmEngine<'a> {
         let layers = &self.weights.layers;
         if let Some(pair) = &self.tp2 {
             pair.begin_checks(&[t], self.force_route_check.get())?;
+        }
+        if self.layer_execution.is_some() {
+            self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            return self.layer_step(scope, w, w1.context("owned attention peer")?, &ranked[0],
+                t, logit_rows, &mut experts, on_layer);
         }
         if tables.decode && on_layer.is_none() && layers.len() == self.cfg.layers {
             // The first captured segment gathers the rows from the staged ids;
@@ -1598,15 +1639,15 @@ impl<'a> GlmEngine<'a> {
     /// posted and received on its thread while this thread queues the other
     /// lanes' GPU layers. Returns the last `logit_rows` rows' logits.
     fn step_lanes(&self, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize) -> Result<Option<StepLogits>> {
-        crate::shared::experts::rtx::pair::submit(
+        crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || {
                 crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM submission shutdown");
                 Ok(())
             },
-            || self.step_lanes_inner(lanes, chunks, logit_rows))
+            |scope| self.step_lanes_inner(scope, lanes, chunks, logit_rows))
     }
 
-    fn step_lanes_inner(&self, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize) -> Result<Option<StepLogits>> {
+    fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize) -> Result<Option<StepLogits>> {
         {
             let mut slots = self.lane_workspaces.borrow_mut();
             while slots.len() < lanes.len() {
@@ -1639,6 +1680,11 @@ impl<'a> GlmEngine<'a> {
         if let Some(pair) = &self.tp2 { pair.begin_checks(&counts, self.force_route_check.get())?; }
         for (tokens, w) in chunks.iter().zip(&workspaces) {
             self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+        }
+        if self.layer_execution.is_some() {
+            drop(transports);
+            return self.layer_prefill(scope, &workspaces[..lanes.len()],
+                peer_workspaces.as_ref().context("owned attention lanes")?, &ranked, logit_rows);
         }
         let layers = &self.weights.layers;
         let cap = "m4096";
@@ -1901,7 +1947,7 @@ impl<'a> GlmEngine<'a> {
         cap: &str, tables: &StepTables, kv: cuteafd_ffi::CuteafdDeviceBuffer,
         index_cache: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
-        let heads = self.cfg.heads / if layer.split { 2 } else { 1 };
+        let heads = self.cfg.heads / if layer.attention_split { 2 } else { 1 };
         self.producer(rank, w, layer, rows, cap, kv, w.query.buffer.ptr)?;
         if let Some(index_cache) = index_cache {
             self.index_producer(rank, w, layer, rows, cap, index_cache)?;
@@ -2176,7 +2222,7 @@ mod long_graph_tests {
 
 impl Drop for GlmEngine<'_> {
     fn drop(&mut self) {
-        if self.tp2.is_some() {
+        if self.tp2.is_some() || self.layer_execution.is_some() {
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM TP2 engine retirement");
         }
     }

@@ -426,6 +426,15 @@ fn glm5_attention_auto_requires_complete_context_programs() {
             let heads = plan(dir.path(), &PlanOptions {
                 attention_placement: Some(AttentionPlacement::Heads), ..options.clone()
             }).unwrap();
+            let layers = plan(dir.path(), &PlanOptions {
+                attention_placement: Some(AttentionPlacement::Layers), ..options.clone()
+            }).unwrap();
+            if gpus == 2 {
+                assert!(layers.executable(), "layers, omitted {omitted:?}: {}", render(&layers));
+                assert_eq!(layers.attention_placement, AttentionPlacement::Layers);
+            } else {
+                assert!(!layers.executable(), "one GPU cannot run layers");
+            }
             // Heads runs whatever the manifest holds.
             assert!(heads.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(&heads));
             assert_eq!(heads.attention_placement, AttentionPlacement::Heads);

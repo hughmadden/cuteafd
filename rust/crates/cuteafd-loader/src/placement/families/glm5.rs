@@ -2,7 +2,9 @@
 //! GPUs the executor runs `heads` (replicated MLA/DSA KV, head-split
 //! attention) or `context` (K3: the same head split for the projections, KV
 //! pages owned by logical-page parity, a q/candidate/partial exchange per
-//! layer). `context` is the default where its programs exist ([`GlmContext`]).
+//! layer), or explicit `layers` (whole attention and owner-local KV, with
+//! split FFNs). `context` remains the default where its programs exist
+//! ([`GlmContext`]); owned attention admits at most two ordered prefill lanes.
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::placement::*;
 use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance};
@@ -352,15 +354,57 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         tp2_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.tp2_workspace } else { [0; 2] },
         minimum_expert_layers: 0,
         onboard: inputs.onboard, expert_gpus: usize::from(!inputs.experts.is_empty()),
-        policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }], by_kind: Vec::new(), ..LayerPolicy::default() },
+        policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }], by_kind: Vec::new(), ownership: LayerOwnership::Alternating, ..LayerPolicy::default() },
         hops: HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: inputs.prefill_rows.max(DECODE_ROWS),
             lanes: inputs.prefill_lanes, entry_gpu: 0, head_gpu: 0, terminal: if gpus == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } },
         // `context` is the recorded default where the build carries its
-        // programs. Without them this executor runs heads and only heads; a
+        // programs. Without them auto keeps heads; an explicit layers request
+        // still runs owned attention through whole-width programs, while a
         // chosen `context` fails closed in `solve_working_set` (#202).
         executor: if inputs.context.is_some() { super::GLM5 }
             else { ExecutorModes { attention: AttentionPlacement::Heads, ..super::GLM5 } },
     })
+}
+
+/// Configure the same owner policy and full-head workspace charge at plan and load time.
+fn configure_attention(req: &mut PlacementRequest, attention: Option<AttentionPlacement>) -> Result<(), PlacementError> {
+    req.attention_placement = attention;
+    if attention == Some(AttentionPlacement::Layers) {
+        // Only explicit layers loads owner-local operands. Keep raw/default
+        // requests from admitting these modes after loading split weights.
+        for layer in &mut req.layers {
+            layer.modes.extend([LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+                LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }]);
+        }
+        validate_layer_pipeline_lanes(req.hops.lanes, req.hops.lanes as usize)
+            .map_err(|_| PlacementError::Inventory("GLM layers requires one or two prefill lanes"))?;
+        // Scratch KV pages follow the chosen owner, not both GPUs.
+        req.fixed.retain(|d| d.group != "padded decode scratch page");
+        for gpu in 0..2 {
+            req.fixed.push(Demand::new(gpu, Category::Kv, "nonowner KV handles",
+                req.layers.len() as u64 * FLOOR, Basis::Formula));
+        }
+        for layer in &mut req.layers {
+            layer.fixed_bytes = ModeBytes { whole: layer.kv_unit.unit_bytes_whole - FLOOR, split: [0; 2] };
+        }
+    }
+    Ok(())
+}
+
+/// Pre-load owner decision through the shared solver. Alternating colocate groups
+/// are independent of loaded weight bytes, and are revalidated after loading.
+pub fn attention_owners(cfg: &GlmDsaConfig, layers: usize) -> Result<Vec<u8>, PlacementError> {
+    let input = GlmInputs { cfg, layers, gpus: vec![(1 << 50, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); 2],
+        headroom_bytes: 0, spark_ranks: 0, skip_routed_experts: true, prefill_rows: 64, prefill_lanes: 1,
+        max_context: 64, scratch: Some([GlmScratch::default(); 2]), drafter_bytes: 0, drafter_staging: 0,
+        pending_code: Vec::new(), experts: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2],
+        requested_pool: Some(64), onboard: Onboard::Layers(0), full_prefill_logits: false, context: None };
+    let mut req = request(&input)?;
+    configure_attention(&mut req, Some(AttentionPlacement::Layers))?;
+    solve(&req)?.layers.into_iter().map(|layer| match layer.mode {
+        LayerMode::Whole { gpu, ffn: FfnMode::Split } => Ok(gpu),
+        _ => Err(PlacementError::Inventory("GLM whole-attention ownership")),
+    }).collect()
 }
 
 /// Storage allocated for the selected Spark suffix, rather than configured peers.
@@ -390,7 +434,28 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
         else { inputs.layers.saturating_sub(inputs.cfg.first_moe_layer) };
     let run = |branch: &GlmInputs<'_>, cap: Option<u64>, floor: Option<u64>| {
         let mut req = request(branch)?;
-        req.attention_placement = attention;
+        configure_attention(&mut req, attention)?;
+        if attention == Some(AttentionPlacement::Layers) {
+            let owners = attention_owners(branch.cfg, branch.layers)?;
+            let routed = branch.layers.saturating_sub(branch.cfg.first_moe_layer);
+            let local = branch.onboard.layers(routed).unwrap_or(if branch.spark_ranks == 0 { routed } else { 0 });
+            let tp2: Vec<_> = (0..branch.layers).map(|layer| !branch.skip_routed_experts
+                && layer >= branch.cfg.first_moe_layer && layer - branch.cfg.first_moe_layer < local).collect();
+            let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
+                branch.max_context as usize, (branch.max_context as usize).div_ceil(PAGE_ROWS as usize), &owners, &tp2)
+                .map_err(|_| PlacementError::Inventory("GLM owned startup graphs"))?;
+            req.fixed.retain(|d| d.group != "decode graph allowance");
+            for rank in 0..2 {
+                for item in startup.inventory.items(rank) {
+                    req.fixed.push(Demand::new(rank as u8, item.category, item.group, item.bytes, item.basis));
+                }
+            }
+            let head_rows = (DECODE_ROWS + branch.prefill_rows * branch.prefill_lanes) * branch.cfg.heads as u64 / 2;
+            for gpu in 0..2 {
+                req.fixed.push(Demand::new(gpu, Category::Workspace, "whole attention rows",
+                    head_rows * (576 + 512) * 2, Basis::Formula));
+            }
+        }
         if let Some(cap) = cap { req.pool.ceiling = req.pool.ceiling.min(cap); }
         if let Some(floor) = floor { req.pool.floor = floor; }
         let tp2_workspace = req.tp2_workspace;
@@ -1533,6 +1598,42 @@ mod tests {
         let mut context = r;
         context.attention_placement = Some(AttentionPlacement::Context);
         assert!(matches!(solve(&context), Err(PlacementError::UnsupportedMode { .. })));
+    }
+
+    #[test]
+    fn whole_attention_colocates_indexers_and_charges_one_logical_kv_copy() {
+        let cfg = config();
+        let owners = attention_owners(&cfg, cfg.layers).unwrap();
+        assert!(owners.contains(&0) && owners.contains(&1));
+        let mut i = inputs(&cfg, &[96 * GIB; 2]);
+        i.prefill_lanes = 2;
+        i.requested_pool = Some(2 << 20);
+        let (placed, _) = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap();
+        assert_eq!(placed.pool_tokens, 2 << 20);
+        let tp2: Vec<_> = placed.layers.iter().map(|layer| layer.experts == ExpertHome::RtxTp2).collect();
+        let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
+            i.max_context as usize, (i.max_context as usize).div_ceil(PAGE_ROWS as usize), &owners, &tp2).unwrap();
+        for rank in 0..2 {
+            assert!(!placed.items[rank].iter().any(|item| item.group == "decode graph allowance"));
+            for item in startup.inventory.items(rank) {
+                assert!(placed.items[rank].contains(&item), "missing {item:?}");
+            }
+        }
+        for (layer, assignment) in placed.layers.iter().enumerate() {
+            assert_eq!(assignment.mode, LayerMode::Whole { gpu: owners[layer], ffn: FfnMode::Split });
+            assert_eq!(owners[layer], owners[cfg.index_source(layer)]);
+        }
+        let mut req = request(&i).unwrap();
+        configure_attention(&mut req, Some(AttentionPlacement::Layers)).unwrap();
+        assert!(!req.fixed.iter().any(|d| d.group == "padded decode scratch page"));
+        assert_eq!(req.layers.iter().map(|layer| layer.fixed_bytes.whole).sum::<u64>(),
+            glm_cache_geometry(&cfg, cfg.layers, 1).unwrap().ranks[0].persistent_unit_bytes - cfg.layers as u64 * FLOOR);
+        assert_eq!(placed.hops.iter().filter(|hop| matches!(hop.at, HopPoint::AfterAttention(_))).count(), cfg.layers);
+        i.prefill_lanes = 3;
+        assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).is_err());
+        let mut one = inputs(&cfg, &[96 * GIB]);
+        one.prefill_lanes = 1;
+        assert!(solve_working_set(&one, [0; 2], Some(AttentionPlacement::Layers)).is_err());
     }
 
     const CONTEXT_SCRATCH: GlmContext = GlmContext { topk_scratch: 3 << 20, partial_scratch: 9 << 20 };
