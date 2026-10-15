@@ -69,9 +69,16 @@ fn layer_operands(prefix: &str, attention: HybridAttention) -> Vec<Operand> {
     out
 }
 
+pub(crate) struct DenseWeightBytes {
+    pub(crate) layers: Vec<u64>,
+    pub(crate) norm: u64,
+    pub(crate) head: u64,
+    pub(crate) embedding: u64,
+}
+
 impl<'a> WeightReader<'a> {
-    /// Check the norm header against the selected AOT ABI before uploading any weights.
-    pub(crate) fn dense_bf16(&self, cfg: &Qwen35Config, norm_dtype: DType) -> Result<DenseWeights<'a>> {
+    /// Header-only native allocation inventory, including widened tiny tensors.
+    pub(crate) fn dense_bf16_bytes(&self, cfg: &Qwen35Config, norm_dtype: DType) -> Result<DenseWeightBytes> {
         ensure!(matches!(norm_dtype, DType::Bf16 | DType::F32), "dense Qwen GDN norm ABI must be BF16 or FP32");
         let specs: Vec<_> = cfg.attention.iter().enumerate().map(|(layer, &kind)|
             layer_operands(&format!("{PREFIX}layers.{layer}"), kind)).collect();
@@ -88,6 +95,29 @@ impl<'a> WeightReader<'a> {
         for name in [&norm_name, &head_name] {
             ensure!(self.tensor(name)?.meta.dtype == DType::Bf16, "{name}: expected BF16");
         }
+        let layers = specs.iter().map(|operands| operands.iter().try_fold(0u64, |total, spec| {
+            let bytes = spec.tensors.iter().try_fold(0u64, |total, name| {
+                let tensor = self.tensor(name)?;
+                let bytes = if spec.storage == Storage::F32 && tensor.meta.dtype == DType::Bf16 {
+                    tensor.meta.byte_length.checked_mul(2).context("dense widened weight size overflow")?
+                } else { tensor.meta.byte_length };
+                total.checked_add(bytes).context("dense packed weight size overflow")
+            })?.max(256);
+            total.checked_add(bytes).context("dense layer weight size overflow")
+        })).collect::<Result<_>>()?;
+        let embedding = self.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
+        ensure!(embedding.meta.dtype == DType::Bf16, "dense embedding must be native BF16");
+        Ok(DenseWeightBytes { layers, norm: self.tensor(&norm_name)?.meta.byte_length.max(256),
+            head: self.tensor(&head_name)?.meta.byte_length.max(256), embedding: embedding.meta.byte_length })
+    }
+
+    /// Validate every header before uploading any weights.
+    pub(crate) fn dense_bf16(&self, cfg: &Qwen35Config, norm_dtype: DType) -> Result<DenseWeights<'a>> {
+        self.dense_bf16_bytes(cfg, norm_dtype)?;
+        let norm_name = format!("{PREFIX}norm.weight");
+        let head_name = if cfg.tied_embeddings { format!("{PREFIX}embed_tokens.weight") } else { "lm_head.weight".into() };
+        let specs = cfg.attention.iter().enumerate().map(|(layer, &kind)|
+            layer_operands(&format!("{PREFIX}layers.{layer}"), kind));
         let layers = cfg.attention.iter().zip(specs).map(|(&attention, specs)| {
             let operands = specs.into_iter().map(|spec| {
                 let weight = match spec.storage {
