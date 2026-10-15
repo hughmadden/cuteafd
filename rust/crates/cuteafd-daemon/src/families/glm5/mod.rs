@@ -100,6 +100,17 @@ pub(crate) struct EngineArgs {
     pub attention_plan_rows: Option<usize>,
 }
 
+fn spark_model(lanes: usize, bf16: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    ensure!(lanes > 0, "GLM Spark admission requires at least one prefill lane");
+    let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
+    let endpoints = 1 + if lanes > 1 { lanes } else { 0 };
+    Ok(cuteafd_transport::worker_selection::ModelAdmission {
+        capacity: 4096, compiled_capacity: 4096,
+        endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 4096, ingress }; endpoints],
+        rings: crate::shared::placement::spark_rings(64 << 20)?,
+    })
+}
+
 #[cfg(test)]
 mod draft_cli_tests {
     use super::*;
@@ -109,6 +120,22 @@ mod draft_cli_tests {
     struct Parse {
         #[command(flatten)]
         engine: EngineArgs,
+    }
+
+    #[test]
+    fn spark_contract_matches_decode_link_and_parallel_prefill_lanes() -> Result<()> {
+        for lanes in [1, 2, 3, 4] {
+            for bf16 in [false, true] {
+                let model = spark_model(lanes, bf16)?;
+                model.validate(cuteafd_core::ExpertGeometry::GLM5)?;
+                assert_eq!(model.endpoints.len(), if lanes == 1 { 1 } else { lanes + 1 });
+                assert!(model.endpoints.iter().all(|endpoint| endpoint.capacity == 4096
+                    && endpoint.ingress == if bf16 { cuteafd_core::SparkIngress::Bf16 }
+                        else { cuteafd_core::SparkIngress::Fp8K32 }));
+            }
+        }
+        assert!(spark_model(0, false).is_err());
+        Ok(())
     }
 
     #[test]
@@ -331,27 +358,19 @@ impl Opened {
             Ok(())
         })?;
         let draft_file = args.draft.as_deref().map(dflash::prefetch);
-        let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-        let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream, device: args.device,
-            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
-                .collect() };
-        let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
-        let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
-            + model.head.buffer.bytes;
-        let peer_bytes: usize = shares.iter().flatten().map(|l| l.bytes()).sum();
-        tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
-            gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
-            split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
         use cuteafd_loader::placement::{families::glm5 as glm, Baseline};
-        let gpus = devices.iter().map(|&device| -> Result<_> {
-            self.library.cuda_set_device(device)?;
-            let (free, total) = self.library.cuda_memory_info()?;
-            Ok((total as u64, Baseline::Measured { free_bytes: free as u64 }))
-        }).collect::<Result<Vec<_>>>();
-        self.library.cuda_set_device(args.device)?;
-        let gpus = gpus?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&self.snapshot, false, false)?;
+        let host_embedding = args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host;
+        if host_embedding { checkpoint.require_untied_embedding("model.embed_tokens.weight")?; }
+        let reserved_weights = cuteafd_loader::plan::layout::glm5::device_bytes(
+            &checkpoint, devices.len(), layers, host_embedding)?;
+        let spark_bf16 = checkpoint.spark_input_is_bf16();
+        let gpus = inventory.gpus.iter().zip(&reserved_weights).map(|(gpu, &bytes)| -> Result<_> {
+            let free_bytes = gpu.free_bytes.checked_sub(bytes)
+                .context("GLM coordinator header-derived weights exceed pre-weight free memory")?;
+            Ok((gpu.total_bytes, Baseline::Measured { free_bytes }))
+        }).collect::<Result<Vec<_>>>()?;
         inventory.record("glm5", &gpus.iter().map(|(_, b)| match b {
             Baseline::Measured { free_bytes } => *free_bytes, _ => unreachable!(),
         }).collect::<Vec<_>>());
@@ -425,6 +444,30 @@ impl Opened {
         let selected_peers = if working.spark.spark_ranks > 0 { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
+        if let Some(peers) = args.peers.as_deref() {
+            let peers = peers.split(',').map(str::parse)
+                .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            crate::shared::placement::SparkAdmission::plan(&self.snapshot,
+                self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
+                peers.len(), None, cuteafd_loader::V41Exl3Partition::Disjoint,
+                spark_model(prefill_lanes, spark_bf16)?)?.select(&peers)?;
+        }
+        let started = Instant::now();
+        let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream, device: args.device,
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
+                .collect() };
+        let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
+        let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
+            + model.norm.buffer.bytes + model.head.buffer.bytes;
+        let embedding_bytes = if host_embedding { 0 } else { embedding.vocab() * embedding.hidden() * 2 };
+        let actual_weights = std::iter::once((bytes + embedding_bytes) as u64)
+            .chain(shares.iter().map(|rank| rank.iter().map(|layer| layer.bytes() as u64).sum()))
+            .collect::<Vec<_>>();
+        ensure!(actual_weights == reserved_weights,
+            "GLM loaded coordinator owners {actual_weights:?} differ from header reservation {reserved_weights:?}");
+        tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
+            resident_bytes = ?actual_weights, "GLM coordinator weights match pre-weight reservation");
         let context_kv = placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context;
         ensure!(!context_kv || peer_stream.is_some(), "context attention needs the head split's second GPU");
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
@@ -434,7 +477,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, prefill_lanes, context.filter(|_| context_kv))?;
-        engine.spark_bf16 = cuteafd_loader::plan::Checkpoint::inventory(&self.snapshot)?.spark_input_is_bf16();
+        engine.spark_bf16 = spark_bf16;
         engine.full_prefill_logits = args.full_prefill_logits;
         engine.attention_plan = attention_plan;
         let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);

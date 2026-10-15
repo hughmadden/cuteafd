@@ -354,33 +354,48 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&glm5_config()).unwrap();
     for (cards, pool) in [vec![32 << 30], vec![96 << 30], vec![96 << 30, 80 << 30]].into_iter()
         .flat_map(|cards| [None, Some(65536)].map(|pool| (cards.clone(), pool))) {
-        let options = layout::LayoutOptions { rtx_bytes: cards.clone(), context_tokens: 65536,
-            pool_tokens: pool, prefill_rows: 4096, prefill_lanes: 3,
-            glm5_drafter_disabled: true, ..Default::default() };
-        // No manifest here: auto resolves context on two GPUs and now fails
-        // closed without its programs (#202), so request heads explicitly.
-        let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()),
-            attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..Default::default() }).unwrap();
-        assert!(report.executable(), "{}", render(&report));
-        let memory = report.memory_layout.unwrap();
-        let gpus = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
-            .map(|d| (d.capacity_bytes, Baseline::Measured { free_bytes: d.capacity_bytes - d.items.iter()
-                .filter(|i| matches!(i.category, Category::Weights | Category::Embedding)
-                    || i.group == "context+modules")
-                .map(|i| i.bytes).sum::<u64>() })).collect();
-        let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
-            headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, skip_routed_experts: false,
-            prefill_rows: 4096,
-            prefill_lanes: 3, max_context: 65536, scratch: None, drafter_bytes: 0,
-            drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
-            tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
-            full_prefill_logits: false, context: None };
-        let (runtime, working) = glm::solve_working_set(&inputs, [0; 2], Some(report.attention_placement)).unwrap();
-        assert_eq!(working.spark.spark_ranks, report.spark_ranks);
-        assert_eq!(working.spark.prefill_lanes, 3);
-        assert_eq!(memory.pool_tokens, runtime.pool_tokens);
-        for (rank, items) in runtime.items.iter().enumerate() {
-            for item in items { assert!(memory.devices[rank].items.contains(item), "missing {item:?}"); }
+        for host_embedding in [false, true] {
+            let options = layout::LayoutOptions { rtx_bytes: cards.clone(), context_tokens: 65536,
+                pool_tokens: pool, prefill_rows: 4096, prefill_lanes: 3, host_embedding,
+                glm5_drafter_disabled: true, ..Default::default() };
+            // No manifest here: auto resolves context on two GPUs and now fails
+            // closed without its programs (#202), so request heads explicitly.
+            let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()),
+                attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..Default::default() }).unwrap();
+            assert!(report.executable(), "{}", render(&report));
+            let memory = report.memory_layout.unwrap();
+            let gpus = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+                .map(|d| (d.capacity_bytes, Baseline::Measured { free_bytes: d.capacity_bytes - d.items.iter()
+                    .filter(|i| matches!(i.category, Category::Weights | Category::Embedding)
+                        || i.group == "context+modules")
+                    .map(|i| i.bytes).sum::<u64>() })).collect::<Vec<_>>();
+            let checkpoint = Checkpoint::coordinator(dir.path(), false, false).unwrap();
+            let weights = layout::glm5::device_bytes(&checkpoint, cards.len(), cfg.layers, host_embedding).unwrap();
+            let pre_weight = memory.devices.iter().take(cards.len()).zip(weights).map(|(device, weights)| {
+                let context = device.items.iter().filter(|item| item.group == "context+modules")
+                    .map(|item| item.bytes).sum::<u64>();
+                (device.capacity_bytes, Baseline::Measured { free_bytes: device.capacity_bytes - context - weights })
+            }).collect::<Vec<_>>();
+            assert_eq!(pre_weight, gpus);
+            let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
+                headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, skip_routed_experts: false,
+                prefill_rows: 4096,
+                prefill_lanes: 3, max_context: 65536, scratch: None, drafter_bytes: 0,
+                drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
+                tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
+                full_prefill_logits: false, context: None };
+            let (runtime, working) = glm::solve_working_set(&inputs, [0; 2], Some(report.attention_placement)).unwrap();
+            let mut before_upload = inputs.clone();
+            before_upload.gpus = pre_weight;
+            let (pre, pre_working) = glm::solve_working_set(&before_upload, [0; 2], Some(report.attention_placement)).unwrap();
+            assert_eq!(pre, runtime);
+            assert_eq!(pre_working, working);
+            assert_eq!(working.spark.spark_ranks, report.spark_ranks);
+            assert_eq!(working.spark.prefill_lanes, 3);
+            assert_eq!(memory.pool_tokens, runtime.pool_tokens);
+            for (rank, items) in runtime.items.iter().enumerate() {
+                for item in items { assert!(memory.devices[rank].items.contains(item), "missing {item:?}"); }
+            }
         }
     }
 }

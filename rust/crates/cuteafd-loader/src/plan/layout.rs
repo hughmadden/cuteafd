@@ -15,7 +15,7 @@ mod deepseek_v4;
 mod glm5_flash;
 mod v41;
 mod mimo;
-mod glm5;
+pub mod glm5;
 mod qwen_dual;
 
 const GIB: u64 = 1 << 30;
@@ -667,7 +667,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         }
     }
     let exact = if family == "glm5" {
-        match glm5::resident(checkpoint, if split { 2 } else { 1 }) {
+        match glm5::resident(checkpoint, if split { 2 } else { 1 }, model.spec().layers.len()) {
             Ok(resident) => Some(resident),
             Err(error) => {
                 report.placement_supported = false;
