@@ -159,6 +159,11 @@ pub(crate) struct GoldenArgs {
     /// Score every prefill row's logits against the golden (mean NLL, top-1).
     #[arg(long)]
     pub nll: bool,
+    /// Save tokens.bin and F32 logits.bin for a reference run: with --nll every prefill row,
+    /// with --prefill N only the decode/verify rows (positions N.., tokens.bin from N), so two
+    /// runs compare exactly the rows the decode path produced.
+    #[arg(long)]
+    pub save_logits: Option<PathBuf>,
     /// After the comparison, time this many greedy single-row decode steps.
     #[arg(long, default_value_t = 0)]
     pub bench_decode: usize,
@@ -492,13 +497,13 @@ impl Opened {
             if let Some(engine::Experts::LocalExl3(local)) = &experts {
                 ensure!(local.window >= layers,
                     "Qwen automatic KV admission requires all EXL3 backbone experts resident; use --exl3-window at least {layers}, a fixed pool, or Sparks");
-                let expected = local.window.min(layers);
+                let expected: Vec<_> = (0..local.window.min(layers)).collect();
                 let plan = crate::families::deepseek_v4::local::plan(&self.library, &local.native_lib,
-                    local.catalog, usize::from(local.mtp), expected, local.max_rows, local.budget)?;
+                    local.catalog, usize::from(local.mtp), &expected, local.max_rows, local.budget)?;
                 ensure!(plan.layers == expected,
                     "Qwen automatic KV admission requires the complete requested EXL3 expert window to fit");
                 future_expert_bytes = u64::try_from(plan.peak_bytes)?;
-                tracing::info!(layers=plan.layers, peak_bytes=plan.peak_bytes,
+                tracing::info!(layers=?plan.layers, peak_bytes=plan.peak_bytes,
                     "Qwen planner reserved the lazy EXL3 expert window");
             }
             Some(experts)
@@ -623,10 +628,10 @@ impl Opened {
         let catalog = self.experts.as_ref().context("--mtp needs the local draft expert catalog")?;
         let started = Instant::now();
         let mtp = if catalog.exl3().is_some() {
-            let experts = crate::families::deepseek_v4::local::LocalExperts::load_range(&self.library,
-                &args.native_lib, catalog, 1, 0..0, args.prefill_rows, budget, stream)?
+            let experts = crate::families::deepseek_v4::local::LocalExperts::load(&self.library,
+                &args.native_lib, catalog, 1, &[], args.prefill_rows, budget, stream)?
                 .context("coordinator-local MTP needs exl3-qwen4-k45/rtx-tp1/m* packages")?;
-            ensure!(experts.layers() == 0 && experts.stages() == 1,
+            ensure!(experts.layers().is_empty() && experts.stages() == 1,
                 "local draft executor must keep exactly the MTP expert layer, no backbone layers");
             engine::MtpExperts::Exl3(std::cell::RefCell::new(experts))
         } else {
@@ -844,6 +849,31 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
                 golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
                 100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
                 nll / scored.max(1) as f64, crate::families::glm5_flash::mean_kl(&decode_logits, &golden, prefill, vocab));
+        }
+    }
+    // Reference dumps for `scripts/bench/golden-run.py --compare-logits`: with --nll every
+    // prefill row, otherwise the decode/verify rows past --prefill (tokens.bin from --prefill).
+    if let Some(dir) = &args.save_logits {
+        std::fs::create_dir_all(dir)?;
+        if args.nll {
+            let rows = logits.as_deref().context("--save-logits with --nll produced no logits")?;
+            ensure!(rows.len() == prefill * vocab, "saved logits cover {} of {prefill} prefill rows",
+                rows.len() / vocab);
+            std::fs::write(dir.join("tokens.bin"), tokens[..prefill].iter()
+                .flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>())?;
+            std::fs::write(dir.join("logits.bin"), rows.iter()
+                .flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+            println!("saved {prefill} prefill rows to {}", dir.display());
+        } else {
+            ensure!(prefill < tokens.len(), "--save-logits without --nll saves the decode rows: pass --prefill N");
+            ensure!(decode_logits.len() == (tokens.len() - prefill) * vocab,
+                "saved logits cover {} of {} decode rows", decode_logits.len() / vocab, tokens.len() - prefill);
+            std::fs::write(dir.join("tokens.bin"), tokens[prefill..].iter()
+                .flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>())?;
+            std::fs::write(dir.join("logits.bin"), decode_logits.iter()
+                .flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+            println!("saved {} decode rows (positions {prefill}..{}) to {}",
+                decode_logits.len() / vocab, tokens.len(), dir.display());
         }
     }
     if args.bench_prefill > 0 {

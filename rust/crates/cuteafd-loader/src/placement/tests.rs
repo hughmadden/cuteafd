@@ -31,7 +31,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         minimum_expert_layers: 0,
         expert_gpus: gpus,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new(), ..LayerPolicy::default() },
-        hops: HopSpec { row_bytes: 0, rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0,
+        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: 0, rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0,
             terminal: if gpus == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } },
         executor: V4_HEADS,
     }
@@ -182,7 +182,7 @@ const W1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
 const S0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Split };
 const S1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Split };
 /// V4/V4.1-sized mHC hop: `[4096,4,4096]` BF16 per lane slot = 128 MiB.
-const MHC: HopSpec = HopSpec { row_bytes: 4 * 4096 * 2, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+const MHC: HopSpec = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * 4096 * 2, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
 const ANY: ExecutorModes = ExecutorModes { family: "test", modes: &[LayerMode::HeadSplit, W0, W1, S0, S1], hops: true, attention: AttentionPlacement::Heads };
 
 #[test]
@@ -311,7 +311,7 @@ fn executors_refuse_modes_they_cannot_run_at_plan_time() {
     assert_eq!(families::DEEPSEEK_V4.check(&handed),
         Err(PlacementError::UnsupportedMode { family: "deepseek_v4", layer: 1, mode: S1 }));
     assert!(families::DEEPSEEK_V41.runs(W1) && !families::QWEN4.runs(LayerMode::HeadSplit));
-    assert_eq!(families::executor("glm5_flash").map(|e| e.hops), Some(false));
+    assert_eq!(families::executor("glm5_flash").map(|e| e.hops), Some(true));
 }
 
 fn tp2_request(free: [u64; 2], onboard: Onboard) -> PlacementRequest {
@@ -576,7 +576,7 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         req.pool.unit_rows = 64;
         req.fixed = fixed.into_iter().enumerate().map(|(gpu, bytes)| Demand::new(gpu as u8, Category::Workspace,
             "P2 fixed", bytes + if nvfp4 { 8_685_388_318 } else { 0 }, Basis::Estimated)).collect();
-        req.hops = HopSpec { row_bytes: 12_288, rows: 4096, lanes: 4, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+        req.hops = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 12_288, rows: 4096, lanes: 4, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
         req.attention_placement = Some(AttentionPlacement::Heads);
         let heads = solve(&req).unwrap();
         print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Heads, &heads);
@@ -659,7 +659,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
             partial_row_bytes: if dim == 4096 { 32_896 } else { 65_792 },
             candidate_row_bytes: if dim == 4096 { 4_096 } else { 8_192 },
             compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
-        req.hops = HopSpec { row_bytes: 4 * dim * 2 + 16, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+        req.hops = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * dim * 2 + 16, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
         let half = (half * GIB as f64) as u64;
         let state_unit = (state * GIB as f64 / count as f64) as u64;
         for (i, layer) in req.layers.iter_mut().enumerate() {
@@ -703,7 +703,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
     req.context_buffers = ContextBuffers { staging_unit_bytes: 256 * 528 + 64 * 132, staging_unit_rows: 256,
         query_row_bytes: 32_768, partial_row_bytes: 32_896, candidate_row_bytes: 4_096,
         compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
-    req.hops = HopSpec { row_bytes: 32_784, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+    req.hops = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 32_784, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
     for (i, layer) in req.layers.iter_mut().enumerate() {
         let mla = i % 4 == 3;
         layer.kind = if mla { AttentionClass::Mla } else { AttentionClass::Kda };
@@ -1325,6 +1325,60 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
     assert_eq!(solve(&req).unwrap().onboard_layers, 0);
     req.layers[0].experts.as_mut().unwrap().whole.resident = 120;
     assert_eq!(solve(&req).unwrap().onboard_layers, 1);
+}
+
+#[test]
+fn pool_failures_name_rank_demands_and_retain_selected_expert_arena() {
+    for onboard in [Onboard::Auto, Onboard::Layers(0)] {
+        let mut req = request(2, 100, 0, 4, onboard);
+        req.pool = PoolPolicy { requested: Some(6), target: 6, floor: 1, ceiling: 100, unit_rows: 1 };
+        req.pool_overhead = vec![1, 2];
+        req.pool_bounded = vec![BoundedDemand { gpu: 1, category: Category::Prefix,
+            group: "recurrent marks".into(), bytes_per_unit: 20, offset_units: 1,
+            cap_units: u64::MAX, basis: Basis::Formula }];
+        let error = solve(&req).unwrap_err();
+        let PlacementError::PoolDoesNotFit { fit, ref limits, .. } = error else { panic!("{error}") };
+        assert_eq!(fit, 3);
+        assert_eq!(limits.0[0].max_units, 100);
+        assert_eq!(limits.0[1].max_units, 3);
+        let text = error.to_string();
+        assert!(text.contains("rtx1 limiting fits 3 units"), "{text}");
+        assert!(text.contains("recurrent marks 20 bytes/unit (offset 1"), "{text}");
+        assert!(text.contains("KV records and metadata 2 bytes/unit"), "{text}");
+        req.onboard = Onboard::Layers(0);
+        req.pool.requested = None;
+        req.pool.floor = 4;
+        let error = solve(&req).unwrap_err();
+        assert!(matches!(error, PlacementError::BelowFloor { pool: 3, .. }));
+        assert!(error.to_string().contains("recurrent marks 20 bytes/unit"));
+    }
+    let mut req = request(2, 44 * GIB, 60, 4, Onboard::Layers(10));
+    req.pool.requested = Some(4 << 20);
+    let error = solve(&req).unwrap_err();
+    let PlacementError::PoolDoesNotFit { limits, .. } = error else { panic!("{error}") };
+    for rank in limits.0 {
+        assert_eq!(rank.available_bytes, 44 * GIB - (5 * GIB + GIB / 2));
+    }
+}
+
+#[test]
+fn successful_pool_limits_retain_auto_onboarded_arenas() {
+    for gpus in [1, 2] {
+        let mut req = request(gpus, 44 * GIB, 60, 4, Onboard::Auto);
+        let automatic = solve(&req).unwrap();
+        assert!(automatic.onboard_layers > 0);
+        for rank in &automatic.pool_limits.0 {
+            let gpu = usize::from(rank.gpu);
+            let arena = automatic.expert_ranges[gpu].peak_bytes
+                + automatic.tp2.map_or(0, |range| range.peak_bytes[gpu]);
+            assert!(arena > 0);
+            assert_eq!(rank.available_bytes, req.inventory.gpus[gpu].available() - arena);
+        }
+        req.onboard = Onboard::Layers(automatic.onboard_layers);
+        req.pool.requested = Some(automatic.pool_tokens);
+        let fixed = solve_frozen(&req, &automatic).unwrap();
+        assert_eq!(fixed.pool_limits, automatic.pool_limits);
+    }
 }
 
 #[test]

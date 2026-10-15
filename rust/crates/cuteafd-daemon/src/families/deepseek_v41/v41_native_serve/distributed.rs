@@ -329,6 +329,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let deferred=[admission::EXPERT_SETUP_HEADROOM as u64,
         (admission::EXPERT_SETUP_HEADROOM + 2*wave_bytes) as u64];
     let pool=admission::resolve(&args,&memory,expert_demands, (2*per_lane) as u64,&deferred,minimum_expert_layers)?;
+    pass.bind_execution_plan(&pool.placement)?;
+    second.bind_execution_plan(&pool.placement)?;
     let expert_layers=pool.placement.onboard_layers;
     let admitted=pool.placement.tp2.context("dual RTX admission has no routed arena")?;
     let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub((2*per_lane) as u64) as usize);

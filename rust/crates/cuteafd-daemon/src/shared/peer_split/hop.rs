@@ -52,6 +52,9 @@ impl<'a> HopLink<'a> {
     /// device must be current, and is again on return.
     pub fn new(library: &'a NativeLibrary, ranks: [RankDevice; 2], hops: &[Hop], spec: HopSpec) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("residual-hops");
+        ensure!(spec.storage == cuteafd_loader::placement::HopStorage::ReceiveSlots,
+            "HopLink requires receive-slot storage; direct-input hops use the destination's own buffers");
+        ensure!(hops.iter().all(|hop| hop.storage == spec.storage), "hop storage differs from spec");
         ensure!(ranks[0].device != ranks[1].device, "a hop moves between two GPUs");
         ensure!(spec.row_bytes % 16 == 0 && spec.lanes > 0, "hop rows must be 16-byte multiples over at least one lane");
         ensure!(hops.iter().all(|h| h.from != h.to && h.from < 2 && h.to < 2 && h.row_bytes == spec.row_bytes),
@@ -171,7 +174,7 @@ mod cuda_tests {
         // SAFETY: every CUDA owner below is dropped before the library.
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let (w0, w1) = (LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner });
-        let spec = HopSpec { row_bytes: 4 * 64 * 2, rows: 32, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: cuteafd_loader::placement::TerminalHome::AttentionOwner };
+        let spec = HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots, row_bytes: 4 * 64 * 2, rows: 32, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: cuteafd_loader::placement::TerminalHome::AttentionOwner };
         let hops = plan_hops(&[w0, w0, w1, w1], &spec).unwrap();
         assert_eq!(hops.len(), 2);
         library.cuda_set_device(0)?;
