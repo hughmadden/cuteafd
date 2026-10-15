@@ -530,6 +530,11 @@ release_serving_docker_args() {
     -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
     -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
     -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor)
+  # ADR-052's dedicated directory survives socket replacement on daemon restart.
+  # Never create it here: absent storage stays unknown without root-owned state.
+  if [[ -d /srv/sparknest/run ]]; then
+    RELEASE_SERVING_ARGS+=(--mount type=bind,src=/srv/sparknest/run,dst=/srv/sparknest/run,readonly)
+  fi
   # Docker's numeric --user otherwise drops groups used by host access checks.
   for group in "${groups[@]}"; do
     [[ "$group" == "$primary_group" ]] || RELEASE_SERVING_ARGS+=(--group-add "$group")

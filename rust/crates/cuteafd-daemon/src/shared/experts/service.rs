@@ -11,6 +11,7 @@ use cuteafd_transport::expert::{BackboneRequest, SparkTopology};
 use std::{path::PathBuf, sync::{mpsc, Arc}, thread};
 
 pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> {
+    tracing::info!(target: "cuteafd::fabric", source = "sparknest", status = cuteafd_transport::traffic::storage_status(), "local storage traffic source");
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),

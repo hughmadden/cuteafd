@@ -246,6 +246,7 @@ impl LocalVerbsExpertConnection {
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut value = read_control_value(&mut reader)?;
         if value["message"] == "fabric_traffic" {
+            crate::traffic::control_phase(&value);
             write_control(&mut stream.try_clone()?, &serde_json::json!({
                 "message": "fabric_traffic", "sample": crate::traffic::local()
             }))?;

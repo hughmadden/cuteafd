@@ -810,6 +810,18 @@ def classify(row, launched):
     return 'measurement'
 
 
+def fabric_assessment(phases):
+    """Assessment hook for timed background traffic; byte evidence stays per port."""
+    caveats = []
+    for phase in phases:
+        if not phase.get('timed'):
+            continue
+        for warning in phase.get('assessments', []):
+            if warning.startswith(('foreign traffic:', 'SparkNest traffic:', 'storage attribution unavailable:')):
+                caveats.append(f"{phase.get('name', '?')}: {warning}; rerun in a quiet window before accepting A/B")
+    return list(dict.fromkeys(caveats))
+
+
 def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
@@ -822,6 +834,7 @@ def summarize_job(job, exit_code):
     if state.exists():
         row['smoke'] = json.loads(state.read_text())
     outcome = (row.get('smoke') or {}).get(job['entry']['name']) or {}
+    row['fabric'] = list(outcome.get('fabric') or [])
     # The first real error wins: the launcher's own words, then smoke's outcome
     # (its wrapper "./run.sh exited ..." last), then checks derived below.
     found = [e for e in (first_log_error(dest, job['entry']['name']), outcome.get('error')) if e]
@@ -837,6 +850,8 @@ def summarize_job(job, exit_code):
         fail(row, f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
+        if not row['fabric']:
+            row['fabric'].extend(report.get('fabric') or [])
         present = {p['id'] for p in report.get('panels', [])} | ({'baseline'} if report.get('baseline') else set())
         missing = set(requested_panels(job['entry'].get('profile', 'smoke'))) - present
         if missing:
@@ -889,6 +904,8 @@ def summarize_job(job, exit_code):
             fail(row, f'expected one sweep.json, found {len(sweeps)}')
         else:
             sweep = json.loads(sweeps[0].read_text())
+            if not outcome.get('fabric'):
+                row['fabric'].extend(p['fabric'] for p in [*sweep.get('points', []), *sweep.get('prefill', [])] if p.get('fabric'))
             row['sweep'] = sweep.get('points', [])
             for point in row['sweep']:
                 key = 'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}"
@@ -926,6 +943,8 @@ def summarize_job(job, exit_code):
             and job['entry'].get('profile') == 'panels:'
         if not row['requests'] and not prefill_only:
             fail(row, 'matched prompts produced no per-request console rounds')
+    row['fabric_caveats'] = fabric_assessment(row['fabric'])
+    row['ab_verdict'] = 'rerun' if row['fabric_caveats'] else 'eligible'
     row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)
     return row
@@ -1036,7 +1055,9 @@ def write_summary(state, rows, arms):
                    key=lambda k: (int(k.split()[1]), k))
     present = [m for m in (*SUMMARY_METRICS, *extra) if any(isinstance(r.get(m), (int, float)) for r in rows)]
     medians, paired = summary_math(rows, names, present or METRICS)
-    save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired))
+    caveats = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], caveat=c) for r in rows for c in r.get('fabric_caveats', [])]
+    save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired,
+                                    ab_verdict='rerun' if caveats else 'eligible', fabric_caveats=caveats))
     def cell(value):
         if isinstance(value, float):
             return f'{value:.4g}'
@@ -1067,6 +1088,25 @@ def write_summary(state, rows, arms):
         text += '## Results\n\n| Card | ' + ' | '.join(present) + ' |\n| --- |' + ' ---: |' * len(present) + '\n'
         for m in medians:
             text += f"| {m['card']} | " + ' | '.join(cell(m.get(k)) for k in present) + ' |\n'
+        text += '\n'
+    if caveats:
+        text += '## A/B Verdict: Rerun\n\nTimed fabric contamination or unknown attribution prevents accepting this A/B. Request correctness and raw rates remain recorded.\n\n'
+        for c in caveats:
+            text += f"- {c['card']} / {c['arm']} / r{c['repeat']}: {c['caveat']}\n"
+        text += '\n'
+    if any(r.get('fabric') for r in rows):
+        text += '## Fabric By Arm And Phase\n\nPer-port tx+rx bytes; not unique-byte fabric totals. Engine headers are ceil(bytes/MTU)*62 lower bounds; SparkNest uses per-op packets*62. Residual includes ACK/retry and sample skew. Unknown is not zero.\n\n'
+        text += '| Card | Arm | Repeat | Phase | Host / port | NIC | Engine | SparkNest | Headers est. | Residual |\n| --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |\n'
+        for r in rows:
+            for phase in r.get('fabric', []):
+                for p in phase.get('ports', []):
+                    def pair(tx, rx):
+                        a, b = p.get(tx), p.get(rx)
+                        return a + b if isinstance(a, int) and isinstance(b, int) else 'unknown'
+                    values = [pair(a,b) for a,b in [('sent_bytes','received_bytes'), ('engine_sent_bytes','engine_received_bytes'),
+                              ('sparknest_sent_bytes','sparknest_received_bytes'), ('estimated_header_sent_bytes','estimated_header_received_bytes'),
+                              ('foreign_sent_bytes','foreign_received_bytes')]]
+                    text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {cell(phase.get('name'))} | {cell(p.get('host'))} {cell(p.get('device'))}/{p.get('port')} | " + ' | '.join(map(cell, values)) + ' |\n'
         text += '\n'
     text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |\n'
     for r in rows:

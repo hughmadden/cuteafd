@@ -1497,3 +1497,29 @@ def test_arm_probe_preserves_card_defaults(entry, tmp_path, monkeypatch):
     jobs = json.loads((state / 'plan.json').read_text())['jobs']
     assert all(set(job['probes']) == {'console', 'fabric'} for job in jobs)
     assert all('observer' in job['entry'] for job in jobs)
+
+
+def test_fabric_assessment_timed_contamination_and_unknown():
+    phases = [dict(name='warmup', timed=False, assessments=['SparkNest traffic: x']),
+              dict(name='decode', timed=True, assessments=['SparkNest traffic: x', 'foreign traffic: x',
+                                                          'storage attribution unavailable: x', 'xmit_wait rising above idle: x'])]
+    caveats = cards.fabric_assessment(phases)
+    assert len(caveats) == 3
+    assert all('decode:' in c and 'rerun' in c for c in caveats)
+    assert cards.fabric_assessment([]) == []
+
+
+def test_summary_retains_fabric_and_requires_rerun(tmp_path):
+    rows = [dict(card='c', arm=arm, repeat=1, simulated=False, status='pass', C1=10,
+                 fabric=[dict(name='decode', timed=True, ports=[dict(host='coordinator',device='nic',port=1,
+                     sent_bytes=100,received_bytes=100,engine_sent_bytes=40,engine_received_bytes=40,
+                     sparknest_sent_bytes=50,sparknest_received_bytes=50)])],
+                 fabric_caveats=['decode: SparkNest traffic: rerun'] if arm == 'candidate' else [])
+            for arm in ['base','candidate']]
+    cards.write_summary(tmp_path, rows, {'base': {}, 'candidate': {}})
+    data = json.loads((tmp_path/'summary.json').read_text())
+    assert data['ab_verdict'] == 'rerun'
+    assert data['rows'][1]['fabric'][0]['ports'][0]['sparknest_sent_bytes'] == 50
+    text = (tmp_path/'summary.md').read_text()
+    assert 'A/B Verdict: Rerun' in text and 'Fabric By Arm And Phase' in text
+    assert 'SparkNest' in text and 'unknown' in text

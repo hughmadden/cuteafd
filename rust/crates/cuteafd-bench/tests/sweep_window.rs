@@ -55,3 +55,24 @@ async fn window_opens_after_warm_up_before_timed_requests() {
     assert_eq!(sweep.points.len(), 3);
     assert_eq!(refused, 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_logging_is_bounded_and_separate_from_inference() {
+    let (queue, receive) = mpsc::channel::<NativeRequest>(1);
+    let router = router_with_console(queue, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+        Duration::from_secs(5), ConsoleHub::disabled());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    });
+    tokio::task::spawn_blocking(move || {
+        let agent = ureq::agent();
+        assert_eq!(agent.post(&format!("{base}/v1/fabric/phase"))
+            .send_json(serde_json::json!({"name":"decode","timed":true,"ports":[]})).unwrap().status(),204);
+        let oversized = agent.post(&format!("{base}/v1/fabric/phase"))
+            .send_json(serde_json::json!({"name":"x".repeat(129),"timed":true,"ports":[]}));
+        assert!(matches!(oversized,Err(ureq::Error::Status(400,_))));
+    }).await.unwrap();
+    assert!(receive.is_empty());
+}
