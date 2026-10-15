@@ -65,6 +65,14 @@ def test_matrix_private_key_and_complete_lanes(entry, tmp_path):
     assert job['simulated']
 
 
+def test_secondary_rail_only_for_v41(entry, tmp_path):
+    # Only V4.1's launcher reads SPARK_i_LANE_B; other families reject unused keys.
+    entry = dict(entry, name='glm-min', family='glm5')
+    e = json.loads((Path(make(entry, tmp_path)['state']) / 'matrix.json').read_text())['entries'][0]
+    assert e['set']['SPARK_2_LANE_A'] == '10.55.0.3'
+    assert not any(key.endswith('_LANE_B') for key in e['set'])
+
+
 @pytest.mark.parametrize('source', ['config', 'set', 'override'])
 def test_glm_ring_expectation_is_observer_only(entry, tmp_path, source):
     entry['observer'] = dict(argv=['python3', 'ring-observer.py'], timeout_s=300)

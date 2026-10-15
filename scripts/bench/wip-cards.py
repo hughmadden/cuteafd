@@ -254,9 +254,13 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     for key in list(values):
         if re.fullmatch(r'SPARK_[0-5]_(HOST|LANE_A|LANE_B)', key):
             del values[key]
+    # Only V4.1's launcher reads a secondary rail; other families reject the key.
+    lane_b = entry.get('family') == 'deepseek_v41'
     for i, host in enumerate(hosts):
         index = HOSTS.index(host) + 1
-        values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}', f'SPARK_{i}_LANE_B': f'10.55.1.{index}'})
+        values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}'})
+        if lane_b:
+            values[f'SPARK_{i}_LANE_B'] = f'10.55.1.{index}'
     values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm.get('wip_instance', arm['instance']), INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPU=str(gpus[0]))
     run_args = ['--wip', arm['slot']]
     if 'release' in arm:
