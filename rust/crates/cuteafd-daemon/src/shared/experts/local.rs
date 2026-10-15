@@ -1,9 +1,10 @@
 //! One lane's local routed-expert scratch; both lanes share immutable weights.
 use super::exl3::{
-    execution::{Exl3Modules, Exl3Execution, Exl3InputFormat, Exl3Workspace},
+    execution::{Exl3Execution, Exl3InputFormat, Exl3Modules, Exl3Workspace},
     Exl3Weights,
 };
 use super::layer::{ExpertLayer, ExpertWeights};
+use super::ExpertReductionPlan;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::ExpertGeometry;
@@ -58,6 +59,7 @@ struct State<'a> {
 enum Backend<'a> {
     Full {
         states: Vec<State<'a>>,
+        reduction_plan: Option<ExpertReductionPlan>,
         _scratch: DeviceAllocation<'a>,
         weights: Rc<Vec<ExpertWeights<'a>>>,
     },
@@ -113,19 +115,35 @@ impl<'a> LocalExpertWave<'a> {
         geometry: ExpertGeometry,
     ) -> Result<usize> {
         Self::require_geometry(geometry)?;
-        let arena = Self::capacities(capacity)?
+        let infos = Self::capacities(capacity)?
             .into_iter()
-            .try_fold(0usize, |largest, c| {
-                let info = if nvfp4 {
-                    library.v41_nvfp4_local_expert_info(c)?
+            .map(|c| {
+                if nvfp4 {
+                    library.v41_nvfp4_local_expert_info(c)
                 } else {
-                    library.v41_local_expert_info(c)?
-                };
-                Ok::<_, anyhow::Error>(largest.max(usize::try_from(info.scratch_bytes)?))
-            })?;
-        Ok(usize::try_from(cuteafd_loader::placement::families::deepseek_v41::NativeWorkspace {
-            scratch_bytes: arena as u64, kernel_intermediate: 0,
-        }.lane_bytes(capacity as u64, geometry.hidden as u64, geometry.topk as u64, false, nvfp4)?)?)
+                    library.v41_local_expert_info(c)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !nvfp4 {
+            ExpertReductionPlan::native(library, infos.iter().copied())?;
+        }
+        let arena = infos.iter().try_fold(0usize, |largest, info| {
+            Ok::<_, anyhow::Error>(largest.max(usize::try_from(info.scratch_bytes)?))
+        })?;
+        Ok(usize::try_from(
+            cuteafd_loader::placement::families::deepseek_v41::NativeWorkspace {
+                scratch_bytes: arena as u64,
+                kernel_intermediate: 0,
+            }
+            .lane_bytes(
+                capacity as u64,
+                geometry.hidden as u64,
+                geometry.topk as u64,
+                false,
+                nvfp4,
+            )?,
+        )?)
     }
     pub fn new(
         library: &'a NativeLibrary,
@@ -151,18 +169,26 @@ impl<'a> LocalExpertWave<'a> {
             weights.iter().all(|weight| weight.is_nvfp4() == nvfp4),
             "local expert layers mix activation formats"
         );
-        ensure!(
-            Self::device_bytes_for(library, capacity, nvfp4, geometry)? <= budget,
-            "local expert workspace exceeds budget"
-        );
+        let workspace = Self::device_bytes_for(library, capacity, nvfp4, geometry)?;
+        ensure!(workspace <= budget, "local expert workspace exceeds budget");
+        let reduction_plan = if nvfp4 {
+            None
+        } else {
+            Some(ExpertReductionPlan::native(
+                library,
+                Self::capacities(capacity)?
+                    .into_iter()
+                    .map(|c| library.v41_local_expert_info(c))
+                    .collect::<Result<Vec<_>>>()?,
+            )?)
+        };
         let stream = LoadStream {
             library,
             raw: library.cuda_stream_create()?,
         };
         let scratch = DeviceAllocation::new(
             library,
-            Self::device_bytes_for(library, capacity, nvfp4, geometry)?
-                - capacity as usize * geometry.row_bytes() as usize,
+            workspace - capacity as usize * geometry.row_bytes() as usize,
         )?;
         let mut states = Vec::new();
         for c in Self::capacities(capacity)? {
@@ -195,6 +221,7 @@ impl<'a> LocalExpertWave<'a> {
             stream,
             backend: Backend::Full {
                 states,
+                reduction_plan,
                 _scratch: scratch,
                 weights,
             },
@@ -439,12 +466,24 @@ impl<'a> LocalExpertWave<'a> {
                     }
                 }
                 Backend::Full {
-                    states, weights, ..
+                    states,
+                    weights,
+                    reduction_plan,
+                    ..
                 } => {
-                    let state = states
-                        .iter_mut()
-                        .find(|s| s.kernel.info().capacity_rows >= rows)
-                        .context("local expert capacity state missing")?;
+                    let capacities = states
+                        .iter()
+                        .map(|s| s.kernel.info().capacity_rows as usize);
+                    let index = if let Some(plan) = reduction_plan {
+                        plan.execution_index(rows as usize, rows as usize, capacities)?
+                    } else {
+                        capacities
+                            .enumerate()
+                            .find(|&(_, c)| c >= rows as usize)
+                            .map(|(index, _)| index)
+                            .context("local expert capacity state missing")?
+                    };
+                    let state = &mut states[index];
                     weights[layer].bind(&state.kernel, &mut state.slots)?;
                     state.slots[0] = inputs[0].ptr;
                     state.slots[1] = inputs[1].ptr;

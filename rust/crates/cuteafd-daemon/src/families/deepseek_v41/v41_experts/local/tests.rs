@@ -254,3 +254,83 @@ fn local_geometry_rejects_unsupported_native_abi_before_planning() {
         );
     }
 }
+
+#[test]
+fn native_local_and_tp2_freeze_decode_recipe_selection() -> Result<()> {
+    use crate::shared::experts::rtx::{native::kernel_capacities, RtxSelectionPolicy};
+    use cuteafd_ffi::V41ExpertReduction;
+
+    for (role, intermediate) in [(2, 2304u32), (3, 1152u32)] {
+        let recipe = V41ExpertReduction {
+            version: 1,
+            slice_width: 192,
+            fc2_k_steps: 6,
+            plane_count: intermediate.div_ceil(192),
+            plane_fold: 1,
+            implementation: 1,
+            mma_k: 32,
+            block_threads: 128,
+            fc1_k_stage: 128,
+        };
+        let incompatible = V41ExpertReduction {
+            slice_width: 64,
+            fc2_k_steps: 2,
+            plane_count: intermediate / 64,
+            ..recipe
+        };
+        let prefill = V41ExpertReduction {
+            plane_fold: 2,
+            ..recipe
+        };
+        let capacities = if role == 2 {
+            LocalExpertWave::capacities(4096)?
+        } else {
+            kernel_capacities(4096)?
+        };
+        let mut variants = capacities
+            .iter()
+            .map(|&capacity| {
+                (
+                    capacity as usize,
+                    match capacity {
+                        16 => incompatible,
+                        1 | 80 => recipe,
+                        _ => prefill,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let plan = ExpertReductionPlan::new(&variants)?;
+        for rows in 1..=80 {
+            let index = if role == 2 {
+                plan.execution_index(rows, rows, variants.iter().map(|v| v.0))?
+            } else {
+                RtxSelectionPolicy::CanonicalDecode.execution_index(
+                    rows,
+                    rows,
+                    variants.iter().map(|v| v.0),
+                    || plan.execution_index(rows, rows, variants.iter().map(|v| v.0)),
+                )?
+            };
+            assert_eq!(variants[index].1, recipe, "role {role}, rows {rows}");
+            assert_eq!(variants[index].0, if rows == 1 { 1 } else { 80 });
+        }
+        for (rows, expected) in [(81, 256), (256, 256), (257, 1024), (4096, 4096)] {
+            let index = plan.execution_index(rows, rows, variants.iter().map(|v| v.0))?;
+            assert_eq!(variants[index], (if role == 2 { 4096 } else { expected }, prefill));
+        }
+        // Freeze at admission: neither later metadata edits nor re-planning
+        // may silently substitute incompatible arithmetic for the live owner.
+        variants[2].1 = incompatible;
+        assert_eq!(
+            plan.execution_index(80, 80, variants.iter().map(|v| v.0))?,
+            2
+        );
+        let error = ExpertReductionPlan::new(&variants).unwrap_err().to_string();
+        assert!(error.contains("80 decode rows") && error.contains("slice_width"));
+        assert!(ExpertReductionPlan::new(&variants[1..]).is_err());
+        let no_wide = [(1, recipe), (16, incompatible), (4096, prefill)];
+        assert!(ExpertReductionPlan::new(&no_wide).is_err());
+    }
+    Ok(())
+}

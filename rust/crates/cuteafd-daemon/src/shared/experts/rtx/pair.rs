@@ -680,7 +680,11 @@ impl<'a> OwnerPair<'a> {
         super::native::NativeTp2::workspace_bytes_for_format(
             library,
             capacity as usize,
-            super::RtxSelectionPolicy::FirstCapacity,
+            if nvfp4 {
+                super::RtxSelectionPolicy::FirstCapacity
+            } else {
+                super::RtxSelectionPolicy::CanonicalDecode
+            },
             super::native::NativeOutputPolicy::KernelPlanes,
             nvfp4,
         )?
