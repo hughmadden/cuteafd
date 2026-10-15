@@ -163,6 +163,16 @@ def test_missing_abi_header_fails_closed(tmp_path):
         compare_sm.compare(left, right)
 
 
+def test_list_includes_dense_qwen_export_groups():
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"), "--list"],
+                            check=True, capture_output=True, text=True)
+    names = result.stdout.splitlines()
+    for geometry in ("qwen35", "qwen38"):
+        assert names.count(geometry) == 1
+        job = next(job for job in compare_sm.jobs("all") if job[0] == geometry)
+        assert job == (geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
+
+
 def test_catalog_includes_all_geometries_and_fused_suspects():
     jobs = compare_sm.jobs("all")
     names = [name for name, _, _ in jobs]
