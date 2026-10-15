@@ -170,6 +170,10 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
         },
     };
     let dir = options.out.clone().unwrap_or_else(|| labeled_dir(&options.root, &report, options.label.as_deref()));
+    // The report this returns is read the way every surface reads it, so the
+    // run's own gate check and a run recovered from the local store after the
+    // server went away cannot carry a verdict the data no longer earns.
+    let report = crate::quality::under_current_rule(&report);
     let written = write_exports(&report, &dir, &options.export)?;
     if !options.quiet {
         for path in &written {

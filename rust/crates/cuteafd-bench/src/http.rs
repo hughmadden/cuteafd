@@ -319,10 +319,16 @@ async fn run_file(State(bench): State<Arc<Bench>>, Path((id, file)): Path<(Strin
     }
 }
 
+/// One run's measured data, read the way every surface reads it.
+///
+/// The dashboard renders its verdict (scary mode, the failing checks, the
+/// quality line) from this response, so it goes through the same rule as the
+/// exports: a run stored before a checkpoint was reclassified does not keep
+/// presenting the verdict the data no longer earns.
 async fn run_report(State(bench): State<Arc<Bench>>, Path(id): Path<String>) -> Response {
     let report = if id == "latest" { bench.latest() } else { bench.report(&id) };
     match report {
-        Some(report) => Json(report).into_response(),
+        Some(report) => Json(crate::quality::under_current_rule(&report)).into_response(),
         None => not_found("run"),
     }
 }
@@ -408,6 +414,48 @@ pub fn mount(router: Router, bench: Arc<Bench>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store holding one measured run of a checkpoint whose own `config.json`
+    /// declares `algo` for its routed experts. The run's fidelity check is the
+    /// failure the export was stored with.
+    fn stored_run(algo: &str) -> (tempfile::TempDir, Arc<Bench>, Report) {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/2061e0b0");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("config.json"), json!({"quantization_config": {"quant_method": "modelopt",
+            "quant_algo": algo, "group_size": 16, "quantized_layers":
+            {"model.language_model.layers.0.mlp.experts": {"quant_algo": algo}}}}).to_string()).unwrap();
+        let mut report = crate::sample::report(true);
+        report.server.model = "nvidia/Qwen3.8-Flash-Next-NVFP4".into();
+        report.server.configuration.snapshot = Some(snapshot.display().to_string());
+        (dir, Bench::new(crate::store::Store::memory().unwrap()), report)
+    }
+
+    /// The dashboard renders a run's verdict (scary mode, the failing checks,
+    /// the quality line) from `/v1/bench/runs/<id>`, so a run measured before
+    /// its checkpoint was reclassified must read informational there too — while
+    /// the same numbers from a checkpoint the bar still gates keep failing.
+    #[tokio::test]
+    async fn the_dashboard_reads_a_stored_run_under_the_rule_in_force_now() {
+        use crate::report::CheckStatus;
+        use tower::ServiceExt;
+        for (algo, expected) in [("NVFP4", CheckStatus::Info), ("W4A16_NVFP4", CheckStatus::Fail)] {
+            let (_hub, bench, report) = stored_run(algo);
+            bench.set_api_key(cuteafd_api::openai::auth::ApiKey::new("k").unwrap());
+            let id = bench.import(report).unwrap();
+            let request = axum::http::Request::get(format!("/v1/bench/runs/{id}"))
+                .header("Authorization", "bearer k").body(Body::empty()).unwrap();
+            let response = routes(bench).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let served: Report = serde_json::from_slice(&bytes).unwrap();
+            let check = served.baseline.as_ref().unwrap().quality.checks.iter()
+                .find(|c| c.id == "fidelity").unwrap();
+            assert_eq!(check.status, expected, "{algo}");
+            assert_eq!(check.note.as_deref(), (expected == CheckStatus::Info)
+                .then_some(crate::quality::CALIBRATED_W4A4), "{algo}");
+        }
+    }
 
     #[tokio::test]
     async fn usage_switch_requires_the_key_and_round_trips() {
