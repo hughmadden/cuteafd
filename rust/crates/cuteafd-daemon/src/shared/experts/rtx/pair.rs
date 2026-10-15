@@ -1087,6 +1087,43 @@ mod tests {
             .any(|cause| cause.to_string() == "projection enqueue failed"));
     }
 
+    fn shared_submission_entrypoint(source: &str) -> bool {
+        [
+            "crate::shared::experts::rtx::pair::submit(",
+            "crate::shared::experts::rtx::pair::submit_scoped(",
+        ]
+        .iter()
+        .any(|call| {
+            source.match_indices(call).any(|(offset, _)| {
+                offset == 0
+                    || !source[..offset]
+                        .ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+            })
+        })
+    }
+
+    #[test]
+    fn submission_entrypoint_audit_rejects_lookalikes_and_direct_backends() {
+        for call in ["submit", "submit_scoped"] {
+            let qualified = format!("crate::shared::experts::rtx::pair::{call}(");
+            assert!(shared_submission_entrypoint(&qualified));
+            for replacement in [
+                format!("{call}("),
+                format!("other::pair::{call}("),
+                format!("crate::shared::experts::rtx::native::{call}("),
+                format!("not_{qualified}"),
+                format!("other::{qualified}"),
+                "backend.enqueue(".into(),
+                "backend.run(".into(),
+            ] {
+                assert!(
+                    !shared_submission_entrypoint(&replacement),
+                    "accepted {replacement}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn family_submission_and_graph_entrypoints_use_the_shared_boundary() {
         for (source, step, graph) in [
@@ -1126,7 +1163,25 @@ mod tests {
                 .find(&format!("    fn {step}_inner("))
                 .unwrap()
                 + start;
-            assert!(source[start..end].contains("crate::shared::experts::rtx::pair::submit("));
+            let wrapper = &source[start..end];
+            assert!(
+                shared_submission_entrypoint(wrapper),
+                "{step} bypasses the shared boundary"
+            );
+            // Replacing either shared boundary with a backend call must fail this audit.
+            let bypass = wrapper
+                .replace(
+                    "crate::shared::experts::rtx::pair::submit(",
+                    "backend.enqueue(",
+                )
+                .replace(
+                    "crate::shared::experts::rtx::pair::submit_scoped(",
+                    "backend.enqueue(",
+                );
+            assert!(
+                !shared_submission_entrypoint(&bypass),
+                "{step} accepts a direct backend"
+            );
             let start = source.find(&format!("    fn {graph}(")).unwrap();
             let body = &source[start
                 ..source[start..]
@@ -1143,7 +1198,7 @@ mod tests {
             );
         }
         let mimo = include_str!("../../../families/mimo_v2/engine.rs");
-        assert!(mimo.contains("crate::shared::experts::rtx::pair::submit("));
+        assert!(shared_submission_entrypoint(mimo));
         assert!(!mimo.contains("pub(crate) struct TerminalStepError"));
     }
 

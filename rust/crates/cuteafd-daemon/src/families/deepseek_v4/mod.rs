@@ -583,6 +583,7 @@ pub(crate) fn with_engine<T>(
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
+        let _coverage_session = engine.graph_coverage.session();
         body(&engine, &mut transports, &runtime)
     })();
     crate::shared::decode_graph::fatal_drain(engine.shutdown_submission(&mut transports), "V4 RTX engine retirement");
