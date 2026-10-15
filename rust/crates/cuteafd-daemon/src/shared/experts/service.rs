@@ -162,6 +162,7 @@ fn load_weights<'a>(
     let workspace = ExpertWeights::plan_execution(
         config.selection(0)?,
         library,
+        config.compiled_capacity()?,
         config.capacity,
         nvfp4,
     )?
@@ -977,6 +978,13 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
 }
 
 impl NativeExpertServiceConfig {
+    fn compiled_capacity(&self) -> Result<u32> {
+        if let Some(model) = &self.model_admission { return Ok(model.compiled_capacity); }
+        let capacities = cuteafd_loader::placement::families::deepseek_v41::expert_capacities(
+            self.capacity as u64, false)?;
+        u32::try_from(*capacities.last().context("missing native compiled capacity")?).map_err(Into::into)
+    }
+
     /// Exact coordinator-selected IDs, or the launched range before selection.
     pub(super) fn resident_layers(&self, layers: usize) -> Result<Vec<usize>> {
         let allowed = self.launched_layers(layers)?;

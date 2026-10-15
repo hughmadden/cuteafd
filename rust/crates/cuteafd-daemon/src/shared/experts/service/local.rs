@@ -20,8 +20,6 @@ fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
     config.selected_layers = Some(selected);
     if let Some(model) = selection.model() {
         model.validate(selection.geometry())?;
-        ensure!(matches!(model.capacity, 1 | 16 | 80 | 256 | 1024 | 4096),
-            "unsupported sealed native capacity {}", model.capacity);
         config.capacity = model.capacity;
         config.max_frame_bytes = model.rings.max_frame_bytes;
         config.rdma_endpoints = model.endpoints.len();
@@ -58,7 +56,7 @@ mod selection_tests {
         assert_eq!(config.resident_layers(70).unwrap(), vec![13, 15]);
         let before = WorkerSelection::new(identity.clone(), &[0]).unwrap();
         assert!(apply_worker_selection(&mut config, &before, 1, 70).is_err());
-        let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80,
+        let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80, compiled_capacity: 80,
             endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 80,
                 ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 } }],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 32 << 20, depth: 2,
@@ -69,7 +67,15 @@ mod selection_tests {
         assert_eq!(config.max_frame_bytes, 32 << 20);
         assert_eq!(config.rdma_endpoints, 1);
         assert!(config.bf16_ingress);
-        assert_eq!(config.model_admission, Some(model));
+        assert_eq!(config.model_admission, Some(model.clone()));
+        let mut covered = model;
+        covered.capacity = 2048;
+        covered.compiled_capacity = 4096;
+        covered.endpoints[0].capacity = 2048;
+        let covered = sealed.clone().with_model(covered).unwrap();
+        apply_worker_selection(&mut config, &covered, 1, 70).unwrap();
+        assert_eq!(config.capacity, 2048);
+        assert_eq!(config.compiled_capacity().unwrap(), 4096);
         let empty = WorkerSelection::new(identity, &[]).unwrap();
         apply_worker_selection(&mut config, &empty, 1, 70).unwrap();
         assert!(config.resident_layers(70).unwrap().is_empty());
@@ -146,7 +152,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         "native rank must be below the launched Spark world"
     );
     ensure!(
-        matches!(config.capacity, 1 | 16 | 80 | 256 | 1024 | 4096),
+        (1..=4096).contains(&config.capacity),
         "unsupported native capacity"
     );
     // The checkpoint fixes the process expert geometry before the native
@@ -311,7 +317,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         let reported = (|| -> Result<_> {
             let report = if let Some(model) = selection.model() {
                 weights.validate_ingress(&library, model)?;
-                let (resident_bytes, slices) = weights.loaded_residency(&library, config.capacity)?;
+                let (resident_bytes, slices) = weights.loaded_residency(&library, config.compiled_capacity()?)?;
                 let runtime = measured_worker_runtime(&library, &baseline, resident_bytes)?;
                 let host_exchange_bytes = exchange.ids.capacity().checked_mul(std::mem::size_of::<i32>())
                     .and_then(|bytes| bytes.checked_add(exchange.routing.capacity().checked_mul(std::mem::size_of::<f32>())?))

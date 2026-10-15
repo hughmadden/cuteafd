@@ -90,7 +90,7 @@ impl<'a> Weights<'a> {
         let (fp8, bf16) = match self {
             Self::Full(weights) => {
                 let first = weights.first().context("sealed native worker has no weights")?;
-                let input = first.layer.select_info(library, model.capacity, first.is_nvfp4())?.input_dtype;
+                let input = first.layer.select_info(library, model.compiled_capacity, first.is_nvfp4())?.input_dtype;
                 (input == cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32,
                     input == cuteafd_transport::ExpertV2Dtype::Bf16 as u32)
             }
@@ -124,7 +124,7 @@ impl<'a> Weights<'a> {
     ) -> Result<Execution<'_, 'a>> {
         Ok(match self {
             Self::Full(weights) => {
-                let mut execution = weights[0].execution(config.capacity, remaining)?;
+                let mut execution = weights[0].execution(config.compiled_capacity()?, config.capacity, remaining)?;
                 execution.install_native_group(config.native_group()?)?;
                 execution.install_worker_timing(config.rank)?;
                 Execution::Full(execution)

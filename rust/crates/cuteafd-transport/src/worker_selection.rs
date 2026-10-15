@@ -71,7 +71,10 @@ pub struct WorkerSelection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelAdmission {
+    /// Actual row storage and endpoint admission extent.
     pub capacity: u32,
+    /// Main native export extent; scratch/program state may exceed live rows.
+    pub compiled_capacity: u32,
     pub endpoints: Vec<cuteafd_core::SparkEndpoint>,
     pub rings: cuteafd_core::SparkRings,
 }
@@ -79,6 +82,9 @@ pub struct ModelAdmission {
 impl ModelAdmission {
     pub fn validate(&self, geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
         ensure!((1..=4096).contains(&self.capacity), "invalid ModelAdmission capacity");
+        ensure!((self.capacity..=4096).contains(&self.compiled_capacity),
+            "ModelAdmission compiled capacity {} must cover live capacity {} and be at most 4096",
+            self.compiled_capacity, self.capacity);
         ensure!(!self.endpoints.is_empty() && self.endpoints.len() <= 8,
             "ModelAdmission requires 1..=8 endpoints");
         let endpoint_capacity = self.endpoints.iter().map(|endpoint| endpoint.capacity).max().unwrap();
@@ -320,6 +326,10 @@ impl InstalledExpertGrouping {
             "invalid installed expert rank/resident layers");
         ensure!((1..=4096).contains(&self.capacity) && (1..=6).contains(&self.variants.len()),
             "invalid installed expert report capacity/variant count");
+        if let Some(model) = self.loaded.model() {
+            ensure!(self.capacity == model.capacity as usize,
+                "installed expert live capacity differs from ModelAdmission");
+        }
         for variant in &self.variants { variant.validate()?; }
         if self.selector != ExpertGroupingSelector::Fp8Nearest {
             ensure!(self.variants.iter().all(|variant| variant.segments.is_empty()
@@ -332,9 +342,14 @@ impl InstalledExpertGrouping {
         let capacities: Vec<_> = self.variants.iter().map(|variant| variant.capacity).collect();
         let expected = match self.selector {
             ExpertGroupingSelector::Native => {
-                ensure!(capacities.last() == Some(&self.capacity)
-                    && capacities.iter().all(|&c| c == self.capacity || c == 1 || (c == 80 && self.capacity > 80)),
+                let main = *capacities.last().context("native main capacity missing")?;
+                ensure!(main >= self.capacity
+                    && capacities.iter().all(|&c| c == main || c == 1 || (c == 80 && main > 80)),
                     "native report must name its actual main and optional m1/m80 executions");
+                if let Some(model) = self.loaded.model() {
+                    ensure!(main == model.compiled_capacity as usize,
+                        "installed native main capacity differs from ModelAdmission compiled capacity");
+                }
                 capacities.clone()
             }
             ExpertGroupingSelector::Fp8Nearest => {
@@ -763,7 +778,7 @@ mod tests {
     fn admission_selection() -> WorkerSelection {
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
         WorkerSelection::new(WorkerIdentity { world: 1, ..identity() }, &[13]).unwrap()
-            .with_model(ModelAdmission { capacity: 4096,
+            .with_model(ModelAdmission { capacity: 4096, compiled_capacity: 4096,
                 endpoints: vec![SparkEndpoint { capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 } }],
                 rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } }).unwrap()
     }
@@ -908,6 +923,29 @@ mod tests {
             message: "worker_selection_start".into(), rank: 0,
             digest: changed.digest()?, selection: changed,
         })?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_compiled_capacity_covers_live_but_does_not_admit_extra_rows() -> Result<()> {
+        let mut selection = admission_selection();
+        let model = selection.model.as_mut().unwrap();
+        model.capacity = 2048;
+        model.endpoints[0].capacity = 2048;
+        selection.validate()?;
+        let variants = [1, 80, 4096].into_iter().map(|capacity|
+            InstalledExpertVariant::from_queries(capacity, |_| Ok(16))).collect::<Result<Vec<_>>>()?;
+        let report = InstalledExpertGrouping::new(selection.clone(), 0, 2048,
+            ExpertGroupingSelector::Native, variants.clone())?;
+        assert!(report.group_rows(2048).is_ok());
+        assert!(report.group_rows(2049).is_err());
+        assert!(InstalledExpertGrouping::new(selection.clone(), 0, 4096,
+            ExpertGroupingSelector::Native, variants.clone()).is_err());
+        selection.model.as_mut().unwrap().compiled_capacity = 1024;
+        assert!(selection.validate().is_err());
+        selection.model.as_mut().unwrap().compiled_capacity = 2048;
+        assert!(InstalledExpertGrouping::new(selection, 0, 2048,
+            ExpertGroupingSelector::Native, variants).is_err());
         Ok(())
     }
 
