@@ -326,7 +326,7 @@ pub(crate) fn with_engine<T>(
     // (placement PR 2): the context and module bytes the planner charges as
     // `ArchContext` + `ProgramSet`.
     let devices: Vec<i32> = std::iter::once(args.device).chain(split_device).collect();
-    let inventory = crate::shared::inventory::RuntimeInventory::measure(&loaded.library, &devices, |_| {
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&loaded.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         let (loaded_count, skipped) = programs.load_matching(|name| selected.contains(name))?;
         tracing::info!(loaded = loaded_count, skipped, elapsed_ms = started.elapsed().as_millis() as u64,
             "DeepSeek V4 programs loaded");

@@ -325,7 +325,7 @@ impl Opened {
             None => None,
         };
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
-        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, |_| {
+        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
             tracing::info!(loaded, skipped, "GLM programs loaded");
             Ok(())

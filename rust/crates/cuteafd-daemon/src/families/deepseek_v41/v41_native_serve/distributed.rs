@@ -81,7 +81,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
     }
     let mut exl3_modules = [None, None];
-    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], |gpu| {
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
         admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)?;
         if compressed {
             exl3_modules[gpu as usize] = Some(admission::preload_exl3(&lib, &exl3_directory, capacity, 2)?);

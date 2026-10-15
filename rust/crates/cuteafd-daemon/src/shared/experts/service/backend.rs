@@ -22,6 +22,77 @@ impl<'a> Weights<'a> {
             Self::Fp8(experts) => experts.layers.len(),
         }
     }
+    pub(super) fn loaded_residency(&self, library: &NativeLibrary, capacity: u32)
+        -> Result<(u64, Vec<cuteafd_core::SparkSlice>)> {
+        use cuteafd_core::SparkSlice;
+        let mut resident = 0u64;
+        let mut slices = Vec::with_capacity(self.len());
+        match self {
+            Self::Full(weights) => for weight in weights {
+                let info = weight.layer.select_info(library, capacity, weight.is_nvfp4())?;
+                ensure!(weight.intermediate() == info.kernel_intermediate as usize,
+                    "native resident carrier width differs from installed kernel");
+                let rank = match weight.layer {
+                    ExpertLayer::Backbone { rank, .. } | ExpertLayer::BackboneTp2 { rank, .. }
+                    | ExpertLayer::BackboneReplicatedTp { rank, .. } => rank,
+                    ExpertLayer::BackboneFull { .. } => 0,
+                    other => anyhow::bail!("non-native backbone worker layer {other:?}"),
+                };
+                resident = resident.checked_add(u64::try_from(weight.resident_bytes()?)?)
+                    .context("native resident sum overflow")?;
+                slices.push(SparkSlice { layer: u32::try_from(weight.layer.layer())?,
+                    first: u32::try_from(rank.checked_mul(info.logical_intermediate as usize)
+                        .context("native slice start overflow")?)?,
+                    width: info.logical_intermediate, stored_width: info.kernel_intermediate,
+                    tiers: vec![], projection_counts: vec![] });
+            },
+            Self::Exl3(weights) => for weight in weights.iter() {
+                let plan = &weight.layout;
+                let layer = match plan.layer {
+                    cuteafd_loader::V41Exl3Layer::Backbone(layer) => layer,
+                    _ => anyhow::bail!("draft layer in resident Spark backbone"),
+                };
+                resident = resident.checked_add(u64::try_from(weight.resident_bytes())?)
+                    .context("EXL3 resident sum overflow")?;
+                slices.push(SparkSlice { layer: u32::try_from(layer)?,
+                    first: u32::try_from(plan.intermediate_start)?, width: u32::try_from(plan.intermediate)?,
+                    stored_width: u32::try_from(plan.intermediate)?,
+                    tiers: plan.tiers.iter().copied().map(u32::try_from).collect::<Result<_, _>>()?,
+                    projection_counts: plan.projection_counts.iter().map(|counts| Ok([
+                        u32::try_from(counts[0])?, u32::try_from(counts[1])?, u32::try_from(counts[2])?,
+                    ])).collect::<Result<_, std::num::TryFromIntError>>()? });
+            },
+            Self::Fp8(experts) => {
+                resident = u64::try_from(experts.resident_bytes())?;
+                for layer in &experts.layers {
+                    ensure!(layer.slice.stored_width as usize == experts.module.info().slice,
+                        "loaded FP8 slice differs from installed package");
+                    slices.push(layer.slice.clone());
+                }
+            }
+        }
+        Ok((resident, slices))
+    }
+
+    pub(super) fn validate_ingress(&self, library: &NativeLibrary,
+        model: &cuteafd_transport::worker_selection::ModelAdmission) -> Result<()> {
+        let (fp8, bf16) = match self {
+            Self::Full(weights) => {
+                let first = weights.first().context("sealed native worker has no weights")?;
+                let input = first.layer.select_info(library, model.capacity, first.is_nvfp4())?.input_dtype;
+                (input == cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32,
+                    input == cuteafd_transport::ExpertV2Dtype::Bf16 as u32)
+            }
+            Self::Exl3(_) => (true, false),
+            Self::Fp8(experts) => (experts.wire_input(), !experts.wire_input() || experts.bf16_module.is_some()),
+        };
+        for endpoint in &model.endpoints {
+            let supported = supports_ingress(endpoint.ingress, fp8, bf16);
+            ensure!(supported, "loaded Spark backend does not support sealed ingress {:?}", endpoint.ingress);
+        }
+        Ok(())
+    }
+
     /// Logical intermediate values this worker loaded per expert, reported as
     /// part of the structured startup evidence. `None` when nothing is resident
     /// (an all-remote worker), where the value would be a claim, not a fact.
@@ -153,12 +224,36 @@ impl<'w, 'a> Execution<'w, 'a> {
     }
 }
 
+fn supports_ingress(ingress: cuteafd_core::SparkIngress, fp8: bool, bf16: bool) -> bool {
+    match ingress {
+        cuteafd_core::SparkIngress::Fp8K32 => fp8,
+        cuteafd_core::SparkIngress::Bf16 => bf16,
+        // FP8 remains legal at every row count, including the BF16 decode extent.
+        cuteafd_core::SparkIngress::Bf16Decode { .. } => fp8 && bf16,
+    }
+}
+
 fn fp8_resident_budget(available: usize, resident: usize, serve_peak: usize) -> usize {
     available.saturating_sub(serve_peak.saturating_sub(resident))
 }
 
 #[cfg(test)]
 mod admission_tests {
+    #[test]
+    fn mixed_ingress_requires_both_backends_even_at_full_decode_extent() {
+        use cuteafd_core::{SparkEndpoint, SparkIngress};
+        for rows in [16, 80] {
+            let endpoint = SparkEndpoint { capacity: 80, ingress: SparkIngress::Bf16Decode { rows } };
+            for (fp8, bf16) in [(false, false), (false, true), (true, false), (true, true)] {
+                assert_eq!(super::supports_ingress(endpoint.ingress, fp8, bf16), fp8 && bf16);
+            }
+        }
+        assert!(super::supports_ingress(SparkIngress::Fp8K32, true, false));
+        assert!(!super::supports_ingress(SparkIngress::Fp8K32, false, true));
+        assert!(super::supports_ingress(SparkIngress::Bf16, false, true));
+        assert!(!super::supports_ingress(SparkIngress::Bf16, true, false));
+    }
+
     #[test]
     fn fp8_load_transients_do_not_reduce_serve_residency() {
         // The load and serve peaks fit independently, not simultaneously.
@@ -174,7 +269,10 @@ fn fp8_worker_workspace(config: &NativeExpertServiceConfig) -> Result<usize> {
     if config.bf16_ingress {
         let io = super::selected_spark_io(config, cuteafd_core::expert_geometry(),
             super::worker_ring_geometry(config)?)?;
-        Ok(usize::try_from(io.intake).context("BF16 worker intake exceeds address space")?)
+        // A BF16 sibling still retains full-capacity intake, even for a mixed
+        // decode-only seal. Shrinking that owner is a separate change (#292).
+        Ok(usize::try_from(io.intake).context("BF16 worker intake exceeds address space")?
+            .max(Fp8Worker::workspace_bytes(config.capacity as usize)))
     } else {
         Ok(Fp8Worker::workspace_bytes(config.capacity as usize))
     }

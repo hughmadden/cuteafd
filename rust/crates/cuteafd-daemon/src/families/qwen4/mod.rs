@@ -430,7 +430,7 @@ impl Opened {
         // every other family's modules, which Qwen never launches.
         let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "qwen4", split_family: None };
         let device = self.library.cuda_get_device()?;
-        crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], |_| {
+        crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
             tracing::info!(loaded, skipped, "Qwen programs loaded");
             Ok(())

@@ -64,6 +64,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         first_layer: args.first_layer as usize,
         last_layer: args.last_layer.map(|layer| layer as usize),
         placement_handshake: args.placement_handshake,
+        model_admission: None,
         capacity: args.capacity,
         device_budget: args.device_budget_bytes,
         max_frame_bytes: args.max_frame_bytes,
@@ -96,6 +97,7 @@ pub(crate) struct NativeExpertServiceConfig {
     /// Inclusive last resident layer; `None` serves through the model's last.
     pub last_layer: Option<usize>,
     pub placement_handshake: bool,
+    model_admission: Option<cuteafd_transport::worker_selection::ModelAdmission>,
     pub capacity: u32,
     pub device_budget: usize,
     pub max_frame_bytes: usize,
@@ -321,11 +323,21 @@ fn selected_spark_io(config: &NativeExpertServiceConfig, geometry: cuteafd_core:
         prefill_lanes: 1, ..Default::default()
     };
     ensure!(working.selected_ranks().contains(&config.rank), "Spark worker rank is not selected");
+    if let Some(model) = &config.model_admission {
+        return Ok(working.rank_endpoints_io(config.rank, geometry, &model.endpoints, model.rings)?);
+    }
     Ok(working.rank_io(config.rank, geometry, config.capacity, config.bf16_ingress, rings)?)
 }
 
 fn worker_ring_geometry(config: &NativeExpertServiceConfig)
     -> Result<cuteafd_loader::placement::SparkRingGeometry> {
+    if let Some(model) = &config.model_admission {
+        return Ok(cuteafd_loader::placement::SparkRingGeometry {
+            max_frame_bytes: model.rings.max_frame_bytes, depth: model.rings.depth,
+            slot_bytes: model.rings.slot_bytes, endpoints: model.endpoints.len(),
+            alignment: model.rings.alignment,
+        });
+    }
     ensure!(config.rdma_endpoints > 0, "Spark ring geometry requires nonzero --rdma-endpoints");
     Ok(cuteafd_loader::placement::SparkRingGeometry {
         max_frame_bytes: config.max_frame_bytes,
@@ -488,6 +500,7 @@ mod tests {
             first_layer: 0,
             last_layer: None,
             placement_handshake: false,
+            model_admission: None,
             capacity: 16,
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,

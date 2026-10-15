@@ -22,6 +22,17 @@ fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
         config.first_layer = range.first as usize;
         config.last_layer = Some(range.end as usize - 1);
     }
+    if let Some(model) = selection.model() {
+        model.validate(selection.geometry())?;
+        ensure!(matches!(model.capacity, 1 | 16 | 80 | 256 | 1024 | 4096),
+            "unsupported sealed native capacity {}", model.capacity);
+        config.capacity = model.capacity;
+        config.max_frame_bytes = model.rings.max_frame_bytes;
+        config.rdma_endpoints = model.endpoints.len();
+        config.bf16_ingress = model.endpoints.iter().any(|endpoint|
+            !matches!(endpoint.ingress, cuteafd_core::SparkIngress::Fp8K32));
+        config.model_admission = Some(model.clone());
+    }
     Ok(())
 }
 
@@ -40,7 +51,7 @@ mod selection_tests {
         let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
             snapshot: dir.path().into(), rank: 0, world: 6, first_layer: 1, last_layer: None,
-            placement_handshake: true, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
+            placement_handshake: true, model_admission: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
             rdma_endpoints: 3, topology: None, native_spark_tp2: false, bf16_ingress: false };
         let selection = WorkerSelection::new(identity.clone(), &(13..70).collect::<Vec<_>>()).unwrap();
         apply_worker_selection(&mut config, &selection, 1, 70).unwrap();
@@ -50,21 +61,43 @@ mod selection_tests {
         assert!(apply_worker_selection(&mut config, &disjoint, 1, 70).is_err());
         let before = WorkerSelection::new(identity.clone(), &[0]).unwrap();
         assert!(apply_worker_selection(&mut config, &before, 1, 70).is_err());
+        let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80,
+            endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 80,
+                ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 } }],
+            rings: cuteafd_core::SparkRings { max_frame_bytes: 32 << 20, depth: 2,
+                slot_bytes: 1 << 20, alignment: 4096 } };
+        let sealed = selection.with_model(model.clone()).unwrap();
+        apply_worker_selection(&mut config, &sealed, 1, 70).unwrap();
+        assert_eq!(config.capacity, 80);
+        assert_eq!(config.max_frame_bytes, 32 << 20);
+        assert_eq!(config.rdma_endpoints, 1);
+        assert!(config.bf16_ingress);
+        assert_eq!(config.model_admission, Some(model));
         let empty = WorkerSelection::new(identity, &[]).unwrap();
         apply_worker_selection(&mut config, &empty, 1, 70).unwrap();
         assert!(empty.ranges().is_empty());
     }
+
+    #[test]
+    fn retained_workspace_subtracts_owners_not_weight_scope() {
+        // Scratch may share the weights scope; only actual owners are resident.
+        assert_eq!(retained_workspace(100, 190, 70, 20, 25).unwrap(), (20, 5));
+        assert_eq!(retained_workspace(100, 100, 0, 20, 20).unwrap(), (0, 0));
+        assert!(retained_workspace(100, 99, 0, 20, 20).is_err());
+        assert!(retained_workspace(100, 190, 91, 20, 20).is_err());
+        assert!(retained_workspace(100, 190, 70, 20, 19).is_err());
+    }
 }
 
 fn run_empty_selection(listener: TcpListener, rank: usize,
-    selection: &cuteafd_transport::worker_selection::WorkerSelection) -> Result<()> {
+    installed: &cuteafd_transport::worker_selection::InstalledModelAdmission) -> Result<()> {
     listener.set_nonblocking(false)?;
     for accepted in listener.incoming() {
         let mut stream = accepted?;
         let result = (|| -> Result<()> {
             let repeated = cuteafd_transport::worker_selection::receive_worker_selection(&stream, rank, Duration::from_secs(30))?;
-            ensure!(&repeated == selection, "empty worker selection is immutable until restart");
-            cuteafd_transport::worker_selection::acknowledge_worker_selection(&mut stream, rank, selection)
+            ensure!(&repeated == installed.selection(), "empty worker selection is immutable until restart");
+            installed.acknowledge(&mut stream)
         })();
         if let Err(error) = result {
             if error.is::<cuteafd_transport::traffic::TrafficProbeOnly>() { continue; }
@@ -73,6 +106,32 @@ fn run_empty_selection(listener: TcpListener, rank: usize,
         }
     }
     Ok(())
+}
+
+fn retained_workspace(before_device: usize, after_device: usize, resident: u64,
+    before_pinned: usize, after_pinned: usize) -> Result<(u64, u64)> {
+    let retained = after_device.checked_sub(before_device)
+        .context("worker device ledger decreased across expert loading")?;
+    let workspace = u64::try_from(retained)?.checked_sub(resident)
+        .context("resident owners exceed retained worker device ledger delta")?;
+    let pinned = after_pinned.checked_sub(before_pinned)
+        .context("worker pinned ledger decreased across expert loading")?;
+    Ok((workspace, u64::try_from(pinned)?))
+}
+
+fn measured_worker_runtime(library: &NativeLibrary,
+    baseline: &cuteafd_ffi::memory_ledger::Snapshot, resident: u64)
+    -> Result<cuteafd_core::SparkRuntimeInventory> {
+    use cuteafd_ffi::memory_ledger::{self, Space};
+    let device = library.cuda_get_device()?;
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(library, &[device],
+        crate::shared::inventory::InventoryPhase::PostLoad, |_| Ok(()))?;
+    let retained = memory_ledger::snapshot();
+    let (workspace_bytes, pinned_workspace_bytes) = retained_workspace(
+        baseline.total(Space::Device, device), retained.total(Space::Device, device), resident,
+        baseline.total(Space::Pinned, -1), retained.total(Space::Pinned, -1))?;
+    Ok(cuteafd_core::SparkRuntimeInventory { sample: inventory.gpus.into_iter().next()
+        .context("worker runtime sample missing")?, workspace_bytes, pinned_workspace_bytes })
 }
 
 struct Admission {
@@ -117,11 +176,6 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         (minimum_frame..=64 * 1024 * 1024).contains(&config.max_frame_bytes),
         "invalid native frame budget"
     );
-    // Every accepted endpoint shares the finite selected-family ring allowance.
-    // Oversized or extra peer advertisements fail before mapped allocation.
-    let ring_budget = Some(worker_ring_budget(&config, geometry)?);
-    tracing::info!(rdma_endpoints = config.rdma_endpoints, bf16_ingress = config.bf16_ingress,
-        ring_budget_bytes = ring_budget.as_ref().unwrap().limit(), "Spark ring admission policy");
     // The vision owner loads in this process/device's primary CUDA context,
     // never beside expertd in a second process. Charge it before expert admission.
     let (_encoder, _audio_encoder, reserved) = crate::shared::vision::worker::start_encoders(
@@ -165,14 +219,41 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             }
         };
         if selection.ranges().is_empty() {
-            cuteafd_transport::worker_selection::acknowledge_worker_selection(&mut stream, config.rank, &selection)?;
+            let installed = (|| -> Result<_> {
+                let report = if selection.model().is_some() {
+                    // SAFETY: the library remains loaded until sampling completes; replay retains only data.
+                    let library = unsafe { NativeLibrary::load(&config.library) }?;
+                    library.release_sync_h2d_staging()?;
+                    let baseline = cuteafd_ffi::memory_ledger::snapshot();
+                    Some(cuteafd_core::ModelAdmissionResponse { rank: u32::try_from(config.rank)?,
+                        resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0)?,
+                        mapped_ring_bytes: 0, host_exchange_bytes: 0, row_indices_bytes: 0 })
+                } else { None };
+                cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, report)
+            })();
+            let installed = match installed {
+                Ok(installed) => installed,
+                Err(error) => {
+                    let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
+                    return Err(error);
+                }
+            };
+            installed.acknowledge(&mut stream)?;
             tracing::info!(rank = config.rank, layers = 0, resident_bytes = 0, "native empty expert worker ready");
-            return run_empty_selection(listener, config.rank, &selection);
+            return run_empty_selection(listener, config.rank, &installed);
         }
         Some((listener, stream, selection))
     } else { None };
+    // Every endpoint shares the sealed finite allowance, fixed before loading.
+    let ring_budget = Some(worker_ring_budget(&config, geometry)?);
+    tracing::info!(rdma_endpoints = config.rdma_endpoints, bf16_ingress = config.bf16_ingress,
+        ring_budget_bytes = ring_budget.as_ref().unwrap().limit(), "Spark ring admission policy");
     // SAFETY: this owner keeps the library loaded through weights/execution Drop.
     let library = unsafe { NativeLibrary::load(&config.library) }?;
+    // Remove upload transients left by media before taking the retained baseline.
+    library.release_sync_h2d_staging()?;
+    // Existing media owners belong to the baseline, not expert residency/workspace.
+    let baseline = cuteafd_ffi::memory_ledger::snapshot();
     let loaded = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         load_weights(&library, &catalog, &config)
@@ -233,7 +314,30 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             return Err(error);
         }
-        let installed = cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, None)?;
+        let reported = (|| -> Result<_> {
+            let report = if let Some(model) = selection.model() {
+                weights.validate_ingress(&library, model)?;
+                let (resident_bytes, slices) = weights.loaded_residency(&library, config.capacity)?;
+                let runtime = measured_worker_runtime(&library, &baseline, resident_bytes)?;
+                let host_exchange_bytes = exchange.ids.capacity().checked_mul(std::mem::size_of::<i32>())
+                    .and_then(|bytes| bytes.checked_add(exchange.routing.capacity().checked_mul(std::mem::size_of::<f32>())?))
+                    .and_then(|bytes| bytes.checked_add(exchange.partials.capacity()))
+                    .context("worker host exchange extent overflow")?;
+                Some(cuteafd_core::ModelAdmissionResponse { rank: u32::try_from(config.rank)?,
+                    resident_bytes, slices, runtime, mapped_ring_bytes: u64::try_from(model.ring_bytes(geometry)?)?,
+                    host_exchange_bytes: u64::try_from(host_exchange_bytes)?,
+                    row_indices_bytes: u64::try_from(row_indices.capacity().checked_mul(std::mem::size_of::<u32>())
+                        .context("worker row index extent overflow")?)? })
+            } else { None };
+            cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, report)
+        })();
+        let installed = match reported {
+            Ok(installed) => installed,
+            Err(error) => {
+                let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
+                return Err(error);
+            }
+        };
         installed.acknowledge(&mut stream)?;
         tracing::info!(rank = config.rank, first_layer = config.first_layer, layers = weights.len(),
             selection_digest = %installed.selection().digest()?, "coordinator-selected worker weights ready");

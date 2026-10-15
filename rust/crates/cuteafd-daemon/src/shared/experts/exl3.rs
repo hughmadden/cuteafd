@@ -130,6 +130,8 @@ fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<Exper
 }
 
 impl<'a> Exl3Weights<'a> {
+    pub(crate) fn resident_bytes(&self) -> usize { self._arena.buffer.bytes }
+
     pub(crate) fn plan(
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,

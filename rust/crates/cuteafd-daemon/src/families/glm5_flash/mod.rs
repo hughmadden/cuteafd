@@ -1386,7 +1386,7 @@ impl Opened {
         ensure!(args.expert_window.is_none(), "solver admission does not support diagnostic expert paging");
         let devices: Vec<_> = std::iter::once(args.device).chain(peer).collect();
         let split = devices.len() == 2;
-        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, |_| {
+        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             programs.load_matching(|name| glmf_startup_program(name, split, args.decode_rows > engine::DECODE_ROWS))?;
             Ok(())
         })?;
