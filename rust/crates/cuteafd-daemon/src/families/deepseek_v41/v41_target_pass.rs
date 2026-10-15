@@ -134,6 +134,14 @@ pub(crate) struct TargetPass<'w, 'a> {
     device_order: bool,
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
+    pub fn bind_execution_plan(&self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
+        let plan = cuteafd_loader::placement::LayerExecutionPlan::new(placement,
+            cuteafd_loader::placement::families::deepseek_v41::execution_hops(1))?;
+        let map = crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::from_execution_plan(&plan)?;
+        ensure!((0..40).all(|layer| map.attention(layer).ok() == Some(0)) && plan.hops().is_empty(),
+            "single RTX execution differs from admitted ownership");
+        Ok(())
+    }
     /// The next pass may run device-ordered (`CUTEAFD_V41_DEVICE`); reset after it.
     pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
     pub fn set_route_capture(&mut self, enabled: bool) {

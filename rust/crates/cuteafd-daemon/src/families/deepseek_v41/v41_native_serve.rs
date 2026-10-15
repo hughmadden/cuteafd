@@ -560,6 +560,8 @@ fn worker(
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
     let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0)?;
+    pass.bind_execution_plan(&pool.placement)?;
+    prefill_pass.bind_execution_plan(&pool.placement)?;
     tracing::info!(source_pages=?pool.pages,global_bytes=pool.global_bytes,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,local_layers=pool.placement.onboard_layers,
         projected_free_bytes=free.saturating_sub(pool.cache_bytes[0]),reservation_bytes=?pool.reservation_bytes,
