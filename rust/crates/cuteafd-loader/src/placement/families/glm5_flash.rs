@@ -589,11 +589,6 @@ pub fn solve_working_set_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_
     let mut refusal = None;
     for n in counts {
         let working = GlmfWorkingSet::candidate(i, n)?;
-        let spark_layers = &working.spark_layers;
-        if spark_layers.windows(2).any(|pair| pair[1] != pair[0] + 1) {
-            refusal.get_or_insert(PlacementError::Inventory("GLM Flash Spark selection requires a contiguous routed range"));
-            continue;
-        }
         let mut branch = i.clone();
         branch.onboard = Onboard::Layers(n);
         let floor = match i.onboard {
@@ -1052,19 +1047,36 @@ mod tests {
     }
 
     #[test]
-    fn inadmissible_noncontiguous_spark_candidates_do_not_hide_empty_candidate() {
+    fn sparse_routed_candidates_preserve_exact_local_and_spark_inventories() {
         let mut cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
         cfg.dense[2] = true;
-        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
-        input.graphs = GraphSet::budget(&[64 << 20; 2]);
-        input.requested_pool = Some(2 << 20);
-        input.onboard = Onboard::Layers(0);
-        assert!(matches!(solve_working_set_with_graphs(&input, 2 << 20, false, 188, true),
-            Err(PlacementError::Inventory("GLM Flash Spark selection requires a contiguous routed range"))));
-        input.onboard = Onboard::Auto;
-        let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
-        assert_eq!(placed.onboard_layers, 2);
-        assert!(working.spark_layers.is_empty());
+        for ranks in [1, 2] {
+            let mut input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
+            input.graphs = GraphSet::budget(&vec![64 << 20; ranks]);
+            input.requested_pool = Some(2 << 20);
+            for n in 0..=2 {
+                input.onboard = Onboard::Layers(n);
+                let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+                assert_eq!(placed.onboard_layers, n);
+                assert_eq!(working.rtx_layers, [1, 3][..n]);
+                assert_eq!(working.spark_layers, [1, 3][n..]);
+                assert_eq!(placed.layers[0].experts, ExpertHome::Dense);
+                assert_eq!(placed.layers[2].experts, ExpertHome::Dense);
+                working.validate(&placed).unwrap();
+                let mut missing = working.clone();
+                if let Some(layer) = missing.spark_layers.pop() {
+                    assert!(missing.validate(&placed).is_err());
+                    missing.spark_layers.push(layer);
+                }
+                missing.spark_layers.push(2);
+                assert!(missing.validate(&placed).is_err());
+            }
+            input.onboard = Onboard::Auto;
+            let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+            assert_eq!(placed.onboard_layers, 2);
+            assert_eq!(working.rtx_layers, [1, 3]);
+            assert!(working.spark_layers.is_empty());
+        }
     }
 
     #[test]
