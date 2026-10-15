@@ -35,7 +35,7 @@ fn local_activation_contract_selects_bf16_only_for_nvfp4() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires RTX, full EXL3 snapshot, TP1 package and six-expert FP8-wire fixture"]
+#[ignore = "requires RTX, full EXL3 snapshot, TP1 package and canonical m80 six-expert FP8-wire fixture"]
 fn exl3_local_capacity_lanes_and_shared_sum_match_reference() -> Result<()> {
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     lib.cuda_set_device(0)?;
@@ -54,7 +54,7 @@ fn exl3_local_capacity_lanes_and_shared_sum_match_reference() -> Result<()> {
             && meta["layer"] == "layers.0"
             && meta["slice_start"] == 0
             && meta["width"] == 2304
-            && meta["capacity"] == 16,
+            && meta["capacity"] == 80,
         "unexpected local expert fixture"
     );
     let payloads = ["input", "ids", "weights", "expected"]
@@ -97,7 +97,7 @@ fn exl3_local_capacity_lanes_and_shared_sum_match_reference() -> Result<()> {
             one_expected = bytes;
         }
     }
-    for (capacity, fixture_meta) in [(1, &one_meta), (16, &meta)] {
+    for (capacity, fixture_meta) in [(1, &one_meta), (80, &meta)] {
         let export: serde_json::Value = serde_json::from_slice(&std::fs::read(
             directory.join(format!("m{capacity}/v41_exl3.json")),
         )?)?;
@@ -210,11 +210,10 @@ fn exl3_local_capacity_lanes_and_shared_sum_match_reference() -> Result<()> {
         }
         // Check the FP32 expert epilogue separately from the established BF16
         // routed-output boundary in the serving reducer.
-        if let Backend::Exl3 { states, .. } = &mut lanes[0].backend {
-            let state = states
-                .iter_mut()
-                .find(|s| s.capacity() >= rows as usize)
-                .unwrap();
+        if let Backend::Exl3 { states, reduction_plan, .. } = &mut lanes[0].backend {
+            let index = reduction_plan.execution_index(rows as usize, rows as usize,
+                states.iter().map(|s| s.capacity()))?;
+            let state = &mut states[index];
             let values =
                 unsafe { state.launch_layer(0, views, rows as usize, lanes[0].stream.raw)? };
             unsafe {
