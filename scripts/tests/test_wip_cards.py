@@ -141,7 +141,9 @@ def test_build_only_builds_without_generating_or_launching_jobs(tmp_path, entry,
     assert cards.main() == 0
     assert len(calls) == 1
     items, selected, dest, task, dry_run, seed = calls[0]
-    assert (items, dest, task, dry_run, seed) == (['base=HEAD'], state, 'build-only', dry, 'rhea')
+    # build_arms receives the ref already pinned to a commit (#315).
+    assert (dest, task, dry_run, seed) == (state, 'build-only', dry, 'rhea')
+    assert items == {'base': _real_head(cards.REPO)}
     assert selected[0]['set']['SPARK_COUNT'] == '4'
     assert len(selected[0]['sparks']) == 4
     plan = json.loads((state / 'plan.json').read_text())
@@ -277,7 +279,7 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     # A revision whose wip.sh predates build slots keeps the outer build.lock.
     monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: False)
     monkeypatch.setattr(cards, 'seed_option_capable', lambda rev: True)
-    cards.build_arms(['base=HEAD', 'candidate=HEAD'], arms, [entry, other], tmp_path, 'task', True)
+    cards.build_arms({'base': 'HEAD', 'candidate': 'HEAD'}, arms, [entry, other], tmp_path, 'task', True)
     for arm in ('base', 'candidate'):
         cfg = cards.config(tmp_path / ('build-' + arm + '.config'))
         hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
@@ -333,7 +335,7 @@ def test_seed_host_moves_the_build_seed_off_moa(entry, tmp_path, monkeypatch):
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     for separate in (False, True):
         monkeypatch.setattr(cards, 'seed_option_capable', lambda rev: separate)
-        cards.build_arms(['base=HEAD'], arms, [entry], tmp_path, 'task', True, 'rhea')
+        cards.build_arms({'base': 'HEAD'}, arms, [entry], tmp_path, 'task', True, 'rhea')
         cfg = cards.config(tmp_path / 'build-base.config')
         hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
         # Legacy wip.sh builds on SPARK_0_HOST; a separate seed is passed as WIP_SEED_HOST.
@@ -345,7 +347,7 @@ def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, 
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'legacy-full-build')
     monkeypatch.setattr(cards, 'toolchain_hash', lambda rev: '0123456789abcdef')
     arms = cards.arms_from(['base=b:s'])
-    cards.build_arms(['base=old'], arms, [entry], tmp_path, 'task', True)
+    cards.build_arms({'base': 'old'}, arms, [entry], tmp_path, 'task', True)
     text = capsys.readouterr().out
     assert 'legacy arm: GPU lock held for the full build' in text
     assert 'hwlock.py --locks gpu1 --wait 1800' in text
@@ -844,7 +846,7 @@ def test_release_arm_validation_and_cleanup(entry, tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='invalid --arm-wip'):
         cards.shared_wip(arms, ['release=shared'], [], 1)
     with pytest.raises(ValueError, match='refuses release'):
-        cards.build_arms(['release=HEAD'], arms, [entry], tmp_path, 'task', True)
+        cards.build_arms({'release': 'HEAD'}, arms, [entry], tmp_path, 'task', True)
     monkeypatch.setattr(cards, 'cleanup_script', lambda *a: pytest.fail('release cleanup'))
     cards.cleanup(arms, 'task', False)
 
@@ -1046,7 +1048,7 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
     card['set']['RTX_EXPERT_LAYERS'] = '0'
     arms = cards.arms_from(['baseline=x:a', 'candidate=y:b'])
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
-    cards.build_arms(['baseline=HEAD', 'candidate=HEAD'], arms, [card], tmp_path, 'task', True)
+    cards.build_arms({'baseline': 'HEAD', 'candidate': 'HEAD'}, arms, [card], tmp_path, 'task', True)
     cfg = cards.config(tmp_path / 'build-candidate.config')
     assert 'SPARK_TP' not in cfg and 'SPARK_EP' not in cfg and 'MODEL_VARIANT' not in cfg
     assert cfg['RTX_EXPERT_LAYERS'] == '0' and cfg['MODEL_ID'].startswith('XiaomiMiMo/')
@@ -1642,6 +1644,31 @@ def test_arm_repo_overrides_arm_wip_and_unmapped_arm_falls_back_to_repo(entry, t
     assert sum(f'--repo {pinned} ' in line for line in smoke) == 1 and sum(f'--repo {fallback} ' in line for line in smoke) == 1
 
 
+def test_build_ref_is_pinned_once_across_build_and_launcher(entry, tmp_path, monkeypatch, capsys):
+    # A symbolic --build ref is resolved once, before the builds; if work moves it while
+    # the (hours-long) build runs, the build record and the launcher phase keep the commit
+    # that was resolved first, never the moved ref (#315).
+    ref = 'refs/wip-cards-315-pin'
+    def git(*args):
+        return subprocess.run(['git', '-C', str(cards.REPO), *args], capture_output=True, text=True, check=True).stdout.strip()
+    first, moved = git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD~1')
+    assert first != moved
+    git('update-ref', ref, first)
+    real_build_arms = cards.build_arms
+    def build_arms_then_move(builds, *args):
+        git('update-ref', ref, moved)  # work/p0 advances while the build runs
+        real_build_arms(builds, *args)
+    monkeypatch.setattr(cards, 'build_arms', build_arms_then_move)
+    try:
+        _smoke, plan = _per_arm_dry_run(entry, tmp_path, monkeypatch, capsys,
+                                        ['--arm', 'base=b:s', '--build', f'base={ref}'])
+        assert git('rev-parse', ref) == moved  # the ref really did move between the phases
+        arm = plan['arms']['base']
+        assert arm['build_revision'] == first and arm['repo_commit'] == first
+    finally:
+        git('update-ref', '-d', ref)
+
+
 def test_per_arm_repo_preflight_refusals(tmp_path, monkeypatch):
     arms = lambda: cards.arms_from(['a=a:s', 'b=b:s2'])
     no_run, plain = tmp_path / 'no-run', tmp_path / 'plain'
@@ -1651,22 +1678,22 @@ def test_per_arm_repo_preflight_refusals(tmp_path, monkeypatch):
     good = tmp_path / 'good'
     _checkout(good)
     with pytest.raises(ValueError, match='no run.sh'):
-        cards.resolve_launchers(arms(), [f'a={no_run}'], [], good, tmp_path, 'perarm', False)
+        cards.resolve_launchers(arms(), [f'a={no_run}'], {}, good, tmp_path, 'perarm', False)
     with pytest.raises(ValueError, match='not a git checkout'):
-        cards.resolve_launchers(arms(), [f'a={plain}'], [], good, tmp_path, 'perarm', False)
+        cards.resolve_launchers(arms(), [f'a={plain}'], {}, good, tmp_path, 'perarm', False)
     with pytest.raises(ValueError, match='invalid --arm-repo'):
-        cards.resolve_launchers(arms(), [f'zz={good}'], [], good, tmp_path, 'perarm', False)
+        cards.resolve_launchers(arms(), [f'zz={good}'], {}, good, tmp_path, 'perarm', False)
     with pytest.raises(ValueError, match='refuses --build'):
-        cards.resolve_launchers(arms(), [f'a={good}'], ['a=HEAD'], good, tmp_path, 'perarm', False)
-    # A built arm's checkout must sit at its built revision.
+        cards.resolve_launchers(arms(), [f'a={good}'], {'a': 'HEAD'}, good, tmp_path, 'perarm', False)
+    # A built arm's checkout must sit at the commit resolve_builds pinned, never a ref re-resolved here.
+    head = subprocess.run(['git', '-C', str(cards.REPO), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
     monkeypatch.setattr(Path, 'home', lambda: tmp_path / 'home')
     source = tmp_path / 'home/.cache/cuteafd/builds/perarm/source-a'
     _checkout(source)
     with pytest.raises(ValueError, match='not its built revision'):
-        cards.resolve_launchers(arms(), [], ['a=HEAD'], good, tmp_path, 'perarm', False)
-    head = subprocess.run(['git', '-C', str(cards.REPO), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
+        cards.resolve_launchers(arms(), [], {'a': head}, good, tmp_path, 'perarm', False)
     monkeypatch.setattr(cards, 'git_head', lambda repo: head if Path(repo) == source else _real_head(repo))
-    resolved = cards.resolve_launchers(arms(), [], ['a=HEAD'], good, tmp_path, 'perarm', False)
+    resolved = cards.resolve_launchers(arms(), [], {'a': head}, good, tmp_path, 'perarm', False)
     assert resolved['a']['repo'] == str(source) and resolved['a']['repo_commit'] == head
     assert resolved['b']['repo'] == str(good)
 

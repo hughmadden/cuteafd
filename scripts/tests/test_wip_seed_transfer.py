@@ -45,7 +45,7 @@ def _build(arms, cards_, tmp_path, monkeypatch, seed, separate=True):
     monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: True)
     monkeypatch.setattr(cards, 'seed_option_capable', lambda rev: separate)
     monkeypatch.setattr(cards, 'toolchain_hash', lambda rev: '0123456789abcdef')
-    cards.build_arms(['base=HEAD'], arms, cards_, tmp_path, 'task', True, seed)
+    cards.build_arms({'base': 'HEAD'}, arms, cards_, tmp_path, 'task', True, seed)
     return cards.config(tmp_path / 'build-base.config')
 
 
