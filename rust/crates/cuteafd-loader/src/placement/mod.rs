@@ -30,7 +30,7 @@ mod tests;
 
 pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
-pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, LayerExecutionPlan, LayerPlanError, ResidualHome, TerminalHome, Transition, HOP_SLOTS};
+pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
 
@@ -491,16 +491,21 @@ impl Placement {
 
     pub fn summary(&self) -> String {
         let attention = self.attention_summary();
+        let charged = self.hops.iter().filter(|h| h.charged()).count();
+        let mut hops = if charged == 0 { String::new() } else { format!("; {charged} residual hops") };
+        let direct: Vec<_> = self.hops.iter().filter(|h| h.storage == HopStorage::DirectInput).map(|h|
+            format!("{:?} rtx{}->rtx{} {} B/row", h.at, h.from, h.to, h.row_bytes)).collect();
+        if !direct.is_empty() {
+            hops.push_str(&format!("; direct-input residual hops [{}] (no extra receive storage)", direct.join(", ")));
+        }
         if let Some(t) = self.tp2 {
-            return format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B",
+            return format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B{hops}",
                 self.pool_tokens, self.onboard_layers, t.layers, t.first, t.first + t.layers,
                 t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
         }
         let ranges = self.expert_ranges.iter().enumerate()
             .map(|(gpu, r)| format!("rtx{gpu} {}..{} ({} B)", r.first, r.first + r.layers, r.peak_bytes))
             .collect::<Vec<_>>().join(", ");
-        let hops = self.hops.iter().filter(|h| h.charged()).count();
-        let hops = if hops == 0 { String::new() } else { format!("; {hops} residual hops") };
         format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.pool_tokens, self.onboard_layers)
     }
 }

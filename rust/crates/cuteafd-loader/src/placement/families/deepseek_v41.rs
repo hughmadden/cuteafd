@@ -492,6 +492,20 @@ pub fn verify_workspace_growth(gpus: usize, rank: usize) -> u64 {
     2 * extra_rows * (head_row + sparse_row)
 }
 
+/// Both target lanes reuse block inputs as their hop destinations. The full
+/// mHC residual and incoming pre coefficients move, without an extra receive slot.
+pub fn execution_hops(ranks: usize) -> HopSpec {
+    HopSpec {
+        storage: HopStorage::DirectInput,
+        row_bytes: 4 * 5120 * 2 + 4 * 4,
+        rows: 4096,
+        lanes: 2,
+        entry_gpu: 0,
+        head_gpu: u8::from(ranks == 2),
+        terminal: TerminalHome::AttentionOwner,
+    }
+}
+
 /// All weights, lanes, graphs and prefix state are charged in the inventory's
 /// baseline. Pool units include private tails supplied by the caller as fixed.
 pub fn request(
@@ -536,7 +550,7 @@ pub fn request(
         minimum_expert_layers: 0,
         expert_gpus: gpus,
         policy: LayerPolicy::default(),
-        hops: HopSpec { row_bytes: 0, rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner },
+        hops: execution_hops(gpus),
         executor: super::DEEPSEEK_V41,
     }
 }
@@ -602,6 +616,20 @@ mod tests {
             );
         }
         assert_eq!(placement.tp2.unwrap().peak_bytes, [380 << 20; 2]);
+        let plan = LayerExecutionPlan::new(&placement, execution_hops(2)).unwrap();
+        assert_eq!(plan.hops(), &[Hop { at: HopPoint::BeforeLayer(20), from: 0, to: 1,
+            kind: HopKind::Boundary, storage: HopStorage::DirectInput, row_bytes: 40976 }]);
+        assert_eq!(hop_buffer_bytes(plan.hops(), &plan.spec(), 2), Some(vec![0, 0]));
+        assert_eq!(plan.homes()[40], ResidualHome::Owned(1));
+        assert!(!placement.items.iter().flatten().any(|item| item.group == "residual hops"));
+        assert!(placement.summary().contains("BeforeLayer(20) rtx0->rtx1 40976 B/row"));
+        assert!(placement.summary().contains("no extra receive storage"));
+        let json = serde_json::to_value(&placement).unwrap();
+        assert_eq!(json["hops"][0]["storage"], "direct_input");
+        assert_eq!(json["hops"][0]["row_bytes"], 40976);
+        let mut wrong_storage = placement.clone();
+        wrong_storage.hops[0].storage = HopStorage::ReceiveSlots;
+        assert_eq!(LayerExecutionPlan::new(&wrong_storage, execution_hops(2)), Err(LayerPlanError::Hops));
     }
 
     #[test]

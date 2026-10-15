@@ -1229,6 +1229,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
                 });
                 match placement {
                     Ok((placement, exact_local_bytes)) => {
+                        notes.push(format!("placement: {}", placement.summary()));
                         pool_tokens = placement.pool_tokens;
                         local_layers = placement.onboard_layers;
                         local_bytes = exact_local_bytes;

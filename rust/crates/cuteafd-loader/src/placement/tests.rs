@@ -31,7 +31,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         minimum_expert_layers: 0,
         expert_gpus: gpus,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new(), ..LayerPolicy::default() },
-        hops: HopSpec { row_bytes: 0, rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0,
+        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: 0, rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0,
             terminal: if gpus == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } },
         executor: V4_HEADS,
     }
@@ -182,7 +182,7 @@ const W1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
 const S0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Split };
 const S1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Split };
 /// V4/V4.1-sized mHC hop: `[4096,4,4096]` BF16 per lane slot = 128 MiB.
-const MHC: HopSpec = HopSpec { row_bytes: 4 * 4096 * 2, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+const MHC: HopSpec = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * 4096 * 2, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
 const ANY: ExecutorModes = ExecutorModes { family: "test", modes: &[LayerMode::HeadSplit, W0, W1, S0, S1], hops: true, attention: AttentionPlacement::Heads };
 
 #[test]
@@ -576,7 +576,7 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         req.pool.unit_rows = 64;
         req.fixed = fixed.into_iter().enumerate().map(|(gpu, bytes)| Demand::new(gpu as u8, Category::Workspace,
             "P2 fixed", bytes + if nvfp4 { 8_685_388_318 } else { 0 }, Basis::Estimated)).collect();
-        req.hops = HopSpec { row_bytes: 12_288, rows: 4096, lanes: 4, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+        req.hops = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 12_288, rows: 4096, lanes: 4, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
         req.attention_placement = Some(AttentionPlacement::Heads);
         let heads = solve(&req).unwrap();
         print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Heads, &heads);
@@ -659,7 +659,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
             partial_row_bytes: if dim == 4096 { 32_896 } else { 65_792 },
             candidate_row_bytes: if dim == 4096 { 4_096 } else { 8_192 },
             compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
-        req.hops = HopSpec { row_bytes: 4 * dim * 2 + 16, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+        req.hops = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * dim * 2 + 16, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
         let half = (half * GIB as f64) as u64;
         let state_unit = (state * GIB as f64 / count as f64) as u64;
         for (i, layer) in req.layers.iter_mut().enumerate() {
@@ -703,7 +703,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
     req.context_buffers = ContextBuffers { staging_unit_bytes: 256 * 528 + 64 * 132, staging_unit_rows: 256,
         query_row_bytes: 32_768, partial_row_bytes: 32_896, candidate_row_bytes: 4_096,
         compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
-    req.hops = HopSpec { row_bytes: 32_784, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+    req.hops = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 32_784, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
     for (i, layer) in req.layers.iter_mut().enumerate() {
         let mla = i % 4 == 3;
         layer.kind = if mla { AttentionClass::Mla } else { AttentionClass::Kda };

@@ -307,7 +307,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
                 else { Vec::new() }, ..LayerPolicy::default() },
         // The mHC streams `[T,4,H]` BF16; V4's only hop is the entry
         // broadcast of the embedding rows into GPU1's step input.
-        hops: HopSpec { row_bytes: 4 * inputs.cfg.dim as u64 * 2, rows: inputs.prefill_rows.max(inputs.decode_rows),
+        hops: HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * inputs.cfg.dim as u64 * 2, rows: inputs.prefill_rows.max(inputs.decode_rows),
             lanes: PREFILL_LANES, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Head },
         // A build without the C4 context programs runs heads only.
         executor: if context.is_some() { super::DEEPSEEK_V4 }
