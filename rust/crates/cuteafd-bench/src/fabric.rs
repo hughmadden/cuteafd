@@ -153,7 +153,7 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
         for (device, number) in ports {
             let old = b.and_then(|h| h.ports.iter().find(|p| p.device == device && p.port == number));
             let new = a.and_then(|h| h.ports.iter().find(|p| p.device == device && p.port == number));
-            let continuous = b.zip(a).is_some_and(|(b,a)| a.incarnation == b.incarnation
+            let continuous = b.zip(a).is_some_and(|(b,a)| a.incarnation == b.incarnation && a.observation_started_s == b.observation_started_s
                 && a.sampled_s > b.sampled_s && (a.sampled_s - b.sampled_s).is_finite());
             if continuous && old.is_some() && new.is_some() { continue; }
             let sample = new.or(old).unwrap();
@@ -167,7 +167,7 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
     for (host, a) in &after.hosts {
         let Some(b) = before.hosts.get(host) else { continue };
         let seconds = a.sampled_s - b.sampled_s;
-        if a.incarnation != b.incarnation || seconds <= 0.0 || !seconds.is_finite() { continue; }
+        if a.incarnation != b.incarnation || a.observation_started_s != b.observation_started_s || seconds <= 0.0 || !seconds.is_finite() { continue; }
         for port in &a.ports {
             let Some(old) = b.ports.iter().find(|p| p.device == port.device && p.port == port.port) else { continue };
             let counters: BTreeMap<_, _> = port.counters.iter().filter_map(|(key, value)|
@@ -431,12 +431,14 @@ mod tests {
     #[test]
     fn stale_reset_restart_and_missing_are_not_traffic() {
         let before = snapshot(1.0, 500, 500);
-        assert!(interval("x", true, &before, &before).ports.is_empty());
+        let stale = interval("x", true, &before, &before);
+        assert_eq!(stale.ports[0].health.as_ref().unwrap().verdict, cuteafd_transport::fabric_health::Verdict::Unknown);
+        assert_eq!(stale.ports[0].sent_bytes, None);
         let mut after = snapshot(2.0, 100, 600);
         let phase = interval("x", true, &before, &after);
         assert_eq!(phase.ports[0].sent_bytes, None);
         after.hosts.get_mut("spark").unwrap().incarnation = "two".into();
-        assert!(interval("x", true, &before, &after).ports.is_empty());
+        assert_eq!(interval("x", true, &before, &after).ports[0].sent_bytes, None);
     }
     #[test]
     fn health_evidence_survives_reports_and_only_timed_warnings_gate() {

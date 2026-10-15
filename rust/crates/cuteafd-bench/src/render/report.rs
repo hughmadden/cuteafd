@@ -136,7 +136,9 @@ pub fn report_svg(report: &Report) -> String {
             let since = p.health_since_start.as_ref().map(|h| h.line()).unwrap_or_else(|| "unknown: no continuous observation".into());
             doc.text(24.0, y + 12.0, Font::new(10.0, t.ink2), &fit(&format!("Since observation start: {since}"), 10.0, w - 48.0));
             y += 18.0;
-            doc.text(24.0, y + 12.0, Font::new(10.0, t.ink2), &format!("Link {:?} Gb/s; MTU {:?}; pause not collected; overlapping events are not lost bytes", p.link_gbps, p.mtu));
+            doc.text(24.0, y + 12.0, Font::new(10.0, t.ink2), &format!("Link {} Gb/s; MTU {}; pause not collected; overlapping events are not lost bytes",
+                p.link_gbps.map(|n| format!("{n:.0}")).unwrap_or_else(|| "unknown".into()),
+                p.mtu.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into())));
             y += 18.0;
         }
         y += 10.0;

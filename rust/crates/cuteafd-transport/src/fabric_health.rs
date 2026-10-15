@@ -38,6 +38,7 @@ pub struct Health {
     /// The events overlap and are not lost packets or retransmitted bytes.
     pub loss_events: BTreeMap<String, Option<u64>>,
     pub loss_events_per_gb: Option<f64>,
+    pub loss_events_per_gb_by_counter: BTreeMap<String, Option<f64>>,
     pub sequence_events_per_gb: Option<f64>,
     pub adapter_retransmits_per_gb: Option<f64>,
     pub loss_warning_threshold_per_gb: f64,
@@ -101,6 +102,18 @@ pub fn evaluate(before: &PortSample, after: &PortSample, seconds: f64) -> Health
         .moved_gb
         .filter(|gb| *gb > 0.0)
         .and_then(|gb| Some(h.loss_events.get("roce_adp_retrans")?.as_ref().copied()? as f64 / gb));
+    h.loss_events_per_gb_by_counter = h
+        .loss_events
+        .iter()
+        .map(|(key, n)| {
+            (
+                key.clone(),
+                h.moved_gb
+                    .filter(|gb| *gb > 0.0)
+                    .and_then(|gb| Some((*n)? as f64 / gb)),
+            )
+        })
+        .collect();
     // A changed link rate cannot describe one utilization envelope reliably.
     h.utilization = after
         .link_gbps
@@ -181,7 +194,17 @@ impl Verdict {
 
 impl Health {
     pub fn line(&self) -> String {
-        format!("{}: {}", self.verdict.label(), self.reasons.join("; "))
+        format!(
+            "{}: loss {} / sequence {} / retransmit {} events/GB; {}",
+            self.verdict.label(),
+            rate(self.loss_events_per_gb),
+            rate(self.sequence_events_per_gb),
+            rate(self.adapter_retransmits_per_gb),
+            self.reasons
+                .first()
+                .map(String::as_str)
+                .unwrap_or("no evidence")
+        )
     }
 }
 
@@ -251,6 +274,8 @@ impl Window {
                     }
                 }
                 p.health_since_start = Some(evaluate(base, p, sampled_s - started));
+            } else {
+                p.health_since_start = Some(evaluate(p, p, 0.0));
             }
         }
         self.baseline
@@ -296,7 +321,9 @@ mod tests {
         assert_eq!(healthy.pause, "not collected");
         assert_eq!(healthy.sequence_events_per_gb, Some(40.0));
         assert_eq!(healthy.adapter_retransmits_per_gb, Some(0.0));
-        assert!(healthy.line().contains("40.0 events/GB"));
+        assert!(healthy
+            .line()
+            .contains("loss 40.0 / sequence 40.0 / retransmit 0.0 events/GB"));
         let bad = evaluate(&b, &port(25_000_000_000, 0, 4_000, 2_000_000), 2.0);
         assert_eq!(bad.verdict, Verdict::Warn);
         assert!(bad
@@ -364,5 +391,43 @@ mod tests {
             },
         ];
         assert_eq!(verdict(&states), Verdict::Warn);
+    }
+    #[test]
+    fn intermediate_reset_and_missing_port_do_not_bridge() {
+        let mut w = Window::default();
+        let mut p = vec![port(1_000_000_000, 10, 10, 10)];
+        w.update(1.0, &mut p);
+        let before = p[0].clone();
+        p[0] = port(1, 1, 1, 1);
+        w.update(2.0, &mut p);
+        p[0] = port(2_000_000_000, 20, 20, 20);
+        w.update(3.0, &mut p);
+        assert_eq!(evaluate(&before, &p[0], 2.0).verdict, Verdict::Unknown);
+        w.update(4.0, &mut []);
+        p[0] = port(3_000_000_000, 30, 30, 30);
+        w.update(5.0, &mut p);
+        assert_eq!(
+            p[0].health_since_start.as_ref().unwrap().verdict,
+            Verdict::Unknown
+        );
+        assert_ne!(before.counter_epoch, p[0].counter_epoch);
+    }
+    #[test]
+    fn hardware_alias_is_not_double_counted_and_bytes_stay_standard() {
+        let mut b = port(0, 0, 0, 0);
+        let mut a = port(1_000_000_000, 1, 1, 10);
+        for p in [&mut b, &mut a] {
+            p.counters.insert("out_of_sequence".into(), 900_000);
+            p.counters.insert("hw_counters/port_xmit_data".into(), 99);
+        }
+        let h = evaluate(&b, &a, 1.0);
+        assert_eq!(h.loss_events_per_gb, Some(5.0));
+        assert_eq!(
+            h.loss_events_per_gb_by_counter["out_of_sequence"],
+            Some(5.0)
+        );
+        assert_eq!(h.moved_gb, Some(2.0));
+        let a = port(5_000_000_000, 1, 0, 0);
+        assert_eq!(evaluate(&b, &a, 1.0).verdict, Verdict::Warn);
     }
 }
