@@ -55,7 +55,9 @@ def decode_inner(trellis):
 
 def hadamard128(values):
     """Normalized blockwise H128 along the final dimension, in float64."""
-    values = np.array(values, dtype=np.float64, copy=True)
+    # Reshaping a Fortran-ordered transpose can copy; butterflies must update
+    # the storage returned below, including multi-block hidden axes.
+    values = np.array(values, dtype=np.float64, copy=True, order='C')
     if values.shape[-1] % 128:
         raise ValueError('EXL3 reference needs H128-aligned dimensions')
     shape = values.shape

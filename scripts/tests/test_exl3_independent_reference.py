@@ -54,6 +54,20 @@ def test_effective_weight_includes_both_normalized_rotations(bits):
     np.testing.assert_allclose(REF.hadamard128(REF.hadamard128(x)), x, atol=2e-15)
 
 
+@pytest.mark.parametrize('layout', ['contiguous', 'transposed', 'strided'])
+def test_hadamard_multiblock_matches_dense_transform(layout):
+    values = np.random.default_rng(270).normal(size=(384, 256))
+    if layout == 'transposed':
+        values = values.T
+    elif layout == 'strided':
+        values = values[::2]
+    hadamard = np.ones((1, 1))
+    while len(hadamard) < 128:
+        hadamard = np.block([[hadamard, hadamard], [hadamard, -hadamard]])
+    expected = (values.reshape(-1, 128) @ (hadamard / np.sqrt(128))).reshape(values.shape)
+    np.testing.assert_allclose(REF.hadamard128(values), expected, atol=3e-15)
+
+
 def test_comparison_rejects_numerical_bug_not_just_bad_cosine():
     values = np.arange(1, 513, dtype=float).reshape(2, 256)
     assert REF.comparison(values * 1.001, values)['passed']
