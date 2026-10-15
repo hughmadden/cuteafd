@@ -46,6 +46,14 @@ pub enum HopKind {
     Boundary,
 }
 
+/// Where a residual move lands; direct inputs already belong to the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HopStorage {
+    ReceiveSlots,
+    DirectInput,
+}
+
 /// One residual move between the two GPUs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Hop {
@@ -53,16 +61,17 @@ pub struct Hop {
     pub from: u8,
     pub to: u8,
     pub kind: HopKind,
+    pub storage: HopStorage,
     /// Bytes per token row: `[H]` BF16, or `[4,H]` BF16 + `[4]` FP32
     /// pre-coefficients for mHC families.
     pub row_bytes: u64,
 }
 
 impl Hop {
-    /// Whether this hop needs a receive buffer on `to` (every hop but the
-    /// entry, which lands in the step input).
+    /// Whether this hop needs extra receive storage on `to`. Entry and
+    /// direct-input hops reuse the destination's existing input buffers.
     pub fn charged(&self) -> bool {
-        self.at != HopPoint::Entry
+        self.at != HopPoint::Entry && self.storage == HopStorage::ReceiveSlots
     }
 }
 
@@ -80,6 +89,8 @@ pub enum TerminalHome {
 /// What the family's executor moves per hop; part of the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HopSpec {
+    /// Destination storage, separate from the bytes transferred per row.
+    pub storage: HopStorage,
     /// Bytes per row of one hop (0: the family has no hops to charge).
     pub row_bytes: u64,
     /// Rows a hop carries at most (the larger of prefill and decode rows).
@@ -188,7 +199,7 @@ impl ResidualHome {
 /// `spec.entry_gpu` to the head on `spec.head_gpu`. One GPU never hops.
 pub fn plan_hops(modes: &[LayerMode], spec: &HopSpec) -> Result<Vec<Hop>, LayerPlanError> {
     let homes = residual_homes(modes, spec)?;
-    let hop = |at, (from, to, kind)| Hop { at, from, to, kind, row_bytes: spec.row_bytes };
+    let hop = |at, (from, to, kind)| Hop { at, from, to, kind, storage: spec.storage, row_bytes: spec.row_bytes };
     let mut hops = Vec::new();
     let mut home = ResidualHome::Owned(spec.entry_gpu);
     for (layer, &mode) in modes.iter().enumerate() {

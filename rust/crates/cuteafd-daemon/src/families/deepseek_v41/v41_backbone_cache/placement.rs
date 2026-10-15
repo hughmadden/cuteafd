@@ -12,6 +12,22 @@ impl CachePlacement {
         }
         Ok(Self { attention })
     }
+    pub fn from_execution_plan(plan: &cuteafd_loader::placement::LayerExecutionPlan) -> Result<Self> {
+        use cuteafd_loader::placement::{FfnMode, HopStorage, LayerMode, ResidualHome};
+        ensure!(plan.modes().len() == 40, "V4.1 execution requires 40 layers");
+        ensure!(plan.spec().storage == HopStorage::DirectInput && plan.spec().row_bytes == 40976,
+            "V4.1 residual hops must land in the existing block inputs");
+        let mut attention = [0; 40];
+        for (layer, owner) in attention.iter_mut().enumerate() {
+            let LayerMode::Whole { gpu, ffn: FfnMode::Owner } = plan.mode(layer)? else {
+                anyhow::bail!("V4.1 layer {layer} requires whole attention and owner-reduced FFN")
+            };
+            ensure!(plan.homes()[layer + 1] == ResidualHome::Owned(gpu),
+                "V4.1 residual must stay on the attention owner");
+            *owner = usize::from(gpu);
+        }
+        Self::new(attention)
+    }
     pub fn encoder_decoder() -> Self {
         Self { attention: std::array::from_fn(|layer| usize::from(layer >= 20)) }
     }
@@ -26,6 +42,28 @@ impl CachePlacement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn execution_plan_binds_single_and_ced_ownership() -> Result<()> {
+        use cuteafd_loader::placement::*;
+        for ranks in [1, 2] {
+            let request = families::deepseek_v41::request(Inventory {
+                gpus: vec![GpuBudget { capacity_bytes: 1 << 40, headroom_bytes: 0,
+                    baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }; ranks],
+                spark_ranks: 4, peer_access: ranks == 2,
+            }, PoolPolicy::resolve(&vec![1 << 40; ranks], 512, Some(512), 512, false),
+                vec![0; ranks], vec![], 0, Onboard::Layers(0));
+            let mut placement = solve(&request)?;
+            let plan = LayerExecutionPlan::new(&placement, request.hops)?;
+            let map = CachePlacement::from_execution_plan(&plan)?;
+            for layer in 0..40 {
+                assert_eq!(map.attention(layer)?, usize::from(ranks == 2 && layer >= 20));
+            }
+            assert_eq!(plan.hops().len(), ranks - 1);
+            placement.residual[1] = ResidualHome::Replicated;
+            assert!(LayerExecutionPlan::new(&placement, request.hops).is_err());
+        }
+        Ok(())
+    }
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs"]
     fn distributed_cache_allocations_and_leases_follow_placement() -> Result<()> {

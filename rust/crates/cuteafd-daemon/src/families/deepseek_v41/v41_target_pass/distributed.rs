@@ -80,6 +80,23 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
+    pub fn bind_execution_plan(&self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
+        use cuteafd_loader::placement::{HopKind, HopPoint, LayerExecutionPlan};
+        let plan = LayerExecutionPlan::new(placement,
+            cuteafd_loader::placement::families::deepseek_v41::execution_hops(2))?;
+        let map = CachePlacement::from_execution_plan(&plan)?;
+        ensure!(map == self.map, "distributed target differs from admitted ownership");
+        for hop in plan.hops() {
+            let HopPoint::BeforeLayer(layer) = hop.at else {
+                anyhow::bail!("V4.1 block transfer requires an adjacent-layer hop")
+            };
+            ensure!((1..40).contains(&layer) && hop.kind == HopKind::Boundary
+                && map.attention(layer - 1)? == usize::from(hop.from)
+                && map.attention(layer)? == usize::from(hop.to),
+                "V4.1 block transfer differs from admitted hop");
+        }
+        Ok(())
+    }
     pub fn enable_dual_attention(&mut self)->Result<()> {
         for lane in &mut self.lanes {
             let device=lane.device;
