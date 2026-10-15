@@ -105,7 +105,8 @@ def package(source, out, config, tokenizer_path, license_path):
             and validation['golden_seal_sha256'] == digest(source / 'golden-seal.json')
             and validation['full_seal_sha256'] == seal['full_seal_sha256'] == digest(source / 'full.sha256.json')
             and validation['scored_tokens'] == meta['scored_tokens'] == 32768
-            and validation['nll'] == meta['nll'] and len(panel['windows']) == 64
+            and np.isfinite(meta['nll']) and abs(validation['nll'] - meta['nll']) <= 1e-8
+            and len(panel['windows']) == 64
             and meta['mtp'] is False and meta['use_cache'] is False and meta['attention'] == 'eager'):
         raise ValueError('unsealed or mismatched oracle evidence')
     inventory = {e['path']: e for e in seal['files']}

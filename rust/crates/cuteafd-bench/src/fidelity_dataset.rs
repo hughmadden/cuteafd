@@ -381,7 +381,8 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             && proof["logits_sha256"].as_array().is_some_and(|a| a.len() == 2 && a.iter().all(|h| hash(h, 64)))
             && qualification["scored_tokens"] == 32768
             && qualification["reference_validation"]["scored_tokens"] == qualification["scored_tokens"]
-            && qualification["reference_validation"]["nll"] == qualification["nll"]
+            && qualification["reference_validation"]["nll"].as_f64().zip(qualification["nll"].as_f64())
+                .is_some_and(|(a, b)| a.is_finite() && (a - b).abs() <= 1e-8)
             && qualification["nll"].as_f64().is_some_and(|x| x.is_finite() && x >= 0.0),
             "incomplete reference-only provenance");
         return Ok("reference-only qualified");
@@ -802,6 +803,10 @@ mod tests {
                 "source_pin":{"revision":"1".repeat(40),"source_tree_sha256":"2".repeat(64),"modeling_sha256":"3".repeat(64)},
                 "tokenizers":"0.23.1","platform":{"gpu":"NVIDIA GB10"},"mtp":false,"use_cache":false,"attention":"eager"}});
         assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference-only qualified");
+        let mut rounded = qualification.clone(); rounded["reference_validation"]["nll"] = json!(1.2 + 1e-15);
+        assert!(qualification_label(&rounded, &manifest).is_ok());
+        rounded["reference_validation"]["nll"] = json!(1.21);
+        assert!(qualification_label(&rounded, &manifest).is_err());
         for path in ["/engine_parity", "/reference_validation/passed", "/prefix_qualification/rows",
             "/prefix_qualification/logits_sha256", "/reference_provenance/source_pin/revision",
             "/reference_provenance/snapshot_identity/snapshot_revision", "/reference_validation/golden_seal_sha256",
