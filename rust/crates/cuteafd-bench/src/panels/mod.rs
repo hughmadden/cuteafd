@@ -4,6 +4,7 @@ use crate::client::Client;
 use crate::report::{Baseline, ServerInfo};
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod agentic;
@@ -53,6 +54,8 @@ impl Rates {
 #[derive(Clone, Default)]
 pub struct Progress {
     state: Arc<Mutex<ProgressState>>,
+    /// Set (under the report lock) once the final baseline is installed; later baseline partials are stale.
+    baseline_final: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -78,6 +81,14 @@ impl Progress {
             s.partial = Some(value);
             s.revision += 1;
         }
+    }
+
+    pub fn finish_baseline(&self) {
+        self.baseline_final.store(true, Ordering::SeqCst);
+    }
+
+    pub fn baseline_final(&self) -> bool {
+        self.baseline_final.load(Ordering::SeqCst)
     }
 
     pub fn get(&self) -> ProgressState {
