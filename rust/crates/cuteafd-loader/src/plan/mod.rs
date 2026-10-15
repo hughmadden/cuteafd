@@ -461,6 +461,10 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     };
     report.quantization = modelopt.as_ref().map(|m| m.summary());
     let Some(family) = family::detect(&checkpoint) else {
+        // No tensor contract or residency model was evaluated. An empty
+        // inventory is not evidence that an unknown architecture fits.
+        report.fits = false;
+        report.placement_supported = false;
         report.hints.push(Hint {
             what: format!(
                 "no family recognizes architectures {:?} (model_type {:?})",
