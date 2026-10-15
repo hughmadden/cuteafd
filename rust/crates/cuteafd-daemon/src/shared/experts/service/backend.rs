@@ -22,6 +22,17 @@ impl<'a> Weights<'a> {
             Self::Fp8(experts) => experts.layers.len(),
         }
     }
+    pub(super) fn layer_ids(&self) -> Result<Vec<usize>> {
+        match self {
+            Self::Full(weights) => Ok(weights.iter().map(|weight| weight.layer.layer()).collect()),
+            Self::Exl3(weights) => weights.iter().map(|weight| match weight.layout.layer {
+                cuteafd_loader::V41Exl3Layer::Backbone(layer) => Ok(layer),
+                _ => anyhow::bail!("draft layer in resident Spark backbone"),
+            }).collect(),
+            Self::Fp8(experts) => Ok(experts.layers.iter().map(|layer| layer.layer).collect()),
+        }
+    }
+
     pub(super) fn loaded_residency(&self, library: &NativeLibrary, capacity: u32)
         -> Result<(u64, Vec<cuteafd_core::SparkSlice>)> {
         use cuteafd_core::SparkSlice;
@@ -318,7 +329,7 @@ pub(super) fn load_fp8<'a>(
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let workspace = fp8_worker_workspace(config)?;
     let budget = config.device_budget.checked_sub(workspace).context("FP8 worker workspace exceeds the budget")?;
-    tracing::info!(rank = config.rank, world = config.world, first_layer = layers.start, layer_count = layers.len(),
+    tracing::info!(rank = config.rank, world = config.world, layer_ids = ?layers, layer_count = layers.len(),
         package = %directory.display(), "FP8 Spark residency plan");
     // The BF16-input sibling package, when built, lets the coordinator send unquantized rows.
     let bf16 = crate::shared::experts::fp8::bf16_sibling(&directory).filter(|d| d.is_dir());
@@ -336,8 +347,7 @@ pub(super) fn load_fp8<'a>(
     // admit their peak above, rather than subtracting both lifetimes here.
     let actual_budget = fp8_resident_budget(library.cuda_allocatable_memory_info()?.0, resident, peak.serve_peak);
     let budget = budget.min(actual_budget);
-    let layer_ids: Vec<_> = layers.collect();
-    let experts = Fp8Experts::load_with_bf16(library, tensors, &directory, bf16.as_deref(), &layer_ids,
+    let experts = Fp8Experts::load_with_bf16(library, tensors, &directory, bf16.as_deref(), &layers,
         config.world, config.rank, config.capacity as usize, budget)?;
     if let Some(bf16) = bf16 {
         tracing::info!(package = %bf16.display(), "FP8 experts also take BF16 rows");
@@ -365,8 +375,8 @@ pub(super) fn load_exl3<'a>(
 
     let workspace = Exl3Worker::plan(&exl3_directory, config.capacity, config.exl3_schedule)
         .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
-    let plans = config.resident_layers(catalog.routed_experts().layers)?
-        .map(|layer| {
+    let layers = config.resident_layers(catalog.routed_experts().layers)?;
+    let plans = layers.iter().map(|&layer| {
             Exl3Weights::plan(
                 catalog,
                 config.exl3_selection(layer)?,
@@ -397,7 +407,7 @@ pub(super) fn load_exl3<'a>(
     let mut weights = Vec::with_capacity(plans.len());
     let mut remaining = config.device_budget;
     for (index, plan) in plans.iter().enumerate() {
-        let layer = config.first_layer + index;
+        let layer = layers[index];
         let started = std::time::Instant::now();
         let weight = Exl3Weights::load(
             library,

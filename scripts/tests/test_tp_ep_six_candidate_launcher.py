@@ -76,9 +76,19 @@ case "$remote" in
     esac
     # Structured startup evidence, ANSI-decorated like the real log, plus the
     # stale-line variants that must NOT satisfy the readiness wait.
-    printf 'INFO cuteafd: \033[2mnative local RoCE expert worker ready\033[0m rank=%s world=6 \033[3mrole\033[0m=%s \033[3mintermediate\033[0m=%s first_layer=%s\n' \
-      "$rank" "${FAKE_WORKER_ROLE:-7}" "${FAKE_WORKER_INTERMEDIATE:-384}" "${FAKE_WORKER_LOG_FIRST:-20}"
-    echo "native local RoCE expert worker ready rank=$rank world=6 first_layer=0"
+    ids="["; stale="["
+    for ((layer=${FAKE_WORKER_LOG_FIRST:-20}; layer<40; layer++)); do
+      [[ "$ids" == "[" ]] || ids+=", "
+      ids+="$layer"
+    done
+    for ((layer=0; layer<40; layer++)); do
+      [[ "$stale" == "[" ]] || stale+=", "
+      stale+="$layer"
+    done
+    ids+="]"; stale+="]"
+    printf 'INFO cuteafd: \033[2mnative local RoCE expert worker ready\033[0m rank=%s world=6 \033[3mrole\033[0m=%s \033[3mintermediate\033[0m=%s layer_ids=%s\n' \
+      "$rank" "${FAKE_WORKER_ROLE:-7}" "${FAKE_WORKER_INTERMEDIATE:-384}" "$ids"
+    echo "native local RoCE expert worker ready rank=$rank world=6 layer_ids=$stale"
     # Real behaviour: the endpoint (and its GID line) exists only after a client
     # connection, and the line is timing-gated by the forwarded diagnostic flag.
     if [[ -f "${log}.connected" && -f "${log}.timing" ]]; then

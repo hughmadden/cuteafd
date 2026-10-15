@@ -56,7 +56,7 @@ candidate_print_plan() {
   done
   echo "STEP worker-ready"
   for rank in "${!hosts[@]}"; do
-    echo "CMD worker-ready-$rank: host=${hosts[$rank]} log=$wip_runtime_root/$expert_process.log offset=<pre-start byte size> match='native local RoCE expert worker ready ... rank=$rank world=$spark_world first_layer=${resolved_first_layer:-<from-plan>}'"
+    echo "CMD worker-ready-$rank: host=${hosts[$rank]} log=$wip_runtime_root/$expert_process.log offset=<pre-start byte size> match='native local RoCE expert worker ready ... rank=$rank world=$spark_world layer_ids=[${resolved_first_layer:-<from-plan>}..39]'"
   done
   if [[ "$rtx_gpus" == 1 ]]; then
     echo "STEP coordinator-start"

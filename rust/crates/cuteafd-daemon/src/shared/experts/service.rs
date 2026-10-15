@@ -65,6 +65,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         last_layer: args.last_layer.map(|layer| layer as usize),
         placement_handshake: args.placement_handshake,
         model_admission: None,
+        selected_layers: None,
         capacity: args.capacity,
         device_budget: args.device_budget_bytes,
         max_frame_bytes: args.max_frame_bytes,
@@ -98,6 +99,7 @@ pub(crate) struct NativeExpertServiceConfig {
     pub last_layer: Option<usize>,
     pub placement_handshake: bool,
     model_admission: Option<cuteafd_transport::worker_selection::ModelAdmission>,
+    selected_layers: Option<Vec<usize>>,
     pub capacity: u32,
     pub device_budget: usize,
     pub max_frame_bytes: usize,
@@ -125,9 +127,9 @@ fn load_weights<'a>(
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
 ) -> Result<(backend::Weights<'a>, usize)> {
-    let layers = config.resident_layers(catalog.routed_experts().layers)?.end;
+    let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let first = catalog.routed_experts().first_layer;
-    ensure!(config.first_layer >= first,
+    ensure!(layers.iter().all(|&layer| layer >= first),
         "this checkpoint's routed experts start at layer {first}; pass --first-layer {first} or later");
     validate_topology(config, catalog)?;
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
@@ -139,7 +141,7 @@ fn load_weights<'a>(
     let mut staging = 0usize;
     let mut pinned_host = 0usize;
     let mut read_scratch = 0usize;
-    for layer in config.first_layer..layers {
+    for &layer in &layers {
         let plan = ExpertWeights::plan(library, catalog, config.selection(layer)?)?;
         resident = resident
             .checked_add(plan.resident_bytes)
@@ -220,9 +222,9 @@ fn load_weights<'a>(
             "explicit Spark replicas admission"
         );
     }
-    let mut weights = Vec::with_capacity(layers - config.first_layer);
+    let mut weights = Vec::with_capacity(layers.len());
     let mut remaining = config.device_budget;
-    for layer in config.first_layer..layers {
+    for &layer in &layers {
         let started = std::time::Instant::now();
         let weight = ExpertWeights::load(
             library,
@@ -501,6 +503,7 @@ mod tests {
             last_layer: None,
             placement_handshake: false,
             model_admission: None,
+            selected_layers: None,
             capacity: 16,
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,
@@ -974,8 +977,19 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
 }
 
 impl NativeExpertServiceConfig {
-    /// Resident backbone layers: `first_layer..=last_layer`, bounded by the model.
-    pub(super) fn resident_layers(&self, layers: usize) -> Result<std::ops::Range<usize>> {
+    /// Exact coordinator-selected IDs, or the launched range before selection.
+    pub(super) fn resident_layers(&self, layers: usize) -> Result<Vec<usize>> {
+        let allowed = self.launched_layers(layers)?;
+        if let Some(selected) = &self.selected_layers {
+            ensure!(selected.windows(2).all(|pair| pair[0] < pair[1])
+                && selected.iter().all(|layer| allowed.contains(layer)),
+                "selected worker layers are outside launched range or not ordered and unique");
+            return Ok(selected.clone());
+        }
+        Ok(allowed.collect())
+    }
+
+    fn launched_layers(&self, layers: usize) -> Result<std::ops::Range<usize>> {
         let end = match self.last_layer {
             Some(last) => {
                 ensure!(last < layers, "native last layer must be below {layers}");

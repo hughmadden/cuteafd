@@ -115,6 +115,10 @@ impl WorkerSelection {
     }
 
     pub fn ranges(&self) -> &[LayerRange] { &self.ranges }
+    /// Exact ordered absolute backbone IDs; ranges are only the compact wire encoding.
+    pub fn layers(&self) -> Vec<usize> {
+        self.ranges.iter().flat_map(|range| range.first as usize..range.end as usize).collect()
+    }
     pub fn identity(&self) -> &WorkerIdentity { &self.identity }
     pub fn model(&self) -> Option<&ModelAdmission> { self.model.as_ref() }
     pub fn with_model(mut self, model: ModelAdmission) -> Result<Self> {
@@ -813,6 +817,37 @@ mod tests {
     }
 
     #[test]
+    fn sparse_installed_layers_are_exact_and_gaps_reject_requests() -> Result<()> {
+        let mut selection = admission_selection();
+        selection.ranges = WorkerSelection::new(selection.identity.clone(), &[13, 15, 20])?.ranges;
+        let mut report = admission_report(&selection);
+        let slice = report.slices[0].clone();
+        report.slices = selection.layers().into_iter().map(|layer| cuteafd_core::SparkSlice {
+            layer: layer as u32, ..slice.clone()
+        }).collect();
+        let installed = InstalledModelAdmission::new(0, selection.clone(), Some(report.clone()))?;
+        assert_eq!(installed.selection().layers(), vec![13, 15, 20]);
+        let lease = installed.reserve_endpoint(Some(0))?.unwrap();
+        let mut header = crate::ExpertProtocolV2RequestHeader {
+            request_id: 1, placement_version: 1, layer_id: 13, row_count: 1,
+            hidden_dim: 6144, hidden_dtype: crate::ExpertV2Dtype::Bf16,
+            hidden_row_stride_bytes: 12288, route_count: 8, row_descriptor_bytes: 40,
+            route_bytes: 12, hidden_payload_bytes: 12288, flags: 0,
+        };
+        for layer in [13, 15, 20] {
+            header.layer_id = layer;
+            lease.validate_request(&header)?;
+        }
+        for layer in [12, 14, 16, 19, 21] {
+            header.layer_id = layer;
+            assert!(lease.validate_request(&header).is_err());
+        }
+        report.slices[1].layer = 14;
+        assert!(InstalledModelAdmission::new(0, selection, Some(report)).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn coordinator_endpoint_credit_survives_selection_replay() -> Result<()> {
         let selection = admission_selection();
         let report = admission_report(&selection);
@@ -1108,6 +1143,7 @@ mod tests {
     fn worker_selection_validates_absolute_ranges_and_identity() {
         let selection = WorkerSelection::new(identity(), &[13, 14, 15, 20]).unwrap();
         assert_eq!(selection.ranges(), &[LayerRange { first: 13, end: 16 }, LayerRange { first: 20, end: 21 }]);
+        assert_eq!(selection.layers(), vec![13, 14, 15, 20]);
         for invalid in [vec![70], vec![14, 13], vec![13, 13]] { assert!(WorkerSelection::new(identity(), &invalid).is_err()); }
         let mut other = identity(); other.checkpoint = "1".repeat(64);
         assert!(selection.validate_for(&other).is_err());

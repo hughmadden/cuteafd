@@ -13,15 +13,11 @@ use std::{
 fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
     selection: &cuteafd_transport::worker_selection::WorkerSelection,
     first_routed: usize, layers: usize) -> Result<()> {
-    ensure!(selection.ranges().len() <= 1,
-        "disjoint worker layer selection needs a sparse native loader");
-    if let Some(range) = selection.ranges().first() {
-        let allowed = config.resident_layers(layers)?;
-        ensure!(range.first as usize >= first_routed && range.first as usize >= allowed.start
-            && range.end as usize <= allowed.end, "solved worker selection is outside launched resident range");
-        config.first_layer = range.first as usize;
-        config.last_layer = Some(range.end as usize - 1);
-    }
+    let allowed = config.launched_layers(layers)?;
+    let selected = selection.layers();
+    ensure!(selected.iter().all(|&layer| layer >= first_routed && allowed.contains(&layer)),
+        "solved worker selection is outside launched resident range");
+    config.selected_layers = Some(selected);
     if let Some(model) = selection.model() {
         model.validate(selection.geometry())?;
         ensure!(matches!(model.capacity, 1 | 16 | 80 | 256 | 1024 | 4096),
@@ -40,25 +36,26 @@ fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
 mod selection_tests {
     use super::*;
     #[test]
-    fn solved_worker_suffix_controls_loaded_and_admitted_range() {
+    fn solved_worker_ids_control_loaded_and_admitted_set() {
         use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
         std::fs::write(dir.path().join("model.safetensors.index.json"), "{}").unwrap();
         let geometry = cuteafd_core::ExpertGeometry::MIMO_V26_PRO;
         let identity = WorkerIdentity::from_snapshot(dir.path(), geometry, 6, None).unwrap();
-        // Native config uses the same range consumed by every backend planner.
+        // Every backend consumes the same exact selected IDs within launch bounds.
         let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
             snapshot: dir.path().into(), rank: 0, world: 6, first_layer: 1, last_layer: None,
-            placement_handshake: true, model_admission: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
+            placement_handshake: true, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
             rdma_endpoints: 3, topology: None, native_spark_tp2: false, bf16_ingress: false };
         let selection = WorkerSelection::new(identity.clone(), &(13..70).collect::<Vec<_>>()).unwrap();
         apply_worker_selection(&mut config, &selection, 1, 70).unwrap();
-        assert_eq!(config.resident_layers(70).unwrap(), 13..70);
+        assert_eq!(config.resident_layers(70).unwrap(), (13..70).collect::<Vec<_>>());
         assert_eq!(config.selection(13).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 13, rank: 0, world: 6 });
         let disjoint = WorkerSelection::new(identity.clone(), &[13, 15]).unwrap();
-        assert!(apply_worker_selection(&mut config, &disjoint, 1, 70).is_err());
+        apply_worker_selection(&mut config, &disjoint, 1, 70).unwrap();
+        assert_eq!(config.resident_layers(70).unwrap(), vec![13, 15]);
         let before = WorkerSelection::new(identity.clone(), &[0]).unwrap();
         assert!(apply_worker_selection(&mut config, &before, 1, 70).is_err());
         let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80,
@@ -75,7 +72,7 @@ mod selection_tests {
         assert_eq!(config.model_admission, Some(model));
         let empty = WorkerSelection::new(identity, &[]).unwrap();
         apply_worker_selection(&mut config, &empty, 1, 70).unwrap();
-        assert!(empty.ranges().is_empty());
+        assert!(config.resident_layers(70).unwrap().is_empty());
     }
 
     #[test]
@@ -239,7 +236,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 }
             };
             installed.acknowledge(&mut stream)?;
-            tracing::info!(rank = config.rank, layers = 0, resident_bytes = 0, "native empty expert worker ready");
+            tracing::info!(rank = config.rank, layer_ids = ?installed.selection().layers(),
+                layers = 0, resident_bytes = 0, "native empty expert worker ready");
             return run_empty_selection(listener, config.rank, &installed);
         }
         Some((listener, stream, selection))
@@ -305,11 +303,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         ring_budget_log.as_ref().map(|budget| (budget.used(), budget.peak())),
     );
     let (listener, worker_selection) = if let Some((listener, mut stream, selection)) = bootstrap.take() {
-        let range = &selection.ranges()[0];
-        let exact = range.first as usize == config.first_layer
-            && range.end as usize == config.last_layer.context("selected worker end")? + 1
-            && weights.len() == (range.end - range.first) as usize;
-        if !exact {
+        if weights.layer_ids()? != selection.layers() {
             let error = anyhow::anyhow!("loaded worker layers do not match the solved selection");
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             return Err(error);
@@ -339,7 +333,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             }
         };
         installed.acknowledge(&mut stream)?;
-        tracing::info!(rank = config.rank, first_layer = config.first_layer, layers = weights.len(),
+        tracing::info!(rank = config.rank, layer_ids = ?weights.layer_ids()?, layers = weights.len(),
             selection_digest = %installed.selection().digest()?, "coordinator-selected worker weights ready");
         (listener, Some(installed))
     } else { (TcpListener::bind(listen)?, None) };
@@ -354,11 +348,12 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let worker_rank = config.rank;
     let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
         &config.snapshot, geometry, config.world, config.topology)?;
-    let resident = config.resident_layers(geometry.layers as usize)?;
+    let resident = weights.layer_ids()?;
+    ensure!(resident == config.resident_layers(geometry.layers as usize)?, "loaded worker IDs differ from selected IDs");
     ensure!(weights.len() == resident.len(), "worker loaded range differs from grouping report");
     let loaded = match &worker_selection {
         Some(installed) => installed.selection().clone(),
-        None => cuteafd_transport::worker_selection::WorkerSelection::new(identity, &resident.collect::<Vec<_>>())?,
+        None => cuteafd_transport::worker_selection::WorkerSelection::new(identity, &resident)?,
     };
     let expert_grouping = execution.installed_grouping(loaded, worker_rank)?;
     thread::Builder::new()
@@ -420,9 +415,9 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // be hashed and checked against the declared topology, instead of trusting a
     // hand-written value; the role comes from the same selection the loader used.
     let loaded = if catalog.exl3().is_some() {
-        config.exl3_selection(config.first_layer)?
+        config.exl3_selection(resident[0])?
     } else {
-        config.selection(config.first_layer)?
+        config.selection(resident[0])?
     };
     tracing::info!(
         rank = config.rank,
@@ -430,7 +425,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         role = loaded.role(),
         intermediate = weights.intermediate(),
         capacity = config.capacity,
-        first_layer = config.first_layer,
+        layer_ids = ?resident,
         layers = weights.len(),
         "native local RoCE expert worker ready"
     );
@@ -531,8 +526,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         }
                     }
                 }
-                let layer = (request.layer() as usize).checked_sub(config.first_layer)
-                    .context("requested expert layer is not resident on this Spark")?;
+                let layer = resident.binary_search(&(request.layer() as usize))
+                    .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
                 execution.bind_layer(&weights, layer)?;
                 if let Some(slot) = mapped.response_slot {
                     // The mapped frame's hidden rows are device-visible, so the

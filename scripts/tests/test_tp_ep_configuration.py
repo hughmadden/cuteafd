@@ -1165,7 +1165,7 @@ ANSI_READY_LINE = (
     "\x1b[3mrank\x1b[0m\x1b[2m=\x1b[0m{rank} "
     "\x1b[3mworld\x1b[0m\x1b[2m=\x1b[0m4 "
     "\x1b[3mcapacity\x1b[0m\x1b[2m=\x1b[0m4096 "
-    "\x1b[3mfirst_layer\x1b[0m\x1b[2m=\x1b[0m20 "
+    "\x1b[3mlayer_ids\x1b[0m\x1b[2m=\x1b[0m[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] "
     "\x1b[3mlayers\x1b[0m\x1b[2m=\x1b[0m20\n"
 )
 ANSI_READY_LINES = "".join(ANSI_READY_LINE.format(rank=rank) for rank in range(4))
@@ -1336,7 +1336,7 @@ class CandidateLauncherTest(unittest.TestCase):
 
     def test_start_waits_for_worker_ready_before_reporting_ready(self) -> None:
         # Nonzero offset before the real ANSI line: the launcher must search only
-        # the current epoch and strip ANSI before matching rank/world/first_layer.
+        # the current epoch and strip ANSI before matching rank/world/layer_ids.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             result = self.candidate(
@@ -1372,9 +1372,14 @@ class CandidateLauncherTest(unittest.TestCase):
         split_line = (
             "\x1b[2m cuteafd: native local RoCE expert worker ready\x1b[0m\n"
             "\x1b[3mrank\x1b[0m\x1b[2m=\x1b[0m1 \x1b[3mworld\x1b[0m\x1b[2m=\x1b[0m4 "
-            "\x1b[3mfirst_layer\x1b[0m\x1b[2m=\x1b[0m20\n"
+            "\x1b[3mlayer_ids\x1b[0m\x1b[2m=\x1b[0m[20, 21]\n"
         )
-        for name, body in (("wrong-rank", wrong_rank), ("split-line", split_line)):
+        full = ANSI_READY_LINES
+        hole = full.replace("20, 21, 22,", "20, 22,")
+        extra = full.replace("38, 39]", "38, 39, 40]")
+        reordered = full.replace("20, 21,", "21, 20,")
+        for name, body in (("wrong-rank", wrong_rank), ("split-line", split_line),
+                           ("missing-id", hole), ("extra-id", extra), ("reordered", reordered)):
             with self.subTest(name=name):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)

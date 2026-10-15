@@ -704,27 +704,33 @@ strip_ansi() {
   sed $'s/\033\\[[0-9;]*[a-zA-Z]//g'
 }
 
-# True when one trimmed line carries the readiness message and this rank's exact
-# numeric fields. All three fields must be on the SAME line and use numeric
-# boundaries, so `rank=1` cannot match `rank=10` and `first_layer=2` cannot
-# match `first_layer=20`.
+# Readiness must report this rank and its exact installed absolute layer IDs on
+# one line. Numeric boundaries prevent rank=1 from matching rank=10.
 worker_ready_line_matches() {
-  local rank="$1" world="$2" first="$3" line
+  local rank="$1" world="$2" expected="$3" line actual
+  local ids_pattern='(^|[[:space:]])layer_ids=(\[[0-9,[:space:]]*\])($|[[:space:]])'
   while IFS= read -r line; do
     [[ "$line" == *"native local RoCE expert worker ready"* ]] || continue
     grep -Eq "(^|[^0-9])rank=$rank([^0-9]|$)" <<<"$line" || continue
     grep -Eq "(^|[^0-9])world=$world([^0-9]|$)" <<<"$line" || continue
-    grep -Eq "(^|[^0-9])first_layer=$first([^0-9]|$)" <<<"$line" || continue
+    [[ "$line" =~ $ids_pattern ]] || continue
+    actual="${BASH_REMATCH[2]//[[:space:]]/}"
+    [[ "$actual" == "$expected" ]] || continue
     return 0
   done <<<"$4"
   return 1
 }
 
-# Block until every rank logs the current process's readiness line (rank, world,
-# first_layer) after the pre-start byte offset, with a bounded timeout and early
-# process-death detection.
+# Block until each current process reports its exact selection after the saved
+# log offset, with a bounded timeout and early process-death detection.
 wait_for_worker_ready() {
-  local resolved="$1"
+  local resolved="$1" expected="[" layer
+  # This launcher is restricted to the official 40-layer V4.1 checkpoint.
+  for ((layer=resolved; layer<40; layer++)); do
+    [[ "$expected" == "[" ]] || expected+=","
+    expected+="$layer"
+  done
+  expected+="]"
   local deadline=$((SECONDS + ${CUTEAFD_TPEP_WORKER_READY_TIMEOUT_SECONDS:-900}))
   local -a pending=()
   local rank host slice_text
@@ -739,7 +745,7 @@ wait_for_worker_ready() {
         release_die "$host candidate expert (rank $rank) exited before reporting ready"
       fi
       slice_text="$(worker_log_since "$host" "${worker_log_offsets[$rank]}" | strip_ansi)"
-      if worker_ready_line_matches "$rank" "$spark_world" "$resolved" "$slice_text"; then
+      if worker_ready_line_matches "$rank" "$spark_world" "$expected" "$slice_text"; then
         echo "  rank $rank ($host): worker ready"
       else
         still+=("$rank")
