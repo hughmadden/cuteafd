@@ -175,8 +175,9 @@ def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
     root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/shared/experts/rtx"
     for name in ["native.rs", "exl3.rs"]:
         source = (root / name).read_text()
-        assert 'format!("experts/TP2 expert layer halves {}..{}", layers.start, layers.end)' in source
-        parent = source.split("pub(crate) fn load_pair(", 1)[1]
+        parent = source.split("pub(crate) fn load_pair_weights(", 1)[1]
+        assert '"experts/TP2 expert layer halves {}..{}"' in parent
+        assert "layers.start, layers.end" in parent
         assert 'scope_owned(&label)' in parent.split("synchronized_load::load_pair", 1)[0]
         parallel = parent.split("synchronized_load::load_pair", 1)[1]
         assert 'scope_owned(&label)' in parallel.split("Ok(vec![", 1)[0]

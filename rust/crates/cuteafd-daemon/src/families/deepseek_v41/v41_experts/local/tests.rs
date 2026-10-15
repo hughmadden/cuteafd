@@ -9,16 +9,26 @@ fn bf16(value: f32) -> u16 {
 #[test]
 fn local_activation_contract_selects_bf16_only_for_nvfp4() -> Result<()> {
     for rows in [1, 3, 16, 80, 4096] {
-        let bf16 = CuteafdDeviceBuffer { ptr: 0x1000usize as *mut c_void,
-            bytes: rows as usize * 10240, device_id: 0, flags: 0 };
-        let fp8 = CuteafdDeviceBuffer { ptr: 0x2000usize as *mut c_void,
-            bytes: rows as usize * 5280, device_id: 0, flags: 0 };
+        let bf16 = CuteafdDeviceBuffer {
+            ptr: 0x1000usize as *mut c_void,
+            bytes: rows as usize * 10240,
+            device_id: 0,
+            flags: 0,
+        };
+        let fp8 = CuteafdDeviceBuffer {
+            ptr: 0x2000usize as *mut c_void,
+            bytes: rows as usize * 5280,
+            device_id: 0,
+            flags: 0,
+        };
         for (nvfp4, expected) in [(false, fp8), (true, bf16)] {
             let format = LocalInputFormat::for_nvfp4(nvfp4);
-            let selected = format.select(rows, bf16, fp8)?;
+            let selected = format.select(rows, bf16, fp8, ExpertGeometry::DEEPSEEK_V41)?;
             assert_eq!(selected.ptr, expected.ptr);
             assert_eq!(selected.bytes, expected.bytes);
-            assert!(format.select(rows, fp8, bf16).is_err());
+            assert!(format
+                .select(rows, fp8, bf16, ExpertGeometry::DEEPSEEK_V41)
+                .is_err());
         }
     }
     Ok(())
@@ -99,7 +109,8 @@ fn exl3_local_capacity_lanes_and_shared_sum_match_reference() -> Result<()> {
         }
     }
     let plan = Exl3Weights::plan(&catalog, ExpertLayer::BackboneFull { layer: 0 })?;
-    let workspace = LocalExpertWave::exl3_device_bytes(&directory, 16)?;
+    let workspace =
+        LocalExpertWave::exl3_device_bytes(&directory, 16, ExpertGeometry::DEEPSEEK_V41)?;
     ensure!(
         lib.cuda_memory_info()?.0 > plan.resident_bytes + workspace * 2 + (256 << 20),
         "insufficient GPU headroom for local qualification"
@@ -133,8 +144,26 @@ fn exl3_local_capacity_lanes_and_shared_sum_match_reference() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     // Both owners drop before their borrowed inputs, and drain before scratch.
     let mut lanes = [
-        unsafe { LocalExpertWave::new_exl3(&lib, weights.clone(), &directory, 16, workspace)? },
-        unsafe { LocalExpertWave::new_exl3(&lib, weights, &directory, 16, workspace)? },
+        unsafe {
+            LocalExpertWave::new_exl3(
+                &lib,
+                weights.clone(),
+                &directory,
+                16,
+                workspace,
+                ExpertGeometry::DEEPSEEK_V41,
+            )?
+        },
+        unsafe {
+            LocalExpertWave::new_exl3(
+                &lib,
+                weights,
+                &directory,
+                16,
+                workspace,
+                ExpertGeometry::DEEPSEEK_V41,
+            )?
+        },
     ];
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     for rows in [1u32, 3, 16, 1] {
@@ -207,4 +236,21 @@ fn exl3_local_capacity_lanes_and_shared_sum_match_reference() -> Result<()> {
     }
     println!("resident_bytes={} workspace_per_lane={workspace}; full 384 experts resident, six routed reference experts", plan.resident_bytes);
     Ok(())
+}
+
+#[test]
+fn local_geometry_rejects_unsupported_native_abi_before_planning() {
+    let g = ExpertGeometry::DEEPSEEK_V41;
+    assert!(LocalExpertWave::require_geometry(g).is_ok());
+    assert!(LocalExpertWave::require_geometry(ExpertGeometry { layers: 1, ..g }).is_ok());
+    for geometry in [
+        ExpertGeometry { hidden: 4096, ..g },
+        ExpertGeometry { topk: 3, ..g },
+        ExpertGeometry { layers: 0, ..g },
+    ] {
+        assert!(LocalExpertWave::require_geometry(geometry).is_err());
+        assert!(
+            LocalExpertWave::exl3_device_bytes(Path::new("/nonexistent"), 16, geometry).is_err()
+        );
+    }
 }

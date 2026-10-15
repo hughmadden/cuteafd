@@ -1,9 +1,11 @@
 //! EXL3 TP2 rank execution: raw FP32 partials, without finish or re-quantization.
 use super::native::{output_bytes, validate_layers, RankCompletion};
-use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxShard};
+use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxSelectionPolicy, RtxShard};
 use crate::shared::experts::{
     exl3::{
-        execution::{Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace},
+        execution::{
+            Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace,
+        },
         Exl3Weights,
     },
     layer::ExpertLayer,
@@ -27,12 +29,68 @@ pub(crate) struct Exl3Tp2<'a> {
     layers: Range<usize>,
     geometry: ExpertGeometry,
     row_policy: Exl3RowPolicy,
-    reduction_plan: Exl3ReductionPlan,
+    selection: RtxSelectionPolicy,
+    reduction_plan: Option<Exl3ReductionPlan>,
+    package: PathBuf,
     max_rows: usize,
     workspace_bytes: usize,
     executions: Option<DeviceOwner<'a, Vec<Exl3Execution<'a>>>>,
-    weights: DeviceOwner<'a, Rc<Vec<Exl3Weights<'a>>>>,
+    weights: Rc<DeviceOwner<'a, Rc<Vec<Exl3Weights<'a>>>>>,
     output: Option<Allocation<'a>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Exl3Tp2Weights<'a> {
+    device: Device<'a>,
+    rank: u8,
+    layers: Range<usize>,
+    geometry: ExpertGeometry,
+    row_policy: Exl3RowPolicy,
+    selection: RtxSelectionPolicy,
+    package: PathBuf,
+    max_rows: usize,
+    workspace_bytes: usize,
+    weights: Rc<DeviceOwner<'a, Rc<Vec<Exl3Weights<'a>>>>>,
+}
+
+impl<'a> Exl3Tp2Weights<'a> {
+    pub(crate) fn device(&self) -> Device<'a> {
+        self.device
+    }
+    pub(crate) fn layers(&self) -> Range<usize> {
+        self.layers.clone()
+    }
+    pub(crate) fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+    pub(crate) fn execution(&self) -> Result<Exl3Tp2<'a>> {
+        let reduction_plan = match self.selection {
+            RtxSelectionPolicy::FirstCapacity => None,
+            RtxSelectionPolicy::CanonicalDecode => Some(Exl3ReductionPlan::new(&directories(
+                &self.package,
+                self.max_rows,
+                self.row_policy,
+            )?)?),
+        };
+        let mut lane = Exl3Tp2 {
+            completion: RankCompletion::new(Event::new(self.device)?),
+            device: self.device,
+            rank: self.rank,
+            layers: self.layers.clone(),
+            geometry: self.geometry,
+            row_policy: self.row_policy,
+            selection: self.selection,
+            reduction_plan,
+            package: self.package.clone(),
+            max_rows: self.max_rows,
+            workspace_bytes: self.workspace_bytes,
+            executions: None,
+            weights: self.weights.clone(),
+            output: None,
+        };
+        lane.initialize_lane()?;
+        Ok(lane)
+    }
 }
 
 fn load_layer_pairs<T, W>(
@@ -51,9 +109,35 @@ fn load_layer_pairs<T, W>(
 }
 
 fn directories(package: &Path, max_rows: usize, row_policy: Exl3RowPolicy) -> Result<Vec<PathBuf>> {
-    Ok(row_policy.capacities(max_rows)?
+    selected_directories(
+        package,
+        max_rows,
+        row_policy,
+        RtxSelectionPolicy::CanonicalDecode,
+    )
+}
+
+fn selected_capacities(
+    max_rows: usize,
+    row_policy: Exl3RowPolicy,
+    selection: RtxSelectionPolicy,
+) -> Result<Vec<u32>> {
+    if selection == RtxSelectionPolicy::FirstCapacity {
+        super::native::kernel_capacities(row_policy.required_capacity(max_rows))
+    } else {
+        Ok(row_policy.capacities(max_rows)?)
+    }
+}
+
+fn selected_directories(
+    package: &Path,
+    max_rows: usize,
+    row_policy: Exl3RowPolicy,
+    selection: RtxSelectionPolicy,
+) -> Result<Vec<PathBuf>> {
+    Ok(selected_capacities(max_rows, row_policy, selection)?
         .into_iter()
-        .map(|c| package.join(format!("m{c}")))
+        .map(|capacity| package.join(format!("m{capacity}")))
         .collect())
 }
 
@@ -77,7 +161,23 @@ impl<'a> Exl3Tp2<'a> {
         max_rows: usize,
         row_policy: Exl3RowPolicy,
     ) -> Result<usize> {
-        let paths = directories(package, max_rows, row_policy)?;
+        Self::workspace_bytes_for_selection(
+            package,
+            hidden,
+            max_rows,
+            row_policy,
+            RtxSelectionPolicy::CanonicalDecode,
+        )
+    }
+
+    pub(crate) fn workspace_bytes_for_selection(
+        package: &Path,
+        hidden: usize,
+        max_rows: usize,
+        row_policy: Exl3RowPolicy,
+        selection: RtxSelectionPolicy,
+    ) -> Result<usize> {
+        let paths = selected_directories(package, max_rows, row_policy, selection)?;
         for path in &paths {
             let manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?;
@@ -92,7 +192,9 @@ impl<'a> Exl3Tp2<'a> {
                 "EXL3 TP2 manifest geometry/capacity mismatch"
             );
         }
-        Exl3ReductionPlan::new(&paths)?;
+        if selection == RtxSelectionPolicy::CanonicalDecode {
+            Exl3ReductionPlan::new(&paths)?;
+        }
         Exl3Workspace::plan(&paths, Self::INPUT_FORMAT)?
             .checked_add(
                 max_rows
@@ -113,8 +215,15 @@ impl<'a> Exl3Tp2<'a> {
         max_rows: usize,
         budgets: [usize; 2],
     ) -> Result<[Self; 2]> {
-        Self::load_pair_with_packages(devices, catalog, expert_geometry(), [package; 2],
-            layers, max_rows, budgets)
+        Self::load_pair_with_packages(
+            devices,
+            catalog,
+            expert_geometry(),
+            [package; 2],
+            layers,
+            max_rows,
+            budgets,
+        )
     }
 
     /// Rank-specific exports support unequal complete-H128 partitions (Qwen 384/256).
@@ -127,19 +236,75 @@ impl<'a> Exl3Tp2<'a> {
         max_rows: usize,
         budgets: [usize; 2],
     ) -> Result<[Self; 2]> {
+        Self::load_pair_with_selection(
+            devices,
+            catalog,
+            geometry,
+            packages,
+            layers,
+            max_rows,
+            budgets,
+            RtxSelectionPolicy::CanonicalDecode,
+        )
+    }
+
+    pub(crate) fn load_pair_with_selection(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        geometry: ExpertGeometry,
+        packages: [&Path; 2],
+        layers: Range<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+        selection: RtxSelectionPolicy,
+    ) -> Result<[Self; 2]> {
+        let owners = Self::load_pair_weights(
+            devices, catalog, geometry, packages, layers, max_rows, budgets, selection,
+        )?;
+        Ok([owners[0].execution()?, owners[1].execution()?])
+    }
+
+    pub(crate) fn load_pair_weights(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        geometry: ExpertGeometry,
+        packages: [&Path; 2],
+        layers: Range<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+        selection: RtxSelectionPolicy,
+    ) -> Result<[Exl3Tp2Weights<'a>; 2]> {
         let started = std::time::Instant::now();
-        let label = format!("experts/TP2 expert layer halves {}..{}", layers.start, layers.end);
+        let label = format!(
+            "experts/TP2 expert layer halves {}..{}",
+            layers.start, layers.end
+        );
         let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
         validate_layers(&layers, 0)?;
-        ensure!(geometry == expert_geometry(), "EXL3 TP2 geometry differs from native process geometry");
+        ensure!(
+            geometry == expert_geometry(),
+            "EXL3 TP2 geometry differs from native process geometry"
+        );
         let row_policy = Exl3RowPolicy::for_geometry(geometry);
         ensure!(
             devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid EXL3 TP2 device pair"
         );
         let workspace_bytes = [
-            Self::workspace_bytes_for(packages[0], geometry.hidden as usize, max_rows)?,
-            Self::workspace_bytes_for(packages[1], geometry.hidden as usize, max_rows)?,
+            Self::workspace_bytes_for_selection(
+                packages[0],
+                geometry.hidden as usize,
+                max_rows,
+                row_policy,
+                selection,
+            )?,
+            Self::workspace_bytes_for_selection(
+                packages[1],
+                geometry.hidden as usize,
+                max_rows,
+                row_policy,
+                selection,
+            )?,
         ];
         let mut remaining = [0; 2];
         for rank in 0..2 {
@@ -160,111 +325,206 @@ impl<'a> Exl3Tp2<'a> {
                 );
             }
         }
-        let ranks = [
-            Self {
-                completion: RankCompletion::new(Event::new(devices[0])?),
-                device: devices[0],
-                rank: 0,
-                layers: layers.clone(),
-                geometry,
-                row_policy,
-                reduction_plan: Exl3ReductionPlan::new(&directories(packages[0], max_rows, row_policy)?)?,
-                max_rows,
-                workspace_bytes: workspace_bytes[0],
-                executions: None,
-                weights: devices[0].own(|| Ok(Rc::new(Vec::with_capacity(layers.len()))))?,
-                output: None,
-            },
-            Self {
-                completion: RankCompletion::new(Event::new(devices[1])?),
-                device: devices[1],
-                rank: 1,
-                layers: layers.clone(),
-                geometry,
-                row_policy,
-                reduction_plan: Exl3ReductionPlan::new(&directories(packages[1], max_rows, row_policy)?)?,
-                max_rows,
-                workspace_bytes: workspace_bytes[1],
-                executions: None,
-                weights: devices[1].own(|| Ok(Rc::new(Vec::with_capacity(layers.len()))))?,
-                output: None,
-            },
+        let unloaded = [
+            devices[0].own(|| Ok(Rc::new(Vec::with_capacity(layers.len()))))?,
+            devices[1].own(|| Ok(Rc::new(Vec::with_capacity(layers.len()))))?,
         ];
-        let mut ranks = if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
+        let [left, right] = unloaded;
+        let make = |rank: usize, weights| Exl3Tp2Weights {
+            device: devices[rank],
+            rank: rank as u8,
+            layers: layers.clone(),
+            geometry,
+            row_policy,
+            selection,
+            package: packages[rank].to_path_buf(),
+            max_rows,
+            workspace_bytes: workspace_bytes[rank],
+            weights: Rc::new(weights),
+        };
+        let ranks = [make(0, left), make(1, right)];
+        let ranks = if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
             let remaining = std::cell::RefCell::new(remaining);
-            load_layer_pairs(ranks, layers.clone(), |layer| {
-                let available = *remaining.borrow();
-                // SAFETY: fresh GPU owners only; load drains all uploads and
-                // DeviceOwner drops on the owning GPU, including partial errors.
-                unsafe { cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
-                    let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
-                    Ok(vec![Exl3Weights::load(devices[rank].library, catalog,
-                        ExpertLayer::BackboneTp2 { layer, rank }, available[rank])?])
-                })) }
-            }, |owner, mut loaded, rank| {
-                remaining.borrow_mut()[rank] -= loaded[0].budget.resident_bytes;
-                devices[rank].run(|| {
-                    Rc::get_mut(owner.weights.get_mut()).expect("unpublished EXL3 rank")
+            load_layer_pairs(
+                ranks,
+                layers.clone(),
+                |layer| {
+                    let available = *remaining.borrow();
+                    // SAFETY: fresh GPU owners only; load drains all uploads and
+                    // DeviceOwner drops on the owning GPU, including partial errors.
+                    unsafe {
+                        cuteafd_ffi::synchronized_load::load_pair(|rank| {
+                            devices[rank].own(|| {
+                                let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
+                                Ok(vec![Exl3Weights::load(
+                                    devices[rank].library,
+                                    catalog,
+                                    ExpertLayer::BackboneTp2 { layer, rank },
+                                    available[rank],
+                                )?])
+                            })
+                        })
+                    }
+                },
+                |owner, mut loaded, rank| {
+                    remaining.borrow_mut()[rank] -= loaded[0].budget.resident_bytes;
+                    devices[rank].run(|| {
+                        Rc::get_mut(
+                            Rc::get_mut(&mut owner.weights)
+                                .expect("unpublished device owner")
+                                .get_mut(),
+                        )
+                        .expect("unpublished EXL3 rank")
                         .append(loaded.get_mut());
-                    Ok(())
-                })
-            })?
+                        Ok(())
+                    })
+                },
+            )?
         } else {
             let pair = Exl3Weights::load_tp2_pair(devices, catalog, layers.clone(), remaining)?;
             let mut ranks = ranks;
             for (rank, mut loaded) in pair.into_iter().enumerate() {
                 devices[rank].run(|| {
-                    Rc::get_mut(ranks[rank].weights.get_mut())
-                        .expect("unpublished EXL3 rank").append(loaded.get_mut());
+                    Rc::get_mut(
+                        Rc::get_mut(&mut ranks[rank].weights)
+                            .expect("unpublished device owner")
+                            .get_mut(),
+                    )
+                    .expect("unpublished EXL3 rank")
+                    .append(loaded.get_mut());
                     Ok(())
                 })?;
             }
             ranks
         };
-        for (index, rank) in ranks.iter_mut().enumerate() {
-            let paths = directories(packages[index], max_rows, row_policy)?;
-            rank.executions = Some(rank.device.own(|| {
-                let arena = Exl3Workspace::new(rank.device.library, &paths)?;
-                paths
-                    .iter()
-                    .zip(row_policy.capacities(max_rows)?)
-                    .map(|(path, capacity)| {
-                        // SAFETY: trusted pinned packages; capacities serialize on the rank stream.
-                        let execution = unsafe {
-                            Exl3Execution::with_shared_workspace(
-                                rank.device.library,
-                                rank.weights.get().clone(),
-                                path,
-                                Self::INPUT_FORMAT,
-                                Some(arena.clone()),
-                            )?
-                        };
-                        crate::shared::inventory::startup_probe(rank.device.library, &[rank.device.id],
-                            &format!("exl3-package-m{capacity}"))?;
-                        ensure!(
-                            execution.capacity() == capacity as usize
-                                && execution.output_element_bytes() == 4,
-                            "EXL3 TP2 requires matching capacity and FP32 token sums"
-                        );
-                        Ok(execution)
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?);
-            rank.output = Some(Allocation::new(
-                rank.device,
-                output_bytes(geometry, max_rows)?,
-            )?);
-        }
         for rank in &ranks {
-            tracing::info!(rank = rank.rank, device = rank.device.id, layers = rank.layers.len(),
-                resident_bytes = rank.resident_bytes(), workspace_bytes = rank.workspace_bytes,
-                elapsed_seconds = started.elapsed().as_secs_f64(), "EXL3 TP2 rank load complete");
+            tracing::info!(
+                rank = rank.rank,
+                device = rank.device.id,
+                layers = rank.layers.len(),
+                resident_bytes = rank
+                    .weights
+                    .iter()
+                    .map(|weight| weight.budget.resident_bytes)
+                    .sum::<usize>(),
+                workspace_bytes = rank.workspace_bytes,
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                "EXL3 TP2 rank load complete"
+            );
         }
         Ok(ranks)
     }
 
+    fn initialize_lane(&mut self) -> Result<()> {
+        let paths = selected_directories(
+            &self.package,
+            self.max_rows,
+            self.row_policy,
+            self.selection,
+        )?;
+        self.executions = Some(self.device.own(|| {
+            let arena = Exl3Workspace::new(self.device.library, &paths)?;
+            paths
+                .iter()
+                .zip(selected_capacities(
+                    self.max_rows,
+                    self.row_policy,
+                    self.selection,
+                )?)
+                .map(|(path, capacity)| {
+                    // SAFETY: trusted pinned packages; capacities serialize on the rank stream.
+                    let execution = unsafe {
+                        Exl3Execution::with_shared_workspace(
+                            self.device.library,
+                            self.weights.get().clone(),
+                            path,
+                            Self::INPUT_FORMAT,
+                            Some(arena.clone()),
+                        )?
+                    };
+                    crate::shared::inventory::startup_probe(
+                        self.device.library,
+                        &[self.device.id],
+                        &format!("exl3-package-m{capacity}"),
+                    )?;
+                    ensure!(
+                        execution.capacity() == capacity as usize
+                            && execution.output_element_bytes() == 4,
+                        "EXL3 TP2 requires matching capacity and FP32 token sums"
+                    );
+                    Ok(execution)
+                })
+                .collect::<Result<Vec<_>>>()
+        })?);
+        self.output = Some(Allocation::new(
+            self.device,
+            output_bytes(self.geometry, self.max_rows)?,
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn immutable_weights(&self) -> Exl3Tp2Weights<'a> {
+        Exl3Tp2Weights {
+            device: self.device,
+            rank: self.rank,
+            layers: self.layers.clone(),
+            geometry: self.geometry,
+            row_policy: self.row_policy,
+            selection: self.selection,
+            package: self.package.clone(),
+            max_rows: self.max_rows,
+            workspace_bytes: self.workspace_bytes,
+            weights: self.weights.clone(),
+        }
+    }
+
+    pub(crate) fn fork_lane(&self) -> Result<Self> {
+        self.immutable_weights().execution()
+    }
+
+    pub(super) fn allocation(&self) -> &Allocation<'a> {
+        self.output.as_ref().expect("initialized EXL3 output")
+    }
+    pub(super) fn execution_device(&self) -> Device<'a> {
+        self.device
+    }
+    pub(super) fn bytes_per_expert(&self, layer: usize) -> Result<usize> {
+        ensure!(
+            self.layers.contains(&layer),
+            "EXL3 TP2 weight metadata layer unavailable"
+        );
+        let weight = &self.weights[layer - self.layers.start];
+        Ok(weight.budget.resident_bytes / weight.layout.experts)
+    }
+
+    fn execution_index(&self, rows: usize) -> Result<usize> {
+        let required = self.row_policy.required_capacity(rows);
+        let executions = self
+            .executions
+            .as_ref()
+            .context("uninitialized EXL3 rank")?;
+        self.selection.execution_index(
+            rows,
+            required,
+            executions.iter().map(|execution| execution.capacity()),
+            || {
+                self.reduction_plan
+                    .as_ref()
+                    .context("missing canonical EXL3 plan")?
+                    .execution_index(
+                        rows,
+                        required,
+                        executions.iter().map(|execution| execution.capacity()),
+                    )
+            },
+        )
+    }
+
     pub(crate) fn resident_bytes(&self) -> usize {
-        self.weights.iter().map(|weight| weight.budget.resident_bytes).sum()
+        self.weights
+            .iter()
+            .map(|weight| weight.budget.resident_bytes)
+            .sum()
     }
 }
 
@@ -286,11 +546,20 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
     }
     fn group_rows(&self, rows: usize) -> Result<usize> {
         ensure!(rows <= self.max_rows, "invalid EXL3 TP2 grouping row count");
-        let executions = self.executions.as_ref().context("uninitialized EXL3 rank")?;
-        let selected = if rows == 0 { executions.last() } else {
-            executions.iter().find(|e| e.capacity() >= self.row_policy.required_capacity(rows))
+        let executions = self
+            .executions
+            .as_ref()
+            .context("uninitialized EXL3 rank")?;
+        let selected = if rows == 0 {
+            executions.last()
+        } else {
+            executions
+                .iter()
+                .find(|e| e.capacity() >= self.row_policy.required_capacity(rows))
         };
-        Ok(selected.context("no EXL3 TP2 capacity for this many rows")?.group_rows())
+        Ok(selected
+            .context("no EXL3 TP2 capacity for this many rows")?
+            .group_rows())
     }
     fn output(&self) -> *mut c_void {
         self.output
@@ -331,11 +600,9 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
                 buffer(routes.ids, self.geometry.topk as usize * 4),
                 buffer(routes.weights, self.geometry.topk as usize * 4),
             ];
-            let required = self.row_policy.required_capacity(rows);
+            let selected = self.execution_index(rows)?;
             self.device.run(|| {
                 let executions = self.executions.as_mut().expect("initialized EXL3 rank");
-                let selected = self.reduction_plan.execution_index(rows, required,
-                    executions.iter().map(|e| e.capacity()))?;
                 let execution = &mut executions[selected];
                 // SAFETY: caller owns rank-local inputs and exclusive stream/arena/output use through completion.
                 unsafe {
@@ -380,15 +647,27 @@ mod tests {
         let released = Rc::new(RefCell::new(Vec::new()));
         let mut order = Vec::new();
         let ranks = [Vec::new(), Vec::new()];
-        let result = load_layer_pairs(ranks, 0..3, |layer| {
-            let pair = std::array::from_fn(|rank| {
-                order.push((layer, rank));
-                live.set(live.get() + 1);
-                ProbeAllocation { rank, live: live.clone(), released: released.clone() }
-            });
-            ensure!(layer != 1, "injected rank1 mid-load failure");
-            Ok(pair)
-        }, |owner, weight, _| { owner.push(weight); Ok(()) });
+        let result = load_layer_pairs(
+            ranks,
+            0..3,
+            |layer| {
+                let pair = std::array::from_fn(|rank| {
+                    order.push((layer, rank));
+                    live.set(live.get() + 1);
+                    ProbeAllocation {
+                        rank,
+                        live: live.clone(),
+                        released: released.clone(),
+                    }
+                });
+                ensure!(layer != 1, "injected rank1 mid-load failure");
+                Ok(pair)
+            },
+            |owner, weight, _| {
+                owner.push(weight);
+                Ok(())
+            },
+        );
         assert!(result.is_err());
         assert_eq!(order, [(0, 0), (0, 1), (1, 0), (1, 1)]);
         assert_eq!(live.get(), 0);
@@ -414,23 +693,52 @@ mod tests {
                 }))?,
             )?;
         }
-        assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 16, Exl3RowPolicy::Nearest).is_err());
-        assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 3, Exl3RowPolicy::Nearest).is_err());
-        assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 16, Exl3RowPolicy::GlmFlashK64).is_err());
+        assert!(
+            Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 16, Exl3RowPolicy::Nearest)
+                .is_err()
+        );
+        assert!(
+            Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, 3, Exl3RowPolicy::Nearest).is_err()
+        );
+        assert!(Exl3Tp2::workspace_bytes_for_policy(
+            root.path(),
+            8,
+            16,
+            Exl3RowPolicy::GlmFlashK64
+        )
+        .is_err());
         let directory = root.path().join("m80");
         std::fs::create_dir_all(&directory)?;
-        std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-            "capacity": 80, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
-                "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": 2048, "zero_on_create": false},
-                "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
-            }
-        }))?)?;
+        std::fs::write(
+            directory.join("v41_exl3.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "capacity": 80, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
+                    "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": 2048, "zero_on_create": false},
+                    "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
+                }
+            }))?,
+        )?;
         for rows in [2, 3, 8, 16] {
-            assert!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 16, rows, Exl3RowPolicy::Nearest).is_err());
-            assert_eq!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, rows, Exl3RowPolicy::Nearest)?,
-                2048 + 3 * (32 + 16) + (1 + 16 + 80) * 8 * 2 + rows * 8 * 4);
-            assert_eq!(Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, rows, Exl3RowPolicy::GlmFlashK64)?,
-                2048 + 3 * (32 + 16) + (1 + 16 + 80) * 8 * 2 + rows * 8 * 4);
+            assert!(Exl3Tp2::workspace_bytes_for_policy(
+                root.path(),
+                16,
+                rows,
+                Exl3RowPolicy::Nearest
+            )
+            .is_err());
+            assert_eq!(
+                Exl3Tp2::workspace_bytes_for_policy(root.path(), 8, rows, Exl3RowPolicy::Nearest)?,
+                2048 + 3 * (32 + 16) + (1 + 16 + 80) * 8 * 2 + rows * 8 * 4
+            );
+            assert_eq!(
+                Exl3Tp2::workspace_bytes_for_policy(
+                    root.path(),
+                    8,
+                    rows,
+                    Exl3RowPolicy::GlmFlashK64
+                )?,
+                2048 + 3 * (32 + 16) + (1 + 16 + 80) * 8 * 2 + rows * 8 * 4
+            );
         }
         Ok(())
     }
@@ -443,7 +751,10 @@ mod tests {
                 let capacities = policy.capacities(maximum)?;
                 assert_eq!(paths.len(), capacities.len());
                 for live in 1..=maximum {
-                    let selected = capacities.iter().find(|&&c| c as usize >= policy.required_capacity(live)).unwrap();
+                    let selected = capacities
+                        .iter()
+                        .find(|&&c| c as usize >= policy.required_capacity(live))
+                        .unwrap();
                     if policy == Exl3RowPolicy::GlmFlashK64 && (2..=16).contains(&live) {
                         assert_eq!(*selected, 80);
                     }

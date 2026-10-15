@@ -1,5 +1,8 @@
-//! Capture-compatible draft expert fork/join; transformer owner stays on RTX1.
-use super::rank::{Wave, Weights};
+//! Capture-compatible draft expert fork/join on the caller-selected owner.
+use super::{
+    rank::{Wave, Weights},
+    Layout,
+};
 use crate::shared::memory::device::{Allocation, Device, Event, Stream};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{
@@ -7,7 +10,7 @@ use cuteafd_ffi::{
 };
 use std::{ffi::c_void, rc::Rc};
 
-pub(super) struct Pair<'a> {
+pub(crate) struct Pair<'a> {
     // External root stream and its graphs must be drained/destroyed by caller
     // first. Our peer stream drains before any of its referenced allocations.
     peer: Stream<'a>,
@@ -23,30 +26,40 @@ pub(super) struct Pair<'a> {
     reducer: V41RouteReducer<'a>,
     owner: Device<'a>,
     capacity: u32,
+    layout: Layout,
 }
 impl<'a> Pair<'a> {
-    pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<[usize; 2]> {
-        let scratch = Wave::device_bytes(library, capacity)?;
+    pub fn device_bytes(
+        library: &NativeLibrary,
+        capacity: u32,
+        layout: Layout,
+    ) -> Result<[usize; 2]> {
+        layout.validate()?;
+        let scratch = Wave::device_bytes(library, capacity, layout)?;
         let rows = capacity as usize;
-        Ok([
-            scratch + rows * (5280 + 12 + 12),
-            scratch + rows * (5280 + 3 * 5120 * 4 + 5120 * 2),
-        ])
+        let widths = layout.input_bytes();
+        let mut bytes = [scratch; 2];
+        bytes[1 - layout.owner] += rows * widths.iter().sum::<usize>();
+        bytes[layout.owner] +=
+            rows * (widths[0] + layout.route_bytes() + layout.geometry.row_bytes() as usize);
+        Ok(bytes)
     }
-    pub fn new(weights: [Rc<Weights<'a>>; 2], capacity: u32) -> Result<Self> {
+    pub fn new(weights: [Rc<Weights<'a>>; 2], capacity: u32, layout: Layout) -> Result<Self> {
+        layout.validate()?;
         let devices = weights.each_ref().map(|w| w.device);
         ensure!(
-            devices[0].id == 0
-                && devices[1].id == 1
-                && std::ptr::eq(devices[0].library, devices[1].library),
-            "invalid draft TP2 weights"
+            devices[0].id != devices[1].id
+                && std::ptr::eq(devices[0].library, devices[1].library)
+                && weights.iter().all(|w| w.layout == layout),
+            "invalid draft TP2 weights/layout"
         );
-        let owner = devices[1];
-        for device in devices {
-            device.run(|| device.library.cuda_enable_peer(1 - device.id))?;
+        let owner = devices[layout.owner];
+        let peer = devices[1 - layout.owner];
+        for (rank, device) in devices.iter().enumerate() {
+            device.run(|| device.library.cuda_enable_peer(devices[1 - rank].id))?;
         }
         let copies = [
-            devices[0].run(|| owner.library.v41_peer_copy())?,
+            peer.run(|| owner.library.v41_peer_copy())?,
             owner.run(|| owner.library.v41_peer_copy())?,
         ];
         let quantizer = owner.run(|| owner.library.v41_expert_input_quantizer())?;
@@ -54,34 +67,36 @@ impl<'a> Pair<'a> {
         let [left, right] = weights;
         let ranks = [Wave::new(left, capacity)?, Wave::new(right, capacity)?];
         let rows = capacity as usize;
+        let widths = layout.input_bytes();
         Ok(Self {
-            peer: Stream::new(devices[0])?,
+            peer: Stream::new(peer)?,
             ready: Event::new(owner)?,
-            done: Event::new(devices[0])?,
+            done: Event::new(peer)?,
             ranks,
-            wire: Allocation::new(owner, rows * 5280)?,
+            wire: Allocation::new(owner, rows * widths[0])?,
             peer_inputs: [
-                Allocation::new(devices[0], rows * 5280)?,
-                Allocation::new(devices[0], rows * 12)?,
-                Allocation::new(devices[0], rows * 12)?,
+                Allocation::new(peer, rows * widths[0])?,
+                Allocation::new(peer, rows * widths[1])?,
+                Allocation::new(peer, rows * widths[2])?,
             ],
-            peer_output: Allocation::new(owner, rows * 3 * 5120 * 4)?,
-            output: Allocation::new(owner, rows * 5120 * 2)?,
+            peer_output: Allocation::new(owner, rows * layout.route_bytes())?,
+            output: Allocation::new(owner, rows * layout.geometry.row_bytes() as usize)?,
             copies,
             quantizer,
             reducer,
             owner,
             capacity,
+            layout,
         })
     }
     pub fn output(&self) -> CuteafdDeviceBuffer {
         self.output.buffer
     }
-    /// Quantize once on RTX1, fork RTX0, then join its FP32 route contributions
+    /// Quantize once on the owner, fork the peer, then join its FP32 route contributions
     /// before ordered top-3 reduction. No allocations or host waits here.
     ///
     /// # Safety
-    /// Caller owns the RTX1 stream and all inputs/shared through completion and
+    /// Caller owns the owner stream and all inputs/shared through completion and
     /// graph lifetime. Prior use of this pair must precede this enqueue. On any
     /// failure, end/abort capture as appropriate and drain both streams before
     /// freeing or reusing any inputs. Graph destruction precedes dropping Pair.
@@ -94,18 +109,23 @@ impl<'a> Pair<'a> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            stage < 3 && rows > 0 && rows <= self.capacity,
+            stage < self.layout.stages && rows > 0 && rows <= self.capacity,
             "invalid draft TP2 stage/rows"
         );
-        for (buffer, width) in inputs.iter().zip([10240, 12, 12]) {
+        for (buffer, width) in inputs.iter().zip([
+            self.layout.geometry.row_bytes() as usize,
+            self.layout.geometry.topk as usize * 4,
+            self.layout.geometry.topk as usize * 4,
+        ]) {
             ensure!(
-                buffer.device_id == 1 && buffer.bytes >= rows as usize * width,
+                buffer.device_id == self.owner.id && buffer.bytes >= rows as usize * width,
                 "draft TP2 root input device or size differs"
             );
         }
         if let Some(buffer) = shared {
             ensure!(
-                buffer.device_id == 1 && buffer.bytes >= rows as usize * 10240,
+                buffer.device_id == self.owner.id
+                    && buffer.bytes >= rows as usize * self.layout.geometry.row_bytes() as usize,
                 "draft TP2 shared output device or size differs"
             );
         }
@@ -118,8 +138,11 @@ impl<'a> Pair<'a> {
         let encoded = [self.wire.buffer, inputs[1], inputs[2]];
         let peer_result = self.peer.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.peer.raw, self.ready.raw)?;
-            for ((destination, source), width) in
-                self.peer_inputs.iter().zip(encoded).zip([5280, 12, 12])
+            for ((destination, source), width) in self
+                .peer_inputs
+                .iter()
+                .zip(encoded)
+                .zip(self.layout.input_bytes())
             {
                 self.copies[0].launch(
                     destination.buffer,
@@ -128,7 +151,7 @@ impl<'a> Pair<'a> {
                     self.peer.raw,
                 )?;
             }
-            let output = self.ranks[0].enqueue(
+            let output = self.ranks[1 - self.layout.owner].enqueue(
                 stage,
                 rows,
                 self.peer_inputs.each_ref().map(|v| v.buffer),
@@ -138,26 +161,24 @@ impl<'a> Pair<'a> {
             Ok(output)
         })?;
         self.owner.run(|| unsafe {
-            let local = self.ranks[1].enqueue(stage, rows, encoded, stream)?;
+            let local = self.ranks[self.layout.owner].enqueue(stage, rows, encoded, stream)?;
             library.cuda_stream_wait_event(stream, self.done.raw)?;
             self.copies[1].launch(
                 self.peer_output.buffer,
                 peer_result,
-                rows as usize * 3 * 5120 * 4,
+                rows as usize * self.layout.route_bytes(),
                 stream,
             )?;
+            let mut planes = [std::ptr::null(); 4];
+            planes[self.layout.owner] = local.ptr.cast();
+            planes[1 - self.layout.owner] = self.peer_output.buffer.ptr.cast();
             self.reducer.launch(
-                [
-                    self.peer_output.buffer.ptr.cast(),
-                    local.ptr.cast(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                ],
+                planes,
                 shared.map_or(std::ptr::null(), |v| v.ptr.cast()),
                 self.output.buffer.ptr.cast(),
                 rows,
                 2,
-                3,
+                self.layout.geometry.topk,
                 stream,
             )
         })

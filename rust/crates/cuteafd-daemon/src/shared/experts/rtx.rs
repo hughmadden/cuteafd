@@ -20,6 +20,7 @@ use anyhow::Result;
 use std::ffi::c_void;
 
 pub(crate) mod combine;
+pub(crate) mod draft;
 pub(crate) mod exl3;
 pub(crate) mod fp8moe;
 pub(crate) mod native;
@@ -39,10 +40,47 @@ pub(crate) enum RtxShard {
     Tp2 { rank: u8 },
 }
 
+/// Kernel selection is part of the caller's arithmetic contract, not placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RtxSelectionPolicy {
+    FirstCapacity,
+    CanonicalDecode,
+}
+
+impl RtxSelectionPolicy {
+    pub(super) fn execution_index(
+        self,
+        rows: usize,
+        required: usize,
+        capacities: impl Iterator<Item = usize>,
+        canonical: impl FnOnce() -> Result<usize>,
+    ) -> Result<usize> {
+        anyhow::ensure!(
+            rows > 0 && required >= rows,
+            "invalid expert selection rows"
+        );
+        match self {
+            Self::FirstCapacity => capacities
+                .enumerate()
+                .find(|&(_, capacity)| capacity >= required)
+                .map(|(index, _)| index)
+                .ok_or_else(|| anyhow::anyhow!("no expert execution for admitted rows")),
+            Self::CanonicalDecode => canonical(),
+        }
+    }
+}
+
+/// Shape of a rank partial; dtype alone cannot distinguish token and route sums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartialLayout {
+    Tokens,
+    Routes { topk: usize },
+}
+
 /// Element type of a rank's routed partial as its kernels publish it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PartialDtype {
-    /// FP32 `[rows, hidden]` token sums (native atomic/route-summed, EXL3).
+    /// FP32 token sums or route planes, as identified by PartialLayout.
     F32,
     /// BF16 `[rows, hidden]` (FP8 MoE packages today).
     Bf16,
@@ -70,6 +108,9 @@ pub(crate) trait RtxExpertLayer {
     fn shard(&self) -> RtxShard;
     /// Element type of [`Self::output`].
     fn partial(&self) -> PartialDtype;
+    fn partial_layout(&self, _rows: usize) -> Result<PartialLayout> {
+        Ok(PartialLayout::Tokens)
+    }
     /// Backbone layers `first..first + count` this rank holds.
     fn layers(&self) -> std::ops::Range<usize>;
     /// The device this rank executes on.
@@ -85,7 +126,7 @@ pub(crate) trait RtxExpertLayer {
     fn weight_read_bytes(&self) -> Result<usize> {
         anyhow::bail!("expert backend does not publish installed read-byte metadata")
     }
-    /// This rank's routed partial `[rows, hidden]` of [`Self::partial`],
+    /// This rank's routed partial of [`Self::partial`] and [`Self::partial_layout`],
     /// valid after the last [`Self::enqueue`] completes on its stream and
     /// until the next one.
     fn output(&self) -> *mut c_void;
@@ -95,7 +136,12 @@ pub(crate) trait RtxExpertLayer {
     /// # Safety
     /// The input/routes contain the backend's maximum initialized row count on
     /// this rank; the startup stream has no pending peer waits and is drained.
-    unsafe fn prime(&mut self, _input: ExpertInput, _routes: Routes, _stream: *mut c_void) -> Result<()> {
+    unsafe fn prime(
+        &mut self,
+        _input: ExpertInput,
+        _routes: Routes,
+        _stream: *mut c_void,
+    ) -> Result<()> {
         Ok(())
     }
     /// This rank's routed sum for `rows` rows of `layer` into [`Self::output`]:
@@ -119,4 +165,73 @@ pub(crate) trait RtxExpertLayer {
         stream: *mut c_void,
         abort: &mut dyn FnMut(),
     ) -> Result<()>;
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn nearest_capacity_never_consults_canonical_reduction() -> Result<()> {
+        for rows in 1..=256 {
+            let capacities = [1, 16, 80, 256];
+            let index = RtxSelectionPolicy::FirstCapacity.execution_index(
+                rows,
+                rows,
+                capacities.into_iter(),
+                || panic!("nearest consulted canonical"),
+            )?;
+            assert_eq!(
+                index,
+                capacities
+                    .iter()
+                    .position(|&capacity| capacity >= rows)
+                    .unwrap()
+            );
+        }
+        assert!(RtxSelectionPolicy::FirstCapacity
+            .execution_index(0, 0, [1].into_iter(), || Ok(0))
+            .is_err());
+        assert!(RtxSelectionPolicy::FirstCapacity
+            .execution_index(81, 81, [1, 16, 80].into_iter(), || Ok(0))
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_selection_remains_distinct_from_nearest_capacity() -> Result<()> {
+        let variants = [(1, 64), (16, 192), (80, 64), (256, 192)];
+        let plan = crate::shared::experts::ExpertReductionPlan::new(&variants)?;
+        for rows in 1..=256 {
+            let expected = plan.execution_index(rows, rows, variants.iter().map(|v| v.0))?;
+            assert_eq!(
+                RtxSelectionPolicy::CanonicalDecode.execution_index(
+                    rows,
+                    rows,
+                    variants.iter().map(|v| v.0),
+                    || Ok(expected)
+                )?,
+                expected
+            );
+        }
+        assert_eq!(
+            RtxSelectionPolicy::FirstCapacity.execution_index(
+                16,
+                16,
+                variants.iter().map(|v| v.0),
+                || Ok(2)
+            )?,
+            1
+        );
+        assert_eq!(
+            RtxSelectionPolicy::CanonicalDecode.execution_index(
+                16,
+                16,
+                variants.iter().map(|v| v.0),
+                || plan.execution_index(16, 16, variants.iter().map(|v| v.0))
+            )?,
+            2
+        );
+        Ok(())
+    }
 }

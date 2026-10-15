@@ -288,7 +288,7 @@ impl<'library> DsparkWeights<'library> {
         let peer_peak=resident[0].checked_add(staging[0].max(workspace[0].checked_mul(3*waves).context("draft TP2 peer wave overflow")?)).context("draft TP2 peer budget overflow")?;
         ensure!(peer_peak<=budgets[0] && root_peak<=budgets[1],
             "draft TP2 needs GPU0/GPU1 bytes {peer_peak}/{root_peak}, budgets are {}/{}",budgets[0],budgets[1]);
-        let weights=tp2::Weights::load_pair(devices,catalog,budgets)?;
+        let weights=tp2::Weights::load_pair(devices,catalog,budgets,tp2::LAYOUT)?;
         Self::load_with_experts(library,catalog,capacity,waves,budgets[1],pinned_staging_bytes,width,None,Some((weights,budget)))
     }
 

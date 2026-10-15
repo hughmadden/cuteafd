@@ -34,12 +34,12 @@ fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
         cuteafd_loader::OFFICIAL_V41_MODEL_ID,
         std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
     )?;
-    let weights = Weights::load_pair(devices, &catalog, [16usize << 30; 2])?;
+    let weights = Weights::load_pair(devices, &catalog, [16usize << 30; 2], super::LAYOUT)?;
     eprintln!(
         "draft TP2 resident bytes: {:?}",
         weights.each_ref().map(|w| w.resident_bytes())
     );
-    let mut pair = Pair::new(weights, 256)?;
+    let mut pair = Pair::new(weights, 256, super::LAYOUT)?;
     let root = Stream::new(owner)?;
     for stage in 0..3 {
         let full = owner.own(|| {
