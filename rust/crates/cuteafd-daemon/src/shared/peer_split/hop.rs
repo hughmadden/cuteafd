@@ -19,10 +19,95 @@
 //! exactly the solver's `residual hops` demand.
 use super::{on_device, End, RankDevice};
 use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::device::{Device, Stream};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::NativeLibrary;
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::placement::{hop_buffer_bytes, Hop, HopSpec, HOP_SLOTS};
 use std::ffi::c_void;
+
+/// One directed transfer stream per request lane. No intermediate device or
+/// host buffer is needed: copies land in the destination's existing inputs.
+pub(crate) struct DirectInputHop<'a> {
+    source: Device<'a>,
+    destination: Stream<'a>,
+    /// Device-ordered passes: an SM copy on the
+    /// destination GPU ordered by the stage chain, with no host wait.
+    sm: Option<cuteafd_ffi::V41PeerCopy<'a>>,
+}
+impl<'a> DirectInputHop<'a> {
+    pub fn new(source: Device<'a>, destination: Device<'a>) -> Result<Self> {
+        ensure!(
+            source.id != destination.id,
+            "block transfer requires different GPUs"
+        );
+        source.run(|| source.library.cuda_enable_peer(destination.id))?;
+        destination.run(|| destination.library.cuda_enable_peer(source.id))?;
+        let sm = crate::shared::memory::chain::device_enabled()
+            .then(|| destination.run(|| destination.library.v41_peer_copy())).transpose()?;
+        Ok(Self {
+            source,
+            destination: Stream::new(destination)?,
+            sm,
+        })
+    }
+    pub fn destination(&self) -> Device<'a> { self.destination.device }
+
+    #[cfg(test)]
+    pub fn stream_raw(&self) -> *mut c_void { self.destination.raw }
+
+    /// # Safety
+    /// Sources are complete and all buffers remain exclusively owned until the
+    /// copy finishes or cancellation drains. Never queue behind an unready
+    /// producer event: doing so can stall otherwise independent peer DMA work.
+    pub async unsafe fn copy<const N: usize>(
+        &mut self,
+        sources: [CuteafdDeviceBuffer; N],
+        destinations: [CuteafdDeviceBuffer; N],
+    ) -> Result<()> {
+        ensure!(
+            sources
+                .iter()
+                .zip(destinations)
+                .all(|(s, d)| s.device_id == self.source.id
+                    && d.device_id == self.destination.device.id
+                    && s.bytes <= d.bytes),
+            "block transfer devices or extents differ"
+        );
+        let device = self.destination.device;
+        if let Some(sm) = self.sm.as_ref().filter(|_| crate::shared::memory::chain::deferred()) {
+            // The SM copy follows the chain head (the producers on the source
+            // GPU) on the device and becomes the new head: no host wait.
+            return device.run(|| unsafe {
+                crate::shared::memory::chain::join(device.library, self.destination.raw)?;
+                for (source, destination) in sources.into_iter().zip(destinations) {
+                    sm.launch(destination, source, source.bytes, self.destination.raw)?;
+                }
+                crate::shared::memory::chain::finish(device.library, self.destination.raw)
+            });
+        }
+        // Peer DMA never waits on an unresolved event; settle chained producers.
+        crate::shared::memory::chain::settle(device.library)?;
+        let queued = device.run(|| {
+            for (source, destination) in sources.into_iter().zip(destinations) {
+                unsafe {
+                    device.library.copy_peer_async(
+                        destination,
+                        source,
+                        source.bytes,
+                        self.destination.raw,
+                    )?;
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = queued {
+            self.destination.drain()?;
+            return Err(error);
+        }
+        // Stream::wait retains and drains the stream on failure/cancellation.
+        self.destination.wait().await
+    }
+}
 
 /// Both GPUs' hop receive slots and control words.
 pub(crate) struct HopLink<'a> {

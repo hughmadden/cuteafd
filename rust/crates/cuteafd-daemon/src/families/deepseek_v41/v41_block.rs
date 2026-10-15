@@ -7,7 +7,6 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 mod encoder_suffix;
 mod transfer;
-pub(crate) use transfer::BlockTransfer;
 pub(crate) use encoder_suffix::EncoderSuffix;
 #[derive(Clone, Copy)]
 enum Phase {

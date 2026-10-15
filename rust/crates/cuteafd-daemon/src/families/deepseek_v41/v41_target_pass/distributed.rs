@@ -4,7 +4,7 @@ use crate::families::deepseek_v41::v41_target_head::distributed_target::{Distrib
 mod encoder_stream;
 use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
 use crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution;
-use crate::families::deepseek_v41::v41_block::BlockTransfer;
+use crate::shared::peer_split::hop::DirectInputHop;
 use crate::families::deepseek_v41::v41_engram::placement::PlacedEngram;
 use crate::shared::memory::device::DeviceOwner;
 use encoder_stream::EncoderFlow;
@@ -32,7 +32,7 @@ pub(crate) struct DistributedTargetPass<'w, 'a> {
     engram: PlacedEngram<'w, 'a>,
     head: DistributedTargetHead<'w, 'a>,
     taps: DeviceOwner<'a, TargetTapWave<'a>>,
-    transfers: [BlockTransfer<'a>; 2],
+    transfers: [DirectInputHop<'a>; 2],
     suffix_stream: DeviceOwner<'a, crate::shared::memory::LoadStream<'a>>,
     timeout: Duration,
     state: State,
@@ -144,8 +144,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             );
         }
         let transfers = [
-            BlockTransfer::new(lanes[1].device, lanes[0].device)?,
-            BlockTransfer::new(lanes[0].device, lanes[1].device)?,
+            DirectInputHop::new(lanes[1].device, lanes[0].device)?,
+            DirectInputHop::new(lanes[0].device, lanes[1].device)?,
         ];
         let device = lanes[map.attention(19)?].device;
         let suffix_stream = device.own(|| {
