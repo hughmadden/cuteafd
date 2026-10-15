@@ -415,6 +415,9 @@ def rebind_text_set(source, source_tokenizer, tokenizer, *, family, model, versi
         raise ValueError("published text source hash mismatch")
     manifest = json.loads(source.read_text())
     original_set = manifest["set_sha256"]
+    source_tokenizer_sha256 = hashlib.sha256(source_tokenizer.read_bytes()).hexdigest()
+    if manifest.get("tokenizer_sha256") not in (None, source_tokenizer_sha256):
+        raise ValueError("source tokenizer differs from published text")
     # Published windows redact deployment metadata while retaining the source set id.
     # Their immutable publication file hash, not that source id, seals these bytes.
     manifest["set_sha256"] = set_hash(manifest)

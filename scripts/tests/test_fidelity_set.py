@@ -121,6 +121,12 @@ def test_rebind_text_set_checks_published_hash_and_used_tokens(tmp_path):
     assert result["family"] == "qwen3_5"
     with pytest.raises(ValueError, match="source hash"):
         builder.rebind_text_set(source, old, new, **{**kwargs, "source_sha256": "0" * 64})
+    pinned = {**manifest, "tokenizer_sha256": "0" * 64}
+    source.write_bytes(canonical(pinned))
+    with pytest.raises(ValueError, match="source tokenizer"):
+        builder.rebind_text_set(source, old, new, **{**kwargs,
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+    source.write_bytes(canonical(manifest))
     Tokenizer(models.WordLevel({"a": 1, "b": 0}, unk_token="a")).save(str(new))
     with pytest.raises(ValueError, match="token ids differ"):
         builder.rebind_text_set(source, old, new, **kwargs)

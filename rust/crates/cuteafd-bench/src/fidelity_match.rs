@@ -147,7 +147,7 @@ fn walk(model: &str, snapshot: Option<&Path>, hub: &Path, depth: usize,
         ensure!(matches!(relation, "quantized" | "merge"), "unsupported base_model relation {relation} for {model}");
     }
     if let Some(root) = official_root(model) {
-        if model == root && official(model).is_none() {
+        if official(root).is_none() {
             bail!("no published fidelity dataset for official root {root}");
         }
     }

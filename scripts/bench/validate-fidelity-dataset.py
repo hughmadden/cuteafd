@@ -368,7 +368,40 @@ def validate_reference_only(root, *, seal=False):
     identity = meta['snapshot_identity']
     if any(identity.get(key) != value for key, value in manifest['reference_snapshot'].items()):
         raise ValueError('golden snapshot identity mismatch')
-    validate_qualification(meta.get('prefix_qualification'), manifest, identity)
+    proof = meta.get('prefix_qualification')
+    validate_qualification(proof, manifest, identity)
+    probes = list(golden.glob('prefix-gate-*/meta.json'))
+    if len(probes) != 1:
+        raise ValueError('reference requires one raw prefix probe')
+    probe_root = probes[0].parent
+    probe_meta = json.loads(probes[0].read_text())
+    probe_set = load_set(probe_root / 'windows.json')
+    source = next((w for w in manifest['windows'] if w['id'] == proof.get('source_window')), None)
+    if (probe_meta.get('set_sha256') != probe_set['set_sha256']
+            or probe_meta.get('family') != manifest['family'] or probe_meta.get('checkpoint') != manifest['checkpoint']):
+        raise ValueError('prefix probe metadata mismatch')
+    if source is None or probe_meta.get('snapshot_identity') != identity:
+        raise ValueError('prefix source/identity mismatch')
+    from fidelity_windows import prefix_comparison
+    arrays = []
+    if len(probe_set['windows']) != 2 or len(probe_meta['windows']) != 2:
+        raise ValueError('prefix probe coverage mismatch')
+    for i, (window, entry) in enumerate(zip(probe_set['windows'], probe_meta['windows'])):
+        size = proof['lengths'][i]
+        if window['tokens'] != source['tokens'][:size] or entry['positions'] != list(range(proof['score_from'], size)):
+            raise ValueError('prefix probe pinning mismatch')
+        folder = (probe_root / entry['path']).resolve()
+        if not folder.is_relative_to(probe_root.resolve()):
+            raise ValueError('prefix probe path escapes root')
+        if np.fromfile(folder / 'tokens.bin', dtype='<i4').tolist() != window['tokens']:
+            raise ValueError('prefix probe tokens mismatch')
+        path = folder / 'logits.bin'
+        if digest(path) != proof['logits_sha256'][i] or path.stat().st_size != (size - proof['score_from']) * proof['vocab'] * 4:
+            raise ValueError('prefix probe hash/extent mismatch')
+        arrays.append(np.memmap(path, dtype='<f4', mode='r', shape=(size - proof['score_from'], proof['vocab'])))
+    observed = prefix_comparison(*arrays)
+    if not observed['passed'] or any(observed[k] != proof[k] for k in observed):
+        raise ValueError('raw prefix qualification failed')
     if meta.get('mtp') is not False or meta.get('use_cache') is not False or meta.get('attention') != 'eager':
         raise ValueError('reference execution policy differs')
     entries = {w['id']: w for w in meta['windows']}
@@ -377,9 +410,16 @@ def validate_reference_only(root, *, seal=False):
         raise ValueError('golden window coverage mismatch')
     rows = json.loads((root / 'full/rows.json').read_text())
     compact = json.loads((root / 'reference.json').read_text())
+    if (rows.get('schema') != 'cuteafd.fidelity.rows/1' or rows.get('dtype') != '<f2'
+            or rows.get('kind') != 'log_softmax' or compact.get('schema') != 'cuteafd.fidelity.reference/2'):
+        raise ValueError('converted reference format mismatch')
     for document in (rows, compact):
         if any(document.get(k) != manifest[k] for k in ('family', 'checkpoint', 'set_sha256')):
             raise ValueError('converted reference identity mismatch')
+    if (compact.get('quick_windows') != manifest['quick_windows']
+            or compact.get('source', {}).get('snapshot_identity') != identity
+            or compact.get('source', {}).get('prefix_qualification') != proof):
+        raise ValueError('compact reference provenance mismatch')
     row_entries = {w['id']: w for w in rows['windows']}
     compact_entries = {w['id']: w for w in compact['windows']}
     if (len(row_entries) != len(rows['windows']) or len(compact_entries) != len(compact['windows'])
@@ -424,6 +464,19 @@ def validate_reference_only(root, *, seal=False):
             if not np.array_equal(logp.astype('<f2'), stored[i]):
                 raise ValueError('full rows differ from golden log-softmax')
             record = summary['positions'][i]
+            top = record['top']
+            k = len(top)
+            if not 1 <= k <= vocab or k != summary['top_k']:
+                raise ValueError('invalid compact top-k')
+            threshold = np.partition(values, vocab - k)[vocab - k]
+            better = np.flatnonzero(values > threshold)
+            order = np.concatenate((better, np.flatnonzero(values == threshold)[:k - len(better)]))
+            order = order[np.lexsort((order, -values[order]))].tolist()
+            if [item['id'] for item in top] != order or any(abs(item['lp'] - logp[item['id']]) > 0.000006 for item in top):
+                raise ValueError('compact top probabilities mismatch')
+            tail = math.log(max(1.0 - float(np.exp(logp[order]).sum()), 1e-30))
+            if abs(record['tail_lp'] - tail) > 0.000006:
+                raise ValueError('compact tail probability mismatch')
             target = window['tokens'][pos]
             if record['pos'] != pos or record['next'] != target or abs(record['next_lp'] - logp[target]) > 0.000006:
                 raise ValueError('compact next-token probability mismatch')
@@ -436,8 +489,10 @@ def validate_reference_only(root, *, seal=False):
         raise ValueError('aggregate NLL mismatch')
     excluded = {'full.sha256.json', 'golden-seal.json', 'reference-validation.json'}
     def inventory(base):
-        return [{'path': str(p.relative_to(base)), 'bytes': p.stat().st_size, 'sha256': digest(p)}
-                for p in sorted(base.rglob('*')) if p.is_file() and p.name not in excluded]
+        paths = [p for p in sorted(base.rglob('*')) if p.is_file() and p.name not in excluded]
+        if any(not p.resolve().is_relative_to(base.resolve()) for p in paths):
+            raise ValueError('sealed file escapes dataset root')
+        return [{'path': str(p.relative_to(base)), 'bytes': p.stat().st_size, 'sha256': digest(p)} for p in paths]
     if seal:
         for name in ('full.sha256.json', 'golden-seal.json'):
             if (root / name).exists():
