@@ -41,8 +41,9 @@ pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
 /// GLM Flash: every layer split over two GPUs; its MLA layers by heads (latent replicated) or by
 /// context (projections head-split, 256-token units owned by parity; #57), KDA always by heads.
 /// `context` is the recorded default on two GPUs (TJ: no context-scaling KV replicated; pool
-/// first) where the build carries its programs (`glm5_flash::resolve_attention`); `heads` stays
-/// an explicit option. Owned MLA layers (`layers`) have no executor yet.
+/// first); a build without its programs fails a chosen `context` closed
+/// (`glm5_flash::resolve_attention`, #202), and `heads` stays an explicit option. Owned MLA
+/// layers (`layers`) have no executor yet.
 pub const GLM5_FLASH: ExecutorModes = ExecutorModes { family: "glm5_flash",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Context };
 /// MiMo: `attach_peer` requires every layer split.

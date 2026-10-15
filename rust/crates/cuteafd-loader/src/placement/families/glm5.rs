@@ -382,7 +382,7 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
     let context_chosen = attention.map_or(inputs.gpus.len() == 2,
         |mode| mode == AttentionPlacement::Context);
     if context_chosen && inputs.context.is_none() {
-        return Err(PlacementError::MissingContextPrograms { programs: context_program_list() });
+        return Err(PlacementError::MissingContextPrograms { family: "glm5", programs: context_program_list() });
     }
     let routed = if inputs.skip_routed_experts { 0 }
         else { inputs.layers.saturating_sub(inputs.cfg.first_moe_layer) };
