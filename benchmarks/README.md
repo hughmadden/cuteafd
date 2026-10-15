@@ -198,6 +198,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## Qwen 3.8
 
+- 2026-10-15 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 390/465 W (370–500) + 2× DGX Spark · build 3672f5c21e41 · [report](qwen4/2026-10-15-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min/report.svg)
 - 2026-10-14 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (355–540) · build 92ad5b03d029 · [report](qwen4/2026-10-14-smoke-qwen3-8-flash-next-nvfp4-2rtx-qwen38-nvfp4-max/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 2× RTX PRO 6000 @ gpu-powerd 440/455 W (300–550) · build 92ad5b03d029 · [report](qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-2rtx-qwen38-exl3-max/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 1× RTX PRO 6000 @ gpu-powerd 410/485 W (300–600) · build 92ad5b03d029 · [report](qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/report.svg)

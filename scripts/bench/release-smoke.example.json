@@ -673,14 +673,21 @@
       "gpus": [
         1
       ],
-      "sparks": [],
+      "sparks": [
+        "ostrich",
+        "dodo"
+      ],
       "set": {
         "RTX_GPUS": "1",
         "COORDINATOR_GPU": "1",
-        "SPARK_COUNT": "0",
+        "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8822",
         "EXPERT_PORT": "19922",
-        "EXPERT_BACKEND": "local"
+        "EXPERT_BACKEND": "spark",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_0_LANE_A": "10.55.0.1",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_1_LANE_A": "10.55.0.2"
       }
     },
     {
