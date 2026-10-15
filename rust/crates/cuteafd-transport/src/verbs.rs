@@ -2082,6 +2082,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                     write: Option<DeviceWriteTarget>, terminal_owner: Option<Arc<AtomicBool>>,
                     flow_label: u32, capacity: Option<u32>)
                     -> Result<Self> {
+        let admitted = crate::worker_selection::reserve_peer_endpoint(addr, &request.header, capacity)?;
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
             "native library not found; set CUTEAFD_NATIVE_LIB or build native/libcuteafd_native.so with RDMA",
@@ -2097,8 +2098,17 @@ impl VerbsHostProtocolV2PersistentClientSession {
             }
             None => (request_wire_bytes, expected_response_wire_bytes),
         };
-        let (request_ring, response_ring) =
-            verbs_host_persistent_rings(config, request_wire_bytes, expected_response_wire_bytes)?;
+        let (request_ring, response_ring) = if let Some(lease) = &admitted {
+            let (spec, rings) = lease.contract();
+            let (request, response) = spec.wire_bytes(cuteafd_core::expert_geometry())
+                .context("invalid sealed endpoint wire geometry")?;
+            anyhow::ensure!(rings.max_frame_bytes <= config.max_frame_bytes,
+                "ModelAdmission frame budget exceeds transport configuration");
+            persistent_ring_geometry(rings.max_frame_bytes, request, response,
+                rings.slot_bytes, rings.alignment, rings.depth)?
+        } else {
+            verbs_host_persistent_rings(config, request_wire_bytes, expected_response_wire_bytes)?
+        };
         let request_capacity_wire_bytes = request_ring.slot_capacity_bytes;
         let response_capacity_wire_bytes = response_ring.slot_capacity_bytes;
         let request_registered_span_bytes = request_ring.registered_span_bytes;
@@ -2126,6 +2136,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
         // Publish the external-owner witness before landing registration or
         // any fallible bootstrap work can drop this temporary endpoint.
         endpoint.terminal_owner = terminal_owner;
+        let model_endpoint = admitted.as_ref().map(|lease| lease.index());
+        endpoint.credits.endpoint = admitted;
         let mut reader = BufReader::new(stream.try_clone()?);
         let (client_host, _server_host) =
             distinct_endpoint_hosts(local_control_host("client"), peer.clone());
@@ -2145,6 +2157,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             write_target: write.map(|target| landing::expose(&endpoint, target)).transpose()?,
             flow_label,
             worker_selection_digest: crate::worker_selection::peer_selection_digest(addr)?,
+            model_endpoint,
         };
         write_control(&mut stream, &start)?;
         let ready: VerbsHostProtocolV2PersistentReady = decode_persistent_control(read_control_value(&mut reader)?)?;
@@ -2300,6 +2313,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
     }
 
     fn fits(&self, request: &ExpertProtocolV2Request) -> Result<bool> {
+        if let Some(lease) = &self.endpoint.credits.endpoint { lease.validate_request(&request.header)?; }
         let request_wire_bytes = request.wire_stats().wire_bytes;
         let response_wire_bytes = verbs_host_expected_response_wire_bytes(request)?;
         Ok(request_wire_bytes <= self.request_capacity_wire_bytes
@@ -2311,6 +2325,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         request: &ExpertProtocolV2Request,
         config: &TcpTransportConfig,
     ) -> Result<VerbsHostProtocolV2ChunkSubmissionTiming> {
+        if let Some(lease) = &self.endpoint.credits.endpoint { lease.validate_request(&request.header)?; }
         if let Some(ring) = &mut self.retained_response_ring {
             ring.reclaim_before_request(&self.endpoint, self.response_ring)?;
         }
@@ -3396,6 +3411,9 @@ struct VerbsHostProtocolV2PersistentStart {
     /// Immutable coordinator selection established before worker allocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     worker_selection_digest: Option<String>,
+    /// Index in the coordinator's sealed endpoint set; not an execution lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_endpoint: Option<u32>,
 }
 
 fn is_zero_label(label: &u32) -> bool {
@@ -3440,12 +3458,14 @@ struct VerbsHostProtocolV2RecvReady {
 #[derive(Default)]
 struct EndpointCredits {
     rings: Option<RingReservation>,
+    endpoint: Option<crate::worker_selection::EndpointReservation>,
 }
 
 impl EndpointCredits {
     fn retire(&mut self, cleanup: impl FnOnce() -> Result<()>) -> Result<()> {
         cleanup()?;
         self.rings.take();
+        self.endpoint.take();
         Ok(())
     }
 }
@@ -3454,6 +3474,7 @@ impl Drop for EndpointCredits {
     fn drop(&mut self) {
         // A failed quiesce retains registered memory, so keep its charge too.
         std::mem::forget(self.rings.take());
+        std::mem::forget(self.endpoint.take());
     }
 }
 
@@ -3788,7 +3809,7 @@ impl NativeRdmaEndpoint {
 
 impl Drop for NativeRdmaEndpoint {
     fn drop(&mut self) {
-        let needs_quiesce = self.terminal_owner.is_some() || self.credits.rings.is_some();
+        let needs_quiesce = self.terminal_owner.is_some() || self.credits.rings.is_some() || self.credits.endpoint.is_some();
         let mut credits = std::mem::take(&mut self.credits);
         let result = credits.retire(|| {
             if !self.info.handle.is_null() {

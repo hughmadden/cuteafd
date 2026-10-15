@@ -233,10 +233,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             return Err(error);
         }
-        cuteafd_transport::worker_selection::acknowledge_worker_selection(&mut stream, config.rank, &selection)?;
+        let installed = cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, None)?;
+        installed.acknowledge(&mut stream)?;
         tracing::info!(rank = config.rank, first_layer = config.first_layer, layers = weights.len(),
-            selection_digest = %selection.digest()?, "coordinator-selected worker weights ready");
-        (listener, Some(selection))
+            selection_digest = %installed.selection().digest()?, "coordinator-selected worker weights ready");
+        (listener, Some(installed))
     } else { (TcpListener::bind(listen)?, None) };
     listener.set_nonblocking(true)?;
     let (admit, incoming) = mpsc::sync_channel(2);
@@ -251,8 +252,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         &config.snapshot, geometry, config.world, config.topology)?;
     let resident = config.resident_layers(geometry.layers as usize)?;
     ensure!(weights.len() == resident.len(), "worker loaded range differs from grouping report");
-    let loaded = cuteafd_transport::worker_selection::WorkerSelection::new(identity,
-        &resident.collect::<Vec<_>>())?;
+    let loaded = match &worker_selection {
+        Some(installed) => installed.selection().clone(),
+        None => cuteafd_transport::worker_selection::WorkerSelection::new(identity, &resident.collect::<Vec<_>>())?,
+    };
     let expert_grouping = execution.installed_grouping(loaded, worker_rank)?;
     thread::Builder::new()
         .name("v41-roce-bootstrap".into())
@@ -266,7 +269,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                                 max_frame_bytes,
                                 protocol_v2_timing,
                                 Arc::clone(budget),
-                                worker_selection.as_ref().map(|selection| (worker_rank, selection)),
+                                worker_selection.as_ref(),
                                 expert_grouping.as_ref(),
                             ),
                             None => LocalVerbsExpertConnection::accept(

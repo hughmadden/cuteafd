@@ -510,11 +510,18 @@ pub fn reject_worker_selection(stream: &mut TcpStream, error: &anyhow::Error) ->
 
 // Immutable peer seals are consulted only while opening a connection, never on
 // a request's hot path. This lets every later lane carry the same solved set.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct PeerSeal {
     digest: String,
     admission: Option<cuteafd_core::ModelAdmissionResponse>,
+    endpoints: std::sync::Arc<EndpointSet>,
 }
+impl PartialEq for PeerSeal {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest && self.admission == other.admission
+    }
+}
+impl Eq for PeerSeal {}
 fn seals() -> &'static Mutex<BTreeMap<SocketAddr, PeerSeal>> {
     static SEALS: OnceLock<Mutex<BTreeMap<SocketAddr, PeerSeal>>> = OnceLock::new();
     SEALS.get_or_init(Mutex::default)
@@ -522,6 +529,27 @@ fn seals() -> &'static Mutex<BTreeMap<SocketAddr, PeerSeal>> {
 pub(crate) fn peer_selection_digest(peer: SocketAddr) -> Result<Option<String>> {
     Ok(seals().lock().map_err(|_| anyhow::anyhow!("worker selection seals poisoned"))?
         .get(&peer).map(|seal| seal.digest.clone()))
+}
+
+/// Claim one coordinator endpoint before allocating its native buffers. The
+/// lease lives on that endpoint, including any retained response payloads.
+pub(crate) fn reserve_peer_endpoint(peer: SocketAddr, header: &crate::ExpertProtocolV2RequestHeader,
+    capacity: Option<u32>) -> Result<Option<EndpointReservation>> {
+    let endpoints = seals().lock().map_err(|_| anyhow::anyhow!("worker selection seals poisoned"))?
+        .get(&peer).map(|seal| seal.endpoints.clone());
+    let Some(endpoints) = endpoints else { return Ok(None); };
+    let Some(model) = endpoints.selection.model() else { return Ok(None); };
+    let installed = InstalledModelAdmission { rank: 0, endpoints: endpoints.clone(), report: None };
+    let mut candidates = model.endpoints.iter().enumerate().collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, spec)| spec.capacity);
+    for (index, spec) in candidates {
+        if capacity.is_some_and(|rows| rows > spec.capacity) { continue; }
+        let valid = validate_endpoint_request(&endpoints.selection, index, header).is_ok();
+        if valid {
+            if let Ok(lease) = installed.reserve_endpoint(Some(index as u32)) { return Ok(lease); }
+        }
+    }
+    anyhow::bail!("worker {peer} has no free ModelAdmission endpoint for capacity {:?} / {:?}", capacity, header.hidden_dtype)
 }
 
 // Prefill lanes and device proxies open separate clients to the same worker.
@@ -590,13 +618,14 @@ pub fn select_model_admission(peers: &[SocketAddr], selection: &WorkerSelection,
     let mut seals = seals().lock().map_err(|_| anyhow::anyhow!("worker selection seals poisoned"))?;
     let candidates = peers.iter().enumerate().map(|(rank, &peer)| (peer, PeerSeal {
         digest: digest.clone(), admission: reports.get(rank).cloned(),
+        endpoints: std::sync::Arc::new(EndpointSet { selection: selection.clone(), used: std::sync::atomic::AtomicUsize::new(0) }),
     })).collect::<Vec<_>>();
     for (peer, seal) in &candidates {
         if let Some(previous) = seals.get(peer) {
             ensure!(previous == seal, "worker {peer} changed placement or admission across reconnect");
         }
     }
-    for (peer, seal) in candidates { seals.insert(peer, seal); }
+    for (peer, seal) in candidates { seals.entry(peer).or_insert(seal); }
     crate::traffic::observe_peers(peers);
     Ok(reports)
 }
@@ -609,12 +638,110 @@ impl std::fmt::Display for WorkerSelectionOnly {
 }
 impl std::error::Error for WorkerSelectionOnly {}
 
-pub(crate) fn acknowledge_repeat(stream: &mut TcpStream, value: serde_json::Value, rank: usize,
-    expected: &WorkerSelection) -> Result<()> {
-    let start: Start = serde_json::from_value(value)?;
-    ensure!(start.message == "worker_selection_start" && start.rank == rank && &start.selection == expected && start.digest == expected.digest()?,
-        "worker selection is immutable until restart");
-    acknowledge_worker_selection(stream, rank, expected)
+/// The worker's loaded, immutable selection and measured response. Every later
+/// control replay and endpoint admission uses this same owner.
+pub struct InstalledModelAdmission {
+    rank: usize,
+    endpoints: std::sync::Arc<EndpointSet>,
+    report: Option<cuteafd_core::ModelAdmissionResponse>,
+}
+
+struct EndpointSet {
+    selection: WorkerSelection,
+    used: std::sync::atomic::AtomicUsize,
+}
+
+impl InstalledModelAdmission {
+    pub fn new(rank: usize, selection: WorkerSelection,
+        report: Option<cuteafd_core::ModelAdmissionResponse>) -> Result<Self> {
+        selection.validate()?;
+        ensure!(rank < selection.identity.world as usize, "installed worker rank outside world");
+        validate_admission_response(&selection, rank, report.as_ref())?;
+        Ok(Self { rank, endpoints: std::sync::Arc::new(EndpointSet {
+            selection, used: std::sync::atomic::AtomicUsize::new(0),
+        }), report })
+    }
+
+    pub fn selection(&self) -> &WorkerSelection { &self.endpoints.selection }
+    pub fn acknowledge(&self, stream: &mut TcpStream) -> Result<()> {
+        acknowledge_model_admission(stream, self.rank, self.selection(), self.report.as_ref())
+    }
+    pub(crate) fn acknowledge_repeat(&self, stream: &mut TcpStream, value: serde_json::Value) -> Result<()> {
+        let start: Start = serde_json::from_value(value)?;
+        ensure!(start.message == "worker_selection_start" && start.rank == self.rank
+            && &start.selection == self.selection() && start.digest == self.selection().digest()?,
+            "worker selection is immutable until restart");
+        self.acknowledge(stream)
+    }
+
+    pub(crate) fn endpoint_spec(&self, index: Option<u32>) -> Result<Option<cuteafd_core::SparkEndpoint>> {
+        match self.selection().model() {
+            None => { ensure!(index.is_none(), "untyped worker cannot admit a typed endpoint"); Ok(None) }
+            Some(model) => {
+                ensure!(!self.selection().ranges().is_empty(), "empty worker cannot admit expert endpoints");
+                let index = index.context("ModelAdmission endpoint identity is required")? as usize;
+                Ok(Some(*model.endpoints.get(index).context("ModelAdmission endpoint index outside admitted set")?))
+            }
+        }
+    }
+
+    pub(crate) fn reserve_endpoint(&self, index: Option<u32>) -> Result<Option<EndpointReservation>> {
+        use std::sync::atomic::Ordering;
+        if self.endpoint_spec(index)?.is_none() { return Ok(None); }
+        let index = index.expect("typed endpoint validated") as usize;
+        let bit = 1usize << index;
+        self.endpoints.used.try_update(Ordering::AcqRel, Ordering::Acquire, |used|
+            (used & bit == 0).then_some(used | bit))
+            .map_err(|_| anyhow::anyhow!("ModelAdmission endpoint {index} is already live or pending"))?;
+        Ok(Some(EndpointReservation { endpoints: self.endpoints.clone(), index }))
+    }
+}
+
+pub(crate) struct EndpointReservation {
+    endpoints: std::sync::Arc<EndpointSet>,
+    index: usize,
+}
+
+impl EndpointReservation {
+    pub(crate) fn validate_request(&self, header: &crate::ExpertProtocolV2RequestHeader) -> Result<()> {
+        validate_endpoint_request(&self.endpoints.selection, self.index, header)
+    }
+    pub(crate) fn index(&self) -> u32 { self.index as u32 }
+    pub(crate) fn contract(&self) -> (cuteafd_core::SparkEndpoint, cuteafd_core::SparkRings) {
+        let model = self.endpoints.selection.model().expect("typed endpoint");
+        (model.endpoints[self.index], model.rings)
+    }
+}
+
+fn validate_endpoint_request(selection: &WorkerSelection, index: usize,
+    header: &crate::ExpertProtocolV2RequestHeader) -> Result<()> {
+    use cuteafd_core::SparkIngress;
+    use crate::ExpertV2Dtype;
+    let spec = selection.model().expect("typed endpoint").endpoints[index];
+    ensure!(header.row_count <= spec.capacity,
+        "endpoint {} rows {} exceed admitted capacity {}", index, header.row_count, spec.capacity);
+    let ingress = match spec.ingress {
+        SparkIngress::Fp8K32 => header.hidden_dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        SparkIngress::Bf16 => header.hidden_dtype == ExpertV2Dtype::Bf16,
+        SparkIngress::Bf16Decode { rows } => header.hidden_dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32
+            || (header.hidden_dtype == ExpertV2Dtype::Bf16 && header.row_count <= rows),
+    };
+    ensure!(ingress, "endpoint {} rejects {:?} ingress at {} rows", index, header.hidden_dtype, header.row_count);
+    let geometry = selection.geometry();
+    ensure!(header.hidden_dim == geometry.hidden && header.route_count as u64 <= header.row_count as u64 * geometry.topk as u64,
+        "endpoint {} request exceeds admitted hidden/route geometry", index);
+    ensure!(selection.ranges().iter().any(|range| (range.first..range.end).contains(&header.layer_id)),
+        "endpoint {} request layer {} outside loaded selection", index, header.layer_id);
+    Ok(())
+
+}
+
+
+impl Drop for EndpointReservation {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.endpoints.used.fetch_and(!(1usize << self.index), Ordering::AcqRel);
+    }
 }
 
 #[cfg(test)]
@@ -648,6 +775,105 @@ mod tests {
                 workspace_bytes: 1 << 28, pinned_workspace_bytes: 0 },
             mapped_ring_bytes: selection.model().unwrap().ring_bytes(selection.geometry()).unwrap() as u64,
             host_exchange_bytes: 4096 * (6144 * 2 + 8 * 8), row_indices_bytes: 4096 * 4 }
+    }
+
+    #[test]
+    fn endpoint_identity_capacity_ingress_and_lifetime_are_sealed() -> Result<()> {
+        let selection = admission_selection();
+        let installed = InstalledModelAdmission::new(0, selection.clone(), Some(admission_report(&selection)))?;
+        assert!(installed.reserve_endpoint(None).is_err());
+        assert!(installed.reserve_endpoint(Some(1)).is_err());
+        let lease = installed.reserve_endpoint(Some(0))?.unwrap();
+        assert!(installed.reserve_endpoint(Some(0)).is_err());
+        let mut header = crate::ExpertProtocolV2RequestHeader {
+            request_id: 1, placement_version: 1, layer_id: 13, row_count: 80,
+            hidden_dim: 6144, hidden_dtype: crate::ExpertV2Dtype::Bf16,
+            hidden_row_stride_bytes: 12288, route_count: 640, row_descriptor_bytes: 40,
+            route_bytes: 12, hidden_payload_bytes: 80 * 12288, flags: 0,
+        };
+        lease.validate_request(&header)?;
+        header.row_count = 81;
+        assert!(lease.validate_request(&header).is_err());
+        header.hidden_dtype = crate::ExpertV2Dtype::Fp8E4m3Ue8m0K32;
+        lease.validate_request(&header)?;
+        header.row_count = 4097;
+        assert!(lease.validate_request(&header).is_err());
+        header.row_count = 80;
+        header.layer_id = 14;
+        assert!(lease.validate_request(&header).is_err());
+        header.layer_id = 13;
+        header.hidden_dim = 5120;
+        assert!(lease.validate_request(&header).is_err());
+        header.hidden_dim = 6144;
+        header.route_count = 641;
+        assert!(lease.validate_request(&header).is_err());
+        drop(lease);
+        drop(installed.reserve_endpoint(Some(0))?);
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_endpoint_credit_survives_selection_replay() -> Result<()> {
+        let selection = admission_selection();
+        let report = admission_report(&selection);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let peer = listener.local_addr()?;
+        std::thread::scope(|scope| -> Result<()> {
+            scope.spawn(|| -> Result<()> {
+                let installed = InstalledModelAdmission::new(0, selection.clone(), Some(report))?;
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept()?;
+                    let received = receive_worker_selection(&stream, 0, Duration::from_secs(3))?;
+                    ensure!(received == selection);
+                    installed.acknowledge(&mut stream)?;
+                }
+                Ok(())
+            });
+            select_model_admission(&[peer], &selection, Duration::from_secs(3))?;
+            let header = crate::ExpertProtocolV2RequestHeader {
+                request_id: 1, placement_version: 1, layer_id: 13, row_count: 80,
+                hidden_dim: 6144, hidden_dtype: crate::ExpertV2Dtype::Bf16,
+                hidden_row_stride_bytes: 12288, route_count: 640, row_descriptor_bytes: 40,
+                route_bytes: 12, hidden_payload_bytes: 80 * 12288, flags: 0,
+            };
+            let lease = reserve_peer_endpoint(peer, &header, Some(4096))?.unwrap();
+            assert_eq!(lease.index(), 0);
+            assert!(reserve_peer_endpoint(peer, &header, Some(4096)).is_err());
+            select_model_admission(&[peer], &selection, Duration::from_secs(3))?;
+            assert!(reserve_peer_endpoint(peer, &header, Some(4096)).is_err());
+            drop(lease);
+            assert!(reserve_peer_endpoint(peer, &header, Some(4096))?.is_some());
+            assert!(reserve_peer_endpoint(peer, &header, Some(4097)).is_err());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn installed_report_replay_preserves_measured_bytes() -> Result<()> {
+        let selection = admission_selection();
+        let report = admission_report(&selection);
+        let installed = InstalledModelAdmission::new(0, selection.clone(), Some(report.clone()))?;
+        for _ in 0..2 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let mut client = TcpStream::connect(listener.local_addr()?)?;
+            let (mut server, _) = listener.accept()?;
+            installed.acknowledge_repeat(&mut server, serde_json::to_value(Start {
+                message: "worker_selection_start".into(), rank: 0,
+                selection: selection.clone(), digest: selection.digest()?,
+            })?)?;
+            let ready: Ready = read(&mut client)?;
+            assert_eq!(ready.admission, Some(report.clone()));
+        }
+        let mut changed = selection.clone();
+        changed.model.as_mut().unwrap().endpoints[0].ingress = cuteafd_core::SparkIngress::Fp8K32;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let _client = TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        assert!(installed.acknowledge_repeat(&mut server, serde_json::to_value(Start {
+            message: "worker_selection_start".into(), rank: 0,
+            digest: changed.digest()?, selection: changed,
+        })?).is_err());
+        Ok(())
     }
 
     #[test]

@@ -150,7 +150,7 @@ impl LocalVerbsExpertConnection {
     /// before any mapped ring/native endpoint allocation.
     pub fn accept_with_selection(
         stream: TcpStream, max_frame_bytes: usize, timing: bool,
-        budget: Arc<RingBudget>, selection: Option<(usize, &crate::worker_selection::WorkerSelection)>,
+        budget: Arc<RingBudget>, selection: Option<&crate::worker_selection::InstalledModelAdmission>,
     ) -> Result<Self> {
         Self::accept_with_grouping(stream, max_frame_bytes, timing, budget, selection, None)
     }
@@ -158,7 +158,7 @@ impl LocalVerbsExpertConnection {
     /// Publish the immutable report obtained from this worker's loaded executions.
     pub fn accept_with_grouping(
         stream: TcpStream, max_frame_bytes: usize, timing: bool,
-        budget: Arc<RingBudget>, selection: Option<(usize, &crate::worker_selection::WorkerSelection)>,
+        budget: Arc<RingBudget>, selection: Option<&crate::worker_selection::InstalledModelAdmission>,
         grouping: Option<&crate::worker_selection::InstalledExpertGrouping>,
     ) -> Result<Self> {
         if selection.is_none() { verbs_host_preflight()?; }
@@ -173,6 +173,7 @@ impl LocalVerbsExpertConnection {
                 return Err(error);
             }
         };
+        let endpoint = selection.map(|installed| installed.reserve_endpoint(start.model_endpoint)).transpose()?.flatten();
         if selection.is_some() { verbs_host_preflight()?; }
         // Validate the wire ring geometry first so the reserved byte count is
         // the authoritative span that the native allocation will pin.
@@ -211,7 +212,7 @@ impl LocalVerbsExpertConnection {
         let path =
             verbs_host_native_library_path().context("native RoCE library not configured")?;
         let library = Arc::new(unsafe { NativeLibrary::load(&path) }?);
-        Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, grouping, Some(reservation))
+        Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, grouping, Some((reservation, endpoint)))
     }
 
     /// Negotiated wire ring geometry from the persistent handshake, as
@@ -232,7 +233,7 @@ impl LocalVerbsExpertConnection {
     fn read_persistent_start(
         stream: &TcpStream,
         max_frame_bytes: usize,
-        selection: Option<(usize, &crate::worker_selection::WorkerSelection)>,
+        selection: Option<&crate::worker_selection::InstalledModelAdmission>,
     ) -> Result<VerbsHostProtocolV2PersistentStart> {
         configure_control_stream(stream, default_control_timeout())?;
         let mut reader = BufReader::new(stream.try_clone()?);
@@ -252,12 +253,12 @@ impl LocalVerbsExpertConnection {
             value = flows::serve_flow_probes(&mut stream, &mut reader, &library, value)?.ok_or(FlowProbesOnly)?;
         }
         if value["message"] == "worker_selection_start" {
-            let (rank, expected) = selection.context("worker is not placement-handshake enabled")?;
-            crate::worker_selection::acknowledge_repeat(&mut stream.try_clone()?, value, rank, expected)?;
+            let installed = selection.context("worker is not placement-handshake enabled")?;
+            installed.acknowledge_repeat(&mut stream.try_clone()?, value)?;
             return Err(crate::worker_selection::WorkerSelectionOnly.into());
         }
         let start: VerbsHostProtocolV2PersistentStart = decode_persistent_control(value)?;
-        let digest = selection.map(|(_, selection)| selection.digest()).transpose()?;
+        let digest = selection.map(|installed| installed.selection().digest()).transpose()?;
         anyhow::ensure!(start.worker_selection_digest == digest,
             "worker connection does not match its loaded placement");
         anyhow::ensure!(
@@ -273,6 +274,21 @@ impl LocalVerbsExpertConnection {
             start.ring_depth <= 8,
             "native peer ring depth exceeds admission budget"
         );
+        if let Some(installed) = selection {
+            if let Some(spec) = installed.endpoint_spec(start.model_endpoint)? {
+                let model = installed.selection().model().expect("typed endpoint");
+                let (request, response) = spec.wire_bytes(installed.selection().geometry())
+                    .context("invalid admitted endpoint wire geometry")?;
+                let slot = |bytes: usize| bytes.max(model.rings.slot_bytes).min(model.rings.max_frame_bytes);
+                let expected_request = VerbsHostRdmaRing::new(slot(request), model.rings.alignment, model.rings.depth)?;
+                let expected_response = VerbsHostRdmaRing::new(slot(response), model.rings.alignment, model.rings.depth)?;
+                let (request, response) = Self::validated_rings(&start)?;
+                anyhow::ensure!(request == expected_request && response == expected_response,
+                    "endpoint {:?} ring geometry differs from ModelAdmission", start.model_endpoint);
+            }
+        } else {
+            anyhow::ensure!(start.model_endpoint.is_none(), "unsealed worker cannot admit a typed endpoint");
+        }
         Ok(start)
     }
 
@@ -335,7 +351,7 @@ impl LocalVerbsExpertConnection {
         response_ring: VerbsHostRdmaRing,
         timing: bool,
         grouping: Option<&crate::worker_selection::InstalledExpertGrouping>,
-        reservation: Option<RingReservation>,
+        pending: Option<(RingReservation, Option<crate::worker_selection::EndpointReservation>)>,
     ) -> Result<Self> {
         let rdma_device = verbs_host_rdma_device_for_stream(&stream)?;
         let mut endpoint = NativeRdmaEndpoint::create_from_wire_bytes_mapped_on_device(
@@ -348,7 +364,9 @@ impl LocalVerbsExpertConnection {
             next_local_psn("server"),
             rdma_device.as_ref(),
         )?;
-        endpoint.credits.rings = reservation;
+        if let Some((rings, admitted)) = pending {
+            endpoint.credits = EndpointCredits { rings: Some(rings), endpoint: admitted };
+        }
         let request_recv_view = endpoint.recv_buffer_view()?;
         let response_send_view = endpoint.send_buffer_view()?;
         validate_mapped_endpoint_buffer_view(
@@ -524,6 +542,9 @@ impl LocalVerbsExpertConnection {
             let request =
                 ExpertProtocolV2RequestView::parse(&request_storage[..request_wire_bytes])
                     .context("parsing persistent verbs-host ProtocolV2 request frame")?;
+            if let Some(admitted) = &endpoint.credits.endpoint {
+                admitted.validate_request(&request.header)?;
+            }
             let parse_ms = elapsed_ms_optional(parse_started);
             let request_id = request.header.request_id;
             let layer_id = request.header.layer_id;
@@ -783,10 +804,57 @@ fn ensure_peer_open(stream: &TcpStream) -> Result<()> {
 mod budget_tests {
     use super::*;
 
+    fn typed_admission() -> Result<crate::worker_selection::InstalledModelAdmission> {
+        use crate::worker_selection::{InstalledModelAdmission, ModelAdmission};
+        use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress,
+            SparkRings, SparkRuntimeInventory, SparkSlice};
+        let selection = placement_selection(&[13]).with_model(ModelAdmission {
+            capacity: 80, endpoints: vec![SparkEndpoint { capacity: 80, ingress: SparkIngress::Bf16 }],
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+        })?;
+        let report = ModelAdmissionResponse {
+            rank: 0, resident_bytes: 1,
+            slices: vec![SparkSlice { layer: 13, first: 0, width: 1024, stored_width: 1024,
+                tiers: vec![], projection_counts: vec![] }],
+            runtime: SparkRuntimeInventory { sample: RuntimeSample {
+                device: 0, total_bytes: 121 << 30, free_bytes: 100 << 30, context_bytes: 1,
+                module_bytes: 1, sms: 48, arch: "sm_121".into(), driver: "test".into(),
+            }, workspace_bytes: 1, pinned_workspace_bytes: 0 },
+            mapped_ring_bytes: selection.model().unwrap().ring_bytes(selection.geometry())? as u64,
+            host_exchange_bytes: 0, row_indices_bytes: 0,
+        };
+        InstalledModelAdmission::new(0, selection, Some(report))
+    }
+
+    #[test]
+    fn typed_endpoint_rejects_wrong_ring_contract_before_allocation() -> Result<()> {
+        let installed = typed_admission()?;
+        for (field, changed) in [("model_endpoint", 1), ("request_capacity_wire_bytes", 4096),
+            ("request_slot_stride_bytes", 4096), ("ring_depth", 4)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let mut client = TcpStream::connect(listener.local_addr()?)?;
+            let (server, _) = listener.accept()?;
+            let mut start = placement_start(Some(installed.selection().digest()?), 0);
+            start["model_endpoint"] = 0.into();
+            start["request_capacity_wire_bytes"] = (8 << 20).into();
+            start["response_capacity_wire_bytes"] = (8 << 20).into();
+            start["request_slot_stride_bytes"] = (8 << 20).into();
+            start["response_slot_stride_bytes"] = (8 << 20).into();
+            start["request_registered_span_bytes"] = (64 << 20).into();
+            start["response_registered_span_bytes"] = (64 << 20).into();
+            start[field] = changed.into();
+            write_control(&mut client, &start)?;
+            assert!(LocalVerbsExpertConnection::read_persistent_start(&server, 64 << 20, Some(&installed)).is_err());
+            assert!(installed.reserve_endpoint(Some(0))?.is_some());
+        }
+        Ok(())
+    }
+
     #[test]
     fn failed_quiesce_drop_keeps_registered_ring_credit_charged() -> Result<()> {
         let budget = RingBudget::new(100);
-        let mut credits = EndpointCredits { rings: Some(budget.reserve(100)?) };
+        let installed = typed_admission()?;
+        let mut credits = EndpointCredits { rings: Some(budget.reserve(100)?), endpoint: installed.reserve_endpoint(Some(0))? };
         let mut destroyed = false;
         assert!(credits.retire(|| {
             anyhow::ensure!(false, "simulated failed QP quiesce");
@@ -797,6 +865,7 @@ mod budget_tests {
         drop(credits);
         assert_eq!(budget.used(), 100);
         assert!(budget.reserve(1).is_err());
+        assert!(installed.reserve_endpoint(Some(0)).is_err());
         Ok(())
     }
 
@@ -807,12 +876,15 @@ mod budget_tests {
             fn drop(&mut self) { self.0.retire(|| Ok(())).unwrap(); }
         }
         let budget = RingBudget::new(100);
-        let endpoint = Arc::new(Owner(EndpointCredits { rings: Some(budget.reserve(100)?) }));
+        let installed = typed_admission()?;
+        let endpoint = Arc::new(Owner(EndpointCredits { rings: Some(budget.reserve(100)?), endpoint: installed.reserve_endpoint(Some(0))? }));
         let retained_response = Arc::clone(&endpoint);
         drop(endpoint);
         assert_eq!(budget.used(), 100);
+        assert!(installed.reserve_endpoint(Some(0)).is_err());
         drop(retained_response);
         assert_eq!(budget.used(), 0);
+        assert!(installed.reserve_endpoint(Some(0))?.is_some());
         let pending = budget.reserve(100)?;
         drop(pending);
         assert_eq!(budget.used(), 0);
@@ -917,8 +989,10 @@ mod budget_tests {
                 let (server, _) = listener.accept()?;
                 write_control(&mut client, &placement_start(wire.clone(), lane))?;
                 let budget = RingBudget::new(0);
+                let installed = expected.map(|selection|
+                    crate::worker_selection::InstalledModelAdmission::new(0, selection.clone(), None)).transpose()?;
                 let start = LocalVerbsExpertConnection::read_persistent_start(
-                    &server, 4096, expected.map(|selection| (0, selection)));
+                    &server, 4096, installed.as_ref());
                 assert_eq!(start.is_ok(), accepted);
                 assert_eq!(budget.used(), 0);
                 if let Ok(start) = start { assert_eq!(start.execution_lane, lane); }
@@ -939,8 +1013,9 @@ mod budget_tests {
                 "message": "worker_selection_start", "rank": rank,
                 "selection": sent, "digest": sent.digest()?
             }))?;
+            let installed = crate::worker_selection::InstalledModelAdmission::new(0, selection.clone(), None)?;
             let result = LocalVerbsExpertConnection::accept_with_selection(
-                server, 4096, false, RingBudget::new(0), Some((0, &selection)));
+                server, 4096, false, RingBudget::new(0), Some(&installed));
             let error = result.err().context("control-only selection allocated a native session")?;
             assert_eq!(error.is::<crate::worker_selection::WorkerSelectionOnly>(), accepted);
             client.set_read_timeout(Some(Duration::from_secs(3)))?;
