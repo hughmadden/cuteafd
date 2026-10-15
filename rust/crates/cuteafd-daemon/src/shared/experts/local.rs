@@ -1,6 +1,6 @@
 //! One lane's local routed-expert scratch; both lanes share immutable weights.
 use super::exl3::{
-    execution::{Exl3Execution, Exl3InputFormat, Exl3Modules, Exl3Workspace},
+    execution::{Exl3Execution, Exl3InputFormat, Exl3Modules, Exl3ReductionPlan, Exl3Workspace},
     Exl3Weights,
 };
 use super::layer::{ExpertLayer, ExpertWeights};
@@ -65,6 +65,7 @@ enum Backend<'a> {
     },
     Exl3 {
         states: Vec<Exl3Execution<'a>>,
+        reduction_plan: Exl3ReductionPlan,
         layers: usize,
     },
 }
@@ -241,10 +242,11 @@ impl<'a> LocalExpertWave<'a> {
         geometry: ExpertGeometry,
     ) -> Result<usize> {
         Self::require_geometry(geometry)?;
-        let directories: Vec<_> = Self::capacities(capacity)?
+        let directories: Vec<_> = cuteafd_loader::placement::families::deepseek_v41::exl3_capacities(capacity as u64, true)?
             .into_iter()
             .map(|c| directory.join(format!("m{c}")))
             .collect();
+        Exl3ReductionPlan::new(&directories)?;
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
             .checked_add(capacity as usize * geometry.row_bytes() as usize)
             .context("local EXL3 workspace overflow")
@@ -291,11 +293,12 @@ impl<'a> LocalExpertWave<'a> {
             raw: library.cuda_stream_create()?,
         };
         let mut states = Vec::new();
-        let capacities = Self::capacities(capacity)?;
+        let capacities = cuteafd_loader::placement::families::deepseek_v41::exl3_capacities(capacity as u64, true)?;
         let directories: Vec<_> = capacities
             .iter()
             .map(|c| directory.join(format!("m{c}")))
             .collect();
+        let reduction_plan = Exl3ReductionPlan::new(&directories)?;
         let arena = Exl3Workspace::new(library, &directories)?;
         let modules = match modules {
             Some(modules) => modules,
@@ -330,6 +333,7 @@ impl<'a> LocalExpertWave<'a> {
             stream,
             backend: Backend::Exl3 {
                 states,
+                reduction_plan,
                 layers: weights.len(),
             },
             input_format: LocalInputFormat::Fp8K32,
@@ -438,11 +442,10 @@ impl<'a> LocalExpertWave<'a> {
                 }
             }
             match &mut self.backend {
-                Backend::Exl3 { states, .. } => {
-                    let state = states
-                        .iter_mut()
-                        .find(|s| s.capacity() >= rows as usize)
-                        .context("local EXL3 capacity state missing")?;
+                Backend::Exl3 { states, reduction_plan, .. } => {
+                    let index = reduction_plan.execution_index(rows as usize, rows as usize,
+                        states.iter().map(|s| s.capacity()))?;
+                    let state = &mut states[index];
                     let values = unsafe {
                         state.launch_layer(
                             layer,

@@ -281,9 +281,20 @@ fn v41_rejects_an_unsupported_expert_format_with_a_hint() {
 #[test]
 fn unknown_architecture_is_reported_not_fatal() {
     let dir = snapshot(json!({"architectures": ["SomethingNew"], "model_type": "new"}), &[t("w", "BF16", &[2])]);
-    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
-    assert!(report.family.is_none());
-    assert!(report.hints[0].what.contains("SomethingNew"));
+    for layout in [None, Some(layout::LayoutOptions::default())] {
+        let report = plan(dir.path(), &PlanOptions { layout, ..Default::default() }).unwrap();
+        assert!(report.family.is_none());
+        assert!(!report.fits);
+        assert!(!report.placement_supported);
+        assert!(!report.executable()); // --require-ready uses this verdict.
+        assert!(report.memory_layout.is_none());
+        assert!(report.hints[0].what.contains("SomethingNew"));
+        assert!(report.hints[0].how.contains("Family"));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["fits"], false);
+        assert_eq!(json["placement_supported"], false);
+        assert_eq!(json["family"], Value::Null);
+    }
 }
 
 // --- R06: lossless formats and the loaders' tensor contracts ---------------

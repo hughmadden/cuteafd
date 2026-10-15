@@ -84,6 +84,9 @@ pub(crate) enum Commands {
     /// python/reference/families/qwen4/golden.py outputs.
     #[command(hide = true)]
     Qwen4Golden(crate::families::qwen4::GoldenArgs),
+    /// Dense Qwen3.5/3.8 qualification (header validation only until AOT/executor exist).
+    #[command(hide = true)]
+    Qwen35Golden(crate::families::qwen3_5::GoldenArgs),
     /// Serve Qwen 3.8 Flash Next (qwen4_exp) through the OpenAI API on the qwen4 engine.
     #[command(hide = true)]
     ServeQwen4(crate::families::qwen4::serve::ServeArgs),

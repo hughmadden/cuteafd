@@ -1589,3 +1589,94 @@ def test_fabric_health_caveat_only_gates_timed_phases():
               dict(name='decode', timed=True, assessments=[warning])]
     assert cards.fabric_assessment(phases) == [
         'decode: ' + warning + '; investigate fabric health and rerun before accepting A/B']
+
+
+def _checkout(path, run_sh=True):
+    path.mkdir(parents=True)
+    subprocess.run(['git', 'init', '-q', str(path)], check=True)
+    if run_sh:
+        (path / 'run.sh').write_text('#!/bin/sh\n')
+    subprocess.run(['git', '-C', str(path), '-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '-A'], check=True)
+    subprocess.run(['git', '-C', str(path), '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'x'], check=True)
+    return subprocess.run(['git', '-C', str(path), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _per_arm_dry_run(entry, tmp_path, monkeypatch, capsys, extra):
+    kit = tmp_path / 'kit'
+    kit.mkdir(exist_ok=True)
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--state', str(state),
+                                      '--task', 'perarm', '--dry-run', *extra])
+    monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
+    monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: True)
+    monkeypatch.setattr(cards, 'seed_option_capable', lambda rev: True)
+    assert cards.main() == 0
+    out = capsys.readouterr().out
+    smoke = [line for line in out.splitlines() if 'bench smoke' in line]
+    plan = json.loads((state / 'plan.json').read_text())
+    return smoke, plan
+
+
+def test_build_arms_serve_through_their_own_source_checkout(entry, tmp_path, monkeypatch, capsys):
+    smoke, plan = _per_arm_dry_run(entry, tmp_path, monkeypatch, capsys,
+                                   ['--arm', 'base=b:s1', '--arm', 'cand=c:s2', '--build', 'base=HEAD', '--build', 'cand=HEAD', '--repo', '/global'])
+    home = Path.home() / '.cache/cuteafd/builds/perarm'
+    assert len(smoke) == 2
+    for arm in ('base', 'cand'):
+        wanted = str(home / ('source-' + arm))
+        assert any(f'--repo {wanted} ' in line for line in smoke)
+        assert plan['arms'][arm]['repo'] == wanted
+        assert next(j for j in plan['jobs'] if j['arm'] == arm)['launcher']['repo'] == wanted
+    assert not any('/global' in line for line in smoke)
+
+
+def test_arm_repo_overrides_arm_wip_and_unmapped_arm_falls_back_to_repo(entry, tmp_path, monkeypatch, capsys):
+    pinned, fallback = tmp_path / 'pinned', tmp_path / 'fallback'
+    pinned_head, fallback_head = _checkout(pinned), _checkout(fallback)
+    smoke, plan = _per_arm_dry_run(entry, tmp_path, monkeypatch, capsys,
+                                   ['--arm', 'a=a:s', '--arm', 'b=b:s2', '--arm-wip', 'a=shared-a', '--arm-repo', f'a={pinned}', '--repo', str(fallback)])
+    jobs = {j['arm']: j for j in plan['jobs']}
+    assert jobs['a']['launcher'] == dict(repo=str(pinned), commit=pinned_head)
+    assert jobs['b']['launcher'] == dict(repo=str(fallback), commit=fallback_head)
+    assert sum(f'--repo {pinned} ' in line for line in smoke) == 1 and sum(f'--repo {fallback} ' in line for line in smoke) == 1
+
+
+def test_per_arm_repo_preflight_refusals(tmp_path, monkeypatch):
+    arms = lambda: cards.arms_from(['a=a:s', 'b=b:s2'])
+    no_run, plain = tmp_path / 'no-run', tmp_path / 'plain'
+    _checkout(no_run, run_sh=False)
+    plain.mkdir()
+    (plain / 'run.sh').write_text('#!/bin/sh\n')
+    good = tmp_path / 'good'
+    _checkout(good)
+    with pytest.raises(ValueError, match='no run.sh'):
+        cards.resolve_launchers(arms(), [f'a={no_run}'], [], good, tmp_path, 'perarm', False)
+    with pytest.raises(ValueError, match='not a git checkout'):
+        cards.resolve_launchers(arms(), [f'a={plain}'], [], good, tmp_path, 'perarm', False)
+    with pytest.raises(ValueError, match='invalid --arm-repo'):
+        cards.resolve_launchers(arms(), [f'zz={good}'], [], good, tmp_path, 'perarm', False)
+    with pytest.raises(ValueError, match='refuses --build'):
+        cards.resolve_launchers(arms(), [f'a={good}'], ['a=HEAD'], good, tmp_path, 'perarm', False)
+    # A built arm's checkout must sit at its built revision.
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path / 'home')
+    source = tmp_path / 'home/.cache/cuteafd/builds/perarm/source-a'
+    _checkout(source)
+    with pytest.raises(ValueError, match='not its built revision'):
+        cards.resolve_launchers(arms(), [], ['a=HEAD'], good, tmp_path, 'perarm', False)
+    head = subprocess.run(['git', '-C', str(cards.REPO), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
+    monkeypatch.setattr(cards, 'git_head', lambda repo: head if Path(repo) == source else _real_head(repo))
+    resolved = cards.resolve_launchers(arms(), [], ['a=HEAD'], good, tmp_path, 'perarm', False)
+    assert resolved['a']['repo'] == str(source) and resolved['a']['repo_commit'] == head
+    assert resolved['b']['repo'] == str(good)
+
+
+def _real_head(repo):
+    result = subprocess.run(['git', '-C', str(repo), 'rev-parse', 'HEAD'], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def test_summary_row_records_the_launcher(tmp_path):
+    job = dict(card='c', arm='a', repeat=1, simulated=True, state=str(tmp_path), launcher=dict(repo='/r', commit='abc'),
+               entry=dict(name='c', set={}))
+    assert cards.summarize_job(job, 1)['launcher'] == dict(repo='/r', commit='abc')

@@ -243,6 +243,9 @@ def main() -> None:
     layer.add_argument('--dspark-stage', type=int, choices=(0,1,2))
     layer.add_argument('--layer', type=int, choices=range(40), default=0)
     parser.add_argument('--slice-start', type=int, default=0)
+    parser.add_argument('--independent-reference', action='store_true',
+        help='Also compare each sampled expert with independent NumPy FP64 dequant/math; '
+             'bounded to three identical input rows, K3/K4, unpaired exports')
     parser.add_argument('--fixture', type=Path)
     parser.add_argument('--fixture-input', type=Path, help='Reuse a prior fixture input prefix for a different capacity/tile reference')
     parser.add_argument('--fixture-canonical-routes', action='store_true',
@@ -272,6 +275,8 @@ def main() -> None:
     assert meta['sparkinfer_revision'] == _pinned_sparkinfer.REVISION
     paired = meta.get('paired_boundary')
     assert paired in (None, 'first', 'last')
+    if args.independent_reference and (paired is not None or meta['bits'] != [3, 4]):
+        raise ValueError('independent reference supports unpaired K3/K4 exports only')
     assert paired is None or meta.get('descriptor_rows') == 4
     hidden, width, experts, capacity = meta['hidden'], meta['intermediate'], meta['experts'], meta['capacity']
     start=args.slice_start
@@ -484,6 +489,7 @@ def main() -> None:
             'its own w1/w3/w2 projections. Sample more experts, use --dspark-stage for '
             'a uniformly quantized sampled draft stage, or qualify a checkpoint whose '
             'manifest is genuinely uniform.')
+    independent_checks=[]
     results=[]; graph=None
     try:
         for rows in sorted(set([1,min(3,capacity),max(1,capacity-1),capacity])):
@@ -492,6 +498,36 @@ def main() -> None:
             assert torch.isfinite(expected).all() and bool(expected.abs().sum()>0)
             assert torch.equal(buffers.output[:rows],expected)
             results.append({'rows':rows,'bitwise_equal':True})
+        if args.independent_reference:
+            from exl3_reference import expert_output, comparison
+            reference_rows=min(3,capacity)
+            cpu_inputs=x[:reference_rows].float().cpu().numpy()
+            saved_ids, saved_weights=ids.clone(), weights.clone()
+            try:
+                for slot,expert in enumerate(sample_experts):
+                    cpu_tensors={(projection,suffix): tensors[slot,projection,suffix].cpu().numpy()
+                        for projection in ('w1','w3','w2') for suffix in ('trellis','suh','svh')}
+                    expected=expert_output(cpu_tensors,cpu_inputs,limit=meta['swiglu_limit'])
+                    ids.fill_(-1);weights.zero_();ids[:,0]=slot;weights[:,0]=1
+                    for rows in sorted({1,reference_rows}):
+                        buffers.output.fill_(float('nan'));poison_metadata();native(rows)
+                        torch.cuda.synchronize()
+                        metrics=comparison(buffers.output[:rows].float().cpu().numpy(),expected[:rows])
+                        independent_checks.append(dict(expert=expert,rows=rows,
+                            bits=[bitmaps[slot,p] for p in ('w1','w3','w2')],**metrics))
+            finally:
+                ids.copy_(saved_ids);weights.copy_(saved_weights)
+            # Retain failure evidence as well as successes for kernel triage.
+            args.output.with_suffix('.independent.json').write_text(json.dumps(dict(
+                passed=all(check['passed'] for check in independent_checks),
+                scope='six sampled expert slices, not whole-checkpoint fidelity',
+                reference='independent NumPy FP64 MCG decode, H128 and dense expert math',
+                checkpoint_revision=args.snapshot.name,sample_experts=list(sample_experts),
+                layer=layer_prefix,slice_start=start,width=width,
+                rounding_bounds=dict(relative_l2_max=0.02,cosine_min=0.9995),
+                aot_manifest_sha256=hashlib.sha256((args.aot/'v41_exl3.json').read_bytes()).hexdigest(),
+                checks=independent_checks),indent=2)+'\n')
+            assert all(check['passed'] for check in independent_checks), independent_checks
         graph=torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph): native(graph_rows)
         x.mul_(1.1);ids.copy_(ids.roll(1,dims=1))
@@ -622,7 +658,8 @@ def main() -> None:
             'projection_tiers':[[bitmaps[e,p] for p in ['w1','w3','w2']] for e in range(experts)],
             'aot_manifest_sha256':hashlib.sha256((args.aot/'v41_exl3.json').read_bytes()).hexdigest(),
             'bridge_sha256':hashlib.sha256((args.aot/'libcuteafd_exl3.so').read_bytes()).hexdigest(),
-            'checks':results,'graph_changed_inputs_and_routes':True,
+            'checks':results,'independent_reference_checks':independent_checks,
+            'graph_changed_inputs_and_routes':True,
             'packed_metadata_poisoned_before_native':route_lib is not None},indent=2)+'\n')
         print(args.output.read_text(),flush=True)
     finally:

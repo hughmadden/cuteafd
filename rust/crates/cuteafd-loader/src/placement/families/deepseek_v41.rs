@@ -123,7 +123,7 @@ impl NativeWorkspace {
 }
 
 /// Enumerate retained scratch specializations independently of numerical
-/// dispatch: MXFP4 uses its admitted reduction plan; EXL3/NVFP4 keep FirstCapacity.
+/// dispatch: MXFP4/EXL3 use admitted reduction plans; NVFP4 keeps FirstCapacity.
 pub fn expert_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
     use anyhow::{ensure, Context};
     ensure!((1..=4096).contains(&rows), "invalid V4.1 expert capacity");
@@ -145,6 +145,12 @@ pub fn expert_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
     } else {
         Ok(capacities.into_iter().filter(|&n| n <= compiled).collect())
     }
+}
+
+/// EXL3 needs a canonical wide decode export even for narrow lane admission.
+/// Keep the existing explicit prefill state set for local owners.
+pub fn exl3_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
+    expert_capacities(if rows > 1 && rows < 80 { 80 } else { rows }, local)
 }
 
 /// The native packer's four resident planes, independent of staging format.
@@ -269,7 +275,7 @@ pub fn expert_inventory(
         .into_iter()
         .find(|p| p.is_dir())
         .context("missing V4.1 EXL3 expert workspace package")?;
-        let manifests = expert_capacities(capacity, local)?
+        let manifests = exl3_capacities(capacity, local)?
             .into_iter()
             .map(|c| {
                 let path = package.join(format!("m{c}/v41_exl3.json"));
@@ -703,6 +709,12 @@ mod tests {
         manifest["variants"].as_array_mut().unwrap().push(duplicate);
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).is_err());
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_backbone",256,5120,1152,256,6).is_err());
+        assert_eq!(exl3_capacities(4096,true).unwrap(), [1,16,80,4096]);
+        assert_eq!(exl3_capacities(16,true).unwrap(), [1,16,80]);
+        assert_eq!(exl3_capacities(16,false).unwrap(), [1,16,80]);
+        assert_eq!(exl3_capacities(1,true).unwrap(), [1]);
+        assert!(exl3_capacities(0,true).is_err());
+        assert!(exl3_capacities(4097,false).is_err());
         assert_eq!(expert_capacities(4096,true).unwrap(), [1,16,80,4096]);
         assert_eq!(expert_capacities(81,false).unwrap(), [1,16,80,256]);
         assert!(expert_capacities(81,true).is_err());

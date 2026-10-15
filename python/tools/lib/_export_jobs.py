@@ -11,10 +11,17 @@ import time
 import uuid
 
 
+GB10_EXPORT_JOBS = 8  # each worker holds a CUDA context plus ~4 GiB; GB10 has 121 GiB unified
+
+
 def export_jobs() -> int:
-    value = os.environ.get('CUTEAFD_EXPORT_JOBS') or os.environ.get('CARGO_BUILD_JOBS')
+    # CARGO_BUILD_JOBS is a CPU-compile knob, not a GPU-context budget.
+    value = os.environ.get('CUTEAFD_EXPORT_JOBS')
     cores = os.cpu_count() or 1
-    default = cores // 4 if os.environ.get('CUTEAFD_EXPORT_HOST_CLASS', 'raptor') == 'raptor' else cores
+    if os.environ.get('CUTEAFD_EXPORT_HOST_CLASS', 'raptor') == 'raptor':
+        default = cores // 4
+    else:  # Spark (GB10) expert-role builds
+        default = min(cores, GB10_EXPORT_JOBS)
     jobs = int(value) if value else max(1, default)
     if jobs < 1:
         raise ValueError('CUTEAFD_EXPORT_JOBS must be positive')

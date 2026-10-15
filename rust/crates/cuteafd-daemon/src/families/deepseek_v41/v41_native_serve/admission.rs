@@ -645,13 +645,15 @@ pub(super) fn preload_exl3<'a>(
     lib: &'a cuteafd_ffi::NativeLibrary, directory: &std::path::Path,
     capacity: u32, ranks: usize,
 ) -> Result<[Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>; 2]> {
-    use crate::shared::experts::exl3::execution::{Exl3InputFormat, Exl3Modules};
-    let capacities = families::deepseek_v41::expert_capacities(capacity as u64, ranks == 1)?;
+    use crate::shared::experts::exl3::execution::{Exl3InputFormat, Exl3Modules, Exl3ReductionPlan};
+    let capacities = families::deepseek_v41::exl3_capacities(capacity as u64, ranks == 1)?;
+    let directories: Vec<_> = capacities.iter().map(|capacity| directory.join(format!("m{capacity}"))).collect();
+    Exl3ReductionPlan::new(&directories)?;
     let mut lanes = [Vec::new(), Vec::new()];
     for lane in &mut lanes {
-        for &capacity in &capacities {
+        for directory in &directories {
             // SAFETY: operator-selected pinned native exports, owned on the current device.
-            lane.push(unsafe { Exl3Modules::load(lib, &directory.join(format!("m{capacity}")), Exl3InputFormat::Fp8K32)? });
+            lane.push(unsafe { Exl3Modules::load(lib, directory, Exl3InputFormat::Fp8K32)? });
         }
     }
     Ok(lanes)

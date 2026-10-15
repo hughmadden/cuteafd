@@ -23,6 +23,85 @@ converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
 
 
+def test_dense_golden_requires_pinned_imported_source():
+    spec = importlib.util.spec_from_file_location("dense_golden", ROOT / "python/reference/families/qwen3_5/golden.py")
+    golden = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(golden)
+    source = (ROOT / "third_party/transformers/src/transformers/models/qwen3_5/modeling_qwen3_5.py").read_bytes()
+    pin = golden.verify_reference_source(source)
+    assert pin["revision"] == json.loads((ROOT / "third_party/transformers.lock.json").read_text())["revision"]
+    assert pin["modeling_sha256"] == hashlib.sha256(source).hexdigest()
+    with pytest.raises(ValueError, match="differs from pinned source"):
+        golden.verify_reference_source(source + b"\n# drift\n")
+
+
+def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
+    spec = importlib.util.spec_from_file_location("validate_dataset", ROOT / "scripts/bench/validate-fidelity-dataset.py")
+    validator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validator)
+    window = dict(id="w", block="E", bucket="0-2K", tokens=[0] * 576,
+                  roles=["ctx"] * 576, score_from=64)
+    identity = dict(snapshot_revision="abcdef", checkpoint="official", precision="BF16")
+    manifest = dict(schema="cuteafd.fidelity.set/1", family="qwen3_5", checkpoint="official",
+                    model="official", generation_arm={}, reference_snapshot=identity,
+                    windows=[window], quick_windows=["w"])
+    manifest["set_sha256"] = set_hash(manifest)
+    proof = dict(schema="cuteafd.fidelity.prefix/1", family="qwen3_5", set_sha256=manifest["set_sha256"],
+                 snapshot_identity=identity, passed=True, finite=True, rows=512, different_rows=[],
+                 argmax_disagreements=0, lengths=[576, 640], score_from=64, fixed_rows=128, vocab=2)
+    logits = np.zeros((512, 2), dtype=np.float32)
+    golden = tmp_path / "golden"
+    entry = write_scored_logits(golden, window, logits)
+    entry.update(nll=float(np.log(2)), scored_tokens=512)
+    folder = golden / entry["path"]
+    (folder / "meta.json").write_bytes(canonical(entry))
+    # Keep raw common-prefix evidence, not just a self-attested pass flag.
+    source = {**window, "tokens": [0] * 640, "roles": ["ctx"] * 640}
+    manifest["windows"] = [source]
+    manifest["set_sha256"] = set_hash(manifest)
+    proof.update(source_window="w", set_sha256=manifest["set_sha256"])
+    # The main fixture also uses 576 scored rows after this extension.
+    logits = np.zeros((576, 2), dtype=np.float32)
+    entry = write_scored_logits(golden, source, logits)
+    entry.update(nll=float(np.log(2)), scored_tokens=576)
+    (folder / "meta.json").write_bytes(canonical(entry))
+    probe_root = golden / "prefix-gate-test"
+    probe_windows, probe_entries, hashes = [], [], []
+    for length, name in zip((576, 640), ("prefix_short", "prefix_extended")):
+        probe_window = {**source, "id": name, "tokens": [0] * length, "roles": ["ctx"] * length}
+        probe_entry = write_scored_logits(probe_root, probe_window, np.zeros((length - 64, 2), dtype=np.float32))
+        probe_windows.append(probe_window)
+        probe_entries.append(probe_entry)
+        hashes.append(hashlib.sha256((probe_root / probe_entry["path"] / "logits.bin").read_bytes()).hexdigest())
+    panel = {**manifest, "windows": probe_windows, "quick_windows": [w["id"] for w in probe_windows]}
+    panel["set_sha256"] = set_hash(panel)
+    finish_golden(probe_root, panel, probe_entries, snapshot_identity=identity)
+    proof["logits_sha256"] = hashes
+    finish_golden(golden, manifest, [entry], snapshot_identity=identity, prefix_qualification=proof,
+                  mtp=False, use_cache=False, attention="eager", nll=float(np.log(2)), scored_tokens=576)
+    args = SimpleNamespace(windows=golden / "windows.json", golden=golden, rows_dir=tmp_path / "full",
+                           out=tmp_path / "reference.json", top_k=2, model=["official"], name=None,
+                           kl_max=None, top1_min=None, quick_out=None)
+    converter.convert_windows(args)
+    result = validator.validate_reference_only(tmp_path, seal=True)
+    assert result["passed"] and not result["engine_parity"]
+    assert result["scored_tokens"] == 576
+    assert validator.validate_reference_only(tmp_path) == result
+    compact_path = tmp_path / "reference.json"
+    original = compact_path.read_bytes()
+    compact = json.loads(original)
+    compact["windows"][0]["positions"][0]["top"][0]["lp"] += 0.01
+    compact_path.write_bytes(canonical(compact))
+    with pytest.raises(ValueError, match="top probabilities"):
+        validator.validate_reference_only(tmp_path)
+    compact_path.write_bytes(original)
+    with pytest.raises(ValueError, match="overwrite"):
+        validator.validate_reference_only(tmp_path, seal=True)
+    (folder / "tokens.bin").write_bytes(np.ones(576, dtype="<i4").tobytes())
+    with pytest.raises(ValueError, match="tokens differ"):
+        validator.validate_reference_only(tmp_path)
+
+
 def validator_panel_counts(panel, manifest, files, record_counts):
     tree = ast.parse((ROOT / "scripts/bench/validate-fidelity-dataset.py").read_text())
     main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")

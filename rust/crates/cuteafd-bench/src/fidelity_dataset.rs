@@ -29,6 +29,11 @@ pub const GLM_REVISION: &str = "581cdf3b5ee5a63dd5a7726b9d33ea16cf105b0d";
 pub const GLM_CONFIG: &str = "glm5-v2_20261006_exl3k4_bf16root";
 pub const V4PRO_REVISION: &str = "5528730649150b8d8753e052f001f203b36ca12f";
 pub const V4PRO_CONFIG: &str = "deepseek_v4-v2_20261005_v4pro";
+pub const QWEN_DENSE_REVISION: &str = "5242b6006b22b488d71b6695fb449221baeb54ff";
+pub const QWEN35_9B_CONFIG: &str = "qwen35-9b-v1_20261015_bf16";
+pub const QWEN35_9B_MANIFEST_SHA256: &str = "205f00fb9267c6a3c6db0324f8263ac61163cd237e926d8f7ffc49df0a01d8b3";
+pub const QWEN38_27B_CONFIG: &str = "qwen38-27b-v1_20261015_bf16";
+pub const QWEN38_27B_MANIFEST_SHA256: &str = "4b1ba4f3eea0557c7f985f0bf0ad7b6fdcc89f74b87033fae08eedef0c7c5d57";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -234,6 +239,8 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         let expected = match (commit, config) {
             (FLASH_REVISION, FLASH_CONFIG) => Some(FLASH_MANIFEST_SHA256),
             (MIMO_PRO_REVISION, MIMO_PRO_CONFIG) => Some(MIMO_PRO_MANIFEST_SHA256),
+            (QWEN_DENSE_REVISION, QWEN35_9B_CONFIG) => Some(QWEN35_9B_MANIFEST_SHA256),
+            (QWEN_DENSE_REVISION, QWEN38_27B_CONFIG) => Some(QWEN38_27B_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -259,7 +266,11 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         fetch(agent, &root, repo, commit, &format!("{config}/{path}"), Some(entry["sha256"].as_str().context("tensor checksum")?))?;
     }
     let reference = load(&base, &manifest)?;
-    Ok((reference, digest(&bytes), json!({"repository":repo,"revision":commit,"config":config})))
+    let qualification: Value = serde_json::from_slice(&checked(&base, "qualification.json",
+        manifest["qualification_sha256"].as_str().context("qualification hash")?)?)?;
+    let label = qualification_label(&qualification, &manifest)?;
+    Ok((reference, digest(&bytes), json!({"repository":repo,"revision":commit,"config":config,
+        "qualification":label,"text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])})))
 }
 
 fn tensor<'a>(bytes: &'a [u8], name: &str, dtype: &str, shape: &[usize]) -> Result<&'a [u8]> {
@@ -293,15 +304,12 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
     let qualification: Value = serde_json::from_slice(&checked(root, "qualification.json", manifest["qualification_sha256"].as_str().context("qualification hash")?)?)?;
     ensure!(panel["set_sha256"] == manifest["set_sha256"] && qualification["set_sha256"] == manifest["set_sha256"]
         && qualification["qualifies"] == true, "unqualified or mismatched dataset set");
-    for shape in ["decode", "prefill"] {
-        ensure!(qualification["shapes"][shape]["qualifies"] == true
-            && qualification["shapes"][shape]["pass_verdict"] == qualification["shapes"][shape]["original_pass"],
-            "dataset lacks paired qualification for {shape}");
-        for metric in ["delta_difference", "bound_difference"] {
-            let difference = qualification["shapes"][shape][metric].as_f64().context("qualification difference")?;
-            ensure!(difference.is_finite() && difference.abs() <= 1e-4,
-                "dataset compact qualification exceeds 1e-4 nat for {shape}/{metric}");
-        }
+    qualification_label(&qualification, manifest)?;
+    if qualification["kind"] == "reference_only" {
+        ensure!(panel["checkpoint"] == manifest["checkpoint"]
+            && manifest["checkpoint"] == manifest["root_checkpoint"]["id"]
+            && panel["windows"].as_array().is_some_and(|w| w.len() == 64),
+            "reference-only panel identity or coverage differs");
     }
     let mut reference: Reference = serde_json::from_value(json!({"name":manifest["config"],
         "models":[manifest["checkpoint"]],"vocab":manifest["vocab"],"expect":manifest["expect"],
@@ -342,6 +350,62 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
     }
     reference.validate()?;
     Ok(reference)
+}
+
+fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
+    ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
+        "unqualified or mismatched dataset set");
+    if qualification["kind"] == "reference_only" {
+        let proof = &qualification["prefix_qualification"];
+        let provenance = &qualification["reference_provenance"];
+        ensure!(qualification["schema"] == "cuteafd.fidelity.qualification/1"
+            && qualification["engine_parity"] == false && qualification["reference_validation"]["passed"] == true
+            && qualification["reference_validation"]["engine_parity"] == false
+            && qualification["reference_validation"]["set_sha256"] == manifest["set_sha256"],
+            "invalid reference-only validation");
+        ensure!(proof["passed"] == true && proof["finite"] == true && proof["rows"] == 512
+            && proof["different_rows"] == json!([]) && proof["argmax_disagreements"] == 0
+            && proof["set_sha256"] == manifest["set_sha256"]
+            && proof["snapshot_identity"] == provenance["snapshot_identity"]
+            && provenance["snapshot_identity"]["checkpoint"] == manifest["root_checkpoint"]["id"],
+            "invalid reference-only prefix evidence");
+        let hash = |v: &Value, n| v.as_str().is_some_and(|s| s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        ensure!(hash(&provenance["source_pin"]["modeling_sha256"], 64)
+            && hash(&provenance["source_pin"]["source_tree_sha256"], 64)
+            && hash(&provenance["source_pin"]["revision"], 40)
+            && provenance["tokenizers"].as_str().is_some_and(|s| !s.is_empty())
+            && provenance["platform"]["gpu"].as_str().is_some_and(|s| !s.is_empty())
+            && provenance["mtp"] == false && provenance["use_cache"] == false
+            && provenance["attention"] == "eager"
+            && proof["fixed_rows"] == 128 && proof["vocab"] == manifest["vocab"]
+            && hash(&provenance["snapshot_identity"]["snapshot_revision"], 40)
+            && provenance["snapshot_identity"]["snapshot_revision"] == manifest["root_checkpoint"]["revision"]
+            && hash(&provenance["snapshot_identity"]["config_sha256"], 64)
+            && hash(&provenance["snapshot_identity"]["tokenizer_sha256"], 64)
+            && hash(&qualification["reference_validation"]["golden_seal_sha256"], 64)
+            && hash(&qualification["reference_validation"]["full_seal_sha256"], 64)
+            && proof["lengths"] == json!([576, 640]) && proof["score_from"] == 64
+            && proof["logits_sha256"].as_array().is_some_and(|a| a.len() == 2 && a.iter().all(|h| hash(h, 64)))
+            && qualification["scored_tokens"] == 32768
+            && qualification["reference_validation"]["scored_tokens"] == qualification["scored_tokens"]
+            && qualification["reference_validation"]["nll"].as_f64().zip(qualification["nll"].as_f64())
+                .is_some_and(|(a, b)| a.is_finite() && (a - b).abs() <= 1e-8)
+            && qualification["nll"].as_f64().is_some_and(|x| x.is_finite() && x >= 0.0),
+            "incomplete reference-only provenance");
+        return Ok("reference-only qualified");
+    }
+    ensure!(qualification["kind"].is_null() || qualification["kind"] == "paired", "unknown qualification kind");
+    for shape in ["decode", "prefill"] {
+        ensure!(qualification["shapes"][shape]["qualifies"] == true
+            && qualification["shapes"][shape]["pass_verdict"] == qualification["shapes"][shape]["original_pass"],
+            "dataset lacks paired qualification for {shape}");
+        for metric in ["delta_difference", "bound_difference"] {
+            let difference = qualification["shapes"][shape][metric].as_f64().context("qualification difference")?;
+            ensure!(difference.is_finite() && difference.abs() <= 1e-4,
+                "dataset compact qualification exceeds 1e-4 nat for {shape}/{metric}");
+        }
+    }
+    Ok("paired qualified")
 }
 
 #[cfg(test)]
@@ -655,6 +719,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires locally staged reference-only publication configs"]
+    fn prepared_reference_only_publications_load_with_label() {
+        let paths = std::env::var_os("CUTEAFD_REFERENCE_ONLY_CONFIGS").unwrap();
+        for root in std::env::split_paths(&paths) {
+            let manifest_bytes = std::fs::read(root.join("manifest.json")).unwrap();
+            let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+            let reference = load(&root, &manifest).unwrap();
+            assert_eq!(reference.windows.len(), 64);
+            assert_eq!(quick_windows(&reference).unwrap().len(), 8);
+            let qualification: Value = serde_json::from_slice(&std::fs::read(root.join("qualification.json")).unwrap()).unwrap();
+            assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference-only qualified");
+            let cache = tempfile::tempdir().unwrap();
+            let revision = "a".repeat(40);
+            let base = cache.path().join("owner--repo").join(&revision);
+            std::fs::create_dir_all(&base).unwrap();
+            let config = manifest["config"].as_str().unwrap();
+            std::os::unix::fs::symlink(&root, base.join(config)).unwrap();
+            std::fs::write(base.join("configs.json"), serde_json::to_vec(&json!({
+                "schema":"cuteafd.fidelity.configs/1", "configs":[{"name":config,
+                "path":format!("{config}/manifest.json"), "sha256":digest(&manifest_bytes)}]})).unwrap()).unwrap();
+            let (_, _, identity) = download(&ureq::Agent::new(), cache.path(), "owner/repo", &revision, config).unwrap();
+            assert_eq!(identity["qualification"], "reference-only qualified");
+        }
+    }
+
+    #[test]
     #[ignore = "requires a locally prepared family dataset and saved paired rows"]
     fn prepared_family_dataset_and_saved_pair() {
         use crate::fidelity::{compare, Run};
@@ -702,6 +792,45 @@ mod tests {
                 assert!((value - expected["shapes"][shape][field].as_f64().unwrap()).abs() < 1e-10);
             }
         }
+    }
+
+    #[test]
+    fn reference_only_requires_complete_non_engine_evidence() {
+        let identity = json!({"checkpoint":"Qwen/Qwen3.5-9B", "snapshot_revision":"a".repeat(40),
+            "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
+        let manifest = json!({"set_sha256":"set", "vocab":248320, "root_checkpoint":{"id":"Qwen/Qwen3.5-9B", "revision":"a".repeat(40)}});
+        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference_only", "qualifies":true, "engine_parity":false,
+            "set_sha256":"set", "nll":1.2, "scored_tokens":32768,
+            "reference_validation":{"passed":true, "engine_parity":false, "set_sha256":"set",
+                "scored_tokens":32768,"nll":1.2,"golden_seal_sha256":"d".repeat(64),"full_seal_sha256":"e".repeat(64)},
+            "prefix_qualification":{"passed":true,"finite":true,"rows":512,"different_rows":[],
+                "argmax_disagreements":0,"set_sha256":"set","snapshot_identity":identity,
+                "lengths":[576,640],"score_from":64,"fixed_rows":128,"vocab":248320,"logits_sha256":["f".repeat(64),"0".repeat(64)]},
+            "reference_provenance":{"snapshot_identity":identity,
+                "source_pin":{"revision":"1".repeat(40),"source_tree_sha256":"2".repeat(64),"modeling_sha256":"3".repeat(64)},
+                "tokenizers":"0.23.1","platform":{"gpu":"NVIDIA GB10"},"mtp":false,"use_cache":false,"attention":"eager"}});
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference-only qualified");
+        let mut rounded = qualification.clone(); rounded["reference_validation"]["nll"] = json!(1.2 + 1e-15);
+        assert!(qualification_label(&rounded, &manifest).is_ok());
+        rounded["reference_validation"]["nll"] = json!(1.21);
+        assert!(qualification_label(&rounded, &manifest).is_err());
+        for path in ["/engine_parity", "/reference_validation/passed", "/prefix_qualification/rows",
+            "/prefix_qualification/logits_sha256", "/reference_provenance/source_pin/revision",
+            "/reference_provenance/snapshot_identity/snapshot_revision", "/reference_validation/golden_seal_sha256",
+            "/reference_provenance/platform/gpu", "/nll", "/scored_tokens"] {
+            let mut bad = qualification.clone(); *bad.pointer_mut(path).unwrap() = Value::Null;
+            assert!(qualification_label(&bad, &manifest).is_err(), "{path}");
+        }
+        let mut bad = qualification.clone(); bad["kind"] = json!("other");
+        assert!(qualification_label(&bad, &manifest).is_err());
+        let mut paired = json!({"qualifies":true,"set_sha256":"set","shapes":{}});
+        for shape in ["decode","prefill"] {
+            paired["shapes"][shape] = json!({"qualifies":true,"pass_verdict":true,"original_pass":true,
+                "delta_difference":0.,"bound_difference":0.});
+        }
+        assert_eq!(qualification_label(&paired, &manifest).unwrap(), "paired qualified");
+        paired["shapes"]["decode"]["delta_difference"] = json!(0.01);
+        assert!(qualification_label(&paired, &manifest).is_err());
     }
 
     #[test]

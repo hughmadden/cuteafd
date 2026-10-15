@@ -98,6 +98,10 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     doc.text(0.0, 14.0, Font::new(11.0, t.ink2), &super::svg::fit(&identity, 11.0, w));
     doc.end();
     y += 28.0;
+    if dataset["qualification"] == "reference-only qualified" {
+        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), "reference-only qualified");
+        y += 22.0;
+    }
     if let Some(how) = v["reference_match"].as_str() {
         let label = format!("Reference via {how}: {}", v["reference_root"].as_str().unwrap_or("?"));
         doc.titled(&label);
@@ -609,6 +613,15 @@ fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
 
 #[cfg(test)]
 mod context_load_tests {
+    #[test]
+    fn fidelity_card_labels_reference_only_qualification() {
+        let value = serde_json::json!({"dataset":{"config":"dense-bf16","revision":"a".repeat(40),
+            "qualification":"reference-only qualified"}});
+        let mut doc = super::Doc::new(900.0, 300.0);
+        super::fidelity(&mut doc, &super::super::theme::NORMAL, &value, 900.0);
+        assert!(doc.finish().contains("reference-only qualified"));
+    }
+
     #[test]
     fn context_table_renders_results_and_skips() {
         let v = serde_json::json!({"points": [

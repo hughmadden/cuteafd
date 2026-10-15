@@ -4,6 +4,7 @@ pub mod dspark;
 pub mod glm;
 pub mod mimo;
 pub mod qwen;
+pub mod qwen35;
 
 use crate::plan::format::{Encoding, QuantOperand, ScaleEncoding};
 
