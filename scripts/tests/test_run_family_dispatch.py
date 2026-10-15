@@ -330,7 +330,7 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     assert "&local_layers, Some(budget)" in body and "&spark_layers, None" in body
     assert "tensors, &package, tp2_layers, args.expert_rows(), budgets" in body
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
-    assert "solve_working_set_with_graphs(" in admission
+    assert "solve_attention_working_set_with_graphs(" in admission
     assert "let local_workspace = workspaces(false, lanes);" in admission
     assert "configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes)" in admission
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()

@@ -1398,6 +1398,10 @@ impl Opened {
             fp8_head: args.fp8_head, output_shard: args.kda_output_shard };
         let resident = runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
             args.token_io.embed_placement, attention)?;
+        let alternate_resident = (attention.mode == placement::AttentionPlacement::Layers).then(||
+            runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
+                args.token_io.embed_placement, engine::GlmfAttention { first_owner: 1 - attention.first_owner, ..attention }))
+            .transpose()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
         let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
@@ -1474,12 +1478,15 @@ impl Opened {
             full_prefill_logits: 0 };
         let target = placement::PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
             args.max_context as u64, inputs.requested_pool, 256, spark_ranks == 0).target;
-        let (placement, graphs, working) = admission::solve_working_set_with_graphs(&inputs, target, automatic_context, sms, true)?;
+        let (placement, graphs, working) = admission::solve_attention_working_set_with_graphs(&inputs,
+            alternate_resident.as_deref(), target, automatic_context, sms, true)?;
+        let attention = admission::placed_attention(attention, &placement);
         ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0
             || (*id == placement::MovableId::Drafter && *gpu == 1 && prepared_draft.is_some())),
             "GLM Flash placement has no matching movable executor");
         tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
-            prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers, "GLM Flash admission before weights");
+            prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers,
+            attention_first_owner = attention.first_owner, "GLM Flash admission before weights");
         let devices: Vec<_> = placement.items.iter().zip(&inventory.gpus).enumerate().map(|(rank, (items, gpu))| {
             let mut items = items.clone();
             items.push(cuteafd_core::memory_layout::Item::new(
@@ -1491,6 +1498,8 @@ impl Opened {
             "memory_layout": {"devices": devices, "pool_tokens": placement.pool_tokens},
             "graph_shapes": graphs.shapes, "graphs": graphs.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(),
             "speculation": speculation, "sequences": sequences,
+            "attention_first_owner": attention.first_owner,
+            "layer_modes": placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
         }), "GLM Flash startup plan");
         cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
         Ok((placement, graphs, working))
@@ -1685,6 +1694,7 @@ impl Opened {
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context, prepared_draft.as_ref(), attention)?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
+        let attention = cuteafd_loader::placement::families::glm5_flash::placed_attention(attention, &placement);
         ensure!(placement.attention_placement == attention.mode,
             "GLM Flash admission placed {} attention, the engine serves {}",
             placement.attention_placement, attention.mode);

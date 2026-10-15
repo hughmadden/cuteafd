@@ -1148,6 +1148,18 @@ fn local_mla_ordinals(layers: impl IntoIterator<Item = (GlmNextAttention,
     }).collect()
 }
 
+/// Native MLA dispatch specializes on head width; warm the actual resident
+/// shapes before either stream can wait on a not-yet-published residual hop.
+fn mla_prefill_head_widths(heads: usize, layers: impl IntoIterator<Item = (GlmNextAttention,
+    crate::shared::placement::layers::AttentionShare)>) -> Vec<usize> {
+    let mut widths: Vec<_> = layers.into_iter().filter_map(|(kind, share)|
+        (kind == GlmNextAttention::Mla && share.present())
+            .then(|| heads / if share.split() { 2 } else { 1 })).collect();
+    widths.sort_unstable();
+    widths.dedup();
+    widths
+}
+
 /// Zero resident MLA layers have no compact tails, and no zero-layer divisor.
 fn compact_index_extents(index: IndexCache, mla_layers: usize, slots: usize, rows: usize) -> Option<(usize, usize)> {
     (index == IndexCache::Compact && mla_layers > 0)
@@ -2589,7 +2601,15 @@ impl<'a> GlmfEngine<'a> {
     /// One masked row of the native MLA prefill on rank `rank` (loads its kernel there).
     fn warm_mla_prefill(&self, rank: usize) -> Result<()> {
         let Some(kernel) = crate::families::glm5::engine::native_mla_prefill() else { return Ok(()) };
-        let heads = self.cfg.heads / 2;
+        let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };
+        for heads in mla_prefill_head_widths(self.cfg.heads,
+            layers.iter().map(|layer| (layer.attention, layer.attention_share))) {
+            self.warm_mla_prefill_width(rank, heads, kernel)?;
+        }
+        Ok(())
+    }
+
+    fn warm_mla_prefill_width(&self, rank: usize, heads: usize, kernel: i32) -> Result<()> {
         let q = self.alloc(heads * self.cfg.kv_lora_rank * 2)?;
         let kv = self.alloc(PAGE_ROWS * RECORD_BYTES)?;
         let indices = self.alloc(SPARSE_TOPK * 4)?;
@@ -5322,6 +5342,16 @@ mod tp2_tests {
         }
         assert_eq!(compact_index_extents(IndexCache::Compact, 2, 8, 64),
             Some((2 * 8 * TAIL_BYTES, 2 * 64 * KEY_BYTES)));
+    }
+
+    #[test]
+    fn native_mla_warmup_uses_only_actual_owner_shapes() {
+        use crate::shared::placement::layers::AttentionShare::{Absent, Split, Whole};
+        use GlmNextAttention::{Kda, Mla};
+        assert_eq!(mla_prefill_head_widths(64, [(Kda, Split), (Mla, Whole), (Mla, Whole)]), [64]);
+        assert!(mla_prefill_head_widths(64, [(Kda, Split), (Mla, Absent)]).is_empty());
+        assert_eq!(mla_prefill_head_widths(64, [(Mla, Split), (Mla, Split)]), [32]);
+        assert_eq!(mla_prefill_head_widths(64, [(Mla, Whole), (Mla, Split), (Mla, Absent)]), [32, 64]);
     }
 
     #[test]

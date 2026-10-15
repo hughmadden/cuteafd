@@ -48,6 +48,12 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             resident[0].embedding = 0;
             notes.push("embedding placement: host (single pinned mapped copy)".into());
         }
+        let alternate_resident = (attention.mode == placement::AttentionPlacement::Layers).then(|| {
+            let mut ranks = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
+                attention.mode, 1 - attention.first_owner as usize).map_err(anyhow::Error::msg)?;
+            if host_embedding { ranks[0].embedding = 0; }
+            Ok::<_, anyhow::Error>(ranks)
+        }).transpose()?;
         let catalog = input.expert_catalog()?;
         let shape = catalog.routed_experts();
         let onboard = options.onboard.or_else(|| options.local_expert_layers.map(|n| Onboard::Layers(n.saturating_sub(shape.first_layer))))
@@ -147,11 +153,18 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
-        let (placed, _, working) = glmf::solve_working_set_with_graphs(&inputs, target, options.context_tokens == 0,
+        let (placed, _, working) = glmf::solve_attention_working_set_with_graphs(&inputs,
+            alternate_resident.as_deref(), target, options.context_tokens == 0,
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms) as usize,
             available.is_some())?;
+        let chosen_attention = glmf::placed_attention(attention, &placed);
+        let chosen_resident = if chosen_attention.first_owner == attention.first_owner { &inputs.resident }
+            else { alternate_resident.as_ref().expect("solved alternate MLA inventory") };
+        if chosen_attention.mode == placement::AttentionPlacement::Layers {
+            notes.push(format!("first MLA owner: rtx{}", chosen_attention.first_owner));
+        }
         if spark_ranks == 0 {
-            let mut weights: Vec<_> = inputs.resident.iter().map(|rank| rank.embedding.checked_add(rank.weights)
+            let mut weights: Vec<_> = chosen_resident.iter().map(|rank| rank.embedding.checked_add(rank.weights)
                 .ok_or_else(|| anyhow::anyhow!("GLM Flash resident weight overflow"))).collect::<anyhow::Result<_>>()?;
             for ((layer, _), cost) in cfg.dense.iter().enumerate().filter(|(_, dense)| !**dense).zip(&inputs.experts) {
                 for (rank, bytes) in weights.iter_mut().enumerate() {
