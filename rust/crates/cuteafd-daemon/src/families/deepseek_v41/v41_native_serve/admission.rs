@@ -517,6 +517,7 @@ pub(super) fn resolve(
         args.tp2_attention,
     )?;
     let placement = solve(&req)?;
+    families::deepseek_v41::validate_pool_floor(&req.pool, &placement)?;
     ensure!(
         placement.onboard_layers >= minimum,
         "mandatory V4.1 expert prefix does not fit"

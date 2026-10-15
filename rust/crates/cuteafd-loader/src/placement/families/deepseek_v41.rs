@@ -12,6 +12,19 @@ pub fn runtime_reserve(total: u64, ranks: usize, automatic: bool) -> u64 {
     else if ranks == 1 { 2 << 30 } else { 800 << 20 }
 }
 
+/// V4.1 requires its full admitted context; other Spark families may clamp it.
+pub fn validate_pool_floor(pool: &PoolPolicy, placement: &Placement) -> Result<(), PlacementError> {
+    if placement.pool_tokens < pool.floor {
+        return Err(PlacementError::BelowFloor {
+            pool: placement.pool_tokens,
+            floor: pool.floor,
+            layers: placement.onboard_layers,
+            short: pool.floor - placement.pool_tokens,
+        });
+    }
+    Ok(())
+}
+
 /// Exact expert allocation extents, supplied either by linked native info or
 /// the corresponding published AOT manifest. No device-specific estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

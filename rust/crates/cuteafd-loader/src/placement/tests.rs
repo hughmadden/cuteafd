@@ -69,6 +69,16 @@ fn one_gpu_runs_whole_layers_and_shrinks_the_pool_before_failing() {
 }
 
 #[test]
+fn spark_auto_pool_can_shrink_below_context_but_v41_refuses_it() {
+    let req = request(1, GIB, 40, 4, Onboard::Auto);
+    let placement = solve(&req).unwrap();
+    assert_eq!(placement.pool_tokens, 65_536);
+    assert!(placement.pool_tokens < req.pool.floor);
+    assert!(matches!(families::deepseek_v41::validate_pool_floor(&req.pool, &placement),
+        Err(PlacementError::BelowFloor { pool: 65_536, floor: 131_072, .. })));
+}
+
+#[test]
 fn fixed_onboard_makes_the_pool_the_output() {
     let placement = solve(&request(2, 44 * GIB, 60, 4, Onboard::Layers(10))).unwrap();
     assert_eq!(placement.onboard_layers, 10);
@@ -1354,7 +1364,10 @@ fn compulsory_prefix_reserves_exact_costs_before_an_automatic_pool() {
         assert!(solve(&req).is_err());
         req.pool.requested = None;
         req.pool.floor = req.pool.target;
-        assert!(matches!(solve(&req), Err(PlacementError::BelowFloor { .. })));
+        let below_floor = solve(&req).unwrap();
+        assert!(below_floor.pool_tokens < req.pool.floor);
+        assert!(matches!(families::deepseek_v41::validate_pool_floor(&req.pool, &below_floor),
+            Err(PlacementError::BelowFloor { .. })));
         req.pool.floor = 131_072;
         req.onboard = Onboard::Layers(3);
         assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));

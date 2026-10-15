@@ -1217,6 +1217,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
                     families::deepseek_v41::cache_demands(&mut request, &checkpoint.config,
                         concurrency, marks.saturating_sub(2) / 2, false)?;
                     let placement = solve(&request)?;
+                    families::deepseek_v41::validate_pool_floor(&request.pool, &placement)?;
                     let local_bytes = request.layers.iter().zip(&placement.layers).map(|(demand, assigned)| {
                         demand.experts.map_or(0, |cost| match assigned.experts {
                             ExpertHome::RtxWhole { .. } => cost.whole.resident,

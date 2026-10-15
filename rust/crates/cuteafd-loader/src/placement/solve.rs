@@ -400,11 +400,6 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 best.ok_or(PlacementError::ExpertLayers { requested: count, placed: most })?
             };
             let units = pool_units(request, if context { fit / 2 * 2 } else { fit })?;
-            if units.saturating_mul(request.pool.unit_rows) < request.pool.floor {
-                let tokens = units.saturating_mul(request.pool.unit_rows);
-                return Err(PlacementError::BelowFloor {pool:tokens,floor:request.pool.floor,layers:0,
-                    short:request.pool.floor - tokens});
-            }
             let used = with_pool(request, &used, &unit_bytes, units)?;
             let caps = [if request.expert_gpus > 0 { usize::MAX } else { 0 }, if request.expert_gpus > 1 { usize::MAX } else { 0 }];
             let (ranges, homes, _, tp2_range) = place_experts(request, &available, &used, &mut arenas, first_moe,
