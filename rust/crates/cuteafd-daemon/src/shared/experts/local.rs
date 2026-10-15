@@ -123,9 +123,9 @@ impl<'a> LocalExpertWave<'a> {
                 };
                 Ok::<_, anyhow::Error>(largest.max(usize::try_from(info.scratch_bytes)?))
             })?;
-        arena
-            .checked_add(capacity as usize * geometry.row_bytes() as usize)
-            .context("local expert workspace size overflow")
+        Ok(usize::try_from(cuteafd_loader::placement::families::deepseek_v41::NativeWorkspace {
+            scratch_bytes: arena as u64, kernel_intermediate: 0,
+        }.lane_bytes(capacity as u64, geometry.hidden as u64, geometry.topk as u64, false, nvfp4)?)?)
     }
     pub fn new(
         library: &'a NativeLibrary,

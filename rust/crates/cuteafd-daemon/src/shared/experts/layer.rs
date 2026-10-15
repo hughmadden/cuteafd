@@ -325,10 +325,11 @@ impl<'a> ExpertWeights<'a> {
                 .checked_mul(experts)
                 .context("resident expert allocation overflow")?;
         }
-        let resident_bytes = sizes.iter().try_fold(0usize, |sum, size| {
-            sum.checked_add(*size)
-                .context("resident expert byte overflow")
-        })?;
+        let resident_bytes = usize::try_from(
+            cuteafd_loader::placement::families::deepseek_v41::resident_bytes(
+                info.hidden_size as u64, info.kernel_intermediate as u64, experts as u64, false)?)?;
+        ensure!(sizes.iter().sum::<usize>() == resident_bytes,
+            "native packer planes disagree with shared resident demand");
         let budget = ExpertLoadBudget {
             resident_bytes,
             device_staging_bytes: first.staging_bytes(),

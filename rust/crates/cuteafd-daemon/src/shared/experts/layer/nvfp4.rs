@@ -69,19 +69,10 @@ fn align_up(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
 }
 
-/// Per-expert fused FC1 payload, FC1 scale plane, FC2 payload and FC2 scale
-/// plane extents for one rank's intermediate width.
+/// The allocator and planner share the same calibrated packed-plane source.
 pub(crate) fn plane_sizes(intermediate: usize) -> [usize; 4] {
-    let hidden = HIDDEN;
-    let fc1_rows = 2 * intermediate;
-    let fc1_cols = hidden / 16;
-    let down_cols = intermediate / 16;
-    [
-        fc1_rows * (hidden / 2),
-        align_up(fc1_rows, 128) * align_up(fc1_cols, 4),
-        hidden * (intermediate / 2),
-        align_up(hidden, 128) * align_up(down_cols, 4),
-    ]
+    cuteafd_loader::placement::families::deepseek_v41::resident_planes(
+        HIDDEN as u64, intermediate as u64, true).expect("validated NVFP4 geometry").map(|n| n as usize)
 }
 
 impl<'a> Nvfp4Side<'a> {
@@ -131,16 +122,12 @@ impl<'a> Nvfp4Side<'a> {
         let (_, experts) = Self::rank_planes(layer, catalog)?;
         let staging = catalog.nvfp4_expert_staging(layer.expert(0))?;
         let sizes = plane_sizes(Self::kernel_intermediate(library, catalog, layer)?);
-        let resident_bytes = sizes
-            .iter()
-            .try_fold(0usize, |sum, size| {
-                sum.checked_add(size.checked_mul(experts).context("NVFP4 resident overflow")?)
-                    .context("NVFP4 resident byte overflow")
-            })?
-            // Four per-expert f32 vectors: alphas, down alphas and the two
-            // activation-scale planes.
-            .checked_add(experts * 4 * 4)
-            .context("NVFP4 scalar vector overflow")?;
+        let resident_bytes = usize::try_from(
+            cuteafd_loader::placement::families::deepseek_v41::resident_bytes(
+                HIDDEN as u64, Self::kernel_intermediate(library, catalog, layer)? as u64,
+                experts as u64, true)?)?;
+        ensure!(sizes.iter().sum::<usize>() * experts + experts * 16 == resident_bytes,
+            "NVFP4 planes disagree with shared resident demand");
         Ok(ExpertLoadBudget {
             resident_bytes,
             device_staging_bytes: staging.staging_bytes(),

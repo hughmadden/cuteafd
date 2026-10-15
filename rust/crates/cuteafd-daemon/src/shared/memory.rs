@@ -20,6 +20,9 @@ pub(crate) mod proposal_replica;
 #[path = "memory/chain.rs"]
 pub(crate) mod chain;
 
+#[path = "memory/budget.rs"]
+pub(crate) mod budget;
+
 pub(crate) struct DeviceAllocation<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) buffer: CuteafdDeviceBuffer,

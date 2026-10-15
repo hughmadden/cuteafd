@@ -169,16 +169,16 @@ fn v41_config() -> Value {
     })
 }
 
-fn full_v41_config() -> Value {
-    let mut cfg = v41_config();
-    cfg["text_config"]["max_position_embeddings"] = json!(1_048_576);
-    cfg["text_config"]["num_hidden_layers"] = json!(40);
-    cfg["text_config"]["head_dim"] = json!(512);
-    cfg["text_config"]["qk_rope_head_dim"] = json!(64);
-    cfg["text_config"]["sliding_window"] = json!(128);
-    cfg["text_config"]["kv_source_layer_ids"] = json!([2, 8, 14, 20]);
-    cfg["text_config"]["compress_ratios"] = json!((0..40).map(|l| if l < 2 { 0 } else if l < 20 { 2 } else { 1 }).collect::<Vec<_>>());
-    cfg
+fn strict_v41_snapshot(nvfp4: bool) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    if nvfp4 { write_v41_nvfp4_snapshot(dir.path()); }
+    else { write_v41_snapshot(dir.path()); }
+    write_v41_workspaces(dir.path());
+    dir
+}
+
+fn v41_workspace(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    Some(dir.join("share/PROGRAMS.json"))
 }
 
 #[test]
@@ -221,31 +221,16 @@ fn deepseek_v41_components_formats_and_placement() {
 fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     for nvfp4 in [false, true] {
-        let mut tensors = Vec::new();
-        for projection in ["w1", "w2", "w3"] {
-            let (n, k) = if projection == "w2" { (5120, 2304) } else { (2304, 5120) };
-            let prefix = format!("layers.0.ffn.experts.0.{projection}");
-            if nvfp4 {
-                tensors.extend([
-                    t(&format!("{prefix}.weight"), "U8", &[n, k / 2]),
-                    t(&format!("{prefix}.weight_scale"), "F8_E4M3", &[n, k / 16]),
-                    t(&format!("{prefix}.weight_scale_2"), "F32", &[]),
-                    t(&format!("{prefix}.input_scale"), "F32", &[]),
-                ]);
-            } else {
-                tensors.extend([
-                    t(&format!("{prefix}.weight"), "I8", &[n, k / 2]),
-                    t(&format!("{prefix}.scale"), "F8_E8M0", &[n, k / 32]),
-                ]);
-            }
-        }
-        let dir = snapshot(full_v41_config(), &tensors);
+        let dir = strict_v41_snapshot(nvfp4);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
         for (ranks, gpus) in [(3, 1), (6, 2)] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions {
                 rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
+                workspace_manifest: v41_workspace(dir.path()),
                 pool_tokens: Some(2_097_152), ..Default::default()
             }), ..sparks(ranks) };
             let report = plan(dir.path(), &options).unwrap();
+            assert!(report.placement_supported, "{}", render(&report));
             let memory = report.memory_layout.as_ref().unwrap();
             let experts = report.experts.as_ref().unwrap();
             assert!(experts.package.starts_with(if nvfp4 { "v41:nvfp4" } else { "v41:mxfp4" }));
@@ -266,7 +251,12 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                     DeviceKind::Rtx => {
                         let local = device.items.iter().find(|item| item.group.starts_with("resident routed")
                             || item.group.starts_with("TP2 expert layer halves")).unwrap();
-                        assert_eq!(local.bytes, packed(gpus as u64) + 288 * 1024 * 1024);
+                        let (costs, workspace) = crate::placement::families::deepseek_v41::expert_inventory(
+                            &catalog, &dir.path().join("share/PROGRAMS.json"),
+                            options.layout.as_ref().unwrap().prefill_rows.max(2048), gpus).unwrap();
+                        let cost = if gpus == 1 { costs[0].whole } else { costs[0].half[device.index as usize] };
+                        assert_eq!(cost.resident, packed(gpus as u64));
+                        assert_eq!(local.bytes, cost.resident + cost.staging + workspace);
                     }
                     _ => {}
                 }
@@ -1319,8 +1309,7 @@ fn observed_zero_ranks_panics() {
 fn spark_rank_options_follow_transport_and_packages() {
     let flash = snapshot_tp(mimo_flash_config(), &mimo_flash_tensors(), Some(1));
     let qwen = qwen_snapshot(4);
-    let dsv41 = snapshot(full_v41_config(), &[t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
-        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160])]);
+    let dsv41 = strict_v41_snapshot(false);
     for ranks in 0..=9 {
         let options = PlanOptions { layout: None, ..sparks(ranks) };
         if ranks > 8 {
@@ -1333,7 +1322,10 @@ fn spark_rank_options_follow_transport_and_packages() {
         assert_eq!(mimo.placement_supported, matches!(ranks, 2 | 4 | 6), "mimo {ranks}");
         if ranks == 0 { assert!(mimo.hints.iter().any(|h| h.what.contains("BF16 package manifest"))); }
         assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, matches!(ranks, 0..=4), "qwen {ranks}");
-        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, matches!(ranks, 2 | 3 | 4 | 6), "v41 {ranks}");
+        let v41_options = PlanOptions { layout: Some(layout::LayoutOptions {
+            workspace_manifest: v41_workspace(dsv41.path()), ..Default::default()
+        }), ..options.clone() };
+        assert_eq!(plan(dsv41.path(), &v41_options).unwrap().placement_supported, matches!(ranks, 2 | 3 | 4 | 6), "v41 {ranks}");
     }
 }
 
@@ -2466,10 +2458,10 @@ fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle
 
 #[test]
 fn v41_small_card_graph_envelope_preserves_pro_allowance() {
-    let dir = snapshot(v41_config(), &[]);
-    for (gib, expected) in [(32, 2u64 << 30), (96, (1u64 << 30) * 150 / 100)] {
+    let dir = strict_v41_snapshot(false);
+    for (gib, expected) in [(32, 2u64 << 30), (96, 3264u64 << 20)] {
         let options = PlanOptions {
-            layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib << 30], ..Default::default() }),
+            layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib << 30], workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
             ..sparks(4)
         };
         let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -2481,28 +2473,21 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
 #[test]
 fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     use cuteafd_core::memory_layout::Category;
-    let mut config = v41_config();
-    let text = &mut config["text_config"];
-    text["num_hidden_layers"] = json!(40);
-    text["head_dim"] = json!(512);
-    text["qk_rope_head_dim"] = json!(64);
-    text["sliding_window"] = json!(128);
-    text["kv_source_layer_ids"] = json!([2, 8, 14, 20]);
-    text["compress_ratios"] = json!((0..40).map(|l| if l < 2 { 0 } else if l < 20 { 2 } else { 1 }).collect::<Vec<_>>());
-    let dir = snapshot(config, &[t("embed.weight", "BF16", &[128, 5120])]);
+    let dir = strict_v41_snapshot(false);
     let mut options = sparks(4);
     options.layout = Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], pool_tokens: Some(0),
-        prefix_slots: Some(0), native_mtp_layers: 0, ..Default::default() });
+        prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(automatic.devices[0].capacity_bytes, (96u64 << 30) * 97 / 100 - (3 << 30));
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
-    let state = automatic.devices[0].items.iter().find(|i| i.group == "state").unwrap().bytes;
+    let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&serde_json::from_reader::<_, Value>(
         std::fs::File::open(dir.path().join("config.json")).unwrap()).unwrap(), 1).unwrap();
-    assert_eq!(state, cache.ranks[0].active_state_per_sequence_bytes * 16);
+    let rank = cache.ranks[0];
+    assert_eq!(state, (rank.active_state_per_sequence_bytes - 4 * 4096 * 4) * 16);
     options.layout.as_mut().unwrap().pool_tokens = Some(512);
     let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert_eq!(explicit.devices[0].capacity_bytes, (96u64 << 30) - (3 << 30));
+    assert_eq!(explicit.devices[0].capacity_bytes, (96u64 << 30) - (2 << 30));
 }
 
 #[test]
@@ -2618,16 +2603,10 @@ fn default_uses_all_sparks_and_explicit_unsupported_count_refuses() {
 
 #[test]
 fn v41_32gib_counts_share_pool_and_local_layer_admission() {
-    let cfg = full_v41_config();
-    let dir = snapshot(cfg, &[
-        t("embed.weight", "BF16", &[128, 5120]),
-        t("head.weight", "BF16", &[128, 5120]),
-        t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
-        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160]),
-    ]);
+    let dir = strict_v41_snapshot(false);
     for ranks in [2, 3, 4, 6] {
         let options = PlanOptions { layout: Some(layout::LayoutOptions {
-            rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), prefill_rows: 256,
+            rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(262_144), prefill_rows: 256,
             ..Default::default()
         }), ..sparks(ranks) };
         let report = plan_spark_count(dir.path(), &options, 6, Some(ranks)).unwrap();
@@ -2648,7 +2627,7 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
         assert!(refused.hints.last().unwrap().what.contains("refused:"));
     }
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
-        rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), prefill_rows: 256,
+        rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(262_144), prefill_rows: 256,
         ..Default::default()
     }), ..sparks(6) };
     let all = plan_spark_count(dir.path(), &options, 6, None).unwrap();
@@ -2679,14 +2658,12 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
 
 #[test]
 fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
-    let dir = snapshot(full_v41_config(), &[
-        t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
-        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160]),
-    ]);
+    let dir = strict_v41_snapshot(false);
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
-        rtx_bytes: vec![32 << 30], pool_tokens: Some(0), context_tokens: 1 << 20,
-        // Fixed backbone/draft owners, independent of the prefill shape.
-        drafter_bytes: 16 << 30, prefill_rows: 0,
+        rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
+        // Full official fixed owners plus an independent external draft budget
+        // leave room for the 1024-row lane, but not the 2048-row lane.
+        drafter_bytes: 4 << 30, prefill_rows: 0,
         ..Default::default()
     }), ..sparks(4) };
     let automatic = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
@@ -2707,12 +2684,11 @@ fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
 
 #[test]
 fn v41_exl3_exact_tp6_refuses_and_default_falls_back_with_reason() {
-    let mut config = full_v41_config();
-    config["quantization_config"] = exl3_compact(3);
-    let tensors = exl3("model.layers.0.mlp.experts.0.gate_proj", 2304, 5120, 3);
-    let dir = snapshot(config, &tensors);
+    let dir = tempfile::tempdir().unwrap();
+    write_v41_exl3_snapshot(dir.path(), 3);
+    write_v41_workspaces(dir.path());
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
-        rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), prefill_rows: 256,
+        rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(262_144), prefill_rows: 256,
         ..Default::default()
     }), ..sparks(6) };
     let refused = plan_spark_count(dir.path(), &options, 6, Some(6)).unwrap();
