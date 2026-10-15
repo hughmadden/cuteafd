@@ -1766,13 +1766,13 @@ impl Opened {
             let ranks: [Box<dyn RtxExpertLayer + '_>; 2] = if let Some(manifest) = catalog.exl3() {
                 let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
                     manifest.decoder_tiers(), "rtx-tp2");
-                Exl3Tp2::load_pair(devices, catalog, &package, range, args.expert_rows(), budgets)?
+                Exl3Tp2::load_pair(devices, catalog, &package, range.collect(), args.expert_rows(), budgets)?
                     .map(|r| Box::new(r) as Box<dyn RtxExpertLayer>)
             } else {
                 let tensors = catalog.fp8().context("FP8 TP2 tensors")?;
                 let package = args.fp8_package.clone().unwrap_or_else(||
                     crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
-                Fp8MoeTp2::load_pair(devices, tensors, &package, range, args.expert_rows(), budgets)?
+                Fp8MoeTp2::load_pair(devices, tensors, &package, range.collect(), args.expert_rows(), budgets)?
                     .map(|r| Box::new(r) as Box<dyn RtxExpertLayer>)
             };
             probe("expert-packages")?;
@@ -1790,7 +1790,7 @@ impl Opened {
                 expert_args.peers = None;
                 if let Some(experts) = self.experts_range(&expert_args, Some(range.clone()), Some(budget))? {
                     if let engine::Experts::LocalExl3(local) = &experts { local.ensure(range.start, stream)?; }
-                    engine.install_local(range, experts)?;
+                    engine.install_local(range.collect(), experts)?;
                 }
             }
             if spark || args.skip_experts {
@@ -1922,7 +1922,8 @@ impl Opened {
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
                 resident: std::cell::RefCell::new(None), window: range.as_ref().map_or(args.exl3_window.max(1), |r| r.len()),
-                layers: range.as_ref().map_or(args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers), |r| r.end), max_rows: args.expert_rows(),
+                layers: range.unwrap_or(0..args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers))
+                    .filter(|&layer| !self.cfg.dense[layer]).collect(), max_rows: args.expert_rows(),
                 // Room for the step workspace (logits alone are 2.4 GiB at 4096 rows).
                 budget, loads: std::cell::RefCell::new(0),
             })));

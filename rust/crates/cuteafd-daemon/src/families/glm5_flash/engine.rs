@@ -425,40 +425,42 @@ pub(crate) struct LocalExl3<'a> {
     pub library: &'a NativeLibrary,
     pub native_lib: std::path::PathBuf,
     pub catalog: &'a cuteafd_loader::OfficialV41Catalog,
-    pub resident: RefCell<Option<(std::ops::Range<usize>, crate::families::deepseek_v4::local::LocalExperts<'a>)>>,
+    pub resident: RefCell<Option<(Vec<usize>, crate::families::deepseek_v4::local::LocalExperts<'a>)>>,
     pub window: usize,
-    /// Layers past the engine's last one never load.
-    pub layers: usize,
+    /// Exact admitted backbone IDs; lazy windows never load a gap or another backend's layer.
+    pub layers: Vec<usize>,
     pub max_rows: usize,
     pub budget: usize,
     pub loads: RefCell<usize>,
 }
 
 impl LocalExl3<'_> {
-    /// Makes `layer` resident (with the next `window - 1` layers).
+    /// Makes `layer` and the following admitted IDs resident, never the IDs between them.
     pub(crate) fn ensure(&self, layer: usize, stream: *mut c_void) -> Result<()> {
-        if self.resident.borrow().as_ref().is_some_and(|(range, _)| range.contains(&layer)) {
+        let slot = self.layers.binary_search(&layer)
+            .map_err(|_| anyhow::anyhow!("EXL3 expert layer {layer} is outside admitted inventory {:?}", self.layers))?;
+        if self.resident.borrow().as_ref().is_some_and(|(layers, _)| layers.binary_search(&layer).is_ok()) {
             return Ok(());
         }
         // SAFETY: the engine owns this stream; the old window's launches drain first.
         unsafe { self.library.cuda_stream_synchronize(stream)? };
         *self.resident.borrow_mut() = None;
-        let range = layer..(layer + self.window).min(self.layers);
+        let layers = &self.layers[slot..slot + self.window.min(self.layers.len() - slot)];
         let started = std::time::Instant::now();
-        let local = crate::families::deepseek_v4::local::LocalExperts::load_range(self.library, &self.native_lib, self.catalog, 0,
-            range.clone(), self.max_rows, self.budget, stream)?
+        let local = crate::families::deepseek_v4::local::LocalExperts::load(self.library, &self.native_lib, self.catalog, 0,
+            layers, self.max_rows, self.budget, stream)?
             .context("no coordinator EXL3 package for this checkpoint (build glmf:exl3-k<tiers>)")?;
-        let range = layer..layer + local.layers();
-        ensure!(range.contains(&layer), "EXL3 expert layer {layer} does not fit the budget");
-        *self.loads.borrow_mut() += range.len();
-        tracing::debug!(?range, elapsed_ms = started.elapsed().as_millis() as u64, "EXL3 expert window resident");
-        *self.resident.borrow_mut() = Some((range, local));
+        let layers = local.layers().to_vec();
+        ensure!(layers.binary_search(&layer).is_ok(), "EXL3 expert layer {layer} does not fit the budget");
+        *self.loads.borrow_mut() += layers.len();
+        tracing::debug!(?layers, elapsed_ms = started.elapsed().as_millis() as u64, "EXL3 expert window resident");
+        *self.resident.borrow_mut() = Some((layers, local));
         Ok(())
     }
 }
 
 struct Tp2Experts<'a> {
-    layers: std::ops::Range<usize>,
+    layers: Vec<usize>,
     ranks: [RefCell<Box<dyn RtxExpertLayer + 'a>>; 2],
     combine: FusedCombine<'a>,
     routes: PeerExchange<'a>,
@@ -1363,7 +1365,7 @@ pub(crate) struct GlmfEngine<'a> {
     exchange: Option<PeerExchange<'a>>,
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     tp2: Option<Tp2Experts<'a>>,
-    local: Option<(std::ops::Range<usize>, Experts<'a>)>,
+    local: Option<(Vec<usize>, Experts<'a>)>,
     expert_routing: Option<crate::shared::placement::layers::ExpertRouting>,
     /// The drafter (DFlash2 or dSpark): every step taps its target layers.
     pub drafter: Option<super::dspark::Drafter<'a>>,
@@ -1934,14 +1936,16 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    /// Installs the admitted routed prefix on both head-split GPUs. Graphs
+    /// Installs the exact admitted routed inventory on both head-split GPUs. Graphs
     /// and workspaces must not yet exist: their pointers depend on these homes.
     pub(crate) fn install_tp2(&mut self, ranks: [Box<dyn RtxExpertLayer + 'a>; 2]) -> Result<()> {
         let peer = self.peer()?;
         check_tp2_lanes(self.prefill_lane_count)?;
-        let layers = ranks[0].layers();
-        ensure!(!layers.is_empty() && layers == ranks[1].layers() && layers.end <= self.weights.layers.len()
-            && self.weights.layers[layers.clone()].iter().all(|l| !l.dense), "invalid GLM Flash TP2 routed range");
+        let layers = ranks[0].layers().to_vec();
+        ensure!(!layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1])
+            && layers == ranks[1].layers()
+            && layers.iter().all(|&id| self.weights.layers.get(id).is_some_and(|l| !l.dense)),
+            "invalid GLM Flash TP2 routed inventory {layers:?}");
         ensure!(self.expert_routing.is_none() && self.tp2.is_none() && self.decode_workspace.borrow().is_none()
             && self.lane_workspaces.borrow().is_empty() && peer.decode_workspace.borrow().is_none()
             && peer.lane_workspaces.borrow().is_empty(), "install TP2 before step workspace allocation");
@@ -2061,7 +2065,7 @@ impl<'a> GlmfEngine<'a> {
                 // SAFETY: startup owns these workspaces; no graph/peer wait has been queued.
                 unsafe { self.library.cuda_zero_bytes_async(w.x.buffer, rows * self.cfg.hidden * 2,
                     self.stream_of(rank))?; }
-                let layer = tp2.layers.start;
+                let layer = tp2.layers[0];
                 let weights = if rank == 0 { &self.weights.layers[layer] } else { &self.peer()?.layers[layer] };
                 self.router_on(rank, w, weights, rows, &[Span { first: 0, rows }])?;
                 let cap = if self.prefill_rows >= self.decode_rows { PREFILL_CAP } else { decode_cap(rows) };
@@ -2119,10 +2123,22 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    pub(crate) fn install_local(&mut self, range: std::ops::Range<usize>, experts: Experts<'a>) -> Result<()> {
+    pub(crate) fn install_local(&mut self, layers: Vec<usize>, experts: Experts<'a>) -> Result<()> {
         ensure!(self.expert_routing.is_none() && self.local.is_none(), "install local experts before binding homes");
-        ensure!(matches!(experts, Experts::Local(_) | Experts::LocalExl3(_)), "local expert backend required");
-        self.local = Some((range, experts));
+        ensure!(!layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1])
+            && layers.iter().all(|&layer| self.weights.layers.get(layer).is_some_and(|weights| !weights.dense)),
+            "invalid GLM Flash local routed inventory {layers:?}");
+        let installed = match &experts {
+            Experts::Local(local) => local.experts.borrow().layers.iter().map(|weights| weights.layer).collect::<Vec<_>>(),
+            Experts::LocalExl3(local) => {
+                ensure!(local.layers == layers, "EXL3 lazy inventory differs from admitted local inventory");
+                local.resident.borrow().as_ref().context("local EXL3 weights must be installed before binding homes")?
+                    .1.layers().to_vec()
+            }
+            _ => anyhow::bail!("local expert backend required"),
+        };
+        ensure!(installed == layers, "GLM Flash installed local inventory {installed:?} differs from admitted {layers:?}");
+        self.local = Some((layers, experts));
         Ok(())
     }
 
@@ -2139,8 +2155,8 @@ impl<'a> GlmfEngine<'a> {
                 "skip experts must not coexist with executing backends");
             ExpertRouting::skipped(&dense)
         } else {
-            let local: Vec<_> = self.local.as_ref().map_or_else(Vec::new, |(range, _)| range.clone().collect());
-            let tp2: Vec<_> = self.tp2.as_ref().map_or_else(Vec::new, |tp2| tp2.layers.clone().collect());
+            let local: Vec<_> = self.local.as_ref().map_or_else(Vec::new, |(layers, _)| layers.clone());
+            let tp2: Vec<_> = self.tp2.as_ref().map_or_else(Vec::new, |tp2| tp2.layers.clone());
             ensure!(spark_layers.is_empty() == !matches!(self.experts, Some(Experts::Spark { .. })),
                 "Spark transport coverage differs from selected worker layers");
             ExpertRouting::bind(&placement.layers, &dense, &[
@@ -2339,7 +2355,7 @@ impl<'a> GlmfEngine<'a> {
         let mut checks = tp2.checks.borrow_mut();
         ensure!(checks.is_empty(), "undrained GLM Flash TP2 route diagnostics");
         // Pinned allocations can synchronize; make them before either stream queues waits.
-        for layer in tp2.layers.clone() {
+        for &layer in &tp2.layers {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.topk * 8;
                 checks.insert((layer, lane), (rows, [self.on(0, || HostAllocation::new(self.library, bytes))?,
