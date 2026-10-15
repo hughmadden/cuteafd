@@ -114,10 +114,10 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
         Some(BenchAction::Smoke(smoke)) => cuteafd_bench::smoke::run(smoke),
         Some(BenchAction::Cancel { url, api_key }) => cuteafd_bench::cli::cancel(&url, &api_key),
         Some(BenchAction::Export { json, out, root, export }) => {
-            let mut report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
-            // Re-render under the rule in force now (an nvidia NVFP4 card's
-            // absolute fidelity is informational, not a gate).
-            cuteafd_bench::quality::reconcile(&mut report);
+            let report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
+            // The exports re-render under the rule in force now (an nvidia NVFP4
+            // card's absolute fidelity is informational, not a gate), so the
+            // report is not reconciled here.
             let out = out.unwrap_or_else(|| cuteafd_bench::cli::default_dir(&root, &report));
             for path in cuteafd_bench::cli::write_exports(&report, &out, &export)? {
                 eprintln!("wrote {}", path.display());
