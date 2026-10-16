@@ -101,6 +101,23 @@ impl DsparkConfig {
     }
 }
 
+fn validate_target_taps(taps: &[super::target::HiddenTap], layers: &[usize], hidden: usize,
+    stream: *mut c_void, end: usize, n: usize) -> Result<()> {
+    ensure!(taps.len() == layers.len(), "target tap count differs from draft checkpoint");
+    for (tap, &layer) in taps.iter().zip(layers) {
+        ensure!(tap.layer == layer, "target tap order differs from draft checkpoint");
+        ensure!(tap.hidden == hidden && tap.stride >= hidden,
+            "target tap hidden width or stride differs from draft checkpoint");
+        ensure!(end <= tap.rows, "target tap rows exceed producer span");
+        ensure!(tap.stream == stream, "target taps require the drafter's producer stream");
+        ensure!(n == 0 || !tap.ptr.is_null(), "target tap has a null device pointer");
+        tap.stride.checked_mul(2).context("target tap pitch overflow")?;
+        tap.rows.saturating_sub(1).checked_mul(tap.stride).and_then(|v| v.checked_add(hidden))
+            .and_then(|v| v.checked_mul(2)).context("target tap byte span overflow")?;
+    }
+    Ok(())
+}
+
 /// Exactly one resident representation of a GEMM weight.
 enum Weight<'a> {
     Bf16(Dev<'a>),
@@ -462,6 +479,43 @@ impl<'a> DsparkDrafter<'a> {
         }
     }
 
+    /// Copies ordered, strided target taps without a host transfer. Reads use
+    /// the producer stream, so returning permits the target to reuse storage.
+    ///
+    /// # Safety
+    /// Each tap points to its declared live BF16 span on this device and stays
+    /// valid until the producer stream reaches these copies.
+    pub unsafe fn capture_target_taps(&self, taps: &[super::target::HiddenTap], first: usize,
+        n: usize, to: usize) -> Result<()> {
+        ensure!(taps.len() == self.cfg.taps.len(), "target tap count differs from draft checkpoint");
+        let end = first.checked_add(n).context("target tap row overflow")?;
+        let destination_end = to.checked_add(n).context("draft tap row overflow")?;
+        ensure!(destination_end <= TAP_ROWS, "draft tap rows exceed capacity");
+        let width_bytes = self.cfg.hidden.checked_mul(2).context("tap width overflow")?;
+        let pitch = taps.len().checked_mul(width_bytes).context("draft tap pitch overflow")?;
+        // Validate the complete set before enqueueing any transfer.
+        validate_target_taps(taps, &self.cfg.taps, self.cfg.hidden, self.stream, end, n)?;
+        if n == 0 { return Ok(()); }
+        let device_id = self.library.cuda_get_device()?;
+        for (index, tap) in taps.iter().enumerate() {
+            let source_pitch = tap.stride.checked_mul(2).context("target tap pitch overflow")?;
+            let offset = first.checked_mul(source_pitch).context("target tap offset overflow")?;
+            let source_bytes = (tap.rows - 1) * source_pitch + width_bytes;
+            let destination_offset = to * pitch + index * width_bytes;
+            // SAFETY: all spans/strides were validated, the caller owns live
+            // producer buffers, and source reads precede reuse on that stream.
+            unsafe {
+                self.library.copy_d2d_2d_async(
+                    CuteafdDeviceBuffer { ptr: at(&self.taps, destination_offset),
+                        bytes: self.taps.buffer.bytes - destination_offset, ..self.taps.buffer }, pitch,
+                    CuteafdDeviceBuffer { ptr: tap.ptr.cast::<u8>().add(offset).cast_mut().cast(),
+                        bytes: source_bytes - offset, device_id, ..CuteafdDeviceBuffer::default() },
+                    source_pitch, width_bytes, n, self.stream)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the context K/V of committed tapped rows (in tap-row order).
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
         if rows.is_empty() {
@@ -749,6 +803,25 @@ mod tests {
         DsparkConfig { hidden: 5120, intermediate: 10240, layers: 5, heads: 40, kv_heads: 8,
             head_dim: 128, eps: 1e-6, theta: 1e7, block: 7, mask_token: 248077, rank: 256,
             taps: vec![4,16,28,40,52], vocab: 248320, causal: false, window, rotary: None }
+    }
+
+    #[test]
+    fn draft_target_taps_validate_order_stride_stream_and_span() {
+        use super::super::target::HiddenTap;
+        let marker = 0u8;
+        let pointer = std::ptr::from_ref(&marker).cast();
+        let tap = HiddenTap { layer: 4, ptr: pointer, rows: 7, hidden: 5120, stride: 5128,
+            stream: std::ptr::null_mut() };
+        let taps = [tap, HiddenTap { layer: 16, ..tap }];
+        validate_target_taps(&taps, &[4, 16], 5120, std::ptr::null_mut(), 7, 7).unwrap();
+        assert!(validate_target_taps(&taps, &[16, 4], 5120, std::ptr::null_mut(), 7, 7).is_err());
+        assert!(validate_target_taps(&taps, &[4], 5120, std::ptr::null_mut(), 7, 7).is_err());
+        for invalid in [HiddenTap { rows: 6, ..tap }, HiddenTap { hidden: 4096, ..tap },
+            HiddenTap { stride: 5119, ..tap }, HiddenTap { ptr: std::ptr::null(), ..tap },
+            HiddenTap { stream: std::ptr::from_ref(&marker).cast_mut().cast(), ..tap },
+            HiddenTap { stride: usize::MAX, ..tap }] {
+            assert!(validate_target_taps(&[invalid], &[4], 5120, std::ptr::null_mut(), 7, 7).is_err());
+        }
     }
 
     #[test]

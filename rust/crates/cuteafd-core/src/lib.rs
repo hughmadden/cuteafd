@@ -14,7 +14,7 @@ pub use target_sampling::{
     TargetSamplingError, TargetSamplingParams, GREEDY_TEMPERATURE_EPS, MAX_TARGET_TEMPERATURE,
 };
 mod dspark_verify;
-pub use dspark_verify::{verify_dspark_greedy, GreedyVerification, MAX_DSPARK_PROPOSALS, V41_VERIFY_ROWS};
+pub use dspark_verify::{verify_dspark_greedy, verify_dspark_greedy_vocab, GreedyVerification, MAX_DSPARK_PROPOSALS, V41_VERIFY_ROWS};
 mod engram;
 pub mod prefix;
 pub mod serving_capacity;
