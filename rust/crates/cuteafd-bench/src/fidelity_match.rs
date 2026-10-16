@@ -30,9 +30,10 @@ pub const PUBLICATIONS: &[Publication] = &[
 ];
 
 /// Official precision identities can exist before their datasets are published
-/// (now every entry here has a PUBLICATIONS row; the table stays separate).
+/// (unpublished roots deliberately have no PUBLICATIONS row).
 /// An instruct root's pretraining ancestry is not a precision upgrade.
 pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
+    ("stepfun-ai/Step-5-Preview-BF16", &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"]),
     ("Qwen/Qwen3.5-9B", &["Qwen/Qwen3.5-9B"]),
     ("Qwen/Qwen3.8-27B", &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"]),
 ];
@@ -269,10 +270,24 @@ mod tests {
         let r = resolve_in("Qwen/Qwen3.8-27B-FP8", None, tmp.path()).unwrap();
         assert_eq!((r.reference_root.as_str(), r.config.as_str()), ("Qwen/Qwen3.8-27B", dataset::QWEN38_27B_CONFIG));
         for (root, siblings) in OFFICIAL_ROOTS {
-            assert!(official(root).is_some_and(|p| p.root == *root && p.siblings == *siblings), "{root}");
+            if let Some(p) = official(root) {
+                assert_eq!((p.root, p.siblings), (*root, *siblings));
+            }
+            for sibling in *siblings { assert_eq!(official_root(sibling), Some(*root)); }
         }
         assert_eq!(official_root("Qwen/Qwen3.8-27B-FP8"), Some("Qwen/Qwen3.8-27B"));
         assert_eq!(official_root("Qwen/Qwen3.5-9B-FP8"), None);
+    }
+
+    #[test]
+    fn step5_official_roots_do_not_claim_an_unpublished_dataset() {
+        for model in ["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview",
+                      "stepfun-ai/Step-5-Preview-NVFP4"] {
+            assert_eq!(official_root(model), Some("stepfun-ai/Step-5-Preview-BF16"));
+            assert!(official(model).is_none());
+        }
+        assert_eq!(official_root("someone/Step-5-Preview-NVFP4"), None);
+        assert_eq!(official_root("stepfun-ai/Step-5-Preview-FP8"), None);
     }
 
     #[test]
