@@ -333,11 +333,12 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         && topology.is_none()
         && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native
         && expert_layers < 40;
-    admission::select_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
+    let spark_admission = admission::start_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
         topology, if device_exchange { 2 } else { 0 })?;
     eprintln!("loading bottom {expert_layers} expert layers as TP2");
     let routed = tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
         rank_budgets, &exl3_directory)?;
+    if let Some(pending) = spark_admission { pending.wait()?; }
     let mut make_transport = || {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {

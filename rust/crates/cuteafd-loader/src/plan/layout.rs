@@ -321,17 +321,6 @@ pub struct FamilyCosts {
 }
 
 
-/// Compatibility query for the dedicated V4.1 worker. Generic planning uses
-/// the selected working set's explicit SparkIoBytes instead of allowances.
-pub fn v41_spark_ring_allowance(family: &str, capacity: u64, calibrated: u64, bf16: bool) -> u64 {
-    if family != "deepseek_v41" { return calibrated; }
-    let exact = u32::try_from(capacity).ok().and_then(|capacity|
-        cuteafd_core::ExpertGeometry::DEEPSEEK_V41.compact_ring_bytes(
-            capacity, 64 << 20, 8, 8 << 20, 4096, 2, bf16));
-    exact.map_or(u64::MAX, |bytes| bytes as u64)
-}
-
-
 fn spark_ring_geometry(family: &str, lanes: u64) -> crate::placement::SparkRingGeometry {
     let endpoints = match family {
         "deepseek_v41" | "deepseek_v4" => 2,

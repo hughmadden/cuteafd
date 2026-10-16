@@ -244,9 +244,17 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                     DeviceKind::Spark => {
                         assert_eq!(device.by_category()[&Category::Experts], packed(ranks as u64) * 39);
                         let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
-                        assert_eq!(rings.bytes, layout::v41_spark_ring_allowance(
-                            "deepseek_v41", options.layout.as_ref().unwrap().spark_capacity_rows, 0, nvfp4,
-                        ));
+                        let ingress = if nvfp4 { cuteafd_core::SparkIngress::Bf16 }
+                            else { cuteafd_core::SparkIngress::Fp8K32 };
+                        let endpoints = vec![cuteafd_core::SparkEndpoint {
+                            capacity: options.layout.as_ref().unwrap().spark_capacity_rows as u32,
+                            ingress,
+                        }; 2];
+                        assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(
+                            cuteafd_core::ExpertGeometry::DEEPSEEK_V41, cuteafd_core::SparkRings {
+                                max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
+                                alignment: 4096,
+                            }).unwrap() as u64).sum::<u64>());
                     }
                     DeviceKind::Rtx => {
                         let local = device.items.iter().find(|item| item.group.starts_with("resident routed")

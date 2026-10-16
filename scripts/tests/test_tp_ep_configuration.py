@@ -186,15 +186,6 @@ class TopologyConfigTest(unittest.TestCase):
             with self.subTest(overlay=overlay):
                 result = load(overlay, "true")
                 self.assertEqual(result.returncode, 0, result.stderr)
-        # A single RTX has no local routed layer, so TP2 remote weights overflow
-        # the default 100 GiB budget and the budget gate must reject them.
-        first_layer = source_common('release_spark_first_layer 1 auto')
-        self.assertEqual(first_layer.stdout.strip(), "0")
-        self.assertEqual(
-            source_common('release_validate_spark_weight_admission 0 2 107374182400').returncode,
-            2,
-        )
-
     def test_explicit_topology_rejects_non_native_formats(self) -> None:
         for overlay, message in (
             ("EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n", "requires EXPERT_FORMAT=native"),
@@ -222,77 +213,6 @@ class TopologyConfigTest(unittest.TestCase):
         result = load("SPARK_GROUPS=2\n", "true")
         self.assertEqual(result.returncode, 2)
         self.assertIn("unknown configuration key: SPARK_GROUPS", result.stderr)
-
-
-class AdmissionTest(unittest.TestCase):
-    def report(self, first_layer: int, tp: int, budget: int = 107374182400) -> subprocess.CompletedProcess[str]:
-        return source_common(
-            'release_validate_spark_weight_admission "$1" "$2" "$3"',
-            str(first_layer), str(tp), str(budget),
-        )
-
-    def test_exact_layer_bytes(self) -> None:
-        # TP6 stores the exact 2304/6 = 384 column slice with no padding, so its
-        # per-rank layer is exactly one sixth of the 7,219,445,760-byte
-        # six-column total and smaller than TP4's 640-padded extent.
-        expected = {2: "3609722880", 3: "2406481920", 4: "2005401600", 6: "1203240960"}
-        for tp, value in expected.items():
-            with self.subTest(tp=tp):
-                result = source_common('release_spark_layer_bytes "$1"', str(tp))
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), value)
-        self.assertLess(int(expected[6]), int(expected[4]))
-        result = source_common('release_spark_layer_bytes 1')
-        self.assertEqual(result.returncode, 2)
-
-    def test_weight_only_boundary_thresholds(self) -> None:
-        # TP2 remote weights need at least 11 RTX-local layers in the 100 GiB
-        # budget: 29 remote layers fit, 30 do not.
-        ok = self.report(11, 2)
-        self.assertEqual(ok.returncode, 0, ok.stderr)
-        self.assertIn("remote_layers=29", ok.stdout)
-        self.assertIn("workspace_accounted=no", ok.stdout)
-        self.assertIn(f"per_rank_weight_bytes={29 * 3609722880}", ok.stdout)
-
-        bad = self.report(10, 2)
-        self.assertEqual(bad.returncode, 2)
-        self.assertIn("weight-only admission fails", bad.stderr)
-
-        # TP3 can hold every layer in the weight budget; TP4 is padded.
-        tp3 = self.report(0, 3)
-        self.assertEqual(tp3.returncode, 0, tp3.stderr)
-        self.assertIn("remote_layers=40", tp3.stdout)
-        self.assertIn(f"per_rank_weight_bytes={40 * 2406481920}", tp3.stdout)
-
-        tp4 = self.report(0, 4)
-        self.assertEqual(tp4.returncode, 0, tp4.stderr)
-        self.assertIn(f"per_rank_weight_bytes={40 * 2005401600}", tp4.stdout)
-
-        # Pure TP6 is the roomiest layout: it fits all 40 remote layers' weights
-        # inside the 100 GiB default fallback with the largest residual. TP3
-        # (96.26 GB) and TP4 (80.2 GB padded) also fit; only TP2 cannot. Real
-        # workspace, staging and ring headroom remain unmeasured for all of them.
-        tp6 = self.report(0, 6)
-        self.assertEqual(tp6.returncode, 0, tp6.stderr)
-        self.assertIn("remote_layers=40", tp6.stdout)
-        self.assertIn(f"per_rank_weight_bytes={40 * 1203240960}", tp6.stdout)
-
-    def test_single_rtx_tp6_can_load_all_forty_layers_remote(self) -> None:
-        # A 1-RTX TP6 placement has no local routed layer, so every layer must be
-        # remote. Pure TP6 fits the tested six-host floor with a large margin.
-        first_layer = source_common('release_spark_first_layer 1 auto')
-        self.assertEqual(first_layer.stdout.strip(), "0")
-        admission = source_common('release_validate_spark_weight_admission 0 6 109119320064')
-        self.assertEqual(admission.returncode, 0, admission.stderr)
-        self.assertIn("remote_layers=40", admission.stdout)
-        self.assertIn(f"per_rank_weight_bytes={40 * 1203240960}", admission.stdout)
-        # The residual is real: 109,119,320,064 - 48,129,638,400.
-        self.assertIn("weight_margin_bytes=60989681664", admission.stdout)
-
-    def test_dynamic_boundary_changes_the_verdict(self) -> None:
-        # The same topology flips at the real boundary; no hardcoded 20.
-        self.assertEqual(self.report(20, 2).returncode, 0)
-        self.assertEqual(self.report(0, 2).returncode, 2)
 
 
 class ExampleConfigTest(unittest.TestCase):
@@ -412,7 +332,6 @@ class LauncherTopologyTest(unittest.TestCase):
             setup = f'''set -euo pipefail
 source scripts/lib/release-common.sh
 release_die() {{ echo "$*" >&2; exit 1; }}
-release_validate_spark_weight_admission() {{ echo "remote_layers=stub"; }}
 RELEASE_RTX_GPUS="$1"
 repo_root="$PWD"
 coordinator=coordinator
@@ -564,8 +483,7 @@ v41_fp8_head_args=()
             plan=dict(version=1, rtx_gpus=2, nonce="fresh", rtx_expert_layers=20, spark_first_layer=20),
             topology_explicit=1, spark_tp=3, spark_ep=1, spark_count=3,
             hosts=["a", "b", "c"],
-            extra_setup='model_is_exl3=true\nexpert_format=exl3-k34\n'
-                        'release_validate_spark_weight_admission() { echo "native sizing used" >&2; return 1; }\n',
+            extra_setup='model_is_exl3=true\nexpert_format=exl3-k34\n',
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         coordinator = next(args for tool, args in events if tool == "docker" and args[0] == "run")

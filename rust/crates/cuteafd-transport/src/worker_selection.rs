@@ -489,11 +489,6 @@ pub fn receive_worker_selection(stream: &TcpStream, rank: usize, timeout: Durati
     Ok(start.selection)
 }
 
-/// Call only after the exact selected set has loaded and passed admission.
-pub fn acknowledge_worker_selection(stream: &mut TcpStream, rank: usize, selection: &WorkerSelection) -> Result<()> {
-    acknowledge_model_admission(stream, rank, selection, None)
-}
-
 pub fn acknowledge_model_admission(stream: &mut TcpStream, rank: usize, selection: &WorkerSelection,
     admission: Option<&cuteafd_core::ModelAdmissionResponse>) -> Result<()> {
     validate_admission_response(selection, rank, admission)?;
@@ -591,62 +586,94 @@ pub(crate) fn seal_installed_grouping(peer: SocketAddr, current: Option<&Install
     Ok(())
 }
 
-/// Solve first, then select all workers concurrently before opening Spark links.
-/// An acknowledgment names the exact loaded set, rank and identity; all later
-/// connections to these peers are sealed to that selection for this process.
-pub fn select_worker_layers(peers: &[SocketAddr], selection: &WorkerSelection, timeout: Duration) -> Result<()> {
-    ensure!(selection.model().is_none(), "typed Spark selection requires ModelAdmissionResponse validation");
-    select_model_admission(peers, selection, timeout).map(|_| ())
+/// Sent selections own only control sockets; dropping closes them without leaving
+/// startup threads behind. No peer seal is published until every reply validates.
+pub struct PendingModelAdmission {
+    peers: Vec<SocketAddr>,
+    selection: WorkerSelection,
+    streams: Vec<TcpStream>,
 }
 
-/// Returns rank-ordered worker measurements; the coordinator must reconcile them
-/// with checkpoint-header SparkAssignments before dependent allocations.
-pub fn select_model_admission(peers: &[SocketAddr], selection: &WorkerSelection,
-    timeout: Duration) -> Result<Vec<cuteafd_core::ModelAdmissionResponse>> {
+/// Send the solved selection concurrently, without waiting for worker loading.
+pub fn start_model_admission(peers: &[SocketAddr], selection: &WorkerSelection,
+    timeout: Duration) -> Result<PendingModelAdmission> {
     selection.validate()?;
+    ensure!(selection.model().is_some(), "Spark selection requires typed ModelAdmission");
     ensure!(peers.len() == selection.identity.world as usize, "worker peer world mismatch");
     ensure!(peers.iter().collect::<std::collections::BTreeSet<_>>().len() == peers.len(), "duplicate worker peer");
     let digest = selection.digest()?;
     for &peer in peers {
         if let Some(previous) = peer_selection_digest(peer)? { ensure!(previous == digest, "worker peer already sealed to another placement"); }
     }
-    let reports = std::thread::scope(|scope| -> Result<Vec<cuteafd_core::ModelAdmissionResponse>> {
-        let jobs = peers.iter().enumerate().map(|(rank, &peer)| scope.spawn(move || -> Result<Option<cuteafd_core::ModelAdmissionResponse>> {
+    let streams = std::thread::scope(|scope| -> Result<Vec<TcpStream>> {
+        let jobs = peers.iter().enumerate().map(|(rank, &peer)| scope.spawn(move || -> Result<TcpStream> {
             let mut stream = TcpStream::connect_timeout(&peer, timeout)?;
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))?;
-            write(&mut stream, &Start { message: "worker_selection_start".into(), rank, selection: selection.clone(), digest: selection.digest()? })?;
-            let ready: Ready = read(&stream)?;
-            ensure!(ready.message == "worker_selection_ready" && ready.rank == rank && &ready.selection == selection
-                && ready.digest == selection.digest()?, "worker loaded-set acknowledgment mismatch for rank {rank}");
-            validate_admission_response(selection, rank, ready.admission.as_ref())?;
-            Ok(ready.admission)
+            write(&mut stream, &Start { message: "worker_selection_start".into(), rank,
+                selection: selection.clone(), digest: selection.digest()? })?;
+            Ok(stream)
         })).collect::<Vec<_>>();
+        let mut streams = Vec::new();
         let mut failure = None;
-        let mut reports = Vec::new();
         for job in jobs {
             match job.join().map_err(|_| anyhow::anyhow!("worker selection thread panicked")).and_then(|result| result) {
-                Ok(Some(report)) => reports.push(report),
-                Ok(None) => {},
+                Ok(stream) => streams.push(stream),
                 Err(error) => { if failure.is_none() { failure = Some(error); } }
             }
         }
         if let Some(error) = failure { return Err(error); }
-        Ok(reports)
+        Ok(streams)
     })?;
-    let mut seals = seals().lock().map_err(|_| anyhow::anyhow!("worker selection seals poisoned"))?;
-    let candidates = peers.iter().enumerate().map(|(rank, &peer)| (peer, PeerSeal {
-        digest: digest.clone(), admission: reports.get(rank).cloned(),
-        endpoints: std::sync::Arc::new(EndpointSet { selection: selection.clone(), used: std::sync::atomic::AtomicUsize::new(0) }),
-    })).collect::<Vec<_>>();
-    for (peer, seal) in &candidates {
-        if let Some(previous) = seals.get(peer) {
-            ensure!(previous == seal, "worker {peer} changed placement or admission across reconnect");
+    Ok(PendingModelAdmission { peers: peers.to_vec(), selection: selection.clone(), streams })
+}
+
+impl PendingModelAdmission {
+    /// Await rank-ordered measurements and seal validated replies before links open.
+    pub fn wait(self) -> Result<Vec<cuteafd_core::ModelAdmissionResponse>> {
+        let Self { peers, selection, streams } = self;
+        let digest = selection.digest()?;
+        let selection = &selection;
+        let reports = std::thread::scope(|scope| -> Result<Vec<cuteafd_core::ModelAdmissionResponse>> {
+            let jobs = streams.into_iter().enumerate().map(|(rank, stream)| scope.spawn(move || -> Result<Option<cuteafd_core::ModelAdmissionResponse>> {
+                let ready: Ready = read(&stream)?;
+                ensure!(ready.message == "worker_selection_ready" && ready.rank == rank && &ready.selection == selection
+                    && ready.digest == selection.digest()?, "worker loaded-set acknowledgment mismatch for rank {rank}");
+                validate_admission_response(selection, rank, ready.admission.as_ref())?;
+                Ok(ready.admission)
+            })).collect::<Vec<_>>();
+            let mut failure = None;
+            let mut reports = Vec::new();
+            for job in jobs {
+                match job.join().map_err(|_| anyhow::anyhow!("worker selection thread panicked")).and_then(|result| result) {
+                    Ok(Some(report)) => reports.push(report),
+                    Ok(None) => {},
+                    Err(error) => { if failure.is_none() { failure = Some(error); } }
+                }
+            }
+            if let Some(error) = failure { return Err(error); }
+            Ok(reports)
+        })?;
+        let mut seals = seals().lock().map_err(|_| anyhow::anyhow!("worker selection seals poisoned"))?;
+        let candidates = peers.iter().enumerate().map(|(rank, &peer)| (peer, PeerSeal {
+            digest: digest.clone(), admission: reports.get(rank).cloned(),
+            endpoints: std::sync::Arc::new(EndpointSet { selection: (*selection).clone(), used: std::sync::atomic::AtomicUsize::new(0) }),
+        })).collect::<Vec<_>>();
+        for (peer, seal) in &candidates {
+            if let Some(previous) = seals.get(peer) {
+                ensure!(previous == seal, "worker {peer} changed placement or admission across reconnect");
+            }
         }
+        for (peer, seal) in candidates { seals.entry(peer).or_insert(seal); }
+        crate::traffic::observe_peers(&peers);
+        Ok(reports)
     }
-    for (peer, seal) in candidates { seals.entry(peer).or_insert(seal); }
-    crate::traffic::observe_peers(peers);
-    Ok(reports)
+}
+
+/// Send and await immediately when no independent coordinator load can overlap.
+pub fn select_model_admission(peers: &[SocketAddr], selection: &WorkerSelection,
+    timeout: Duration) -> Result<Vec<cuteafd_core::ModelAdmissionResponse>> {
+    start_model_admission(peers, selection, timeout)?.wait()
 }
 
 /// A startup/reconnect control-only request; no QP or GPU allocation occurred.
@@ -993,6 +1020,65 @@ mod tests {
     }
 
     #[test]
+    fn selection_send_overlaps_load_and_wait_seals_only_valid_replies() -> Result<()> {
+        let selection = admission_selection();
+        let report = admission_report(&selection);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let peer = listener.local_addr()?;
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| -> Result<()> {
+            let worker_selection = &selection;
+            let worker_report = &report;
+            let worker = scope.spawn(move || -> Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                let received = receive_worker_selection(&stream, 0, Duration::from_secs(3))?;
+                // The coordinator can finish an independent load before Ready.
+                ensure!(&received == worker_selection);
+                loaded_rx.recv_timeout(Duration::from_secs(3))?;
+                acknowledge_model_admission(&mut stream, 0, &received, Some(worker_report))
+            });
+            let pending = start_model_admission(&[peer], &selection, Duration::from_secs(3))?;
+            assert!(peer_selection_digest(peer)?.is_none());
+            loaded_tx.send(())?;
+            assert_eq!(pending.wait()?, [report.clone()]);
+            worker.join().unwrap()?;
+            Ok(())
+        })?;
+        assert_eq!(peer_selection_digest(peer)?, Some(selection.digest()?));
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_selection_closes_control_without_waiting_for_ready() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let peer = listener.local_addr()?;
+        let pending = start_model_admission(&[peer], &admission_selection(), Duration::from_secs(3))?;
+        let (mut stream, _) = listener.accept()?;
+        receive_worker_selection(&stream, 0, Duration::from_secs(3))?;
+        drop(pending);
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte)?, 0);
+        assert!(peer_selection_digest(peer)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_ready_never_publishes_peer_seal() -> Result<()> {
+        let selection = admission_selection();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let peer = listener.local_addr()?;
+        let pending = start_model_admission(&[peer], &selection, Duration::from_secs(3))?;
+        let (mut stream, _) = listener.accept()?;
+        receive_worker_selection(&stream, 0, Duration::from_secs(3))?;
+        write(&mut stream, &Ready { message: "worker_selection_ready".into(), rank: 1,
+            selection: selection.clone(), digest: selection.digest()?,
+            admission: Some(admission_report(&selection)) })?;
+        assert!(pending.wait().is_err());
+        assert!(peer_selection_digest(peer)?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn model_admission_returns_rank_reports_and_rejects_changed_reconnect() {
         let selection = admission_selection();
         let report = admission_report(&selection);
@@ -1014,7 +1100,6 @@ mod tests {
             }
             assert!(select_model_admission(&[peer], &selection, Duration::from_secs(3)).is_err());
         });
-        assert!(select_worker_layers(&[peer], &selection, Duration::from_secs(3)).is_err());
     }
 
     #[test]
@@ -1222,22 +1307,5 @@ mod tests {
         assert_eq!(reply["message"], "fabric_traffic");
         assert!(reply["sample"].is_object());
     }
-    #[test]
-    fn worker_selection_control_checks_exact_ack_and_reconnect() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let selection = WorkerSelection::new(WorkerIdentity { world: 1, ..identity() }, &[13, 14]).unwrap();
-        let peer = listener.local_addr().unwrap();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let (mut stream, _) = listener.accept().unwrap();
-                let received = receive_worker_selection(&stream, 0, Duration::from_secs(3)).unwrap();
-                assert_eq!(received, selection);
-                acknowledge_worker_selection(&mut stream, 0, &received).unwrap();
-            });
-            select_worker_layers(&[peer], &selection, Duration::from_secs(3)).unwrap();
-        });
-        assert_eq!(peer_selection_digest(peer).unwrap(), Some(selection.digest().unwrap()));
-        let changed = WorkerSelection::new(WorkerIdentity { world: 1, ..identity() }, &[14]).unwrap();
-        assert!(select_worker_layers(&[peer], &changed, Duration::from_secs(3)).is_err());
-    }
+
 }

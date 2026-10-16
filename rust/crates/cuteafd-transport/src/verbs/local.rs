@@ -120,32 +120,6 @@ pub struct LocalVerbsExpertConnection {
 unsafe impl Send for LocalVerbsExpertConnection {}
 
 impl LocalVerbsExpertConnection {
-    /// Bootstrap only; call on an admission thread, then transfer to the GPU owner.
-    /// `timing` is the startup-resolved diagnostics flag; it is not re-read from
-    /// the environment on the poll path.
-    pub fn accept(stream: TcpStream, max_frame_bytes: usize, timing: bool) -> Result<Self> {
-        verbs_host_preflight()?;
-        let start = Self::read_persistent_start(&stream, max_frame_bytes, None)?;
-        let path =
-            verbs_host_native_library_path().context("native RoCE library not configured")?;
-        let library = Arc::new(unsafe { NativeLibrary::load(&path) }?);
-        Self::initialize(stream, library, start, timing)
-    }
-
-    /// Bootstrap with a shared mapped-ring byte budget. The reservation is
-    /// validated against the peer's advertised wire spans and charged **before**
-    /// the native mapped allocation, then held by the returned connection until
-    /// it is dropped. A malformed or oversized advertisement fails closed
-    /// without touching the other live peers.
-    pub fn accept_with_budget(
-        stream: TcpStream,
-        max_frame_bytes: usize,
-        timing: bool,
-        budget: Arc<RingBudget>,
-    ) -> Result<Self> {
-        Self::accept_with_selection(stream, max_frame_bytes, timing, budget, None)
-    }
-
     /// An opt-in placement worker rejects unsealed or different later lanes
     /// before any mapped ring/native endpoint allocation.
     pub fn accept_with_selection(

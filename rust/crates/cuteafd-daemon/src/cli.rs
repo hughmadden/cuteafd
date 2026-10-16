@@ -52,8 +52,6 @@ pub(crate) enum Commands {
     Plan(PlanArgs),
     /// Report RDMA ports, link and PCIe rates, subnets and the rail plan.
     Fabric(FabricArgs),
-    /// Check live Spark expert ranks for one layer against a CPU oracle.
-    ExpertProbe(ExpertProbeArgs),
     /// Serve a checkpoint through the OpenAI API; the family comes from
     /// --snapshot's config.json (or --family). `serve --family ID --help` lists
     /// that family's options.
@@ -111,60 +109,6 @@ pub(crate) enum Commands {
     BenchRdma(BenchRdmaArgs),
     BenchRdmaRing(BenchRdmaRingArgs),
     TransportCapabilities(TransportCapabilitiesArgs),
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct ExpertProbeArgs {
-    /// Checkpoint snapshot directory the Spark ranks serve.
-    #[arg(long)]
-    pub(crate) snapshot: PathBuf,
-    /// Spark ranks in TP order, comma-separated HOST:PORT.
-    #[arg(long, required_unless_present = "local")]
-    pub(crate) peers: Option<String>,
-    /// Run the experts on this GPU through the coordinator's resident-layer
-    /// path (DeepSeek V4 `LocalExperts`) instead of the Sparks.
-    #[arg(long, requires = "native_lib")]
-    pub(crate) local: bool,
-    /// Native library whose coordinator kernels/packages serve `--local`.
-    #[arg(long)]
-    pub(crate) native_lib: Option<PathBuf>,
-    /// With `--local`, probe dSpark stage S (`mtp.S`) instead of `--layer`.
-    #[arg(long, requires = "local")]
-    pub(crate) stage: Option<usize>,
-    #[arg(long, default_value_t = 3)]
-    pub(crate) layer: usize,
-    #[arg(long, default_value_t = 16)]
-    pub(crate) rows: u32,
-    /// Transport capacity; must not exceed the ranks' --capacity.
-    #[arg(long, default_value_t = 4096)]
-    pub(crate) capacity: u32,
-    #[arg(long, default_value_t = 20260929)]
-    pub(crate) seed: u64,
-    /// Time this many more round trips after the checked one (median, min).
-    #[arg(long, default_value_t = 0)]
-    pub(crate) repeat: usize,
-    /// With `--local` on an FP8 checkpoint: the package layout directory
-    /// (default `<libdir>/fp8/fp8-<family>/tp<local-tp>`).
-    #[arg(long)]
-    pub(crate) fp8_package: Option<PathBuf>,
-    /// With `--local` on an FP8 checkpoint: run every rank slice of TP degree
-    /// N on this GPU in turn (a Spark package's tp2/tp4 layout) and sum the
-    /// BF16 rank partials in FP32, as the coordinator does.
-    #[arg(long, default_value_t = 1, requires = "local")]
-    pub(crate) local_tp: usize,
-    /// Compare and time coordinator intakes of the ranks' partials, e.g.
-    /// `host,pinned,gpu` (bit-identical planes and sums; `--repeat` waves each).
-    #[arg(long, requires = "native_lib")]
-    pub(crate) intake: Option<String>,
-    /// With `--intake`: run each mode's transport on its own lane thread (as
-    /// GLM 5.3 prefill does) instead of inline.
-    #[arg(long, requires = "intake")]
-    pub(crate) intake_lane: bool,
-    /// With `--local --local-tp N` on an EXL3 checkpoint: the Spark-role EXL3
-    /// package root (`tp<N>-rank<R>/m<capacity>` layouts, e.g. a `--loopback`
-    /// build) whose rank slices run on this GPU in turn, BF16 partials summed.
-    #[arg(long, requires = "local")]
-    pub(crate) exl3_package: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

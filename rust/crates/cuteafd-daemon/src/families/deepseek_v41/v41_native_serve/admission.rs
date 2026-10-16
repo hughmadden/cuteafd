@@ -23,28 +23,42 @@ fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool, device_endpoin
     Ok(model)
 }
 
-pub(super) fn select_sparks(args: &crate::cli::NativeServeArgs,
+pub(super) fn start_sparks(args: &crate::cli::NativeServeArgs,
     catalog: &cuteafd_loader::OfficialV41Catalog, local_layers: usize,
     capacity: u32, compiled_capacity: u32,
     topology: Option<cuteafd_transport::expert::SparkTopology>,
-    device_endpoints: usize) -> Result<()> {
+    device_endpoints: usize) -> Result<Option<crate::shared::placement::PendingSparkAdmission>> {
     let geometry = catalog.routed_experts().geometry()?;
     ensure!(local_layers <= geometry.layers as usize, "V4.1 local boundary exceeds checkpoint");
     if args.peers.is_empty() {
         ensure!(local_layers == geometry.layers as usize, "V4.1 remote layers require Spark peers");
-        return Ok(());
+        return Ok(None);
     }
     let working = SparkWorkingSet { spark_layers: (local_layers..geometry.layers as usize).collect(),
         rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: 2 };
-    crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
+    Ok(Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
         &working, args.peers.len(), topology,
         spark_model(capacity, compiled_capacity, catalog.nvfp4().is_some(), device_endpoints)?)?
-        .select(&args.peers)
+        .start(&args.peers)?))
 }
 
 #[cfg(test)]
 mod spark_tests {
     use super::*;
+
+    #[test]
+    fn local_load_overlaps_spark_load_before_transport_connects() {
+        for (source, load, connect) in [
+            (include_str!("../v41_native_serve.rs"), "ExpertWeights::load(", "transport.install_device_link("),
+            (include_str!("distributed.rs"), "tp2_ffn::load_routed_weights(", "let mut make_transport ="),
+        ] {
+            let start = source.find("admission::start_sparks(").unwrap();
+            let load = source[start..].find(load).unwrap() + start;
+            let wait = source.find("pending.wait()?").unwrap();
+            let connect = source[wait..].find(connect).unwrap() + wait;
+            assert!(start < load && load < wait && wait < connect);
+        }
+    }
 
     #[test]
     fn endpoint_contract_covers_both_regular_and_each_device_lane() -> Result<()> {

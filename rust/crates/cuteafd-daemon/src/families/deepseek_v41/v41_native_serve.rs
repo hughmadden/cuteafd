@@ -512,7 +512,7 @@ fn worker(
     let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
         && topology.is_none()
         && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40;
-    admission::select_sparks(&args, &catalog, local_layers, capacity, aot_capacity,
+    let spark_admission = admission::start_sparks(&args, &catalog, local_layers, capacity, aot_capacity,
         topology, usize::from(device_exchange))?;
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
@@ -565,6 +565,7 @@ fn worker(
         tracing::info!(layers=local_layers, elapsed_ms=local_started.elapsed().as_millis(),
             "local RTX experts ready");
     }
+    if let Some(pending) = spark_admission { pending.wait()?; }
     if device_exchange {
         // Verification waves (up to 80 rows) on the device-driven exchange; it
         // connects (and warms) the workers, so only once they are serving.

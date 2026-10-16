@@ -1852,21 +1852,6 @@ release_select_build_hosts() {
   done
 }
 
-# The Spark interval must cover every routed layer the coordinator delegates.
-# Auto currently guarantees at least 20 RTX layers for the dual layout; an
-# explicit boundary can be lower while the coordinator-produced plan is pending.
-release_spark_first_layer() {
-  local layout="$1" layers="$2"
-  if [[ "$layout" == 1 ]]; then printf '0\n'; return; fi
-  [[ "$layout" == 2 ]] || release_die "invalid RTX layout"
-  if [[ "$layers" == auto ]]; then printf '20\n'; return; fi
-  [[ "$layers" =~ ^([1-9]|[1-3][0-9]|40)$ ]] || release_die "dual RTX expert layers must be 1..40"
-  # The existing expert service requires a nonempty interval even when every
-  # routed layer is local. Keep its last layer as an unused transport endpoint.
-  if [[ "$layers" == 40 ]]; then printf '39\n'; return; fi
-  printf '%s\n' "$layers"
-}
-
 # Native per-TP-rank routed weight for one 40-layer backbone layer, in bytes.
 # These are the exact tensor windows from the official checkpoint geometry:
 # 1,804,861,440 B/rank at TP4 raw, padded to a 640-wide kernel extent
@@ -1895,39 +1880,6 @@ release_spark_layer_bytes() {
     6) printf '%s\n' 1203240960 ;;
     *) release_die "unsupported Spark TP degree: $1 (expected 2, 3, 4, or 6)" ;;
   esac
-}
-
-release_spark_remote_layers() {
-  local first_layer="$1"
-  [[ "$first_layer" =~ ^([0-9]|[1-3][0-9]|40)$ ]] ||
-    release_die "Spark first layer must be 0..40: $first_layer"
-  ((first_layer <= 39)) ||
-    release_die "Spark first layer must be 0..39: $first_layer"
-  printf '%s\n' "$((40 - first_layer))"
-}
-
-release_spark_remote_weight_bytes() {
-  local first_layer="$1" tp="$2" format="${3:-native}"
-  printf '%s\n' "$(($(release_spark_remote_layers "$first_layer") * $(release_spark_layer_bytes "$tp" "$format")))"
-}
-
-# Weight-only admission for the resolved dynamic RTX/Spark boundary.
-#
-# IMPORTANT: a successful check means the *weights* fit the Spark budget. It is
-# not a launch-feasibility claim: SparkInfer workspace, load staging, replicated
-# activation buffers and runtime headroom are only known after the expert
-# service reports them at startup. run.sh prints the residual and labels it
-# explicitly. Weight-only overflow is a hard failure before any service change.
-release_validate_spark_weight_admission() {
-  local first_layer="$1" tp="$2" budget="$3" format="${4:-native}" remote_layers weight margin
-  [[ "$budget" =~ ^[1-9][0-9]*$ ]] || release_die "Spark device budget must be a positive integer"
-  remote_layers="$(release_spark_remote_layers "$first_layer")"
-  weight="$(release_spark_remote_weight_bytes "$first_layer" "$tp" "$format")"
-  ((weight <= budget)) ||
-    release_die "Spark TP${tp} weight-only admission fails: ${remote_layers} remote layers need ${weight} B > ${budget} B budget (lower the RTX boundary first layer)"
-  margin=$((budget - weight))
-  printf 'remote_layers=%s per_rank_weight_bytes=%s weight_margin_bytes=%s budget_bytes=%s workspace_accounted=no\n' \
-    "$remote_layers" "$weight" "$margin" "$budget"
 }
 
 # Validate booleans independently of resolved GPU selection. Called again after

@@ -63,14 +63,30 @@ impl SparkAdmission {
         Ok(())
     }
 
-    pub(crate) fn select(self, peers: &[SocketAddr]) -> Result<()> {
-        let reports = cuteafd_transport::worker_selection::select_model_admission(
+    pub(crate) fn start(self, peers: &[SocketAddr]) -> Result<PendingSparkAdmission> {
+        let pending = cuteafd_transport::worker_selection::start_model_admission(
             peers, &self.selection, Duration::from_secs(1200))?;
-        self.reconcile(&reports)?;
+        Ok(PendingSparkAdmission { plan: self, pending })
+    }
+
+    pub(crate) fn select(self, peers: &[SocketAddr]) -> Result<()> {
+        self.start(peers)?.wait()
+    }
+}
+
+pub(crate) struct PendingSparkAdmission {
+    plan: SparkAdmission,
+    pending: cuteafd_transport::worker_selection::PendingModelAdmission,
+}
+
+impl PendingSparkAdmission {
+    pub(crate) fn wait(self) -> Result<()> {
+        let reports = self.pending.wait()?;
+        self.plan.reconcile(&reports)?;
         for report in reports {
             tracing::info!(rank = report.rank, resident_bytes = report.resident_bytes,
                 workspace_bytes = report.runtime.workspace_bytes, ring_bytes = report.mapped_ring_bytes,
-                slices = ?report.slices, "Spark checkpoint assignment reconciled before coordinator allocation");
+                slices = ?report.slices, "Spark checkpoint assignment reconciled before transport connection");
         }
         Ok(())
     }

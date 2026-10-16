@@ -752,25 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn standard_v41_planner_allowance_covers_exact_worker_rings() {
-        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, 96);
-        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, 96);
-        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN, 40);
-        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN, 12);
-        let allowance = cuteafd_loader::plan::layout::family_costs("deepseek_v41").spark_ring_bytes;
-        for bf16 in [false, true] {
-            for capacity in [1, 16, 80, 256, 1024, 2048, 4096] {
-                let exact = spark_ring_bytes_for_ingress(capacity, 64 << 20, 8, 8 << 20,
-                    cuteafd_transport::verbs_host_capabilities().preferred_alignment, 2, bf16).unwrap();
-                let charged = cuteafd_loader::plan::layout::v41_spark_ring_allowance(
-                    "deepseek_v41", capacity as u64, allowance, bf16);
-                assert!(exact as u64 <= charged, "capacity={capacity} bf16={bf16} rings={exact} charged={charged}");
-                assert_eq!(charged, exact as u64);
-            }
-        }
-    }
-
-    #[test]
     fn typed_v41_ring_budget_covers_three_or_four_endpoints() {
         let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
         for device in [1, 2] {
