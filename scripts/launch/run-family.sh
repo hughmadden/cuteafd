@@ -115,8 +115,7 @@ _spark_slot_keys() {
 # WIP_INSTANCE and WIP_ROOT are the shared `--wip` slot staging root (the
 # start_coordinator block below passes both to every rank's staging script).
 _family_allowed_keys() {
-  if [[ "$1" == qwen3_5 ]]; then
-    cat <<'EOF'
+  cat <<'EOF'
 VISION
 AUDIO
 COORDINATOR_GPU_BUDGET_GIB
@@ -134,72 +133,48 @@ SPECULATOR
 EMBEDDING
 COORDINATOR_GPUS
 COORDINATOR_GPU
-RTX_GPUS
-COORDINATOR_SPLIT
 CONCURRENCY
+DECODE_SHARE
 SERVED_MODEL_ID
 ADDR
+RTX_GPUS
+COORDINATOR_SPLIT
 POOL_TOKENS
 PREFIX_CACHE_ENTRIES
-PREFIX_CACHE_MARK_MIB
-PREFIX_POINT_BOUNDARIES
 HOST_CACHE_BYTES
 MAX_OUTPUT_TOKENS
-DECODE_SHARE
 THERMAL
 API_KEY_FILE
 ENABLE_BENCH
 USAGE
 GATEWAY
 EOF
+  if [[ "$1" == qwen3_5 ]]; then
+    cat <<'EOF'
+PREFIX_CACHE_MARK_MIB
+PREFIX_POINT_BOUNDARIES
+EOF
     # Inventory hosts are accepted but never contacted by this RTX-only family.
     _spark_slot_keys HOST LANE_A
     return
   fi
   cat <<'EOF'
-VISION
-AUDIO
 VISION_REPLICAS
-COORDINATOR_GPU_BUDGET_GIB
 RDMA_BOND_BALANCE
 HOST_ISA
 ATTENTION_PLACEMENT
-INSTANCE
-MODEL_ID
-MODEL_REVISION
-SPARK_COUNT
-SPARK_HOSTS
-EXPERT_BACKEND
-COORDINATOR_DOCKER_INFERENCE
-COORDINATOR_DOCKER_DEV
-WIP_INSTANCE
-WIP_ROOT
-SPECULATOR
-EMBEDDING
-COORDINATOR_GPUS
-COORDINATOR_GPU
-CONCURRENCY
 CHAT_TEMPLATE_FROM
 FULL_PREFILL_LOGITS
 SPECULATOR_DRAFTS
-DECODE_SHARE
 EXPERT_INPUT
-SERVED_MODEL_ID
 SPARK_EXPERT_DOCKER_INFERENCE
 SPARK_EXPERT_DOCKER_DEV
 EXPERT_PORT
-ADDR
 SPARK_DEVICE_BUDGET_BYTES
-RTX_GPUS
-COORDINATOR_SPLIT
 COORDINATOR_SPLIT_GPU
-POOL_TOKENS
-PREFIX_CACHE_ENTRIES
-HOST_CACHE_BYTES
 MAX_CONTEXT_TOKENS
 PREFILL_BATCH_TOKENS
 RTX_EXPERT_LAYERS
-MAX_OUTPUT_TOKENS
 PROBE_DUMP_ROOT
 DRAFT_SURVIVAL_LENGTHS
 SPECULATION_TRACE
@@ -208,17 +183,12 @@ SPARK_INTAKE
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
 ATTENTION_PLAN_ROWS
-THERMAL
 PROFILE
 PROFILE_DIR
 PROFILE_NCU_KERNEL
 PROFILE_NCU_COUNT
 PROFILE_NCU_SET
 PROFILE_NSYS_GPU_METRICS
-API_KEY_FILE
-ENABLE_BENCH
-USAGE
-GATEWAY
 EOF
   _spark_slot_keys HOST LANE_A
   case "$1" in
@@ -326,6 +296,15 @@ FP8_SCALES
 EOF
       ;;
   esac
+}
+# WIP bypasses artifact readiness, never the planner's deployment guards.
+release_validate_deployment() {
+  local plan="$1" family="$2"
+  if ! jq -e --arg family "$family" --arg wip "$wip_slot" \
+    '.version == 1 and .family == $family and .launch.family == $family and (.executable == true or ($wip != "" and .wip_launchable == true))' <<<"$plan" >/dev/null; then
+    jq -r '.report.hints[]?' <<<"$plan" >&2 || true
+    release_die "invalid deployment specification"
+  fi
 }
 # DeepSeek V4.1 reads shell variables after release_load_config, not get().
 _v41_allowed_keys() {
@@ -917,14 +896,13 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" \
   --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")")"
+release_validate_deployment "$count_plan" deepseek_v41
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
 if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   [[ "$selected_count" == "$SPARK_COUNT" ]] || release_die "planner changed exact Spark count $SPARK_COUNT to $selected_count"
 fi
 SPARK_COUNT="$selected_count"
 PREFILL_BATCH_TOKENS="$(jq -er '.prefill_rows' <<<"$count_plan")"
-jq -e --arg wip "$wip_slot" '.version == 1 and .family == "deepseek_v41" and .launch.family == "deepseek_v41" and (.executable == true or ($wip != "" and .wip_launchable == true))' <<<"$count_plan" >/dev/null ||
-  release_die "invalid planner deployment"
 spark_tp="$(jq -er '.topology.tp' <<<"$count_plan")"
 spark_ep="$(jq -er '.topology.ep' <<<"$count_plan")"
 topology_explicit=0
@@ -2481,9 +2459,7 @@ audio_encoder_hash=""
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
-  if [[ "$family" == qwen3_5 ]]; then
-    python3 -c 'import json,sys;p=json.load(sys.stdin)["report"]; assert p["placement_supported"] and p["fits"], "dense native placement refused: "+str(p.get("hints"))' <<<"$plan_json" || exit 2
-  fi
+  release_validate_deployment "$plan_json" "$family"
   selected_ranks="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["spark_ranks"])' <<<"$plan_json")"
   if ((count_explicit)) || [[ "$backend" == local ]]; then
     [[ "$selected_ranks" == "$ranks" ]] || release_die "planner changed exact Spark count $ranks to $selected_ranks"
@@ -2492,7 +2468,6 @@ audio_encoder_hash=""
     export SPARK_COUNT="$selected_ranks"
     exec bash "$repo_root/scripts/launch/run-family.sh" "${launch_argv[@]}"
   fi
-  jq -e --arg family "$family" --arg wip "$wip_slot" '.version == 1 and .family == $family and (.executable == true or ($wip != "" and .wip_launchable == true)) and .launch.family == $family' <<<"$plan_json" >/dev/null || release_die "invalid deployment specification"
   read -r first_layer last_layer placement_handshake < <(jq -r '[.launch.first_expert_layer, (.launch.last_expert_layer // -1), (if .placement_handshake then 1 else 0 end)] | @tsv' <<<"$plan_json")
   layer_args="--first-layer $first_layer"
   [[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"

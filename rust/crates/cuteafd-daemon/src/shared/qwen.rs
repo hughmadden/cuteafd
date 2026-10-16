@@ -8,6 +8,36 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::families::qwen::{GdnGeometry, HybridAttention};
 use std::{ffi::c_void, rc::Rc};
 
+pub(crate) enum Encoder {
+    Local(crate::shared::vision::local::LocalEncoder),
+    Remote(crate::shared::vision::remote::RemoteEncoder),
+    Off,
+}
+impl Encoder {
+    pub fn health_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        match self { Self::Remote(client) => Some(client.health_handle()), Self::Local(client) => Some(client.health_handle()), Self::Off => None }
+    }
+    pub fn available(&self) -> bool {
+        match self { Self::Remote(client) => client.healthy(), Self::Local(client) => client.healthy(), Self::Off => false }
+    }
+}
+impl cuteafd_engine::media::EncoderClient for Encoder {
+    fn submit(&mut self, job: cuteafd_engine::media::EncodeJob) -> std::result::Result<cuteafd_engine::media::EncoderTicket, cuteafd_engine::media::MediaError> {
+        use cuteafd_engine::media::MediaError;
+        match self { Self::Local(client) => client.submit(job), Self::Remote(client) => client.submit(job),
+            Self::Off => Err(MediaError::Encoder("encoder not loaded".into())) }
+    }
+    fn poll(&mut self, ticket: cuteafd_engine::media::EncoderTicket) -> Option<std::result::Result<cuteafd_engine::media::EncodeOutput, cuteafd_engine::media::MediaError>> {
+        match self { Self::Local(client) => client.poll(ticket), Self::Remote(client) => client.poll(ticket), Self::Off => None }
+    }
+    fn cancel(&mut self, ticket: cuteafd_engine::media::EncoderTicket) {
+        match self { Self::Local(client) => client.cancel(ticket), Self::Remote(client) => client.cancel(ticket), Self::Off => () }
+    }
+}
+impl scheduler::Encoder for Encoder {
+    fn available(&self) -> bool { self.available() }
+}
+
 type Dev<'a> = Rc<Allocation<'a>>;
 
 /// Rows recorded by the shared GDN replay ABI in the fork.

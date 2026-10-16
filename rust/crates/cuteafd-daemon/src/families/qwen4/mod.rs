@@ -1,7 +1,7 @@
 //! Qwen 3.8 Flash Next (qwen4_exp) on the generic engine: weights, the PLE
 //! n-gram table, the coordinator programs' layer chain, and the golden
 //! comparison command.
-pub(crate) mod media;
+mod media;
 pub(crate) mod engine;
 mod admission;
 mod dual;

@@ -332,7 +332,36 @@ def test_dense_qwen_refuses_failed_native_plan(tmp_path: Path) -> None:
         extra_args=("--wip", "dense-test"),
         encoder_plan={"placement_supported": False, "fits": False, "spark_ranks": 0, "hints": ["missing export"]})
     assert result.returncode != 0
-    assert "dense native placement refused" in result.stderr
+    assert "invalid deployment specification" in result.stderr
+    assert "missing export" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("family", ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5"])
+@pytest.mark.parametrize("failure", ["refused", "wrong-launch-family"])
+def test_every_family_failed_wip_deployment_prints_planner_hints(tmp_path, family, failure):
+    config = ({"model_type": "deepseek_v41"} if family == "deepseek_v41" else
+              {"model_type": "deepseek_v4"} if family == "deepseek_v4" else
+              {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3} if family == "glm5" else
+              DENSE_CONFIG if family == "qwen3_5" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
+    keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    if family == "deepseek_v41":
+        keys += "MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=1\n"
+    elif family == "qwen3_5":
+        keys += "SPARK_COUNT=0\n"
+    elif family == "glm5_flash":
+        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
+    overrides = {"executable": False, "wip_launchable": failure != "refused"}
+    if failure == "wrong-launch-family":
+        overrides["launch"] = {"family": "wrong"}
+    hints = ["missing native export", "requested allocation exceeds budget"]
+    result = _family_launch_result(tmp_path, config, "test/model", keys,
+        extra_args=("--wip", "refusal-test"), encoder_plan={"hints": hints},
+        deployment_overrides=overrides)
+    assert result.returncode != 0, result.stderr
+    assert "invalid deployment specification" in result.stderr
+    for hint in hints:
+        assert hint in result.stderr
     assert "docker run -d" not in result.stderr
 
 
@@ -609,7 +638,8 @@ onboard = value("--rtx-expert-layers", "auto")
 gpus = int(value("--rtx", "1"))
 boundary = None if family != "deepseek_v41" or onboard == "auto" or gpus == 1 else min(int(onboard), 39)
 handoff = {"kind": "runtime", "directory": "/tmp/cuteafd-home/placement", "spark_first_layer": boundary} if family == "deepseek_v41" and (gpus == 2 or onboard != "0") else {"kind": "fixed", "spark_first_layer": int(first)}
-deployment = dict(version=1, family=family, executable=family != "qwen3_5", wip_launchable=True, rtx_gpus=gpus, spark_ranks=ranks,
+placement_ready = report.get("placement_supported", True) and report.get("fits", True)
+deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep, explicit=explicit), peers=peers,
     speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),

@@ -34,6 +34,7 @@ impl<'a> Verification<'a> {
         MarkLayout::new(&regions)
     }
 
+    #[cfg(test)]
     pub(super) fn bytes(cfg: &Qwen35Config, slots: usize) -> Result<usize> {
         let mark = Self::layout(cfg, slots)?.bytes.max(256);
         let logits = REPLAY_ROWS.checked_mul(cfg.vocab).and_then(|n| n.checked_mul(4))

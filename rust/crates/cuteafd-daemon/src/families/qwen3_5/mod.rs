@@ -1,4 +1,4 @@
-//! Dense Qwen qualification entry point. Execution remains fail-closed until the executor qualifies.
+//! Native dense Qwen execution, serving and qualification.
 mod programs;
 mod weights;
 mod block;

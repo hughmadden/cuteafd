@@ -179,7 +179,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
     let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
-    let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision| (vision.encoder, vision.cache_bytes));
+    let (encoder, bytes) = vision.map_or((crate::shared::qwen::Encoder::Off, 0), |vision| (vision.encoder, vision.cache_bytes));
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     if args.pool_tokens == 0 {
@@ -317,7 +317,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     type Draft = super::speculate::MtpSeq;
     type History = cuteafd_loader::families::qwen4::NgramHistory;
     type Coordinates = cuteafd_loader::families::qwen4::RopePositions;
-    type Encoder = super::media::Encoder;
+    type Encoder = crate::shared::qwen::Encoder;
     type Prefix = Qwen4Prefix<'e, 'a>;
 
     fn geometry(&self) -> scheduler::Geometry {

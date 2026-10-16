@@ -35,7 +35,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     type Draft = DraftState;
     type History = ();
     type Coordinates = ();
-    type Encoder = super::super::qwen4::media::Encoder;
+    type Encoder = crate::shared::qwen::Encoder;
     type Prefix = DensePrefix<'e, 'a>;
 
     fn geometry(&self) -> scheduler::Geometry {
@@ -269,6 +269,6 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn text_media() -> MediaAdmission<scheduler::Prompt, super::super::qwen4::media::Encoder> {
-    MediaAdmission::new(EmbeddingCache::new(0), super::super::qwen4::media::Encoder::Off, 16)
+pub(crate) fn text_media() -> MediaAdmission<scheduler::Prompt, crate::shared::qwen::Encoder> {
+    MediaAdmission::new(EmbeddingCache::new(0), crate::shared::qwen::Encoder::Off, 16)
 }

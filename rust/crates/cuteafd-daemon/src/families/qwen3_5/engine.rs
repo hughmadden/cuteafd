@@ -8,6 +8,9 @@ use cuteafd_ffi::{programs::{Programs, Scalar, VocabularyHead}, CuteafdDeviceBuf
 use cuteafd_loader::{families::{qwen::HybridAttention, qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint,
     placement::{self, families::qwen3_5::{DenseInputs, NativeBuffers, NativeWeights}, Baseline, GpuBudget}};
 
+const _: () = assert!(placement::families::qwen3_5::HEAD_WORKSPACE
+    == cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE);
+
 const ROWS: usize = 4096;
 const HEAD_ROWS: usize = 64;
 const PREFIX: &str = "model.language_model.";
@@ -105,16 +108,6 @@ mod hook_borrow_tests {
 fn alloc_bytes(bytes: usize) -> usize { bytes.max(256) }
 
 impl<'a> DenseEngine<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>) -> Result<Self> {
-        Self::with_slots(library, programs, checkpoint, cfg, requested_pool, drafter, 1)
-    }
-
-    pub(crate) fn with_slots(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize) -> Result<Self> {
-        Self::with_prefix(library, programs, checkpoint, cfg, requested_pool, drafter, slots, None)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
