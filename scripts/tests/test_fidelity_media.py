@@ -25,12 +25,19 @@ def load_script(name):
 
 @pytest.mark.parametrize("family", ["mimo_v2", "glm5_flash", "qwen4"])
 def test_scoring_launch_admission_precedes_media_work(family):
-    source = (ROOT / "rust/crates/cuteafd-daemon/src/families" / family / "serve.rs").read_text()
+    adapter = (ROOT / "rust/crates/cuteafd-daemon/src/families" / family / "serve.rs").read_text()
+    if family == "qwen4":
+        source = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
+        assert "super::media::prepare(" in adapter
+        assert "super::media::probe_features(" in adapter
+        operations = ("engine.prepare(", "engine.probe_features(")
+    else:
+        source = adapter
+        operations = ("super::media::prepare(", "super::media::probe_features(")
     receipt = source.index("let job = if !busy && media.is_empty()")
     guard = source.index("probe::validate_scoring(&job.probe,", receipt)
     assert source.count("probe::validate_scoring(") == 1
-    for operation in ("!job.media.is_empty()", "probe::prompt_ids(",
-                      "super::media::prepare(", "super::media::probe_features(", "media.enqueue("):
+    for operation in ("!job.media.is_empty()", "probe::prompt_ids(", *operations, "media.enqueue("):
         assert receipt < guard < source.index(operation, receipt)
     if family == "mimo_v2":
         assert source.index("failures.watch(&job.events)", receipt) < guard
