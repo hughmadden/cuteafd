@@ -90,18 +90,31 @@ impl Reservation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocalLayers {
     Auto,
+    ExpertsFirst,
     Count(usize),
+}
+impl LocalLayers {
+    pub(crate) fn onboard(self) -> cuteafd_loader::placement::Onboard {
+        use cuteafd_loader::placement::{Onboard, EXPERTS_FIRST_POOL_FLOOR};
+        match self {
+            Self::Auto => Onboard::Auto,
+            Self::ExpertsFirst => Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR },
+            Self::Count(n) => Onboard::Layers(n),
+        }
+    }
 }
 impl FromStr for LocalLayers {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self> {
-        if value == "auto" {
-            return Ok(Self::Auto);
+        match value {
+            "auto" => return Ok(Self::Auto),
+            "max" => return Ok(Self::ExpertsFirst),
+            _ => {}
         }
         let count: usize = value
             .parse()
-            .context("RTX expert layers must be auto or 0..40")?;
-        ensure!(count <= 40, "RTX expert layers must be auto or 0..40");
+            .context("RTX expert layers must be auto, max or 0..40")?;
+        ensure!(count <= 40, "RTX expert layers must be auto, max or 0..40");
         Ok(Self::Count(count))
     }
 }
@@ -109,6 +122,18 @@ impl FromStr for LocalLayers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_layers_max_uses_shared_experts_first_policy() {
+        use cuteafd_loader::placement::{Onboard, EXPERTS_FIRST_POOL_FLOOR};
+        assert_eq!("max".parse::<LocalLayers>().unwrap().onboard(),
+            Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR });
+        assert_eq!("auto".parse::<LocalLayers>().unwrap().onboard(), Onboard::Auto);
+        assert_eq!("40".parse::<LocalLayers>().unwrap().onboard(), Onboard::Layers(40));
+        for value in ["41", "-1", "all", "50%"] {
+            assert!(value.parse::<LocalLayers>().is_err(), "{value}");
+        }
+    }
+
     #[test]
     fn sizes_and_reservations_validate_units_and_overflow() {
         for (value, bytes) in [

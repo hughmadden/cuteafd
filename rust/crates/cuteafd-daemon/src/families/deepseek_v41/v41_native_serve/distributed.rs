@@ -14,7 +14,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
     let minimum_expert_layers = match args.rtx_expert_layers {
-        admission::LocalLayers::Auto => 1,
+        admission::LocalLayers::Auto | admission::LocalLayers::ExpertsFirst => 1,
         admission::LocalLayers::Count(count) => {
             ensure!((1..=40).contains(&count), "dual RTX expert layers must be 1..=40");
             count as usize
@@ -33,6 +33,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             .into_iter().collect::<Result<Vec<_>>>()?;
         tracing::info!(stage, occupied_bytes=?occupied, "dual RTX startup memory");
         cuteafd_ffi::memory_ledger::relabel_other(cuteafd_ffi::memory_ledger::intern(&format!("v41/{stage}")));
+        crate::shared::inventory::startup_probe(&lib, &[0, 1], &format!("v41/{stage}"))?;
         Ok(())
     };
     memory_checkpoint("CUDA contexts and peer access")?;
@@ -73,6 +74,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
     }
     let mut exl3_modules = [None, None];
+    memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
         admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)?;
         if compressed {
@@ -80,6 +82,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         }
         Ok(())
     })?;
+    memory_checkpoint("after native preload")?;
     let [mut decode_modules, mut prefill_modules] = [0, 1].map(|_| [None, None]);
     for (rank, modules) in exl3_modules.into_iter().enumerate() {
         if let Some([decode, prefill]) = modules {
@@ -272,37 +275,25 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     pass.install_attention_plan(attention_plan)?;
     second.install_attention_plan(attention_plan)?;
     memory_checkpoint("second target lane")?;
-    let draft_weights = if args.dspark {
-        let width=if args.dspark_draft_limit>5 {7} else {5};
-        Some(if args.tp2_dspark_experts {
-            let budgets=[devices[0].run(||Ok(lib.cuda_memory_info()?.0.min(32usize<<30)))?,
-                devices[1].run(||Ok(lib.cuda_memory_info()?.0.min(32usize<<30)))?];
-            devices[1].own(||crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
-                capacity,args.concurrency,budgets,16<<20,width))?
-        } else {devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
-            capacity, args.concurrency, 32 << 30, 16 << 20, width,
-            Some(&crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "dspark"))))?})
+    // dSpark is admitted before it exists (#65): plan every retained owner from
+    // the native plans and AOT packages, sample with no draft allocation, solve
+    // with the drafter as a shared Movable, then load with the admitted bytes.
+    let draft_width = if args.dspark_draft_limit > 5 { 7 } else { 5 };
+    let dspark_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
+        &args.native_lib, exl3_tiers, "dspark");
+    ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
+    let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };
+    let dspark_inventory = if args.dspark {
+        Some(devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
+            &lib, &catalog, capacity, args.concurrency, draft_width, args.tp2_dspark_experts,
+            Some(&dspark_directory), 64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
     } else { None };
-    memory_checkpoint("draft weights")?;
-    let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
-        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency)).transpose()?;
-    if let Some(draft) = &mut draft {
-        draft.set_draft_limit(args.dspark_draft_limit)?;
-        draft.set_fixed(args.dspark_fixed);
-    }
-    attention_plan.validate_loaded(draft.as_ref().map(|draft| draft.attention_drafts()))?;
-    tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
-        "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
-    memory_checkpoint("draft runtime")?;
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
     let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
     memory_checkpoint("vision")?;
-    ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
-    let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };
-    let prefix_arenas = super::prefix::Arenas::new(devices[0],
-        draft.as_ref().map(|d| d.mark_device()), snapshot_slots)?;
-    let snapshot_bytes = super::prefix::Arenas::device_bytes(snapshot_slots, draft.is_some());
-    memory_checkpoint("snapshot arenas")?;
+    let prefix_arenas = super::prefix::Arenas::new(devices[0], None, snapshot_slots)?;
+    let snapshot_bytes = super::prefix::Arenas::device_bytes(snapshot_slots, args.dspark);
+    memory_checkpoint("target snapshot arenas")?;
     // Every other persistent owner is now live. Reserve both transport lanes,
     // minimum routed weights, KV and setup headroom before filling extra layers.
     let per_lane = match format {
@@ -321,7 +312,50 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let memory=admission::admission_memory(&lib,&inventory)?;
     let deferred=[admission::EXPERT_SETUP_HEADROOM as u64,
         (admission::EXPERT_SETUP_HEADROOM + 2*wave_bytes) as u64];
-    let pool=admission::resolve(&args,&memory,expert_demands, (2*per_lane) as u64,&deferred,minimum_expert_layers)?;
+    // The dSpark load phase is its experts plus their transient staging above
+    // this sample; nothing else is allocated until it drains.
+    let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
+    let pool=admission::resolve_with_owners(&args,&memory,expert_demands,(2*per_lane) as u64,&deferred,
+        minimum_expert_layers,&[],&draft_load,dspark_inventory.as_ref())?;
+    // The loaders re-check the admitted load phase (their own conservative
+    // peak is part of it); retained owners are the Movable's exact bytes.
+    let draft_budgets = |gpu: usize| -> usize { draft_load.iter().filter(|d| usize::from(d.gpu) == gpu)
+        .map(|d| d.bytes as usize).sum::<usize>() };
+    if args.dspark {
+        ensure!(cuteafd_loader::placement::draft::home(&pool.placement) == Some(1), "V4.1 dSpark must be placed beside the decoder head");
+    }
+    let draft_weights = if args.dspark {
+        Some(if args.tp2_dspark_experts {
+            devices[1].own(||crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
+                capacity,args.concurrency,[draft_budgets(0),draft_budgets(1)],16<<20,draft_width))?
+        } else {devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
+            capacity, args.concurrency, draft_budgets(1), 16 << 20, draft_width, Some(&dspark_directory)))?})
+    } else { None };
+    memory_checkpoint("draft weights")?;
+    if let (Some(weights), Some(inventory)) = (&draft_weights, &dspark_inventory) {
+        // The loaded weights size their lane chains through the same shape the
+        // pre-load inventory used; any divergence is an accounting defect.
+        let lane_requests = args.concurrency.div_ceil(if args.concurrency == 1 { 1 } else { 2 });
+        let lanes = if args.concurrency == 1 { 1 } else { 2 };
+        let loaded = devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain::device_bytes(
+            weights, lane_requests, 64640))?;
+        for (gpu, bytes) in loaded.iter().enumerate() {
+            let admitted = inventory.runtime.iter().filter(|d| usize::from(d.gpu) == gpu && d.group == "dSpark request lanes")
+                .map(|d| d.bytes as usize).sum::<usize>();
+            ensure!(bytes * lanes == admitted, "V4.1 dSpark lanes on GPU {gpu}: loaded {} B, admitted {admitted} B", bytes * lanes);
+        }
+    }
+    let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
+        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency)).transpose()?;
+    if let Some(draft) = &mut draft {
+        draft.set_draft_limit(args.dspark_draft_limit)?;
+        draft.set_fixed(args.dspark_fixed);
+    }
+    attention_plan.validate_loaded(draft.as_ref().map(|draft| draft.attention_drafts()))?;
+    tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
+        "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
+    let prefix_arenas = match &draft { Some(draft) => prefix_arenas.with_draft(draft.mark_device())?, None => prefix_arenas };
+    memory_checkpoint("draft runtime and marks")?;
     pass.bind_execution_plan(&pool.placement)?;
     second.bind_execution_plan(&pool.placement)?;
     let expert_layers=pool.placement.onboard_layers;
@@ -385,6 +419,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;
+    memory_checkpoint("ready")?;
     ready.take().context("startup readiness missing")?.send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,
