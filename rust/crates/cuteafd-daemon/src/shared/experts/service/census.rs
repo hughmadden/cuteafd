@@ -216,6 +216,38 @@ mod tests {
         }
     }
     #[test]
+    fn isolated_system_noise_is_symmetric_and_bounded() {
+        let mut data = samples();
+        for sample in &mut data {
+            sample.device_kind = Some(CensusDeviceKind::Integrated);
+            sample.device_witness = Some(CensusDeviceWitness::SystemAvailableCgroup);
+            sample.cuda_mapping_pss_bytes = 0;
+        }
+        for phase in [3, 5] {
+            for noise in [1, 16 << 20, (16 << 20) + 1] {
+                let mut noisy = data.clone();
+                noisy[phase].system_available_bytes = noisy[phase - 1].system_available_bytes + noise;
+                noisy[phase].system_headroom_bytes = noisy[phase - 1].system_headroom_bytes + noise;
+                assert_eq!(spark_census_deltas(&noisy).is_ok(), noise <= 16 << 20,
+                    "phase {phase}, negative delta {noise}");
+            }
+            for cgroup_only in [false, true] {
+                let mut noisy = data.clone();
+                if cgroup_only {
+                    noisy[phase].system_headroom_bytes = noisy[phase - 1].system_headroom_bytes + (16 << 20) + 1;
+                    noisy[phase].system_available_bytes = noisy[phase].system_headroom_bytes;
+                } else {
+                    noisy[phase].system_available_bytes = noisy[phase - 1].system_available_bytes + (16 << 20) + 1;
+                }
+                assert!(spark_census_deltas(&noisy).is_err());
+            }
+        }
+        // Retained payload control never uses the isolated-phase noise allowance.
+        data[4].system_available_bytes = data[3].system_available_bytes + 1;
+        data[4].system_headroom_bytes = data[3].system_headroom_bytes + 1;
+        assert!(spark_census_deltas(&data).is_err());
+    }
+    #[test]
     fn process_snapshot_requires_explicit_fields_and_units() {
         let block = "Rss: 12 kB\nPss: 8 kB\nPrivate_Clean: 2 kB\nPrivate_Dirty: 3 kB\n";
         let maps = parse_smaps(&format!("1000-2000 rw-s 00000000 00:00 0 /dev/nvidia0\n{block}")).unwrap();

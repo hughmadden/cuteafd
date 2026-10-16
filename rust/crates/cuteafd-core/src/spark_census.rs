@@ -51,11 +51,18 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
         || ordered.windows(2).any(|p| p[0].monotonic_ns >= p[1].monotonic_ns) {
         return Err(error("phase/process/system/device mismatch"));
     }
-    let system = |before: &SparkProcessSample, after: &SparkProcessSample| {
-        let available = before.system_available_bytes.checked_sub(after.system_available_bytes)
-            .ok_or_else(|| error("system memory increased during isolated phase"))?;
-        let bounded = before.system_headroom_bytes.checked_sub(after.system_headroom_bytes)
-            .ok_or_else(|| error("cgroup-bounded headroom increased during isolated phase"))?;
+    let system = |before: &SparkProcessSample, after: &SparkProcessSample, isolated: bool| {
+        let growth = |before: u64, after: u64| {
+            match before.checked_sub(after) {
+                Some(bytes) => Ok(bytes),
+                // MemAvailable and cgroup samples can reclaim a small amount
+                // during a payload-free phase; use the symmetric phase noise bar.
+                None if isolated && after - before <= 16 << 20 => Ok(0),
+                None => Err(error("system headroom increased beyond permitted phase noise")),
+            }
+        };
+        let available = growth(before.system_available_bytes, after.system_available_bytes)?;
+        let bounded = growth(before.system_headroom_bytes, after.system_headroom_bytes)?;
         if available.abs_diff(bounded) > available / 20 {
             return Err(error("MemAvailable/cgroup phase deltas disagree by more than 5%"));
         }
@@ -66,7 +73,7 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
             || before.tracked_pinned_bytes != after.tracked_pinned_bytes {
             return Err(error("isolated context/module phase allocated payload storage"));
         }
-        let sys = system(before, after)?;
+        let sys = system(before, after, true)?;
         if witness == SystemAvailableCgroup { return Ok(sys); }
         let maps = after.cuda_mapping_pss_bytes.checked_sub(before.cuda_mapping_pss_bytes)
             .ok_or_else(|| error("CUDA mapping PSS decreased"))?;
@@ -81,7 +88,7 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
     let retained = host.tracked_device_bytes.checked_sub(ma.tracked_device_bytes)
         .filter(|v| *v > 0).ok_or_else(|| error("missing retained device control"))?;
     let visible = match witness {
-        SystemAvailableCgroup => system(ma, host)?,
+        SystemAvailableCgroup => system(ma, host, false)?,
         CudaMappingPss => host.cuda_mapping_pss_bytes.checked_sub(ma.cuda_mapping_pss_bytes)
             .ok_or_else(|| error("retained CUDA mapping PSS decreased"))?,
     };
@@ -100,8 +107,28 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
         .ok_or_else(|| error("host PSS overflow"));
     let maps = host_maps(ready)?.checked_sub(host_maps(host)?)
         .ok_or_else(|| error("host-only mapping PSS decreased"))?;
-    if maps.abs_diff(system(host, ready)?) > 16 << 20 {
+    if maps.abs_diff(system(host, ready, true)?) > 16 << 20 {
         return Err(error("host-only process-map/system phase disagrees by more than 16 MiB"));
     }
     Ok(SparkCensusDeltas { context, modules, witness })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Replay extracted process-sample arrays without starting CUDA or serving.
+    #[test]
+    #[ignore = "requires CUTEAFD_SPARK_CENSUS_REPLAY pointing to recorded rank samples"]
+    fn replay_recorded_rank_census() {
+        let path = std::env::var("CUTEAFD_SPARK_CENSUS_REPLAY").unwrap();
+        let ranks: std::collections::BTreeMap<String, Vec<SparkProcessSample>> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(!ranks.is_empty());
+        for (rank, samples) in ranks {
+            let deltas = spark_census_deltas(&samples)
+                .unwrap_or_else(|error| panic!("{rank}: {error}"));
+            println!("{rank}: {deltas:?}");
+        }
+    }
 }
