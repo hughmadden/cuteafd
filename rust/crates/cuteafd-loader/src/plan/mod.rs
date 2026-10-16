@@ -186,6 +186,9 @@ pub struct PlanReport {
     /// Named deviations that still need a native arithmetic kernel.
     pub numerics_deviations: Vec<String>,
     pub runtime: Option<RuntimeStatus>,
+    /// Successful native runtime-owner admission, never inferred from inventory layouts.
+    #[serde(skip)]
+    pub(crate) native_serving_admitted: bool,
     /// Why the family's runtime refuses this configuration, when it does.
     pub config_error: Option<String>,
     pub spec: Option<ModelSpec>,
@@ -237,13 +240,20 @@ pub struct PlanReport {
 }
 
 impl PlanReport {
-    pub fn executable(&self) -> bool {
-        self.family.is_some()
+    pub fn executable(&self) -> bool { self.launchable(false) }
+
+    pub fn wip_launchable(&self) -> bool { self.launchable(true) }
+
+    fn launchable(&self, wip: bool) -> bool {
+        let planned = wip && self.runtime == Some(RuntimeStatus::Planned) && self.native_serving_admitted;
+        (self.runtime != Some(RuntimeStatus::Planned) || planned)
+            && self.family.is_some()
             && self.config_error.is_none()
             && self.missing_shards.is_empty()
             && self.role_readiness.iter().all(|role| role.unavailable.is_empty())
             && self.unclassified.is_empty()
-            && self.components.iter().all(|c| matches!(c.status, Status::Ready | Status::Unused | Status::Disabled))
+            && self.components.iter().all(|c| matches!(c.status, Status::Ready | Status::Unused | Status::Disabled)
+                || (planned && c.status == Status::Planned && c.rejected == 0))
             && self.placement_supported
             && self.fits
     }
@@ -404,10 +414,13 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 }
 
 fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanReport,
-    options: &layout::LayoutOptions, weight_budget: u64, requested: ExpertPlacement)
+    options: &layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     match model.placement(input, report, options, requested) {
-        Some(Ok(memory)) => Ok(memory),
+        Some(Ok(memory)) => {
+            report.native_serving_admitted = model.native_serving_admission();
+            Ok(memory)
+        },
         Some(Err(error)) => {
             report.fits = false;
             report.placement_supported = false;
@@ -416,7 +429,7 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0,
                 waste: vec![], notes: vec![format!("native placement refused: {error:#}")] })
         }
-        None => Ok(layout::layout_with_weight_budget(report, model, input, options, weight_budget)),
+        None => Ok(layout::layout(report, model, input, options)),
     }
 }
 
@@ -441,6 +454,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         precision_optimizations: Vec::new(),
         numerics_deviations: Vec::new(),
         runtime: None,
+        native_serving_admitted: false,
         config_error: None,
         spec: None,
         cache_requirements: None,
@@ -534,6 +548,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             return Ok(report);
         }
     };
+    report.vision = model.vision_mode(options.vision);
     let spec = model.spec();
     let ownership = options.draft_ownership.unwrap_or_else(|| {
         let native = options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0);
@@ -548,7 +563,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         let mut read_roles = vec![files::ReadRole::Coordinator {
             local_experts: ranks == 0, speculator: ownership.uses_checkpoint() }];
         read_roles.extend((0..ranks).map(|rank| files::ReadRole::Spark { rank, world: ranks }));
-        if options.vision != MediaMode::Off { read_roles.push(files::ReadRole::Vision); }
+        if report.vision != MediaMode::Off { read_roles.push(files::ReadRole::Vision); }
         if report.audio != MediaMode::Off { read_roles.push(files::ReadRole::Audio); }
         for role in read_roles {
             let names = files::required_tensors(&checkpoint, role)?;
@@ -634,7 +649,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             rejections.insert(0, Rejection { tensor: "routed experts (read_expert_catalog)".into(), reason: error.clone() });
             rejections.truncate(REJECTIONS_KEPT);
         }
-        let disabled = (*component == Component::Vision && options.vision == MediaMode::Off)
+        let disabled = (*component == Component::Vision && report.vision == MediaMode::Off)
             || (*component == Component::Audio && report.audio == MediaMode::Off)
             || !ownership.includes(*component);
         let status = if disabled { Status::Disabled } else { match family.runtime() {
@@ -681,8 +696,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     if let Some(layout_options) = &options.layout {
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
-        let memory = family_layout(model.as_ref(), input, &mut report, &layout_options,
-            options.coordinator_budget_bytes, options.placement)?;
+        layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
+        let memory = family_layout(model.as_ref(), input, &mut report, &layout_options, options.placement)?;
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -725,9 +740,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget_bytes,
             spark_allocation_budget_bytes: Some(options.spark_budget_bytes), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
-            ..Default::default() };
-        let _ = family_layout(model.as_ref(), input, &mut report, &inventory,
-            options.coordinator_budget_bytes, options.placement)?;
+            weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
+        let _ = family_layout(model.as_ref(), input, &mut report, &inventory, options.placement)?;
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
@@ -774,7 +788,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         }
     }
     report.encoder_plan_hash = format!("{:x}", hash.finalize());
-    if family.runtime() == RuntimeStatus::Planned {
+    if family.runtime() == RuntimeStatus::Planned && !report.native_serving_admitted {
         report.fits = false;
         report.placement_supported = false;
         report.hints.push(Hint {
@@ -980,7 +994,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             how: "Choose a count within the available inventory.".into(),
         });
     }
-    if requested.executable() { return Ok(requested); }
+    if requested.wip_launchable() { return Ok(requested); }
     let reason = requested.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; ");
     let reason = if reason.is_empty() { requested.config_error.clone().unwrap_or_else(||
         "checkpoint tensors or required package artifacts unavailable".into()) } else { reason };
@@ -988,7 +1002,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
     let mut best = None;
     for ranks in (0..=available).rev().filter(|&ranks| ranks != count) {
         let report = candidate(ranks)?;
-        if report.executable() {
+        if report.wip_launchable() {
             working.push(ranks);
             if best.is_none() { best = Some(report); }
         }

@@ -103,6 +103,23 @@ def test_glm_ring_expectation_requires_preserved_observer(entry, tmp_path):
                        tmp_path, tmp_path / 'key', {}, {'memory'}, None, 1)
 
 
+def test_dense_candidate_cards_are_zero_spark_and_do_not_change_release_matrix():
+    kit = ROOT / 'scripts/bench/kits/gate'
+    names = ['qwen35-9b-bf16-min', 'qwen38-27b-bf16-min']
+    dense = cards.load_cards(kit, names)
+    assert [card['name'] for card in dense] == names
+    assert [cards.config(card['config'])['MODEL_ID'] for card in dense] == [
+        'Qwen/Qwen3.5-9B', 'Qwen/Qwen3.8-27B']
+    for card in dense:
+        values = cards.config(card['config'])
+        assert card['family'] == 'qwen3_5' and card['sparks'] == [] and card['gpus'] == [1]
+        assert values['SPARK_COUNT'] == '0' and values['EXPERT_BACKEND'] == 'local'
+        assert values['CONCURRENCY'] == '8' and values['POOL_TOKENS'] == 'auto'
+        assert values['SPECULATOR'] == 'off' and values['VISION'] == values['AUDIO'] == 'off'
+    release = json.loads((ROOT / 'scripts/bench/release-smoke.example.json').read_text())
+    assert not set(names).intersection(card['name'] for card in release['entries'])
+
+
 def test_key_file_created_private_and_never_printed(tmp_path, entry, monkeypatch, capsys):
     kit = tmp_path / 'kit'
     kit.mkdir()

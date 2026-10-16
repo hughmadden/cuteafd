@@ -179,7 +179,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
     let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
-    let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision| (vision.encoder, vision.cache_bytes));
+    let (encoder, bytes) = vision.map_or((crate::shared::qwen::Encoder::Off, 0), |vision| (vision.encoder, vision.cache_bytes));
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     if args.pool_tokens == 0 {
@@ -272,7 +272,7 @@ mod scheduler_tests {
         assert!(geometry.layers.iter().all(|layer| layer.class.is_some()));
         let mut history = DraftHistory::default();
         history.observe(3, 2);
-        let priors = super::super::mtp_policy::acceptance(&[&history], &[3]);
+        let priors = DraftHistory::acceptance(&[&history], &[3]);
         assert_eq!(priors[0], history.pooled(3, std::iter::empty::<&DraftHistory>()));
     }
 
@@ -317,7 +317,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     type Draft = super::speculate::MtpSeq;
     type History = cuteafd_loader::families::qwen4::NgramHistory;
     type Coordinates = cuteafd_loader::families::qwen4::RopePositions;
-    type Encoder = super::media::Encoder;
+    type Encoder = crate::shared::qwen::Encoder;
     type Prefix = Qwen4Prefix<'e, 'a>;
 
     fn geometry(&self) -> scheduler::Geometry {
@@ -380,9 +380,6 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         self.engine.draft_geometry(snapshot, width)
     }
     fn arm_draft_probe(&self) -> Result<()> { self.engine.arm_draft_probe() }
-    fn acceptance(&self, histories: &[&crate::shared::draft_policy::DraftHistory], limits: &[usize]) -> Vec<Vec<f64>> {
-        super::mtp_policy::acceptance(histories, limits)
-    }
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>, draft: &mut Self::Draft)
         -> Result<()> {
         super::speculate::prefill_chunk(self.engine, placement, start, chunk, next, draft)

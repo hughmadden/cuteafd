@@ -115,6 +115,15 @@ pub enum Basis {
     Estimated,
 }
 
+/// Whether admission reserves bytes already resident when serving becomes ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemLifetime {
+    ReadyResident,
+    /// Lazy allocations or safety headroom; charged to admission, not ready residency.
+    PostReadyReserve,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub category: Category,
@@ -124,36 +133,28 @@ pub struct Item {
     pub format: String,
     pub bytes: u64,
     pub basis: Basis,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifetime: Option<MemoryLifetime>,
-}
-
-/// Lifetime of a resident charge relative to worker readiness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryLifetime {
-    ReadyResident,
+    pub lifetime: ItemLifetime,
 }
 
 /// Shared allowance for unclassified Spark runtime growth, not an exact owner.
-/// The V4.1 min/max census at 0a6fc7b1 observed at most 2,083,518,960 B/rank.
+/// Source: V4.1 min/max seven-rank system/cgroup census at 0a6fc7b1;
+/// maximum measured residual 2,083,518,960 B plus margin, attribution pending #388.
 pub const SPARK_RUNTIME_RESIDUAL_BYTES: u64 = 5 * (1 << 29);
 pub const SPARK_RUNTIME_RESIDUAL_GROUP: &str = "Spark runtime residual";
+pub const SPARK_RUNTIME_RESIDUAL_SOURCE: &str = "V4.1 min/max seven-rank system/cgroup census at 0a6fc7b1; maximum measured residual 2,083,518,960 B plus margin; shared cross-family estimate, attribution pending #388";
 
 pub fn spark_runtime_residual() -> Item {
-    let mut item = Item::new(Category::Runtime, SPARK_RUNTIME_RESIDUAL_GROUP, "",
-        SPARK_RUNTIME_RESIDUAL_BYTES, Basis::Estimated);
-    item.source = Some("V4.1 min/max seven-rank system/cgroup census at 0a6fc7b1; maximum measured residual 2,083,518,960 B plus margin; shared cross-family estimate, attribution pending #388".into());
-    item.lifetime = Some(MemoryLifetime::ReadyResident);
-    item
+    Item::new(Category::Runtime, SPARK_RUNTIME_RESIDUAL_GROUP, "",
+        SPARK_RUNTIME_RESIDUAL_BYTES, Basis::Estimated).with_lifetime(ItemLifetime::ReadyResident)
 }
 
 impl Item {
     pub fn new(category: Category, group: impl Into<String>, format: impl Into<String>, bytes: u64, basis: Basis) -> Self {
-        Self { category, group: group.into(), format: format.into(), bytes, basis, source: None, lifetime: None }
+        Self { category, group: group.into(), format: format.into(), bytes, basis,
+            lifetime: ItemLifetime::ReadyResident }
     }
+
+    pub fn with_lifetime(self, lifetime: ItemLifetime) -> Self { Self { lifetime, ..self } }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,11 +318,23 @@ mod tests {
         assert_eq!(item.bytes, 2_684_354_560);
         assert!(item.bytes > 2_083_518_960);
         assert_eq!(item.basis, Basis::Estimated);
-        assert_eq!(item.lifetime, Some(MemoryLifetime::ReadyResident));
-        assert!(item.source.as_ref().unwrap().contains("0a6fc7b1"));
+        assert_eq!(item.lifetime, ItemLifetime::ReadyResident);
+        assert!(SPARK_RUNTIME_RESIDUAL_SOURCE.contains("0a6fc7b1"));
         let encoded = serde_json::to_value(&item).unwrap();
         assert_eq!(encoded["lifetime"], "ready_resident");
         assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);
+    }
+
+    #[test]
+    fn item_lifetime_is_explicit_and_survives_serialization() {
+        let resident = Item::new(Category::Runtime, "context", "", 100, Basis::Calibrated);
+        assert_eq!(resident.lifetime, ItemLifetime::ReadyResident);
+        for lifetime in [ItemLifetime::ReadyResident, ItemLifetime::PostReadyReserve] {
+            let item = resident.clone().with_lifetime(lifetime);
+            let encoded = serde_json::to_value(&item).unwrap();
+            assert_eq!(encoded["lifetime"], serde_json::to_value(lifetime).unwrap());
+            assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);
+        }
     }
 
     #[test]

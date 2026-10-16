@@ -105,7 +105,6 @@ pub(crate) trait Backend<'a> {
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value;
     fn draft_geometry(&self, snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry>;
     fn arm_draft_probe(&self) -> Result<()>;
-    fn acceptance(&self, histories: &[&DraftHistory], limits: &[usize]) -> Vec<Vec<f64>>;
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>,
         draft: &mut Self::Draft) -> Result<()>;
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming)
@@ -141,11 +140,9 @@ struct Active<'a, P: Placement, D> {
     keyed_history: Vec<u32>,
     constraint: Option<crate::shared::constraints::State<'a>>,
     placement: P,
-    /// Family draft continuation and recent outcomes; cycles in a row planned
-    /// without drafts (a probe draft follows eight).
+    /// Family draft continuation and recent outcomes.
     draft: D,
     outcomes: DraftHistory,
-    idle: usize,
     /// Drafts proposed and accepted, verify cycles.
     proposed: usize,
     accepted: usize,
@@ -419,6 +416,51 @@ mod readiness_tests {
         let source = include_str!("scheduler.rs");
         let schedule = source.split_once("\npub(crate) fn schedule").unwrap().1;
         assert!(schedule.find("engine.prefix_cache(").unwrap() < schedule.find("}, initialized)?").unwrap());
+    }
+
+    #[test]
+    fn qwen_rewritten_assistant_history_keeps_an_exact_prefill_boundary() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_api::openai::chat::qwen4::{ChatTemplate, QwenPromptOptions, template_context};
+        use cuteafd_api::openai::chat::qwen4::prompt::QwenToolChoice;
+        use serde_json::json;
+        #[derive(Parser)]
+        struct Args { #[command(flatten)] prefix: PrefixArgs }
+        let args = Args::parse_from(["serve", "--prefix-point-boundaries", "1"]);
+        // Dense Qwen's checkpoint always drops historical thinking; Flash Next's
+        // otherwise shared fixture also offers a preserve_thinking override.
+        let fixture = include_str!(
+            "../../../../cuteafd-api/src/openai/chat/qwen4/fixtures/qwen38_flash_next.jinja");
+        let historical_thinking = "preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index";
+        assert!(fixture.contains(historical_thinking));
+        let template = ChatTemplate::new(&fixture.replace(historical_thinking,
+            "loop.index0 > ns.last_query_index"))?;
+        let options = QwenPromptOptions { thinking: false, tool_names: vec![],
+            tool_choice: QwenToolChoice::Auto, response_format: None };
+        let mut body = json!({"messages":[{"role":"system", "content":"notes ".repeat(30)},
+            {"role":"user", "content":"first question"}]});
+        let first = template.render(&template_context(&body, &options).map_err(anyhow::Error::msg)?)?;
+        body["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant", "content":"answer"}),
+            json!({"role":"user", "content":"next question"})]);
+        let next = template.render(&template_context(&body, &options).map_err(anyhow::Error::msg)?)?;
+        assert!(!next.starts_with(&first), "old thinking suffix is rewritten");
+        // Byte ids stand in for text tokens; the marker positions are the rendered
+        // template's real message boundaries, independent of tokenizer merges.
+        let tokens = first.bytes().map(u32::from).collect::<Vec<_>>();
+        let markers = first.match_indices("<|im_start|>").map(|(i, _)| i).collect::<Vec<_>>();
+        let boundary = *markers.last().unwrap();
+        let plan = cuteafd_engine::prefix::plan_media_points(0, tokens.len(), 4096, &markers,
+            0, args.prefix.prefix_cache_min_tokens, args.prefix.points(), &[]);
+        assert_eq!(plan.points, vec![(0, boundary)]);
+        assert_eq!(plan.chunks, vec![boundary, tokens.len()]);
+        assert!(next.starts_with(&first[..boundary]));
+        // The live scheduler must use these points and retain all three frontiers.
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        for fragment in ["prefix.points()", "&p.keys.tokens()[..point]", "retain_prompt(", "SnapshotKind::Turn"] {
+            assert!(source.contains(fragment), "scheduler lost {fragment}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -805,7 +847,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         history: p.tokens,
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft: p.seq,
-                        outcomes: DraftHistory::default(), idle: 0, proposed: 0, accepted: 0, cycles: 0, turn: None,
+                        outcomes: DraftHistory::default(), proposed: 0, accepted: 0, cycles: 0, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
                         ticket: p.ticket,
                     };
@@ -863,7 +905,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             Drafts::Neural { depth, fixed } => {
                 let limits: Vec<usize> = limits.iter().map(|&l| l.min(depth)).collect();
                 let histories: Vec<&DraftHistory> = active.iter().map(|a| &a.outcomes).collect();
-                neural_confidence = engine.acceptance(&histories, &limits);
+                neural_confidence = DraftHistory::acceptance(&histories, &limits);
                 for (a, prior) in active.iter().zip(&mut neural_confidence) {
                     if a.draft.pending_rows() == 0 { prior.clear(); }
                 }
@@ -874,13 +916,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     neural_confidence.iter().filter(|p| !p.is_empty()).count());
                 predicted = selection.predicted;
                 let mut depths = if fixed { neural_confidence.iter().map(Vec::len).collect() } else { selection.lengths };
-                for ((a, d), &limit) in active.iter_mut().zip(depths.iter_mut()).zip(&limits) {
-                    // A sequence planned without drafts for a while probes one.
-                    a.idle = if *d == 0 { a.idle + 1 } else { 0 };
-                    if a.idle > 8 && limit > 0 {
-                        *d = 1;
-                        a.idle = 0;
-                    }
+                for (a, d) in active.iter().zip(depths.iter_mut()) {
                     // A whole-prompt prefix hit has no draft continuation yet: it drafts after its first step.
                     if a.draft.pending_rows() == 0 {
                         *d = 0;

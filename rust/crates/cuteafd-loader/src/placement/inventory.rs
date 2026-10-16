@@ -256,6 +256,70 @@ impl ProgramSet {
         Self { families: families.iter().map(|f| f.to_string()).collect(), names, scratch }
     }
 
+    /// Native V4.1 projection plans retain a separate aligned arena for each
+    /// small-row specialization and the first compiled capacity holding `rows`.
+    /// These exports live in V41_FP8_AOT.json, not PROGRAMS.json. Module residency
+    /// still comes from LoadedCode; `scratch` here describes allocation owners.
+    pub fn v41_fp8(manifest: &Value, matrices: &[(u64, u64)], rows: u64, sms: u32)
+        -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        ensure!((1..=4096).contains(&rows) && sms > 0, "invalid V4.1 FP8 plan geometry");
+        let compiled = [1, 16, 80, 256, 1024, 4096].into_iter().find(|&n| n >= rows).unwrap();
+        let capacities: Vec<_> = [1, 16, 80].into_iter().filter(|&n| n < compiled).chain([compiled]).collect();
+        let variants = manifest["variants"].as_array().context("missing V4.1 FP8 variants")?;
+        let card = if sms >= 188 { 188 } else { 170 };
+        let mut names = Vec::new();
+        let mut scratch = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for &(k, n) in matrices {
+            ensure!(seen.insert((k, n)), "duplicate V4.1 FP8 matrix owner");
+            if k == 8192 && matches!(n, 5120 | 2560) {
+                let canonical: Vec<_> = variants.iter().filter(|v|
+                    v["capacity"].as_u64() == Some(16)
+                        && v["input_dim"].as_u64() == Some(k)
+                        && v["output_dim"].as_u64() == Some(n)
+                        && matches!(v["plan_sms"].as_u64(), None | Some(0))
+                ).collect();
+                ensure!(canonical.len() == 1, "missing or duplicate V4.1 output reduction recipe");
+                let expected = canonical[0]["expected_m"].as_u64().context("missing output reduction rows")?;
+                let slices = canonical[0]["split_k_slices"].as_u64().context("missing output reduction slices")?;
+                let plan = cuteafd_core::coordinator_programs::OutputReductionPlan::new(
+                    1, usize::try_from(expected)?, usize::try_from(slices)?)?;
+                for &capacity in capacities.iter().filter(|&&capacity| capacity <= 80) {
+                    let recipe: Vec<_> = variants.iter().filter(|v|
+                        v["capacity"].as_u64() == Some(capacity)
+                            && v["input_dim"].as_u64() == Some(k)
+                            && v["output_dim"].as_u64() == Some(n)
+                            && matches!(v["plan_sms"].as_u64(), None | Some(0))
+                    ).collect();
+                    ensure!(recipe.len() == 1, "missing or duplicate V4.1 output reduction capacity");
+                    plan.validate(usize::try_from(capacity)?,
+                        usize::try_from(recipe[0]["expected_m"].as_u64().context("missing output reduction rows")?)?,
+                        usize::try_from(recipe[0]["split_k_slices"].as_u64().context("missing output reduction slices")?)?,
+                        recipe[0]["all_rows"].as_bool().context("missing output reduction coverage")?)?;
+                }
+            }
+            for &capacity in &capacities {
+                let matching: Vec<_> = variants.iter().filter(|v| {
+                    let plan = v["plan_sms"].as_u64().unwrap_or(0);
+                    v["capacity"].as_u64() == Some(capacity)
+                        && v["input_dim"].as_u64() == Some(k)
+                        && v["output_dim"].as_u64() == Some(n)
+                        && (plan == 0 || plan == card)
+                }).collect();
+                ensure!(matching.len() == 1,
+                    "missing or duplicate V4.1 FP8 projection {k}x{n} m{capacity} sm{card}");
+                let variant = matching[0];
+                let name = variant["label"].as_str().context("missing V4.1 FP8 program label")?.to_string();
+                let bytes = variant["scratch_bytes"].as_u64().context("missing V4.1 FP8 scratch extent")?
+                    .checked_add(255).context("V4.1 FP8 scratch alignment overflow")? & !255;
+                names.push(name.clone());
+                scratch.push((name, bytes));
+            }
+        }
+        Ok(Self { families: vec!["v41".into()], names, scratch })
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         name.split_once('_').is_some_and(|(prefix, _)| self.families.iter().any(|f| f == prefix))
     }
@@ -268,8 +332,7 @@ impl ProgramSet {
     }
 }
 
-/// The planner item group of reserved bytes allocated only after ready (lazy
-/// graph captures, graph margins): outside the ready-ledger compare.
+/// Display group for graph reserves; ready comparison uses each item's lifetime.
 pub const GRAPH_GROWTH: &str = "graph growth";
 
 /// When an item exists relative to readiness.
@@ -398,20 +461,27 @@ impl GraphSet {
         self.bytes(rank) - self.at_ready(rank)
     }
 
-    /// The solver demand for this set on `rank` (Runtime "graphs"; growth sets
-    /// are labelled so the ledger compare can leave them out).
+    /// The solver demand for this set on `rank`; lazy budgets are post-ready reserves.
     pub fn demand(&self, rank: usize) -> super::Demand {
+        use cuteafd_core::memory_layout::ItemLifetime;
         let group = match self.lifetime { Lifetime::Startup => "graphs", Lifetime::Growth => "graph growth" };
         super::Demand::new(rank as u8, Category::Runtime, group, self.bytes(rank), Basis::Formula)
+            .with_lifetime(match self.lifetime {
+                Lifetime::Startup => ItemLifetime::ReadyResident,
+                Lifetime::Growth => ItemLifetime::PostReadyReserve,
+            })
     }
 
     /// The planner items for `rank`: the captured estimate at ready ("graphs")
     /// and the margin (or a lazy set's budget) as "graph growth".
     pub fn items(&self, rank: usize) -> Vec<cuteafd_core::memory_layout::Item> {
-        use cuteafd_core::memory_layout::Item;
+        use cuteafd_core::memory_layout::{Item, ItemLifetime};
         if rank >= self.ranks.len() { return Vec::new() }
-        [("graphs", self.at_ready(rank)), (GRAPH_GROWTH, self.growth(rank))].into_iter().filter(|(_, b)| *b > 0)
-            .map(|(group, bytes)| Item::new(Category::Runtime, group, "", bytes, Basis::Formula)).collect()
+        [("graphs", self.at_ready(rank), ItemLifetime::ReadyResident),
+            (GRAPH_GROWTH, self.growth(rank), ItemLifetime::PostReadyReserve)]
+            .into_iter().filter(|(_, bytes, _)| *bytes > 0)
+            .map(|(group, bytes, lifetime)| Item::new(Category::Runtime, group, "", bytes, Basis::Formula)
+                .with_lifetime(lifetime)).collect()
     }
 }
 
@@ -565,8 +635,13 @@ mod tests {
         assert_eq!(set.bytes(0), 1_855_979_664 + (256 << 20));
         assert_eq!(set.items(0).iter().map(|i| (i.group.as_str(), i.bytes)).collect::<Vec<_>>(),
             [("graphs", 1_855_979_664), ("graph growth", 256 << 20)]);
-        assert_eq!(set.demand(0).group, "graphs");
-        assert_eq!(GraphSet::budget(&[1 << 30]).demand(0).group, "graph growth");
+        use cuteafd_core::memory_layout::ItemLifetime::{PostReadyReserve, ReadyResident};
+        assert_eq!(set.items(0).iter().map(|i| i.lifetime).collect::<Vec<_>>(),
+            [ReadyResident, PostReadyReserve]);
+        assert_eq!((set.demand(0).group.as_str(), set.demand(0).lifetime), ("graphs", ReadyResident));
+        let lazy = GraphSet::budget(&[1 << 30]);
+        assert_eq!((lazy.demand(0).group.as_str(), lazy.demand(0).lifetime), ("graph growth", PostReadyReserve));
+        assert_eq!(lazy.items(0)[0].lifetime, PostReadyReserve);
     }
 
     #[test]
@@ -578,6 +653,76 @@ mod tests {
         assert_eq!(set.names, ["dsv4f_wo_m64", "dsv4f2_wo_m64"]);
         assert_eq!(set.scratch, [("dsv4f_wo_m64".to_string(), 7)]);
         assert!(!set.contains("glmf_kda_w8_m4096") && set.contains("dsv4f2_x"));
+    }
+
+    #[test]
+    fn v41_fp8_retains_aligned_capacity_arenas_and_selects_physical_sms() {
+        let variants = [1, 16, 80, 256, 1024, 4096].into_iter().flat_map(|capacity| {
+            let plans: &[u64] = if capacity <= 16 { &[170, 188] } else { &[0] };
+            plans.iter().map(move |&sms| json!({"capacity": capacity, "plan_sms": sms,
+                "input_dim": 5120, "output_dim": 1280,
+                "label": format!("v41_query_m{capacity}_sm{sms}"),
+                "scratch_bytes": capacity * 257 + sms})).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        let manifest = json!({"variants": variants});
+        let expected = |rows: u64, sms: u64| {
+            let compiled = [1,16,80,256,1024,4096].into_iter().find(|&n| n >= rows).unwrap();
+            [1,16,80].into_iter().filter(|&n| n < compiled).chain([compiled])
+                .map(|n| (n * 257 + if n <= 16 { sms } else { 0 }).div_ceil(256) * 256)
+                .sum::<u64>()
+        };
+        for rows in [1,2,16,17,40,80,81,256,257,1024,1025,4096] {
+            for sms in [170,188] {
+                let set = ProgramSet::v41_fp8(&manifest, &[(5120,1280)], rows, sms).unwrap();
+                assert_eq!(set.scratch.iter().map(|(_,n)| n).sum::<u64>(), expected(rows, sms as u64));
+                assert!(set.scratch.iter().all(|(_,n)| n % 256 == 0));
+                assert!(set.names.iter().filter(|name| !name.ends_with("sm0"))
+                    .all(|name| name.ends_with(&format!("sm{sms}"))));
+                if rows > 1 {
+                    assert!(set.scratch.iter().map(|(_,n)| n).sum::<u64>()
+                        > *set.scratch.iter().map(|(_,n)| n).max().unwrap());
+                }
+            }
+        }
+        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,1280)], 0,188).is_err());
+        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,1280)], 4097,188).is_err());
+        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,1280)], 1,0).is_err());
+        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,1280);2], 1,188).is_err());
+        let mut missing = manifest.clone();
+        missing["variants"].as_array_mut().unwrap().remove(0);
+        assert!(ProgramSet::v41_fp8(&missing, &[(5120,1280)], 80,170).is_err());
+        let mut duplicate = manifest.clone();
+        duplicate["variants"].as_array_mut().unwrap().push(manifest["variants"][0].clone());
+        assert!(ProgramSet::v41_fp8(&duplicate, &[(5120,1280)], 80,170).is_err());
+        let mut overflow = manifest.clone();
+        overflow["variants"][0]["scratch_bytes"] = u64::MAX.into();
+        assert!(ProgramSet::v41_fp8(&overflow, &[(5120,1280)], 1,170).is_err());
+    }
+
+    #[test]
+    fn v41_output_reduction_is_immutable_across_retained_capacities() {
+        for n in [2560, 5120] {
+            let variants = [1,16,80,256,1024,4096].into_iter().map(|capacity|
+                json!({"capacity":capacity, "plan_sms":0, "input_dim":8192, "output_dim":n,
+                    "label":format!("v41_output_{n}_m{capacity}"), "scratch_bytes":capacity * 257,
+                    "expected_m":if capacity <= 80 {16} else {capacity},
+                    "split_k_slices":1, "all_rows":capacity <= 80})
+            ).collect::<Vec<_>>();
+            let manifest = json!({"variants":variants});
+            for rows in [1,16,40,80,81,256,4096] {
+                assert!(ProgramSet::v41_fp8(&manifest, &[(8192,n)], rows,188).is_ok());
+            }
+            for (field, value) in [("expected_m", json!(80)), ("split_k_slices", json!(2)),
+                ("all_rows", json!(false))] {
+                let mut changed = manifest.clone();
+                changed["variants"][2][field] = value;
+                assert!(ProgramSet::v41_fp8(&changed, &[(8192,n)], 80,188).is_err(), "{field}");
+                assert!(ProgramSet::v41_fp8(&changed, &[(8192,n)], 4096,188).is_err(), "{field}");
+            }
+            let mut missing_canonical = manifest.clone();
+            missing_canonical["variants"].as_array_mut().unwrap().remove(1);
+            assert!(ProgramSet::v41_fp8(&missing_canonical, &[(8192,n)], 1,188).is_err());
+        }
     }
 
     #[test]

@@ -1682,9 +1682,8 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--kit', default=str(Path.home() / '.cache/cuteafd/builds/release-v2-rc2/kit'),
-                        help='kit directory, or "gate" for the shared gate kit (scripts/bench/kits/gate: mimo26-flash-max, '
-                        'qwen38-exl3-min, glmf-exl3-max, v41-flash-max)')
+    parser.add_argument('--kit', default='gate',
+                        help='kit directory, or "gate" (default) for the shared in-repo gate kit (scripts/bench/kits/gate)')
     parser.add_argument('--cards', nargs='+', default=[])
     parser.add_argument('--arm', action='append', default=[], metavar='NAME=INSTANCE:SLOT')
     parser.add_argument('--arm-release', action='append', default=[], metavar='NAME=INSTANCE:TAG', help='use published image pair with the same launcher, without --wip')

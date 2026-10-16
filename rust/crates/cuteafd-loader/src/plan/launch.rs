@@ -51,6 +51,10 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
             let cfg = Qwen4Config::from_hf(config)?;
             ("qwen4", 0, Some(cfg.layers - 1))
         }
+        "qwen3_5" => {
+            let cfg = crate::families::qwen3_5::Qwen35Config::from_hf(config)?;
+            ("qwen3_5", cfg.attention.len(), Some(cfg.attention.len() - 1))
+        }
         other => bail!("unsupported model_type {other:?}"),
     };
     Ok(LaunchDescription { family, model_type, first_expert_layer: first, last_expert_layer: last })
