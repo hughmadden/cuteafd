@@ -5,7 +5,7 @@ mod draft_policy;
 pub use draft_policy::{
     draft_expected_tokens, DraftAction, DraftCandidate, DraftCostSnapshot, DraftPolicy, DraftPolicyError, DraftPolicyStats,
     DraftRoundObservation, DraftSelection, LayerResource, ObservedDraftRequest, PolicyGeometry, PolicySeed, ResourceClass,
-    draft_concurrency_bucket, CLASS_PRIOR_ROUNDS, CONCURRENCY_BUCKETS, MAX_RESOURCE_CLASSES,
+    draft_concurrency_bucket, CLASS_PRIOR_ROUNDS, CONCURRENCY_BUCKETS, MAX_RESOURCE_CLASSES, SURVIVAL_FLOOR,
 };
 mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};

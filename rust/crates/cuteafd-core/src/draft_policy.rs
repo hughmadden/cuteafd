@@ -77,6 +77,9 @@ pub fn draft_concurrency_bucket(requests: usize) -> usize {
 }
 /// Reached samples before a position uses its own calibration.
 const POOLED_BELOW: u64 = 32;
+/// Least survival (cumulative acceptance probability) a draft row needs under
+/// the survival length rule: the row is more likely verified than wasted.
+pub const SURVIVAL_FLOOR: f64 = 0.5;
 
 /// Policy failures. Each is a caller or binding error; none is fatal to
 /// serving, which falls back to verifying every draft.
@@ -952,6 +955,19 @@ impl DraftPolicy {
             .collect()
     }
 
+    /// Drafts a request verifies before its concurrency bucket engages: the
+    /// calibrated survival rule capped at the seed's cold drafts. Before the
+    /// cost fit can price rows, the drafter's own confidence still says which
+    /// rows are more likely verified than wasted. A drafted request verifies
+    /// at least one draft, so calibration keeps learning while cold.
+    pub fn cold_length(&self, requests: usize, candidate: DraftCandidate<'_>) -> usize {
+        let cap = self.seed.cold_drafts.min(candidate.confidence.len());
+        let mut survival = 1.;
+        let surviving = self.probabilities(requests, candidate).iter().take(cap)
+            .take_while(|&&p| { survival *= p; survival >= SURVIVAL_FLOOR }).count();
+        surviving.max(cap.min(1))
+    }
+
     /// Last chosen verifier extent before grammar/output censoring, for traces.
     pub fn selected_rows(&self, id: u64) -> Option<usize> { self.selected_rows.get(&id).copied() }
 
@@ -1359,7 +1375,7 @@ impl DraftPolicy {
     fn select_survival(&mut self, bucket: usize, ids: &[u64], cumulative: &[Vec<f64>], draft_us: f64,
         max_rows: usize) -> DraftSelection {
         let max_rows = max_rows.min(self.geometry.verify_capacity());
-        let mut lengths: Vec<usize> = cumulative.iter().map(|c| c.iter().take_while(|&&s| s >= 0.5).count()).collect();
+        let mut lengths: Vec<usize> = cumulative.iter().map(|c| c.iter().take_while(|&&s| s >= SURVIVAL_FLOOR).count()).collect();
         for (index, &id) in ids.iter().enumerate() {
             if lengths[index] == 0 && !cumulative[index].is_empty()
                 && self.skipped.get(&id).copied().unwrap_or(0) >= REQUEST_EXPLORE_SKIPS {
@@ -2982,6 +2998,40 @@ mod tests {
         let tight = policy.select_within(false, &candidates, 5, 3).unwrap().unwrap();
         assert_eq!(tight.lengths.iter().sum::<usize>(), 1);
         assert!(policy.restarted(false).survival_lengths());
+    }
+
+    #[test]
+    fn cold_lengths_follow_calibrated_survival_not_a_fixed_count() {
+        let seed = PolicySeed { cold_drafts: 5, ..PolicySeed::weak(7) };
+        let policy = DraftPolicy::new(placement(7), seed, false).unwrap();
+        assert!(!policy.engaged(false, 1));
+        let length = |confidence: &[f64]| policy.cold_length(1, DraftCandidate { id: 1, confidence });
+        // Seeded calibration is the identity: survival 0.9, 0.81, 0.73, 0.66, 0.59 ...
+        assert_eq!(length(&[0.9; 7]), 5, "capped at the seed's cold drafts");
+        // 0.95, 0.76, 0.27: only two rows are more likely verified than wasted.
+        assert_eq!(length(&[0.95, 0.8, 0.35, 0.99, 0.99, 0.99, 0.99]), 2);
+        // A hopeless block still verifies one draft so calibration keeps learning.
+        assert_eq!(length(&[0.05; 7]), 1);
+        assert_eq!(length(&[0.9, 0.9]), 2, "within the request's room");
+        assert_eq!(length(&[]), 0, "an undrafted request verifies only its anchor");
+        // Cold lengths read the bucket's own calibration: wide rounds whose
+        // confident drafts all fail recalibrate C16 only, never C1.
+        let mut swept = policy.clone();
+        let confidence = [0.9; 7];
+        let p = [0.9, 0.9, 0.9, 0.6, 0.9, 0.9, 0.9];
+        for round in 0..64u64 {
+            let requests: Vec<_> = (0..16).map(|id| ObservedDraftRequest { id: 100 + id, rows: 3, accepted: 1,
+                confidence: Some(&confidence) }).collect();
+            let routes = flat(&(0..40).map(|l| (0..48).map(|r| token_routes(round * 48 + r, 24)[l]).collect())
+                .collect::<Vec<_>>());
+            swept.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &routes,
+                layer_us: &[Some(1000.); 40], total_us: 90_000., draft_us: 6000., drafted_requests: Some(16),
+                wide: true, predicted_us: None }).unwrap();
+        }
+        assert!(swept.cold_length(16, DraftCandidate { id: 2, confidence: &p }) < 3, "C16 calibration learned");
+        assert_eq!(swept.calibration(1), policy.calibration(1));
+        assert_eq!(swept.cold_length(1, DraftCandidate { id: 2, confidence: &p }),
+            policy.cold_length(1, DraftCandidate { id: 2, confidence: &p }));
     }
 
     #[test]
