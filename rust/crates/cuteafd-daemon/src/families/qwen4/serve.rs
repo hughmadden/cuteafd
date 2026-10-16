@@ -28,7 +28,6 @@ use super::open;
 use crate::shared::{console, probe, qwen::scheduler::{self, Backend, Drafts}, prefix::CudaCopyEngine,
     prefill_share::DecodeShareArgs};
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
-pub(crate) use scheduler::trim_copy_rows;
 use cuteafd_engine::{media::{EmbeddingCache, MediaAdmission}, prefix::{MarkArena, PrefixCache, PrefixConfig, PrefixFamily}};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
@@ -288,7 +287,7 @@ mod scheduler_tests {
                 let real = original.iter().map(Vec::len).sum::<usize>();
                 let limit = super::super::engine::copy_row_limit(real, sequences);
                 let mut trimmed = original.clone();
-                super::trim_copy_rows(&mut trimmed, limit);
+                crate::shared::qwen::scheduler::trim_copy_rows(&mut trimmed, limit);
                 assert_eq!(trimmed.iter().map(Vec::len).sum::<usize>(), limit);
                 for (before, after) in original.iter().zip(&trimmed) {
                     assert!(!after.is_empty());
@@ -323,7 +322,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "qwen4", vocab_size: self.engine.cfg.vocab_size,
-            max_context: self.engine.max_context, slots: self.engine.slots,
+            max_context: self.engine.max_context, slots: self.engine.slots, decode_rows: DECODE_ROWS,
             prefill_rows: self.engine.prefill_rows, full_prefill_logits: self.engine.full_prefill_logits }
     }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.engine.library }

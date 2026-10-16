@@ -232,7 +232,7 @@ def test_shared_copy_extensions_precede_grammar_and_verify_width():
     assert "self.startup_graphs && self.use_graphs && !diagnostic" in route
     assert "copy_row_limit(rows, sequences)" in route and "else { rows }" in route
     gate = engine[engine.index("// Exercise the serving trim helper"):engine.index("pub(crate) fn copy_verify_row_limit")]
-    assert "super::serve::trim_copy_rows(&mut sequences, limit)" in gate
+    assert "crate::shared::qwen::scheduler::trim_copy_rows(&mut sequences, limit)" in gate
     assert "before_rows == 37 && input.len() == 32" in gate
     assert "self.verify_device_ungraphed" in gate and "self.verify_device(" in gate
     assert "snapshot(&buffers)? == exact_state" in gate

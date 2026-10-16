@@ -7,8 +7,6 @@ use crate::shared::{draft::routes::RoundRoutes, draft_policy::DraftHistory,
     prefix::{CudaCopyEngine, PrefixArgs}, token_io::DeviceLogits};
 use std::{cell::RefCell, path::Path};
 
-pub(crate) const DECODE_ROWS: usize = super::REPLAY_ROWS;
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Drafts {
     None,
@@ -21,6 +19,7 @@ pub(crate) struct Geometry {
     pub max_context: usize,
     pub slots: usize,
     pub prefill_rows: usize,
+    pub decode_rows: usize,
     pub full_prefill_logits: bool,
 }
 
@@ -295,9 +294,9 @@ impl Trace {
 
 /// Gives a finished or failed sequence's units and state slot back.
 fn release<P: Placement, F: PrefixFamily<Placement = P>>(family: &F, cache: &mut PrefixCache<CudaCopyEngine<'_>>, slots: &mut Vec<i32>,
-    placement: &P) {
+    placement: &P, family_name: &str) {
     if let Err(error) = cache.release(family, placement.units()) {
-        tracing::error!(%error, "releasing a Qwen 3.8 Flash Next sequence's units");
+        tracing::error!(%error, family = family_name, "releasing sequence units");
     }
     slots.push(placement.slot());
 }
@@ -311,18 +310,16 @@ struct VerifyBucket {
 }
 
 struct VerifyStats {
-    real: [VerifyBucket; DECODE_ROWS + 1],
-    bucket: [VerifyBucket; DECODE_ROWS + 1],
-}
-
-impl Default for VerifyStats {
-    fn default() -> Self {
-        Self { real: [VerifyBucket::default(); DECODE_ROWS + 1],
-            bucket: [VerifyBucket::default(); DECODE_ROWS + 1] }
-    }
+    real: Vec<VerifyBucket>,
+    bucket: Vec<VerifyBucket>,
 }
 
 impl VerifyStats {
+    fn new(decode_rows: usize) -> Self {
+        Self { real: vec![VerifyBucket::default(); decode_rows + 1],
+            bucket: vec![VerifyBucket::default(); decode_rows + 1] }
+    }
+
     fn record(&mut self, rows: usize, bucket: usize, spec: bool, ms: f64) {
         for entry in [&mut self.real[rows], &mut self.bucket[bucket]] {
             entry.steps += 1;
@@ -366,8 +363,17 @@ mod verify_tests {
     }
 
     #[test]
+    fn histogram_uses_target_decode_capacity() {
+        for capacity in [1, 16, 64, 128] {
+            let mut stats = super::VerifyStats::new(capacity);
+            stats.record(capacity, capacity, false, 1.0);
+            assert_eq!(stats.snapshot()["rows"][capacity.to_string()], serde_json::json!(1));
+        }
+    }
+
+    #[test]
     fn histogram_counts_real_and_physical_rows_at_existing_timing_boundary() {
-        let mut stats = super::VerifyStats::default();
+        let mut stats = super::VerifyStats::new(64);
         assert_eq!(stats.snapshot()["rows"], serde_json::json!({}));
         stats.record(17, 24, true, 12.5);
         stats.record(24, 24, true, 10.0);
@@ -409,6 +415,13 @@ mod readiness_tests {
     use std::cell::Cell;
 
     #[test]
+    fn scheduler_prefix_cache_is_initialized_before_readiness() {
+        let source = include_str!("scheduler.rs");
+        let schedule = source.split_once("\npub(crate) fn schedule").unwrap().1;
+        assert!(schedule.find("engine.prefix_cache(").unwrap() < schedule.find("}, initialized)?").unwrap());
+    }
+
+    #[test]
     fn scheduler_init_failure_never_publishes_ready() {
         let published = Cell::new(false);
         let result = initialize(|| -> Result<()> { anyhow::bail!("scheduler init failed") }, || {
@@ -440,6 +453,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     initialized: impl FnOnce() -> Result<()>)
     -> Result<()> {
     let geometry = engine.geometry();
+    anyhow::ensure!(geometry.decode_rows > 0 && max_sequences <= geometry.decode_rows
+        && max_sequences <= geometry.slots, "scheduler lanes exceed target decode/state capacity");
     let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
     // Publish readiness only after all fallible scheduler-owned startup work.
     let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
@@ -448,7 +463,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let grammars = crate::shared::constraints::Compiler::with_vocab(
             engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
         let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-        let selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, DECODE_ROWS)?;
+        let selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, geometry.decode_rows)?;
         let shared = if width > 0 {
             let geometry = engine.draft_geometry(snapshot, width)?;
             engine.arm_draft_probe()?;
@@ -466,7 +481,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     // Verify steps since the last completed request, host seconds in verifies and in family draft steps.
     let (mut steps, mut verify_s) = (0u64, 0f64);
     let mut timing = DraftTiming::default();
-    let mut verify_stats = VerifyStats::default();
+    let mut verify_stats = VerifyStats::new(geometry.decode_rows);
     let neural = matches!(drafts, Drafts::Neural { .. });
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<Prompt>>::default();
     loop {
@@ -551,7 +566,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 Err(error) => { reject(&ready, format!("{error:#}")); continue; }
             };
             if let Some(probe) = &ready.job().job.probe {
-                if let Err(error) = probe.spec.validate_cold_steps(ready.job().tokens.len(), geometry.prefill_rows, DECODE_ROWS) {
+                if let Err(error) = probe.spec.validate_cold_steps(ready.job().tokens.len(), geometry.prefill_rows, geometry.decode_rows) {
                     probe.fail(format!("cold replay: {error:#}"));
                     reject(&ready, format!("cold replay: {error:#}"));
                     continue;
@@ -572,7 +587,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             // Lookup, fork of the retained units and restore of the state mark (byte-exact), with
             // room for the rows a verify may write past the last kept one.
             let build = |units| engine.placement(units, slot);
-            let extent = (capacity + DECODE_ROWS).min(geometry.max_context);
+            let extent = (capacity + geometry.decode_rows).min(geometry.max_context);
             let admission = if cold { cache.admit_cold(&family, ready.job().tokens.len(), extent, build) }
                 else { cache.admit_media(&family, ready.job().keys.tokens(), ready.job().keys.spans(), extent, true, build) };
             let admitted = match admission {
@@ -590,7 +605,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let ready = match ready.reconcile(resume) {
                 Ok(ready) => ready,
                 Err(waiter) => {
-                    release(&family, &mut cache, &mut free_slots, &admitted.placement);
+                    release(&family, &mut cache, &mut free_slots, &admitted.placement, geometry.family);
                     let events = waiter.job.job.events.clone();
                     if let Err((_, error)) = media.enqueue(waiter) {
                         let _ = events.send(Err(media_failure(error)));
@@ -611,7 +626,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let scored = probe::score(engine.library(), &job.probe, &tokens, from, geometry.prefill_rows,
-                    DECODE_ROWS, probe::verify_rows(&job.probe), geometry.full_prefill_logits, &mut placement,
+                    geometry.decode_rows, probe::verify_rows(&job.probe), geometry.full_prefill_logits, &mut placement,
                     |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows)?
                         .map(probe::ScoreLogits::Device)),
                     |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false)?
@@ -620,7 +635,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
                 }
-                release(&family, &mut cache, &mut free_slots, &placement);
+                release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
                 continue;
             }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.media.len(),
@@ -740,7 +755,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         tracing::warn!("prefill failed: {error:#}");
                         let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     }
-                    release(&family, &mut cache, &mut free_slots, &placement);
+                    release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
                     continue;
                 }
                 // A whole-prompt hit selects from its retained logits; a prefill selected already.
@@ -758,7 +773,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     Ok(first) => first,
                     Err(error) => {
                         tracing::warn!("{error:#}");
-                        release(&family, &mut cache, &mut free_slots, &placement);
+                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
                         continue;
                     }
                 };
@@ -812,7 +827,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                                 }
                                 request.ticket.done(request.generated);
-                                release(&family, &mut cache, &mut free_slots, &request.placement)
+                                release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family)
                             }
                         }
                     }
@@ -820,7 +835,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         tracing::warn!("admission failed: {error:#}");
                         let _ = job_events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         retain_prompt(&mut cache, &placement);
-                        release(&family, &mut cache, &mut free_slots, &placement);
+                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
                     }
                 }
             }
@@ -840,7 +855,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let mut predicted = None;
         let (steps_before, draft_s_before) = (timing.steps, timing.seconds);
         // Each sequence verifies its next token plus its drafts within the decode programs' rows.
-        let room = DECODE_ROWS.saturating_sub(active.len());
+        let room = geometry.decode_rows.saturating_sub(active.len());
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len() - 1) }).collect();
         let mut proposals: Vec<Vec<u32>> = match drafts {
@@ -855,7 +870,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 let shared = shared.as_mut().expect("neural drafts have a shared policy");
                 let candidates: Vec<_> = active.iter().zip(&neural_confidence).zip(&limits).map(|((a, prior), &limit)|
                     resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: false }).collect();
-                let selection = resource::select_drafted(shared, &candidates, depth, DECODE_ROWS,
+                let selection = resource::select_drafted(shared, &candidates, depth, geometry.decode_rows,
                     neural_confidence.iter().filter(|p| !p.is_empty()).count());
                 predicted = selection.predicted;
                 let mut depths = if fixed { neural_confidence.iter().map(Vec::len).collect() } else { selection.lengths };
@@ -872,9 +887,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     }
                 }
                 let pending: usize = active.iter().map(|a| a.draft.pending_rows()).sum();
-                if resource::trim_budget(&mut depths, DECODE_ROWS) { predicted = None; }
+                if resource::trim_budget(&mut depths, geometry.decode_rows) { predicted = None; }
                 let rows: usize = depths.iter().map(|d| d + 1).sum();
-                if depths.iter().any(|&d| d > 0) || pending + rows > DECODE_ROWS / 2 {
+                if depths.iter().any(|&d| d > 0) || pending + rows > geometry.decode_rows / 2 {
                     let mut seqs: Vec<DraftSeq<'_, _, _>> = active.iter_mut().zip(&depths).map(|(a, &depth)| DraftSeq {
                         placement: &a.placement, seq: &mut a.draft, depth }).collect();
                     drafted_requests = depths.iter().filter(|&&n| n > 0).count();
@@ -901,7 +916,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0 && !matches!(drafts, Drafts::Neural { fixed: true, .. })) {
             let candidates: Vec<_> = active.iter().zip(&neural_confidence).zip(&limits).map(|((a, prior), &limit)|
                 resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: false }).collect();
-            let selection = resource::select_drafted(shared, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
+            let selection = resource::select_drafted(shared, &candidates, drafted_width, geometry.decode_rows, drafted_requests);
             predicted = selection.predicted;
             for (((proposal, copy), neural), length) in proposals.iter_mut().zip(copies)
                 .zip(&mut neural_lengths).zip(selection.lengths) {
@@ -957,7 +972,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 for request in active.drain(..) {
                     if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    release(&family, &mut cache, &mut free_slots, &request.placement);
+                    release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family);
                 }
                 continue;
             }
@@ -1110,7 +1125,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     tracing::warn!("turn snapshot not retained: {error:#}");
                 }
             }
-            release(&family, &mut cache, &mut free_slots, &request.placement);
+            release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family);
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats);
@@ -1128,3 +1143,23 @@ fn media_failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::opena
     }
 }
 
+
+#[cfg(test)]
+mod media_failure_tests {
+    #[test]
+    fn permanent_image_admission_and_transient_pressure_have_distinct_errors() {
+        use cuteafd_engine::media::MediaError;
+        let error = MediaError::ImageTooLarge { needed: 5242880, capacity: 2621440 };
+        assert!(matches!(super::media_failure(error), cuteafd_api::openai::NativeFailure::BadRequest(message)
+            if message == "image needs 5242880 bytes > media cache capacity 2621440"));
+        let error = MediaError::CacheFull { needed: 2621440, free: 0, capacity: 5242880 };
+        assert!(matches!(super::media_failure(error), cuteafd_api::openai::NativeFailure::Unavailable(message)
+            if message.contains("2621440") && message.contains("5242880")));
+        assert!(matches!(super::media_failure(MediaError::QueueFull), cuteafd_api::openai::NativeFailure::Unavailable(_)));
+    }
+    #[test]
+    fn encoder_failure_does_not_expose_internal_error() {
+        assert!(matches!(super::media_failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
+            cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
+    }
+}
