@@ -591,7 +591,8 @@ release_profile_docker_args() {
   IFS=, read -ra switches <<<"$profile"
   for switch in "${switches[@]}"; do
     case "$switch" in
-      census) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_GRAPH_CENSUS=1 -e 'RUST_LOG=info,cuteafd::graph_capture=debug') ;;
+      census) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_GRAPH_CENSUS=1 -e 'RUST_LOG=info,cuteafd::graph_capture=debug'
+        -e CUTEAFD_STARTUP_MEMORY_PROBE=1) ;;
       transport-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_PROTOCOL_V2_TCP_TIMING=1) ;;
       expert-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_TIMING=1) ;;
       draft-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_DRAFT_TIMING=1) ;;

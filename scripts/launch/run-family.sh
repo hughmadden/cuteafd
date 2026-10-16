@@ -488,7 +488,13 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 }
 # PROFILE=switch[,switch...] turns on profiling for one launch, the same way in
 # every family, through release-common.sh:
-#   census            CUTEAFD_GRAPH_CENSUS=1 (graph capture/replay census)
+#   census            CUTEAFD_GRAPH_CENSUS=1 (graph capture/replay census) and
+#                     CUTEAFD_STARTUP_MEMORY_PROBE=1 (the startup memory ledger:
+#                     free/tracked/untracked bytes per device at each load stage,
+#                     logged as `startup memory probe`). With PROFILE_DIR the
+#                     native per-capture records go to
+#                     PROFILE_DIR/graph-census-captures-HOST.jsonl (without it,
+#                     /tmp/cuteafd-graph-census-captures.jsonl in the container).
 #   transport-timing  CUTEAFD_PROTOCOL_V2_TCP_TIMING=1 (expert exchange timing)
 #   expert-timing     CUTEAFD_EXPERT_TIMING=1 (Spark worker expert compute timing)
 #   draft-timing      CUTEAFD_DRAFT_TIMING=1 (drafter device and host launch spans)
