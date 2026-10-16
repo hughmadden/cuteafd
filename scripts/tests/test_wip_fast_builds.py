@@ -272,6 +272,9 @@ def test_zero_spark_card_sets_build_coordinator_only(tmp_path, monkeypatch, caps
     cards.build_arms({'cand': 'new'}, arms, [entry], tmp_path, 'task', True)
     assert '--role coordinator' in capsys.readouterr().out
     assert arms['cand']['build_role'] == 'coordinator'
+    staged = (tmp_path / 'build-cand.config').read_text()
+    assert 'SPARK_COUNT=0\n' in staged
+    assert 'SPARK_0_HOST' not in staged
 
 
 def test_seed_uses_only_owner_aware_build_resource():
