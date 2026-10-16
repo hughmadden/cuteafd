@@ -397,38 +397,77 @@ fn publish<E: Encoder>(stats: &Mutex<serde_json::Value>, requests: u64, generate
 /// Message starts of the Qwen chat template: a snapshot right before one is a message boundary.
 pub(crate) const MESSAGE_STARTS: [&str; 1] = ["<|im_start|>"];
 
+fn initialize<T>(init: impl FnOnce() -> Result<T>, ready: impl FnOnce() -> Result<()>) -> Result<T> {
+    let state = init()?;
+    ready()?;
+    Ok(state)
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn scheduler_init_failure_never_publishes_ready() {
+        let published = Cell::new(false);
+        let result = initialize(|| -> Result<()> { anyhow::bail!("scheduler init failed") }, || {
+            published.set(true);
+            Ok(())
+        });
+        assert!(result.unwrap_err().to_string().contains("scheduler init failed"));
+        assert!(!published.get());
+    }
+
+    #[test]
+    fn scheduler_ready_follows_successful_initialization() -> Result<()> {
+        let initialized = Cell::new(false);
+        let result = initialize(|| { initialized.set(true); Ok(17) }, || {
+            assert!(initialized.get());
+            Ok(())
+        })?;
+        assert_eq!(result, 17);
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
     drafts: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: &PrefixArgs, select: SelectPlacement,
     media: &mut MediaAdmission<Prompt, B::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>)
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>,
+    initialized: impl FnOnce() -> Result<()>)
     -> Result<()> {
     let geometry = engine.geometry();
-    let (family, mut cache) = engine.prefix_cache(prefix, max_sequences)?;
-    let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
+    let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
+    // Publish readiness only after all fallible scheduler-owned startup work.
+    let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
+        let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
+        let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
+        let grammars = crate::shared::constraints::Compiler::with_vocab(
+            engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
+        let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
+        let selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, DECODE_ROWS)?;
+        let shared = if width > 0 {
+            let geometry = engine.draft_geometry(snapshot, width)?;
+            engine.arm_draft_probe()?;
+            let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, cuteafd_core::PolicySeed::weak(width))?;
+            crate::shared::draft::apply_length_rule(&mut policy);
+            Some(policy)
+        } else { None };
+        let trace = Trace::open()?;
+        let prefills = decode_share.queue::<Prefill<'_, B::Placement, B::Draft>>()?;
+        Ok((family, cache, markers, grammars, tokenizer, selector, shared, trace, prefills))
+    }, initialized)?;
     let mut free_slots: Vec<i32> = (0..geometry.slots as i32).rev().collect();
-    let mut grammars = crate::shared::constraints::Compiler::with_vocab(
-        engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
-    let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let mut active: Vec<Active<'_, B::Placement, B::Draft>> = Vec::new();
     let (mut requests, mut generated_total, mut admissions) = (0u64, 0u64, 0u64);
     // Verify steps since the last completed request, host seconds in verifies and in family draft steps.
     let (mut steps, mut verify_s) = (0u64, 0f64);
     let mut timing = DraftTiming::default();
     let mut verify_stats = VerifyStats::default();
-    let mut selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, DECODE_ROWS)?;
     let neural = matches!(drafts, Drafts::Neural { .. });
-    let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
-    let mut shared = if width > 0 {
-        let geometry = engine.draft_geometry(snapshot, width)?;
-        engine.arm_draft_probe()?;
-        let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, cuteafd_core::PolicySeed::weak(width))?;
-        crate::shared::draft::apply_length_rule(&mut policy);
-        Some(policy)
-    } else { None };
-    let mut trace = Trace::open()?;
-    let mut prefills = decode_share.queue::<Prefill<'_, B::Placement, B::Draft>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<Prompt>>::default();
     loop {
         engine.require_live()?;

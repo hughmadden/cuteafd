@@ -214,11 +214,13 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             *stats = serde_json::json!({});
             probe::graph_capture_stats(&mut stats);
         }
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
-        }
         scheduler::schedule(&Qwen4Backend { engine, opened: &opened }, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, eos,
-            decode_share, &prefix, args.token_io.token_select, &mut media, preparer.as_deref())
+            decode_share, &prefix, args.token_io.token_select, &mut media, preparer.as_deref(), || {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
+                }
+                Ok(())
+            })
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| (args.max_context, None)).map_err(|e| anyhow::anyhow!("{e:#}")));
