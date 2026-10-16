@@ -459,9 +459,10 @@ mod tests {
     use super::*;
 
     /// The planner's Spark I/O (`plan --layout`) against the worker's own
-    /// sample: the expert service's selected rank I/O at the capacity, ring
-    /// endpoints and wire format the launcher passes it, under the
-    /// transport's real alignment. MiMo Flash/Pro on their natural minimum
+    /// sample: the expert service's selected rank I/O (per-endpoint rings,
+    /// shared intake/exchange/indices) for the typed admission the
+    /// coordinator sends it: capacity, one endpoint per MiMo prefill lane,
+    /// and the wire format. MiMo Flash/Pro on their natural minimum
     /// Spark counts, FP8 and BF16 wires.
     #[test]
     fn mimo_planner_spark_io_equals_worker_sample() {
@@ -489,10 +490,13 @@ mod tests {
                 for device in sparks {
                     let planned = |group: &str| device.items.iter().find(|i| i.group == group)
                         .unwrap_or_else(|| panic!("pro={pro} {input:?} {}: no {group}", device.name())).bytes;
+                    // The worker's typed admission as the coordinator selects it: one endpoint per
+                    // MiMo prefill lane (the runtime's own lane resolution), at its wire format.
                     let mut worker = config(ranks, device.index as usize, None);
                     worker.capacity = 4096;
                     worker.rdma_endpoints = lanes;
                     worker.bf16_ingress = input.bf16(false);
+                    set_model(&mut worker, 4096, input.bf16(false), lanes);
                     let rings = worker_ring_geometry(&worker).unwrap();
                     let sample = selected_spark_io(&worker, geometry, rings).unwrap();
                     assert_eq!(planned("rdma rings"), sample.mapped_rings, "pro={pro} {input:?} {}", device.name());
