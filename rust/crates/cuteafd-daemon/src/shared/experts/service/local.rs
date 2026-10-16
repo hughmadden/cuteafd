@@ -172,7 +172,14 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;
     let mut census = super::census::Census::new();
-    census.sample("before_media_or_native_library", None)?;
+    census.sample("before_native_library", None)?;
+    // SAFETY: this owner outlives media, weights, retained modules and executions.
+    let library = unsafe { NativeLibrary::load(&config.library) }?;
+    census.sample("before_context", None)?;
+    if census.enabled() {
+        library.cuda_device_synchronize()?;
+        census.sample("after_context_before_media", Some(&library))?;
+    }
     // The vision owner loads in this process/device's primary CUDA context,
     // never beside expertd in a second process. Charge it before expert admission.
     let (_encoder, _audio_encoder, reserved) = crate::shared::vision::worker::start_encoders(
@@ -219,8 +226,6 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         if selection.ranges().is_empty() {
             let installed = (|| -> Result<_> {
                 let report = {
-                    // SAFETY: the library remains loaded until sampling completes; replay retains only data.
-                    let library = unsafe { NativeLibrary::load(&config.library) }?;
                     library.release_sync_h2d_staging()?;
                     let baseline = cuteafd_ffi::memory_ledger::snapshot();
                     Some(cuteafd_core::ModelAdmissionResponse { rank: u32::try_from(config.rank)?,
@@ -247,20 +252,22 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let ring_budget = worker_ring_budget(&config, geometry)?;
     tracing::info!(rdma_endpoints = config.rdma_endpoints, bf16_ingress = config.bf16_ingress,
         ring_budget_bytes = ring_budget.limit(), "Spark ring admission policy");
-    // SAFETY: this owner keeps the library loaded through weights/execution Drop.
-    let library = unsafe { NativeLibrary::load(&config.library) }?;
-    census.sample("after_native_library_before_explicit_context", None)?;
-    if std::env::var("CUTEAFD_GRAPH_CENSUS").is_ok_and(|v| v == "1") {
-        library.cuda_device_synchronize()?;
-        census.sample("after_context_existing_media_may_share_primary_context", Some(&library))?;
-    }
     // Remove upload transients left by media before taking the retained baseline.
     library.release_sync_h2d_staging()?;
     // Existing media owners belong to the baseline, not expert residency/workspace.
     let baseline = cuteafd_ffi::memory_ledger::snapshot();
+    census.sample("before_expert_modules", Some(&library))?;
+    let mut modules = match super::modules::WarmModules::load(&library, &catalog, &config) {
+        Ok(modules) => modules,
+        Err(error) => {
+            let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
+            return Err(error);
+        }
+    };
+    census.sample("after_expert_modules_before_weights", Some(&library))?;
     let loaded = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        load_weights(&library, &catalog, &config)
+        load_weights(&library, &catalog, &config, &mut modules)
     };
     let (weights, remaining) = match loaded {
         Ok(loaded) => loaded,
@@ -275,10 +282,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     census.sample("after_expert_load_includes_weights_and_loader_code", Some(&library))?;
     let released = library.release_sync_h2d_staging()?;
     tracing::info!(released_bytes = released, "released load-time pinned upload staging");
-    census.sample("before_execution_modules_and_retained_arenas", Some(&library))?;
+    census.sample("before_retained_arenas", Some(&library))?;
     let allocated = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
-        weights.execution(&library, &config, remaining)
+        weights.execution(&library, &config, remaining, &mut modules)
     };
     let mut execution = match allocated {
         Ok(execution) => execution,
@@ -287,7 +294,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             return Err(error);
         }
     };
-    census.sample("after_execution_modules_and_retained_arenas", Some(&library))?;
+    census.sample("after_retained_arenas", Some(&library))?;
     let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];
     // Transport benchmarks only: answer each request with its response slot

@@ -139,6 +139,7 @@ impl<'a> Weights<'a> {
         library: &'a NativeLibrary,
         config: &NativeExpertServiceConfig,
         remaining: usize,
+        modules: &mut super::modules::WarmModules<'a>,
     ) -> Result<Execution<'_, 'a>> {
         Ok(match self {
             Self::Full(weights) => {
@@ -148,7 +149,7 @@ impl<'a> Weights<'a> {
                 Execution::Full(execution)
             }
             Self::Exl3(weights) => {
-                let mut execution = Exl3Worker::new(
+                let mut execution = Exl3Worker::with_modules(
                     library,
                     weights.clone(),
                     &config.exl3_directory_for(
@@ -160,6 +161,7 @@ impl<'a> Weights<'a> {
                     config.capacity,
                     remaining,
                     config.exl3_schedule,
+                    Some(modules.take_exl3()?),
                 )?;
                 execution.install_topology(config.topology)?;
                 Execution::Exl3(execution)
@@ -313,6 +315,7 @@ pub(super) fn load_fp8<'a>(
     library: &'a NativeLibrary,
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
+    modules: crate::shared::experts::fp8::Fp8Modules,
 ) -> Result<(Weights<'a>, usize)> {
     let tensors = catalog.fp8().context("FP8 residency requires the checkpoint's FP8 experts")?;
     // FP8 slices are whole 128-row blocks (TP2/TP4 of 2048); MXFP4 slices are
@@ -365,8 +368,8 @@ pub(super) fn load_fp8<'a>(
     // admit their peak above, rather than subtracting both lifetimes here.
     let actual_budget = fp8_resident_budget(library.cuda_allocatable_memory_info()?.0, resident, peak.serve_peak);
     let budget = budget.min(actual_budget);
-    let experts = Fp8Experts::load_with_bf16(library, tensors, &directory, bf16.as_deref(), &layers,
-        config.world, config.rank, config.capacity as usize, budget)?;
+    let experts = Fp8Experts::load_with_modules(library, tensors, &directory, bf16.as_deref(), &layers,
+        config.world, config.rank, config.capacity as usize, budget, Some(modules))?;
     if let Some(bf16) = bf16 {
         tracing::info!(package = %bf16.display(), "FP8 experts also take BF16 rows");
     }

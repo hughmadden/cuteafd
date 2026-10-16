@@ -1,7 +1,7 @@
 //! Spark request adapter: preserve the compact BF16 wire response and write
 //! directly into registered send storage when the transport permits it.
 use super::{
-    execution::{Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Schedule, Exl3Workspace},
+    execution::{Exl3Execution, Exl3InputFormat, Exl3Modules, Exl3ReductionPlan, Exl3RowPolicy, Exl3Schedule, Exl3Workspace},
     Exl3Weights,
 };
 use crate::shared::experts::execution::HostExpertExchange;
@@ -227,6 +227,14 @@ impl<'a> Exl3Worker<'a> {
         available_bytes: usize,
         schedule: Exl3Schedule,
     ) -> Result<Self> {
+        Self::with_modules(library, weights, directory, capacity, available_bytes, schedule, None)
+    }
+
+    pub(crate) fn with_modules(
+        library: &'a NativeLibrary, weights: Rc<Vec<Exl3Weights<'a>>>, directory: &Path,
+        capacity: u32, available_bytes: usize, schedule: Exl3Schedule,
+        modules: Option<Vec<Exl3Modules<'a>>>,
+    ) -> Result<Self> {
         let first = weights.first().context("EXL3 worker has no layers")?;
         let layer_ids = Self::resident_layers(weights.iter().map(|weight| &weight.layout))?;
         let rank = first.layout.rank;
@@ -241,15 +249,19 @@ impl<'a> Exl3Worker<'a> {
         let directories: Vec<_> = capacities.iter().map(|&c| schedule.directory(directory, c)).collect();
         let reduction_plan = Exl3ReductionPlan::new(&directories)?;
         let arena = Exl3Workspace::new(library, &directories)?;
+        let mut modules = modules.map(Vec::into_iter);
+        if let Some(modules) = &modules {
+            ensure!(modules.len() == capacities.len(), "EXL3 warmed capacity count mismatch");
+        }
         for c in capacities {
+            let module = match modules.as_mut() {
+                Some(modules) => modules.next().context("missing warmed EXL3 capacity")?,
+                // SAFETY: validated trusted packages on the current owner device.
+                None => unsafe { Exl3Modules::load(library, &schedule.directory(directory, c), Exl3InputFormat::Fp8K32)? },
+            };
+            // SAFETY: this worker serializes all executions sharing the arena.
             let execution = unsafe {
-                Exl3Execution::with_shared_workspace(
-                    library,
-                    weights.clone(),
-                    &schedule.directory(directory, c),
-                    Exl3InputFormat::Fp8K32,
-                    Some(arena.clone()),
-                )?
+                Exl3Execution::with_modules(library, weights.clone(), module, Some(arena.clone()))?
             };
             ensure!(
                 execution.capacity() == c as usize && execution.output_element_bytes() == 2,

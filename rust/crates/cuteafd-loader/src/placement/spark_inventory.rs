@@ -1,7 +1,7 @@
 //! Spark owners: manifests describe execution, checkpoint selection describes weights.
 use crate::placement::SparkAssignment;
 use cuteafd_core::memory_layout::{Basis, Category, Item};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -26,21 +26,24 @@ fn item(category: Category, name: &str, bytes: u64, basis: Basis) -> Item {
 }
 
 /// Every manifest is fingerprinted, including its object hashes and capacity state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SparkManifestProvenance {
-    pub sha256: String,
-    pub revision: String,
-    pub capacity_rows: Vec<u32>,
-    pub physical_sms: u32,
+    sha256: String,
+    revision: String,
+    capacity_rows: Vec<u32>,
+    physical_sms: u32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SparkMemoryDomains {
-    pub device: Vec<Item>,
-    pub pinned: Vec<Item>,
-    pub host: Vec<Item>,
+    device: Vec<Item>,
+    pinned: Vec<Item>,
+    host: Vec<Item>,
 }
 impl SparkMemoryDomains {
+    pub fn device(&self) -> &[Item] { &self.device }
+    pub fn pinned(&self) -> &[Item] { &self.pinned }
+    pub fn host(&self) -> &[Item] { &self.host }
     pub fn total(&self) -> Result<u64> {
         add(self.device.iter().chain(&self.pinned).chain(&self.host).map(|i| i.bytes))
     }
@@ -49,15 +52,19 @@ impl SparkMemoryDomains {
 /// Actual loader high-water owners, not a multiple of resident weights. Maxima
 /// are across sequential layer loads; simultaneous banks/read lanes are summed
 /// by the checkpoint loader before constructing this value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SparkLoadInventory {
-    pub device_staging_bytes: u64,
-    pub pinned_staging_bytes: u64,
-    pub host_read_scratch_bytes: u64,
-    pub source: String,
+    device_staging_bytes: u64,
+    pinned_staging_bytes: u64,
+    host_read_scratch_bytes: u64,
+    source: String,
 }
 
 impl SparkLoadInventory {
+    pub fn device_staging_bytes(&self) -> u64 { self.device_staging_bytes }
+    pub fn pinned_staging_bytes(&self) -> u64 { self.pinned_staging_bytes }
+    pub fn host_read_scratch_bytes(&self) -> u64 { self.host_read_scratch_bytes }
+    pub fn source(&self) -> &str { &self.source }
     pub fn native(catalog: &crate::OfficialV41Catalog, selections: &[crate::V41ExpertSelection]) -> Result<Self> {
         if selections.is_empty() { return Err(invalid("no selected native layer load plans")); }
         let mut staging = 0u64;
@@ -98,17 +105,23 @@ impl SparkLoadInventory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+/// Validated installed-package proof. Not deserializable or publicly writable.
+///
+/// ```compile_fail
+/// use cuteafd_loader::placement::inventory::SparkExecutionInventory;
+/// let _: SparkExecutionInventory = serde_json::from_str("{}").unwrap();
+/// ```
 pub struct SparkExecutionInventory {
-    pub compiled_capacity: u32,
-    pub live_capacity: u32,
-    pub retained_capacities: Vec<u32>,
-    pub physical_sms: u32,
-    pub logical_intermediate: u32,
-    pub stored_intermediate: u32,
-    pub manifests: Vec<SparkManifestProvenance>,
-    pub retained: SparkMemoryDomains,
-    pub load: SparkLoadInventory,
+    compiled_capacity: u32,
+    live_capacity: u32,
+    retained_capacities: Vec<u32>,
+    physical_sms: u32,
+    logical_intermediate: u32,
+    stored_intermediate: u32,
+    manifests: Vec<SparkManifestProvenance>,
+    retained: SparkMemoryDomains,
+    load: SparkLoadInventory,
 }
 
 fn capacities(compiled: u32, live: u32, retained: &[u32]) -> Result<()> {
@@ -129,6 +142,16 @@ fn provenance(manifest: &Value, rows: Vec<u32>, sms: u32) -> Result<SparkManifes
 }
 
 impl SparkExecutionInventory {
+    pub fn compiled_capacity(&self) -> u32 { self.compiled_capacity }
+    pub fn live_capacity(&self) -> u32 { self.live_capacity }
+    pub fn retained_capacities(&self) -> &[u32] { &self.retained_capacities }
+    pub fn physical_sms(&self) -> u32 { self.physical_sms }
+    pub fn logical_intermediate(&self) -> u32 { self.logical_intermediate }
+    pub fn stored_intermediate(&self) -> u32 { self.stored_intermediate }
+    pub fn manifests(&self) -> &[SparkManifestProvenance] { &self.manifests }
+    pub fn retained(&self) -> &SparkMemoryDomains { &self.retained }
+    pub fn load(&self) -> &SparkLoadInventory { &self.load }
+
     /// Native Spark owns separate main, serial and grouped-decode arenas. The
     /// compact reducer owns code/handles, not another device scratch arena.
     pub fn native(manifest: &Value, physical_sms: u32, compiled: u32, live: u32,
@@ -229,62 +252,208 @@ impl SparkExecutionInventory {
 
 /// Calibration must come from an isolated same-process phase pair. Neither
 /// MemAvailable nor total CUDA use minus the ledger qualifies a runtime term.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SparkRuntimeProvenance {
-    pub source: String,
-    pub method: SparkRuntimeMethod,
-    pub phase: String,
-    pub pid: u32,
-    pub quiet_host: bool,
+    source: String,
+    method: SparkRuntimeMethod,
+    phase: String,
+    pid: u32,
+    quiet_host: bool,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SparkRuntimeMethod {
     ProcessAttributedPhaseDelta,
     MeasuredResidual,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SparkRuntimeTerm {
-    pub item: Item,
-    pub provenance: SparkRuntimeProvenance,
+    item: Item,
+    provenance: SparkRuntimeProvenance,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+/// Runtime proof can only be constructed through validation, not deserialization.
+///
+/// ```compile_fail
+/// use cuteafd_loader::placement::inventory::QualifiedSparkRuntime;
+/// let _: QualifiedSparkRuntime = serde_json::from_str("{}").unwrap();
+/// ```
 pub struct QualifiedSparkRuntime {
-    pub arch: String,
-    pub driver: String,
-    pub physical_sms: u32,
+    arch: String,
+    driver: String,
+    physical_sms: u32,
     /// Fingerprints of the selected capacity packages, not just family name.
-    pub manifest_sha256: Vec<String>,
-    pub device: Vec<SparkRuntimeTerm>,
-    pub pinned: Vec<SparkRuntimeTerm>,
-    pub host: Vec<SparkRuntimeTerm>,
+    manifest_sha256: Vec<String>,
+    /// Explicit host owners excluded before forming the measured remainder.
+    host_owner_bytes: u64,
+    device: Vec<SparkRuntimeTerm>,
+    pinned: Vec<SparkRuntimeTerm>,
+    host: Vec<SparkRuntimeTerm>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SparkRankInventory {
-    pub rank: u32,
+    rank: u32,
     /// Serving owners; domains are disjoint even on GB10's unified pool.
-    pub device: Vec<Item>,
-    pub pinned: Vec<Item>,
-    pub host: Vec<Item>,
+    device: Vec<Item>,
+    pinned: Vec<Item>,
+    host: Vec<Item>,
     /// Additional load-only owners. They do not coexist with execution/rings.
-    pub load_transient: SparkMemoryDomains,
+    load_transient: SparkMemoryDomains,
     /// Full independent unified-memory peaks, including resident and runtime.
-    pub load_peak: u64,
-    pub serve_peak: u64,
-    pub manifests: Vec<SparkManifestProvenance>,
-    pub runtime_provenance: Vec<SparkRuntimeProvenance>,
-    pub load_provenance: String,
+    load_peak: u64,
+    serve_peak: u64,
+    manifests: Vec<SparkManifestProvenance>,
+    runtime_provenance: Vec<SparkRuntimeProvenance>,
+    load_provenance: String,
 }
 
-pub fn v41_spark_inventory(assignment: &SparkAssignment, execution: &SparkExecutionInventory,
-    runtime: &QualifiedSparkRuntime) -> Result<SparkRankInventory> {
-    capacities(execution.compiled_capacity, execution.live_capacity, &execution.retained_capacities)?;
-    if runtime.arch != "sm_121" || runtime.driver.is_empty() || runtime.physical_sms != execution.physical_sms
-        || execution.load.source.is_empty() || assignment.slices.is_empty()
-        || assignment.slices.iter().any(|s| s.width != execution.logical_intermediate
-            || s.stored_width != execution.stored_intermediate) {
-        return Err(invalid("assignment/execution/runtime qualification mismatch (idle rank needs no execution)"));
+impl SparkManifestProvenance {
+    pub fn sha256(&self) -> &str { &self.sha256 }
+    pub fn revision(&self) -> &str { &self.revision }
+    pub fn capacity_rows(&self) -> &[u32] { &self.capacity_rows }
+    pub fn physical_sms(&self) -> u32 { self.physical_sms }
+}
+
+impl SparkRuntimeProvenance {
+    fn new(source: String, method: SparkRuntimeMethod, phase: String, pid: u32,
+        quiet_host: bool) -> Result<Self> {
+        if source.trim().is_empty() || phase.trim().is_empty() || pid == 0 || !quiet_host {
+            return Err(invalid("runtime provenance requires a quiet same-process phase source"));
+        }
+        Ok(Self { source, method, phase, pid, quiet_host })
+    }
+    pub fn source(&self) -> &str { &self.source }
+    pub fn method(&self) -> SparkRuntimeMethod { self.method }
+    pub fn phase(&self) -> &str { &self.phase }
+    pub fn pid(&self) -> u32 { self.pid }
+    pub fn quiet_host(&self) -> bool { self.quiet_host }
+}
+
+impl SparkRuntimeTerm {
+    fn new(item: Item, provenance: SparkRuntimeProvenance) -> Result<Self> {
+        if item.basis != Basis::Calibrated || item.category != Category::Runtime
+            || item.group.trim().is_empty()
+            || (provenance.method == SparkRuntimeMethod::MeasuredResidual
+                && !item.group.contains("measured_residual")) {
+            return Err(invalid("runtime terms require calibrated runtime owners; residuals must be named measured_residual"));
+        }
+        Ok(Self { item, provenance })
+    }
+    pub fn item(&self) -> &Item { &self.item }
+    pub fn provenance(&self) -> &SparkRuntimeProvenance { &self.provenance }
+}
+
+impl QualifiedSparkRuntime {
+    /// Build only from isolated same-process phase evidence and externally
+    /// established quiet-host conditions. System memory alone is not attribution.
+    pub fn from_census(assignment: &SparkAssignment, execution: &SparkExecutionInventory,
+        sample: &cuteafd_core::RuntimeSample,
+        manifest_sha256: Vec<String>, samples: &[cuteafd_core::expert_geometry::SparkProcessSample],
+        source: String, quiet_host: bool) -> Result<Self> {
+        use cuteafd_core::expert_geometry::SparkProcessSample;
+        if !quiet_host || source.trim().is_empty() { return Err(invalid("quiet-host census source required")); }
+        let phase = |name: &str| -> Result<&SparkProcessSample> {
+            let mut found = samples.iter().filter(|s| s.phase == name);
+            let value = found.next().ok_or_else(|| invalid(format!("missing isolated phase {name}")))?;
+            if found.next().is_some() { return Err(invalid(format!("duplicate phase {name}"))); }
+            Ok(value)
+        };
+        let context_before = phase("before_context")?;
+        let context_after = phase("after_context_before_media")?;
+        let modules_before = phase("before_expert_modules")?;
+        let modules_after = phase("after_expert_modules_before_weights")?;
+        let ready = phase("serve_owners_before_endpoint_rings")?;
+        let ordered = [context_before, context_after, modules_before, modules_after, ready];
+        if context_before.pid == 0 || context_before.system_total_bytes == 0
+            || ordered.iter().any(|s| s.pid != context_before.pid
+                || s.system_total_bytes != context_before.system_total_bytes
+                || s.system_available_bytes > s.system_total_bytes)
+            || ordered.windows(2).any(|pair| pair[0].monotonic_ns >= pair[1].monotonic_ns) {
+            return Err(invalid("census process/system/phase order mismatch"));
+        }
+        let delta = |before: &SparkProcessSample, after: &SparkProcessSample| -> Result<u64> {
+            if before.tracked_device_bytes != after.tracked_device_bytes
+                || before.tracked_pinned_bytes != after.tracked_pinned_bytes {
+                return Err(invalid("isolated context/module phase allocated payload storage"));
+            }
+            let process = after.cuda_mapping_pss_bytes.checked_sub(before.cuda_mapping_pss_bytes)
+                .ok_or_else(|| invalid("CUDA process mapping PSS decreased"))?;
+            let system = before.system_available_bytes.checked_sub(after.system_available_bytes)
+                .ok_or_else(|| invalid("system memory grew during isolated CUDA phase"))?;
+            if process == 0 || process.abs_diff(system) > 16 << 20 {
+                return Err(invalid("CUDA process-map/system-memory phase witnesses disagree or are invisible; stop"));
+            }
+            Ok(process)
+        };
+        let context = delta(context_before, context_after)?;
+        let modules = delta(modules_before, modules_after)?;
+        let retained = ready.tracked_device_bytes.checked_sub(modules_after.tracked_device_bytes)
+            .filter(|bytes| *bytes > 0).ok_or_else(|| invalid("missing retained payload visibility control"))?;
+        let visible = ready.cuda_mapping_pss_bytes.checked_sub(modules_after.cuda_mapping_pss_bytes)
+            .ok_or_else(|| invalid("CUDA retained process PSS decreased"))?;
+        if visible == 0 || retained.abs_diff(visible) > retained / 20 {
+            return Err(invalid("CUDA UMA retained allocations invisible/incomplete in process maps; stop"));
+        }
+        let total_growth = context_before.system_available_bytes.checked_sub(ready.system_available_bytes)
+            .ok_or_else(|| invalid("system memory grew across census"))?;
+        let tracked_device = ready.tracked_device_bytes.checked_sub(context_before.tracked_device_bytes)
+            .ok_or_else(|| invalid("device payload ledger decreased"))?;
+        let tracked_pinned = ready.tracked_pinned_bytes.checked_sub(context_before.tracked_pinned_bytes)
+            .ok_or_else(|| invalid("pinned payload ledger decreased"))?;
+        let host_owner_bytes = add([assignment.io.host_exchange, assignment.io.row_indices,
+            add(execution.retained.host.iter().map(|item| item.bytes))?])?;
+        let accounted = add([context, modules, tracked_device, tracked_pinned, host_owner_bytes])?;
+        let residual = total_growth.checked_sub(accounted)
+            .ok_or_else(|| invalid("system witness below attributed owners; cannot form disjoint residual"))?;
+        let term = |name: &str, bytes, method, phase: &str| -> Result<SparkRuntimeTerm> {
+            SparkRuntimeTerm::new(item(Category::Runtime, name, bytes, Basis::Calibrated),
+                SparkRuntimeProvenance::new(source.clone(), method, phase.into(), context_before.pid, quiet_host)?)
+        };
+        Self::new(execution, sample.arch.clone(), sample.driver.clone(), sample.sms,
+            manifest_sha256, host_owner_bytes,
+            vec![term("cuda_context", context, SparkRuntimeMethod::ProcessAttributedPhaseDelta,
+                    "before_context/after_context_before_media: CUDA mapping PSS + system MemAvailable")?,
+                term("expert_modules", modules, SparkRuntimeMethod::ProcessAttributedPhaseDelta,
+                    "before_expert_modules/after_expert_modules_before_weights: CUDA mapping PSS + system MemAvailable")?],
+            vec![], vec![term("host_measured_residual", residual, SparkRuntimeMethod::MeasuredResidual,
+                "before_context/serve_owners_before_endpoint_rings: system growth less disjoint tracked and attributed owners")?])
+    }
+
+    fn new(execution: &SparkExecutionInventory, arch: String, driver: String,
+        physical_sms: u32, manifest_sha256: Vec<String>, host_owner_bytes: u64,
+        device: Vec<SparkRuntimeTerm>, pinned: Vec<SparkRuntimeTerm>, host: Vec<SparkRuntimeTerm>) -> Result<Self> {
+        let runtime = Self { arch, driver, physical_sms, manifest_sha256, host_owner_bytes, device, pinned, host };
+        validate_runtime(execution, &runtime)?;
+        Ok(runtime)
+    }
+    pub fn arch(&self) -> &str { &self.arch }
+    pub fn driver(&self) -> &str { &self.driver }
+    pub fn physical_sms(&self) -> u32 { self.physical_sms }
+    pub fn manifest_sha256(&self) -> &[String] { &self.manifest_sha256 }
+    pub fn host_owner_bytes(&self) -> u64 { self.host_owner_bytes }
+    pub fn device(&self) -> &[SparkRuntimeTerm] { &self.device }
+    pub fn pinned(&self) -> &[SparkRuntimeTerm] { &self.pinned }
+    pub fn host(&self) -> &[SparkRuntimeTerm] { &self.host }
+}
+
+impl SparkRankInventory {
+    pub fn rank(&self) -> u32 { self.rank }
+    pub fn device(&self) -> &[Item] { &self.device }
+    pub fn pinned(&self) -> &[Item] { &self.pinned }
+    pub fn host(&self) -> &[Item] { &self.host }
+    pub fn load_transient(&self) -> &SparkMemoryDomains { &self.load_transient }
+    pub fn load_peak(&self) -> u64 { self.load_peak }
+    pub fn serve_peak(&self) -> u64 { self.serve_peak }
+    pub fn manifests(&self) -> &[SparkManifestProvenance] { &self.manifests }
+    pub fn runtime_provenance(&self) -> &[SparkRuntimeProvenance] { &self.runtime_provenance }
+    pub fn load_provenance(&self) -> &str { &self.load_provenance }
+}
+
+fn validate_runtime(execution: &SparkExecutionInventory, runtime: &QualifiedSparkRuntime) -> Result<()> {
+    if runtime.arch != "sm_121" || runtime.driver.trim().is_empty()
+        || runtime.physical_sms != execution.physical_sms {
+        return Err(invalid("runtime architecture/driver/physical SM mismatch"));
     }
     let fingerprints: Vec<_> = execution.manifests.iter().map(|m| m.sha256.clone()).collect();
     if fingerprints != runtime.manifest_sha256 { return Err(invalid("runtime calibrated for different package manifests")); }
@@ -292,7 +461,7 @@ pub fn v41_spark_inventory(assignment: &SparkAssignment, execution: &SparkExecut
     for term in &all {
         let p = &term.provenance;
         if p.source.is_empty() || p.phase.is_empty() || p.pid == 0 || !p.quiet_host
-            || term.item.basis != Basis::Calibrated
+            || term.item.basis != Basis::Calibrated || term.item.category != Category::Runtime
             || (p.method == SparkRuntimeMethod::MeasuredResidual && !term.item.group.contains("measured_residual")) {
             return Err(invalid("unqualified runtime term; residuals must be named measured_residual"));
         }
@@ -313,6 +482,25 @@ pub fn v41_spark_inventory(assignment: &SparkAssignment, execution: &SparkExecut
         && t.provenance.method != SparkRuntimeMethod::ProcessAttributedPhaseDelta) {
         return Err(invalid("context/modules require isolated process-attributable phase deltas"));
     }
+    add(all.iter().map(|t| t.item.bytes))?;
+    Ok(())
+}
+
+pub fn v41_spark_inventory(assignment: &SparkAssignment, execution: &SparkExecutionInventory,
+    runtime: &QualifiedSparkRuntime) -> Result<SparkRankInventory> {
+    capacities(execution.compiled_capacity, execution.live_capacity, &execution.retained_capacities)?;
+    if runtime.arch != "sm_121" || runtime.driver.is_empty() || runtime.physical_sms != execution.physical_sms
+        || execution.load.source.is_empty() || assignment.slices.is_empty()
+        || assignment.slices.iter().any(|s| s.width != execution.logical_intermediate
+            || s.stored_width != execution.stored_intermediate) {
+        return Err(invalid("assignment/execution/runtime qualification mismatch (idle rank needs no execution)"));
+    }
+    validate_runtime(execution, runtime)?;
+    if runtime.host_owner_bytes != add([assignment.io.host_exchange, assignment.io.row_indices,
+        add(execution.retained.host.iter().map(|item| item.bytes))?])? {
+        return Err(invalid("runtime residual calibrated for different host owners"));
+    }
+    let all: Vec<_> = runtime.device.iter().chain(&runtime.pinned).chain(&runtime.host).collect();
     let mut retained = execution.retained.clone();
     retained.device.insert(0, Item::new(Category::Experts, "expert_weights", "checkpoint_native",
         assignment.resident_bytes, Basis::Exact));
@@ -363,6 +551,7 @@ mod tests {
                 method, phase: "before/after isolated same-process phase".into(), pid: 42, quiet_host: true } };
         QualifiedSparkRuntime { arch: "sm_121".into(), driver: "test".into(), physical_sms: 48,
             manifest_sha256: e.manifests.iter().map(|m| m.sha256.clone()).collect(),
+            host_owner_bytes: assignment().io.host_exchange + assignment().io.row_indices,
             device: vec![term("cuda_context", 10, SparkRuntimeMethod::ProcessAttributedPhaseDelta),
                 term("expert_modules", 20, SparkRuntimeMethod::ProcessAttributedPhaseDelta)],
             pinned: vec![], host: vec![term("host_measured_residual", 30, SparkRuntimeMethod::MeasuredResidual)] }
@@ -372,6 +561,89 @@ mod tests {
             layer: 5, first: 768, width: 768, stored_width: 768, tiers: vec![], projection_counts: vec![] }],
             io: crate::placement::SparkIoBytes { intake: u64::MAX, host_exchange: 111, row_indices: 222, mapped_rings: 333 } }
     }
+    #[test]
+    fn constructors_validate_before_publishing_read_only_proofs() {
+        let e = execution();
+        let r = runtime(&e);
+        let qualified = QualifiedSparkRuntime::new(&e, r.arch.clone(), r.driver.clone(), r.physical_sms,
+            r.manifest_sha256.clone(), r.host_owner_bytes, r.device.clone(), r.pinned.clone(), r.host.clone()).unwrap();
+        assert_eq!(qualified.arch(), "sm_121");
+        assert_eq!(e.compiled_capacity(), 4096);
+        assert_eq!(e.retained_capacities(), &[4096, 1, 80]);
+        assert!(QualifiedSparkRuntime::new(&e, "sm_120".into(), r.driver.clone(), r.physical_sms,
+            r.manifest_sha256.clone(), r.host_owner_bytes, r.device.clone(), r.pinned.clone(), r.host.clone()).is_err());
+        assert!(SparkRuntimeProvenance::new(" ".into(), SparkRuntimeMethod::ProcessAttributedPhaseDelta,
+            "phase".into(), 42, true).is_err());
+        assert!(SparkRuntimeProvenance::new("source".into(), SparkRuntimeMethod::ProcessAttributedPhaseDelta,
+            "phase".into(), 42, false).is_err());
+        let provenance = SparkRuntimeProvenance::new("isolated same-process maps/system pair".into(),
+            SparkRuntimeMethod::MeasuredResidual, "phase".into(), 42, true).unwrap();
+        assert!(SparkRuntimeTerm::new(item(Category::Runtime, "cuda_context", 10, Basis::Calibrated),
+            provenance.clone()).is_err());
+        assert!(SparkRuntimeTerm::new(item(Category::Workspace, "host_measured_residual", 10, Basis::Calibrated),
+            provenance.clone()).is_err());
+        let term = SparkRuntimeTerm::new(item(Category::Runtime, "host_measured_residual", 10, Basis::Calibrated),
+            provenance).unwrap();
+        assert_eq!(term.item().bytes, 10);
+    }
+
+    fn census_samples() -> Vec<cuteafd_core::expert_geometry::SparkProcessSample> {
+        let phases = ["before_context", "after_context_before_media", "before_expert_modules",
+            "after_expert_modules_before_weights", "serve_owners_before_endpoint_rings"];
+        phases.into_iter().enumerate().map(|(i, phase)| {
+            let mib = 1 << 20;
+            let cuda = [0, 32, 32, 96, 1120][i] * mib;
+            cuteafd_core::expert_geometry::SparkProcessSample {
+                phase: phase.into(), pid: 42, monotonic_ns: i as u64 + 1,
+                rss_bytes: cuda, pss_bytes: cuda, private_bytes: 0,
+                tracked_device_bytes: if i == 4 { 1024 * mib } else { 0 }, tracked_pinned_bytes: 0,
+                cuda_mapping_pss_bytes: cuda, anonymous_pss_bytes: 0, file_pss_bytes: 0,
+                system_available_bytes: 8192 * mib - cuda - if i == 4 { 8 * mib + 333 } else { 0 },
+                system_total_bytes: 16384 * mib, allocatable_bytes: None,
+                raw_cuda_free_bytes: None, method: "synthetic unit-test maps/system".into() }
+        }).collect()
+    }
+    #[test]
+    fn public_constructor_requires_dual_witness_evidence_and_package_identity() {
+        let e = execution();
+        let runtime = cuteafd_core::RuntimeSample { device: 0, total_bytes: 16384 << 20,
+            free_bytes: 8192 << 20, context_bytes: 0, module_bytes: 0, sms: 48,
+            arch: "sm_121".into(), driver: "test".into() };
+        let hashes: Vec<_> = e.manifests().iter().map(|m| m.sha256().to_owned()).collect();
+        let construct = |samples: &[_], hashes, quiet| QualifiedSparkRuntime::from_census(
+            &assignment(), &e, &runtime, hashes, samples,
+            "synthetic unit test; not hardware qualification".into(), quiet);
+        let qualified = construct(&census_samples(), hashes.clone(), true).unwrap();
+        assert_eq!(qualified.device()[0].item().bytes, 32 << 20);
+        assert_eq!(qualified.device()[1].item().bytes, 64 << 20);
+        assert_eq!(qualified.host()[0].item().bytes, 8 << 20);
+        assert_eq!(qualified.host_owner_bytes(), 333);
+        let mut different = assignment();
+        different.io.host_exchange += 1;
+        assert!(v41_spark_inventory(&different, &e, &qualified).is_err());
+        assert_eq!(qualified.host()[0].provenance().method(), SparkRuntimeMethod::MeasuredResidual);
+        assert!(construct(&census_samples(), hashes.clone(), false).is_err());
+        assert!(construct(&census_samples(), vec!["wrong-package".into()], true).is_err());
+        for bad in 0..12 {
+            let mut samples = census_samples();
+            match bad {
+                0 => samples[1].pid = 43,
+                1 => samples[2].monotonic_ns = samples[1].monotonic_ns,
+                2 => samples[1].tracked_device_bytes = 1,
+                3 => samples[3].tracked_pinned_bytes = 1,
+                4 => samples[4].cuda_mapping_pss_bytes = samples[3].cuda_mapping_pss_bytes,
+                5 => samples[1].cuda_mapping_pss_bytes = 0,
+                6 => samples[3].system_available_bytes -= 32 << 20,
+                7 => samples[1].system_total_bytes = 0,
+                8 => samples.push(samples[0].clone()),
+                9 => samples[4].tracked_device_bytes = 0,
+                10 => samples[4].system_available_bytes += 9 << 20,
+                _ => { samples.pop(); },
+            }
+            assert!(construct(&samples, hashes.clone(), true).is_err(), "case {bad}");
+        }
+    }
+
     #[test]
     fn native_sums_retained_arenas_instead_of_coordinator_maximum() {
         let e = execution();

@@ -77,6 +77,14 @@ pub struct SparkProcessSample {
     pub tracked_device_bytes: u64,
     pub tracked_pinned_bytes: u64,
     pub raw_cuda_free_bytes: Option<u64>,
+    /// Independent witnesses. CUDA mappings may report zero PSS on GB10;
+    /// zero visibility never qualifies a CUDA context/module attribution.
+    pub cuda_mapping_pss_bytes: u64,
+    pub anonymous_pss_bytes: u64,
+    pub file_pss_bytes: u64,
+    pub system_available_bytes: u64,
+    pub system_total_bytes: u64,
+    pub allocatable_bytes: Option<u64>,
     pub method: String,
 }
 
