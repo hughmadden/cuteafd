@@ -21,9 +21,11 @@
 //! Flash's existing dSpark prior), then Platt.
 //!
 //! **Seed and cold start** (D3). The policy starts from GLM Flash's typical
-//! warm fits (D2's cards) and verifies `COLD_DRAFTS` per request until its
-//! fits are warm and have predicted enough rounds within `WARM_ERROR`; then
-//! it engages for good. No table from the old per-family policy is used.
+//! warm fits (D2's cards). Until its fits are warm and have predicted enough
+//! rounds within `WARM_ERROR` (then it engages for good), each request
+//! verifies its drafts while their calibrated survival is at least one half,
+//! at most `COLD_DRAFTS` and at least one. No table from the old per-family
+//! policy is used.
 //!
 //! **One row budget** (D3): the step's verify rows across every request, no
 //! equal quota; the selection gives each row to the draft that pays most.
@@ -323,8 +325,8 @@ pub(crate) struct Selection {
 
 /// Draft counts for every active sequence through the shared policy under
 /// one budget of `max_rows` verify rows (anchors included), with GLM's kept
-/// adapter rules. Until the policy engages every request verifies up to its
-/// cold drafts.
+/// adapter rules. Until the policy engages every request verifies its
+/// calibrated-survival cold drafts ([`DraftPolicy::cold_length`]).
 pub(crate) fn select(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], width: usize, max_rows: usize)
     -> Selection {
     select_drafted(policy, candidates, width, max_rows, candidates.len())
@@ -339,8 +341,9 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
     let cores: Vec<DraftCandidate<'_>> = candidates.iter().zip(&confidence)
         .map(|(c, &confidence)| DraftCandidate { id: c.id, confidence }).collect();
     let minimum = |c: &Candidate<'_>, available: usize| if c.selector && c.cold { START_DRAFTS.min(available) } else { 0 };
-    let cold = policy.cold_drafts();
-    let mut lengths: Vec<usize> = confidence.iter().map(|c| c.len().min(cold)).collect();
+    // Until the bucket engages, each request verifies its calibrated-survival
+    // drafts (at most the seed's cold drafts), not a fixed count.
+    let mut lengths: Vec<usize> = cores.iter().map(|&c| policy.cold_length(cores.len(), c)).collect();
     let mut predicted = None;
     if let Ok(Some(selection)) = policy.select_drafted_within(false, &cores, width, max_rows, drafted_requests) {
         lengths = selection.lengths;
@@ -814,7 +817,11 @@ mod tests {
             Candidate { id: 2, prior: &p, limit: 3, selector: false, cold: false },
             Candidate { id: 3, prior: &[], limit: 7, selector: true, cold: true }];
         let selection = select(&mut policy, &candidates, 7, 64);
-        assert_eq!((selection.lengths, selection.predicted), (vec![7, 3, 0], None));
+        // A hopeless request verifies one probe draft, except the DFlash2 cold floor.
+        assert_eq!((selection.lengths, selection.predicted), (vec![5, 1, 0], None));
+        let sure = [Candidate { id: 4, prior: &[0.99; 7], limit: 7, selector: false, cold: false },
+            Candidate { id: 5, prior: &[0.99; 7], limit: 3, selector: false, cold: false }];
+        assert_eq!(select(&mut policy, &sure, 7, 64).lengths, vec![7, 3], "survival >= 0.5 within limits");
         // Warm fits: a hopeless cold DFlash2 request still verifies five.
         let mut policy = warm_policy(true);
         let cold = [Candidate { id: 9, prior: &[0.01; 7], limit: 7, selector: true, cold: true }];
@@ -935,17 +942,38 @@ mod tests {
             .unwrap();
         assert!(!policy.engaged(false, 1));
         let p = [0.1; 7];
-        let long = [0.9; 20];
+        let long = [0.95; 20];
         let candidates = [Candidate { id: 1, prior: &p, limit: 7, selector: false, cold: false },
             Candidate { id: 2, prior: &long, limit: 63, selector: false, cold: false },
             // A cold DFlash2 request keeps its five.
             Candidate { id: 3, prior: &p, limit: 7, selector: true, cold: true }];
         let selection = select(&mut policy, &candidates, 7, 64);
-        assert_eq!((selection.lengths, selection.predicted), (vec![COLD_DRAFTS, COLD_DRAFTS, 5], None));
+        // Survival, not a fixed count: one probe draft for the hopeless block,
+        // the confident one up to the cold drafts.
+        assert_eq!((selection.lengths, selection.predicted), (vec![1, COLD_DRAFTS, 5], None));
         // Eight rows: three anchors and five drafts, trimmed from the longest.
         let tight = select(&mut policy, &candidates, 7, 8);
         assert_eq!(tight.lengths.iter().sum::<usize>() + 3, 8, "{:?}", tight.lengths);
         assert!(tight.lengths.iter().max().unwrap() - tight.lengths.iter().min().unwrap() <= 1);
+    }
+
+    /// #222: GLM 5.3's first long C1 decode spent up to 40 rounds before the
+    /// C1 bucket engaged, verifying five drafts at ~35% acceptance whatever the
+    /// drafter's confidence. Before engagement a warm (four-outcome) DFlash2
+    /// request verifies its calibrated-survival depth instead.
+    #[test]
+    fn unengaged_c1_follows_the_drafters_confidence_not_a_fixed_five() {
+        let homes = homes(true);
+        let mut policy = DraftPolicy::seeded(geometry(&homes, 288, 8, 64, 7, COPY_EXTENSION).unwrap(),
+            PolicySeed { cold_drafts: 5, ..seed() }).unwrap();
+        assert!(!policy.engaged(false, 1));
+        // Recorded round shapes: confident first two, then a falling tail.
+        for (prior, depth) in [([0.95, 0.85, 0.5, 0.2, 0.4, 0.3, 0.2], 2), ([0.99, 0.98, 0.95, 0.9, 0.9, 0.5, 0.5], 5),
+            ([0.4, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9], 1), ([0.8, 0.7, 0.9, 0.6, 0.9, 0.9, 0.9], 3)] {
+            let lone = [Candidate { id: 7, prior: &prior, limit: 7, selector: true, cold: false }];
+            let selection = select(&mut policy, &lone, 7, 64);
+            assert_eq!((selection.lengths, selection.predicted), (vec![depth], None), "{prior:?}");
+        }
     }
 
     #[test]

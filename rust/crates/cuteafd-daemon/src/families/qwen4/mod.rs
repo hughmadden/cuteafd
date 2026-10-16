@@ -6,7 +6,6 @@ pub(crate) mod engine;
 mod admission;
 mod dual;
 mod mtp_golden;
-pub(crate) mod mtp_policy;
 pub(crate) mod ple;
 pub(crate) mod prefix;
 pub(crate) mod serve;
