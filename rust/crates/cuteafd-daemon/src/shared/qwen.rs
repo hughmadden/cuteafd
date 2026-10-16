@@ -136,6 +136,12 @@ impl<'a> GdnBank<'a> {
             commit_tables: zeroed(3 * REPLAY_ROWS * 4)? })
     }
 
+    pub(crate) fn allocated_bytes(&self) -> [usize; 3] {
+        [self.conv.as_ref().map_or(0, |a| a.buffer.bytes)
+            + self.state.as_ref().map_or(0, |a| a.buffer.bytes),
+            self.replay.as_ref().map_or(0, |a| a.buffer.bytes), self.commit_tables.buffer.bytes]
+    }
+
     fn region(pool: &Dev<'_>, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
         debug_assert!(offset + bytes <= pool.buffer.bytes);
         CuteafdDeviceBuffer { ptr: pool.buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..pool.buffer }

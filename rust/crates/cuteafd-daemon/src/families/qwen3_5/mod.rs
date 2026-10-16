@@ -38,6 +38,12 @@ pub(crate) struct GoldenArgs {
     /// Check block verify padding, taps, exact restore and accepted-input replay before scoring.
     #[arg(long)]
     pub verify_check: bool,
+    /// Admitted native state slots; --verify-check also exercises interleaved slots when greater than one.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=64))]
+    pub state_slots: u8,
+    /// Check exact recurrent prefix restore and copied GQA full/partial pages before scoring.
+    #[arg(long)]
+    pub prefix_check: bool,
     /// Maximum absolute mean-NLL difference from the supplied reference.
     #[arg(long, default_value_t = 0.01)]
     pub nll_tolerance: f64,
@@ -71,8 +77,18 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(native)? };
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let mut engine = engine::DenseEngine::new(&library, &programs, &checkpoint, cfg.clone(), args.pool_tokens, None)?;
-    if args.verify_check { engine.verify_check(&tokens)?; }
+    let slots = usize::from(args.state_slots);
+    let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
+        lanes: slots, entries: 1, budget_bytes: 1 << 30 });
+    let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
+        args.pool_tokens, None, slots, marks)?;
+    if args.verify_check {
+        engine.verify_check(&tokens)?;
+        if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
+    }
+    let engine = std::cell::RefCell::new(engine);
+    if args.prefix_check { engine::prefix::check(&engine, &tokens)?; }
+    let mut engine = engine.into_inner();
     let mut logits = Vec::with_capacity(tokens.len() * cfg.vocab);
     let mut first = 0;
     for chunk in tokens.chunks(args.prefill_chunk) {

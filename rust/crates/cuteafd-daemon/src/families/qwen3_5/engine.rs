@@ -4,10 +4,9 @@ use super::{block::{Blocks, Planes, Step}, programs::DensePrograms, weights::Den
 use crate::shared::{memory::device::{Allocation, Device, Stream}, qwen::{GdnBank, GdnLayout, LayerStateMap},
     qwen::weights::WeightReader, target_head::TargetHead, token_io::{DeviceLogits, EmbedPlacement, EmbedSource, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::memory_layout::{Basis, Category};
-use cuteafd_ffi::{programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE}, CuteafdDeviceBuffer, NativeLibrary};
+use cuteafd_ffi::{programs::{Programs, Scalar, VocabularyHead}, CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{families::{qwen::HybridAttention, qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint,
-    placement::{self, families::qwen3_5::{DenseInputs, LayerBytes}, Baseline, Demand, GpuBudget}};
+    placement::{self, families::qwen3_5::{DenseInputs, NativeBuffers, NativeWeights}, Baseline, GpuBudget}};
 
 const ROWS: usize = 4096;
 const HEAD_ROWS: usize = 64;
@@ -63,6 +62,32 @@ mod hook_borrow_tests {
     }
 
     #[test]
+    #[ignore = "requires dense BF16 checkpoint, matching native library and an allocated GPU"]
+    fn planner_equals_runtime_actual_dense_allocations() -> Result<()> {
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_DENSE_TEST_SNAPSHOT")?);
+        let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_DENSE_TEST_MANIFEST")?);
+        let library_path = std::env::var("CUTEAFD_NATIVE_LIB")?;
+        let cfg = Qwen35Config::read(&snapshot)?;
+        let checkpoint = Checkpoint::open(&snapshot)?;
+        // SAFETY: the library outlives every program, stream and allocation owner.
+        let library = unsafe { NativeLibrary::load(library_path)? };
+        library.cuda_set_device(std::env::var("CUTEAFD_CACHE_TEST_DEVICE").unwrap_or_else(|_| "0".into()).parse()?)?;
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        // Startup compares independently loaded allocation owners to offline
+        // native admission, including multislot marks and retained prefixes.
+        let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg, None, None, 4,
+            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30 }))?;
+        assert!(engine.pool_tokens >= 262144);
+        let tokens = (1..=9).collect::<Vec<_>>();
+        engine.verify_check(&tokens)?;
+        engine.multislot_verify_check(&tokens)?;
+        let engine = std::cell::RefCell::new(engine);
+        prefix::check(&engine, &tokens)?;
+        let drained = engine.borrow().stream.drain();
+        drained
+    }
+
+    #[test]
     fn embedding_stream_and_head_can_be_borrowed_together() {
         // Compile the actual binding pattern without requiring a CUDA fixture.
         fn bind(engine: &DenseEngine<'_>, hidden: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer) -> Result<()> {
@@ -78,10 +103,6 @@ mod hook_borrow_tests {
 }
 
 fn alloc_bytes(bytes: usize) -> usize { bytes.max(256) }
-
-fn weight_demand(group: &str, bytes: u64, category: Category) -> Demand {
-    Demand::new(0, category, group, bytes, Basis::Exact)
-}
 
 impl<'a> DenseEngine<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -101,7 +122,7 @@ impl<'a> DenseEngine<'a> {
         ensure!((1..=HEAD_ROWS).contains(&slots), "dense state slots must be 1..64");
         let admitted = DensePrograms::new(&cfg, programs)?;
         let reader = WeightReader { library, checkpoint };
-        let weight_bytes = reader.dense_bf16_bytes(&cfg, admitted.norm_dtype.clone())?;
+        let weight_bytes = NativeWeights::bf16(checkpoint, &cfg, admitted.norm_dtype.clone())?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
         let device = Device { library, id: library.cuda_get_device()? };
         let stream = Stream::new(device)?;
@@ -111,41 +132,18 @@ impl<'a> DenseEngine<'a> {
             .context("dense prefix mark size overflow")?;
         let prefix_marks = prefix.map_or(0, |rule| rule.slots(mark_bytes));
         let prefix_bytes = prefix_marks.checked_mul(mark_bytes).context("dense prefix arena overflow")?;
-        let mut layer_bytes = Vec::new();
-        for (&kind, weights) in cfg.attention.iter().zip(weight_bytes.layers) {
-            let (state, replay) = if kind == HybridAttention::Gdn {
-                (((layout.state_slot_bytes + layout.conv_slot_bytes) * slots) as u64, layout.replay_layer_bytes as u64)
-            } else { (0, 0) };
-            layer_bytes.push(LayerBytes { weights, state, replay, prefix: 0 });
-        }
-        let hidden = ROWS * cfg.hidden * 2;
-        let query = ROWS * cfg.heads * cfg.head_dim * 2;
-        let table_bytes = HEAD_ROWS * cfg.max_context.div_ceil(64) * 4;
-        let sizes = [hidden, hidden, hidden, query, query, query, admitted.scratch_bytes,
-            ROWS * 4, ROWS * 4, ROWS * 12, ROWS * 8, ROWS * 8, table_bytes];
-        let plane_bytes: usize = sizes.iter().map(|&bytes| alloc_bytes(bytes)).sum();
-        let logit_bytes = HEAD_ROWS * cfg.vocab * 4;
-        let mut fixed = vec![weight_demand("token embedding", weight_bytes.embedding, Category::Embedding),
-            weight_demand("final norm", weight_bytes.norm, Category::Weights),
-            weight_demand("vocabulary head", weight_bytes.head, Category::Weights),
-            weight_demand("native step planes and scratch", plane_bytes as u64, Category::Workspace),
-            weight_demand("vocabulary head workspace", VOCABULARY_HEAD_WORKSPACE as u64, Category::Workspace),
-            weight_demand("logits", logit_bytes as u64, Category::Workspace),
-            weight_demand("token ids", (ROWS * 4) as u64, Category::Workspace),
-            weight_demand("GDN commit table", (3 * 64 * 4) as u64, Category::Workspace),
-            weight_demand("exact retained prefix marks", prefix_bytes as u64, Category::Prefix)];
-        // cuBLAS handle/code and untracked runtime growth must not consume the pool.
-        fixed.push(weight_demand("head and runtime growth", 512 << 20, Category::Runtime));
-        fixed.push(weight_demand("block verify marks, logits and taps", verify::Verification::bytes(&cfg, slots)? as u64,
-            Category::Workspace));
+        let buffers = NativeBuffers::new(&cfg, admitted.scratch_bytes, slots, prefix_marks)?;
+        ensure!(buffers.mark_bytes == mark_bytes && buffers.prefix == prefix_bytes,
+            "dense native prefix admission differs from state layout");
+        let (layer_bytes, fixed) = weight_bytes.demands(&cfg, &buffers, slots);
+        let sizes = buffers.planes;
+        let logit_bytes = buffers.logits;
         let (free, total) = library.cuda_memory_info()?;
-        let request = placement::families::qwen3_5::request(DenseInputs { cfg: &cfg,
+        let placement = placement::families::qwen3_5::placement(DenseInputs { cfg: &cfg,
             gpu: GpuBudget { capacity_bytes: total as u64, headroom_bytes: 1 << 30,
                 baseline: Baseline::Measured { free_bytes: free as u64 } }, layers: &layer_bytes,
             fixed, drafter, requested_pool, max_context: cfg.max_context as u64,
             record_bytes: (2 * cfg.kv_heads * cfg.head_dim * 2) as u64, pool_overhead: 0, pool_bounded: vec![] })?;
-        let placement = placement::solve(&request)?;
-        placement::families::qwen3_5::SINGLE.check(&placement)?;
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
         tracing::info!(pool_tokens, layout = %placement.summary(), "dense Qwen admitted before weight/state allocation");
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
@@ -154,20 +152,20 @@ impl<'a> DenseEngine<'a> {
             || reader.dense_bf16(&cfg, admitted.norm_dtype.clone()))?;
         let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
             .collect::<Result<Vec<_>>>()?;
-        let buffers: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
-        let planes = Planes { residual: buffers[0], norm: buffers[1], delta: buffers[2], query: buffers[3],
-            gate: buffers[4], attention: buffers[5], scratch: buffers[6], slots: buffers[7], seq_first: buffers[8],
-            rope_positions: buffers[9], kv_slots: buffers[10], positions: buffers[11], page_table: buffers[12] };
-        let ids = Allocation::new(device, ROWS * 4)?;
+        let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
+        let planes = Planes { residual: views[0], norm: views[1], delta: views[2], query: views[3],
+            gate: views[4], attention: views[5], scratch: views[6], slots: views[7], seq_first: views[8],
+            rope_positions: views[9], kv_slots: views[10], positions: views[11], page_table: views[12] };
+        let ids = Allocation::new(device, buffers.ids)?;
         let logits = Allocation::new(device, logit_bytes)?;
-        let head_workspace = Allocation::new(device, VOCABULARY_HEAD_WORKSPACE)?;
+        let head_workspace = Allocation::new(device, buffers.head)?;
         // SAFETY: owned workspace is retained after the head and stream, including error cleanup.
         let head = unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr, cfg.hidden as u32,
             HEAD_ROWS as u32, cfg.vocab as u32)? };
         let commit = match admitted.prefix { "qwen35" => "qwen35_gdn_commit", "qwen38" => "qwen38_gdn_commit",
             _ => anyhow::bail!("unadmitted dense prefix") };
         let bank = GdnBank::new(library, programs, stream.raw, cfg.gdn, homes.gdn_layers[0], slots, commit)?;
-        let kv = cfg.attention.iter().map(|&kind| -> Result<_> {
+        let kv: Vec<Option<std::rc::Rc<Allocation<'a>>>> = cfg.attention.iter().map(|&kind| -> Result<_> {
             if kind == HybridAttention::Gdn { return Ok(None); }
             Ok(Some(std::rc::Rc::new(Allocation::new(device, pool_tokens * 2 * cfg.kv_heads * cfg.head_dim * 2)?)))
         }).collect::<Result<_>>()?;
@@ -175,6 +173,26 @@ impl<'a> DenseEngine<'a> {
         let prefix_arena = if prefix_bytes == 0 { None } else {
             Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes)?))
         };
+        // Compare actual allocation owners, not a second evaluation of the
+        // planner recipe. This gate also runs for every golden/serving startup.
+        ensure!(weights.layers.iter().map(|layer| layer.bytes() as u64).collect::<Vec<_>>() == weight_bytes.layers
+            && weights.norm.buffer.bytes as u64 == weight_bytes.norm
+            && weights.head.buffer.bytes as u64 == weight_bytes.head
+            && embedding.device_bytes() as u64 == weight_bytes.embedding,
+            "dense native planner weights differ from actual runtime allocations");
+        ensure!(allocated.iter().map(|a| a.buffer.bytes).collect::<Vec<_>>() == buffers.planes
+            && ids.buffer.bytes == buffers.ids && logits.buffer.bytes == buffers.logits
+            && head_workspace.buffer.bytes == buffers.head
+            && verification.allocated_bytes() == buffers.verify
+            && prefix_arena.as_ref().map_or(0, |a| a.buffer.bytes) == buffers.prefix,
+            "dense native planner workspace/prefix differs from actual runtime allocations");
+        ensure!(bank.allocated_bytes() == [layer_bytes.iter().map(|layer| layer.state as usize).sum(),
+            layer_bytes.iter().map(|layer| layer.replay as usize).sum(), buffers.commit],
+            "dense native planner recurrence/replay differs from actual runtime allocations");
+        ensure!(kv.iter().flatten().map(|a| a.buffer.bytes).sum::<usize>()
+            == pool_tokens * cfg.full_kv_bytes_per_token(),
+            "dense native planner KV differs from actual runtime allocations");
+        tracing::info!("dense native planner equals actual weight, KV, state, replay, workspace and prefix allocations");
         Ok(Self { stream, cfg, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, _head_workspace: head_workspace,
             pool_tokens, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],

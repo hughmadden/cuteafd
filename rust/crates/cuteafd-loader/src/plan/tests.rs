@@ -7,6 +7,37 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
+fn family_native_placement_bypasses_legacy_layout_and_refuses_closed() {
+    struct Native { spec: spec::ModelSpec, refuse: bool }
+    impl FamilyModel for Native {
+        fn spec(&self) -> &spec::ModelSpec { &self.spec }
+        fn placement(&self, _: &PlanInput, _: &mut PlanReport, _: &layout::LayoutOptions, _: ExpertPlacement)
+            -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
+            Some(if self.refuse { Err(anyhow::anyhow!("native test refusal")) } else {
+                Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 123456,
+                    waste: vec![], notes: vec!["native hook sentinel".into()] })
+            })
+        }
+    }
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&PlanOptions::default()).unwrap();
+    let native = Native { spec: report.spec.clone().unwrap(), refuse: false };
+    // An unknown family has no legacy layout adapter. The sentinel can only
+    // come from the hook, independent of any registered family's dispatch.
+    report.family = Some("test_native_placement".into());
+    let options = layout::LayoutOptions::default();
+    let memory = family_layout(&native, &input, &mut report, &options, 0, ExpertPlacement::Local).unwrap();
+    assert_eq!(memory.pool_tokens, 123456);
+    assert_eq!(memory.notes, ["native hook sentinel"]);
+    let refusal = Native { refuse: true, ..native };
+    let memory = family_layout(&refusal, &input, &mut report, &options, 0, ExpertPlacement::Local).unwrap();
+    assert!(memory.devices.is_empty());
+    assert!(!report.fits && !report.placement_supported);
+    assert!(report.hints.iter().any(|hint| hint.what.contains("native test refusal")));
+}
+
+#[test]
 fn declared_numerics_report_preserves_optimizations_and_names_pending_kernel() {
     use checkpoint::ModuleNumerics;
     let modules = BTreeMap::from([("mtp.layers.0.mlp.experts.0.down_proj".into(), ModuleNumerics::W8A8)]);

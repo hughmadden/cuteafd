@@ -28,6 +28,7 @@ FAMILIES = {
     "mimo_v2_flash": "mimo_v2",
     "mimo_v2": "mimo_v2",
     "qwen4_exp": "qwen4",
+    "qwen3_5": "qwen3_5",
 }
 
 
@@ -75,7 +76,7 @@ def describe(config: dict) -> tuple[str, str, int, int]:
     if family is None:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
-    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4"):
+    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5"):
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
@@ -100,11 +101,14 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         if dense is None:
             dense = [layer == 0 for layer in range(layers)]
         first = dense.index(False) if False in dense else layers
-    elif family == "qwen4":
+    elif family in ("qwen4", "qwen3_5"):
         kinds = {"linear_attention": "gdn", "full_attention": "full"}
         if _pattern(text, layers, {"layer_types": kinds}) is None:
             raise SystemExit("config lacks layer_types")
         last = layers - 1
+        if family == "qwen3_5":
+            # Empty routed range: dense decoder blocks never start Spark workers.
+            first = layers
     return family, kind, first, last
 
 

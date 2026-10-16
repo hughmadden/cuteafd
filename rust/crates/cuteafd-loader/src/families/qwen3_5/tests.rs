@@ -53,6 +53,76 @@ fn tensors(fp8: bool) -> Vec<Tensor> {
 }
 
 #[test]
+fn native_planner_uses_export_contract_and_exact_dense_allocations() {
+    use crate::placement::families::qwen3_5::NativeBuffers;
+    let dir = tempfile::tempdir().unwrap();
+    let raw = config(4096, 12288, 16, 32, 4);
+    let cfg = Qwen35Config::from_hf(&raw).unwrap();
+    write_snapshot(dir.path(), &raw, &tensors(false), None);
+    let buffers = NativeBuffers::new(&cfg, 1024, 4, 10).unwrap();
+    let mut programs = Vec::new();
+    for (op, rows) in [("norm", 0), ("add", 0), ("gdn_commit", 0)].into_iter().chain(
+        [64, 4096].into_iter().flat_map(|rows| ["gdn", "attn_producer", "full_gqa", "attn_o", "ffn"].map(|op| (op, rows)))) {
+        let mut pointers = match op {
+            "norm" => vec!["x", "weight", "out"], "add" => vec!["a", "b", "out"],
+            "gdn_commit" => vec!["state", "conv_state", "replay", "tables"],
+            "gdn" => vec!["x", "w_in", "conv_w", "a_log", "dt_bias", "norm_w", "w_out", "conv_state", "state", "slots", "seq_first", "out"],
+            "attn_producer" => vec!["x", "w_in", "q_norm", "k_norm", "rope_positions", "kv_slots", "kv_cache", "query", "gate", "scratch"],
+            "full_gqa" => vec!["query", "kv_cache", "positions", "page_table", "out", "scratch"],
+            "attn_o" => vec!["attn", "gate", "w_o", "out", "scratch"],
+            "ffn" => vec!["x", "w_gate_up", "w_down", "out", "scratch"], _ => unreachable!(),
+        };
+        if op == "gdn" { if rows == 64 { pointers.push("replay"); } pointers.push("scratch"); }
+        let scalars = match op { "gdn_commit" | "full_gqa" => 3, "gdn" if rows == 64 => 2, _ => 1 };
+        let name = if rows == 0 { format!("qwen35_{op}") } else { format!("qwen35_{op}_m{rows}") };
+        let in_width = if op == "gdn" { 12352 } else { 10240 };
+        programs.push(json!({"name":name, "capacity_rows":rows,
+            "geometry":{"hidden":4096,"max_rows":rows,"eps":1e-6,"zero_centered":true,
+                "key_heads":16,"value_heads":32,"head_dim":if op == "gdn" {128} else {256},
+                "in_width":in_width,"output_gate":"silu","fp8_weights":false,"norm_dtype":"torch.float32",
+                "channels":8192,"replay_rows":64,"replay_bytes":buffers.replay_per_layer,
+                "heads":16,"kv_heads":4,"record_bytes":4096,"indexed":false,"rope_dim":64,
+                "rope_theta":10000000.0,"page_rows":64,"max_splits":32,"causal":true,
+                "empty_rows_zero":true,"width":4096,"intermediate":12288},
+            "pointers":pointers.iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
+            "scalars":(0..scalars).map(|_| json!({"type":"int32"})).collect::<Vec<_>>(),
+            "scratch_bytes_at_capacity":{"scratch":1024}}));
+    }
+    let manifest = dir.path().join("PROGRAMS.json");
+    let mut exports = json!({"programs":programs});
+    std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
+    let options = PlanOptions { placement: ExpertPlacement::Local, vision: plan::MediaMode::Off,
+        audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30], concurrency: 4, prefix_slots: Some(10), native_mtp_layers: 0,
+            pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()), ..Default::default() }),
+        ..Default::default() };
+    let report = plan::plan(dir.path(), &options).unwrap();
+    let memory = report.memory_layout.unwrap();
+    assert_eq!(memory.pool_tokens, 262144, "{:?}", report.hints);
+    assert_eq!(memory.devices.len(), 1);
+    assert!(memory.devices[0].items.iter().any(|item| item.group == "exact retained prefix marks"
+        && item.bytes == buffers.prefix as u64));
+    assert!(memory.notes.iter().any(|note| note.contains("no captured graphs")));
+    let spark_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 2 }, ..options.clone() };
+    let refused = plan::plan(dir.path(), &spark_options).unwrap();
+    assert!(!refused.fits && !refused.placement_supported);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("no Spark layout")));
+    assert!(refused.memory_layout.unwrap().devices.is_empty());
+    exports["programs"][0]["geometry"]["zero_centered"] = json!(false);
+    std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits && !refused.placement_supported);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("zero-centered")));
+    assert!(refused.memory_layout.unwrap().devices.is_empty());
+    exports["programs"][0]["geometry"]["zero_centered"] = json!(true);
+    exports["programs"][0]["pointers"][0]["name"] = json!("wrong_input");
+    std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits && !refused.placement_supported);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("pointer order")));
+}
+
+#[test]
 fn dense_geometry_and_native_gate_sites() {
     for (h, i, heads, values, layers, kv, state) in [(4096, 12288, 16, 32, 32, 32768, 51511296),
         (5120, 17408, 24, 48, 64, 65536, 153944064)] {

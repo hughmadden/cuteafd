@@ -54,6 +54,10 @@ impl<'a> Verification<'a> {
         Ok(Self { owner, generation: 0, mark, layout, logits, hidden, taps: Vec::new(), pending: None })
     }
 
+    pub(super) fn allocated_bytes(&self) -> [usize; 3] {
+        [self.mark.buffer.bytes, self.logits.buffer.bytes, self.hidden.buffer.bytes]
+    }
+
     pub(super) fn invalidate(&mut self) -> Result<()> {
         self.generation = self.generation.checked_add(1).context("dense mark generation exhausted")?;
         self.pending = None;
@@ -178,6 +182,76 @@ impl<'a> DenseEngine<'a> {
             "dense nonzero-prefix restored continuation differs");
         reset(self)?;
         println!("dense block verify: serial logits/taps, sentinel padding, nonzero-prefix restore and every keep=0..7 state byte-exact");
+        Ok(())
+    }
+
+    /// Exercise real disjoint KV pages and interleaved physical rows. All slot
+    /// state, including untouched slots, must match independent serial prefill.
+    pub(crate) fn multislot_verify_check(&mut self, tokens: &[u32]) -> Result<()> {
+        use crate::shared::speculation::target::VerifyRow;
+        ensure!(self.slots.len() >= 2 && tokens.len() >= 9 && self.pool_tokens >= 384,
+            "multislot verify check requires two slots, six pages and nine inputs");
+        let library = self.stream.device.library;
+        let sequences = [&tokens[..7], &tokens[2..8]];
+        let reset = |engine: &mut Self| -> Result<()> {
+            for slot in 0..engine.slots.len() { engine.reset_slot(slot)?; }
+            engine.bind_slot(0, &[3, 1])?;
+            engine.bind_slot(1, &[5, 2])?;
+            for (slot, sequence) in sequences.iter().enumerate() {
+                engine.prefill_device(slot, &sequence[..3], 1)?;
+            }
+            engine.stream.drain()
+        };
+        let state = |engine: &Self| -> Result<Vec<Vec<u8>>> {
+            engine.stream.drain()?;
+            engine.mark_regions().into_iter().map(|region| {
+                let mut bytes = vec![0; region.bytes];
+                library.copy_d2h(&mut bytes, region)?;
+                Ok(bytes)
+            }).collect()
+        };
+        reset(self)?;
+        let padding = VerifyRow { slot: usize::MAX, position: usize::MAX, token: None };
+        let mut rows = vec![padding];
+        for offset in 0..4 {
+            for slot in [1, 0] {
+                if let Some(&token) = sequences[slot].get(3 + offset) {
+                    rows.push(VerifyRow { slot, position: 3 + offset, token: Some(token) });
+                }
+            }
+            rows.push(padding);
+        }
+        let mark = self.checkpoint(&[1, 0])?;
+        let actual = self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?
+            .logits.to_host(library)?;
+        self.restore(&mark)?;
+        for (physical, row) in rows.iter().enumerate() {
+            let actual = &actual[physical * self.cfg.vocab..(physical + 1) * self.cfg.vocab];
+            if let Some(token) = row.token {
+                let expected = self.prefill_device(row.slot, &[token], 1)?.to_host(library)?;
+                ensure!(expected.iter().map(|v| v.to_bits()).eq(actual.iter().map(|v| v.to_bits())),
+                    "dense multislot serial/verify logits differ at physical row {physical}");
+            } else {
+                ensure!(actual.iter().all(|&v| v == 0.0), "dense multislot padding logits are not zero");
+            }
+        }
+        for kept in [[0, 3], [1, 2], [4, 0], [2, 3]] {
+            reset(self)?;
+            let mark = self.checkpoint(&[1, 0])?;
+            self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?;
+            self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: kept[0] },
+                AcceptedPrefix { slot: 1, rows: kept[1] }])?;
+            let actual = state(self)?;
+            ensure!(self.slots[0].position == 3 + kept[0] && self.slots[1].position == 3 + kept[1],
+                "dense multislot commit changed the wrong frontier");
+            reset(self)?;
+            for (slot, sequence) in sequences.iter().enumerate() {
+                for &token in &sequence[3..3 + kept[slot]] { self.prefill_device(slot, &[token], 1)?; }
+            }
+            ensure!(state(self)? == actual, "dense multislot accepted-input state differs for {kept:?}");
+        }
+        for slot in 0..self.slots.len() { self.reset_slot(slot)?; }
+        println!("dense multislot verify: interleaved logits, sentinel padding and independent accepted-input state byte-exact");
         Ok(())
     }
 
@@ -383,5 +457,13 @@ mod tests {
             + 32 * 64 * cfg.hidden * 2);
         assert_eq!(Verification::bytes(&cfg, 16).unwrap(), 16 * layout.bytes + 64 * cfg.vocab * 4
             + 32 * 64 * cfg.hidden * 2);
+        for slots in [1, 4, 16, 64] {
+            let native = placement::families::qwen3_5::NativeBuffers::new(&cfg, 1024, slots, 10).unwrap();
+            assert_eq!(native.verify.iter().sum::<usize>(), Verification::bytes(&cfg, slots).unwrap());
+            assert_eq!(native.verify[0], Verification::layout(&cfg, slots).unwrap().bytes);
+            let gdn = GdnLayout::new(cfg.gdn).unwrap();
+            assert_eq!(native.state_per_layer, gdn.conv_slot_bytes + gdn.state_slot_bytes);
+            assert_eq!(native.replay_per_layer, gdn.replay_layer_bytes);
+        }
     }
 }

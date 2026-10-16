@@ -238,10 +238,14 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens, None, lanes, Some(engine_args.prefix.mark_rule(lanes)))?);
             let backend = DenseBackend::new(&engine, &library);
-            if let Some(ready) = ready.take() { let _ = ready.send(Ok(backend.geometry().max_context)); }
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 scheduler::Drafts::None, eos, engine_args.decode_share, &engine_args.prefix,
-                engine_args.token_io.token_select, &mut text_media(), None)
+                engine_args.token_io.token_select, &mut text_media(), None, || {
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Ok(backend.geometry().max_context));
+                    }
+                    Ok(())
+                })
         })();
         if let Some(ready) = ready.take() {
             let _ = ready.send(Err(anyhow::anyhow!("dense initialization failed: {:#}", result.as_ref().unwrap_err())));
