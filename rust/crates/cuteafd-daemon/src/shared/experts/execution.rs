@@ -12,6 +12,29 @@ mod grouping;
 pub(crate) use grouping::{ExpertGroupingError, InstalledExpertGrouping};
 use timing::ExpertTiming;
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum NativeExpertCapacityError {
+    #[error("native expert live capacity {live} must be positive and no greater than compiled capacity {compiled} (maximum 4096)")]
+    InvalidExtent { compiled: u32, live: u32 },
+    #[error("native expert rows {rows} exceed live capacity {live}")]
+    RowsExceedLive { rows: usize, live: u32 },
+    #[error("native expert execution requires positive rows")]
+    EmptyRows,
+}
+
+fn validate_capacity(compiled: u32, live: u32) -> std::result::Result<(), NativeExpertCapacityError> {
+    if live == 0 || compiled < live || compiled > 4096 {
+        return Err(NativeExpertCapacityError::InvalidExtent { compiled, live });
+    }
+    Ok(())
+}
+
+fn validate_live_rows(rows: usize, live: u32) -> std::result::Result<(), NativeExpertCapacityError> {
+    if rows == 0 { return Err(NativeExpertCapacityError::EmptyRows); }
+    if rows > live as usize { return Err(NativeExpertCapacityError::RowsExceedLive { rows, live }); }
+    Ok(())
+}
+
 /// Native roles that publish token-major FP32 routed partials and therefore
 /// need the compact output buffer plus the compact reducer: legacy grouped
 /// Spark TP4 (role 1) and the Spark shard families TP2/TP3/pure-TP6 (roles
@@ -44,6 +67,20 @@ pub(crate) struct ExpertExecutionBudget {
     pub output_and_shared_bytes: usize,
 }
 impl ExpertExecutionBudget {
+    fn from_info(info: cuteafd_ffi::V41ExpertInfo, live: u32, decode: usize, small: usize) -> Result<Self> {
+        validate_capacity(info.capacity_rows, live)?;
+        Ok(Self {
+            scratch_bytes: usize::try_from(info.scratch_bytes)?,
+            decode_scratch_bytes: decode,
+            small_scratch_bytes: small,
+            hidden_bytes: (live as usize).checked_mul(info.input_row_bytes()?).context("hidden buffer overflow")?,
+            routing_bytes: (live as usize).checked_mul(info.topk as usize * 8).context("routing buffer overflow")?,
+            output_and_shared_bytes: (live as usize)
+                .checked_mul(cuteafd_core::expert_geometry().row_bytes() as usize * if info.role == 0 { 2 } else { 1 })
+                .context("output buffer overflow")?,
+        })
+    }
+
     pub fn total(self) -> Result<usize> {
         [
             self.scratch_bytes,
@@ -101,59 +138,47 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     /// explicit `TP×EP` topology, `None` for every legacy path. The group is
     /// independent of the resident layer, so rebinding a layer never changes it.
     native_group: Option<u8>,
+    live_capacity: u32,
     budget: ExpertExecutionBudget,
 }
 impl<'library> ExpertWeights<'library> {
-    pub fn execution_budget(&self, capacity: u32) -> Result<ExpertExecutionBudget> {
+    pub fn execution_budget(&self, compiled: u32, live: u32) -> Result<ExpertExecutionBudget> {
         let library = self.buffers[0].library;
-        Self::plan_execution(self.layer, library, capacity, self.is_nvfp4())
+        Self::plan_execution(self.layer, library, compiled, live, self.is_nvfp4())
     }
     pub(crate) fn plan_execution(
         layer: ExpertLayer,
         library: &NativeLibrary,
-        capacity: u32,
+        compiled: u32,
+        live: u32,
         nvfp4: bool,
     ) -> Result<ExpertExecutionBudget> {
-        let _ = native_reduction_plan(layer, library, capacity, nvfp4)?;
-        let info = layer.select_info(library, capacity, nvfp4)?;
-        let hidden = (capacity as usize)
-            .checked_mul(info.input_row_bytes()?)
-            .context("hidden buffer overflow")?;
-        let routing = (capacity as usize)
-            .checked_mul(info.topk as usize * 8)
-            .context("routing buffer overflow")?;
-        Ok(ExpertExecutionBudget {
-            scratch_bytes: usize::try_from(info.scratch_bytes)?,
-            decode_scratch_bytes: if compact_output_role(info.role) && capacity > 1 {
-                usize::try_from(layer.select_info(library, 1, nvfp4)?.scratch_bytes)?
-            } else {
-                0
-            },
-            small_scratch_bytes: if compact_output_role(info.role) && capacity > 80 {
-                usize::try_from(layer.select_info(library, 80, nvfp4)?.scratch_bytes)?
-            } else {
-                0
-            },
-            hidden_bytes: hidden,
-            routing_bytes: routing,
-            output_and_shared_bytes: (capacity as usize)
-                .checked_mul(cuteafd_core::expert_geometry().row_bytes() as usize * if info.role == 0 { 2 } else { 1 })
-                .context("output buffer overflow")?,
-        })
+        validate_capacity(compiled, live)?;
+        let _ = native_reduction_plan(layer, library, compiled, nvfp4)?;
+        let info = layer.select_info(library, compiled, nvfp4)?;
+        let decode = if compact_output_role(info.role) && compiled > 1 {
+            usize::try_from(layer.select_info(library, 1, nvfp4)?.scratch_bytes)?
+        } else { 0 };
+        let small = if compact_output_role(info.role) && compiled > 80 {
+            usize::try_from(layer.select_info(library, 80, nvfp4)?.scratch_bytes)?
+        } else { 0 };
+        ExpertExecutionBudget::from_info(info, live, decode, small)
     }
     pub fn execution(
         &self,
-        capacity: u32,
+        compiled: u32,
+        live: u32,
         available_device_bytes: usize,
     ) -> Result<ExpertExecution<'_, 'library>> {
+        validate_capacity(compiled, live)?;
         let library = self.buffers[0].library;
-        let reduction_plan = native_reduction_plan(self.layer, library, capacity, self.is_nvfp4())?;
-        let budget = self.execution_budget(capacity)?;
+        let reduction_plan = native_reduction_plan(self.layer, library, compiled, self.is_nvfp4())?;
+        let budget = self.execution_budget(compiled, live)?;
         ensure!(
             budget.total()? <= available_device_bytes,
             "expert execution buffers exceed device budget"
         );
-        let kernel = self.layer.select_kernel(library, capacity, self.is_nvfp4())?;
+        let kernel = self.layer.select_kernel(library, compiled, self.is_nvfp4())?;
         let reducer = library.v41_route_reducer()?;
         // Role-gated, DEBUG-only diagnostics. The same routed breakdown is
         // available for the replicated Spark TP2/TP3 shards (roles 5/6), whose
@@ -272,6 +297,7 @@ impl<'library> ExpertWeights<'library> {
             slots,
             graph: None,
             native_group: None,
+            live_capacity: live,
             budget,
         })
     }
@@ -348,10 +374,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Borrow the output state selected for a launch of exactly `rows` rows.
     /// A one-row view is not a prefix of the multi-row state's output.
     pub fn route_partials(&self, rows: u32) -> Result<CuteafdDeviceBuffer> {
-        ensure!(
-            rows > 0 && rows <= self.kernel.info().capacity_rows,
-            "invalid expert output row count"
-        );
+        validate_live_rows(rows as usize, self.live_capacity)?;
         let (kernel, slots, scratch) = self.execution_state(rows)?;
         ensure!(kernel.output_kind() == cuteafd_ffi::V41ExpertOutputKind::Fp32Routes,
             "expert output is not FP32 route planes");
@@ -370,6 +393,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         &[*mut c_void; 44],
         &DeviceAllocation<'library>,
     )> {
+        validate_live_rows(rows as usize, self.live_capacity)?;
         if let Some(plan) = &self.reduction_plan {
             let capacities = [Some(self.kernel.info().capacity_rows),
                 self.decode.as_ref().map(|s| s.kernel.info().capacity_rows),
@@ -401,8 +425,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Zero queries the main compiled tile; positive rows follow the launch selector.
     pub fn group_rows(&self, rows: usize) -> Result<usize> {
         if rows == 0 { return Ok(self.kernel.group_rows()); }
-        ensure!(rows <= self.kernel.info().capacity_rows as usize,
-            "invalid expert grouping row count {rows}");
+        validate_live_rows(rows, self.live_capacity)?;
         self.execution_state(u32::try_from(rows)?)?.0.group_rows_for(rows)
     }
 
@@ -413,9 +436,9 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         kernels.extend([&self.decode, &self.small].into_iter().flatten().map(|state| &state.kernel));
         let variants = kernels.into_iter().map(|kernel| InstalledExpertVariant::from_queries(
             kernel.info().capacity_rows as usize, |rows| kernel.group_rows_for(rows))).collect::<Result<Vec<_>>>()?;
-        let report = InstalledExpertGrouping::new(loaded, rank, self.kernel.info().capacity_rows as usize,
+        let report = InstalledExpertGrouping::new(loaded, rank, self.live_capacity as usize,
             ExpertGroupingSelector::Native, variants)?;
-        for rows in 0..=self.kernel.info().capacity_rows as usize {
+        for rows in 0..=self.live_capacity as usize {
             ensure!(report.group_rows(rows)? == self.group_rows(rows)?,
                 "native installed grouping differs from actual selector at rows {rows}");
         }
@@ -647,10 +670,7 @@ impl ExpertExecution<'_, '_> {
             "request does not match resident expert layer"
         );
         ensure!(executor_id != 0, "native response needs executor identity");
-        ensure!(
-            request.rows() <= self.kernel.info().capacity_rows,
-            "request exceeds native execution capacity"
-        );
+        validate_live_rows(request.rows() as usize, self.live_capacity)?;
         request.require_input_dtype(self.kernel.info().input_dtype)?;
         let routes = request.rows() as usize * cuteafd_core::expert_geometry().topk as usize;
         let bytes = request.plane_bytes()?;
@@ -805,6 +825,40 @@ impl ExpertExecution<'_, '_> {
 
 #[cfg(test)]
 mod mapped_tests;
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn rows_above_live_are_refused_even_when_the_compiled_export_covers_them() {
+        validate_capacity(4096, 2048).unwrap();
+        validate_live_rows(2048, 2048).unwrap();
+        let error = validate_live_rows(2049, 2048).unwrap_err();
+        assert_eq!(error, NativeExpertCapacityError::RowsExceedLive { rows: 2049, live: 2048 });
+        let error = anyhow::Error::from(error);
+        assert!(error.downcast_ref::<NativeExpertCapacityError>().is_some());
+        assert_eq!(error.to_string(), "native expert rows 2049 exceed live capacity 2048");
+        assert!(validate_capacity(1024, 2048).is_err());
+        assert!(validate_capacity(4096, 0).is_err());
+        assert!(validate_capacity(4097, 2048).is_err());
+    }
+
+    #[test]
+    fn compiled_scratch_is_retained_but_row_storage_uses_live_extent() {
+        let info = cuteafd_ffi::V41ExpertInfo { role: 1, capacity_rows: 4096,
+            hidden_size: 5120, topk: 8, input_dtype: 7, scratch_bytes: 1 << 30,
+            ..Default::default() };
+        let compiled = ExpertExecutionBudget::from_info(info, 4096, 128, 256).unwrap();
+        let live = ExpertExecutionBudget::from_info(info, 2048, 128, 256).unwrap();
+        assert_eq!(live.scratch_bytes, compiled.scratch_bytes);
+        assert_eq!(live.decode_scratch_bytes, compiled.decode_scratch_bytes);
+        assert_eq!(live.small_scratch_bytes, compiled.small_scratch_bytes);
+        assert_eq!(live.hidden_bytes * 2, compiled.hidden_bytes);
+        assert_eq!(live.routing_bytes * 2, compiled.routing_bytes);
+        assert_eq!(live.output_and_shared_bytes * 2, compiled.output_and_shared_bytes);
+    }
+}
 
 #[cfg(test)]
 mod timing_role_tests {

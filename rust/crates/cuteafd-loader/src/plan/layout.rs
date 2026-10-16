@@ -15,7 +15,7 @@ mod deepseek_v4;
 mod glm5_flash;
 mod v41;
 mod mimo;
-mod glm5;
+pub mod glm5;
 mod qwen_dual;
 
 const GIB: u64 = 1 << 30;
@@ -318,17 +318,6 @@ pub struct FamilyCosts {
     pub spark_ring_bytes: u64,
     /// Non-reclaimable host memory charged beside CUDA allocations on GB10.
     pub spark_host_bytes: u64,
-}
-
-
-/// Compatibility query for the dedicated V4.1 worker. Generic planning uses
-/// the selected working set's explicit SparkIoBytes instead of allowances.
-pub fn v41_spark_ring_allowance(family: &str, capacity: u64, calibrated: u64, bf16: bool) -> u64 {
-    if family != "deepseek_v41" { return calibrated; }
-    let exact = u32::try_from(capacity).ok().and_then(|capacity|
-        cuteafd_core::ExpertGeometry::DEEPSEEK_V41.compact_ring_bytes(
-            capacity, 64 << 20, 8, 8 << 20, 4096, 2, bf16));
-    exact.map_or(u64::MAX, |bytes| bytes as u64)
 }
 
 
@@ -668,7 +657,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         }
     }
     let exact = if family == "glm5" {
-        match glm5::resident(checkpoint, if split { 2 } else { 1 }) {
+        match glm5::resident(checkpoint, if split { 2 } else { 1 }, model.spec().layers.len()) {
             Ok(resident) => Some(resident),
             Err(error) => {
                 report.placement_supported = false;

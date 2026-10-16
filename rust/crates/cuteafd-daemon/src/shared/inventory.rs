@@ -1,11 +1,32 @@
-//! `RuntimeInventory::measure`: one sample per coordinator GPU after the CUDA
-//! context, cuBLAS and the family's program modules, before any weight. The
-//! runtime side of `cuteafd_loader::placement::inventory`: admission sizes
-//! from these samples ([`RuntimeInventory::baselines`]); the planner charges
-//! `ArchContext` for the same bytes.
+//! Phase-labelled runtime samples for coordinator admission and loaded workers.
+//! The runtime side of `cuteafd_loader::placement::inventory`: coordinator
+//! admission uses pre-weight samples ([`RuntimeInventory::baselines`]); loaded
+//! workers report their own architecture and retained memory after loading.
 use anyhow::{Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::placement::{Baseline, RuntimeSample};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InventoryPhase {
+    PreWeight,
+    PostLoad,
+}
+
+impl InventoryPhase {
+    fn description(self) -> &'static str {
+        match self {
+            Self::PreWeight => "after context and program modules, before weights",
+            Self::PostLoad => "after retained weights and execution workspace",
+        }
+    }
+
+    fn module_bytes(self, before: usize, after: usize) -> u64 {
+        match self {
+            Self::PreWeight => before.saturating_sub(after) as u64,
+            Self::PostLoad => 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeInventory {
@@ -13,12 +34,12 @@ pub(crate) struct RuntimeInventory {
 }
 
 impl RuntimeInventory {
-    /// Samples `devices` (lead first) with `load_modules` run on each device
-    /// between a context sample and the admission sample, so `module_bytes`
-    /// is the family's program modules alone. Restores the calling thread's
-    /// device. `context_bytes` is CUDA's used bytes minus this process's
-    /// ledger-tracked allocations on the device.
-    pub fn measure(library: &NativeLibrary, devices: &[i32],
+    /// Samples `devices` (lead first), restoring the calling thread's device.
+    /// Pre-weight callbacks load program modules between samples; post-load
+    /// callbacks only synchronize/sample retained owners and do not attribute
+    /// free-memory changes to module loading. `context_bytes` is CUDA's used
+    /// bytes minus this process's ledger-tracked device allocations.
+    pub fn measure(library: &NativeLibrary, devices: &[i32], phase: InventoryPhase,
         mut load_modules: impl FnMut(i32) -> Result<()>) -> Result<Self> {
         let current = library.cuda_get_device()?;
         let mut gpus = Vec::with_capacity(devices.len());
@@ -39,7 +60,7 @@ impl RuntimeInventory {
                     total_bytes: total as u64,
                     free_bytes: free as u64,
                     context_bytes: (total.saturating_sub(free) as u64).saturating_sub(tracked as u64),
-                    module_bytes: before.saturating_sub(free) as u64,
+                    module_bytes: phase.module_bytes(before, free),
                     sms: library.sm_count().unwrap_or(0) as u32,
                     arch: format!("sm_{}{}", info.compute_capability_major, info.compute_capability_minor),
                     driver: text(&info.driver_version),
@@ -51,7 +72,7 @@ impl RuntimeInventory {
         for gpu in &gpus {
             tracing::info!(device = gpu.device, total_bytes = gpu.total_bytes, free_bytes = gpu.free_bytes,
                 context_bytes = gpu.context_bytes, module_bytes = gpu.module_bytes, sms = gpu.sms, arch = %gpu.arch,
-                driver = %gpu.driver, "runtime inventory (after context and program modules, before weights)");
+                driver = %gpu.driver, phase = ?phase, stage = phase.description(), "runtime inventory");
         }
         Ok(Self { gpus })
     }
@@ -73,6 +94,20 @@ impl RuntimeInventory {
         self.gpus.iter().enumerate().map(|(i, g)| (g.total_bytes,
             Baseline::Measured { free_bytes: g.free_bytes.saturating_sub(loaded.get(i).copied().unwrap_or(0)) }))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::InventoryPhase;
+
+    #[test]
+    fn only_pre_weight_samples_attribute_module_growth() {
+        assert_eq!(InventoryPhase::PreWeight.module_bytes(100, 60), 40);
+        assert_eq!(InventoryPhase::PreWeight.module_bytes(60, 100), 0);
+        assert_eq!(InventoryPhase::PostLoad.module_bytes(100, 60), 0);
+        assert!(InventoryPhase::PreWeight.description().contains("before weights"));
+        assert!(!InventoryPhase::PostLoad.description().contains("before weights"));
     }
 }
 

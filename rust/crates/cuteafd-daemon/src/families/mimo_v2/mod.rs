@@ -32,9 +32,6 @@ pub(crate) struct EngineArgs {
     /// Checkpoint snapshot (XiaomiMiMo/MiMo-V2-Flash).
     #[arg(long)]
     pub snapshot: PathBuf,
-    /// Send the solved Spark layer set before opt-in workers allocate experts.
-    #[arg(long)]
-    pub placement_handshake: bool,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -859,6 +856,27 @@ impl Opened {
         let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
         let args = &resolved;
+        if args.peers.is_some() {
+            let peers = args.peers.as_deref().context("worker admission needs Spark peers")?
+                .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
+                experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
+                intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? };
+            let capacity = u32::try_from(engine::expert_capacity(args.prefill_rows))?;
+            let ingress = if args.expert_input.bf16(false) { cuteafd_core::SparkIngress::Bf16 }
+                else if args.expert_input.bf16(true) { cuteafd_core::SparkIngress::Bf16Decode {
+                    rows: u32::try_from(engine::DECODE_ROWS)? } }
+                else { cuteafd_core::SparkIngress::Fp8K32 };
+            let model = cuteafd_transport::worker_selection::ModelAdmission {
+                capacity, compiled_capacity: capacity,
+                endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress };
+                    usize::try_from(preflight.working_set.prefill_lanes)?],
+                rings: crate::shared::placement::spark_rings(64 << 20)?,
+            };
+            crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
+                &preflight.working_set, peers.len(), None, model)?
+                .select(&peers)?;
+        }
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
@@ -1068,19 +1086,6 @@ impl Opened {
     /// warmed with a full-capacity request) or the local TP1 package.
     fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize], local_budget: usize, lanes: usize)
         -> Result<Option<engine::Experts<'s>>> {
-        let selected_peers = args.peers.as_deref().map(|peers| peers.split(',')
-            .map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()).transpose()?;
-        if let Some(peers) = selected_peers.as_ref().filter(|_| args.placement_handshake) {
-            let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
-                experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
-                intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? };
-            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
-                &args.snapshot, geometry, peers.len(), None)?;
-            let layers = if args.skip_experts || args.local_experts { &[][..] } else { moe_layers };
-            let selection = cuteafd_transport::worker_selection::WorkerSelection::new(identity, layers)?;
-            cuteafd_transport::worker_selection::select_worker_layers(peers, &selection,
-                std::time::Duration::from_secs(1200))?;
-        }
         if moe_layers.is_empty() {
             return Ok(None);
         }

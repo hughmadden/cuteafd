@@ -1,7 +1,7 @@
 //! Planner-owned launch decisions. Live artifact proof and measured placement
 //! remain launcher/runtime responsibilities, not offline identity claims.
 use super::{encoder::EncoderPlacement, PlanReport};
-use crate::placement::{Onboard, Placement};
+use crate::placement::Placement;
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 
@@ -12,8 +12,6 @@ pub struct DeploymentOptions {
     pub spark_ep: Option<usize>,
     pub peers: Vec<String>,
     pub speculator: String,
-    pub placement_handshake: bool,
-    pub onboard: Onboard,
     pub admission: AdmissionArgs,
 }
 
@@ -41,15 +39,11 @@ pub struct SparkRole {
     pub peer: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PlacementHandoff {
-    /// Only the coordinator can publish the final boundary after measuring its
-    /// actual loaded representations, workspaces and available device memory.
-    Runtime { directory: &'static str, spark_first_layer: Option<usize> },
-    Fixed { spark_first_layer: usize },
-    /// Workers admit media first, then await the coordinator's measured solve.
-    WorkerHandshake { initial_spark_first_layer: usize },
+/// All Spark owners are selected over the startup TCP protocol after the live solve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SparkAdmission {
+    CoordinatorAuthoritative,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,8 +69,7 @@ pub struct DeploymentSpec<'a> {
     pub peers: Vec<String>,
     pub speculator: &'a str,
     pub admission: &'a AdmissionArgs,
-    pub placement_handoff: PlacementHandoff,
-    pub placement_handshake: bool,
+    pub spark_admission: SparkAdmission,
     pub launch: Option<&'a super::launch::LaunchDescription>,
     pub estimated_placement: Option<&'a Placement>,
     pub memory_layout: &'a cuteafd_core::memory_layout::MemoryLayout,
@@ -122,28 +115,13 @@ impl<'a> DeploymentSpec<'a> {
         let roles = (0..ranks).map(|rank| SparkRole { rank,
             group: rank / topology.tp, tp_rank: rank % topology.tp,
             peer: peers.get(rank).cloned() }).collect();
-        ensure!(!options.placement_handshake || matches!(family, "mimo_v2" | "glm5_flash"),
-            "placement handshake requires MiMo or GLM Flash");
-        let fixed_layers = options.onboard.layers(report.spec.as_ref().map_or(0, |s| s.layers.len()));
-        let placement_handoff = if family == "deepseek_v41" {
-            let boundary = fixed_layers.map(|layers| if options.rtx_gpus == 1 { 0 } else { layers.min(39) });
-            if options.rtx_gpus == 2 || fixed_layers != Some(0) {
-                PlacementHandoff::Runtime { directory: "/tmp/cuteafd-home/placement", spark_first_layer:
-                    if fixed_layers.is_none() || options.rtx_gpus == 1 { None } else { boundary } }
-            } else { PlacementHandoff::Fixed { spark_first_layer: 0 } }
-        } else if options.placement_handshake && ranks > 0 {
-            PlacementHandoff::WorkerHandshake {
-                initial_spark_first_layer: report.launch.as_ref().map_or(0, |l| l.first_expert_layer) }
-        } else {
-            PlacementHandoff::Fixed { spark_first_layer: report.launch.as_ref().map_or(0, |l| l.first_expert_layer) }
-        };
         let spark_tp_role = (family == "deepseek_v41" && !exl3 && explicit && topology.tp != 4)
             .then(|| format!("tp{}", topology.tp));
         Ok(Self { version: 1, family, snapshot: &report.snapshot,
             rtx_gpus: options.rtx_gpus, spark_ranks: ranks,
             prefill_rows: report.prefill_rows.unwrap_or(0), topology, roles, peers,
             speculator: &options.speculator, admission: &options.admission,
-            placement_handoff, placement_handshake: options.placement_handshake,
+            spark_admission: SparkAdmission::CoordinatorAuthoritative,
             launch: report.launch.as_ref(), estimated_placement: report.solver_placement.as_ref(), memory_layout,
             encoder: report.encoder.as_ref(), audio_encoder: report.audio_encoder.as_ref(),
             encoder_plan_hash: &report.encoder_plan_hash,
@@ -188,12 +166,14 @@ mod tests {
             let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
             assert_eq!(deployment.roles.len(), ranks);
             assert_eq!(deployment.topology, Topology { tp: ranks, ep: 1, explicit: ranks != 4 });
-            assert_eq!(deployment.placement_handoff, PlacementHandoff::Runtime {
-                directory: "/tmp/cuteafd-home/placement", spark_first_layer: None });
+            assert_eq!(deployment.spark_admission, SparkAdmission::CoordinatorAuthoritative);
             assert!(deployment.estimated_placement.is_some());
             assert_eq!(serde_json::to_value(deployment.estimated_placement).unwrap(),
                 serde_json::to_value(&report.solver_placement).unwrap());
             let value = serde_json::to_value(deployment).unwrap();
+            assert_eq!(value["spark_admission"], "coordinator_authoritative");
+            assert!(value.get("placement_handoff").is_none());
+            assert!(value.get("placement_handshake").is_none());
             assert_eq!(value["admission"]["pool_tokens"], 0);
             assert_eq!(value["artifact_requirements"]["verify_live_identity"], true);
             assert!(value.get("native_library_sha256").is_none());
@@ -237,16 +217,12 @@ mod tests {
             });
             let options = DeploymentOptions { rtx_gpus: 1,
                 speculator: "off".into(),
-                placement_handshake: matches!(family, "mimo_v2" | "glm5_flash"),
                 admission: AdmissionArgs { kv_pool_size: Some("1.50GiB".into()),
                     memory_reservation: Some("7.5%".into()), pool_tokens: Some(0) },
                 ..Default::default() };
             let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
             assert_eq!(deployment.launch.unwrap(), report.launch.as_ref().unwrap());
-            assert_eq!(deployment.placement_handoff, if options.placement_handshake {
-                PlacementHandoff::WorkerHandshake { initial_spark_first_layer: 3 }
-            } else { PlacementHandoff::Fixed { spark_first_layer: 3 } });
-            assert_eq!(deployment.placement_handshake, options.placement_handshake);
+            assert_eq!(deployment.spark_admission, SparkAdmission::CoordinatorAuthoritative);
             assert!(deployment.artifact_requirements.verify_live_identity);
             assert!(!deployment.artifact_requirements.verify_resolved_config_fingerprint);
             assert!(deployment.artifact_requirements.spark_tp_manifest.is_none());
@@ -254,22 +230,19 @@ mod tests {
             assert_eq!(deployment.admission.kv_pool_size.as_deref(), Some("1.50GiB"));
             assert_eq!(deployment.admission.memory_reservation.as_deref(), Some("7.5%"));
         }
-        report.family = Some("qwen4".into());
-        let options = DeploymentOptions { rtx_gpus: 1, placement_handshake: true, ..Default::default() };
-        assert!(DeploymentSpec::from_report(&report, &options).is_err());
     }
 
     #[test]
-    fn deployment_validates_replicated_roles_endpoints_and_fixed_handoff() {
+    fn deployment_validates_replicated_roles_endpoints_and_admission() {
         let (_dir, mut report) = fixture(1, 4);
         let mut options = DeploymentOptions { rtx_gpus: 1,
-            spark_tp: Some(2), spark_ep: Some(2), onboard: Onboard::Layers(0),
+            spark_tp: Some(2), spark_ep: Some(2),
             peers: (0..4).map(|rank| format!("worker-{rank}:9200")).collect(),
             ..Default::default() };
         let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
         assert_eq!(deployment.roles.iter().map(|r| (r.group, r.tp_rank)).collect::<Vec<_>>(),
             [(0, 0), (0, 1), (1, 0), (1, 1)]);
-        assert_eq!(deployment.placement_handoff, PlacementHandoff::Fixed { spark_first_layer: 0 });
+        assert_eq!(deployment.spark_admission, SparkAdmission::CoordinatorAuthoritative);
         assert_eq!(deployment.artifact_requirements.spark_tp_role.as_deref(), Some("tp2"));
         options.spark_ep = Some(3);
         assert!(DeploymentSpec::from_report(&report, &options).is_err());

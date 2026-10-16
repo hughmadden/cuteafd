@@ -8,6 +8,18 @@ use cuteafd_loader::serving_capacity::qwen_cache_geometry;
 use cuteafd_loader::serving_capacity::qwen_graphs::QwenAdmissionInputs;
 use cuteafd_loader::placement::{families::qwen4, Baseline};
 
+pub(super) fn spark_model(rows: usize, bf16: bool)
+    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    let capacity = u32::try_from(rows)?;
+    let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 }
+        else { cuteafd_core::SparkIngress::Fp8K32 };
+    Ok(cuteafd_transport::worker_selection::ModelAdmission {
+        capacity, compiled_capacity: capacity,
+        endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress }],
+        rings: crate::shared::placement::spark_rings(64 << 20)?,
+    })
+}
+
 /// The shared admission inputs (`serving_capacity::qwen_graphs::qwen_admission`) at serve's arguments.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize, mtp: bool,
@@ -160,6 +172,22 @@ pub(super) fn dual_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan:
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
+
+    #[test]
+    fn spark_contract_matches_single_link_capacity_and_checkpoint_ingress() -> anyhow::Result<()> {
+        for rows in [64, 2048, 4096] {
+            for bf16 in [false, true] {
+                let model = super::spark_model(rows, bf16)?;
+                model.validate(cuteafd_core::ExpertGeometry::QWEN4)?;
+                assert_eq!((model.capacity, model.compiled_capacity), (rows as u32, rows as u32));
+                assert_eq!(model.endpoints.len(), 1);
+                assert_eq!(model.endpoints[0].capacity, rows as u32);
+                assert_eq!(model.endpoints[0].ingress, if bf16 { cuteafd_core::SparkIngress::Bf16 }
+                    else { cuteafd_core::SparkIngress::Fp8K32 });
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn dual_exl3_packages_match_shared_manifest_plan_before_cuda() -> anyhow::Result<()> {

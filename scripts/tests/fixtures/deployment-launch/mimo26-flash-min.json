@@ -192,14 +192,8 @@
       "0",
       "--world",
       "2",
-      "--rdma-endpoints",
-      "2",
-      "--capacity",
-      "4096",
       "--device-budget-bytes",
       "107374182400",
-      "--first-layer",
-      "3",
       "--listen",
       "0.0.0.0:19916"
     ]
@@ -265,14 +259,8 @@
       "1",
       "--world",
       "2",
-      "--rdma-endpoints",
-      "2",
-      "--capacity",
-      "4096",
       "--device-budget-bytes",
       "107374182400",
-      "--first-layer",
-      "3",
       "--listen",
       "0.0.0.0:19916"
     ]

@@ -84,7 +84,7 @@ release_stop_wip_containers
                               env=dict(os.environ, DRY_RUN='1', SPARK_COUNT='2', **env))
 
     @unittest.skipUnless(HELPER.exists(), 'manual WIP helper lives in ignored runs/')
-    def test_wip_commands_have_world_two_peers_ceiling_and_first_layer(self):
+    def test_wip_commands_have_world_two_peers_and_ceiling(self):
         result = self.helper('start-experts', '3')
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = [shlex.split(line[len('DRY RUN:'):]) for line in result.stdout.splitlines()
@@ -92,7 +92,6 @@ release_stop_wip_containers
         self.assertEqual(len(commands), 2)
         for rank, command in enumerate(commands):
             self.assertIn(f'--rank {rank} --world 2', command[-1])
-            self.assertIn('--first-layer 3', command[-1])
             self.assertIn('--capacity 256', command[-1])
         result = self.helper('start-coordinator', '1')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -221,13 +220,13 @@ release_stop_wip_containers
         for world in (2, 3):
             with self.subTest(world=world):
                 result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; docker() { printf "%s\\n" "$@"; }\n' +
-                    remote.replace(' >/dev/null', ''), 'test', 'image', 'name', '1', '4096',
-                    '107374182400', '19441', 'snapshot', 'fingerprint', '3', str(world)],
+                    remote.replace(' >/dev/null', ''), 'test', 'image', 'name', '1',
+                    '107374182400', '19441', 'snapshot', 'fingerprint', str(world), '0', str(world), '1'],
                     cwd=ROOT, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 arguments = result.stdout.splitlines()
                 self.assertEqual(arguments[arguments.index('--world') + 1], str(world))
-                self.assertEqual(arguments[arguments.index('--first-layer') + 1], '3')
+                self.assertNotIn('--first-layer', arguments)
                 # A legacy world-2/3 launch carries no explicit topology flags.
                 self.assertNotIn('--spark-tp', arguments)
                 self.assertNotIn('--spark-ep', arguments)

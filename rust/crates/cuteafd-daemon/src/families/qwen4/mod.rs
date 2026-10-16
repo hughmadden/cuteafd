@@ -226,7 +226,8 @@ pub(crate) struct Opened {
     pub checkpoint: Checkpoint,
     pub cfg: Qwen4Config,
     pub library: std::sync::Arc<NativeLibrary>,
-    /// Local backbone experts, or the coordinator-local MTP layer with Spark peers.
+    /// Complete routed headers for local ownership or exact Spark admission;
+    /// bundled MTP experts remain coordinator-local with Spark peers.
     pub experts: Option<cuteafd_loader::OfficialV41Catalog>,
 }
 
@@ -271,6 +272,25 @@ mod weight_representation_tests {
     fn args(extra: &[&str]) -> std::result::Result<EngineArgs, clap::Error> {
         Command::try_parse_from(["qwen", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
             .into_iter().chain(extra.iter().copied())).map(|c| c.engine)
+    }
+
+    #[test]
+    fn remote_catalog_keeps_complete_backbone_without_mtp() -> Result<()> {
+        use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(2, 4);
+        write_snapshot(root.path(), &qwen4_config(2), &tensors, None);
+        let mut args = args(&["--peers", "127.0.0.1:9870"])?;
+        args.snapshot = root.path().to_owned();
+        let catalog = expert_catalog(&args)?.context("remote routed catalog")?;
+        assert_eq!(args.mtp, 0);
+        assert_eq!(catalog.routed_experts().layers, 2);
+        let manifest = catalog.exl3().context("EXL3 headers")?;
+        for layer in 0..2 {
+            assert!(manifest.residency(cuteafd_loader::V41Exl3Layer::Backbone(layer), 3, 0)?
+                .device_arena_layout()?.1 > 0);
+        }
+        Ok(())
     }
 
     #[test]
@@ -369,6 +389,17 @@ mod weight_representation_tests {
     }
 }
 
+fn expert_catalog(args: &EngineArgs) -> Result<Option<cuteafd_loader::OfficialV41Catalog>> {
+    if !args.local_experts && args.peers.is_none() { return Ok(None); }
+    let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
+    let mut catalog = cuteafd_loader::read_expert_catalog(source)?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("qwen4",
+        if args.mtp > 0 { "mtp" } else { "off" }))?;
+    ensure!(catalog.fp8().is_some() || catalog.exl3().is_some(),
+        "Qwen routed experts need FP8 or EXL3 headers; {} has neither", source.display());
+    Ok(Some(catalog))
+}
+
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let checkpoint = Checkpoint::coordinator(&args.snapshot, args.local_experts, args.mtp > 0)?;
     let cfg = Qwen4Config::read(&args.snapshot)?;
@@ -380,18 +411,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         && geometry.topk as usize == cfg.topk && geometry.intermediate as usize == cfg.moe_intermediate,
         "checkpoint experts do not match the Qwen 3.8 Flash Next geometry");
     cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
-    let experts = if args.local_experts || (args.peers.is_some() && args.mtp > 0) {
-        let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
-        let mut catalog = if args.local_experts { cuteafd_loader::read_expert_catalog(source)? }
-            else { cuteafd_loader::read_qwen4_mtp_expert_catalog(source, 1)? };
-        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("qwen4",
-            if args.mtp > 0 { "mtp" } else { "off" }))?;
-        ensure!(catalog.fp8().is_some() || catalog.exl3().is_some(),
-            "--local-experts runs FP8 or EXL3 experts; {} has neither", source.display());
-        Some(catalog)
-    } else {
-        None
-    };
+    let experts = expert_catalog(args)?;
     // SAFETY: the library is the cuteafd native shim built for this engine.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
@@ -430,16 +450,28 @@ impl Opened {
         // every other family's modules, which Qwen never launches.
         let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "qwen4", split_family: None };
         let device = self.library.cuda_get_device()?;
-        crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], |_| {
+        crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
             tracing::info!(loaded, skipped, "Qwen programs loaded");
             Ok(())
         })?;
+        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        if let Some(peers) = args.peers.as_deref() {
+            let peers = peers.split(',').map(str::parse)
+                .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            let working = cuteafd_loader::placement::SparkWorkingSet {
+                spark_layers: (0..layers).collect(), spark_ranks: peers.len(), prefill_lanes: 1,
+                ..Default::default()
+            };
+            let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
+            crate::shared::placement::SparkAdmission::plan(source, cuteafd_core::ExpertGeometry::QWEN4,
+                self.experts.as_ref(), &working, peers.len(), None,
+                admission::spark_model(args.prefill_rows, self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
+        }
         let mut manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
-        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
             fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream };
         let source = self.embed_source()?;

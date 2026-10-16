@@ -10,17 +10,9 @@ use crate::families::deepseek_v41::v41_target_head::distributed_target::Distribu
 use crate::families::deepseek_v41::v41_target_pass::{DistributedTargetPass, TargetTapWave};
 use std::rc::Rc;
 
-pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
+pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
-    if let Some(directory)=args.placement_directory.as_deref() {
-        if let Some(layers)=PlacementHandoff::<PlacementPlan>::resumed(directory)?.map(|plan| plan.rtx_expert_layers) {
-            if let admission::LocalLayers::Count(requested)=args.rtx_expert_layers {
-                ensure!(requested==layers,"restart layer request differs from acknowledged workers");
-            }
-            args.rtx_expert_layers=admission::LocalLayers::Count(layers);
-        }
-    }
     let minimum_expert_layers = match args.rtx_expert_layers {
         admission::LocalLayers::Auto => 1,
         admission::LocalLayers::Count(count) => {
@@ -28,7 +20,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             count as usize
         }
     };
-    prefill_capacity(args.prefill_batch_tokens)?;
+    let aot_capacity = prefill_capacity(args.prefill_batch_tokens)?;
     // AOT kernels keep their full scratch; row storage follows live capacity.
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
@@ -81,7 +73,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
     }
     let mut exl3_modules = [None, None];
-    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], |gpu| {
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
         admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)?;
         if compressed {
             exl3_modules[gpu as usize] = Some(admission::preload_exl3(&lib, &exl3_directory, capacity, 2)?);
@@ -337,14 +329,16 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub((2*per_lane) as u64) as usize);
     tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
-    let placement_handoff=args.placement_directory.as_deref().map(|directory|
-        PlacementHandoff::publish(std::path::Path::new(directory), PlacementPlan::new(args.rtx_gpus, expert_layers))).transpose()?;
+    let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
+        && topology.is_none()
+        && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native
+        && expert_layers < 40;
+    let spark_admission = admission::start_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
+        topology, if device_exchange { 2 } else { 0 })?;
     eprintln!("loading bottom {expert_layers} expert layers as TP2");
     let routed = tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
         rank_budgets, &exl3_directory)?;
-    if let Some(handoff)=placement_handoff {
-        handoff.wait_ready(Duration::from_secs(900))?;
-    }
+    if let Some(pending) = spark_admission { pending.wait()?; }
     let mut make_transport = || {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {
@@ -352,8 +346,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             NativeTp4Wave::new(&lib, roce, wave_bytes)
         })?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
-        if crate::shared::memory::chain::device_exchange_enabled() && topology.is_none()
-            && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native {
+        if device_exchange {
             // Verification waves (up to 80 rows) on the device-driven exchange.
             devices[1].run(|| transport.get_mut().install_device_link(&args.peers, 80.min(capacity as usize), 39,
                 cuteafd_transport::TcpTransportConfig { timing, timeout: Duration::from_secs(120),

@@ -361,15 +361,18 @@ def test_v41_worker_takes_profile_args_after_every_positional():
     remote = remote.split('\nREMOTE', 1)[0]
     assert '--profile-args' in invocation
     assert '"${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"}' in remote
-    positional = ['image', 'name', '1', '4096', '107374182400', '19441', 'snapshot', 'fingerprint', '3', '4',
+    positional = ['image', 'name', '1', '107374182400', '19441', 'snapshot', 'fingerprint', '4',
                   '0', '', '', '', '', '', 'info', '__none__']
+    assert len(positional) == 16
     for tail, expected in [([], []), (['--profile-args', '-e', 'CUTEAFD_EXPERT_TIMING=1', '-e', 'CUTEAFD_PROFILE_HOST=emu'],
                                       ['CUTEAFD_EXPERT_TIMING=1', 'CUTEAFD_PROFILE_HOST=emu'])]:
         result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; docker() { printf "%s\\n" "$@"; }\n' + remote.replace(' >/dev/null', ''),
                                  'test', *positional, *tail], cwd=ROOT, text=True, capture_output=True)
         assert result.returncode == 0, result.stderr
         arguments = result.stdout.splitlines()
-        assert arguments[arguments.index('--world') + 1] == '4'
+        for flag, value in [('--rank', '1'), ('--world', '4'), ('--device-budget-bytes', '107374182400')]:
+            assert arguments[arguments.index(flag) + 1] == value
+        assert not {'--capacity', '--first-layer', '--rdma-endpoints'} & set(arguments)
         for flag in expected:
             assert flag in arguments
         assert ('CUTEAFD_PROFILE_HOST=emu' in arguments) == bool(expected)

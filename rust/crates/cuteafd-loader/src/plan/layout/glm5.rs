@@ -4,9 +4,10 @@ use crate::plan::Checkpoint;
 use cuteafd_core::DType;
 use std::collections::BTreeMap;
 
-pub(super) fn resident(checkpoint: &Checkpoint, ranks: usize) -> anyhow::Result<Vec<Vec<(String, String, u64)>>> {
+pub fn resident(checkpoint: &Checkpoint, ranks: usize, layers: usize) -> anyhow::Result<Vec<Vec<(String, String, u64)>>> {
     anyhow::ensure!((1..=2).contains(&ranks), "GLM coordinator ranks");
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
+    anyhow::ensure!(layers <= cfg.layers, "GLM resident layer extent exceeds checkpoint");
     let tensors: BTreeMap<_, _> = checkpoint.tensors.iter().map(|t| (t.meta.name.as_str(), &t.meta)).collect();
     let tensor = |name: &str| tensors.get(name).copied().ok_or_else(|| anyhow::anyhow!("missing GLM operand {name}"));
     let mut groups = vec![BTreeMap::<(String, String), u64>::new(); ranks];
@@ -14,7 +15,7 @@ pub(super) fn resident(checkpoint: &Checkpoint, ranks: usize) -> anyhow::Result<
         *groups[rank].entry((group.into(), format.into())).or_default() += bytes.max(256);
     };
     let native = std::env::var("CUTEAFD_GLM_BF16").is_ok_and(|v| v == "native");
-    for layer in 0..cfg.layers {
+    for layer in 0..layers {
         let p = format!("model.layers.{layer}");
         let attn = format!("{p}.self_attn");
         let qkv = [format!("{attn}.q_a_proj.weight"), format!("{attn}.kv_a_proj_with_mqa.weight")];
@@ -93,6 +94,15 @@ pub(super) fn resident(checkpoint: &Checkpoint, ranks: usize) -> anyhow::Result<
     Ok(groups.into_iter().map(|g| g.into_iter().map(|((group, format), bytes)| (group, format, bytes)).collect()).collect())
 }
 
+/// The planner's packed owners, excluding a host-mapped embedding when selected.
+pub fn device_bytes(checkpoint: &Checkpoint, ranks: usize, layers: usize, host_embedding: bool)
+    -> anyhow::Result<Vec<u64>> {
+    resident(checkpoint, ranks, layers)?.into_iter().map(|groups| groups.into_iter()
+        .filter(|(group, _, _)| !host_embedding || group != "embedding")
+        .try_fold(0u64, |sum, (_, _, bytes)| sum.checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("GLM retained weight bytes overflow")))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,8 +113,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
-        let one = resident(&checkpoint, 1).unwrap();
-        let two = resident(&checkpoint, 2).unwrap();
+        let layers = GlmDsaConfig::from_hf(&checkpoint.config).unwrap().layers;
+        let one = resident(&checkpoint, 1, layers).unwrap();
+        let two = resident(&checkpoint, 2, layers).unwrap();
         let bytes = |rank: &Vec<(String, String, u64)>, group: &str| rank.iter()
             .filter(|(g, _, _)| g == group).map(|(_, _, b)| *b).sum::<u64>();
         assert_eq!(bytes(&one[0], "router"), bytes(&two[0], "router"));
@@ -123,5 +134,29 @@ mod tests {
             .filter(|(g, f, _)| g == "attention" && f == "fp8-scale").map(|(_, _, b)| *b).sum::<u64>();
         assert!(scales(&two[0]) > 2 * 64 * 512 * (192 + 256) / 2 / 64 * 4);
         assert_eq!(scales(&two[0]), scales(&two[1]));
+    }
+
+    #[test]
+    fn retained_headers_respect_selected_extent_and_host_embedding() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let layers = GlmDsaConfig::from_hf(&checkpoint.config).unwrap().layers;
+        for ranks in [1, 2] {
+            let globals = device_bytes(&checkpoint, ranks, 0, true).unwrap();
+            assert!(globals[0] > 0);
+            assert!(globals[1..].iter().all(|&bytes| bytes == 0));
+            let mut previous = globals;
+            for extent in 1..=layers {
+                let gpu = device_bytes(&checkpoint, ranks, extent, false).unwrap();
+                let host = device_bytes(&checkpoint, ranks, extent, true).unwrap();
+                let embedding = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight").unwrap();
+                assert_eq!(gpu[0] - host[0], embedding.meta.byte_length);
+                assert_eq!(gpu[1..], host[1..]);
+                assert!(host.iter().zip(&previous).all(|(next, before)| next > before));
+                previous = host;
+            }
+            assert!(resident(&checkpoint, ranks, layers + 1).is_err());
+        }
     }
 }

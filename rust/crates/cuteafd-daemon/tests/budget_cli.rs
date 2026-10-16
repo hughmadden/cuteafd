@@ -36,7 +36,6 @@ fn deployment_rejects_conflicting_modes_and_incomplete_topology() {
         vec!["--deployment", "--spark-tp", "2"],
         vec!["--deployment", "--spark-ep", "2"],
         vec!["--deployment-peers", "worker:9200"],
-        vec!["--deployment-placement-handshake"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["plan", "/deployment-cli-missing-snapshot"])

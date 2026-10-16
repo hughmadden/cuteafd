@@ -640,6 +640,17 @@ impl<'a> ExpertWeights<'a> {
         per_expert * 2 / cuteafd_core::expert_geometry().hidden as usize
     }
 
+    pub(crate) fn resident_bytes(&self) -> Result<usize> {
+        let mut bytes = self.buffers.iter().try_fold(0usize, |sum, owner|
+            sum.checked_add(owner.buffer.bytes).context("native resident bytes overflow"))?;
+        if let Some(side) = &self.nvfp4 {
+            for owner in [&side.alphas, &side.down_alphas, &side.input_scales, &side.down_input_scales] {
+                bytes = bytes.checked_add(owner.buffer.bytes).context("NVFP4 resident bytes overflow")?;
+            }
+        }
+        Ok(bytes)
+    }
+
     pub fn budget(&self) -> ExpertLoadBudget {
         self.budget
     }
