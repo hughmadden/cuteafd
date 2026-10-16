@@ -124,11 +124,35 @@ pub struct Item {
     pub format: String,
     pub bytes: u64,
     pub basis: Basis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<MemoryLifetime>,
+}
+
+/// Lifetime of a resident charge relative to worker readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLifetime {
+    ReadyResident,
+}
+
+/// Shared allowance for unclassified Spark runtime growth, not an exact owner.
+/// The V4.1 min/max census at 0a6fc7b1 observed at most 2,083,518,960 B/rank.
+pub const SPARK_RUNTIME_RESIDUAL_BYTES: u64 = 5 * (1 << 29);
+pub const SPARK_RUNTIME_RESIDUAL_GROUP: &str = "Spark runtime residual";
+
+pub fn spark_runtime_residual() -> Item {
+    let mut item = Item::new(Category::Runtime, SPARK_RUNTIME_RESIDUAL_GROUP, "",
+        SPARK_RUNTIME_RESIDUAL_BYTES, Basis::Estimated);
+    item.source = Some("V4.1 min/max seven-rank system/cgroup census at 0a6fc7b1; maximum measured residual 2,083,518,960 B plus margin; shared cross-family estimate, attribution pending #388".into());
+    item.lifetime = Some(MemoryLifetime::ReadyResident);
+    item
 }
 
 impl Item {
     pub fn new(category: Category, group: impl Into<String>, format: impl Into<String>, bytes: u64, basis: Basis) -> Self {
-        Self { category, group: group.into(), format: format.into(), bytes, basis }
+        Self { category, group: group.into(), format: format.into(), bytes, basis, source: None, lifetime: None }
     }
 }
 
@@ -286,6 +310,19 @@ pub fn size_pool(free: &[i64], per_token: &[u64], unit_tokens: u64, target: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spark_residual_is_estimated_ready_resident_with_census_provenance() {
+        let item = spark_runtime_residual();
+        assert_eq!(item.bytes, 2_684_354_560);
+        assert!(item.bytes > 2_083_518_960);
+        assert_eq!(item.basis, Basis::Estimated);
+        assert_eq!(item.lifetime, Some(MemoryLifetime::ReadyResident));
+        assert!(item.source.as_ref().unwrap().contains("0a6fc7b1"));
+        let encoded = serde_json::to_value(&item).unwrap();
+        assert_eq!(encoded["lifetime"], "ready_resident");
+        assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);
+    }
 
     #[test]
     fn scopes_map_onto_categories() {

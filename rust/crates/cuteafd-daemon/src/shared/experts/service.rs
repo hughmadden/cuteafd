@@ -351,12 +351,11 @@ fn worker_ring_budget(config: &NativeExpertServiceConfig, geometry: cuteafd_core
     Ok(cuteafd_transport::RingBudget::new(limit))
 }
 
-/// Optional explicit reserve for allocation granularity, the CUDA context and
-/// library state that the source cannot see. It defaults to zero: no arbitrary
-/// headroom is invented, and a real reserve is supplied from an actual
-/// measurement. `CUTEAFD_SPARK_RUNTIME_HEADROOM_BYTES` sets it.
+/// Shared ready-resident residual estimate from the seven-rank Spark census.
+/// It is separate from known context/modules and applies to every family.
 fn spark_runtime_headroom() -> Result<usize> {
-    env_usize("CUTEAFD_SPARK_RUNTIME_HEADROOM_BYTES", 0)
+    env_usize("CUTEAFD_SPARK_RUNTIME_HEADROOM_BYTES",
+        usize::try_from(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES)?)
 }
 
 fn spark_admission_budget(
@@ -664,8 +663,8 @@ mod tests {
         .is_err()
     }
 
-    /// The explicit-topology admission is exactly the source-known transient sum,
-    /// with no invented headroom when the override is unset.
+    /// Both phase peaks include the shared measured-residual estimate, alongside
+    /// their own disjoint source-known transient and retained owners.
     #[test]
     fn explicit_admission_counts_every_known_transient_exactly() {
         let topology = SparkTopology::new(2, 2).unwrap();
