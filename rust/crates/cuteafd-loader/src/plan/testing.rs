@@ -625,10 +625,19 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
             }
         }
     }
-    let variants = [(5120,1152),(1152,5120)].into_iter().flat_map(|(k,n)|
-        [1,16,80,256,1024,4096].map(|c| json!({"capacity":c,"input_dim":k,
-            "output_dim":n,"label":format!("shared_{k}_{n}_m{c}"),"scratch_bytes":c+1}))).collect::<Vec<_>>();
+    let matrices = [(5120,1152),(1152,5120),(5120,1280),(1280,32768),
+        (32768,8192),(8192,5120),(5120,2304),(2304,5120),(5120,512),
+        (1280,4096),(6144,25600),(15360,5120)];
+    let variants = matrices.into_iter().flat_map(|(k,n)|
+        [1,16,80,256,1024,4096].map(move |c| json!({"capacity":c,"input_dim":k,
+            "output_dim":n,"label":format!("matrix_{k}_{n}_m{c}"),"scratch_bytes":c+1,
+            "expected_m":if c<=80 {16}else{c},"split_k_slices":1,"all_rows":c<=80}))).collect::<Vec<_>>();
     fs::write(share.join("V41_FP8_AOT.json"), serde_json::to_vec(&json!({"variants":variants})).unwrap()).unwrap();
+    fs::write(share.join("V41_EXPERT_AOT.json"), serde_json::to_vec(&json!({
+        "role":"coordinator","input_format":"bf16","geometry":{"hidden":5120,
+            "intermediate":2304,"kernel_intermediate":2304,"experts":128,"topk":3},
+        "variants":([16,40,80,256].map(|c|json!({"capacity_rows":c,"core_scratch_nbytes":c*7})))
+    })).unwrap()).unwrap();
     programs
 }
 

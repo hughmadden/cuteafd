@@ -13,7 +13,7 @@ use cuteafd_core::memory_layout::{size_pool, Basis, Category, DeviceKind, Device
 
 pub(crate) mod deepseek_v4;
 pub(crate) mod glm5_flash;
-mod v41;
+pub(crate) mod v41;
 pub(crate) mod mimo;
 pub(crate) mod glm5;
 pub(crate) mod qwen;
