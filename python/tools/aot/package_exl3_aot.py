@@ -431,6 +431,33 @@ def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, .
     return TILE_384
 
 
+# Decode capacities ship the tile m1 ships. B12x's mixed-Trellis planner widens
+# the tile of 10..32-row batches to (128,128,128,128) (`_projection_mixed_tile_config`
+# with no direct top-k routes, which no packaged EXL3 geometry uses). The tile is
+# part of the reduction signature a decode plan admits, so a widened decode export
+# can never be selected: rows in its range fall through to the next capacity, and
+# the export ships as dead weight (#309). Re-exporting it with the canonical tile is
+# what makes the capacity selectable again. Enabled for the geometry whose decode
+# capacities are measured; the other geometries carry the same B12x policy and can
+# be added here with their own gate run.
+DECODE_TILE_PIN = ('v41',)
+
+
+def decode_tile(geometry: str, width: int, capacity: int, paired: bool = False) -> tuple[int, ...] | None:
+    """Canonical m1 tile for a decode capacity the B12x planner would widen.
+
+    The canonical tile is the planner's own prefill/default answer at this width,
+    which is what m1 and every capacity above the widened window already compile:
+    tile_n is 256 when both the rank's intermediate width and the geometry's hidden
+    size are whole 256 tiles, 128 otherwise. Paired TP4 packages are left alone:
+    they refuse tile overrides, so their geometry is not ours to restate here.
+    """
+    if paired or geometry not in DECODE_TILE_PIN or not 10 <= capacity <= 32:
+        return None
+    tile_n = 256 if width % 256 == 0 and GEOMETRIES[geometry][0] % 256 == 0 else 128
+    return (64, tile_n, 64, tile_n)
+
+
 # Decode-schedule variants: a capacity directory m<capacity>-<name> beside the
 # default m<capacity>, exported with per-capacity options (bit-identical; the
 # worker's --exl3-schedule NAME selects it). gb10 is the DGX Spark schedule of
@@ -741,6 +768,10 @@ def build(args: argparse.Namespace) -> None:
         for profile, width, experts, topk, dtype, destinations in profiles:
             for capacity in capacities:
                 tile = tiles.get(profile, {}).get(capacity)
+                if tile is None:
+                    # A decode capacity the B12x policy widens is pinned back to the
+                    # canonical tile (an explicit override above still wins).
+                    tile = decode_tile(geometry, width, capacity, paired)
                 # Content-keyed: an override changes the compiled geometry, so it
                 # must never land in (or be read from) the policy-keyed export.
                 # Without an override the path is what every existing build used.
