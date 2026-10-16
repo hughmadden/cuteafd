@@ -27,11 +27,11 @@ fn family_native_placement_bypasses_legacy_layout_and_refuses_closed() {
     // come from the hook, independent of any registered family's dispatch.
     report.family = Some("test_native_placement".into());
     let options = layout::LayoutOptions::default();
-    let memory = family_layout(&native, &input, &mut report, &options, 0, ExpertPlacement::Local).unwrap();
+    let memory = family_layout(&native, &input, &mut report, &options, ExpertPlacement::Local).unwrap();
     assert_eq!(memory.pool_tokens, 123456);
     assert_eq!(memory.notes, ["native hook sentinel"]);
     let refusal = Native { refuse: true, ..native };
-    let memory = family_layout(&refusal, &input, &mut report, &options, 0, ExpertPlacement::Local).unwrap();
+    let memory = family_layout(&refusal, &input, &mut report, &options, ExpertPlacement::Local).unwrap();
     assert!(memory.devices.is_empty());
     assert!(!report.fits && !report.placement_supported);
     assert!(report.hints.iter().any(|hint| hint.what.contains("native test refusal")));
