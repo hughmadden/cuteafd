@@ -259,14 +259,14 @@ impl<'a> Exl3Worker<'a> {
         }
         let topk = Self::topk();
         let weights_offset = capacity as usize * topk * 4;
-        let staging = HostAllocation::new(library, weights_offset + capacity as usize * topk * 4)?;
+        let staging = HostAllocation::named(library, weights_offset + capacity as usize * topk * 4, "experts/workspace/route_staging")?;
         let host_path = HostPath::from_env()?;
         let executor_id = cuteafd_transport::expert::v41_spark_executor_id(first.layout.world, rank)?;
         let route_dump = RouteDump::from_env(executor_id)?;
         let inputs = [
-            DeviceAllocation::new(library, capacity as usize * Self::wire_row_bytes())?,
-            DeviceAllocation::new(library, capacity as usize * topk * 4)?,
-            DeviceAllocation::new(library, capacity as usize * topk * 4)?,
+            DeviceAllocation::named(library, capacity as usize * Self::wire_row_bytes(), "experts/workspace/hidden")?,
+            DeviceAllocation::named(library, capacity as usize * topk * 4, "experts/workspace/routes")?,
+            DeviceAllocation::named(library, capacity as usize * topk * 4, "experts/workspace/routes")?,
         ];
         ensure!(
             executions

@@ -50,10 +50,55 @@ pub struct RuntimeSample {
     pub driver: String,
 }
 
+/// A retained allocation delta from the process ledger. Aliases are not owners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkAllocationTerm {
+    pub space: String,
+    pub scope: String,
+    pub tensor: Option<String>,
+    pub format: Option<String>,
+    pub bytes: u64,
+    pub allocations: u64,
+    pub method: String,
+}
+
+/// Same-process census evidence, never a CUDA context/module attribution by
+/// itself. PSS includes host mappings; CUDA UMA accounting is driver-dependent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkProcessSample {
+    pub phase: String,
+    pub pid: u32,
+    pub monotonic_ns: u64,
+    pub rss_bytes: u64,
+    pub pss_bytes: u64,
+    pub private_bytes: u64,
+    pub tracked_device_bytes: u64,
+    pub tracked_pinned_bytes: u64,
+    pub raw_cuda_free_bytes: Option<u64>,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkRuntimeDetail {
+    /// Checkpoint-derived, layer-sequential load-only owners, absent for backends
+    /// without a qualified load plan. Never added to the serving workspace.
+    pub load_transient: Vec<SparkAllocationTerm>,
+    pub allocations: Vec<SparkAllocationTerm>,
+    pub process_samples: Vec<SparkProcessSample>,
+    /// PostLoad's GB10 free-memory residual includes unrelated system/cache
+    /// state and must not become an offline context/modules calibration.
+    pub runtime_sample_method: String,
+    pub context_modules_qualified: bool,
+}
+
 /// Measurements made by the Spark owner, not coordinator-architecture estimates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SparkRuntimeInventory {
+    pub detail: SparkRuntimeDetail,
     pub sample: RuntimeSample,
     /// All retained native/AOT device workspace, including worker intake.
     pub workspace_bytes: u64,

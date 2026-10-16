@@ -28,6 +28,11 @@ pub(crate) struct DeviceAllocation<'a> {
     pub(crate) buffer: CuteafdDeviceBuffer,
 }
 impl<'a> DeviceAllocation<'a> {
+    pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
+        let _scope = cuteafd_ffi::memory_ledger::scope(scope);
+        Self::new(library, bytes)
+    }
+
     /// Attention value/scale planes retain 16-byte alignment under every row slice.
     pub(crate) fn attention_plane(library: &'a NativeLibrary, rows: usize, stride: usize,
         name: &str) -> Result<Self> {
@@ -63,6 +68,11 @@ pub(crate) struct HostAllocation<'a> {
     pub(crate) buffer: CuteafdHostBuffer,
 }
 impl<'a> HostAllocation<'a> {
+    pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
+        let _scope = cuteafd_ffi::memory_ledger::scope(scope);
+        Self::new(library, bytes)
+    }
+
     pub(crate) fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
         let value = Self {
             library,

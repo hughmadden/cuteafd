@@ -790,7 +790,7 @@ mod budget_tests {
             rank: 0, resident_bytes: 1,
             slices: vec![SparkSlice { layer: 13, first: 0, width: 1024, stored_width: 1024,
                 tiers: vec![], projection_counts: vec![] }],
-            runtime: SparkRuntimeInventory { sample: RuntimeSample {
+            runtime: SparkRuntimeInventory { detail: Default::default(), sample: RuntimeSample {
                 device: 0, total_bytes: 121 << 30, free_bytes: 100 << 30, context_bytes: 1,
                 module_bytes: 1, sms: 48, arch: "sm_121".into(), driver: "test".into(),
             }, workspace_bytes: 1, pinned_workspace_bytes: 0 },

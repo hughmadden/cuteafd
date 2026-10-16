@@ -1,6 +1,7 @@
 //! Native GPU resources and inference QPs share one owning thread.
 mod local;
 mod backend;
+mod census;
 
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};

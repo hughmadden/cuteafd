@@ -15,6 +15,24 @@ pub(super) enum Weights<'a> {
 }
 
 impl<'a> Weights<'a> {
+    pub(super) fn load_inventory(&self) -> Vec<cuteafd_core::expert_geometry::SparkAllocationTerm> {
+        let budgets: Vec<_> = match self {
+            Self::Full(weights) => weights.iter().map(|w| w.budget).collect(),
+            Self::Exl3(weights) => weights.iter().map(|w| w.budget).collect(),
+            Self::Fp8(_) => return vec![],
+        };
+        let terms = [
+            ("device", "expert_load_staging", budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)),
+            ("pinned", "expert_load_staging", budgets.iter().map(|b| b.pinned_host_bytes).max().unwrap_or(0)),
+            ("host", "expert_load_read_scratch", budgets.iter().map(|b| b.read_scratch_bytes).max().unwrap_or(0)),
+        ];
+        terms.into_iter().map(|(space, scope, bytes)| cuteafd_core::expert_geometry::SparkAllocationTerm {
+            space: space.into(), scope: scope.into(), tensor: None, format: None, bytes: bytes as u64,
+            allocations: 0,
+            method: "checkpoint loader plan high-water payload; sequential layer maxima; transient, not retained; allocation count not sampled".into(),
+        }).collect()
+    }
+
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Full(weights) => weights.len(),
