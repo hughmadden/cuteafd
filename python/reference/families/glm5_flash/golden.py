@@ -315,7 +315,7 @@ def main() -> None:
             with torch.device("meta"):
                 layer = ref.Glm5NextTextDecoderLayer(config, layer_id)
             torch.set_default_dtype(torch.float32)
-            layer = layer.to_empty(device="cuda")
+            layer = layer.to_empty(device="cuda").eval()
             for name, param in list(layer.named_parameters()) + list(layer.named_buffers()):
                 if any(k in name for k in fp32_keys):
                     param.data = param.data.float()
