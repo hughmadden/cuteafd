@@ -53,3 +53,13 @@ def test_seal_paths_cannot_escape(tmp_path):
     (tmp_path / 'link').symlink_to('/etc/passwd')
     with pytest.raises(ValueError):
         packager.contained(tmp_path, 'link')
+
+def test_retokenized_panel_caveat_discloses_provisional_legacy_extension():
+    panel = dict(windows=[dict(tokenizer_length_extension=dict(reason="extended for tokenizer length"))],
+                 retokenized_text_source=dict(caveat="not Step-5's own greedy path; model-generated-span property does not hold."))
+    caveat = packager.panel_caveat(panel)
+    assert 'extended for tokenizer length' in caveat
+    assert 'not byte-comparable' in caveat
+    assert 'model-generated-span property does not hold' in caveat
+    assert 'not a Step-5-generated panel' in caveat
+    assert '#302' in caveat
