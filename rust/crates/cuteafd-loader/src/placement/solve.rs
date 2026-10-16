@@ -137,6 +137,22 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     if request.pool_bounded.iter().any(|d| usize::from(d.gpu) >= gpus) {
         return Err(PlacementError::Inventory("bounded pool demand on an absent GPU"));
     }
+    if request.startup.iter().any(|d| usize::from(d.gpu) >= gpus) {
+        return Err(PlacementError::Inventory("startup phase on an absent GPU"));
+    }
+    for phase in &request.startup {
+        let gpu = &request.inventory.gpus[usize::from(phase.gpu)];
+        // Growth/headroom is not allocated during sequential weight loading.
+        let available = match gpu.baseline {
+            Baseline::Measured { free_bytes } => free_bytes,
+            Baseline::Planned { context_bytes, loaded_bytes } => gpu.capacity_bytes
+                .saturating_sub(context_bytes).saturating_sub(loaded_bytes),
+        };
+        if phase.bytes > available {
+            return Err(PlacementError::StartupPeak { gpu: phase.gpu, phase: phase.group.clone(),
+                required: phase.bytes, available });
+        }
+    }
     if request.fixed.iter().any(|d| usize::from(d.gpu) >= gpus)
         || request.movables.iter().any(|m| m.allowed.is_empty() || m.allowed.iter().any(|&g| usize::from(g) >= gpus)) {
         return Err(PlacementError::Inventory("demand on an absent GPU"));

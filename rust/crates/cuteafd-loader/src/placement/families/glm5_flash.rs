@@ -422,6 +422,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
                 offset_units: 0, cap_units: u64::MAX, basis: Basis::Formula })
         }).collect(),
         layers, pool_overhead: geometry.ranks.iter().map(|g| g.pool_metadata_unit_bytes).collect(), fixed,
+        startup: Vec::new(),
         movables,
         expert_workspace: if working.includes(GlmfComponent::RtxExperts) { i.expert_workspace } else { 0 },
         tp2_workspace: if working.includes(GlmfComponent::RtxExperts) { i.tp2_workspace } else { [0; 2] },

@@ -89,7 +89,7 @@ pub fn request(inputs: DenseInputs<'_>) -> Result<PlacementRequest> {
         pool: PoolPolicy::resolve(&[inputs.gpu.capacity_bytes], inputs.max_context,
             inputs.requested_pool, PAGE_ROWS, true),
         layers, pool_overhead: vec![inputs.pool_overhead], pool_bounded: inputs.pool_bounded,
-        fixed: inputs.fixed, movables: inputs.drafter.map(DrafterBytes::movable).transpose()?.into_iter().collect(),
+        fixed: inputs.fixed, startup: Vec::new(), movables: inputs.drafter.map(DrafterBytes::movable).transpose()?.into_iter().collect(),
         expert_workspace: 0, tp2_workspace: [0; 2],
         onboard: Onboard::Auto, expert_gpus: 0, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![WHOLE], ..Default::default() },
