@@ -94,7 +94,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             let hops: Vec<_> = plan.hops().iter().filter(|hop| usize::from(hop.to) == gpu).copied().collect();
             transfer.bind(&hops, plan.spec())?;
         }
-        self.resources.map = map;
         Ok(())
     }
     pub fn enable_dual_attention(&mut self)->Result<()> {
@@ -143,9 +142,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 "distributed index owner absent"
             );
         }
+        let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
         let transfers = [
-            DirectInputHop::new(lanes[1].device, lanes[0].device)?,
-            DirectInputHop::new(lanes[0].device, lanes[1].device)?,
+            DirectInputHop::new(lanes[1].device, lanes[0].device, spec)?,
+            DirectInputHop::new(lanes[0].device, lanes[1].device, spec)?,
         ];
         let device = lanes[map.attention(19)?].device;
         let suffix_stream = device.own(|| {
@@ -1057,7 +1057,7 @@ mod tests {
                     1,
                 )?),
             ];
-            DistributedTargetPass::new(
+            let mut pass = DistributedTargetPass::new(
                 map,
                 devices[0].own(|| {
                     TargetEmbeddingWave::new(
@@ -1082,7 +1082,17 @@ mod tests {
                 devices[1]
                     .own(|| TargetTapWave::new(&lib, 16, TargetTapWave::device_bytes(16)?))?,
                 Duration::from_secs(120),
-            )
+            )?;
+            let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+            let modes = (0..40).map(|layer| Ok(cuteafd_loader::placement::LayerMode::Whole {
+                gpu: map.attention(layer)? as u8, ffn: cuteafd_loader::placement::FfnMode::Owner,
+            })).collect::<Result<Vec<_>>>()?;
+            let hops = cuteafd_loader::placement::plan_hops(&modes, &spec)?;
+            for (gpu, transfer) in pass.resources.transfers.iter_mut().enumerate() {
+                let incoming: Vec<_> = hops.iter().filter(|hop| usize::from(hop.to) == gpu).copied().collect();
+                transfer.bind(&incoming, spec)?;
+            }
+            Ok(pass)
         };
         let mut pass = make_pass()?;
         let token_map = cuteafd_loader::EngramTokenMap::from_file(
