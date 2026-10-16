@@ -1,49 +1,25 @@
 //! One GPU1 DFlash2 owner; the target retains its single embedding and head.
+//! GLM Flash's binding of the shared device-driven draft bridge
+//! (`shared::draft::remote`): taps, input rows, hidden rows and logits.
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, GlmDrafter, ReplayDrafter, TargetHead, TAP_ROWS};
-use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event, Stream};
-use crate::shared::peer_split::{PeerExchange, RankDevice, TerminalState};
+use crate::shared::draft::remote::{RemoteBridge, CONTEXT as TAPS};
+pub(crate) use crate::shared::draft::remote::Prepared;
+use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
+use crate::shared::peer_split::RankDevice;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::programs::VocabularyHead;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use std::cell::Cell;
 use std::ffi::c_void;
 
-const TAPS: usize = 0;
-const INPUT: usize = 1;
-const HIDDEN: usize = 2;
-const LOGITS: usize = 3;
+pub(crate) const IDENTITY: &str = "glmf-remote-dflash:taps,input,hidden,logits";
 
 fn tap_frontier(rows: &[ContextRow]) -> Result<Option<(usize, usize)>> {
     let Some(first) = rows.iter().map(|r| r.tap_row).min() else { return Ok(None) };
     let last = rows.iter().map(|r| r.tap_row).max().unwrap();
     ensure!(last < TAP_ROWS, "remote tap row {last} past {TAP_ROWS}");
     Ok(Some((first, last)))
-}
-
-pub(crate) struct Prepared<'a> {
-    pub exchange: PeerExchange<'a>,
-    pub stream: Stream<'a>,
-    target_peer: RankDevice,
-    target_ready: Event<'a>,
-}
-
-impl<'a> Prepared<'a> {
-    pub fn new(library: &'a NativeLibrary, target: RankDevice, target_peer: RankDevice) -> Result<Self> {
-        ensure!(target.device != target_peer.device && !target_peer.stream.is_null(),
-            "remote draft requires the peer target producer stream");
-        let device = Device { library, id: target_peer.device };
-        let stream = Stream::new(device)?;
-        let target_ready = Event { device, raw: device.run(|| library.cuda_event_create_ordering())? };
-        let exchange = PeerExchange::new_abortable(library,
-            [target, RankDevice { device: target_peer.device, stream: stream.raw }], 4, 0)?;
-        exchange.trace_identity("glmf-remote-dflash:taps,input,hidden,logits");
-        Ok(Self { exchange, stream, target_peer, target_ready })
-    }
-
-    /// Sampled before admission but charged only for the selected GPU1 candidate.
-    pub fn sampled_bytes(&self) -> u64 { 4 * 256 + 256 + 256 }
 }
 
 struct TargetBuffers<'a> {
@@ -59,13 +35,9 @@ struct TargetBuffers<'a> {
 pub(crate) struct RemoteDflash<'a> {
     pub draft: DeviceOwner<'a, GlmDrafter<'a>>,
     target: DeviceOwner<'a, TargetBuffers<'a>>,
-    exchange: PeerExchange<'a>,
-    target_peer: RankDevice,
-    target_ready: Event<'a>,
-    // The drafter, exchange and event drop before the stream they borrow.
-    stream: Stream<'a>,
+    // The drafter drops before the bridge's stream it borrows.
+    bridge: RemoteBridge<'a>,
     rows: usize,
-    update_pending: Cell<bool>,
 }
 
 impl<'a> RemoteDflash<'a> {
@@ -77,7 +49,8 @@ impl<'a> RemoteDflash<'a> {
             .ok_or_else(|| anyhow::anyhow!("remote draft rows overflow"))?;
         let inventory = cuteafd_loader::placement::families::glm5_flash::remote_dflash_bridge_demands(
             c.hidden as u64, c.vocab as u64, c.taps.len() as u64, rows as u64)?;
-        let device = Device { library, id: prepared.exchange.device(0) };
+        let bridge = RemoteBridge::new(prepared);
+        let device = Device { library, id: bridge.target_device() };
         let target = device.own(|| {
             let _scope = cuteafd_ffi::memory_ledger::scope("drafter/bridge");
             let alloc = |name| -> Result<Allocation<'a>> {
@@ -93,8 +66,7 @@ impl<'a> RemoteDflash<'a> {
                 logits: alloc("DFlash bridge logits")?, head, _head_workspace: workspace })
         })?;
         draft.device.run(|| draft.prepare_workspace())?;
-        Ok(Self { draft, target, exchange: prepared.exchange, target_peer: prepared.target_peer,
-            target_ready: prepared.target_ready, stream: prepared.stream, rows, update_pending: Cell::new(false) })
+        Ok(Self { draft, target, bridge, rows })
     }
 
     /// All draft and target-head first-use work finishes without peer waits.
@@ -108,12 +80,12 @@ impl<'a> RemoteDflash<'a> {
                 for count in 1..=self.draft.max_batch_sequences() {
                     let rows = count * self.draft.cfg.block;
                     embedding.embed(&vec![self.draft.cfg.mask_token; rows], self.target.ids.buffer, 1,
-                        self.target.input.buffer, self.exchange.stream(0))?;
+                        self.target.input.buffer, self.bridge.exchange.stream(0))?;
                     self.launch_head(&head, rows, true)?;
                     self.launch_head(&head, rows, false)?;
                     // SAFETY: retire gathers before synchronous ids reuse on the
                     // next width; this target stream has no peer wait during priming.
-                    unsafe { library.cuda_stream_synchronize(self.exchange.stream(0))?; }
+                    unsafe { library.cuda_stream_synchronize(self.bridge.exchange.stream(0))?; }
                 }
                 Ok(())
             })
@@ -126,17 +98,17 @@ impl<'a> RemoteDflash<'a> {
                 // SAFETY: target-owned weight and admitted scratch stay live on this stream.
                 unsafe { crate::shared::draft::launch_bf16_head(&self.target.head,
                     self.target.hidden.buffer.ptr.cast(), weight.buffer.ptr.cast(),
-                    self.target.logits.buffer.ptr.cast(), rows, self.exchange.stream(0)) }
+                    self.target.logits.buffer.ptr.cast(), rows, self.bridge.exchange.stream(0)) }
             }
             TargetHead::Bf16(weight) => {
                 // SAFETY: target head and admitted operands share the target stream.
                 unsafe { crate::families::glm5::launch_draft_head(self.draft.device.library,
                     &self.target.head, self.target.hidden.buffer.ptr.cast_const(), weight.buffer.ptr.cast_const(),
                     self.target.logits.buffer.ptr.cast(), rows, self.draft.cfg.hidden, self.draft.cfg.vocab,
-                    self.exchange.stream(0), self.draft.draft_head_mode()) }
+                    self.bridge.exchange.stream(0), self.draft.draft_head_mode()) }
             }
             TargetHead::Launch(launch) => launch(self.target.hidden.buffer.ptr.cast_const(),
-                self.target.logits.buffer.ptr.cast(), rows, self.exchange.stream(0)),
+                self.target.logits.buffer.ptr.cast(), rows, self.bridge.exchange.stream(0)),
         })
     }
 
@@ -151,51 +123,17 @@ impl<'a> RemoteDflash<'a> {
         ranges
     }
 
-    pub fn require_live(&self) -> Result<()> { self.exchange.require_live() }
+    pub fn require_live(&self) -> Result<()> { self.bridge.require_live() }
 
-    pub fn publish_abort(&self) -> Result<()> {
-        match self.exchange.terminal_state() {
-            TerminalState::Aborting | TerminalState::Drained => Ok(()),
-            _ => self.exchange.publish_abort(),
-        }
-    }
+    pub fn publish_abort(&self) -> Result<()> { self.bridge.publish_abort() }
 
-    /// No owner is released on an unproved drain; the engine's fatal-drain
-    /// boundary also retains every target graph and peer-exchange operand.
-    pub fn synchronize(&self) -> Result<()> {
-        self.finish_request()?;
-        self.stream.drain()?;
-        if self.exchange.terminal_state() == TerminalState::Aborting { self.update_pending.set(false); }
-        Ok(())
-    }
+    pub fn synchronize(&self) -> Result<()> { self.bridge.synchronize() }
 
-    /// Consume the final acknowledgement before any request slot is reused.
-    pub fn finish_request(&self) -> Result<()> {
-        if self.update_pending.get() && self.exchange.terminal_state() == TerminalState::Active {
-            self.exchange.wait(0, TAPS)?;
-            self.target.device.run(|| {
-                // SAFETY: request owners remain live until this acknowledgement retires.
-                unsafe { self.draft.device.library.cuda_stream_synchronize(self.exchange.stream(0)) }
-            })?;
-            self.update_pending.set(false);
-        }
-        Ok(())
-    }
+    pub fn finish_request(&self) -> Result<()> { self.bridge.finish_request() }
 
-    pub fn finish_terminal(&self, drained: bool) {
-        if self.exchange.terminal_state() == TerminalState::Aborting {
-            self.exchange.finish_terminal(drained);
-        }
-    }
+    pub fn finish_terminal(&self, drained: bool) { self.bridge.finish_terminal(drained) }
 
-    fn checked<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
-        self.require_live()?;
-        let result = work();
-        if result.is_err() {
-            crate::shared::decode_graph::fatal_drain(self.publish_abort(), "DFlash bridge abort publication");
-        }
-        result
-    }
+    fn checked<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> { self.bridge.checked(work) }
 
     /// Target graph segments write only their own staging. Remote work is
     /// enqueued by `update`, never while a rank0 segment is being captured.
@@ -205,22 +143,18 @@ impl<'a> RemoteDflash<'a> {
         let c = &self.draft.cfg;
         let width = c.taps.len() * c.hidden;
         ensure!(to.checked_add(n).is_some_and(|end| end <= TAP_ROWS), "remote tap rows exceed {TAP_ROWS}");
-        self.checked(|| self.exchange.on(0, || {
+        self.checked(|| self.bridge.exchange.on(0, || {
             // SAFETY: target rows are final on its stream; admitted local tap
             // storage outlives every captured graph and its queued reader.
             unsafe { self.draft.device.library.glm_dflash_tap_mean(
                 streams.cast::<u8>().add(first * hc * c.hidden * 2).cast(),
                 self.target.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(),
-                n, c.hidden, hc, width, index * c.hidden, self.exchange.stream(0)) }
+                n, c.hidden, hc, width, index * c.hidden, self.bridge.exchange.stream(0)) }
         }))
     }
 
     pub(crate) fn validate_target_peer(&self, producer: RankDevice) -> Result<()> {
-        ensure!(self.target_peer.device == producer.device && self.target_peer.stream == producer.stream
-            && self.target_ready.device.id == producer.device
-            && self.stream.device.id == producer.device && self.exchange.stream(1) == self.stream.raw,
-            "resident remote peer waits must be ordered behind the cooperative target producer");
-        Ok(())
+        self.bridge.validate_target_peer(producer)
     }
 
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
@@ -228,7 +162,6 @@ impl<'a> RemoteDflash<'a> {
         let pitch = self.draft.cfg.taps.len() * self.draft.cfg.hidden * 2;
         self.checked(|| {
             self.draft.device.run(|| self.draft.update_with(rows, || {
-                if self.update_pending.get() { self.exchange.wait(0, TAPS)?; }
                 // SAFETY: the checked row frontier is inside both tap owners.
                 let plane = unsafe { PeerPlane {
                     source: self.target.taps.buffer.ptr.cast::<u8>().add(first * pitch).cast(),
@@ -236,27 +169,11 @@ impl<'a> RemoteDflash<'a> {
                     rows: (last - first + 1) as u64, row_bytes: pitch as u64,
                     source_pitch: pitch as u64, destination_pitch: pitch as u64,
                 } };
-                self.exchange.push_planes(0, TAPS, &[plane])?;
-                // Both target ranks have submitted this prefill chunk or decode
-                // round. A resident waiter must not steal the SM needed by the
-                // peer target's full-grid cooperative EXL3 launch. Wait on its
-                // completion event before starting the TAPS spinner, with no host
-                // sync. GPU0 publishes TAPS N before its chunk-N+1 waits, so this
-                // spinner retires before GPU1 needs its next cooperative grid.
-                self.validate_target_peer(self.target_peer)?;
-                self.stream.device.run(|| unsafe {
-                    // SAFETY: both same-device streams and the reusable ordering
-                    // event survive every queued update; stream order protects reuse.
-                    self.draft.device.library.cuda_event_record(self.target_ready.raw, self.target_peer.stream)?;
-                    self.draft.device.library.cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)
-                })?;
-                self.exchange.wait(1, TAPS)
+                // Waits for the previous acknowledgement, pushes, and orders the
+                // draft-side wait behind the cooperative peer target producer.
+                self.bridge.publish_context(&[plane])
             }))?;
-            // Acknowledgement means all context readers are finished, not just
-            // that the incoming taps arrived. The next overwrite waits for it.
-            self.exchange.signal(1, TAPS)?;
-            self.update_pending.set(true);
-            Ok(())
+            self.bridge.acknowledge_context()
         })
     }
 
@@ -283,22 +200,17 @@ impl<'a> RemoteDflash<'a> {
         head: TargetHead<'_>, serving: bool) -> Result<Vec<Draft>> {
         self.checked(|| {
             let input = |ids: &[u32], out: CuteafdDeviceBuffer, stream: *mut c_void| {
-                ensure!(stream == self.stream.raw && ids.len() <= self.rows, "remote draft input capacity/stream");
+                ensure!(stream == self.bridge.stream.raw && ids.len() <= self.rows, "remote draft input capacity/stream");
                 self.target.device.run(|| embedding.embed(ids, self.target.ids.buffer, 1,
-                    self.target.input.buffer, self.exchange.stream(0)))?;
-                self.exchange.push_to(0, INPUT, self.target.input.buffer.ptr.cast_const(), out.ptr,
-                    ids.len() * embedding.hidden() * 2)?;
-                self.exchange.wait(1, INPUT)
+                    self.target.input.buffer, self.bridge.exchange.stream(0)))?;
+                self.bridge.send_input(self.target.input.buffer.ptr.cast_const(), out.ptr,
+                    ids.len() * embedding.hidden() * 2)
             };
             let launch = |hidden: *const c_void, logits: *mut f32, rows: usize, stream: *mut c_void| {
-                ensure!(stream == self.stream.raw && rows <= self.rows, "remote draft head capacity/stream");
-                self.exchange.push_to(1, HIDDEN, hidden, self.target.hidden.buffer.ptr,
-                    rows * self.draft.cfg.hidden * 2)?;
-                self.exchange.wait(0, HIDDEN)?;
-                self.launch_head(&head, rows, serving)?;
-                self.exchange.push_to(0, LOGITS, self.target.logits.buffer.ptr.cast_const(), logits.cast(),
-                    rows * self.draft.cfg.vocab * 4)?;
-                self.exchange.wait(1, LOGITS)
+                ensure!(stream == self.bridge.stream.raw && rows <= self.rows, "remote draft head capacity/stream");
+                self.bridge.round_trip_head(hidden, self.target.hidden.buffer.ptr,
+                    rows * self.draft.cfg.hidden * 2, || self.launch_head(&head, rows, serving),
+                    self.target.logits.buffer.ptr.cast_const(), logits.cast(), rows * self.draft.cfg.vocab * 4)
             };
             self.draft.device.run(|| self.draft.draft_device_with(sequences, &input,
                 TargetHead::Launch(Box::new(launch))))
@@ -317,7 +229,9 @@ impl Drop for RemoteDflash<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::peer_split::order::{self, Schedule};
+    use crate::shared::draft::remote::{HIDDEN, INPUT};
+    use crate::shared::memory::device::Stream;
+    use crate::shared::peer_split::TerminalState;
 
     fn row(tap_row: usize) -> ContextRow { ContextRow { tap_row, slot: 0, position: tap_row } }
 
@@ -327,45 +241,6 @@ mod tests {
         assert_eq!(tap_frontier(&[row(5), row(2), row(5)]).unwrap(), Some((2, 5)));
         assert_eq!(tap_frontier(&[row(TAP_ROWS - 1)]).unwrap(), Some((TAP_ROWS - 1, TAP_ROWS - 1)));
         assert!(tap_frontier(&[row(TAP_ROWS)]).is_err());
-    }
-
-    fn update(schedule: &mut Schedule, pending: bool) {
-        if pending { schedule.wait(0, "draft", TAPS, "previous context readers"); }
-        schedule.push(0, "draft", TAPS, "target taps final");
-        schedule.wait(1, "draft", TAPS, "context taps arrived");
-        schedule.push(1, "draft", TAPS, "context readers finished");
-    }
-
-    fn draft(schedule: &mut Schedule) {
-        schedule.push(0, "draft", INPUT, "target input gathered");
-        schedule.wait(1, "draft", INPUT, "draft input arrived");
-        schedule.push(1, "draft", HIDDEN, "draft hidden normalized");
-        schedule.wait(0, "draft", HIDDEN, "target head input arrived");
-        schedule.push(0, "draft", LOGITS, "target head finished");
-        schedule.wait(1, "draft", LOGITS, "draft selector logits arrived");
-    }
-
-    #[test]
-    fn repeated_context_and_head_bridges_have_no_wait_cycle() {
-        for rounds in [1, 2, 8, 32] {
-            let mut schedule = Schedule::default();
-            for round in 0..rounds {
-                update(&mut schedule, round > 0);
-                // Target-only rounds still update the drafter's context.
-                if round % 3 != 1 { draft(&mut schedule); }
-            }
-            schedule.wait(0, "draft", TAPS, "request boundary context readers");
-            schedule.end_request();
-            assert_eq!(order::check(&schedule), Ok(()));
-        }
-    }
-
-    #[test]
-    fn head_wait_before_input_publication_is_detected() {
-        let mut schedule = Schedule::default();
-        schedule.wait(0, "draft", HIDDEN, "head before input");
-        draft(&mut schedule);
-        assert!(order::check(&schedule).is_err());
     }
 
     /// Component transport/ownership gate, not a target-model quality gate.
@@ -410,7 +285,7 @@ mod tests {
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
             let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw },
-                RankDevice { device: 1, stream: peer_target.raw })?;
+                RankDevice { device: 1, stream: peer_target.raw }, IDENTITY)?;
             let local = GlmDrafter::load(&library, &draft_path, file.clone(), lead.raw, 4, 4,
                 mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8)?;
             let draft_device = prepared.stream.device;
@@ -452,12 +327,12 @@ mod tests {
                 }
                 // Queue genuine unmatched CUDA waits on both sides, then fail
                 // validation before metadata uploads or any blocking drain.
-                remote.exchange.wait(0, HIDDEN)?;
-                remote.exchange.wait(1, INPUT)?;
+                remote.bridge.exchange.wait(0, HIDDEN)?;
+                remote.bridge.exchange.wait(1, INPUT)?;
                 for rank in 0..2 {
-                    remote.exchange.on(rank, || {
+                    remote.bridge.exchange.on(rank, || {
                         // SAFETY: query observes live fixture-owned streams.
-                        ensure!(!unsafe { library.cuda_stream_query(remote.exchange.stream(rank))? },
+                        ensure!(!unsafe { library.cuda_stream_query(remote.bridge.exchange.stream(rank))? },
                             "fixture wait unexpectedly completed on rank {rank}");
                         Ok(())
                     })?;
@@ -468,7 +343,7 @@ mod tests {
                 lead.drain()?;
                 remote.synchronize()?;
                 remote.finish_terminal(true);
-                ensure!(remote.exchange.terminal_state() == TerminalState::Drained,
+                ensure!(remote.bridge.exchange.terminal_state() == TerminalState::Drained,
                     "remote bridge did not finish terminal drainage");
                 eprintln!("remote_dflash_component representation={representation:?} rounds=8 hidden_exact=true tokens_exact=true selector_exact=true terminal_drained=true target_quality=false");
                 Ok(())

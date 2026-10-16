@@ -113,7 +113,7 @@ def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
     diagnostic = remote.split('pub fn draft_device_diagnostic(', 1)[1].split('\n    }', 1)[0]
     assert 'head, true)' in serving and 'head, false)' in diagnostic
     bridge = remote.split('fn draft_device_from(', 1)[1].split('\n    }', 1)[0]
-    assert 'self.launch_head(&head, rows, serving)?' in bridge
+    assert 'self.launch_head(&head, rows, serving)' in bridge
     for path in ['glm5/mod.rs', 'glm5_flash/speculate.rs']:
         text = (source / path).read_text()
         assert '.draft_device_diagnostic(' in text and '.draft_device(' not in text

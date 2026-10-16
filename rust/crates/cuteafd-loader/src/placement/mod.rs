@@ -17,6 +17,7 @@ use cuteafd_core::memory_layout::{Basis, Category, Item};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod draft;
 pub mod families;
 pub mod inventory;
 mod pool;
