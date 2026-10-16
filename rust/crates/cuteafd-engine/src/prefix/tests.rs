@@ -791,6 +791,35 @@ fn divergent_suffixes_restore_exactly_from_the_deepest_shared_point() {
     assert_eq!(cache.pool().free(), 128);
 }
 
+#[test]
+fn rewritten_assistant_turn_restores_the_stable_message_boundary() {
+    for boundaries in [0, 1] {
+        let fake = Fake::new(128, 4, 16);
+        let mut cache = cache(&fake, 16, 0);
+        let user_end = 24;
+        let mut prompt = seq(100, user_end);
+        prompt.extend(seq(1000, 8)); // assistant generation/thinking suffix
+        let policy = PointPolicy { gap: 0, boundaries, per_request: 4 };
+        let (_, mut placement) = serve_with_points(&mut cache, &fake, 0, &prompt, &[0, 12, user_end], policy);
+        let mut turn = prompt.clone();
+        turn.extend(seq(2000, 3));
+        let logits = fake.forward(&mut placement, &turn).unwrap();
+        assert!(cache.capture(&fake, SnapshotKind::Turn, &turn, &placement, After::from_logits(&logits, true)).unwrap());
+        assert!(cache.stats().captures_prompt > 0 && cache.stats().captures_turn > 0);
+        cache.release(&fake, &placement.pages).unwrap();
+        // Rendering a later user drops the old assistant's thinking suffix.
+        let mut next = prompt[..user_end].to_vec();
+        next.extend(seq(3000, 16));
+        let (resume, mut restored) = serve_with_points(&mut cache, &fake, 1, &next, &[], PointPolicy::default());
+        assert_eq!(resume, if boundaries == 0 { 0 } else { user_end });
+        next.push(42);
+        fake.forward(&mut restored, &next).unwrap();
+        cache.release(&fake, &restored.pages).unwrap();
+        cache.clear(&fake).unwrap();
+        assert_eq!(cache.pool().free(), 128);
+    }
+}
+
 /// Opt-in partial reuse (`PREFIX_PARTIAL=on`): a partial match shares pages below the replay
 /// window and restarts the positional state there; the page rows it shares stay exact and the
 /// snapshot it came from is untouched (its later exact restore still checks every row).

@@ -142,6 +142,7 @@ ADDR
 POOL_TOKENS
 PREFIX_CACHE_ENTRIES
 PREFIX_CACHE_MARK_MIB
+PREFIX_POINT_BOUNDARIES
 HOST_CACHE_BYTES
 MAX_OUTPUT_TOKENS
 DECODE_SHARE
@@ -1796,6 +1797,9 @@ if [[ $family == mimo_v2 ]]; then
 fi
 if [[ "$family" == qwen3_5 ]]; then
   [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
+  # Qwen templates can remove old thinking; retain the exact frontier before
+  # the generation message, not an approximate reconstruction of that state.
+  family_args+=(--prefix-point-boundaries "$(get PREFIX_POINT_BOUNDARIES 1)")
 fi
 # EXPERT_INPUT is opt-in for MiMo's Spark exchange; unset preserves image defaults.
 expert_input="$(get EXPERT_INPUT)"
