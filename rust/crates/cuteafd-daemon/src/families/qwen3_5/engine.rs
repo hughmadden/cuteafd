@@ -115,9 +115,10 @@ impl<'a> DenseEngine<'a> {
         cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
         prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool) -> Result<Self> {
         ensure!((1..=HEAD_ROWS).contains(&slots), "dense state slots must be 1..64");
-        let admitted = DensePrograms::new(&cfg, programs, kv_format)?;
         let reader = WeightReader { library, checkpoint };
-        let weight_bytes = NativeWeights::bf16(checkpoint, &cfg, admitted.norm_dtype.clone())?;
+        let format = super::weights::DenseFormat::detect(&reader)?;
+        let admitted = DensePrograms::new(&cfg, programs, kv_format, format)?;
+        let weight_bytes = NativeWeights::native(checkpoint, &cfg, admitted.norm_dtype.clone())?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
         let device = Device { library, id: library.cuda_get_device()? };
         let stream = Stream::new(device)?;
@@ -144,7 +145,7 @@ impl<'a> DenseEngine<'a> {
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         let (embedding, weights) = TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
-            || reader.dense_bf16(&cfg, admitted.norm_dtype.clone()))?;
+            || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format))?;
         let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
             .collect::<Result<Vec<_>>>()?;
         let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();

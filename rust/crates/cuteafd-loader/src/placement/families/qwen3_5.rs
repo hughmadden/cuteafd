@@ -181,7 +181,7 @@ pub struct NativeWeights {
 }
 
 impl NativeWeights {
-    pub fn bf16(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config,
+    pub fn native(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config,
         norm_dtype: cuteafd_core::DType) -> Result<Self> {
         use cuteafd_core::DType;
         ensure!(matches!(norm_dtype, DType::Bf16 | DType::F32), "invalid native GDN norm dtype");
@@ -195,6 +195,7 @@ impl NativeWeights {
                 "{name}: unsupported native dense BF16 operand {dtype:?}");
             Ok(if widen && *dtype == DType::Bf16 { t.meta.byte_length * 2 } else { t.meta.byte_length })
         };
+        let fp8 = tensor("model.language_model.layers.0.mlp.gate_proj.weight")?.meta.dtype == DType::F8E4M3;
         let mut layers = Vec::new();
         for (index, &kind) in cfg.attention.iter().enumerate() {
             let p = format!("model.language_model.layers.{index}.");
@@ -203,18 +204,42 @@ impl NativeWeights {
                 names.iter().try_fold(0u64, |n, name| Ok(n + bytes(&format!("{p}{name}.weight"), false, false)?))
                     .map(|n| n.max(256))
             };
+            let projection = |names: &[&str]| -> Result<u64> {
+                if !fp8 { return pack(names); }
+                let mut weights = 0u64;
+                let mut scales = 0u64;
+                let mut columns = None;
+                for name in names {
+                    let name = format!("{p}{name}.weight");
+                    let w = tensor(&name)?;
+                    let scale = tensor(&format!("{name}_scale_inv"))?;
+                    ensure!(w.meta.dtype == DType::F8E4M3 && w.meta.shape.len() == 2
+                        && w.meta.shape.iter().all(|n| *n > 0 && n % 128 == 0),
+                        "{name}: expected whole 128x128 E4M3 blocks");
+                    ensure!(columns.is_none_or(|n| n == w.meta.shape[1]), "{name}: packed columns differ");
+                    columns = Some(w.meta.shape[1]);
+                    ensure!(scale.meta.shape == w.meta.shape.iter().map(|n| n / 128).collect::<Vec<_>>()
+                        && matches!(scale.meta.dtype, DType::Bf16 | DType::F32),
+                        "{name}: invalid native FP8 block scale grid");
+                    weights += w.meta.byte_length;
+                    scales += if scale.meta.dtype == DType::Bf16 { scale.meta.byte_length * 2 } else { scale.meta.byte_length };
+                }
+                Ok(weights.max(256) + scales.max(256))
+            };
             let mut total = one("input_layernorm")? + one("post_attention_layernorm")?
-                + one("mlp.down_proj")? + pack(&["mlp.gate_proj", "mlp.up_proj"])?;
+                + projection(&["mlp.down_proj"])? + projection(&["mlp.gate_proj", "mlp.up_proj"])?;
             total += if kind == HybridAttention::Gdn {
-                pack(&["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a"])?
-                    + one("linear_attn.out_proj")?
+                (if fp8 { projection(&["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"])?
+                        + pack(&["linear_attn.in_proj_b", "linear_attn.in_proj_a"])? }
+                     else { pack(&["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a"])? })
+                    + projection(&["linear_attn.out_proj"])?
                     + bytes(&format!("{p}linear_attn.conv1d.weight"), true, false)?.max(256)
                     + bytes(&format!("{p}linear_attn.A_log"), true, false)?.max(256)
                     + bytes(&format!("{p}linear_attn.dt_bias"), true, false)?.max(256)
                     + bytes(&format!("{p}linear_attn.norm.weight"), false, true)?.max(256)
             } else {
-                pack(&["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"])?
-                    + one("self_attn.o_proj")? + one("self_attn.q_norm")? + one("self_attn.k_norm")?
+                projection(&["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"])?
+                    + projection(&["self_attn.o_proj"])? + one("self_attn.q_norm")? + one("self_attn.k_norm")?
             };
             layers.push(total);
         }
@@ -292,6 +317,17 @@ pub fn program_name(prefix: &str, op: &str, rows: usize, format: crate::families
     if rows == 0 { format!("{prefix}_{op}{suffix}") } else { format!("{prefix}_{op}{suffix}_m{rows}") }
 }
 
+pub fn native_program_name(prefix: &str, op: &str, rows: usize,
+    kv: crate::families::qwen4::Qwen4KvCache, fp8: bool) -> String {
+    let op = if fp8 && matches!(op, "gdn" | "attn_producer" | "attn_o" | "ffn") {
+        format!("{op}_fp8")
+    } else { op.to_owned() };
+    let suffix = if kv == crate::families::qwen4::Qwen4KvCache::Fp8
+        && matches!(op.as_str(), "attn_producer_fp8" | "full_gqa") { "_kv_fp8" } else { "" };
+    if fp8 { if rows == 0 { format!("{prefix}_{op}{suffix}") } else { format!("{prefix}_{op}{suffix}_m{rows}") } }
+    else { program_name(prefix, &op, rows, kv) }
+}
+
 pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, format: crate::families::qwen4::Qwen4KvCache, spec: &NativeProgram) -> Result<()> {
     if rows > 0 {
         ensure!(spec.capacity_rows as usize >= rows, "{} capacity is smaller than {rows}", spec.name);
@@ -311,8 +347,13 @@ pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, format: crate::famili
             integer(spec, "head_dim", cfg.gdn.key_dim)?;
             integer(spec, "in_width", cfg.gdn.conv_width() + cfg.gdn.value_width() + 2 * cfg.gdn.value_heads)?;
             number(spec, "eps", cfg.rms_norm_eps)?;
-            ensure!(spec.geometry["output_gate"] == "silu" && spec.geometry["fp8_weights"] == false,
-                "{}: dense BF16 GDN needs SiLU and native BF16 projections", spec.name);
+            ensure!(spec.geometry["output_gate"] == "silu"
+                && (spec.geometry["fp8_weights"] == false || spec.geometry["fp8_weights"] == "only"),
+                "{}: dense GDN needs SiLU and native checkpoint projections", spec.name);
+            if spec.geometry["fp8_weights"] == "only" {
+                ensure!(spec.geometry["gate_weights"] == "bf16" && spec.geometry["gate_order"] == serde_json::json!(["b", "a"]),
+                    "{}: native GDN gates require BF16 b/a order", spec.name);
+            }
             norm_dtype(spec)?;
         }
         "gdn_commit" => {
@@ -342,7 +383,7 @@ pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, format: crate::famili
         }
         "attn_o" => {
             integer(spec, "width", cfg.heads * cfg.head_dim)?;
-            ensure!(spec.geometry["fp8_weights"] == false, "{}: expected native BF16 output projection", spec.name);
+            ensure!(spec.geometry["fp8_weights"] == false || spec.geometry["fp8_weights"] == "only", "{}: expected native checkpoint output projection", spec.name);
         }
         "ffn" => integer(spec, "intermediate", cfg.intermediate)?,
         "add" => (),
@@ -365,6 +406,18 @@ pub fn validate_abi(op: &str, rows: usize, spec: &NativeProgram) -> Result<()> {
         "ffn" => vec!["x", "w_gate_up", "w_down", "out", "scratch"],
         _ => anyhow::bail!("unknown dense Qwen ABI {op}"),
     };
+    let fp8 = spec.geometry["fp8_weights"] == "only";
+    if fp8 {
+        pointers = match op {
+            "gdn" => vec!["x", "w_qkvz_fp8", "w_qkvz_scale", "w_ba", "conv_w", "a_log", "dt_bias", "norm_w",
+                "w_out_fp8", "w_out_scale", "conv_state", "state", "slots", "seq_first", "out"],
+            "attn_producer" => vec!["x", "w_in_fp8", "w_in_scale", "q_norm", "k_norm", "rope_positions", "kv_slots",
+                "kv_cache", "query", "gate", "scratch"],
+            "attn_o" => vec!["attn", "gate", "w_o_fp8", "w_o_scale", "out", "scratch"],
+            "ffn" => vec!["x", "w_gate_up_fp8", "w_gate_up_scale", "w_down_fp8", "w_down_scale", "out", "scratch"],
+            _ => anyhow::bail!("unexpected FP8 projection ABI {op}"),
+        };
+    }
     if op == "gdn" {
         if rows == VERIFY_ROWS { pointers.push("replay"); }
         pointers.push("scratch");
@@ -373,6 +426,7 @@ pub fn validate_abi(op: &str, rows: usize, spec: &NativeProgram) -> Result<()> {
     let scalars = match op {
         "gdn_commit" | "full_gqa" => 3,
         "gdn" if rows == VERIFY_ROWS => 2,
+        "attn_o" if fp8 && rows > VERIFY_ROWS => 2,
         _ => 1,
     };
     ensure!(spec.scalar_kinds == vec![b'i'; scalars], "{}: dense scalar ABI differs", spec.name);
