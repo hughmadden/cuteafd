@@ -79,6 +79,37 @@ def test_official_zero_centered_norm_and_clamp_byte_exact(release):
     assert not torch.equal(wrong, expected)
 
 
+def test_official_cuda_qkv_dispatch_uses_deployed_norm_rotary(release, monkeypatch):
+    import torch
+    calls = []
+    packed = SimpleNamespace(is_cuda=True, shape=(2, 768))
+    q, k, v = (torch.zeros(2, heads * 192, dtype=torch.bfloat16) for heads in (2, 1, 1))
+
+    def fused(*args, **kwargs):
+        calls.append((args, kwargs))
+        return q, k, v
+
+    def fallback(*args):
+        pytest.fail("deployed CUDA projection must not use CPU norm/rotary fallback")
+
+    monkeypatch.setattr(release, "fused_qknorm_rope", fused)
+    weight = torch.zeros(192)
+    for span in (192, 64):
+        attention = SimpleNamespace(
+            _project_packed_qkv=lambda hidden: packed, _split_packed_qkv=fallback, _apply_rope=fallback,
+            head_dim=192, num_heads=2, num_kv_groups=1, rotary_span=span,
+            q_norm=SimpleNamespace(weight=weight, variance_epsilon=1e-5),
+            k_norm=SimpleNamespace(weight=weight), rope_cos=torch.ones(16, span // 2),
+            rope_sin=torch.zeros(16, span // 2))
+        positions = torch.tensor([0, 1], dtype=torch.int32)
+        result = release.Step5Attention._project(attention, torch.zeros(2, 4), positions)
+        assert [tuple(t.shape) for t in result] == [(2, 2, 192), (2, 1, 192), (2, 1, 192)]
+        assert calls[-1][0][0] is packed
+        assert calls[-1][1] == dict(head_dim=192, num_q_heads=2, num_kv_heads=1,
+                                    rotary_pairs=span // 2, eps=1e-5, norm_weight_bias=1.0)
+    assert len(calls) == 2
+
+
 def test_official_router_bias_selection_only_and_fp32_slot_sum(release):
     import torch
     from shape_invariant import linear
