@@ -1,6 +1,7 @@
 //! V4.1 CED ownership stays fixed; pool and local experts use shared admission.
 use super::super::*;
 pub mod owners;
+pub mod resident;
 
 /// Reserved lazy graph envelope; small cards charge their measured 2 GiB bank
 /// through the admission sample instead.
