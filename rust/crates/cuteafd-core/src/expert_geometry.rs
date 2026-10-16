@@ -89,6 +89,11 @@ impl ExpertGeometry {
             && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)).then_some(10.0)
     }
 
+    /// Legacy expert arithmetic, unchanged for all currently executable shapes.
+    pub fn activation(&self) -> crate::FfnActivation {
+        crate::FfnActivation::SiluBf16Product { limit: self.swiglu_limit() }
+    }
+
     /// Equal kernel shape (hidden, experts, top-k, intermediate), any layer bound.
     pub fn same_shape(&self, other: &Self) -> bool {
         Self { layers: other.layers, ..*self } == *other
