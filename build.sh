@@ -827,7 +827,7 @@ build_spark_release_leg() {
   timeout "$export_timeout" --foreground ssh "${release_ssh_opts[@]}" "$seed_host" setsid --wait bash -s -- \
   "$remote_dir" "$SPARK_EXPERT_DOCKER_DEV" "$SPARK_EXPERT_DOCKER_INFERENCE" \
   "$engine_commit" "$sparkinfer_commit" "$release_version" \
-  "$EXL3_PAIRED_TP4" "${source_manifest_sha256:-__legacy__}" "$(r="${spark_tp_roles//;/,}"; echo "${r:-__legacy__}")" \
+  "${source_manifest_sha256:-__legacy__}" "$(r="${spark_tp_roles//;/,}"; echo "${r:-__legacy__}")" \
   "${release_build_root:-__legacy__}" \
   "$(f="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"; f="${f//;/,}"; echo "${f:-__legacy__}")" \
   "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" \
@@ -842,24 +842,23 @@ inference_image="$3"
 engine_commit="$4"
 sparkinfer_commit="$5"
 release_version="$6"
-exl3_paired_tp4="$7"
 # SSH reconstructs a shell command and can omit an empty argument, so every
 # optional trailing value is passed as a non-empty sentinel and decoded here.
 # Both source_manifest_sha256 and spark_tp_roles are optional: sentinels keep
 # the two from shifting into each other's position.
-source_manifest_sha256="${8-__legacy__}"
+source_manifest_sha256="${7-__legacy__}"
 # The role list travels as a comma list so a remote shell cannot split it at a
 # semicolon; it is restored to the CMake semicolon list here.
-spark_tp_roles="${9-__legacy__}"
+spark_tp_roles="${8-__legacy__}"
 # The relocated build root is optional and uses the same sentinel convention.
 # It is already created and filesystem-guarded by the caller, on this host.
-release_build_root="${10-__legacy__}"
+release_build_root="${9-__legacy__}"
 # Extra routed-expert kernel families (FAMILY:ROLE), comma-encoded like the roles.
-expert_families="${11-__legacy__}"
+expert_families="${10-__legacy__}"
 [[ "$expert_families" != "__legacy__" ]] || expert_families=
 expert_families="${expert_families//,/;}"
 # Optional BF16-input siblings travel with a sentinel and the same comma encoding.
-bf16_families="${12-__legacy__}"
+bf16_families="${11-__legacy__}"
 [[ "$bf16_families" != "__legacy__" ]] || bf16_families=
 bf16_families="${bf16_families//,/;}"
 [[ "$source_manifest_sha256" != "__legacy__" ]] || source_manifest_sha256=
@@ -881,18 +880,18 @@ if [[ -n "$source_manifest_sha256" ]]; then
 fi
 cd "$remote_dir"
 compiler_cache_args=()
-export CUTEAFD_BUILD_CACHES="${22:-on}"
-[[ "${16:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${16}"
-[[ "${18:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${18}"
-export CUTEAFD_SCCACHE_CUDA="${19:-1}"
+export CUTEAFD_BUILD_CACHES="${21:-on}"
+[[ "${15:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${15}"
+[[ "${17:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${17}"
+export CUTEAFD_SCCACHE_CUDA="${18:-1}"
 source scripts/build/build-caches.sh
 source scripts/lib/cdi-gpus.sh
 cuteafd_build_cache_defaults
-phase="${13:?}"
+phase="${12:?}"
 # The audio tower switch reaches the remote leg as its own argument (ON/OFF).
-audio_aot="${21:-ON}"
-export_container="${14:?}"
-native_build_jobs="${15-__legacy__}"
+audio_aot="${20:-ON}"
+export_container="${13:?}"
+native_build_jobs="${14-__legacy__}"
 [[ "$native_build_jobs" != "__legacy__" ]] || native_build_jobs=
 native_build_env_args=()
 [[ -z "$native_build_jobs" ]] || native_build_env_args=(-e "CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs")
@@ -925,7 +924,7 @@ python3 scripts/build/verify-sparkinfer-source.py \
   --require-no-python-cache
 python3 scripts/build/select-dev-image.py select \
   --source "$remote_dir" --arch arm64 --local-tag "$dev_image" \
-  --engine-commit "$engine_commit" --mode "${20:-registry}" --output "$dev_manifest"
+  --engine-commit "$engine_commit" --mode "${19:-registry}" --output "$dev_manifest"
 else
 dev_image="$(python3 scripts/build/select-dev-image.py image --manifest "$dev_manifest")"
 fi
@@ -1002,7 +1001,6 @@ docker run --rm --name "$export_container" \
   "${CUTEAFD_CDI_ARGS[@]}" \
   --ipc=host \
   --ulimit memlock=-1:-1 \
-  -e "CUTEAFD_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \
   -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \

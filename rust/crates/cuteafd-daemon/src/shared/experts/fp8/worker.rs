@@ -85,7 +85,6 @@ impl<'a> Fp8Worker<'a> {
         ensure!(executor_id == self.executor_id, "FP8 response executor identity mismatch");
         let rows = request.rows() as usize;
         ensure!(rows > 0 && rows <= self.capacity, "FP8 request exceeds capacity");
-        ensure!(!request.is_paired(), "FP8 experts have no paired layout");
         // FP8 K32 wire rows, or BF16 rows when the BF16-input package is loaded.
         let bf16 = request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32).is_err();
         if bf16 {

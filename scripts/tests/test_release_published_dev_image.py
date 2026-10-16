@@ -115,14 +115,14 @@ def test_remote_leg_selects_and_reuses_exact_image_across_ssh_phases(tmp_path):
     ssh = tmp_path/'bin/ssh'
     ssh.write_text('#!/bin/bash\nshift\nexec bash -s -- "$@"\n')
     ssh.chmod(0o755)
-    args = [str(staging), 'local-dev', 'release-image', 'fixture', 'pin', 'version', '0'] + ['__legacy__'] * 5
+    args = [str(staging), 'local-dev', 'release-image', 'fixture', 'pin', 'version'] + ['__legacy__'] * 5
     args += ['dev', 'fixture-export', '__legacy__', '__legacy__', '__legacy__', '__legacy__', '0', 'registry', 'ON']
     result = subprocess.run(['ssh', 'seed', *args], input=remote, env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     manifest_path = staging/'.cuteafd-release/fixture-export.dev-image.json'
     assert json.loads(manifest_path.read_text())['registry_digest'] == DIGEST
     assert not any(call[0] == 'build' for call in calls(tmp_path))
-    args[12] = 'image'
+    args[11] = 'image'
     result = subprocess.run(['ssh', 'seed', *args], input=remote, env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     image_build = next(call for call in calls(tmp_path) if call[0] == 'build')

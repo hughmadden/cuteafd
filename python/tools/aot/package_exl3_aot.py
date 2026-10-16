@@ -45,24 +45,6 @@ def verify_object_target(path, compute):
         raise ValueError(f'EXL3 object has no CUDA image: {path}')
 
 
-def residency_overrides(values: list[str], capacities: list[int], paired: bool) -> dict[int, int]:
-    """Explicit offline build choices; B12X validates kernel resource limits."""
-    if values and not paired:
-        raise ValueError('residency overrides require a paired TP4 package')
-    result = {}
-    for value in values:
-        try:
-            capacity, blocks = map(int, value.split('='))
-        except (ValueError, AttributeError):
-            raise ValueError('residency override must be CAPACITY=BLOCKS') from None
-        if capacity not in capacities or blocks not in (1, 2):
-            raise ValueError('residency override requires a selected capacity and one or two blocks/SM')
-        if capacity in result:
-            raise ValueError('duplicate residency override capacity')
-        result[capacity] = blocks
-    return result
-
-
 def verify(package: Path, revision: str | None = None, runtime: Path | None = None, role: str | None = None) -> dict:
     manifest = json.loads((package / 'manifest.json').read_text())
     if manifest['schema'] != 'cuteafd.exl3-package.v1':
@@ -71,11 +53,6 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         raise ValueError('EXL3 package/source revision mismatch')
     if role is not None and manifest['role'] != ('spark' if role == 'expert' else role):
         raise ValueError('EXL3 package/serving role mismatch')
-    paired = manifest.get('paired_tp4', False)
-    if not isinstance(paired, bool) or (paired and manifest['role'] != 'spark'):
-        raise ValueError('paired EXL3 package requires Spark role')
-    overrides = residency_overrides(manifest.get('residency_overrides', []),
-                                    [v['capacity'] for v in manifest['variants']], paired)
     expected = manifest['files']
     actual = {str(p.relative_to(package)) for p in package.rglob('*') if p.is_file()}
     if actual != set(expected) | {'manifest.json'}:
@@ -144,19 +121,6 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant decode schedule mismatch: {directory}')
         if variant.get('token_major_rotation', False) != meta.get('token_major_rotation', False):
             raise ValueError(f'EXL3 variant input rotation mismatch: {directory}')
-        if meta['capacity'] in overrides and meta.get('blocks_per_sm') != overrides[meta['capacity']]:
-            raise ValueError('EXL3 compiled residency differs from requested override')
-        boundary = meta.get('paired_boundary')
-        if paired:
-            rank_name = directory.split('/')[0]
-            boundaries = {'tp4-rank0': 'last', 'tp4-rank1': 'first', 'tp4-rank2': 'last', 'tp4-rank3': 'first'}
-            if (boundary != boundaries.get(rank_name) or boundary is None
-                    or variant.get('paired_boundary') != boundary
-                    or meta.get('descriptor_rows') != 4 or meta.get('native_info_version') != 3
-                    or meta['intermediate'] != 640 or len(meta['bits']) != 2 or meta['top_k'] != 6):
-                raise ValueError('paired EXL3 package boundary/contract mismatch')
-        elif boundary is not None or variant.get('paired_boundary') is not None:
-            raise ValueError('paired artifact in disjoint EXL3 package')
         if meta['sparkinfer_revision'] != manifest['sparkinfer_revision']:
             raise ValueError('EXL3 variant/source revision mismatch')
         required.update(f'{directory}/{name}' for name in
@@ -557,7 +521,7 @@ def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41')
     return sorted(requested)
 
 
-def tile_overrides(values: list[str], capacities: list[int], role: str, paired: bool,
+def tile_overrides(values: list[str], capacities: list[int], role: str,
                    geometry: str = 'v41') -> dict[str, dict[int, tuple]]:
     """Parse repeatable `--tile PROFILE=CAPACITIES:FC1_K,FC1_N,FC2_K,FC2_N`.
 
@@ -569,8 +533,6 @@ def tile_overrides(values: list[str], capacities: list[int], role: str, paired: 
     shape-checked (four integers); the pinned planner decides whether a geometry is
     legal, so its rules are not restated here.
     """
-    if values and paired:
-        raise ValueError('EXL3 tile overrides are not supported for paired TP4 packages')
     # Role-scoped for the same reason as --require-layout: an override naming a
     # profile this role does not build would otherwise be accepted and silently
     # ignored, which is a knob that ships looking effective.
@@ -696,18 +658,14 @@ def compile_variants(payloads, jobs):
 
 def build(args: argparse.Namespace) -> None:
     validate_destination(args.output)
-    paired = getattr(args, 'paired_tp4', False)
     geometry = getattr(args, 'geometry', 'v41')
     hidden = GEOMETRIES[geometry][0]
-    if paired and (args.role != 'spark' or len(args.bits) != 2 or geometry != 'v41'):
-        raise ValueError('paired TP4 package requires V4.1 Spark role and two tiers')
     capacities = sorted(set(int(v) for v in args.capacities.split(',')))
     if not capacities or any(v < 1 or v > 4096 for v in capacities):
         raise ValueError('EXL3 capacities must be in 1..4096')
-    overrides = residency_overrides(getattr(args, 'residency', []), capacities, paired)
     all_counts = getattr(args, 'all_spark_counts', False)
-    if all_counts and (args.role != 'spark' or paired):
-        raise ValueError('--all-spark-counts requires an unpaired Spark role')
+    if all_counts and args.role != 'spark':
+        raise ValueError('--all-spark-counts requires a Spark role')
     only = set(getattr(args, 'profile', None) or [])
     profiles = build_profiles(args.role, geometry, all_spark_counts=all_counts or bool(only))
     if only:
@@ -716,7 +674,7 @@ def build(args: argparse.Namespace) -> None:
             raise ValueError(f'unknown EXL3 profiles for {geometry} {args.role}: {sorted(unknown)}')
         profiles = [entry for entry in profiles if entry[0] in only]
     requested_layouts = parse_requested_layouts(getattr(args, 'require_layout', []), args.role, geometry)
-    tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, paired, geometry)
+    tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, geometry)
     # Import the source-pinned compiler only for builds, never package checks.
     import _pinned_sparkinfer
     import torch
@@ -729,9 +687,6 @@ def build(args: argparse.Namespace) -> None:
     expected_compute = (12, 1) if args.role == 'spark' and not getattr(args, 'loopback', False) else (12, 0)
     if (props.major, props.minor) != expected_compute:
         raise ValueError(f'{args.role} package requires GPU {expected_compute}')
-    if paired:
-        profiles = [('paired-last', 640, 384, 6, 'bf16', ['tp4-rank0', 'tp4-rank2']),
-                    ('paired-first', 640, 384, 6, 'bf16', ['tp4-rank1', 'tp4-rank3'])]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.build_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.exl3-package-', dir=args.output.parent) as temporary:
@@ -747,9 +702,7 @@ def build(args: argparse.Namespace) -> None:
                 profile_dir = (args.build_dir / profile if tile is None else
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
                 raw = profile_dir / f'm{capacity}'  # one capacity, one directory
-                options = {'paired_boundary': profile.removeprefix('paired-')} if paired else {}
-                if capacity in overrides:
-                    options['blocks_per_sm'] = overrides[capacity]
+                options = {}
                 if tile is not None:
                     options['tile'] = tile
                 if geometry != 'v41':
@@ -825,8 +778,6 @@ def build(args: argparse.Namespace) -> None:
                     variant['schedule'] = schedule
                     variant['decode_schedule'] = meta['decode_schedule']
                 variants.append(variant)
-                if paired:
-                    variants[-1]['paired_boundary'] = meta['paired_boundary']
         files = {str(p.relative_to(stage)): {'bytes': p.stat().st_size, 'sha256': digest(p)}
                  for p in sorted(stage.rglob('*')) if p.is_file()}
         manifest = {'schema': 'cuteafd.exl3-package.v1', 'role': args.role,
@@ -835,12 +786,8 @@ def build(args: argparse.Namespace) -> None:
                     'variants': variants, 'files': files,
                     'runtime': {'library': 'libcute_dsl_runtime.so', 'sha256': digest(args.runtime),
                                 'provider': 'installed nvidia-cutlass-dsl CUDA runtime; release entrypoint sets its library path'}}
-        if paired:
-            manifest['paired_tp4'] = True
         if geometry != 'v41':
             manifest['geometry'] = geometry
-        if overrides:
-            manifest['residency_overrides'] = [f'{capacity}={blocks}' for capacity, blocks in sorted(overrides.items())]
         if requested_layouts:
             present = {v['directory'].split('/')[0] for v in variants}
             missing = sorted(set(requested_layouts) - present)
@@ -870,9 +817,6 @@ def main() -> None:
     create.add_argument('--profile', action='append', default=[],
                         help='Build only these profiles (repeatable), for bring-up; '
                              'without selection the legacy role profiles remain the default')
-    create.add_argument('--paired-tp4', action='store_true', help='Export explicit paired H128 ownership kernels for all four Spark ranks')
-    create.add_argument('--residency', action='append', default=[], metavar='CAPACITY=BLOCKS',
-                        help='Explicit paired-package blocks/SM override; repeat per capacity (for example 80=2). B12X validates resources.')
     create.add_argument('--require-layout', action='append', default=[],
                         help='Layouts this package must contain (comma list, repeatable). '
                              'Recorded in the manifest and re-checked on verify, so a '

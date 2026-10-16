@@ -483,8 +483,7 @@ fn response_header_len_from_flags(flags: u32) -> usize {
 fn validate_flags(flags: u32, label: &str) -> Result<()> {
     let allowed = match label {
         "request" => {
-            crate::expert::V41_EXL3_PAIRED_REQUEST_FLAG
-                | crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
+            crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
                 | EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP
@@ -506,22 +505,12 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
         }
         _ => EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
     };
-    if label == "request" && flags & crate::expert::V41_EXL3_PAIRED_REQUEST_FLAG != 0 {
-        let paired_allowed = crate::expert::V41_EXL3_PAIRED_REQUEST_FLAG
-            | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
-        if flags & !paired_allowed != 0 || flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0 {
-            bail!("paired EXL3 requires the native compact request contract");
-        }
-    }
     // Native replicated-group ownership: same compact request contract as the
-    // canonical native batch, never combined with paired EXL3 admission, and
+    // canonical native batch, and
     // never present in a response.
     if label == "request" && flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG != 0 {
         let native_allowed = crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
             | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
-        if flags & crate::expert::V41_EXL3_PAIRED_REQUEST_FLAG != 0 {
-            bail!("native group ownership cannot combine with paired EXL3 admission");
-        }
         if flags & !native_allowed != 0 || flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0 {
             bail!("native group ownership requires the native compact request contract");
         }

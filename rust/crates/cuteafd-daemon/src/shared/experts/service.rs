@@ -606,6 +606,19 @@ mod tests {
     }
 
     #[test]
+    fn compact_exl3_topology_keeps_shards_packages_and_group_zero() {
+        for rank in 0..3 {
+            let config = config(3, rank, Some(SparkTopology::NATIVE_TP3_EP1));
+            assert_eq!(config.exl3_selection(7).unwrap(),
+                ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 3 });
+            assert!(config.exl3_directory_for(&[2, 3]).ends_with(format!("tp3-rank{rank}")));
+            assert_eq!(config.native_group().unwrap(), Some(0));
+        }
+        let config = config(6, 0, Some(SparkTopology::NATIVE_TP3_EP2));
+        assert!(config.exl3_selection(7).is_err());
+    }
+
+    #[test]
     fn flash_native_tp2_selects_spark_role_without_changing_wire_protocol() {
         for rank in 0..2 {
             let mut flash = config(2, rank, None);
@@ -906,14 +919,12 @@ fn validate_new_world_blocks(intermediate: usize, world: usize) -> Result<()> {
     Ok(())
 }
 
-/// Reject an explicit topology before any weight allocation: it is defined only
-/// for the official native checkpoint, its rank count must match `--world`, and
-/// every rank must be inside the topology. Legacy V4.1 native TP4/EXL3
-/// selection is preserved. Native V4 Flash TP2 selects its Spark shard while
-/// keeping the generic coordinator's legacy request protocol.
+/// Validate format support and exact physical rank identity before allocation.
+/// Compressed compact TP3 shares ownership topology, not native weight storage.
+/// Native V4 Flash TP2 retains the generic coordinator's canonical protocol.
 fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Catalog) -> Result<()> {
     if let Some(topology) = config.topology {
-        crate::shared::spark_topology::require_native(Some(topology), catalog)?;
+        crate::shared::spark_topology::require_supported(Some(topology), catalog)?;
         ensure!(
             config.world == topology.world_size() && config.rank < config.world,
             "explicit Spark topology {}x{} needs --world {} and --rank below it, got world {} rank {}",
@@ -986,6 +997,18 @@ impl NativeExpertServiceConfig {
             4 => ExpertLayer::Backbone { layer, rank: shard },
             world => ExpertLayer::BackboneReplicatedTp { layer, rank: shard, world: world as usize },
         })
+    }
+    /// Compressed residency stays on the same whole-block TP partition even
+    /// when requests carry an explicit EP1 ownership contract.
+    fn exl3_selection(&self, layer: usize) -> Result<ExpertLayer> {
+        if let Some(topology) = self.topology {
+            ensure!(topology == SparkTopology::NATIVE_TP3_EP1,
+                "compact EXL3 topology requires TP3EP1");
+            return Ok(ExpertLayer::BackboneExl3Tp {
+                layer, rank: topology.tp_rank(self.rank)? as usize, world: topology.tp() as usize,
+            });
+        }
+        self.selection(layer)
     }
     /// Replicated group this worker unpacks routes for, or `None` for legacy.
     fn native_group(&self) -> Result<Option<u8>> {

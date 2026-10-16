@@ -4,7 +4,7 @@ use super::layer::{ExpertLayer, ExpertLoadBudget, EXPERT_READ_LANES};
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::{OfficialV41Catalog, V41Exl3Layer, V41Exl3Partition, V41Exl3Residency};
+use cuteafd_loader::{OfficialV41Catalog, V41Exl3Layer, V41Exl3Residency};
 
 const JOBS_PER_EXPERT: usize = 9;
 const BANKS: usize = 2;
@@ -91,12 +91,12 @@ fn residency_selection(layer: ExpertLayer) -> Result<(V41Exl3Layer, usize, usize
     })
 }
 
-fn layout(catalog: &OfficialV41Catalog, layer: ExpertLayer, partition: V41Exl3Partition) -> Result<V41Exl3Residency> {
+fn layout(catalog: &OfficialV41Catalog, layer: ExpertLayer) -> Result<V41Exl3Residency> {
     let (layer, world, rank) = residency_selection(layer)?;
     catalog
         .exl3()
         .context("EXL3 residency requires a routed EXL3 checkpoint")?
-        .residency_with_layout(layer, world, rank, partition)
+        .residency(layer, world, rank)
 }
 
 fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<ExpertLoadBudget> {
@@ -134,15 +134,7 @@ impl<'a> Exl3Weights<'a> {
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,
     ) -> Result<ExpertLoadBudget> {
-        Self::plan_with_layout(catalog, layer, V41Exl3Partition::Disjoint)
-    }
-
-    pub(crate) fn plan_with_layout(
-        catalog: &OfficialV41Catalog,
-        layer: ExpertLayer,
-        partition: V41Exl3Partition,
-    ) -> Result<ExpertLoadBudget> {
-        budget(catalog, &layout(catalog, layer, partition)?)
+        budget(catalog, &layout(catalog, layer)?)
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
@@ -172,7 +164,7 @@ impl<'a> Exl3Weights<'a> {
         for &layer in layers {
             let mut pinned = 0;
             for rank in 0..2 {
-                let plan = layout(catalog, ExpertLayer::BackboneTp2 { layer, rank }, V41Exl3Partition::Disjoint)?;
+                let plan = layout(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
                 let budget = budget(catalog, &plan)?;
                 ensure!(budget.peak_device_bytes()? <= remaining[rank], "paired EXL3 admission exceeded");
                 remaining[rank] -= budget.resident_bytes;
@@ -296,17 +288,7 @@ impl<'a> Exl3Weights<'a> {
         layer: ExpertLayer,
         available_device_bytes: usize,
     ) -> Result<Self> {
-        Self::load_with_layout(library, catalog, layer, available_device_bytes, V41Exl3Partition::Disjoint)
-    }
-
-    pub(crate) fn load_with_layout(
-        library: &'a NativeLibrary,
-        catalog: &OfficialV41Catalog,
-        layer: ExpertLayer,
-        available_device_bytes: usize,
-        partition: V41Exl3Partition,
-    ) -> Result<Self> {
-        let layout = layout(catalog, layer, partition)?;
+        let layout = layout(catalog, layer)?;
         let budget = budget(catalog, &layout)?;
         ensure!(
             budget.peak_device_bytes()? <= available_device_bytes,

@@ -1,10 +1,9 @@
-//! Native V4.1 expert family: coordinator exchange, local and TP2 waves, paired
-//! EXL3 ownership and the dSpark drafter. The layer, resident-weight, execution,
+//! Native V4.1 expert family: coordinator exchange, local and TP2 waves,
+//! and the dSpark drafter. The layer, resident-weight, execution,
 //! host-exchange and EXL3 types live in `shared::experts`; the re-exports below
 //! keep the family's paths for one step.
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 pub(crate) mod coordinator;
-pub(crate) mod paired;
 pub(crate) mod local;
 pub(crate) mod tp2;
 pub(crate) mod tp2_ffn;

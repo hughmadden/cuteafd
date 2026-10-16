@@ -255,14 +255,6 @@ fn spark_transport(
             cuteafd_transport::expert::v41_spark_executor_id(2, 0)?,
             cuteafd_transport::expert::v41_spark_executor_id(2, 1)?,
         ], capacity, config),
-        // The implicit three-rank EXL3 group answers in the TP3EP1 namespace
-        // (7..=9) but keeps the canonical non-ownership frame contract, so it
-        // must not be built through `new_topology`.
-        3 => SparkExperts::new_ranks(peers, &[
-            cuteafd_transport::expert::v41_spark_executor_id(3, 0)?,
-            cuteafd_transport::expert::v41_spark_executor_id(3, 1)?,
-            cuteafd_transport::expert::v41_spark_executor_id(3, 2)?,
-        ], capacity, config),
         4 => SparkExperts::new(peers.try_into().expect("four peers"), [1, 2, 3, 4], capacity, config),
         6 => {
             let ids = (0..6).map(|rank| cuteafd_transport::expert::v41_spark_executor_id(6, rank))
@@ -270,7 +262,7 @@ fn spark_transport(
             SparkExperts::new_ranks(peers, &ids, capacity, config)
         }
         _ => anyhow::bail!(
-            "the legacy non-topology transport takes two, three, four or six Spark peers; \
+            "the non-topology transport takes two, four or six Spark peers; \
              replicated layouts must pass --spark-tp/--spark-ep"
         ),
     }
@@ -344,9 +336,11 @@ fn worker(
         args.peers.len(),
         "serve-native",
     )?;
-    // Explicit replicated groups are native-only and are rejected here, before
-    // any expert weight is allocated or readiness published.
-    crate::shared::spark_topology::require_native(topology, &catalog)?;
+    // Bind compact EXL3 to the same ownership contract on coordinator and workers
+    // before expert allocation or readiness publication.
+    let topology = crate::shared::spark_topology::for_checkpoint(
+        topology, args.peers.len(), catalog.exl3().is_some());
+    crate::shared::spark_topology::require_supported(topology, &catalog)?;
     if let Some(topology) = topology {
         // Fail before any CUDA allocation or readiness publication when the
         // library cannot reduce this physical-rank count.
@@ -362,7 +356,6 @@ fn worker(
         "an implicit two- or three-peer Spark group requires an EXL3 checkpoint; \
          a native three-rank group must pass --spark-tp 3 --spark-ep 1"
     );
-    let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
     let local_exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
         &args.native_lib, catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]), "rtx-tp1");
     let mut exl3_modules = None;
@@ -480,7 +473,6 @@ fn worker(
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, args.peers.len())?;
     let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
-    if let Some(profile) = &paired_profile { transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
     let mut prefill_pass = TargetPass::new(
@@ -499,7 +491,6 @@ fn worker(
     if small_card { admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?; }
     let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
-    if let Some(profile) = &paired_profile { prefill_transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
     pass.install_attention_plan(attention_plan)?;
@@ -641,7 +632,7 @@ fn worker(
     if let Some(handoff) = placement_handoff {
         handoff.wait_ready(Duration::from_secs(900))?;
     }
-    if crate::shared::memory::chain::device_exchange_enabled() && paired_profile.is_none() && topology.is_none()
+    if crate::shared::memory::chain::device_exchange_enabled() && topology.is_none()
         && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40 {
         // Verification waves (up to 80 rows) on the device-driven exchange; it
         // connects (and warms) the workers, so only once they are serving.

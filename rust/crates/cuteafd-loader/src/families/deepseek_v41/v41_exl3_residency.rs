@@ -1,6 +1,6 @@
 //! Compressed layer residency matching B12x projection-native Trellis storage.
 //! No weight dequantization or tier-wide temporary payload is required.
-use crate::{OfficialV41Catalog, V41Exl3Manifest, V41Exl3Partition, V41Exl3ProjectionKind};
+use crate::{OfficialV41Catalog, V41Exl3Manifest, V41Exl3ProjectionKind};
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 
@@ -32,7 +32,6 @@ pub struct V41Exl3Residency {
     pub layer: V41Exl3Layer,
     pub world: usize,
     pub rank: usize,
-    pub layout: V41Exl3Partition,
     pub intermediate_start: usize,
     pub experts: usize,
     pub intermediate: usize,
@@ -74,11 +73,10 @@ impl V41Exl3Residency {
         self.loads.iter().try_fold(0, |n, load| {
             Ok(n.max(
                 catalog
-                    .exl3_tensor_slice_with_layout(
+                    .exl3_tensor_slice(
                         &load.tensor,
                         self.world,
                         self.rank,
-                        self.layout,
                     )?
                     .scratch_bytes(),
             ))
@@ -101,11 +99,10 @@ impl V41Exl3Residency {
             .context("EXL3 load index out of range")?;
         if let Some(prefix) = load.tensor.strip_suffix(".trellis") {
             let mut mcg = [0u8; 4];
-            catalog.read_exl3_tensor_into_with_layout(
+            catalog.read_exl3_tensor_into(
                 &format!("{prefix}.mcg"),
                 self.world,
                 self.rank,
-                self.layout,
                 &mut mcg,
                 &mut [],
             )?;
@@ -114,11 +111,10 @@ impl V41Exl3Residency {
                 "unsupported EXL3 MCG multiplier for {prefix}"
             );
         }
-        let bytes = catalog.read_exl3_tensor_into_with_layout(
+        let bytes = catalog.read_exl3_tensor_into(
             &load.tensor,
             self.world,
             self.rank,
-            self.layout,
             staging,
             scratch,
         )?;
@@ -142,18 +138,6 @@ impl V41Exl3Manifest {
         layer: V41Exl3Layer,
         world: usize,
         rank: usize,
-    ) -> Result<V41Exl3Residency> {
-        self.residency_with_layout(layer, world, rank, V41Exl3Partition::Disjoint)
-    }
-
-    /// Paired plans are for ownership-aware kernels only; existing serving uses
-    /// the disjoint wrapper above until transport and execution are qualified.
-    pub fn residency_with_layout(
-        &self,
-        layer: V41Exl3Layer,
-        world: usize,
-        rank: usize,
-        layout: V41Exl3Partition,
     ) -> Result<V41Exl3Residency> {
         let shape = self.experts;
         let (draft, index, experts) = match layer {
@@ -189,23 +173,17 @@ impl V41Exl3Manifest {
         // All layers retain the package's checkpoint-wide descriptor tier IDs.
         let tiers = self.decoder_tiers.clone();
         let partition =
-            projections[0][0].intermediate_partition_with_layout(world, rank, layout)?;
+            projections[0][0].intermediate_partition(world, rank)?;
         let width = partition.end - partition.start;
         let hidden = shape.hidden;
         let mut counts = vec![[0; 3]; tiers.len()];
         let stride = experts * tiers.len();
-        let descriptor_rows = if layout == V41Exl3Partition::PairedTp4 { 4 } else { 3 };
-        let mut descriptor = vec![-1; descriptor_rows * stride];
-        if layout == V41Exl3Partition::PairedTp4 {
-            // Per-batch local ownership, populated before paired kernel launch.
-            // Inactive and padded slots do not own the optional block.
-            descriptor[3 * stride..].fill(0);
-        }
+        let mut descriptor = vec![-1; 3 * stride];
         let mut locals = vec![[0; 3]; experts];
         for (expert, row) in projections.iter().enumerate() {
             for (projection, p) in row.iter().enumerate() {
                 ensure!(
-                    p.intermediate_partition_with_layout(world, rank, layout)? == partition,
+                    p.intermediate_partition(world, rank)? == partition,
                     "inconsistent EXL3 intermediate partition"
                 );
                 let tier = tiers.binary_search(&p.bits).map_err(|_| {
@@ -305,7 +283,6 @@ impl V41Exl3Manifest {
             layer,
             world,
             rank,
-            layout,
             intermediate_start: partition.start,
             experts,
             intermediate: width,
@@ -384,28 +361,13 @@ mod tests {
     fn mixed_and_uniform_payload_destinations_cover_buffers_without_overlap() {
         for tiers in [&[2][..], &[3], &[4], &[5], &[3, 4], &[2, 3, 4, 5]] {
             let manifest = fixture(tiers);
-            for (world, layout) in [
-                (1, V41Exl3Partition::Disjoint),
-                (2, V41Exl3Partition::Disjoint),
-                (3, V41Exl3Partition::Disjoint),
-                (4, V41Exl3Partition::Disjoint),
-                (4, V41Exl3Partition::PairedTp4),
-            ] {
+            for world in [1, 2, 3, 4] {
                 let mut total_width = 0;
                 for rank in 0..world {
                     let plan = manifest
-                        .residency_with_layout(V41Exl3Layer::Backbone(0), world, rank, layout)
+                        .residency(V41Exl3Layer::Backbone(0), world, rank)
                         .unwrap();
                     total_width += plan.intermediate;
-                    assert_eq!(plan.layout, layout);
-                    if layout == V41Exl3Partition::PairedTp4 {
-                        assert_eq!(plan.intermediate, 640);
-                        assert_eq!(plan.intermediate_start, [0, 512, 1152, 1664][rank]);
-                        let descriptor = plan.buffers.iter().find(|b| b.name == "descriptor_map").unwrap();
-                        let stride = 384 * plan.tiers.len();
-                        assert_eq!(descriptor.initial_words.len(), 4 * stride);
-                        assert!(descriptor.initial_words[3 * stride..].iter().all(|&v| v == 0));
-                    }
                     let mut spans = vec![Vec::new(); plan.buffers.len()];
                     for job in &plan.loads {
                         for &(buffer, offset) in &job.destinations {
@@ -445,14 +407,7 @@ mod tests {
                         .sum();
                     assert_eq!(payload, expected);
                 }
-                assert_eq!(
-                    total_width,
-                    if layout == V41Exl3Partition::PairedTp4 {
-                        2560
-                    } else {
-                        2304
-                    }
-                );
+                assert_eq!(total_width, 2304);
             }
         }
     }
@@ -460,28 +415,6 @@ mod tests {
     #[test]
     fn missing_layer_and_bad_partitions_are_rejected() {
         let manifest = fixture(&[3, 4]);
-        for world in [1, 2, 3] {
-            assert!(manifest
-                .residency_with_layout(
-                    V41Exl3Layer::Backbone(0),
-                    world,
-                    0,
-                    V41Exl3Partition::PairedTp4,
-                )
-                .is_err());
-        }
-        assert!(manifest
-            .residency_with_layout(V41Exl3Layer::Backbone(0), 4, 4, V41Exl3Partition::PairedTp4,)
-            .is_err());
-        let mut malformed = fixture(&[3, 4]);
-        malformed
-            .projections
-            .get_mut("layers.0.ffn.experts.0.w1")
-            .unwrap()
-            .output_features = 2048;
-        assert!(malformed
-            .residency_with_layout(V41Exl3Layer::Backbone(0), 4, 0, V41Exl3Partition::PairedTp4,)
-            .is_err());
         assert!(manifest
             .residency(V41Exl3Layer::Backbone(40), 1, 0)
             .is_err());
@@ -512,16 +445,15 @@ mod tests {
                 let shard_payload: Vec<usize> = (0..world)
                     .map(|rank| {
                         let plan = manifest
-                            .residency_with_layout(
+                            .residency(
                                 V41Exl3Layer::Backbone(0),
                                 world,
                                 rank,
-                                V41Exl3Partition::Disjoint,
                             )
                             .unwrap();
                         assert_eq!(
-                            (plan.world, plan.rank, plan.layout),
-                            (world, rank, V41Exl3Partition::Disjoint)
+                            (plan.world, plan.rank),
+                            (world, rank)
                         );
                         assert_eq!(plan.intermediate, width);
                         assert_eq!(plan.intermediate_start, rank * width);

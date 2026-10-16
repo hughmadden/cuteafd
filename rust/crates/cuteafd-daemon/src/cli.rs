@@ -748,12 +748,6 @@ mod tests {
         assert_eq!(args.concurrency, 16);
         assert_eq!(args.prefix_cache_entries, 20);
         assert_eq!(args.dspark_draft_limit, 5);
-        assert!(!args.exl3_paired_tp4);
-        let super::Commands::ServeNative(paired) = super::Cli::try_parse_from(
-            base.into_iter().chain(["--exl3-paired-tp4"])).unwrap().command else {
-            panic!("expected native serving");
-        };
-        assert!(paired.exl3_paired_tp4);
         assert!(!args.adaptive_dspark()); // Target-only remains target-only.
         for (flags, adaptive) in [
             (vec!["--dspark"], true),
@@ -973,9 +967,6 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value = "auto")]
     pub rtx_expert_layers: crate::shared::memory::budget::LocalLayers,
 
-    /// Use paired H128 EXL3 ownership; requires paired AOT packages on all four Spark peers.
-    #[arg(long)]
-    pub exl3_paired_tp4: bool,
 
     /// Maximum active requests, shared by both execution lanes.
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=16))]

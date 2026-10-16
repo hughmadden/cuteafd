@@ -14,7 +14,7 @@ mod local;
 use crate::cli::ExpertProbeArgs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_transport::{
-    expert::{SparkExperts, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+    expert::{SparkExperts, SparkTopology, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertV2Dtype, ExpertV2SourceKind, TcpTransportConfig,
 };
@@ -145,14 +145,19 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()
         .context("--peers takes comma-separated HOST:PORT addresses")?;
     let config = TcpTransportConfig { timing: false, timeout: Duration::from_secs(60), max_frame_bytes: 64 << 20 };
-    // Implicit Spark worlds: TP4 ranks are executors 1..=4, TP2 5..=6, TP3 7..=9.
+    let topology = crate::shared::spark_topology::for_checkpoint(None, peers.len(),
+        exl3 && geometry.family() == Some("v41"));
+    if let Some(topology) = topology {
+        request.with_native_group_owners(&vec![0; shape.experts], topology)?;
+    }
+    // Canonical layouts retain their identities; topology-bound layouts derive theirs.
     let executors = (0..peers.len())
         .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
         .collect::<Result<Vec<u64>>>()?;
     if let Some(modes) = args.intake.as_deref() {
-        return intake::run(&args, &intake::parse_modes(modes)?, &peers, &executors, &mut request, hidden).await;
+        return intake::run(&args, &intake::parse_modes(modes)?, &peers, &executors, topology, &mut request, hidden).await;
     }
-    let mut client = SparkExperts::new_ranks(&peers, &executors, args.capacity, config)?;
+    let mut client = probe_transport(&peers, &executors, args.capacity, config, topology)?;
     let mut actual = vec![0f32; rows * hidden];
     let started = Instant::now();
     client
@@ -184,6 +189,14 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     };
     report(&format!("layer {} rows {rows} ranks {}", args.layer, peers.len()), exl3, &actual, &expected,
         remote, started.elapsed())
+}
+
+fn probe_transport(peers: &[std::net::SocketAddr], executors: &[u64], capacity: u32,
+    config: TcpTransportConfig, topology: Option<SparkTopology>) -> Result<SparkExperts> {
+    match topology {
+        Some(topology) => SparkExperts::new_topology(topology, peers, capacity, config),
+        None => SparkExperts::new_ranks(peers, executors, capacity, config),
+    }
 }
 
 /// Sends the probe rows to every Spark rank and sums the BF16 rank partials.

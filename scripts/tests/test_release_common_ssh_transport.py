@@ -322,7 +322,7 @@ class TestRunShLifecycle:
     def test_transport_is_resolved_after_validation_and_before_any_host(self):
         text = run_text()
         configure = text.index("release_configure_ssh_transport")
-        assert configure > text.index("release_validate_compact_spark"), (
+        assert configure > text.index("release_validate_spark_topology"), (
             "resolving the transport before configuration validation would report a"
             " transport error in place of a bad config value"
         )

@@ -19,7 +19,7 @@ pub use families::deepseek_v41::v41_hc::V41Hc;
 pub use families::deepseek_v41::v41_dspark::{V41DraftStep, V41DsparkConfidence, V41VocabularyProjection};
 pub use families::deepseek_v41::v41_fp8::{V41Fp8Info, V41Fp8Kernel, V41SharedSwiGlu};
 pub use families::deepseek_v41::v41_fp8_plan::{V41Fp8Plan, V41Fp8PlanInfo};
-pub use shared::v41_exl3::{exl3_shard_widths, V41Exl3Info, V41Exl3Kernel, V41Exl3Layout, V41Exl3Routes};
+pub use shared::v41_exl3::{exl3_shard_widths, V41Exl3Info, V41Exl3Kernel, V41Exl3Routes};
 pub use shared::v41_exl3_wire::V41Exl3Wire;
 pub use shared::v41_experts::{
     V41ExpertReduction, V41ExpertInfo, V41ExpertInputQuantizer, V41ExpertKernel, V41ExpertLaunchArgs, V41ExpertPacker, V41ExpertPointer, V41ExpertOutputKind,
