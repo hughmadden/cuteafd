@@ -106,9 +106,10 @@ pub struct PolicyGeometry {
     /// Empty keeps the static fast path; row zero records the compiled tile.
     /// A nonempty table covers every row through the verifier capacity.
     pub group_rows_by_rows: Vec<Vec<u8>>,
-    /// Routed experts per layer; route ids are `u16`.
+    /// Routed experts per layer; route ids are `u16`. Zero with `topk == 0`
+    /// describes a target whose layers are all dense (`class == None`).
     pub experts: u16,
-    /// Routes per token and layer.
+    /// Routes per token and layer; zero for a fully dense target.
     pub topk: u8,
     /// The lane's row budget in requests.
     pub max_requests: usize,
@@ -210,7 +211,10 @@ impl PolicyGeometry {
     fn validate(&self) -> Result<(), DraftPolicyError> {
         let invalid = |reason| Err(DraftPolicyError::Geometry(reason));
         if self.layers.is_empty() { return invalid("no layers"); }
-        if self.experts == 0 || self.topk == 0 { return invalid("no routed experts"); }
+        let routed = self.layers.iter().any(|layer| layer.class.is_some());
+        if self.experts == 0 || self.topk == 0 {
+            if routed || self.experts != 0 || self.topk != 0 { return invalid("no routed experts"); }
+        }
         if self.max_requests == 0 { return invalid("zero request budget"); }
         if self.max_positions == 0 { return invalid("zero draft positions"); }
         if self.classes.is_empty() || self.classes.len() > MAX_RESOURCE_CLASSES {
@@ -1727,6 +1731,46 @@ mod tests {
             group_rows_by_rows: (0..=16).map(|rows| vec![if (1..=4).contains(&rows) { 1 } else { 4 }; 2]).collect(),
             experts: 4, topk: 1, max_requests: 4, max_positions: 7, widths: vec![5, 7],
             classes: vec![ResourceClass::rtx()], regimes: 1,
+        }
+    }
+
+    #[test]
+    fn dense_only_geometry_selects_and_learns_without_synthetic_routes() {
+        let mut geometry = hybrid_geometry();
+        for layer in &mut geometry.layers { layer.class = None; layer.slice_bytes = 0.; }
+        geometry.experts = 0;
+        geometry.topk = 0;
+        let mut policy = DraftPolicy::seeded(geometry, PolicySeed::weak(5)).unwrap();
+        assert!(policy.priced.is_empty());
+        assert!(policy.counts.is_empty() && policy.scratch.is_empty() && policy.occupancy.is_empty());
+        let confidence = [0.9; 7];
+        let candidates = [DraftCandidate { id: 1, confidence: &confidence }];
+        policy.engaged[draft_concurrency_bucket(1)] = true;
+        let selection = policy.select(false, &candidates, 5).unwrap().unwrap();
+        assert!(selection.predicted_us.is_finite() && selection.predicted_us > 0.);
+        assert_eq!(policy.forecast_megabytes(&[1], &selection.lengths), vec![0.]);
+        let requests = [ObservedDraftRequest { id: 1, rows: 1 + selection.lengths[0],
+            accepted: 1, confidence: Some(&confidence) }];
+        policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &[],
+            layer_us: &[None, None], total_us: 8000., draft_us: 2600., drafted_requests: Some(1),
+            wide: false, predicted_us: Some(selection.predicted_us) }).unwrap();
+        assert_eq!(policy.stats.rounds, 1);
+        assert!(policy.history[&1].iter().all(|routes| routes.is_empty()));
+        assert!(policy.select(false, &candidates, 7).unwrap().unwrap().predicted_us.is_finite());
+        policy.release(1);
+        assert!(!policy.history.contains_key(&1));
+    }
+
+    #[test]
+    fn dense_zero_routes_reject_inconsistent_routed_geometry() {
+        for (experts, topk, routed) in [(0, 0, true), (0, 1, false), (4, 0, false),
+            (0, 1, true), (4, 0, true)] {
+            let mut geometry = hybrid_geometry();
+            geometry.experts = experts;
+            geometry.topk = topk;
+            if !routed { for layer in &mut geometry.layers { layer.class = None; } }
+            assert!(DraftPolicy::seeded(geometry, PolicySeed::weak(5)).is_err(),
+                "experts={experts}, topk={topk}, routed={routed}");
         }
     }
 

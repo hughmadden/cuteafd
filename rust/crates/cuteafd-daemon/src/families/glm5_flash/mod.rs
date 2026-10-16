@@ -1484,9 +1484,10 @@ impl Opened {
         let (placement, graphs, working) = admission::solve_attention_working_set_with_graphs(&inputs,
             alternate_resident.as_deref(), target, automatic_context, sms, true)?;
         let attention = admission::placed_attention(attention, &placement);
-        ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0
-            || (*id == placement::MovableId::Drafter && *gpu == 1 && prepared_draft.is_some())),
+        ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0 || *id == placement::MovableId::Drafter),
             "GLM Flash placement has no matching movable executor");
+        placement::draft::require_home(&placement, "GLM Flash",
+            if prepared_draft.is_some() { &[0, 1] } else { &[0] })?;
         tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
             prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers,
             attention_first_owner = attention.first_owner, "GLM Flash admission before weights");
@@ -1690,7 +1691,8 @@ impl Opened {
                 let (device, peer_stream) = peer_stream.context("remote draft needs the peer target stream")?;
                 Some(remote_dflash::Prepared::new(&self.library,
                     crate::shared::peer_split::RankDevice { device: args.device, stream },
-                    crate::shared::peer_split::RankDevice { device, stream: peer_stream })?)
+                    crate::shared::peer_split::RankDevice { device, stream: peer_stream },
+                    remote_dflash::IDENTITY)?)
             },
             _ => None,
         };
@@ -1701,8 +1703,7 @@ impl Opened {
         ensure!(placement.attention_placement == attention.mode,
             "GLM Flash admission placed {} attention, the engine serves {}",
             placement.attention_placement, attention.mode);
-        let draft_gpu = placement.movables.iter().find(|(id, _)| *id == cuteafd_loader::placement::MovableId::Drafter)
-            .map_or(0, |(_, gpu)| *gpu);
+        let draft_gpu = cuteafd_loader::placement::draft::home(&placement).unwrap_or(0);
         if draft_gpu == 0 { drop(prepared_draft.take()); }
         probe("admission-programs")?;
         let mut selected_args = args.clone();

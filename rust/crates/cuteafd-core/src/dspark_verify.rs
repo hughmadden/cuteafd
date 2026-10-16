@@ -25,14 +25,22 @@ pub fn verify_dspark_greedy(
     eos: u32,
     remaining: usize,
 ) -> Result<GreedyVerification, &'static str> {
+    verify_dspark_greedy_vocab(inputs, target_next, Some(eos), remaining, 129280)
+}
+
+/// Vocabulary-parametric greedy verification for checkpoint-defined targets.
+/// `None` disables EOS stopping for fixed-length numerical qualification.
+pub fn verify_dspark_greedy_vocab(inputs: &[u32], target_next: &[u32], eos: Option<u32>,
+    remaining: usize, vocab: usize) -> Result<GreedyVerification, &'static str> {
     if inputs.is_empty() || inputs.len() != target_next.len() {
         return Err("verification requires nonempty corresponding target rows");
     }
-    if remaining == 0 || inputs[0] == eos {
+    if remaining == 0 || eos == Some(inputs[0]) {
         return Err("completed request cannot verify another anchor");
     }
-    if eos >= 129280 || inputs.iter().chain(target_next).any(|&id| id >= 129280) {
-        return Err("verification token outside official vocabulary");
+    if vocab == 0 || eos.is_some_and(|id| id as usize >= vocab)
+        || inputs.iter().chain(target_next).any(|&id| id as usize >= vocab) {
+        return Err("verification token outside target vocabulary");
     }
     let mut result = GreedyVerification {
         accepted_inputs: 1,
@@ -46,7 +54,7 @@ pub fn verify_dspark_greedy(
         if matched {
             result.accepted_inputs += 1;
         }
-        result.eos = token == eos;
+        result.eos = eos == Some(token);
         result.length_limit = result.emitted.len() == remaining;
         if !matched || result.eos || result.length_limit {
             break;
@@ -58,6 +66,24 @@ pub fn verify_dspark_greedy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkpoint_vocabulary_supports_large_ids_without_changing_legacy_results() {
+        let result = verify_dspark_greedy_vocab(&[248077, 200001], &[200001, 200002], None, 8, 248320).unwrap();
+        assert_eq!(result.accepted_inputs, 2);
+        assert_eq!(result.emitted, [200001, 200002]);
+        assert!(!result.eos);
+        for mismatch in 0..3 {
+            let inputs = [10, 11, 12];
+            let mut next = [11, 12, 13];
+            next[mismatch] = 99;
+            assert_eq!(verify_dspark_greedy(&inputs, &next, 1, 8),
+                verify_dspark_greedy_vocab(&inputs, &next, Some(1), 8, 129280));
+        }
+        assert!(verify_dspark_greedy_vocab(&[248320], &[0], None, 1, 248320).is_err());
+        assert!(verify_dspark_greedy_vocab(&[0], &[0], Some(248320), 1, 248320).is_err());
+        assert!(verify_dspark_greedy_vocab(&[0], &[0], None, 1, 0).is_err());
+    }
+
     #[test]
     fn seven_drafts_correct_at_every_position_and_stop() {
         let inputs = [10, 11, 12, 13, 14, 15, 16, 17];
