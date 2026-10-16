@@ -31,6 +31,27 @@ pub fn window_batch_bytes(rows: u64) -> Result<u64> {
     Ok(40 * (64 + rows * 8 + 16 * 16))
 }
 
+/// Coordinator-owned Spark wave planes. Pinned intake belongs to its own domain.
+pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
+    ensure!((1..=4096).contains(&rows) && matches!(ranks, 2 | 3 | 4 | 6),
+        "invalid V4.1 transport geometry");
+    Ok(rows * (ranks as u64 * 5120 * 2 + 2 * 5120 * 2))
+}
+
+/// Full vocabulary packing peak above the pre-weight sample. The first lane's
+/// backbone/cache/index/embedding/Engram owners already exist; heads, taps,
+/// transports, the second lane, draft, vision and marks do not.
+pub fn vocabulary_load_phase(weights: &[Demand], target: &[Demand], packing: u64) -> Result<Demand> {
+    ensure!(weights.iter().chain(target).all(|d| d.gpu == 0),
+        "vocabulary startup phase requires the single-RTX owners");
+    let retained = weights.iter().filter(|d| !matches!(d.group.as_str(), "lm_head" | "norm"));
+    let lane = target.iter().filter(|d| d.group.starts_with("lane 0 ")
+        && !matches!(d.group.as_str(), "lane 0 target head" | "lane 0 target taps"));
+    let bytes = retained.chain(lane).try_fold(packing, |sum, d|
+        sum.checked_add(d.bytes).context("V4.1 vocabulary phase overflow"))?;
+    Ok(Demand::new(0, Category::Staging, "vocabulary packing", bytes, Basis::Formula))
+}
+
 pub struct NativePrograms<'a> {
     manifest: &'a Value,
     sms: u32,
@@ -225,6 +246,28 @@ mod tests {
 
     fn owner(demands: &[Demand], rank: u8, group: &str) -> u64 {
         demands.iter().find(|d| d.gpu == rank && d.group == group).unwrap().bytes
+    }
+
+    #[test]
+    fn vocabulary_phase_charges_only_the_first_lanes_live_owners() -> Result<()> {
+        let demand = |group: &str, bytes| Demand::new(0, Category::Workspace, group, bytes, Basis::Formula);
+        let weights = vec![demand("attention", 100), demand("engram-projections", 20),
+            demand("embedding", 50), demand("lm_head", 300), demand("norm", 10)];
+        let target = vec![demand("lane 0 backbone", 40), demand("lane 0 engram", 30),
+            demand("lane 0 window batch table", 5), demand("lane 0 target head", 60),
+            demand("lane 0 target taps", 70), demand("lane 1 backbone", 80)];
+        let phase = vocabulary_load_phase(&weights, &target, 400)?;
+        assert_eq!(phase.bytes, 400 + 100 + 20 + 50 + 40 + 30 + 5);
+        assert_eq!(phase.category, Category::Staging);
+        assert!(vocabulary_load_phase(&[demand("attention", u64::MAX)], &target, 400).is_err());
+        assert!(vocabulary_load_phase(&[demand("attention", 1).on(1)], &target, 400).is_err());
+        for ranks in [2, 3, 4, 6] {
+            assert_eq!(transport_bytes(1024, ranks)?, 1024 * (ranks as u64 + 2) * 10240);
+        }
+        assert!(transport_bytes(0, 4).is_err());
+        assert!(transport_bytes(4097, 4).is_err());
+        assert!(transport_bytes(1024, 5).is_err());
+        Ok(())
     }
 
     #[test]
