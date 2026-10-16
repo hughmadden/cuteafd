@@ -24,6 +24,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         pool_bounded: Vec::new(),
         pool_overhead: vec![UNIT; gpus],
         fixed: Vec::new(),
+        startup: Vec::new(),
         movables: Vec::new(),
         expert_workspace: GIB / 4,
         tp2_workspace: [0; 2],
@@ -162,6 +163,45 @@ fn experts_first_fills_layers_above_the_pool_floor() {
     let explicit = solve(&one).unwrap();
     assert_eq!(explicit.pool_tokens, 1 << 20);
     assert_eq!(explicit.onboard_layers, 27);
+}
+
+#[test]
+fn startup_phases_are_independent_and_not_retained_with_the_pool() {
+    use cuteafd_core::memory_layout::{Basis, Category};
+    let mut req = request(1, 12 * GIB, 40, 4, Onboard::Layers(0));
+    req.inventory.gpus[0].headroom_bytes = GIB;
+    let before = solve(&req).unwrap();
+    req.startup = vec![
+        Demand::new(0, Category::Staging, "vocabulary packing", 12 * GIB, Basis::Formula),
+        Demand::new(0, Category::Staging, "draft loading", 11 * GIB, Basis::Formula),
+    ];
+    let after = solve(&req).unwrap();
+    assert_eq!(before.pool_tokens, after.pool_tokens);
+    assert_eq!(before.items, after.items);
+    req.startup[0].bytes += 1;
+    assert!(matches!(solve(&req), Err(PlacementError::StartupPeak {
+        gpu: 0, required, available, ..
+    }) if required == 12 * GIB + 1 && available == 12 * GIB));
+    req.startup[0].gpu = 1;
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory("startup phase on an absent GPU"))));
+}
+
+#[test]
+fn startup_peak_uses_the_same_baseline_for_planned_and_measured_inventory() {
+    use cuteafd_core::memory_layout::{Basis, Category};
+    let mut measured = request(1, 12 * GIB, 40, 4, Onboard::Layers(0));
+    measured.startup.push(Demand::new(0, Category::Staging, "load", 12 * GIB, Basis::Formula));
+    let mut planned = measured.clone();
+    planned.inventory.gpus[0].baseline = Baseline::Planned {
+        context_bytes: GIB, loaded_bytes: 83 * GIB,
+    };
+    assert_eq!(solve(&measured).unwrap().pool_tokens, solve(&planned).unwrap().pool_tokens);
+    for req in [&mut measured, &mut planned] {
+        req.startup[0].bytes += 1;
+        assert!(matches!(solve(req), Err(PlacementError::StartupPeak {
+            available, ..
+        }) if available == 12 * GIB));
+    }
 }
 
 #[test]

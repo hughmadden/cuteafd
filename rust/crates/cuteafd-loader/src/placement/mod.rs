@@ -54,6 +54,10 @@ pub struct PlacementRequest {
     pub pool_bounded: Vec<BoundedDemand>,
     /// Non-layer items charged before the pool, per GPU.
     pub fixed: Vec<Demand>,
+    /// Sequential loading-phase peaks above the baseline. Each phase is checked
+    /// independently against physical free memory, before steady-state growth
+    /// reserves, and is not retained beside the KV pool.
+    pub startup: Vec<Demand>,
     /// Mandatory items the solver places on an allowed GPU (drafter, encoders).
     pub movables: Vec<Movable>,
     /// Workspace of a GPU's local expert arena, charged once on every GPU
@@ -555,6 +559,8 @@ pub enum PlacementError {
     Inventory(&'static str),
     #[error("explicit KV pool of {requested} tokens does not fit beside admitted demands (fits {fit}); {limits}")]
     PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
+    #[error("startup phase {phase} needs {required} bytes on rtx{gpu}, but only {available} bytes are free")]
+    StartupPeak { gpu: u8, phase: String, required: u64, available: u64 },
     #[error("KV pool and mandatory {what} do not fit on rtx{gpu}")]
     Mandatory { gpu: u8, what: String },
     #[error("{requested} RTX expert layers do not fit beside the fixed demands (at most {placed})")]
