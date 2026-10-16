@@ -1,6 +1,6 @@
 //! Dense target adapter for the shared Qwen request lifecycle.
 use super::engine::{DenseEngine, DenseMark, prefix::{DensePrefix, Placement}};
-use crate::shared::{draft::routes::RoundRoutes, draft_policy::DraftHistory, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
+use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
     qwen::scheduler::{self, Backend}, speculation::target::{AcceptedPrefix, BlockVerifyTarget, VerifyRequest, VerifyRow},
     token_io::DeviceLogits};
 use anyhow::{ensure, Context, Result};
@@ -137,9 +137,6 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         anyhow::bail!("dense drafter adapter is not yet qualified")
     }
     fn arm_draft_probe(&self) -> Result<()> { anyhow::bail!("dense drafter adapter is not yet qualified") }
-    fn acceptance(&self, _histories: &[&DraftHistory], limits: &[usize]) -> Vec<Vec<f64>> {
-        limits.iter().map(|_| Vec::new()).collect()
-    }
     fn prefill_draft(&self, _placement: &Placement, _start: usize, _chunk: &[u32], _next: Option<u32>, _draft: &mut DraftState) -> Result<()> {
         anyhow::bail!("dense drafter adapter is not yet qualified")
     }
