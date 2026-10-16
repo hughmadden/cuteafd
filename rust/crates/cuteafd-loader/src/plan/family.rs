@@ -55,6 +55,12 @@ pub struct ExpertContract {
 pub trait FamilyModel: Send + Sync {
     fn spec(&self) -> &ModelSpec;
 
+    /// Placement accounts for executable runtime owners, not only checkpoint inventory.
+    fn native_serving_admission(&self) -> bool { false }
+
+    /// Resolve automatic vision to the mode this executor can actually admit.
+    fn vision_mode(&self, mode: super::MediaMode) -> super::MediaMode { mode }
+
     /// Native solver adapter. Returning None retains the legacy layout path.
     fn placement(&self, _input: &super::PlanInput, _report: &mut super::PlanReport,
         _options: &super::layout::LayoutOptions, _requested: super::ExpertPlacement)

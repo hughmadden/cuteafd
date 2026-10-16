@@ -12,7 +12,41 @@ import sys
 SPEC = importlib.util.spec_from_file_location('checkpoint_family', Path(__file__).with_name('checkpoint-family.py'))
 checkpoint_family = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checkpoint_family)
-PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4')
+PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
+                        qwen3_5='QWEN_DENSE')
+
+
+def require_mapping(family):
+    if family != 'deepseek_v41' and family not in PROGRAM_SWITCHES:
+        raise ValueError(f'no WIP AOT scope mapping for {family}')
+
+
+def checkpoint_config(values):
+    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash')
+    hub = Path(os.environ.get('HF_HOME', Path.home() / '.cache/huggingface')) / 'hub'
+    root = hub / ('models--' + model.replace('/', '--'))
+    revision = values.get('MODEL_REVISION', '')
+    if not revision and (root / 'refs/main').is_file():
+        revision = (root / 'refs/main').read_text().strip()
+    path = root / 'snapshots' / revision / 'config.json'
+    return json.loads(path.read_text()) if revision and path.is_file() else None
+
+
+def dense_switch(values):
+    config = checkpoint_config(values)
+    if config is None:
+        raise ValueError('dense Qwen WIP AOT scopes require checkpoint config.json')
+    if checkpoint_family.describe(config)[0] != 'qwen3_5':
+        raise ValueError('dense Qwen WIP AOT scopes require qwen3_5 checkpoint geometry')
+    text = config.get('text_config', config)
+    geometry = tuple(text.get(key) for key in ('hidden_size', 'intermediate_size', 'num_hidden_layers',
+                                              'num_attention_heads', 'num_key_value_heads',
+                                              'linear_num_key_heads', 'linear_num_value_heads'))
+    switches = {(4096, 12288, 32, 16, 4, 16, 32): 'QWEN_DENSE',
+                (5120, 17408, 64, 24, 4, 16, 48): 'QWEN_DENSE'}
+    if geometry not in switches:
+        raise ValueError(f'unsupported dense Qwen WIP AOT checkpoint geometry {geometry}')
+    return switches[geometry]
 
 
 def family_scopes(cards, config_reader):
@@ -23,8 +57,13 @@ def family_scopes(cards, config_reader):
     scopes, spark_scopes, roles, counts, env = set(), set(), set(), set(), {}
     for card in cards:
         family = card.get('family')
+        require_mapping(family)
         values = {**config_reader(card['config']), **card.get('set', {})}
         count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
+        if family == 'qwen3_5':
+            if count or values.get('SPARK_HOSTS') or values.get('EXPERT_BACKEND') == 'spark':
+                raise ValueError('dense Qwen has no Spark layout or dense-FFN offboarding')
+            env['CUTEAFD_WIP_' + dense_switch(values) + '_AOT'] = 'ON'
         scopes_before = set(scopes)
         scopes = set()
         if family == 'deepseek_v41' and count in (2, 3, 6):
@@ -82,17 +121,13 @@ def read_config(path):
 
 def config_family(values):
     declared = values.get('FAMILY', '')
-    if declared and declared not in checkpoint_family.FAMILIES.values():
-        raise ValueError(f'unsupported FAMILY {declared!r}')
+    if declared:
+        require_mapping(declared)
     model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash')
-    hub = Path(os.environ.get('HF_HOME', Path.home() / '.cache/huggingface')) / 'hub'
-    root = hub / ('models--' + model.replace('/', '--'))
-    revision = values.get('MODEL_REVISION', '')
-    if not revision and (root / 'refs/main').is_file():
-        revision = (root / 'refs/main').read_text().strip()
-    snapshot = root / 'snapshots' / revision / 'config.json'
-    if revision and snapshot.is_file():
-        detected = checkpoint_family.describe(json.loads(snapshot.read_text()))[0]
+    config = checkpoint_config(values)
+    if config is not None:
+        detected = checkpoint_family.describe(config)[0]
+        require_mapping(detected)
         if declared and declared != detected:
             raise ValueError(f'FAMILY={declared} does not match checkpoint family {detected}')
         return detected
@@ -129,6 +164,7 @@ def config_scopes(values):
 
 
 def check_programs(family, path):
+    require_mapping(family)
     switch = PROGRAM_SWITCHES.get(family)
     if switch is None:
         return  # V4.1 uses separate native manifests, not PROGRAMS.json.

@@ -119,16 +119,11 @@ pub(crate) struct VocabularyHead<'library> {
 /// 128-K FP32 scales (`fp8_linear`, the better of amax and power-of-two per
 /// block) and the W8A16 tensor-core GEMV. `all` releases BF16 after packing;
 /// `draft` retains BF16 for target projections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Fp8Head { Off, Draft, All }
+pub(crate) use cuteafd_loader::placement::families::deepseek_v41::resident::Fp8Head;
 pub(crate) fn fp8_head() -> Fp8Head {
     static MODE: std::sync::OnceLock<Fp8Head> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        let mode = match std::env::var("CUTEAFD_V41_FP8_HEAD").as_deref() {
-            Ok("off" | "0" | "bf16") => Fp8Head::Off,
-            Ok("draft") => Fp8Head::Draft,
-            _ => Fp8Head::All,
-        };
+        let mode = Fp8Head::configured();
         tracing::info!(?mode, "V4.1 vocabulary heads");
         mode
     })
@@ -209,11 +204,7 @@ impl<'library> VocabularyHead<'library> {
     }
     pub fn resident_bytes(catalog: &OfficialV41Catalog) -> Result<usize> {
         let source = VocabularyShard::device_bytes(catalog, 0..129280)?;
-        Ok(match fp8_head() {
-            Fp8Head::Off => source,
-            Fp8Head::Draft => source + source / 2 + source / 64,
-            Fp8Head::All => source / 2 + source / 64,
-        })
+        Ok(usize::try_from(fp8_head().resident(source as u64).0)?)
     }
     pub fn load(
         library: &'library NativeLibrary,

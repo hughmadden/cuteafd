@@ -1,4 +1,4 @@
-//! Single-slot implementation of the shared, slot-indexed block verification contract.
+//! Multi-slot implementation of the shared, slot-indexed block verification contract.
 //! Padding is absent from native state tables and scattered into zeroed physical outputs.
 use super::*;
 use crate::shared::{prefix::view, qwen::{MarkLayout, REPLAY_ROWS},
@@ -11,7 +11,7 @@ static NEXT_ENGINE: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct DenseMark<'a> {
     owner: u64,
     generation: u64,
-    position: usize,
+    slots: Vec<(usize, rows::Slot)>,
     storage: Rc<Allocation<'a>>,
 }
 
@@ -23,19 +23,20 @@ pub(super) struct Verification<'a> {
     logits: Allocation<'a>,
     hidden: Allocation<'a>,
     taps: Vec<HiddenTap>,
-    pub(super) pending: Option<usize>,
+    pub(super) pending: Option<rows::Rows>,
 }
 
 impl<'a> Verification<'a> {
-    fn layout(cfg: &Qwen35Config) -> Result<MarkLayout> {
+    fn layout(cfg: &Qwen35Config, slots: usize) -> Result<MarkLayout> {
         let gdn = GdnLayout::new(cfg.gdn)?;
         let regions = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn)
-            .flat_map(|_| [(0, gdn.conv_slot_bytes), (0, gdn.state_slot_bytes)]).collect::<Vec<_>>();
+            .flat_map(|_| (0..slots).flat_map(|_| [(0, gdn.conv_slot_bytes), (0, gdn.state_slot_bytes)])).collect::<Vec<_>>();
         MarkLayout::new(&regions)
     }
 
-    pub(super) fn bytes(cfg: &Qwen35Config) -> Result<usize> {
-        let mark = Self::layout(cfg)?.bytes.max(256);
+    #[cfg(test)]
+    pub(super) fn bytes(cfg: &Qwen35Config, slots: usize) -> Result<usize> {
+        let mark = Self::layout(cfg, slots)?.bytes.max(256);
         let logits = REPLAY_ROWS.checked_mul(cfg.vocab).and_then(|n| n.checked_mul(4))
             .context("dense verify logits size overflow")?;
         let taps = REPLAY_ROWS.checked_mul(cfg.hidden).and_then(|n| n.checked_mul(2))
@@ -43,8 +44,8 @@ impl<'a> Verification<'a> {
         mark.checked_add(logits).and_then(|n| n.checked_add(taps)).context("dense verify admission overflow")
     }
 
-    pub(super) fn new(device: Device<'a>, cfg: &Qwen35Config) -> Result<Self> {
-        let mut layout = Self::layout(cfg)?;
+    pub(super) fn new(device: Device<'a>, cfg: &Qwen35Config, slots: usize) -> Result<Self> {
+        let mut layout = Self::layout(cfg, slots)?;
         for owner in &mut layout.owners { owner.0 = device.id; }
         let mark = Rc::new(Allocation::new(device, layout.bytes.max(256))?);
         let logits = Allocation::new(device, REPLAY_ROWS * cfg.vocab * 4)?;
@@ -52,6 +53,10 @@ impl<'a> Verification<'a> {
         let owner = NEXT_ENGINE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| anyhow::anyhow!("dense target identity exhausted"))?;
         Ok(Self { owner, generation: 0, mark, layout, logits, hidden, taps: Vec::new(), pending: None })
+    }
+
+    pub(super) fn allocated_bytes(&self) -> [usize; 3] {
+        [self.mark.buffer.bytes, self.logits.buffer.bytes, self.hidden.buffer.bytes]
     }
 
     pub(super) fn invalidate(&mut self) -> Result<()> {
@@ -66,28 +71,6 @@ impl<'a> Verification<'a> {
             && Rc::ptr_eq(&mark.storage, &self.mark), "stale or foreign dense checkpoint");
         Ok(())
     }
-}
-
-/// Only active tokens enter state, rotary and page tables. The mapping is the
-/// entire scatter policy; sentinel padding slot/position fields are never read.
-fn accepted_rows(accepted: &[AcceptedPrefix], verified: usize) -> Result<usize> {
-    ensure!(accepted.len() == 1 && accepted[0].slot == 0 && accepted[0].rows <= verified,
-        "dense accepted prefix outside verified slot/input rows");
-    Ok(accepted[0].rows)
-}
-
-fn active_rows(request: &VerifyRequest<'_>, cfg: &Qwen35Config, position: usize, pool: usize)
-    -> Result<(Vec<u32>, Vec<usize>)> {
-    ensure!((1..=REPLAY_ROWS).contains(&request.rows.len()), "dense verify needs 1..64 physical rows");
-    request.validate(cfg.attention.len(), cfg.vocab, &[(0, position)])?;
-    let mut tokens = Vec::new();
-    let mut physical = Vec::new();
-    for (index, row) in request.rows.iter().enumerate() {
-        if let Some(token) = row.token { tokens.push(token); physical.push(index); }
-    }
-    let end = position.checked_add(tokens.len()).context("dense verify position overflow")?;
-    ensure!(end <= cfg.max_context && end <= pool, "dense verify exceeds admitted cache/context");
-    Ok((tokens, physical))
 }
 
 impl<'a> DenseEngine<'a> {
@@ -107,6 +90,7 @@ impl<'a> DenseEngine<'a> {
             for (region, bytes) in engine.mark_regions().into_iter().zip(&initial) { engine.put(region, bytes)?; }
             engine.stream.drain()?;
             engine.position = 0;
+            engine.slots[0].position = 0;
             engine.verification.invalidate()?;
             Ok(())
         };
@@ -202,15 +186,87 @@ impl<'a> DenseEngine<'a> {
         Ok(())
     }
 
+    /// Exercise real disjoint KV pages and interleaved physical rows. All slot
+    /// state, including untouched slots, must match independent serial prefill.
+    pub(crate) fn multislot_verify_check(&mut self, tokens: &[u32]) -> Result<()> {
+        use crate::shared::speculation::target::VerifyRow;
+        ensure!(self.slots.len() >= 2 && tokens.len() >= 9 && self.pool_tokens >= 384,
+            "multislot verify check requires two slots, six pages and nine inputs");
+        let library = self.stream.device.library;
+        let sequences = [&tokens[..7], &tokens[2..8]];
+        let reset = |engine: &mut Self| -> Result<()> {
+            for slot in 0..engine.slots.len() { engine.reset_slot(slot)?; }
+            engine.bind_slot(0, &[3, 1])?;
+            engine.bind_slot(1, &[5, 2])?;
+            for (slot, sequence) in sequences.iter().enumerate() {
+                engine.prefill_device(slot, &sequence[..3], 1)?;
+            }
+            engine.stream.drain()
+        };
+        let state = |engine: &Self| -> Result<Vec<Vec<u8>>> {
+            engine.stream.drain()?;
+            engine.mark_regions().into_iter().map(|region| {
+                let mut bytes = vec![0; region.bytes];
+                library.copy_d2h(&mut bytes, region)?;
+                Ok(bytes)
+            }).collect()
+        };
+        reset(self)?;
+        let padding = VerifyRow { slot: usize::MAX, position: usize::MAX, token: None };
+        let mut rows = vec![padding];
+        for offset in 0..4 {
+            for slot in [1, 0] {
+                if let Some(&token) = sequences[slot].get(3 + offset) {
+                    rows.push(VerifyRow { slot, position: 3 + offset, token: Some(token) });
+                }
+            }
+            rows.push(padding);
+        }
+        let mark = self.checkpoint(&[1, 0])?;
+        let actual = self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?
+            .logits.to_host(library)?;
+        self.restore(&mark)?;
+        for (physical, row) in rows.iter().enumerate() {
+            let actual = &actual[physical * self.cfg.vocab..(physical + 1) * self.cfg.vocab];
+            if let Some(token) = row.token {
+                let expected = self.prefill_device(row.slot, &[token], 1)?.to_host(library)?;
+                ensure!(expected.iter().map(|v| v.to_bits()).eq(actual.iter().map(|v| v.to_bits())),
+                    "dense multislot serial/verify logits differ at physical row {physical}");
+            } else {
+                ensure!(actual.iter().all(|&v| v == 0.0), "dense multislot padding logits are not zero");
+            }
+        }
+        for kept in [[0, 3], [1, 2], [4, 0], [2, 3]] {
+            reset(self)?;
+            let mark = self.checkpoint(&[1, 0])?;
+            self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?;
+            self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: kept[0] },
+                AcceptedPrefix { slot: 1, rows: kept[1] }])?;
+            let actual = state(self)?;
+            ensure!(self.slots[0].position == 3 + kept[0] && self.slots[1].position == 3 + kept[1],
+                "dense multislot commit changed the wrong frontier");
+            reset(self)?;
+            for (slot, sequence) in sequences.iter().enumerate() {
+                for &token in &sequence[3..3 + kept[slot]] { self.prefill_device(slot, &[token], 1)?; }
+            }
+            ensure!(state(self)? == actual, "dense multislot accepted-input state differs for {kept:?}");
+        }
+        for slot in 0..self.slots.len() { self.reset_slot(slot)?; }
+        println!("dense multislot verify: interleaved logits, sentinel padding and independent accepted-input state byte-exact");
+        Ok(())
+    }
+
     fn mark_regions(&self) -> Vec<CuteafdDeviceBuffer> {
         self.homes.layers.iter().filter_map(|home| home.gdn_ordinal)
-            .flat_map(|ordinal| self.bank.slot_regions(ordinal, 0)).collect()
+            .flat_map(|ordinal| (0..self.slots.len()).flat_map(move |slot| self.bank.slot_regions(ordinal, slot))).collect()
     }
 
     fn move_mark(&self, mark: &DenseMark<'_>, capture: bool) -> Result<()> {
         let regions = self.mark_regions();
         ensure!(regions.len() == self.verification.layout.regions.len(), "dense mark geometry changed");
-        for (region, &(owner, offset, bytes)) in regions.into_iter().zip(&self.verification.layout.regions) {
+        for (index, (region, &(owner, offset, bytes))) in regions.into_iter().zip(&self.verification.layout.regions).enumerate() {
+            let slot = (index / 2) % self.slots.len();
+            if !mark.slots.iter().any(|(marked, _)| *marked == slot) { continue; }
             ensure!(owner == 0 && bytes == region.bytes && region.device_id == mark.storage.buffer.device_id,
                 "dense mark region does not match its owner");
             let saved = view(mark.storage.buffer, offset, bytes)?;
@@ -226,18 +282,20 @@ impl<'a> DenseEngine<'a> {
         self.stream.drain()?;
         self.healthy = false;
         self.move_mark(mark, false)?;
-        // KV is append-only with an immutable identity page map. Rows at or past
-        // this frontier are unreachable, and every subsequent input overwrites them.
-        self.position = mark.position;
+        // Append-only records beyond each saved frontier are unreachable and overwritten.
+        for (slot, state) in &mark.slots { self.slots[*slot] = state.clone(); }
+        self.position = self.slots[0].position;
         self.verification.pending = None;
         self.verification.taps.clear();
         self.healthy = true;
         Ok(())
     }
 
-    fn verify_rows(&mut self, tokens: &[u32], physical: &[usize], rows: usize, layers: &[usize]) -> Result<()> {
+    fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize]) -> Result<()> {
         self.stream.drain()?;
         self.healthy = false;
+        let tokens = &plan.tokens;
+        let physical = &plan.physical;
         let library = self.stream.device.library;
         // SAFETY: output arenas are admitted and no prior consumer remains after the drain.
         unsafe {
@@ -249,9 +307,9 @@ impl<'a> DenseEngine<'a> {
             layer, ptr: self.verification.hidden.buffer.ptr.cast::<u8>().wrapping_add(index * rows * self.cfg.hidden * 2).cast(),
             rows, hidden: self.cfg.hidden, stride: self.cfg.hidden, stream: self.stream.raw }).collect();
         if !tokens.is_empty() {
-            self.tables(tokens.len())?;
+            self.row_tables(&plan)?;
             self.embedding.embed(tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
-            let step = Step { rows: tokens.len(), capacity: REPLAY_ROWS, table_stride: 0, splits: 1, speculative: true };
+            let step = Step { rows: tokens.len(), capacity: REPLAY_ROWS, table_stride: plan.stride, splits: 1, speculative: true };
             let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
                 homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
             for (index, layer) in self.weights.layers.iter().enumerate() {
@@ -283,7 +341,7 @@ impl<'a> DenseEngine<'a> {
             }
         }
         self.stream.drain()?;
-        self.verification.pending = Some(tokens.len());
+        self.verification.pending = Some(plan);
         self.healthy = true;
         Ok(())
     }
@@ -293,22 +351,26 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
     type Mark = DenseMark<'a>;
 
     fn checkpoint(&mut self, slots: &[usize]) -> Result<Self::Mark> {
-        ensure!(slots == [0], "dense target currently admits exactly slot 0");
+        ensure!(!slots.is_empty() && slots.len() <= self.slots.len(), "dense checkpoint slot count outside admission");
+        for (index, &slot) in slots.iter().enumerate() {
+            ensure!(slot < self.slots.len() && !slots[..index].contains(&slot), "duplicate or unadmitted dense checkpoint slot");
+        }
         ensure!(self.healthy && self.verification.pending.is_none(), "dense checkpoint requires committed healthy state");
         self.stream.drain()?;
         self.verification.invalidate()?;
         let mark = DenseMark { owner: self.verification.owner, generation: self.verification.generation,
-            position: self.position, storage: self.verification.mark.clone() };
+            slots: slots.iter().map(|&slot| (slot, self.slots[slot].clone())).collect(), storage: self.verification.mark.clone() };
         self.move_mark(&mark, true)?;
         Ok(mark)
     }
 
     fn verify<'e>(&'e mut self, mark: &Self::Mark, request: VerifyRequest<'_>) -> Result<VerifyOutput<'e>> {
         self.verification.validate(mark)?;
-        let active = active_rows(&request, &self.cfg, mark.position, self.pool_tokens);
+        let active = rows::Rows::new(&request, self.cfg.attention.len(), self.cfg.vocab, &mark.slots,
+            self.cfg.max_context, self.pool_tokens);
         self.restore_mark(mark)?;
-        let (tokens, physical) = active?;
-        if let Err(error) = self.verify_rows(&tokens, &physical, request.rows.len(), request.tap_layers) {
+        let plan = active?;
+        if let Err(error) = self.verify_rows(plan, request.rows.len(), request.tap_layers) {
             self.restore_mark(mark).context("restoring dense checkpoint after failed verify")?;
             return Err(error);
         }
@@ -321,16 +383,17 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
 
     fn commit(&mut self, mark: &Self::Mark, accepted: &[AcceptedPrefix]) -> Result<()> {
         self.verification.validate(mark)?;
-        let verified = self.verification.pending.context("dense commit requires a successful verify")?;
-        let keep = accepted_rows(accepted, verified)?;
+        let verified = self.verification.pending.as_ref().context("dense commit requires a successful verify")?;
+        let table = verified.accepted(accepted)?;
         self.restore_mark(mark)?;
         self.healthy = false;
-        let result = self.bank.commit(&[0, 0, i32::try_from(keep)?], 1).and_then(|()| self.stream.drain());
+        let result = self.bank.commit(&table, accepted.len()).and_then(|()| self.stream.drain());
         if let Err(error) = result {
             self.restore_mark(mark).context("restoring dense checkpoint after failed commit")?;
             return Err(error);
         }
-        self.position = mark.position + keep;
+        for entry in accepted { self.slots[entry.slot].position += entry.rows; }
+        self.position = self.slots[0].position;
         self.verification.invalidate()?;
         self.healthy = true;
         Ok(())
@@ -359,39 +422,49 @@ mod tests {
     #[test]
     fn padding_compaction_does_not_read_sentinel_metadata() {
         let cfg = config();
-        let rows = [VerifyRow { slot: usize::MAX, position: usize::MAX, token: None },
-            VerifyRow { slot: 0, position: 17, token: Some(3) },
-            VerifyRow { slot: usize::MAX, position: usize::MAX, token: None },
+        let padding = VerifyRow { slot: usize::MAX, position: usize::MAX, token: None };
+        let rows = [padding, VerifyRow { slot: 0, position: 17, token: Some(3) }, padding,
             VerifyRow { slot: 0, position: 18, token: Some(4) }];
-        let request = VerifyRequest { rows: &rows, tap_layers: &[28, 4, 16] };
-        assert_eq!(active_rows(&request, &cfg, 17, 64).unwrap(), (vec![3, 4], vec![1, 3]));
-        assert!(active_rows(&request, &cfg, 17, 18).is_err());
-        assert!(active_rows(&request, &cfg, 18, 64).is_err());
-        let padding = [rows[0]; REPLAY_ROWS];
-        assert_eq!(active_rows(&VerifyRequest { rows: &padding, tap_layers: &[] }, &cfg, 17, 64).unwrap(),
-            (vec![], vec![]));
-        assert!(active_rows(&VerifyRequest { rows: &[rows[0]; REPLAY_ROWS + 1], tap_layers: &[] }, &cfg, 17, 64).is_err());
+        let starts = [(0, rows::Slot { position: 17, pages: vec![] })];
+        let plan = rows::Rows::new(&VerifyRequest { rows: &rows, tap_layers: &[28, 4, 16] },
+            cfg.attention.len(), cfg.vocab, &starts, cfg.max_context, 64).unwrap();
+        assert_eq!((plan.tokens, plan.physical), (vec![3, 4], vec![1, 3]));
+        assert!(rows::Rows::new(&VerifyRequest { rows: &rows, tap_layers: &[] },
+            cfg.attention.len(), cfg.vocab, &starts, cfg.max_context, 18).is_err());
     }
 
     #[test]
     fn commit_counts_only_retained_active_inputs_and_requires_exact_slot_set() {
+        let cfg = config();
+        let inputs = (0..7).map(|position| VerifyRow { slot: 0, position, token: Some(3) }).collect::<Vec<_>>();
+        let plan = rows::Rows::new(&VerifyRequest { rows: &inputs, tap_layers: &[] }, cfg.attention.len(), cfg.vocab,
+            &[(0, rows::Slot { position: 0, pages: vec![] })], cfg.max_context, 64).unwrap();
         for keep in 0..=7 {
-            assert_eq!(accepted_rows(&[AcceptedPrefix { slot: 0, rows: keep }], 7).unwrap(), keep);
+            assert_eq!(plan.accepted(&[AcceptedPrefix { slot: 0, rows: keep }]).unwrap(), [0, 0, keep as i32]);
         }
         for invalid in [vec![], vec![AcceptedPrefix { slot: 0, rows: 8 }],
-            vec![AcceptedPrefix { slot: 1, rows: 1 }],
-            vec![AcceptedPrefix { slot: 0, rows: 1 }; 2]] {
-            assert!(accepted_rows(&invalid, 7).is_err());
+            vec![AcceptedPrefix { slot: 1, rows: 1 }], vec![AcceptedPrefix { slot: 0, rows: 1 }; 2]] {
+            assert!(plan.accepted(&invalid).is_err());
         }
     }
 
     #[test]
     fn verify_admission_reserves_marks_and_every_requested_tap() {
         let cfg = config();
-        let layout = Verification::layout(&cfg).unwrap();
+        let layout = Verification::layout(&cfg, 1).unwrap();
         assert_eq!(layout.regions.len(), 48);
         assert_eq!(layout.bytes, 24 * cfg.gdn.state_bytes());
-        assert_eq!(Verification::bytes(&cfg).unwrap(), layout.bytes + 64 * cfg.vocab * 4
+        assert_eq!(Verification::bytes(&cfg, 1).unwrap(), layout.bytes + 64 * cfg.vocab * 4
             + 32 * 64 * cfg.hidden * 2);
+        assert_eq!(Verification::bytes(&cfg, 16).unwrap(), 16 * layout.bytes + 64 * cfg.vocab * 4
+            + 32 * 64 * cfg.hidden * 2);
+        for slots in [1, 4, 16, 64] {
+            let native = placement::families::qwen3_5::NativeBuffers::new(&cfg, 1024, slots, 10).unwrap();
+            assert_eq!(native.verify.iter().sum::<usize>(), Verification::bytes(&cfg, slots).unwrap());
+            assert_eq!(native.verify[0], Verification::layout(&cfg, slots).unwrap().bytes);
+            let gdn = GdnLayout::new(cfg.gdn).unwrap();
+            assert_eq!(native.state_per_layer, gdn.conv_slot_bytes + gdn.state_slot_bytes);
+            assert_eq!(native.replay_per_layer, gdn.replay_layer_bytes);
+        }
     }
 }

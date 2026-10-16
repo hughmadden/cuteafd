@@ -26,7 +26,7 @@ impl<'a> VocabularyShard<'a> {
         Ok(Self::peak_bytes(source, super::fp8_head()))
     }
     fn peak_bytes(source: usize, mode: super::Fp8Head) -> usize {
-        source + if mode == super::Fp8Head::Off { 0 } else { source / 2 + source / 64 }
+        mode.load_bytes(source as u64) as usize
     }
 
     /// The caller scopes construction/destruction to the owning GPU. Admission
