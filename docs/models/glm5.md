@@ -124,6 +124,28 @@ the third Layers arm additionally failed matched prompt hashes. No speed
 or placement-default decision follows. The separate default-three-lane
 8K run is held until the correctness investigation is resolved.
 
+The 2026-10-17 attribution follow-up did **not reproduce** the Context
+failure. In one queue turn, immutable original seal `3be01a02` ran first,
+then rebased K4 head `1bdda27c`; each used its own matching launcher and the
+same benchmark client. Both used the original nonce `301102bc7c4af2fa`,
+baseline then strict-set then client-sweep order, two prefill lanes, plan
+rows 8, exactly 2,097,152 pool tokens, two RTX PRO 6000 GPUs and six expert
+ranks. Both passed strict 10/10 with identical generated IDs and raw-logit
+row hashes, quick fidelity and `cache_exact` (prompt and turn restores plus
+cold recompute). Neither encountered the known Spark admission query OOM.
+
+The current head additionally saved 456 paired full-vocabulary F32
+log-probability rows: code-1/2/3/5/6/7, generated offsets 25 through 100,
+154,880 entries per row. All pairs were byte-identical; both KL directions,
+L2 and maximum absolute difference were zero. Original-seal diagnostics
+were trace-only because its immutable server predates row-dump support.
+Two independent plain-base full-order checks also passed strict 10/10,
+quick fidelity and exact cache restore. These are scoped non-reproductions,
+not a proven root cause, evidence that later fixes cured the earlier
+failure, or general row/batch invariance. The earlier failures remain part
+of the record. Full tagged ready-ledger agreement and a new matched
+placement decision remain pending; Context stays the default.
+
 ## Known limits
 
 <!-- release-v2-limits -->
