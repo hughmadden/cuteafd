@@ -572,16 +572,19 @@ pub struct DraftInventory {
     pub marks: u64,
     /// `--tp2-dspark-experts`: GPU0's expert halves plus its wave workspace.
     pub peer_half: u64,
-    /// Largest transient load staging on the home and on the peer half.
+    /// Largest transient load staging on the home and on the peer half; the
+    /// caller folds it into the full dSpark load-phase peak.
     pub staging: [u64; 2],
 }
 
 /// The dSpark drafter as one itemized shared drafter Movable at the head GPU
 /// (GPU1 on two RTX): it reads the decoder's taps and the GPU1 vocabulary
 /// shard every step, so it has no bridge. The TP2 expert half is a cross-GPU
-/// demand of that home; load staging is a startup phase, never retained.
-pub fn drafter(inventory: &DraftInventory, ranks: usize)
-    -> Result<(Movable, Vec<Demand>), PlacementError> {
+/// demand of that home. Load staging is not retained and is not a startup
+/// phase by itself: `request.startup` holds full sequential phase peaks, so the
+/// caller composes the dSpark load phase from `staging` plus the owners that
+/// coexist with it.
+pub fn drafter(inventory: &DraftInventory, ranks: usize) -> Result<Movable, PlacementError> {
     if !(1..=2).contains(&ranks) || (ranks == 1 && inventory.peer_half > 0)
         || inventory.runtime.iter().any(|d| usize::from(d.gpu) >= ranks) {
         return Err(PlacementError::Inventory("V4.1 dSpark draft inventory"));
@@ -603,12 +606,7 @@ pub fn drafter(inventory: &DraftInventory, ranks: usize)
     if !cross.is_empty() {
         drafter.per_home = vec![MovableDemands { placement_gpu: home, demands: cross }];
     }
-    let mut startup = vec![Demand::new(home, Category::Drafter, "dSpark load staging", inventory.staging[0], Basis::Exact)];
-    if inventory.peer_half > 0 {
-        startup.push(Demand::new(0, Category::Drafter, "dSpark TP2 load staging", inventory.staging[1], Basis::Exact));
-    }
-    startup.retain(|d| d.bytes > 0);
-    Ok((drafter.movable(ranks)?, startup))
+    drafter.movable(ranks)
 }
 
 #[cfg(test)]
@@ -853,7 +851,7 @@ mod tests {
 
 
     #[test]
-    fn dspark_drafter_is_one_movable_at_the_head_with_its_peer_half_and_startup_staging() {
+    fn dspark_drafter_is_one_movable_at_the_head_with_its_peer_half() {
         let runtime = vec![Demand::new(0, Category::Drafter, "dSpark request lanes", 7 << 20, Basis::Formula),
             Demand::new(1, Category::Drafter, "dSpark request lanes", 900 << 20, Basis::Formula),
             Demand::new(1, Category::Drafter, "dSpark main context", 300 << 20, Basis::Formula),
@@ -861,7 +859,7 @@ mod tests {
         for peer_half in [0, 3 << 30] {
             let inventory = DraftInventory { resident: if peer_half > 0 { 4 << 30 } else { 7 << 30 }, runtime: runtime.clone(),
                 marks: 64 << 20, peer_half, staging: [512 << 20, if peer_half > 0 { 256 << 20 } else { 0 }] };
-            let (movable, startup) = drafter(&inventory, 2).unwrap();
+            let movable = drafter(&inventory, 2).unwrap();
             assert_eq!((movable.id, movable.allowed.clone(), movable.parts.len()), (MovableId::Drafter, vec![1], 0));
             assert_eq!(movable.conditional.len(), 1);
             let home = &movable.conditional[0];
@@ -869,12 +867,10 @@ mod tests {
             let on = |gpu| home.demands.iter().filter(|d| d.gpu == gpu).map(|d| d.bytes).sum::<u64>();
             assert_eq!(on(1), inventory.resident + (64 << 20) + (900 << 20) + (300 << 20) + (9 << 20));
             assert_eq!(on(0), (7 << 20) + peer_half);
-            assert_eq!(startup.len(), if peer_half > 0 { 2 } else { 1 });
-            // One GPU: everything is on GPU0, the head.
         }
         let one = DraftInventory { resident: 7 << 30, runtime: runtime.iter().filter(|d| d.gpu == 1)
             .cloned().map(|d| d.on(0)).collect(), marks: 0, peer_half: 0, staging: [1, 0] };
-        let (movable, _) = drafter(&one, 1).unwrap();
+        let movable = drafter(&one, 1).unwrap();
         assert_eq!(movable.allowed, [0]);
         assert!(movable.conditional[0].demands.iter().all(|d| d.gpu == 0));
         assert!(drafter(&DraftInventory { peer_half: 1, ..one.clone() }, 1).is_err());
@@ -889,12 +885,11 @@ mod tests {
         let cost = ExpertCost { whole: Bytes2 { resident: 200 << 20, staging: 32 << 20 },
             half: [Bytes2 { resident: 100 << 20, staging: 16 << 20 }; 2], tp2: true, spark_ok: true };
         let base = request(inventory, pool, vec![1 << 20; 2], vec![cost; 40], 64 << 20, Onboard::Layers(4));
-        let (movable, startup) = drafter(&DraftInventory { resident: 6 << 30,
+        let movable = drafter(&DraftInventory { resident: 6 << 30,
             runtime: vec![Demand::new(1, Category::Drafter, "dSpark request lanes", 1 << 30, Basis::Formula)],
             marks: 0, peer_half: 2 << 30, staging: [1 << 30, 1 << 29] }, 2).unwrap();
         let mut with = base.clone();
         with.movables = vec![movable];
-        with.startup = startup;
         let (a, b) = (solve(&base).unwrap(), solve(&with).unwrap());
         assert_eq!(draft::home(&b), Some(1));
         let units = |p: &Placement| p.pool_tokens / 512;
