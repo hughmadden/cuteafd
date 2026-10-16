@@ -60,7 +60,7 @@ const WORD_MASK: u32 = 0xfff;
 
 /// Validated native Spark `TP×EP` topology.
 ///
-/// Pure TP accepts every degree in 1..=8; replicated groups retain the
+/// Pure TP accepts every degree in 1..=6; replicated groups retain the
 /// qualified `TP2EP2`, `TP3EP2` and `TP2EP3` layouts. `TP×EP` is the physical
 /// rank count, with no dummy ranks. Package/fit admission is a separate gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,10 +185,10 @@ impl SparkTopology {
             (1, 1) => Ok(33),
             // New pure-TP worlds reserve eight IDs each, above every legacy
             // namespace. Existing workers retain their exact executor identity.
-            (tp @ 1..=8, 1) => Ok(64 + 8 * u64::from(tp)),
+            (5, 1) => Ok(104),
             (tp, ep) => bail!(
                 "unsupported native Spark TP×EP topology TP{tp}EP{ep}: \
-                 supported are TP1..TP8 with EP1, TP2EP2, TP3EP2 and TP2EP3"
+                 supported are TP1..TP6 with EP1, TP2EP2, TP3EP2 and TP2EP3"
             ),
         }
     }
@@ -370,16 +370,15 @@ mod tests {
     ];
 
     #[test]
-    fn pure_tp_one_through_eight_have_disjoint_executor_namespaces() -> Result<()> {
+    fn pure_tp_one_through_six_have_disjoint_executor_namespaces() -> Result<()> {
         let mut ids = BTreeSet::new();
-        for world in 1..=8 {
+        for world in 1..=6 {
             let topology = SparkTopology::new(world, 1)?;
             assert_eq!(topology.world_size(), usize::from(world));
             for rank in 0..topology.world_size() {
                 let id = topology.executor_id(rank)?;
                 assert!(ids.insert(id), "executor namespace overlaps at {id}");
                 assert_eq!(topology.rank_of_executor(id), Some(rank));
-                assert_eq!(crate::expert::v41_spark_executor_id(usize::from(world), rank)?, id);
             }
             assert!(topology.executor_id(topology.world_size()).is_err());
         }
@@ -387,7 +386,7 @@ mod tests {
                          SparkTopology::NATIVE_TP2_EP3] {
             for id in topology.executor_ids() { assert!(ids.insert(id)); }
         }
-        assert!(SparkTopology::new(9, 1).is_err());
+        for tp in [7, 8, 9] { assert!(SparkTopology::new(tp, 1).is_err()); }
         Ok(())
     }
 
@@ -838,8 +837,8 @@ mod tests {
     }
 
     #[test]
-    fn pure_tp_one_through_eight_rejects_stale_and_foreign_responses() -> Result<()> {
-        for world in 1..=8 {
+    fn pure_tp_one_through_six_rejects_stale_and_foreign_responses() -> Result<()> {
+        for world in 1..=6 {
             let topology = SparkTopology::new(world, 1)?;
             let owners = owners_for(topology);
             let request = native_request(2, topology, &owners)?;
@@ -851,7 +850,7 @@ mod tests {
             let mut stale = native.response(executors[0], &payload)?.to_owned()?;
             stale.header.request_id += 1;
             assert!(receiver.push(&stale.encode()?, |_, _, _| panic!("stale response")).is_err());
-            for other_world in (1..=8).filter(|other| *other != world) {
+            for other_world in (1..=6).filter(|other| *other != world) {
                 let foreign_id = SparkTopology::new(other_world, 1)?.executor_id(0)?;
                 let response = native.response(foreign_id, &payload)?.to_owned()?.encode()?;
                 assert!(receiver.push(&response, |_, _, _| panic!("foreign topology")).is_err());
@@ -1021,47 +1020,45 @@ mod tests {
         for topology in ALL {
             let world = topology.world_size();
             let mut client =
-                SparkExperts::new_topology(topology, &peers[..world], 80, config.clone())?;
+                SparkExperts::new_world(crate::expert::SparkWorld::owned(topology)?, &peers[..world], 80, config.clone())?;
             assert_eq!(client.world_size(), world);
-            assert_eq!(client.topology(), Some(topology));
+            assert_eq!(client.ownership_topology(), Some(topology));
             assert_eq!(client.capacity(), 80);
             client.reset_connections();
         }
-        let one = SparkExperts::new_ranks(&peers[..1], &[33], 80, config.clone())?;
+        let one = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers[..1].len())?, &peers[..1], 80, config.clone())?;
         assert_eq!(one.world_size(), 1);
-        assert_eq!(one.topology(), None);
-        let three = SparkExperts::new_ranks(&peers[..3], &[7, 8, 9], 80, config.clone())?;
+        assert_eq!(one.ownership_topology(), None);
+        let three = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers[..3].len())?, &peers[..3], 80, config.clone())?;
         assert_eq!(three.world_size(), 3);
-        assert_eq!(three.topology(), None);
+        assert_eq!(three.ownership_topology(), None);
 
-        for world in 1..=8 {
+        for world in 1..=6 {
             let topology = SparkTopology::new(world as u8, 1)?;
-            let client = SparkExperts::new_topology(topology, &peers[..world], 80, config.clone())?;
-            assert_eq!(client.world_size(), world);
-            let legacy = SparkExperts::new_ranks(&peers[..world], &topology.executor_ids(), 80, config.clone())?;
-            assert_eq!(legacy.world_size(), world);
+            if !matches!(world, 1 | 5) {
+                let client = SparkExperts::new_world(crate::expert::SparkWorld::owned(topology)?, &peers[..world], 80, config.clone())?;
+                assert_eq!(client.world_size(), world);
+            }
+            let canonical = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers[..world].len())?, &peers[..world], 80, config.clone())?;
+            assert_eq!(canonical.world_size(), world);
         }
         // Unsupported world sizes, mismatched topology peers, duplicates.
-        assert!(SparkExperts::new_ranks(&peers, &[1, 2, 3, 4, 5, 6, 7, 8, 9], 80, config.clone()).is_err());
-        assert!(SparkExperts::new_ranks(&peers[..2], &[1, 2, 3], 80, config.clone()).is_err());
-        assert!(SparkExperts::new_topology(
-            SparkTopology::NATIVE_TP3_EP2,
+        assert!(crate::expert::SparkWorld::canonical(9).is_err());
+        assert!(SparkExperts::new_world(crate::expert::SparkWorld::canonical(3)?, &peers[..2], 80, config.clone()).is_err());
+        assert!(SparkExperts::new_world(crate::expert::SparkWorld::owned(SparkTopology::NATIVE_TP3_EP2)?,
             &peers[..4],
             80,
             config.clone()
         )
         .is_err());
-        assert!(SparkExperts::new_topology(
-            SparkTopology::NATIVE_TP2_EP2,
+        assert!(SparkExperts::new_world(crate::expert::SparkWorld::owned(SparkTopology::NATIVE_TP2_EP2)?,
             &peers[..3],
             80,
             config.clone()
         )
         .is_err());
-        assert!(SparkExperts::new_ranks(&[peers[0]; 3], &[7, 8, 9], 80, config.clone()).is_err());
-        assert!(SparkExperts::new_ranks(&peers[..3], &[7, 7, 9], 80, config.clone()).is_err());
-        assert!(SparkExperts::new_ranks(&peers[..3], &[7, 0, 9], 80, config.clone()).is_err());
-        assert!(SparkExperts::new_ranks(&peers[..6], &[7, 8, 9, 10, 11, 12], 0, config).is_err());
+        assert!(SparkExperts::new_world(crate::expert::SparkWorld::canonical([peers[0]; 3].len())?, &[peers[0]; 3], 80, config.clone()).is_err());
+        assert!(SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers[..6].len())?, &peers[..6], 0, config).is_err());
         Ok(())
     }
 
@@ -1176,16 +1173,18 @@ mod tests {
         let flagged = native_request(2, topology, &owners_for(topology))?;
         let canonical = request(2);
 
-        // Legacy (topology-free) transports reject ownership before any I/O.
-        let mut legacy_roce = SparkExperts::new_ranks(&peers, &[1, 2, 3, 4], 80, config.clone())?;
-        assert!(legacy_roce.dispatch(&flagged).await.is_err());
-        let mut legacy_tcp = V41Tp4Tcp::new_ranks(&peers, &[1, 2, 3, 4], 80, config.clone())?;
-        assert!(legacy_tcp.dispatch(&flagged).await.is_err());
+        // Canonical worlds reject ownership before any I/O.
+        let mut canonical_roce = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 80, config.clone())?;
+        assert!(canonical_roce.dispatch(&flagged).await.is_err());
+        assert!(canonical_roce.post_written(&flagged).is_err());
+        let mut canonical_tcp = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 80, config.clone())?;
+        assert!(canonical_tcp.dispatch(&flagged).await.is_err());
 
         // Topology-bound transports require the flag; no silent canonical fallback.
-        let mut bound_roce = SparkExperts::new_topology(topology, &peers, 80, config.clone())?;
+        let mut bound_roce = SparkExperts::new_world(crate::expert::SparkWorld::owned(topology)?, &peers, 80, config.clone())?;
         assert!(bound_roce.dispatch(&canonical).await.is_err());
-        let mut bound_tcp = V41Tp4Tcp::new_topology(topology, &peers, 80, config.clone())?;
+        assert!(bound_roce.post_written(&canonical).is_err());
+        let mut bound_tcp = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers, 80, config.clone())?;
         assert!(bound_tcp.dispatch(&canonical).await.is_err());
         Ok(())
     }

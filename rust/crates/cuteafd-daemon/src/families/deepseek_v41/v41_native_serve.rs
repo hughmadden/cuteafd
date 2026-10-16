@@ -205,30 +205,11 @@ fn spark_transport(
     peers: &[std::net::SocketAddr],
     capacity: u32,
     timing: bool,
-    topology: Option<cuteafd_transport::expert::SparkTopology>,
+    world: cuteafd_transport::expert::SparkWorld,
 ) -> Result<SparkExperts> {
     let config = TcpTransportConfig { timing, timeout: Duration::from_secs(120), max_frame_bytes: 64 * 1024 * 1024 };
-    if let Some(topology) = topology {
-        // Topology-bound transport: canonical executor ids come from the shared
-        // topology and requests must carry the native ownership contract.
-        return SparkExperts::new_topology(topology, peers, capacity, config);
-    }
-    match peers.len() {
-        2 => SparkExperts::new_tp2(peers.try_into().expect("two peers"), [
-            cuteafd_transport::expert::v41_spark_executor_id(2, 0)?,
-            cuteafd_transport::expert::v41_spark_executor_id(2, 1)?,
-        ], capacity, config),
-        4 => SparkExperts::new(peers.try_into().expect("four peers"), [1, 2, 3, 4], capacity, config),
-        6 => {
-            let ids = (0..6).map(|rank| cuteafd_transport::expert::v41_spark_executor_id(6, rank))
-                .collect::<Result<Vec<_>>>()?;
-            SparkExperts::new_ranks(peers, &ids, capacity, config)
-        }
-        _ => anyhow::bail!(
-            "the non-topology transport takes two, four or six Spark peers; \
-             replicated layouts must pass --spark-tp/--spark-ep"
-        ),
-    }
+    SparkExperts::new_world(world,
+        peers, capacity, config)
 }
 
 fn worker(
@@ -291,22 +272,11 @@ fn worker(
     // before expert allocation or readiness publication.
     let topology = crate::shared::spark_topology::for_checkpoint(
         topology, args.peers.len(), catalog.exl3().is_some());
-    crate::shared::spark_topology::require_supported(topology, &catalog)?;
-    if let Some(topology) = topology {
-        // Fail before any CUDA allocation or readiness publication when the
-        // library cannot reduce this physical-rank count.
-        lib.v41_compact_reducer()?
-            .require_rank_count(topology.world_size() as u32)?;
-    } else if matches!(args.peers.len(), 3 | 6) {
-        // Implicit EXL3 groups use the N-plane reducer too; reject missing
-        // artifacts before weights are loaded. TP2 keeps its pairwise path.
-        lib.v41_compact_reducer()?.require_rank_count(args.peers.len() as u32)?;
-    }
-    ensure!(
-        args.peers.len() == 4 || topology.is_some() || catalog.exl3().is_some(),
-        "an implicit two- or three-peer Spark group requires an EXL3 checkpoint; \
-         a native three-rank group must pass --spark-tp 3 --spark-ep 1"
-    );
+    let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
+    crate::shared::spark_topology::require_world(spark_world, &catalog)?;
+    // Check reduction support before CUDA allocation or readiness publication.
+    lib.v41_compact_reducer()?
+        .require_rank_count(spark_world.topology().world_size() as u32)?;
     let local_exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
         &args.native_lib, catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]), "rtx-tp1");
     let mut exl3_modules = None;
@@ -424,7 +394,7 @@ fn worker(
     // Every replicated layout reserves its exact physical rank plane count; the
     // legacy 4-rank forecast is no longer reused for six ranks.
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, args.peers.len())?;
-    let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
+    let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
@@ -442,7 +412,7 @@ fn worker(
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-pass");
     admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?;
-    let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
+    let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world)?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
@@ -512,7 +482,7 @@ fn worker(
         "shared V4.1 cache and expert admission");
     let local_layers = pool.placement.onboard_layers;
     let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
-        && topology.is_none()
+        && spark_world.supports_device_exchange()
         && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40;
     let spark_admission = admission::start_sparks(&args, &catalog, local_layers, capacity, aot_capacity,
         topology, usize::from(device_exchange))?;

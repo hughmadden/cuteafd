@@ -125,7 +125,7 @@ impl V41Tp4ChunkReceiver {
     ) -> Result<Self> {
         Self::new_ranks(request, &executors, max_frame_bytes)
     }
-    /// Generic constructor for the validated physical rank counts 1..=8.
+    /// Generic constructor for the validated physical rank counts 1..=6.
     ///
     /// A request admitted under the native replicated-group contract must match
     /// its topology's world size.
@@ -135,8 +135,8 @@ impl V41Tp4ChunkReceiver {
         max_frame_bytes: usize,
     ) -> Result<Self> {
         ensure!(
-            (1..=8).contains(&executors.len()),
-            "native TP/EP requires 1..=8 executors"
+            (1..=6).contains(&executors.len()),
+            "native TP/EP requires 1..=6 executors"
         );
         if let Some(topology) = request.native_topology() {
             ensure!(

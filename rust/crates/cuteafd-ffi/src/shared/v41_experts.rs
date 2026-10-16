@@ -226,11 +226,11 @@ pub fn v41_pack_intermediate_supported(intermediate: u32) -> bool {
     intermediate > 0 && intermediate % 32 == 0 && intermediate <= 8192
 }
 
-/// Physical-rank counts the compact reduction contract defines: one through eight. Library-independent; use
+/// Physical-rank counts the compact reduction contract defines: one through six. Library-independent; use
 /// [`V41CompactReducer::supports_rank_count`] for what the loaded library can
 /// actually execute.
 pub fn v41_rank_count_supported(ranks: u32) -> bool {
-    (1..=8).contains(&ranks)
+    (1..=6).contains(&ranks)
 }
 
 /// Expected `(experts, logical, kernel, topk)` for one `(family, role)` pair
@@ -343,7 +343,7 @@ impl V41CompactReducer<'_> {
     /// Whether the loaded library can reduce `ranks` physical-rank BF16 planes.
     ///
     /// 4 is always available (the 4-plane entry point is required to construct
-    /// this handle); 2 depends on the optional TP2 entry point and 1/3/5/6/7/8 depend on
+    /// this handle); 2 depends on the optional TP2 entry point and 1/3/5/6 depend on
     /// the optional N-plane entry point. Check this during admission, before any
     /// allocation or readiness publication, so an older library fails fast
     /// instead of at the first reduction. Any other value is unsupported.
@@ -351,7 +351,7 @@ impl V41CompactReducer<'_> {
         match ranks {
             2 => self.reduce_planes.is_some() || self.reduce_tp2.is_some(),
             4 => true,
-            1 | 3 | 5 | 6 | 7 | 8 => self.reduce_planes.is_some(),
+            1 | 3 | 5 | 6 => self.reduce_planes.is_some(),
             _ => false,
         }
     }
@@ -361,7 +361,7 @@ impl V41CompactReducer<'_> {
     pub fn require_rank_count(&self, ranks: u32) -> Result<()> {
         ensure!(
             v41_rank_count_supported(ranks),
-            "unsupported physical rank count {ranks}; expected 1 through 8"
+            "unsupported physical rank count {ranks}; expected 1 through 6"
         );
         ensure!(
             self.supports_rank_count(ranks),
@@ -373,7 +373,7 @@ impl V41CompactReducer<'_> {
     /// Shared Spark intake always uses the N-plane ABI, even at two/four ranks.
     /// Reject a legacy-only library before allocating its landing planes.
     pub fn require_plane_reduction(&self, ranks: u32) -> Result<()> {
-        ensure!(v41_rank_count_supported(ranks), "unsupported physical rank count {ranks}; expected 1 through 8");
+        ensure!(v41_rank_count_supported(ranks), "unsupported physical rank count {ranks}; expected 1 through 6");
         ensure!(self.reduce_planes.is_some(), "native N-plane compact BF16 reduction unavailable; rebuild the native library");
         Ok(())
     }
@@ -381,7 +381,7 @@ impl V41CompactReducer<'_> {
     /// The physical-rank counts this loaded library can reduce, in ascending
     /// order. Useful for startup logging and fallback rejection.
     pub fn available_rank_counts(&self) -> Vec<u32> {
-        (1u32..=8)
+        (1u32..=6)
             .into_iter()
             .filter(|ranks| self.supports_rank_count(*ranks))
             .collect()
@@ -491,7 +491,7 @@ impl V41CompactReducer<'_> {
     /// `planes[0..ranks]` must be live non-null CUDA BF16 [rows,5120] views on the
     /// current device; `planes[ranks..N]` must be null. Output must not overlap any
     /// plane and may alias `shared` only exactly. 1 <= rows <= 4096 and ranks is
-    /// in 1..=8. Storage and this library must outlive stream completion and
+    /// in 1..=6. Storage and this library must outlive stream completion and
     /// every captured graph replay, with producer writes ordered first. The eight
     /// pointers travel to the kernel by value; no device pointer array is used.
     pub unsafe fn reduce_planes<const N: usize>(
@@ -504,8 +504,8 @@ impl V41CompactReducer<'_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            (1..=8).contains(&ranks),
-            "N-plane reduction requires ranks 1 through 8"
+            (1..=6).contains(&ranks),
+            "N-plane reduction requires ranks 1 through 6"
         );
         let function = self
             .reduce_planes
@@ -1121,11 +1121,11 @@ mod tests {
     }
 
     #[test]
-    fn rank_count_contract_is_one_through_eight() {
-        for ranks in 1u32..=8 {
+    fn rank_count_contract_is_one_through_six() {
+        for ranks in 1u32..=6 {
             assert!(v41_rank_count_supported(ranks));
         }
-        for ranks in [0u32, 9, 12] {
+        for ranks in [0u32, 7, 8, 9, 12] {
             assert!(!v41_rank_count_supported(ranks));
         }
     }
@@ -1153,7 +1153,7 @@ mod tests {
         assert!(reducer.require_plane_reduction(9).is_err());
         // The current build must expose every count through the eight-slot path.
         assert!(
-            (1..=8).all(|ranks| reducer.supports_rank_count(ranks)),
+            (1..=6).all(|ranks| reducer.supports_rank_count(ranks)),
             "current library is missing the N-plane compact reducer"
         );
         let legacy = V41CompactReducer { reduce_planes: None, ..reducer };

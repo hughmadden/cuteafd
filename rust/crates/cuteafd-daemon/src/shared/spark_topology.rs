@@ -6,13 +6,13 @@
 //! worker shard selection and coordinator assembly cannot drift apart.
 use anyhow::{ensure, Result};
 use cuteafd_loader::OfficialV41Catalog;
-use cuteafd_transport::expert::SparkTopology;
+use cuteafd_transport::expert::{SparkTopology, SparkWorld};
 
 /// Resolve the opt-in `--spark-tp N --spark-ep M` pair for a command that knows
 /// how many physical Spark ranks were launched.
 ///
-/// Both keys are all-or-none: absent means the legacy topology for the rank
-/// count, present means the explicit replicated-group contract. `world` is the
+/// Both keys are all-or-none: absent selects canonical wire for the pure-TP rank
+/// count, present selects the ownership-aware replicated-group contract. `world` is the
 /// physical rank count (coordinator peers / worker `--world`), and it must equal
 /// `TP * EP` exactly.
 pub(crate) fn resolve(
@@ -48,41 +48,53 @@ pub(crate) fn for_checkpoint(
     topology.or_else(|| (v41_exl3 && world == 3).then_some(SparkTopology::NATIVE_TP3_EP1))
 }
 
-/// Replicated groups require native experts. NVFP4 supports pure TP3/TP4/TP6;
-/// compact EXL3 supports TP3EP1 with its compressed shards and FP8 input intact.
-/// Reject unsupported formats before allocation or readiness publication.
+/// Resolve the declared wire independently from the physical TP/EP layout.
+/// Omitted CLI keys choose canonical pure TP, except the compact V4.1 TP3
+/// ownership protocol. No transport derives rank identities from a fallback.
+pub(crate) fn world(topology: Option<SparkTopology>, ranks: usize) -> Result<SparkWorld> {
+    let world = match topology {
+        Some(topology) => SparkWorld::owned(topology)?,
+        None => SparkWorld::canonical(ranks)?,
+    };
+    ensure!(world.topology().world_size() == ranks,
+        "Spark world differs from the declared physical rank count");
+    Ok(world)
+}
+
+/// Check package qualification before admitting any retained world. The native
+/// ownership wire requires native experts; generic programs keep canonical routes.
 pub(crate) fn require_supported(
     topology: Option<SparkTopology>,
     catalog: &OfficialV41Catalog,
 ) -> Result<()> {
-    let Some(topology) = topology else {
-        return Ok(());
-    };
-    ensure!(
-        if catalog.exl3().is_some() {
+    if let Some(topology) = topology {
+        ensure!(catalog.fp8().is_none(),
+            "generic expert programs require canonical Spark wire");
+        ensure!(if catalog.exl3().is_some() {
             topology == SparkTopology::NATIVE_TP3_EP1
                 && catalog.routed_experts().geometry()?.family() == Some("v41")
         } else {
             catalog.nvfp4().is_none()
                 || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))
-        },
-        "SPARK_TP/SPARK_EP {}x{} requires native experts, pure NVFP4 TP3/TP4/TP6, \
-         or compact EXL3 TP3EP1",
-        topology.tp(),
-        topology.ep()
-    );
+        }, "unsupported Spark ownership wire for this checkpoint");
+        SparkWorld::owned(topology)?;
+    }
     Ok(())
 }
 
-/// The group this physical rank belongs to, or `None` for the legacy topology.
-pub(crate) fn group_of(topology: Option<SparkTopology>, rank: usize) -> Result<Option<u8>> {
-    topology.map(|topology| topology.group(rank)).transpose()
-}
-
-/// The worker's tensor-parallel shard index inside its group, or `None` for the
-/// legacy topology.
-pub(crate) fn tp_rank_of(topology: Option<SparkTopology>, rank: usize) -> Result<Option<u8>> {
-    topology.map(|topology| topology.tp_rank(rank)).transpose()
+pub(crate) fn require_world(world: SparkWorld, catalog: &OfficialV41Catalog) -> Result<()> {
+    require_supported(world.ownership_topology(), catalog)?;
+    let family = catalog.routed_experts().geometry()?.family();
+    if world.ownership_topology().is_none() && catalog.exl3().is_none() && catalog.fp8().is_none() {
+        ensure!(world.topology().tp() == 4
+            || (family == Some("dsv4f") && world.topology().tp() == 2),
+            "native Spark experts outside TP4 require ownership wire (except V4 Flash TP2)");
+    }
+    let tp = world.topology().tp() as usize;
+    let headers = cuteafd_loader::plan::files::open_role(catalog.snapshot(),
+        cuteafd_loader::plan::files::ReadRole::Spark { rank: 0, world: tp })?;
+    cuteafd_loader::plan::experts::checkpoint_spark_recipe(&headers, tp)?;
+    Ok(())
 }
 
 /// Roles published by the native Spark shard families, for callers that need
@@ -102,15 +114,64 @@ pub(crate) const SPARK_TP6_ROLE: u32 = 7;
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_world_requires_owned_wire_outside_tp4() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        require_world(SparkWorld::canonical(4)?, &catalog)?;
+        require_world(SparkWorld::owned(SparkTopology::NATIVE_TP3_EP1)?, &catalog)?;
+        let error = require_world(SparkWorld::canonical(3)?, &catalog).unwrap_err();
+        assert!(error.to_string().contains("native Spark experts outside TP4 require ownership wire"));
+        Ok(())
+    }
+
+    #[test]
+    fn generic_programs_refuse_ownership_wire() -> Result<()> {
+        use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, write_snapshot};
+        let root = tempfile::tempdir()?;
+        write_snapshot(root.path(), &mimo_flash_config(), &mimo_flash_tensors(), None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let error = require_world(SparkWorld::owned(SparkTopology::NATIVE_TP4_EP1)?, &catalog)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "generic expert programs require canonical Spark wire");
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_recipe_refuses_unqualified_generic_world() -> Result<()> {
+        use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(3, 4);
+        write_snapshot(root.path(), &qwen4_config(3), &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        require_world(SparkWorld::canonical(1)?, &catalog)?;
+        require_world(SparkWorld::canonical(3)?, &catalog)?;
+        let error = require_world(SparkWorld::canonical(5)?, &catalog).unwrap_err();
+        assert!(error.downcast_ref::<cuteafd_loader::plan::experts::SparkRecipeRefusal>().is_some(),
+            "{error:#}");
+        Ok(())
+    }
+
     fn topology(tp: u8, ep: u8) -> SparkTopology {
         SparkTopology::new(tp, ep).unwrap()
     }
 
     #[test]
-    fn absent_keys_keep_the_legacy_topology() {
+    fn absent_keys_select_canonical_wire() {
         assert_eq!(resolve(None, None, 4, "serve-native").unwrap(), None);
-        // The world count is irrelevant to the legacy path.
+        // Physical topology is declared when the wire selection becomes a world.
         assert_eq!(resolve(None, None, 2, "expertd-native").unwrap(), None);
+    }
+
+    #[test]
+    fn world_resolution_binds_count_and_retains_canonical_device_tp4() {
+        let canonical = world(None, 4).unwrap();
+        assert!(canonical.supports_device_exchange());
+        assert_eq!(canonical.topology(), SparkTopology::NATIVE_TP4_EP1);
+        assert!(!world(Some(SparkTopology::NATIVE_TP4_EP1), 4).unwrap().supports_device_exchange());
+        assert!(world(Some(SparkTopology::NATIVE_TP3_EP1), 4).is_err());
+        for count in [0, 7, 8] { assert!(world(None, count).is_err()); }
     }
 
     #[test]
@@ -136,7 +197,7 @@ mod tests {
 
     #[test]
     fn approved_layouts_require_their_exact_rank_count() {
-        for (tp, ep) in [(1u8, 1u8), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (2, 2), (3, 2), (2, 3)] {
+        for (tp, ep) in [(1u8, 1u8), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (2, 2), (3, 2), (2, 3)] {
             let expected = topology(tp, ep);
             let resolved = resolve(Some(tp), Some(ep), expected.world_size(), "serve-native")
                 .unwrap()
@@ -149,7 +210,7 @@ mod tests {
 
     #[test]
     fn unapproved_layouts_and_ranges_are_rejected() {
-        for (tp, ep) in [(9u8, 1u8), (2, 4), (4, 2), (3, 3), (0, 1), (6, 2), (6, 3)] {
+        for (tp, ep) in [(7u8, 1u8), (8, 1), (9, 1), (2, 4), (4, 2), (3, 3), (0, 1), (6, 2), (6, 3)] {
             let world = tp as usize * ep as usize;
             assert!(resolve(Some(tp), Some(ep), world, "serve-native").is_err(), "{tp}x{ep}");
         }
@@ -164,27 +225,16 @@ mod tests {
         assert_eq!(resolved.ep(), 1);
         assert_eq!(resolved.group_count(), 1);
         for rank in 0..6 {
-            assert_eq!(group_of(Some(resolved), rank).unwrap(), Some(0));
-            assert_eq!(tp_rank_of(Some(resolved), rank).unwrap(), Some(rank as u8));
+            assert_eq!(resolved.group(rank).unwrap(), 0);
+            assert_eq!(resolved.tp_rank(rank).unwrap(), rank as u8);
             assert_eq!(resolved.executor_id(rank).unwrap(), 27 + rank as u64);
         }
-        assert!(group_of(Some(resolved), 6).is_err());
-        // The implicit six-rank EXL3 group shares the TP6EP1 namespace.
+        assert!(resolved.group(6).is_err());
+        // The canonical six-rank group shares the TP6EP1 namespace.
         for rank in 0..6 {
-            assert_eq!(cuteafd_transport::expert::v41_spark_executor_id(6, rank).unwrap(),
+            assert_eq!(cuteafd_transport::expert::SparkWorld::canonical(6).unwrap().topology().executor_id(rank).unwrap(),
                 resolved.executor_id(rank).unwrap());
         }
     }
 
-    #[test]
-    fn rank_helpers_use_the_shared_topology_mapping() {
-        let topology = topology(2, 3);
-        for rank in 0..6 {
-            assert_eq!(group_of(Some(topology), rank).unwrap(), Some((rank / 2) as u8));
-            assert_eq!(tp_rank_of(Some(topology), rank).unwrap(), Some((rank % 2) as u8));
-        }
-        assert!(group_of(Some(topology), 6).is_err());
-        assert_eq!(group_of(None, 99).unwrap(), None);
-        assert_eq!(tp_rank_of(None, 99).unwrap(), None);
-    }
 }

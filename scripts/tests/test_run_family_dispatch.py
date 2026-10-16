@@ -643,7 +643,8 @@ report.update(spark_ranks=ranks)
 gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
-    topology=dict(tp=tp, ep=ep, explicit=explicit), peers=peers,
+    topology=dict(tp=tp, ep=ep, explicit=explicit,
+                  wire="native_ownership" if explicit else "canonical"), peers=peers,
     speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
@@ -1016,7 +1017,7 @@ def test_explicit_pool_hosts_reject_invalid_selection(tmp_path: Path, hosts: str
     assert "cuteafd serve-qwen4" not in result.stderr
 
 
-@pytest.mark.parametrize("count", [1, 5, 7, 8])
+@pytest.mark.parametrize("count", [1, 5])
 def test_explicit_custom_hosts_use_configured_rails_in_csv_order(count):
     hosts = [f"spark-{rank}.example" for rank in range(count)]
     script = ['set -eu', 'source "$1"']
@@ -1031,6 +1032,17 @@ def test_explicit_custom_hosts_use_configured_rails_in_csv_order(count):
     assert result.stdout.splitlines() == [
         f"{rank} {host} 192.0.2.{count - rank} 198.51.100.{count - rank}"
         for rank, host in enumerate(reversed(hosts))]
+
+
+@pytest.mark.parametrize("count", [7, 8])
+def test_custom_hosts_reject_deleted_worlds(count):
+    hosts = ",".join(f"spark-{rank}.example" for rank in range(count))
+    result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows "$2" "$3"',
+                             "test", str(ROOT / "scripts/lib/release-common.sh"), hosts, str(count)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2
+    assert f"SPARK_HOSTS must name exactly SPARK_COUNT={count} hosts" in result.stderr
+    assert not result.stdout
 
 
 @pytest.mark.parametrize("host,lane_a,message", [

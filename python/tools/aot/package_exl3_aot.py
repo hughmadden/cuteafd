@@ -480,8 +480,8 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
         return profiles
     profiles = []
     # Every transport count with at least one whole rotation block per rank.
-    # Qwen's five H128 blocks intentionally exclude TP6/7/8.
-    worlds = range(1, min(8, blocks) + 1)
+    # Qwen's five H128 blocks intentionally exclude TP6.
+    worlds = range(1, min(6, blocks) + 1)
     for world in worlds:
         widths: dict[int, list[str]] = {}
         for rank in range(world):
@@ -849,7 +849,7 @@ def main() -> None:
     create.add_argument('--geometry', choices=sorted(GEOMETRIES), default='v41',
                         help='Routed-expert geometry (cuteafd_core::ExpertGeometry::family)')
     create.add_argument('--all-spark-counts', action='store_true',
-                        help='Opt in to all nonempty H128 Spark TP profiles (1..8)')
+                        help='Opt in to all nonempty H128 Spark TP profiles (1..6)')
     create.add_argument('--profile', action='append', default=[],
                         help='Build only these profiles (repeatable), for bring-up; '
                              'without selection the legacy role profiles remain the default')

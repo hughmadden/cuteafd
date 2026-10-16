@@ -13,7 +13,7 @@ use tokio::{
 };
 
 const FRAME: usize = 200_000;
-const EXECUTORS: [u64; 4] = [11, 12, 13, 14];
+const EXECUTORS: [u64; 4] = [1, 2, 3, 4];
 async fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut frame = vec![0; EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN];
     stream.read_exact(&mut frame).await?;
@@ -74,7 +74,7 @@ async fn native_tcp_dispatch_finishes_before_responses_and_reuses_connections() 
             Ok::<_, anyhow::Error>(())
         }));
     }
-    let mut transport = V41Tp4Tcp::new(peers.try_into().unwrap(), EXECUTORS, 2, config())?;
+    let mut transport = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 2, config())?;
     for cycle in 0..2 {
         let mut req = request(2);
         req.header.request_id += cycle as u64;
@@ -136,7 +136,7 @@ async fn native_tcp_dropped_dispatch_closes_unread_responses_and_reconnects() ->
             Ok::<_, anyhow::Error>(())
         }));
     }
-    let mut transport = V41Tp4Tcp::new(peers.try_into().unwrap(), EXECUTORS, 2, config())?;
+    let mut transport = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 2, config())?;
     let first = request(1);
     let pending = transport.dispatch(&first).await?;
     for _ in 0..4 {
@@ -201,7 +201,7 @@ async fn native_tcp_cancelled_receive_discards_partial_wave() -> Result<()> {
             Ok::<_, anyhow::Error>(())
         }));
     }
-    let mut transport = V41Tp4Tcp::new(peers.try_into().unwrap(), EXECUTORS, 2, config())?;
+    let mut transport = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 2, config())?;
     let first = request(2);
     let pending = transport.dispatch(&first).await?;
     for _ in 0..4 {
@@ -246,7 +246,7 @@ async fn native_tcp_cancelled_receive_discards_partial_wave() -> Result<()> {
 
 #[tokio::test]
 async fn implicit_tp1_round_trips_chunks_and_reuses_connection() -> Result<()> {
-    let executor = super::v41_spark_executor_id(1, 0)?;
+    let executor = super::SparkWorld::canonical(1)?.topology().executor_id(0)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let peer = listener.local_addr()?;
     let server = tokio::spawn(async move {
@@ -264,7 +264,7 @@ async fn implicit_tp1_round_trips_chunks_and_reuses_connection() -> Result<()> {
         }
         Ok::<_, anyhow::Error>(())
     });
-    let mut transport = V41Tp4Tcp::new_ranks(&[peer], &[executor], 2, config())?;
+    let mut transport = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical([peer].len())?, &[peer], 2, config())?;
     assert_eq!(transport.world_size(), 1);
     for cycle in 0..2 {
         let mut req = request(2);
@@ -296,36 +296,35 @@ fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
         SparkTopology::NATIVE_TP6_EP1,
     ] {
         let world = topology.world_size();
-        let client = V41Tp4Tcp::new_topology(topology, &peers[..world], 80, config())?;
+        let client = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers[..world], 80, config())?;
         assert_eq!(client.world_size(), world);
-        assert_eq!(client.topology(), Some(topology));
+        assert_eq!(client.ownership_topology(), Some(topology));
     }
-    for world in 1..=8 {
+    for world in 1..=6 {
         let topology = SparkTopology::new(world as u8, 1)?;
-        let client = V41Tp4Tcp::new_topology(topology, &peers[..world], 80, config())?;
-        assert_eq!(client.world_size(), world);
-        let legacy = V41Tp4Tcp::new_ranks(&peers[..world], &topology.executor_ids(), 80, config())?;
+        if !matches!(world, 1 | 5) {
+            let client = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers[..world], 80, config())?;
+            assert_eq!(client.world_size(), world);
+        }
+        let legacy = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers[..world].len())?, &peers[..world], 80, config())?;
         assert_eq!(legacy.world_size(), world);
     }
-    assert!(V41Tp4Tcp::new_ranks(&peers, &[1, 2, 3, 4, 5, 6, 7, 8, 9], 80, config()).is_err());
-    assert!(V41Tp4Tcp::new_ranks(&peers[..2], &[1, 2, 3], 80, config()).is_err());
-    assert!(V41Tp4Tcp::new_topology(
-        SparkTopology::NATIVE_TP3_EP2,
+        assert!(crate::expert::SparkWorld::canonical(9).is_err());
+        assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(3)?, &peers[..2], 80, config()).is_err());
+    assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(SparkTopology::NATIVE_TP3_EP2)?,
         &peers[..4],
         80,
         config()
     )
     .is_err());
-    assert!(V41Tp4Tcp::new_ranks(&[peers[0]; 3], &[7, 8, 9], 80, config()).is_err());
-    assert!(V41Tp4Tcp::new_ranks(&peers[..3], &[7, 7, 9], 80, config()).is_err());
-    assert!(V41Tp4Tcp::new_ranks(&peers[..3], &[7, 0, 9], 80, config()).is_err());
-    assert!(V41Tp4Tcp::new_ranks(&peers[..3], &[7, 8, 9], 0, config()).is_err());
+    assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical([peers[0]; 3].len())?, &[peers[0]; 3], 80, config()).is_err());
+    assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers[..3].len())?, &peers[..3], 0, config()).is_err());
     Ok(())
 }
 
 #[tokio::test]
-async fn pure_tp_one_through_eight_tcp_collects_every_rank() -> Result<()> {
-    for world in 1..=8 {
+async fn pure_tp_one_through_six_tcp_collects_every_rank() -> Result<()> {
+    for world in 1..=6 {
         let executors = SparkTopology::new(world as u8, 1)?.executor_ids();
         let mut peers = Vec::new();
         let mut servers = Vec::new();
@@ -346,7 +345,7 @@ async fn pure_tp_one_through_eight_tcp_collects_every_rank() -> Result<()> {
                 Ok::<_, anyhow::Error>(())
             }));
         }
-        let mut transport = V41Tp4Tcp::new_ranks(&peers, &executors, 2, config())?;
+        let mut transport = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 2, config())?;
         let mut received = vec![0; world];
         transport.execute(&request(2), |rank, row, bytes| {
             assert_eq!(row, received[rank]);
@@ -389,7 +388,7 @@ async fn six_rank_native_group_tcp_covers_every_group_and_rank() -> Result<()> {
         .map(|expert| (expert % topology.group_count() as usize) as u8)
         .collect();
     request.with_native_group_owners(&owners, topology)?;
-    let mut transport = V41Tp4Tcp::new_topology(topology, &peers, 2, config())?;
+    let mut transport = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers, 2, config())?;
     let mut chunks = 0;
     transport
         .execute(&request, |rank, row, bytes| {
@@ -440,7 +439,7 @@ async fn six_rank_pure_tp6_tcp_returns_six_distinct_rank_planes() -> Result<()> 
     let mut request = request(2);
     let owners = vec![0u8; V41_ROUTED_EXPERTS];
     request.with_native_group_owners(&owners, topology)?;
-    let mut transport = V41Tp4Tcp::new_topology(topology, &peers, 2, config())?;
+    let mut transport = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers, 2, config())?;
     let mut seen = std::collections::BTreeSet::new();
     transport
         .execute(&request, |rank, row, bytes| {

@@ -45,7 +45,7 @@ def test_generic_spark_profiles_cover_every_nonempty_whole_block_rank(geometry):
                     rank = int(destination.split("rank")[1])
                     assert rank not in ranks
                     ranks[rank] = width
-        if tp > intermediate // 128:
+        if tp > 6 or tp > intermediate // 128:
             assert not ranks
         else:
             assert sorted(ranks) == list(range(tp))

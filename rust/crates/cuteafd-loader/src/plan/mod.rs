@@ -293,14 +293,14 @@ impl Default for PlanOptions {
 
 impl PlanOptions {
     /// Rejects options that describe no deployment: Spark worlds the
-    /// transport does not run (it runs 1 through 8; 0 is the local-only
+    /// transport does not run (it runs 1 through 6; 0 is the local-only
     /// placement) and empty budgets.
     pub fn validate(&self) -> Result<(), PlanError> {
         if let ExpertPlacement::Sparks { ranks } = self.placement {
             if !experts::TRANSPORT_WORLDS.contains(&ranks) {
                 return Err(PlanError::InvalidOption {
                     option: "spark ranks",
-                    reason: format!("{ranks}: the expert transport runs 1 through 8 Spark ranks \
+                    reason: format!("{ranks}: the expert transport runs 1 through 6 Spark ranks \
                         (0 places every routed expert on the coordinator)"),
                 });
             }
@@ -862,7 +862,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             let i = intermediate?;
             // New generic counts require nonempty H128 ownership; a 16-row
             // NVFP4 fallback remains valid only for previously calibrated layouts.
-            if matches!(ranks, 1 | 5 | 7 | 8) && (i % 128 != 0 || i / 128 < ranks) {
+            if matches!(ranks, 1 | 5) && (i % 128 != 0 || i / 128 < ranks) {
                 return None;
             }
             experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
@@ -882,7 +882,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                     report.fits = false;
                     report.hints.push(Hint {
                         what: format!("geometry-invalid: {} intermediate {} cannot give each of {ranks} Spark ranks a nonempty whole-{} row slice",
-                            contract.package, intermediate.unwrap_or(0), if matches!(ranks, 1 | 5 | 7 | 8) { 128 } else { contract.block }),
+                            contract.package, intermediate.unwrap_or(0), if matches!(ranks, 1 | 5) { 128 } else { contract.block }),
                         how: format!("{advice}; adding a package cannot repair empty or unaligned expert slices."),
                     });
                 } else if !contract.spark_worlds.contains(&ranks) {

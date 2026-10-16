@@ -41,13 +41,7 @@ pub(crate) struct LocalTp4Client {
     flows: super::flows::FlowSlots,
 }
 impl LocalTp4Client {
-    pub(crate) fn new(peers: [SocketAddr; 4], config: TcpTransportConfig) -> Self {
-        Self::with_peers(peers.to_vec(), config)
-    }
-    pub(crate) fn new_tp2(peers: [SocketAddr; 2], config: TcpTransportConfig) -> Self {
-        Self::with_peers(peers.to_vec(), config)
-    }
-    /// Generic peer set for the validated physical rank counts 2, 3, 4 and 6.
+    /// Generic peer set for the declared physical rank counts 1 through 6.
     pub(crate) fn new_ranks(peers: Vec<SocketAddr>, config: TcpTransportConfig) -> Self {
         Self::with_peers(peers, config)
     }
@@ -568,7 +562,7 @@ mod tests {
     #[test]
     fn grouping_without_a_bootstrap_names_the_missing_session() -> Result<()> {
         let peers = ["127.0.0.1:19451".parse()?, "127.0.0.1:19452".parse()?];
-        let client = LocalTp4Client::new_tp2(peers, TcpTransportConfig::default());
+        let client = LocalTp4Client::new_ranks(peers.to_vec(), TcpTransportConfig::default());
         assert!(client.sessions.iter().all(Option::is_none));
         let error = format!("{:#}", client.installed_grouping().unwrap_err());
         assert!(error.contains("rank 0 has no live Spark session"), "{error}");
@@ -594,7 +588,7 @@ mod tests {
     #[test]
     fn tp2_reset_retains_only_two_actual_peer_slots() -> Result<()> {
         let peers = ["127.0.0.1:19441".parse()?, "127.0.0.1:19442".parse()?];
-        let mut client = LocalTp4Client::new_tp2(peers, TcpTransportConfig { timing: false,
+        let mut client = LocalTp4Client::new_ranks(peers.to_vec(), TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000,
         });
         let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();

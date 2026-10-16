@@ -555,14 +555,12 @@ pub(crate) fn with_engine<T>(
         }
         tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
             elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
-        // Implicit Spark worlds: TP4 executors 1..=4, TP2 5..=6, TP3 7..=9, TP6 27..=32.
-        let executors = (0..peers.len())
-            .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
-            .collect::<Result<Vec<u64>>>()?;
+        // Declare rank ownership once for every transport and device lane.
+        let spark_world = (!peers.is_empty()).then(|| cuteafd_transport::expert::SparkWorld::canonical(peers.len())).transpose()?;
         // One transport (connection set) per prefill lane, so each lane can keep
         // a Spark wave in flight; decode uses the first.
         let lanes = if skip { 0 } else { engine::PREFILL_LANES };
-        transports = (0..lanes).map(|_| SparkLink::new(&loaded.library, &peers, &executors, 4096,
+        transports = (0..lanes).map(|_| SparkLink::new(&loaded.library, spark_world.context("Spark transport needs a declared world")?, &peers, 4096,
             TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
             loaded.cfg.dim * 2))
             .collect::<Result<Vec<_>>>()?;
@@ -576,7 +574,7 @@ pub(crate) fn with_engine<T>(
         crate::shared::memory_report::release_load_staging(&loaded.library);
         let started = Instant::now();
         let identity = if skip { None } else { Some(cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
-            &loaded.snapshot, loaded.catalog.routed_experts().geometry()?, peers.len(), None)?) };
+            &loaded.snapshot, loaded.catalog.routed_experts().geometry()?, spark_world.context("worker identity needs a declared world")?)?) };
         let mut installed = None;
         for transport in &mut transports {
             engine.warm_transport(transport, &runtime)?;
@@ -592,7 +590,7 @@ pub(crate) fn with_engine<T>(
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         if device_exchange {
             let started = Instant::now();
-            engine.attach_device_link(&peers, &executors,
+            engine.attach_device_link(spark_world.context("device exchange needs a declared world")?, &peers,
                 TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
         }

@@ -551,12 +551,10 @@ impl Opened {
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(),
             active_drafts = ?engine.attention_plan.active_drafts(), "immutable attention reduction plan");
-        let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, Vec<u64>)> {
+        let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, cuteafd_transport::expert::SparkWorld)> {
             let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-            let executors: Vec<u64> = (0..peers.len())
-                .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
-                .collect::<Result<_>>()?;
-            Ok((peers, executors))
+            let world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
+            Ok((peers, world))
         };
         let config = cuteafd_transport::TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
@@ -584,8 +582,8 @@ impl Opened {
             Ok(request)
         };
         let mut transport = selected_peers.map(|peers| -> Result<SparkLink<'_>> {
-            let (peers, executors) = ranks(peers)?;
-            let mut link = SparkLink::new(&self.library, &peers, &executors, 4096, config.clone(), row_bytes)?;
+            let (peers, world) = ranks(peers)?;
+            let mut link = SparkLink::new(&self.library, world, &peers, 4096, config.clone(), row_bytes)?;
             // The bootstrap opens every rank before any wave does, so the
             // installed grouping is readable from here on. The warm-up below
             // then reuses these sessions.
@@ -595,8 +593,8 @@ impl Opened {
         // One transport thread per prefill lane (their waves fly beside each other's).
         let mut lanes = match selected_peers {
             Some(peers) => (0..prefill_lanes).filter(|_| prefill_lanes > 1).map(|_| {
-                let (peers, executors) = ranks(peers)?;
-                SparkLane::new(&self.library, peers, executors, 4096, config.clone(), row_bytes)
+                let (peers, world) = ranks(peers)?;
+                SparkLane::new(&self.library, world, peers, 4096, config.clone(), row_bytes)
             }).collect::<Result<Vec<_>>>()?,
             None => Vec::new(),
         };

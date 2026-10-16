@@ -320,7 +320,7 @@ impl<'a> SparkIntake<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize, row_bytes: usize)
         -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
-        ensure!((1..=MAX_INTAKE_RANKS).contains(&ranks), "{ranks} Spark ranks exceed the {MAX_INTAKE_RANKS} intake planes");
+        ensure!((1..=6).contains(&ranks), "{ranks} Spark ranks are outside the qualified one-through-six worlds");
         let plane_bytes = rows * row_bytes;
         let planes = (0..ranks).map(|_| DeviceAllocation::new(library, plane_bytes.max(256)))
             .collect::<Result<Vec<_>>>()?;
@@ -367,14 +367,12 @@ impl<'a> SparkIntake<'a> {
     ///
     /// # Safety
     /// As [`Self::attach`], for the lane's thread and waves.
-    pub(crate) unsafe fn spawn_lane(&self, peers: Vec<std::net::SocketAddr>, executors: Vec<u64>, capacity: u32,
-        config: cuteafd_transport::TcpTransportConfig, topology: Option<cuteafd_transport::expert::SparkTopology>) -> Result<SparkExpertLane> {
+    pub(crate) unsafe fn spawn_lane(&self, world: cuteafd_transport::expert::SparkWorld,
+        peers: Vec<std::net::SocketAddr>, capacity: u32,
+        config: cuteafd_transport::TcpTransportConfig) -> Result<SparkExpertLane> {
         ensure!(peers.len() == self.ranks, "intake ranks differ from the lane's");
         // SAFETY: forwarded from this function's contract.
-        match topology {
-            Some(topology) => unsafe { SparkExpertLane::spawn_topology_with_landing(topology, peers, capacity, config, self.landing()) },
-            None => unsafe { SparkExpertLane::spawn_with_landing(peers, executors, capacity, config, self.landing()) },
-        }
+        unsafe { SparkExpertLane::spawn_world(world, peers, capacity, config, self.landing()) }
     }
 
     /// Before dispatching a wave on this intake's transport: the previous
@@ -1052,11 +1050,11 @@ pub(crate) struct SparkLink<'a> {
 }
 
 impl<'a> SparkLink<'a> {
-    /// Connects a [`SparkExperts::new_ranks`] transport whose `capacity`-row
+    /// Connects a [`SparkExperts::new_world`] transport whose `capacity`-row
     /// waves land in an intake of the process-wide [`choose_mode`].
-    pub(crate) fn new(library: &'a NativeLibrary, peers: &[std::net::SocketAddr], executors: &[u64], capacity: u32,
+    pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr], capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
-        let transport = SparkExperts::new_ranks(peers, executors, capacity, config)?;
+        let transport = SparkExperts::new_world(world, peers, capacity, config)?;
         Self::with_egress(library, transport, row_bytes, IntakePreference::Probed, true)
     }
 
@@ -1207,13 +1205,13 @@ pub(crate) struct SparkLane<'a> {
 }
 
 impl<'a> SparkLane<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, peers: Vec<std::net::SocketAddr>, executors: Vec<u64>, capacity: u32,
+    pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>, capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
         let mode = transport_mode(library, peers.len(), capacity as usize, row_bytes)?;
         let intake = SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?;
         // SAFETY: the lane drops (joining its thread) before its intake, and
         // every submit goes through `submit`, which calls `before_dispatch`.
-        let lane = unsafe { intake.spawn_lane(peers, executors, capacity, config, None)? };
+        let lane = unsafe { intake.spawn_lane(world, peers, capacity, config)? };
         Ok(Self { lane, intake })
     }
 
@@ -1297,7 +1295,7 @@ impl<'a> SparkDeviceLink<'a> {
     /// `wire_row_bytes` per wave; partial rows of `row_bytes`) on `device`.
     /// Needs GPU landing (the probed intake mode must be `gpu`).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(library: &'a NativeLibrary, device: i32, peers: &[std::net::SocketAddr], executors: &[u64],
+    pub(crate) fn new(library: &'a NativeLibrary, device: i32, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr],
         capacity: usize, topk: usize, wire_row_bytes: usize, row_bytes: usize,
         config: cuteafd_transport::TcpTransportConfig, warm: Option<cuteafd_transport::ExpertProtocolV2Request>,
         build: cuteafd_transport::expert::DeviceBuild) -> Result<Self> {
@@ -1328,7 +1326,7 @@ impl<'a> SparkDeviceLink<'a> {
         // reduced its planes (`dispatch` follows `collect` + `reduce` in
         // stream order).
         let lane = unsafe {
-            cuteafd_transport::expert::SparkDeviceLane::spawn(peers.to_vec(), executors.to_vec(), capacity as u32,
+            cuteafd_transport::expert::SparkDeviceLane::spawn(world, peers.to_vec(), capacity as u32,
                 config, landing, device, mailbox.buffer.ptr as usize, mailbox.buffer.bytes, topk, wire_row_bytes,
                 warm, targets, build)?
         };
@@ -1594,8 +1592,7 @@ mod tests {
         let peers = std::env::var("CUTEAFD_LIVE_ROCE_PEERS")?.split(',')
             .map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         ensure!(peers.len() == 4, "four peers required");
-        let mut transport = SparkExperts::new_ranks(&peers, &[1, 2, 3, 4], 4096,
-            TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(30),
+        let mut transport = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 4096, TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(30),
                 max_frame_bytes: 64 << 20 })?;
         let intake = SparkIntake::new(&library, IntakeMode::Pinned, 4, 4096, 10240)?;
         // SAFETY: transport drops first and dispatch follows before_dispatch.

@@ -1,6 +1,6 @@
-//! Concurrent TP1..TP8 TCP dispatch with bounded per-rank response storage.
+//! Concurrent declared-world TCP dispatch with bounded per-rank response storage.
 use super::{
-    BackboneRequest, SparkTopology, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG,
+    BackboneRequest, SparkTopology, SparkWorld, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG,
 };
 use crate::{
     ExpertProtocolV2Request, TcpProtocolV2PendingChunks, TcpProtocolV2PersistentClient,
@@ -14,54 +14,34 @@ pub struct V41Tp4Tcp {
     executors: Vec<u64>,
     capacity: u32,
     max_frame_bytes: usize,
-    topology: Option<SparkTopology>,
+    world: SparkWorld,
 }
 impl V41Tp4Tcp {
-    pub fn new(
-        peers: [SocketAddr; 4],
-        executors: [u64; 4],
-        capacity: u32,
-        config: TcpTransportConfig,
-    ) -> Result<Self> {
-        Self::new_ranks(&peers, &executors, capacity, config)
-    }
-    /// Generic constructor for the validated physical rank counts 1..=8
-    /// under the legacy (non-ownership) frame contract.
-    pub fn new_ranks(
-        peers: &[SocketAddr],
-        executors: &[u64],
-        capacity: u32,
-        config: TcpTransportConfig,
-    ) -> Result<Self> {
-        Self::with_clients(peers, executors, capacity, config, None)
-    }
-    /// Topology-bound constructor: canonical executor identities come from
-    /// `topology`, and the transport then accepts native group requests.
-    pub fn new_topology(
-        topology: SparkTopology,
+    /// Rank identity and request encoding are declared before connecting.
+    pub fn new_world(
+        world: SparkWorld,
         peers: &[SocketAddr],
         capacity: u32,
         config: TcpTransportConfig,
     ) -> Result<Self> {
-        ensure!(
-            peers.len() == topology.world_size(),
-            "native group topology requires exactly its physical rank count"
-        );
-        let executors = topology.executor_ids();
-        Self::with_clients(peers, &executors, capacity, config, Some(topology))
+        ensure!(peers.len() == world.topology().world_size(),
+            "Spark world requires exactly its physical rank count");
+        let executors = world.topology().executor_ids();
+        Self::with_clients(peers, &executors, capacity, config, world)
     }
+
     fn with_clients(
         peers: &[SocketAddr],
         executors: &[u64],
         capacity: u32,
         config: TcpTransportConfig,
-        topology: Option<SparkTopology>,
+        world: SparkWorld,
     ) -> Result<Self> {
         ensure!(
-            peers.len() == executors.len() && (1..=8).contains(&peers.len()),
-            "native TP/EP requires 1..=8 matching peers and executors"
+            peers.len() == executors.len() && (1..=6).contains(&peers.len()),
+            "native TP/EP requires 1..=6 matching peers and executors"
         );
-        if let Some(topology) = topology {
+        if let Some(topology) = world.ownership_topology() {
             ensure!(
                 peers.len() == topology.world_size(),
                 "native group topology requires exactly its physical rank count"
@@ -97,7 +77,7 @@ impl V41Tp4Tcp {
             executors: executors.to_vec(),
             capacity,
             max_frame_bytes: config.max_frame_bytes,
-            topology,
+            world,
         })
     }
     pub fn capacity(&self) -> u32 {
@@ -106,9 +86,10 @@ impl V41Tp4Tcp {
     pub fn world_size(&self) -> usize {
         self.executors.len()
     }
-    /// Topology this transport was bound to, if any.
-    pub fn topology(&self) -> Option<SparkTopology> {
-        self.topology
+    /// Physical ownership and request wire bound before any connection.
+    pub fn world(&self) -> SparkWorld { self.world }
+    pub fn ownership_topology(&self) -> Option<SparkTopology> {
+        self.world.ownership_topology()
     }
     /// Drop idle sockets before a new admission. Pending dispatches borrow this
     /// owner exclusively, so an in-flight wave cannot be reset through this API.
@@ -133,10 +114,8 @@ impl V41Tp4Tcp {
     /// Return after every complete request has been written. Expert workers can
     /// execute while the caller produces the coordinator's shared FFN result.
     ///
-    /// Flag and topology must agree: a topology-bound transport accepts only
-    /// native group requests, and a legacy transport rejects them. There is no
-    /// silent canonical fallback for an EP1 topology-bound transport; legacy EP1
-    /// uses [`Self::new`]/[`Self::new_ranks`] with canonical requests.
+    /// Request flags must match the declared wire: ownership worlds require
+    /// native group requests, while canonical worlds reject ownership flags.
     pub async fn dispatch<'c, 'r>(
         &'c mut self,
         request: &'r ExpertProtocolV2Request,
@@ -147,7 +126,7 @@ impl V41Tp4Tcp {
             "native request exceeds TCP frame budget"
         );
         let flagged = request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0;
-        let native = match self.topology {
+        let native = match self.world.ownership_topology() {
             Some(topology) => {
                 ensure!(
                     flagged,

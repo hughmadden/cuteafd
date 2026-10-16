@@ -93,7 +93,7 @@ impl V41Exl3Projection {
     /// padding and no duplicated boundary block.
     pub fn intermediate_partition(&self, world: usize, rank: usize) -> Result<Range<usize>> {
         ensure!(
-            (1..=8).contains(&world) && rank < world,
+            (1..=6).contains(&world) && rank < world,
             "invalid EXL3 TP rank/world"
         );
         let intermediate = match self.kind {
@@ -1318,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn new_transport_worlds_partition_nonempty_h128_blocks_exactly() {
+    fn retained_transport_worlds_partition_nonempty_h128_blocks_exactly() {
         for intermediate in [640, 2048, 2304, 3072] {
             for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Down] {
                 let (input_features, output_features) = if kind == V41Exl3ProjectionKind::Down {
@@ -1328,7 +1328,7 @@ mod tests {
                 };
                 let p = V41Exl3Projection { name: "test".into(), kind, bits: 4,
                     input_features, output_features };
-                for world in [1, 5, 7, 8] {
+                for world in [1, 5] {
                     if intermediate / 128 < world {
                         assert!(p.intermediate_partition(world, 0).is_err());
                         continue;
@@ -1406,7 +1406,7 @@ mod tests {
                 assert!(p.intermediate_partition(world, world).is_err());
             }
             // Unadmitted worlds and empty shards fail closed.
-            for world in [0usize, 9, 19] {
+            for world in [0usize, 7, 8, 9, 19] {
                 assert!(
                     p.intermediate_partition(world, 0).is_err(),
                     "EXL3 world {world} must stay unadmitted"

@@ -1,7 +1,7 @@
 //! TP2/TP3/TP4/TP6 dispatch through persistent RoCE QPs; TCP is used only for bootstrap.
 #[cfg(test)]
 use super::BackboneRequest;
-use super::{SparkTopology, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG};
+use super::{SparkTopology, SparkWorld, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG};
 use crate::verbs::LocalTp4Client;
 use crate::{
     DeviceLanding, ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2SourceKind,
@@ -26,7 +26,7 @@ pub struct SparkExperts {
     executors: Vec<u64>,
     capacity: u32,
     max_frame_bytes: usize,
-    topology: Option<SparkTopology>,
+    world: SparkWorld,
     /// A [`SparkExpertWave`] was dispatched and not yet received.
     wave_open: bool,
 }
@@ -50,65 +50,31 @@ pub struct WaveReceipt {
 }
 
 impl SparkExperts {
-    pub fn new(
-        peers: [SocketAddr; 4],
-        executors: [u64; 4],
-        capacity: u32,
-        config: TcpTransportConfig,
-    ) -> Result<Self> {
-        Self::with_clients(&peers, &executors, capacity, &config,
-            LocalTp4Client::new(peers, config.clone()), None)
-    }
-    /// Two actual Spark TP ranks; no placeholder peers or responses are used.
-    pub fn new_tp2(
-        peers: [SocketAddr; 2],
-        executors: [u64; 2],
-        capacity: u32,
-        config: TcpTransportConfig,
-    ) -> Result<Self> {
-        Self::with_clients(&peers, &executors, capacity, &config,
-            LocalTp4Client::new_tp2(peers, config.clone()), None)
-    }
-    /// Generic constructor for the validated physical rank counts 1..=8
-    /// under the legacy (non-ownership) frame contract.
-    pub fn new_ranks(
-        peers: &[SocketAddr],
-        executors: &[u64],
-        capacity: u32,
-        config: TcpTransportConfig,
-    ) -> Result<Self> {
-        let clients = LocalTp4Client::new_ranks(peers.to_vec(), config.clone());
-        Self::with_clients(peers, executors, capacity, &config, clients, None)
-    }
-    /// Topology-bound constructor: canonical executor identities are derived from
-    /// `topology`, so a stale worker admitted for another `TP×EP` layout cannot
-    /// satisfy this transport's response coverage. Requests must then carry the
-    /// native group flag.
-    pub fn new_topology(
-        topology: SparkTopology,
+    /// Rank identity and request encoding are declared before connecting.
+    pub fn new_world(
+        world: SparkWorld,
         peers: &[SocketAddr],
         capacity: u32,
         config: TcpTransportConfig,
     ) -> Result<Self> {
-        ensure!(
-            peers.len() == topology.world_size(),
-            "native group topology requires exactly its physical rank count"
-        );
-        let executors = topology.executor_ids();
+        ensure!(peers.len() == world.topology().world_size(),
+            "Spark world requires exactly its physical rank count");
+        let executors = world.topology().executor_ids();
         let clients = LocalTp4Client::new_ranks(peers.to_vec(), config.clone());
-        Self::with_clients(peers, &executors, capacity, &config, clients, Some(topology))
+        Self::with_clients(peers, &executors, capacity, &config, clients, world)
     }
+
     fn with_clients(
         peers: &[SocketAddr],
         executors: &[u64],
         capacity: u32,
         config: &TcpTransportConfig,
         mut clients: LocalTp4Client,
-        topology: Option<SparkTopology>,
+        world: SparkWorld,
     ) -> Result<Self> {
-        ensure!(peers.len() == executors.len() && (1..=8).contains(&peers.len()),
-            "native TP/EP requires 1..=8 matching peers and executors");
-        if let Some(topology) = topology {
+        ensure!(peers.len() == executors.len() && (1..=6).contains(&peers.len()),
+            "native TP/EP requires 1..=6 matching peers and executors");
+        if let Some(topology) = world.ownership_topology() {
             ensure!(
                 peers.len() == topology.world_size(),
                 "native group topology requires exactly its physical rank count"
@@ -143,7 +109,7 @@ impl SparkExperts {
             executors: executors.to_vec(),
             capacity,
             max_frame_bytes: config.max_frame_bytes,
-            topology,
+            world,
             wave_open: false,
         })
     }
@@ -173,9 +139,10 @@ impl SparkExperts {
             request.header.row_count, self.capacity);
         self.clients.bootstrap(request)
     }
-    /// Topology this transport was bound to, if any.
-    pub fn topology(&self) -> Option<SparkTopology> {
-        self.topology
+    /// Physical ownership and request wire bound before any connection.
+    pub fn world(&self) -> SparkWorld { self.world }
+    pub fn ownership_topology(&self) -> Option<SparkTopology> {
+        self.world.ownership_topology()
     }
     /// Reset persistent QPs before a new admission. Pending dispatches borrow this
     /// owner exclusively, so an in-flight wave cannot be reset through this API.
@@ -245,8 +212,9 @@ impl SparkExperts {
         if std::mem::take(&mut self.wave_open) {
             self.reset_connections();
         }
-        ensure!(request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG == 0 || self.topology.is_some(),
-            "native group request requires a topology-bound transport");
+        ensure!((request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0)
+                == self.world.ownership_topology().is_some(),
+            "Spark request ownership flag differs from its declared wire");
         crate::health::ensure_available()?;
         let result = self.clients.post_written(request);
         if let Err(error) = &result { crate::health::record_failure(format!("expert write failed: {error:#}")); }
@@ -300,10 +268,8 @@ impl SparkExperts {
     /// Post every active rank's request directly from the inference owner. Remote work
     /// overlaps the shared FFN; dispatch completion is not send completion.
     ///
-    /// Flag and topology must agree: a topology-bound transport accepts only
-    /// native group requests, and a legacy transport rejects them. There is no
-    /// silent canonical fallback for an EP1 topology-bound transport; legacy EP1
-    /// uses [`Self::new`]/[`Self::new_tp2`] with canonical requests.
+    /// Request flags must match the declared wire: ownership worlds require
+    /// native group requests, while canonical worlds reject ownership flags.
     pub async fn dispatch<'c, 'r>(
         &'c mut self,
         request: &'r ExpertProtocolV2Request,
@@ -397,7 +363,7 @@ impl SparkExperts {
             self.reset_connections();
         }
         let flagged = request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0;
-        let receiver = match self.topology {
+        let receiver = match self.world.ownership_topology() {
             Some(topology) => {
                 ensure!(
                     flagged,
@@ -518,14 +484,12 @@ mod tests {
         let config = TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000,
         };
-        let mut client = SparkExperts::new_tp2(peers, [11, 27], 2, config.clone())?;
+        let mut client = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 2, config.clone())?;
         assert_eq!(client.world_size(), 2);
         client.reset_connections();
         assert_eq!(client.world_size(), 2);
-        assert!(SparkExperts::new_tp2([peers[0]; 2], [11, 27], 2, config.clone()).is_err());
-        for ids in [[0, 27], [11, 11]] {
-            assert!(SparkExperts::new_tp2(peers, ids, 2, config.clone()).is_err());
-        }
+        assert!(SparkExperts::new_world(crate::expert::SparkWorld::canonical((&[peers[0]; 2]).len())?, &[peers[0]; 2], 2, config.clone()).is_err());
+        assert_eq!(client.world().topology().executor_ids(), [5, 6]);
         Ok(())
     }
 
@@ -660,15 +624,10 @@ mod tests {
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            let mut client = SparkExperts::new(
-                peers,
-                [1, 2, 3, 4],
-                capacity,
-                TcpTransportConfig { timing: false,
+            let mut client = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, capacity, TcpTransportConfig { timing: false,
                     timeout: std::time::Duration::from_secs(10),
                     max_frame_bytes: 64 * 1024 * 1024,
-                },
-            )?;
+                })?;
             for rows in shapes {
                 let base = super::super::tests::request(rows);
                 let mut payload = Vec::new();

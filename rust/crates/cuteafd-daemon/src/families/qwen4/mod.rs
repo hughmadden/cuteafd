@@ -629,10 +629,8 @@ impl Opened {
             Some(self.spark_mtp_experts(args, layers, stream)?)
         } else { None };
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-        let executors: Vec<u64> = (0..peers.len())
-            .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
-            .collect::<Result<_>>()?;
-        let mut transport = crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+        let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
+        let mut transport = crate::shared::spark_intake::SparkLink::new(&self.library, spark_world, &peers,
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
         transport.enable_terminal_ownership(self.library.clone())?;

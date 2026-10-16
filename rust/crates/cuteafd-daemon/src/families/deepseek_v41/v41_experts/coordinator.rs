@@ -337,7 +337,7 @@ impl<'a> NativeTp4Wave<'a> {
         // than at their first request.
         reducer.require_rank_count(world_size as u32)?;
         let native = transport
-            .topology()
+            .ownership_topology()
             .map(ReplicatedGroupPlanner::new)
             .transpose()?;
         let hidden_bytes = capacity as usize * 5120 * 2;
@@ -368,9 +368,7 @@ impl<'a> NativeTp4Wave<'a> {
         }
         ensure!(self.native.is_none(),
             "the device exchange serves the legacy TP contract only");
-        let world = peers.len();
-        let executors = (0..world).map(|rank| cuteafd_transport::expert::v41_spark_executor_id(world, rank))
-            .collect::<Result<Vec<_>>>()?;
+        let spark_world = self.link.transport.world();
         let warm_context = DeviceContext { placement: 0, rows: (0..capacity as u64).map(|row|
             cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row,
                 source_kind: cuteafd_transport::ExpertV2SourceKind::MtpVerify, source_request_id: 1,
@@ -385,7 +383,7 @@ impl<'a> NativeTp4Wave<'a> {
             device_request(&context, wave.layer, wave.rows as usize, routes, wire)
         });
         let device = self.library.cuda_get_device()?;
-        let link = crate::shared::spark_intake::SparkDeviceLink::new(self.library, device, peers, &executors,
+        let link = crate::shared::spark_intake::SparkDeviceLink::new(self.library, device, spark_world, peers,
             capacity, 6, 5280, V41_PARTIAL_ROW_BYTES as usize,
             cuteafd_transport::TcpTransportConfig { timing: false, ..config }, Some(warm), build)?;
         // The other RTX publishes waves too when the router runs there.

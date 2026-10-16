@@ -151,22 +151,17 @@ async fn run_wave(
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     ensure!(args.len() == 6, "fixture-root and four peers required");
-    let peers = args[2..]
+    let peers: [std::net::SocketAddr; 4] = args[2..]
         .iter()
         .map(|v| v.parse())
         .collect::<std::result::Result<Vec<_>, _>>()?
         .try_into()
         .unwrap();
     let make = || {
-        SparkExperts::new(
-            peers,
-            [1, 2, 3, 4],
-            80,
-            TcpTransportConfig { timing: false,
+        SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
                 timeout: Duration::from_secs(30),
                 max_frame_bytes: 2 * 1024 * 1024,
-            },
-        )
+            })
     };
     let mut lanes = [make()?, make()?];
     let runtime = tokio::runtime::Builder::new_current_thread()

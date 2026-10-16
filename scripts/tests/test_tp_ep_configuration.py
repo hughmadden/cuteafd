@@ -59,19 +59,30 @@ SPARK_5_LANE_B=
 
 
 class TopologyConfigTest(unittest.TestCase):
-    def test_pure_tp_counts_one_through_eight_use_configured_hosts(self) -> None:
-        for count in range(1, 9):
-            overlay = [f"SPARK_COUNT={count}", f"SPARK_TP={count}", "SPARK_EP=1"]
-            for rank in range(8):
-                overlay += [f"SPARK_{rank}_HOST=worker-{rank}",
-                            f"SPARK_{rank}_LANE_A=192.0.2.{rank + 1}",
-                            f"SPARK_{rank}_LANE_B="]
+    def test_retained_canonical_and_owned_tp_counts_use_configured_hosts(self) -> None:
+        for explicit, counts in [(False, range(1, 7)), (True, (2, 3, 4, 6))]:
+            for count in counts:
+                overlay = [f"SPARK_COUNT={count}",
+                           f"SPARK_TP={count}" if explicit else "SPARK_TP=",
+                           "SPARK_EP=1" if explicit else "SPARK_EP="]
+                for rank in range(6):
+                    overlay += [f"SPARK_{rank}_HOST=worker-{rank}",
+                                f"SPARK_{rank}_LANE_A=192.0.2.{rank + 1}",
+                                f"SPARK_{rank}_LANE_B="]
+                with self.subTest(explicit=explicit, count=count):
+                    result = load("\n".join(overlay), "release_spark_rank_map; release_hosts_csv")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines(),
+                                     [f"{rank} 0 {rank}" for rank in range(count)] +
+                                     [",".join(f"worker-{rank}" for rank in range(count))])
+
+    def test_deleted_worlds_and_unqualified_ownership_refuse(self) -> None:
+        for count in (1, 5, 7, 8):
             with self.subTest(count=count):
-                result = load("\n".join(overlay), "release_spark_rank_map; release_hosts_csv")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.splitlines(),
-                                 [f"{rank} 0 {rank}" for rank in range(count)] +
-                                 [",".join(f"worker-{rank}" for rank in range(count))])
+                result = load(f"SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unsupported native Spark topology" if count <= 6
+                              else "SPARK_TP must be in 1..6", result.stderr)
 
     def test_v41_accepts_explicit_vision_placement(self) -> None:
         for vision in ("auto", "off", "rtx", "rtx:0", "spark", "spark:3"):
@@ -163,7 +174,7 @@ class TopologyConfigTest(unittest.TestCase):
         cases = {
             "SPARK_TP=2\nSPARK_EP=1\n": "must equal SPARK_COUNT",
             "SPARK_TP=5\nSPARK_EP=2\n": "must equal SPARK_COUNT",
-            "SPARK_TP=9\nSPARK_EP=1\n": "SPARK_TP must be in 1..8",
+            "SPARK_TP=9\nSPARK_EP=1\n": "SPARK_TP must be in 1..6",
             "SPARK_EP=4\n": "SPARK_EP must be 1, 2, or 3",
             "SPARK_TP=2\n": "set together or omitted together",
             "SPARK_COUNT=6\nSPARK_TP=3\nSPARK_EP=3\n" + SIX_HOSTS: "must equal SPARK_COUNT",

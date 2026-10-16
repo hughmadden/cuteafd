@@ -1112,9 +1112,7 @@ impl Opened {
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-        let executors: Vec<u64> = (0..peers.len())
-            .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
-            .collect::<Result<_>>()?;
+        let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         let timing = cuteafd_transport::protocol_v2_timing_from_env();
         // The widest wave this family dispatches, built before the links so each
         // can be bootstrapped with it (see `link` below). The first request
@@ -1144,7 +1142,7 @@ impl Opened {
             warmups.push(warm(1, true)?);
         }
         let link = || -> Result<crate::shared::spark_intake::SparkLink<'_>> {
-            let mut link=crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+            let mut link=crate::shared::spark_intake::SparkLink::new(&self.library, spark_world, &peers,
             u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
             link.enable_terminal_ownership(self.library.clone())?;
