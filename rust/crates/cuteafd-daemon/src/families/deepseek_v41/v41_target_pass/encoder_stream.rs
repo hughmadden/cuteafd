@@ -89,20 +89,20 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             let pass = &mut *guard.pass;
             let batch = &mut guard.batch;
             pass.state.begin()?;
-            pass.execution.restart_for(CacheStage::Encoder);
-            pass.lane.restart()?; pass.index.restart()?; pass.taps.reset();
-            unsafe { requests.borrow_mut().begin_input(batch, &mut pass.embedding, &mut pass.lane)?; }
+            pass.resources.execution.restart_for(CacheStage::Encoder);
+            pass.resources.lane.restart()?; pass.resources.index.restart()?; pass.resources.taps.reset();
+            unsafe { requests.borrow_mut().begin_input(batch, &mut pass.resources.embedding, &mut pass.resources.lane)?; }
             unsafe { pass.execute_encoder_chunk(requests, batch, transport,
                 Some(&permit)).await?; }
             // A following chunk may finish first. Retain its output until its
             // predecessor's suffix, source-20 boundary and histories are committed.
             permit.wait_commit_turn().await;
             ensure!(keep_running(), "client disconnected");
-            suffix.borrow_mut().capture(&pass.lane.output()?)?;
-            pass.lane.advance()?;
+            suffix.borrow_mut().capture(&pass.resources.lane.output()?)?;
+            pass.resources.lane.advance()?;
             unsafe {
-                pass.lane.begin_prepared()?;
-                requests.borrow_mut().publish_encoder_boundary(batch, &mut pass.execution, &pass.lane)?;
+                pass.resources.lane.begin_prepared()?;
+                requests.borrow_mut().publish_encoder_boundary(batch, &mut pass.resources.execution, &pass.resources.lane)?;
             }
             pass.state = State::Encoded(batch.cache()?.identity());
             pass.commit(&mut requests.borrow_mut(), batch, &[chunk.len() as u32])?;
