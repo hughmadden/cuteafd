@@ -55,11 +55,21 @@ pub struct ExpertContract {
 pub trait FamilyModel: Send + Sync {
     fn spec(&self) -> &ModelSpec;
 
+    /// Native solver adapter. Returning None retains the legacy layout path.
+    fn placement(&self, _input: &super::PlanInput, _report: &mut super::PlanReport,
+        _options: &super::layout::LayoutOptions, _requested: super::ExpertPlacement)
+        -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
+        None
+    }
+
     /// Physical cache records and state from the same parsed configuration as
     /// the runtime. Weight/workspace admission remains a separate requirement.
     fn cache_geometry(&self, _options: CacheOptions) -> Result<Option<FamilyCacheGeometry>, CacheGeometryError> {
         Ok(None)
     }
+
+    /// Per-layer routed/dense or shared FFN arithmetic, when declared by a family.
+    fn activation(&self, _layer: usize, _shared: bool) -> Option<cuteafd_core::FfnActivation> { None }
 
     /// The tensor contract: whether this build's loaders take `operand` (the
     /// logical weight `stem`) for `role`, and the precise reason when not.
@@ -117,7 +127,7 @@ pub trait Family: Sync {
     }
 }
 
-static REGISTRY: [&dyn Family; 9] = [
+static REGISTRY: [&dyn Family; 10] = [
     &super::families::deepseek::DEEPSEEK_V41,
     &super::families::deepseek::DEEPSEEK_V4,
     &super::families::glm::GLM5,
@@ -125,6 +135,7 @@ static REGISTRY: [&dyn Family; 9] = [
     &super::families::mimo::MIMO_V2,
     &super::families::qwen::QWEN4,
     &super::families::qwen35::QWEN35,
+    &super::families::step5::STEP5,
     &super::families::dflash::DFLASH2,
     &super::families::dspark::DSPARK,
 ];

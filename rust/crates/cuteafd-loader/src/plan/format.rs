@@ -357,6 +357,30 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
             }
         },
     };
+    // A stacked projection has independent quantization grids/scalars per expert.
+    // Validate the expert axis before applying the existing matrix contract.
+    if weight.shape.len() == 3 && ["weight_scale_inv", "weight_scale", "scale"].iter().any(|suffix|
+        members.get(*suffix).is_some_and(|scale| scale.meta.shape.iter().product::<usize>() != 1)) {
+        let experts = &weight.shape[0];
+        if *experts == 0 {
+            return Err(malformed(&weight.name, "empty stacked expert axis".into()));
+        }
+        let mut views = BTreeMap::new();
+        for (suffix, tensor) in members {
+            let mut view = (*tensor).clone();
+            if view.meta.shape.first() != Some(experts) {
+                return Err(malformed(&view.meta.name, format!("expected expert axis {experts}, found {:?}", view.meta.shape)));
+            }
+            view.meta.shape.remove(0);
+            views.insert(suffix.clone(), view);
+        }
+        let refs = views.iter().map(|(suffix, tensor)| (suffix.clone(), tensor)).collect();
+        let mut operand = detect(&refs)?;
+        operand.logical.insert(0, *experts);
+        operand.stored = weight.shape.clone();
+        if let Some(scale) = &mut operand.scale { scale.grid.insert(0, *experts); }
+        return Ok(operand);
+    }
     let companions: Vec<String> = members.keys().filter(|s| *s == "bias").cloned().collect();
     let mut operand = match &weight.dtype {
         DType::Bf16 => QuantOperand::plain(Encoding::Bf16, weight),
