@@ -4,6 +4,11 @@ use cuteafd_api::openai::{media::MediaPreparer, NativeRequest};
 use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
 use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander}, plan::MediaMode};
 use std::sync::Arc;
+pub(crate) use crate::shared::qwen::scheduler::Prompt;
+
+impl crate::shared::qwen::scheduler::Encoder for Encoder {
+    fn available(&self) -> bool { self.available() }
+}
 
 fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<serde_json::Value>> {
     if mode == MediaMode::Off { return Ok(None); }
@@ -119,7 +124,7 @@ impl ReadyVision {
     }
 }
 
-pub(super) enum Encoder {
+pub(crate) enum Encoder {
     Local(crate::shared::vision::local::LocalEncoder),
     Remote(crate::shared::vision::remote::RemoteEncoder),
     Off,
@@ -154,11 +159,6 @@ pub(super) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::
     }
 }
 
-pub(super) struct Prompt {
-    pub job: NativeRequest,
-    pub tokens: Vec<u32>,
-    pub keys: MediaKeys,
-}
 pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json::Value,
     vocabulary: usize, hidden: usize, max_context: usize) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)> {
     let (tokens, spans) = if config.get("vision_config").is_some() {
