@@ -50,12 +50,11 @@ REQUIRED_IDENTITY_STRUCTURES = ("source_snapshots", "expert_tp_manifests")
 # was recorded but never applied.
 REQUIRED_COORDINATOR_FLAGS = ("--rtx-gpus", "--prefill-batch-tokens", "--concurrency",
                               "--prefix-cache-entries", "--max-context-tokens", "--max-output-tokens")
-REQUIRED_WORKER_FLAGS = ("--rank", "--world", "--capacity", "--device-budget-bytes", "--first-layer")
+REQUIRED_WORKER_FLAGS = ("--rank", "--world", "--device-budget-bytes")
 TOPOLOGY_FLAGS = ("--spark-tp", "--spark-ep")
 KNOWN_COORDINATOR_FLAGS = set(REQUIRED_COORDINATOR_FLAGS) | set(TOPOLOGY_FLAGS) | {
     "--kv-pool-size", "--rtx-expert-layers", "--dspark", "--dspark-draft-limit"}
-KNOWN_WORKER_FLAGS = set(REQUIRED_WORKER_FLAGS) | {"--capacity"} | set(TOPOLOGY_FLAGS)
-SUPPORTED_WORKER_CAPACITIES = (1, 16, 80, 256, 1024, 4096)
+KNOWN_WORKER_FLAGS = set(REQUIRED_WORKER_FLAGS) | set(TOPOLOGY_FLAGS)
 _CODE_FENCE = re.compile(r"```(?:python|py)?[ \t]*\n.*?\n```", re.DOTALL | re.IGNORECASE)
 
 
@@ -469,8 +468,8 @@ def coordinator_applied(name, metadata, argv, problems):
         problems.append(f"{name}: requested_rtx_expert_layers must be 'auto' or an integer, got {requested!r}")
     if not isinstance(resolved, int) or isinstance(resolved, bool):
         problems.append(f"{name}: resolved_rtx_expert_layers must be the actual integer plan boundary, got {resolved!r}")
-    elif str(metadata.get("spark_first_layer")) != str(min(resolved, 39)):
-        problems.append(f"{name}: spark_first_layer={metadata.get('spark_first_layer')} != min(resolved_rtx_expert_layers, 39)={min(resolved, 39)}")
+    elif str(metadata.get("spark_first_layer")) != str(resolved):
+        problems.append(f"{name}: spark_first_layer={metadata.get('spark_first_layer')} != resolved_rtx_expert_layers={resolved}")
     if "--rtx-expert-layers" in values:
         if str(values["--rtx-expert-layers"]) != str(resolved):
             problems.append(f"{name}: coordinator --rtx-expert-layers={values['--rtx-expert-layers']} but resolved actual={resolved}")
@@ -490,11 +489,39 @@ def worker_applied(name, metadata, per_rank, problems):
     if world and str(metadata.get("spark_count")) != str(world):
         problems.append(f"{name}: spark_count={metadata.get('spark_count')} != spark_tp*spark_ep={world}")
     capacity = metadata.get("worker_capacity")
-    minimum = next((c for c in (80, 256, 1024, 4096) if int(metadata.get("prefill_batch_tokens", 0)) <= c), 4096)
-    if capacity not in SUPPORTED_WORKER_CAPACITIES:
-        problems.append(f"{name}: worker_capacity={capacity!r} is not one of {SUPPORTED_WORKER_CAPACITIES}")
-    elif capacity < minimum:
-        problems.append(f"{name}: worker_capacity={capacity} is below the {minimum} required for prefill_batch_tokens={metadata.get('prefill_batch_tokens')}")
+    minimum = max(int(metadata.get("prefill_batch_tokens", 0)), 256)
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or not 256 <= capacity <= 4096:
+        problems.append(f"{name}: worker_capacity={capacity!r} is not one of the live extents 256..4096")
+    elif capacity != minimum:
+        problems.append(f"{name}: worker_capacity={capacity} differs from the {minimum} required for prefill_batch_tokens={metadata.get('prefill_batch_tokens')}")
+    admissions = metadata.get("worker_admissions")
+    if not isinstance(admissions, list) or len(admissions) != world:
+        problems.append(f"{name}: worker_admissions must contain every installed rank")
+        admissions = []
+    admitted_ranks = []
+    for report in admissions:
+        if not isinstance(report, dict):
+            problems.append(f"{name}: worker admission must be an object")
+            continue
+        rank = report.get("rank")
+        if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < world:
+            problems.append(f"{name}: invalid worker admission rank={rank!r}")
+        else:
+            admitted_ranks.append(rank)
+        if report.get("capacity") != capacity:
+            problems.append(f"{name}: admitted capacity={report.get('capacity')} differs from worker_capacity={capacity}")
+        compiled = report.get("compiled_capacity")
+        expected_compiled = next((rows for rows in (256, 1024, 4096) if isinstance(capacity, int) and rows >= capacity), None)
+        if compiled != expected_compiled or expected_compiled is None:
+            problems.append(f"{name}: invalid worker compiled_capacity={compiled!r}")
+        first = metadata.get("spark_first_layer")
+        expected = list(range(first, 40)) if isinstance(first, int) and 0 <= first <= 40 else None
+        if report.get("layer_ids") != expected:
+            problems.append(f"{name}: worker admission layer_ids differ from exact solved owners")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(report.get("selection_digest", ""))):
+            problems.append(f"{name}: worker admission lacks a selection_digest")
+    if sorted(admitted_ranks) != list(range(world)):
+        problems.append(f"{name}: installed worker admissions do not cover every rank exactly once")
     if len(per_rank) != world:
         problems.append(f"{name}: worker_argv has {len(per_rank)} rank argvs but world={world}")
     ranks = []
@@ -507,9 +534,8 @@ def worker_applied(name, metadata, per_rank, problems):
             problems.append(f"{name}: worker rank-{index} --rank={rank} is not a valid rank in 0..{world - 1}")
         else:
             ranks.append(int(rank))
-        for flag, expected in (("--world", world), ("--capacity", capacity),
+        for flag, expected in (("--world", world),
                                ("--device-budget-bytes", metadata.get("spark_device_budget_bytes")),
-                               ("--first-layer", metadata.get("spark_first_layer")),
                                ("--spark-tp", metadata.get("spark_tp")), ("--spark-ep", metadata.get("spark_ep"))):
             if flag in values and str(values[flag]) != str(expected):
                 problems.append(f"{name}: worker rank-{index} {flag}={values[flag]} but metadata expects {expected}")

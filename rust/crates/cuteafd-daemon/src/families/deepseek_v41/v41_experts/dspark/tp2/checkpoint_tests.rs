@@ -45,7 +45,7 @@ fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
         let full = owner.own(|| {
             ExpertWeights::load(&lib, &catalog, ExpertLayer::Dspark { stage }, 8usize << 30)
         })?;
-        let mut reference = owner.own(|| full.execution(256, 2usize << 30))?;
+        let mut reference = owner.own(|| full.execution(256, 256, 2usize << 30))?;
         for (rows, include_shared) in [1u32, 7, 16, 65, 112, 1]
             .into_iter()
             .flat_map(|rows| [false, true].map(|shared| (rows, shared)))

@@ -3,9 +3,11 @@ use super::*;
 use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
 use crate::families::glm5_flash::{GlmNextConfig, resident};
 
-pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions, manifest: Option<&serde_json::Value>,
-    rows: u64, sequences: u64, context: u64, weight_budget: u64) -> MemoryLayout {
+pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
+    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
+    let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_ref(), shape.prefill_rows,
+        shape.concurrency, shape.context_tokens, options.weight_budget_bytes);
     let checkpoint = input.checkpoint();
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };
@@ -239,7 +241,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                     u32::try_from(options.spark_capacity_rows)
                         .map_err(|_| placement::PlacementError::Overflow("Spark capacity"))
                         .and_then(|capacity| charge_spark_io(&mut device, &working, geometry, capacity,
-                            checkpoint.spark_input_is_bf16(), spark_ring_geometry("glm5_flash", working.prefill_lanes),
+                            checkpoint.spark_input_is_bf16(), spark_ring_geometry(spark_endpoints("glm5_flash", working.prefill_lanes)),
                             gib(56) * options.spark_capacity_rows / 4096))
                 });
             if let Err(error) = io {
@@ -251,7 +253,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     // Media placement is still the shared planner path, outside the coordinator solver port.
     let mut sparks = devices.split_off(ranks);
-    resolve_encoder(checkpoint, report, model, &mut devices, &mut sparks, &vec![0; ranks], options, &mut notes);
+    resolve_encoder(report, &glm_flash_towers(report, checkpoint), &mut devices, &mut sparks, &vec![0; ranks], options, &mut notes);
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens: pool, waste, notes }
 }

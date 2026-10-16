@@ -118,10 +118,8 @@ readiness claim — see the
 [compact EXL3 TP3 report](../../docs/release-v10-tp3-exl3-compact-1x-3spark.md).
 
 The native profile pins `RTX_EXPERT_LAYERS=5`: the RTX holds the first five
-routed layers and each Spark starts at layer 5 to hold the other 35. Because
-that is an explicit local count on an explicit topology, the launcher takes the
-single-RTX placement handoff (the coordinator publishes the boundary, workers
-start at `--first-layer 5`) instead of the all-remote no-handoff shape. The
+routed layers and each Spark starts at layer 5 to hold the other 35. The coordinator derives the exact per-rank assignment from checkpoint headers
+and sends typed admission before workers load; no launcher boundary file is used. The
 5-local / 35-remote single-RTX placement has prior TP6xEP1 functional evidence
 on the final v9 images and matched the measured v8 baseline dispatch; that is
 TP6 placement evidence, not TP3 qualification. Remote TP3 weight is

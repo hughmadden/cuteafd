@@ -223,23 +223,20 @@ def test_family_table_names_every_launchable_family() -> None:
         assert out.stdout.split()[0] == family
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_glmf_solved_worker_startup_waits_bootstrap_only_when_opted_in(tmp_path: Path, enabled: bool) -> None:
+def test_glmf_solved_worker_startup_waits_bootstrap_by_default(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
-                                  extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": str(int(enabled)),
-                                             "STUB_WORKER_READY": "worker bootstrap ready" if enabled else "worker ready"})
+                                  extra_env={"STUB_WORKER_READY": "worker bootstrap ready"})
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     worker = next(line for line in lines if "cuteafd expertd-native" in line)
     coordinator = next(line for line in lines if "cuteafd" in line and "serve-glmf" in line)
-    assert ("--placement-handshake" in worker) == enabled
-    assert ("--placement-handshake" in coordinator) == enabled
-    marker = "worker bootstrap ready" if enabled else "worker ready"
+    assert "--placement-handshake" not in worker
+    assert "--placement-handshake" not in coordinator
+    marker = "worker bootstrap ready"
     readiness = next(i for i, line in enumerate(lines) if f"grep -q '{marker}'" in line)
     assert readiness < lines.index(coordinator)
-    if enabled:
-        assert not any("grep -q 'worker ready'" in line for line in lines)
+    assert not any("grep -q 'worker ready'" in line for line in lines)
 
 
 def test_glmf_zero_spark_launch_does_not_enable_worker_selection(tmp_path: Path) -> None:
@@ -281,16 +278,23 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     transport = remote.split("    pub fn update(", 1)[1].split("    pub fn put_taps(", 1)[0]
     assert "self.synchronize()?" not in transport
     assert "cuda_stream_synchronize" not in transport
-    final_ack = remote.split("    pub fn finish_request(", 1)[1].split("    pub fn finish_terminal(", 1)[0]
-    assert final_ack.index("self.exchange.wait(0, TAPS)") < final_ack.index("cuda_stream_synchronize")
+    bridge = (family.parent.parent / "shared/draft/remote.rs").read_text()
+    final_ack = bridge.split("    pub fn finish_request(", 1)[1].split("    pub fn finish_terminal(", 1)[0]
+    assert final_ack.index("self.exchange.wait(0, CONTEXT)") < final_ack.index("cuda_stream_synchronize")
     release = (family / "serve.rs").read_text().split("fn release(", 1)[1].split("#[derive", 1)[0]
     assert release.index("family.finish_request()") < release.index("cache.release(")
-    assert transport.index("self.exchange.wait(0, TAPS)") < transport.index("self.exchange.push_planes(0, TAPS")
-    assert transport.index("self.exchange.wait(1, TAPS)") < transport.index("self.exchange.signal(1, TAPS)")
+    publish = bridge.split("    pub fn publish_context(", 1)[1].split("    pub fn acknowledge_context(", 1)[0]
+    assert publish.index("self.exchange.wait(0, CONTEXT)") < publish.index("self.exchange.push_planes(0, CONTEXT")
+    acknowledge = bridge.split("    pub fn acknowledge_context(", 1)[1].split("\n    }", 1)[0]
+    assert "self.exchange.wait(1, CONTEXT)" in publish and "self.exchange.signal(1, CONTEXT)" in acknowledge
+    assert bridge.index("    pub fn publish_context(") < bridge.index("    pub fn acknowledge_context(")
+    assert transport.index("self.bridge.publish_context(") < transport.index("self.bridge.acknowledge_context()")
     taps = remote.split("    pub fn tap_streams_at(", 1)[1].split("    pub fn update(", 1)[0]
     assert "self.target.taps.buffer.ptr" in taps and "push_planes" not in taps
     owner = remote.split("pub(crate) struct RemoteDflash", 1)[1].split("impl<'a>", 1)[0]
-    assert owner.index("pub draft:") < owner.index("exchange:") < owner.index("stream:")
+    assert owner.index("pub draft:") < owner.index("bridge: RemoteBridge")
+    shared_owner = bridge.split("pub(crate) struct RemoteBridge", 1)[1].split("impl<'a>", 1)[0]
+    assert shared_owner.index("pub exchange:") < shared_owner.index("pub stream:")
     drain = (family / "engine.rs").read_text().split("    pub(crate) fn synchronize(", 1)[1].split("    fn start(", 1)[0]
     assert "drain_ranks(" in drain
     shutdown = (family / "engine.rs").read_text().split("    fn shutdown_submission(", 1)[1].split("    fn publish_tp2_abort(", 1)[0]
@@ -303,9 +307,9 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert "self.draft.prime_remote()" in prime
     assert "self.launch_head(&head, rows, true)?" in prime
     assert "self.launch_head(&head, rows, false)?" in prime
-    assert prime.index("self.launch_head(&head, rows, true)?") < prime.index("self.launch_head(&head, rows, false)?") < prime.index("cuda_stream_synchronize(self.exchange.stream(0))")
-    assert "cuda_stream_synchronize(self.exchange.stream(0))" in prime
-    assert "self.exchange.wait(" not in prime and "self.exchange.push" not in prime
+    assert prime.index("self.launch_head(&head, rows, true)?") < prime.index("self.launch_head(&head, rows, false)?") < prime.index("cuda_stream_synchronize(self.bridge.exchange.stream(0))")
+    assert "cuda_stream_synchronize(self.bridge.exchange.stream(0))" in prime
+    assert "self.bridge.exchange.wait(" not in prime and "self.bridge.exchange.push" not in prime
     isolated = shared.split("    pub(crate) fn prime_remote(", 1)[1].split("    fn workspace(", 1)[0]
     assert "0..TAP_ROWS" in isolated and "1..=self.max_sequences" in isolated
     assert "self.draft_device_with(" in isolated
@@ -317,10 +321,10 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
 def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() -> None:
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
     body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]
-    assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("select_worker_layers(")
-    assert body.index("select_worker_layers(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
+    assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("SparkAdmission::plan(")
+    assert body.index("SparkAdmission::plan(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
-    assert "WorkerSelection::new(identity, &spark_layers)" in body
+    assert "model)?.select(&peers)?" in body
     assert "let spark = !spark_layers.is_empty();" in body
     assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
     assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
@@ -429,7 +433,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker ready}"; '
+                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
@@ -510,15 +514,12 @@ explicit = "--spark-tp" in args or family == "deepseek_v41" and ranks not in (0,
 peers = value("--deployment-peers", "").split(",")[:ranks] if ranks else []
 report = json.loads(os.environ["STUB_ENCODER_PLAN"])
 report.update(spark_ranks=ranks)
-onboard = value("--rtx-expert-layers", "auto")
 gpus = int(value("--rtx", "1"))
-boundary = None if family != "deepseek_v41" or onboard == "auto" or gpus == 1 else min(int(onboard), 39)
-handoff = {"kind": "runtime", "directory": "/tmp/cuteafd-home/placement", "spark_first_layer": boundary} if family == "deepseek_v41" and (gpus == 2 or onboard != "0") else {"kind": "fixed", "spark_first_layer": int(first)}
 print(json.dumps(dict(report, version=1, family=family, executable=True, rtx_gpus=gpus,
     topology=dict(tp=tp, ep=ep, explicit=explicit), peers=peers,
     speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
-    placement_handoff=handoff, placement_handshake="--deployment-placement-handshake" in args,
+    spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
     artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report)))
 """)
@@ -665,20 +666,18 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
     assert f"{flag} {expected}" in serving
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_mimo_worker_selection_handshake_is_opt_in_on_both_ends(tmp_path, enabled):
+def test_mimo_worker_selection_is_default_on_both_ends(tmp_path):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
     result = _family_launch_result(
         tmp_path, config, "test/mimo",
         "SPARK_COUNT=1\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
-        extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": "1" if enabled else "0"})
+        extra_env={"STUB_WORKER_READY": "worker bootstrap ready"})
     assert result.returncode == 0, result.stderr
     worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
     coordinator = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    assert ("--placement-handshake" in worker) == enabled
-    assert ("--placement-handshake" in coordinator) == enabled
-    if enabled:
-        assert "worker bootstrap ready" in result.stderr
+    assert "--placement-handshake" not in worker
+    assert "--placement-handshake" not in coordinator
+    assert "worker bootstrap ready" in result.stderr
 
 
 @pytest.mark.parametrize("embedding", ["host", "gpu"])
@@ -840,7 +839,7 @@ def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, con
     assert result.returncode == 0, result.stderr
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert workers
-    assert all(f"--rdma-endpoints {endpoints}" in line for line in workers)
+    assert all("--rdma-endpoints" not in line and "--capacity" not in line for line in workers)
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
     assert all(f"{name}={value}" in launch for name, value in env.items())
 
@@ -851,7 +850,9 @@ def test_only_wide_optional_bf16_changes_worker_ring_admission(tmp_path, mode, w
         f"EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nEXPERT_INPUT={mode}\n")
     assert result.returncode == 0, result.stderr
     worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
-    assert ("--bf16-ingress" in worker) == wide
+    assert "--bf16-ingress" not in worker
+    coordinator = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    assert f"--expert-input {mode}" in coordinator
 
 
 def test_qwen_tp1_explicit_pool_host_maps_physical_rails(tmp_path: Path) -> None:

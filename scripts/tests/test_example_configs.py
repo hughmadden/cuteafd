@@ -151,7 +151,7 @@ report = json.loads(REPORT)
 family, first, last = FAMILY, FIRST, LAST
 print(json.dumps(dict(report, version=1, family=family, executable=True, report=report,
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
-    placement_handshake="--deployment-placement-handshake" in args,
+    spark_admission="coordinator_authoritative",
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
     speculator=value("--speculator", "off"))))
 """.replace("REPORT", repr(json.dumps(plan))).replace("FAMILY", repr(family))

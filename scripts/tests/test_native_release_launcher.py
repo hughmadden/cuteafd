@@ -130,9 +130,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
 
     def test_v41_placement_uses_writable_serving_home(self) -> None:
         source = v41_source()
-        self.assertIn(".placement_handoff.directory", source)
-        deployment = (ROOT / 'rust/crates/cuteafd-loader/src/plan/deployment.rs').read_text()
-        self.assertIn('directory: "/tmp/cuteafd-home/placement"', deployment)
+        self.assertNotIn('--placement-directory', source)
         self.assertNotIn('placement_directory=/run/cuteafd-placement', source)
 
     def test_serving_identity_is_evaluated_on_each_host(self) -> None:
@@ -471,21 +469,6 @@ RTX_EXPERT_LAYERS=auto
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, expected)
 
-    def test_explicit_dual_layer_boundary_covers_delegated_experts(self) -> None:
-        for layout, layers, expected in [('2', 'auto', '20'), ('2', '17', '17'),
-                                         ('2', '1', '1'), ('2', '40', '39'),
-                                         ('1', '17', '0'), ('1', '0', '0')]:
-            with self.subTest(layout=layout, layers=layers):
-                result = subprocess.run(['bash', '-c',
-                    'source scripts/lib/release-common.sh; release_spark_first_layer "$1" "$2"',
-                    'test', layout, layers], cwd=ROOT, text=True, capture_output=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), expected)
-        result = subprocess.run(['bash', '-c',
-            'source scripts/lib/release-common.sh; release_spark_first_layer 2 0'],
-            cwd=ROOT, text=True, capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
-
     def test_spark_build_arguments_survive_ssh_empty_argument_elision(self) -> None:
         source = (ROOT / 'build.sh').read_text()
         block = source.split('echo "== building Spark development and inference images natively on $seed_host =="', 1)[1]
@@ -704,7 +687,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
         script = v41_source()
         self.assertIn('RUST_LOG=${RUST_LOG:-info}', script)
         self.assertIn('--rtx-gpus "$RELEASE_RTX_GPUS"', script)
-        self.assertIn('--first-layer "$first_layer"', script)
+        self.assertNotIn('--first-layer', script)
         self.assertIn('CUDA_VISIBLE_DEVICES=$gpu_uuid_csv', script)
         self.assertIn("trap cleanup EXIT", script)
 

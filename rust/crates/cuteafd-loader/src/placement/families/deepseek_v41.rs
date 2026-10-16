@@ -1,15 +1,34 @@
 //! V4.1 CED ownership stays fixed; pool and local experts use shared admission.
 use super::super::*;
+pub mod owners;
+pub mod resident;
 
-/// Reserved lazy graph envelope; small cards charge their measured 2 GiB bank
-/// through the admission sample instead.
+/// Existing lazy-capture envelope, separate from qualified ready residency.
+/// Small cards previously hid this same growth allowance in the CUDA sample.
 pub fn graph_reserve(total: u64, ranks: usize) -> u64 {
-    if total <= 32 << 30 { 0 } else if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
+    if total <= 32 << 30 { 2048 << 20 } else if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
 }
 
 pub fn runtime_reserve(total: u64, ranks: usize, automatic: bool) -> u64 {
     if total <= 32 << 30 { 0 } else if automatic { 3 << 30 }
     else if ranks == 1 { 2 << 30 } else { 800 << 20 }
+}
+
+/// Future owners beside the pool; none of these bytes is live at ready.
+pub fn growth_demands(total: u64, ranks: usize, automatic: bool, gpu: u8) -> Vec<Demand> {
+    let mut demands = vec![GraphSet::budget(&[graph_reserve(total, ranks)]).demand(0).on(gpu)];
+    let runtime = runtime_reserve(total, ranks, automatic);
+    if runtime > 0 {
+        demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
+            "runtime growth", runtime, cuteafd_core::memory_layout::Basis::Calibrated)
+            .with_lifetime(ItemLifetime::PostReadyReserve));
+    }
+    if total <= 32 << 30 {
+        demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
+            "memory sample margin", 32 << 20, cuteafd_core::memory_layout::Basis::Calibrated)
+            .with_lifetime(ItemLifetime::PostReadyReserve));
+    }
+    demands
 }
 
 /// V4.1 requires its full admitted context; other Spark families may clamp it.
@@ -244,6 +263,7 @@ pub fn expert_inventory(
     programs: &std::path::Path,
     rows: u64,
     gpus: usize,
+    sms: u32,
 ) -> anyhow::Result<(Vec<ExpertCost>, u64)> {
     use anyhow::{ensure, Context};
     ensure!(matches!(gpus, 1 | 2), "V4.1 supports one or two RTX owners");
@@ -344,7 +364,7 @@ pub fn expert_inventory(
         let fp8: serde_json::Value =
             serde_json::from_slice(&std::fs::read(parent.join("V41_FP8_AOT.json"))?)?;
         routed
-            .checked_add(shared_workspace(&fp8, rows)?)
+            .checked_add(shared_workspace(&fp8, rows, sms)?)
             .and_then(|n| n.checked_add(rows * (10240 + 5280 + 24 + 24 + 10240)))
             .context("V4.1 FFN workspace overflow")?
     };
@@ -382,45 +402,12 @@ pub fn owner_workspace(rows: u64, hidden: u64, topk: u64) -> anyhow::Result<u64>
 
 /// The two TP2 FP8 projection plans keep each capacity's aligned arena, while
 /// routed experts share a maximum-sized scratch arena across capacities.
-pub fn shared_workspace(manifest: &serde_json::Value, rows: u64) -> anyhow::Result<u64> {
-    use anyhow::{ensure, Context};
-    let compiled = expert_capacities(rows, false)?
-        .into_iter()
-        .last()
-        .context("missing FP8 capacity")?;
-    let capacities: Vec<_> = [1, 16, 80]
-        .into_iter()
-        .filter(|&n| n < compiled)
-        .chain([compiled])
-        .collect();
-    let variants = manifest["variants"]
-        .as_array()
-        .context("missing V4.1 FP8 variants")?;
-    let mut scratch = 0u64;
-    for (k, n) in [(5120, 1152), (1152, 5120)] {
-        for &capacity in &capacities {
-            let matching: Vec<_> = variants
-                .iter()
-                .filter(|v| {
-                    v["capacity"].as_u64() == Some(capacity)
-                        && v["input_dim"].as_u64() == Some(k)
-                        && v["output_dim"].as_u64() == Some(n)
-                })
-                .collect();
-            ensure!(
-                matching.len() == 1,
-                "missing or duplicate V4.1 shared projection {k}x{n} m{capacity}"
-            );
-            let bytes = matching[0]["scratch_bytes"]
-                .as_u64()
-                .context("missing FP8 scratch extent")?;
-            scratch = scratch
-                .checked_add(bytes.checked_add(255).context("FP8 alignment overflow")? & !255)
-                .context("FP8 capacity arenas overflow")?;
-        }
-    }
-    scratch
-        .checked_add(16 + rows * ((3 * 1152 + 5120) * 2 + 5120 * 4))
+pub fn shared_workspace(manifest: &serde_json::Value, rows: u64, sms: u32) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    let programs = ProgramSet::v41_fp8(manifest, &[(5120, 1152), (1152, 5120)], rows, sms)?;
+    programs.scratch.into_iter().try_fold(0u64, |sum, (_, bytes)| {
+        sum.checked_add(bytes).context("FP8 capacity arenas overflow")
+    })?.checked_add(16 + rows * ((3 * 1152 + 5120) * 2 + 5120 * 4))
         .context("shared FFN workspace overflow")
 }
 
@@ -520,7 +507,7 @@ pub fn request(
     assert!(experts.len() <= 40, "V4.1 has exactly 40 backbone layers");
     PlacementRequest {
         inventory,
-        attention_placement: Some(AttentionPlacement::Heads),
+        attention_placement: Some(if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads }),
         context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0,
         pool,
@@ -556,9 +543,105 @@ pub fn request(
     }
 }
 
+/// What the V4.1 dSpark drafter retains, measured from its own plan before
+/// any payload is read. Runtime owners come from `owners::NativePrograms::dspark`
+/// (request lanes, main context, windows) on the default native BF16 path;
+/// EXL3 arenas and TP2 expert halves are sized from their packages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DraftInventory {
+    /// Auxiliary transformer weights plus the routed experts this rank owns
+    /// beside the head (whole TP1 experts, or the GPU1 TP2 half).
+    pub resident: u64,
+    /// Request lanes, main contexts and windows on each rank (index = GPU).
+    pub runtime: Vec<Demand>,
+    /// Prefix draft marks (`DRAFT_MARK_BYTES` per retained mark slot).
+    pub marks: u64,
+    /// `--tp2-dspark-experts`: GPU0's expert halves plus its wave workspace.
+    pub peer_half: u64,
+    /// Largest transient load staging on the home and on the peer half; the
+    /// caller folds it into the full dSpark load-phase peak.
+    pub staging: [u64; 2],
+    /// Routed-expert bytes resident while that staging is live, [home, GPU0
+    /// TP2 half]: experts load first, serially, before anything else.
+    pub loading_experts: [u64; 2],
+    /// The loaders' exact device load bound per GPU [home, GPU0 TP2 half]:
+    /// max(experts + their staging, all retained weights). Runtime owners
+    /// (lanes, windows, main contexts) are not part of loading.
+    pub loader_peak: [u64; 2],
+}
+
+impl DraftInventory {
+    /// The full dSpark load phase above a pre-draft sample: experts plus their
+    /// transient staging on each GPU that loads them (`request.startup`).
+    pub fn load_phase(&self, ranks: usize) -> Result<Vec<Demand>, PlacementError> {
+        if !(1..=2).contains(&ranks) { return Err(PlacementError::Inventory("V4.1 dSpark draft ranks")); }
+        let home = (ranks - 1) as u8;
+        let peak = |gpu: usize| self.loading_experts[gpu].checked_add(self.staging[gpu])
+            .map(|bytes| bytes.max(self.loader_peak[gpu]))
+            .ok_or(PlacementError::Overflow("V4.1 dSpark load phase"));
+        let mut phases = vec![Demand::new(home, Category::Staging, "dSpark load phase", peak(0)?, Basis::Exact)];
+        if self.peer_half > 0 {
+            phases.push(Demand::new(0, Category::Staging, "dSpark TP2 load phase", peak(1)?, Basis::Exact));
+        }
+        phases.retain(|d| d.bytes > 0);
+        Ok(phases)
+    }
+}
+
+/// The dSpark drafter as one itemized shared drafter Movable at the head GPU
+/// (GPU1 on two RTX): it reads the decoder's taps and the GPU1 vocabulary
+/// shard every step, so it has no bridge. The TP2 expert half is a cross-GPU
+/// demand of that home. Load staging is not retained and is not a startup
+/// phase by itself: `request.startup` holds full sequential phase peaks, so the
+/// caller composes the dSpark load phase from `staging` plus the owners that
+/// coexist with it.
+pub fn drafter(inventory: &DraftInventory, ranks: usize) -> Result<Movable, PlacementError> {
+    if !(1..=2).contains(&ranks) || (ranks == 1 && inventory.peer_half > 0)
+        || inventory.runtime.iter().any(|d| usize::from(d.gpu) >= ranks) {
+        return Err(PlacementError::Inventory("V4.1 dSpark draft inventory"));
+    }
+    let home = (ranks - 1) as u8;
+    let mut owned = vec![Demand::new(home, Category::Drafter, "dSpark weights", inventory.resident, Basis::Exact)];
+    if inventory.marks > 0 {
+        owned.push(Demand::new(home, Category::Prefix, "dSpark marks", inventory.marks, Basis::Formula));
+    }
+    // Runtime owners name their rank (the terminal's vocabulary half lives on
+    // GPU0); only the home's are re-homed with the movable.
+    let (local, peer): (Vec<_>, Vec<_>) = inventory.runtime.iter().cloned().partition(|d| d.gpu == home);
+    owned.extend(local);
+    let mut drafter = draft::DrafterDemand::itemized(owned, home);
+    let mut cross = peer;
+    if inventory.peer_half > 0 {
+        cross.push(Demand::new(0, Category::Drafter, "dSpark TP2 expert half", inventory.peer_half, Basis::Exact));
+    }
+    if !cross.is_empty() {
+        drafter.per_home = vec![MovableDemands { placement_gpu: home, demands: cross }];
+    }
+    drafter.movable(ranks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn growth_owners_are_post_ready_reserves_on_every_card_and_policy() {
+        for total in [32 << 30, 96 << 30] {
+            for ranks in [1, 2] {
+                for automatic in [false, true] {
+                    for gpu in 0..ranks {
+                        let demands = growth_demands(total, ranks, automatic, gpu as u8);
+                        assert!(demands.iter().all(|d| d.gpu == gpu as u8
+                            && d.lifetime == ItemLifetime::PostReadyReserve
+                            && d.item().lifetime == ItemLifetime::PostReadyReserve));
+                        assert_eq!(demands.iter().map(|d| d.bytes).sum::<u64>(),
+                            graph_reserve(total, ranks) + runtime_reserve(total, ranks, automatic)
+                                + if total <= 32 << 30 { 32 << 20 } else { 0 });
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn ced_ownership_and_tp2_loading_peak_are_preserved() {
@@ -598,6 +681,7 @@ mod tests {
             Onboard::Layers(3),
         ))
         .unwrap();
+        assert_eq!(placement.attention_placement, AttentionPlacement::Layers);
         assert_eq!(placement.onboard_layers, 3);
         for (layer, assignment) in placement.layers.iter().enumerate() {
             assert_eq!(
@@ -758,13 +842,13 @@ mod tests {
     fn shared_fp8_capacity_scratch_is_a_sum_not_a_maximum() {
         let variants = [(5120,1152),(1152,5120)].into_iter().flat_map(|(k,n)|
             [1,16,80,256,1024,4096].map(|c| serde_json::json!({"capacity":c,"input_dim":k,
-                "output_dim":n,"scratch_bytes":c+1}))).collect::<Vec<_>>();
+                "output_dim":n,"label":format!("shared_{k}_{n}_m{c}"),"scratch_bytes":c+1}))).collect::<Vec<_>>();
         let manifest = serde_json::json!({"variants":variants});
-        assert_eq!(shared_workspace(&manifest,257).unwrap(),
+        assert_eq!(shared_workspace(&manifest,257,188).unwrap(),
             2*(256+256+256+1280)+16+257*((3*1152+5120)*2+5120*4));
         let mut bad = manifest.clone();
         bad["variants"].as_array_mut().unwrap().remove(0);
-        assert!(shared_workspace(&bad,257).is_err());
+        assert!(shared_workspace(&bad,257,188).is_err());
     }
 
     #[test]
@@ -796,4 +880,63 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn dspark_drafter_is_one_movable_at_the_head_with_its_peer_half() {
+        let runtime = vec![Demand::new(0, Category::Drafter, "dSpark request lanes", 7 << 20, Basis::Formula),
+            Demand::new(1, Category::Drafter, "dSpark request lanes", 900 << 20, Basis::Formula),
+            Demand::new(1, Category::Drafter, "dSpark main context", 300 << 20, Basis::Formula),
+            Demand::new(1, Category::Drafter, "dSpark windows", 9 << 20, Basis::Formula)];
+        for peer_half in [0, 3 << 30] {
+            let inventory = DraftInventory { resident: if peer_half > 0 { 4 << 30 } else { 7 << 30 }, runtime: runtime.clone(),
+                marks: 64 << 20, peer_half, staging: [512 << 20, if peer_half > 0 { 256 << 20 } else { 0 }], loading_experts: [6 << 30, peer_half], loader_peak: [0; 2] };
+            let movable = drafter(&inventory, 2).unwrap();
+            assert_eq!((movable.id, movable.allowed.clone(), movable.parts.len()), (MovableId::Drafter, vec![1], 0));
+            assert_eq!(movable.conditional.len(), 1);
+            let home = &movable.conditional[0];
+            assert_eq!(home.placement_gpu, 1);
+            let on = |gpu| home.demands.iter().filter(|d| d.gpu == gpu).map(|d| d.bytes).sum::<u64>();
+            assert_eq!(on(1), inventory.resident + (64 << 20) + (900 << 20) + (300 << 20) + (9 << 20));
+            assert_eq!(on(0), (7 << 20) + peer_half);
+        }
+        let one = DraftInventory { resident: 7 << 30, runtime: runtime.iter().filter(|d| d.gpu == 1)
+            .cloned().map(|d| d.on(0)).collect(), marks: 0, peer_half: 0, staging: [1, 0], loading_experts: [0; 2], loader_peak: [0; 2] };
+        let movable = drafter(&one, 1).unwrap();
+        assert_eq!(movable.allowed, [0]);
+        assert!(movable.conditional[0].demands.iter().all(|d| d.gpu == 0));
+        assert!(drafter(&DraftInventory { peer_half: 1, ..one.clone() }, 1).is_err());
+        assert!(drafter(&DraftInventory { runtime: runtime.clone(), ..one }, 1).is_err());
+    }
+
+    #[test]
+    fn dspark_drafter_placement_charges_both_gpus_before_the_pool() {
+        let inventory = Inventory { gpus: vec![GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 0,
+            baseline: Baseline::Measured { free_bytes: 80 << 30 } }; 2], spark_ranks: 4, peer_access: true };
+        let pool = PoolPolicy::resolve(&[96 << 30; 2], 512, None, 512, false);
+        let cost = ExpertCost { whole: Bytes2 { resident: 200 << 20, staging: 32 << 20 },
+            half: [Bytes2 { resident: 100 << 20, staging: 16 << 20 }; 2], tp2: true, spark_ok: true };
+        let base = request(inventory, pool, vec![1 << 20; 2], vec![cost; 40], 64 << 20, Onboard::Layers(4));
+        let movable = drafter(&DraftInventory { resident: 6 << 30,
+            runtime: vec![Demand::new(1, Category::Drafter, "dSpark request lanes", 1 << 30, Basis::Formula)],
+            marks: 0, peer_half: 2 << 30, staging: [1 << 30, 1 << 29], loading_experts: [4 << 30, 2 << 30], loader_peak: [0; 2] }, 2).unwrap();
+        let mut with = base.clone();
+        with.movables = vec![movable];
+        let (a, b) = (solve(&base).unwrap(), solve(&with).unwrap());
+        assert_eq!(draft::home(&b), Some(1));
+        let units = |p: &Placement| p.pool_tokens / 512;
+        assert!(units(&b) < units(&a), "the drafter's bytes come out of the pool, not after it");
+        crate::placement::draft::assert_same_as_fixed(&with);
+    }
+
+    #[test]
+    fn dspark_load_phase_is_experts_plus_staging_or_the_loader_check() {
+        let mut d = DraftInventory { staging: [1 << 30, 1 << 29], loading_experts: [6 << 30, 2 << 30],
+            peer_half: 2 << 30, ..Default::default() };
+        let phase = |d: &DraftInventory| d.load_phase(2).unwrap().iter().map(|p| (p.gpu, p.bytes)).collect::<Vec<_>>();
+        assert_eq!(phase(&d), [(1, 7 << 30), (0, (2 << 30) + (1 << 29))]);
+        d.loader_peak = [9 << 30, 0];
+        assert_eq!(phase(&d), [(1, 9 << 30), (0, (2 << 30) + (1 << 29))]);
+        d.peer_half = 0;
+        assert_eq!(d.load_phase(1).unwrap()[0].gpu, 0);
+    }
 }

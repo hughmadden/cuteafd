@@ -13,10 +13,11 @@
 //! mode set; hop receive buffers are fixed demands. Peer-accessible two-GPU
 //! builds use a contiguous TP2 expert prefix with no additional residual hop;
 //! TP1 arena-sharing movables retain a separate arena and workspace.
-use cuteafd_core::memory_layout::{Basis, Category, Item};
+use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod draft;
 pub mod families;
 pub mod inventory;
 mod pool;
@@ -24,7 +25,7 @@ pub mod attention;
 mod residual;
 mod solve;
 mod spark;
-pub use spark::{ComponentDemand, SparkIoBytes, SparkRingGeometry, SparkWorkingSet, WorkingSetComponent};
+pub use spark::{ComponentDemand, SparkAssignment, SparkIoBytes, SparkResidentLayout, SparkRingGeometry, SparkWorkingSet, WorkingSetComponent};
 #[cfg(test)]
 mod tests;
 
@@ -313,11 +314,18 @@ pub struct Demand {
     pub group: String,
     pub bytes: u64,
     pub basis: Basis,
+    pub lifetime: ItemLifetime,
 }
 
 impl Demand {
     pub fn new(gpu: u8, category: Category, group: impl Into<String>, bytes: u64, basis: Basis) -> Self {
-        Self { gpu, category, group: group.into(), bytes, basis }
+        Self { gpu, category, group: group.into(), bytes, basis, lifetime: ItemLifetime::ReadyResident }
+    }
+
+    pub fn with_lifetime(self, lifetime: ItemLifetime) -> Self { Self { lifetime, ..self } }
+
+    pub fn item(&self) -> Item {
+        Item::new(self.category, self.group.clone(), "", self.bytes, self.basis).with_lifetime(self.lifetime)
     }
 
     /// This demand on `gpu`.
@@ -559,6 +567,8 @@ pub enum PlacementError {
     Inventory(&'static str),
     #[error("explicit KV pool of {requested} tokens does not fit beside admitted demands (fits {fit}); {limits}")]
     PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
+    #[error("{family} drafter was placed on rtx{gpu}, where this build has no executor for it")]
+    DrafterHome { family: &'static str, gpu: u8 },
     #[error("startup phase {phase} needs {required} bytes on rtx{gpu}, but only {available} bytes are free")]
     StartupPeak { gpu: u8, phase: String, required: u64, available: u64 },
     #[error("KV pool and mandatory {what} do not fit on rtx{gpu}")]

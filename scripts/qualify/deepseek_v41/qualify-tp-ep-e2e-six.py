@@ -37,7 +37,7 @@ from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parents[3]
 RUNNER = REPO / "scripts" / "qualify-ds41-tp-ep-e2e.py"
-EXPECTED_RUNNER_SHA256 = "e197146aa6c98de0c8c731a698de69cbb0f3dadf3edb6fe20e3690e82a6008c4"
+EXPECTED_RUNNER_SHA256 = "0890e8b1102717bce8993754df7540133a9c6a8b1b5f9f29641a4a5ca326f98c"
 V3_CORPUS = REPO / "scripts" / "fixtures" / "tp-ep-e2e-corpus.jsonl"
 V4_CORPUS = REPO / "scripts" / "fixtures" / "tp-ep-e2e-corpus-v4-six.jsonl"
 # v5 adds the two pure unreplicated TP6EP1 arms (2 RTX and 1 RTX) on top of the
@@ -52,7 +52,7 @@ CANONICAL_REPEATS = 3
 CONFIG_KEYS = ("id", "rtx_count", "spark_count", "spark_tp", "spark_ep", "world",
                "expected_resolved_rtx_expert_layers", "expected_spark_first_layer", "remote_layers",
                "requested_rtx_expert_layers", "kv_class", "memory_qualification",
-               "require_explicit_rtx_expert_layers", "require_placement_directory",
+               "require_explicit_rtx_expert_layers",
                "spark_min_reserve_bytes", "coordinator_runtime_headroom_bytes",
                "spark_layer_bytes", "expected_spark_resident_bytes", "dspark_draft_limit")
 # 20 GiB Spark host reserve, required for every config (actual MemTotal minus 20 GiB).
@@ -189,16 +189,16 @@ def validate_six(records, frozen_records, corpus_path: Path = V4_CORPUS) -> dict
             errors.append(f"config {cid}: expected_spark_resident_bytes != spark_layer_bytes * remote_layers")
         if not isinstance(config["memory_qualification"], bool):
             errors.append(f"config {cid}: memory_qualification must be a boolean")
-        if not isinstance(config["require_explicit_rtx_expert_layers"], bool) or not isinstance(config["require_placement_directory"], bool):
-            errors.append(f"config {cid}: require_explicit_rtx_expert_layers/require_placement_directory must be booleans")
+        if not isinstance(config["require_explicit_rtx_expert_layers"], bool):
+            errors.append(f"config {cid}: require_explicit_rtx_expert_layers must be a boolean")
         if not positive_int(config["dspark_draft_limit"]):
             errors.append(f"config {cid}: dspark_draft_limit must be a positive integer")
         if config["spark_tp"] * config["spark_ep"] != config["spark_count"]:
             errors.append(f"config {cid}: spark_tp*spark_ep != spark_count")
         if config["world"] != config["spark_count"]:
             errors.append(f"config {cid}: world != spark_count")
-        if config["expected_spark_first_layer"] != min(config["expected_resolved_rtx_expert_layers"], 39):
-            errors.append(f"config {cid}: expected_spark_first_layer != min(expected_resolved_rtx_expert_layers, 39)")
+        if config["expected_spark_first_layer"] != config["expected_resolved_rtx_expert_layers"]:
+            errors.append(f"config {cid}: expected_spark_first_layer != expected_resolved_rtx_expert_layers")
         if config["remote_layers"] != 40 - config["expected_resolved_rtx_expert_layers"]:
             errors.append(f"config {cid}: remote_layers != 40 - expected_resolved_rtx_expert_layers")
         if not non_negative_int(config["requested_rtx_expert_layers"]):
@@ -213,12 +213,6 @@ def validate_six(records, frozen_records, corpus_path: Path = V4_CORPUS) -> dict
                 errors.append(f"config {cid}: a 1-RTX arm must request an explicit rtx expert layer count")
             if not positive_int(config["coordinator_runtime_headroom_bytes"]):
                 errors.append(f"config {cid}: a standalone arm must declare the coordinator runtime headroom separately")
-            # A 1-RTX arm with local expert layers must hand them off, so it needs
-            # a placement directory; the all-remote arm must not have one.
-            has_local = config["expected_resolved_rtx_expert_layers"] > 0
-            if has_local != bool(config["require_placement_directory"]):
-                errors.append(f"config {cid}: require_placement_directory must be true exactly when a "
-                              "1-RTX arm keeps local expert layers")
     if approved is not None and sorted(configs) != sorted(approved):
         errors.append(f"corpus v{version} must define exactly its approved configs {sorted(approved)}; got {sorted(configs)}")
     comparison_ids = []
@@ -486,10 +480,6 @@ def verify_arm_metadata(records, config: dict, metadata: dict) -> list:
         if str(parsed.get("--rtx-expert-layers")) != requested:
             problems.append(f"coordinator argv must pass --rtx-expert-layers {requested} explicitly; "
                             "an omitted flag defaults to auto and reabsorbs the KV/experts")
-    if config["require_placement_directory"] and "--placement-directory" not in parsed:
-        problems.append("2RTX six-rank requires --placement-directory")
-    if not config["require_placement_directory"] and "--placement-directory" in parsed:
-        problems.append("1RTX must omit --placement-directory")
     problems.extend(verify_common_controls(records, config, metadata))
     problems.extend(verify_worker_runtime_role(records, config, metadata))
     problems.extend(verify_cost_model_evidence(records, metadata))

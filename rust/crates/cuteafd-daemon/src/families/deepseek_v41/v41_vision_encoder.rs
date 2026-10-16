@@ -309,7 +309,7 @@ impl Encoder {
             VisionRuntime::device_bytes(catalog, CAPACITY)?,
         )?))
     }
-    /// Connect only after the launcher has consumed the expert-boundary handoff.
+    /// Connect after coordinator-authoritative Spark admission completes.
     pub fn connect(&mut self) -> Result<()> {
         if let Self::Pending { peers, handshake } = self {
             let remote =

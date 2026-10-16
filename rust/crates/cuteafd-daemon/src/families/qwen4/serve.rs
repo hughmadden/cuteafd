@@ -272,7 +272,7 @@ mod scheduler_tests {
         assert!(geometry.layers.iter().all(|layer| layer.class.is_some()));
         let mut history = DraftHistory::default();
         history.observe(3, 2);
-        let priors = super::super::mtp_policy::acceptance(&[&history], &[3]);
+        let priors = DraftHistory::acceptance(&[&history], &[3]);
         assert_eq!(priors[0], history.pooled(3, std::iter::empty::<&DraftHistory>()));
     }
 
@@ -380,9 +380,6 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         self.engine.draft_geometry(snapshot, width)
     }
     fn arm_draft_probe(&self) -> Result<()> { self.engine.arm_draft_probe() }
-    fn acceptance(&self, histories: &[&crate::shared::draft_policy::DraftHistory], limits: &[usize]) -> Vec<Vec<f64>> {
-        super::mtp_policy::acceptance(histories, limits)
-    }
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>, draft: &mut Self::Draft)
         -> Result<()> {
         super::speculate::prefill_chunk(self.engine, placement, start, chunk, next, draft)

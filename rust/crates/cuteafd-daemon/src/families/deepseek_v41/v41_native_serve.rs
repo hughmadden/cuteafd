@@ -36,42 +36,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 
-use crate::shared::placement::handoff::{HandoffPlan, PlacementHandoff};
-
-/// Family launcher wire schema; publication and exact acknowledgement are shared.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PlacementPlan {
-    version: u32,
-    nonce: String,
-    rtx_gpus: u32,
-    rtx_expert_layers: usize,
-    spark_first_layer: usize,
-}
-impl PlacementPlan {
-    fn new(rtx_gpus: u32, layers: usize) -> Self {
-        Self { version: 1, nonce: String::new(), rtx_gpus,
-            rtx_expert_layers: layers, spark_first_layer: layers.min(39) }
-    }
-}
-impl HandoffPlan for PlacementPlan {
-    fn validate(&self) -> Result<()> {
-        ensure!(self.version == 1 && matches!(self.rtx_gpus, 1 | 2)
-            && self.rtx_expert_layers <= 40
-            && (self.rtx_expert_layers > 0 || self.rtx_gpus == 1)
-            && self.spark_first_layer == self.rtx_expert_layers.min(39),
-            "invalid planned RTX expert boundary");
-        Ok(())
-    }
-    fn nonce(&self) -> &str { &self.nonce }
-    fn set_nonce(&mut self, nonce: String) { self.nonce = nonce; }
-    fn same_placement(&self, other: &Self) -> bool {
-        self.version == other.version && self.rtx_gpus == other.rtx_gpus
-            && self.rtx_expert_layers == other.rtx_expert_layers
-            && self.spark_first_layer == other.spark_first_layer
-    }
-}
-
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
     let Http { api, listen, snapshot, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
@@ -273,19 +237,6 @@ fn worker(
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
-    // Auto placement must publish its live boundary even when no local layer
-    // fits. Explicit all-remote single-RTX launches do not need a handoff.
-    if let Some(directory) = args.placement_directory.as_deref() {
-        ensure!(
-            args.rtx_gpus == 2 || args.rtx_expert_layers != admission::LocalLayers::Count(0),
-            "placement handoff requires --rtx-gpus 2 or single-RTX auto/local expert placement"
-        );
-        // The handoff directory must name a real path, not an empty string.
-        ensure!(
-            !directory.as_os_str().is_empty(),
-            "placement handoff requires a non-empty directory"
-        );
-    }
     ensure!(!args.tp2_dspark_experts || (args.rtx_gpus==2 && args.dspark),
         "--tp2-dspark-experts requires --rtx-gpus 2 and --dspark");
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
@@ -309,6 +260,7 @@ fn worker(
     let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
     let (_, device_total) = lib.cuda_memory_info()?;
     let small_card = device_total <= 32usize << 30;
+    admission::startup_phase(&lib, "v41/context", device_total)?;
     if small_card {
         let explicit = std::env::var("CUTEAFD_V41_FIXED_GRAPH_ROWS").ok();
         if let Some(shapes) = super::graph_policy::profile_fixed_shapes(device_total, explicit.as_deref())? {
@@ -358,17 +310,19 @@ fn worker(
     let local_exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
         &args.native_lib, catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]), "rtx-tp1");
     let mut exl3_modules = None;
-    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], |_| {
+    admission::startup_phase(&lib, "v41/before native preload", device_total)?;
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some(), catalog.exl3().is_some())?;
         if catalog.exl3().is_some() && args.rtx_expert_layers != admission::LocalLayers::Count(0) {
             exl3_modules = Some(admission::preload_exl3(&lib, &local_exl3_directory, aot_capacity, 1)?);
         }
         Ok(())
     })?;
+    admission::startup_phase(&lib, "v41/after native preload", device_total)?;
     admission::admit_startup(&lib, &catalog, &args)?;
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
-    if small_card { admission::startup_phase(&lib, "v41/startup", device_total)?; }
+    admission::startup_phase(&lib, "v41/startup", device_total)?;
     let weights = BackboneLaneWeights::load(
         &lib,
         &catalog,
@@ -396,7 +350,7 @@ fn worker(
     let embedding =
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
-    if small_card { admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?; }
+    admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?;
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
         args.attention_plan_rows)?;
@@ -416,7 +370,7 @@ fn worker(
         BackboneExecution::workspace_bytes(&lib, capacity)?,
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:backbone-lanes");
-    if small_card { admission::startup_phase(&lib, "v41/workspace:backbone-lanes", device_total)?; }
+    admission::startup_phase(&lib, "v41/workspace:backbone-lanes", device_total)?;
     let map = cuteafd_loader::EngramTokenMap::from_file(&&args.snapshot.join("tokenizer.json"))?;
     // Both Engram layers retain their staging leases until consumed. Reserve
     // both layers for both active lanes so the second lane can gather early.
@@ -433,7 +387,7 @@ fn worker(
     ];
     let upload = EngramDeviceRows::new(&lib, rows, EngramDeviceRows::device_bytes(rows)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/engram");
-    if small_card { admission::startup_phase(&lib, "v41/engram", device_total)?; }
+    admission::startup_phase(&lib, "v41/engram", device_total)?;
     let vocabulary = VocabularyHead::load(
         &lib,
         &catalog,
@@ -448,7 +402,7 @@ fn worker(
     )?;
     let head = head_weights.wave(&vocabulary, cuteafd_core::V41_VERIFY_ROWS, TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:head");
-    if small_card { admission::startup_phase(&lib, "v41/weights:head", device_total)?; }
+    admission::startup_phase(&lib, "v41/weights:head", device_total)?;
     let mut pass = TargetPass::new(
         embedding,
         lane,
@@ -465,7 +419,7 @@ fn worker(
         Duration::from_secs(120),
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:target-pass");
-    if small_card { admission::startup_phase(&lib, "v41/workspace:target-pass", device_total)?; }
+    admission::startup_phase(&lib, "v41/workspace:target-pass", device_total)?;
     let protocol_v2_timing = protocol_v2_timing();
     // Every replicated layout reserves its exact physical rank plane count; the
     // legacy 4-rank forecast is no longer reused for six ranks.
@@ -473,7 +427,7 @@ fn worker(
     let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
-    if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
+    admission::startup_phase(&lib, "v41/transport", device_total)?;
     let mut prefill_pass = TargetPass::new(
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?,
         BackboneLane::new(&weights, capacity, BackboneLane::workspace_bytes(&lib, capacity)?.into_iter().sum())?,
@@ -487,11 +441,11 @@ fn worker(
         Duration::from_secs(120),
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-pass");
-    if small_card { admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?; }
+    admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?;
     let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
-    if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
+    admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
     prefill_pass.install_attention_plan(attention_plan)?;
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
@@ -522,7 +476,7 @@ fn worker(
     tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
         "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
     cuteafd_ffi::memory_ledger::relabel_other("v41/drafter");
-    if small_card { admission::startup_phase(&lib, "v41/drafter", device_total)?; }
+    admission::startup_phase(&lib, "v41/drafter", device_total)?;
     let vision_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
     let dspark_bytes = draft_free_before.saturating_sub(vision_free_before);
     let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
@@ -531,7 +485,7 @@ fn worker(
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     cuteafd_ffi::memory_ledger::relabel_other("v41/vision");
-    if small_card { admission::startup_phase(&lib, "v41/vision", device_total)?; }
+    admission::startup_phase(&lib, "v41/vision", device_total)?;
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else {
         (args.prefix_cache_entries as usize).checked_mul(2).and_then(|n| n.checked_add(2))
             .context("snapshot slot count overflow")?
@@ -542,31 +496,32 @@ fn worker(
     let snapshot_bytes = prefix::Arenas::device_bytes(snapshot_slots, draft.is_some());
     tracing::info!(snapshot_slots, snapshot_bytes, "snapshot arenas reserved before serving");
     cuteafd_ffi::memory_ledger::relabel_other("v41/prefix-snapshots");
-    if small_card { admission::startup_phase(&lib, "v41/prefix-snapshots", device_total)?; }
+    admission::startup_phase(&lib, "v41/prefix-snapshots", device_total)?;
     // Size after vision, both lanes, transports and optional draft allocations are live.
     let experts = if args.rtx_expert_layers == admission::LocalLayers::Count(0) { Vec::new() }
         else { admission::expert_demands(&lib, &catalog, aot_capacity, 1)? };
     let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
-    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0)?;
+    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0, None)?;
     pass.bind_execution_plan(&pool.placement)?;
     prefill_pass.bind_execution_plan(&pool.placement)?;
     tracing::info!(source_pages=?pool.pages,global_bytes=pool.global_bytes,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,local_layers=pool.placement.onboard_layers,
         projected_free_bytes=free.saturating_sub(pool.cache_bytes[0]),reservation_bytes=?pool.reservation_bytes,
         "shared V4.1 cache and expert admission");
+    let local_layers = pool.placement.onboard_layers;
+    let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
+        && topology.is_none()
+        && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40;
+    let spark_admission = admission::start_sparks(&args, &catalog, local_layers, capacity, aot_capacity,
+        topology, usize::from(device_exchange))?;
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
-    if small_card { admission::startup_phase(&lib, "v41/kv", device_total)?; }
+    admission::startup_phase(&lib, "v41/kv", device_total)?;
     requests.use_engine_pages()?;
-    let mut local_layers = 0usize;
-    // Published only on the single-RTX path; the 2-RTX distributed worker owns
-    // its own handshake. Dropping it without a ready acknowledgement leaves the
-    // launch unpublished, which the launcher treats as a failure.
-    let mut placement_handoff: Option<PlacementHandoff<PlacementPlan>> = None;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv-prefix-install");
-    if small_card { admission::startup_phase(&lib, "v41/kv-prefix-install", device_total)?; }
+    admission::startup_phase(&lib, "v41/kv-prefix-install", device_total)?;
     if args.rtx_expert_layers != admission::LocalLayers::Count(0) {
         use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
         let local_started = Instant::now();
@@ -582,24 +537,11 @@ fn worker(
             if compressed { Exl3Weights::plan(&catalog, selection) }
             else { ExpertWeights::plan(&lib, &catalog, selection) }
         }).collect::<Result<Vec<_>>>()?;
-        local_layers = pool.placement.onboard_layers;
         let admitted = pool.placement.expert_ranges[0];
         let expected = budgets.iter().take(local_layers).map(|b| b.resident_bytes).sum::<usize>()
             + if local_layers>0 {per_lane*2 + budgets.iter().take(local_layers).map(|b|b.device_staging_bytes).max().unwrap_or(0)} else {0};
         ensure!(expected as u64 <= admitted.peak_bytes,"runtime local owners exceed shared admission");
         tracing::info!(layers=local_layers,peak_bytes=admitted.peak_bytes,"shared RTX expert placement");
-        // Publish the resolved boundary before anything waits on it. On 1 RTX the
-        // 2-RTX distributed path never ran, so without this the launcher cannot
-        // know the real first remote layer and must start every worker at 0,
-        // over-reserving remote layers that the coordinator already owns.
-        // Computing the plan only needs the local device: it does not read the
-        // remote transport, connect to a peer, or wait on readiness.
-        if let Some(directory) = args.placement_directory.as_deref() {
-            placement_handoff = Some(PlacementHandoff::publish(
-                std::path::Path::new(directory),
-                PlacementPlan::new(args.rtx_gpus, local_layers),
-            )?);
-        }
         if local_layers > 0 && compressed {
             let mut loaded = Vec::with_capacity(local_layers);
             for layer in 0..local_layers {
@@ -625,14 +567,8 @@ fn worker(
         tracing::info!(layers=local_layers, elapsed_ms=local_started.elapsed().as_millis(),
             "local RTX experts ready");
     }
-    // The launcher has already started the workers at the published boundary and
-    // now acknowledges it; only then may remote transport creation and the first
-    // request proceed. The local experts above are installed either way.
-    if let Some(handoff) = placement_handoff {
-        handoff.wait_ready(Duration::from_secs(900))?;
-    }
-    if crate::shared::memory::chain::device_exchange_enabled() && topology.is_none()
-        && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40 {
+    if let Some(pending) = spark_admission { pending.wait()?; }
+    if device_exchange {
         // Verification waves (up to 80 rows) on the device-driven exchange; it
         // connects (and warms) the workers, so only once they are serving.
         transport.install_device_link(&args.peers, 80.min(capacity as usize), 39,
@@ -642,7 +578,7 @@ fn worker(
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;
     cuteafd_ffi::memory_ledger::relabel_other("v41/local-experts");
-    if small_card { admission::startup_phase(&lib, "v41/local-experts", device_total)?; }
+    admission::startup_phase(&lib, "v41/local-experts", device_total)?;
     crate::shared::memory_report::release_load_staging(&lib);
     tracing::info!(rtx_layers=local_layers, first_remote_dispatch_layer=local_layers,
         remote_dispatch_layers=40-local_layers, spark_world=args.peers.len(),
@@ -656,6 +592,7 @@ fn worker(
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     vision.connect()?;
+    admission::startup_phase(&lib, "v41/ready", device_total)?;
     ready
         .take()
         .context("startup readiness missing")?
@@ -976,116 +913,4 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         console::Prefill::done(console::PrefillKind::Continuation, 0, index, count, chunk.len(), started);
     }
     anchor.context("prefix continuation produced no logits")
-}
-
-#[cfg(test)]
-mod placement_tests {
-    use super::*;
-    use std::fs;
-    fn publish(directory: &std::path::Path, gpus: u32, layers: usize) -> Result<PlacementHandoff<PlacementPlan>> {
-        PlacementHandoff::publish(directory, PlacementPlan::new(gpus, layers))
-    }
-    fn resumed_layers(directory: &std::path::Path) -> Result<Option<usize>> {
-        Ok(PlacementHandoff::<PlacementPlan>::resumed(directory)?.map(|p| p.rtx_expert_layers))
-    }
-    #[test]
-    fn placement_publication_and_exact_acknowledgement() -> Result<()> {
-        for layers in [1, 17, 20, 40] {
-            let directory = tempfile::tempdir()?;
-            let handoff = publish(directory.path(), 2, layers)?;
-            assert!(!directory.path().join(".plan-pending").exists());
-            let bytes = fs::read(directory.path().join("plan.json"))?;
-            let plan: PlacementPlan = serde_json::from_slice(&bytes)?;
-            assert_eq!(plan.spark_first_layer, layers.min(39));
-            assert_eq!(plan.rtx_gpus, 2);
-            assert!(handoff.wait_ready(Duration::ZERO).is_err());
-            fs::write(directory.path().join("ready.json"), bytes)?;
-            handoff.wait_ready(Duration::ZERO)?;
-            assert_eq!(
-                resumed_layers(directory.path())?,
-                Some(layers)
-            );
-            fs::remove_file(directory.path().join("ready.json"))?;
-            publish(directory.path(), 2, layers)?.wait_ready(Duration::ZERO)?;
-            assert!(
-                publish(directory.path(), 2, if layers == 1 { 2 } else { 1 })
-                    .is_err()
-            );
-        }
-        Ok(())
-    }
-
-    /// The published GPU count is the actual launch width, not an unconditional
-    /// two, and an unknown width is rejected before any state is written.
-    #[test]
-    fn placement_records_and_validates_the_actual_rtx_gpu_count() -> Result<()> {
-        for rtx_gpus in [1u32, 2] {
-            let directory = tempfile::tempdir()?;
-            publish(directory.path(), rtx_gpus, 5)?;
-            let plan: PlacementPlan = serde_json::from_slice(&fs::read(directory.path().join("plan.json"))?)?;
-            assert_eq!(plan.rtx_gpus, rtx_gpus);
-            assert_eq!(resumed_layers(directory.path())?, None);
-        }
-        for rtx_gpus in [0u32, 3] {
-            let directory = tempfile::tempdir()?;
-            assert!(publish(directory.path(), rtx_gpus, 5).is_err());
-            assert!(!directory.path().join("plan.json").exists());
-        }
-        // A one-GPU acknowledgement round-trips exactly.
-        let directory = tempfile::tempdir()?;
-        let handoff = publish(directory.path(), 1, 9)?;
-        let bytes = fs::read(directory.path().join("plan.json"))?;
-        fs::write(directory.path().join("ready.json"), bytes)?;
-        handoff.wait_ready(Duration::ZERO)?;
-        assert_eq!(resumed_layers(directory.path())?, Some(9));
-        Ok(())
-    }
-    #[test]
-    fn single_rtx_auto_can_publish_an_all_remote_boundary() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let handoff = publish(directory.path(), 1, 0)?;
-        let bytes = fs::read(directory.path().join("plan.json"))?;
-        let plan: PlacementPlan = serde_json::from_slice(&bytes)?;
-        assert_eq!((plan.rtx_expert_layers, plan.spark_first_layer), (0, 0));
-        assert!(handoff.wait_ready(Duration::ZERO).is_err());
-        fs::write(directory.path().join("ready.json"), bytes)?;
-        handoff.wait_ready(Duration::ZERO)?;
-        assert_eq!(resumed_layers(directory.path())?, Some(0));
-        publish(directory.path(), 1, 0)?.wait_ready(Duration::ZERO)?;
-        assert!(publish(directory.path(), 2, 0).is_err());
-        assert!(publish(directory.path(), 1, 1).is_err());
-        Ok(())
-    }
-    #[test]
-    fn acknowledged_boundary_cannot_change_gpu_count() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let handoff = publish(directory.path(), 1, 5)?;
-        fs::copy(directory.path().join("plan.json"), directory.path().join("ready.json"))?;
-        handoff.wait_ready(Duration::ZERO)?;
-        assert!(publish(directory.path(), 2, 5).is_err());
-        Ok(())
-    }
-    #[test]
-    fn placement_rejects_wrong_launch_boundary_and_oversized_ack() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let handoff = publish(directory.path(), 2, 17)?;
-        for mutation in [0, 1, 2] {
-            let mut wrong: PlacementPlan = serde_json::from_slice(&fs::read(directory.path().join("plan.json"))?)?;
-            match mutation {
-                0 => wrong.nonce.push('x'),
-                1 => wrong.spark_first_layer = 20,
-                _ => wrong.rtx_gpus = 1,
-            }
-            fs::write(
-                directory.path().join("ready.json"),
-                serde_json::to_vec(&wrong)?,
-            )?;
-            assert!(handoff.wait_ready(Duration::ZERO).is_err());
-        }
-        fs::write(directory.path().join("ready.json"), vec![b' '; 4097])?;
-        assert!(handoff.wait_ready(Duration::ZERO).is_err());
-        assert!(publish(directory.path(), 2, 0).is_err());
-        assert!(publish(directory.path(), 2, 41).is_err());
-        Ok(())
-    }
 }

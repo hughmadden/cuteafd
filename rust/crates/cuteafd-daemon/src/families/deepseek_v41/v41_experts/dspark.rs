@@ -69,38 +69,15 @@ impl DsparkBudget {
             .and_then(|bytes| bytes.checked_add(self.grouped_output_resident_bytes))
             .context("dSpark residency overflow")
     }
-    /// Experts load serially, then native auxiliary tensors, then execution waves.
-    /// Committed dSpark windows are shared across waves and counted once below.
-    /// Remaining draft-attention/norm scratch, shared head,
-    /// driver and graph allocations must be budgeted separately by the coordinator.
-    pub fn peak_device_bytes(self, waves: usize) -> Result<usize> {
-        ensure!((1..=2).contains(&waves), "dSpark needs one or two waves");
-        let execution = self
-            .execution_bytes_per_wave
-            .checked_add(self.draft_token_bytes_per_wave)
-            .and_then(|bytes| bytes.checked_add(self.main_context_additional_bytes_per_wave))
-            .and_then(|bytes| bytes.checked_add(self.shared_execution_bytes_per_wave))
-            .and_then(|bytes| bytes.checked_add(self.projection_bytes_per_wave))
-            .and_then(|bytes| bytes.checked_add(self.attention_output_additional_bytes_per_wave))
-            .and_then(|bytes| bytes.checked_add(self.attention_wave_additional_bytes_per_wave))
-            .and_then(|bytes| bytes.checked_add(self.hc_bytes_per_wave))
-            .and_then(|bytes| bytes.checked_add(self.router_bytes_per_wave))
-            .and_then(|bytes| bytes.checked_add(self.confidence_bytes_per_wave))
-            .and_then(|bytes| bytes.checked_add(self.markov_bytes_per_wave))
-            .and_then(|bytes| bytes.checked_add(self.terminal_additional_bytes_per_wave))
-            .context("dSpark combined wave budget overflow")?
-            .checked_mul(waves)
-            .context("dSpark wave budget overflow")?;
-        let loading = self
-            .expert_resident_bytes
-            .checked_add(self.load_staging_bytes)
+    /// Exactly what `load_with_experts` allocates on the drafter's GPU: experts
+    /// load serially (each with transient device staging), then auxiliary
+    /// tensors (host-pinned staging, no device staging) and packed scales.
+    /// Waves, windows and main contexts belong to the draft runtime, which
+    /// allocates them later from their own exact budgets.
+    pub fn load_bound(self) -> Result<usize> {
+        let loading = self.expert_resident_bytes.checked_add(self.load_staging_bytes)
             .context("dSpark load peak overflow")?;
-        let serving = self
-            .resident_bytes()?
-            .checked_add(execution)
-            .and_then(|bytes| bytes.checked_add(self.window_cache_bytes))
-            .context("dSpark serving peak overflow")?;
-        Ok(loading.max(serving))
+        Ok(loading.max(self.resident_bytes()?))
     }
 }
 
@@ -109,6 +86,63 @@ enum ExpertStages<'a> {
     Full([ExpertWeights<'a>; 3]),
     Exl3 { weights: Rc<Vec<Exl3Weights<'a>>>, directory: PathBuf },
 }
+/// Which routed-expert backend a dSpark drafter executes, without its weights.
+#[derive(Clone, Copy)]
+pub(crate) enum DraftExpertKind<'p> {
+    /// Native BF16 experts, whole on the drafter's GPU.
+    Full,
+    /// EXL3 experts and their AOT layout directory.
+    Exl3(&'p Path),
+    /// `--tp2-dspark-experts`: native halves on both RTX.
+    Tp2,
+}
+
+/// Weight-free sizing of every dSpark owner. Loaded weights size through the
+/// same functions (`DsparkWeights::shape`), so pre-load admission and the
+/// allocations made after loading are the same numbers by construction.
+#[derive(Clone, Copy)]
+pub(crate) struct DsparkShape<'p, 'library> {
+    pub library: &'library NativeLibrary,
+    pub width: usize,
+    pub experts: DraftExpertKind<'p>,
+}
+
+impl DsparkShape<'_, '_> {
+    pub fn expert_bytes(&self, capacity: u32) -> Result<usize> {
+        match self.experts {
+            DraftExpertKind::Tp2 => Ok(tp2::RoutedWave::device_bytes(self.library, capacity)?[1]),
+            DraftExpertKind::Full => ExpertWeights::plan_execution(ExpertLayer::Dspark { stage: 0 },
+                self.library, capacity, capacity, false)?.total(),
+            DraftExpertKind::Exl3(directory) => CompressedDraftExperts::device_bytes(directory, capacity),
+        }
+    }
+    pub fn ffn_bytes(&self, capacity: u32) -> Result<usize> {
+        [HcSublayer::device_bytes(capacity as usize)?, DsparkRouter::device_bytes(capacity as usize)?,
+            DsparkSharedFfn::device_bytes(self.library, capacity)?].into_iter()
+            .try_fold(self.expert_bytes(capacity)?, |bytes, next| bytes.checked_add(next)
+                .context("dSpark FFN combined budget overflow"))
+    }
+    pub fn stage_bytes(&self, requests: u32) -> Result<usize> {
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, self.width)?;
+        let attention = DsparkAttentionWave::device_bytes_with_width(self.library, requests, self.width)?;
+        self.ffn_bytes(capacity)?
+            .checked_add(HcSublayer::device_bytes(capacity as usize)?)
+            .and_then(|v| v.checked_add(attention))
+            .context("dSpark combined stage budget overflow")
+    }
+    pub fn chain_bytes(&self, requests: u32) -> Result<usize> {
+        self.stage_bytes(requests)?.checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(requests as usize * 4))
+            .context("dSpark chain budget overflow")
+    }
+    pub fn peer_chain_bytes(&self, requests: u32) -> Result<usize> {
+        if let DraftExpertKind::Tp2 = self.experts {
+            let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, self.width)?;
+            tp2::RoutedWave::device_bytes(self.library, capacity)?[0].checked_mul(3).context("draft TP2 peer chain overflow")
+        } else { Ok(0) }
+    }
+}
+
 pub(crate) struct DsparkWeights<'library> {
     library: &'library NativeLibrary,
     draft_width: usize,
@@ -123,29 +157,26 @@ impl<'library> DsparkWeights<'library> {
     fn full_expert(&self, stage: usize) -> Option<&ExpertWeights<'library>> {
         match &self.experts { ExpertStages::Full(weights) => weights.get(stage), ExpertStages::Exl3 { .. } | ExpertStages::Tp2(_) => None }
     }
-    fn expert_bytes(&self, capacity: u32) -> Result<usize> {
-        match &self.experts {
-            ExpertStages::Tp2(_) => Ok(tp2::RoutedWave::device_bytes(self.library,capacity)?[1]),
-            ExpertStages::Full(weights) => weights[0].execution_budget(capacity)?.total(),
-            ExpertStages::Exl3 { directory, .. } => CompressedDraftExperts::device_bytes(directory, capacity),
-        }
+    /// The weight-free sizing view of these loaded weights.
+    pub(crate) fn shape(&self) -> DsparkShape<'_, 'library> {
+        DsparkShape { library: self.library, width: self.draft_width, experts: match &self.experts {
+            ExpertStages::Tp2(_) => DraftExpertKind::Tp2,
+            ExpertStages::Full(_) => DraftExpertKind::Full,
+            ExpertStages::Exl3 { directory, .. } => DraftExpertKind::Exl3(directory),
+        } }
     }
+    fn expert_bytes(&self, capacity: u32) -> Result<usize> { self.shape().expert_bytes(capacity) }
     fn expert_wave(&self, stage: usize, capacity: u32) -> Result<DraftExperts<'_, 'library>> {
         ensure!(stage < 3, "invalid dSpark expert stage");
         match &self.experts {
             ExpertStages::Tp2(weights) => Ok(DraftExperts::Tp2(tp2::RoutedWave::new(self,weights.clone(),stage,capacity)?)),
-            ExpertStages::Full(weights) => Ok(DraftExperts::Full(weights[stage].execution(capacity, self.expert_bytes(capacity)?)?)),
+            ExpertStages::Full(weights) => Ok(DraftExperts::Full(weights[stage].execution(capacity, capacity, self.expert_bytes(capacity)?)?)),
             ExpertStages::Exl3 { weights, directory } => Ok(DraftExperts::Exl3(unsafe {
                 CompressedDraftExperts::new(self, weights.clone(), directory, stage, capacity)?
             })),
         }
     }
-    pub fn peer_chain_bytes(&self,requests:u32)->Result<usize> {
-        if matches!(self.experts,ExpertStages::Tp2(_)) {
-            let capacity=DsparkAttentionWave::projection_capacity_with_width(requests,self.draft_width)?;
-            tp2::RoutedWave::device_bytes(self.library,capacity)?[0].checked_mul(3).context("draft TP2 peer chain overflow")
-        } else {Ok(0)}
-    }
+    pub fn peer_chain_bytes(&self,requests:u32)->Result<usize> { self.shape().peer_chain_bytes(requests) }
     pub fn draft_width(&self) -> usize { self.draft_width }
     fn auxiliary_names(catalog: &OfficialV41Catalog) -> Vec<String> {
         catalog
@@ -181,7 +212,7 @@ impl<'library> DsparkWeights<'library> {
             NativeRtxTensors::plan(catalog, &Self::auxiliary_names(catalog))?;
         let execution_bytes_per_wave = (if !catalog.native_dspark_experts() {
             CompressedDraftExperts::device_bytes(exl3_directory.context("dSpark EXL3 AOT directory missing")?, capacity)?
-        } else { ExpertWeights::plan_execution(ExpertLayer::Dspark { stage: 0 }, library, capacity, false)?.total()? })
+        } else { ExpertWeights::plan_execution(ExpertLayer::Dspark { stage: 0 }, library, capacity, capacity, false)?.total()? })
             .checked_mul(3)
             .context("dSpark stage workspace overflow")?;
         Ok(DsparkBudget {
@@ -208,6 +239,89 @@ impl<'library> DsparkWeights<'library> {
             terminal_additional_bytes_per_wave: DsparkTerminal::additional_bytes_with_width(16, width)?,
         })
     }
+    /// Single-RTX `serving_bytes` as a drafter inventory: weights, the
+    /// request lanes, main contexts and windows as one exact named owner, and
+    /// the loader's load phase. Marks are 0; the caller fills `marks`.
+    pub fn single_inventory(library: &NativeLibrary, catalog: &OfficialV41Catalog,
+        context_capacity: u32, requests: u32, width: usize, directory: Option<&Path>)
+        -> Result<cuteafd_loader::placement::families::deepseek_v41::DraftInventory> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        let (resident, runtime, staging) = Self::serving_bytes(library, catalog, context_capacity, requests, width, directory)?;
+        // `load_serving_with_width` plans at the full request batch; its check is weights-only.
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, width)?;
+        let budget = Self::plan_with_width(library, catalog, capacity, width, directory)?;
+        let peak = budget.load_bound()?;
+        Ok(cuteafd_loader::placement::families::deepseek_v41::DraftInventory {
+            resident: resident as u64,
+            runtime: vec![cuteafd_loader::placement::Demand::new(0, Category::Drafter, "dSpark lanes/windows",
+                runtime as u64, Basis::Exact)],
+            marks: 0, peer_half: 0, staging: [staging as u64, 0],
+            loading_experts: [budget.expert_resident_bytes as u64, 0], loader_peak: [peak as u64, 0] })
+    }
+
+    /// Every owner the distributed (two-RTX) drafter retains, before any
+    /// payload is read: weights, the GPU0 TP2 expert half, lane chains and
+    /// terminals, main contexts, windows and prefix draft marks. These are
+    /// exactly what `load_serving*` and `DraftRuntime::with_distributed_requests`
+    /// later allocate; the admission solver places them as one drafter Movable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn distributed_inventory(library: &NativeLibrary, catalog: &OfficialV41Catalog,
+        context_capacity: u32, requests: u32, width: usize, tp2_experts: bool,
+        exl3_directory: Option<&Path>, split: usize, mark_bytes: usize)
+        -> Result<cuteafd_loader::placement::families::deepseek_v41::DraftInventory> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        use cuteafd_loader::placement::Demand;
+        ensure!((1..=16).contains(&requests), "invalid draft request limit");
+        ensure!(!tp2_experts || catalog.native_dspark_experts(), "TP2 dSpark requires native expert weights");
+        let lanes = if requests == 1 { 1 } else { 2 };
+        let lane_requests = requests.div_ceil(lanes);
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, width)?;
+        let experts = if tp2_experts { DraftExpertKind::Tp2 }
+            else if catalog.native_dspark_experts() { DraftExpertKind::Full }
+            else { DraftExpertKind::Exl3(exl3_directory.context("dSpark EXL3 AOT directory missing")?) };
+        let shape = DsparkShape { library, width, experts };
+        let budget = Self::plan_with_width(library, catalog, capacity, width,
+            if tp2_experts { None } else { exl3_directory })?;
+        // Weights on GPU1 (auxiliary, packed scales, grouped outputs, experts or
+        // their GPU1 half) and, under TP2, the GPU0 half.
+        // The loaders' exact weights-only load bound (`DsparkBudget::load_bound`).
+        let (resident, peer_half, staging, loading_experts, loader_peak) = if tp2_experts {
+            let (mut half, mut stage) = ([0usize; 2], [0usize; 2]);
+            for rank in 0..2 { for stage_index in 0..3 {
+                let plan = crate::shared::memory::device::Device { library, id: rank as i32 }.run(|| ExpertWeights::plan(library, catalog,
+                    ExpertLayer::DsparkTp2 { stage: stage_index, rank }))?;
+                half[rank] += plan.resident_bytes;
+                stage[rank] = stage[rank].max(plan.device_staging_bytes);
+            }}
+            let mut root = budget;
+            root.expert_resident_bytes = half[1];
+            root.load_staging_bytes = root.load_staging_bytes.max(stage[1]);
+            let peer = half[0].checked_add(stage[0]).context("draft TP2 peer budget overflow")?;
+            let resident = budget.resident_bytes()? - budget.expert_resident_bytes + half[1];
+            (resident, half[0], [root.load_staging_bytes, stage[0]], [half[1], half[0]],
+                [root.load_bound()?, peer])
+        } else {
+            (budget.resident_bytes()?, 0, [budget.load_staging_bytes, 0], [budget.expert_resident_bytes, 0],
+                [budget.load_bound()?, 0])
+        };
+        // Lane chains and terminals per GPU, as DistributedDsparkChain::device_bytes.
+        let mut lane = DistributedDsparkTerminal::device_bytes_with_width(lane_requests as usize, split, width)?;
+        lane[0] = lane[0].checked_add(shape.peer_chain_bytes(lane_requests)?).context("draft peer lane overflow")?;
+        lane[1] = lane[1].checked_add(shape.chain_bytes(lane_requests)?).context("draft lane overflow")?;
+        let mut main = DsparkMainContext::device_bytes(library, context_capacity)?;
+        if lanes > 1 { main = main.checked_add(DsparkMainContext::device_bytes(library, 80)?).context("draft main overflow")?; }
+        let windows = DsparkWindow::device_bytes(requests as usize, context_capacity)?.checked_mul(3)
+            .context("draft windows overflow")?;
+        let demand = |gpu, group, bytes: usize| Demand::new(gpu, Category::Drafter, group, bytes as u64, Basis::Exact);
+        let runtime = vec![demand(0, "dSpark request lanes", lane[0] * lanes as usize),
+            demand(1, "dSpark request lanes", lane[1] * lanes as usize),
+            demand(1, "dSpark main context", main), demand(1, "dSpark windows", windows)];
+        Ok(cuteafd_loader::placement::families::deepseek_v41::DraftInventory {
+            resident: resident as u64, runtime: runtime.into_iter().filter(|d| d.bytes > 0).collect(),
+            marks: mark_bytes as u64, peer_half: peer_half as u64, staging: staging.map(|b| b as u64),
+            loading_experts: loading_experts.map(|b| b as u64), loader_peak: loader_peak.map(|b| b as u64) })
+    }
+
     /// Exact single-coordinator serving owners, before reading any payload.
     pub fn serving_bytes(library: &NativeLibrary, catalog: &OfficialV41Catalog,
         context_capacity: u32, requests: u32, width: usize, directory: Option<&Path>) -> Result<(usize, usize, usize)> {
@@ -251,18 +365,16 @@ impl<'library> DsparkWeights<'library> {
     pub fn load_serving_with_width(library: &'library NativeLibrary, catalog: &OfficialV41Catalog,
         context_capacity: u32, requests: u32, device_budget: usize,
         pinned_staging_bytes: usize, width: usize, exl3_directory: Option<&Path>) -> Result<Self> {
+        // The main context is a draft-runtime owner, allocated later from its own budget.
+        let _ = context_capacity;
         let draft_capacity = DsparkAttentionWave::projection_capacity_with_width(requests, width)?;
-        let context_bytes = DsparkMainContext::device_bytes(library, context_capacity)?;
-        let draft_budget = device_budget.checked_sub(context_bytes)
-            .context("dSpark main context exceeds device budget")?;
-        Self::load_with_width(library, catalog, draft_capacity, 1, draft_budget, pinned_staging_bytes, width, exl3_directory)
+        Self::load_with_width(library, catalog, draft_capacity, 1, device_budget, pinned_staging_bytes, width, exl3_directory)
     }
 
     pub fn load_serving_tp2(library:&'library NativeLibrary,catalog:&OfficialV41Catalog,
-        context_capacity:u32,requests:u32,mut budgets:[usize;2],pinned_staging_bytes:usize,width:usize)->Result<Self> {
+        context_capacity:u32,requests:u32,budgets:[usize;2],pinned_staging_bytes:usize,width:usize)->Result<Self> {
+        let _ = context_capacity;
         let capacity=DsparkAttentionWave::projection_capacity_with_width(requests,width)?;
-        budgets[1]=budgets[1].checked_sub(DsparkMainContext::device_bytes(library,context_capacity)?)
-            .context("TP2 draft main context exceeds RTX1 budget")?;
         Self::load_tp2_with_width(library,catalog,capacity,2,budgets,pinned_staging_bytes,width)
     }
 
@@ -284,8 +396,9 @@ impl<'library> DsparkWeights<'library> {
         budget.expert_resident_bytes=resident[1];
         budget.load_staging_bytes=budget.load_staging_bytes.max(staging[1]);
         budget.execution_bytes_per_wave=workspace[1].checked_mul(3).context("draft TP2 workspace overflow")?;
-        let root_peak=budget.peak_device_bytes(waves)?;
-        let peer_peak=resident[0].checked_add(staging[0].max(workspace[0].checked_mul(3*waves).context("draft TP2 peer wave overflow")?)).context("draft TP2 peer budget overflow")?;
+        let _ = (workspace, waves);
+        let root_peak=budget.load_bound()?;
+        let peer_peak=resident[0].checked_add(staging[0]).context("draft TP2 peer budget overflow")?;
         ensure!(peer_peak<=budgets[0] && root_peak<=budgets[1],
             "draft TP2 needs GPU0/GPU1 bytes {peer_peak}/{root_peak}, budgets are {}/{}",budgets[0],budgets[1]);
         let weights=tp2::Weights::load_pair(devices,catalog,budgets,tp2::LAYOUT)?;
@@ -313,9 +426,10 @@ impl<'library> DsparkWeights<'library> {
         capacity:u32,waves:usize,device_budget:usize,pinned_staging_bytes:usize,width:usize,
         exl3_directory:Option<&Path>,tp2:Option<([Rc<tp2::Weights<'library>>;2],DsparkBudget)>)->Result<Self> {
         let budget = if let Some((_,budget))=&tp2 {*budget} else {Self::plan_with_width(library, catalog, capacity, width, exl3_directory)?};
+        let _ = waves;
         ensure!(
-            budget.peak_device_bytes(waves)? <= device_budget,
-            "dSpark RTX residency and expert waves exceed device budget"
+            budget.load_bound()? <= device_budget,
+            "dSpark weights need {} device bytes while loading, budget is {device_budget}", budget.load_bound()?
         );
         ensure!(
             (1..=64 * 1024 * 1024).contains(&pinned_staging_bytes),

@@ -273,9 +273,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         let deployment = DeploymentOptions {
             rtx_gpus: args.rtx, spark_tp: args.spark_tp.map(usize::from),
             spark_ep: args.spark_ep.map(usize::from), peers: args.deployment_peers.clone(),
-            speculator: args.speculator.clone(), placement_handshake: args.placement_handshake,
-            onboard: args.rtx_expert_layers.or(args.local_expert_layers.map(cuteafd_loader::placement::Onboard::Layers))
-                .unwrap_or_default(),
+            speculator: args.speculator.clone(),
             admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
                 memory_reservation: args.memory_reservation.clone(), pool_tokens: args.pool_tokens },
         };
@@ -663,7 +661,7 @@ mod tests {
             spark_budget_gib: 100.0,
             coordinator_weight_budget_gib: 80.0,
             json: true,
-            deployment: false, spark_tp: None, spark_ep: None, deployment_peers: vec![], placement_handshake: false,
+            deployment: false, spark_tp: None, spark_ep: None, deployment_peers: vec![],
             kv_pool_size: None, memory_reservation: None,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,

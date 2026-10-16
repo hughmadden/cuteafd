@@ -61,16 +61,15 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         snapshot: args.snapshot,
         rank: args.rank as usize,
         world: args.world as usize,
-        first_layer: args.first_layer as usize,
-        last_layer: args.last_layer.map(|layer| layer as usize),
-        placement_handshake: args.placement_handshake,
-        capacity: args.capacity,
+        model_admission: None,
+        selected_layers: None,
+        capacity: 0,
         device_budget: args.device_budget_bytes,
-        max_frame_bytes: args.max_frame_bytes,
-        rdma_endpoints: args.rdma_endpoints as usize,
+        max_frame_bytes: 0,
+        rdma_endpoints: 0,
         topology,
         native_spark_tp2: false,
-        bf16_ingress: args.bf16_ingress,
+        bf16_ingress: false,
         encoder,
         audio_encoder,
     };
@@ -92,10 +91,8 @@ pub(crate) struct NativeExpertServiceConfig {
     pub snapshot: PathBuf,
     pub rank: usize,
     pub world: usize,
-    pub first_layer: usize,
-    /// Inclusive last resident layer; `None` serves through the model's last.
-    pub last_layer: Option<usize>,
-    pub placement_handshake: bool,
+    model_admission: Option<cuteafd_transport::worker_selection::ModelAdmission>,
+    selected_layers: Option<Vec<usize>>,
     pub capacity: u32,
     pub device_budget: usize,
     pub max_frame_bytes: usize,
@@ -123,10 +120,10 @@ fn load_weights<'a>(
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
 ) -> Result<(backend::Weights<'a>, usize)> {
-    let layers = config.resident_layers(catalog.routed_experts().layers)?.end;
+    let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let first = catalog.routed_experts().first_layer;
-    ensure!(config.first_layer >= first,
-        "this checkpoint's routed experts start at layer {first}; pass --first-layer {first} or later");
+    ensure!(layers.iter().all(|&layer| layer >= first),
+        "coordinator selected experts before this checkpoint's routed boundary {first}");
     validate_topology(config, catalog)?;
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
     if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config); }
@@ -137,7 +134,7 @@ fn load_weights<'a>(
     let mut staging = 0usize;
     let mut pinned_host = 0usize;
     let mut read_scratch = 0usize;
-    for layer in config.first_layer..layers {
+    for &layer in &layers {
         let plan = ExpertWeights::plan(library, catalog, config.selection(layer)?)?;
         resident = resident
             .checked_add(plan.resident_bytes)
@@ -158,6 +155,7 @@ fn load_weights<'a>(
     let workspace = ExpertWeights::plan_execution(
         config.selection(0)?,
         library,
+        config.compiled_capacity()?,
         config.capacity,
         nvfp4,
     )?
@@ -218,9 +216,9 @@ fn load_weights<'a>(
             "explicit Spark replicas admission"
         );
     }
-    let mut weights = Vec::with_capacity(layers - config.first_layer);
+    let mut weights = Vec::with_capacity(layers.len());
     let mut remaining = config.device_budget;
-    for layer in config.first_layer..layers {
+    for &layer in &layers {
         let started = std::time::Instant::now();
         let weight = ExpertWeights::load(
             library,
@@ -315,24 +313,23 @@ fn spark_ring_bytes_for_ingress(capacity: u32, max_frame_bytes: usize, depth: us
 }
 
 fn selected_spark_io(config: &NativeExpertServiceConfig, geometry: cuteafd_core::ExpertGeometry,
-    rings: cuteafd_loader::placement::SparkRingGeometry) -> Result<cuteafd_loader::placement::SparkIoBytes> {
+    _rings: cuteafd_loader::placement::SparkRingGeometry) -> Result<cuteafd_loader::placement::SparkIoBytes> {
     let working = cuteafd_loader::placement::SparkWorkingSet {
-        spark_layers: vec![config.first_layer], spark_ranks: config.world,
+        spark_layers: vec![0], spark_ranks: config.world,
         prefill_lanes: 1, ..Default::default()
     };
     ensure!(working.selected_ranks().contains(&config.rank), "Spark worker rank is not selected");
-    Ok(working.rank_io(config.rank, geometry, config.capacity, config.bf16_ingress, rings)?)
+    let model = config.model_admission.as_ref().context("Spark I/O requires coordinator model admission")?;
+    Ok(working.rank_endpoints_io(config.rank, geometry, &model.endpoints, model.rings)?)
 }
 
 fn worker_ring_geometry(config: &NativeExpertServiceConfig)
     -> Result<cuteafd_loader::placement::SparkRingGeometry> {
-    ensure!(config.rdma_endpoints > 0, "Spark ring geometry requires nonzero --rdma-endpoints");
+    let model = config.model_admission.as_ref().context("Spark rings require coordinator model admission")?;
     Ok(cuteafd_loader::placement::SparkRingGeometry {
-        max_frame_bytes: config.max_frame_bytes,
-        depth: env_usize("CUTEAFD_VERBS_HOST_RING_DEPTH", 8)?,
-        slot_bytes: env_usize("CUTEAFD_VERBS_HOST_RING_SLOT_BYTES", 8 << 20)?,
-        endpoints: config.rdma_endpoints,
-        alignment: cuteafd_transport::verbs_host_capabilities().preferred_alignment,
+        max_frame_bytes: model.rings.max_frame_bytes, depth: model.rings.depth,
+        slot_bytes: model.rings.slot_bytes, endpoints: model.endpoints.len(),
+        alignment: model.rings.alignment,
     })
 }
 
@@ -341,28 +338,13 @@ fn spark_transport_bytes(config: &NativeExpertServiceConfig) -> Result<usize> {
     let rings = worker_ring_geometry(config)?;
     let bytes = usize::try_from(selected_spark_io(config, cuteafd_core::expert_geometry(),
         rings)?.mapped_rings)?;
-    validate_v41_ring_charge(config, cuteafd_core::expert_geometry(), rings.depth,
-        rings.slot_bytes, bytes)?;
     Ok(bytes)
-}
-
-fn validate_v41_ring_charge(config: &NativeExpertServiceConfig, geometry: cuteafd_core::ExpertGeometry,
-    depth: usize, slot_bytes: usize, bytes: usize) -> Result<()> {
-    if geometry.family() == Some("v41") {
-        let charge = cuteafd_loader::plan::layout::v41_spark_ring_allowance(
-            "deepseek_v41", config.capacity as u64, 0, config.bf16_ingress);
-        ensure!(bytes as u64 <= charge,
-            "V4.1 CUTEAFD_VERBS_HOST_RING_DEPTH={depth} CUTEAFD_VERBS_HOST_RING_SLOT_BYTES={slot_bytes} \
-             geometry uses {bytes} bytes, exceeding planner charge {charge} bytes");
-    }
-    Ok(())
 }
 
 fn worker_ring_budget(config: &NativeExpertServiceConfig, geometry: cuteafd_core::ExpertGeometry)
     -> Result<Arc<cuteafd_transport::RingBudget>> {
     let rings = worker_ring_geometry(config)?;
     let limit = usize::try_from(selected_spark_io(config, geometry, rings)?.mapped_rings)?;
-    validate_v41_ring_charge(config, geometry, rings.depth, rings.slot_bytes, limit)?;
     Ok(cuteafd_transport::RingBudget::new(limit))
 }
 
@@ -485,9 +467,14 @@ mod tests {
             snapshot: PathBuf::from("/model"),
             rank,
             world,
-            first_layer: 0,
-            last_layer: None,
-            placement_handshake: false,
+            model_admission: Some(cuteafd_transport::worker_selection::ModelAdmission {
+                capacity: 16, compiled_capacity: 16,
+                endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 16,
+                    ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2],
+                rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+            }),
+            selected_layers: None,
             capacity: 16,
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,
@@ -498,6 +485,17 @@ mod tests {
             encoder: None,
             audio_encoder: None,
         }
+    }
+
+    fn set_model(config: &mut NativeExpertServiceConfig, capacity: u32, bf16: bool, endpoints: usize) {
+        config.model_admission = Some(cuteafd_transport::worker_selection::ModelAdmission {
+            capacity, compiled_capacity: capacity,
+            endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress: if bf16 {
+                cuteafd_core::SparkIngress::Bf16
+            } else { cuteafd_core::SparkIngress::Fp8K32 } }; endpoints],
+            rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
+                depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+        });
     }
 
     #[test]
@@ -670,6 +668,7 @@ mod tests {
         let topology = SparkTopology::new(2, 2).unwrap();
         let mut config = config(4, 0, Some(topology));
         config.capacity = 4096;
+        set_model(&mut config, 4096, false, 2);
         let headroom = spark_runtime_headroom().unwrap();
         let rings = spark_transport_bytes(&config).unwrap();
         let budget = spark_admission_budget(&config, 10, 1, 2, 3, 4).unwrap();
@@ -753,38 +752,28 @@ mod tests {
     }
 
     #[test]
-    fn standard_v41_planner_allowance_covers_exact_worker_rings() {
-        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, 96);
-        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, 96);
-        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN, 40);
-        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN, 12);
-        let allowance = cuteafd_loader::plan::layout::family_costs("deepseek_v41").spark_ring_bytes;
-        for bf16 in [false, true] {
-            for capacity in [1, 16, 80, 256, 1024, 2048, 4096] {
-                let exact = spark_ring_bytes_for_ingress(capacity, 64 << 20, 8, 8 << 20,
-                    cuteafd_transport::verbs_host_capabilities().preferred_alignment, 2, bf16).unwrap();
-                let charged = cuteafd_loader::plan::layout::v41_spark_ring_allowance(
-                    "deepseek_v41", capacity as u64, allowance, bf16);
-                assert!(exact as u64 <= charged, "capacity={capacity} bf16={bf16} rings={exact} charged={charged}");
-                assert_eq!(charged, exact as u64);
-            }
-        }
-    }
-
-    #[test]
-    fn v41_ring_overrides_cannot_exceed_planner_charge() {
+    fn typed_v41_ring_budget_covers_three_or_four_endpoints() {
         let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
-        let config = config(3, 0, None);
-        let charge = cuteafd_loader::plan::layout::v41_spark_ring_allowance(
-            "deepseek_v41", config.capacity as u64, 0, false) as usize;
-        let smaller = geometry.compact_ring_bytes(config.capacity, 64 << 20, 4, 8 << 20, 4096, 2, false).unwrap();
-        let larger = geometry.compact_ring_bytes(config.capacity, 64 << 20, 8, 64 << 20, 4096, 2, false).unwrap();
-        assert!(validate_v41_ring_charge(&config, geometry, 4, 8 << 20, smaller).is_ok());
-        let error = validate_v41_ring_charge(&config, geometry, 8, 64 << 20, larger)
-            .unwrap_err().to_string();
-        for detail in ["CUTEAFD_VERBS_HOST_RING_DEPTH=8", "CUTEAFD_VERBS_HOST_RING_SLOT_BYTES=67108864",
-            &format!("{larger} bytes"), &format!("planner charge {charge}")] {
-            assert!(error.contains(detail), "{error}");
+        for device in [1, 2] {
+            let mut config = config(4, 0, None);
+            let mut endpoints = vec![cuteafd_core::SparkEndpoint { capacity: 1024,
+                ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2];
+            endpoints.extend(std::iter::repeat_n(cuteafd_core::SparkEndpoint { capacity: 80,
+                ingress: cuteafd_core::SparkIngress::Fp8K32 }, device));
+            let model = cuteafd_transport::worker_selection::ModelAdmission {
+                capacity: 1024, compiled_capacity: 1024, endpoints,
+                rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+            };
+            model.validate(geometry).unwrap();
+            let exact = model.ring_bytes(geometry).unwrap();
+            config.model_admission = Some(model);
+            let budget = worker_ring_budget(&config, geometry).unwrap();
+            assert_eq!(budget.limit(), exact);
+            let all = budget.reserve(exact).unwrap();
+            assert!(budget.reserve(1).is_err());
+            drop(all);
+            assert_eq!(budget.used(), 0);
         }
     }
 
@@ -795,6 +784,7 @@ mod tests {
                 let mut config = config(3, 0, topology);
                 config.capacity = 1024;
                 config.bf16_ingress = bf16;
+                set_model(&mut config, 1024, bf16, 2);
                 let budget = worker_ring_budget(&config, cuteafd_core::ExpertGeometry::DEEPSEEK_V41).unwrap();
                 let bytes = spark_ring_bytes_for_ingress(1024, 64 << 20, 8, 8 << 20, 4096, 1, bf16).unwrap();
                 let decode = budget.reserve(bytes).unwrap();
@@ -847,6 +837,7 @@ mod tests {
     fn generic_ring_budget_uses_explicit_endpoints_for_every_format() {
         let mut config = config(4, 0, None);
         config.capacity = 4096;
+        set_model(&mut config, 4096, false, 2);
         for geometry in [cuteafd_core::ExpertGeometry::GLM5,
             cuteafd_core::ExpertGeometry::GLM5_FLASH, cuteafd_core::ExpertGeometry::QWEN4] {
             for bf16 in [false, true] {
@@ -854,6 +845,7 @@ mod tests {
                 let mut previous = 0;
                 for endpoints in [1, 2, 4] {
                     config.rdma_endpoints = endpoints;
+                    set_model(&mut config, 4096, bf16, endpoints);
                     let rings = worker_ring_geometry(&config).unwrap();
                     let expected = selected_spark_io(&config, geometry, rings).unwrap().mapped_rings as usize;
                     let budget = worker_ring_budget(&config, geometry).unwrap();
@@ -865,7 +857,7 @@ mod tests {
                 }
             }
         }
-        config.rdma_endpoints = 0;
+        config.model_admission = None;
         assert!(worker_ring_geometry(&config).is_err());
     }
 
@@ -878,6 +870,7 @@ mod tests {
         let topology = SparkTopology::new(2, 2).unwrap();
         let mut config = config(4, 0, Some(topology));
         config.capacity = 4096;
+        set_model(&mut config, 4096, false, 2);
         let limit = spark_transport_bytes(&config).unwrap();
         // One capacity-sized endpoint is half the allowance; two fit exactly.
         let planned_endpoint = spark_ring_bytes(
@@ -961,22 +954,19 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
 }
 
 impl NativeExpertServiceConfig {
-    /// Resident backbone layers: `first_layer..=last_layer`, bounded by the model.
-    pub(super) fn resident_layers(&self, layers: usize) -> Result<std::ops::Range<usize>> {
-        let end = match self.last_layer {
-            Some(last) => {
-                ensure!(last < layers, "native last layer must be below {layers}");
-                last + 1
-            }
-            None => layers,
-        };
-        ensure!(
-            self.first_layer < end,
-            "native first layer {} must be below {layers} and not after the last layer",
-            self.first_layer
-        );
-        Ok(self.first_layer..end)
+    fn compiled_capacity(&self) -> Result<u32> {
+        Ok(self.model_admission.as_ref().context("expert extent requires coordinator model admission")?.compiled_capacity)
     }
+
+    /// Only exact coordinator-selected absolute IDs may become resident.
+    pub(super) fn resident_layers(&self, layers: usize) -> Result<Vec<usize>> {
+        let selected = self.selected_layers.as_ref().context("expert ownership requires coordinator selection")?;
+        ensure!(selected.windows(2).all(|pair| pair[0] < pair[1])
+            && selected.iter().all(|&layer| layer < layers),
+            "selected worker layers are outside checkpoint or not ordered and unique");
+        Ok(selected.clone())
+    }
+
     /// Resident layer selection for the running checkpoint format. Explicit
     /// replicated topologies always select the native generic shard; the legacy
     /// path keeps the fixed TP4/EXL3-TP2 behavior byte-for-byte, and an

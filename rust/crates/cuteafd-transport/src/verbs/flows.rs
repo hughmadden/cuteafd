@@ -628,6 +628,7 @@ mod tests {
             write_target: None,
             flow_label,
             worker_selection_digest: None,
+            model_endpoint: None,
         }
     }
 
