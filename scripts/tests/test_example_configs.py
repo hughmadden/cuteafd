@@ -282,6 +282,9 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
     for name in ("glm53f-exl3-max", "qwen38-exl3-min", "qwen38-exl3-max", "qwen38-nvfp4-max"):
         assert not entries[name]["sparks"]
         assert entries[name]["set"]["EXPERT_BACKEND"] == "local"
+    for name in ("glm53f-nvfp4-max", "glm53f-tr3-max"):
+        assert len(entries[name]["sparks"]) == 2
+        assert entries[name]["set"]["EXPERT_BACKEND"] == "spark"
     assert entries["glm53f-exl3-reference-all-spark"]["set"]["RTX_EXPERT_LAYERS"] == "0"
     half = entries["glm53f-exl3-reference-half"]["set"]
     assert half["RTX_EXPERT_LAYERS"] == "22"

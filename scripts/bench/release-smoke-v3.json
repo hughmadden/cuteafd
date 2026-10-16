@@ -406,9 +406,7 @@
       ],
       "sparks": [
         "REPLACE-ME-spark-0",
-        "REPLACE-ME-spark-1",
-        "REPLACE-ME-spark-2",
-        "REPLACE-ME-spark-3"
+        "REPLACE-ME-spark-1"
       ],
       "set": {
         "RTX_GPUS": "2",
@@ -417,15 +415,11 @@
         "EXPERT_PORT": "19913",
         "EXPERT_BACKEND": "spark",
         "SPECULATOR": "dflash2",
-        "SPARK_COUNT": "4",
+        "SPARK_COUNT": "2",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
-        "SPARK_1_LANE_A": "192.0.2.2",
-        "SPARK_2_HOST": "REPLACE-ME-spark-2",
-        "SPARK_2_LANE_A": "192.0.2.3",
-        "SPARK_3_HOST": "REPLACE-ME-spark-3",
-        "SPARK_3_LANE_A": "192.0.2.4"
+        "SPARK_1_LANE_A": "192.0.2.2"
       }
     },
     {
@@ -462,9 +456,7 @@
       ],
       "sparks": [
         "REPLACE-ME-spark-0",
-        "REPLACE-ME-spark-1",
-        "REPLACE-ME-spark-2",
-        "REPLACE-ME-spark-3"
+        "REPLACE-ME-spark-1"
       ],
       "set": {
         "RTX_GPUS": "2",
@@ -473,15 +465,11 @@
         "EXPERT_PORT": "19915",
         "EXPERT_BACKEND": "spark",
         "SPECULATOR": "dflash2",
-        "SPARK_COUNT": "4",
+        "SPARK_COUNT": "2",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
-        "SPARK_1_LANE_A": "192.0.2.2",
-        "SPARK_2_HOST": "REPLACE-ME-spark-2",
-        "SPARK_2_LANE_A": "192.0.2.3",
-        "SPARK_3_HOST": "REPLACE-ME-spark-3",
-        "SPARK_3_LANE_A": "192.0.2.4"
+        "SPARK_1_LANE_A": "192.0.2.2"
       }
     },
     {
