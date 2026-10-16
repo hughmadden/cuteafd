@@ -482,7 +482,8 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
                 req.fixed.retain(|d| d.group != "graphs" && d.group != "graph growth");
                 for rank in 0..2 {
                     for item in startup.inventory.items(rank) {
-                        req.fixed.push(Demand::new(rank as u8, item.category, item.group, item.bytes, item.basis));
+                        req.fixed.push(Demand::new(rank as u8, item.category, item.group, item.bytes, item.basis)
+                            .with_lifetime(item.lifetime));
                     }
                 }
                 req.pool.ceiling = req.pool.ceiling.min(candidate);
@@ -1788,10 +1789,17 @@ mod tests {
         let request = request(&i).unwrap();
         assert_eq!(request.startup.len(), 1);
         assert_eq!(request.startup[0].bytes, 3 * GIB + (432 << 20));
-        assert_eq!(request.fixed.iter().filter(|d| d.category == Category::Drafter)
-            .map(|d| d.bytes).sum::<u64>(), 3 * GIB);
+        assert!(!request.fixed.iter().any(|d| d.category == Category::Drafter));
+        assert_eq!(request.movables.len(), 1);
+        assert_eq!(request.movables[0].allowed, [0]);
+        assert_eq!(request.movables[0].conditional.iter().flat_map(|home| &home.demands)
+            .filter(|d| d.category == Category::Drafter).map(|d| d.bytes).sum::<u64>(), 3 * GIB);
         let with_staging = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).unwrap().0;
         assert_eq!(with_staging.pool_tokens, steady.pool_tokens);
+        assert_eq!(draft::home(&with_staging), Some(0));
+        assert_eq!(with_staging.items[0].iter().filter(|item| item.category == Category::Drafter)
+            .map(|item| item.bytes).sum::<u64>(), 3 * GIB);
+        assert!(!with_staging.items.iter().flatten().any(|item| item.group == "drafter packing peak"));
         i.drafter_staging = 96 * GIB;
         assert!(matches!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)),
             Err(PlacementError::StartupPeak { gpu: 0, .. })));
