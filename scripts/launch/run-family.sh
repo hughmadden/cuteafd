@@ -907,9 +907,11 @@ for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
 done
 ((${#deployment_peers[@]} == 0)) || count_args+=(--deployment-peers "$(IFS=,; echo "${deployment_peers[*]}")")
 release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
+readiness_args=(--require-ready)
+[[ -z "$wip_slot" ]] || readiness_args=()
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
   "${count_command[@]}" plan "/hf/$snapshot_rel" --vision "$VISION" --audio off \
-  --deployment --require-ready "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
+  --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   --coordinator-gpu-budget-gib "$profile_gib" --coordinator-weight-budget-gib "$profile_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" \
@@ -920,7 +922,7 @@ if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
 fi
 SPARK_COUNT="$selected_count"
 PREFILL_BATCH_TOKENS="$(jq -er '.prefill_rows' <<<"$count_plan")"
-jq -e '.version == 1 and .family == "deepseek_v41" and .executable == true' <<<"$count_plan" >/dev/null ||
+jq -e --arg wip "$wip_slot" '.version == 1 and .family == "deepseek_v41" and .launch.family == "deepseek_v41" and (.executable == true or ($wip != "" and .wip_launchable == true))' <<<"$count_plan" >/dev/null ||
   release_die "invalid planner deployment"
 spark_tp="$(jq -er '.topology.tp' <<<"$count_plan")"
 spark_ep="$(jq -er '.topology.ep' <<<"$count_plan")"
@@ -2469,15 +2471,14 @@ audio_encoder_hash=""
   [[ -z "$(get KV_POOL_SIZE)" ]] || deployment_args+=(--kv-pool-size "$(get KV_POOL_SIZE)")
   [[ -z "$(get MEMORY_RESERVATION)" ]] || deployment_args+=(--memory-reservation "$(get MEMORY_RESERVATION)")
   readiness_args=(--require-ready)
-  # Planned dense execution is WIP-only until its hardware qualification lands.
-  [[ "$family" != qwen3_5 ]] || readiness_args=()
+  [[ -z "$wip_slot" ]] || readiness_args=()
   # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
   plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   if [[ "$family" == qwen3_5 ]]; then
-    python3 -c 'import json,sys;p=json.load(sys.stdin); assert p["placement_supported"] and p["fits"], "dense native placement refused: "+str(p.get("hints"))' <<<"$plan_json" || exit 2
+    python3 -c 'import json,sys;p=json.load(sys.stdin)["report"]; assert p["placement_supported"] and p["fits"], "dense native placement refused: "+str(p.get("hints"))' <<<"$plan_json" || exit 2
   fi
   selected_ranks="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["spark_ranks"])' <<<"$plan_json")"
   if ((count_explicit)) || [[ "$backend" == local ]]; then
@@ -2487,7 +2488,7 @@ audio_encoder_hash=""
     export SPARK_COUNT="$selected_ranks"
     exec bash "$repo_root/scripts/launch/run-family.sh" "${launch_argv[@]}"
   fi
-  jq -e --arg family "$family" '.version == 1 and .family == $family and .executable == true and .launch.family == $family' <<<"$plan_json" >/dev/null || release_die "invalid deployment specification"
+  jq -e --arg family "$family" --arg wip "$wip_slot" '.version == 1 and .family == $family and (.executable == true or ($wip != "" and .wip_launchable == true)) and .launch.family == $family' <<<"$plan_json" >/dev/null || release_die "invalid deployment specification"
   read -r first_layer last_layer placement_handshake < <(jq -r '[.launch.first_expert_layer, (.launch.last_expert_layer // -1), (if .placement_handshake then 1 else 0 end)] | @tsv' <<<"$plan_json")
   layer_args="--first-layer $first_layer"
   [[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"

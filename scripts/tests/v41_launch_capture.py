@@ -128,7 +128,7 @@ if tool == "docker":
             gpus = int(value("--rtx", "1"))
             runtime = gpus == 2 or onboard != "0"
             boundary = None if family != "deepseek_v41" or onboard == "auto" or (gpus == 1 and onboard != "0") else (0 if gpus == 1 else min(int(onboard), 39))
-            response.update(version=1, family=family, executable=True,
+            response.update(version=1, family=family, executable=True, wip_launchable=True,
                 report=report, placement_handshake="--deployment-placement-handshake" in args,
                 launch={"family": family, "first_expert_layer": int(os.environ.get("CAPTURE_FIRST_LAYER", "0")),
                         "last_expert_layer": json.loads(os.environ.get("CAPTURE_LAST_LAYER", "null"))},

@@ -74,7 +74,7 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
     let result = report(dir.path(),1,96,6,Some(262_144));
     assert!(result.config_error.is_none(),"{:?}",result.config_error);
     assert!(result.unclassified.is_empty(),"{:?}",result.unclassified);
-    assert!(!result.executable());
+    assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
     assert!(result.components.iter().all(|c| c.status != Status::Ready));
     assert!(result.hints.iter().any(|hint|hint.how.contains("CSA-8")));
     assert!(result.hints.iter().any(|hint|hint.how.contains("BF16-tail")));
@@ -218,7 +218,7 @@ fn missing_headers_stale_index_and_direct_text_detection() {
     let input = PlanInput::from_checkpoint(cp);
     let result = input.plan(&PlanOptions { placement:ExpertPlacement::Sparks { ranks:6 },
         layout:Some(Default::default()), ..Default::default() }).unwrap();
-    assert!(!result.executable());
+    assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
     assert!(result.hints.iter().any(|h| h.what.contains("missing safetensors headers")));
 }
 

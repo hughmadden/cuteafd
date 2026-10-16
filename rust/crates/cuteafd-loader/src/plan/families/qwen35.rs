@@ -75,6 +75,10 @@ impl Family for Qwen35 {
 struct Model { header: Qwen35Checkpoint, spec: ModelSpec }
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
+    fn native_serving_admission(&self) -> bool { true }
+    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
+        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
+    }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
@@ -114,8 +118,8 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     ensure!(options.rtx_bytes.len() == 1 && report.spark_ranks == 0,
         "dense Qwen currently requires one coordinator GPU and zero Sparks");
     ensure!(!options.host_embedding, "dense Qwen requires device token embedding");
-    ensure!(matches!(report.vision, crate::plan::MediaMode::Off | crate::plan::MediaMode::Auto)
-        && report.audio == crate::plan::MediaMode::Off, "dense Qwen media execution is not qualified");
+    ensure!(report.vision == crate::plan::MediaMode::Off && report.audio == crate::plan::MediaMode::Off,
+        "dense Qwen media execution is not qualified");
     ensure!(options.native_mtp_layers == 0 && options.drafter_bytes == 0,
         "dense native planner currently requires speculation off");
     let prefix = match (cfg.hidden, cfg.intermediate, cfg.heads, cfg.gdn.value_heads) {

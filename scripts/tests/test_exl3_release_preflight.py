@@ -48,7 +48,8 @@ if tool == 'docker':
         onboard = value('--rtx-expert-layers', 'auto')
         runtime = gpus == 2 or onboard != '0'
         print(json.dumps(dict(spark_ranks=ranks, prefill_rows=rows or 1024,
-            version=1, family='deepseek_v41', executable=True,
+            version=1, family='deepseek_v41', executable=True, wip_launchable=True,
+            launch=dict(family='deepseek_v41'),
             topology=dict(tp=tp, ep=ep, explicit=explicit),
             artifact_requirements=dict(spark_tp_role=None),
             speculator=value('--speculator', 'off'),

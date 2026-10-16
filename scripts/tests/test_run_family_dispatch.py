@@ -267,6 +267,40 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path) ->
     assert "--prefill-rows 4096" in plan and "--require-ready" not in plan
 
 
+@pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
+@pytest.mark.parametrize("wip", [False, True])
+@pytest.mark.parametrize("allowed", [True, False, None, "true", "absent"])
+def test_deployment_planned_permission_is_strict_and_wip_only(tmp_path, family, wip, allowed):
+    config = {"model_type": "deepseek_v41"} if family == "deepseek_v41" else {
+        "model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "XiaomiMiMo/MiMo-V2-Flash"
+    keys = ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n"
+            if family == "deepseek_v41" else "SPARK_COUNT=0\nEXPERT_BACKEND=local\n")
+    result = _family_launch_result(tmp_path, config, model, keys + "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        extra_args=("--wip", "planned-test") if wip else (),
+        deployment_overrides={"executable": False, "wip_launchable": allowed})
+    assert (result.returncode == 0) == (wip and allowed is True), result.stderr
+    plans = [line for line in result.stderr.splitlines() if " plan " in line and "--deployment" in line]
+    assert plans and ("--require-ready" not in plans[0]) == wip, result.stderr
+    if result.returncode:
+        assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
+@pytest.mark.parametrize("launch", [None, {"family": "wrong"}])
+def test_deployment_wip_still_requires_matching_launch_family(tmp_path, family, launch):
+    config = {"model_type": "deepseek_v41"} if family == "deepseek_v41" else {
+        "model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "XiaomiMiMo/MiMo-V2-Flash"
+    keys = ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n"
+            if family == "deepseek_v41" else "SPARK_COUNT=0\nEXPERT_BACKEND=local\n")
+    result = _family_launch_result(tmp_path, config, model, keys + "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        extra_args=("--wip", "planned-test"),
+        deployment_overrides={"executable": False, "wip_launchable": True, "launch": launch})
+    assert result.returncode != 0
+    assert "docker run -d" not in result.stderr
+
+
 @pytest.mark.parametrize("keys,diagnostic", [
     ("SPARK_COUNT=1\n", "no Spark layout"),
     ("SPARK_COUNT=0\nEXPERT_BACKEND=spark\n", "no Spark layout"),
@@ -438,7 +472,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           extra_args: tuple[str, ...] = (), with_nest: bool = True,
                           extra_env: dict[str, str] | None = None,
                           program_manifest: dict | None = None,
-                          launcher_source: Path | None = None) -> subprocess.CompletedProcess[str]:
+                          launcher_source: Path | None = None,
+                          deployment_overrides: dict | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -502,13 +537,13 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                      if tool == "docker" and previous_peers is not None else ''))
         if tool == "ssh" and native_v41:
             with (bin_dir / tool).open("a") as stream:
-                stream.write('case "$*" in *spark_tp_roles*) echo tp2 ;; *"docker container inspect"*) exit 1 ;; esac\n')
+                stream.write('case "$*" in *spark_tp_roles*|*"python3 -"*"tp2"*) echo tp2 ;; *"docker container inspect"*) exit 1 ;; esac\n')
         if tool == "docker":
             stub = (bin_dir / tool).read_text()
-            intercept = 'case "$*" in *"cuteafd plan"*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; esac\n'
+            intercept = 'case "$*" in *" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; esac\n'
             stub = stub.replace('case "$*" in', intercept + 'case "$*" in', 1)
             if native_v41:
-                stub += ('case "$*" in container\\ inspect*|inspect\\ *) exit 1 ;; image\\ inspect*) echo test-pin ;; esac\n'
+                stub += ('case "$*" in container\\ inspect*|inspect\\ *) ' + ('if [[ "$*" == *-wip* ]]; then exit 0; else exit 1; fi' if wip else 'exit 1') + ' ;; image\\ inspect*) echo test-pin ;; esac\n'
                          'case "$*" in *"cuteafd plan"*) printf \'{"spark_ranks":%s,"prefill_rows":4096}\\n\' '
                          '"$STUB_SPARK_COUNT" ;; esac\n')
             if program_manifest is None:
@@ -565,13 +600,17 @@ onboard = value("--rtx-expert-layers", "auto")
 gpus = int(value("--rtx", "1"))
 boundary = None if family != "deepseek_v41" or onboard == "auto" or gpus == 1 else min(int(onboard), 39)
 handoff = {"kind": "runtime", "directory": "/tmp/cuteafd-home/placement", "spark_first_layer": boundary} if family == "deepseek_v41" and (gpus == 2 or onboard != "0") else {"kind": "fixed", "spark_first_layer": int(first)}
-print(json.dumps(dict(report, version=1, family=family, executable=True, rtx_gpus=gpus,
+deployment = dict(version=1, family=family, executable=family != "qwen3_5", wip_launchable=True, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep, explicit=explicit), peers=peers,
     speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     placement_handoff=handoff, placement_handshake="--deployment-placement-handshake" in args,
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
-    artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report)))
+    artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report)
+deployment.update(json.loads(os.environ["STUB_DEPLOYMENT_OVERRIDES"]))
+if deployment.get("wip_launchable") == "absent":
+    deployment.pop("wip_launchable")
+print(json.dumps(deployment))
 """)
     config = repo / "f.config"
     initial_count = 0 if "EXPERT_BACKEND=local" in keys else 1
@@ -584,6 +623,7 @@ print(json.dumps(dict(report, version=1, family=family, executable=True, rtx_gpu
            "STUB_PREFERRED_RANKS": str(preferred_ranks if preferred_ranks is not None else 1),
            "STUB_FORCE_PREFERRED": "1" if preferred_ranks is not None and encoder_plan is None else "",
            "STUB_ENCODER_PLAN": json.dumps(encoder_plan or {"spark_ranks": exact_count}),
+           "STUB_DEPLOYMENT_OVERRIDES": json.dumps(deployment_overrides or {}),
            **(extra_env or {})}
     env["HOME"] = str(tmp_path / "home")
     if not with_nest:

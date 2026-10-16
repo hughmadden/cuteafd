@@ -2272,6 +2272,7 @@ fn glm_next_facts_and_dflash2_drafter_are_described() {
     );
     let report = plan(draft.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.family.as_deref(), Some("dflash2"));
+    assert!(!report.wip_launchable() && !report.native_serving_admitted);
     assert!(report.spec.unwrap().notes[0].contains("taps [5, 14] of a 45-layer target"));
 }
 

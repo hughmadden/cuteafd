@@ -52,8 +52,7 @@ fn tensors(fp8: bool) -> Vec<Tensor> {
     out
 }
 
-#[test]
-fn native_planner_uses_export_contract_and_exact_dense_allocations() {
+fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement::families::qwen3_5::NativeBuffers, Value) {
     use crate::placement::families::qwen3_5::NativeBuffers;
     let dir = tempfile::tempdir().unwrap();
     let raw = config(4096, 12288, 16, 32, 4);
@@ -89,14 +88,27 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
             "scratch_bytes_at_capacity":{"scratch":1024}}));
     }
     let manifest = dir.path().join("PROGRAMS.json");
-    let mut exports = json!({"programs":programs});
+    let exports = json!({"programs":programs});
     std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
     let options = PlanOptions { placement: ExpertPlacement::Local, vision: plan::MediaMode::Off,
         audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions {
             rtx_bytes: vec![96 << 30], concurrency: 4, prefix_slots: Some(10), native_mtp_layers: 0,
             pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()), ..Default::default() }),
         ..Default::default() };
+    (dir, options, buffers, exports)
+}
+
+#[test]
+fn native_planner_uses_export_contract_and_exact_dense_allocations() {
+    let (dir, options, buffers, mut exports) = native_planner_fixture();
+    let manifest = options.layout.as_ref().unwrap().workspace_manifest.as_ref().unwrap();
     let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.fits && report.placement_supported && report.native_serving_admitted);
+    assert!(report.wip_launchable());
+    assert!(!report.executable());
+    let deployment_options = plan::deployment::DeploymentOptions { rtx_gpus: 1, ..Default::default() };
+    let deployment = plan::deployment::DeploymentSpec::from_report(&report, &deployment_options).unwrap();
+    assert!(deployment.wip_launchable && !deployment.executable);
     let memory = report.memory_layout.unwrap();
     assert_eq!(memory.pool_tokens, 262144, "{:?}", report.hints);
     assert_eq!(memory.devices.len(), 1);
@@ -105,21 +117,84 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
     assert!(memory.notes.iter().any(|note| note.contains("no captured graphs")));
     let spark_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 2 }, ..options.clone() };
     let refused = plan::plan(dir.path(), &spark_options).unwrap();
-    assert!(!refused.fits && !refused.placement_supported);
+    assert!(!refused.fits && !refused.placement_supported && !refused.native_serving_admitted
+        && !refused.wip_launchable());
     assert!(refused.hints.iter().any(|hint| hint.what.contains("no Spark layout")));
     assert!(refused.memory_layout.unwrap().devices.is_empty());
     exports["programs"][0]["geometry"]["zero_centered"] = json!(false);
     std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
     let refused = plan::plan(dir.path(), &options).unwrap();
-    assert!(!refused.fits && !refused.placement_supported);
+    assert!(!refused.fits && !refused.placement_supported && !refused.native_serving_admitted
+        && !refused.wip_launchable());
     assert!(refused.hints.iter().any(|hint| hint.what.contains("zero-centered")));
     assert!(refused.memory_layout.unwrap().devices.is_empty());
     exports["programs"][0]["geometry"]["zero_centered"] = json!(true);
     exports["programs"][0]["pointers"][0]["name"] = json!("wrong_input");
     std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
     let refused = plan::plan(dir.path(), &options).unwrap();
-    assert!(!refused.fits && !refused.placement_supported);
+    assert!(!refused.fits && !refused.placement_supported && !refused.native_serving_admitted
+        && !refused.wip_launchable());
     assert!(refused.hints.iter().any(|hint| hint.what.contains("pointer order")));
+}
+
+#[test]
+fn native_text_admission_disables_automatic_bundled_vision() {
+    use plan::{MediaMode, Status, spec::Component};
+    let (dir, mut options, _, _) = native_planner_fixture();
+    let mut raw = config(4096, 12288, 16, 32, 4);
+    raw["vision_config"] = json!({"depth":27,"hidden_size":1152,"intermediate_size":4304,
+        "num_heads":16,"out_hidden_size":4096,"patch_size":16,"temporal_patch_size":2,
+        "spatial_merge_size":2,"num_position_embeddings":2304,"in_channels":3,
+        "hidden_act":"gelu_pytorch_tanh","deepstack_visual_indexes":[]});
+    let mut weights = tensors(false);
+    let mut tower = |name: &str, shape: &[usize], bias: bool| {
+        weights.push(t(format!("model.visual.{name}.weight"), "BF16", shape));
+        if bias { weights.push(t(format!("model.visual.{name}.bias"), "BF16", &[shape[0]])); }
+    };
+    tower("patch_embed.proj", &[1152, 3, 2, 16, 16], true);
+    tower("pos_embed", &[2304, 1152], false);
+    tower("merger.norm", &[1152], true);
+    tower("merger.linear_fc1", &[4608, 4608], true);
+    tower("merger.linear_fc2", &[4096, 4608], true);
+    for layer in 0..27 {
+        for (name, shape) in [("norm1", vec![1152]), ("norm2", vec![1152]),
+            ("attn.qkv", vec![3456, 1152]), ("attn.proj", vec![1152, 1152]),
+            ("mlp.linear_fc1", vec![4304, 1152]), ("mlp.linear_fc2", vec![1152, 4304])] {
+            tower(&format!("blocks.{layer}.{name}"), &shape, true);
+        }
+    }
+    write_snapshot(dir.path(), &raw, &weights, None);
+    options.vision = MediaMode::Auto;
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert_eq!(report.vision, MediaMode::Off);
+    assert!(report.wip_launchable() && !report.executable(), "{:?}", report.hints);
+    let vision = report.components.iter().find(|c| c.component == Component::Vision).unwrap();
+    assert_eq!(vision.status, Status::Disabled);
+    assert_eq!(vision.rejected, 0);
+    assert_eq!(vision.bytes, 0);
+    assert!(report.disabled_media_bytes > 0 && report.encoder.is_none());
+    let off = plan::plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
+    assert_eq!(report.memory_layout.as_ref().unwrap().devices[0].used_bytes(),
+        off.memory_layout.as_ref().unwrap().devices[0].used_bytes());
+    assert_eq!(report.encoder_plan_hash, off.encoder_plan_hash);
+    for vision in [MediaMode::Rtx(None), MediaMode::Spark(None)] {
+        let refused = plan::plan(dir.path(), &PlanOptions { vision, ..options.clone() }).unwrap();
+        assert!(!refused.wip_launchable() && !refused.native_serving_admitted);
+        assert!(refused.hints.iter().any(|h| h.what.contains("media execution is not qualified")));
+    }
+}
+
+#[test]
+fn automatic_spark_count_retains_native_wip_zero_spark_candidate() {
+    let (dir, options, _, _) = native_planner_fixture();
+    let report = plan::plan_spark_count(dir.path(), &options, 2, None).unwrap();
+    assert_eq!(report.spark_ranks, 0);
+    assert!(report.native_serving_admitted && report.wip_launchable());
+    assert!(!report.executable());
+    assert!(report.spark_count_warning.as_ref().unwrap().contains("using 0 Sparks"));
+    let explicit = plan::plan_spark_count(dir.path(), &options, 2, Some(2)).unwrap();
+    assert!(!explicit.wip_launchable() && !explicit.executable());
+    assert!(explicit.hints.iter().any(|h| h.what.contains("counts that work: [0]")));
 }
 
 #[test]
@@ -159,7 +234,7 @@ fn bf16_and_native_block_fp8_headers_remain_planned_and_zero_spark() {
         let report = plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local, ..Default::default() }).unwrap();
         assert_eq!(report.family.as_deref(), Some("qwen3_5"));
         assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
-        assert!(!report.fits && !report.placement_supported && !report.executable());
+        assert!(!report.fits && !report.placement_supported && !report.executable() && !report.wip_launchable());
         assert_eq!(report.spark_ranks, 0);
         assert!(report.experts.is_none() && report.spec.as_ref().unwrap().moe.is_none());
         assert!(report.unclassified.is_empty(), "{:?}", report.unclassified);
