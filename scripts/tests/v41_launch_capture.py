@@ -124,22 +124,15 @@ if tool == "docker":
             report = dict(response)
             exl3 = os.environ.get("CAPTURE_EXL3") == "1"
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))
-            onboard = value("--rtx-expert-layers", "auto")
-            gpus = int(value("--rtx", "1"))
-            runtime = gpus == 2 or onboard != "0"
-            boundary = None if family != "deepseek_v41" or onboard == "auto" or (gpus == 1 and onboard != "0") else (0 if gpus == 1 else min(int(onboard), 39))
             response.update(version=1, family=family, executable=True, wip_launchable=True,
-                report=report, placement_handshake="--deployment-placement-handshake" in args,
+                report=report, spark_admission="coordinator_authoritative",
                 launch={"family": family, "first_expert_layer": int(os.environ.get("CAPTURE_FIRST_LAYER", "0")),
                         "last_expert_layer": json.loads(os.environ.get("CAPTURE_LAST_LAYER", "null"))},
                 topology={"tp": tp, "ep": ep, "explicit": explicit_topology},
                 artifact_requirements={"spark_tp_role": f"tp{tp}" if family == "deepseek_v41" and not exl3 and explicit_topology and tp != 4 else None},
                 speculator=value("--speculator"),
                 admission={"kv_pool_size": value("--kv-pool-size"), "memory_reservation": value("--memory-reservation")},
-                peers=value("--deployment-peers", "").split(",")[:int(ranks)],
-                placement_handoff={"kind": "runtime" if runtime else "fixed", "spark_first_layer": boundary})
-            if runtime:
-                response["placement_handoff"]["directory"] = "/tmp/cuteafd-home/placement"
+                peers=value("--deployment-peers", "").split(",")[:int(ranks)])
         print(json.dumps(response))
         sys.exit(0)
     if args and args[0] == "run" and "--entrypoint" in args and "python3" in args:
@@ -154,9 +147,6 @@ if tool == "docker":
     if args and args[0] == "exec" and "python3" in args:
         sys.stdin.read()
         print("tp2;tp3;tp6")
-        sys.exit(0)
-    if args and args[0] == "exec" and "cat" in args and any(a.endswith("plan.json") for a in args):
-        print(Path(os.environ["CAPTURE_PLAN"]).read_text())
         sys.exit(0)
     if args and args[0] == "exec":
         sys.exit(0)
@@ -205,7 +195,7 @@ if tool == "docker":
             (dst / "verify-sparkinfer-source.py").write_text("print('ok')\n")
         sys.exit(0)
     if args and args[0] == "logs":
-        print("worker ready")
+        print("native worker bootstrap ready")
         sys.exit(0)
     if args and args[0] in ("info", "top", "pull", "rm", "stop", "ps"):
         sys.exit(0)
@@ -377,14 +367,11 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         text = config.read_text()
         sparks = next(int(line.split("=", 1)[1]) for line in text.splitlines() if line.startswith("SPARK_COUNT="))
         rtx = next(int(line.split("=", 1)[1]) for line in text.splitlines() if line.startswith("RTX_GPUS="))
-        (root / "plan.json").write_text(json.dumps({
-            "version": 1, "rtx_gpus": rtx, "nonce": "n", "rtx_expert_layers": 20 if rtx == 2 else 5,
-            "spark_first_layer": 20 if rtx == 2 else 5}))
         spec = root / "nvidia.yaml"
         spec.write_text("devices:\n" + "".join(f"  - name: {name}\n" for name in (*GPU_UUIDS, "0", "1", "all")))
         log = root / "log.jsonl"
         env = {"PATH": f"{root / 'bin'}:/usr/bin:/bin", "HOME": str(home), "HF_HOME": str(root / "hf"),
-               "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_HOST": coordinator_host, "CAPTURE_PLAN": str(root / "plan.json"),
+               "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_HOST": coordinator_host,
                "CAPTURE_SPARKS": str(sparks), "CAPTURE_SPARKINFER": lock["revision"],
                "CAPTURE_FAMILY": release_entry["family"] if release_entry else "deepseek_v41",
                "CAPTURE_EXL3": "1" if release_values.get("EXPERT_FORMAT") == "exl3" else "0",

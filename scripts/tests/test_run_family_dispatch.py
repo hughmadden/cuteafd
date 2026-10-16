@@ -223,23 +223,20 @@ def test_family_table_names_every_launchable_family() -> None:
         assert out.stdout.split()[0] == family
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_glmf_solved_worker_startup_waits_bootstrap_only_when_opted_in(tmp_path: Path, enabled: bool) -> None:
+def test_glmf_solved_worker_startup_waits_bootstrap_by_default(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
-                                  extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": str(int(enabled)),
-                                             "STUB_WORKER_READY": "worker bootstrap ready" if enabled else "worker ready"})
+                                  extra_env={"STUB_WORKER_READY": "worker bootstrap ready"})
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     worker = next(line for line in lines if "cuteafd expertd-native" in line)
     coordinator = next(line for line in lines if "cuteafd" in line and "serve-glmf" in line)
-    assert ("--placement-handshake" in worker) == enabled
-    assert ("--placement-handshake" in coordinator) == enabled
-    marker = "worker bootstrap ready" if enabled else "worker ready"
+    assert "--placement-handshake" not in worker
+    assert "--placement-handshake" not in coordinator
+    marker = "worker bootstrap ready"
     readiness = next(i for i, line in enumerate(lines) if f"grep -q '{marker}'" in line)
     assert readiness < lines.index(coordinator)
-    if enabled:
-        assert not any("grep -q 'worker ready'" in line for line in lines)
+    assert not any("grep -q 'worker ready'" in line for line in lines)
 
 
 DENSE_CONFIG = {"model_type": "qwen3_5", "text_config": {
@@ -338,7 +335,7 @@ def test_dense_qwen_refuses_failed_native_plan(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("family", ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5"])
-@pytest.mark.parametrize("failure", ["refused", "wrong-launch-family"])
+@pytest.mark.parametrize("failure", ["refused", "wrong-launch-family", "wrong-spark-admission"])
 def test_every_family_failed_wip_deployment_prints_planner_hints(tmp_path, family, failure):
     config = ({"model_type": "deepseek_v41"} if family == "deepseek_v41" else
               {"model_type": "deepseek_v4"} if family == "deepseek_v4" else
@@ -354,6 +351,8 @@ def test_every_family_failed_wip_deployment_prints_planner_hints(tmp_path, famil
     overrides = {"executable": False, "wip_launchable": failure != "refused"}
     if failure == "wrong-launch-family":
         overrides["launch"] = {"family": "wrong"}
+    if failure == "wrong-spark-admission":
+        overrides["spark_admission"] = "worker_local"
     hints = ["missing native export", "requested allocation exceeds budget"]
     result = _family_launch_result(tmp_path, config, "test/model", keys,
         extra_args=("--wip", "refusal-test"), encoder_plan={"hints": hints},
@@ -447,10 +446,10 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
 def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() -> None:
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
     body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]
-    assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("select_worker_layers(")
-    assert body.index("select_worker_layers(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
+    assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("SparkAdmission::plan(")
+    assert body.index("SparkAdmission::plan(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
-    assert "WorkerSelection::new(identity, &spark_layers)" in body
+    assert "model)?.select(&peers)?" in body
     assert "let spark = !spark_layers.is_empty();" in body
     assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
     assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
@@ -560,7 +559,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker ready}"; '
+                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
@@ -641,16 +640,13 @@ explicit = "--spark-tp" in args or family == "deepseek_v41" and ranks not in (0,
 peers = value("--deployment-peers", "").split(",")[:ranks] if ranks else []
 report = json.loads(os.environ["STUB_ENCODER_PLAN"])
 report.update(spark_ranks=ranks)
-onboard = value("--rtx-expert-layers", "auto")
 gpus = int(value("--rtx", "1"))
-boundary = None if family != "deepseek_v41" or onboard == "auto" or gpus == 1 else min(int(onboard), 39)
-handoff = {"kind": "runtime", "directory": "/tmp/cuteafd-home/placement", "spark_first_layer": boundary} if family == "deepseek_v41" and (gpus == 2 or onboard != "0") else {"kind": "fixed", "spark_first_layer": int(first)}
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep, explicit=explicit), peers=peers,
     speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
-    placement_handoff=handoff, placement_handshake="--deployment-placement-handshake" in args,
+    spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
     artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report)
 deployment.update(json.loads(os.environ["STUB_DEPLOYMENT_OVERRIDES"]))
@@ -802,20 +798,18 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
     assert f"{flag} {expected}" in serving
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_mimo_worker_selection_handshake_is_opt_in_on_both_ends(tmp_path, enabled):
+def test_mimo_worker_selection_is_default_on_both_ends(tmp_path):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
     result = _family_launch_result(
         tmp_path, config, "test/mimo",
         "SPARK_COUNT=1\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
-        extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": "1" if enabled else "0"})
+        extra_env={"STUB_WORKER_READY": "worker bootstrap ready"})
     assert result.returncode == 0, result.stderr
     worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
     coordinator = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    assert ("--placement-handshake" in worker) == enabled
-    assert ("--placement-handshake" in coordinator) == enabled
-    if enabled:
-        assert "worker bootstrap ready" in result.stderr
+    assert "--placement-handshake" not in worker
+    assert "--placement-handshake" not in coordinator
+    assert "worker bootstrap ready" in result.stderr
 
 
 @pytest.mark.parametrize("embedding", ["host", "gpu"])
@@ -977,7 +971,7 @@ def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, con
     assert result.returncode == 0, result.stderr
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert workers
-    assert all(f"--rdma-endpoints {endpoints}" in line for line in workers)
+    assert all("--rdma-endpoints" not in line and "--capacity" not in line for line in workers)
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
     assert all(f"{name}={value}" in launch for name, value in env.items())
 
@@ -988,7 +982,9 @@ def test_only_wide_optional_bf16_changes_worker_ring_admission(tmp_path, mode, w
         f"EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nEXPERT_INPUT={mode}\n")
     assert result.returncode == 0, result.stderr
     worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
-    assert ("--bf16-ingress" in worker) == wide
+    assert "--bf16-ingress" not in worker
+    coordinator = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    assert f"--expert-input {mode}" in coordinator
 
 
 def test_qwen_tp1_explicit_pool_host_maps_physical_rails(tmp_path: Path) -> None:

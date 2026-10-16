@@ -126,7 +126,7 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
     std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&meta)?)?;
     library.cuda_set_device(0)?;
     let mut lanes = Vec::new();
-    let inventory = crate::shared::inventory::RuntimeInventory::measure(&library, &[1], |_| {
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&library, &[1], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         for _ in 0..2 {
             // SAFETY: CPU-only fixture implements the trusted module ABI.
             lanes.push(unsafe { Exl3Modules::load(&library, directory, Exl3InputFormat::Fp8K32)? });
@@ -180,7 +180,7 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
     invalid["route_preparation"]["sha256"] = serde_json::json!("invalid");
     std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&invalid)?)?;
     let before = fixture.events()?.len();
-    let error = crate::shared::inventory::RuntimeInventory::measure(&library, &[1], |_| {
+    let error = crate::shared::inventory::RuntimeInventory::measure(&library, &[1], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         // SAFETY: the trusted fixture intentionally carries a failing route hash.
         let _modules = unsafe { Exl3Modules::load(&library, directory, Exl3InputFormat::Fp8K32)? };
         Ok(())

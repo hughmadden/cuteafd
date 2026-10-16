@@ -182,8 +182,8 @@ pub fn env_settings() -> Vec<Setting> {
 
 /// Option names that describe the deployment rather than a tuning choice:
 /// never shown as chips (they are in the hardware and configuration panels).
-pub const DEPLOYMENT: [&str; 14] = ["snapshot", "native-lib", "native_lib", "peers", "listen", "model-id",
-    "model_id", "hf-home", "hf_home", "placement-directory", "placement_directory", "device", "split-device",
+pub const DEPLOYMENT: [&str; 12] = ["snapshot", "native-lib", "native_lib", "peers", "listen", "model-id",
+    "model_id", "hf-home", "hf_home", "device", "split-device",
     "split_device"];
 
 #[cfg(test)]

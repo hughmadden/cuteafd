@@ -61,7 +61,7 @@ fi
 [[ "$speculator" == "dspark" ]] || fail "SPECULATOR must be dspark"
 if [[ "$rtx" == "1" ]]; then
   # A 1-RTX arm either keeps no local routed layers (0, all 40 remote) or an
-  # explicit local count in 1..=39 with a placement handoff, which is the current
+  # explicit local count in 1..=39 with typed Spark admission, which is the current
   # official 1-RTX placement shape (5 local / 35 remote).
   if [[ "$layers" != "0" ]]; then
     [[ "$layers" =~ ^([1-9]|[1-3][0-9])$ ]] ||

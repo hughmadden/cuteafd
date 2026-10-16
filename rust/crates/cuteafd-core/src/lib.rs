@@ -2,12 +2,13 @@ pub mod ffn_activation;
 pub use ffn_activation::FfnActivation;
 pub mod coordinator_programs;
 pub mod expert_geometry;
-pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy};
+pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy,
+    ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress, SparkRings, SparkRuntimeInventory, SparkSlice};
 mod draft_policy;
 pub use draft_policy::{
     draft_expected_tokens, DraftAction, DraftCandidate, DraftCostSnapshot, DraftPolicy, DraftPolicyError, DraftPolicyStats,
     DraftRoundObservation, DraftSelection, LayerResource, ObservedDraftRequest, PolicyGeometry, PolicySeed, ResourceClass,
-    draft_concurrency_bucket, CLASS_PRIOR_ROUNDS, CONCURRENCY_BUCKETS, MAX_RESOURCE_CLASSES,
+    draft_concurrency_bucket, CLASS_PRIOR_ROUNDS, CONCURRENCY_BUCKETS, MAX_RESOURCE_CLASSES, SURVIVAL_FLOOR,
 };
 mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};

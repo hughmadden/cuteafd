@@ -45,8 +45,6 @@ if tool == 'docker':
         tp, ep = int(value('--spark-tp', str(ranks))), int(value('--spark-ep', '1'))
         explicit = '--spark-tp' in args or ranks == 3
         gpus = int(value('--rtx', '1'))
-        onboard = value('--rtx-expert-layers', 'auto')
-        runtime = gpus == 2 or onboard != '0'
         print(json.dumps(dict(spark_ranks=ranks, prefill_rows=rows or 1024,
             version=1, family='deepseek_v41', executable=True, wip_launchable=True,
             launch=dict(family='deepseek_v41'),
@@ -55,8 +53,7 @@ if tool == 'docker':
             speculator=value('--speculator', 'off'),
             admission=dict(kv_pool_size=value('--kv-pool-size'), memory_reservation=value('--memory-reservation')),
             peers=value('--deployment-peers', '').split(',')[:ranks],
-            placement_handoff=dict(kind='runtime' if runtime else 'fixed', spark_first_layer=None if runtime else 0,
-                **(dict(directory='/tmp/cuteafd-home/placement') if runtime else {})))))
+            spark_admission='coordinator_authoritative')))
         sys.exit(0)
     if args[:1] == ['run'] and '--entrypoint' in args:
         entry = args[args.index('--entrypoint') + 1]

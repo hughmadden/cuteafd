@@ -11,7 +11,6 @@ use cli::{Cli, Commands};
 use commands::bench_rdma::run_bench_rdma;
 use commands::bench_rdma_ring::run_bench_rdma_ring;
 use commands::doctor::run_doctor;
-use commands::expert_probe::run_expert_probe;
 use commands::plan::run_plan;
 use commands::transport_capabilities::run_transport_capabilities;
 
@@ -203,7 +202,6 @@ async fn run() -> Result<()> {
         Commands::Usage(args) => commands::usage::run(args).await,
         Commands::Doctor(args) => run_doctor(args),
         Commands::Plan(args) => run_plan(args),
-        Commands::ExpertProbe(args) => run_expert_probe(args).await,
         Commands::V41Golden(args) => families::deepseek_v41::v41_golden::run_golden(args).await,
         Commands::Dsv4Golden(args) => families::deepseek_v4::run_golden(args).await,
         Commands::GlmGolden(args) => families::glm5::run_golden(args).await,

@@ -28,7 +28,7 @@ impl Opened {
             for name in required_fp8_programs(args) { program.spec(&name)?; }
         }
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library,
-            &[args.device, peer], |id| {
+            &[args.device, peer], crate::shared::inventory::InventoryPhase::PreWeight, |id| {
                 let rank = usize::from(id == peer);
                 programs[rank].load_matching(|name| selected.contains(name))?;
                 self.library.tp2_native_initialize()?;

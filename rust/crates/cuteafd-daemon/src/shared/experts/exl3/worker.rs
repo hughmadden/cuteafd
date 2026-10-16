@@ -143,8 +143,7 @@ pub(crate) struct Exl3Worker<'a> {
     host_path: HostPath,
     route_dump: Option<RouteDump>,
     library: &'a NativeLibrary,
-    first_layer: usize,
-    layer_count: usize,
+    layer_ids: Vec<usize>,
     layer: usize,
     executor_id: u64,
 }
@@ -192,6 +191,34 @@ impl<'a> Exl3Worker<'a> {
         Ok(())
     }
 
+    fn resident_layers<'w>(layouts: impl IntoIterator<Item = &'w cuteafd_loader::V41Exl3Residency>)
+        -> Result<Vec<usize>> {
+        let mut layouts = layouts.into_iter();
+        let first = layouts.next().context("EXL3 worker has no layers")?;
+        Self::validate_rank(first.world, first.rank)?;
+        let mut ids = Vec::new();
+        for layout in std::iter::once(first).chain(layouts) {
+            let cuteafd_loader::V41Exl3Layer::Backbone(layer) = layout.layer else {
+                anyhow::bail!("EXL3 Spark worker requires backbone layers");
+            };
+            ensure!(ids.last().is_none_or(|previous| *previous < layer),
+                "EXL3 worker layer IDs must be sorted and unique");
+            ensure!(layout.world == first.world && layout.rank == first.rank
+                && layout.intermediate_start == first.intermediate_start
+                && layout.intermediate == first.intermediate && layout.experts == first.experts
+                && layout.tiers == first.tiers,
+                "EXL3 worker layers must share TP rank and storage geometry");
+            ids.push(layer);
+        }
+        Ok(ids)
+    }
+
+    fn validate_layer(layer_ids: &[usize], index: usize, requested: usize) -> Result<()> {
+        let selected = layer_ids.get(index).context("requested EXL3 layer is not resident")?;
+        ensure!(*selected == requested, "request does not match selected EXL3 layer");
+        Ok(())
+    }
+
     pub(crate) fn new(
         library: &'a NativeLibrary,
         weights: Rc<Vec<Exl3Weights<'a>>>,
@@ -201,19 +228,8 @@ impl<'a> Exl3Worker<'a> {
         schedule: Exl3Schedule,
     ) -> Result<Self> {
         let first = weights.first().context("EXL3 worker has no layers")?;
-        let cuteafd_loader::V41Exl3Layer::Backbone(first_layer) = first.layout.layer else {
-            anyhow::bail!("EXL3 Spark worker requires backbone layers");
-        };
+        let layer_ids = Self::resident_layers(weights.iter().map(|weight| &weight.layout))?;
         let rank = first.layout.rank;
-        Self::validate_rank(first.layout.world, rank)?;
-        for (index, weight) in weights.iter().enumerate() {
-            ensure!(
-                matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(layer)
-                if layer == first_layer + index),
-                "EXL3 worker layers must be contiguous"
-            );
-        }
-        let layer_count = weights.len();
         let budget = Self::plan(directory, capacity, schedule)?;
         ensure!(
             budget <= available_bytes,
@@ -293,8 +309,7 @@ impl<'a> Exl3Worker<'a> {
             host_path,
             route_dump,
             library,
-            first_layer,
-            layer_count,
+            layer_ids,
             layer: 0,
             executor_id,
         })
@@ -365,7 +380,7 @@ impl<'a> Exl3Worker<'a> {
 
     pub(crate) fn bind_layer(&mut self, layer: usize) -> Result<()> {
         ensure!(
-            layer < self.layer_count,
+            layer < self.layer_ids.len(),
             "requested EXL3 layer is not resident"
         );
         self.layer = layer;
@@ -380,10 +395,7 @@ impl<'a> Exl3Worker<'a> {
         destination: Option<CuteafdDeviceBuffer>,
         hidden_view: Option<CuteafdDeviceBuffer>,
     ) -> Result<()> {
-        ensure!(
-            request.layer() as usize == self.first_layer + self.layer,
-            "request does not match selected EXL3 layer"
-        );
+        Self::validate_layer(&self.layer_ids, self.layer, request.layer() as usize)?;
         ensure!(
             executor_id == self.executor_id,
             "EXL3 response executor identity mismatch"
