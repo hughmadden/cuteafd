@@ -29,6 +29,29 @@ SOURCE_PINS = {
     "kernel.py": "2cd01d57d2d135397d2fd36c203684af7564b5e6c6f5d3853b3d35bedeb548be",
     "vision_encoder.py": "8943ee555ffd2a32213f6f9f0a7146d1f49566c65c8b7691c37055208cdb6b53",
 }
+SPARSE_LAUNCH = {
+    "official_launch_configuration": False,
+    "kernel": "_sparse_attn_prefill_kernel",
+    "num_stages": 1,
+    "block_regions": 16,
+    "arithmetic": "official tiles and region-loop order unchanged; pipeline stages overridden",
+}
+
+
+class SparsePrefillLaunch:
+    """Override pipelining only; retain the official wrapper and kernel arithmetic."""
+    def __init__(self, kernel):
+        self.kernel = kernel
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+
+        def invoke(*args, **kwargs):
+            if "num_stages" in kwargs:
+                raise ValueError("official sparse prefill now sets pipeline stages explicitly")
+            return launch(*args, **kwargs, num_stages=SPARSE_LAUNCH["num_stages"])
+
+        return invoke
 
 
 def verify_source(snapshot):
@@ -70,6 +93,8 @@ def load_release(snapshot):
             sys.modules[module_name] = module
             spec.loader.exec_module(module)
             modules[name] = module
+        modules["kernel"]._sparse_attn_prefill_kernel = SparsePrefillLaunch(
+            modules["kernel"]._sparse_attn_prefill_kernel)
     finally:
         for name, module in previous.items():
             if module is None:
@@ -294,6 +319,7 @@ def run_windows(args, ref, kernel, config, weights, extent):
                   use_cache=False, attention="eager", ssmax="checkpoint-only; inactive", dtype="bf16",
                   native_fp32_parameters="norms, indexer weights, router bias and residual stream",
                   gates={"head": "sigmoid", "ffn": "post-SiLU clamp 7; FP32 product"},
+                  sparse_attention_launch=SPARSE_LAUNCH,
                   golden_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   torch=torch.__version__, tokenizers=tokenizers.__version__, transformers=transformers.__version__,
                   platform=dict(machine=platform.machine(), gpu=torch.cuda.get_device_name(0),
@@ -323,7 +349,8 @@ def main():
         parser.error("reference requires all 92 target layers and native BF16 expert weights")
     if args.check_only:
         print(json.dumps(dict(snapshot_identity=identity,
-                              source_pin={**verify_source(args.snapshot), **args.runtime_source})))
+                              source_pin={**verify_source(args.snapshot), **args.runtime_source},
+                              sparse_attention_launch=SPARSE_LAUNCH)))
         return
     import torch
     from shape_invariant import install

@@ -35,6 +35,26 @@ def test_reference_uses_official_kernels_and_target_layers_only():
     assert "num_nextn_predict_layers" not in names
 
 
+def test_sparse_launch_override_changes_stages_only():
+    calls = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((grid, args, kwargs))
+                return "compiled"
+            return launch
+
+    wrapped = golden.SparsePrefillLaunch(Kernel())
+    assert wrapped[(128, 4)]("q", "k", BLOCK_H=16, BLOCK_D=256, BLOCK_R=16) == "compiled"
+    assert calls == [((128, 4), ("q", "k"),
+                      dict(BLOCK_H=16, BLOCK_D=256, BLOCK_R=16, num_stages=1))]
+    assert golden.SPARSE_LAUNCH["official_launch_configuration"] is False
+    with pytest.raises(ValueError, match="explicitly"):
+        wrapped[(128, 4)](num_stages=3)
+    assert len(calls) == 1
+
+
 @pytest.fixture
 def release():
     snapshot = os.environ.get("STEP5_REFERENCE_SNAPSHOT")

@@ -88,6 +88,17 @@ def panel_caveat(panel):
     return caveat
 
 
+def sparse_launch_note(meta):
+    launch = meta.get('sparse_attention_launch')
+    if launch is None:
+        return ''
+    if (launch.get('official_launch_configuration') is not False or launch.get('num_stages') != 1
+            or launch.get('block_regions') != 16 or launch.get('kernel') != '_sparse_attn_prefill_kernel'):
+        raise ValueError('unsupported sparse reference launch configuration')
+    return ('This is not the official sparse-attention launch configuration: the adapter sets num_stages=1; '
+            'official region/head/dimension tiles and region-loop order remain unchanged.\n')
+
+
 def public_panel(panel):
     public = copy.deepcopy(panel)
     # Keep immutable generation identity, not deployment arguments or local paths.
@@ -111,6 +122,9 @@ def package(source, out, config, tokenizer_path, license_path):
     rows = read('full/rows.json')
     set_id = panel['set_sha256']
     caveat = panel_caveat(panel)
+    launch_note = sparse_launch_note(meta)
+    if panel['family'] == 'step5' and not launch_note:
+        raise ValueError('Step-5 reference must disclose its sparse launch configuration')
     if not (validation['passed'] is True and validation['engine_parity'] is False
             and validation['set_sha256'] == seal['set_sha256'] == full_seal['set_sha256'] == meta['set_sha256'] == rows['set_sha256'] == set_id
             and validation['golden_seal_sha256'] == digest(source / 'golden-seal.json')
@@ -172,6 +186,8 @@ def package(source, out, config, tokenizer_path, license_path):
         print(f'packaged {config}/{wid}', flush=True)
     provenance = {k: meta[k] for k in ('snapshot_identity', 'source_pin', 'platform', 'tokenizers', 'torch',
                                       'transformers', 'attention', 'mtp', 'use_cache', 'gates', 'native_fp32_parameters')}
+    if launch_note:
+        provenance['sparse_attention_launch'] = meta['sparse_attention_launch']
     if digest(source / 'platform.json') != inventory['platform.json']['sha256']:
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
@@ -200,6 +216,8 @@ def package(source, out, config, tokenizer_path, license_path):
                                         if panel.get('retokenized_text_source') else
                                         'REFERENCE-ONLY QUALIFIED; coordinator review/upload required'),
                     text_checkpoint=panel['generation_arm']['checkpoint'], panel_caveat=caveat)
+    if launch_note:
+        manifest['reference_execution'] = dict(sparse_attention_launch=meta['sparse_attention_launch'])
     manifest['reference_sha256'] = hashlib.sha256(canonical(manifest)).hexdigest()
     validate_public_metadata(manifest)
     (destination / 'manifest.json').write_bytes(canonical(manifest) + b'\n')
@@ -215,6 +233,7 @@ def package(source, out, config, tokenizer_path, license_path):
             f'32,768 scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
             'Checkpoint-native BF16/F32 tensors and family activation arithmetic, bounded attention, fixed GEMM rows 128, MTP/cache off.\n'
+            f'{launch_note}'
             'Pinned Transformers source, tokenizer runtime, platform and oracle seal hashes are in qualification.json.\n'
             'No engine parity, paired compact/full-engine calibration, dense baseline calibration, or precision-default verdict is claimed.\n'
             'The common top-1/KL policy floor in the manifest is not a measured dense-engine baseline.\n\n'

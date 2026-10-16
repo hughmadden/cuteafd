@@ -63,3 +63,15 @@ def test_retokenized_panel_caveat_discloses_provisional_legacy_extension():
     assert 'model-generated-span property does not hold' in caveat
     assert 'not a Step-5-generated panel' in caveat
     assert '#302' in caveat
+
+
+def test_sparse_launch_disclosure_preserves_tiles_and_rejects_missing_parameters():
+    launch = dict(official_launch_configuration=False, num_stages=1, block_regions=16,
+                  kernel='_sparse_attn_prefill_kernel')
+    note = packager.sparse_launch_note(dict(sparse_attention_launch=launch))
+    assert 'not the official' in note and 'num_stages=1' in note
+    assert 'tiles and region-loop order remain unchanged' in note
+    assert packager.sparse_launch_note({}) == ''
+    for key, wrong in (('official_launch_configuration', True), ('num_stages', 3), ('block_regions', 8)):
+        with pytest.raises(ValueError, match='unsupported'):
+            packager.sparse_launch_note(dict(sparse_attention_launch={**launch, key: wrong}))
