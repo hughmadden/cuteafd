@@ -41,6 +41,35 @@ pub(crate) struct DenseEngine<'a> {
     verification: verify::Verification<'a>,
 }
 
+#[cfg(test)]
+mod hook_borrow_tests {
+    use super::*;
+
+    #[test]
+    fn target_head_workspace_owner_is_not_sync() {
+        // Inference becomes ambiguous if a future refactor makes DenseEngine Sync.
+        trait AmbiguousIfSync<A> { fn check() {} }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        struct IsSync;
+        impl<T: ?Sized + Sync> AmbiguousIfSync<IsSync> for T {}
+        let _ = <DenseEngine<'static> as AmbiguousIfSync<_>>::check;
+    }
+
+    #[test]
+    fn embedding_stream_and_head_can_be_borrowed_together() {
+        // Compile the actual binding pattern without requiring a CUDA fixture.
+        fn bind(engine: &DenseEngine<'_>, hidden: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer) -> Result<()> {
+            let embedding = engine.token_embedding();
+            let stream = engine.target_stream();
+            let head = |x, logits, rows| engine.target_head(x, logits, rows);
+            head(hidden, output, 1)?;
+            embedding.check(&[0])?;
+            stream.drain()
+        }
+        let _: fn(&DenseEngine<'_>, CuteafdDeviceBuffer, CuteafdDeviceBuffer) -> Result<()> = bind;
+    }
+}
+
 fn alloc_bytes(bytes: usize) -> usize { bytes.max(256) }
 
 fn weight_demand(group: &str, bytes: u64, category: Category) -> Demand {
@@ -131,7 +160,9 @@ impl<'a> DenseEngine<'a> {
 
     /// Queue the borrowed target head over already-normalized BF16 hidden rows.
     /// Source and destination storage must remain live until the target stream drains.
-    pub(crate) fn target_head(&mut self, hidden: CuteafdDeviceBuffer,
+    /// The FFI-owned head workspace is reused in target-stream order, so borrowing
+    /// the embedding concurrently needs no mutable engine borrow or storage copy.
+    pub(crate) fn target_head(&self, hidden: CuteafdDeviceBuffer,
         output: CuteafdDeviceBuffer, rows: usize) -> Result<DeviceLogits> {
         ensure!((1..=HEAD_ROWS).contains(&rows), "target head requires 1..64 rows");
         ensure!(hidden.device_id == self.stream.device.id && output.device_id == self.stream.device.id,
@@ -141,7 +172,7 @@ impl<'a> DenseEngine<'a> {
         ensure!(!output.ptr.is_null() && output.bytes >= rows * self.cfg.vocab * 4,
             "target head logits extent differs from dense vocabulary");
         self.stream.device.run(|| {
-            // SAFETY: checked row extents; the caller retains both buffers through drain.
+            // SAFETY: checked extents stay live through drain; !Sync engine serializes FFI workspace use on its one target stream.
             unsafe { crate::shared::target_head::launch(TargetHead::configured(), &self.head,
                 hidden.ptr, self.weights.head.buffer.ptr, output.ptr.cast(), rows, self.stream.raw) }
         })?;
