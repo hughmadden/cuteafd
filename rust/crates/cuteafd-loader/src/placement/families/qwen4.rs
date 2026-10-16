@@ -5,7 +5,7 @@
 use crate::families::qwen4::Qwen4Attention;
 use crate::placement::*;
 use crate::serving_capacity::qwen_graphs::{qwen_admission, qwen_startup_graphs, QwenAdmissionInputs, QWEN_UNIT_ROWS};
-use cuteafd_core::memory_layout::{Basis, Category};
+use cuteafd_core::memory_layout::{Basis, Category, ItemLifetime};
 
 pub const DEFAULT_MARK_SLOTS: u64 = 18;
 pub const LAZY_GRAPH_BYTES: u64 = (1 << 30) / 2;
@@ -91,7 +91,10 @@ pub fn placement(inputs: &QwenInputs<'_>) -> anyhow::Result<Placement> {
     let Some((sequences, speculation)) = inputs.startup_graph_modes else {
         let mut result = solve(&request(inputs, LAZY_GRAPH_BYTES)?)?;
         for item in &mut result.items[0] {
-            if item.group == "startup graphs" { item.group = "graph growth".into(); }
+            if item.group == "startup graphs" {
+                item.group = "graph growth".into();
+                item.lifetime = ItemLifetime::PostReadyReserve;
+            }
         }
         return Ok(result);
     };
@@ -483,7 +486,17 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
     let pending = (complete.active_state_per_sequence_bytes - previous.active_state_per_sequence_bytes)
         .checked_mul(a.slots).and_then(|n| n.checked_add(complete.fixed_state_bytes - 3 * 64 * 4))
         .ok_or_else(|| anyhow::anyhow!("Qwen MTP state overflow"))?;
-    fixed.push(Demand::new(0, Category::Kv, "owner0 MTP pending", pending, Basis::Formula));
+    // The MTP layer reads the head owner's pre-mixer streams every step and
+    // shares its head and embedding, so the shared drafter Movable stays there.
+    // Its MTP KV record stays in that owner's pool unit.
+    let (draft, mut fixed): (Vec<_>, Vec<_>) = fixed.into_iter().partition(|d| d.gpu == 0
+        && matches!(d.group.as_str(), "owner0 MTP weights" | "MTP expert weights" | "MTP expert workspace"));
+    let mut draft = draft;
+    if a.mtp { draft.push(Demand::new(0, Category::Kv, "owner0 MTP pending", pending, Basis::Formula)); }
+    else { fixed.push(Demand::new(0, Category::Kv, "owner0 MTP pending", pending, Basis::Formula)); }
+    let movables = if draft.is_empty() { Vec::new() } else {
+        vec![crate::placement::draft::DrafterDemand::itemized(draft, 0).movable(2)?]
+    };
     if a.full_prefill_logits > 0 {
         fixed.push(Demand::new(0, Category::Workspace, "probe prefill logits", a.full_prefill_logits, Basis::Formula));
     }
@@ -495,7 +508,7 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
         inventory: Inventory { gpus: inputs.gpus.to_vec(), spark_ranks: inputs.spark_ranks, peer_access: true },
         attention_placement: Some(AttentionPlacement::Layers), context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool_bounded: Vec::new(),
-        pool, layers, pool_overhead: overhead.to_vec(), fixed, startup: Vec::new(), movables: Vec::new(), expert_workspace: 0,
+        pool, layers, pool_overhead: overhead.to_vec(), fixed, startup: Vec::new(), movables, expert_workspace: 0,
         minimum_expert_layers: 0,
         tp2_workspace: inputs.tp2_workspace, onboard: inputs.onboard, expert_gpus: 2,
         policy: LayerPolicy { default: DUAL_WHOLE.to_vec(), by_kind: Vec::new(),
@@ -522,7 +535,12 @@ pub fn dual_placement(inputs: &QwenDualInputs<'_>) -> anyhow::Result<Placement> 
         let mut result = solve(&dual_request(inputs, [LAZY_GRAPH_BYTES; 2])?)?;
         check_dual_layer_owners(&owners(&result)?)?;
         for rank in &mut result.items {
-            for item in rank { if item.group == "startup graphs" { item.group = "graph growth".into(); } }
+            for item in rank {
+                if item.group == "startup graphs" {
+                    item.group = "graph growth".into();
+                    item.lifetime = ItemLifetime::PostReadyReserve;
+                }
+            }
         }
         return Ok(result);
     };
@@ -819,6 +837,51 @@ mod tests {
     }
 
     #[test]
+    fn dual_mtp_drafter_is_a_movable_placed_like_the_former_fixed_demands() {
+        let mut cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        cfg.mtp_layers = 1;
+        let weights = vec![100 << 20; 48];
+        let experts = vec![Some(ExpertCost { whole: Bytes2::default(),
+            half: [Bytes2 { resident: 600 << 20, staging: 64 << 20 }; 2], tp2: true, spark_ok: true }); 48];
+        let layer_extra = vec![Vec::new(); 48];
+        for mtp in [false, true] {
+            let mut fixed = vec![Demand::new(0, Category::Weights, "owner0 head", 1 << 30, Basis::Exact)];
+            if mtp {
+                fixed.extend([Demand::new(0, Category::Weights, "owner0 MTP weights", 900 << 20, Basis::Exact),
+                    Demand::new(0, Category::Experts, "MTP expert weights", 1300 << 20, Basis::Exact),
+                    Demand::new(0, Category::Experts, "MTP expert workspace", 64 << 20, Basis::Formula)]);
+            }
+            let inputs = QwenDualInputs { owner_manifests: [None, None],
+                admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, kv_format: Qwen4KvCache::Bf16, manifest: None,
+                    prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
+                    ple: None, future_expert_bytes: 0, headroom: 3 << 30 },
+                gpus: [0, 1].map(|_| GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 3 << 30,
+                    baseline: Baseline::Planned { context_bytes: 512 << 20, loaded_bytes: 0 } }),
+                layer_weights: &weights, layer_experts: &experts, layer_extra: &layer_extra, fixed,
+                tp2_workspace: [128 << 20; 2], pending_code_bytes: [64 << 20; 2], mark_slots: 0,
+                max_context: 131072, requested_pool: None, spark_ranks: 0, onboard: Onboard::Auto,
+                startup_graph_modes: None };
+            let lazy = dual_placement(&inputs).unwrap();
+            for rank in &lazy.items {
+                let graph = rank.iter().find(|item| item.group == "graph growth").unwrap();
+                assert_eq!(graph.lifetime, ItemLifetime::PostReadyReserve);
+                assert_eq!(graph.bytes, LAZY_GRAPH_BYTES);
+            }
+            let req = dual_request(&inputs, [256 << 20; 2]).unwrap();
+            assert_eq!(req.movables.len(), usize::from(mtp));
+            if mtp {
+                assert_eq!(req.movables[0].allowed, [0]);
+                assert_eq!(req.movables[0].conditional[0].demands.iter().map(|d| d.group.as_str()).collect::<Vec<_>>(),
+                    ["owner0 MTP weights", "MTP expert weights", "MTP expert workspace", "owner0 MTP pending"]);
+                assert!(req.fixed.iter().all(|d| !d.group.contains("MTP")));
+                crate::placement::draft::assert_same_as_fixed(&req);
+            } else {
+                assert!(req.fixed.iter().any(|d| d.group == "owner0 MTP pending"));
+            }
+        }
+    }
+
+    #[test]
     fn planner_equals_runtime_qwen4_dual_contract() {
         use crate::serving_capacity::qwen_graphs::qwen_cache_geometry_placed;
         let mut cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
@@ -966,6 +1029,10 @@ mod tests {
                 pending_code_bytes: 780_221_844, max_context: 131072, requested_pool: None,
                 spark_ranks: 0, startup_graph_modes: None,
             };
+            let lazy = placement(&inputs).unwrap();
+            let graph = lazy.items[0].iter().find(|item| item.group == "graph growth").unwrap();
+            assert_eq!(graph.lifetime, ItemLifetime::PostReadyReserve);
+            assert_eq!(graph.bytes, LAZY_GRAPH_BYTES);
             let req = request(&inputs, LAZY_GRAPH_BYTES).unwrap();
             let admission = qwen_admission(&inputs.admission).unwrap();
             assert_eq!(req.layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum::<u64>() + req.pool_overhead[0],
