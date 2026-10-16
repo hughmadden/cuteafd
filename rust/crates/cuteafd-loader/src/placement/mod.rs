@@ -556,6 +556,8 @@ pub enum PlacementError {
     Inventory(&'static str),
     #[error("explicit KV pool of {requested} tokens does not fit beside admitted demands (fits {fit}); {limits}")]
     PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
+    #[error("{family} drafter was placed on rtx{gpu}, where this build has no executor for it")]
+    DrafterHome { family: &'static str, gpu: u8 },
     #[error("KV pool and mandatory {what} do not fit on rtx{gpu}")]
     Mandatory { gpu: u8, what: String },
     #[error("{requested} RTX expert layers do not fit beside the fixed demands (at most {placed})")]
