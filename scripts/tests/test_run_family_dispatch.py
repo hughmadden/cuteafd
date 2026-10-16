@@ -281,16 +281,23 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     transport = remote.split("    pub fn update(", 1)[1].split("    pub fn put_taps(", 1)[0]
     assert "self.synchronize()?" not in transport
     assert "cuda_stream_synchronize" not in transport
-    final_ack = remote.split("    pub fn finish_request(", 1)[1].split("    pub fn finish_terminal(", 1)[0]
-    assert final_ack.index("self.exchange.wait(0, TAPS)") < final_ack.index("cuda_stream_synchronize")
+    bridge = (family.parent.parent / "shared/draft/remote.rs").read_text()
+    final_ack = bridge.split("    pub fn finish_request(", 1)[1].split("    pub fn finish_terminal(", 1)[0]
+    assert final_ack.index("self.exchange.wait(0, CONTEXT)") < final_ack.index("cuda_stream_synchronize")
     release = (family / "serve.rs").read_text().split("fn release(", 1)[1].split("#[derive", 1)[0]
     assert release.index("family.finish_request()") < release.index("cache.release(")
-    assert transport.index("self.exchange.wait(0, TAPS)") < transport.index("self.exchange.push_planes(0, TAPS")
-    assert transport.index("self.exchange.wait(1, TAPS)") < transport.index("self.exchange.signal(1, TAPS)")
+    publish = bridge.split("    pub fn publish_context(", 1)[1].split("    pub fn acknowledge_context(", 1)[0]
+    assert publish.index("self.exchange.wait(0, CONTEXT)") < publish.index("self.exchange.push_planes(0, CONTEXT")
+    acknowledge = bridge.split("    pub fn acknowledge_context(", 1)[1].split("\n    }", 1)[0]
+    assert "self.exchange.wait(1, CONTEXT)" in publish and "self.exchange.signal(1, CONTEXT)" in acknowledge
+    assert bridge.index("    pub fn publish_context(") < bridge.index("    pub fn acknowledge_context(")
+    assert transport.index("self.bridge.publish_context(") < transport.index("self.bridge.acknowledge_context()")
     taps = remote.split("    pub fn tap_streams_at(", 1)[1].split("    pub fn update(", 1)[0]
     assert "self.target.taps.buffer.ptr" in taps and "push_planes" not in taps
     owner = remote.split("pub(crate) struct RemoteDflash", 1)[1].split("impl<'a>", 1)[0]
-    assert owner.index("pub draft:") < owner.index("exchange:") < owner.index("stream:")
+    assert owner.index("pub draft:") < owner.index("bridge: RemoteBridge")
+    shared_owner = bridge.split("pub(crate) struct RemoteBridge", 1)[1].split("impl<'a>", 1)[0]
+    assert shared_owner.index("pub exchange:") < shared_owner.index("pub stream:")
     drain = (family / "engine.rs").read_text().split("    pub(crate) fn synchronize(", 1)[1].split("    fn start(", 1)[0]
     assert "drain_ranks(" in drain
     shutdown = (family / "engine.rs").read_text().split("    fn shutdown_submission(", 1)[1].split("    fn publish_tp2_abort(", 1)[0]
@@ -303,9 +310,9 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert "self.draft.prime_remote()" in prime
     assert "self.launch_head(&head, rows, true)?" in prime
     assert "self.launch_head(&head, rows, false)?" in prime
-    assert prime.index("self.launch_head(&head, rows, true)?") < prime.index("self.launch_head(&head, rows, false)?") < prime.index("cuda_stream_synchronize(self.exchange.stream(0))")
-    assert "cuda_stream_synchronize(self.exchange.stream(0))" in prime
-    assert "self.exchange.wait(" not in prime and "self.exchange.push" not in prime
+    assert prime.index("self.launch_head(&head, rows, true)?") < prime.index("self.launch_head(&head, rows, false)?") < prime.index("cuda_stream_synchronize(self.bridge.exchange.stream(0))")
+    assert "cuda_stream_synchronize(self.bridge.exchange.stream(0))" in prime
+    assert "self.bridge.exchange.wait(" not in prime and "self.bridge.exchange.push" not in prime
     isolated = shared.split("    pub(crate) fn prime_remote(", 1)[1].split("    fn workspace(", 1)[0]
     assert "0..TAP_ROWS" in isolated and "1..=self.max_sequences" in isolated
     assert "self.draft_device_with(" in isolated

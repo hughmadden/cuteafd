@@ -225,11 +225,9 @@ pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u6
     ];
     let mut demands: Vec<_> = bytes.into_iter().map(|(group, bytes)|
         Demand::new(0, Category::Drafter, group, bytes, Basis::Formula)).collect();
-    // Four zero-size receive slots still own 256B each; controls and the
-    // abort word own 256B each. No duplicate payload destination is allocated.
     for gpu in 0..2 {
         demands.push(Demand::new(gpu, Category::Transport, "DFlash bridge exchange",
-            4 * 256 + 256 + 256, Basis::Formula));
+            draft::BRIDGE_EXCHANGE_BYTES, Basis::Formula));
     }
     for gpu in 0..2 {
         demands.iter().filter(|d| d.gpu == gpu).try_fold(0u64, |sum, d|
@@ -310,16 +308,13 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         return Err(PlacementError::Inventory("GLM Flash remote draft candidate"));
     }
     let movables = if i.drafter_bytes == 0 { vec![] } else {
-        let conditional = i.drafter_scratch.iter().enumerate().filter_map(|(rank, &bytes)| {
-            let mut demands = if rank == 1 { i.drafter_bridge.as_ref().map(|b| b.demands.clone()).unwrap_or_default() }
-                else { vec![] };
-            if bytes > 0 { demands.push(Demand::new(rank as u8, Category::Workspace,
-                "DFlash linear/attention scratch", bytes, Basis::Formula)); }
-            (!demands.is_empty()).then_some(MovableDemands { placement_gpu: rank as u8, demands })
-        }).collect();
-        vec![Movable { id: MovableId::Drafter, parts: vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }],
-            allowed: if i.drafter_bridge.is_some() { vec![0, 1] } else { vec![0] },
-            expert_arena: false, conditional }]
+        let mut drafter = draft::DrafterDemand::local(MovableId::Drafter,
+            vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }], 0);
+        drafter.per_home = i.drafter_scratch.iter().enumerate().filter(|(_, &bytes)| bytes > 0)
+            .map(|(rank, &bytes)| MovableDemands { placement_gpu: rank as u8, demands: vec![Demand::new(rank as u8,
+                Category::Workspace, "DFlash linear/attention scratch", bytes, Basis::Formula)] }).collect();
+        drafter.bridge = i.drafter_bridge.as_ref().map(|b| b.demands.clone());
+        vec![drafter.movable(ranks)?]
     };
     if ranks == 2 && i.decode_rows != cache::GLMF_DECODE_ROWS {
         return Err(PlacementError::Inventory("GLM Flash head split needs 64 decode rows"));
