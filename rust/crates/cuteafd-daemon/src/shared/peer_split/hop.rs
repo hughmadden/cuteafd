@@ -29,33 +29,31 @@ use std::ffi::c_void;
 /// host buffer is needed: copies land in the destination's existing inputs.
 pub(crate) struct DirectInputHop<'a> {
     source: Device<'a>,
-    contract: Option<HopSpec>,
+    contract: HopSpec,
     destination: Stream<'a>,
+    /// Direct-input storage is V4.1-only today; v41_peer_copy is its FFI entry point.
     /// Device-ordered passes: an SM copy on the
     /// destination GPU ordered by the stage chain, with no host wait.
     sm: Option<cuteafd_ffi::V41PeerCopy<'a>>,
 }
 impl<'a> DirectInputHop<'a> {
-    pub fn new(source: Device<'a>, destination: Device<'a>) -> Result<Self> {
-        ensure!(
-            source.id != destination.id,
-            "block transfer requires different GPUs"
-        );
+    pub fn new(source: Device<'a>, destination: Device<'a>, spec: HopSpec) -> Result<Self> {
+        validate_direct_input_contract(source.id, destination.id, &[], spec)?;
         source.run(|| source.library.cuda_enable_peer(destination.id))?;
         destination.run(|| destination.library.cuda_enable_peer(source.id))?;
         let sm = crate::shared::memory::chain::device_enabled()
             .then(|| destination.run(|| destination.library.v41_peer_copy())).transpose()?;
         Ok(Self {
             source,
-            contract: None,
+            contract: spec,
             destination: Stream::new(destination)?,
             sm,
         })
     }
-    /// Admission binds geometry once; destination inputs remain family-owned.
+    /// Admission checks the planned endpoints against the required geometry.
     pub fn bind(&mut self, hops: &[Hop], spec: HopSpec) -> Result<()> {
         validate_direct_input_contract(self.source.id, self.destination.device.id, hops, spec)?;
-        self.contract = Some(spec);
+        ensure!(self.contract == spec, "direct-input hop geometry differs from construction");
         Ok(())
     }
 
@@ -82,13 +80,7 @@ impl<'a> DirectInputHop<'a> {
                     && s.bytes <= d.bytes),
             "block transfer devices or extents differ"
         );
-        if let Some(spec) = self.contract {
-            let bytes = sources.iter().try_fold(0usize, |sum, source| sum.checked_add(source.bytes))
-                .context("direct-input hop extent overflow")?;
-            let row_bytes = usize::try_from(spec.row_bytes)?;
-            ensure!(bytes > 0 && bytes % row_bytes == 0 && (bytes / row_bytes) as u64 <= spec.rows,
-                "direct-input hop exceeds admitted row geometry");
-        }
+        validate_direct_input_extent(self.contract, sources.iter().map(|source| source.bytes))?;
         let device = self.destination.device;
         if let Some(sm) = self.sm.as_ref().filter(|_| crate::shared::memory::chain::deferred()) {
             // The SM copy follows the chain head (the producers on the source
@@ -123,6 +115,15 @@ impl<'a> DirectInputHop<'a> {
         // Stream::wait retains and drains the stream on failure/cancellation.
         self.destination.wait().await
     }
+}
+
+fn validate_direct_input_extent(spec: HopSpec, extents: impl IntoIterator<Item = usize>) -> Result<()> {
+    let bytes = extents.into_iter().try_fold(0usize, |sum, bytes| sum.checked_add(bytes))
+        .context("direct-input hop extent overflow")?;
+    let row_bytes = usize::try_from(spec.row_bytes)?;
+    ensure!(row_bytes > 0 && bytes > 0 && bytes % row_bytes == 0 && (bytes / row_bytes) as u64 <= spec.rows,
+        "direct-input hop exceeds admitted row geometry");
+    Ok(())
 }
 
 fn validate_direct_input_contract(source: i32, destination: i32, hops: &[Hop], spec: HopSpec) -> Result<()> {
@@ -295,6 +296,20 @@ mod cuda_tests {
         let mut bad = hops;
         bad[0].storage = HopStorage::ReceiveSlots;
         assert!(validate_direct_input_contract(0, 1, &bad, spec).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_input_extent_always_enforces_admitted_geometry() -> Result<()> {
+        let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+        let row_bytes = usize::try_from(spec.row_bytes)?;
+        for rows in [1, spec.rows as usize] {
+            validate_direct_input_extent(spec, [rows * 40960, rows * 16])?;
+        }
+        for extents in [vec![], vec![0], vec![row_bytes - 1], vec![row_bytes + 1],
+            vec![(spec.rows as usize + 1) * row_bytes], vec![usize::MAX, 1]] {
+            assert!(validate_direct_input_extent(spec, extents).is_err());
+        }
         Ok(())
     }
 
