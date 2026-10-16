@@ -103,41 +103,22 @@ def write_bridge(output: Path, manifest: dict) -> None:
         len(epilogue['pointer_slots']), len(epilogue['scalar_slots']),
         *manifest['bits'], *([0] * (4 - len(manifest['bits']))),
         2 if manifest['output_dtype'] == 'bf16' else 4]
-    boundary = manifest.get('paired_boundary')
-    if boundary is None:
-        lines += ['extern "C" int cuteafd_exl3_info(uint32_t* out, uint32_t words) {',
-            'if (!out || words != 16) return int(cudaErrorInvalidValue);',
-            'const uint32_t info[16] = {' + ','.join(map(str, info)) + '};',
-            'for (int i = 0; i < 16; ++i) out[i] = info[i]; return 0; }']
-    else:
-        # Old consumers must fail instead of interpreting four-row descriptors
-        # as the original three-row/disjoint contract.
-        lines += ['extern "C" int cuteafd_exl3_info(uint32_t*, uint32_t) { return int(cudaErrorInvalidValue); }']
-        paired_info = [3, *info[1:], 1 if boundary == 'first' else 2, 4]
-        lines += ['extern "C" int cuteafd_exl3_paired_info(uint32_t* out, uint32_t words) {',
-            'if (!out || words != 18) return int(cudaErrorInvalidValue);',
-            'const uint32_t info[18] = {' + ','.join(map(str, paired_info)) + '};',
-            'for (int i = 0; i < 18; ++i) out[i] = info[i]; return 0; }']
+    lines += ['extern "C" int cuteafd_exl3_info(uint32_t* out, uint32_t words) {',
+        'if (!out || words != 16) return int(cudaErrorInvalidValue);',
+        'const uint32_t info[16] = {' + ','.join(map(str, info)) + '};',
+        'for (int i = 0; i < 16; ++i) out[i] = info[i]; return 0; }']
     (output / 'v41_exl3_bridge.cc').write_text('\n'.join(lines) + '\n')
 
 
 def export(output: Path, intermediate: int, experts: int, capacity: int,
            bits: tuple[int, ...], routing: str, topk: int = 6, output_dtype: str = "bf16",
-           blocks_per_sm: int | None = None, paired_boundary: str | None = None,
+           blocks_per_sm: int | None = None,
            tile: tuple[int, ...] | None = None, hidden: int = 5120, route_block: int = 8,
            token_major_rotation: bool = False, swiglu_limit: float | None = 10.0,
            fused_input_rotation: bool = False, warp_specialized: bool = False,
            wire_input: bool = False, ws_input_stages: int | None = None,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
            compile_only: bool = False) -> dict:
-    if paired_boundary not in (None, "first", "last"):
-        raise ValueError("paired boundary must be first, last, or None")
-    if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
-                                        or hidden != 5120):
-        raise ValueError("paired export requires width 640, two tiers and top-k 6")
-    if paired_boundary is not None and tile is not None:
-        raise ValueError("paired exports keep the qualified tile policy; the offline "
-                         "tile override is for disjoint layouts only")
     # The (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple is b12x's own
     # geometry vocabulary: _projection_mixed_tile_config()/the compile path reject a
     # thread-count mismatch or a tile that does not fit the problem, so the pinned
@@ -147,20 +128,18 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # decode over more rows once many rows share an expert (large prefill).
     if route_block not in (8, 16, 32, 64):
         raise ValueError("EXL3 route block must be 8, 16, 32 or 64 rows")
-    if route_block != 8 and paired_boundary is not None:
-        raise ValueError("paired exports keep the qualified 8-row route block")
     # Token-major input rotation reads each token's input block once for all of
     # its routes (bit-identical); it applies to two-tier packed-route exports.
-    if token_major_rotation and (paired_boundary is not None or len(bits) != 2):
+    if token_major_rotation and (len(bits) != 2):
         raise ValueError("token-major rotation requires a disjoint two-tier export")
     # FC1 rotates the staged token rows in shared memory instead of reading
     # materialized per-route copies (bit-identical); wide packed blocks only.
-    if fused_input_rotation and (paired_boundary is not None or len(bits) != 2 or route_block < 16):
+    if fused_input_rotation and (len(bits) != 2 or route_block < 16):
         raise ValueError("fused input rotation requires a disjoint two-tier export with 16+ row blocks")
     # Warp-specialized prefill: producer warps stream weights and input rows and
     # rotate FC1 inputs; consumer warps decode and multiply (bit-identical to the
     # cooperative kernel). FC1, SwiGLU and FC2 become three launches of the core.
-    if warp_specialized and (paired_boundary is not None or len(bits) != 2 or route_block < 16
+    if warp_specialized and (len(bits) != 2 or route_block < 16
                              or fused_input_rotation or token_major_rotation):
         raise ValueError("warp-specialized prefill requires a disjoint two-tier export with 16+ "
                          "row blocks and brings its own input rotation")
@@ -184,7 +163,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # l2/pf1/pf2/pdl options): when and with which L2 policy the cooperative
     # kernel fetches weight words. Bit-identical to the default schedule; the
     # manifest records the canonical options, and only when one is set.
-    if decode_schedule is not None and (paired_boundary is not None or warp_specialized
+    if decode_schedule is not None and (warp_specialized
                                         or len(bits) != 2):
         raise ValueError("a decode schedule applies to cooperative disjoint two-tier exports")
     # Disk-loaded B12x executors omit the compiler IR required by export_to_c.
@@ -235,8 +214,6 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         tier0_bits=bits[0], tier1_bits=bits[1], trellis_codebook="mcg", swiglu_limit=swiglu_limit,
         moe_block_size=block_m, rotation_input_dtype="bf16", full_rotation_output_dtype=output_dtype,
         route_ids_dtype=torch.int32)
-    if paired_boundary is not None:
-        options['paired_boundary'] = paired_boundary
     if len(bits) == 2:
         rotation = {"token_major_rotation": True} if token_major_rotation and not direct else {}
         if fused_input_rotation and not direct:
@@ -326,8 +303,6 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         manifest["fused_input_rotation"] = True
     elif token_major_rotation and not direct:
         manifest["token_major_rotation"] = True
-    if paired_boundary is not None:
-        manifest.update(paired_boundary=paired_boundary, descriptor_rows=4, native_info_version=3)
     if getattr(launch, "decode_schedule", None) is not None:
         manifest["decode_schedule"] = launch.decode_schedule
     write_bridge(output, manifest)
@@ -360,7 +335,6 @@ def main() -> None:
                         help="SwiGLU clamp limit, or none for an unclamped SwiGLU (GLM)")
     parser.add_argument("--output-dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--blocks-per-sm", type=int, choices=(1, 2), help="Offline residency override; default uses B12x policy")
-    parser.add_argument("--paired-boundary", choices=("first", "last"), help="Candidate TP4 ownership-aware layout")
     parser.add_argument("--route-block", type=int, choices=(8, 16, 32, 64), default=8,
                         help="Packed-route M block (rows per expert block); direct routes ignore it")
     parser.add_argument("--fused-input-rotation", action="store_true",
@@ -382,7 +356,7 @@ def main() -> None:
                                        "(for example 64,256,64,256 or 128,128,128,128); default is the "
                                        "B12x per-capacity policy")
     args = parser.parse_args()
-    export(args.output, args.intermediate, args.experts, args.capacity, tuple(args.bits), args.routing, args.topk, args.output_dtype, args.blocks_per_sm, args.paired_boundary,
+    export(args.output, args.intermediate, args.experts, args.capacity, tuple(args.bits), args.routing, args.topk, args.output_dtype, args.blocks_per_sm,
            tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden,
            route_block=args.route_block, token_major_rotation=args.token_major_rotation,
            fused_input_rotation=args.fused_input_rotation,

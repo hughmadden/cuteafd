@@ -394,7 +394,7 @@ class TestPipelineWiring:
     def test_the_expert_leg_receives_the_root_as_a_sentinel_positional(self):
         text = build_text()
         assert '"${release_build_root:-__legacy__}"' in text
-        assert 'release_build_root="${10-__legacy__}"' in text
+        assert 'release_build_root="${9-__legacy__}"' in text
         assert '[[ "$release_build_root" != "__legacy__" ]] || release_build_root=' in text
         remote_block = text.split("building Spark development and inference images natively", 1)[1]
         remote_block = remote_block.split("<<'REMOTE'", 1)[1].split("\nREMOTE", 1)[0]

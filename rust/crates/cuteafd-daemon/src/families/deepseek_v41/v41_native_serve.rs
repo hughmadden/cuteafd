@@ -356,7 +356,6 @@ fn worker(
         "an implicit two- or three-peer Spark group requires an EXL3 checkpoint; \
          a native three-rank group must pass --spark-tp 3 --spark-ep 1"
     );
-    let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
     let local_exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
         &args.native_lib, catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]), "rtx-tp1");
     let mut exl3_modules = None;
@@ -474,7 +473,6 @@ fn worker(
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, args.peers.len())?;
     let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
-    if let Some(profile) = &paired_profile { transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
     let mut prefill_pass = TargetPass::new(
@@ -493,7 +491,6 @@ fn worker(
     if small_card { admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?; }
     let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
-    if let Some(profile) = &paired_profile { prefill_transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
     pass.install_attention_plan(attention_plan)?;
@@ -635,7 +632,7 @@ fn worker(
     if let Some(handoff) = placement_handoff {
         handoff.wait_ready(Duration::from_secs(900))?;
     }
-    if crate::shared::memory::chain::device_exchange_enabled() && paired_profile.is_none() && topology.is_none()
+    if crate::shared::memory::chain::device_exchange_enabled() && topology.is_none()
         && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40 {
         // Verification waves (up to 80 rows) on the device-driven exchange; it
         // connects (and warms) the workers, so only once they are serving.

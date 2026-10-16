@@ -66,7 +66,6 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     }
     ensure!(args.peers.len() == 4 || topology.is_some() || catalog.exl3().is_some(),
         "implicit non-TP4 Spark layouts require an EXL3 checkpoint");
-    let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
     let map = CachePlacement::encoder_decoder();
     let started = Instant::now();
     // Sum resident storage plus the largest transient loading excess.
@@ -352,9 +351,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             let roce = super::spark_transport(&args.peers, capacity, timing, topology)?;
             NativeTp4Wave::new(&lib, roce, wave_bytes)
         })?;
-        if let Some(profile) = &paired_profile { transport.install_paired(profile.clone())?; }
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
-        if crate::shared::memory::chain::device_exchange_enabled() && paired_profile.is_none() && topology.is_none()
+        if crate::shared::memory::chain::device_exchange_enabled() && topology.is_none()
             && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native {
             // Verification waves (up to 80 rows) on the device-driven exchange.
             devices[1].run(|| transport.get_mut().install_device_link(&args.peers, 80.min(capacity as usize), 39,

@@ -79,7 +79,6 @@ pub(super) enum Execution<'w, 'a> {
     Fp8(Fp8Worker<'a>),
 }
 impl<'w, 'a> Execution<'w, 'a> {
-    pub(super) fn is_paired(&self) -> bool { matches!(self, Self::Exl3(worker) if worker.is_paired()) }
     pub(super) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
         rank: usize) -> Result<Option<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
         match self {
@@ -263,18 +262,16 @@ pub(super) fn load_exl3<'a>(
         .map(|manifest| manifest.decoder_tiers())
         .unwrap_or(&[]);
     let exl3_directory = config.exl3_directory_for(exl3_tiers);
-    let partition = Exl3Worker::partition(&exl3_directory, config.capacity, config.rank,
+    Exl3Worker::validate_exports(&exl3_directory, config.capacity, config.rank,
         config.exl3_schedule)?;
-    ensure!(config.world == 4 || partition == cuteafd_loader::V41Exl3Partition::Disjoint,
-        "an implicit Spark TP2/TP3 group cannot use paired TP4 artifacts");
+
     let workspace = Exl3Worker::plan(&exl3_directory, config.capacity, config.exl3_schedule)
         .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
     let plans = config.resident_layers(catalog.routed_experts().layers)?
         .map(|layer| {
-            Exl3Weights::plan_with_layout(
+            Exl3Weights::plan(
                 catalog,
                 config.exl3_selection(layer)?,
-                partition,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -304,12 +301,11 @@ pub(super) fn load_exl3<'a>(
     for (index, plan) in plans.iter().enumerate() {
         let layer = config.first_layer + index;
         let started = std::time::Instant::now();
-        let weight = Exl3Weights::load_with_layout(
+        let weight = Exl3Weights::load(
             library,
             catalog,
             config.exl3_selection(layer)?,
             remaining,
-            partition,
         )?;
         remaining = remaining
             .checked_sub(plan.resident_bytes)

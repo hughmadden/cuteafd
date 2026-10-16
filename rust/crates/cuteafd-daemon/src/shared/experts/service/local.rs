@@ -404,8 +404,6 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         config.capacity,
                         topology,
                     )?,
-                    None if execution.is_paired() =>
-                        BackboneRequest::parse_paired(view.frame_bytes(), config.capacity)?,
                     None => BackboneRequest::parse(view.frame_bytes(), config.capacity)?,
                 };
                 if pending_steady_log {

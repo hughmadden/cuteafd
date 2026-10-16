@@ -176,7 +176,6 @@ pub(crate) struct NativeTp4Wave<'a> {
     ready_rows: Option<u32>,
     local: Option<super::local::LocalExpertWave<'a>>,
     tp2: Option<Box<super::tp2_ffn::Wave<'a>>>,
-    paired: Option<Box<(super::paired::PairedAssignment, std::rc::Rc<super::paired::PairedProfile>)>>,
     /// Present only for an explicit `TP×EP` topology; legacy transports stay on
     /// the canonical request contract.
     native: Option<ReplicatedGroupPlanner>,
@@ -217,21 +216,12 @@ impl<'a> NativeTp4Wave<'a> {
     pub(crate) fn native_topology(&self) -> Option<SparkTopology> {
         self.native.as_ref().map(ReplicatedGroupPlanner::topology)
     }
-    pub(crate) fn install_paired(&mut self, profile: std::rc::Rc<super::paired::PairedProfile>) -> Result<()> {
-        ensure!(self.paired.is_none(), "paired assignment already installed");
-        ensure!(self.native.is_none(), "paired EXL3 and replicated groups are mutually exclusive");
-        self.paired = Some(Box::new((super::paired::PairedAssignment::new(), profile)));
-        Ok(())
-    }
     /// Apply the lane's whole-expert ownership to one remote request. Legacy
     /// lanes are a no-op; replicated lanes re-encode the route words and set the
     /// native group flag, so every remote path that dispatches through this wave
     /// carries the same contract.
     pub(crate) fn prepare_remote_request(&mut self, request: &mut crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest) -> Result<()> {
-        if let Some(paired) = &mut self.paired {
-            ensure!(self.native.is_none(), "paired EXL3 and replicated groups are mutually exclusive");
-            request.assign_paired(&mut paired.0, &paired.1)?;
-        } else if let Some(native) = &mut self.native {
+        if let Some(native) = &mut self.native {
             request.assign_native(native)?;
         }
         Ok(())
@@ -364,7 +354,6 @@ impl<'a> NativeTp4Wave<'a> {
             ready_rows: None,
             local: None,
             tp2: None,
-            paired: None,
             native,
             device: None,
         })
@@ -377,7 +366,7 @@ impl<'a> NativeTp4Wave<'a> {
         if !crate::shared::spark_intake::preferred_device_exchange_available(self.library, crate::shared::spark_intake::IntakePreference::Pinned)? {
             return Ok(());
         }
-        ensure!(self.native.is_none() && self.paired.is_none(),
+        ensure!(self.native.is_none(),
             "the device exchange serves the legacy TP contract only");
         let world = peers.len();
         let executors = (0..world).map(|rank| cuteafd_transport::expert::v41_spark_executor_id(world, rank))

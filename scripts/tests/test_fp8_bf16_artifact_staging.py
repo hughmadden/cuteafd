@@ -373,7 +373,7 @@ def test_remote_opt_in_preserves_preceding_optional_arguments(bf16_arg, expected
     text = (REPO / "build.sh").read_text()
     decoder = 'set -euo pipefail\nremote_dir="$1"' + text.split(
         'set -euo pipefail\nremote_dir="$1"', 1)[1].split('\ncd "$remote_dir"', 1)[0]
-    arguments = ["/source", "dev", "inference", "engine", REVISION, "version", "OFF",
+    arguments = ["/source", "dev", "inference", "engine", REVISION, "version",
                  "__legacy__", "tp2,tp6", "__legacy__", "mimo:fp8,glm:fp8"]
     if bf16_arg is not None:
         arguments.append(bf16_arg)

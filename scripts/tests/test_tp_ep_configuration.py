@@ -198,7 +198,6 @@ class TopologyConfigTest(unittest.TestCase):
     def test_explicit_topology_rejects_non_native_formats(self) -> None:
         for overlay, message in (
             ("EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n", "requires EXPERT_FORMAT=native"),
-            ("EXL3_PAIRED_TP4=on\n", "EXL3_PAIRED_TP4 must be off"),
             ("SPARKINFER_EXL3=auto\n", "requires SPARKINFER_EXL3=disable"),
         ):
             with self.subTest(overlay=overlay):
@@ -213,7 +212,6 @@ class TopologyConfigTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["0 0 0", "1 0 1", "2 0 2"])
         for tp, ep, count, extra in ((2, 1, 2, ""), (3, 2, 6, ""), (4, 1, 4, ""),
-                                      (3, 1, 3, "EXL3_PAIRED_TP4=on\n"),
                                       (3, 1, 3, "SPARKINFER_EXL3=disable\n")):
             with self.subTest(tp=tp, ep=ep, extra=extra):
                 result = load(f"SPARK_COUNT={count}\nSPARK_TP={tp}\nSPARK_EP={ep}\n"

@@ -308,7 +308,6 @@ DSPARK_DRAFT_LIMIT
 DSPARK_DRAFT_POLICY
 EMBEDDING
 ENABLE_BENCH
-EXL3_PAIRED_TP4
 EXPERT_FORMAT
 EXPERT_PORT
 FP8_EXPERT_PREFILL
@@ -683,7 +682,6 @@ case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2"
 [[ -z "$KV_POOL_SIZE" || "$KV_POOL_SIZE" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] || release_die "KV_POOL_SIZE has an invalid unit"
 [[ -z "$MEMORY_RESERVATION" || "$MEMORY_RESERVATION" =~ ^[0-9]+([.][0-9]{1,6})?((B|MB|GB|MiB|GiB)|%)$ ]] || release_die "MEMORY_RESERVATION has an invalid unit"
 ((restart == 0 || dry_run == 0)) || release_die "--restart and --dry-run are mutually exclusive"
-release_validate_compact_spark
 if ((SPARK_COUNT == 0)); then
   [[ "$RTX_EXPERT_LAYERS" == 40 && "$RTX_GPUS" != 1 ]] ||
     release_die "SPARK_COUNT=0 requires two RTX GPUs and RTX_EXPERT_LAYERS=40"
@@ -746,7 +744,7 @@ model_is_nvfp4="$(jq -r '.quantization_config.moe_quant_algo // empty' "$hf_home
 # Compact EXL3 TP3EP1 retains compressed shards. Reject other modes early.
 if ((topology_explicit)); then
   if [[ "$model_is_exl3" == true ]]; then
-    [[ "$EXPERT_FORMAT" == exl3 && "$spark_tp" == 3 && "$spark_ep" == 1 && "$EXL3_PAIRED_TP4" == off ]] ||
+    [[ "$EXPERT_FORMAT" == exl3 && "$spark_tp" == 3 && "$spark_ep" == 1 ]] ||
       release_die "explicit EXL3 topology requires compact TP3EP1 with disjoint packages"
   fi
   if [[ "$model_is_nvfp4" == "NVFP4" ]]; then
@@ -973,8 +971,6 @@ REMOTE
   if [[ "$model_is_exl3" == true ]]; then
     identity="$(release_exl3_package_identity "$sparkinfer_commit" <<<"$spark_manifest")"
     if release_spark_compact_active || [[ "$SPARK_COUNT" == 6 || ( "$spark_tp" == 3 && "$spark_ep" == 1 ) ]]; then
-      [[ "$identity" != paired:* ]] ||
-        release_die "SPARK_COUNT=$SPARK_COUNT requires disjoint EXL3 packages, not paired TP4"
       release_validate_exl3_compact_variants "$expert_capacity" "$exl3_family_tag" "$SPARK_COUNT" <<<"$spark_manifest"
     fi
     [[ -z "$spark_exl3_identity" || "$spark_exl3_identity" == "$identity" ]] ||
@@ -1220,7 +1216,6 @@ fi
 [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)
 [[ "$TP2_OUTPUT_PROJECTION" != on ]] || args+=(--tp2-output-projection)
 [[ "$TP2_DSPARK_EXPERTS" != on ]] || args+=(--tp2-dspark-experts)
-[[ "$spark_exl3_identity" != paired:* ]] || args+=(--exl3-paired-tp4)
 # Explicit replicated topology is described to the coordinator once, and each
 # worker derives group=rank/TP and tp_rank=rank%TP from the same two flags.
 if ((topology_explicit)); then

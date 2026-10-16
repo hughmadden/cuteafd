@@ -64,18 +64,10 @@ class Tp3SliceContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     harness.resolve_layout(768, start)
 
-    def test_legacy_tp4_rules_are_unchanged(self):
-        self.assertEqual(harness.resolve_layout(640, 1280)['mode'], 'tp4-paired-legacy')
-        self.assertEqual(harness.resolve_layout(512, 1792)['mode'], 'tp4-paired-legacy')
-        self.assertEqual(harness.resolve_layout(640, 1664)['mode'], 'tp4-paired-legacy')
-        with self.assertRaises(ValueError):
-            harness.resolve_layout(512, 1920)   # past 2304
-        with self.assertRaises(ValueError):
-            harness.resolve_layout(640, 100)    # off the H128 grid
-        with self.assertRaises(ValueError):
-            harness.resolve_layout(1024, 0)     # unsupported width
-        with self.assertRaises(ValueError):
-            harness.resolve_layout(1152, 0)
+    def test_unsupported_widths_are_rejected(self):
+        for width in (512, 640, 1024, 1152):
+            with self.assertRaises(ValueError):
+                harness.resolve_layout(width, 0)
 
 class TierFamilyTests(unittest.TestCase):
     def test_family_is_derived_from_real_widths_not_names(self):
@@ -147,15 +139,10 @@ class VariantRaceTests(unittest.TestCase):
                 self.assertIsNone(spec['blocks_per_sm_forced'], spec['name'])
                 self.assertNotEqual(spec['kind'], 'paired-residency')
 
-    def test_legacy_race_is_byte_for_byte_the_historical_one(self):
-        specs = harness.plan_variants(640, (64, 128, 64, 128))
-        self.assertEqual([(s['name'], s['tile'], s['blocks_per_sm_forced'])
-                          for s in specs],
-                         [('baseline', (64, 128, 64, 128), 1),
-                          ('k64-one-block', (64, 128, 64, 128), 1),
-                          ('k64-two-blocks', (64, 128, 64, 128), 2)])
-        self.assertEqual([s['name'] for s in harness.plan_variants(512, (64, 256, 64, 256))],
-                         ['baseline', 'k64-one-block', 'k64-two-blocks'])
+    def test_unsupported_widths_have_no_variant_race(self):
+        for width in (512, 640):
+            with self.assertRaises(ValueError):
+                harness.plan_variants(width, (64, 128, 64, 128))
 
     def test_controlled_candidates_declined_by_the_compiler_are_narrowly_skipped(self):
         self.assertTrue(harness.is_tile_legality_error(
@@ -351,8 +338,8 @@ class CliContractTests(unittest.TestCase):
     BASE = ['--snapshot', '/nonexistent', '--intermediate', '768',
             '--slice-start', '0', '--output', '/tmp/out.json']
 
-    def test_defaults_keep_the_legacy_surface(self):
-        args = harness.parse_args(['--snapshot', 's', '--intermediate', '640',
+    def test_defaults_keep_the_tp3_surface(self):
+        args = harness.parse_args(['--snapshot', 's', '--intermediate', '768',
                                    '--output', 'o'])
         self.assertEqual(args.slice_start, 0)
         self.assertEqual(args.layer, 30)
@@ -443,7 +430,7 @@ class NonPolicyContractTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.SOURCE)
 
-    def test_paired_sibling_call_signature_is_preserved(self):
+    def test_weight_loader_call_signature_is_preserved(self):
         import inspect
         params = list(inspect.signature(harness.load_weights).parameters)
         self.assertEqual(params[:6], ['args', 'torch', 'safe_open',
