@@ -839,10 +839,20 @@ count_args+=(--embedding-placement "$EMBEDDING")
 count_prefill=0
 ((RELEASE_PREFILL_EXPLICIT == 0)) || count_prefill="$PREFILL_BATCH_TOKENS"
 [[ "$SPECULATOR" != off ]] || count_args+=(--native-mtp-layers 0)
+((topology_explicit == 0)) || count_args+=(--spark-tp "$spark_tp" --spark-ep "$spark_ep")
+[[ -z "$KV_POOL_SIZE" ]] || count_args+=(--kv-pool-size "$KV_POOL_SIZE")
+[[ -z "$MEMORY_RESERVATION" ]] || count_args+=(--memory-reservation "$MEMORY_RESERVATION")
+count_args+=(--speculator "$SPECULATOR")
+deployment_peers=()
+for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
+  lane_key="SPARK_${rank}_LANE_A"
+  deployment_peers+=("${!lane_key}:$EXPERT_PORT")
+done
+((${#deployment_peers[@]} == 0)) || count_args+=(--deployment-peers "$(IFS=,; echo "${deployment_peers[*]}")")
 release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
   "${count_command[@]}" plan "/hf/$snapshot_rel" --vision "$VISION" --audio off \
-  --json --layout --require-ready "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
+  --deployment --require-ready "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   --coordinator-gpu-budget-gib "$profile_gib" --coordinator-weight-budget-gib "$profile_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" \
@@ -853,21 +863,20 @@ if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
 fi
 SPARK_COUNT="$selected_count"
 PREFILL_BATCH_TOKENS="$(jq -er '.prefill_rows' <<<"$count_plan")"
-# Native non-TP4 counts require the explicit ownership transport contract.
-if ((topology_explicit == 0)); then
-  if [[ "$model_is_exl3" == true && "$SPARK_COUNT" == 3 ]]; then
-    # Compact compressed TP3 uses the same ownership contract on both ends.
-    SPARK_TP=3 SPARK_EP=1
-  elif [[ "$model_is_exl3" != true && "$SPARK_COUNT" != 4 && "$SPARK_COUNT" != 0 ]]; then
-    SPARK_TP="$SPARK_COUNT" SPARK_EP=1
-  fi
+jq -e '.version == 1 and .family == "deepseek_v41" and .executable == true and .spark_admission == "coordinator_authoritative"' <<<"$count_plan" >/dev/null ||
+  release_die "invalid planner deployment"
+spark_tp="$(jq -er '.topology.tp' <<<"$count_plan")"
+spark_ep="$(jq -er '.topology.ep' <<<"$count_plan")"
+topology_explicit=0
+if [[ "$(jq -r '.topology.explicit' <<<"$count_plan")" == true ]]; then
+  topology_explicit=1
+  SPARK_TP="$spark_tp" SPARK_EP="$spark_ep"
 fi
 release_validate_spark_topology
-topology_explicit=0; release_spark_topology_explicit && topology_explicit=1
-spark_tp="$(release_spark_tp)"; spark_ep="$(release_spark_ep)"
-spark_tp_roles_required=""
-# Compressed TP3 proves its own rank/capacity packages below, not native roles.
-if ((topology_explicit)) && [[ "$model_is_exl3" != true && "$spark_tp" != 4 ]]; then spark_tp_roles_required="tp$spark_tp"; fi
+spark_tp_roles_required="$(jq -r '.artifact_requirements.spark_tp_role // ""' <<<"$count_plan")"
+SPECULATOR="$(jq -er '.speculator' <<<"$count_plan")"
+KV_POOL_SIZE="$(jq -r '.admission.kv_pool_size // ""' <<<"$count_plan")"
+MEMORY_RESERVATION="$(jq -r '.admission.memory_reservation // ""' <<<"$count_plan")"
 [[ -n "$POOL_TOKENS" || -n "$KV_POOL_SIZE" ]] || POOL_TOKENS=auto
 
 expert_capacity="$(release_v41_expert_capacity "$PREFILL_BATCH_TOKENS")" ||
@@ -1038,9 +1047,7 @@ fi
 if ((SPARK_COUNT == 0)); then
   peers="127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"
 else
-  peer_addresses=()
-  for lane in "${lanes[@]}"; do peer_addresses+=("$lane:$EXPERT_PORT"); done
-  peers="$(IFS=,; echo "${peer_addresses[*]}")"
+  peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
 fi
 fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
@@ -1313,7 +1320,6 @@ if [[ "$family" == deepseek_v41 ]]; then
   launch_deepseek_v41
   exit 0
 fi
-((dry_run == 0)) || release_die "--dry-run validates DeepSeek V4.1 launches only; $family checkpoints print their argv in the script tests"
 # Validate the name before it is used to identify allocations during admission.
 instance="$(get INSTANCE)"
 [[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
@@ -2310,10 +2316,18 @@ audio_encoder_hash=""
     fi
   done
   release_reject_unused_keys "$family" $(_family_allowed_keys "$family")
+  deployment_args=()
+  deployment_peers=()
+  for ((rank = 0; rank < available_sparks; rank++)); do
+    deployment_peers+=("$(get "SPARK_${rank}_LANE_A"):$port")
+  done
+  ((${#deployment_peers[@]} == 0)) || deployment_args+=(--deployment-peers "$(IFS=,; printf '%s' "${deployment_peers[*]}")")
+  [[ -z "$(get KV_POOL_SIZE)" ]] || deployment_args+=(--kv-pool-size "$(get KV_POOL_SIZE)")
+  [[ -z "$(get MEMORY_RESERVATION)" ]] || deployment_args+=(--memory-reservation "$(get MEMORY_RESERVATION)")
   # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
   plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
-    "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout --require-ready \
-    "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
+    "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment --require-ready \
+    "${deployment_args[@]}" "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   selected_ranks="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["spark_ranks"])' <<<"$plan_json")"
   if ((count_explicit)) || [[ "$backend" == local ]]; then
@@ -2323,6 +2337,13 @@ audio_encoder_hash=""
     export SPARK_COUNT="$selected_ranks"
     exec bash "$repo_root/scripts/launch/run-family.sh" "${launch_argv[@]}"
   fi
+  jq -e --arg family "$family" '.version == 1 and .family == $family and .executable == true and .launch.family == $family and .spark_admission == "coordinator_authoritative"' <<<"$plan_json" >/dev/null || release_die "invalid deployment specification"
+  deployment_peer_csv="$(jq -er '.peers | join(",")' <<<"$plan_json")"
+  [[ "$(jq -r '.speculator' <<<"$plan_json")" == "$speculator" ]] || release_die "deployment changed resolved speculator"
+  # Media still reads the complete report's capability diagnostics. Launch roles,
+  # admission policy and endpoints come from the typed deployment above.
+  deployment_json="$plan_json"
+  plan_json="$(jq -c '.report' <<<"$deployment_json")"
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
 # when only decode requests use BF16, so this preflight requires the same coverage.
@@ -2416,6 +2437,13 @@ for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
   [[ "${family_args[arg]}" != --audio ]] || family_args[arg+1]="$audio"
 done
 peers=()
+[[ -z "$deployment_peer_csv" ]] || IFS=, read -r -a peers <<<"$deployment_peer_csv"
+if ((dry_run)); then
+  # No serving container, restart or remote staging below this point is allowed
+  # during validation. Runtime-only proofs (including audio exports) stay pending.
+  printf '%s\n' "$deployment_json"
+  exit 0
+fi
 # --restart removes only this coordinator and its host-port workers. Broad
 # cleanup is opt-in (--all); shared hosts may hold another instance's workers.
 if [[ "$restart" == 1 ]]; then
@@ -2510,8 +2538,6 @@ STAGE
 fi
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
-  lane="$(get "SPARK_${rank}_LANE_A")"
-  peers+=("$lane:$port")
   encoder_args=""
   for encoder_rank in "${encoder_ranks[@]}"; do
     if [[ "$rank" == "$encoder_rank" ]]; then

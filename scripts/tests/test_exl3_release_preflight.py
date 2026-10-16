@@ -39,8 +39,23 @@ if tool == 'docker':
     if args[:1] == ['run'] and 'plan' in args:
         assert '--gpus' not in args and '--network' in args
         rows = int(args[args.index('--prefill-rows') + 1])
-        print(json.dumps({'spark_ranks': int(args[args.index('--spark-ranks') + 1]),
-                          'prefill_rows': rows or 1024}))
+        def value(flag, default=None):
+            return args[args.index(flag) + 1] if flag in args else default
+        ranks = int(value('--spark-ranks'))
+        tp, ep = int(value('--spark-tp', str(ranks))), int(value('--spark-ep', '1'))
+        explicit = '--spark-tp' in args or ranks == 3
+        gpus = int(value('--rtx', '1'))
+        onboard = value('--rtx-expert-layers', 'auto')
+        runtime = gpus == 2 or onboard != '0'
+        print(json.dumps(dict(spark_ranks=ranks, prefill_rows=rows or 1024,
+            version=1, family='deepseek_v41', executable=True,
+            topology=dict(tp=tp, ep=ep, explicit=explicit),
+            artifact_requirements=dict(spark_tp_role=None),
+            speculator=value('--speculator', 'off'),
+            admission=dict(kv_pool_size=value('--kv-pool-size'), memory_reservation=value('--memory-reservation')),
+            peers=value('--deployment-peers', '').split(',')[:ranks],
+            placement_handoff=dict(kind='runtime' if runtime else 'fixed', spark_first_layer=None if runtime else 0,
+                **(dict(directory='/tmp/cuteafd-home/placement') if runtime else {})))))
         sys.exit(0)
     if args[:1] == ['run'] and '--entrypoint' in args:
         entry = args[args.index('--entrypoint') + 1]

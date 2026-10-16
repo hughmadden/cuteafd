@@ -1,6 +1,7 @@
 //! `cuteafd plan`: what a checkpoint is, where each part would live, and what
 //! this build can or cannot run - with hints a code agent can act on.
 pub mod checkpoint;
+pub mod deployment;
 pub mod experts;
 pub mod encoder;
 pub mod families;
@@ -206,7 +207,7 @@ pub struct PlanReport {
     /// A single diagnostic when an unspecified Spark count falls back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spark_count_warning: Option<String>,
-    /// Resolved V4.1 prefill shape, including automatic capacity admission.
+    /// Resolved prefill shape, including V4.1 automatic capacity admission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_rows: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +231,9 @@ pub struct PlanReport {
     /// Per-device memory layout, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
+    /// Offline solver result; runtime admission still samples live resources.
+    #[serde(skip)]
+    pub solver_placement: Option<crate::placement::Placement>,
 }
 
 impl PlanReport {
@@ -443,6 +447,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         expert_storage: None,
         hints: Vec::new(),
         memory_layout: None,
+        solver_placement: None,
     };
     // ModelOpt exports describe what they quantized; each weight's tensors
     // must agree with that description.

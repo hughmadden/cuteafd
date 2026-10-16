@@ -231,6 +231,21 @@ pub(crate) struct PlanArgs {
     pub(crate) coordinator_weight_budget_gib: f64,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
+    /// Emit typed launch decisions; live artifact verification stays with the launcher.
+    #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
+    pub(crate) deployment: bool,
+    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=8))]
+    pub(crate) spark_tp: Option<u8>,
+    #[arg(long, requires = "deployment", requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
+    pub(crate) spark_ep: Option<u8>,
+    /// Ordered endpoint inventory; selected ranks take its prefix.
+    #[arg(long = "deployment-peers", requires = "deployment", value_delimiter = ',')]
+    pub(crate) deployment_peers: Vec<String>,
+    /// Preserve launch admission spelling; checked by the native admission parser.
+    #[arg(long, requires = "deployment")]
+    pub(crate) kv_pool_size: Option<String>,
+    #[arg(long, requires = "deployment")]
+    pub(crate) memory_reservation: Option<String>,
     /// Emit snapshot-relative paths suitable for rsync --files-from.
     #[arg(long)]
     pub(crate) files: bool,

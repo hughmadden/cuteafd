@@ -87,6 +87,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut pool_tokens = 0;
     match apply(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
         Ok(placement) => {
+            report.solver_placement = Some(placement.clone());
             pool_tokens = placement.pool_tokens;
             notes.push(format!("placement: {}", placement.summary()));
             if let Some(tp2) = placement.tp2 {

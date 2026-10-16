@@ -461,7 +461,6 @@ spark_prefix=worker
 hosts=({' '.join(hosts)})
 EXPERT_PORT=19441
 expert_capacity=4096
-spark_first_layer=0
 wip_layout=
 wip_slot=
 SPARK_COUNT={spark_count}
@@ -475,6 +474,7 @@ shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on
 thermal_args=(-e CUTEAFD_THERMAL=on)
 v41_fp8_head_args=()
 {extra_setup}'''
+            setup += '\ncount_plan=\'{"spark_admission":"coordinator_authoritative"}\'\n'
             result = subprocess.run(
                 ["bash", "-c", setup + block, "test", str(gpus)],
                 env=env,
