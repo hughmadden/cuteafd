@@ -68,6 +68,9 @@ pub trait FamilyModel: Send + Sync {
         Ok(None)
     }
 
+    /// Per-layer routed/dense or shared FFN arithmetic, when declared by a family.
+    fn activation(&self, _layer: usize, _shared: bool) -> Option<cuteafd_core::FfnActivation> { None }
+
     /// The tensor contract: whether this build's loaders take `operand` (the
     /// logical weight `stem`) for `role`, and the precise reason when not.
     /// A contract may refine the operand (resolve a segmented scale grid).
@@ -124,7 +127,7 @@ pub trait Family: Sync {
     }
 }
 
-static REGISTRY: [&dyn Family; 9] = [
+static REGISTRY: [&dyn Family; 10] = [
     &super::families::deepseek::DEEPSEEK_V41,
     &super::families::deepseek::DEEPSEEK_V4,
     &super::families::glm::GLM5,
@@ -132,6 +135,7 @@ static REGISTRY: [&dyn Family; 9] = [
     &super::families::mimo::MIMO_V2,
     &super::families::qwen::QWEN4,
     &super::families::qwen35::QWEN35,
+    &super::families::step5::STEP5,
     &super::families::dflash::DFLASH2,
     &super::families::dspark::DSPARK,
 ];
