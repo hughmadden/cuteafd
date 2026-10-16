@@ -422,10 +422,17 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
             let family = report.family.as_deref().unwrap_or("unknown");
             report.fits = false;
             report.placement_supported = false;
-            let what = format!("{family}: no placement adapter in this build");
-            report.hints.push(Hint { what: what.clone(),
-                how: format!("Implement FamilyModel::placement for {family} (plan/families/), solving the same \
-                    PlacementRequest its runtime admits, before claiming a memory layout.") });
+            let drafter = matches!(family, "dflash2" | "dspark");
+            let what = if drafter { format!("{family}: a drafter checkpoint has no memory layout of its own") }
+                else { format!("{family}: no placement adapter in this build") };
+            let how = if drafter {
+                "Plan the target model with this snapshot as its drafter (--drafter-snapshot): the target's \
+                    placement charges the drafter beside its own weights and KV pool.".to_string()
+            } else {
+                format!("Implement FamilyModel::placement for {family} (plan/families/), solving the same \
+                    PlacementRequest its runtime admits, before claiming a memory layout.")
+            };
+            report.hints.push(Hint { what: what.clone(), how });
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![what] })
         }
     }

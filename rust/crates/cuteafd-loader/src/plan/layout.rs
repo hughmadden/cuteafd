@@ -458,7 +458,7 @@ pub fn family_costs(family: &str) -> FamilyCosts {
     }
 }
 
-fn share_of(family: &str, component: Component) -> Share {
+fn share_of(component: Component) -> Share {
     match component {
         Component::Norm | Component::HyperConnection => Share::Replicated,
         Component::Attention | Component::DenseFfn | Component::SharedExpert | Component::Indexer
@@ -618,40 +618,39 @@ pub fn program_families(base: &str, split: bool) -> Vec<String> {
     std::iter::once(base.to_string()).chain(split.then(|| format!("{base}2"))).collect()
 }
 
-/// Lays out `report` (a `plan` of the checkpoint) on the inventory, for
-/// families without their own `FamilyModel::placement` adapter.
+/// DeepSeek V4.1's legacy layout of `report` (a `plan` of the checkpoint) on
+/// the inventory: the only family `plan` still routes here, until its own
+/// `FamilyModel::placement` adapter lands; every other family without an
+/// adapter is refused. Deleted with `family_costs` (P13 stage B).
 pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &super::PlanInput,
     options: &LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
     let family_name = report.family.clone().unwrap_or_else(|| "unknown".into());
     let family = family_name.as_str();
     let policy = ShapePolicy {
-        context: if matches!(family, "mimo_v2" | "deepseek_v41") { ContextPolicy::Checkpoint }
+        context: if family == "deepseek_v41" { ContextPolicy::Checkpoint }
             else { ContextPolicy::ManifestBounded },
         prefill_rows: (family == "deepseek_v41").then_some(2048),
         all_native_stages: false,
     };
     let mut shape = Shape::resolve(report, model, options, policy);
     let native_layers = shape.native_layers;
-    // Cache and graph ownership follows the selected checkpoint drafter.
-    let cache_native_layers = native_layers;
-    let small_card = matches!(family, "deepseek_v41" | "mimo_v2")
-        && options.rtx_bytes.first().is_some_and(|&bytes| bytes <= 32 * GIB);
-    let (prefill_rows, decode_rows, concurrency, checkpoint_context, context_tokens) = (shape.prefill_rows,
-        shape.decode_rows, shape.concurrency, shape.checkpoint_context, shape.context_tokens);
+    let small_card = family == "deepseek_v41" && options.rtx_bytes.first().is_some_and(|&bytes| bytes <= 32 * GIB);
+    let (prefill_rows, concurrency, checkpoint_context, context_tokens) = (shape.prefill_rows,
+        shape.concurrency, shape.checkpoint_context, shape.context_tokens);
     let target_pool_tokens = options.target_pool_tokens.max(context_tokens);
     let towers = match family {
         "deepseek_v41" => v41_towers(report),
         _ => Towers::checkpoint(report),
     };
-    let mut costs = family_costs(family);
+    let costs = family_costs(family);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
     let active_gpus = if split { 2 } else { 1 };
     let automatic = options.pool_tokens == Some(0);
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: if matches!(family, "deepseek_v41" | "mimo_v2") && bytes <= 32 * GIB {
+            capacity_bytes: if family == "deepseek_v41" && bytes <= 32 * GIB {
                 ((bytes as u128 * 97 / 100) as u64).min(bytes.saturating_sub(
                     options.headroom_bytes.max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES)))
             } else { (if family == "deepseek_v41" && automatic { (bytes as u128 * 97 / 100) as u64 } else { bytes })
@@ -664,7 +663,6 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &s
     let mut notes = vec![format!("resolved context {context_tokens} tokens (checkpoint {checkpoint_context})"),
         format!("attention placement {}", report.attention_placement)];
     shape.select_card_plans(report, options, &mut notes);
-    let workspace_manifest = shape.manifest;
     let reference_gpu = gpus == 1 && (94 * GIB..=96 * GIB).contains(&options.rtx_bytes[0])
         && native_layers > 0 && options.local_expert_layers.is_none();
     let package = report.experts.as_ref().map(|e| e.package.as_str());
@@ -714,7 +712,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &s
             _ => Category::Weights,
         };
         let group = component.component.label();
-        let share = if split { share_of(family, component.component) } else { Share::Lead };
+        let share = if split { share_of(component.component) } else { Share::Lead };
         let attention_share = if component.component == Component::Attention { costs.attention_replicated } else { 0.0 };
         match share {
             Share::Lead => devices[0].items.push(Item::new(category, group, &format, resident, Basis::Exact)),
@@ -753,18 +751,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &s
     let gpus_now = active_gpus;
     for (index, device) in devices.iter_mut().take(active_gpus).enumerate() {
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
-        device.items.push(match program_base(family, model, checkpoint) {
-            // Measured inventory: the arch's CUDA context and cuBLAS (`placement::ArchContext`), plus the
-            // modules of the programs this family launches (`ProgramSet`), what the runtime's sample sees
-            // before its first weight.
-            // Where the family's ready ledger is measured (`placement::inventory::LOADED_CODE`), the
-            // context plus every byte of code it holds at ready (lazily loaded functions, packages,
-            // cuBLAS) instead: serve reserves what has not arrived by its admission sample.
-            Some(base) => runtime_item(workspace_manifest.as_ref(),
-                &program_families(base, split), local_package(report), split, index,
-                options.rtx_bytes[index]),
-            None => Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role], allowance_basis),
-        });
+        // V4.1 still loads every program in the image: its context stays the allowance.
+        device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role], allowance_basis));
         let graph_allowance = if family == "deepseek_v41" && options.rtx_bytes[index] <= 32 * GIB {
             // Match the qualified fixed-bank envelope reserved by measured_pool_memory.
             2 * GIB
@@ -812,16 +800,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &s
     let spark_format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
         .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
     let spark_bf16 = checkpoint.spark_input_is_bf16();
-    let glmf_lanes = if options.prefill_lanes > 0 { options.prefill_lanes }
-        else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES };
-    let spark_lanes = match family {
-        "glm5_flash" => if std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "1") { 1 } else { glmf_lanes },
-        "mimo_v2" => crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config).ok()
-            .and_then(|cfg| cfg.program_family().ok()).and_then(|id|
-                crate::families::mimo_v2::admission::resolve_transport_lanes(true, id,
-                    std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok().as_deref()).ok()).unwrap_or(0) as u64,
-        _ => 1,
-    };
+    let spark_lanes = 1;
     let mut spark_working = crate::placement::SparkWorkingSet {
         rtx_layers: (0..local_layers).collect(),
         spark_layers: if matches!(report.placement, ExpertPlacement::Sparks { .. }) {
@@ -894,17 +873,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &s
         prefill_rows,
         ..Default::default() }) };
     match geometry {
-        Ok(Some(mut geometry)) => {
-            for rank in &mut geometry.ranks {
-                rank.pool_metadata_unit_bytes += 0;
-            }
+        Ok(Some(geometry)) => {
             // GLM 5.3 Flash takes no mark without entries, so pool marks then keep no unit back.
             let pool_marks = false;
-            let marks = if pool_marks { 0 } else { options.prefix_slots.unwrap_or_else(|| {
-                let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-                let _ = bytes;
-                costs.mark_slots
-            }) };
+            let marks = if pool_marks { 0 } else { options.prefix_slots.unwrap_or(costs.mark_slots) };
             let unit = geometry.logical_unit_rows.max(1);
             let per_token: Vec<u64> = (0..devices.len()).map(|d| geometry.ranks.get(d)
                 .map_or(0, |r| (r.persistent_unit_bytes + r.pool_metadata_unit_bytes).div_ceil(unit))).collect();
@@ -1231,16 +1203,6 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
             notes.push(format!("{}: {error}", what(device)));
         }
     }
-}
-
-/// The program family (manifest name prefix) a family's coordinator loads, or
-/// `None` where it still loads every program in the image (its context stays the allowance).
-fn program_base(family: &str, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint) -> Option<&'static str> {
-    Some(match family {
-        "mimo_v2" => crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config).ok()?.program_family().ok()?,
-        "glm5_flash" => "glmf",
-        _ => return None,
-    })
 }
 
 /// The local expert package kind a coordinator GPU loads (`LoadedCode::experts`): `exl3`, `fp8`

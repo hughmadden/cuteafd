@@ -54,11 +54,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         // solve. An explicit POOL_TOKENS stays strict.
         media_options.pool_ceiling_at_target = true;
         let mut admission = devices.clone();
-        match apply(input, &media_options, &mut admission, spark_ranks, rows, concurrency, context, manifest) {
-            Ok(placement) => {
+        match apply_selected(input, &media_options, &mut admission, spark_ranks, rows, concurrency, context, manifest) {
+            Ok((placement, working)) => {
                 if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
                     report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
                 }
+                // The tower's Spark headroom is what the worker has left after its
+                // rank I/O; the final solve re-charges it for its own working set.
+                spark_io(report, model, options, &working, &mut sparks, &mut notes);
                 resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
                 for (device, admitted) in devices.iter_mut().zip(admission) {
@@ -338,7 +341,8 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     Ok((costs, workspace, tp2_workspace, onboard))
 }
 
-pub(super) fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
+#[cfg(test)]
+fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
     devices: &mut [DeviceLayout], spark_ranks: usize, rows: u64, concurrency: u64,
     context: u64, manifest: Option<&serde_json::Value>) -> Result<crate::placement::Placement> {
     apply_selected(input, options, devices, spark_ranks, rows, concurrency, context, manifest).map(|(placement, _)| placement)
