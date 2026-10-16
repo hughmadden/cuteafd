@@ -228,6 +228,13 @@ mod tests {
                 let mut noisy = data.clone();
                 noisy[phase].system_available_bytes = noisy[phase - 1].system_available_bytes + noise;
                 noisy[phase].system_headroom_bytes = noisy[phase - 1].system_headroom_bytes + noise;
+                if phase == 3 {
+                    let shift = noisy[phase].system_available_bytes - data[phase].system_available_bytes;
+                    for later in &mut noisy[4..] {
+                        later.system_available_bytes += shift;
+                        later.system_headroom_bytes += shift;
+                    }
+                }
                 assert_eq!(spark_census_deltas(&noisy).is_ok(), noise <= 16 << 20,
                     "phase {phase}, negative delta {noise}");
             }
