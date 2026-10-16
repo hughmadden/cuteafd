@@ -43,6 +43,7 @@ def run_script(mirrors, worktree):
 class Fixture:
     """super --modules/sub--> middle --inner--> inner, with local bare upstreams."""
 
+    root: Path
     super_repo: Path
     mirrors: Path
     middle_url: str
@@ -93,7 +94,7 @@ class SubmoduleInitLocalTest(unittest.TestCase):
         git(super_repo, *FILE_ALLOWED, "submodule", "add", "-q",
             str(middle_url), "modules/sub")
         git(super_repo, "commit", "-qm", "add submodule")
-        return Fixture(super_repo, root / "mirrors", str(middle_url), str(inner_url),
+        return Fixture(root, super_repo, root / "mirrors", str(middle_url), str(inner_url),
                        middle_pin, inner_pin, str(stale_url))
 
     def test_mirror_store_restores_pins_and_upstream_urls(self):
@@ -185,6 +186,34 @@ class SubmoduleInitLocalTest(unittest.TestCase):
         self.assertEqual(git(sub, "rev-parse", "HEAD").stdout.strip(), fixture.middle_pin)
         self.assertEqual(git(sub / "inner", "rev-parse", "HEAD").stdout.strip(),
                          fixture.inner_pin)
+
+    def test_a_failed_run_still_restores_upstream_urls(self):
+        """A run that stops partway must not leave a submodule pointed at the mirror.
+
+        The second submodule's upstream is gone and has no mirror, so the run ends
+        with the upstream clone failing; the first submodule and its nested
+        submodule have already been cloned from the store by then.
+        """
+        fixture = self.fixture()
+        seed_bare(fixture.root, "gone.git", "gone.txt")
+        gone_url = fixture.root / "gone.git"
+        git(fixture.super_repo, *FILE_ALLOWED, "submodule", "add", "-q",
+            str(gone_url), "modules/gone")
+        git(fixture.super_repo, "commit", "-qm", "add an unreachable submodule")
+        git(fixture.super_repo, "submodule", "deinit", "-f", "modules/gone")
+        shutil.rmtree(fixture.super_repo / ".git/modules/modules/gone")
+        shutil.rmtree(gone_url)
+
+        result = run_script(fixture.mirrors, fixture.super_repo)
+        self.assertNotEqual(result.returncode, 0)
+
+        sub = fixture.super_repo / "modules/sub"
+        self.assertEqual(git(fixture.super_repo, "config",
+                             "submodule.modules/sub.url").stdout.strip(), fixture.middle_url)
+        self.assertEqual(git(sub, "remote", "get-url", "origin").stdout.strip(),
+                         fixture.middle_url)
+        self.assertEqual(git(sub / "inner", "remote", "get-url", "origin").stdout.strip(),
+                         fixture.inner_url)
 
     def test_second_run_reuses_the_mirror(self):
         fixture = self.fixture()
