@@ -52,7 +52,7 @@ if tool == 'docker':
             speculator=value('--speculator', 'off'),
             admission=dict(kv_pool_size=value('--kv-pool-size'), memory_reservation=value('--memory-reservation')),
             peers=value('--deployment-peers', '').split(',')[:ranks],
-            spark_admission='coordinator_authoritative'))))
+            spark_admission='coordinator_authoritative')))
         sys.exit(0)
     if args[:1] == ['run'] and '--entrypoint' in args:
         entry = args[args.index('--entrypoint') + 1]
