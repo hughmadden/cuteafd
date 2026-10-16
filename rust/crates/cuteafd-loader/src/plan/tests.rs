@@ -1254,7 +1254,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
             let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
-            let graph = layout::family_costs("deepseek_v4").graph_bytes[0];
+            let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
             // The PRO envelope covers the measured loaded code as well (`V4Inputs::code_bytes`).
             let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;
             assert_eq!(total - device.capacity_bytes, crate::serving_capacity::deepseek_v4_headroom_bytes(
@@ -1274,7 +1274,7 @@ fn v4_missing_workspace_manifest_keeps_conservative_small_card_reserve() {
     }), ..sparks(2) }).unwrap();
     let device = report.memory_layout.unwrap().devices.remove(0);
     let workspace = device.items.iter().find(|i| i.group == "steps").unwrap().bytes;
-    let graph = layout::family_costs("deepseek_v4").graph_bytes[0];
+    let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
     assert_eq!(total - device.capacity_bytes,
         (10u64 << 30).saturating_sub(workspace + graph).max(3 << 30));
 }

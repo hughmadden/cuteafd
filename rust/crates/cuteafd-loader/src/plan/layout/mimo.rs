@@ -38,9 +38,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }).collect::<Vec<_>>();
     let mut sparks = (0..spark_ranks).map(|rank| DeviceLayout { kind: DeviceKind::Spark,
         index: rank as u32, capacity_bytes: options.spark_bytes, kv_tokens: 0,
-        items: vec![Item::new(Category::Workspace, "expert waves", "", gib(51) * options.spark_capacity_rows / 4096, Basis::Calibrated),
-            Item::new(Category::Transport, "rdma rings", "", gib(117), Basis::Calibrated),
-            Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] }).collect::<Vec<_>>();
+        items: vec![Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] }).collect::<Vec<_>>();
     // Media sees fixed target/pool demands and mandatory experts, not the
     // optional Auto prefix. Spark-free admission must reserve every expert.
     if report.encoder.is_none() {
@@ -90,8 +88,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     let mut pool_tokens = 0;
     let mut waste = Vec::new();
-    match apply(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
-        Ok(placement) => {
+    match apply_selected(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
+        Ok((placement, working)) => {
+            spark_io(report, model, options, &working, &mut sparks, &mut notes);
             waste = replicated_weights(&placement);
             report.solver_placement = Some(placement.clone());
             pool_tokens = placement.pool_tokens;
@@ -119,6 +118,29 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     if manifest.is_none() { notes.push("MiMo native scratch needs --workspace-manifest; native scratch is not qualified without it".into()); }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
+}
+
+/// The non-I/O residual of a MiMo Spark wave at 4096 capacity rows (P11
+/// replaces it with the worker's own measurement).
+const SPARK_WAVE_BYTES: u64 = gib(51);
+
+/// Each selected Spark rank's exact intake, host exchange, row indices and
+/// rings for the working set the solve selected, in MiMo's prefill wire
+/// format (`--expert-input`), beside the non-I/O wave residual.
+fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, options: &LayoutOptions,
+    working: &crate::placement::SparkWorkingSet, sparks: &mut [DeviceLayout], notes: &mut Vec<String>) {
+    let rings = spark_ring_geometry(spark_endpoints("mimo_v2", working.prefill_lanes));
+    for device in sparks {
+        let io = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
+            .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
+                .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))
+                .and_then(|capacity| charge_spark_io(device, working, geometry, capacity,
+                    options.mimo_expert_input.bf16(false), rings, SPARK_WAVE_BYTES * options.spark_capacity_rows / 4096)));
+        if let Err(error) = io {
+            report.placement_supported = false;
+            notes.push(format!("{} I/O admission: {error}", device.name()));
+        }
+    }
 }
 
 /// GQA/SWA cache records and projection shards are partitioned, but the
@@ -319,6 +341,16 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
 pub(super) fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
     devices: &mut [DeviceLayout], spark_ranks: usize, rows: u64, concurrency: u64,
     context: u64, manifest: Option<&serde_json::Value>) -> Result<crate::placement::Placement> {
+    apply_selected(input, options, devices, spark_ranks, rows, concurrency, context, manifest).map(|(placement, _)| placement)
+}
+
+/// [`apply`], also returning the working set the solve selected (the Spark
+/// layers, ranks and prefill lanes whose I/O the workers allocate).
+#[allow(clippy::too_many_arguments)]
+fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
+    devices: &mut [DeviceLayout], spark_ranks: usize, rows: u64, concurrency: u64,
+    context: u64, manifest: Option<&serde_json::Value>)
+    -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet)> {
     let checkpoint = input.checkpoint();
     let profiles = profile(checkpoint, options, devices.len(), spark_ranks, rows, concurrency, context, manifest)?;
     let no_spark = if spark_ranks == 0 { profiles.clone() }
@@ -362,6 +394,7 @@ pub(super) fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
     };
     let selected = inputs.selected(&no_spark.steady, &solution.working_set);
     let placement = solution.placement;
+    let working = solution.working_set;
     for (rank, (device, costs)) in devices.iter_mut().zip(&selected.profile.devices).enumerate() {
         device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(solution.request.inventory.gpus[rank].headroom_bytes);
         for cost in &costs.reservations {
@@ -381,7 +414,7 @@ pub(super) fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
     for (rank, device) in devices.iter_mut().enumerate() {
         device.items.extend(crate::placement::families::mimo_v2::expert_items(&selected, &placement, rank)?);
     }
-    Ok(placement)
+    Ok((placement, working))
 }
 
 use crate::placement::families::mimo_v2::reservation_category;

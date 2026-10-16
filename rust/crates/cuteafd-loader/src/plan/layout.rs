@@ -390,11 +390,9 @@ mod selected_spark_io_tests {
             let rings = spark_ring_geometry(spark_endpoints(family, lanes));
             let io = working.rank_io(0, geometry, 4096, false, rings).unwrap();
             assert_eq!(io.mapped_rings, expected);
-            assert!(io.mapped_rings > family_costs(family).spark_ring_bytes);
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
                 capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
-            charge_spark_io(&mut device, &working, geometry, 4096, false, rings,
-                family_costs(family).spark_workspace_bytes).unwrap();
+            charge_spark_io(&mut device, &working, geometry, 4096, false, rings, GIB).unwrap();
             assert_eq!(device.items.iter().find(|item| item.group == "rdma rings").unwrap().bytes, expected);
         }
     }
@@ -409,7 +407,7 @@ mod selected_spark_io_tests {
             let rings = spark_ring_geometry(spark_endpoints(family, lanes));
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 5,
                 capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
-            let wave = family_costs(family).spark_workspace_bytes;
+            let wave = GIB;
             charge_spark_io(&mut device, &working, geometry, 4096, false, rings, wave).unwrap();
             let wire = device.items.iter().find(|item| item.group == "expert intake").unwrap().bytes;
             charge_spark_io(&mut device, &working, geometry, 4096, true, rings, wave).unwrap();
@@ -446,16 +444,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         spark_host_bytes: 13 * GIB,
     };
     match family {
-        "deepseek_v4" => FamilyCosts {
-            runtime_bytes: [gib(65), gib(60), gib(60)],
-            graph_bytes: [gib(35), gib(40), gib(25)],
-            workspace_bytes: [gib(480), gib(414), gib(355)],
-            exchange_bytes: gib(31),
-            mark_slots: 18,
-            spark_workspace_bytes: gib(35),
-            spark_ring_bytes: gib(52),
-            ..generic
-        },
         "deepseek_v41" => FamilyCosts {
             runtime_bytes: [gib(133), gib(100), gib(100)],
             graph_bytes: [gib(150), gib(100), gib(90)],
@@ -464,15 +452,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             spark_workspace_bytes: gib(21),
             spark_ring_bytes: gib(48),
             spark_host_bytes: 9 * GIB,
-            ..generic
-        },
-        "qwen4" => FamilyCosts {
-            runtime_bytes: [0; 3],
-            graph_bytes: [0; 3],
-            workspace_bytes: [0; 3],
-            mark_slots: crate::placement::families::qwen4::DEFAULT_MARK_SLOTS,
-            spark_workspace_bytes: crate::placement::families::qwen4::SPARK_WORKSPACE_BYTES,
-            spark_ring_bytes: crate::placement::families::qwen4::SPARK_RING_BYTES,
             ..generic
         },
         _ => generic,
