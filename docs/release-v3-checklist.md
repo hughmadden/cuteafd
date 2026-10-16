@@ -38,8 +38,8 @@ logs and build outputs outside Git. No dense Qwen, Step-5 or V4.1 EXL3 card.
    accepting exports; inability to admit the mixed reference blocks that card.
 4. **V4.1 parity (blocks cut):** in a fabric-quiet window, use private
    `$V2_CHECKOUT`/`$RC_CHECKOUT` configs pinned to the respective image pairs,
-   and the same prompts/config per layout. The existing runner alternates
-   arms; six launches give three matched pairs on each min/max layout.
+   and the same prompts/config per layout. The existing runner uses ABBA
+   order; six launches give three matched pairs on each min/max layout.
    ```sh
    scripts/bench/bench-ab.py --label v3-v41-parity \
      --arm v2="$V2_CHECKOUT" --arm rc="$RC_CHECKOUT" \
