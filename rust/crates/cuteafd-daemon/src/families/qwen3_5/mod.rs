@@ -266,6 +266,18 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn qwen35_serving_accepts_product_launcher_contract() {
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-qwen35", "--snapshot", "/m",
+            "--native-lib", "/lib.so", "--embedding-placement", "gpu", "--vision", "off", "--audio", "off",
+            "--max-sequences", "8", "--pool-tokens", "0", "--prefix-cache-entries", "4",
+            "--prefix-cache-mark-mib", "1024", "--listen", "0.0.0.0:8000", "--max-output", "4096"]).unwrap();
+        let crate::cli::Commands::ServeQwen35(args) = cli.command else { panic!("dense serving not registered") };
+        assert_eq!(args.max_sequences, 8);
+        assert_eq!(args.pool_tokens.filter(|&tokens| tokens > 0), None);
+        assert_eq!(args.prefix.prefix_cache_entries, 4);
+    }
+
+    #[test]
     fn qwen35_golden_is_registered() {
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "qwen35-golden", "--snapshot", "/m", "--check-headers"]).unwrap();
         let crate::cli::Commands::Qwen35Golden(args) = cli.command else { panic!("dense golden not registered") };

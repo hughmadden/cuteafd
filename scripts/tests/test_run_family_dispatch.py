@@ -242,6 +242,57 @@ def test_glmf_solved_worker_startup_waits_bootstrap_only_when_opted_in(tmp_path:
         assert not any("grep -q 'worker ready'" in line for line in lines)
 
 
+DENSE_CONFIG = {"model_type": "qwen3_5", "text_config": {
+    "model_type": "qwen3_5_text", "num_hidden_layers": 32,
+    "layer_types": ["linear_attention"] * 3 + ["full_attention"] + ["linear_attention"] * 28,
+}}
+
+
+def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        "SPARK_COUNT=0\nCONCURRENCY=8\nPREFIX_CACHE_ENTRIES=4\nPREFIX_CACHE_MARK_MIB=1024\n",
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
+    assert "--max-sequences 8" in launch
+    assert "--prefix-cache-entries 4" in launch and "--prefix-cache-mark-mib 1024" in launch
+    assert "--pool-tokens 0" in launch and "--vision off --audio off" in launch
+    for unsupported in ("--max-context", "--local-experts", "--peers", "--split-device"):
+        assert unsupported not in launch
+    assert "cuteafd expertd-native" not in result.stderr
+    assert "ssh h0" not in result.stderr
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert "--spark-ranks 0" in plan and "--state-slots 8" in plan
+    assert "--prefill-rows 4096" in plan and "--require-ready" not in plan
+
+
+@pytest.mark.parametrize("keys,diagnostic", [
+    ("SPARK_COUNT=1\n", "no Spark layout"),
+    ("SPARK_COUNT=0\nEXPERT_BACKEND=spark\n", "no Spark layout"),
+    ("SPARK_COUNT=0\nRTX_GPUS=2\n", "two-RTX layer ranges are not qualified"),
+    ("SPARK_COUNT=0\nVISION=rtx\n", "media execution is not qualified"),
+    ("SPARK_COUNT=0\nEMBEDDING=host\n", "requires device token embedding"),
+    ("SPARK_COUNT=0\nMAX_CONTEXT_TOKENS=4096\n", "unused configuration key"),
+    ("SPARK_COUNT=0\nSPECULATOR=mtp\n", "does not apply to qwen3_5"),
+])
+def test_dense_qwen_refuses_unqualified_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B", keys,
+                                  extra_args=("--wip", "dense-test"))
+    assert result.returncode != 0, result.stderr
+    assert diagnostic in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+def test_dense_qwen_refuses_failed_native_plan(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B", "SPARK_COUNT=0\n",
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": False, "fits": False, "spark_ranks": 0, "hints": ["missing export"]})
+    assert result.returncode != 0
+    assert "dense native placement refused" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
 def test_glmf_zero_spark_launch_does_not_enable_worker_selection(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   "SPARK_COUNT=0\nSPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",

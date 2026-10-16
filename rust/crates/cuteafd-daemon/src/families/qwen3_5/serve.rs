@@ -236,7 +236,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             let programs = library.programs()?.with_manifest(&engine_args.manifest)?;
             let lanes = usize::from(engine_args.max_sequences);
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
-                header.config, engine_args.pool_tokens, None, lanes, Some(engine_args.prefix.mark_rule(lanes)))?);
+                header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0), None, lanes, Some(engine_args.prefix.mark_rule(lanes)))?);
             let backend = DenseBackend::new(&engine, &library);
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 scheduler::Drafts::None, eos, engine_args.decode_share, &engine_args.prefix,
