@@ -3,6 +3,7 @@ mod programs;
 mod weights;
 mod block;
 pub(crate) mod engine;
+mod dspark;
 use anyhow::{ensure, Context, Result};
 use std::path::PathBuf;
 use cuteafd_loader::families::qwen3_5::Qwen35Checkpoint;
@@ -37,6 +38,12 @@ pub(crate) struct GoldenArgs {
     /// Check block verify padding, taps, exact restore and accepted-input replay before scoring.
     #[arg(long)]
     pub verify_check: bool,
+    /// Checkpoint-native dSpark drafter, borrowing this target's embedding/head.
+    #[arg(long)]
+    pub draft: Option<PathBuf>,
+    /// Compare this many plain and policy-selected speculative greedy tokens.
+    #[arg(long, requires = "draft")]
+    pub spec_decode: Option<usize>,
     /// Maximum absolute mean-NLL difference from the supplied reference.
     #[arg(long, default_value_t = 0.01)]
     pub nll_tolerance: f64,
@@ -70,6 +77,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(native)? };
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
+    if let Some(count) = args.spec_decode {
+        return dspark::spec_decode(&args, &library, &programs, &checkpoint, cfg, &tokens, count);
+    }
+    ensure!(args.draft.is_none(), "--draft requires --spec-decode for dense qualification");
     let mut engine = engine::DenseEngine::new(&library, &programs, &checkpoint, cfg.clone(), args.pool_tokens, None)?;
     if args.verify_check { engine.verify_check(&tokens)?; }
     let mut logits = Vec::with_capacity(tokens.len() * cfg.vocab);
@@ -248,6 +259,17 @@ mod tests {
         assert!(super::reference_window(root.path(), "a00", snapshot.path(), 2).is_err());
         Ok(())
     }
+    #[test]
+    fn dense_golden_speculation_requires_an_explicit_drafter() {
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "qwen35-golden", "--snapshot", "/m",
+            "--spec-decode", "16"]).is_err());
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "qwen35-golden", "--snapshot", "/m",
+            "--draft", "/d", "--spec-decode", "16"]).unwrap();
+        let crate::cli::Commands::Qwen35Golden(args) = cli.command else { panic!("dense golden not registered") };
+        assert_eq!(args.spec_decode, Some(16));
+        assert_eq!(args.draft, Some(std::path::PathBuf::from("/d")));
+    }
+
     #[test]
     fn qwen35_golden_is_registered() {
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "qwen35-golden", "--snapshot", "/m", "--check-headers"]).unwrap();

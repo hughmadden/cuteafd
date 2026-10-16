@@ -18,6 +18,62 @@ fn i(value: usize) -> Result<i32> {
 }
 
 impl NativeLibrary {
+    /// Shared block dSpark per-head norm and checkpoint RoPE. For 128-wide
+    /// heads, `inv_freq` is immutable FP32 [64] on device and `factor` scales
+    /// cos/sin before BF16 rounding. The 64-wide default route is unchanged.
+    ///
+    /// # Safety
+    /// Device buffers follow [`Self::glmf_dspark_qk_rope`] with `head_dim`
+    /// replacing 64; all remain live until `stream` finishes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn block_dspark_qk_rope(&self, qkv: P, q_norm: P, k_norm: P, positions: P, slots: P,
+        inv_freq: P, q_out: M, k_out: M, v_out: M, rows: usize, heads: usize, kv_heads: usize,
+        head_dim: usize, theta: f32, factor: f32, eps: f32, stream: M) -> Result<()> {
+        ensure!(rows > 0 && kv_heads > 0, "invalid block dSpark qk geometry");
+        ensure!((head_dim == 64 && inv_freq.is_null() && factor == 1.0)
+            || (head_dim == 128 && !inv_freq.is_null()), "unsupported block dSpark RoPE");
+        type F = unsafe extern "C" fn(P, P, P, P, P, P, M, M, M, i32, i32, i32, i32, f32, f32, f32, M) -> i32;
+        // SAFETY: the symbol has the native signature above.
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_block_dspark_qk_rope") }?;
+        // SAFETY: caller supplies the live device buffers described above.
+        check(unsafe { f(qkv, q_norm, k_norm, positions, slots, inv_freq, q_out, k_out, v_out,
+            i(rows)?, i(heads)?, i(kv_heads)?, i(head_dim)?, theta, factor, eps, stream) }, "block qk rope")
+    }
+
+    /// Shared block attention workspace, including all query slices for GQA.
+    pub fn block_dspark_attention_workspace(&self, sequences: usize, heads: usize, kv_heads: usize,
+        block: usize, max_keys: usize, head_dim: usize) -> Result<usize> {
+        type F = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32) -> u64;
+        // SAFETY: the symbol has the native signature above.
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_block_dspark_attention_workspace") }?;
+        // SAFETY: this metadata-only call takes no pointers.
+        let bytes = unsafe { f(i(sequences)?, i(heads)?, i(kv_heads)?, i(block)?, i(max_keys)?, i(head_dim)?) };
+        ensure!(bytes > 0, "invalid block dSpark attention geometry");
+        Ok(usize::try_from(bytes)?)
+    }
+
+    /// Shared attention over context capacity and the noise block. Full-context
+    /// callers admit the complete position extent before allocation; no ring
+    /// truncation is implied by this API.
+    ///
+    /// # Safety
+    /// As [`Self::glmf_dspark_attention`], with `head_dim` replacing 64 and
+    /// workspace sized by [`Self::block_dspark_attention_workspace`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn block_dspark_attention(&self, q: P, k_block: P, v_block: P, k_context: P, v_context: P,
+        slots: P, lengths: P, ends: P, out: M, workspace: M, sequences: usize, block: usize, heads: usize,
+        kv_heads: usize, capacity: usize, max_keys: usize, causal: bool, head_dim: usize, scale: f32,
+        stream: M) -> Result<()> {
+        type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, M, M,
+            i32, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
+        // SAFETY: the symbol has the native signature above.
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_block_dspark_attention") }?;
+        // SAFETY: caller supplies live and correctly sized device buffers.
+        check(unsafe { f(q, k_block, v_block, k_context, v_context, slots, lengths, ends, out, workspace,
+            i(sequences)?, i(block)?, i(heads)?, i(kv_heads)?, i(capacity)?, i(max_keys)?,
+            i32::from(causal), i(head_dim)?, scale, stream) }, "block attention")
+    }
+
     /// Per-head (64-wide) RMSNorm + RoPE of `qkv` rows; k/v rows land at
     /// `slots[row]` (row when null, skipped when negative).
     ///

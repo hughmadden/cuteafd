@@ -93,7 +93,7 @@ def test_mimo_serving_draft_head_is_separate_from_fixed_target_and_replay():
 
 def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
     source = ROOT / 'rust/crates/cuteafd-daemon/src/families'
-    for path, variant in [('glm5/dflash.rs', 'HeadCall'), ('glm5_flash/dspark.rs', 'HeadRef')]:
+    for path, variant in [('glm5/dflash.rs', 'HeadCall'), ('../shared/speculation/block_dspark.rs', 'HeadRef')]:
         text = (source / path).read_text()
         assert f'{variant}::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(' in text
         serving = text.split('pub fn draft_device(', 1)[1].split('pub fn draft_device_diagnostic(', 1)[0]
@@ -162,10 +162,11 @@ def test_draft_attention_uses_one_shared_kernel_and_the_checked_timing_helper():
     source = ROOT / 'rust/crates/cuteafd-daemon/src/families'
     for path, entry in [('mimo_v2/dflash.rs', 'fn draft_from('),
                         ('glm5/dflash.rs', 'fn draft_from('),
-                        ('glm5_flash/dspark.rs', 'fn draft_from(')]:
+                        ('../shared/speculation/block_dspark.rs', 'fn draft_from(')]:
         text = (source / path).read_text()
         step = text.split(entry, 1)[1].split('l.cuda_stream_synchronize(s)?', 1)[0]
         assert 'tables[s_count..2 * s_count].iter().copied().max()' in step
         assert 'max_keys,' in step and 'RING + block,' not in step
         assert 'cuda_graph_begin_capture' not in step and 'cuda_graph_launch' not in step
-        assert 'attention_workspace(sequences,' in text and 'RING + c.block' in text
+        assert 'attention_workspace(sequences,' in text
+        assert ('self.context_capacity + c.block' if 'block_dspark' in path else 'RING + c.block') in text
