@@ -198,7 +198,13 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         let residual = Allocation::new(devices[0], 16 * 40960)?;
         let pre = Allocation::new(devices[0], 16 * 16)?;
-        let mut transfer = DirectInputHop::new(devices[0], devices[1])?;
+        let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+        let modes = [0, 1].map(|gpu| cuteafd_loader::placement::LayerMode::Whole {
+            gpu, ffn: cuteafd_loader::placement::FfnMode::Owner,
+        });
+        let hops = cuteafd_loader::placement::plan_hops(&modes, &spec)?;
+        let mut transfer = DirectInputHop::new(devices[0], devices[1], spec)?;
+        transfer.bind(&hops, spec)?;
         let addresses = blocks[1].inputs().map(|b| b.ptr);
         let token_capacity = blocks[1].tokens.capacity();
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;

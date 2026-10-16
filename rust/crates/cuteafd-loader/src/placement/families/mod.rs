@@ -28,7 +28,7 @@ const WHOLE1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
 pub const DEEPSEEK_V4: ExecutorModes = ExecutorModes { family: "deepseek_v4",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Heads };
 /// V4.1: layer ranges, layers 0-19 / 20-39 whole on each GPU with one boundary
-/// hop (`BlockTransfer`) and the owner-reduce FFN.
+/// hop (`DirectInputHop`) and the owner-reduce FFN; direct-input storage is V4.1-only today.
 pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", modes: &[WHOLE0, WHOLE1], hops: true, attention: AttentionPlacement::Heads };
 /// GLM 5.3: every layer split over two GPUs, by heads (latent replicated) or
 /// by context (heads for the projections, KV pages owned by parity; K3).
