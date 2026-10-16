@@ -127,20 +127,8 @@ impl<'a> GlmEngine<'a> {
         }
         self.run_layer_pipeline(scope, LaneOrder::OrderedChunks, &mut bindings)?;
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
-        if wanted == 0 { return Ok(None); }
-        let mut logits = Vec::with_capacity(wanted * self.cfg.vocab_size);
-        let mut first = 0;
-        for (table, w) in tables.iter().zip(work) {
-            let rows = table[0].positions.len();
-            let count = (first + rows).saturating_sub((total - wanted).max(first));
-            if count > 0 {
-                self.launch_head(w, rows, count)?;
-                logits.extend(self.download(&w.logits, count * self.cfg.vocab_size * 4)?.chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap())));
-            }
-            first += rows;
-        }
-        Ok(Some(StepLogits::Host(logits)))
+        let counts: Vec<_> = tables.iter().map(|table| table[0].positions.len()).collect();
+        self.prefill_logits(work, &counts, wanted)
     }
 }
 

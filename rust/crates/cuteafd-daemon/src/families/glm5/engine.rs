@@ -1831,27 +1831,33 @@ impl<'a> GlmEngine<'a> {
             }
         }
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
-        if logit_rows == 0 {
-            // SAFETY: the engine owns this stream.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-            return Ok(None);
-        }
-        let last = counts.len() - 1;
-        if logit_rows <= counts[last] {
-            // The wanted rows are the last lane's: they stay on the device.
-            self.launch_head(workspaces[last], counts[last], logit_rows)?;
-            return Ok(Some(StepLogits::Device(self.device_logits(workspaces[last], logit_rows, false))));
-        }
-        let mut logits = Vec::with_capacity(logit_rows * self.cfg.vocab_size);
-        for ((w, &t), &begin) in workspaces.iter().zip(&counts).zip(&starts) {
-            // Rows of this lane inside the last `logit_rows` of the chunk.
-            let wanted = (begin + t).saturating_sub((total - logit_rows).max(begin));
-            if wanted > 0 {
-                self.launch_head(w, t, wanted)?;
-                logits.extend(self.device_logits(w, wanted, false).to_host(self.library)?);
+        self.prefill_logits(&workspaces[..lanes.len()], &counts, logit_rows)
+    }
+
+    /// Keep a last-lane suffix on device for serving; only cross-lane logits need a host join.
+    fn prefill_logits(&self, work: &[&Workspace<'_>], counts: &[usize], wanted: usize) -> Result<Option<StepLogits>> {
+        ensure!(work.len() == counts.len(), "prefill logits workspace geometry");
+        match prefill_logits_plan(counts, wanted)? {
+            PrefillLogitsPlan::None => {
+                // SAFETY: the engine owns this stream and every queued prefill operand.
+                unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                Ok(None)
+            }
+            PrefillLogitsPlan::Device { lane, rows } => {
+                self.launch_head(work[lane], counts[lane], rows)?;
+                Ok(Some(StepLogits::Device(self.device_logits(work[lane], rows, false))))
+            }
+            PrefillLogitsPlan::Host(rows) => {
+                let mut logits = Vec::with_capacity(wanted * self.cfg.vocab_size);
+                for ((w, &count), rows) in work.iter().zip(counts).zip(rows) {
+                    if rows > 0 {
+                        self.launch_head(w, count, rows)?;
+                        logits.extend(self.device_logits(w, rows, false).to_host(self.library)?);
+                    }
+                }
+                Ok(Some(StepLogits::Host(logits)))
             }
         }
-        Ok(Some(StepLogits::Host(logits)))
     }
 
     /// A transport's rank planes + shared expert into `delta`. The next
@@ -2181,9 +2187,53 @@ fn weight(layer: &GlmLayer<'_>, name: &'static str, cap: &str) -> Result<Vec<(&'
     Ok(vec![(fp8, layer.ptr(fp8)?), (scale, layer.ptr(scale)?)])
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PrefillLogitsPlan {
+    None,
+    Device { lane: usize, rows: usize },
+    Host(Vec<usize>),
+}
+
+fn prefill_logits_plan(counts: &[usize], wanted: usize) -> Result<PrefillLogitsPlan> {
+    ensure!(!counts.is_empty() && counts.iter().all(|&rows| rows > 0), "empty prefill lanes");
+    let total: usize = counts.iter().sum();
+    ensure!(wanted <= total, "prefill logits exceed lane rows");
+    if wanted == 0 { return Ok(PrefillLogitsPlan::None); }
+    let lane = counts.len() - 1;
+    if wanted <= counts[lane] { return Ok(PrefillLogitsPlan::Device { lane, rows: wanted }); }
+    let mut first = 0;
+    Ok(PrefillLogitsPlan::Host(counts.iter().map(|&rows| {
+        let count = (first + rows).saturating_sub((total - wanted).max(first));
+        first += rows;
+        count
+    }).collect()))
+}
+
 #[cfg(test)]
 mod long_graph_tests {
     use super::*;
+
+    #[test]
+    fn prefill_last_lane_logits_stay_on_device_for_every_executor() {
+        for counts in [vec![4096], vec![4096, 1024], vec![4096, 4096, 17]] {
+            let lane = counts.len() - 1;
+            for rows in [1, counts[lane]] {
+                assert_eq!(prefill_logits_plan(&counts, rows).unwrap(), PrefillLogitsPlan::Device { lane, rows });
+            }
+            assert_eq!(prefill_logits_plan(&counts, 0).unwrap(), PrefillLogitsPlan::None);
+            if lane > 0 {
+                let mut expected = vec![0; counts.len()];
+                expected[lane - 1] = 1;
+                expected[lane] = counts[lane];
+                assert_eq!(prefill_logits_plan(&counts, counts[lane] + 1).unwrap(), PrefillLogitsPlan::Host(expected));
+                assert_eq!(prefill_logits_plan(&counts, counts.iter().sum()).unwrap(), PrefillLogitsPlan::Host(counts.clone()));
+            }
+            assert!(prefill_logits_plan(&counts, counts.iter().sum::<usize>() + 1).is_err());
+        }
+        assert!(prefill_logits_plan(&[], 0).is_err());
+        assert!(prefill_logits_plan(&[4096, 0], 1).is_err());
+    }
+
 
     #[test]
     fn long_padding_resolves_only_to_sized_scratch_records() {
