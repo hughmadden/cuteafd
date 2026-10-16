@@ -64,6 +64,109 @@ GLM 5.3 EXL3 K4, 1 RTX + 4 Sparks. `SPECULATOR_FP8=off` keeps the BF16 drafter.
 | --- | --- | --- |
 | `ATTENTION_PLAN_ROWS` / `--attention-plan-rows` | `auto` | Numerical recipe chosen once before admission: loaded drafter width + 1, clamped to 64; without a drafter, 1. Explicit 1..64 overrides it. Serial decode and verification share the recipe; selected scratch covers all 64 execution rows. |
 
+## D-GLM attention qualification
+
+`context` remains the default. Explicit `layers` uses the shared owner-aware
+pipeline, whole attention/cache/indexer groups on one GPU, split FFNs and
+AfterAttention residual broadcasts. Decode and verify keep one packed step;
+ordered prefill currently supports at most two lanes, versus three by default
+for `context`. Matched comparisons pin two lanes in both modes; default
+three-lane Context 8K prefill is a separate measurement.
+
+The initial 2026-10-15 campaign is **not qualified**: both Layers launches
+failed the prefill device-logits return contract after graph warmup, and a
+Context launch failed the shared expert-worker CUDA memory query. All three
+matched pairs must restart on one fixed sealed candidate, at exactly
+2,097,152 pool tokens, two RTX PRO 6000 GPUs and six expert ranks. No placement
+speedup or default decision follows from the incomplete arms.
+
+Owned-phase graph calibration from those two launches (78 layers, two TP2
+expert layers, 1M context, 213 shapes, 49,416 executables per rank):
+
+| Ready graph bytes | Rank 0 | Rank 1 |
+| --- | ---: | ---: |
+| Provisional estimate | 8,400,720,000 | 8,400,720,000 |
+| Measured capture delta | 5,790,236,672 | 5,762,973,696 |
+| Calibrated estimate (117,000 bytes/executable) | 5,781,672,000 | 5,781,672,000 |
+
+The calibrated errors are 8.2 / 17.8 MiB; a separate 10% growth reserve is not
+counted at ready. This is an SM120 RTX PRO 6000 measurement, not a 5090 or
+arbitrary-shape qualification; new hardware/census and full ready-ledger
+agreement require rechecking.
+
+The final Context carry-over check, `ae1c2627` versus sealed K4
+`3be01a02`, produced byte-identical saved F32 logits (6,000 x 154,880;
+SHA256 `d31225130e056c1237628424d4d2a3cb2f2c1bdaec2bdd106b5d7dbc73dc184b`).
+Both used a 2M pool, three prefill lanes and all 78 layers, with routed experts
+intentionally skipped to isolate the unchanged coordinator path. NLL was
+9.045842721924554 on both; maximum absolute difference and KL were zero.
+This is not a routed-expert quality result.
+
+The fresh 2026-10-16 three-session campaign on that same seal is **not
+qualified**. All six launches served the exact 2,097,152-token pool; quick
+fidelity and `cache_exact` passed in every arm. Layers passed strict lossless
+10/10 in all three sessions. Context passed 10/10, then 9/10 (token 109,
+0.0054-nat margin), then 5/10. The third Context session also failed baseline
+speculation losslessness at token 85/128 with a 0.351-nat margin, while its
+repeated drafts-off output and all 128 recorded rows were byte-identical.
+Its strict code-5 case diverged at token 89 with a 0.8107-nat margin. These
+are correctness failures under investigation, not accepted rounding or
+fabric-related speed caveats. Exact retained-prompt replay, fixed verify
+widths and a current-base check are required before attribution.
+
+The final Layers census changed to three TP2 expert layers: 49,203
+executables per rank over 213 shapes. Predicted ready graph bytes were
+5,756,751,000 per rank; measured capture deltas were 5,767,168,000 and
+5,739,905,024 bytes, within 10 / 17 MiB. This clears the graph-component
+64-MiB bar, not the still-pending full tagged ready-ledger comparison.
+Every arm retained an A/B rerun verdict from fabric/residual-traffic caveats;
+the third Layers arm additionally failed matched prompt hashes. No speed
+or placement-default decision follows. The separate default-three-lane
+8K run is held until the correctness investigation is resolved.
+
+The 2026-10-17 attribution follow-up did **not reproduce** the Context
+failure. In one queue turn, immutable original seal `3be01a02` ran first,
+then rebased K4 head `1bdda27c`; each used its own matching launcher and the
+same benchmark client. Both used the original nonce `301102bc7c4af2fa`,
+baseline then strict-set then client-sweep order, two prefill lanes, plan
+rows 8, exactly 2,097,152 pool tokens, two RTX PRO 6000 GPUs and six expert
+ranks. Both passed strict 10/10 with identical generated IDs and raw-logit
+row hashes, quick fidelity and `cache_exact` (prompt and turn restores plus
+cold recompute). Neither encountered the known Spark admission query OOM.
+
+The current head additionally saved 456 paired full-vocabulary F32
+log-probability rows: code-1/2/3/5/6/7, generated offsets 25 through 100,
+154,880 entries per row. All pairs were byte-identical; both KL directions,
+L2 and maximum absolute difference were zero. Original-seal diagnostics
+were trace-only because its immutable server predates row-dump support.
+Two independent plain-base full-order checks also passed strict 10/10,
+quick fidelity and exact cache restore. These are scoped non-reproductions,
+not a proven root cause, evidence that later fixes cured the earlier
+failure, or general row/batch invariance. The earlier failures remain part
+of the record. Full tagged ready-ledger agreement and a new matched
+placement decision remain pending; Context stays the default.
+
+D-GLM is **decided: Context default, Layers explicit** after the 2026-10-17
+single matched decision pair on sealed `1bdda27c`. Layers ran first, then
+Context, with two lanes, plan rows 8, exactly 2,097,152 pool tokens, two
+RTX PRO 6000 GPUs and six expert ranks. Prompt hashes matched. Both passed
+quick fidelity, `cache_exact` and strict 10/10 IDs/raw-logit hashes.
+
+| Client measurement | Layers | Context | Layers / Context |
+| --- | ---: | ---: | ---: |
+| C1 code decode, tok/s | 45.77 | 47.70 | 0.96 |
+| C16 code decode, tok/s | 123.46 | 136.00 | 0.91 |
+| Cold 8K prefill, tok/s | 1,198.25 | 2,323.74 | 0.52 |
+| Cold 8K TTFT, s | 6.713 | 3.462 | 1.94 |
+
+These measurements are **provisional**: both arms retained fabric/foreign
+traffic A/B rerun flags, and Layers also reported sequence/retransmit
+warnings. They do not establish an accepted speedup or precise regression
+magnitude. The default-change bar (C1 at least 1.03, C16 at least 0.98) was
+not met; there is no reason to change Context or repeat this campaign.
+Default-three-lane Context performance and full ready-memory agreement
+are not qualified by this two-lane decision pair.
+
 ## Known limits
 
 <!-- release-v2-limits -->

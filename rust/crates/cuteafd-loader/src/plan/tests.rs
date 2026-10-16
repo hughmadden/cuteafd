@@ -410,7 +410,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
                         || i.group == "context+modules")
                     .map(|i| i.bytes).sum::<u64>() })).collect::<Vec<_>>();
             let checkpoint = Checkpoint::coordinator(dir.path(), false, false).unwrap();
-            let weights = layout::glm5::device_bytes(&checkpoint, cards.len(), cfg.layers, host_embedding).unwrap();
+            let weights = layout::glm5::device_bytes(&checkpoint, cards.len(), cfg.layers, host_embedding, None).unwrap();
             let pre_weight = memory.devices.iter().take(cards.len()).zip(weights).map(|(device, weights)| {
                 let context = device.items.iter().filter(|item| item.group == "context+modules")
                     .map(|item| item.bytes).sum::<u64>();
@@ -420,7 +420,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
                 headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, skip_routed_experts: false,
                 prefill_rows: 4096,
-                prefill_lanes: 3, max_context: 65536, scratch: None, drafter_bytes: 0,
+                prefill_lanes: 3, max_context: 65536, automatic_context: options.context_tokens == 0, scratch: None, drafter_bytes: 0,
                 drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
                 tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
                 full_prefill_logits: false, context: None };
@@ -481,6 +481,15 @@ fn glm5_attention_auto_requires_complete_context_programs() {
             let heads = plan(dir.path(), &PlanOptions {
                 attention_placement: Some(AttentionPlacement::Heads), ..options.clone()
             }).unwrap();
+            let layers = plan(dir.path(), &PlanOptions {
+                attention_placement: Some(AttentionPlacement::Layers), ..options.clone()
+            }).unwrap();
+            if gpus == 2 {
+                assert!(layers.executable(), "layers, omitted {omitted:?}: {}", render(&layers));
+                assert_eq!(layers.attention_placement, AttentionPlacement::Layers);
+            } else {
+                assert!(!layers.executable(), "one GPU cannot run layers");
+            }
             // Heads runs whatever the manifest holds.
             assert!(heads.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(&heads));
             assert_eq!(heads.attention_placement, AttentionPlacement::Heads);

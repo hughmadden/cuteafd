@@ -92,6 +92,7 @@ pub struct LayoutOptions {
     pub glm5_drafter_snapshot: Option<std::path::PathBuf>,
     pub glm5_drafter_disabled: bool,
     pub glm5_draft_bf16: bool,
+    pub glm5_attention_plan_rows: Option<usize>,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
     /// Concurrent sequences (state slots = concurrency + 2).
@@ -185,6 +186,7 @@ impl Default for LayoutOptions {
             glm5_drafter_snapshot: None,
             glm5_drafter_disabled: false,
             glm5_draft_bf16: false,
+            glm5_attention_plan_rows: None,
             headroom_bytes: 2 * GIB,
             concurrency: 0,
             state_slots: None,
