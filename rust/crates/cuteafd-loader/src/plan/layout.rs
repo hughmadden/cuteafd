@@ -618,10 +618,8 @@ pub fn program_families(base: &str, split: bool) -> Vec<String> {
     std::iter::once(base.to_string()).chain(split.then(|| format!("{base}2"))).collect()
 }
 
-/// DeepSeek V4.1's legacy layout of `report` (a `plan` of the checkpoint) on
-/// the inventory: the only family `plan` still routes here, until its own
-/// `FamilyModel::placement` adapter lands; every other family without an
-/// adapter is refused. Deleted with `family_costs` (P13 stage B).
+/// The legacy V4.1 layout body. No family reaches it any more (V4.1 plans
+/// through `layout::v41`); it is deleted with `family_costs` (P13 stage B).
 pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &super::PlanInput,
     options: &LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();

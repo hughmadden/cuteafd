@@ -57,8 +57,7 @@ pub trait FamilyModel: Send + Sync {
 
     /// The family's memory layout: its own adapter over the shared solver,
     /// solving the same request its runtime admits. `None` means the family
-    /// has no adapter: `plan` refuses its layout (V4.1 alone still takes the
-    /// legacy body until its adapter lands).
+    /// has no adapter: `plan` refuses its layout.
     fn placement(&self, _input: &super::PlanInput, _report: &mut super::PlanReport,
         _options: &super::layout::LayoutOptions, _requested: super::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {

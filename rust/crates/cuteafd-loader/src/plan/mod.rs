@@ -416,8 +416,6 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0,
                 waste: vec![], notes: vec![format!("native placement refused: {error:#}")] })
         }
-        // V4.1 keeps the legacy layout until its own adapter lands (P13 stage A).
-        None if report.family.as_deref() == Some("deepseek_v41") => Ok(layout::layout(report, model, input, options)),
         None => {
             let family = report.family.as_deref().unwrap_or("unknown");
             report.fits = false;
