@@ -36,42 +36,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 
-use crate::shared::placement::handoff::{HandoffPlan, PlacementHandoff};
-
-/// Family launcher wire schema; publication and exact acknowledgement are shared.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PlacementPlan {
-    version: u32,
-    nonce: String,
-    rtx_gpus: u32,
-    rtx_expert_layers: usize,
-    spark_first_layer: usize,
-}
-impl PlacementPlan {
-    fn new(rtx_gpus: u32, layers: usize) -> Self {
-        Self { version: 1, nonce: String::new(), rtx_gpus,
-            rtx_expert_layers: layers, spark_first_layer: layers.min(39) }
-    }
-}
-impl HandoffPlan for PlacementPlan {
-    fn validate(&self) -> Result<()> {
-        ensure!(self.version == 1 && matches!(self.rtx_gpus, 1 | 2)
-            && self.rtx_expert_layers <= 40
-            && (self.rtx_expert_layers > 0 || self.rtx_gpus == 1)
-            && self.spark_first_layer == self.rtx_expert_layers.min(39),
-            "invalid planned RTX expert boundary");
-        Ok(())
-    }
-    fn nonce(&self) -> &str { &self.nonce }
-    fn set_nonce(&mut self, nonce: String) { self.nonce = nonce; }
-    fn same_placement(&self, other: &Self) -> bool {
-        self.version == other.version && self.rtx_gpus == other.rtx_gpus
-            && self.rtx_expert_layers == other.rtx_expert_layers
-            && self.spark_first_layer == other.spark_first_layer
-    }
-}
-
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
     let Http { api, listen, snapshot, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
@@ -273,19 +237,6 @@ fn worker(
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
-    // Auto placement must publish its live boundary even when no local layer
-    // fits. Explicit all-remote single-RTX launches do not need a handoff.
-    if let Some(directory) = args.placement_directory.as_deref() {
-        ensure!(
-            args.rtx_gpus == 2 || args.rtx_expert_layers != admission::LocalLayers::Count(0),
-            "placement handoff requires --rtx-gpus 2 or single-RTX auto/local expert placement"
-        );
-        // The handoff directory must name a real path, not an empty string.
-        ensure!(
-            !directory.as_os_str().is_empty(),
-            "placement handoff requires a non-empty directory"
-        );
-    }
     ensure!(!args.tp2_dspark_experts || (args.rtx_gpus==2 && args.dspark),
         "--tp2-dspark-experts requires --rtx-gpus 2 and --dspark");
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
@@ -360,7 +311,7 @@ fn worker(
         &args.native_lib, catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]), "rtx-tp1");
     let mut exl3_modules = None;
     admission::startup_phase(&lib, "v41/before native preload", device_total)?;
-    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], |_| {
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some(), catalog.exl3().is_some())?;
         if catalog.exl3().is_some() && args.rtx_expert_layers != admission::LocalLayers::Count(0) {
             exl3_modules = Some(admission::preload_exl3(&lib, &local_exl3_directory, aot_capacity, 1)?);
@@ -559,15 +510,16 @@ fn worker(
         pool_tokens=pool.placement.pool_tokens,local_layers=pool.placement.onboard_layers,
         projected_free_bytes=free.saturating_sub(pool.cache_bytes[0]),reservation_bytes=?pool.reservation_bytes,
         "shared V4.1 cache and expert admission");
+    let local_layers = pool.placement.onboard_layers;
+    let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
+        && topology.is_none()
+        && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40;
+    let spark_admission = admission::start_sparks(&args, &catalog, local_layers, capacity, aot_capacity,
+        topology, usize::from(device_exchange))?;
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
     admission::startup_phase(&lib, "v41/kv", device_total)?;
     requests.use_engine_pages()?;
-    let mut local_layers = 0usize;
-    // Published only on the single-RTX path; the 2-RTX distributed worker owns
-    // its own handshake. Dropping it without a ready acknowledgement leaves the
-    // launch unpublished, which the launcher treats as a failure.
-    let mut placement_handoff: Option<PlacementHandoff<PlacementPlan>> = None;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv-prefix-install");
     admission::startup_phase(&lib, "v41/kv-prefix-install", device_total)?;
     if args.rtx_expert_layers != admission::LocalLayers::Count(0) {
@@ -585,24 +537,11 @@ fn worker(
             if compressed { Exl3Weights::plan(&catalog, selection) }
             else { ExpertWeights::plan(&lib, &catalog, selection) }
         }).collect::<Result<Vec<_>>>()?;
-        local_layers = pool.placement.onboard_layers;
         let admitted = pool.placement.expert_ranges[0];
         let expected = budgets.iter().take(local_layers).map(|b| b.resident_bytes).sum::<usize>()
             + if local_layers>0 {per_lane*2 + budgets.iter().take(local_layers).map(|b|b.device_staging_bytes).max().unwrap_or(0)} else {0};
         ensure!(expected as u64 <= admitted.peak_bytes,"runtime local owners exceed shared admission");
         tracing::info!(layers=local_layers,peak_bytes=admitted.peak_bytes,"shared RTX expert placement");
-        // Publish the resolved boundary before anything waits on it. On 1 RTX the
-        // 2-RTX distributed path never ran, so without this the launcher cannot
-        // know the real first remote layer and must start every worker at 0,
-        // over-reserving remote layers that the coordinator already owns.
-        // Computing the plan only needs the local device: it does not read the
-        // remote transport, connect to a peer, or wait on readiness.
-        if let Some(directory) = args.placement_directory.as_deref() {
-            placement_handoff = Some(PlacementHandoff::publish(
-                std::path::Path::new(directory),
-                PlacementPlan::new(args.rtx_gpus, local_layers),
-            )?);
-        }
         if local_layers > 0 && compressed {
             let mut loaded = Vec::with_capacity(local_layers);
             for layer in 0..local_layers {
@@ -628,14 +567,8 @@ fn worker(
         tracing::info!(layers=local_layers, elapsed_ms=local_started.elapsed().as_millis(),
             "local RTX experts ready");
     }
-    // The launcher has already started the workers at the published boundary and
-    // now acknowledges it; only then may remote transport creation and the first
-    // request proceed. The local experts above are installed either way.
-    if let Some(handoff) = placement_handoff {
-        handoff.wait_ready(Duration::from_secs(900))?;
-    }
-    if crate::shared::memory::chain::device_exchange_enabled() && topology.is_none()
-        && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40 {
+    if let Some(pending) = spark_admission { pending.wait()?; }
+    if device_exchange {
         // Verification waves (up to 80 rows) on the device-driven exchange; it
         // connects (and warms) the workers, so only once they are serving.
         transport.install_device_link(&args.peers, 80.min(capacity as usize), 39,
@@ -980,116 +913,4 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         console::Prefill::done(console::PrefillKind::Continuation, 0, index, count, chunk.len(), started);
     }
     anchor.context("prefix continuation produced no logits")
-}
-
-#[cfg(test)]
-mod placement_tests {
-    use super::*;
-    use std::fs;
-    fn publish(directory: &std::path::Path, gpus: u32, layers: usize) -> Result<PlacementHandoff<PlacementPlan>> {
-        PlacementHandoff::publish(directory, PlacementPlan::new(gpus, layers))
-    }
-    fn resumed_layers(directory: &std::path::Path) -> Result<Option<usize>> {
-        Ok(PlacementHandoff::<PlacementPlan>::resumed(directory)?.map(|p| p.rtx_expert_layers))
-    }
-    #[test]
-    fn placement_publication_and_exact_acknowledgement() -> Result<()> {
-        for layers in [1, 17, 20, 40] {
-            let directory = tempfile::tempdir()?;
-            let handoff = publish(directory.path(), 2, layers)?;
-            assert!(!directory.path().join(".plan-pending").exists());
-            let bytes = fs::read(directory.path().join("plan.json"))?;
-            let plan: PlacementPlan = serde_json::from_slice(&bytes)?;
-            assert_eq!(plan.spark_first_layer, layers.min(39));
-            assert_eq!(plan.rtx_gpus, 2);
-            assert!(handoff.wait_ready(Duration::ZERO).is_err());
-            fs::write(directory.path().join("ready.json"), bytes)?;
-            handoff.wait_ready(Duration::ZERO)?;
-            assert_eq!(
-                resumed_layers(directory.path())?,
-                Some(layers)
-            );
-            fs::remove_file(directory.path().join("ready.json"))?;
-            publish(directory.path(), 2, layers)?.wait_ready(Duration::ZERO)?;
-            assert!(
-                publish(directory.path(), 2, if layers == 1 { 2 } else { 1 })
-                    .is_err()
-            );
-        }
-        Ok(())
-    }
-
-    /// The published GPU count is the actual launch width, not an unconditional
-    /// two, and an unknown width is rejected before any state is written.
-    #[test]
-    fn placement_records_and_validates_the_actual_rtx_gpu_count() -> Result<()> {
-        for rtx_gpus in [1u32, 2] {
-            let directory = tempfile::tempdir()?;
-            publish(directory.path(), rtx_gpus, 5)?;
-            let plan: PlacementPlan = serde_json::from_slice(&fs::read(directory.path().join("plan.json"))?)?;
-            assert_eq!(plan.rtx_gpus, rtx_gpus);
-            assert_eq!(resumed_layers(directory.path())?, None);
-        }
-        for rtx_gpus in [0u32, 3] {
-            let directory = tempfile::tempdir()?;
-            assert!(publish(directory.path(), rtx_gpus, 5).is_err());
-            assert!(!directory.path().join("plan.json").exists());
-        }
-        // A one-GPU acknowledgement round-trips exactly.
-        let directory = tempfile::tempdir()?;
-        let handoff = publish(directory.path(), 1, 9)?;
-        let bytes = fs::read(directory.path().join("plan.json"))?;
-        fs::write(directory.path().join("ready.json"), bytes)?;
-        handoff.wait_ready(Duration::ZERO)?;
-        assert_eq!(resumed_layers(directory.path())?, Some(9));
-        Ok(())
-    }
-    #[test]
-    fn single_rtx_auto_can_publish_an_all_remote_boundary() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let handoff = publish(directory.path(), 1, 0)?;
-        let bytes = fs::read(directory.path().join("plan.json"))?;
-        let plan: PlacementPlan = serde_json::from_slice(&bytes)?;
-        assert_eq!((plan.rtx_expert_layers, plan.spark_first_layer), (0, 0));
-        assert!(handoff.wait_ready(Duration::ZERO).is_err());
-        fs::write(directory.path().join("ready.json"), bytes)?;
-        handoff.wait_ready(Duration::ZERO)?;
-        assert_eq!(resumed_layers(directory.path())?, Some(0));
-        publish(directory.path(), 1, 0)?.wait_ready(Duration::ZERO)?;
-        assert!(publish(directory.path(), 2, 0).is_err());
-        assert!(publish(directory.path(), 1, 1).is_err());
-        Ok(())
-    }
-    #[test]
-    fn acknowledged_boundary_cannot_change_gpu_count() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let handoff = publish(directory.path(), 1, 5)?;
-        fs::copy(directory.path().join("plan.json"), directory.path().join("ready.json"))?;
-        handoff.wait_ready(Duration::ZERO)?;
-        assert!(publish(directory.path(), 2, 5).is_err());
-        Ok(())
-    }
-    #[test]
-    fn placement_rejects_wrong_launch_boundary_and_oversized_ack() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let handoff = publish(directory.path(), 2, 17)?;
-        for mutation in [0, 1, 2] {
-            let mut wrong: PlacementPlan = serde_json::from_slice(&fs::read(directory.path().join("plan.json"))?)?;
-            match mutation {
-                0 => wrong.nonce.push('x'),
-                1 => wrong.spark_first_layer = 20,
-                _ => wrong.rtx_gpus = 1,
-            }
-            fs::write(
-                directory.path().join("ready.json"),
-                serde_json::to_vec(&wrong)?,
-            )?;
-            assert!(handoff.wait_ready(Duration::ZERO).is_err());
-        }
-        fs::write(directory.path().join("ready.json"), vec![b' '; 4097])?;
-        assert!(handoff.wait_ready(Duration::ZERO).is_err());
-        assert!(publish(directory.path(), 2, 0).is_err());
-        assert!(publish(directory.path(), 2, 41).is_err());
-        Ok(())
-    }
 }

@@ -112,7 +112,7 @@ impl DsparkShape<'_, '_> {
         match self.experts {
             DraftExpertKind::Tp2 => Ok(tp2::RoutedWave::device_bytes(self.library, capacity)?[1]),
             DraftExpertKind::Full => ExpertWeights::plan_execution(ExpertLayer::Dspark { stage: 0 },
-                self.library, capacity, false)?.total(),
+                self.library, capacity, capacity, false)?.total(),
             DraftExpertKind::Exl3(directory) => CompressedDraftExperts::device_bytes(directory, capacity),
         }
     }
@@ -170,7 +170,7 @@ impl<'library> DsparkWeights<'library> {
         ensure!(stage < 3, "invalid dSpark expert stage");
         match &self.experts {
             ExpertStages::Tp2(weights) => Ok(DraftExperts::Tp2(tp2::RoutedWave::new(self,weights.clone(),stage,capacity)?)),
-            ExpertStages::Full(weights) => Ok(DraftExperts::Full(weights[stage].execution(capacity, self.expert_bytes(capacity)?)?)),
+            ExpertStages::Full(weights) => Ok(DraftExperts::Full(weights[stage].execution(capacity, capacity, self.expert_bytes(capacity)?)?)),
             ExpertStages::Exl3 { weights, directory } => Ok(DraftExperts::Exl3(unsafe {
                 CompressedDraftExperts::new(self, weights.clone(), directory, stage, capacity)?
             })),
@@ -212,7 +212,7 @@ impl<'library> DsparkWeights<'library> {
             NativeRtxTensors::plan(catalog, &Self::auxiliary_names(catalog))?;
         let execution_bytes_per_wave = (if !catalog.native_dspark_experts() {
             CompressedDraftExperts::device_bytes(exl3_directory.context("dSpark EXL3 AOT directory missing")?, capacity)?
-        } else { ExpertWeights::plan_execution(ExpertLayer::Dspark { stage: 0 }, library, capacity, false)?.total()? })
+        } else { ExpertWeights::plan_execution(ExpertLayer::Dspark { stage: 0 }, library, capacity, capacity, false)?.total()? })
             .checked_mul(3)
             .context("dSpark stage workspace overflow")?;
         Ok(DsparkBudget {

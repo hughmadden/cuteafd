@@ -14,6 +14,13 @@ pub(crate) struct DraftHistory {
 }
 
 impl DraftHistory {
+    /// Per-request priors pooled from the other requests in the same step.
+    pub fn acceptance(histories: &[&Self], limits: &[usize]) -> Vec<Vec<f64>> {
+        histories.iter().zip(limits).enumerate().map(|(i, (history, &limit))| {
+            history.pooled(limit, histories.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, h)| *h))
+        }).collect()
+    }
+
     /// Fewer than four outcomes observed.
     pub fn cold(&self) -> bool {
         self.outcomes.len() < COLD_START_CYCLES
@@ -80,6 +87,17 @@ const POOL_TRIALS: f64 = 8.0;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acceptance_preserves_request_history_and_position_limits() {
+        let (mut good, mut bad) = (DraftHistory::default(), DraftHistory::default());
+        for _ in 0..16 { good.observe(4, 4); bad.observe(4, 0); }
+        let rates = DraftHistory::acceptance(&[&good, &bad], &[2, 7]);
+        assert_eq!((rates[0].len(), rates[1].len()), (2, 7));
+        assert!(rates[0][0] > rates[1][0]);
+        assert_eq!(rates[0], good.pooled(2, [&bad].into_iter()));
+    }
+
 
     #[test]
     fn history_censors_positions_after_a_miss() {

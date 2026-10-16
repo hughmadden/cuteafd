@@ -68,11 +68,8 @@ def _metadata(config_id: str) -> dict:
     topology = ["--spark-tp", str(config["spark_tp"]), "--spark-ep", str(config["spark_ep"])]
     requested = config["requested_rtx_expert_layers"]
     rtx_argv = ["--rtx-expert-layers", str(requested)]
-    placement = ["--placement-directory", "/run/cuteafd-placement"] if config["require_placement_directory"] else []
-    workers = [["expertd-native", "--rdma-endpoints", "2", "--rank", str(rank), "--world", str(world), "--capacity", "4096",
-                "--device-budget-bytes", "109119320064", "--first-layer",
-                str(config["expected_spark_first_layer"])] + topology
-               for rank in range(world)]
+    workers = [["expertd-native", "--rank", str(rank), "--world", str(world),
+                "--device-budget-bytes", "109119320064"] + topology for rank in range(world)]
     return dict(
         source_commit="abc", source_artifact="manifest:1", model="deepseek-ai/DeepSeek-V4.1-Flash",
         revision="dba1be0a", rtx_gpus=config["rtx_count"], requested_rtx_expert_layers=requested,
@@ -80,7 +77,7 @@ def _metadata(config_id: str) -> dict:
         spark_first_layer=config["expected_spark_first_layer"], spark_count=world,
         spark_tp=config["spark_tp"], spark_ep=config["spark_ep"],
         concurrency=16, max_context_tokens=1048576, max_output_tokens=393216,
-        kv_pool="auto", prefix_cache_entries=20, prefill_batch_tokens=2048, worker_capacity=4096,
+        kv_pool="auto", prefix_cache_entries=20, prefill_batch_tokens=2048, worker_capacity=2048,
         dspark="on", dspark_draft_limit=config["dspark_draft_limit"],
         spark_device_budget_bytes=109119320064, power_caps_watts=400,
         source_snapshots={"daemon": "d1", "native": "n1"},
@@ -92,7 +89,10 @@ def _metadata(config_id: str) -> dict:
         coordinator_argv=["serve-native", "--rtx-gpus", str(config["rtx_count"]), "--prefill-batch-tokens", "2048",
                           "--concurrency", "16", "--prefix-cache-entries", "20",
                           "--max-context-tokens", "1048576", "--max-output-tokens", "393216", "--dspark"]
-                         + rtx_argv + placement + topology,
+                         + rtx_argv + topology,
+        worker_admissions=[dict(rank=rank, capacity=2048, compiled_capacity=4096,
+            layer_ids=list(range(config["expected_spark_first_layer"], 40)),
+            selection_digest="a" * 64) for rank in range(world)],
         worker_argv=workers, active_topology=f"TP{config['spark_tp']}EP{config['spark_ep']}",
         release_identity_full=f"fp-{config_id}")
 
@@ -272,10 +272,6 @@ def test_1rtx_requires_explicit_zero_and_no_placement() -> None:
     auto = _without_rtx_expert_layers(dict(_metadata("1rtx6-tp3ep2"), requested_rtx_expert_layers="auto"))
     problems = six.verify_arm_metadata(_records(), config, auto)
     assert any("--rtx-expert-layers 0 explicitly" in problem for problem in problems), problems
-    with_placement = _metadata("1rtx6-tp3ep2")
-    with_placement["coordinator_argv"] += ["--placement-directory", "/run/x"]
-    assert any("must omit --placement-directory" in problem
-               for problem in six.verify_arm_metadata(_records(), config, with_placement))
     # 2RTX must also pass its explicit 20 to keep the KV from being reabsorbed.
     dual = _without_rtx_expert_layers(_metadata("2rtx6-tp2ep3"))
     assert any("--rtx-expert-layers 20 explicitly" in problem

@@ -15,7 +15,7 @@ fn real_registered_output_matches_device_compaction_and_preserves_guards() -> Re
     let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
         std::path::Path::new(&snapshot))?;
     let weights = ExpertWeights::load(&lib, &catalog, ExpertLayer::Backbone { layer: 0, rank: 0 }, 16 << 30)?;
-    let mut execution = weights.execution(4096, 16 << 30)?;
+    let mut execution = weights.execution(4096, 4096, 16 << 30)?;
     let mut exchange = HostExpertExchange::new(4096)?;
     for rows in [1u32, 16, 80, 256, 2048, 4096] {
         let mut hidden = Vec::new();

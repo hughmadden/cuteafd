@@ -152,10 +152,19 @@ pub(crate) fn bf16_sibling(directory: &Path) -> Option<PathBuf> {
 /// FP32 alphas).
 pub(crate) struct Fp8Layer<'a> {
     pub layer: usize,
+    pub(crate) slice: cuteafd_core::SparkSlice,
     regions: Vec<DeviceAllocation<'a>>,
 }
 
 impl<'a> Fp8Layer<'a> {
+    fn loaded_slice(tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize,
+        slicing: Slicing) -> Result<cuteafd_core::SparkSlice> {
+        let (first, width) = tensors.rank_range_with(tp, rank, slicing)?;
+        Ok(cuteafd_core::SparkSlice { layer: u32::try_from(layer)?, first: u32::try_from(first)?,
+            width: u32::try_from(width)?, stored_width: u32::try_from(tensors.rank_width(tp, rank, slicing)?)?,
+            tiers: vec![], projection_counts: vec![] })
+    }
+
     /// Device bytes of one layer's slice.
     pub fn bytes(tensors: &Fp8ExpertTensors, tp: usize) -> Result<usize> {
         Self::bytes_for(tensors, tp, 0, Slicing::Padded)
@@ -234,7 +243,7 @@ impl<'a> Fp8Layer<'a> {
             }
         }
         // Regions in [w1, s1, w3, s3, w2, s2] order (gate, up, down).
-        Ok(Self { layer, regions })
+        Ok(Self { layer, slice: Self::loaded_slice(tensors, layer, tp, rank, slicing)?, regions })
     }
 
     fn pointers(&self) -> [*mut c_void; 6] {
@@ -310,7 +319,7 @@ impl<'a> Fp8Experts<'a> {
         let weights = match tensors.format() {
             ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
             ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
-            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4 { w4a4: true },
+            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
         };
         ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
             && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
@@ -374,7 +383,8 @@ impl<'a> Fp8Experts<'a> {
                             regions.push(DeviceAllocation::new(devices[rank].library, bytes)?);
                         }
                     }
-                    owners[rank].layers.push(Fp8Layer { layer, regions });
+                    owners[rank].layers.push(Fp8Layer { layer,
+                        slice: Fp8Layer::loaded_slice(tensors, layer, 2, rank, slicing[rank])?, regions });
                     Ok(())
                 })?;
             }
@@ -727,7 +737,7 @@ mod tests {
     #[test]
     fn bf16_sibling_must_share_weight_layout_arithmetic_and_capacity() {
         let primary = Fp8MoeInfo { hidden: 6144, slice: 512, experts: 256, topk: 8, intermediate: 2048, tp: 4,
-            wire_input: true, swiglu_limit: 10.0, capacities: vec![64, 4096], weights: Fp8MoeWeights::Fp8 };
+            wire_input: true, swiglu_limit: 10.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![64, 4096], weights: Fp8MoeWeights::Fp8 };
         let mut bf16 = primary.clone();
         bf16.wire_input = false;
         // A sibling may compile different capacities; its own scratch uses its own top.

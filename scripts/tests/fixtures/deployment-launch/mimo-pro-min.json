@@ -190,14 +190,8 @@
       "0",
       "--world",
       "6",
-      "--rdma-endpoints",
-      "3",
-      "--capacity",
-      "4096",
       "--device-budget-bytes",
       "107374182400",
-      "--first-layer",
-      "3",
       "--listen",
       "0.0.0.0:19918"
     ]
@@ -263,14 +257,8 @@
       "1",
       "--world",
       "6",
-      "--rdma-endpoints",
-      "3",
-      "--capacity",
-      "4096",
       "--device-budget-bytes",
       "107374182400",
-      "--first-layer",
-      "3",
       "--listen",
       "0.0.0.0:19918"
     ]
@@ -336,14 +324,8 @@
       "2",
       "--world",
       "6",
-      "--rdma-endpoints",
-      "3",
-      "--capacity",
-      "4096",
       "--device-budget-bytes",
       "107374182400",
-      "--first-layer",
-      "3",
       "--listen",
       "0.0.0.0:19918"
     ]
@@ -409,14 +391,8 @@
       "3",
       "--world",
       "6",
-      "--rdma-endpoints",
-      "3",
-      "--capacity",
-      "4096",
       "--device-budget-bytes",
       "107374182400",
-      "--first-layer",
-      "3",
       "--listen",
       "0.0.0.0:19918"
     ]
@@ -482,14 +458,8 @@
       "4",
       "--world",
       "6",
-      "--rdma-endpoints",
-      "3",
-      "--capacity",
-      "4096",
       "--device-budget-bytes",
       "107374182400",
-      "--first-layer",
-      "3",
       "--listen",
       "0.0.0.0:19918"
     ]
@@ -555,14 +525,8 @@
       "5",
       "--world",
       "6",
-      "--rdma-endpoints",
-      "3",
-      "--capacity",
-      "4096",
       "--device-budget-bytes",
       "107374182400",
-      "--first-layer",
-      "3",
       "--listen",
       "0.0.0.0:19918"
     ]

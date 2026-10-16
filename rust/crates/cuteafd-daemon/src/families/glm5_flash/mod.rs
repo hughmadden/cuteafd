@@ -127,9 +127,6 @@ pub(crate) struct EngineArgs {
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long)]
     pub peers: Option<String>,
-    /// Select the solver's exact Spark layer set before worker expert allocation.
-    #[arg(long, requires = "peers")]
-    pub placement_handshake: bool,
     /// Run the routed experts on this GPU: EXL3 checkpoints through the
     /// coordinator `exl3-glmf-k<tiers>/rtx-tp1` package, FP8 ones through the
     /// TP1 `fp8-glmf` package. `--experts-snapshot` names another checkpoint
@@ -856,14 +853,6 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn worker_placement_handshake_is_opt_in_and_requires_peers() {
-        assert!(!parse(&[]).placement_handshake);
-        assert!(parse(&["--peers", "127.0.0.1:19441", "--placement-handshake"]).placement_handshake);
-        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
-            "--placement-handshake"]).is_err());
-    }
-
-    #[test]
     fn solved_spark_selection_excludes_dense_and_local_layers_and_keeps_absolute_ids() {
         use cuteafd_loader::placement::{ExpertHome, LayerAssignment, LayerMode};
         let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(2)).unwrap();
@@ -1375,7 +1364,7 @@ impl Opened {
     #[allow(clippy::too_many_arguments)]
     fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
-        prepared_draft: Option<&remote_dflash::Prepared<'_>>, attention: engine::GlmfAttention)
+        prepared_draft: Option<&crate::shared::draft::remote::Prepared<'_>>, attention: engine::GlmfAttention)
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
@@ -1385,7 +1374,7 @@ impl Opened {
         ensure!(args.expert_window.is_none(), "solver admission does not support diagnostic expert paging");
         let devices: Vec<_> = std::iter::once(args.device).chain(peer).collect();
         let split = devices.len() == 2;
-        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, |_| {
+        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             programs.load_matching(|name| glmf_startup_program(name, split, args.decode_rows > engine::DECODE_ROWS))?;
             Ok(())
         })?;
@@ -1468,7 +1457,7 @@ impl Opened {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
         let inputs = admission::GlmfInputs { attention, cfg: &self.cfg, layers, local_tp2_exl3,
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
-                free_bytes: gpu.free_bytes + prepared_draft.map_or(0, remote_dflash::Prepared::sampled_bytes) })).collect(),
+                free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
             pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
             prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
             partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,
@@ -1688,7 +1677,7 @@ impl Opened {
             (Some(_), Some(path)) if cuteafd_loader::placement::families::glm5_flash::remote_dflash_requested()
                 && !dspark::is_dspark(path)? => {
                 let (device, peer_stream) = peer_stream.context("remote draft needs the peer target stream")?;
-                Some(remote_dflash::Prepared::new(&self.library,
+                Some(crate::shared::draft::remote::Prepared::new(&self.library,
                     crate::shared::peer_split::RankDevice { device: args.device, stream },
                     crate::shared::peer_split::RankDevice { device, stream: peer_stream },
                     remote_dflash::IDENTITY)?)
@@ -1720,7 +1709,7 @@ impl Opened {
             ensure!(rtx_layers == working.rtx_layers,
                 "GLM Flash runtime RTX selection disagrees with admitted working set");
         }
-        if args.placement_handshake {
+        if args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }
@@ -1728,13 +1717,16 @@ impl Opened {
                     experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
                     intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? } };
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
-            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
-                source, geometry, peers.len(), None)?;
-            let selection = cuteafd_transport::worker_selection::WorkerSelection::new(identity, &spark_layers)?;
-            cuteafd_transport::worker_selection::select_worker_layers(&peers, &selection,
-                std::time::Duration::from_secs(1200))?;
-            tracing::info!(layers = ?spark_layers, digest = %selection.digest()?,
-                "GLM Flash Spark solved layer set acknowledged before lanes");
+            let capacity = u32::try_from(args.expert_rows())?;
+            let ingress = if self.checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
+                else { cuteafd_core::SparkIngress::Fp8K32 };
+            let model = cuteafd_transport::worker_selection::ModelAdmission {
+                capacity, compiled_capacity: capacity,
+                endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress }; args.prefill_lanes],
+                rings: crate::shared::placement::spark_rings(64 << 20)?,
+            };
+            crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
+                &working, peers.len(), None, model)?.select(&peers)?;
         }
         let execution = cuteafd_loader::placement::LayerExecutionPlan::new(&placement,
             cuteafd_loader::placement::HopSpec {
@@ -1943,7 +1935,7 @@ impl Opened {
 
     /// The drafter `--draft` names, on `stream` (it reads only the mask token's embedding row).
     fn load_drafter<'s>(&'s self, args: &EngineArgs, stream: *mut std::ffi::c_void,
-        embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<remote_dflash::Prepared<'s>>)
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<crate::shared::draft::remote::Prepared<'s>>)
         -> Result<Option<dspark::Drafter<'s>>> {
         let Some(snapshot) = &args.draft else { return Ok(None) };
         let started = Instant::now();

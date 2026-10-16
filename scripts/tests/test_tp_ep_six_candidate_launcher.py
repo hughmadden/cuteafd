@@ -48,6 +48,7 @@ if [[ "${1:-}" == "exec" ]]; then
     cat "${FAKE_PLAN_FILE:?}"; exit 0
   fi
   for token in "${cmd[@]}"; do [[ "$token" == "status" ]] && { echo "running 4321"; exit 0; }; done
+  [[ "$*" == *"exec -d"* && "$*" == *"candidate-coordinator"* ]] && touch "${log}.coordinator"
   exit 0
 fi
 exit 0
@@ -76,9 +77,23 @@ case "$remote" in
     esac
     # Structured startup evidence, ANSI-decorated like the real log, plus the
     # stale-line variants that must NOT satisfy the readiness wait.
-    printf 'INFO cuteafd: \033[2mnative local RoCE expert worker ready\033[0m rank=%s world=6 \033[3mrole\033[0m=%s \033[3mintermediate\033[0m=%s first_layer=%s\n' \
-      "$rank" "${FAKE_WORKER_ROLE:-7}" "${FAKE_WORKER_INTERMEDIATE:-384}" "${FAKE_WORKER_LOG_FIRST:-20}"
-    echo "native local RoCE expert worker ready rank=$rank world=6 first_layer=0"
+    ids="["; stale="["
+    for ((layer=${FAKE_WORKER_LOG_FIRST:-20}; layer<40; layer++)); do
+      [[ "$ids" == "[" ]] || ids+=", "
+      ids+="$layer"
+    done
+    for ((layer=0; layer<40; layer++)); do
+      [[ "$stale" == "[" ]] || stale+=", "
+      stale+="$layer"
+    done
+    ids+="]"; stale+="]"
+    echo "native worker bootstrap ready rank=$rank world=6"
+    if [[ -f "${log}.coordinator" ]]; then
+      echo "coordinator-selected worker weights ready rank=$rank world=6 layer_ids=$ids selection_digest=sealed"
+    fi
+    printf 'INFO cuteafd: \033[2mnative local RoCE expert worker ready\033[0m rank=%s world=6 \033[3mrole\033[0m=%s \033[3mintermediate\033[0m=%s layer_ids=%s\n' \
+      "$rank" "${FAKE_WORKER_ROLE:-7}" "${FAKE_WORKER_INTERMEDIATE:-384}" "$ids"
+    echo "native local RoCE expert worker ready rank=$rank world=6 layer_ids=$stale"
     # Real behaviour: the endpoint (and its GID line) exists only after a client
     # connection, and the line is timing-gated by the forwarded diagnostic flag.
     if [[ -f "${log}.connected" && -f "${log}.timing" ]]; then
@@ -140,9 +155,9 @@ def test_plan_renders_ordered_six_rank_lifecycle() -> None:
     dual = _plan("site-2rtx6-tp3ep2.config", 2)
     steps = [line for line in dual.splitlines() if line.startswith("STEP ")]
     assert steps == ["STEP prestage-prerequisite (NOT performed by this launcher; run before start)",
-                     "STEP coordinator-start", "STEP plan-read"] + \
+                     ] + \
         [f"STEP expert-start rank={index}" for index in range(6)] + \
-        ["STEP worker-ready", "STEP plan-ack", "STEP readiness-gate",
+        ["STEP worker-bootstrap-ready", "STEP coordinator-start", "STEP worker-admission-ready", "STEP readiness-gate",
          "STEP first-request", "STEP gid-capture"], steps
     assert "speculator=dspark dspark_draft_limit=7 (coordinator only)" in dual
     assert "tcp_timing=CUTEAFD_PROTOCOL_V2_TCP_TIMING=unset" in dual
@@ -156,7 +171,7 @@ def test_plan_renders_ordered_six_rank_lifecycle() -> None:
     single_steps = [line for line in single.splitlines() if line.startswith("STEP ")]
     assert single_steps == ["STEP prestage-prerequisite (NOT performed by this launcher; run before start)"] + \
         [f"STEP expert-start rank={index}" for index in range(6)] + \
-        ["STEP worker-ready", "STEP coordinator-start", "STEP readiness-gate",
+        ["STEP worker-bootstrap-ready", "STEP coordinator-start", "STEP worker-admission-ready", "STEP readiness-gate",
          "STEP first-request", "STEP gid-capture"], single_steps
     assert "speculator=dspark dspark_draft_limit=5 (coordinator only)" in single
 
@@ -203,7 +218,7 @@ def test_six_wrapper_rejects_bad_fixture_inputs(tmp_path) -> None:
         config.write_text(text)
         result = subprocess.run(
             ["bash", str(WRAPPER), "start", "--config", str(config), "--rtx-gpus", "2",
-             "--first-layer", "20", "--run-id", name, "--host-artifact-root", str(ROOT / "runs" / "tp-ep-six")],
+             "--run-id", name, "--host-artifact-root", str(ROOT / "runs" / "tp-ep-six")],
             capture_output=True, text=True, cwd=ROOT, env=_start_env(bin_dir, log))
         assert result.returncode == 2 and expected in result.stderr, (name, result.stderr)
     assert not log.exists() or log.read_text() == "", "a rejected config must send no remote command"
@@ -213,7 +228,7 @@ def _mock_start(tmp_path, config: str, rtx_gpus: int, first_layer: int, run_id: 
                 plan_layers: int | None = None):
     bin_dir, log = _fake_bin(tmp_path), tmp_path / "calls.log"
     command = ["bash", str(WRAPPER), "start", "--config", str(FIX / config), "--rtx-gpus", str(rtx_gpus),
-               "--first-layer", str(first_layer), "--run-id", run_id, "--host-device-map", DEVICE_MAP,
+               "--run-id", run_id, "--host-device-map", DEVICE_MAP,
                "--host-artifact-root", str(ROOT / "runs" / "tp-ep-six")]
     if tcp_timing:
         command += ["--tcp-timing", "1"]
@@ -231,21 +246,21 @@ def test_mock_start_dual_orders_ack_health_request_gid(tmp_path) -> None:
     result, calls, launches = _mock_start(tmp_path, "site-2rtx6-tp3ep2.config", 2, 20, "mockdual", True)
     assert result.returncode == 0, result.stderr
     assert len(launches) == 7, launches
-    coordinator, experts = launches[0], launches[1:]
-    assert "--placement-directory" in coordinator and "--dspark-draft-limit 7" in coordinator
+    experts, coordinator = launches[:6], launches[6]
+    assert "--placement-directory" not in coordinator and "--dspark-draft-limit 7" in coordinator
     assert "--kv-pool-size 5037542400" in coordinator and "--rtx-expert-layers 20" in coordinator
     for index, line in enumerate(experts):
         assert line.startswith("ssh ") and HOSTS[index] in line
-        assert f"--rank {index} " in line and "--world 6" in line and "--first-layer 20" in line
+        assert f"--rank {index} " in line and "--world 6" in line and "--first-layer" not in line
         assert f"--device-budget-bytes {BUDGET}" in line
     for line in launches:
         assert f"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP={DEVICE_MAP}" in line, line
         assert "CUTEAFD_PROTOCOL_V2_TCP_TIMING=1" in line, line
         assert "docker run" not in line and "build.sh" not in line
-    ack = calls.index(next(line for line in calls if "ready.json" in line))
+    admitted = calls.index(coordinator)
     health = calls.index(next(line for line in calls if "/health" in line))
     first_request = calls.index(next(line for line in calls if "/v1/chat/completions" in line))
-    assert calls.index(experts[-1]) < ack < health < first_request
+    assert calls.index(experts[-1]) < admitted < health < first_request
     binding = ROOT / "runs" / "tp-ep-six" / "gid-binding-mockdual.txt"
     assert binding.exists() and "gid_index=5" in binding.read_text()
     binding.unlink()
@@ -276,7 +291,7 @@ def test_mock_start_single_arm_orders_workers_first(tmp_path) -> None:
     assert "--placement-directory" not in coordinator and "--kv-pool-size" not in coordinator
     for index, line in enumerate(workers):
         assert line.startswith("ssh ") and HOSTS[index] in line
-        assert f"--rank {index} " in line and "--world 6" in line and "--first-layer 0" in line
+        assert f"--rank {index} " in line and "--world 6" in line and "--first-layer" not in line
     first_request = calls.index(next(line for line in calls if "/v1/chat/completions" in line))
     assert calls.index(workers[-1]) < calls.index(coordinator) < first_request
     binding = ROOT / "runs" / "tp-ep-six" / "gid-binding-mocksingle.txt"
@@ -299,23 +314,23 @@ def test_mock_start_single_rtx_local_count_acknowledges_once(tmp_path) -> None:
     coordinator = next(line for line in launches if "candidate-coordinator" in line)
     workers = [line for line in launches if "candidate-expert" in line]
     assert len(workers) == 6, launches
-    assert launches.index(coordinator) < launches.index(workers[0]), launches
+    assert launches.index(workers[-1]) < launches.index(coordinator), launches
     assert "--rtx-gpus 1" in coordinator
     assert "--rtx-expert-layers 5" in coordinator
-    assert "--placement-directory" in coordinator
+    assert "--placement-directory" not in coordinator
     assert "--spark-tp 6" in coordinator and "--spark-ep 1" in coordinator
     for index, line in enumerate(workers):
         assert line.startswith("ssh ") and HOSTS[index] in line
-        assert f"--rank {index} " in line and "--world 6" in line and "--first-layer 5" in line
+        assert f"--rank {index} " in line and "--world 6" in line and "--first-layer" not in line
         assert "--spark-tp 6" in line and "--spark-ep 1" in line
     # Exactly one coordinator start for the whole run.
     starts = [line for line in calls if "exec -d" in line and "candidate-coordinator-18000" in line]
     assert len(starts) == 1, starts
     # Exactly one plan acknowledgement, and it happens after the workers start.
     acks = [line for line in calls if "ready.json" in line and "plan.json" in line]
-    assert len(acks) == 1, acks
+    assert not acks, acks
     first_request = calls.index(next(line for line in calls if "/v1/chat/completions" in line))
-    assert calls.index(workers[-1]) < calls.index(acks[0]) < first_request
+    assert calls.index(workers[-1]) < calls.index(coordinator) < first_request
     binding = ROOT / "runs" / "tp-ep-six" / "gid-binding-mocktp6local.txt"
     binding.unlink(missing_ok=True)
     for path in (tmp_path / "calls.log.connected", tmp_path / "calls.log.timing"):
@@ -328,14 +343,14 @@ def test_tp6_dual_arm_is_approved_and_forwards_the_pure_topology(tmp_path) -> No
     result, calls, launches = _mock_start(tmp_path, "site-2rtx6-tp6ep1.config", 2, 20, "mocktp6", True)
     assert result.returncode == 0, result.stderr
     assert len(launches) == 7, launches
-    coordinator, experts = launches[0], launches[1:]
+    experts, coordinator = launches[:6], launches[6]
     assert "--spark-tp 6" in coordinator and "--spark-ep 1" in coordinator
     assert "--rtx-expert-layers 20" in coordinator and "--world 6" not in coordinator
     for index, line in enumerate(experts):
         assert line.startswith("ssh ") and HOSTS[index] in line
         assert f"--rank {index} " in line and "--world 6" in line
         assert "--spark-tp 6" in line and "--spark-ep 1" in line
-        assert "--first-layer 20" in line
+        assert "--first-layer" not in line
     binding = ROOT / "runs" / "tp-ep-six" / "gid-binding-mocktp6.txt"
     binding.unlink(missing_ok=True)
     for path in (tmp_path / "calls.log.connected", tmp_path / "calls.log.timing"):

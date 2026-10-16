@@ -222,23 +222,7 @@ impl LoadedCode {
     }
 }
 
-/// One GPU's measured inventory: one sample after the CUDA context, cuBLAS and
-/// the family's program modules, before any weight.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeSample {
-    pub device: i32,
-    /// CUDA total under the coordinator budget (what admission may use).
-    pub total_bytes: u64,
-    pub free_bytes: u64,
-    /// Device bytes not owned by this process's allocations: context, cuBLAS,
-    /// modules, and anything another process holds on the GPU.
-    pub context_bytes: u64,
-    /// Of `context_bytes`, the family's program modules (measured delta).
-    pub module_bytes: u64,
-    pub sms: u32,
-    pub arch: String,
-    pub driver: String,
-}
+pub use cuteafd_core::RuntimeSample;
 
 /// The programs a family launches: a prefix filter over the image's program
 /// manifest (`<family>_...` and its head-split `<family>2_...`), not every

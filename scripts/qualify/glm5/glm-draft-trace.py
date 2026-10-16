@@ -20,7 +20,7 @@ import argparse
 import json
 from collections import defaultdict
 
-# rows -> verify ms: dflash_policy.rs K4_TP4_STEP_MS (1 RTX PRO 6000 at 325 W + 4 Sparks TP4).
+# Historical rows -> verify ms (GLM 5.3 K4, 1 RTX PRO 6000 at 325 W + 4 Sparks TP4).
 K4_TP4 = [(1, 35.0), (2, 50.5), (3, 60.2), (4, 67.2), (5, 77.6), (6, 85.3), (7, 92.8), (8, 102.6)]
 
 
@@ -34,7 +34,7 @@ def interpolate(table, rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('trace')
-    parser.add_argument('--table', help='rows:ms,... verify-step table (default: K4_TP4_STEP_MS)')
+    parser.add_argument('--table', help='rows:ms,... verify-step table (default: historical K4_TP4 measurements)')
     parser.add_argument('--draft-ms', type=float, default=4.7, help='drafter step ms added to every cycle')
     args = parser.parse_args()
     table = K4_TP4 if not args.table else [tuple(map(float, p.split(':'))) for p in args.table.split(',')]

@@ -13,10 +13,10 @@ candidate_print_plan() {
   echo "run_id=$run_id"
   echo "topology tp=$spark_tp ep=$spark_ep world=$spark_world"
   echo "rtx_gpus=$rtx_gpus"
-  echo "first_layer=${resolved_first_layer:-pending}"
+  echo "ownership=coordinator-selected exact layer IDs"
   echo "budget_bytes=$SPARK_DEVICE_BUDGET_BYTES"
   echo "admission=$admission"
-  echo "expert_capacity=$expert_capacity (from PREFILL_BATCH_TOKENS=$PREFILL_BATCH_TOKENS)"
+  echo "worker_geometry=coordinator-selected typed model admission"
   echo "coordinator_container=$coordinator_container"
   echo "spark_container=$spark_container"
   echo "api_port=$api_port expert_port=$expert_port"
@@ -30,7 +30,6 @@ candidate_print_plan() {
   echo "artifact_contract=per-role daemon=$daemon_bin coordinator_lib=$coordinator_native_lib spark_lib=$spark_native_lib (per-host existence+arch verified on start; uniform Spark staging step below)"
   echo "wip_runtime_root=$wip_runtime_root"
   echo "coordinator_cuda_visible_devices=${coordinator_cuda_visible_devices:-unset} (coordinator container only)"
-  echo "placement_dir=$placement_dir"
   echo "expect_spark_lib_sha256=${expect_spark_lib_sha256:-unset}"
   echo "role_manifest=${role_manifest:-unset}"
   echo "qualified=$qualified require_arch=$require_arch"
@@ -43,29 +42,20 @@ candidate_print_plan() {
   for rank in "${!hosts[@]}"; do
     echo "PREREQ stage-$rank: host=${hosts[$rank]} install -D -m644 $spark_lib_source_host $spark_lib_stage_host && verify aarch64+sha; container reads $spark_native_lib (built source $spark_lib_source)"
   done
-  local planned_first="${resolved_first_layer:-<from-plan>}"
-  if [[ "$rtx_gpus" == 2 ]]; then
-    echo "STEP coordinator-start"
-    echo "CMD coordinator: $(coordinator_command_string)"
-    echo "STEP plan-read"
-    echo "CMD plan-read: docker exec $coordinator_container cat $placement_dir/plan.json"
-  fi
   for rank in "${!hosts[@]}"; do
     echo "STEP expert-start rank=$rank"
-    echo "CMD expert-$rank: $(expert_command_string "$rank" "${hosts[$rank]}" "$planned_first")"
+    echo "CMD expert-$rank: $(expert_command_string "$rank" "${hosts[$rank]}")"
   done
-  echo "STEP worker-ready"
+  echo "STEP worker-bootstrap-ready"
   for rank in "${!hosts[@]}"; do
-    echo "CMD worker-ready-$rank: host=${hosts[$rank]} log=$wip_runtime_root/$expert_process.log offset=<pre-start byte size> match='native local RoCE expert worker ready ... rank=$rank world=$spark_world first_layer=${resolved_first_layer:-<from-plan>}'"
+    echo "CMD worker-bootstrap-ready-$rank: host=${hosts[$rank]} log=$wip_runtime_root/$expert_process.log offset=<pre-start byte size> match='native worker bootstrap ready ... rank=$rank world=$spark_world'"
   done
-  if [[ "$rtx_gpus" == 1 ]]; then
-    echo "STEP coordinator-start"
-    echo "CMD coordinator: $(coordinator_command_string)"
-  fi
-  if [[ "$rtx_gpus" == 2 ]]; then
-    echo "STEP plan-ack"
-    echo "CMD plan-ack: docker exec $coordinator_container sh -c 'cp $placement_dir/plan.json $placement_dir/.ready-pending && mv $placement_dir/.ready-pending $placement_dir/ready.json'"
-  fi
+  echo "STEP coordinator-start"
+  echo "CMD coordinator: $(coordinator_command_string)"
+  echo "STEP worker-admission-ready"
+  for rank in "${!hosts[@]}"; do
+    echo "CMD worker-admission-ready-$rank: host=${hosts[$rank]} log=$wip_runtime_root/$expert_process.log offset=<pre-start byte size> match='coordinator-selected worker weights ready ... rank=$rank world=$spark_world layer_ids=<actual installed owners>' (or native empty expert worker ready)"
+  done
   echo "STEP readiness-gate"
   local probe_host="$listen_host"; [[ "$probe_host" != "0.0.0.0" ]] || probe_host=127.0.0.1
   echo "CMD readiness-api: curl -fsS http://$probe_host:$api_port/health && curl -fsS http://$probe_host:$api_port/v1/models"
