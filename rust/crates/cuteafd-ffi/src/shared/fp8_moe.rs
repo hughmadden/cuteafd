@@ -12,14 +12,13 @@ pub const FP8_MOE_LIBRARY: &str = "libcuteafd_fp8moe.so";
 /// The expert weight format a package reads (ABI word 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp8MoeWeights {
-    /// ABI 1: E4M3 with FP32 128x128 block scales.
+    /// Storage 1: E4M3 with FP32 128x128 block scales.
     Fp8,
-    /// ABI 2: packed E2M1 with UE8M0 scales per 32.
+    /// Storage 2: packed E2M1 with UE8M0 scales per 32.
     Mxfp4,
-    /// ABI 3 / 4: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each
+    /// Storage 4: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each
     /// scale region followed by the experts' FP32 `weight_scale_2` and
-    /// `input_scale`. Serving requires ABI 4: calibrated W4A4 at every row count;
-    /// ABI 3 is decoded only to identify and reject stale A16 packages.
+    /// `input_scale`. ABI v5 accepts calibrated W4A4 only, at every row count.
     Nvfp4 { w4a4: bool },
     /// Native BF16 row-major matrices; scale pointers are unused.
     Bf16,

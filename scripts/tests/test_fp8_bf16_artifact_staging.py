@@ -487,10 +487,12 @@ def test_explicit_activation_info_words(kind, storage, activation, code):
             package_tool.info_words(bad, [16], False)
 
 
-def test_package_requires_explicit_activation_contract(tmp_path):
+@pytest.mark.parametrize("field,value", [("activation", None), ("activation", "unknown"),
+                                         ("projection", "fp32"), ("abi_version", 4)])
+def test_package_requires_explicit_activation_contract(tmp_path, field, value):
     path = write_package(tmp_path / "package")
     manifest = json.loads((path / "manifest.json").read_text())
-    del manifest["layouts"]["tp4"]["activation"]
+    manifest["layouts"]["tp4"][field] = value
     (path / "manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="activation/projection ABI"):
         package_tool.verify(path)
