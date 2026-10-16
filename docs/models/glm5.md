@@ -146,6 +146,27 @@ failure, or general row/batch invariance. The earlier failures remain part
 of the record. Full tagged ready-ledger agreement and a new matched
 placement decision remain pending; Context stays the default.
 
+D-GLM is **decided: Context default, Layers explicit** after the 2026-10-17
+single matched decision pair on sealed `1bdda27c`. Layers ran first, then
+Context, with two lanes, plan rows 8, exactly 2,097,152 pool tokens, two
+RTX PRO 6000 GPUs and six expert ranks. Prompt hashes matched. Both passed
+quick fidelity, `cache_exact` and strict 10/10 IDs/raw-logit hashes.
+
+| Client measurement | Layers | Context | Layers / Context |
+| --- | ---: | ---: | ---: |
+| C1 code decode, tok/s | 45.77 | 47.70 | 0.96 |
+| C16 code decode, tok/s | 123.46 | 136.00 | 0.91 |
+| Cold 8K prefill, tok/s | 1,198.25 | 2,323.74 | 0.52 |
+| Cold 8K TTFT, s | 6.713 | 3.462 | 1.94 |
+
+These measurements are **provisional**: both arms retained fabric/foreign
+traffic A/B rerun flags, and Layers also reported sequence/retransmit
+warnings. They do not establish an accepted speedup or precise regression
+magnitude. The default-change bar (C1 at least 1.03, C16 at least 0.98) was
+not met; there is no reason to change Context or repeat this campaign.
+Default-three-lane Context performance and full ready-memory agreement
+are not qualified by this two-lane decision pair.
+
 ## Known limits
 
 <!-- release-v2-limits -->
