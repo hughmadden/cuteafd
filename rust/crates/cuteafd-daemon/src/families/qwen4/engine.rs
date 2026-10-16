@@ -1351,7 +1351,7 @@ impl<'a> Qwen4Engine<'a> {
         let mut sequences = vec![tokens[32..69].to_vec()];
         let before_rows = sequences[0].len();
         let limit = self.copy_verify_row_limit(before_rows, sequences.len(), false);
-        super::serve::trim_copy_rows(&mut sequences, limit);
+        crate::shared::qwen::scheduler::trim_copy_rows(&mut sequences, limit);
         let input = sequences[0].as_slice();
         ensure!(before_rows == 37 && input.len() == 32 && input == &tokens[32..64],
             "Qwen copy trim byte gate must preserve the 37->32 proposal prefix");
