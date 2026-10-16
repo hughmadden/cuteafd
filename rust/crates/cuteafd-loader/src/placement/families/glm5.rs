@@ -113,11 +113,19 @@ pub fn context_buffers(cfg: &GlmDsaConfig, extent: u64, prefill_rows: u64, lanes
 }
 
 /// The `context` programs a manifest carries (PROGRAMS.json), as [`context_programs`].
-pub fn manifest_context(manifest: &serde_json::Value) -> Option<GlmContext> {
+pub fn manifest_context(manifest: &serde_json::Value, sms: usize,
+    plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Option<GlmContext> {
     let programs = manifest["programs"].as_array()?;
+    let lookup = |name: &str| programs.iter().find(|p| p["name"].as_str() == Some(name))
+        .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0));
     let names = programs.iter().filter_map(|p| p["name"].as_str());
-    context_programs(names, |name| programs.iter().find(|p| p["name"].as_str() == Some(name))
-        .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0)))
+    let mut context = context_programs(names, lookup)?;
+    context.partial_scratch = [0, 32].into_iter().map(|begin| {
+        let name = cuteafd_core::coordinator_programs::attention_partial_program(
+            manifest, "glm", begin, DECODE_ROWS as usize, sms, plan).ok()?;
+        lookup(&name)
+    }).collect::<Option<Vec<_>>>()?.into_iter().max()?;
+    Some(context)
 }
 
 /// [`context_workspace`]'s bytes with the engine's allocation floor.
@@ -307,8 +315,6 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             if inputs.drafter_bytes > 0 {
                 rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Drafter, "drafter owned storage",
                     inputs.drafter_bytes, Basis::Formula)));
-                rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Drafter, "drafter load staging",
-                    inputs.drafter_staging, Basis::Formula)));
             }
         }
         pool_overhead.push(table_bytes);
@@ -338,6 +344,11 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             _ => vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
         },
     }).collect();
+    let startup = if inputs.drafter_staging > 0 {
+        vec![Demand::new(0, Category::Drafter, "drafter packing peak",
+            inputs.drafter_bytes.checked_add(inputs.drafter_staging)
+                .ok_or(PlacementError::Overflow("GLM drafter packing peak"))?, Basis::Formula)]
+    } else { Vec::new() };
     let cards: Vec<_> = inputs.gpus.iter().map(|g| g.0).collect();
     Ok(PlacementRequest {
         pool_bounded: Vec::new(),
@@ -350,7 +361,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: 1 << 31, ..PoolPolicy::resolve(&cards, inputs.max_context,
             inputs.requested_pool, PAGE_ROWS, inputs.spark_ranks == 0) },
-        layers, pool_overhead, fixed, startup: Vec::new(), movables: Vec::new(),
+        layers, pool_overhead, fixed, startup, movables: Vec::new(),
         expert_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.expert_workspace } else { 0 },
         tp2_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.tp2_workspace } else { [0; 2] },
         minimum_expert_layers: 0,
@@ -1748,6 +1759,25 @@ mod tests {
     }
 
     #[test]
+    fn drafter_packing_peak_is_checked_but_not_retained_beside_pool() {
+        let cfg = config();
+        let mut i = inputs(&cfg, &[96 * GIB; 2]);
+        i.drafter_bytes = 3 * GIB;
+        let steady = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).unwrap().0;
+        i.drafter_staging = 432 << 20;
+        let request = request(&i).unwrap();
+        assert_eq!(request.startup.len(), 1);
+        assert_eq!(request.startup[0].bytes, 3 * GIB + (432 << 20));
+        assert_eq!(request.fixed.iter().filter(|d| d.category == Category::Drafter)
+            .map(|d| d.bytes).sum::<u64>(), 3 * GIB);
+        let with_staging = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).unwrap().0;
+        assert_eq!(with_staging.pool_tokens, steady.pool_tokens);
+        i.drafter_staging = 96 * GIB;
+        assert!(matches!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)),
+            Err(PlacementError::StartupPeak { gpu: 0, .. })));
+    }
+
+    #[test]
     fn context_programs_need_every_primitive() {
         let names = ["glm_scored_index_topk_decode_m64", "glm_dsa_candidate_merge", "glm_lse_combine2",
             "glm_paged_staging_gather_kv", "glm_paged_staging_gather_index", "glm_sparse_mla_partial_h0_s2_m64",
@@ -1758,6 +1788,38 @@ mod tests {
         for missing in names[..5].iter().chain(&names[5..6]) {
             let kept: Vec<_> = names.iter().copied().filter(|n| n != missing).collect();
             assert_eq!(context_programs(kept.iter().copied(), |n| kept.contains(&n).then_some(1)), None, "{missing}");
+        }
+    }
+
+    #[test]
+    fn context_manifest_scratch_matches_runtime_partial_recipe_for_every_plan() {
+        use cuteafd_core::coordinator_programs::{attention_partial_program, AttentionReductionPlan};
+        let mut programs: Vec<_> = CONTEXT_PROGRAMS.iter().map(|name|
+            serde_json::json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 70}})).collect();
+        for begin in [0, 32] {
+            for (splits, caps170, caps188, bytes) in [(2, vec![64], vec![64], 100),
+                (4, vec![1, 8], vec![1], 900), (8, vec![], vec![8], 1800)] {
+                programs.push(serde_json::json!({
+                    "name": format!("glm_sparse_mla_partial_h{begin}_s{splits}_m64"),
+                    "params": {"device_sm_counts": [170, 188],
+                        "row_caps": {"170": caps170, "188": caps188}},
+                    "scratch_bytes_at_capacity": {"scratch": bytes}}));
+            }
+        }
+        let manifest = serde_json::json!({"programs": programs});
+        for sms in [170, 188] {
+            for rows in 1..=64 {
+                let plan = AttentionReductionPlan::new(64, None, Some(rows)).unwrap();
+                let selected = manifest_context(&manifest, sms, &plan).unwrap();
+                let runtime_scratch = [0, 32].into_iter().map(|begin| {
+                    let name = attention_partial_program(&manifest, "glm", begin, 64, sms, &plan).unwrap();
+                    manifest["programs"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap()
+                        ["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap()
+                }).max().unwrap();
+                assert_eq!(selected, GlmContext { topk_scratch: 70, partial_scratch: runtime_scratch });
+                assert_eq!(selected.partial_scratch, if rows == 1 || (rows <= 8 && sms == 170) { 900 }
+                    else if rows <= 8 { 1800 } else { 100 });
+            }
         }
     }
 

@@ -441,6 +441,28 @@ impl Opened {
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
         let max_context = crate::shared::context::pool_context("glm5", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
+        // Pack before allocating the serving pool and expert arenas: the load-phase
+        // admission peak is above the same resident target-weight baseline.
+        let drafter = if let Some(snapshot) = &args.draft {
+            let started = Instant::now();
+            let cfg = dflash::DflashConfig::read(snapshot)?;
+            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
+            let mask = embedding.host_rows(&[cfg.mask_token])?;
+            tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
+            let file = draft_file.context("drafter prefetch")?.join()
+                .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
+            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
+                ::from_fp8_option(args.draft_fp8);
+            let drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+                args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
+                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16)?;
+            // Admission includes the shared drafter's maximum serving workspace.
+            drafter.prepare_workspace()?;
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+                draft_head = "tensor", "DFlash2 drafter resident");
+            Some(drafter)
+        } else { None };
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, prefill_lanes, context.filter(|_| context_kv))?;
         engine.spark_bf16 = cuteafd_loader::plan::Checkpoint::inventory(&self.snapshot)?.spark_input_is_bf16();
@@ -483,24 +505,7 @@ impl Opened {
         if args.skip_routed_experts {
             engine.skip_routed_experts()?;
         }
-        if let Some(snapshot) = &args.draft {
-            let started = Instant::now();
-            let cfg = dflash::DflashConfig::read(snapshot)?;
-            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
-                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
-            let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
-            tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
-            let file = draft_file.context("drafter prefetch")?.join()
-                .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
-                ::from_fp8_option(args.draft_fp8);
-            let drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
-                args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16)?;
-            engine.drafter = Some(drafter);
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
-                draft_head = "tensor", "DFlash2 drafter resident");
-        }
+        engine.drafter = drafter;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(),
             active_drafts = ?engine.attention_plan.active_drafts(), "immutable attention reduction plan");

@@ -347,7 +347,7 @@ pub(crate) struct PlanArgs {
     /// GLM Flash draft head arithmetic; it borrows the target's resident copy.
     #[arg(long, value_enum, default_value = "exact")]
     pub(crate) draft_head: crate::families::glm5::DraftHead,
-    /// Qwen immutable attention scratch override.
+    /// Immutable GLM/Qwen attention scratch override.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub(crate) attention_plan_rows: Option<usize>,
     /// External drafter GiB on the last GPU for --layout (DFlash).

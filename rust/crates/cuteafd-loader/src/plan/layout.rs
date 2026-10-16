@@ -92,6 +92,7 @@ pub struct LayoutOptions {
     pub glm5_drafter_snapshot: Option<std::path::PathBuf>,
     pub glm5_drafter_disabled: bool,
     pub glm5_draft_bf16: bool,
+    pub glm5_attention_plan_rows: Option<usize>,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
     /// Concurrent sequences (state slots = concurrency + 2).
@@ -183,6 +184,7 @@ impl Default for LayoutOptions {
             glm5_drafter_snapshot: None,
             glm5_drafter_disabled: false,
             glm5_draft_bf16: false,
+            glm5_attention_plan_rows: None,
             headroom_bytes: 2 * GIB,
             concurrency: 0,
             state_slots: None,
@@ -1519,8 +1521,8 @@ fn glm5_placement(report: &PlanReport, input: &super::PlanInput, options: &Layou
     let mut lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
         else { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 });
     if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) { lanes = lanes.min(2); }
-    let (draft, draft_staging) = if options.glm5_drafter_disabled { (0, 0) }
-        else if options.drafter_bytes > 0 { (options.drafter_bytes, 0) }
+    let (draft, draft_staging, active_drafts) = if options.glm5_drafter_disabled { (0, 0, None) }
+        else if options.drafter_bytes > 0 { (options.drafter_bytes, 0, None) }
         else {
             let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
@@ -1529,11 +1531,25 @@ fn glm5_placement(report: &PlanReport, input: &super::PlanInput, options: &Layou
             }).ok_or_else(|| anyhow::anyhow!("GLM drafter config unavailable; pass its snapshot, --drafter-gib, or disable speculation"))?;
             let sequences = options.draft_sequences as usize;
             let slots = options.draft_context_slots.unwrap_or(20.max(options.draft_sequences)) as usize;
+            let config = super::checkpoint::read_json(&snapshot.join("config.json"))?;
+            let (_, block) = crate::families::glm5::draft_representation::draft_geometry(&config)?;
+            let drafts = usize::try_from(block)?.checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("GLM draft block must include an anchor"))?;
             (glm::drafter_bytes(&snapshot, slots, sequences,
                 options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as u64,
-                options.glm5_draft_bf16)?, glm::drafter_staging(&snapshot, slots, sequences, options.glm5_draft_bf16)?)
+                options.glm5_draft_bf16)?, glm::drafter_staging(&snapshot, slots, sequences, options.glm5_draft_bf16)?, Some(drafts))
         };
-    let scratch = manifest.map(|m| -> anyhow::Result<_> {
+    let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
+    let selected_manifest = manifest.map(|m| -> anyhow::Result<_> {
+        let mut selected = m.clone();
+        let family = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm",
+            split_family: (devices.len() == 2).then_some("glm2") };
+        cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, attention_plan,
+            |name| family.contains(name))?;
+        Ok(selected)
+    }).transpose()?;
+    let scratch = selected_manifest.as_ref().map(|m| -> anyhow::Result<_> {
         let mut scratch = glm::manifest_scratch(&cfg, devices.len() == 2, m)?;
         if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
             let whole = glm::manifest_scratch(&cfg, false, m)?;
@@ -1558,7 +1574,9 @@ fn glm5_placement(report: &PlanReport, input: &super::PlanInput, options: &Layou
         experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()), expert_workspace: 0,
         tp2_workspace, requested_pool: options.pool_tokens,
         onboard, full_prefill_logits: options.full_prefill_logits,
-        context: manifest.and_then(glm::manifest_context) };
+        context: selected_manifest.as_ref().and_then(|m| glm::manifest_context(m,
+            options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
+                "sm_120", options.rtx_bytes[0]).sms) as usize, &attention_plan)) };
     // Auto resolves in the solver (context where the build carries its programs), as at runtime.
     Ok(glm::solve_working_set(&inputs, serial_workspace, report.requested_attention)?)
 }

@@ -86,48 +86,9 @@ pub(crate) fn combine_order<T>(rank: usize, own: T, received: T) -> [T; 2] {
     if rank == 0 { [own, received] } else { [received, own] }
 }
 
-/// The `{family}_sparse_mla_partial_h{begin}_s{N}_m{rows}` variants a GPU with `sms` SMs runs,
-/// as (row cap, program) ascending: the exporter's split plan per (SM count, row cap)
-/// (`row_caps`; a variant without it serves the full `rows` of its `device_sm_counts`), else
-/// the one variant. These caps describe numerical plan alternatives, not live row limits.
-fn partial_programs(manifest: &serde_json::Value, family: &str, begin: usize, rows: usize, sms: usize)
-    -> Result<Vec<(usize, String)>> {
-    let programs = manifest["programs"].as_array().context("program manifest")?;
-    let prefix = format!("{family}_sparse_mla_partial_h{begin}_s");
-    let suffix = format!("_m{rows}");
-    let variants: Vec<&serde_json::Value> = programs.iter()
-        .filter(|p| p["name"].as_str().is_some_and(|n| n.starts_with(&prefix) && n.ends_with(&suffix))).collect();
-    let mut out: Vec<(usize, String)> = Vec::new();
-    for p in &variants {
-        let name = p["name"].as_str().context("program name")?.to_string();
-        let caps: Vec<usize> = match p["params"]["row_caps"].get(sms.to_string()) {
-            Some(caps) => caps.as_array().context("row caps")?.iter().filter_map(|c| c.as_u64().map(|c| c as usize)).collect(),
-            None if p["params"]["device_sm_counts"].as_array()
-                .is_some_and(|sm| sm.iter().any(|s| s.as_u64() == Some(sms as u64))) => vec![rows],
-            None => Vec::new(),
-        };
-        out.extend(caps.into_iter().map(|cap| (cap, name.clone())));
-    }
-    if out.is_empty() && variants.len() == 1 {
-        out.push((rows, variants[0]["name"].as_str().context("program name")?.to_string()));
-    }
-    out.sort();
-    out.dedup_by_key(|(cap, _)| *cap);
-    ensure!(out.last().is_some_and(|(cap, _)| *cap >= rows), "no {prefix}*{suffix} variant planned for {sms} SMs at {rows} rows");
-    Ok(out)
-}
-
-/// Select once at load, using numerical plan rows rather than live execution rows.
-/// Every exported alternative has the same full execution capacity in its name.
-pub(crate) fn partial_program(manifest: &serde_json::Value, family: &str, begin: usize,
-    execution_capacity_rows: usize, sms: usize,
-    plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<String> {
-    ensure!(plan.capacity_rows() <= execution_capacity_rows,
-        "attention numerical domain exceeds execution capacity");
-    let partials = partial_programs(manifest, family, begin, execution_capacity_rows, sms)?;
-    partials.into_iter().find(|(cap, _)| *cap >= plan.rows()).map(|(_, name)| name)
-        .context("attention plan has no partial reduction recipe")
-}
+pub(crate) use cuteafd_core::coordinator_programs::attention_partial_program as partial_program;
+#[cfg(test)]
+use cuteafd_core::coordinator_programs::attention_partial_programs as partial_programs;
 
 /// One cache plane within an ownership unit. Its row coordinates can differ
 /// from token coordinates (pooled index keys use one row per four tokens).

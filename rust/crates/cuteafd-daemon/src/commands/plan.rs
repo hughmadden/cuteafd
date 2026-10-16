@@ -86,6 +86,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glm5_drafter_disabled: args.no_speculator || args.speculator == "off",
                 glm5_drafter_snapshot: args.drafter_snapshot.clone(),
                 glm5_draft_bf16: args.glm5_draft_bf16,
+                glm5_attention_plan_rows: args.attention_plan_rows,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
             })
@@ -936,13 +937,15 @@ mod tests {
         use clap::Parser;
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout",
             "--mimo-prefix-draft", "--rings", "20", "--draft-sequences", "8",
-            "--draft-context-slots", "25"]).unwrap();
+            "--draft-context-slots", "25", "--attention-plan-rows", "8"]).unwrap();
         let crate::cli::Commands::Plan(args) = cli.command else { unreachable!() };
         let layout = options(&args).unwrap().layout.unwrap();
         assert!(layout.mimo_prefix_draft);
         assert_eq!(layout.mimo_rings, 20);
         assert_eq!(layout.draft_sequences, 8);
         assert_eq!(layout.draft_context_slots, Some(25));
+        assert_eq!(layout.glm5_attention_plan_rows, Some(8));
+        assert_eq!(layout.qwen_attention_plan_rows, Some(8));
     }
 
     #[test]
