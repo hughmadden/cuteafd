@@ -1417,6 +1417,41 @@ mod tests {
     }
 
     #[test]
+    fn publish_keeps_superseded_images_and_data_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), format!("{RESULTS_BEGIN}\n{RESULTS_END}\n")).unwrap();
+        let current = marked("current-min", 1, None);
+        let old = marked("superseded-min", 1, None);
+        for p in [&current, &old] {
+            let dir = root.path().join(&p.dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("report.json"), serde_json::to_vec(&p.report).unwrap()).unwrap();
+        }
+        let archive = root.path().join(&old.dir);
+        std::fs::write(archive.join("card.svg"), "archived image, not a rendering under today's rule").unwrap();
+        let before = tree(&archive);
+        let mut cells = v41();
+        cells[1].report = Some(current.dir.clone());
+        let matrix = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
+            "deepseek-ai/DeepSeek-V4.1-Flash", cells)]);
+        let (readme, index, _) = publish(root.path(), &[], &matrix).unwrap();
+        assert_eq!(tree(&archive), before);
+        assert!(!std::fs::read_to_string(&readme).unwrap().contains("superseded-min"));
+        assert!(std::fs::read_to_string(index).unwrap().contains("superseded-min"));
+        // Refusing a missing pin must also leave both current and archived exports alone.
+        let current_dir = root.path().join(&current.dir);
+        std::fs::write(current_dir.join("card.svg"), "not yet rerendered").unwrap();
+        let before_current = tree(&current_dir);
+        let mut missing = v41();
+        missing[1].report = Some("benchmarks/deepseek_v41/missing-min".into());
+        let matrix = write_matrix(root.path(), &[MatrixRow::new("deepseek_v41",
+            "deepseek-ai/DeepSeek-V4.1-Flash", missing)]);
+        assert!(publish(root.path(), &[], &matrix).is_err());
+        assert_eq!(tree(&current_dir), before_current);
+        assert_eq!(tree(&archive), before);
+    }
+
+    #[test]
     fn checked_in_matrix_resolves_one_pinned_card_per_pro_cell() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let placed = scan(&root).unwrap();
