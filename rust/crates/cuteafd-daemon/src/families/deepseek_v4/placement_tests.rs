@@ -477,7 +477,7 @@ fn planner_equals_runtime_deepseek_v4() {
     if std::env::var_os(CHILD).is_none() {
         // Bound real-checkpoint/FUSE work without dropping any of the 80 cases.
         let started = std::time::Instant::now();
-        let output = std::process::Command::new("timeout").args(["--kill-after=5s", "120s"])
+        let output = std::process::Command::new("timeout").args(["--kill-after=5s", "300s"])
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", "families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4",
                 "--nocapture", "--test-threads=1"])
@@ -499,9 +499,12 @@ fn planner_equals_runtime_deepseek_v4() {
     let budget = (95.5 * (1u64 << 30) as f64) as u64;
     // One open per checkpoint for all 40 of its cases: the plan and the runtime
     // admission both read its shard headers and routed-expert catalog.
-    let flash = Shared::open(&flash).unwrap();
-    let pro = Shared::open(&pro).unwrap();
     let sweep_started = std::time::Instant::now();
+    eprintln!("live V4 equality: opening Flash checkpoint {}", flash.display());
+    let flash = Shared::open(&flash).unwrap();
+    eprintln!("live V4 equality: opening Pro checkpoint {} after {:?}", pro.display(), sweep_started.elapsed());
+    let pro = Shared::open(&pro).unwrap();
+    eprintln!("live V4 equality: checkpoints ready after {:?}", sweep_started.elapsed());
     let mut cases = 0;
     for context in [131_072u64, 1_048_576] {
         for (model, shared, rtx, sparks) in [("flash", &flash, 1, 2), ("flash", &flash, 2, 4),
@@ -514,6 +517,8 @@ fn planner_equals_runtime_deepseek_v4() {
                     let case = Case { snapshot, manifest: &manifest, rtx, sparks, context, budget,
                         onboard, dspark: true, exchange_f32: asymmetric,
                         peer_budget: asymmetric.then_some(budget - (2 << 30)), attention: None };
+                    eprintln!("live V4 equality: starting case {} after {:?}: {model} rtx{rtx} {context} {onboard:?} asym={asymmetric}",
+                        cases + 1, sweep_started.elapsed());
                     let placement = assert_equal(shared, &case, &format!("{model} rtx{rtx} {context} {onboard:?} asym={asymmetric}"));
                     cases += 1;
                     if rtx == 2 {
