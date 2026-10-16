@@ -1,0 +1,205 @@
+//! Dense-target binding of the shared block drafter and online draft policy.
+use super::{engine::{DenseEngine, DrafterBytes}, GoldenArgs};
+use crate::families::glm5::dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS};
+use crate::shared::{draft::{binding, clock::RoundTimes, evidence::{Censor, DraftSource, Evidence}, routes::RoundRoutes},
+    fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{block_dspark::{self, DsparkConfig, DsparkDrafter},
+        target::{verify_commit, AcceptedPrefix, VerifyRequest, VerifyRow}}};
+use anyhow::{ensure, Context, Result};
+use cuteafd_core::{verify_dspark_greedy_vocab, DraftCandidate, DraftPolicy, LayerResource, PolicyGeometry,
+    PolicySeed, ResourceClass};
+use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer, NativeLibrary};
+use cuteafd_loader::{families::{glm5::draft_representation::{block_dspark_resident_bytes, GlmDraftRepresentation},
+    qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint};
+use std::time::{Duration, Instant};
+
+fn policy(layers: usize, block: usize) -> Result<DraftPolicy> {
+    Ok(DraftPolicy::seeded(PolicyGeometry {
+        layers: vec![LayerResource { class: None, slice_bytes: 0., group_rows: 1, timed: false }; layers],
+        group_rows_by_rows: vec![], experts: 0, topk: 0, max_requests: 1, max_positions: block,
+        widths: vec![block], classes: vec![ResourceClass::rtx()], regimes: 1,
+    }, PolicySeed::weak(block))?)
+}
+
+fn argmax(row: &[f32]) -> Result<u32> {
+    ensure!(!row.is_empty() && row.iter().all(|value| value.is_finite()), "nonfinite dense posterior");
+    Ok(row.iter().enumerate().max_by(|(i, a), (j, b)| a.total_cmp(b).then_with(|| j.cmp(i)))
+        .context("empty dense posterior")?.0 as u32)
+}
+
+fn top_margin(row: &[f32], best: u32) -> (f32, Vec<u32>) {
+    let top = row[best as usize];
+    let second = row.iter().enumerate().filter(|&(index, _)| index != best as usize)
+        .map(|(_, &value)| value).fold(f32::NEG_INFINITY, f32::max);
+    (top - second, row.iter().enumerate().filter(|(_, value)| **value == top)
+        .map(|(index, _)| index as u32).collect())
+}
+
+fn micros(duration: Duration) -> u64 { duration.as_micros().min(u128::from(u64::MAX)) as u64 }
+
+/// Opt-in fixed-length numerical check, not a serving benchmark. Both arms
+/// deliberately continue through EOS so they compare exactly `count` tokens.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, programs: &'a Programs<'a>,
+    checkpoint: &'a Checkpoint, cfg: &Qwen35Config, prompt: &[u32], count: usize) -> Result<()> {
+    ensure!(count > 0 && !prompt.is_empty(), "spec decode needs a prompt and positive token count");
+    let snapshot = args.draft.as_ref().context("spec decode requires --draft")?;
+    block_dspark::check_checkpoint(snapshot, cfg.hidden, cfg.vocab, cfg.attention.len())?;
+    let draft_cfg = DsparkConfig::read(snapshot)?;
+    ensure!(draft_cfg.window.is_none(), "dense golden expects checkpoint-native full-context drafting");
+    let required = prompt.len().checked_add(count).and_then(|n| n.checked_add(draft_cfg.block))
+        .context("dense draft context size overflow")?;
+    ensure!(required <= cfg.max_context, "spec decode exceeds target checkpoint context");
+    let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+    // Full checkpoint context is charged before target pool selection; no
+    // diagnostic-sized truncation is allowed to masquerade as serving admission.
+    let (owned, scratch) = block_dspark_resident_bytes(&config, 1, 1, library.sm_count()? as u64,
+        GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context)?;
+    let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
+        Some(DrafterBytes { owned, scratch }), 1, None)?;
+    ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
+    if args.verify_check { engine.verify_check(prompt)?; }
+    let plain = (|| -> Result<(Vec<u32>, Duration, Vec<(f32, Vec<u32>)>)> {
+        let mut last = vec![];
+        for chunk in prompt.chunks(args.prefill_chunk) { last = engine.evaluate(chunk, |_, _| Ok(()))?; }
+        let mut next = argmax(&last[last.len() - cfg.vocab..])?;
+        let mut output = vec![next];
+        let mut margins = vec![top_margin(&last[last.len() - cfg.vocab..], next)];
+        let start = Instant::now();
+        while output.len() < count {
+            let logits = engine.evaluate(&[next], |_, _| Ok(()))?;
+            next = argmax(&logits)?;
+            margins.push(top_margin(&logits, next));
+            output.push(next);
+        }
+        Ok((output, start.elapsed(), margins))
+    })()?;
+    // Normal evaluation invalidates target marks; use a fresh executor rather
+    // than reconstructing the recurrent state or reusing a stale mark.
+    drop(engine);
+    let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
+        Some(DrafterBytes { owned, scratch }), 1, None)?;
+    let stream = engine.target_stream().raw;
+    let weights = block_dspark::prefetch(snapshot);
+    let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
+    let drafter = DsparkDrafter::load_admitted(library, snapshot,
+        weights.join().map_err(|_| anyhow::anyhow!("draft tensor loader panicked"))??,
+        stream, 1, 1, mask, GlmDraftRepresentation::Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
+        cfg.max_context)?;
+    drafter.prepare_workspace()?;
+    let mut last = vec![];
+    let mut position = 0;
+    for chunk in prompt.chunks(args.prefill_chunk.min(TAP_ROWS)) {
+        last = engine.evaluate(chunk, |layer, hidden| {
+            if drafter.tap_index(layer).is_some() {
+                // SAFETY: evaluate retains its live post-block buffer through
+                // this callback; capture reads on the same producer stream.
+                drafter.tap_streams_at(layer, hidden.ptr, 1, 0, chunk.len(), 0)?;
+            }
+            Ok(())
+        })?;
+        let rows: Vec<_> = (0..chunk.len()).map(|tap_row| ContextRow { tap_row, slot: 0,
+            position: position + tap_row }).collect();
+        drafter.update(&rows)?;
+        engine.target_stream().drain()?;
+        position += chunk.len();
+    }
+    let mut next = argmax(&last[last.len() - cfg.vocab..])?;
+    let mut output = vec![next];
+    let mut policy = policy(cfg.attention.len(), draft_cfg.block)?;
+    let mut routes = RoundRoutes::new(cfg.attention.len(), 0);
+    let (mut cycles, mut proposed, mut accepted) = (0usize, 0usize, 0usize);
+    let (mut draft_time, mut verify_time) = (Duration::ZERO, Duration::ZERO);
+    let started = Instant::now();
+    while output.len() < count {
+        let round_start = Instant::now();
+        let position = engine.position;
+        let draft_start = Instant::now();
+        let embedding = engine.token_embedding();
+        let device_id = engine.target_stream().device.id;
+        let head = TargetHead::Launch(Box::new(|hidden, logits, rows, actual_stream| {
+            ensure!(actual_stream == stream, "dense draft head stream differs from target");
+            engine.target_head(CuteafdDeviceBuffer { ptr: hidden.cast_mut(), bytes: rows * cfg.hidden * 2,
+                device_id, ..CuteafdDeviceBuffer::default() }, CuteafdDeviceBuffer { ptr: logits.cast(),
+                bytes: rows * cfg.vocab * 4, device_id, ..CuteafdDeviceBuffer::default() }, rows)?;
+            Ok(())
+        }));
+        let draft = drafter.draft_device(&[DraftSeq { slot: 0, anchor: next, position, valid_from: 0 }],
+            embedding, head)?.remove(0);
+        let draft_elapsed = draft_start.elapsed();
+        draft_time += draft_elapsed;
+        let confidence: Vec<_> = draft.confidence.iter().map(|&value| f64::from(value)).collect();
+        let candidates = [DraftCandidate { id: 0, confidence: &confidence }];
+        let room = count - output.len();
+        let selection = policy.select_within(false, &candidates, draft_cfg.block, (room + 1).min(64))?;
+        let want = selection.as_ref().map_or(policy.cold_drafts(), |s| s.lengths[0])
+            .min(draft.tokens.len()).min(room.saturating_sub(1));
+        let inputs: Vec<_> = std::iter::once(next).chain(draft.tokens[..want].iter().copied()).collect();
+        let rows: Vec<_> = inputs.iter().enumerate().map(|(index, &token)| VerifyRow {
+            slot: 0, position: position + index, token: Some(token) }).collect();
+        let verify_start = Instant::now();
+        let result = verify_commit(&mut engine, &[0], VerifyRequest { rows: &rows, tap_layers: &draft_cfg.taps }, |verified| {
+            let logits = verified.logits.to_host(library)?;
+            let target = logits.chunks_exact(cfg.vocab).map(argmax).collect::<Result<Vec<_>>>()?;
+            let result = verify_dspark_greedy_vocab(&inputs, &target, None, room, cfg.vocab)
+                .map_err(anyhow::Error::msg)?;
+            // SAFETY: borrowed taps stay valid through this consumer and the
+            // producer stream orders their copies before target commit/reuse.
+            unsafe { drafter.capture_target_taps(verified.taps, 0, rows.len(), 0)?; }
+            let retained = result.accepted_inputs as usize;
+            Ok((result, vec![AcceptedPrefix { slot: 0, rows: retained }]))
+        })?;
+        let retained = result.accepted_inputs as usize;
+        let context: Vec<_> = (0..retained).map(|tap_row| ContextRow { tap_row, slot: 0,
+            position: position + tap_row }).collect();
+        drafter.update(&context)?;
+        engine.target_stream().drain()?;
+        verify_time += verify_start.elapsed();
+        proposed += want;
+        accepted += retained - 1;
+        cycles += 1;
+        next = *result.emitted.last().context("verify emitted no correction/bonus")?;
+        output.extend(&result.emitted);
+        routes.begin(inputs.len());
+        for layer in 0..cfg.attention.len() { routes.dense(layer)?; }
+        let requests = [binding::RoundRequest { id: 0, rows: inputs.len(), accepted: retained,
+            source: DraftSource::Neural, evidence: Some(Evidence::Head(&confidence)),
+            censor: result.length_limit.then_some(Censor::OutputLimit) }];
+        binding::observe(&mut policy, &binding::RoundRecord { shared: false, requests: &requests,
+            routes: &routes, layer_us: &vec![None; cfg.attention.len()],
+            times: RoundTimes { total_us: micros(round_start.elapsed()), draft_us: Some(micros(draft_elapsed)) },
+            draft: Some(binding::DraftPass { width: draft_cfg.block, requests: Some(1) }),
+            predicted: selection.as_ref().map(|selection| selection.predicted_us) })?;
+    }
+    let elapsed = started.elapsed();
+    let same = plain.0.iter().zip(&output).take_while(|(a, b)| a == b).count();
+    println!("dense spec decode: {same}/{count} greedy tokens identical; accepted {accepted}/{proposed} drafts, {cycles} cycles");
+    println!("plain {:.2} tok/s; dSpark {:.2} tok/s; draft {:.3} ms/cycle, verify+commit {:.3} ms/cycle (diagnostic host posterior)",
+        count.saturating_sub(1) as f64 / plain.1.as_secs_f64(), count.saturating_sub(1) as f64 / elapsed.as_secs_f64(),
+        1000. * draft_time.as_secs_f64() / cycles.max(1) as f64,
+        1000. * verify_time.as_secs_f64() / cycles.max(1) as f64);
+    ensure!(output.len() == count, "dense speculative output length differs");
+    if same < count {
+        let (margin, tied) = &plain.2[same];
+        println!("first mismatch token {same}: plain {}, dSpark {}, target top-2 margin {margin:.8}, tied top IDs {tied:?}",
+            plain.0[same], output[same]);
+        let tie_broken = *margin == 0. && tied.contains(&output[same]);
+        ensure!(tie_broken, "non-tie dense speculative mismatch at generated token {same}");
+        println!("dense speculative mismatch is tie-broken at the common-prefix target posterior; suffix equality is not claimed");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dense_draft_binding_uses_empty_route_geometry_and_checkpoint_vocabulary() {
+        let policy = policy(64, 7).unwrap();
+        assert_eq!(policy.widths(), &[7]);
+        assert_eq!(argmax(&[2., 2., 1.]).unwrap(), 0);
+        assert_eq!(top_margin(&[2., 2., 1.], 0), (0., vec![0, 1]));
+        assert_eq!(top_margin(&[3., 2., 1.], 0), (1., vec![0]));
+        assert!(argmax(&[f32::NAN]).is_err());
+        assert!(argmax(&[]).is_err());
+    }
+}

@@ -449,7 +449,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
         pool_bounded: Vec::new(),
         inventory: Inventory { gpus, spark_ranks: inputs.spark_ranks, peer_access: ranks == 2 },
         pool,
-        layers: demands, pool_overhead, fixed, movables: Vec::new(),
+        layers: demands, pool_overhead, fixed, startup: Vec::new(), movables: Vec::new(),
         attention_placement: None, context_buffers: Default::default(), layers_first_gpu: 0,
         expert_workspace: inputs.expert_workspace, tp2_workspace,
         minimum_expert_layers: 0,

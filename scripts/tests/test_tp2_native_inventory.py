@@ -132,8 +132,10 @@ def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
     engine = (family / "engine.rs").read_text()
     assert 'routes.trace_identity("glmf-tp2-routes")' in engine
     assert 'exchange.trace_identity("glmf-target-main")' in engine
-    assert 'exchange.trace_identity("glmf-remote-dflash:taps,input,hidden,logits")' in (
+    assert 'IDENTITY: &str = "glmf-remote-dflash:taps,input,hidden,logits"' in (
         family / "remote_dflash.rs").read_text()
+    assert "exchange.trace_identity(identity)" in (
+        family.parent.parent / "shared/draft/remote.rs").read_text()
 
 
 def test_peer_diagnostics_keep_graph_identity_and_dump_both_rank_frontiers(tmp_path):
@@ -180,17 +182,21 @@ def test_remote_context_wait_is_ordered_after_cooperative_target_producer():
     update = remote.split("pub fn update(&self", 1)[1].split("pub fn put_taps", 1)[0]
     assert "self.synchronize()?" not in update
     assert "cuda_stream_synchronize" not in update
-    ack = update.index("self.exchange.signal(1, TAPS)?")
-    assert update.index("self.exchange.wait(0, TAPS)?") < ack < update.rindex("Ok(())")
-    event = update.index("cuda_event_record(self.target_ready.raw, self.target_peer.stream)")
-    wait = update.index("cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)")
-    assert update.index("self.exchange.push_planes(0, TAPS") < event < wait
-    assert wait < update.index("self.exchange.wait(1, TAPS)") < ack
-    assert "chunk-N+1 waits" in update
-    assert "cuda_event_create_ordering" in remote
-    assert "target_ready: Event<'a>" in remote
-    assert remote.index("target_ready: Event<'a>", remote.index("pub(crate) struct RemoteDflash")) < remote.index(
-        "stream: Stream<'a>", remote.index("pub(crate) struct RemoteDflash"))
+    assert update.index("self.bridge.publish_context(&[plane])") < update.index("self.bridge.acknowledge_context()")
+    # The shared bridge owns the ordering edge for every family binding.
+    bridge = (ROOT / "rust/crates/cuteafd-daemon/src/shared/draft/remote.rs").read_text()
+    publish = bridge.split("pub fn publish_context(&self", 1)[1].split("pub fn acknowledge_context", 1)[0]
+    assert "cuda_stream_synchronize" not in publish
+    event = publish.index("cuda_event_record(self.target_ready.raw, self.target_peer.stream)")
+    wait = publish.index("cuda_stream_wait_event(self.stream.raw, self.target_ready.raw)")
+    assert publish.index("self.exchange.wait(0, CONTEXT)?") < publish.index("self.exchange.push_planes(0, CONTEXT") < event < wait
+    assert wait < publish.index("self.exchange.wait(1, CONTEXT)")
+    assert "chunk-N+1 waits" in publish
+    ack = bridge.split("pub fn acknowledge_context(&self", 1)[1].split("\n    }", 1)[0]
+    assert "self.exchange.signal(1, CONTEXT)?" in ack
+    assert "cuda_event_create_ordering" in bridge
+    owner = bridge.split("pub(crate) struct RemoteBridge", 1)[1]
+    assert owner.index("target_ready: Event<'a>") < owner.index("pub stream: Stream<'a>")
     startup = (family / "mod.rs").read_text()
     assert startup.index("engine.drafter = self.load_drafter") < startup.index("draft.validate_target_peer(")
     engine = (family / "engine.rs").read_text()

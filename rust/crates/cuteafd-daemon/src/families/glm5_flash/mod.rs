@@ -17,7 +17,6 @@ pub(crate) mod packing;
 mod header;
 pub(crate) mod head;
 mod precision;
-pub(crate) mod verify;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -1376,7 +1375,7 @@ impl Opened {
     #[allow(clippy::too_many_arguments)]
     fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
-        prepared_draft: Option<&remote_dflash::Prepared<'_>>, attention: engine::GlmfAttention)
+        prepared_draft: Option<&crate::shared::draft::remote::Prepared<'_>>, attention: engine::GlmfAttention)
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
@@ -1469,7 +1468,7 @@ impl Opened {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
         let inputs = admission::GlmfInputs { attention, cfg: &self.cfg, layers, local_tp2_exl3,
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
-                free_bytes: gpu.free_bytes + prepared_draft.map_or(0, remote_dflash::Prepared::sampled_bytes) })).collect(),
+                free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
             pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
             prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
             partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,
@@ -1484,9 +1483,10 @@ impl Opened {
         let (placement, graphs, working) = admission::solve_attention_working_set_with_graphs(&inputs,
             alternate_resident.as_deref(), target, automatic_context, sms, true)?;
         let attention = admission::placed_attention(attention, &placement);
-        ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0
-            || (*id == placement::MovableId::Drafter && *gpu == 1 && prepared_draft.is_some())),
+        ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0 || *id == placement::MovableId::Drafter),
             "GLM Flash placement has no matching movable executor");
+        placement::draft::require_home(&placement, "GLM Flash",
+            if prepared_draft.is_some() { &[0, 1] } else { &[0] })?;
         tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
             prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers,
             attention_first_owner = attention.first_owner, "GLM Flash admission before weights");
@@ -1688,9 +1688,10 @@ impl Opened {
             (Some(_), Some(path)) if cuteafd_loader::placement::families::glm5_flash::remote_dflash_requested()
                 && !dspark::is_dspark(path)? => {
                 let (device, peer_stream) = peer_stream.context("remote draft needs the peer target stream")?;
-                Some(remote_dflash::Prepared::new(&self.library,
+                Some(crate::shared::draft::remote::Prepared::new(&self.library,
                     crate::shared::peer_split::RankDevice { device: args.device, stream },
-                    crate::shared::peer_split::RankDevice { device, stream: peer_stream })?)
+                    crate::shared::peer_split::RankDevice { device, stream: peer_stream },
+                    remote_dflash::IDENTITY)?)
             },
             _ => None,
         };
@@ -1701,8 +1702,7 @@ impl Opened {
         ensure!(placement.attention_placement == attention.mode,
             "GLM Flash admission placed {} attention, the engine serves {}",
             placement.attention_placement, attention.mode);
-        let draft_gpu = placement.movables.iter().find(|(id, _)| *id == cuteafd_loader::placement::MovableId::Drafter)
-            .map_or(0, |(_, gpu)| *gpu);
+        let draft_gpu = cuteafd_loader::placement::draft::home(&placement).unwrap_or(0);
         if draft_gpu == 0 { drop(prepared_draft.take()); }
         probe("admission-programs")?;
         let mut selected_args = args.clone();
@@ -1943,7 +1943,7 @@ impl Opened {
 
     /// The drafter `--draft` names, on `stream` (it reads only the mask token's embedding row).
     fn load_drafter<'s>(&'s self, args: &EngineArgs, stream: *mut std::ffi::c_void,
-        embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<remote_dflash::Prepared<'s>>)
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<crate::shared::draft::remote::Prepared<'s>>)
         -> Result<Option<dspark::Drafter<'s>>> {
         let Some(snapshot) = &args.draft else { return Ok(None) };
         let started = Instant::now();

@@ -4,6 +4,7 @@ mod weights;
 mod block;
 pub(crate) mod serve;
 pub(crate) mod engine;
+mod dspark;
 use anyhow::{ensure, Context, Result};
 use std::path::PathBuf;
 use cuteafd_loader::families::qwen3_5::Qwen35Checkpoint;
@@ -44,6 +45,12 @@ pub(crate) struct GoldenArgs {
     /// Check exact recurrent prefix restore and copied GQA full/partial pages before scoring.
     #[arg(long)]
     pub prefix_check: bool,
+    /// Checkpoint-native dSpark drafter, borrowing this target's embedding/head.
+    #[arg(long)]
+    pub draft: Option<PathBuf>,
+    /// Compare this many plain and policy-selected speculative greedy tokens.
+    #[arg(long, requires = "draft")]
+    pub spec_decode: Option<usize>,
     /// Maximum absolute mean-NLL difference from the supplied reference.
     #[arg(long, default_value_t = 0.01)]
     pub nll_tolerance: f64,
@@ -77,6 +84,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(native)? };
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
+    if let Some(count) = args.spec_decode {
+        return dspark::spec_decode(&args, &library, &programs, &checkpoint, cfg, &tokens, count);
+    }
+    ensure!(args.draft.is_none(), "--draft requires --spec-decode for dense qualification");
     let slots = usize::from(args.state_slots);
     let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
         lanes: slots, entries: 1, budget_bytes: 1 << 30 });
@@ -275,6 +286,17 @@ mod tests {
         assert_eq!(args.max_sequences, 8);
         assert_eq!(args.pool_tokens.filter(|&tokens| tokens > 0), None);
         assert_eq!(args.prefix.prefix_cache_entries, 4);
+    }
+
+    #[test]
+    fn dense_golden_speculation_requires_an_explicit_drafter() {
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "qwen35-golden", "--snapshot", "/m",
+            "--spec-decode", "16"]).is_err());
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "qwen35-golden", "--snapshot", "/m",
+            "--draft", "/d", "--spec-decode", "16"]).unwrap();
+        let crate::cli::Commands::Qwen35Golden(args) = cli.command else { panic!("dense golden not registered") };
+        assert_eq!(args.spec_decode, Some(16));
+        assert_eq!(args.draft, Some(std::path::PathBuf::from("/d")));
     }
 
     #[test]

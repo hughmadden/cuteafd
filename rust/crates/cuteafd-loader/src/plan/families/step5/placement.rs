@@ -109,7 +109,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         attention_placement: Some(AttentionPlacement::Heads), context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool: PoolPolicy { requested, target: opts.target_pool_tokens.max(FLOOR), floor: FLOOR,
             ceiling: opts.target_pool_tokens.max(requested.unwrap_or(0)).max(FLOOR), unit_rows: PAGE },
-        layers, pool_overhead: vec![0;gpus], pool_bounded: vec![summaries], fixed, movables: vec![],
+        layers, pool_overhead: vec![0;gpus], pool_bounded: vec![summaries], fixed, startup: Vec::new(), movables: vec![],
         expert_workspace: 0, tp2_workspace: [0;2], onboard: Onboard::Auto, expert_gpus: 0, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![mode], ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64*4, rows: 0, lanes: 0,
