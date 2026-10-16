@@ -567,7 +567,7 @@ drafter, KV records and state, prefix marks, workspaces, peer exchange,
 runtime and graph allowance, Spark experts with padding, workspace and
 rings) and sizes the pool from the tightest KV-owning GPU; MiMo weights come
 from the codex resident layout, GLM Flash from its FP8-snapshot conversion.
-Per-family costs are calibrated from the ledger (`plan::layout::family_costs`);
+Per-family costs were then calibrated from the ledger (`family_costs`, deleted in P13);
 device totals at ready match the ledger within 2% (GLM 5.3 39.10/27.63 vs
 39.18/27.70, MiMo Pro 22.81/14.99 vs 23.03/15.23, GLM Flash 27.55 vs 28.05), and
 on the held-out auto-pool launches (MiMo Pro 49.42/41.86 vs 49.4/41.6, GLM Flash
@@ -2012,7 +2012,7 @@ value (the measured GLM Flash regression and V4's 603K pool first).
 - The ds41rt design's `ShardedVocabulary` (its "what `shared/` must grow"
   item 9) is the placement design's head shard ("shard the vocabulary,
   solver-chosen ratio"); it lands with `P5`.
-- `P13` (delete `family_costs` rows) is folded into each family's solver port.
+- `P13` (delete `family_costs` rows): done. Every family plans through its own `FamilyModel::placement` adapter (#377, #373); `family_costs` and the generic layout body were deleted in stage B.
 - `P3`'s hop primitive is `S4c`'s; `S4c` follows `P7` (the first generic
   per-layer executor) rather than inventing a second one.
 - `Fp8Layer::bytes_for` and the EXL3 manifest residency are the one source of
@@ -3421,7 +3421,7 @@ Full V4.1 parity applies when a shared hot path changes (marked †).
 | 10 | Qwen: solver port, layer ranges on 2 RTX (Spark-free 2M), FP8 KV option plugs in (item 5) | M | golden; 1 RTX local + 2 RTX ranges A/B | head split only if later measured |
 | 11 † | Exact Spark admission: `ModelAdmission` request/response, endpoints and ingress, finite `RingBudget` for all, EXL3 worker geometry | M | every family's min/max: ring peak == charge (as work/spark-vision-ring) | |
 | 12 † | **= ds41rt stage 4a+4b.** V4.1 onto the solver (`FamilyPlacement` impl, `NativeTp2`/`V41Nvfp4Tp2`/`Exl3Tp2` with `OwnerReduce`, `PlacementHandoff`, coordinator exchange on `SparkLink`, `planner_equals_runtime_deepseek_v41`); delete `memory*.rs`, `placement.rs` and `v41_experts/tp2.rs` `RankWave`/`RankWeights` once shared impls serve it byte-exact | L | V4.1 golden byte-exact; the stage's standard gates; full 3-session parity at the release cut | one branch for both designs (revised 2026-10-09) |
-| 13 | Delete `family_costs` rows and `layout.rs` family branches | S | planner fixture tests | folded into each family's solver port (PRs 1, 6, 8, 9, 10, 12), not a PR of its own (revised 2026-10-09) |
+| 13 | Delete `family_costs` rows and `layout.rs` family branches | S | planner fixture tests | done: per-family hooks #377 + V4.1 #373, then the stage B deletion (2026-10-17) |
 
 **V4.1 reuse.** The `NativeTp2`, `V41Nvfp4Tp2` and `Exl3Tp2` impls are
 V4.1's code moved, not rewritten:

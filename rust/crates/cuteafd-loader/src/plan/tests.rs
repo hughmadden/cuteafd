@@ -23,7 +23,7 @@ fn family_native_placement_bypasses_legacy_layout_and_refuses_closed() {
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&PlanOptions::default()).unwrap();
     let native = Native { spec: report.spec.clone().unwrap(), refuse: false };
-    // An unknown family has no legacy layout adapter. The sentinel can only
+    // An unknown family has no adapter of its own. The sentinel can only
     // come from the hook, independent of any registered family's dispatch.
     report.family = Some("test_native_placement".into());
     let options = layout::LayoutOptions::default();
