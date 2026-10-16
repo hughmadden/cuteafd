@@ -310,13 +310,13 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let spark_ranks = args.peers.len();
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
-    let deferred=[admission::EXPERT_SETUP_HEADROOM as u64,
-        (admission::EXPERT_SETUP_HEADROOM + 2*wave_bytes) as u64];
+    let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
+        2, (2 * wave_bytes) as u64)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
-    let pool=admission::resolve_with_owners(&args,&memory,expert_demands,(2*per_lane) as u64,&deferred,
-        minimum_expert_layers,&[],&draft_load,dspark_inventory.as_ref())?;
+    let pool=admission::resolve_with_owners(&args,&memory,expert_demands,(2*per_lane) as u64,&[0; 2],
+        minimum_expert_layers,&deferred,&draft_load,dspark_inventory.as_ref())?;
     // The loaders re-check the admitted load phase (their own conservative
     // peak is part of it); retained owners are the Movable's exact bytes.
     let draft_budgets = |gpu: usize| -> usize { draft_load.iter().filter(|d| usize::from(d.gpu) == gpu)

@@ -2,7 +2,7 @@
 //! Projection scratch is read from the same AOT manifest as the linked native
 //! library. Lanes own separate arenas; immutable weights and cache banks do not.
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::memory_layout::{Basis, Category};
+use cuteafd_core::memory_layout::{Basis, Category, ItemLifetime};
 use serde_json::Value;
 use crate::placement::{Demand, ProgramSet};
 
@@ -50,6 +50,73 @@ pub fn vocabulary_load_phase(weights: &[Demand], target: &[Demand], packing: u64
     let bytes = retained.chain(lane).try_fold(packing, |sum, d|
         sum.checked_add(d.bytes).context("V4.1 vocabulary phase overflow"))?;
     Ok(Demand::new(0, Category::Staging, "vocabulary packing", bytes, Basis::Formula))
+}
+
+/// Serving lanes allocated after the dual-RTX draft loader drains. Setup is
+/// admission slack, not an allocation live at ready; transports are resident.
+pub fn deferred_owners(ranks: usize, transport: u64) -> Result<Vec<Demand>> {
+    ensure!(matches!(ranks, 1 | 2), "invalid V4.1 coordinator ranks");
+    let mut demands = Vec::new();
+    if transport > 0 {
+        demands.push(Demand::new((ranks - 1) as u8, Category::Transport,
+            "target/prefill transports", transport, Basis::Formula));
+    }
+    if ranks == 2 {
+        for gpu in 0..2 {
+            demands.push(Demand::new(gpu, Category::Reserved, "expert setup headroom",
+                64 << 20, Basis::Formula).with_lifetime(ItemLifetime::PostReadyReserve));
+        }
+    }
+    Ok(demands)
+}
+
+/// Shared pre-weight admission inventory. Only `before_draft` coexists with the
+/// transient draft load: one RTX has transports but no snapshots/vision yet;
+/// two RTX have snapshots/vision but no transports or setup allocation yet.
+pub struct TargetOwners {
+    pub fixed: Vec<Demand>,
+    before_draft: Vec<Demand>,
+    ranks: usize,
+}
+
+impl TargetOwners {
+    pub fn new(weights: Vec<Demand>, target: Vec<Demand>, ranks: usize,
+        transport: u64, snapshot_slots: u64) -> Result<Self> {
+        ensure!(matches!(ranks, 1 | 2), "invalid V4.1 coordinator ranks");
+        let mut fixed = weights;
+        fixed.extend(target);
+        ensure!(fixed.iter().all(|d| usize::from(d.gpu) < ranks
+            && d.lifetime == ItemLifetime::ReadyResident), "invalid V4.1 target owners");
+        let mut before_draft = fixed.clone();
+        let deferred = deferred_owners(ranks, transport)?;
+        let snapshots = super::resident::prefix_arena_bytes(snapshot_slots, false, ranks)
+            .into_iter().enumerate().map(|(gpu, bytes)| Demand::new(gpu as u8,
+                Category::Prefix, "target snapshot arenas", bytes, Basis::Formula))
+            .collect::<Vec<_>>();
+        if ranks == 1 { before_draft.extend(deferred.iter().cloned()); }
+        else { before_draft.extend(snapshots.iter().cloned()); }
+        fixed.extend(deferred);
+        fixed.extend(snapshots);
+        Ok(Self { fixed, before_draft, ranks })
+    }
+
+    pub fn add_vision(&mut self, demand: Demand) -> Result<()> {
+        ensure!(usize::from(demand.gpu) < self.ranks
+            && demand.lifetime == ItemLifetime::ReadyResident, "invalid V4.1 vision owner");
+        if self.ranks == 2 { self.before_draft.push(demand.clone()); }
+        self.fixed.push(demand);
+        Ok(())
+    }
+
+    pub fn draft_load_phases(&self, draft: &super::DraftInventory) -> Result<Vec<Demand>> {
+        let mut phases = draft.load_phase(self.ranks)?;
+        for phase in &mut phases {
+            phase.bytes = self.before_draft.iter().filter(|d| d.gpu == phase.gpu)
+                .try_fold(phase.bytes, |sum, d| sum.checked_add(d.bytes)
+                    .context("V4.1 draft loading coexistence overflow"))?;
+        }
+        Ok(phases)
+    }
 }
 
 pub struct NativePrograms<'a> {
@@ -267,6 +334,60 @@ mod tests {
         assert!(transport_bytes(0, 4).is_err());
         assert!(transport_bytes(4097, 4).is_err());
         assert!(transport_bytes(1024, 5).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_and_ready_fixture_pins_single_and_dual_allocation_order() -> Result<()> {
+        use super::super::DraftInventory;
+        use super::super::resident::Fp8Head;
+        let demand = |gpu, group: &str, bytes| Demand::new(gpu, Category::Workspace,
+            group, bytes, Basis::Formula);
+        // A synthetic allocation trace, independent of the composition helper:
+        // weights=170, first lane=75, head/taps=130, second lane=80.
+        let weights = vec![demand(0, "attention", 100), demand(0, "engram-projections", 20),
+            demand(0, "embedding", 50), demand(0, "lm_head", 682_598_400), demand(0, "norm", 10)];
+        let target = vec![demand(0, "lane 0 backbone", 40), demand(0, "lane 0 engram", 30),
+            demand(0, "lane 0 window batch table", 5), demand(0, "lane 0 target head", 60),
+            demand(0, "lane 0 target taps", 70), demand(0, "lane 1 backbone", 80)];
+        let vocabulary = vocabulary_load_phase(&weights, &target,
+            Fp8Head::All.load_bytes(1_323_827_200))?;
+        assert_eq!(vocabulary.bytes, 2_006_425_845);
+        let draft = DraftInventory { resident: 600, loading_experts: [500, 0],
+            staging: [200, 0], loader_peak: [600, 0], marks: 50,
+            runtime: vec![demand(0, "draft runtime", 70)], ..Default::default() };
+        let mut single = TargetOwners::new(weights, target, 1, 200, 2)?;
+        single.add_vision(demand(0, "vision", 300))?;
+        // Transport already exists. Vision, target snapshots, draft runtime and
+        // marks allocate after draft weights, and cannot enter this phase.
+        assert_eq!(single.draft_load_phases(&draft)?[0].bytes, 682_599_765);
+        assert_eq!(single.fixed.iter().map(|d| d.bytes).sum::<u64>(), 688_039_877);
+        assert!(single.fixed.iter().all(|d| d.lifetime == ItemLifetime::ReadyResident));
+        let draft_owner = super::super::drafter(&draft, 1)?;
+        assert_eq!(draft_owner.conditional.iter().flat_map(|home| &home.demands).map(|d| d.bytes).sum::<u64>(), 720);
+
+        let mut dual = TargetOwners::new(vec![demand(0, "weights", 100), demand(1, "weights", 200)],
+            vec![demand(0, "target", 30), demand(1, "target", 40)], 2, 200, 2)?;
+        dual.add_vision(demand(0, "vision", 300))?;
+        let split = DraftInventory { resident: 600, peer_half: 400,
+            loading_experts: [500, 300], staging: [200, 150], loader_peak: [600, 400],
+            ..Default::default() };
+        let phases = dual.draft_load_phases(&split)?;
+        // Decoder weights/lanes + draft only: later transport (200) and both
+        // 64 MiB setup reserves are absent. GPU0 also has vision and snapshots.
+        assert_eq!(phases.iter().map(|d| (d.gpu, d.bytes)).collect::<Vec<_>>(),
+            vec![(1, 940), (0, 5_441_392)]);
+        let totals = |lifetime| (0..2).map(|gpu| dual.fixed.iter()
+            .filter(|d| d.gpu == gpu && d.lifetime == lifetime).map(|d| d.bytes).sum::<u64>())
+            .collect::<Vec<_>>();
+        assert_eq!(totals(ItemLifetime::ReadyResident), vec![5_440_942, 440]);
+        assert_eq!(totals(ItemLifetime::PostReadyReserve), vec![67_108_864; 2]);
+        // Renaming owners must not change their structural phase membership.
+        for owner in &mut dual.fixed { owner.group = "renamed".into(); }
+        assert_eq!(dual.draft_load_phases(&split)?, phases);
+        assert!(TargetOwners::new(vec![demand(2, "bad", 1)], vec![], 2, 0, 0).is_err());
+        let overflow = TargetOwners::new(vec![demand(0, "overflow", u64::MAX)], vec![], 1, 0, 0)?;
+        assert!(overflow.draft_load_phases(&draft).is_err());
         Ok(())
     }
 
