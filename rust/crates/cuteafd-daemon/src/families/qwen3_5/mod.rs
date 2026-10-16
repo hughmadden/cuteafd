@@ -1,7 +1,8 @@
-//! Dense Qwen qualification entry point. Execution remains fail-closed until the executor qualifies.
+//! Native dense Qwen execution, serving and qualification.
 mod programs;
 mod weights;
 mod block;
+pub(crate) mod serve;
 pub(crate) mod engine;
 mod dspark;
 use anyhow::{ensure, Context, Result};
@@ -38,6 +39,12 @@ pub(crate) struct GoldenArgs {
     /// Check block verify padding, taps, exact restore and accepted-input replay before scoring.
     #[arg(long)]
     pub verify_check: bool,
+    /// Admitted native state slots; --verify-check also exercises interleaved slots when greater than one.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=64))]
+    pub state_slots: u8,
+    /// Check exact recurrent prefix restore and copied GQA full/partial pages before scoring.
+    #[arg(long)]
+    pub prefix_check: bool,
     /// Checkpoint-native dSpark drafter, borrowing this target's embedding/head.
     #[arg(long)]
     pub draft: Option<PathBuf>,
@@ -81,8 +88,18 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         return dspark::spec_decode(&args, &library, &programs, &checkpoint, cfg, &tokens, count);
     }
     ensure!(args.draft.is_none(), "--draft requires --spec-decode for dense qualification");
-    let mut engine = engine::DenseEngine::new(&library, &programs, &checkpoint, cfg.clone(), args.pool_tokens, None)?;
-    if args.verify_check { engine.verify_check(&tokens)?; }
+    let slots = usize::from(args.state_slots);
+    let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
+        lanes: slots, entries: 1, budget_bytes: 1 << 30 });
+    let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
+        args.pool_tokens, None, slots, marks)?;
+    if args.verify_check {
+        engine.verify_check(&tokens)?;
+        if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
+    }
+    let engine = std::cell::RefCell::new(engine);
+    if args.prefix_check { engine::prefix::check(&engine, &tokens)?; }
+    let mut engine = engine.into_inner();
     let mut logits = Vec::with_capacity(tokens.len() * cfg.vocab);
     let mut first = 0;
     for chunk in tokens.chunks(args.prefill_chunk) {
@@ -259,6 +276,18 @@ mod tests {
         assert!(super::reference_window(root.path(), "a00", snapshot.path(), 2).is_err());
         Ok(())
     }
+    #[test]
+    fn qwen35_serving_accepts_product_launcher_contract() {
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-qwen35", "--snapshot", "/m",
+            "--native-lib", "/lib.so", "--embedding-placement", "gpu", "--vision", "off", "--audio", "off",
+            "--max-sequences", "8", "--pool-tokens", "0", "--prefix-cache-entries", "4",
+            "--prefix-cache-mark-mib", "1024", "--listen", "0.0.0.0:8000", "--max-output", "4096"]).unwrap();
+        let crate::cli::Commands::ServeQwen35(args) = cli.command else { panic!("dense serving not registered") };
+        assert_eq!(args.max_sequences, 8);
+        assert_eq!(args.pool_tokens.filter(|&tokens| tokens > 0), None);
+        assert_eq!(args.prefix.prefix_cache_entries, 4);
+    }
+
     #[test]
     fn dense_golden_speculation_requires_an_explicit_drafter() {
         assert!(crate::cli::Cli::try_parse_from(["cuteafd", "qwen35-golden", "--snapshot", "/m",

@@ -78,6 +78,8 @@ pub struct DeploymentSpec<'a> {
     pub encoder_plan_hash: &'a str,
     pub artifact_requirements: ArtifactRequirements,
     pub executable: bool,
+    /// Includes release-ready deployments and native-admitted, unqualified WIP runtimes.
+    pub wip_launchable: bool,
     /// Keep the full unsupported/tensor diagnostics available to consumers.
     pub report: &'a PlanReport,
 }
@@ -130,7 +132,7 @@ impl<'a> DeploymentSpec<'a> {
                 require_symbols_verified: spark_tp_role.is_some(),
                 verify_native_library_sha256: spark_tp_role.is_some(), spark_tp_role,
                 spark_tp_manifest: (family == "deepseek_v41").then_some("V41_EXPERT_TP_AOT.json") },
-            executable: report.executable(), report })
+            executable: report.executable(), wip_launchable: report.wip_launchable(), report })
     }
 }
 
@@ -179,6 +181,56 @@ mod tests {
             assert!(value.get("native_library_sha256").is_none());
             assert!(value.get("resolved_config_fingerprint").is_none());
         }
+    }
+
+    #[test]
+    fn wip_readiness_preserves_release_and_hard_admission_guards() {
+        use crate::plan::{ComponentPlan, Rejection, RoleReadiness, RuntimeStatus, Status, spec::Component};
+        let (_dir, mut report) = fixture(1, 3);
+        assert!(report.executable() && report.wip_launchable());
+        report.runtime = Some(RuntimeStatus::Planned);
+        for component in &mut report.components {
+            if component.status == Status::Ready { component.status = Status::Planned; }
+        }
+        assert!(!report.executable() && !report.wip_launchable());
+        report.native_serving_admitted = true;
+        assert!(!report.executable() && report.wip_launchable());
+        let planned = report.clone();
+        let index = report.components.iter().position(|c| c.status == Status::Planned).unwrap();
+        report.components[index].rejected = 1;
+        assert!(!report.wip_launchable());
+        report = planned.clone();
+        report.components[index].status = Status::MissingKernel;
+        assert!(!report.wip_launchable());
+        for change in 0..8 {
+            report = planned.clone();
+            match change {
+                0 => report.family = None,
+                1 => report.config_error = Some("invalid".into()),
+                2 => report.missing_shards.push("missing".into()),
+                3 => report.unclassified.push("unknown".into()),
+                4 => report.role_readiness.push(RoleReadiness { role: "target".into(), required_shards: vec![],
+                    unavailable: vec![Rejection { tensor: "missing".into(), reason: "unavailable".into() }] }),
+                5 => report.fits = false,
+                6 => report.placement_supported = false,
+                _ => report.runtime = Some(RuntimeStatus::Serving),
+            }
+            assert!(!report.wip_launchable(), "hard guard {change}");
+        }
+        for status in [Status::Unused, Status::Disabled] {
+            report = planned.clone();
+            report.components[index].status = status;
+            report.components[index].rejected = 1;
+            assert!(report.wip_launchable());
+        }
+        report = planned;
+        report.components.clear();
+        assert!(!report.executable() && report.wip_launchable());
+        report.components.push(ComponentPlan { component: Component::Vision, owner: crate::plan::Owner::Rtx,
+            tensors: 0, bytes: 0, formats: Default::default(), status: Status::Disabled, rejected: 0, rejections: vec![] });
+        assert!(!report.executable() && report.wip_launchable());
+        let value = serde_json::to_value(&report).unwrap();
+        assert!(value.get("native_serving_admitted").is_none());
     }
 
     #[test]

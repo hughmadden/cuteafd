@@ -10,114 +10,22 @@ pub(crate) struct DensePrograms {
     pub(crate) scratch_bytes: usize,
 }
 
-fn integer(spec: &ProgramSpec, field: &str, expected: usize) -> Result<()> {
-    ensure!(spec.geometry[field].as_u64() == Some(expected as u64),
-        "{}: geometry.{field} must be {expected}, found {}", spec.name, spec.geometry[field]);
-    Ok(())
-}
-
-fn number(spec: &ProgramSpec, field: &str, expected: f64) -> Result<()> {
-    ensure!(spec.geometry[field].as_f64() == Some(expected),
-        "{}: geometry.{field} must be {expected}, found {}", spec.name, spec.geometry[field]);
-    Ok(())
+fn native(spec: &ProgramSpec) -> cuteafd_loader::placement::families::qwen3_5::NativeProgram {
+    cuteafd_loader::placement::families::qwen3_5::NativeProgram { name: spec.name.clone(),
+        geometry: spec.geometry.clone(), capacity_rows: spec.capacity_rows as u64,
+        pointers: spec.pointers.clone(), scalar_kinds: spec.scalar_kinds.clone(), scratch: spec.scratch.clone() }
 }
 
 fn norm_dtype(spec: &ProgramSpec) -> Result<DType> {
-    match spec.geometry["norm_dtype"].as_str() {
-        Some("torch.float32") => Ok(DType::F32),
-        Some("torch.bfloat16") => Ok(DType::Bf16),
-        _ => anyhow::bail!("{}: missing or unsupported GDN norm dtype", spec.name),
-    }
+    cuteafd_loader::placement::families::qwen3_5::norm_dtype(&native(spec))
 }
 
 fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &ProgramSpec) -> Result<()> {
-    if rows > 0 {
-        ensure!(spec.capacity_rows as usize >= rows, "{} capacity is smaller than {rows}", spec.name);
-        integer(spec, "max_rows", rows)?;
-    }
-    if matches!(op, "norm" | "add" | "gdn" | "attn_producer" | "attn_o" | "ffn") {
-        integer(spec, "hidden", cfg.hidden)?;
-    }
-    match op {
-        "norm" => {
-            number(spec, "eps", cfg.rms_norm_eps)?;
-            ensure!(spec.geometry["zero_centered"] == true, "{}: dense norm must be zero-centered", spec.name);
-        }
-        "gdn" => {
-            integer(spec, "key_heads", cfg.gdn.key_heads)?;
-            integer(spec, "value_heads", cfg.gdn.value_heads)?;
-            integer(spec, "head_dim", cfg.gdn.key_dim)?;
-            integer(spec, "in_width", cfg.gdn.conv_width() + cfg.gdn.value_width() + 2 * cfg.gdn.value_heads)?;
-            number(spec, "eps", cfg.rms_norm_eps)?;
-            ensure!(spec.geometry["output_gate"] == "silu" && spec.geometry["fp8_weights"] == false,
-                "{}: dense BF16 GDN needs SiLU and native BF16 projections", spec.name);
-            norm_dtype(spec)?;
-        }
-        "gdn_commit" => {
-            integer(spec, "key_heads", cfg.gdn.key_heads)?;
-            integer(spec, "value_heads", cfg.gdn.value_heads)?;
-            integer(spec, "channels", cfg.gdn.conv_width())?;
-            integer(spec, "replay_rows", crate::shared::qwen::REPLAY_ROWS)?;
-            integer(spec, "replay_bytes", crate::shared::qwen::GdnLayout::new(cfg.gdn)?.replay_layer_bytes)?;
-        }
-        "attn_producer" | "full_gqa" => {
-            integer(spec, "heads", cfg.heads)?;
-            integer(spec, "kv_heads", cfg.kv_heads)?;
-            integer(spec, "head_dim", cfg.head_dim)?;
-            integer(spec, "record_bytes", 2 * cfg.kv_heads * cfg.head_dim * 2)?;
-            ensure!(spec.geometry["indexed"] == false, "{}: dense attention must not use QSA", spec.name);
-            if op == "attn_producer" {
-                integer(spec, "in_width", 2 * (cfg.heads + cfg.kv_heads) * cfg.head_dim)?;
-                integer(spec, "rope_dim", cfg.rope_dim)?;
-                number(spec, "rope_theta", cfg.rope_theta)?;
-            } else {
-                integer(spec, "page_rows", 64)?;
-                integer(spec, "max_splits", 32)?;
-                ensure!(spec.geometry["causal"] == true && spec.geometry["empty_rows_zero"] == true,
-                    "{}: dense attention requires causal traversal and zero inactive rows", spec.name);
-            }
-        }
-        "attn_o" => {
-            integer(spec, "width", cfg.heads * cfg.head_dim)?;
-            ensure!(spec.geometry["fp8_weights"] == false, "{}: expected native BF16 output projection", spec.name);
-        }
-        "ffn" => integer(spec, "intermediate", cfg.intermediate)?,
-        "add" => (),
-        _ => anyhow::bail!("unknown dense Qwen op {op}"),
-    }
-    Ok(())
+    cuteafd_loader::placement::families::qwen3_5::validate(cfg, op, rows, &native(spec))
 }
 
 fn validate_abi(op: &str, rows: usize, spec: &ProgramSpec) -> Result<()> {
-    let mut pointers: Vec<&str> = match op {
-        "norm" => vec!["x", "weight", "out"],
-        "add" => vec!["a", "b", "out"],
-        "gdn_commit" => vec!["state", "conv_state", "replay", "tables"],
-        "gdn" => vec!["x", "w_in", "conv_w", "a_log", "dt_bias", "norm_w", "w_out",
-            "conv_state", "state", "slots", "seq_first", "out"],
-        "attn_producer" => vec!["x", "w_in", "q_norm", "k_norm", "rope_positions", "kv_slots",
-            "kv_cache", "query", "gate", "scratch"],
-        "full_gqa" => vec!["query", "kv_cache", "positions", "page_table", "out", "scratch"],
-        "attn_o" => vec!["attn", "gate", "w_o", "out", "scratch"],
-        "ffn" => vec!["x", "w_gate_up", "w_down", "out", "scratch"],
-        _ => anyhow::bail!("unknown dense Qwen ABI {op}"),
-    };
-    if op == "gdn" {
-        if rows == crate::shared::qwen::REPLAY_ROWS { pointers.push("replay"); }
-        pointers.push("scratch");
-    }
-    ensure!(spec.pointers == pointers, "{}: native pointer order differs from dense {op} ABI", spec.name);
-    let scalars = match op {
-        "gdn_commit" | "full_gqa" => 3,
-        "gdn" if rows == crate::shared::qwen::REPLAY_ROWS => 2,
-        _ => 1,
-    };
-    ensure!(spec.scalar_kinds == vec![b'i'; scalars], "{}: dense scalar ABI differs", spec.name);
-    if pointers.contains(&"scratch") {
-        ensure!(spec.scratch.get("scratch").is_some_and(|&n| n > 0 && n % 1024 == 0),
-            "{}: missing or unaligned scratch admission", spec.name);
-    }
-    Ok(())
+    cuteafd_loader::placement::families::qwen3_5::validate_abi(op, rows, &native(spec))
 }
 
 impl DensePrograms {
