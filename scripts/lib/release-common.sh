@@ -930,6 +930,17 @@ print("auto" if qualified else "off")
 PY
 }
 
+# Resolve fixed onboarding from the checkpoint's sparse layers.
+release_onboard() {
+  local value="$1" model="$2" revision="${3:-}" hub snapshot
+  hub="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--${model//\//--}"
+  [[ -n "$revision" || ! -f "$hub/refs/main" ]] || revision="$(<"$hub/refs/main")"
+  snapshot="$hub/snapshots/$revision/config.json"
+  local -a args=(--onboard "$value")
+  [[ ! -f "$snapshot" ]] || args+=("$snapshot")
+  python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" "${args[@]}"
+}
+
 release_load_config() {
   local config="$1"
   local mode="${2:-launch}"
@@ -1113,11 +1124,9 @@ release_load_config() {
       release_die "SPARKINFER_EXL3=force requires EXPERT_FORMAT=exl3"
   fi
   if [[ "$mode" == stop ]]; then
-    [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
-      release_die "RTX_EXPERT_LAYERS must be auto or a non-negative integer"
+    RTX_EXPERT_LAYERS="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" --onboard "$RTX_EXPERT_LAYERS")" || return 2
   else
-    [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^([0-9]|[1-3][0-9]|40)$ ]] ||
-      release_die "RTX_EXPERT_LAYERS must be auto or 0..40"
+    RTX_EXPERT_LAYERS="$(release_onboard "$RTX_EXPERT_LAYERS" "$MODEL_ID" "$MODEL_REVISION")" || return 2
   fi
   case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
   [[ "$COORDINATOR_GPU" =~ ^[0-9]+$ ]] || release_die "COORDINATOR_GPU must be a non-negative host GPU index"

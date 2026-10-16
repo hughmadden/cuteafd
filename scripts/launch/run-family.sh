@@ -673,7 +673,8 @@ case "${V41_FP8_HEAD:-}" in
   *) release_die "V41_FP8_HEAD must be off, draft or all" ;;
 esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
-[[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^([0-9]|[1-3][0-9]|40)$ ]] || release_die "RTX_EXPERT_LAYERS must be auto or 0..40"
+[[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
+  release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
 ((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
 [[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
 [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)) || release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
@@ -1398,6 +1399,9 @@ read -r detected model_type first_layer last_layer <<<"$described"
 [[ -z "$family" || "$family" == "$detected" ]] ||
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
 family="$detected"
+if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
+  cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
+fi
 attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # auto is the family's recorded default (GLM 5.3 and GLM 5.3 Flash: context where the image
 # carries its programs); the planner and the server resolve it. Explicit modes run only where an
@@ -1798,13 +1802,7 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; th
   esac
   case "$local_layers" in
     "") ;;
-    auto|all|max) family_args+=("$onboard_flag" "$local_layers") ;;
-    *%)
-      percent="${local_layers%\%}"
-      [[ "$percent" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v p="$percent" 'BEGIN { exit !(p <= 100) }' ||
-        { echo "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)" >&2; exit 2; }
-      family_args+=("$onboard_flag" "$local_layers") ;;
-    *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)" >&2; exit 2 ;;
+    auto|max) family_args+=("$onboard_flag" "$local_layers") ;;
     *) family_args+=("$fixed_onboard_flag" "$local_layers") ;;
   esac
 fi

@@ -349,3 +349,40 @@ def test_v41_starting_config_matches_the_launcher_defaults(path: Path, tmp_path:
 
 def test_tp_ep_examples_are_left_alone() -> None:
     assert TP_EP <= {p.name for p in EXAMPLES.glob("*.config")}
+
+
+@pytest.mark.parametrize("config,count", [
+    ({"model_type": "deepseek_v41", "text_config": {"num_hidden_layers": 40}}, 40),
+    ({"model_type": "deepseek_v4", "n_layers": 61}, 61),
+    ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 48}}, 48),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 78, "first_k_dense_replace": 3}, 75),
+    ({"model_type": "glm5_next", "num_hidden_layers": 4,
+      "layer_types": ["linear_attention"] * 4,
+      "mlp_layer_types": ["sparse", "dense", "sparse", "dense"]}, 2),
+    ({"model_type": "mimo_v2", "num_hidden_layers": 5, "moe_layer_freq": [0, 1, 0, 1, 1]}, 3),
+    ({"model_type": "mimo_v2_flash", "num_hidden_layers": 48}, 47),
+])
+@pytest.mark.parametrize("value", ["auto", "max", "all", "50%", "100%", "0"])
+def test_checkpoint_onboarding_count_and_rounding(tmp_path, config, count, value):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                             "--onboard", value, str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    expected = {"all": str(count), "100%": str(count), "50%": str(int(count * 0.5 + 0.5))}.get(value, value)
+    assert result.stdout.strip() == expected
+    bounded = subprocess.run(["bash", "-c", 'source "$1"; release_onboard "$2" test/model pinned',
+                              "test", str(ROOT / "scripts/lib/release-common.sh"), value],
+                             env={**os.environ, "HF_HOME": str(tmp_path / "hf")},
+                             capture_output=True, text=True)
+    # With no cached checkpoint, validate grammar without inventing a family limit.
+    assert bounded.returncode == 0, bounded.stderr
+    assert bounded.stdout.strip() == value
+
+
+@pytest.mark.parametrize("value", ["-1", "101%", "NaN%", "inf%", "half", "5x", ""])
+def test_checkpoint_onboarding_rejects_invalid_grammar(value):
+    result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                             "--onboard", value], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "RTX_EXPERT_LAYERS must be" in result.stderr
