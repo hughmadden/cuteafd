@@ -30,7 +30,7 @@ impl SparkAdmission {
             let catalog = catalog.context("Spark admission needs routed checkpoint headers")?;
             ensure!(catalog.routed_experts().geometry()? == geometry,
                 "Spark admission catalog geometry differs from coordinator");
-            crate::shared::spark_topology::require_native(topology, catalog)?;
+            crate::shared::spark_topology::require_supported(topology, catalog)?;
             ensure!(topology.is_none() || catalog.fp8().is_none(),
                 "Spark FP8-family packages do not support replicated native topology");
             let tp = topology.map_or(world, |topology| topology.tp() as usize);
