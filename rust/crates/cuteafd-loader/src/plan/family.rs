@@ -55,6 +55,13 @@ pub struct ExpertContract {
 pub trait FamilyModel: Send + Sync {
     fn spec(&self) -> &ModelSpec;
 
+    /// Native solver adapter. Returning None retains the legacy layout path.
+    fn placement(&self, _input: &super::PlanInput, _report: &mut super::PlanReport,
+        _options: &super::layout::LayoutOptions, _requested: super::ExpertPlacement)
+        -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
+        None
+    }
+
     /// Physical cache records and state from the same parsed configuration as
     /// the runtime. Weight/workspace admission remains a separate requirement.
     fn cache_geometry(&self, _options: CacheOptions) -> Result<Option<FamilyCacheGeometry>, CacheGeometryError> {

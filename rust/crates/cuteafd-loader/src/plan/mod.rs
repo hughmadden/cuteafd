@@ -399,6 +399,23 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         .plan(options)
 }
 
+fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanReport,
+    options: &layout::LayoutOptions, weight_budget: u64, requested: ExpertPlacement)
+    -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
+    match model.placement(input, report, options, requested) {
+        Some(Ok(memory)) => Ok(memory),
+        Some(Err(error)) => {
+            report.fits = false;
+            report.placement_supported = false;
+            report.hints.push(Hint { what: format!("native placement refused: {error:#}"),
+                how: "Supply the native exports and a shape supported by the family's executor.".into() });
+            Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0,
+                waste: vec![], notes: vec![format!("native placement refused: {error:#}")] })
+        }
+        None => Ok(layout::layout_with_weight_budget(report, model, input, options, weight_budget)),
+    }
+}
+
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
     options.validate()?;
     let checkpoint = input.checkpoint();
@@ -659,8 +676,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     if let Some(layout_options) = &options.layout {
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
-        let memory = layout::layout_with_weight_budget(&mut report, model.as_ref(), input, &layout_options,
-            options.coordinator_budget_bytes);
+        let memory = family_layout(model.as_ref(), input, &mut report, &layout_options,
+            options.coordinator_budget_bytes, options.placement)?;
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -704,8 +721,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             spark_allocation_budget_bytes: Some(options.spark_budget_bytes), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             ..Default::default() };
-        let _ = layout::layout_with_weight_budget(&mut report, model.as_ref(), input, &inventory,
-            options.coordinator_budget_bytes);
+        let _ = family_layout(model.as_ref(), input, &mut report, &inventory,
+            options.coordinator_budget_bytes, options.placement)?;
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
