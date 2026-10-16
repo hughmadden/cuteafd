@@ -527,6 +527,7 @@ pub fn request(
         pool_bounded: Vec::new(),
         pool_overhead: unit_bytes,
         fixed: vec![],
+        startup: Vec::new(),
         movables: vec![],
         layers: (0..40)
             .map(|layer| LayerDemand {

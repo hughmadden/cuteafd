@@ -294,6 +294,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         layers,
         pool_overhead,
         fixed,
+        startup: Vec::new(),
         movables,
         expert_workspace: inputs.expert_workspace,
         tp2_workspace: inputs.tp2_workspace,

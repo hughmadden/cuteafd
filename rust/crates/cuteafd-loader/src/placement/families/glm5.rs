@@ -347,7 +347,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: 1 << 31, ..PoolPolicy::resolve(&cards, inputs.max_context,
             inputs.requested_pool, PAGE_ROWS, inputs.spark_ranks == 0) },
-        layers, pool_overhead, fixed, movables: Vec::new(),
+        layers, pool_overhead, fixed, startup: Vec::new(), movables: Vec::new(),
         expert_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.expert_workspace } else { 0 },
         tp2_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.tp2_workspace } else { [0; 2] },
         minimum_expert_layers: 0,
