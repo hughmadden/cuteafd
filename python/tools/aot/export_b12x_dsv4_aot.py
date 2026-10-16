@@ -43,6 +43,8 @@ CHECKPOINT_CONTEXTS = {
     "glm": ("zai-org/GLM-5.3", 1048576),
     "glmf": ("zai-org/GLM-5.3-Flash", 1048576),
     "qwen4": ("Qwen/Qwen3.8-Flash-Next", 262144),
+    "qwen35": ("Qwen/Qwen3.5-9B", 262144),
+    "qwen38": ("Qwen/Qwen3.8-27B", 262144),
 }
 
 
@@ -548,6 +550,31 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
+def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int, *, norm_dtype):
+    """Ordinary residual, dense BF16 FFN and unrestricted causal hybrid attention."""
+    from b12x.integration.cuteafd import qwen_dense as dense
+
+    out = [
+        ("norm", "norm", {}, lambda: dense.compile_qwen_dense_norm_aot(g)),
+        ("add", "add", {}, lambda: dense.compile_qwen_dense_add_aot(g)),
+        ("gdn_commit", "gdn_commit", {}, lambda: dense.compile_qwen_dense_gdn_commit_aot(g)),
+    ]
+    for rows in dict.fromkeys((decode_rows, prefill_rows)):
+        out += [
+            (f"gdn_m{rows}", "gdn", {"max_rows": rows, "norm_dtype": str(norm_dtype)},
+             lambda r=rows: dense.compile_qwen_dense_gdn_aot(g, max_rows=r, norm_dtype=norm_dtype)),
+            (f"attn_producer_m{rows}", "attn_producer", {"max_rows": rows},
+             lambda r=rows: dense.compile_qwen_dense_producer_aot(g, max_rows=r)),
+            (f"full_gqa_m{rows}", "full_gqa", {"max_rows": rows, "max_splits": 32},
+             lambda r=rows: dense.compile_qwen_dense_full_gqa_aot(g, max_rows=r, max_splits=32)),
+            (f"attn_o_m{rows}", "attn_o", {"max_rows": rows},
+             lambda r=rows: dense.compile_qwen_dense_attn_o_aot(g, max_rows=r)),
+            (f"ffn_m{rows}", "ffn", {"max_rows": rows},
+             lambda r=rows: dense.compile_qwen_dense_ffn_aot(g, max_rows=r)),
+        ]
+    return out
+
+
 def context_split_programs(g, decode_rows: int, max_context: int):
     """Opt-in K1 primitives only; never change a serving table by default."""
     from b12x.integration.cuteafd import context_split as split
@@ -611,7 +638,7 @@ def main() -> None:
                              "glm2 (GLM 5.x, one GPU of a two-GPU head split), mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), "
                              "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), mimof/mimof2 (V2.6 Flash MOPD), "
                              "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
-                             "qwen4 (Qwen 3.8 Flash Next)")
+                             "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B)")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
                         help="with glmf: also the decode and verify programs at this many rows (serve "
@@ -631,15 +658,15 @@ def main() -> None:
 
     import torch
     from b12x.integration.cuteafd import (
-        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN38_FLASH_NEXT, exportable_compilation,
+        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN35_9B, QWEN38_27B, QWEN38_FLASH_NEXT, exportable_compilation,
         validate_exported_header,
     )
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2 and/or qwen4")
+                         "glmf, glmf2, qwen4, qwen35 and/or qwen38")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     props = torch.cuda.get_device_properties(0)
@@ -691,9 +718,11 @@ def main() -> None:
                      for n, base in (("flash2", FLASH), ("pro2", PRO))}
         g = {"flash": FLASH, "flash2": dsv4_half["flash2"], "pro": PRO, "pro2": dsv4_half["pro2"], "glm": GLM53,
              "glm2": glm2, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO,
-             "mimo2": mimo2, "mimop2": mimop2, "mimof": MIMO_V26_FLASH, "mimof2": mimof2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT}[name]
+             "mimo2": mimo2, "mimop2": mimop2, "mimof": MIMO_V26_FLASH, "mimof2": mimof2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT,
+             "qwen35": QWEN35_9B, "qwen38": QWEN38_27B}[name]
         family = {"flash": "dsv4f", "flash2": "dsv4f2", "pro": "dsv4p", "pro2": "dsv4p2", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
-                  "mimo2": "mimo2", "mimop2": "mimop2", "mimof": "mimof", "mimof2": "mimof2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4"}[name]
+                  "mimo2": "mimo2", "mimop2": "mimop2", "mimof": "mimof", "mimof2": "mimof2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4",
+                  "qwen35": "qwen35", "qwen38": "qwen38"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
         extent = geometry_context(name, args.max_context)
         manifest["family_capacities"][family] = {"max_context": extent}
@@ -703,8 +732,14 @@ def main() -> None:
                 "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
                 "qwen4": qwen4_programs}.get(name, programs)
-        family_work = (context_split_programs(g, args.decode_rows, extent) if args.context_split_only else
-                       make(g, args.decode_rows, args.prefill_rows, extent))
+        if name in ("qwen35", "qwen38"):
+            # These exports target the named official checkpoints' native norm storage.
+            norm_dtype = torch.float32 if name == "qwen35" else torch.bfloat16
+            family_work = qwen_dense_programs(g, args.decode_rows, args.prefill_rows, extent,
+                                              norm_dtype=norm_dtype)
+        else:
+            family_work = (context_split_programs(g, args.decode_rows, extent) if args.context_split_only else
+                           make(g, args.decode_rows, args.prefill_rows, extent))
         work += [(family, *item) for item in family_work]
     if "glmf" in geometries and not args.context_split_only:
         # Last, so every program above compiles exactly as before.

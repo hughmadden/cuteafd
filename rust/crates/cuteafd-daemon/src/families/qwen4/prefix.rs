@@ -41,30 +41,7 @@ const KEY_BYTES: usize = INDEX_DIM * 2;
 const BLOCK_KEY_BYTES: usize = INDEX_DIM * 2;
 const POOL_PAGE_BYTES: usize = PAGE_ROWS * BLOCK_KEY_BYTES;
 
-#[derive(Debug, PartialEq, Eq)]
-struct MarkLayout {
-    owners: Vec<(i32, usize)>,
-    /// Owner arena, byte offset, byte length, in global state-region order.
-    regions: Vec<(usize, usize, usize)>,
-    bytes: usize,
-}
-
-impl MarkLayout {
-    fn new(regions: &[(i32, usize)]) -> Result<Self> {
-        let mut layout = Self { owners: Vec::new(), regions: Vec::new(), bytes: 0 };
-        for &(device, bytes) in regions {
-            let owner = layout.owners.iter().position(|&(id, _)| id == device).unwrap_or_else(|| {
-                layout.owners.push((device, 0));
-                layout.owners.len() - 1
-            });
-            let offset = layout.owners[owner].1;
-            layout.owners[owner].1 = offset.checked_add(bytes).context("Qwen owner mark size overflow")?;
-            layout.bytes = layout.bytes.checked_add(bytes).context("Qwen logical mark size overflow")?;
-            layout.regions.push((owner, offset, bytes));
-        }
-        Ok(layout)
-    }
-}
+use crate::shared::qwen::MarkLayout;
 
 pub(crate) struct Qwen4Prefix<'e, 'a> {
     engine: &'e Qwen4Engine<'a>,

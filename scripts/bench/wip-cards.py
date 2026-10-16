@@ -1585,7 +1585,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPU='1', RTX_GPUS='1')
         if len(hosts) in (2, 3):
             # Two or three ranks without explicit keys are the compact EXL3 layout.
-            values.update(EXPERT_FORMAT='exl3', SPARKINFER_EXL3='force', EXL3_PAIRED_TP4='off')
+            values.update(EXPERT_FORMAT='exl3', SPARKINFER_EXL3='force')
         tag = 'tc-' + toolchain_hash(revision)
         values.update(COORDINATOR_DOCKER_DEV='cuteafd-coordinator-dev:' + tag, SPARK_EXPERT_DOCKER_DEV='cuteafd-spark-expert-dev:' + tag)
         arm['dev_image_tag'] = tag

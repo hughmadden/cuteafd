@@ -91,7 +91,7 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()> {
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
-    use cuteafd_loader::{V41Exl3Layer, V41Exl3Partition, V41Exl3Residency, V41Exl3ResidentBuffer};
+    use cuteafd_loader::{V41Exl3Layer, V41Exl3Residency, V41Exl3ResidentBuffer};
     use crate::shared::experts::exl3::WeightBuffer;
     use crate::shared::experts::layer::ExpertLoadBudget;
     let fixture = Fixture::build()?;
@@ -146,7 +146,7 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
     let weights = Rc::new(vec![Exl3Weights {
         buffers: specs.iter().map(|s| WeightBuffer { buffer: CuteafdDeviceBuffer { bytes:s.bytes, ..arena.buffer } }).collect(),
         _arena: arena,
-        layout: V41Exl3Residency { layer:V41Exl3Layer::Backbone(0),world:2,rank:1,layout:V41Exl3Partition::Disjoint,
+        layout: V41Exl3Residency { layer:V41Exl3Layer::Backbone(0),world:2,rank:1,
             intermediate_start:1152,experts:6,intermediate:1152,tiers:vec![3,4],projection_counts:vec![[0;3];2],buffers:specs,loads:vec![] },
         budget: ExpertLoadBudget { resident_bytes:1024,device_staging_bytes:0,pinned_host_bytes:0,read_scratch_bytes:0 },
     }]);

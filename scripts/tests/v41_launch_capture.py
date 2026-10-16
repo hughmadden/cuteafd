@@ -122,7 +122,8 @@ if tool == "docker":
             tp = int(value("--spark-tp", ranks))
             ep = int(value("--spark-ep", "1"))
             report = dict(response)
-            explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and int(ranks) not in (0, 4)
+            exl3 = os.environ.get("CAPTURE_EXL3") == "1"
+            explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))
             onboard = value("--rtx-expert-layers", "auto")
             gpus = int(value("--rtx", "1"))
             runtime = gpus == 2 or onboard != "0"
@@ -132,7 +133,7 @@ if tool == "docker":
                 launch={"family": family, "first_expert_layer": int(os.environ.get("CAPTURE_FIRST_LAYER", "0")),
                         "last_expert_layer": json.loads(os.environ.get("CAPTURE_LAST_LAYER", "null"))},
                 topology={"tp": tp, "ep": ep, "explicit": explicit_topology},
-                artifact_requirements={"spark_tp_role": f"tp{tp}" if explicit_topology and tp != 4 else None},
+                artifact_requirements={"spark_tp_role": f"tp{tp}" if family == "deepseek_v41" and not exl3 and explicit_topology and tp != 4 else None},
                 speculator=value("--speculator"),
                 admission={"kv_pool_size": value("--kv-pool-size"), "memory_reservation": value("--memory-reservation")},
                 peers=value("--deployment-peers", "").split(",")[:int(ranks)],
@@ -386,6 +387,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
                "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_HOST": coordinator_host, "CAPTURE_PLAN": str(root / "plan.json"),
                "CAPTURE_SPARKS": str(sparks), "CAPTURE_SPARKINFER": lock["revision"],
                "CAPTURE_FAMILY": release_entry["family"] if release_entry else "deepseek_v41",
+               "CAPTURE_EXL3": "1" if release_values.get("EXPERT_FORMAT") == "exl3" else "0",
                "CAPTURE_FIRST_LAYER": first, "CAPTURE_LAST_LAYER": last, "CAPTURE_RELEASE": "1" if release_entry else "",
                "CUTEAFD_CDI_CHECK": "on", "CUTEAFD_CDI_SPECS": str(spec),
                "CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS": "30", "TMPDIR": str(root),

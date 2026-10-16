@@ -8,7 +8,7 @@ use crate::shared::spark_intake::{self, IntakeMode, SparkIntake, SparkLane};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_transport::{expert::SparkExperts, ExpertProtocolV2Request, TcpTransportConfig};
+use cuteafd_transport::{expert::{SparkExperts, SparkTopology}, ExpertProtocolV2Request, TcpTransportConfig};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -44,7 +44,7 @@ impl<'a> Arm<'a> {
 }
 
 pub(super) async fn run(args: &ExpertProbeArgs, modes: &[IntakeMode], peers: &[SocketAddr], executors: &[u64],
-    request: &mut ExpertProtocolV2Request, hidden: usize) -> Result<()> {
+    topology: Option<SparkTopology>, request: &mut ExpertProtocolV2Request, hidden: usize) -> Result<()> {
     let native_lib = args.native_lib.as_deref().context("--intake needs --native-lib")?;
     // SAFETY: a trusted image library, loaded once for this process.
     let library = unsafe { NativeLibrary::load(native_lib) }?;
@@ -70,10 +70,10 @@ pub(super) async fn run(args: &ExpertProbeArgs, modes: &[IntakeMode], peers: &[S
         let path = if args.intake_lane {
             // SAFETY: the lane drops (joining its thread) before its intake,
             // and every submit below follows `before_dispatch`.
-            let lane = unsafe { intake.spawn_lane(peers.to_vec(), executors.to_vec(), args.capacity, config.clone())? };
+            let lane = unsafe { intake.spawn_lane(peers.to_vec(), executors.to_vec(), args.capacity, config.clone(), topology)? };
             Path::Lane(SparkLane { lane, intake })
         } else {
-            let mut transport = SparkExperts::new_ranks(peers, executors, args.capacity, config.clone())?;
+            let mut transport = super::probe_transport(peers, executors, args.capacity, config.clone(), topology)?;
             // SAFETY: the arm drops its transport before its intake, and every
             // dispatch below follows `before_dispatch`.
             unsafe { intake.attach(&mut transport)? };

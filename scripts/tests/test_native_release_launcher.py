@@ -497,10 +497,10 @@ RTX_EXPERT_LAYERS=auto
         # not shift a later one, because OpenSSH joins argv into one command
         # string and does not preserve an empty argument.
         for digest, roles, jobs, expected in (
-            ('', '', '', ['on', '', '', '']),
-            ('a' * 64, '', '1', ['on', 'a' * 64, '', '1']),
-            ('', 'tp2', '2', ['on', '', 'tp2', '2']),
-            ('a' * 64, 'tp2;tp3', '4', ['on', 'a' * 64, 'tp2;tp3', '4']),
+            ('', '', '', ['', '', '']),
+            ('a' * 64, '', '1', ['a' * 64, '', '1']),
+            ('', 'tp2', '2', ['', 'tp2', '2']),
+            ('a' * 64, 'tp2;tp3', '4', ['a' * 64, 'tp2;tp3', '4']),
         ):
             with self.subTest(digest=digest, roles=roles, jobs=jobs):
                 harness = f'''set -euo pipefail
@@ -519,7 +519,6 @@ SPARK_EXPERT_DOCKER_INFERENCE=inference
 engine_commit=engine
 sparkinfer_commit=fork
 release_version=v5
-EXL3_PAIRED_TP4=on
 bf16_families=
 audio_aot=OFF
 source_manifest_sha256={shlex.quote(digest)}
@@ -527,7 +526,7 @@ spark_tp_roles={shlex.quote(roles)}
 native_build_jobs={shlex.quote(jobs)}
 '''
                 harness += invocation + "<<'REMOTE'" + preamble
-                harness += 'printf "%s\\n" "$exl3_paired_tp4" "$source_manifest_sha256" "$spark_tp_roles" "$native_build_jobs"\nREMOTE\n'
+                harness += 'printf "%s\\n" "$source_manifest_sha256" "$spark_tp_roles" "$native_build_jobs"\nREMOTE\n'
                 result = subprocess.run(['bash', '-c', harness],
                                         cwd=ROOT, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -583,7 +582,6 @@ SPARK_EXPERT_DOCKER_INFERENCE=inference
 engine_commit=engine
 sparkinfer_commit=fork
 release_version=v5
-EXL3_PAIRED_TP4=on
 bf16_families=
 audio_aot=OFF
 source_manifest_sha256=
@@ -593,7 +591,7 @@ spark_tp_roles=
             environment['PATH'] = f"{stub_dir}:{environment['PATH']}"
             result = subprocess.run(
                 ['bash', '-c', harness + invocation + "<<'REMOTE'" + preamble
-                 + 'printf "%s\\n" "$exl3_paired_tp4" "$source_manifest_sha256" "$spark_tp_roles"\nREMOTE\n'],
+                 + 'printf "%s\\n" "$source_manifest_sha256" "$spark_tp_roles"\nREMOTE\n'],
                 cwd=ROOT, text=True, capture_output=True, env=environment)
             self.assertEqual(result.returncode, 0, result.stderr)
             records = {'H': [], 'O': [], 'C': []}
@@ -606,7 +604,7 @@ spark_tp_roles=
                              'the remote command is what OpenSSH joins into one string')
             self.assertFalse([t for t in records['C'] if str(config) in t],
                              'the config path must not appear in the remote command line')
-            self.assertEqual(result.stdout.splitlines(), ['on', '', ''])
+            self.assertEqual(result.stdout.splitlines(), ['', ''])
 
     def test_native_api_identity_is_independent_of_checkpoint_repository(self) -> None:
         for model, expected in [('deepseek-ai/DeepSeek-V4.1-Flash', 0),
@@ -617,23 +615,6 @@ spark_tp_roles=
                     cwd=ROOT, input=json.dumps({'object': 'list', 'data': [{'id': model}]}),
                     text=True, capture_output=True)
                 self.assertEqual(result.returncode, expected, result.stderr)
-
-    def test_paired_build_setting_is_explicit_and_validated(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            config = Path(temporary) / 'release.config'
-            for setting in ('on', 'off', 'invalid'):
-                with self.subTest(setting=setting):
-                    config.write_text((ROOT / 'cuteafd.config').read_text()
-                                      + f'\nEXL3_PAIRED_TP4={setting}\n')
-                    result = subprocess.run(
-                        ['bash', '-c', 'source scripts/lib/release-common.sh; release_load_config "$1"; printf "%s" "$EXL3_PAIRED_TP4"',
-                         'test', str(config)], cwd=ROOT, capture_output=True, text=True)
-                    if setting == 'invalid':
-                        self.assertEqual(result.returncode, 2)
-                        self.assertIn('EXL3_PAIRED_TP4 must be on or off', result.stderr)
-                    else:
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertEqual(result.stdout, setting)
 
     def package_identity(self, manifest: dict) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -647,15 +628,9 @@ spark_tp_roles=
         disjoint = self.package_identity(manifest)
         self.assertEqual(disjoint.returncode, 0, disjoint.stderr)
         self.assertTrue(disjoint.stdout.startswith('disjoint:'))
-        manifest['paired_tp4'] = True
-        paired = self.package_identity(manifest)
-        self.assertEqual(paired.returncode, 0, paired.stderr)
-        self.assertTrue(paired.stdout.startswith('paired:'))
-        self.assertNotEqual(disjoint.stdout, paired.stdout)
         manifest['files']['kernel'] = 'second'
-        self.assertNotEqual(paired.stdout, self.package_identity(manifest).stdout)
-        for field, value in [('paired_tp4', 'true'), ('paired_tp4', None),
-                             ('role', 'coordinator'), ('schema', 'wrong'),
+        self.assertNotEqual(disjoint.stdout, self.package_identity(manifest).stdout)
+        for field, value in [('role', 'coordinator'), ('schema', 'wrong'),
                              ('sparkinfer_revision', 'another-build')]:
             with self.subTest(field=field, value=value):
                 result = self.package_identity({**manifest, field: value})

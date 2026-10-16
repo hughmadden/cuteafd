@@ -32,5 +32,5 @@ def test_spark_remote_leg_receives_the_audio_switch():
     invocation, remote = block.split("<<'REMOTE'", 1)
     remote = remote.split("\nREMOTE\n", 1)[0]
     assert invocation.rstrip().endswith('"$audio_aot" "${CUTEAFD_BUILD_CACHES:-on}"'), "the Spark leg must pass the audio switch"
-    assert 'audio_aot="${21:-ON}"' in remote
-    assert remote.index('audio_aot="${21:-ON}"') < remote.index('CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot')
+    assert 'audio_aot="${20:-ON}"' in remote
+    assert remote.index('audio_aot="${20:-ON}"') < remote.index('CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot')

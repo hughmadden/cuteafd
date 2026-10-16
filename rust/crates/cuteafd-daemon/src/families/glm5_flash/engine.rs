@@ -5595,8 +5595,9 @@ mod prefill_lane_tests {
             ("integration/cuteafd/_fp8_weights.py", 0x622a_1b45_96e9_71da),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
-            // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
-            ("integration/cuteafd/_common.py", 0x86ea_ace0_6ff1_26ca),
+            // Dense Qwen geometry only: glmf/glmf2 retain all 88 objects and 90 headers
+            // byte-identically against 515a0b94 at both 188 and 170 SMs (2b792f04 export gate).
+            ("integration/cuteafd/_common.py", 0x9d74_ed3b_938b_e00a),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
             ("gemm/bf16_gemv/_skinny.py", 0x3351_3301_8c37_3f8f),

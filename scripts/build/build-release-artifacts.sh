@@ -67,8 +67,6 @@ case "$role" in
     exit 2
     ;;
 esac
-exl3_paired_tp4=OFF
-exl3_residency=""
 # Opt-in replicated-group Spark expert roles. Empty is the default and keeps
 # the historical Spark TP4 shard (and every release default) byte-identical.
 # Release images carry the audio tower: AUDIO=auto serves it for qualified checkpoints.
@@ -105,19 +103,8 @@ for bf16_family in "${bf16_family_list[@]}"; do
     { echo "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_family needs $bf16_family:fp8 in CUTEAFD_RELEASE_EXPERT_FAMILIES" >&2; exit 2; }
 done
 # v7 ships both EXL3 decoder families by default: the uniform K=2 raw
-# publication family (2,3) and the staged K3.25 family (3,4). Paired TP4
-# builds remain single-family and stay on the v5 (3,4) family.
+# publication family (2,3) and the staged K3.25 family (3,4).
 exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4}"
-case "${CUTEAFD_RELEASE_EXL3_PAIRED_TP4:-off}" in
-  on)
-    [[ "$role" == expert ]] || { echo "Paired EXL3 package requires expert role" >&2; exit 2; }
-    exl3_paired_tp4=ON
-    exl3_residency=80=2
-    exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-3,4}"
-    ;;
-  off) ;;
-  *) echo "CUTEAFD_RELEASE_EXL3_PAIRED_TP4 must be on or off" >&2; exit 2 ;;
-esac
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
@@ -249,8 +236,6 @@ cmake \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="${CUTEAFD_RELEASE_NVFP4_AOT:-ON}" \
   -DCUTEAFD_ENABLE_EXL3_PACKAGES=ON \
   -DCUTEAFD_V41_EXL3_BIT_FAMILIES="$exl3_bit_families" \
-  -DCUTEAFD_V41_EXL3_PAIRED_TP4="$exl3_paired_tp4" \
-  -DCUTEAFD_V41_EXL3_RESIDENCY="$exl3_residency" \
   -DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_FP8_AOT="$coordinator_aot" \
@@ -262,6 +247,7 @@ cmake \
   -DCUTEAFD_MIMO_GEOMETRIES="$(g="${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}"; echo "${g//,/;}")" \
   -DCUTEAFD_ENABLE_GLMF_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_QWEN4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_QWEN_DENSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \

@@ -34,10 +34,13 @@ using cudaError_t = int;
 using cudaStream_t = void*;
 using cudaLibrary_t = void*;
 constexpr int cudaSuccess=0, cudaErrorInvalidValue=1, cudaErrorMemoryAllocation=2, cudaErrorInvalidDevice=10;
-struct cudaDeviceProp { int major, minor, multiProcessorCount; };
+enum cudaDeviceAttr { cudaDevAttrComputeCapabilityMajor, cudaDevAttrComputeCapabilityMinor, cudaDevAttrMultiProcessorCount };
 static int major=12, minor=0, sms=188, current=0, last_grid=-1;
 static int cudaGetDevice(int* out) { *out=current; return 0; }
-static int cudaGetDeviceProperties(cudaDeviceProp* out,int) { *out={major,minor,sms}; return 0; }
+static int cudaDeviceGetAttribute(int* out,cudaDeviceAttr attr,int) {
+    *out=attr==cudaDevAttrComputeCapabilityMajor ? major : attr==cudaDevAttrComputeCapabilityMinor ? minor : sms;
+    return 0;
+}
 static int cudaLibraryUnload(void*) { return 0; }
 extern "C" void set_device(int ma,int mi,int sm,int id) { major=ma;minor=mi;sms=sm;current=id; }
 extern "C" int observed_grid() { return last_grid; }
@@ -72,7 +75,7 @@ static int wrapper_{role}({module_type}*,void*,int32_t active_m,int32_t grid_x,c
                 lib.cuteafd_exl3_destroy.argtypes = [ct.c_void_p]
                 lib.cuteafd_exl3_core.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p),
                                                 ct.POINTER(ct.c_int32), ct.c_void_p]
-                for sms in (170, 188, 200):
+                for sms in (170, 188):
                     lib.set_device(12, 0, sms, 0)
                     context = ct.c_void_p()
                     self.assertEqual(lib.cuteafd_exl3_create(ct.byref(context)), 0)
@@ -90,7 +93,7 @@ static int wrapper_{role}({module_type}*,void*,int32_t active_m,int32_t grid_x,c
                                          (ct.c_int32 * 2)(1, 1), None), 0)
                     lib.set_device(12, 0, sms, 0)
                     lib.cuteafd_exl3_destroy(context)
-                for major, minor, sms in ((12, 1, 188), (11, 0, 188), (12, 0, 0)):
+                for major, minor, sms in ((12, 1, 188), (11, 0, 188), (12, 0, 0), (12, 0, 200)):
                     lib.set_device(major, minor, sms, 0)
                     context = ct.c_void_p()
                     self.assertNotEqual(lib.cuteafd_exl3_create(ct.byref(context)), 0)

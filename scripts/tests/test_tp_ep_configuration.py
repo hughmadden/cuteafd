@@ -198,13 +198,25 @@ class TopologyConfigTest(unittest.TestCase):
     def test_explicit_topology_rejects_non_native_formats(self) -> None:
         for overlay, message in (
             ("EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n", "requires EXPERT_FORMAT=native"),
-            ("EXL3_PAIRED_TP4=on\n", "EXL3_PAIRED_TP4 must be off"),
             ("SPARKINFER_EXL3=auto\n", "requires SPARKINFER_EXL3=disable"),
         ):
             with self.subTest(overlay=overlay):
                 result = load("SPARK_COUNT=4\nSPARK_TP=2\nSPARK_EP=2\n" + overlay, "true")
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(message, result.stderr)
+
+    def test_compact_exl3_accepts_only_explicit_tp3_ep1(self) -> None:
+        for mode in ("auto", "force"):
+            result = load(f"SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3={mode}\n",
+                          "release_spark_rank_map")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["0 0 0", "1 0 1", "2 0 2"])
+        for tp, ep, count, extra in ((2, 1, 2, ""), (3, 2, 6, ""), (4, 1, 4, ""),
+                                      (3, 1, 3, "SPARKINFER_EXL3=disable\n")):
+            with self.subTest(tp=tp, ep=ep, extra=extra):
+                result = load(f"SPARK_COUNT={count}\nSPARK_TP={tp}\nSPARK_EP={ep}\n"
+                              "EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=force\n" + extra)
+                self.assertEqual(result.returncode, 2)
 
     def test_unknown_topology_alias_is_not_accepted(self) -> None:
         result = load("SPARK_GROUPS=2\n", "true")
@@ -436,6 +448,7 @@ spark_tp={spark_tp}
 spark_ep={spark_ep}
 spark_admission=not-applicable
 expert_format=native
+model_is_exl3=false
 spark_exl3_identity=
 gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
@@ -547,6 +560,26 @@ v41_fp8_head_args=()
         for args in starts:
             self.assertEqual(args[-8:-5], ["1", "2", "2"])
             self.assertEqual(args[-9], "4")
+
+    def test_compact_tp3_startup_keeps_compressed_admission_and_topology(self) -> None:
+        result, events = self.run_startup(
+            gpus=2,
+            plan=dict(version=1, rtx_gpus=2, nonce="fresh", rtx_expert_layers=20, spark_first_layer=20),
+            topology_explicit=1, spark_tp=3, spark_ep=1, spark_count=3,
+            hosts=["a", "b", "c"],
+            extra_setup='model_is_exl3=true\nexpert_format=exl3-k34\n'
+                        'release_validate_spark_weight_admission() { echo "native sizing used" >&2; return 1; }\n',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        coordinator = next(args for tool, args in events if tool == "docker" and args[0] == "run")
+        self.assertEqual(coordinator[coordinator.index("--spark-tp") + 1], "3")
+        self.assertEqual(coordinator[coordinator.index("--spark-ep") + 1], "1")
+        self.assertNotIn("--exl3-paired-tp4", coordinator)
+        starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
+        self.assertEqual(len(starts), 3)
+        for args in starts:
+            self.assertEqual(args[-8:-5], ["1", "3", "1"])
+            self.assertEqual(args[-9], "3")
 
     def test_six_rank_explicit_topology_starts_six_workers(self) -> None:
         result, events = self.run_startup(

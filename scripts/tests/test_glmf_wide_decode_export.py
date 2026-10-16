@@ -37,7 +37,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -61,10 +61,12 @@ def exporter(monkeypatch):
     ("glm", "zai-org/GLM-5.3", 1048576),
     ("glmf", "zai-org/GLM-5.3-Flash", 1048576),
     ("qwen4", "Qwen/Qwen3.8-Flash-Next", 262144),
+    ("qwen35", "Qwen/Qwen3.5-9B", 262144),
+    ("qwen38", "Qwen/Qwen3.8-27B", 262144),
 ])
 def test_checkpoint_extent_table_and_head_splits(exporter, geometry, checkpoint, limit):
     assert exporter.CHECKPOINT_CONTEXTS[geometry] == (checkpoint, limit)
-    for name in (geometry, geometry + "2") if geometry != "qwen4" else (geometry,):
+    for name in (geometry, geometry + "2") if not geometry.startswith("qwen") else (geometry,):
         assert exporter.geometry_context(name, 131072) == 131072
         assert exporter.geometry_context(name, 1048576) == limit
         assert exporter.geometry_context(name, 2097152) == limit
@@ -88,6 +90,27 @@ def test_qwen_fp8_kv_exports_preserve_bf16_and_weight_variants(exporter):
         assert calls[f"attn_producer_w8_kv_fp8_m{cap}"] == {
             "max_rows": cap, "fp8_only": mode, "kv_format": "fp8"}
     assert calls["attn_producer_fp8_kv_fp8_m64"] == {"max_rows": 64, "fp8": True, "kv_format": "fp8"}
+
+
+@pytest.mark.parametrize("norm_dtype", ["torch.float32", "torch.bfloat16"])
+@pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
+def test_dense_qwen_exports_only_native_dense_programs(exporter, norm_dtype, decode_rows, prefill_rows):
+    programs = exporter.qwen_dense_programs(GEOMETRY, decode_rows, prefill_rows, 262144,
+                                             norm_dtype=norm_dtype)
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
+    caps = set((decode_rows, prefill_rows))
+    assert len(calls) == len(programs) == 3 + 5 * len(caps)
+    assert set(calls) == {"norm", "add", "gdn_commit"} | {
+        f"{op}_m{cap}" for cap in caps for op in ("gdn", "attn_producer", "full_gqa", "attn_o", "ffn")}
+    for stem, (op, params, call) in calls.items():
+        module, function, args, kwargs = call
+        assert module == "qwen_dense" and args == (GEOMETRY,)
+        expected_function = "producer" if op == "attn_producer" else op
+        assert function == f"compile_qwen_dense_{expected_function}_aot"
+        assert params == {k: str(v) if k == "norm_dtype" else v for k, v in kwargs.items()}
+    for cap in caps:
+        assert calls[f"gdn_m{cap}"][2][3] == {"max_rows": cap, "norm_dtype": norm_dtype}
+        assert calls[f"full_gqa_m{cap}"][2][3] == {"max_rows": cap, "max_splits": 32}
 
 
 def test_glm_declared_static_w8a8_exports_decode_and_prefill(exporter):

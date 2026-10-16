@@ -8,10 +8,12 @@ torch's C extensions corrupts later imports in the same process (see
 absent the dependent tests skip rather than error.
 """
 import argparse
+from contextlib import nullcontext
 import importlib.util
 import json
 from pathlib import Path
 import shutil
+import struct
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -96,12 +98,12 @@ class PackageProfileTests(unittest.TestCase):
     # How many ranks share one export per width, from the layout contract.
     expected_rank_count = {'tp2-rank': 2, 'tp3-rank': 3}
 
-    def build_fixture(self, root, role, bits, paired=False, require=(), tiles=(), geometry='v41'):
+    def build_fixture(self, root, role, bits, require=(), tiles=(), geometry='v41'):
         capacities = (1, 80)
         args = argparse.Namespace(
             output=root / 'package', build_dir=root / 'build', role=role, geometry=geometry,
-            bits=list(bits), capacities=','.join(map(str, capacities)), paired_tp4=paired,
-            residency=[], require_layout=list(require), tile=list(tiles),
+            bits=list(bits), capacities=','.join(map(str, capacities)),
+            require_layout=list(require), tile=list(tiles),
             cxx='unused-cxx', cuda_include=root, cuda_libdir=root,
             cuda_driver=root / 'libcuda.so', runtime=root / 'libcute_dsl_runtime.so')
         args.runtime.write_bytes(b'runtime fixture')
@@ -109,10 +111,19 @@ class PackageProfileTests(unittest.TestCase):
         pinned.REVISION = 'fixture-revision'
         exporter = ModuleType('export_b12x_exl3_aot')
         torch = ModuleType('torch')
+        compute = [12, 1 if role == 'spark' else 0]
         torch.cuda = SimpleNamespace(
             get_device_properties=Mock(return_value=SimpleNamespace(
-                major=12, minor=1 if role == 'spark' else 0, multi_processor_count=48)),
+                major=compute[0], minor=compute[1], multi_processor_count=48)),
+            get_device_capability=Mock(return_value=tuple(compute)),
             empty_cache=Mock())
+        jobs = ModuleType('_export_jobs')
+        jobs.export_jobs = lambda: 1
+        jobs.export_slot = nullcontext
+        image = bytearray(64)
+        image[:6] = b'\x7fELF\x02\x01'
+        struct.pack_into('<H', image, 18, 190)
+        struct.pack_into('<I', image, 48, (10 * compute[0] + compute[1]) << 8)
 
         def export(raw, width, experts, capacity, tiers, routing, topk, dtype, **options):
             self.assertEqual(routing, 'auto')
@@ -120,17 +131,15 @@ class PackageProfileTests(unittest.TestCase):
             meta = dict(capacity=capacity, intermediate=width, experts=experts,
                         top_k=topk, output_dtype=dtype, bits=list(tiers),
                         blocks_per_sm=options.get('blocks_per_sm', 1),
-                        sparkinfer_revision=pinned.REVISION)
-            if paired:
-                meta.update(paired_boundary=options['paired_boundary'],
-                            descriptor_rows=4, native_info_version=3)
-                self.assertNotIn('tile', options,
-                                 'the exporter refuses a tile override on paired builds')
-            # The build command may request a tile override, a residency cap and a
-            # decode schedule.
-            self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'paired_boundary',
+                        compute=compute, sparkinfer_revision=pinned.REVISION)
+            for label in ('v41_exl3_core', 'v41_exl3_sum'):
+                (raw / f'{label}.o').write_bytes(image)
+            # Preserve the policy's options in the fake export record.
+            self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'route_block',
                                                 'hidden', 'swiglu_limit', 'decode_schedule'},
                                  'unexpected option consumed by the fake export')
+            if 'route_block' in options:
+                meta['route_block'] = options['route_block']
             if 'decode_schedule' in options:
                 # The exporter records b12x's canonical options; any string will do here.
                 meta['decode_schedule'] = f"canonical:{options['decode_schedule']}"
@@ -144,8 +153,7 @@ class PackageProfileTests(unittest.TestCase):
                 capacity, topk, direct_exl3=len(tiers) == 2)))
             meta['direct'] = direct
             meta['requires_route_preparation'] = not direct
-            # The real exporter always records the tile it resolved, paired builds
-            # included, and the pinned policy differs per width *and* per capacity,
+            # The real exporter always records the tile it resolved, and the pinned policy differs per width *and* per capacity,
             # so the fixture asks the planner itself rather than restating numbers.
             if 'tile' in options:
                 meta['tile'] = list(options['tile'])
@@ -174,10 +182,17 @@ class PackageProfileTests(unittest.TestCase):
         def link(command, *, check):
             self.assertTrue(check)
             self.assertEqual(command[0], 'unused-cxx')
-            Path(command[-1]).write_bytes(b'linked fixture')
+            Path(command[-1]).write_bytes(image)
 
-        with patch.dict(sys.modules, {'_pinned_sparkinfer': pinned,
+        # Keep fake compiler modules in-process; exercise the real worker and
+        # package assembly, not multiprocessing's serialization of local mocks.
+        def compile_inline(payloads, _jobs):
+            return [package.compile_variant(payload) for payload in payloads]
+
+        with patch.dict(sys.modules, {'_pinned_sparkinfer': pinned, '_export_jobs': jobs,
                                      'export_b12x_exl3_aot': exporter, 'torch': torch}), \
+                patch.object(package, 'compile_variants', side_effect=compile_inline), \
+                patch.object(package.os, 'setsid'), \
                 patch.object(package.subprocess, 'run', side_effect=link):
             package.build(args)
         manifest = package.verify(args.output, pinned.REVISION, args.runtime, role)
@@ -205,12 +220,12 @@ class PackageProfileTests(unittest.TestCase):
                     for rank in range(4)}
         expected.update({f'tp2-rank{rank}': (1152, 384, 6, 'bf16') for rank in range(2)})
         expected.update({f'tp3-rank{rank}': (768, 384, 6, 'bf16') for rank in range(3)})
+        expected.update({f'tp6-rank{rank}': (384, 384, 6, 'bf16') for rank in range(6)})
         for bits in ((2, 3), (3, 4)):
             with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
                 output, manifest, calls, capacities = self.build_fixture(Path(temporary), 'spark', bits)
                 self.assert_layouts(manifest, capacities, expected, bits)
-                self.assertFalse(manifest.get('paired_tp4', False))
-                self.assertEqual(len(calls), 4 * len(capacities))
+                self.assertEqual(len(calls), 5 * len(capacities))
                 for group, width in (('tp2-rank', 1152), ('tp3-rank', 768)):
                     for capacity in capacities:
                         shared = [call for call in calls
@@ -278,7 +293,7 @@ class PackageProfileTests(unittest.TestCase):
                 expected = ({'tile': (64, 128, 64, 128), 'blocks_per_sm': 2} if call.args[3] == 80 else {})
                 self.assertEqual({key: call.kwargs[key] for key in ('tile', 'blocks_per_sm')
                                   if key in call.kwargs}, expected)
-            profiles = package.profiles_for_role('spark', 'glmf')
+            profiles = package.build_profiles('spark', 'glmf')
             self.assertEqual(len(calls) - len(gb10), len(profiles) * len(capacities))
             for directory in (v['directory'] for v in manifest['variants'] if 'schedule' not in v):
                 self.assertRegex(directory, r'^tp[2346]-rank[0-5]/m(1|80)$')
@@ -362,11 +377,11 @@ class PackageProfileTests(unittest.TestCase):
         for example in examples:
             cleaned = example.strip("'(),;")
             with self.subTest(example=cleaned):
-                parsed = package.tile_overrides([cleaned], [1, 16, 80], 'spark', False)
+                parsed = package.tile_overrides([cleaned], [1, 16, 80], 'spark')
                 self.assertEqual(list(parsed), ['tp3-width768'])
         for bad in ('tp3-width768=64,256,64,256', 'tp3-width768=16=64,256,64,256'):
             with self.subTest(bad=bad), self.assertRaises(ValueError) as caught:
-                package.tile_overrides([bad], [1, 16, 80], 'spark', False)
+                package.tile_overrides([bad], [1, 16, 80], 'spark')
             self.assertIn('must name a spark profile as PROFILE=CAPACITIES', str(caught.exception))
 
     @unittest.skipIf(POLICY_TILE is None, 'requires the pinned b12x planner')
@@ -420,8 +435,8 @@ class PackageProfileTests(unittest.TestCase):
 
     def test_six_rank_profiles_split_whole_blocks(self):
         """V4 Pro's 24 H128 blocks split four apiece; a 2048 intermediate's 16
-        split 3, 3, 3, 3, 2, 2 (one export per width); V4.1 and Qwen (5
-        blocks) carry no TP6."""
+        split 3, 3, 3, 3, 2, 2 (one export per width). V4.1's exporter
+        carries three blocks per rank; Qwen's five blocks cannot span TP6."""
         pro = {name: (width, dest) for name, width, _, _, _, dest in package.shard_profiles('dsv4p', 'spark')}
         self.assertEqual(pro['tp6-width512'], (512, [f'tp6-rank{rank}' for rank in range(6)]))
         for geometry in ('glm', 'glmf', 'dsv4f'):
@@ -432,7 +447,7 @@ class PackageProfileTests(unittest.TestCase):
         qwen = [name for name, *_ in package.shard_profiles('qwen4', 'spark')]
         self.assertFalse([name for name in qwen if name.startswith('tp6')])
         v41 = [name for name, *_ in package.profiles_for_role('spark')]
-        self.assertFalse([name for name in v41 if name.startswith('tp6')])
+        self.assertEqual([name for name in v41 if name.startswith('tp6')], ['tp6-width384'])
         coordinator = [name for name, *_ in package.shard_profiles('dsv4p', 'coordinator')]
         self.assertFalse([name for name in coordinator if name.startswith('tp6')])
 
@@ -661,7 +676,7 @@ class PackageProfileTests(unittest.TestCase):
             self.assertTrue((staged / 'tp3-width768/m1').is_dir(), 'policy path unchanged')
             self.assertEqual(package.verify(output, 'fixture-revision'), manifest)
 
-    def test_tile_override_rejects_unscoped_and_paired_requests(self):
+    def test_tile_override_rejects_unscoped_requests(self):
         for value, reason in (
                 ('tp9-width1=1:64,256,64,256', 'must name a spark profile'),
                 ('tp3-width768=99:64,256,64,256', 'not packaged'),
@@ -671,24 +686,6 @@ class PackageProfileTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     self.build_fixture(Path(temporary), 'spark', (2, 3), tiles=[value])
             self.assertIn(reason, str(caught.exception))
-        with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaises(ValueError) as caught:
-                self.build_fixture(Path(temporary), 'spark', (2, 3), paired=True,
-                                   tiles=['tp3-width768=1:64,256,64,256'])
-        self.assertIn('not supported for paired', str(caught.exception))
-
-    def test_spark_paired_families_remain_tp4_only(self):
-        expected = {f'tp4-rank{rank}': (640, 384, 6, 'bf16') for rank in range(4)}
-        for bits in ((2, 3), (3, 4)):
-            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
-                _, manifest, calls, capacities = self.build_fixture(Path(temporary), 'spark', bits, paired=True)
-                self.assert_layouts(manifest, capacities, expected, bits)
-                self.assertTrue(manifest['paired_tp4'])
-                self.assertEqual(len(calls), 2 * len(capacities))
-                for variant in manifest['variants']:
-                    rank = int(variant['directory'].split('/')[0][-1])
-                    self.assertEqual(variant['paired_boundary'], 'last' if rank % 2 == 0 else 'first')
-
     def test_coordinator_families_unchanged(self):
         expected = {'rtx-tp1': (2304, 384, 6, 'fp32'),
                     'rtx-tp2': (1152, 384, 6, 'fp32'), 'dspark': (2304, 128, 3, 'bf16')}
@@ -697,7 +694,6 @@ class PackageProfileTests(unittest.TestCase):
                 _, manifest, calls, capacities = self.build_fixture(Path(temporary), 'coordinator', bits)
                 self.assert_layouts(manifest, capacities, expected, bits)
                 self.assertEqual(len(calls), 3 * len(capacities))
-                self.assertFalse(manifest.get('paired_tp4', False))
 
 
 if __name__ == '__main__':

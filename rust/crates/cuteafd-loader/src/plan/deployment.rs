@@ -99,7 +99,7 @@ impl<'a> DeploymentSpec<'a> {
             "--spark-tp and --spark-ep must be set together");
         let exl3 = report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"));
         let explicit = options.spark_tp.is_some()
-            || (family == "deepseek_v41" && !exl3 && ranks != 0 && ranks != 4);
+            || (family == "deepseek_v41" && if exl3 { ranks == 3 } else { ranks != 0 && ranks != 4 });
         let topology = Topology { tp: options.spark_tp.unwrap_or(ranks),
             ep: options.spark_ep.unwrap_or(1), explicit };
         if explicit {
@@ -108,7 +108,8 @@ impl<'a> DeploymentSpec<'a> {
                 "Spark TP * EP must equal selected rank count");
             ensure!(topology.ep == 1 || matches!((topology.tp, topology.ep), (2, 2) | (3, 2) | (2, 3)),
                 "unsupported replicated Spark topology");
-            ensure!(!exl3, "explicit Spark topology requires native experts");
+            ensure!(!exl3 || (family == "deepseek_v41" && topology.tp == 3 && topology.ep == 1),
+                "explicit Spark topology requires native experts or V4.1 compact EXL3 TP3EP1");
         }
         ensure!(options.peers.is_empty() || options.peers.len() >= ranks,
             "deployment peer inventory does not cover selected Spark ranks");
@@ -136,7 +137,7 @@ impl<'a> DeploymentSpec<'a> {
         } else {
             PlacementHandoff::Fixed { spark_first_layer: report.launch.as_ref().map_or(0, |l| l.first_expert_layer) }
         };
-        let spark_tp_role = (family == "deepseek_v41" && explicit && topology.tp != 4)
+        let spark_tp_role = (family == "deepseek_v41" && !exl3 && explicit && topology.tp != 4)
             .then(|| format!("tp{}", topology.tp));
         Ok(Self { version: 1, family, snapshot: &report.snapshot,
             rtx_gpus: options.rtx_gpus, spark_ranks: ranks,
@@ -197,6 +198,31 @@ mod tests {
             assert_eq!(value["artifact_requirements"]["verify_live_identity"], true);
             assert!(value.get("native_library_sha256").is_none());
             assert!(value.get("resolved_config_fingerprint").is_none());
+        }
+    }
+
+    #[test]
+    fn compact_exl3_tp3_normalizes_topology_without_native_role_proof() {
+        let (_dir, mut report) = fixture(1, 3);
+        report.experts.as_mut().unwrap().package = "v41:exl3-k23".into();
+        for explicit in [false, true] {
+            let options = DeploymentOptions { rtx_gpus: 1,
+                spark_tp: explicit.then_some(3), spark_ep: explicit.then_some(1),
+                ..Default::default() };
+            let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
+            assert_eq!(deployment.topology, Topology { tp: 3, ep: 1, explicit: true });
+            assert_eq!(deployment.roles.iter().map(|r| (r.group, r.tp_rank)).collect::<Vec<_>>(),
+                [(0, 0), (0, 1), (0, 2)]);
+            assert!(deployment.artifact_requirements.verify_live_identity);
+            assert!(deployment.artifact_requirements.spark_tp_role.is_none());
+            assert!(!deployment.artifact_requirements.require_symbols_verified);
+            assert!(!deployment.artifact_requirements.verify_native_library_sha256);
+        }
+        for (tp, ep) in [(2, 1), (4, 1), (3, 2)] {
+            report.spark_ranks = tp * ep;
+            let options = DeploymentOptions { rtx_gpus: 1,
+                spark_tp: Some(tp), spark_ep: Some(ep), ..Default::default() };
+            assert!(DeploymentSpec::from_report(&report, &options).is_err());
         }
     }
 
