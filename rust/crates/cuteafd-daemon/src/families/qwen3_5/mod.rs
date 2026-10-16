@@ -2,6 +2,7 @@
 mod programs;
 mod weights;
 mod block;
+pub(crate) mod serve;
 pub(crate) mod engine;
 use anyhow::{ensure, Context, Result};
 use std::path::PathBuf;

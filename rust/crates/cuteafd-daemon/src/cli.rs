@@ -87,6 +87,9 @@ pub(crate) enum Commands {
     /// Dense Qwen3.5/3.8 qualification (header validation only until AOT/executor exist).
     #[command(hide = true)]
     Qwen35Golden(crate::families::qwen3_5::GoldenArgs),
+    /// Serve dense Qwen BF16 through the shared Qwen scheduler.
+    #[command(hide = true)]
+    ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),
     /// Serve Qwen 3.8 Flash Next (qwen4_exp) through the OpenAI API on the qwen4 engine.
     #[command(hide = true)]
     ServeQwen4(crate::families::qwen4::serve::ServeArgs),
