@@ -1,6 +1,6 @@
 //! GLM owned-attention captures: one census for warm-up, replay and admission.
 use super::{glm_decode_row_buckets, glm_decode_table_widths};
-use crate::placement::inventory::{GraphSet, Lifetime, StartupGraphs};
+use crate::placement::inventory::{GraphSet, Lifetime, StartupGraphs, GLM_OWNED_SM120_GRAPH_BYTES};
 
 /// These values are the persistent graph-key phase, not a launch count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,9 +54,8 @@ pub fn glm_graph_shapes(context: usize, pool_pages: usize) -> Vec<GlmGraphShape>
     }).collect()
 }
 
-/// Existing SM120 170 KB/segment calibration, with its 10% driver margin and
-/// 64 MiB minimum. Owned phase sizes still require a ready-ledger calibration;
-/// the phase census is exact, unlike multiplying a whole-engine byte budget.
+/// Measured SM120 owned-phase calibration with a separate 10% growth margin
+/// (64 MiB minimum). Planner and startup use the same executable census.
 pub fn glm_owned_startup_graphs(context: usize, pool_pages: usize, owners: &[u8], tp2: &[bool])
     -> Result<StartupGraphs<GlmGraphShape>, String> {
     let segments = glm_owned_segments(owners, tp2)?;
@@ -66,7 +65,7 @@ pub fn glm_owned_startup_graphs(context: usize, pool_pages: usize, owners: &[u8]
         counts[segment.rank] = counts[segment.rank].checked_add(keys.len() as u64)
             .ok_or("GLM graph count overflow")?;
     }
-    GraphSet::new(&counts, 170_000, 10, 64 << 20, keys.len() as u64, Lifetime::Startup).startup(keys)
+    GraphSet::new(&counts, GLM_OWNED_SM120_GRAPH_BYTES, 10, 64 << 20, keys.len() as u64, Lifetime::Startup).startup(keys)
 }
 
 #[cfg(test)]
@@ -91,12 +90,31 @@ mod tests {
             let startup = glm_owned_startup_graphs(1 << 20, 32768, &owners, &tp2).unwrap();
             for rank in 0..2 {
                 assert_eq!(startup.inventory.ranks[rank].executables, startup.keys.len() as u64 * 10);
-                assert_eq!(startup.inventory.at_ready(rank), startup.keys.len() as u64 * 10 * 170_000);
+                assert_eq!(startup.inventory.at_ready(rank), startup.keys.len() as u64 * 10 * GLM_OWNED_SM120_GRAPH_BYTES);
                 assert_eq!(startup.inventory.at_ready(rank) + startup.inventory.growth(rank), startup.inventory.bytes(rank));
             }
         }
         assert!(glm_owned_segments(&[2], &[false]).is_err());
         assert!(glm_owned_segments(&[0], &[]).is_err());
+    }
+
+    #[test]
+    fn owned_sm120_ready_calibration_matches_recorded_capture_census() {
+        // RTX PRO 6000 SM120, GLM 5.3 EXL3 K4, two RTX + six expert ranks,
+        // 2M pool, 1M context, 78 layers (TP2 layers 3..5), 2026-10-15.
+        // Both launches measured the same deltas. The 213 shapes use widths
+        // 16..16384 and the shared short/long decode-row buckets (up to 64).
+        // Recheck on RTX 5090 or a changed census; neither is measured here.
+        let owners: Vec<_> = (0..78).map(|layer| (layer % 2) as u8).collect();
+        let tp2: Vec<_> = (0..78).map(|layer| (3..5).contains(&layer)).collect();
+        let startup = glm_owned_startup_graphs(1 << 20, 32768, &owners, &tp2).unwrap();
+        assert_eq!(startup.keys.len(), 213);
+        for (rank, observed) in [5_790_236_672u64, 5_762_973_696].into_iter().enumerate() {
+            assert_eq!(startup.inventory.ranks[rank].executables, 49_416);
+            assert_eq!(startup.inventory.at_ready(rank), 5_781_672_000);
+            assert!(startup.inventory.at_ready(rank).abs_diff(observed) <= 64 << 20);
+            assert_eq!(startup.inventory.growth(rank), 578_167_200);
+        }
     }
 
     #[test]

@@ -64,6 +64,45 @@ GLM 5.3 EXL3 K4, 1 RTX + 4 Sparks. `SPECULATOR_FP8=off` keeps the BF16 drafter.
 | --- | --- | --- |
 | `ATTENTION_PLAN_ROWS` / `--attention-plan-rows` | `auto` | Numerical recipe chosen once before admission: loaded drafter width + 1, clamped to 64; without a drafter, 1. Explicit 1..64 overrides it. Serial decode and verification share the recipe; selected scratch covers all 64 execution rows. |
 
+## D-GLM attention qualification
+
+`context` remains the default. Explicit `layers` uses the shared owner-aware
+pipeline, whole attention/cache/indexer groups on one GPU, split FFNs and
+AfterAttention residual broadcasts. Decode and verify keep one packed step;
+ordered prefill currently supports at most two lanes, versus three by default
+for `context`. Matched comparisons pin two lanes in both modes; default
+three-lane Context 8K prefill is a separate measurement.
+
+The initial 2026-10-15 campaign is **not qualified**: both Layers launches
+failed the prefill device-logits return contract after graph warmup, and a
+Context launch failed the shared expert-worker CUDA memory query. All three
+matched pairs must restart on one fixed sealed candidate, at exactly
+2,097,152 pool tokens, two RTX PRO 6000 GPUs and six expert ranks. No placement
+speedup or default decision follows from the incomplete arms.
+
+Owned-phase graph calibration from those two launches (78 layers, two TP2
+expert layers, 1M context, 213 shapes, 49,416 executables per rank):
+
+| Ready graph bytes | Rank 0 | Rank 1 |
+| --- | ---: | ---: |
+| Provisional estimate | 8,400,720,000 | 8,400,720,000 |
+| Measured capture delta | 5,790,236,672 | 5,762,973,696 |
+| Calibrated estimate (117,000 bytes/executable) | 5,781,672,000 | 5,781,672,000 |
+
+The calibrated errors are 8.2 / 17.8 MiB; a separate 10% growth reserve is not
+counted at ready. This is an SM120 RTX PRO 6000 measurement, not a 5090 or
+arbitrary-shape qualification; new hardware/census and full ready-ledger
+agreement require rechecking.
+
+A separate Context carry-over check, `ae1c2627` versus the P7-integrated K4
+`38cc2847`, produced byte-identical saved F32 logits (6,000 x 154,880;
+SHA256 `d31225130e056c1237628424d4d2a3cb2f2c1bdaec2bdd106b5d7dbc73dc184b`).
+Both used a 2M pool, three prefill lanes and all 78 layers, with routed experts
+intentionally skipped to isolate the unchanged coordinator path. NLL was
+9.045842721924554 on both; maximum absolute difference and KL were zero.
+This is not a routed-expert quality result. The final prefill-routing fix
+still needs the same saved-logit check and the complete matched campaign.
+
 ## Known limits
 
 <!-- release-v2-limits -->
