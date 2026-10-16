@@ -172,9 +172,9 @@ async fn run() -> Result<()> {
         args.coordinator_gpu_budget_gib = coordinator_budget_gib;
     } else if let Some(gib) = coordinator_budget_gib {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
-            | Commands::ServeQwen4(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
+            | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
             | Commands::ServeDsv4(_) | Commands::V41Golden(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
-            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_)),
+            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_)),
             "--coordinator-gpu-budget-gib applies only to coordinator serve/golden and plan commands");
         let budget = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib)?;
         cuteafd_ffi::set_coordinator_gpu_budget(budget.0)?;
@@ -188,7 +188,7 @@ async fn run() -> Result<()> {
             shared::memory_report::monitor("expertd", std::time::Duration::from_secs(10));
             shared::thermal::monitor("expertd");
         }
-        Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeGlmf(_)
+        Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeGlmf(_)
         | Commands::ServeGlm(_) | Commands::ServeDsv4(_) => {
             tracing::info!(target: "cuteafd::fabric", source = "sparknest", status = cuteafd_transport::traffic::storage_status(), "local storage traffic source");
             shared::memory_report::monitor("coordinator", std::time::Duration::from_secs(10));
@@ -210,6 +210,7 @@ async fn run() -> Result<()> {
         Commands::GlmfGolden(args) => families::glm5_flash::run_golden(args).await,
         Commands::Qwen4Golden(args) => families::qwen4::run_golden(args).await,
         Commands::Qwen35Golden(args) => families::qwen3_5::run_golden(args).await,
+        Commands::ServeQwen35(args) => families::qwen3_5::serve::run_serve(args).await,
         Commands::ServeQwen4(args) => families::qwen4::serve::run_serve(args).await,
         Commands::ServeGlmf(args) => families::glm5_flash::serve::run_serve(args).await,
         Commands::ServeGlm(args) => families::glm5::serve::run_serve(args).await,

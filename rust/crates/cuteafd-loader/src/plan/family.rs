@@ -55,6 +55,12 @@ pub struct ExpertContract {
 pub trait FamilyModel: Send + Sync {
     fn spec(&self) -> &ModelSpec;
 
+    /// Placement accounts for executable runtime owners, not only checkpoint inventory.
+    fn native_serving_admission(&self) -> bool { false }
+
+    /// Resolve automatic vision to the mode this executor can actually admit.
+    fn vision_mode(&self, mode: super::MediaMode) -> super::MediaMode { mode }
+
     /// The family's memory layout: its own adapter over the shared solver,
     /// solving the same request its runtime admits. `None` means the family
     /// has no adapter: `plan` refuses its layout.

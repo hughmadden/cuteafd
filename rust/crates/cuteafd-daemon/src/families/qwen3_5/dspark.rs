@@ -54,8 +54,8 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     // diagnostic-sized truncation is allowed to masquerade as serving admission.
     let (owned, scratch) = block_dspark_resident_bytes(&config, 1, 1, library.sm_count()? as u64,
         GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context)?;
-    let mut engine = DenseEngine::new(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DrafterBytes { owned, scratch }))?;
+    let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
+        Some(DrafterBytes { owned, scratch }), 1, None)?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
     if args.verify_check { engine.verify_check(prompt)?; }
     let plain = (|| -> Result<(Vec<u32>, Duration, Vec<(f32, Vec<u32>)>)> {
@@ -76,8 +76,8 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     // Normal evaluation invalidates target marks; use a fresh executor rather
     // than reconstructing the recurrent state or reusing a stale mark.
     drop(engine);
-    let mut engine = DenseEngine::new(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DrafterBytes { owned, scratch }))?;
+    let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
+        Some(DrafterBytes { owned, scratch }), 1, None)?;
     let stream = engine.target_stream().raw;
     let weights = block_dspark::prefetch(snapshot);
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;

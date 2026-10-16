@@ -143,6 +143,8 @@ impl<'a> TokenEmbedding<'a> {
         if self.table.is_host() { EmbedPlacement::Host } else { EmbedPlacement::Gpu }
     }
 
+    pub(crate) fn device_bytes(&self) -> usize { self.table.device_bytes() }
+
     pub fn device_gather(&self) -> bool { true }
 
     pub fn vocab(&self) -> usize {

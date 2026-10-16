@@ -145,7 +145,7 @@ def test_missing_metadata_fails_closed_unless_family_is_explicit(tmp_path, monke
     with pytest.raises(ValueError, match='set FAMILY'):
         aot.config_family(dict(MODEL_ID='test/unavailable'))
     assert aot.config_family(dict(MODEL_ID='test/unavailable', FAMILY='glm5')) == 'glm5'
-    with pytest.raises(ValueError, match='unsupported FAMILY'):
+    with pytest.raises(ValueError, match='no WIP AOT scope mapping for unknown'):
         aot.config_family(dict(FAMILY='unknown'))
 
 
@@ -171,3 +171,68 @@ def test_v41_direct_config_uses_explicit_spark_tp_role(count, tp, role):
     values = {'FAMILY': 'deepseek_v41', 'SPARK_COUNT': count, 'SPARK_TP': tp}
     _, scopes = aot.config_scopes(values)
     assert scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] == role
+
+
+@pytest.mark.parametrize('hidden,intermediate,layers,heads,value_heads,switch', [
+    (4096, 12288, 32, 16, 32, 'QWEN35'),
+    (5120, 17408, 64, 24, 48, 'QWEN38'),
+])
+def test_dense_cards_and_direct_configs_use_checkpoint_geometry(tmp_path, monkeypatch,
+        hidden, intermediate, layers, heads, value_heads, switch):
+    monkeypatch.setenv('HF_HOME', str(tmp_path))
+    snapshot = tmp_path / 'hub/models--test--unlabelled/snapshots/revision'
+    snapshot.mkdir(parents=True)
+    config = dict(model_type='qwen3_5', text_config=dict(hidden_size=hidden,
+        intermediate_size=intermediate, num_hidden_layers=layers, num_attention_heads=heads,
+        num_key_value_heads=4, linear_num_key_heads=16, linear_num_value_heads=value_heads,
+        layer_types=['linear_attention', 'full_attention'] * (layers // 2)))
+    (snapshot / 'config.json').write_text(json.dumps(config))
+    values = dict(MODEL_ID='test/unlabelled', MODEL_REVISION='revision', SPARK_COUNT='0', RTX_GPUS='1')
+    expected = {'CUTEAFD_WIP_QWEN_DENSE_AOT': 'ON',
+        'CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES': '', 'CUTEAFD_WIP_EXPERT_FAMILIES': '',
+        'CUTEAFD_WIP_GENERIC_SPARK_COUNTS': '', 'CUTEAFD_WIP_SPARK_TP_ROLES': ''}
+    # Misleading names must never choose the native geometry.
+    card = dict(family='qwen3_5', name='qwen38-27b' if switch == 'QWEN35' else 'qwen35-9b', config=None)
+    assert aot.family_scopes([card], lambda _: values) == expected
+    family, scopes = aot.config_scopes(values)
+    assert family == 'qwen3_5' and scopes == expected
+    values['SPARK_COUNT'] = '2'
+    with pytest.raises(ValueError, match='no Spark layout'):
+        aot.family_scopes([card], lambda _: values)
+    values['SPARK_COUNT'] = '0'
+    config['text_config']['hidden_size'] = 1
+    (snapshot / 'config.json').write_text(json.dumps(config))
+    with pytest.raises(ValueError, match='unsupported dense Qwen WIP AOT checkpoint geometry'):
+        aot.config_scopes(values)
+
+
+@pytest.mark.parametrize('operation', ['card', 'config', 'seal'])
+def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
+    with pytest.raises(ValueError, match='no WIP AOT scope mapping for unknown'):
+        if operation == 'card':
+            aot.family_scopes([dict(family='unknown', config=None)], lambda _: {})
+        elif operation == 'config':
+            aot.config_scopes(dict(FAMILY='unknown'))
+        else:
+            aot.check_programs('unknown', tmp_path / 'PROGRAMS.json')
+
+
+@pytest.mark.parametrize('family,model,count,program,coordinator,spark,counts,roles,extra', [
+    ('deepseek_v41', 'DeepSeek-V4.1-Flash', 4, None, '', '', '', '', {}),
+    ('deepseek_v4', 'DeepSeek-V4-Flash', 2, 'DSV4', 'dsv4f:rtx_backbone;dsv4f:spark_tp2',
+     'dsv4f:rtx_backbone;dsv4f:spark_tp2', '', '', {}),
+    ('glm5', 'GLM-5.3-EXL3-K4', 4, 'GLM', 'glm:exl3-k45;glm:fp8', 'glm:exl3-k45;glm:fp8', 'glm=4', '', {}),
+    ('glm5_flash', 'GLM-5.3-Flash-NVFP4', 4, 'GLMF', 'glmf:nvfp4;glmfdense:nvfp4', 'glmf:nvfp4', 'glmf=4', '', {}),
+    ('mimo_v2', 'MiMo-V2.6-Pro', 6, 'MIMO', 'mimop:fp8', 'mimop:fp8', 'mimop=6', '',
+     {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_MIMO_GEOMETRIES': 'mimop'}),
+    ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '', {}),
+])
+def test_existing_family_scope_outputs_are_unchanged(family, model, count, program,
+        coordinator, spark, counts, roles, extra):
+    values = dict(MODEL_ID='test/' + model, SPARK_COUNT=str(count), RTX_GPUS='1')
+    expected = dict(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=coordinator,
+        CUTEAFD_WIP_EXPERT_FAMILIES=spark, CUTEAFD_WIP_GENERIC_SPARK_COUNTS=counts,
+        CUTEAFD_WIP_SPARK_TP_ROLES=roles, **extra)
+    if program:
+        expected[f'CUTEAFD_WIP_{program}_AOT'] = 'ON'
+    assert aot.family_scopes([dict(family=family, name=model.lower(), config=None)], lambda _: values) == expected
