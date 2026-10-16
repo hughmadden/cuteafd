@@ -30,7 +30,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let owners = (report.requested_attention == Some(crate::placement::AttentionPlacement::Layers))
             .then(|| {
                 let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
-                crate::placement::families::glm5::attention_owners(&cfg, layers).map_err(Into::into)
+                crate::placement::families::glm5::attention_owners(&cfg, layers).map_err(anyhow::Error::from)
             }).transpose()?;
         resident_owned(checkpoint, ranks, layers, owners.as_deref())
     })();
