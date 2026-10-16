@@ -65,3 +65,22 @@ def test_every_fingerprinted_build_input_reaches_both_build_containers():
             continue
         assert name in coordinator, f'{name} is fingerprinted but not passed to the coordinator build'
     assert 'CUTEAFD_WIP_EXL3_BITS' in spark
+
+
+def test_dense_qwen_aot_opt_in_reaches_native_and_fingerprints():
+    wip = (ROOT / 'wip.sh').read_text()
+    keys = wip.split('for key in EXL3_AOT', 1)[1].split('; do', 1)[0].split()
+    assert 'QWEN_DENSE_AOT' in keys
+    cmake = (ROOT / 'native/CMakeLists.txt').read_text()
+    assert 'option(CUTEAFD_ENABLE_QWEN_DENSE_AOT ' in cmake
+    assert cmake.split('option(CUTEAFD_ENABLE_QWEN_DENSE_AOT ', 1)[1].splitlines()[0].endswith(' OFF)')
+    assert cmake.count('OR CUTEAFD_ENABLE_QWEN_DENSE_AOT') == 3
+    programs = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
+    dense = programs.split('if(CUTEAFD_ENABLE_QWEN_DENSE_AOT)', 1)[1].split('set(CUTEAFD_DSV4_DIR', 1)[0]
+    assert '"qwen35,qwen38"' in dense
+    assert '"${CUTEAFD_PROGRAM_GEOMETRY},qwen35,qwen38"' in dense
+    for mode, launcher in [('wip', wip), ('release', (ROOT / 'build.sh').read_text())]:
+        variable = f'CUTEAFD_{mode.upper()}_QWEN_DENSE_AOT'
+        assert f'-e "{variable}=${{{variable}:-OFF}}"' in launcher
+        build = (ROOT / f'scripts/build/build-{mode}-artifacts.sh').read_text()
+        assert f'-DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${{{variable}:-OFF}}" || echo OFF)"' in build

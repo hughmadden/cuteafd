@@ -12,13 +12,13 @@
 use crate::shared::memory::device::{Allocation, Device};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
-use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
+use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use cuteafd_loader::families::qwen4::resident::{self, fp8_operands, BF16_PROJECTION_OPERANDS};
 use cuteafd_loader::families::qwen4::{Qwen4Attention, Qwen4Config};
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::os::unix::fs::FileExt;
+use crate::shared::qwen::weights::{f32_bytes, WeightReader};
 
 pub(crate) const PREFIX: &str = "model.language_model.";
 /// Rows of the shared expert's packed gate/up/gate-logit operand.
@@ -173,82 +173,37 @@ pub(crate) struct Qwen4Loader<'a> {
     pub stream: *mut c_void,
 }
 
-fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect()
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
 impl<'a> Qwen4Loader<'a> {
     fn device(&self) -> Result<Device<'a>> {
         Ok(Device { library: self.library, id: self.library.cuda_get_device()? })
     }
 
+    fn reader(&self) -> WeightReader<'a> {
+        WeightReader { library: self.library, checkpoint: self.checkpoint }
+    }
+
     pub fn tensor(&self, name: &str) -> Result<&CheckpointTensor> {
-        cuteafd_ffi::memory_ledger::tensor(name);
-        let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
-            .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
-        Ok(&self.checkpoint.tensors[at])
+        self.reader().tensor(name)
     }
 
     pub fn raw(&self, name: &str) -> Result<(Vec<u8>, DType, Vec<usize>)> {
-        let tensor = self.tensor(name)?;
-        let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
-        std::fs::File::open(self.checkpoint.snapshot.join(&tensor.shard))?
-            .read_exact_at(&mut bytes, tensor.meta.byte_offset)
-            .with_context(|| format!("reading {name}"))?;
-        Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
+        self.reader().raw(name)
     }
 
     fn upload(&self, bytes: &[u8]) -> Result<Allocation<'a>> {
-        let allocation = Allocation::new(self.device()?, bytes.len().max(256))?;
-        self.library.copy_h2d(allocation.buffer, bytes)?;
-        Ok(allocation)
+        self.reader().upload(bytes)
     }
 
-    /// The row-concatenation of BF16 2-D `names` plus `pad_rows` zero rows as one operand.
     fn rows(&self, names: &[String], pad_rows: usize) -> Result<Allocation<'a>> {
-        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
-        let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
-        let cols = tensors[0].1 .2[1];
-        let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum::<usize>() + pad_rows;
-        let out = Allocation::new(self.device()?, rows * cols * 2)?;
-        self.library.cuda_zero_bytes(out.buffer, out.buffer.bytes)?;
-        let mut row = 0;
-        for (name, (bytes, dtype, shape)) in &tensors {
-            ensure!(shape.len() == 2 && shape[1] == cols, "{names:?} do not share columns");
-            ensure!(*dtype == DType::Bf16, "{name}: coordinator tensors must be BF16, found {dtype:?}");
-            let dest = CuteafdDeviceBuffer {
-                // SAFETY: rows row..row+shape[0] lie inside `out`.
-                ptr: unsafe { out.buffer.ptr.cast::<u8>().add(row * cols * 2) }.cast(),
-                bytes: shape[0] * cols * 2,
-                ..out.buffer
-            };
-            self.library.copy_h2d(dest, bytes)?;
-            row += shape[0];
-        }
-        Ok(out)
+        self.reader().rows(names, pad_rows)
     }
 
     fn one(&self, name: &str) -> Result<Allocation<'a>> {
-        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
-        let (bytes, dtype, _) = self.raw(name)?;
-        ensure!(dtype == DType::Bf16, "{name}: coordinator tensors must be BF16, found {dtype:?}");
-        self.upload(&bytes)
+        self.reader().bf16(name)
     }
 
-    /// A BF16 tensor widened to FP32.
     fn f32(&self, name: &str) -> Result<Allocation<'a>> {
-        let _memory_format = cuteafd_ffi::memory_ledger::format("f32");
-        let (bytes, dtype, _) = self.raw(name)?;
-        let values = match dtype {
-            DType::Bf16 => bf16_to_f32(&bytes),
-            DType::F32 => bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect(),
-            other => anyhow::bail!("{name}: expected BF16 or FP32, found {other:?}"),
-        };
-        self.upload(&f32_bytes(&values))
+        self.reader().f32(name)
     }
 
     fn hc(&self, prefix: &str, inject: bool) -> Result<[Allocation<'a>; 3]> {
