@@ -527,7 +527,8 @@ mod tests {
         let modes = (0..40).map(|layer| Ok(cuteafd_loader::placement::LayerMode::Whole {
             gpu: map.attention(layer)? as u8, ffn: cuteafd_loader::placement::FfnMode::Owner,
         })).collect::<Result<Vec<_>>>()?;
-        let hops = cuteafd_loader::placement::plan_hops(&modes, &spec)?;
+        let hops: Vec<_> = cuteafd_loader::placement::plan_hops(&modes, &spec)?
+            .into_iter().filter(|hop| hop.from == 1 && hop.to == 0).collect();
         let mut handoff = crate::shared::peer_split::hop::DirectInputHop::new(devices[1], devices[0], spec)?;
         handoff.bind(&hops, spec)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
