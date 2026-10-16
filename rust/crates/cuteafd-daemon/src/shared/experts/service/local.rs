@@ -175,6 +175,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     census.sample("before_native_library", None)?;
     // SAFETY: this owner outlives media, weights, retained modules and executions.
     let library = unsafe { NativeLibrary::load(&config.library) }?;
+    census.identify_device(&library)?;
     census.sample("before_context", None)?;
     if census.enabled() {
         library.cuda_device_synchronize()?;

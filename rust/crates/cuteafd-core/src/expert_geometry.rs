@@ -63,8 +63,12 @@ pub struct SparkAllocationTerm {
     pub method: String,
 }
 
-/// Same-process census evidence, never a CUDA context/module attribution by
-/// itself. PSS includes host mappings; CUDA UMA accounting is driver-dependent.
+#[path = "spark_census.rs"]
+mod spark_census;
+pub use spark_census::{spark_census_deltas, CensusDeviceKind, CensusDeviceWitness, SparkCensusDeltas, SparkCensusError};
+
+/// Same-process evidence: integrated CUDA uses system/cgroup phase deltas;
+/// process maps attribute host-only memory, never driver-owned CUDA UMA.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SparkProcessSample {
@@ -77,13 +81,14 @@ pub struct SparkProcessSample {
     pub tracked_device_bytes: u64,
     pub tracked_pinned_bytes: u64,
     pub raw_cuda_free_bytes: Option<u64>,
-    /// Independent witnesses. CUDA mappings may report zero PSS on GB10;
-    /// zero visibility never qualifies a CUDA context/module attribution.
+    pub device_kind: Option<CensusDeviceKind>,
+    pub device_witness: Option<CensusDeviceWitness>,
     pub cuda_mapping_pss_bytes: u64,
     pub anonymous_pss_bytes: u64,
     pub file_pss_bytes: u64,
     pub system_available_bytes: u64,
     pub system_total_bytes: u64,
+    pub system_headroom_bytes: u64,
     pub allocatable_bytes: Option<u64>,
     pub method: String,
 }

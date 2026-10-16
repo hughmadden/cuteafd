@@ -250,8 +250,7 @@ impl SparkExecutionInventory {
     }
 }
 
-/// Calibration must come from an isolated same-process phase pair. Neither
-/// MemAvailable nor total CUDA use minus the ledger qualifies a runtime term.
+/// Calibration uses isolated phases and the explicit device-kind witness policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SparkRuntimeProvenance {
     source: String,
@@ -264,6 +263,7 @@ pub struct SparkRuntimeProvenance {
 #[serde(rename_all = "snake_case")]
 pub enum SparkRuntimeMethod {
     ProcessAttributedPhaseDelta,
+    IntegratedSystemPhaseDelta,
     MeasuredResidual,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -346,55 +346,24 @@ impl SparkRuntimeTerm {
 
 impl QualifiedSparkRuntime {
     /// Build only from isolated same-process phase evidence and externally
-    /// established quiet-host conditions. System memory alone is not attribution.
+    /// established quiet-host conditions and device-kind-specific witnesses.
     pub fn from_census(assignment: &SparkAssignment, execution: &SparkExecutionInventory,
         sample: &cuteafd_core::RuntimeSample,
         manifest_sha256: Vec<String>, samples: &[cuteafd_core::expert_geometry::SparkProcessSample],
         source: String, quiet_host: bool) -> Result<Self> {
-        use cuteafd_core::expert_geometry::SparkProcessSample;
+        use cuteafd_core::expert_geometry::{spark_census_deltas, CensusDeviceWitness};
         if !quiet_host || source.trim().is_empty() { return Err(invalid("quiet-host census source required")); }
-        let phase = |name: &str| -> Result<&SparkProcessSample> {
-            let mut found = samples.iter().filter(|s| s.phase == name);
-            let value = found.next().ok_or_else(|| invalid(format!("missing isolated phase {name}")))?;
-            if found.next().is_some() { return Err(invalid(format!("duplicate phase {name}"))); }
-            Ok(value)
+        let deltas = spark_census_deltas(samples).map_err(|error| invalid(error.to_string()))?;
+        let context_before = samples.iter().find(|s| s.phase == "before_context").unwrap();
+        let ready = samples.iter().find(|s| s.phase == "serve_owners_before_endpoint_rings").unwrap();
+        let context = deltas.context;
+        let modules = deltas.modules;
+        let (method, witness) = match deltas.witness {
+            CensusDeviceWitness::SystemAvailableCgroup => (SparkRuntimeMethod::IntegratedSystemPhaseDelta,
+                "integrated device: isolated MemAvailable + cgroup headroom; retained ledger/system control within 5%; host-only maps/system within 16 MiB"),
+            CensusDeviceWitness::CudaMappingPss => (SparkRuntimeMethod::ProcessAttributedPhaseDelta,
+                "discrete device: CUDA mapping PSS + system phase within 16 MiB; retained ledger/maps control within 5%"),
         };
-        let context_before = phase("before_context")?;
-        let context_after = phase("after_context_before_media")?;
-        let modules_before = phase("before_expert_modules")?;
-        let modules_after = phase("after_expert_modules_before_weights")?;
-        let ready = phase("serve_owners_before_endpoint_rings")?;
-        let ordered = [context_before, context_after, modules_before, modules_after, ready];
-        if context_before.pid == 0 || context_before.system_total_bytes == 0
-            || ordered.iter().any(|s| s.pid != context_before.pid
-                || s.system_total_bytes != context_before.system_total_bytes
-                || s.system_available_bytes > s.system_total_bytes)
-            || ordered.windows(2).any(|pair| pair[0].monotonic_ns >= pair[1].monotonic_ns) {
-            return Err(invalid("census process/system/phase order mismatch"));
-        }
-        let delta = |before: &SparkProcessSample, after: &SparkProcessSample| -> Result<u64> {
-            if before.tracked_device_bytes != after.tracked_device_bytes
-                || before.tracked_pinned_bytes != after.tracked_pinned_bytes {
-                return Err(invalid("isolated context/module phase allocated payload storage"));
-            }
-            let process = after.cuda_mapping_pss_bytes.checked_sub(before.cuda_mapping_pss_bytes)
-                .ok_or_else(|| invalid("CUDA process mapping PSS decreased"))?;
-            let system = before.system_available_bytes.checked_sub(after.system_available_bytes)
-                .ok_or_else(|| invalid("system memory grew during isolated CUDA phase"))?;
-            if process == 0 || process.abs_diff(system) > 16 << 20 {
-                return Err(invalid("CUDA process-map/system-memory phase witnesses disagree or are invisible; stop"));
-            }
-            Ok(process)
-        };
-        let context = delta(context_before, context_after)?;
-        let modules = delta(modules_before, modules_after)?;
-        let retained = ready.tracked_device_bytes.checked_sub(modules_after.tracked_device_bytes)
-            .filter(|bytes| *bytes > 0).ok_or_else(|| invalid("missing retained payload visibility control"))?;
-        let visible = ready.cuda_mapping_pss_bytes.checked_sub(modules_after.cuda_mapping_pss_bytes)
-            .ok_or_else(|| invalid("CUDA retained process PSS decreased"))?;
-        if visible == 0 || retained.abs_diff(visible) > retained / 20 {
-            return Err(invalid("CUDA UMA retained allocations invisible/incomplete in process maps; stop"));
-        }
         let total_growth = context_before.system_available_bytes.checked_sub(ready.system_available_bytes)
             .ok_or_else(|| invalid("system memory grew across census"))?;
         let tracked_device = ready.tracked_device_bytes.checked_sub(context_before.tracked_device_bytes)
@@ -412,10 +381,10 @@ impl QualifiedSparkRuntime {
         };
         Self::new(execution, sample.arch.clone(), sample.driver.clone(), sample.sms,
             manifest_sha256, host_owner_bytes,
-            vec![term("cuda_context", context, SparkRuntimeMethod::ProcessAttributedPhaseDelta,
-                    "before_context/after_context_before_media: CUDA mapping PSS + system MemAvailable")?,
-                term("expert_modules", modules, SparkRuntimeMethod::ProcessAttributedPhaseDelta,
-                    "before_expert_modules/after_expert_modules_before_weights: CUDA mapping PSS + system MemAvailable")?],
+            vec![term("cuda_context", context, method,
+                    &format!("before_context/after_context_before_media: {witness}"))?,
+                term("expert_modules", modules, method,
+                    &format!("before_expert_modules/after_expert_modules_before_weights: {witness}"))?],
             vec![], vec![term("host_measured_residual", residual, SparkRuntimeMethod::MeasuredResidual,
                 "before_context/serve_owners_before_endpoint_rings: system growth less disjoint tracked and attributed owners")?])
     }
@@ -479,8 +448,12 @@ fn validate_runtime(execution: &SparkExecutionInventory, runtime: &QualifiedSpar
         return Err(invalid("qualified context, modules and physical host residual are required"));
     }
     if runtime.device.iter().any(|t| matches!(t.item.group.as_str(), "cuda_context" | "expert_modules")
-        && t.provenance.method != SparkRuntimeMethod::ProcessAttributedPhaseDelta) {
-        return Err(invalid("context/modules require isolated process-attributable phase deltas"));
+        && !matches!(t.provenance.method, SparkRuntimeMethod::ProcessAttributedPhaseDelta | SparkRuntimeMethod::IntegratedSystemPhaseDelta)) {
+        return Err(invalid("context/modules require isolated device-kind-qualified phase deltas"));
+    }
+    if runtime.device.iter().filter(|t| matches!(t.item.group.as_str(), "cuda_context" | "expert_modules"))
+        .map(|t| t.provenance.method).collect::<Vec<_>>().windows(2).any(|p| p[0] != p[1]) {
+        return Err(invalid("context/modules use different device witnesses"));
     }
     add(all.iter().map(|t| t.item.bytes))?;
     Ok(())
@@ -589,16 +562,19 @@ mod tests {
 
     fn census_samples() -> Vec<cuteafd_core::expert_geometry::SparkProcessSample> {
         let phases = ["before_context", "after_context_before_media", "before_expert_modules",
-            "after_expert_modules_before_weights", "serve_owners_before_endpoint_rings"];
+            "after_expert_modules_before_weights", "after_retained_arenas", "serve_owners_before_endpoint_rings"];
         phases.into_iter().enumerate().map(|(i, phase)| {
             let mib = 1 << 20;
-            let cuda = [0, 32, 32, 96, 1120][i] * mib;
+            let cuda = [0, 32, 32, 96, 1120, 1120][i] * mib;
             cuteafd_core::expert_geometry::SparkProcessSample {
                 phase: phase.into(), pid: 42, monotonic_ns: i as u64 + 1,
                 rss_bytes: cuda, pss_bytes: cuda, private_bytes: 0,
-                tracked_device_bytes: if i == 4 { 1024 * mib } else { 0 }, tracked_pinned_bytes: 0,
+                tracked_device_bytes: if i >= 4 { 1024 * mib } else { 0 }, tracked_pinned_bytes: 0,
+                device_kind: Some(cuteafd_core::expert_geometry::CensusDeviceKind::Discrete),
+                device_witness: Some(cuteafd_core::expert_geometry::CensusDeviceWitness::CudaMappingPss),
                 cuda_mapping_pss_bytes: cuda, anonymous_pss_bytes: 0, file_pss_bytes: 0,
-                system_available_bytes: 8192 * mib - cuda - if i == 4 { 8 * mib + 333 } else { 0 },
+                system_available_bytes: 8192 * mib - cuda - if i == 5 { 8 * mib + 333 } else { 0 },
+                system_headroom_bytes: 8192 * mib - cuda - if i == 5 { 8 * mib + 333 } else { 0 },
                 system_total_bytes: 16384 * mib, allocatable_bytes: None,
                 raw_cuda_free_bytes: None, method: "synthetic unit-test maps/system".into() }
         }).collect()
@@ -618,6 +594,16 @@ mod tests {
         assert_eq!(qualified.device()[1].item().bytes, 64 << 20);
         assert_eq!(qualified.host()[0].item().bytes, 8 << 20);
         assert_eq!(qualified.host_owner_bytes(), 333);
+        let mut integrated = census_samples();
+        for sample in &mut integrated {
+            sample.device_kind = Some(cuteafd_core::expert_geometry::CensusDeviceKind::Integrated);
+            sample.device_witness = Some(cuteafd_core::expert_geometry::CensusDeviceWitness::SystemAvailableCgroup);
+            sample.cuda_mapping_pss_bytes = 0;
+        }
+        let uma = construct(&integrated, hashes.clone(), true).unwrap();
+        assert_eq!(uma.device()[0].item().bytes, 32 << 20);
+        assert_eq!(uma.device()[0].provenance().method(), SparkRuntimeMethod::IntegratedSystemPhaseDelta);
+        assert!(uma.device()[0].provenance().phase().contains("cgroup"));
         let mut different = assignment();
         different.io.host_exchange += 1;
         assert!(v41_spark_inventory(&different, &e, &qualified).is_err());
@@ -637,7 +623,7 @@ mod tests {
                 7 => samples[1].system_total_bytes = 0,
                 8 => samples.push(samples[0].clone()),
                 9 => samples[4].tracked_device_bytes = 0,
-                10 => samples[4].system_available_bytes += 9 << 20,
+                10 => samples[5].system_available_bytes += 9 << 20,
                 _ => { samples.pop(); },
             }
             assert!(construct(&samples, hashes.clone(), true).is_err(), "case {bad}");

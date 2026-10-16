@@ -122,7 +122,8 @@ fn cgroup_allocatable_bytes(mut available: usize, membership: &str,
     Ok(available)
 }
 
-fn cgroup_memory_headroom(available: usize) -> Result<usize> {
+/// Bound a MemAvailable sample by every visible cgroup ancestor, without CUDA queries.
+pub fn cgroup_memory_headroom(available: usize) -> Result<usize> {
     let membership = std::fs::read_to_string("/proc/self/cgroup").context("reading device cgroup membership")?;
     cgroup_allocatable_bytes(available, &membership, |path| match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
