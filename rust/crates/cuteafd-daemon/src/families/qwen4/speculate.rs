@@ -67,18 +67,12 @@ pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement
 }
 
 /// One sequence's part of a draft cycle.
-pub(crate) struct DraftSeq<'p> {
-    pub placement: &'p Qwen4Placement,
-    pub seq: &'p mut MtpSeq,
-    /// Drafts wanted (0: canonical rows only).
-    pub depth: usize,
-}
+pub(crate) type DraftSeq<'p> = crate::shared::qwen::scheduler::DraftSeq<'p, Qwen4Placement, MtpSeq>;
+pub(crate) use crate::shared::qwen::scheduler::DraftTiming;
 
-/// Seconds spent in the cycle's MTP steps and their count.
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct DraftTiming {
-    pub steps: usize,
-    pub seconds: f64,
+impl crate::shared::qwen::scheduler::DraftState for MtpSeq {
+    fn pending_rows(&self) -> usize { self.pending.len() }
+    fn close(&mut self, token: u32) { MtpSeq::close(self, token); }
 }
 
 /// Runs the pending rows of every sequence (canonical history) and drafts up
@@ -180,20 +174,7 @@ pub(crate) fn draft(engine: &Qwen4Engine<'_>, seqs: &mut [DraftSeq<'_>], timing:
 /// A sequence's verified rows: the tokens it verified from `start` (next
 /// token, then drafts), its n-gram history before the step, and its first
 /// row in the step.
-pub(crate) struct Verified<'p> {
-    pub placement: &'p mut Qwen4Placement,
-    pub seq: &'p mut MtpSeq,
-    pub start: usize,
-    pub history: NgramHistory,
-    pub rows: &'p [u32],
-    pub first_row: usize,
-    /// Rows kept (the next token plus the accepted drafts) and the token
-    /// after them (the correction or bonus); None drops the sequence (finished).
-    pub kept: Option<(usize, u32)>,
-    /// The sequence finished in this step: its kept rows are committed (its turn snapshot
-    /// captures the state at its kept length) but not stashed for the MTP.
-    pub finished: bool,
-}
+pub(crate) type Verified<'p> = crate::shared::qwen::scheduler::Verified<'p, Qwen4Placement, MtpSeq, NgramHistory>;
 
 /// After a speculative verify: commits each sequence's kept rows to the GDN
 /// and PLE state, rewinds its placement, and stashes the kept rows' streams
