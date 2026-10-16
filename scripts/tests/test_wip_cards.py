@@ -248,7 +248,7 @@ def test_slot_check_every_host_and_seal(monkeypatch):
 
 @pytest.mark.parametrize('family,tag,count', [('glm5', 'glm', 4), ('glm5_flash', 'glmf', 2), ('qwen4', 'qwen4', 4)])
 @pytest.mark.parametrize('declared_by', ['name', 'model', 'format'])
-def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, tag, count, declared_by):
+def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, tag, count, declared_by, tmp_path):
     values = {'SPARK_COUNT': str(count)}
     name = 'unlabelled-native-card'
     if declared_by == 'name':
@@ -265,8 +265,14 @@ def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, ta
     # nvfp4 and mandatory all-row nvfp4a4 packages at supported TP layouts.
     cmake = (ROOT / 'native/cmake/shared/fp8_moe.cmake').read_text()
     assert tag + ':nvfp4' in built
-    assert 'if(entry MATCHES ":nvfp4$")' in cmake
-    assert 'list(APPEND CUTEAFD_FP8_MOE_ENTRIES "${entry}a4")' in cmake
+    expansion = cmake.split('set(CUTEAFD_FP8_MOE_ENTRIES)\n', 1)[1].split(
+        'foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)', 1)[0]
+    script = tmp_path / 'expand.cmake'
+    script.write_text(f'set(CUTEAFD_EXPERT_FAMILIES {tag}:nvfp4 step5:nvfp4)\n'
+                      + expansion + '\nmessage("ENTRIES=${CUTEAFD_FP8_MOE_ENTRIES}")\n')
+    result = subprocess.run(['cmake', '-P', str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert f'ENTRIES={tag}:nvfp4;{tag}:nvfp4a4;step5:nvfp4\n' in result.stderr
     assert 'list(APPEND requested_layouts "tp${count}")' in cmake
     assert count in (2, 4)
     assert 'glmfdense:nvfp4' not in built

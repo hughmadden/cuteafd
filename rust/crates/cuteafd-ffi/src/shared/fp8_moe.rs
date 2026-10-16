@@ -19,7 +19,7 @@ pub enum Fp8MoeWeights {
     /// Storage 4: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each
     /// scale region followed by the experts' FP32 `weight_scale_2` and
     /// `input_scale`. ABI v5 accepts calibrated W4A4 only, at every row count.
-    Nvfp4 { w4a4: bool },
+    Nvfp4,
     /// Native BF16 row-major matrices; scale pointers are unused.
     Bf16,
 }
@@ -64,7 +64,7 @@ impl Fp8MoeInfo {
         let count = words[9] as usize;
         let [version, format, activation, projection] = words[0].to_le_bytes();
         ensure!(version == 5 && matches!(format, 1 | 2 | 4 | 5)
-            && matches!(activation, 1 | 2) && projection == 1
+            && matches!(activation, 1 | 2) && !(format == 2 && activation == 2) && projection == 1
             && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
@@ -85,7 +85,7 @@ impl Fp8MoeInfo {
             weights: match format {
                 1 => Fp8MoeWeights::Fp8,
                 2 => Fp8MoeWeights::Mxfp4,
-                4 => Fp8MoeWeights::Nvfp4 { w4a4: true },
+                4 => Fp8MoeWeights::Nvfp4,
                 _ => Fp8MoeWeights::Bf16,
             },
         };
@@ -103,7 +103,7 @@ impl Fp8MoeInfo {
             && info.swiglu_limit.is_finite() && info.swiglu_limit >= 0.0
             && info.capacities[0] > 0 && info.capacities.iter().all(|&c| c <= i32::MAX as usize)
             && info.capacities.windows(2).all(|w| w[0] < w[1])
-            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4 { .. }) || !info.wire_input),
+            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input),
             "inconsistent FP8 expert package info {info:?}");
         Ok(info)
     }
@@ -385,6 +385,10 @@ mod metadata_tests {
                 let mut w = words();
                 w[0] = 5 | format << 8 | activation << 16 | 1 << 24;
                 w[8] = 7.0f32.to_bits();
+                if format == 2 && activation == 2 {
+                    assert!(Fp8MoeInfo::from_words(w).is_err());
+                    continue;
+                }
                 let info = Fp8MoeInfo::from_words(w).unwrap();
                 let requested = if activation == 1 { Fp8MoeActivation::SiluBf16Product }
                     else { Fp8MoeActivation::SiluPostClampFp32Product };

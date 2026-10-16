@@ -274,7 +274,8 @@ extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void*
   void* values[{POINTERS}];
   void* arguments[{POINTERS} + 3];
   for (uint32_t i = 0; i < {POINTERS}; ++i) {{
-    if (!pointers[i]) return cudaErrorInvalidValue;
+    const bool unused_scale = ((kInfo[0] >> 8) & 0xffu) == 5u && (i == 4u || i == 6u || i == 8u);
+    if (!pointers[i] && !unused_scale) return cudaErrorInvalidValue;
     values[i] = pointers[i];
     arguments[i] = &values[i];
   }}
@@ -353,6 +354,8 @@ def info_words(g, capacities: list[int], wire: bool) -> list[int]:
         raise ValueError("SwiGLU limit must be finite and nonnegative")
     if g.kind not in STORAGE or g.activation not in ACTIVATION or g.projection not in PROJECTION:
         raise ValueError("unknown expert storage/activation/projection contract")
+    if g.kind == "mxfp4" and g.activation != "silu_bf16_product":
+        raise ValueError("MXFP4 supports only the pre-SiLU activation contract")
     if wire and g.weights in ("nvfp4", "bf16"):
         raise ValueError("NVFP4/BF16 packages require BF16 input")
     if not capacities or any(c <= 0 or c > 0x7fffffff for c in capacities) or capacities != sorted(set(capacities)):
@@ -500,6 +503,8 @@ def verify(package: Path, *, revision: str | None = None, role: str | None = Non
         info = layouts[name]
         if info.get("abi_version") != ABI_VERSION or info.get("activation") not in ACTIVATION or info.get("projection") not in PROJECTION:
             raise ValueError(f"{package}/{name}: missing or unknown expert activation/projection ABI")
+        if info.get("weights") == "mxfp4" and info["activation"] != "silu_bf16_product":
+            raise ValueError(f"{package}/{name}: MXFP4 supports only the pre-SiLU activation contract")
         if info.get("weights") in ("nvfp4", "bf16") and info.get("input") != "bf16":
             raise ValueError(f"{package}/{name}: {info['weights'].upper()} requires BF16 input")
         if input_kind is not None and info.get("input") != input_kind:
@@ -526,7 +531,7 @@ def main() -> None:
     create.add_argument("--role", choices=sorted(ROLE_LAYOUTS), required=True)
     create.add_argument("--geometry", choices=("mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
                                                "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
-                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4", "step5_nvfp4a4"),
+                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4"),
                         required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")

@@ -310,7 +310,7 @@ impl<'a> Fp8Experts<'a> {
         let weights = match tensors.format() {
             ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
             ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
-            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4 { w4a4: true },
+            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
         };
         ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
             && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
