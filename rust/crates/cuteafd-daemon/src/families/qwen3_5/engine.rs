@@ -200,6 +200,7 @@ impl<'a> DenseEngine<'a> {
     }
 
     pub(crate) fn slot_count(&self) -> usize { self.slots.len() }
+    pub(crate) fn decode_rows(&self) -> usize { HEAD_ROWS }
     pub(crate) fn slot_position(&self, slot: usize) -> Result<usize> {
         self.slots.get(slot).map(|state| state.position).context("dense slot outside admission")
     }

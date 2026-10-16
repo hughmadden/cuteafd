@@ -41,7 +41,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         let engine = self.engine.borrow();
         scheduler::Geometry { family: "qwen3_5", vocab_size: engine.cfg.vocab, max_context: engine.cfg.max_context,
-            slots: engine.slot_count(), prefill_rows: 4096, full_prefill_logits: false }
+            slots: engine.slot_count(), prefill_rows: 4096, decode_rows: engine.decode_rows(), full_prefill_logits: false }
     }
     fn library(&self) -> &'a NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
