@@ -94,14 +94,35 @@ counted at ready. This is an SM120 RTX PRO 6000 measurement, not a 5090 or
 arbitrary-shape qualification; new hardware/census and full ready-ledger
 agreement require rechecking.
 
-A separate Context carry-over check, `ae1c2627` versus the P7-integrated K4
-`38cc2847`, produced byte-identical saved F32 logits (6,000 x 154,880;
+The final Context carry-over check, `ae1c2627` versus sealed K4
+`3be01a02`, produced byte-identical saved F32 logits (6,000 x 154,880;
 SHA256 `d31225130e056c1237628424d4d2a3cb2f2c1bdaec2bdd106b5d7dbc73dc184b`).
 Both used a 2M pool, three prefill lanes and all 78 layers, with routed experts
 intentionally skipped to isolate the unchanged coordinator path. NLL was
 9.045842721924554 on both; maximum absolute difference and KL were zero.
-This is not a routed-expert quality result. The final prefill-routing fix
-still needs the same saved-logit check and the complete matched campaign.
+This is not a routed-expert quality result.
+
+The fresh 2026-10-16 three-session campaign on that same seal is **not
+qualified**. All six launches served the exact 2,097,152-token pool; quick
+fidelity and `cache_exact` passed in every arm. Layers passed strict lossless
+10/10 in all three sessions. Context passed 10/10, then 9/10 (token 109,
+0.0054-nat margin), then 5/10. The third Context session also failed baseline
+speculation losslessness at token 85/128 with a 0.351-nat margin, while its
+repeated drafts-off output and all 128 recorded rows were byte-identical.
+Its strict code-5 case diverged at token 89 with a 0.8107-nat margin. These
+are correctness failures under investigation, not accepted rounding or
+fabric-related speed caveats. Exact retained-prompt replay, fixed verify
+widths and a current-base check are required before attribution.
+
+The final Layers census changed to three TP2 expert layers: 49,203
+executables per rank over 213 shapes. Predicted ready graph bytes were
+5,756,751,000 per rank; measured capture deltas were 5,767,168,000 and
+5,739,905,024 bytes, within 10 / 17 MiB. This clears the graph-component
+64-MiB bar, not the still-pending full tagged ready-ledger comparison.
+Every arm retained an A/B rerun verdict from fabric/residual-traffic caveats;
+the third Layers arm additionally failed matched prompt hashes. No speed
+or placement-default decision follows. The separate default-three-lane
+8K run is held until the correctness investigation is resolved.
 
 ## Known limits
 
