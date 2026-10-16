@@ -1565,7 +1565,8 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         # unless this revision's wip.sh predates it.
         union = {h for card in cards for h in card.get('sparks', [])}
         arm['seed_separate'] = seed_option_capable(revision)
-        hosts = staging_hosts(union, seed, arm['seed_separate'])
+        # A coordinator-only slot stages to no Spark: SPARK_COUNT=0, no ranks named.
+        hosts = staging_hosts(union, seed, arm['seed_separate']) if build_role == 'both' else []
         if build_role == 'both' and len(hosts) > 6:
             raise ValueError(f'{name}: {revision} predates WIP_SEED_HOST, so its wip.sh builds on SPARK_0_HOST and '
                              f'{seed} plus the {len(union)}-Spark union makes {len(hosts)} ranks; use --seed rhea|moa '
@@ -1585,7 +1586,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPU='1', RTX_GPUS='1')
         if len(hosts) in (2, 3):
             # Two or three ranks without explicit keys are the compact EXL3 layout.
-            values.update(EXPERT_FORMAT='exl3', SPARKINFER_EXL3='force', EXL3_PAIRED_TP4='off')
+            values.update(EXPERT_FORMAT='exl3', SPARKINFER_EXL3='force')
         tag = 'tc-' + toolchain_hash(revision)
         values.update(COORDINATOR_DOCKER_DEV='cuteafd-coordinator-dev:' + tag, SPARK_EXPERT_DOCKER_DEV='cuteafd-spark-expert-dev:' + tag)
         arm['dev_image_tag'] = tag

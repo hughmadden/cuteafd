@@ -102,8 +102,24 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
         assert flag_values(after["command"]) == flag_values(before["command"]), where
-    # The planner preflight (`cuteafd plan`, HF_HOME=/hf) is unchanged too.
-    assert current["plans"] == golden["plans"], case
+    # S5 replaces report JSON with the planner-owned deployment. Only the
+    # preflight argv changes; all serving commands and fingerprint env above
+    # remain byte-identical to the original captures.
+    expected_plans = []
+    for old in golden["plans"]:
+        expected = [value for value in old if value not in ("--json", "--layout")]
+        expected.insert(expected.index("--require-ready"), "--deployment")
+        coordinator = parse_run(golden["containers"][0]["argv"])
+        command = coordinator["command"]
+        additions = []
+        for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--memory-reservation"):
+            if flag in command:
+                additions += [flag, command[command.index(flag) + 1]]
+        additions += ["--speculator", "dspark" if "--dspark" in command else "off",
+                      "--deployment-peers", command[command.index("--peers") + 1]]
+        expected[expected.index("--rtx"):expected.index("--rtx")] = additions
+        expected_plans.append(expected)
+    assert current["plans"] == expected_plans, case
 
 
 def test_goldens_cover_every_v41_example_and_gate_card() -> None:

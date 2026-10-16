@@ -160,11 +160,7 @@ impl V41Tp4Tcp {
                     !flagged,
                     "native group request requires a topology-bound transport"
                 );
-                if request.header.flags & super::V41_EXL3_PAIRED_REQUEST_FLAG != 0 {
-                    BackboneRequest::parse_paired(&frame, self.capacity)?
-                } else {
-                    BackboneRequest::parse(&frame, self.capacity)?
-                }
+                BackboneRequest::parse(&frame, self.capacity)?
             }
         };
         let rows = native.rows() as usize;

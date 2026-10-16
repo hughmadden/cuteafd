@@ -78,7 +78,7 @@ impl BackboneRequest<'_> {
                 output_payload_bytes: partials.len() as u64,
                 status: ExpertProtocolV2Status::Ok,
                 flags: (request.flags
-                    & !(super::V41_EXL3_PAIRED_REQUEST_FLAG | V41_NATIVE_GROUP_REQUEST_FLAG))
+                    & !V41_NATIVE_GROUP_REQUEST_FLAG)
                     | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
                     | if end < self.rows() {
                         EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
@@ -128,7 +128,7 @@ impl V41Tp4ChunkReceiver {
     /// Generic constructor for the validated physical rank counts 1..=8.
     ///
     /// A request admitted under the native replicated-group contract must match
-    /// its topology's world size; paired EXL3 keeps its four-rank requirement.
+    /// its topology's world size.
     pub fn new_ranks(
         request: &BackboneRequest<'_>,
         executors: &[u64],
@@ -138,9 +138,6 @@ impl V41Tp4ChunkReceiver {
             (1..=8).contains(&executors.len()),
             "native TP/EP requires 1..=8 executors"
         );
-        if request.is_paired() {
-            ensure!(executors.len() == 4, "paired EXL3 requires four ranks");
-        }
         if let Some(topology) = request.native_topology() {
             ensure!(
                 executors.len() == topology.world_size(),
@@ -176,12 +173,7 @@ impl V41Tp4ChunkReceiver {
             request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG == 0,
             "native group ownership requires a topology-bound receiver"
         );
-        if request.header.flags & super::V41_EXL3_PAIRED_REQUEST_FLAG != 0 {
-            ensure!(executors.len() == 4, "paired EXL3 requires four ranks");
-            BackboneRequest::validate_owned_paired(request, max_rows)?;
-        } else {
-            BackboneRequest::validate_owned(request, max_rows)?;
-        }
+        BackboneRequest::validate_owned(request, max_rows)?;
         ensure!(request.wire_stats().wire_bytes <= max_frame_bytes,
             "native request exceeds RoCE frame budget");
         let header_bytes = if request.header.flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM != 0 {

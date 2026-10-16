@@ -16,7 +16,6 @@
 #   * ALWAYS writes a manifest — on abort it records status=aborted with the
 #     reason, the cell that died, tool hashes, and every partial evidence
 #     file, so the offline analyzer still sees commit provenance;
-#   * optional legacy paired-width regression ONLY after all primaries.
 #
 # Evidence layout under $EVIDENCE/v10-exl3-tp3/tile-tuning/<utc>-<host>/:
 # per-run JSONs (harness --output), manifest.json, lane.log.
@@ -114,14 +113,6 @@ for cap in 16 80; do
     run_cell "tp3-w768-s${start}-c${cap}" 768 "$start" "$cap"
   done
 done
-
-# --- optional legacy paired-width regression, ONLY after the primaries ---
-if [[ "${1:-}" == --with-legacy ]]; then
-  for cap in 16 80; do
-    run_cell "legacy-w512-s0-c${cap}"  512 0   "$cap"
-    run_cell "legacy-w640-s640-c${cap}" 640 640 "$cap"
-  done
-fi
 
 write_manifest complete
 echo "lane complete $RUN_ID" | tee -a "$OUT/lane.log"

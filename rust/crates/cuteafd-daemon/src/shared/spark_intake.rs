@@ -368,10 +368,13 @@ impl<'a> SparkIntake<'a> {
     /// # Safety
     /// As [`Self::attach`], for the lane's thread and waves.
     pub(crate) unsafe fn spawn_lane(&self, peers: Vec<std::net::SocketAddr>, executors: Vec<u64>, capacity: u32,
-        config: cuteafd_transport::TcpTransportConfig) -> Result<SparkExpertLane> {
+        config: cuteafd_transport::TcpTransportConfig, topology: Option<cuteafd_transport::expert::SparkTopology>) -> Result<SparkExpertLane> {
         ensure!(peers.len() == self.ranks, "intake ranks differ from the lane's");
         // SAFETY: forwarded from this function's contract.
-        unsafe { SparkExpertLane::spawn_with_landing(peers, executors, capacity, config, self.landing()) }
+        match topology {
+            Some(topology) => unsafe { SparkExpertLane::spawn_topology_with_landing(topology, peers, capacity, config, self.landing()) },
+            None => unsafe { SparkExpertLane::spawn_with_landing(peers, executors, capacity, config, self.landing()) },
+        }
     }
 
     /// Before dispatching a wave on this intake's transport: the previous
@@ -1210,7 +1213,7 @@ impl<'a> SparkLane<'a> {
         let intake = SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?;
         // SAFETY: the lane drops (joining its thread) before its intake, and
         // every submit goes through `submit`, which calls `before_dispatch`.
-        let lane = unsafe { intake.spawn_lane(peers, executors, capacity, config)? };
+        let lane = unsafe { intake.spawn_lane(peers, executors, capacity, config, None)? };
         Ok(Self { lane, intake })
     }
 

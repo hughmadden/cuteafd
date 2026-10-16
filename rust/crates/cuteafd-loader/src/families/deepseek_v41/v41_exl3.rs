@@ -25,14 +25,6 @@ pub enum V41Exl3ProjectionKind {
     Down,
 }
 
-/// Explicit resident layout; paired storage requires ownership-aware execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum V41Exl3Partition {
-    Disjoint,
-    PairedTp4,
-}
-
 /// One projection's on-disk contract, before conversion into native kernel tiles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V41Exl3Projection {
@@ -100,15 +92,6 @@ impl V41Exl3Projection {
     /// TP2 (9 blocks) and TP3 (6 blocks) divide 18 exactly, so they carry no
     /// padding and no duplicated boundary block.
     pub fn intermediate_partition(&self, world: usize, rank: usize) -> Result<Range<usize>> {
-        self.intermediate_partition_with_layout(world, rank, V41Exl3Partition::Disjoint)
-    }
-
-    pub fn intermediate_partition_with_layout(
-        &self,
-        world: usize,
-        rank: usize,
-        layout: V41Exl3Partition,
-    ) -> Result<Range<usize>> {
         ensure!(
             (1..=8).contains(&world) && rank < world,
             "invalid EXL3 TP rank/world"
@@ -123,14 +106,6 @@ impl V41Exl3Projection {
             intermediate % 128 == 0,
             "EXL3 intermediate axis is not H128 aligned"
         );
-        if layout == V41Exl3Partition::PairedTp4 {
-            ensure!(
-                world == 4 && intermediate == 2304,
-                "paired EXL3 layout requires TP4 with 2304 intermediate channels"
-            );
-            let blocks = &cuteafd_core::EXL3_TP4_RESIDENT_BLOCKS[rank];
-            return Ok(blocks.start * 128..blocks.end * 128);
-        }
         let blocks = intermediate / 128;
         ensure!(blocks >= world, "EXL3 partition would be empty");
         let count = blocks / world + usize::from(rank < blocks % world);

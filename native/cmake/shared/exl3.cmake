@@ -19,47 +19,15 @@ set(CUTEAFD_V41_EXL3_CAPACITIES "1;16;80;256;1024;4096" CACHE STRING "EXL3 batch
 # (exl3-k23, exl3-k34) and the daemon selects by checkpoint tiers.
 set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4" CACHE STRING "EXL3 decoder tier families to package; one comma-joined tier list per family")
 set(CUTEAFD_V41_EXL3_BITS "" CACHE STRING "Single EXL3 decoder tier family override (replaces CUTEAFD_V41_EXL3_BIT_FAMILIES)")
-option(CUTEAFD_V41_EXL3_PAIRED_TP4 "Build paired H128 ownership modules for Spark TP4" OFF)
 set(CUTEAFD_V41_EXL3_TILES "" CACHE STRING "Per-profile EXL3 tile overrides for a controlled A/B (for example tp3-width768=all:128,128,128,128, or tp3-width768=16:64,256,64,256)")
-set(CUTEAFD_V41_EXL3_RESIDENCY "" CACHE STRING "Explicit paired EXL3 capacity=blocks/SM overrides (for example 80=2)")
 if(CUTEAFD_V41_EXL3_BITS)
   list(JOIN CUTEAFD_V41_EXL3_BITS "," CUTEAFD_V41_EXL3_BITS_JOINED)
   set(CUTEAFD_V41_EXL3_BIT_FAMILIES "${CUTEAFD_V41_EXL3_BITS_JOINED}")
 endif()
-set(CUTEAFD_EXL3_LAYOUT_ARGS)
-if(CUTEAFD_V41_EXL3_PAIRED_TP4)
-  list(LENGTH CUTEAFD_V41_EXL3_BIT_FAMILIES CUTEAFD_EXL3_FAMILY_COUNT)
-  if(NOT CUTEAFD_EXL3_FAMILY_COUNT EQUAL 1)
-    message(FATAL_ERROR "Paired EXL3 TP4 requires exactly one decoder tier family")
-  endif()
-  list(GET CUTEAFD_V41_EXL3_BIT_FAMILIES 0 CUTEAFD_EXL3_PAIRED_FAMILY)
-  string(REPLACE "," ";" CUTEAFD_EXL3_PAIRED_TIERS "${CUTEAFD_EXL3_PAIRED_FAMILY}")
-  list(LENGTH CUTEAFD_EXL3_PAIRED_TIERS CUTEAFD_EXL3_TIER_COUNT)
-  if(NOT CUTEAFD_EXL3_ROLE STREQUAL "spark" OR NOT CUTEAFD_EXL3_TIER_COUNT EQUAL 2)
-    message(FATAL_ERROR "Paired EXL3 TP4 requires SM121 and exactly two decoder tiers")
-  endif()
-  list(APPEND CUTEAFD_EXL3_LAYOUT_ARGS --paired-tp4)
-elseif(CUTEAFD_V41_EXL3_RESIDENCY)
-  message(FATAL_ERROR "EXL3 residency overrides require paired TP4")
-endif()
-# Disjoint Spark packages serve TP4, equal-width TP2 and exact TP3 ownership: a
-# release image must be able to answer every approved topology. Paired H128
-# packages remain TP4-only, so they declare neither TP2 nor TP3 byproducts.
-if(CUTEAFD_EXL3_ROLE STREQUAL "spark" AND NOT CUTEAFD_V41_EXL3_PAIRED_TP4)
+# Spark packages include every approved whole-block topology.
+if(CUTEAFD_EXL3_ROLE STREQUAL "spark")
   list(APPEND CUTEAFD_EXL3_LAYOUTS tp2-rank0 tp2-rank1 tp3-rank0 tp3-rank1 tp3-rank2)
 endif()
-set(CUTEAFD_EXL3_OVERRIDE_CAPACITIES)
-foreach(override IN LISTS CUTEAFD_V41_EXL3_RESIDENCY)
-  if(NOT override MATCHES "^([1-9][0-9]*)=([12])$")
-    message(FATAL_ERROR "EXL3 residency must be capacity=1 or capacity=2")
-  endif()
-  set(capacity "${CMAKE_MATCH_1}")
-  if(NOT capacity IN_LIST CUTEAFD_V41_EXL3_CAPACITIES OR capacity IN_LIST CUTEAFD_EXL3_OVERRIDE_CAPACITIES)
-    message(FATAL_ERROR "EXL3 residency requires a selected, nonduplicate capacity")
-  endif()
-  list(APPEND CUTEAFD_EXL3_OVERRIDE_CAPACITIES "${capacity}")
-  list(APPEND CUTEAFD_EXL3_LAYOUT_ARGS --residency "${override}")
-endforeach()
 set(CUTEAFD_EXL3_TILE_ARGS)
 foreach(tile IN LISTS CUTEAFD_V41_EXL3_TILES)
   if(NOT tile MATCHES "^([A-Za-z0-9._+-]+)=(all|[0-9]+(\\+[0-9]+)*):([0-9]+,[0-9]+,[0-9]+,[0-9]+)$")
@@ -96,7 +64,7 @@ foreach(family IN LISTS CUTEAFD_V41_EXL3_BIT_FAMILIES)
   set(CUTEAFD_EXL3_PACKAGE "${CMAKE_CURRENT_BINARY_DIR}/exl3-k${CUTEAFD_EXL3_FAMILY_TAG}")
   string(JOIN "|" CUTEAFD_EXL3_CONFIG_KEY "role=${CUTEAFD_EXL3_ROLE}"
     "layouts=${CUTEAFD_EXL3_REQUIRE_LAYOUTS}" "capacities=${CUTEAFD_V41_EXL3_CAPACITIES}"
-    "tiers=${family}" "args=${CUTEAFD_EXL3_LAYOUT_ARGS}" "tiles=${CUTEAFD_EXL3_TILE_ARGS}")
+    "tiers=${family}" "tiles=${CUTEAFD_EXL3_TILE_ARGS}")
   set(CUTEAFD_EXL3_CONFIG_STAMP "${CMAKE_CURRENT_BINARY_DIR}/v41_exl3_k${CUTEAFD_EXL3_FAMILY_TAG}_config.stamp")
   file(GENERATE OUTPUT "${CUTEAFD_EXL3_CONFIG_STAMP}" CONTENT "${CUTEAFD_EXL3_CONFIG_KEY}\n")
   set(CUTEAFD_EXL3_BYPRODUCTS)
@@ -115,7 +83,7 @@ foreach(family IN LISTS CUTEAFD_V41_EXL3_BIT_FAMILIES)
       "${Python3_EXECUTABLE}" "${CUTEAFD_EXL3_TOOL}" build
       --role "${CUTEAFD_EXL3_ROLE}" --capacities "${CUTEAFD_EXL3_CAPACITIES_ARG}"
       --bits ${CUTEAFD_EXL3_FAMILY_TIERS}
-      ${CUTEAFD_EXL3_LAYOUT_ARGS} ${CUTEAFD_EXL3_REQUIRE_ARGS} ${CUTEAFD_EXL3_TILE_ARGS}
+      ${CUTEAFD_EXL3_REQUIRE_ARGS} ${CUTEAFD_EXL3_TILE_ARGS}
       --build-dir "${CMAKE_CURRENT_BINARY_DIR}/v41_exl3_exports/k${CUTEAFD_EXL3_FAMILY_TAG}"
       --output "${CUTEAFD_EXL3_PACKAGE}"
       --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_EXL3_CUDA_INCLUDE}"
@@ -144,9 +112,6 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
   endif()
   if(NOT entry MATCHES "^(dsv4f|dsv4p|glm|glmf|qwen4):exl3-k([2-5][2-5]+)$")
     message(FATAL_ERROR "EXL3 expert family ${entry} must be (dsv4f|dsv4p|glm|glmf|qwen4):exl3-k<tiers>, for example dsv4p:exl3-k23")
-  endif()
-  if(CUTEAFD_V41_EXL3_PAIRED_TP4)
-    message(FATAL_ERROR "Paired EXL3 TP4 packages exist only for DeepSeek V4.1")
   endif()
   set(CUTEAFD_EXL3_GEOMETRY "${CMAKE_MATCH_1}")
   set(CUTEAFD_EXL3_FAMILY_TAG "${CMAKE_MATCH_2}")

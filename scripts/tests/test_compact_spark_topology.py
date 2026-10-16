@@ -135,13 +135,10 @@ release_stop_wip_containers
     NATIVE3 = ('SPARK_COUNT=3\nEXPERT_FORMAT=native\nSPARKINFER_EXL3=disable\n'
                'SPARK_TP=3\nSPARK_EP=1')
 
-    def test_implicit_counts_only_reject_paired_tp4_packages(self):
+    def test_implicit_counts_are_admitted(self):
         for count in (2, 3):
             for settings in (f'SPARK_COUNT={count}', f'SPARK_COUNT={count}\nRTX_GPUS=2'):
                 self.assertEqual(self.config(settings).returncode, 0)
-            self.assertEqual(self.config(f'SPARK_COUNT={count}\nEXL3_PAIRED_TP4=on',
-                'release_validate_compact_spark').returncode, 2)
-
     def test_explicit_native_tp3ep1_bypasses_every_compact_rule(self):
         # The bypass must hold for MEMORY_RESERVATION, KV, prefill and the
         # single-RTX rule: nothing in the compact block may touch this launch.
@@ -159,9 +156,9 @@ release_stop_wip_containers
         self.assertEqual(result.returncode, 0, result.stderr)   # no 256 cap
         self.assertEqual(result.stdout, '4096')
         self.assertNotIn('caps PREFILL_BATCH_TOKENS', result.stderr)
-        result = self.config(self.NATIVE3 + '\nEXL3_PAIRED_TP4=on')
-        self.assertEqual(result.returncode, 2, result.stderr)   # native-only guard
-        self.assertIn('native topology', result.stderr)
+    def test_explicit_compact_tp3_exl3_is_admitted(self):
+        result = self.config('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto')
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_malformed_partial_three_rank_topologies_are_rejected(self):
         for settings, message in [
@@ -170,8 +167,6 @@ release_stop_wip_containers
             ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=2', 'must equal SPARK_COUNT'),
             ('SPARK_COUNT=3\nSPARK_TP=1\nSPARK_EP=3', 'unsupported native Spark topology TP1EP3'),
             ('SPARK_COUNT=3\nSPARK_TP=2\nSPARK_EP=1', 'must equal SPARK_COUNT'),
-            ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto',
-             'requires EXPERT_FORMAT=native'),
             ('SPARK_COUNT=9', 'SPARK_COUNT must be in 0..8'),
         ]:
             with self.subTest(settings=settings):

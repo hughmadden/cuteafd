@@ -111,13 +111,9 @@ pub(super) fn oracle(catalog: &OfficialV41Catalog, layer: usize, input: &[f32], 
                 for route in routes {
                     let x = &input[route.row_index as usize * hidden..][..hidden];
                     let act: Vec<f32> = (0..inter).map(|n| {
-                        let mut gate = bf16(a1 * dot(x, &w1[n * hidden..][..hidden]));
-                        let mut up = bf16(a3 * dot(x, &w3[n * hidden..][..hidden]));
-                        if let Some(limit) = limit {
-                            gate = gate.min(limit);
-                            up = up.clamp(-limit, limit);
-                        }
-                        bf16(bf16(gate / (1.0 + (-gate).exp())) * up)
+                        let gate = bf16(a1 * dot(x, &w1[n * hidden..][..hidden]));
+                        let up = bf16(a3 * dot(x, &w3[n * hidden..][..hidden]));
+                        cuteafd_core::FfnActivation::SiluBf16Product { limit }.evaluate(gate, up)
                     }).collect();
                     let row = &mut out[slot[&(route.row_index as usize)] * hidden..][..hidden];
                     for (h, value) in row.iter_mut().enumerate() {

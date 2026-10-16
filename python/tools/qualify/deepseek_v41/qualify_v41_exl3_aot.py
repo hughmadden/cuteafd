@@ -245,7 +245,7 @@ def main() -> None:
     parser.add_argument('--slice-start', type=int, default=0)
     parser.add_argument('--independent-reference', action='store_true',
         help='Also compare each sampled expert with independent NumPy FP64 dequant/math; '
-             'bounded to three identical input rows, K3/K4, unpaired exports')
+             'bounded to three identical input rows, K3/K4 exports')
     parser.add_argument('--fixture', type=Path)
     parser.add_argument('--fixture-input', type=Path, help='Reuse a prior fixture input prefix for a different capacity/tile reference')
     parser.add_argument('--fixture-canonical-routes', action='store_true',
@@ -273,11 +273,8 @@ def main() -> None:
         raise ValueError('this oracle qualifies a six-expert probe, not the full production '
                          f'inventory; read experts {meta["experts"]}')
     assert meta['sparkinfer_revision'] == _pinned_sparkinfer.REVISION
-    paired = meta.get('paired_boundary')
-    assert paired in (None, 'first', 'last')
-    if args.independent_reference and (paired is not None or meta['bits'] != [3, 4]):
-        raise ValueError('independent reference supports unpaired K3/K4 exports only')
-    assert paired is None or meta.get('descriptor_rows') == 4
+    if args.independent_reference and meta['bits'] != [3, 4]:
+        raise ValueError('independent reference supports K3/K4 exports only')
     hidden, width, experts, capacity = meta['hidden'], meta['intermediate'], meta['experts'], meta['capacity']
     start=args.slice_start
     assert start >= 0 and start % 128 == 0 and start+width <= 2304
@@ -379,8 +376,7 @@ def main() -> None:
         max_shared_mem=props.shared_memory_per_block_optin,force_tile_config=tuple(meta['tile']),
         tier0_bits=meta['bits'][0], tier1_bits=meta['bits'][1],
         swiglu_limit=10.0, direct_topk_routes=meta['direct'],full_rotation_output_dtype=meta['output_dtype'],
-        force_blocks_per_sm=meta['blocks_per_sm'] if meta['blocks_per_sm'] > 1 else None,
-        **({'paired_boundary':paired} if paired is not None else {}))
+        force_blocks_per_sm=meta['blocks_per_sm'] if meta['blocks_per_sm'] > 1 else None)
     # B12x derives every tier extent from the LAUNCH, not from the declared tier
     # objects, so a reference compiled at the wrong widths fails later as an opaque
     # storage-extent error. Assert the compiled pair instead of trusting defaults.
@@ -394,11 +390,6 @@ def main() -> None:
         device='cuda',dtype=torch.int32)
         for name in ('packed_route_indices','block_expert_ids')})
     descriptor=prepared.descriptor_map
-    ownership=None
-    if paired is not None:
-        descriptor=torch.cat((descriptor,torch.ones(experts*2,device='cuda',dtype=torch.int32)))
-        descriptor._mt_projection_counts=prepared.descriptor_map._mt_projection_counts
-        ownership=descriptor[-experts*2:]
     binding=bind_mixed_trellis(*prepared.tiers,prepared.global_to_combined,descriptor,prepared.rotations,launch,
         gate_experts=prepared.gate_counts,up_experts=prepared.up_counts)
     lib=ct.CDLL(str(args.aot/'libcuteafd_exl3.so'))
@@ -406,19 +397,12 @@ def main() -> None:
     if hasattr(lib,'cuteafd_exl3_info'):
         lib.cuteafd_exl3_info.argtypes=[ct.POINTER(ct.c_uint32),ct.c_uint32]
         lib.cuteafd_exl3_info.restype=ct.c_int
-        if paired is not None:
-            assert lib.cuteafd_exl3_info((ct.c_uint32*16)(),16)!=0
-            query=lib.cuteafd_exl3_paired_info
-            query.argtypes=[ct.POINTER(ct.c_uint32),ct.c_uint32];query.restype=ct.c_int
-            count=18
-        else:
-            query=lib.cuteafd_exl3_info;count=16
+        query=lib.cuteafd_exl3_info;count=16
         native_info=(ct.c_uint32*count)()
         assert query(native_info,count)==0
-        expected_info=[3 if paired else 2,hidden,width,experts,capacity,topk,2,
+        expected_info=[2,hidden,width,experts,capacity,topk,2,
             *[len(e[key]) for e in meta['objects'] for key in ['pointer_slots','scalar_slots']], *meta['bits'], 0, 0,
             2 if meta['output_dtype']=='bf16' else 4]
-        if paired: expected_info += [1 if paired=='first' else 2,4]
         assert list(native_info)==expected_info
         info_verified=True
     lib.cuteafd_exl3_create.argtypes=[ct.POINTER(ct.c_void_p)];lib.cuteafd_exl3_create.restype=ct.c_int
@@ -535,18 +519,6 @@ def main() -> None:
         expected=run_bound_mixed_trellis(x[:graph_rows],weights[:graph_rows],ids[:graph_rows],binding,buffers).clone()
         buffers.output.fill_(float('nan'));poison_metadata();graph.replay();torch.cuda.synchronize()
         assert torch.equal(buffers.output[:graph_rows],expected)
-        ownership_checks=[]
-        if ownership is not None:
-            for pattern in ([0]*experts, [i%2 for i in range(experts)], [(i+1)%2 for i in range(experts)], [1]*experts):
-                ownership.fill_(0)
-                ownership[:experts].copy_(torch.tensor(pattern,device='cuda',dtype=torch.int32))
-                x.mul_(-.75)
-                expected=run_bound_mixed_trellis(x[:graph_rows],weights[:graph_rows],ids[:graph_rows],binding,buffers).clone()
-                assert torch.isfinite(expected).all() and expected.abs().max()>0
-                buffers.fc1.fill_(float('nan'));buffers.output.fill_(float('nan'));poison_metadata()
-                graph.replay();torch.cuda.synchronize()
-                assert torch.equal(buffers.output[:graph_rows],expected)
-                ownership_checks.append({'owners':pattern,'rows':graph_rows,'bitwise_equal':True})
         if args.fixture is not None:
             args.fixture.mkdir(parents=True,exist_ok=True)
             if args.fixture_canonical_routes:
@@ -581,25 +553,9 @@ def main() -> None:
                 values=fixture_input[:,:5120].contiguous().view(torch.float8_e4m3fn).float()
                 scales=fixture_input[:,5120:].int().repeat_interleave(32,dim=1)-127
                 x=torch.ldexp(values,scales).to(torch.bfloat16)
-            fixture_owners = None
-            if ownership is not None:
-                starts = {0: 0, 512: 1, 1152: 2, 1664: 3}
-                assert start in starts, 'paired fixture must use a real TP4 resident slice'
-                rank = starts[start]
-                assert paired == ('last' if rank % 2 == 0 else 'first')
-                fixture_owners = torch.arange(experts, device='cuda', dtype=torch.int32).remainder(4)
-                if args.fixture_input is not None and 'owners' in source_meta['artifacts']:
-                    raw = (args.fixture_input/'owners.bin').read_bytes()
-                    spec = source_meta['artifacts']['owners']
-                    assert len(raw) == spec['bytes'] and hashlib.sha256(raw).hexdigest() == spec['sha256']
-                    fixture_owners = torch.frombuffer(bytearray(raw), dtype=torch.int32).clone().to('cuda')
-                    assert fixture_owners.numel() == experts and ((fixture_owners >= 0) & (fixture_owners < 4)).all()
-                ownership.zero_()
-                ownership[:experts].copy_(((fixture_owners >> (rank // 2)) & 1) == rank % 2)
             expected=run_bound_mixed_trellis(x,weights,ids,binding,buffers).clone()
             artifacts={}
             values = [('input',fixture_input),('ids',ids),('weights',weights),('expected',expected)]
-            if fixture_owners is not None: values.append(('owners', fixture_owners))
             for name,value in values:
                 raw=value.contiguous().view(torch.uint8).cpu().numpy().tobytes()
                 (args.fixture/(name+'.bin')).write_bytes(raw)
@@ -609,7 +565,6 @@ def main() -> None:
                 'direct':meta['direct'],'tile':meta['tile'],
                 'input_format':args.fixture_format,'output_dtype':meta['output_dtype'],
                 'canonical_routes':args.fixture_canonical_routes,
-                'paired_boundary':paired,'paired_rank':None if paired is None else rank,
                 'input_fixture_manifest_sha256':None if args.fixture_input is None else
                     hashlib.sha256((args.fixture_input/'fixture.json').read_bytes()).hexdigest(),
                 'snapshot_revision':args.snapshot.name,'artifacts':artifacts},indent=2)+'\n')
@@ -650,7 +605,7 @@ def main() -> None:
             'reference_tier_bits': [int(launch.tier0_bits), int(launch.tier1_bits)],
             'experts_qualified': experts, 'full_production_experts': 384,
             'output_dtype':meta['output_dtype'],'checkpoint_layer':layer_prefix,'topk':topk,'native_info_verified':info_verified,
-            'slice_start':start,'paired_boundary':paired,'ownership_graph_checks':ownership_checks,
+            'slice_start':start,
             'sparkinfer_revision':_pinned_sparkinfer.REVISION,'compute':meta['compute'],'intermediate':width,
             'direct':meta['direct'],
             'route_bridge_sha256':None if route_lib is None else hashlib.sha256((route_path.parent/'libv41_exl3_routes.so').read_bytes()).hexdigest(),

@@ -231,6 +231,24 @@ pub(crate) struct PlanArgs {
     pub(crate) coordinator_weight_budget_gib: f64,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
+    /// Emit typed launch decisions; live artifact verification stays with the launcher.
+    #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
+    pub(crate) deployment: bool,
+    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=8))]
+    pub(crate) spark_tp: Option<u8>,
+    #[arg(long, requires = "deployment", requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
+    pub(crate) spark_ep: Option<u8>,
+    /// Ordered endpoint inventory; selected ranks take its prefix.
+    #[arg(long = "deployment-peers", requires = "deployment", value_delimiter = ',')]
+    pub(crate) deployment_peers: Vec<String>,
+    /// Keep the coordinator-owned measured expert boundary protocol enabled.
+    #[arg(long = "deployment-placement-handshake", requires = "deployment")]
+    pub(crate) placement_handshake: bool,
+    /// Preserve launch admission spelling; checked by the native admission parser.
+    #[arg(long, requires = "deployment")]
+    pub(crate) kv_pool_size: Option<String>,
+    #[arg(long, requires = "deployment")]
+    pub(crate) memory_reservation: Option<String>,
     /// Emit snapshot-relative paths suitable for rsync --files-from.
     #[arg(long)]
     pub(crate) files: bool,
@@ -748,12 +766,6 @@ mod tests {
         assert_eq!(args.concurrency, 16);
         assert_eq!(args.prefix_cache_entries, 20);
         assert_eq!(args.dspark_draft_limit, 5);
-        assert!(!args.exl3_paired_tp4);
-        let super::Commands::ServeNative(paired) = super::Cli::try_parse_from(
-            base.into_iter().chain(["--exl3-paired-tp4"])).unwrap().command else {
-            panic!("expected native serving");
-        };
-        assert!(paired.exl3_paired_tp4);
         assert!(!args.adaptive_dspark()); // Target-only remains target-only.
         for (flags, adaptive) in [
             (vec!["--dspark"], true),
@@ -973,9 +985,6 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value = "auto")]
     pub rtx_expert_layers: crate::shared::memory::budget::LocalLayers,
 
-    /// Use paired H128 EXL3 ownership; requires paired AOT packages on all four Spark peers.
-    #[arg(long)]
-    pub exl3_paired_tp4: bool,
 
     /// Maximum active requests, shared by both execution lanes.
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=16))]

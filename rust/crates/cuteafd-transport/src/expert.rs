@@ -19,8 +19,6 @@ mod lane;
 pub use lane::{LaneBuild, LaneOwnedSink, LaneSink, LaneTimes, SparkExpertLane};
 mod tcp;
 pub use tcp::{V41Tp4Pending, V41Tp4Tcp};
-mod paired;
-pub use paired::{V41PairedOwnershipBatch, V41PairedRouteWord, V41_EXL3_PAIRED_REQUEST_FLAG};
 mod native_group;
 pub use native_group::{
     V41NativeOwnerRouteWord, V41NativeOwnershipBatch, SparkTopology, V41_MAX_NATIVE_GROUPS,
@@ -145,10 +143,6 @@ fn validate_native_group(
         "native group worker requires the native group request flag"
     );
     ensure!(
-        header.flags & V41_EXL3_PAIRED_REQUEST_FLAG == 0,
-        "native group requests cannot use paired EXL3 admission"
-    );
-    ensure!(
         header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0,
         "native group request requires compact BF16 response agreement"
     );
@@ -171,22 +165,6 @@ fn validate_native_group(
     })
 }
 
-fn validate_paired(
-    header: &crate::ExpertProtocolV2RequestHeader, max_rows: u32,
-    row_at: impl Fn(usize) -> Result<crate::ExpertProtocolV2RowDescriptor>,
-    route_at: impl Fn(usize) -> Result<crate::ExpertProtocolV2RouteEntry>,
-) -> Result<()> {
-    ensure!(header.flags & V41_EXL3_PAIRED_REQUEST_FLAG != 0, "paired worker requires paired request");
-    let mut canonical = header.clone();
-    canonical.flags &= !V41_EXL3_PAIRED_REQUEST_FLAG;
-    let mut batch = V41PairedOwnershipBatch::default();
-    validate_canonical(&canonical, max_rows, row_at, |index| {
-        let mut route = route_at(index)?;
-        route.expert_id = batch.observe(route.expert_id)?.expert_id;
-        Ok(route)
-    })
-}
-
 /// Validated canonical row-major routing; the same request must reach every TP rank.
 pub struct BackboneRequest<'a> {
     view: ExpertProtocolV2RequestView<'a>,
@@ -198,12 +176,6 @@ impl<'a> BackboneRequest<'a> {
     pub fn parse(frame: &'a [u8], max_rows: u32) -> Result<Self> {
         let view = ExpertProtocolV2RequestView::parse(frame)?;
         validate_canonical(&view.header, max_rows, |i| view.row(i), |i| view.route(i))?;
-        Ok(Self { view, native_topology: None })
-    }
-    /// Explicit admission for a worker bound to paired EXL3 resident weights.
-    pub fn parse_paired(frame: &'a [u8], max_rows: u32) -> Result<Self> {
-        let view = ExpertProtocolV2RequestView::parse(frame)?;
-        validate_paired(&view.header, max_rows, |i| view.row(i), |i| view.route(i))?;
         Ok(Self { view, native_topology: None })
     }
     /// Explicit admission for a worker bound to one replicated `TP×EP`
@@ -218,16 +190,10 @@ impl<'a> BackboneRequest<'a> {
         validate_native_group(&view.header, max_rows, topology, |i| view.row(i), |i| view.route(i))?;
         Ok(Self { view, native_topology: Some(topology) })
     }
-    pub fn is_paired(&self) -> bool { self.view.header.flags & V41_EXL3_PAIRED_REQUEST_FLAG != 0 }
     pub fn is_native_group(&self) -> bool { self.native_topology.is_some() }
     /// Topology this request was admitted under, if it carries native ownership.
     pub fn native_topology(&self) -> Option<SparkTopology> { self.native_topology }
 
-    pub fn validate_owned_paired(request: &crate::ExpertProtocolV2Request, max_rows: u32) -> Result<()> {
-        request.validate()?;
-        validate_paired(&request.header, max_rows,
-            |i| Ok(request.rows[i].clone()), |i| Ok(request.routes[i].clone()))
-    }
     /// Ownership-aware check of a locally owned native group request; the caller
     /// must supply the topology its workers are bound to.
     pub fn validate_owned_native_group(
@@ -275,31 +241,16 @@ impl<'a> BackboneRequest<'a> {
     }
     /// Fill caller-owned GPU-upload arrays without reordering or rounding routes.
     pub fn copy_routes_into(&self, ids: &mut [i32], weights: &mut [f32]) -> Result<()> {
-        ensure!(!self.is_paired(), "paired routes require ownership-aware unpacking");
         ensure!(!self.is_native_group(), "native group routes require ownership-aware unpacking");
         let count = self.view.header.route_count as usize;
-        ensure!(
-            ids.len() >= count && weights.len() >= count,
-            "native routing buffers are too short"
-        );
+        ensure!(ids.len() >= count && weights.len() >= count,
+            "native routing buffers are too short");
         for index in 0..count {
             let route = self.view.route(index)?;
             ids[index] = route.expert_id as i32;
             weights[index] = route.gate_weight;
         }
         Ok(())
-    }
-    pub fn copy_paired_routes_into(&self, ids: &mut [i32], weights: &mut [f32], rank: usize, ownership: &mut [i32]) -> Result<()> {
-        ensure!(self.is_paired(), "disjoint routes cannot use paired unpacking");
-        let count = self.view.header.route_count as usize;
-        ensure!(ids.len() >= count && weights.len() >= count, "paired routing buffers too short");
-        let mut batch = V41PairedOwnershipBatch::default();
-        for index in 0..count {
-            let route = self.view.route(index)?;
-            ids[index] = batch.observe(route.expert_id)?.expert_id as i32;
-            weights[index] = route.gate_weight;
-        }
-        batch.write_local_ownership(rank, ownership)
     }
     /// Unpack one replicated group's routes for a worker bound to `topology`.
     ///
@@ -353,7 +304,7 @@ impl<'a> BackboneRequest<'a> {
                 status: ExpertProtocolV2Status::Ok,
                 // Request-only admission flags never appear in a response.
                 flags: header.flags
-                    & !(V41_EXL3_PAIRED_REQUEST_FLAG | V41_NATIVE_GROUP_REQUEST_FLAG),
+                    & !V41_NATIVE_GROUP_REQUEST_FLAG,
                 executor_id,
             })
     }

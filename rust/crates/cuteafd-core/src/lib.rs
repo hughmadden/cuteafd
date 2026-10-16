@@ -1,3 +1,5 @@
+pub mod ffn_activation;
+pub use ffn_activation::FfnActivation;
 pub mod coordinator_programs;
 pub mod expert_geometry;
 pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy};
@@ -30,11 +32,6 @@ mod errors;
 mod expert_batch;
 mod expert_host_batch;
 mod expert_route_plan;
-mod exl3_tp4_ownership;
-pub use exl3_tp4_ownership::{
-    exl3_tp4_active_blocks, Exl3BoundaryCost, Exl3Tp4OwnershipPlan,
-    Exl3Tp4OwnershipPlanner, EXL3_TP4_RESIDENT_BLOCKS,
-};
 mod ids;
 mod kv_cache;
 mod layerwave;

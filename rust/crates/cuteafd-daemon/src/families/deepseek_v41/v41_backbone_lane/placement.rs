@@ -151,7 +151,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub async unsafe fn import_previous_cooperative(
         &mut self,
         previous: &BlockOutput<'_>,
-        transfer: &mut crate::families::deepseek_v41::v41_block::BlockTransfer<'a>,
+        transfer: &mut crate::shared::peer_split::hop::DirectInputHop<'a>,
     ) -> Result<()> {
         self.phase = Phase::Invalid;
         ensure!(previous.layer < 39, "final layer has no successor");

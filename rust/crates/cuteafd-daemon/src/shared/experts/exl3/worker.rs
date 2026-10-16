@@ -9,7 +9,7 @@ use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_transport::{
-    expert::BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
+    expert::{BackboneRequest, SparkTopology}, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
     ExpertV2Dtype, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
 };
 use std::{io::Write, path::Path, rc::Rc};
@@ -108,6 +108,19 @@ impl Drop for RouteDump {
     }
 }
 
+fn copy_routes(request: &BackboneRequest<'_>, topology: Option<SparkTopology>,
+    ids: &mut [i32], weights: &mut [f32]) -> Result<()> {
+    match (topology, request.is_native_group()) {
+        (Some(topology), true) => {
+            ensure!(topology == SparkTopology::NATIVE_TP3_EP1,
+                "compact EXL3 ownership requires TP3EP1");
+            request.copy_native_group_routes_into(ids, weights, 0)
+        }
+        (None, false) => request.copy_routes_into(ids, weights),
+        _ => anyhow::bail!("EXL3 request ownership differs from admitted topology"),
+    }
+}
+
 pub(crate) struct Exl3Worker<'a> {
     // Drain the stream before dropping kernels, weights or input allocations.
     stream: LoadStream<'a>,
@@ -120,16 +133,15 @@ pub(crate) struct Exl3Worker<'a> {
     capacity: usize,
     inputs: [DeviceAllocation<'a>; 3],
     /// Pinned staging of a call's routes, laid out as `inputs[1]` and
-    /// `inputs[2]` receive them: int32 ids (then a paired layout's ownership
-    /// words) from the start, FP32 gate weights from `weights_offset`. Every
+    /// `inputs[2]` receive them: int32 ids
+    /// from the start, FP32 gate weights from `weights_offset`. Every
     /// call completes its stream before returning, so the next call may
     /// overwrite it.
     staging: HostAllocation<'a>,
     weights_offset: usize,
-    paired: bool,
+    topology: Option<SparkTopology>,
     host_path: HostPath,
     route_dump: Option<RouteDump>,
-    ownership_words: usize,
     library: &'a NativeLibrary,
     first_layer: usize,
     layer_count: usize,
@@ -144,24 +156,15 @@ impl<'a> Exl3Worker<'a> {
 
     /// Validate every capacity before allocating or reading resident weights,
     /// including that each export carries the requested decode schedule.
-    pub(crate) fn partition(directory: &Path, capacity: u32, rank: usize, schedule: Exl3Schedule)
-        -> Result<cuteafd_loader::V41Exl3Partition> {
-        use cuteafd_ffi::V41Exl3Layout;
-        use cuteafd_loader::V41Exl3Partition;
+    pub(crate) fn validate_exports(directory: &Path, capacity: u32, rank: usize, schedule: Exl3Schedule)
+        -> Result<()> {
         ensure!(rank < 6, "EXL3 worker rank must be 0..5");
         schedule.validate(Exl3RowPolicy::active())?;
-        let mut selected = None;
         for c in Self::capacities(capacity)? {
             schedule.check_export(directory, c)?;
-            let layout = Exl3Execution::artifact_layout(&schedule.directory(directory, c))?;
-            ensure!(selected.is_none_or(|previous| previous == layout), "EXL3 capacity artifacts disagree on partition");
-            ensure!(layout == V41Exl3Layout::Disjoint || layout == if rank % 2 == 0 {
-                V41Exl3Layout::PairedLast
-            } else { V41Exl3Layout::PairedFirst }, "EXL3 artifact boundary does not match worker rank");
-            selected = Some(layout);
+            Exl3Execution::validate_artifact(&schedule.directory(directory, c))?;
         }
-        Ok(if selected == Some(V41Exl3Layout::Disjoint) { V41Exl3Partition::Disjoint }
-            else { V41Exl3Partition::PairedTp4 })
+        Ok(())
     }
 
     /// FP8 E4M3 wire row: hidden values then hidden/32 UE8M0 K32 scales.
@@ -178,10 +181,8 @@ impl<'a> Exl3Worker<'a> {
         let directories: Vec<_> = Self::capacities(capacity)?.into_iter()
             .map(|c| schedule.directory(directory, c)).collect();
         Exl3ReductionPlan::new(&directories)?;
-        let ownership_bytes = Exl3Execution::ownership_bytes(&directories[0])?;
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
             .checked_add(capacity as usize * (Self::wire_row_bytes() + Self::topk() * 8))
-            .and_then(|bytes| bytes.checked_add(ownership_bytes))
             .context("EXL3 worker workspace budget overflow")
     }
 
@@ -240,18 +241,15 @@ impl<'a> Exl3Worker<'a> {
             );
             executions.push(execution);
         }
-        let ownership_words = if first.layout.layout == cuteafd_loader::V41Exl3Partition::PairedTp4 {
-            first.layout.experts * first.layout.tiers.len()
-        } else { 0 };
         let topk = Self::topk();
-        let weights_offset = (capacity as usize * topk + ownership_words) * 4;
+        let weights_offset = capacity as usize * topk * 4;
         let staging = HostAllocation::new(library, weights_offset + capacity as usize * topk * 4)?;
         let host_path = HostPath::from_env()?;
         let executor_id = cuteafd_transport::expert::v41_spark_executor_id(first.layout.world, rank)?;
         let route_dump = RouteDump::from_env(executor_id)?;
         let inputs = [
             DeviceAllocation::new(library, capacity as usize * Self::wire_row_bytes())?,
-            DeviceAllocation::new(library, (capacity as usize * topk + ownership_words) * 4)?,
+            DeviceAllocation::new(library, capacity as usize * topk * 4)?,
             DeviceAllocation::new(library, capacity as usize * topk * 4)?,
         ];
         ensure!(
@@ -291,10 +289,9 @@ impl<'a> Exl3Worker<'a> {
             inputs,
             staging,
             weights_offset,
-            paired: ownership_words > 0,
+            topology: None,
             host_path,
             route_dump,
-            ownership_words,
             library,
             first_layer,
             layer_count,
@@ -303,7 +300,17 @@ impl<'a> Exl3Worker<'a> {
         })
     }
 
-    pub(crate) fn is_paired(&self) -> bool { self.paired }
+    pub(crate) fn install_topology(&mut self, topology: Option<SparkTopology>) -> Result<()> {
+        ensure!(self.topology.is_none(), "EXL3 topology already installed");
+        if let Some(topology) = topology {
+            ensure!(topology == SparkTopology::NATIVE_TP3_EP1,
+                "compact EXL3 ownership requires disjoint TP3EP1 artifacts");
+            ensure!((0..3).any(|rank| topology.executor_id(rank).ok() == Some(self.executor_id)),
+                "EXL3 topology differs from loaded shard identity");
+        }
+        self.topology = topology;
+        Ok(())
+    }
 
     pub(crate) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
         rank: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
@@ -325,19 +332,18 @@ impl<'a> Exl3Worker<'a> {
         Ok(report)
     }
 
-    /// The staged ids, ownership words and weights of a call of `routes` routes.
-    fn staged(&mut self, routes: usize) -> (&mut [i32], &mut [i32], &mut [f32]) {
-        assert!(routes * 4 <= self.weights_offset - self.ownership_words * 4,
+    /// The staged ids and weights of a call of `routes` routes.
+    fn staged(&mut self, routes: usize) -> (&mut [i32], &mut [f32]) {
+        assert!(routes * 4 <= self.weights_offset,
             "EXL3 staged routes exceed capacity");
         let base = self.staging.buffer.ptr.cast::<u8>();
-        // SAFETY: the three ranges are disjoint, inside the pinned allocation
-        // (ids + ownership end at or before `weights_offset`, the weights
+        // SAFETY: the two ranges are disjoint, inside the pinned allocation
+        // (ids end at or before `weights_offset`, the weights
         // region holds capacity * top-k floats), 4-byte aligned, and
         // exclusively borrowed through `self`.
         unsafe {
             (
                 std::slice::from_raw_parts_mut(base.cast::<i32>(), routes),
-                std::slice::from_raw_parts_mut(base.cast::<i32>().add(routes), self.ownership_words),
                 std::slice::from_raw_parts_mut(base.add(self.weights_offset).cast::<f32>(), routes),
             )
         }
@@ -345,7 +351,7 @@ impl<'a> Exl3Worker<'a> {
 
     /// Read-only view of the staged ids and weights of a call of `routes` routes.
     fn staged_view(&self, routes: usize) -> (&[i32], &[f32]) {
-        assert!(routes * 4 <= self.weights_offset - self.ownership_words * 4,
+        assert!(routes * 4 <= self.weights_offset,
             "EXL3 staged routes exceed capacity");
         let base = self.staging.buffer.ptr.cast::<u8>();
         // SAFETY: as in `staged`; shared borrows of `self` exclude writers.
@@ -386,7 +392,6 @@ impl<'a> Exl3Worker<'a> {
             request.rows() > 0 && request.rows() as usize <= self.capacity,
             "EXL3 request exceeds capacity"
         );
-        ensure!(request.is_paired() == self.is_paired(), "EXL3 request/resident layout mismatch");
         request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32)?;
         let bytes = request.plane_bytes()?;
         ensure!(
@@ -395,14 +400,10 @@ impl<'a> Exl3Worker<'a> {
         );
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
         let routes = request.rows() as usize * Self::topk();
-        let (paired, rank) = (self.paired, self.executor_id.saturating_sub(1) as usize);
+        let topology = self.topology;
         {
-            let (ids, ownership, weights) = self.staged(routes);
-            if paired {
-                request.copy_paired_routes_into(ids, weights, rank, ownership)?;
-            } else {
-                request.copy_routes_into(ids, weights)?;
-            }
+            let (ids, weights) = self.staged(routes);
+            copy_routes(request, topology, ids, weights)?;
         }
         ensure!(
             cfg!(target_endian = "little"),
@@ -434,7 +435,7 @@ impl<'a> Exl3Worker<'a> {
             },
             None => self.library.copy_h2d(self.inputs[0].buffer, request.hidden())?,
         }
-        let id_bytes = (routes + self.ownership_words) * 4;
+        let id_bytes = routes * 4;
         let staged = self.staging.buffer;
         let id_source = CuteafdHostBuffer { bytes: id_bytes, ..staged };
         let weight_source = CuteafdHostBuffer {
@@ -475,15 +476,7 @@ impl<'a> Exl3Worker<'a> {
             unsafe { timing.record(0, self.stream.raw)?; }
         }
         let output = unsafe {
-            if self.ownership_words > 0 {
-                let ownership = CuteafdDeviceBuffer {
-                    ptr: self.inputs[1].buffer.ptr.cast::<u8>().add(routes * 4).cast(),
-                    bytes: self.ownership_words * 4,
-                    ..self.inputs[1].buffer
-                };
-                execution.launch_paired_layer_into(self.layer, inputs, request.rows() as usize,
-                    self.stream.raw, destination, ownership)?
-            } else { match destination {
+            match destination {
                 Some(output) => execution.launch_layer_into(
                     self.layer,
                     inputs,
@@ -497,7 +490,7 @@ impl<'a> Exl3Worker<'a> {
                     request.rows() as usize,
                     self.stream.raw,
                 )?,
-            } }
+            }
         };
         let enqueued_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         if let Some([_, end]) = &self.timing {
