@@ -10,7 +10,6 @@ use cuteafd_core::memory_layout::{Basis, Category, ItemLifetime};
 pub const DEFAULT_MARK_SLOTS: u64 = 18;
 pub const LAZY_GRAPH_BYTES: u64 = (1 << 30) / 2;
 pub const SPARK_WORKSPACE_BYTES: u64 = 56 * (1 << 30) / 100;
-pub const SPARK_RING_BYTES: u64 = 78 * (1 << 30) / 100;
 
 /// A dual Qwen executor requires nonempty whole-width ownership on both ends.
 /// Do not silently turn the shared solver's legal all-on-one-rank cut into a

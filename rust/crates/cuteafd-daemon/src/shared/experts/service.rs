@@ -458,6 +458,56 @@ fn log_spark_memory_if_enabled(
 mod tests {
     use super::*;
 
+    /// The planner's Spark I/O (`plan --layout`) against the worker's own
+    /// sample: the expert service's selected rank I/O (per-endpoint rings,
+    /// shared intake/exchange/indices) for the typed admission the
+    /// coordinator sends it: capacity, one endpoint per MiMo prefill lane,
+    /// and the wire format. MiMo Flash/Pro on their natural minimum
+    /// Spark counts, FP8 and BF16 wires.
+    #[test]
+    fn mimo_planner_spark_io_equals_worker_sample() {
+        use cuteafd_core::memory_layout::DeviceKind;
+        use cuteafd_loader::plan::{layout::LayoutOptions, testing as fixture, ExpertPlacement, PlanOptions};
+        for (pro, ranks) in [(false, 2usize), (true, 4)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = if pro { fixture::mimo_pro_config() } else { fixture::mimo_flash_mopd_config() };
+            cfg["max_position_embeddings"] = serde_json::json!(1 << 20);
+            fixture::write_snapshot(dir.path(), &cfg, &if pro { fixture::mimo_pro_tensors() }
+                else { fixture::mimo_flash_mopd_tensors() }, Some(if pro { 8 } else { 4 }));
+            let geometry = if pro { cuteafd_core::ExpertGeometry::MIMO_V26_PRO } else { cuteafd_core::ExpertGeometry::MIMO_V2_FLASH };
+            for input in [cuteafd_loader::families::mimo_v2::MimoExpertInput::Fp8,
+                cuteafd_loader::families::mimo_v2::MimoExpertInput::Bf16] {
+                let report = cuteafd_loader::plan::plan(dir.path(), &PlanOptions {
+                    placement: ExpertPlacement::Sparks { ranks },
+                    layout: Some(LayoutOptions { pool_tokens: Some(32768), concurrency: 4, mimo_expert_input: input,
+                        onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), ..Default::default() }),
+                    ..Default::default() }).unwrap();
+                let layout = report.memory_layout.unwrap();
+                let lanes = cuteafd_loader::families::mimo_v2::admission::resolve_transport_lanes(true,
+                    if pro { "mimop" } else { "mimo" }, None).unwrap();
+                let sparks = layout.devices.iter().filter(|d| d.kind == DeviceKind::Spark).collect::<Vec<_>>();
+                assert_eq!(sparks.len(), ranks, "pro={pro} {input:?}: {}", layout.render());
+                for device in sparks {
+                    let planned = |group: &str| device.items.iter().find(|i| i.group == group)
+                        .unwrap_or_else(|| panic!("pro={pro} {input:?} {}: no {group}", device.name())).bytes;
+                    // The worker's typed admission as the coordinator selects it: one endpoint per
+                    // MiMo prefill lane (the runtime's own lane resolution), at its wire format.
+                    let mut worker = config(ranks, device.index as usize, None);
+                    worker.capacity = 4096;
+                    worker.rdma_endpoints = lanes;
+                    worker.bf16_ingress = input.bf16(false);
+                    set_model(&mut worker, 4096, input.bf16(false), lanes);
+                    let rings = worker_ring_geometry(&worker).unwrap();
+                    let sample = selected_spark_io(&worker, geometry, rings).unwrap();
+                    assert_eq!(planned("rdma rings"), sample.mapped_rings, "pro={pro} {input:?} {}", device.name());
+                    assert_eq!(planned("expert intake"), sample.intake, "pro={pro} {input:?}");
+                    assert_eq!(planned("host expert exchange"), sample.host_exchange, "pro={pro} {input:?}");
+                    assert_eq!(planned("expert row indices"), sample.row_indices, "pro={pro} {input:?}");
+                }
+            }
+        }
+    }
+
     fn config(world: usize, rank: usize, topology: Option<SparkTopology>) -> NativeExpertServiceConfig {
         NativeExpertServiceConfig {
             library: PathBuf::from("/native.so"),

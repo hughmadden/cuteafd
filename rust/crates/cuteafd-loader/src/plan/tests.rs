@@ -1294,7 +1294,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
             let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
-            let graph = layout::family_costs("deepseek_v4").graph_bytes[0];
+            let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
             // The PRO envelope covers the measured loaded code as well (`V4Inputs::code_bytes`).
             let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;
             assert_eq!(total - device.capacity_bytes, crate::serving_capacity::deepseek_v4_headroom_bytes(
@@ -1314,7 +1314,7 @@ fn v4_missing_workspace_manifest_keeps_conservative_small_card_reserve() {
     }), ..sparks(2) }).unwrap();
     let device = report.memory_layout.unwrap().devices.remove(0);
     let workspace = device.items.iter().find(|i| i.group == "steps").unwrap().bytes;
-    let graph = layout::family_costs("deepseek_v4").graph_bytes[0];
+    let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
     assert_eq!(total - device.capacity_bytes,
         (10u64 << 30).saturating_sub(workspace + graph).max(3 << 30));
 }
@@ -2975,6 +2975,49 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
     let rendered = super::render(&glm);
     assert!(rendered.contains("Rtx { gpu: 0 }") && rendered.contains("1128026176"));
     assert!(!rendered.contains("MiMo key-0"));
+}
+
+/// A Spark-hosted MiMo tower is admitted against what each worker holds after
+/// its selected rank I/O (rings, intake, exchange, row indices), and the final
+/// layout keeps every Spark's allocations inside --spark-budget-gib.
+#[test]
+fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
+    use super::encoder::EncoderKind;
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    let mut config = mimo_flash_mopd_config();
+    config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
+        "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,
+        "temporal_patch_size":2,"spatial_merge_size":2,"hidden_act":"silu"});
+    let mut tensors = mimo_flash_mopd_tensors();
+    tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
+    let dir = snapshot_tp(config, &tensors, Some(4));
+    let options = |budget: u64| PlanOptions { vision: super::MediaMode::Spark(None), spark_budget_bytes: budget,
+        layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), concurrency: 4,
+            spark_allocation_budget_bytes: Some(budget),
+            onboard: Some(crate::placement::Onboard::Layers(0)), ..Default::default() }), ..sparks(4) };
+    let roomy = plan(dir.path(), &options(100 << 30)).unwrap();
+    assert!(roomy.executable(), "{}", render(&roomy));
+    let EncoderKind::Spark { rank } = roomy.encoder.as_ref().unwrap().kind else { panic!("{}", render(&roomy)) };
+    let memory = roomy.memory_layout.as_ref().unwrap();
+    let host = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark && d.index as usize == rank).unwrap();
+    let sum = |groups: &[&str]| host.items.iter().filter(|i| groups.contains(&i.group.as_str())).map(|i| i.bytes).sum::<u64>();
+    let io = sum(&["expert waves", "expert intake", "host expert exchange", "expert row indices", "rdma rings"]);
+    let tower = sum(&["vision tower", "vision scratch"]);
+    assert!(io > 0 && tower > 0, "{}", memory.render());
+    let allocated: u64 = host.items.iter().filter(|i| i.category != Category::Reserved).map(|i| i.bytes).sum();
+    // Room for the tower and its 1 GiB guard only if the rank I/O were invisible.
+    // Room for the tower and its 1 GiB guard only if half the rank I/O were invisible:
+    // refused, short by exactly that half.
+    let tight = allocated - io / 2 + (1 << 30);
+    let report = plan(dir.path(), &options(tight)).unwrap();
+    let encoder = report.encoder.as_ref().unwrap();
+    assert_eq!(encoder.kind, EncoderKind::Off, "{}", render(&report));
+    assert_eq!(encoder.shortfall, io / 2, "{}", render(&report));
+    assert!(!report.executable());
+    // With the whole I/O budgeted the same rank hosts it, and every Spark stays in budget.
+    let report = plan(dir.path(), &options(allocated + (1 << 30))).unwrap();
+    assert_eq!(report.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank }, "{}", render(&report));
+    assert!(report.executable(), "{}", render(&report));
 }
 
 /// Explicit VISION=spark on a GLM Flash layout whose routed experts never
