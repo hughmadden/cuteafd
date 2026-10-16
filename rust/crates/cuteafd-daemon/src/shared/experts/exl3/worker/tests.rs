@@ -90,7 +90,7 @@ fn exl3_worker_rank_bounds_include_tp1() -> Result<()> {
 
 fn sparse_layout(layer: cuteafd_loader::V41Exl3Layer) -> cuteafd_loader::V41Exl3Residency {
     cuteafd_loader::V41Exl3Residency {
-        layer, world: 4, rank: 3, layout: cuteafd_loader::V41Exl3Partition::Disjoint,
+        layer, world: 4, rank: 3,
         intermediate_start: 1536, experts: 256, intermediate: 512, tiers: vec![4],
         projection_counts: vec![[256; 3]], buffers: vec![], loads: vec![],
     }
@@ -118,16 +118,15 @@ fn exl3_worker_sparse_owners_reject_invalid_ids_and_geometry() {
         [Backbone(13), Dspark(0)]] {
         assert!(Exl3Worker::resident_layers(&layers.map(sparse_layout)).is_err());
     }
-    for change in 0..7 {
+    for change in 0..6 {
         let mut layouts = [sparse_layout(Backbone(13)), sparse_layout(Backbone(15))];
         let second = &mut layouts[1];
         match change {
             0 => second.rank = 2,
             1 => second.world = 6,
-            2 => second.layout = cuteafd_loader::V41Exl3Partition::PairedTp4,
-            3 => second.intermediate_start = 1024,
-            4 => second.intermediate = 384,
-            5 => second.experts = 128,
+            2 => second.intermediate_start = 1024,
+            3 => second.intermediate = 384,
+            4 => second.experts = 128,
             _ => second.tiers = vec![3, 4],
         }
         assert!(Exl3Worker::resident_layers(&layouts).is_err());

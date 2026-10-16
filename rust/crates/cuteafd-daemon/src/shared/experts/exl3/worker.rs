@@ -204,7 +204,7 @@ impl<'a> Exl3Worker<'a> {
             ensure!(ids.last().is_none_or(|previous| *previous < layer),
                 "EXL3 worker layer IDs must be sorted and unique");
             ensure!(layout.world == first.world && layout.rank == first.rank
-                && layout.layout == first.layout && layout.intermediate_start == first.intermediate_start
+                && layout.intermediate_start == first.intermediate_start
                 && layout.intermediate == first.intermediate && layout.experts == first.experts
                 && layout.tiers == first.tiers,
                 "EXL3 worker layers must share TP rank and storage geometry");

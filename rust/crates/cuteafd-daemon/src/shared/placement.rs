@@ -16,7 +16,7 @@ pub(crate) struct SparkAdmission {
 impl SparkAdmission {
     pub(crate) fn plan(snapshot: &Path, geometry: ExpertGeometry,
         catalog: Option<&cuteafd_loader::OfficialV41Catalog>, working: &SparkWorkingSet,
-        world: usize, topology: Option<SparkTopology>, partition: cuteafd_loader::V41Exl3Partition,
+        world: usize, topology: Option<SparkTopology>,
         model: ModelAdmission) -> Result<Self> {
         ensure!(working.spark_layers.is_empty() || working.spark_ranks == world,
             "Spark admission working-set world differs from launched peers");
@@ -37,14 +37,11 @@ impl SparkAdmission {
             let headers = cuteafd_loader::plan::files::open_role(snapshot,
                 cuteafd_loader::plan::files::ReadRole::Spark { rank: 0, world: tp })?;
             let recipe = cuteafd_loader::plan::experts::checkpoint_spark_recipe(&headers, tp)?;
-            ensure!(partition == cuteafd_loader::V41Exl3Partition::Disjoint
-                || (catalog.exl3().is_some() && tp == 4 && topology.is_none()),
-                "paired Spark EXL3 requires an explicit implicit-TP4 placement");
             (0..world).map(|rank| {
                 let shard = topology.map(|topology| topology.tp_rank(rank)).transpose()?
                     .map_or(rank, usize::from);
                 let layout = if catalog.exl3().is_some() {
-                    SparkResidentLayout::Exl3 { world: tp, rank: shard, partition }
+                    SparkResidentLayout::Exl3 { world: tp, rank: shard }
                 } else if catalog.fp8().is_some() {
                     SparkResidentLayout::Fp8 { world: tp, rank: shard, slicing: recipe.slicing }
                 } else {
@@ -90,7 +87,7 @@ mod tests {
         std::fs::write(root.path().join("config.json"), b"{}")?;
         std::fs::write(root.path().join("model.safetensors.index.json"), b"{}")?;
         SparkAdmission::plan(root.path(), ExpertGeometry::GLM5_FLASH, None,
-            &SparkWorkingSet::default(), 2, None, cuteafd_loader::V41Exl3Partition::Disjoint,
+            &SparkWorkingSet::default(), 2, None,
             ModelAdmission { capacity: 2048, compiled_capacity: 4096,
                 endpoints: vec![SparkEndpoint { capacity: 2048, ingress: SparkIngress::Fp8K32 }],
                 rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } })
@@ -157,7 +154,7 @@ mod tests {
         let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
             ..Default::default() };
         let plan = SparkAdmission::plan(root.path(), geometry, Some(&catalog), &working, 6, None,
-            cuteafd_loader::V41Exl3Partition::Disjoint, fixture_model())?;
+            fixture_model())?;
         assert_eq!(plan.selection.layers(), [1]);
         assert_eq!(plan.assignments.iter().map(|rank| rank.slices[0].stored_width).collect::<Vec<_>>(),
             [384, 384, 384, 384, 256, 256]);
@@ -178,7 +175,7 @@ mod tests {
         let working = SparkWorkingSet { spark_layers: vec![0, 2], rtx_layers: vec![1], spark_ranks: 3,
             prefill_lanes: 1 };
         let plan = SparkAdmission::plan(root.path(), catalog.routed_experts().geometry()?, Some(&catalog),
-            &working, 3, None, cuteafd_loader::V41Exl3Partition::Disjoint, fixture_model())?;
+            &working, 3, None, fixture_model())?;
         assert_eq!(plan.selection.layers(), [0, 2]);
         for (rank, assignment) in plan.assignments.iter().enumerate() {
             assert_eq!(assignment.slices.iter().map(|slice| slice.layer).collect::<Vec<_>>(), [0, 2]);
@@ -187,8 +184,6 @@ mod tests {
             assert_eq!(assignment.slices[0].tiers, expected.tiers.iter().map(|&tier| tier as u32).collect::<Vec<_>>());
             assert!(!assignment.slices[0].projection_counts.is_empty());
         }
-        assert!(SparkAdmission::plan(root.path(), catalog.routed_experts().geometry()?, Some(&catalog),
-            &working, 3, None, cuteafd_loader::V41Exl3Partition::PairedTp4, fixture_model()).is_err());
         check_reports(&plan)
     }
 
@@ -202,7 +197,7 @@ mod tests {
         let working = SparkWorkingSet { spark_layers: vec![1, 3], spark_ranks: 6,
             prefill_lanes: 1, ..Default::default() };
         let plan = SparkAdmission::plan(root.path(), geometry, Some(&catalog), &working, 6,
-            Some(SparkTopology::new(2, 3)?), cuteafd_loader::V41Exl3Partition::Disjoint, fixture_model())?;
+            Some(SparkTopology::new(2, 3)?), fixture_model())?;
         for rank in 0..6 {
             let assignment = &plan.assignments[rank];
             assert_eq!(assignment.rank, rank as u32);
@@ -225,7 +220,7 @@ mod tests {
             let mut model = fixture_model();
             if nvfp4 { model.endpoints.iter_mut().for_each(|e| e.ingress = SparkIngress::Bf16); }
             let plan = SparkAdmission::plan(root.path(), ExpertGeometry::DEEPSEEK_V41, Some(&catalog),
-                &working, 4, None, cuteafd_loader::V41Exl3Partition::Disjoint, model)?;
+                &working, 4, None, model)?;
             assert_eq!(plan.selection.layers(), [17, 39]);
             assert!(plan.assignments.iter().all(|a| a.resident_bytes > 0 && a.slices.len() == 2));
             check_reports(&plan)?;
@@ -234,18 +229,17 @@ mod tests {
     }
 
     #[test]
-    fn v41_deliberate_paired_tp4_reconciles_checkpoint_layout() -> Result<()> {
+    fn v41_exl3_tp4_reconciles_checkpoint_layout() -> Result<()> {
         let root = tempfile::tempdir()?;
         cuteafd_loader::plan::testing::write_v41_exl3_snapshot(root.path(), 4);
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         let working = SparkWorkingSet { spark_layers: vec![17, 39], spark_ranks: 4,
             prefill_lanes: 2, ..Default::default() };
-        let partition = cuteafd_loader::V41Exl3Partition::PairedTp4;
         let plan = SparkAdmission::plan(root.path(), ExpertGeometry::DEEPSEEK_V41, Some(&catalog),
-            &working, 4, None, partition, fixture_model())?;
+            &working, 4, None, fixture_model())?;
         for (rank, assignment) in plan.assignments.iter().enumerate() {
-            let expected = catalog.exl3().unwrap().residency_with_layout(
-                cuteafd_loader::V41Exl3Layer::Backbone(17), 4, rank, partition)?;
+            let expected = catalog.exl3().unwrap().residency(
+                cuteafd_loader::V41Exl3Layer::Backbone(17), 4, rank)?;
             assert_eq!(assignment.resident_bytes, 2 * expected.device_arena_layout()?.1 as u64);
         }
         check_reports(&plan)

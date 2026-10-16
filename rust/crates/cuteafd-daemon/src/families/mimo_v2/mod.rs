@@ -874,7 +874,7 @@ impl Opened {
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
             crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
-                &preflight.working_set, peers.len(), None, cuteafd_loader::V41Exl3Partition::Disjoint, model)?
+                &preflight.working_set, peers.len(), None, model)?
                 .select(&peers)?;
         }
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);

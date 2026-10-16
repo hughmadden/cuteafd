@@ -330,11 +330,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
     let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
-        && paired_profile.is_none() && topology.is_none()
+        && topology.is_none()
         && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native
         && expert_layers < 40;
     admission::select_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
-        topology, paired_profile.as_deref(), if device_exchange { 2 } else { 0 })?;
+        topology, if device_exchange { 2 } else { 0 })?;
     eprintln!("loading bottom {expert_layers} expert layers as TP2");
     let routed = tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
         rank_budgets, &exl3_directory)?;

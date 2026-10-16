@@ -466,7 +466,6 @@ impl Opened {
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
             crate::shared::placement::SparkAdmission::plan(source, cuteafd_core::ExpertGeometry::QWEN4,
                 self.experts.as_ref(), &working, peers.len(), None,
-                cuteafd_loader::V41Exl3Partition::Disjoint,
                 admission::spark_model(args.prefill_rows, self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
         }
         let mut manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()

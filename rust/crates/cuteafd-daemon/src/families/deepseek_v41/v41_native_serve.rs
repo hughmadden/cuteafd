@@ -510,10 +510,10 @@ fn worker(
         "shared V4.1 cache and expert admission");
     let local_layers = pool.placement.onboard_layers;
     let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
-        && paired_profile.is_none() && topology.is_none()
+        && topology.is_none()
         && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40;
     admission::select_sparks(&args, &catalog, local_layers, capacity, aot_capacity,
-        topology, paired_profile.as_deref(), usize::from(device_exchange))?;
+        topology, usize::from(device_exchange))?;
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
     if small_card { admission::startup_phase(&lib, "v41/kv", device_total)?; }

@@ -449,8 +449,7 @@ impl Opened {
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             crate::shared::placement::SparkAdmission::plan(&self.snapshot,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
-                peers.len(), None, cuteafd_loader::V41Exl3Partition::Disjoint,
-                spark_model(prefill_lanes, spark_bf16)?)?.select(&peers)?;
+                peers.len(), None, spark_model(prefill_lanes, spark_bf16)?)?.select(&peers)?;
         }
         let started = Instant::now();
         let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream, device: args.device,

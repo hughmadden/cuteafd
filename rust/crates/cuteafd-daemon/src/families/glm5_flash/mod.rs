@@ -1726,7 +1726,7 @@ impl Opened {
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
             crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
-                &working, peers.len(), None, cuteafd_loader::V41Exl3Partition::Disjoint, model)?.select(&peers)?;
+                &working, peers.len(), None, model)?.select(&peers)?;
         }
         let execution = cuteafd_loader::placement::LayerExecutionPlan::new(&placement,
             cuteafd_loader::placement::HopSpec {

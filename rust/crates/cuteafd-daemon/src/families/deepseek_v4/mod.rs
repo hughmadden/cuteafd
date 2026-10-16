@@ -425,8 +425,7 @@ pub(crate) fn with_engine<T>(
             };
             crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
-                peers.len(), None, cuteafd_loader::V41Exl3Partition::Disjoint,
-                admission::spark_model(decode_rows, device_exchange)?)?.select(&peers)?;
+                peers.len(), None, admission::spark_model(decode_rows, device_exchange)?)?.select(&peers)?;
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let started = Instant::now();
