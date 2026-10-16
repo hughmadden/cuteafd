@@ -2256,7 +2256,7 @@ def test_coordinator_gpu_budget_is_forwarded_only_to_the_coordinator(tmp_path, f
     result = _family_launch_result(tmp_path, family_config, model,
                                   "COORDINATOR_GPU_BUDGET_GIB=32.5\n")
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "--coordinator-gpu-budget-gib" in line and "serve-" in line)
+    launch = next(line for line in result.stderr.splitlines() if "--coordinator-gpu-budget-gib" in line and " serve-" in line)
     assert "cuteafd --coordinator-gpu-budget-gib 32.5 serve-" in launch
     for line in result.stderr.splitlines():
         if "expertd-native" in line:
