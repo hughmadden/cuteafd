@@ -91,7 +91,13 @@ init_repo() {
     fi
     git -C "$repo" -c protocol.file.allow=always submodule update --init \
       --reference "$(mirror_path "$full")" -- "$path"
+    # Restore the upstream URL as soon as this submodule is done: the clone that
+    # just ran recorded the mirror as origin, and a failure later in the walk
+    # must not leave it there.
     git -C "$repo" config "submodule.$name.url" "$url"
+    if [ -e "$repo/$path/.git" ]; then
+      git -C "$repo/$path" remote set-url origin "$url"
+    fi
     init_repo "$repo/$path" "$full/"
   done < <(git -C "$repo" config -f .gitmodules --get-regexp '^submodule\..*\.path$')
 }
@@ -114,6 +120,23 @@ restore_urls() {
   done < <(git -C "$repo" config -f .gitmodules --get-regexp '^submodule\..*\.path$')
 }
 
+# A failure or a signal partway through leaves the submodules walked so far, and
+# anything this run cloned, pointing at the store, so restore every upstream URL
+# on the way out as well.
+restored=0
+restore_on_exit() {
+  local status=$?
+  if [ "$restored" -eq 0 ]; then
+    restore_urls "$root" || warn "some submodule URLs could not be restored"
+  fi
+  exit "$status"
+}
+trap restore_on_exit EXIT
+# A signal must report the signal, not whatever the interrupted command returned,
+# and exiting here still runs the restore above.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 if [ "$store_ready" -eq 1 ]; then
   init_repo "$root" ""
 fi
@@ -122,6 +145,7 @@ if [ "$degraded" -eq 1 ]; then
   git ${allow_args[@]+"${allow_args[@]}"} submodule update --init --recursive
 fi
 restore_urls "$root"
+restored=1
 
 # A leading '-', '+' or 'U' means uninitialized, wrong commit, or conflicted.
 unpinned="$(git submodule status --recursive | grep -E '^[-+U]' || true)"
