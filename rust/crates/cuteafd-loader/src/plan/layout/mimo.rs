@@ -4,9 +4,12 @@ use crate::families::mimo_v2::{admission::*, capacity::*, resident::MimoResident
     projection::MimoProjectionRepresentation as R, weight_policy::*, *};
 use anyhow::{Context, Result};
 
-pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions, rows: u64,
-    concurrency: u64, context: u64, manifest: Option<&serde_json::Value>) -> MemoryLayout {
+pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
+    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    let shape = Shape::resolve(report, model, options,
+        ShapePolicy { context: ContextPolicy::Checkpoint, ..ShapePolicy::manifest_bounded() });
+    let (rows, concurrency, context, manifest) = (shape.prefill_rows, shape.concurrency, shape.context_tokens,
+        shape.manifest.as_ref());
     let checkpoint = input.checkpoint();
     let ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 };

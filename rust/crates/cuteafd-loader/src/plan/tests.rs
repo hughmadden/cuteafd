@@ -40,9 +40,10 @@ fn snapshot_tp(config: Value, tensors: &[Tensor], tp: Option<usize>) -> tempfile
 
 /// One Qwen layer with all 512 EXL3 experts and its storage map.
 fn qwen_snapshot(bits: usize) -> tempfile::TempDir {
-    let (tensors, manifest) = qwen4_exl3(1, bits);
+    let (mut tensors, manifest) = qwen4_exl3(1, bits);
     let mut config = qwen4_config(1);
     config["quantization_config"] = exl3_compact(bits);
+    tensors.extend(qwen4_coordinator(&config, false));
     let dir = snapshot(config, &tensors);
     write_quantize_config(dir.path(), &manifest);
     dir
@@ -1411,6 +1412,7 @@ fn qwen_nvfp4_legacy_tp6_remains_valid_but_new_empty_h128_ranks_do_not() {
             ]);
         }
     }
+    tensors.extend(qwen4_coordinator(&config, false));
     let dir = snapshot(config, &tensors);
     let legacy = plan(dir.path(), &sparks(6)).unwrap();
     assert!(legacy.placement_supported && legacy.fits && legacy.executable(), "{}", render(&legacy));
@@ -2720,9 +2722,12 @@ fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
     tensors.extend(draft);
     let mut config = qwen4_config(1);
     config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    tensors.extend(qwen4_coordinator(&config, true));
     let dir = snapshot(config, &tensors);
+    let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
-        rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1, ..Default::default()
+        rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1,
+        workspace_manifest: Some(manifest), ..Default::default()
     }), ..sparks(1) };
     let with_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     let lead = &with_mtp.devices[0];

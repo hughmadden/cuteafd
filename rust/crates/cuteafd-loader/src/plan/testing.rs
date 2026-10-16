@@ -369,6 +369,51 @@ pub fn qwen4_config(layers: usize) -> Value {
     })
 }
 
+/// Qwen's coordinator headers for `layers` target layers (and one native MTP
+/// layer with `mtp`): exactly what `checkpoint_resident_bytes` packs, so a
+/// fixture's plan charges the serve-qwen4 resident inventory.
+pub fn qwen4_coordinator(config: &Value, mtp: bool) -> Vec<Tensor> {
+    use crate::families::qwen4::{resident::layer_projections, Qwen4Attention, Qwen4Config};
+    let cfg = Qwen4Config::from_hf(config).unwrap();
+    let h = cfg.hidden;
+    let mut out = vec![t("model.language_model.embed_tokens.weight", "BF16", &[cfg.vocab_size, h]),
+        t("lm_head.weight", "BF16", &[cfg.vocab_size, h])];
+    let layer = |out: &mut Vec<Tensor>, p: String, attention: Qwen4Attention| {
+        // Both selectable projections as one BF16 matrix each, at their packed shapes.
+        for projection in layer_projections(&cfg, attention, None) {
+            out.push(t(format!("{p}.self_attn.{}.weight", projection.operand), "BF16", &[projection.rows, projection.cols]));
+        }
+        let s = cfg.shared_intermediate;
+        out.extend([t(format!("{p}.mlp.shared_expert.gate_proj.weight"), "BF16", &[s, h]),
+            t(format!("{p}.mlp.shared_expert.up_proj.weight"), "BF16", &[s, h]),
+            t(format!("{p}.mlp.shared_expert_gate.weight"), "BF16", &[1, h]),
+            t(format!("{p}.mlp.shared_expert.down_proj.weight"), "BF16", &[h, s])]);
+    };
+    for l in 0..cfg.layers {
+        layer(&mut out, format!("model.language_model.layers.{l}"), cfg.attention[l]);
+    }
+    if mtp { layer(&mut out, "mtp.layers.0".into(), Qwen4Attention::Full); }
+    out
+}
+
+/// TP1 EXL3 capacity manifests for Qwen's routed geometry under `share/exl3`,
+/// as images bundle them beside PROGRAMS.json; returns that PROGRAMS.json.
+pub fn write_qwen4_exl3_capacities(dir: &Path, tiers: &str) -> std::path::PathBuf {
+    let share = dir.join("share");
+    for capacity in crate::placement::inventory::exl3_capacities(4096) {
+        let path = share.join("exl3").join(format!("exl3-qwen4-k{tiers}")).join(format!("rtx-tp1/m{capacity}"));
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+            "capacity": capacity, "hidden": 2560, "experts": 512, "intermediate": 640, "top_k": 10,
+            "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
+                "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 8, "zero_on_create": false}}
+        })).unwrap()).unwrap();
+    }
+    let programs = share.join("PROGRAMS.json");
+    fs::write(&programs, b"{}").unwrap();
+    programs
+}
+
 /// Every Qwen routed expert of every layer as complete EXL3 projections at
 /// `bits`, a BF16 router per layer, and the storage map.
 pub fn qwen4_exl3(layers: usize, bits: usize) -> (Vec<Tensor>, Value) {

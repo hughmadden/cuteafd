@@ -384,6 +384,12 @@ impl FamilyModel for DeepSeekModel {
         &self.spec
     }
 
+    fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
+        options: &crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
+        -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
+        (self.id == "deepseek_v4").then(|| Ok(crate::plan::layout::deepseek_v4::layout(report, self, input, options)))
+    }
+
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         use crate::serving_capacity::{deepseek_v41_cache_geometry, deepseek_v4_cache_geometry, CacheGeometryError};
