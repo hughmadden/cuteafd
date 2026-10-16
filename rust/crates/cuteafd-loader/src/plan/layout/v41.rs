@@ -7,7 +7,7 @@ use crate::placement::{self, families::deepseek_v41 as v41, ArchContext, Baselin
     Demand, GpuBudget, Inventory, Onboard, PoolPolicy, SparkWorkingSet};
 use v41::DraftInventory;
 
-// Interim, explicitly unqualified until the native startup census and P11 land.
+// Conservative combined code/ready-graph envelope; pure LoadedCode is unqualified.
 // Neither generic PROGRAMS.json module counts nor other families' graph costs
 // describe the native executor's loaded code.
 const NATIVE_CODE_ESTIMATE: u64 = 2 * GIB;
@@ -39,8 +39,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         .context("missing V4.1 native FP8 allocation manifest")?)?;
     let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms);
     let programs = v41::owners::NativePrograms::new(&fp8, sms)?;
-    let mode = std::env::var("CUTEAFD_V41_FP8_HEAD").unwrap_or_default();
-    let fp8_head = !matches!(mode.as_str(), "off" | "0" | "bf16" | "draft");
+    let mode = Fp8Head::configured();
+    let fp8_head = mode.target();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
     let target = programs.target(rows, ranks, fp8_head, window_batch)?;
     let weights = resident_weights(checkpoint, ranks, false)
@@ -51,41 +51,35 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }).collect::<Vec<_>>();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
-        "Native LoadedCode: Estimated 2 GiB per GPU beyond the measured architecture context; startup/native capture census pending. Ready parity is not qualified.".into(),
+        "Native LoadedCode: Estimated 2 GiB per GPU beyond the measured architecture context; combined startup census residuals fit this bound. Pure LoadedCode and ready parity are not qualified.".into(),
         "Spark host, wave residual and native runtime: Estimated pending qualified worker inventory; explicit rank I/O remains formula-derived.".into(),
         "Lazy graph/runtime growth is reserved by shared V4.1 solver demands, not included in the ready residency claim.".into()];
     mapped_table_note(report, &mut notes);
     if options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding) {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
-    let mut fixed = devices.iter().flat_map(|d| d.items.iter().map(|i|
+    let fixed = devices.iter().flat_map(|d| d.items.iter().map(|i|
         Demand::new(d.index as u8, i.category, i.group.clone(), i.bytes, i.basis))).collect::<Vec<_>>();
     let mut startup = Vec::new();
     if ranks == 1 {
         if let Some(head) = checkpoint.tensors.iter().find(|t| t.meta.name == "head.weight") {
             let source = head.meta.byte_length;
-            let packing = source + if matches!(mode.as_str(), "off" | "0" | "bf16") { 0 } else { source / 2 + source / 64 };
+            let packing = mode.load_bytes(source);
             startup.push(v41::owners::vocabulary_load_phase(&fixed, &target, packing)?);
         }
     }
-    fixed.extend(target);
+    let spark_ranks = report.placement.spark_ranks();
+    let transport = if spark_ranks > 0 { 2 * v41::owners::transport_bytes(rows, spark_ranks)? } else { 0 };
+    let mut fixed = fixed;
     if options.drafter_bytes > 0 {
         fixed.push(Demand::new(0, Category::Drafter, "external drafter weights",
             options.drafter_bytes, Basis::Exact));
     }
-    let spark_ranks = report.placement.spark_ranks();
-    if spark_ranks > 0 {
-        fixed.push(Demand::new((ranks - 1) as u8, Category::Transport, "target/prefill transports",
-            2 * v41::owners::transport_bytes(rows, spark_ranks)?, Basis::Formula));
-    }
-    if ranks == 2 {
-        for gpu in 0..2 {
-            fixed.push(Demand::new(gpu, Category::Reserved, "expert setup headroom", 64 * MIB, Basis::Formula));
-        }
-    }
+    let mut owners = v41::owners::TargetOwners::new(fixed, target, ranks, transport, marks)?;
+    let mut fixed = owners.fixed.clone();
     let catalog = input.expert_catalog()?;
     let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms)?;
-    let mut draft = if dspark {
+    let draft = if dspark {
         ensure!(catalog.native_dspark_experts(), "V4.1 compressed dSpark owner manifest is not supported by this adapter");
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))
             .context("missing V4.1 dSpark coordinator allocation manifest")?)?;
@@ -93,24 +87,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let bytes = resident.iter().flatten().filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum();
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
         Some(DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, 5, ranks,
-            !matches!(mode.as_str(), "off" | "0" | "bf16"))?, marks: marks * 3 * 128 * 528,
+            mode.draft())?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
-            ..Default::default() })
+            loader_peak: [bytes, 0], ..Default::default() })
     } else { None };
-    if let Some(draft) = draft.as_mut() {
-        let home = ranks - 1;
-        let before = fixed.iter().filter(|d| usize::from(d.gpu) == home).map(|d| d.bytes).sum::<u64>();
-        draft.loader_peak[0] = draft.resident;
-        for mut phase in draft.load_phase(ranks)? {
-            phase.bytes = phase.bytes.checked_add(if usize::from(phase.gpu) == home { before } else {
-                fixed.iter().filter(|d| d.gpu == phase.gpu).map(|d| d.bytes).sum()
-            }).context("V4.1 draft loading coexistence overflow")?;
-            startup.push(phase);
-        }
-    }
-    for (gpu, bytes) in prefix_arena_bytes(marks, false, ranks).into_iter().enumerate() {
-        fixed.push(Demand::new(gpu as u8, Category::Prefix, "target snapshot arenas", bytes, Basis::Formula));
-    }
     let automatic = options.pool_tokens == Some(0);
     let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0);
     if pool.requested.is_none() {
@@ -139,7 +119,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     };
     let mut request = v41::request(inventory, pool, vec![0; ranks], experts, workspace, onboard);
     request.fixed = fixed;
-    request.startup = startup;
+    request.startup = startup.clone();
+    if let Some(draft) = &draft { request.startup.extend(owners.draft_load_phases(draft)?); }
     request.minimum_expert_layers = usize::from(ranks == 2 && !matches!(onboard, Onboard::Layers(0)));
     if let Some(draft) = &draft { request.movables.push(v41::drafter(draft, ranks)?); }
     v41::cache_demands(&mut request, &checkpoint.config, shape.concurrency, turns, false)?;
@@ -161,10 +142,16 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     resolve_encoder(report, &v41_towers(report), &mut encoder_devices, &mut sparks, &vec![0; ranks], options, &mut notes);
     for device in &encoder_devices {
         for item in device.items.iter().filter(|i| i.group.starts_with("vision ")) {
-            request.fixed.push(Demand::new(device.index as u8, item.category, item.group.clone(), item.bytes, item.basis));
+            let demand = Demand::new(device.index as u8, item.category, item.group.clone(), item.bytes, item.basis);
+            owners.add_vision(demand.clone())?;
+            request.fixed.push(demand);
         }
     }
     if request.fixed.len() > request.fixed.iter().filter(|d| !d.group.starts_with("vision ")).count() {
+        if let Some(draft) = &draft {
+            request.startup = startup.clone();
+            request.startup.extend(owners.draft_load_phases(draft)?);
+        }
         placement = solve_with_weight_limit(&request, draft.as_ref(), options.weight_budget_bytes)?;
     }
     v41::validate_pool_floor(&request.pool, &placement)?;
@@ -240,6 +227,25 @@ fn retained_weight_bytes(request: &placement::PlacementRequest, placed: &placeme
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_ready_census_residuals_fit_the_native_estimate() {
+        // Raw ready untracked samples from the min/max native startup census.
+        // Removing the calibrated context/cuBLAS leaves a combined code/graph
+        // residual, NOT pure LoadedCode or a 64 MiB ready-parity qualification.
+        let arch = ArchContext::coordinator(96 * GIB, None);
+        assert_eq!(arch.context_bytes + arch.cublas_bytes, 657_719_296);
+        for (card, untracked, residual, slack) in [
+            ("min GPU0", 2_149_527_512, 1_491_808_216, 655_675_432),
+            ("max GPU0", 1_771_348_088, 1_113_628_792, 1_033_854_856),
+            ("max GPU1", 2_010_851_632, 1_353_132_336, 794_351_312),
+        ] {
+            let combined = untracked - arch.context_bytes - arch.cublas_bytes;
+            assert_eq!(combined, residual, "{card}");
+            assert!(combined <= NATIVE_CODE_ESTIMATE, "{card}");
+            assert_eq!(NATIVE_CODE_ESTIMATE - combined, slack, "{card}");
+        }
+    }
 
     #[test]
     fn retained_weight_ceiling_limits_optional_experts_not_their_arena() -> Result<()> {

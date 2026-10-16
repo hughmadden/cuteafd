@@ -6,6 +6,42 @@ use std::collections::BTreeMap;
 
 pub const DEFAULT_POOL_TOKENS: u64 = 2 * 1_048_576;
 
+/// One mode parser for checkpoint residency, startup packing and native execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8Head { Off, Draft, All }
+
+impl Fp8Head {
+    pub fn parse(mode: &str) -> Self {
+        match mode {
+            "off" | "0" | "bf16" => Self::Off,
+            "draft" => Self::Draft,
+            _ => Self::All,
+        }
+    }
+
+    pub fn configured() -> Self {
+        Self::parse(&std::env::var("CUTEAFD_V41_FP8_HEAD").unwrap_or_default())
+    }
+
+    pub fn target(self) -> bool { self == Self::All }
+    pub fn draft(self) -> bool { self != Self::Off }
+
+    /// One E4M3 value and FP32 scales per 128-K block.
+    pub fn packed_bytes(source: u64) -> u64 { source / 2 + source / 64 }
+
+    pub fn load_bytes(self, source: u64) -> u64 {
+        source + if self.draft() { Self::packed_bytes(source) } else { 0 }
+    }
+
+    pub fn resident(self, source: u64) -> (u64, &'static str) {
+        match self {
+            Self::Off => (source, "bf16"),
+            Self::Draft => (self.load_bytes(source), "bf16+fp8-row128"),
+            Self::All => (Self::packed_bytes(source), "fp8-row128"),
+        }
+    }
+}
+
 /// Native MXFP4 packer storage, including the padding of each intermediate
 /// slice. This applies to full RTX experts and each independently packed TP
 /// Spark/RTX slice; dividing a full layer's bytes misses TP4's 576->640 pad.
@@ -62,7 +98,7 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
         return None;
     }
     let decoder = ranks - 1;
-    let head_mode = std::env::var("CUTEAFD_V41_FP8_HEAD").unwrap_or_default();
+    let head_mode = Fp8Head::configured();
     let mut totals: Vec<BTreeMap<(Category, String, String), u64>> = vec![BTreeMap::new(); ranks];
     let mut add = |rank: usize, category, group: &str, format: &str, bytes: u64| {
         *totals[rank].entry((category, group.into(), format.into())).or_default() += bytes;
@@ -86,7 +122,7 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
             continue;
         }
         if name == "head.weight" {
-            let (resident, head_format) = vocabulary_bytes(bytes / ranks as u64, &head_mode);
+            let (resident, head_format) = head_mode.resident(bytes / ranks as u64);
             for rank in 0..ranks { add(rank, Category::Weights, "lm_head", head_format, resident); }
             continue;
         }
@@ -129,17 +165,6 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
     }
     Some(totals.into_iter().map(|rank| rank.into_iter().map(|((category, group, format), bytes)|
         Item::new(category, group, format, bytes, Basis::Formula)).collect()).collect())
-}
-
-// Mirror the vocabulary packer: one E4M3 value and FP32 scales per 128-K
-// block. Draft-only retains the BF16 target; all mode releases it after packing.
-fn vocabulary_bytes(source: u64, mode: &str) -> (u64, &'static str) {
-    let packed = source / 2 + source / 64;
-    match mode {
-        "off" | "0" | "bf16" => (source, "bf16"),
-        "draft" => (source + packed, "bf16+fp8-row128"),
-        _ => (packed, "fp8-row128"),
-    }
 }
 
 /// Target snapshots always live on RTX0, even with partitioned live caches.
@@ -261,14 +286,31 @@ mod tests {
     }
 
     #[test]
+    fn vocabulary_modes_share_execution_residency_and_startup_semantics() {
+        let source = 1_323_827_200;
+        let packed = 682_598_400;
+        for (text, mode) in [("off", Fp8Head::Off), ("0", Fp8Head::Off),
+            ("bf16", Fp8Head::Off), ("draft", Fp8Head::Draft),
+            ("", Fp8Head::All), ("all", Fp8Head::All), ("other", Fp8Head::All)] {
+            assert_eq!(Fp8Head::parse(text), mode);
+            assert_eq!(mode.target(), mode == Fp8Head::All);
+            assert_eq!(mode.draft(), mode != Fp8Head::Off);
+            assert_eq!(mode.load_bytes(source), source + if mode.draft() { packed } else { 0 });
+            assert_eq!(mode.resident(source).0, match mode {
+                Fp8Head::Off => source, Fp8Head::Draft => source + packed, Fp8Head::All => packed,
+            });
+        }
+    }
+
+    #[test]
     fn vocabulary_counts_single_fp8_copy_and_explicit_overrides() {
         let source = 129280 * 5120 * 2;
         let packed = 129280 * (5120 + 40 * 4);
-        assert_eq!(vocabulary_bytes(source, ""), (packed, "fp8-row128"));
-        assert_eq!(vocabulary_bytes(source, "all"), (packed, "fp8-row128"));
-        assert_eq!(vocabulary_bytes(source, "off"), (source, "bf16"));
-        assert_eq!(vocabulary_bytes(source, "draft"), (source + packed, "bf16+fp8-row128"));
-        assert_eq!(vocabulary_bytes(source / 2, "all").0 * 2, packed);
+        assert_eq!(Fp8Head::parse("").resident(source), (packed, "fp8-row128"));
+        assert_eq!(Fp8Head::parse("all").resident(source), (packed, "fp8-row128"));
+        assert_eq!(Fp8Head::parse("off").resident(source), (source, "bf16"));
+        assert_eq!(Fp8Head::parse("draft").resident(source), (source + packed, "bf16+fp8-row128"));
+        assert_eq!(Fp8Head::parse("all").resident(source / 2).0 * 2, packed);
     }
 
     #[test]

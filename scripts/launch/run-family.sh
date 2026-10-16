@@ -118,11 +118,7 @@ _family_allowed_keys() {
   cat <<'EOF'
 VISION
 AUDIO
-VISION_REPLICAS
 COORDINATOR_GPU_BUDGET_GIB
-RDMA_BOND_BALANCE
-HOST_ISA
-ATTENTION_PLACEMENT
 INSTANCE
 MODEL_ID
 MODEL_REVISION
@@ -138,27 +134,47 @@ EMBEDDING
 COORDINATOR_GPUS
 COORDINATOR_GPU
 CONCURRENCY
-CHAT_TEMPLATE_FROM
-FULL_PREFILL_LOGITS
-SPECULATOR_DRAFTS
 DECODE_SHARE
-EXPERT_INPUT
 SERVED_MODEL_ID
-SPARK_EXPERT_DOCKER_INFERENCE
-SPARK_EXPERT_DOCKER_DEV
-EXPERT_PORT
 ADDR
-SPARK_DEVICE_BUDGET_BYTES
 RTX_GPUS
 COORDINATOR_SPLIT
-COORDINATOR_SPLIT_GPU
 POOL_TOKENS
 PREFIX_CACHE_ENTRIES
 HOST_CACHE_BYTES
+MAX_OUTPUT_TOKENS
+THERMAL
+API_KEY_FILE
+ENABLE_BENCH
+USAGE
+GATEWAY
+EOF
+  if [[ "$1" == qwen3_5 ]]; then
+    cat <<'EOF'
+PREFIX_CACHE_MARK_MIB
+PREFIX_POINT_BOUNDARIES
+EOF
+    # Inventory hosts are accepted but never contacted by this RTX-only family.
+    _spark_slot_keys HOST LANE_A
+    return
+  fi
+  cat <<'EOF'
+VISION_REPLICAS
+RDMA_BOND_BALANCE
+HOST_ISA
+ATTENTION_PLACEMENT
+CHAT_TEMPLATE_FROM
+FULL_PREFILL_LOGITS
+SPECULATOR_DRAFTS
+EXPERT_INPUT
+SPARK_EXPERT_DOCKER_INFERENCE
+SPARK_EXPERT_DOCKER_DEV
+EXPERT_PORT
+SPARK_DEVICE_BUDGET_BYTES
+COORDINATOR_SPLIT_GPU
 MAX_CONTEXT_TOKENS
 PREFILL_BATCH_TOKENS
 RTX_EXPERT_LAYERS
-MAX_OUTPUT_TOKENS
 PROBE_DUMP_ROOT
 DRAFT_SURVIVAL_LENGTHS
 SPECULATION_TRACE
@@ -167,17 +183,12 @@ SPARK_INTAKE
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
 ATTENTION_PLAN_ROWS
-THERMAL
 PROFILE
 PROFILE_DIR
 PROFILE_NCU_KERNEL
 PROFILE_NCU_COUNT
 PROFILE_NCU_SET
 PROFILE_NSYS_GPU_METRICS
-API_KEY_FILE
-ENABLE_BENCH
-USAGE
-GATEWAY
 EOF
   _spark_slot_keys HOST LANE_A
   case "$1" in
@@ -283,6 +294,15 @@ FP8_SCALES
 EOF
       ;;
   esac
+}
+# WIP bypasses artifact readiness, never the planner's deployment guards.
+release_validate_deployment() {
+  local plan="$1" family="$2"
+  if ! jq -e --arg family "$family" --arg wip "$wip_slot" \
+    '.version == 1 and .family == $family and .launch.family == $family and .spark_admission == "coordinator_authoritative" and (.executable == true or ($wip != "" and .wip_launchable == true))' <<<"$plan" >/dev/null; then
+    jq -r '.report.hints[]?' <<<"$plan" >&2 || true
+    release_die "invalid deployment specification"
+  fi
 }
 # DeepSeek V4.1 reads shell variables after release_load_config, not get().
 _v41_allowed_keys() {
@@ -855,21 +875,22 @@ for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
 done
 ((${#deployment_peers[@]} == 0)) || count_args+=(--deployment-peers "$(IFS=,; echo "${deployment_peers[*]}")")
 release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
+readiness_args=(--require-ready)
+[[ -z "$wip_slot" ]] || readiness_args=()
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
   "${count_command[@]}" plan "/hf/$snapshot_rel" --vision "$VISION" --audio off \
-  --deployment --require-ready "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
+  --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   --coordinator-gpu-budget-gib "$profile_gib" --coordinator-weight-budget-gib "$profile_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" \
   --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")")"
+release_validate_deployment "$count_plan" deepseek_v41
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
 if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   [[ "$selected_count" == "$SPARK_COUNT" ]] || release_die "planner changed exact Spark count $SPARK_COUNT to $selected_count"
 fi
 SPARK_COUNT="$selected_count"
 PREFILL_BATCH_TOKENS="$(jq -er '.prefill_rows' <<<"$count_plan")"
-jq -e '.version == 1 and .family == "deepseek_v41" and .executable == true and .spark_admission == "coordinator_authoritative"' <<<"$count_plan" >/dev/null ||
-  release_die "invalid planner deployment"
 spark_tp="$(jq -er '.topology.tp' <<<"$count_plan")"
 spark_ep="$(jq -er '.topology.ep' <<<"$count_plan")"
 spark_wire="$(jq -er '.topology.wire' <<<"$count_plan")"
@@ -1374,8 +1395,17 @@ case "$family" in
   glm5_flash) serve=serve-glmf ;;
   mimo_v2) serve=serve-mimo ;;
   qwen4) serve=serve-qwen4 ;;
+  qwen3_5) serve=serve-qwen35 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
+if [[ "$family" == qwen3_5 ]]; then
+  [[ -n "$wip_slot" ]] || release_die "dense Qwen serving is under qualification; run it from a WIP slot"
+  [[ "$attention_placement" == auto ]] || release_die "dense Qwen currently supports only single-GPU automatic attention placement"
+  case "$vision:$audio" in
+    auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
+    *) release_die "dense Qwen bundled media execution is not qualified" ;;
+  esac
+fi
 # VISION and AUDIO default to auto for every family, as the release configs
 # set them. Qualified MiMo, GLM Flash and Qwen towers are placed Spark-first by
 # the encoder plan below; DeepSeek V4 and GLM 5.3 have no tower, so auto starts
@@ -1412,6 +1442,12 @@ case "$backend" in
     ranks=0 ;;
   *) echo "EXPERT_BACKEND must be auto, local or spark" >&2; exit 2 ;;
 esac
+if [[ "$family" == qwen3_5 ]]; then
+  [[ "$backend" != spark && ( "$count_explicit" == 0 || "$ranks" == 0 ) ]] ||
+    release_die "dense Qwen has no Spark layout or dense-FFN offboarding"
+  ranks=0
+  backend=local
+fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 # --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from
 # the WIP containers into a release-shaped /opt/cuteafd layout per host (as ./run.sh --wip
@@ -1549,6 +1585,7 @@ profile_gpu="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; profile_gpu="$
 profile_mib="$(nvidia-smi -i "$profile_gpu" --query-gpu=memory.total --format=csv,noheader,nounits)"
 profile="$(release_coordinator_profile "$profile_mib" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
+[[ "$family" != qwen3_5 ]] || default_concurrency=4
 effective_concurrency="$(get CONCURRENCY "$default_concurrency")"
 if [[ "$family" == mimo_v2 ]]; then
   if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
@@ -1557,6 +1594,7 @@ if [[ "$family" == mimo_v2 ]]; then
   fi
 fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
+[[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
 family_args=(--embedding-placement "$embedding")
 chat_template_mounts=()
 # Vision-only override: no template inference and no changes to text-only prompts.
@@ -1638,7 +1676,7 @@ fi
 # snapshots the device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by
 # live sequences and retained snapshots.
 case $family in
-  mimo_v2|glm5|glm5_flash|qwen4|deepseek_v4)
+  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
@@ -1681,6 +1719,12 @@ if [[ $family == mimo_v2 ]]; then
     *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
   esac
 fi
+if [[ "$family" == qwen3_5 ]]; then
+  [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
+  # Qwen templates can remove old thinking; retain the exact frontier before
+  # the generation message, not an approximate reconstruction of that state.
+  family_args+=(--prefix-point-boundaries "$(get PREFIX_POINT_BOUNDARIES 1)")
+fi
 # EXPERT_INPUT is opt-in for MiMo's Spark exchange; unset preserves image defaults.
 expert_input="$(get EXPERT_INPUT)"
 if [[ -n "$expert_input" ]]; then
@@ -1711,7 +1755,7 @@ fi
 # pool admitted only seven 4096-output requests, below the default eight
 # serving lanes; DeepSeek V4's former engine default was 262144 tokens (v2.0.0
 # cards: 650K-1.3M tokens with auto).
-if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ ]]; then
+if [[ $family =~ ^(glm5|qwen4|qwen3_5|deepseek_v4)$ ]]; then
   pool="$(get POOL_TOKENS auto)"
   if [[ "$pool" == auto ]]; then
     pool=0
@@ -1847,6 +1891,8 @@ explicit_split=0
 if [[ "$rtx_gpus" == 2 || "$explicit_coordinator_gpus" == *,* || "$split" == heads ]]; then
   explicit_split=1
 fi
+[[ "$family" != qwen3_5 || "$explicit_split" == 0 ]] ||
+  release_die "dense Qwen two-RTX layer ranges are not qualified"
 split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
@@ -2168,7 +2214,7 @@ fi
 # --local-experts.
 if [[ "$ranks" == 0 ]]; then
   case "$family" in
-    glm5) ;;
+    glm5|qwen3_5) ;;
     glm5_flash|mimo_v2|qwen4) family_args+=(--local-experts) ;;
     *) echo "SPARK_COUNT=0 serves GLM 5.3, GLM 5.3 Flash, MiMo V2 and Qwen 3.8, not $family" >&2; exit 2 ;;
   esac
@@ -2194,7 +2240,7 @@ case "$family" in
       off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
       "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
     esac ;;
-  qwen4) ;;
+  qwen4|qwen3_5) ;;
   mimo_v2)
     hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); t=c.get("text_config", c); print(t.get("hidden_size", 4096 if t.get("model_type") == "mimo_v2_flash" else 6144))' "$root/snapshots/$revision/config.json")"
     selected_lanes="${CUTEAFD_MIMO_PREFILL_LANES:-$([[ "$hidden" == 4096 ]] && printf 2 || printf 3)}"
@@ -2235,6 +2281,11 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t=map(float,sys.argv[1:3]);b=float(sys.argv[3]) if sys.argv[3] else t/1024;print(max(0,min(f/1024,b-(t-f)/1024)))' "$free_mib" "$total_mib" "$coordinator_budget")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency")
+  if [[ "$family" == qwen3_5 ]]; then
+    plan_draft_args+=(--state-slots "$effective_concurrency" --prefill-rows 4096
+      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
+    [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
+  fi
   if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)"
       --context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
@@ -2315,11 +2366,14 @@ audio_encoder_hash=""
   ((${#deployment_peers[@]} == 0)) || deployment_args+=(--deployment-peers "$(IFS=,; printf '%s' "${deployment_peers[*]}")")
   [[ -z "$(get KV_POOL_SIZE)" ]] || deployment_args+=(--kv-pool-size "$(get KV_POOL_SIZE)")
   [[ -z "$(get MEMORY_RESERVATION)" ]] || deployment_args+=(--memory-reservation "$(get MEMORY_RESERVATION)")
+  readiness_args=(--require-ready)
+  [[ -z "$wip_slot" ]] || readiness_args=()
   # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
   plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
-    "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment --require-ready \
+    "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
+  release_validate_deployment "$plan_json" "$family"
   selected_ranks="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["spark_ranks"])' <<<"$plan_json")"
   if ((count_explicit)) || [[ "$backend" == local ]]; then
     [[ "$selected_ranks" == "$ranks" ]] || release_die "planner changed exact Spark count $ranks to $selected_ranks"
@@ -2328,7 +2382,6 @@ audio_encoder_hash=""
     export SPARK_COUNT="$selected_ranks"
     exec bash "$repo_root/scripts/launch/run-family.sh" "${launch_argv[@]}"
   fi
-  jq -e --arg family "$family" '.version == 1 and .family == $family and .executable == true and .launch.family == $family and .spark_admission == "coordinator_authoritative"' <<<"$plan_json" >/dev/null || release_die "invalid deployment specification"
   deployment_peer_csv="$(jq -er '.peers | join(",")' <<<"$plan_json")"
   [[ "$(jq -r '.speculator' <<<"$plan_json")" == "$speculator" ]] || release_die "deployment changed resolved speculator"
   # Media still reads the complete report's capability diagnostics. Launch roles,
@@ -2595,6 +2648,8 @@ for key in CUTEAFD_TP2_EXCHANGE CUTEAFD_ROUTE_CHECK; do
 done
 release_serving_docker_args
 cuteafd_cdi_gpu_args "$gpus" || exit 2
+context_args=(--max-context "$(get MAX_CONTEXT_TOKENS "$default_context")")
+[[ "$family" != qwen3_5 ]] || context_args=()
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
@@ -2603,7 +2658,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   -v "$hub:/hf/hub:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
-  --max-sequences "$effective_concurrency" --max-context "$(get MAX_CONTEXT_TOKENS "$default_context")" \
+  --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
 url="http://127.0.0.1:${addr##*:}"

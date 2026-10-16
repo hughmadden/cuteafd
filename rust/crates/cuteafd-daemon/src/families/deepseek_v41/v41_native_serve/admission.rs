@@ -3,9 +3,6 @@ pub(crate) use crate::shared::memory::budget::LocalLayers;
 use anyhow::{Context, Result, ensure};
 use cuteafd_loader::placement::*;
 
-pub(super) const RUNTIME_HEADROOM: usize = 2 << 30;
-pub(super) const EXPERT_SETUP_HEADROOM: usize = 64 << 20;
-
 fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool, device_endpoints: usize)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
@@ -164,11 +161,10 @@ pub(super) fn admit_startup(
     }
     let mut startup = vec![owners::vocabulary_load_phase(&weights, &target,
         VocabularyHead::plan(catalog)? as u64)?];
-    let mut fixed_demands = weights;
-    fixed_demands.append(&mut target);
-    fixed_demands.push(Demand::new(0, Category::Transport, "target/prefill transports",
-        2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, Basis::Formula));
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
+    let slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * u64::from(args.prefix_cache_entries) + 2 };
+    let mut target_owners = owners::TargetOwners::new(weights, target, 1,
+        2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, slots)?;
     let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
@@ -177,23 +173,17 @@ pub(super) fn admit_startup(
             crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(
                 lib, catalog, capacity, args.concurrency,
                 if args.dspark_draft_limit > 5 { 7 } else { 5 }, Some(&directory))?;
-        let before_draft = fixed_demands.iter().try_fold(0u64, |n, d|
-            n.checked_add(d.bytes).context("pre-draft owners overflow"))?;
-        for mut phase in draft.load_phase(1)? {
-            phase.bytes = phase.bytes.checked_add(before_draft).context("dSpark phase overflow")?;
-            startup.push(phase);
-        }
+        startup.extend(target_owners.draft_load_phases(&draft)?);
         draft.marks = resident::prefix_bytes(u64::from(args.prefix_cache_entries), true, 1)[0]
             - resident::prefix_bytes(u64::from(args.prefix_cache_entries), false, 1)[0];
         Some(draft)
     } else { None };
     if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
-        fixed_demands.push(Demand::new(0, Category::Workspace, "vision weights/scratch",
+        target_owners.add_vision(Demand::new(0, Category::Workspace, "vision weights/scratch",
             crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(catalog, 9216)? as u64,
-            Basis::Formula));
+            Basis::Formula))?;
     }
-    fixed_demands.push(Demand::new(0, Category::Prefix, "target snapshot arenas",
-        resident::prefix_bytes(u64::from(args.prefix_cache_entries), false, 1)[0], Basis::Formula));
+    let fixed_demands = target_owners.fixed;
     let fixed = fixed_demands.iter().try_fold(0u64, |n, d|
         n.checked_add(d.bytes).context("startup fixed-owner overflow"))?;
     let expert_rows = cuteafd_core::coordinator_programs::v41_aot_rows(capacity)
@@ -219,15 +209,6 @@ pub(super) fn admit_startup(
 // Remote vision reserves its tower on the Spark, never in the RTX startup bound.
 fn local_vision_owner(enabled: bool, remote: bool) -> bool {
     enabled && !remote
-}
-
-fn startup_peak(fixed: usize, loading_phases: &[(&str, usize)]) -> Result<usize> {
-    Ok(loading_phases
-        .iter()
-        .map(|(_, bytes)| *bytes)
-        .max()
-        .unwrap_or(0)
-        .max(fixed))
 }
 
 #[cfg(test)]
@@ -284,18 +265,6 @@ mod startup_tests {
                 if total <= 32usize << 30 { Host } else { Gpu }
             );
         }
-    }
-    #[test]
-    fn sequential_loading_peaks_do_not_shrink_the_serving_pool() {
-        let fixed = 26usize << 30;
-        let phases = [
-            ("head packing", 20usize << 30),
-            ("draft staging", 27usize << 30),
-        ];
-        assert_eq!(super::startup_peak(fixed, &phases).unwrap(), 27usize << 30);
-        assert_eq!(super::startup_peak(fixed, &[]).unwrap(), fixed);
-        // Retained residency, not sum of loading phases, is subtracted before KV.
-        assert_eq!((32usize << 30) - fixed, 6usize << 30);
     }
 }
 
@@ -734,16 +703,12 @@ mod admission_tests {
                 let weights = resident::resident_headers(&config,
                     catalog.tensors().iter().map(|tensor| &tensor.metadata), ranks, false)
                     .context("synthetic native backbone residency")?;
-                let mut fixed = weights.into_iter().enumerate().flat_map(|(gpu, items)|
+                let weights = weights.into_iter().enumerate().flat_map(|(gpu, items)|
                     items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
                         item.group, item.bytes, item.basis))).collect::<Vec<_>>();
-                fixed.extend(programs.target(256, ranks, true, ranks == 1)?);
-                fixed.push(Demand::new((ranks - 1) as u8, Category::Transport,
-                    "target/prefill transports", 2 * owners::transport_bytes(256, 4)?, Basis::Formula));
-                for (gpu, bytes) in resident::prefix_arena_bytes(42, false, ranks).into_iter().enumerate() {
-                    fixed.push(Demand::new(gpu as u8, Category::Prefix,
-                        "target snapshot arenas", bytes, Basis::Formula));
-                }
+                let fixed = owners::TargetOwners::new(weights,
+                    programs.target(256, ranks, true, ranks == 1)?, ranks,
+                    2 * owners::transport_bytes(256, 4)?, 42)?.fixed;
                 let (experts, workspace) = families::deepseek_v41::expert_inventory(
                     &catalog, &manifest, 256, ranks, 188)?;
                 // Deliberately synthetic pre-weight inventory, independent of
@@ -776,6 +741,9 @@ mod admission_tests {
                             .filter(|item| item.category == owner.category && item.group == owner.group)
                             .map(|item| item.bytes).sum::<u64>();
                         assert_eq!(actual, expected, "{owner:?}");
+                        assert!(admitted.placement.items[usize::from(owner.gpu)].iter()
+                            .filter(|item| item.category == owner.category && item.group == owner.group)
+                            .all(|item| item.lifetime == owner.lifetime));
                     }
                     assert_eq!(admitted.placement.attention_placement,
                         if ranks == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads });

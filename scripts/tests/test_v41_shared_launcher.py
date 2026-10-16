@@ -18,7 +18,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from v41_launch_capture import CASES, FIXTURES, ROOT, capture, parse_run  # noqa: E402
+from v41_launch_capture import CASES, FIXTURES, KIT_CARDS, ROOT, capture, parse_run  # noqa: E402
 
 # Environment the shared launcher adds, by role, at its default values. Each
 # comes from a shared helper in scripts/launch/run-family.sh:
@@ -109,6 +109,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
     for old in golden["plans"]:
         expected = [value for value in old if value not in ("--json", "--layout")]
         expected.insert(expected.index("--require-ready"), "--deployment")
+        if case in KIT_CARDS:
+            expected.remove("--require-ready")
         coordinator = parse_run(golden["containers"][0]["argv"])
         command = coordinator["command"]
         additions = []

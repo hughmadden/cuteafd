@@ -1,0 +1,34 @@
+{
+  "build": "dense-qwen-candidate",
+  "profile": "smoke",
+  "defaults": {
+    "timeout_s": 1200,
+    "run_timeout_s": 1800
+  },
+  "entries": [
+    {
+      "name": "qwen35-9b-bf16-min",
+      "family": "qwen3_5",
+      "config": "cfg/qwen35-9b-bf16.config",
+      "gpus": [1],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8740",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "0"
+      }
+    },
+    {
+      "name": "qwen38-27b-bf16-min",
+      "family": "qwen3_5",
+      "config": "cfg/qwen38-27b-bf16.config",
+      "gpus": [1],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8741",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "0"
+      }
+    }
+  ]
+}
