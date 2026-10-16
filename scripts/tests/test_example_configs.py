@@ -139,7 +139,24 @@ def _family_launch(tmp_path: Path, config: Path) -> subprocess.CompletedProcess[
     if plan is not None:
         # The encoder plan the coordinator image would print for this layout.
         docker = bin_dir / "docker"
-        docker.write_text(docker.read_text() + f"case \"$*\" in *\"cuteafd plan\"*) printf '%s\\n' '{json.dumps(plan)}' ;; esac\n")
+        described = subprocess.check_output(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+            str(hf / "hub" / f"models--{keys(config)['MODEL_ID'].replace('/', '--')}" / "snapshots/abc/config.json")], text=True).split()
+        family, _, first, last = described
+        stub = tmp_path / "deployment.py"
+        stub.write_text("""import json, sys
+args = sys.argv[1:]
+def value(flag, default=None):
+    return args[args.index(flag) + 1] if flag in args else default
+report = json.loads(REPORT)
+family, first, last = FAMILY, FIRST, LAST
+print(json.dumps(dict(report, version=1, family=family, executable=True, report=report,
+    launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
+    placement_handshake="--deployment-placement-handshake" in args,
+    peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
+    speculator=value("--speculator", "off"))))
+""".replace("REPORT", repr(json.dumps(plan))).replace("FAMILY", repr(family))
+            .replace("FIRST", first).replace("LAST", "None" if last == "-1" else last))
+        docker.write_text(docker.read_text() + f'case "$*" in *"cuteafd plan"*) exec python3 "{stub}" "$@" ;; esac\n')
     env = {**os.environ, "HF_HOME": str(hf), "HOME": str(tmp_path / "home"),
            "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     return subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config)], cwd=ROOT, env=env,
