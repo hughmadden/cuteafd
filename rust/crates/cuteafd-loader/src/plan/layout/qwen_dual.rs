@@ -42,7 +42,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }
     }
     let pool_tokens = match apply(input, options, &mut devices, rows, concurrency, context, mtp, manifest) {
-        Ok(placement) => { notes.push(format!("placement: {}", placement.summary())); placement.pool_tokens },
+        Ok(placement) => { report.solver_placement = Some(placement.clone()); notes.push(format!("placement: {}", placement.summary())); placement.pool_tokens },
         Err(error) => {
             report.placement_supported = false;
             report.hints.push(super::super::Hint { what: format!("Qwen dual admission: {error:#}"),

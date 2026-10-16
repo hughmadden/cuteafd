@@ -75,13 +75,6 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
             rules = root / 'build/build.ninja'
             return result, rules.read_text() if rules.exists() else ''
 
-    def test_explicit_paired_residency_reaches_export_command(self):
-        result, rules = self.configure('-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON',
-                                       '-DCUTEAFD_V41_EXL3_BITS=3;4',
-                                       '-DCUTEAFD_V41_EXL3_RESIDENCY=80=2;16=1')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('--paired-tp4 --residency 80=2 --residency 16=1', rules)
-
     def test_default_keeps_disjoint_export(self):
         for architecture in ('120', '121'):
             with self.subTest(architecture=architecture):
@@ -146,13 +139,6 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                 self.assertIn('exl3-qwen4-k45/manifest.json', rules)
                 if architecture != '121':
                     self.assertNotIn('tp1-rank0', stamp)
-
-    def test_paired_package_requests_only_tp4(self):
-        result, rules = self.configure('-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON',
-                                       '-DCUTEAFD_V41_EXL3_BITS=3;4')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(set(re.findall(r'--require-layout +(\S+)', rules)),
-                         {'tp4-rank0,tp4-rank1,tp4-rank2,tp4-rank3'})
 
     def test_tile_override_reaches_export_and_is_a_build_dependency(self):
         """An A/B override is a dependency, not just a command-line detail.
@@ -219,7 +205,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         self.assertEqual(len(documented), 2, f'expected both documented examples, got {documented}')
         for example in documented:
             with self.subTest(example=example):
-                parsed = package.tile_overrides([example], [1, 16, 80], 'spark', False)
+                parsed = package.tile_overrides([example], [1, 16, 80], 'spark')
                 self.assertEqual(list(parsed), ['tp3-width768'])
                 self.assertIn(int(example.split(':')[0].split('=')[1].split('+')[0]
                                  if example.split(':')[0].split('=')[1] != 'all' else 1), [1, 16, 80])
@@ -231,40 +217,6 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                 result, _ = self.configure(f'-DCUTEAFD_V41_EXL3_TILES={value}')
                 self.assertNotEqual(result.returncode, 0, value)
                 self.assertIn('EXL3 tile override must be PROFILE=CAPACITIES', result.stderr)
-
-    def test_paired_families_remain_tp4_only(self):
-        for bits, family in (('2;3', '23'), ('3;4', '34')):
-            with self.subTest(family=family):
-                result, rules = self.configure('-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON',
-                                               f'-DCUTEAFD_V41_EXL3_BITS={bits}')
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn('--paired-tp4', rules)
-                self.assertNotIn('/tp2-rank', rules)
-                self.assertNotIn('/tp3-rank', rules)
-                for rank in range(4):
-                    self.assertIn(f'exl3-k{family}/tp4-rank{rank}/m16/libcuteafd_exl3.so', rules)
-
-    def test_paired_default_rejects_multiple_families(self):
-        result, _ = self.configure('-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('exactly one decoder tier family', result.stderr)
-
-    def test_invalid_layouts_fail_during_configuration(self):
-        paired = '-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON'
-        cases = [
-            (['-DCUTEAFD_V41_EXL3_RESIDENCY=80=2'], 'require paired TP4'),
-            ([paired, '-DCUTEAFD_CUDA_ARCHITECTURES=120'], 'requires SM121'),
-            ([paired, '-DCUTEAFD_V41_EXL3_BITS=2;3;4'], 'exactly two decoder tiers'),
-            ([paired, '-DCUTEAFD_V41_EXL3_RESIDENCY=80=3'], 'capacity=1 or capacity=2'),
-            ([paired, '-DCUTEAFD_V41_EXL3_RESIDENCY=17=2'], 'selected, nonduplicate'),
-            ([paired, '-DCUTEAFD_V41_EXL3_RESIDENCY=80=1;80=2'], 'selected, nonduplicate'),
-        ]
-        for options, error in cases:
-            with self.subTest(options=options):
-                result, _ = self.configure('-DCUTEAFD_V41_EXL3_BITS=3;4', *options)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(error, result.stderr)
-
 
 if __name__ == '__main__':
     unittest.main()

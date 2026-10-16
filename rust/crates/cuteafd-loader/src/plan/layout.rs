@@ -562,6 +562,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
     let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
         else if family == "deepseek_v41" { 2048 }
         else { workspace_manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
+    report.prefill_rows = Some(prefill_rows);
     let decode_rows = workspace_manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
     let concurrency = if options.concurrency > 0 { options.concurrency }
         else { cuteafd_core::serving_capacity::default_concurrency(
@@ -1003,6 +1004,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
                 manifest: workspace_manifest.clone() });
         match solved {
             Ok((placement, reserves)) => {
+                report.solver_placement = Some(placement.clone());
                 for (device, reserve) in devices.iter_mut().zip(&reserves) {
                     device.capacity_bytes = options.rtx_bytes[device.index as usize].saturating_sub(*reserve);
                 }
@@ -1058,6 +1060,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
         match glm5_placement(report, input, options, &devices[..active_gpus], workspace_manifest.as_ref(),
             prefill_rows, context_tokens) {
             Ok((placement, working)) => {
+                report.solver_placement = Some(placement.clone());
                 // The solver resolved auto against this build's programs.
                 report.attention_placement = placement.attention_placement;
                 if let Some(note) = notes.iter_mut().find(|n| n.starts_with("attention placement ")) {
@@ -1229,6 +1232,7 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
                 });
                 match placement {
                     Ok((placement, exact_local_bytes)) => {
+                        report.solver_placement = Some(placement.clone());
                         notes.push(format!("placement: {}", placement.summary()));
                         pool_tokens = placement.pool_tokens;
                         local_layers = placement.onboard_layers;
@@ -1390,8 +1394,6 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let mut prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
     // Shared replay records live in the prefill scratch.
     prefill.programs = prefill.programs.max(shared_records);
-    // A lane needs a Spark transport of its own: local experts prefill in one.
-    let lanes = if spark { lanes } else { 1 };
     Some(crate::placement::families::glm5_flash::step_workspace_demands(&cfg,
         usize::try_from(lanes).ok()?, rows, decode_rows, shape, decode, prefill))
 }
@@ -1408,7 +1410,7 @@ struct QwenPlanShape {
 /// (`qwen_admission`), its startup graph set and the largest pool both fit
 /// beside, over what the planner already laid out (context, weights, embedding,
 /// head, drafter, resident experts and their package scratch, encoder).
-fn qwen_placement(input: &super::PlanInput, report: &PlanReport, options: &LayoutOptions,
+fn qwen_placement(input: &super::PlanInput, report: &mut PlanReport, options: &LayoutOptions,
     device: &mut DeviceLayout, manifest: Option<&serde_json::Value>, shape: QwenPlanShape) -> anyhow::Result<u64> {
     use crate::serving_capacity::qwen_graphs::*;
     let checkpoint = input.checkpoint();
@@ -1444,7 +1446,9 @@ fn qwen_placement(input: &super::PlanInput, report: &PlanReport, options: &Layou
     let placement = crate::placement::families::qwen4::placement(&inputs)?;
     device.items.extend(placement.items[0].iter().cloned());
     device.kv_tokens = placement.pool_tokens;
-    Ok(placement.pool_tokens)
+    let pool_tokens = placement.pool_tokens;
+    report.solver_placement = Some(placement);
+    Ok(pool_tokens)
 }
 
 /// Package scratch of Qwen's resident FP8/NVFP4 experts (`Fp8Experts::load`): one scratch per package

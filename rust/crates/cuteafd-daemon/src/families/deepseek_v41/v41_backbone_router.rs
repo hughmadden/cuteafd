@@ -771,12 +771,6 @@ pub(crate) struct BoundExpertRequest {
     binding: QueryBinding,
 }
 impl BoundExpertRequest {
-    pub(crate) fn assign_paired(&mut self, assignment: &mut crate::families::deepseek_v41::v41_experts::paired::PairedAssignment,
-        profile: &crate::families::deepseek_v41::v41_experts::paired::PairedProfile) -> Result<()> {
-        let layer = self.binding.layer();
-        assignment.encode(&mut self.request, profile.layer(layer)?, layer)?;
-        Ok(())
-    }
     /// Encode this lane's replicated-group ownership after proving the request
     /// still describes the same layer as its block binding. The request stays
     /// private to this owner; only the ownership encoder can rewrite route words.

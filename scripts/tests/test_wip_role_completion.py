@@ -204,7 +204,8 @@ def test_transformers_requires_include_bytes_inputs_and_confined_links(tmp_path)
 
 @pytest.mark.parametrize('role', ['coordinator', 'expert'])
 @pytest.mark.parametrize('enabled', [False, True])
-def test_wip_programs_stage_current_table_or_empty_even_after_previous_opt_in(tmp_path, role, enabled):
+@pytest.mark.parametrize('family', ['GLMF', 'QWEN_DENSE'])
+def test_wip_programs_stage_current_table_or_empty_even_after_previous_opt_in(tmp_path, role, enabled, family):
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     block = '# Generic-family tables' + script.split('# Generic-family tables', 1)[1]
     build = tmp_path / 'build'
@@ -219,8 +220,8 @@ def test_wip_programs_stage_current_table_or_empty_even_after_previous_opt_in(tm
     (output / 'V41_EXPERT_WORKSPACES').mkdir()
     (output / 'PROGRAMS.json').write_text('stale table')
     env = {key: value for key, value in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
-    env.update(role=role, build_dir=str(build), output_dir=str(output),
-               CUTEAFD_WIP_GLMF_AOT='ON' if enabled else 'OFF')
+    env.update(role=role, build_dir=str(build), output_dir=str(output))
+    env[f'CUTEAFD_WIP_{family}_AOT'] = 'ON' if enabled else 'OFF'
     result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block], env=env,
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr

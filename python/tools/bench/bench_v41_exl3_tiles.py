@@ -1,43 +1,8 @@
 #!/usr/bin/env python3
-"""Offline Spark tile/residency experiment; never changes the serving policy.
+"""Offline tile experiment for disjoint EXL3 TP3 slices.
 
-Two disjoint-package modes share one harness:
-
-* ``--intermediate 512|640 --slice-start S`` keeps the legacy TP4 paired-width
-  geometry exactly as this harness has always raced it: the production
-  baseline plus the same-tile 1-vs-2 blocks/SM residency pair.  Forcing
-  blocks/SM is a *paired-only* knob (see
-  ``package_exl3_aot.residency_overrides``), so it is legal only here.
-* ``--intermediate 768 --slice-start {0,768,1536}`` benchmarks the real
-  disjoint EXL3 TP3 rank slices (the ``tp3-width768`` package layouts).  A
-  width of 768 is exactly six whole H128 blocks with no padding, so the only
-  admissible slice starts are the three exact rank thirds of 2304.  This mode
-  races the real production planner tile against controlled tile candidates
-  ((64,256) vs (64,128), and the m10..m32 (128,128) geometry) with automatic
-  residency only: blocks/SM is recorded as the compiler resolved it and is
-  never forced, so paired residency semantics cannot leak into a disjoint run.
-
-The tier family is never inferred from the checkpoint name, repository id, or
-nominal bits-per-weight.  It is derived from the checkpoint's own per-tensor
-MCG trellis widths, must equal the family the loader builds for the WHOLE
-checkpoint (``checkpoint_global_family`` over the publication manifest), is
-optionally declared with ``--tiers``, and must agree; any other family fails
-closed before anything compiles or times.
-
-Deliberate scope: the EXL3 package path serves the disjoint TP3 width-768 rank
-slices and the legacy TP4 paired 512/640 widths, and only those are benchmark.
-TP2 (width 1152) is exportable but has NO APPROVED EXL3 TP2 serving config in
-this repository, so there is no sanctioned deployment whose geometry a
-measurement would describe; TP6 (width 384) has no package profile at all.
-Both are therefore excluded on purpose, not by omission
-(``resolve_layout`` and the CLI choices reject them fail-closed).
-
-Uses all 384 experts of a checkpoint layer and compares against the production
-tile.  Graph timings include routing, mixed core and reduction, not transport.
-Correctness gates (finite/nonzero, cross-variant agreement against the
-production baseline, eager/graph bitwise equality, replay determinism, live
-row-count schedule independence, stable preplanned workspace with zero replay
-allocations) all run before any timing sample is taken.
+Compare the production planner tile with controlled candidate tiles. Residency
+is resolved by the compiler; this does not change the serving policy.
 """
 
 import sys as _sys
@@ -89,7 +54,6 @@ checkpoint_global_family = _V41_EXL3_FAMILY.checkpoint_global_family
 TOTAL_INTERMEDIATE = 2304
 TP3_WIDTH = 768
 TP3_RANK_STARTS = (0, 768, 1536)
-LEGACY_PAIRED_WIDTHS = (512, 640)
 H128_BLOCK = 128
 MCG_MAGIC = 0xCBAC1FED
 # The packed-router block and every compile option the exported EXL3 package is
@@ -126,10 +90,10 @@ TILE_LEGALITY_MARKERS = (
 
 
 def resolve_layout(intermediate, slice_start):
-    """Validate one offline slice request; return its disjoint/paired layout record."""
+    """Validate one offline slice request; return its disjoint layout record."""
     intermediate = int(intermediate)
     slice_start = int(slice_start)
-    if intermediate not in (*LEGACY_PAIRED_WIDTHS, TP3_WIDTH):
+    if intermediate != TP3_WIDTH:
         raise ValueError(f'unsupported benchmark width {intermediate}')
     if slice_start < 0 or slice_start + intermediate > TOTAL_INTERMEDIATE:
         raise ValueError(
@@ -137,7 +101,7 @@ def resolve_layout(intermediate, slice_start):
             f'{TOTAL_INTERMEDIATE}-wide intermediate')
     if intermediate == TP3_WIDTH:
         # Disjoint TP3 is exactly three unpadded thirds of 2304, each six whole
-        # H128 blocks. Anything else is a padded/paired request wearing a 768.
+        # H128 blocks. Anything else is a padded request wearing a 768.
         if slice_start not in TP3_RANK_STARTS:
             raise ValueError(
                 f'disjoint TP3 width {TP3_WIDTH} admits slice starts '
@@ -145,11 +109,7 @@ def resolve_layout(intermediate, slice_start):
         return dict(mode='tp3-disjoint-width768', intermediate=intermediate,
                     slice_start=slice_start, rank=slice_start // TP3_WIDTH,
                     whole_h128_blocks=intermediate // H128_BLOCK, padded=False)
-    if slice_start % H128_BLOCK != 0:
-        raise ValueError('legacy TP4 slices must start on an H128 block boundary')
-    return dict(mode='tp4-paired-legacy', intermediate=intermediate,
-                slice_start=slice_start, rank=None,
-                whole_h128_blocks=intermediate // H128_BLOCK, padded=True)
+    raise ValueError('only disjoint TP3 width 768 is supported')
 
 
 def parse_tiers(spec):
@@ -227,9 +187,6 @@ def plan_variants(intermediate, planner_tile):
     forced blocks/SM.  A candidate equal to the planner tile is a duplicate of
     the production geometry (that is the m16 case: the planner itself picks
     (128,128,128,128)), so it is recorded but not recompiled.
-    Legacy widths: the historical race, byte-for-byte — planner tile with the
-    historical forced-1 baseline, plus the same-tile (64,128) 1-vs-2
-    blocks/SM paired-residency pair.
     """
     planner_tile = tuple(int(value) for value in planner_tile)
     if intermediate == TP3_WIDTH:
@@ -244,12 +201,7 @@ def plan_variants(intermediate, planner_tile):
                 spec['skip'] = 'duplicate-of-production-planner'
             specs.append(spec)
         return specs
-    return [dict(name='baseline', kind='production-planner', tile=planner_tile,
-                 blocks_per_sm_forced=1),
-            dict(name='k64-one-block', kind='paired-residency', tile=(64, 128, 64, 128),
-                 blocks_per_sm_forced=1),
-            dict(name='k64-two-blocks', kind='paired-residency', tile=(64, 128, 64, 128),
-                 blocks_per_sm_forced=2)]
+    raise ValueError('only disjoint TP3 width 768 is supported')
 
 
 def is_tile_legality_error(message):
@@ -559,11 +511,10 @@ def load_weights(args, torch, safe_open, ProjectionTrellisTierWeights, prepare_p
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--snapshot', type=Path, required=True)
-    parser.add_argument('--intermediate', type=int, choices=(512, 640, 768), required=True,
-                        help='512/640: legacy TP4 paired widths; 768: disjoint TP3 rank slice')
+    parser.add_argument('--intermediate', type=int, choices=(768,), required=True,
+                        help='disjoint TP3 rank slice')
     parser.add_argument('--slice-start', type=int, default=0,
-                        help='TP3 (width 768) admits 0/768/1536 only; legacy widths keep the '
-                             'H128-block rule')
+                        help='TP3 (width 768) admits 0/768/1536 only')
     parser.add_argument('--layer', type=int, default=30)
     parser.add_argument('--capacity', type=int, choices=(16, 80), default=16)
     parser.add_argument('--tiers', default=None,
@@ -677,9 +628,7 @@ def main(argv=None):
                       'invariance, and quantization-semantics contracts (MCG magic, tier '
                       'membership partition, fail-closed family rule); the pinned source '
                       'ships no independent MCG dequant reference to price against',
-                      'blocks_per_sm is recorded as the compiler resolved it; forcing '
-                      'residency exists only on the legacy paired TP4 widths and cannot be '
-                      'requested on the disjoint TP3 path',
+                      'blocks_per_sm is recorded as the compiler resolved it',
                       'graph timings cover routing, mixed core and reduction for one rank '
                       'slice; TP3 serving sums three rank partials, transport excluded',
                   ],
@@ -749,8 +698,6 @@ def main(argv=None):
                              'least one legal controlled tile candidate')
         save()
         raise SystemExit(record['failure'])
-    residency_pair = [index for index, plan in enumerate(plans)
-                      if plan[1] == 'paired-residency']
     workspace_pointers = {name: tuple(int(tensor.data_ptr()) for field in fields(buffers)
                                       for tensor in (getattr(buffers, field.name),))
                           for name, _, _, buffers in plans}
@@ -820,10 +767,6 @@ def main(argv=None):
             torch.cuda.synchronize()
             reference = outputs[0].clone()
             assert torch.isfinite(reference).all() and reference.abs().max() > 0
-            if len(residency_pair) == 2:
-                # A residency-only change must preserve the whole-tile arithmetic.
-                assert torch.equal(outputs[residency_pair[0]], outputs[residency_pair[1]]), \
-                    'changing residency changed same-tile output'
             for (name, kind, binding, buffers), output in zip(plans, outputs):
                 assert torch.isfinite(output).all() and output.abs().max() > 0
                 error = float((output.float() - reference.float()).abs().max() / reference.float().abs().max())
@@ -884,8 +827,6 @@ def main(argv=None):
                         case=[rows, unique], worst_relative_max_error=worst))
         record['results'].append(dict(rows=rows, distinct_experts=unique, checks=checks,
                                       invariants=invariants, row_consistency=row_consistency,
-                                      same_tile_residency_bitwise=(
-                                          True if len(residency_pair) == 2 else None),
                                       timings=None))
         timing_queue.append(dict(rows=rows, unique=unique, graphs=graphs, outputs=outputs,
                                  result=record['results'][-1]))

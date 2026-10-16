@@ -11,7 +11,7 @@
 //! unchanged: bits `0..8` still carry the true expert id `0..383`, bits `9..11`
 //! carry the one-hot owning-group bitmap (`bit 9 + group`, exactly one bit set),
 //! and bits `12..31` are reserved and rejected. A new request flag selects the
-//! contract, so canonical and paired EXL3 consumers reject it and only a worker
+//! contract, so canonical consumers reject it and only a worker
 //! admitted with a matching topology may decode the owner bits. Route order,
 //! FP32 gate weights, the canonical six unique experts per token and the hidden
 //! payload are left byte-identical; only the route word's owner field is added.
@@ -35,7 +35,7 @@
 use anyhow::{bail, ensure, Result};
 
 /// Selects the native replicated-group ownership contract. Distinct from the
-/// paired EXL3 request flag (`1 << 17`). Only the native compact BF16 request
+/// reserved request bit (`1 << 17`). Only the native compact BF16 request
 /// contract may combine with it, and it never appears in a response.
 pub const V41_NATIVE_GROUP_REQUEST_FLAG: u32 = 1 << 18;
 
@@ -315,10 +315,6 @@ impl crate::ExpertProtocolV2Request {
             "native group ownership requires the native compact BF16 request contract"
         );
         ensure!(
-            self.header.flags & super::V41_EXL3_PAIRED_REQUEST_FLAG == 0,
-            "native group ownership cannot combine with paired EXL3 admission"
-        );
-        ensure!(
             self.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG == 0,
             "request already carries native group ownership"
         );
@@ -357,7 +353,7 @@ mod tests {
     use super::*;
     use crate::expert::{
         tests::request, BackboneRequest, V41Tp4ChunkReceiver, V41Tp4Planes, SparkExperts,
-        V41Tp4Tcp, V41_EXL3_PAIRED_REQUEST_FLAG, V41_PARTIAL_ROW_BYTES,
+        V41Tp4Tcp, V41_PARTIAL_ROW_BYTES,
     };
     use crate::{ExpertProtocolV2Request, ExpertProtocolV2Response, TcpTransportConfig};
     use std::collections::BTreeSet;
@@ -607,7 +603,7 @@ mod tests {
             let canonical_frame = canonical.encode()?;
             let request = native_request(3, topology, &owners)?;
             assert_ne!(request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG, 0);
-            assert_eq!(request.header.flags & V41_EXL3_PAIRED_REQUEST_FLAG, 0);
+            assert_eq!(request.header.flags & (1 << 17), 0);
             assert_eq!(request.rows, canonical.rows);
             assert_eq!(request.hidden_payload, canonical.hidden_payload);
 
@@ -655,11 +651,9 @@ mod tests {
                 "active expert ownership is available after validation"
             );
 
-            // Canonical and paired consumers reject the new flag.
+            // Canonical consumers reject the new flag.
             assert!(BackboneRequest::parse(&frame, 3).is_err());
-            assert!(BackboneRequest::parse_paired(&frame, 3).is_err());
             assert!(BackboneRequest::validate_owned(&request, 3).is_err());
-            assert!(BackboneRequest::validate_owned_paired(&request, 3).is_err());
             // The unowned canonical frame cannot be parsed as native group.
             assert!(BackboneRequest::parse_native_group(&canonical_frame, 3, topology).is_err());
         }
@@ -707,9 +701,9 @@ mod tests {
         owners[0] = topology.group_count();
         assert!(oversized.with_native_group_owners(&owners, topology).is_err());
 
-        let mut paired = canonical.clone();
-        paired.header.flags |= V41_EXL3_PAIRED_REQUEST_FLAG;
-        assert!(paired
+        let mut reserved = canonical.clone();
+        reserved.header.flags |= 1 << 17;
+        assert!(reserved
             .with_native_group_owners(&vec![0u8; V41_ROUTED_EXPERTS], topology)
             .is_err());
 
@@ -1075,10 +1069,10 @@ mod tests {
     fn generic_protocol_flag_validator_bounds_the_new_flag() -> Result<()> {
         use crate::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let compact = EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        // Native group flag alone, with the paired flag, or with foreign flags.
+        // Native group flag alone, with a reserved flag, or with foreign flags.
         for flags in [
             V41_NATIVE_GROUP_REQUEST_FLAG,
-            V41_NATIVE_GROUP_REQUEST_FLAG | V41_EXL3_PAIRED_REQUEST_FLAG | compact,
+            V41_NATIVE_GROUP_REQUEST_FLAG | (1 << 17) | compact,
             V41_NATIVE_GROUP_REQUEST_FLAG | compact | (1 << 9),
             V41_NATIVE_GROUP_REQUEST_FLAG | compact | (1 << 20),
             V41_NATIVE_GROUP_REQUEST_FLAG | crate::EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,

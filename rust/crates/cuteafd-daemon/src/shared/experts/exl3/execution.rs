@@ -3,7 +3,7 @@
 use super::Exl3Weights;
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Exl3Kernel, V41Exl3Layout, V41Exl3Routes};
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Exl3Kernel, V41Exl3Routes};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, ffi::c_void, path::{Path, PathBuf}, rc::Rc};
@@ -115,7 +115,7 @@ impl Exl3ReductionPlan {
             for key in ["direct", "warp_specialized", "fused_input_rotation", "token_major_rotation"] {
                 result.push(meta[key].as_bool().unwrap_or(false).into());
             }
-            for key in ["paired_boundary", "bits", "swiglu_limit", "output_dtype",
+            for key in ["bits", "swiglu_limit", "output_dtype",
                 "hidden", "intermediate", "experts", "top_k", "sparkinfer_revision"] {
                 result.push(meta[key].clone());
             }
@@ -186,7 +186,6 @@ struct Manifest {
     objects: Vec<Object>,
     trellis_lut: Asset,
     route_preparation: Option<RouteManifest>,
-    paired_boundary: Option<String>,
     descriptor_rows: Option<usize>,
     native_info_version: Option<u32>,
     /// `e4m3_k32`: the core reads E4M3 + UE8M0 K32 wire rows itself (no
@@ -209,22 +208,11 @@ impl Manifest {
             Some(other) => anyhow::bail!("unknown EXL3 input format {other}"),
         }
     }
-    fn native_layout(&self) -> Result<V41Exl3Layout> {
-        match self.paired_boundary.as_deref() {
-            None => {
-                ensure!(self.descriptor_rows.is_none_or(|rows| rows == 3)
-                    && self.native_info_version.is_none_or(|version| version == 2),
-                    "disjoint EXL3 descriptor/version mismatch");
-                Ok(V41Exl3Layout::Disjoint)
-            }
-            Some(boundary @ ("first" | "last")) => {
-                ensure!(self.intermediate == 640 && self.bits.len() == 2 && self.top_k == 6
-                    && self.descriptor_rows == Some(4) && self.native_info_version == Some(3),
-                    "paired EXL3 manifest contract mismatch");
-                Ok(if boundary == "first" { V41Exl3Layout::PairedFirst } else { V41Exl3Layout::PairedLast })
-            }
-            Some(_) => anyhow::bail!("unknown paired EXL3 boundary"),
-        }
+    fn validate_native_contract(&self) -> Result<()> {
+        ensure!(self.descriptor_rows.is_none_or(|rows| rows == 3)
+            && self.native_info_version.is_none_or(|version| version == 2),
+            "EXL3 descriptor/version mismatch");
+        Ok(())
     }
     fn workspace_bytes(&self, format: Exl3InputFormat) -> Result<usize> {
         let mut bytes = self.trellis_lut.bytes.max(16);
@@ -359,7 +347,6 @@ struct LayerBinding {
     core: Table,
     sum: Table,
     expert_map: CuteafdDeviceBuffer,
-    ownership: Option<CuteafdDeviceBuffer>,
     output_slot: usize,
 }
 
@@ -399,9 +386,9 @@ impl<'a> Exl3Modules<'a> {
                 "EXL3 export/source mismatch"
             );
 
-            let expected_layout = meta.native_layout()?;
+            meta.validate_native_contract()?;
             // SAFETY: the caller trusts this native package; the device owner scopes destruction.
-            let kernel = unsafe { V41Exl3Kernel::load_with_layout(directory.join("libcuteafd_exl3.so"), expected_layout)? };
+            let kernel = unsafe { V41Exl3Kernel::load(directory.join("libcuteafd_exl3.so"))? };
             let info = kernel.info();
             ensure!(
                 info.hidden == meta.hidden
@@ -475,15 +462,11 @@ pub(crate) enum Exl3InputFormat {
 }
 
 impl<'a> Exl3Execution<'a> {
-    pub(crate) fn artifact_layout(directory: &Path) -> Result<V41Exl3Layout> {
+    pub(crate) fn validate_artifact(directory: &Path) -> Result<()> {
         let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
-        meta.native_layout()
+        meta.validate_native_contract()
     }
 
-    pub(crate) fn ownership_bytes(directory: &Path) -> Result<usize> {
-        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
-        Ok(if meta.native_layout()? == V41Exl3Layout::Disjoint { 0 } else { meta.experts * meta.bits.len() * 4 })
-    }
 
     /// Device allocation payload per lane, including aliases and optional wire
     /// reconstruction. Weight storage and CUDA module/driver reserve are separate.
@@ -548,19 +531,10 @@ impl<'a> Exl3Execution<'a> {
             !weights.is_empty(),
             "EXL3 execution requires resident layers"
         );
-        let expected_layout = meta.native_layout()?;
+        meta.validate_native_contract()?;
         let device = library.cuda_get_device()?;
         for weight in weights.iter() {
-            let resident_layout = match weight.layout.layout {
-                cuteafd_loader::V41Exl3Partition::Disjoint => V41Exl3Layout::Disjoint,
-                cuteafd_loader::V41Exl3Partition::PairedTp4 => {
-                    ensure!(weight.layout.world == 4 && weight.layout.rank < 4,
-                        "paired EXL3 resident rank/world mismatch");
-                    if weight.layout.rank % 2 == 0 { V41Exl3Layout::PairedLast } else { V41Exl3Layout::PairedFirst }
-                }
-            };
-            ensure!(resident_layout == expected_layout, "EXL3 manifest/resident layout mismatch");
-            let descriptor_rows = if resident_layout == V41Exl3Layout::Disjoint { 3 } else { 4 };
+            let descriptor_rows = 3;
             ensure!(weight.buffer("descriptor_map")?.bytes == descriptor_rows * meta.experts * meta.bits.len() * 4,
                 "EXL3 resident descriptor extent mismatch");
             ensure!(
@@ -704,16 +678,7 @@ impl<'a> Exl3Execution<'a> {
                     && sum.scalars.len() == info.sum_scalars,
                 "EXL3 native argument lengths disagree"
             );
-            let ownership = if expected_layout == V41Exl3Layout::Disjoint { None } else {
-                let descriptor = weight.buffer("descriptor_map")?;
-                let bytes = meta.experts * meta.bits.len() * 4;
-                Some(CuteafdDeviceBuffer {
-                    ptr: descriptor.ptr.cast::<u8>().add(3 * bytes).cast(),
-                    bytes, ..descriptor
-                })
-            };
             layers.push(LayerBinding {
-                ownership,
                 core,
                 sum,
                 expert_map: weight.buffer("global_to_combined")?,
@@ -830,31 +795,8 @@ impl<'a> Exl3Execution<'a> {
         stream: *mut c_void,
         output: CuteafdDeviceBuffer,
     ) -> Result<CuteafdDeviceBuffer> {
-        self.launch_layer_with_ownership(layer, inputs, rows, stream, output, None)
-    }
-
-    /// # Safety
-    /// In addition to `launch_layer_into`, ownership is a device int32 row
-    /// validated by the batch decoder, with zero inactive/padded entries. Its
-    /// producer precedes this call on `stream`, and it remains live until copy
-    /// completion. No other execution may use or mutate this layer's shared
-    /// descriptor until the launch (or its captured graph replay) completes.
-    pub(crate) unsafe fn launch_paired_layer_into(
-        &mut self, layer: usize, inputs: [CuteafdDeviceBuffer; 3], rows: usize,
-        stream: *mut c_void, output: Option<CuteafdDeviceBuffer>, ownership: CuteafdDeviceBuffer,
-    ) -> Result<CuteafdDeviceBuffer> {
-        self.launch_layer_with_ownership(layer, inputs, rows, stream, output.unwrap_or(self.output), Some(ownership))
-    }
-
-    unsafe fn launch_layer_with_ownership(
-        &mut self,
-        layer: usize,
-        mut inputs: [CuteafdDeviceBuffer; 3],
-        rows: usize,
-        stream: *mut c_void,
-        mut output: CuteafdDeviceBuffer,
-        ownership: Option<CuteafdDeviceBuffer>,
-    ) -> Result<CuteafdDeviceBuffer> {
+        let mut inputs = inputs;
+        let mut output = output;
         ensure!(
             rows > 0 && rows <= self.capacity,
             "EXL3 live rows exceed capacity"
@@ -884,15 +826,6 @@ impl<'a> Exl3Execution<'a> {
             "EXL3 output buffer contract mismatch"
         );
         let binding = self.layers.get_mut(layer).context("EXL3 layer is not bound")?;
-        ensure!(binding.ownership.is_some() == ownership.is_some(),
-            "EXL3 launch ownership/layout mismatch");
-        if let Some(source) = ownership {
-            let destination = binding.ownership.context("missing EXL3 ownership binding")?;
-            ensure!(!source.ptr.is_null() && source.ptr as usize % 4 == 0
-                && source.device_id == self.device && source.bytes == destination.bytes,
-                "EXL3 ownership device row mismatch");
-            self.library.copy_d2d_async(destination, source, destination.bytes, stream)?;
-        }
         if let Some(decoded) = &self.wire {
             self.modules.owner.wire.as_ref().context("missing retained EXL3 wire decoder")?.decode(inputs[0], decoded.buffer, rows, stream)?;
             inputs[0] = decoded.buffer;
@@ -1090,6 +1023,13 @@ mod tests {
             "buffers":{},"objects":[],"trellis_lut":{"file":"lut","bytes":16,"sha256":"test"}
         });
         let parse = |value| serde_json::from_value::<Manifest>(value).unwrap();
+        assert!(parse(original.clone()).validate_native_contract().is_ok());
+        for (rows, version, accepted) in [(3, 2, true), (4, 2, false), (3, 3, false)] {
+            let mut value = original.clone();
+            value["descriptor_rows"] = rows.into();
+            value["native_info_version"] = version.into();
+            assert_eq!(parse(value).validate_native_contract().is_ok(), accepted);
+        }
         assert_eq!(parse(original.clone()).group_rows().unwrap(), 8);
         for block in [8, 16, 32, 64] {
             let mut value = original.clone();
@@ -1102,34 +1042,6 @@ mod tests {
             value["direct"] = direct.into();
             assert!(parse(value).group_rows().is_err());
         }
-    }
-
-    #[test]
-    fn paired_manifest_requires_complete_explicit_contract() {
-        let original = serde_json::json!({
-            "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16", "sparkinfer_revision":"test",
-            "hidden":5120,"intermediate":640,"experts":384,"capacity":80,"top_k":6,
-            "bits":[3,4],"swiglu_limit":10.0,"direct":false,"sms":48,"blocks_per_sm":1,
-            "buffers":{},"objects":[],"trellis_lut":{"file":"lut","bytes":16,"sha256":"test"}
-        });
-        let parse = |value: serde_json::Value| serde_json::from_value::<super::Manifest>(value).unwrap();
-        assert_eq!(parse(original.clone()).native_layout().unwrap(), cuteafd_ffi::V41Exl3Layout::Disjoint);
-        for (boundary, expected) in [("first", cuteafd_ffi::V41Exl3Layout::PairedFirst), ("last", cuteafd_ffi::V41Exl3Layout::PairedLast)] {
-            let mut paired = original.clone();
-            paired["paired_boundary"] = boundary.into();
-            assert!(parse(paired.clone()).native_layout().is_err());
-            paired["descriptor_rows"] = 4.into();
-            paired["native_info_version"] = 3.into();
-            assert_eq!(parse(paired.clone()).native_layout().unwrap(), expected);
-            for (key, value) in [("descriptor_rows", serde_json::json!(3)), ("native_info_version", serde_json::json!(2)),
-                ("intermediate", serde_json::json!(512)), ("top_k", serde_json::json!(3)), ("bits", serde_json::json!([2,3,4])),
-                ("paired_boundary", serde_json::json!("unknown"))] {
-                let mut invalid = paired.clone(); invalid[key] = value;
-                assert!(parse(invalid).native_layout().is_err());
-            }
-        }
-        let mut invalid = original; invalid["descriptor_rows"] = 4.into();
-        assert!(parse(invalid).native_layout().is_err());
     }
 
     use crate::shared::experts::layer::ExpertLayer;

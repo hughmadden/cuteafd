@@ -318,16 +318,32 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
     body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]
     assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("select_worker_layers(")
-    assert body.index("select_worker_layers(") < body.index("TokenEmbedding::load(") < body.index("self.experts_range(")
+    assert body.index("select_worker_layers(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
     assert "WorkerSelection::new(identity, &spark_layers)" in body
     assert "let spark = !spark_layers.is_empty();" in body
     assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
     assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
     assert "spark_layers == working.spark_layers" in body
+    assert "rtx_layers == working.rtx_layers" in body
+    assert "admitted_tp2_range" not in source and "spark_range" not in body
+    assert "&local_layers, Some(budget)" in body and "&spark_layers, None" in body
+    assert "tensors, &package, tp2_layers, args.expert_rows(), budgets" in body
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
-    assert "solve_working_set_with_graphs(" in admission
-    assert "let local_workspace = workspaces(false, 1);" in admission
+    assert "solve_attention_working_set_with_graphs(" in admission
+    assert "let local_workspace = workspaces(false, lanes);" in admission
+    assert "configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes)" in admission
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// Longest chunk", 1)[0]
+    assert "prefill_pipeline_available(" in pipeline and "_ => None" in pipeline
+    lane_step = engine.split("    fn step_lanes_inner(", 1)[1].split("    ///", 1)[0]
+    assert "pipelined prefill needs Spark experts" not in lane_step
+    assert "self.spark_land_lane(" in lane_step
+    assert "Some(Experts::Skip)" in lane_step
+    layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
+    assert "step_workspace(&ExpertPlacement::Local, lanes)" in layout
+    assert "local_workspace = Some(estimate(lanes))" in layout
+
     assert "admission::step_workspace_demands(" in admission
     normalization = body.split("let mut selected_args = args.clone();", 1)[1].split("let args = &selected_args;", 1)[0]
     assert "if " not in normalization, "zero-peer exchanges must also use admitted effective lanes"
@@ -340,9 +356,12 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     assert "SparkWorkingSet as GlmfWorkingSet" in loader
     assert "GlmfComponent::RtxExperts, gpu, Category::Transport, \"route exchange\"" in request
     assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
-    expert = source[source.index("    fn experts_range<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
-    assert expert.index("if remote.is_empty() { return Ok(None); }") < expert.index("SparkLink::new(")
-    assert "spark_warmup_request(&self.cfg, warm_rows, remote.start, self.checkpoint.spark_input_is_bf16())" in expert
+    expert = source[source.index("    fn experts_for_layers<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
+    assert expert.index("validate_expert_layers(&self.cfg, served, selected)?;") < expert.index("if selected.is_empty() { return Ok(None); }")
+    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new(")
+    assert "tensors, &directory, selected, 1, 0," in expert
+    assert "layers: selected.to_vec()" in expert
+    assert "spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())" in expert
 
 
 def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
@@ -367,13 +386,14 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           previous_peers: str | None = None, encoder_plan: dict | None = None,
                           extra_args: tuple[str, ...] = (), with_nest: bool = True,
                           extra_env: dict[str, str] | None = None,
-                          program_manifest: dict | None = None) -> subprocess.CompletedProcess[str]:
+                          program_manifest: dict | None = None,
+                          launcher_source: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
     (repo / "scripts" / "lib").mkdir(parents=True)
     (repo / "scripts" / "launch").mkdir(parents=True)
-    shutil.copy(ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
+    shutil.copy(launcher_source or ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
@@ -434,6 +454,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                 stream.write('case "$*" in *spark_tp_roles*) echo tp2 ;; *"docker container inspect"*) exit 1 ;; esac\n')
         if tool == "docker":
             stub = (bin_dir / tool).read_text()
+            intercept = 'case "$*" in *"cuteafd plan"*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; esac\n'
+            stub = stub.replace('case "$*" in', intercept + 'case "$*" in', 1)
             if native_v41:
                 stub += ('case "$*" in container\\ inspect*|inspect\\ *) exit 1 ;; image\\ inspect*) echo test-pin ;; esac\n'
                          'case "$*" in *"cuteafd plan"*) printf \'{"spark_ranks":%s,"prefill_rows":4096}\\n\' '
@@ -473,11 +495,44 @@ exec python3 -c "$code" "$@"
             f'*memory.total*) echo {gpu_total_mib} ;; *memory.free*) echo {gpu_free_mib} ;; *) echo 0 ;; esac\n')
         (bin_dir / "curl").write_text(
             '#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"object":"list","data":[{"id":"deepseek-ai/DeepSeek-V4.1-Flash"}]}\'\n')
+    deployment_stub = tmp_path / "deployment-stub.py"
+    deployment_stub.write_text("""import json, os, subprocess, sys
+args = sys.argv[1:]
+def value(flag, default=None):
+    return args[args.index(flag) + 1] if flag in args else default
+config = json.loads(os.environ["STUB_CHECKPOINT"])
+described = subprocess.check_output([sys.executable, os.environ["STUB_FAMILY_READER"], os.environ["STUB_CONFIG_PATH"]], text=True).split()
+family, _, first, last = described
+ranks = int(os.environ["STUB_PREFERRED_RANKS"] if os.environ["STUB_FORCE_PREFERRED"] else value("--spark-ranks", os.environ["STUB_PREFERRED_RANKS"]))
+tp = int(value("--spark-tp", str(ranks)))
+ep = int(value("--spark-ep", "1"))
+explicit = "--spark-tp" in args or family == "deepseek_v41" and ranks not in (0, 4)
+peers = value("--deployment-peers", "").split(",")[:ranks] if ranks else []
+report = json.loads(os.environ["STUB_ENCODER_PLAN"])
+report.update(spark_ranks=ranks)
+onboard = value("--rtx-expert-layers", "auto")
+gpus = int(value("--rtx", "1"))
+boundary = None if family != "deepseek_v41" or onboard == "auto" or gpus == 1 else min(int(onboard), 39)
+handoff = {"kind": "runtime", "directory": "/tmp/cuteafd-home/placement", "spark_first_layer": boundary} if family == "deepseek_v41" and (gpus == 2 or onboard != "0") else {"kind": "fixed", "spark_first_layer": int(first)}
+print(json.dumps(dict(report, version=1, family=family, executable=True, rtx_gpus=gpus,
+    topology=dict(tp=tp, ep=ep, explicit=explicit), peers=peers,
+    speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
+    admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
+    placement_handoff=handoff, placement_handshake="--deployment-placement-handshake" in args,
+    launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
+    artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report)))
+""")
     config = repo / "f.config"
     initial_count = 0 if "EXPERT_BACKEND=local" in keys else 1
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT={initial_count}\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "STUB_PROGRAMS": str(tmp_path / "PROGRAMS.json"), "STUB_SPARK_COUNT": str(exact_count),
+           "STUB_DEPLOYMENT": str(deployment_stub), "STUB_CHECKPOINT": json.dumps(family_config),
+           "STUB_CONFIG_PATH": str(hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc") / "config.json"),
+           "STUB_FAMILY_READER": str(repo / "scripts/lib/checkpoint-family.py"),
+           "STUB_PREFERRED_RANKS": str(preferred_ranks if preferred_ranks is not None else 1),
+           "STUB_FORCE_PREFERRED": "1" if preferred_ranks is not None and encoder_plan is None else "",
+           "STUB_ENCODER_PLAN": json.dumps(encoder_plan or {"spark_ranks": exact_count}),
            **(extra_env or {})}
     env["HOME"] = str(tmp_path / "home")
     if not with_nest:
@@ -598,7 +653,7 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
                                    extra_args=("--set", "CONCURRENCY=4") if override == "set" else ())
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    plans = [line for line in lines if "cuteafd plan" in line and "--layout" in line]
+    plans = [line for line in lines if "cuteafd plan" in line and "--deployment" in line]
     assert plans, result.stderr
     for plan in plans:
         args = plan.split()
@@ -1483,7 +1538,7 @@ def test_glmf_prefix_marks_reach_the_encoder_plan(tmp_path, keys, expected):
                                   f"RTX_GPUS=1\nSPECULATOR=off\nVISION=auto\n{keys}", encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--layout" in line)
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--deployment" in line)
     for command in [launch, planner]:
         if expected is None:
             assert "--prefix-marks" not in command, command
@@ -1716,7 +1771,7 @@ def test_mimo_prefix_budget_matches_serving_and_encoder_plan(tmp_path):
                                   encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--layout" in line)
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--deployment" in line)
     for command in [launch, planner]:
         assert "--prefix-cache-entries 24" in command
         assert "--prefix-cache-mark-mib 512" in command
@@ -2485,7 +2540,7 @@ def test_glmf_remote_drafter_config_overrides_env_for_plan_and_server(tmp_path, 
                                   encoder_plan=plan, extra_env={"CUTEAFD_GLMF_REMOTE_DFLASH": legacy})
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line)
+    planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
     server = next(line for line in lines if "cuteafd serve-glmf" in line)
     for command in (planner, server):
         assert command.count("-e CUTEAFD_GLMF_REMOTE_DFLASH=") == 1, command
@@ -2503,7 +2558,7 @@ def test_glmf_remote_dflash_candidate_env_matches_plan_and_server(tmp_path, valu
                                   extra_env={"CUTEAFD_GLMF_REMOTE_DFLASH": value})
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line)
+    planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
     server = next(line for line in lines if "cuteafd serve-glmf" in line)
     expected = f"-e CUTEAFD_GLMF_REMOTE_DFLASH={value}"
     for command in (planner, server):
@@ -2525,7 +2580,7 @@ def test_glmf_auto_vision_serves_text_when_the_plan_turns_vision_off(tmp_path, v
     result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash", keys, encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line) + " "
+    planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line) + " "
     launch = next(line for line in lines if "cuteafd serve-glmf" in line) + " "
     worker = next(line for line in lines if "cuteafd expertd-native" in line)
     assert " --vision auto " in planner and "--chat-template-from" not in planner, planner
@@ -2551,7 +2606,7 @@ def test_glmf_encoder_placement_plan_gets_the_template_source_serving_gets(tmp_p
     result = _family_launch_result(tmp_path, config, "test/model", keys, encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line) + " "
+    planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line) + " "
     launch = next(line for line in lines if "cuteafd serve-glmf" in line) + " "
     for command in [planner, launch]:
         assert " --chat-template-from test/model " in command and command.count("--chat-template-from") == 1, command
@@ -2586,7 +2641,7 @@ def test_glmf_encoder_placement_plans_the_decode_rows_serving_takes(tmp_path, ke
                                    encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line)
+    planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
     launch = next(line for line in lines if "cuteafd serve-glmf" in line)
     assert "--vision rtx" in planner and "--pool-tokens 262144" in planner, planner
     for command in [planner, launch]:
@@ -2629,7 +2684,7 @@ def test_glmf_encoder_placement_plans_the_prefix_knobs_serving_takes(tmp_path, k
                                    encoder_plan=GLMF_RTX_ENCODER_PLAN)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    commands = {"plan": next(line for line in lines if "cuteafd plan" in line and "--layout" in line) + " ",
+    commands = {"plan": next(line for line in lines if "cuteafd plan" in line and "--deployment" in line) + " ",
                 "serve": next(line for line in lines if "cuteafd serve-glmf" in line) + " "}
     flags = ("--max-sequences", "--concurrency", "--state-slots", "--mark-lanes", "--prefix-cache-entries",
              "--prefix-cache-mark-mib", "--replay-records")

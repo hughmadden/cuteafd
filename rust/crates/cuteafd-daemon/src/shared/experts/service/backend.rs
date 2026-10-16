@@ -47,19 +47,23 @@ impl<'a> Weights<'a> {
                 execution.install_worker_timing(config.rank)?;
                 Execution::Full(execution)
             }
-            Self::Exl3(weights) => Execution::Exl3(Exl3Worker::new(
-                library,
-                weights.clone(),
-                &config.exl3_directory_for(
-                    weights
-                        .first()
-                        .map(|weight| weight.layout.tiers.as_slice())
-                        .unwrap_or(&[]),
-                ),
-                config.capacity,
-                remaining,
-                config.exl3_schedule,
-            )?),
+            Self::Exl3(weights) => {
+                let mut execution = Exl3Worker::new(
+                    library,
+                    weights.clone(),
+                    &config.exl3_directory_for(
+                        weights
+                            .first()
+                            .map(|weight| weight.layout.tiers.as_slice())
+                            .unwrap_or(&[]),
+                    ),
+                    config.capacity,
+                    remaining,
+                    config.exl3_schedule,
+                )?;
+                execution.install_topology(config.topology)?;
+                Execution::Exl3(execution)
+            }
             Self::Fp8(experts) => {
                 ensure!(fp8_worker_workspace(config)? <= remaining,
                     "FP8 worker workspace exceeds the device budget");
@@ -75,7 +79,6 @@ pub(super) enum Execution<'w, 'a> {
     Fp8(Fp8Worker<'a>),
 }
 impl<'w, 'a> Execution<'w, 'a> {
-    pub(super) fn is_paired(&self) -> bool { matches!(self, Self::Exl3(worker) if worker.is_paired()) }
     pub(super) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
         rank: usize) -> Result<Option<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
         match self {
@@ -233,7 +236,7 @@ pub(super) fn load_fp8<'a>(
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
     // Loading buffers are gone before package scratch and worker storage exist;
     // admit their peak above, rather than subtracting both lifetimes here.
-    let actual_budget = fp8_resident_budget(library.cuda_memory_info()?.0, resident, peak.serve_peak);
+    let actual_budget = fp8_resident_budget(library.cuda_allocatable_memory_info()?.0, resident, peak.serve_peak);
     let budget = budget.min(actual_budget);
     let layer_ids: Vec<_> = layers.collect();
     let experts = Fp8Experts::load_with_bf16(library, tensors, &directory, bf16.as_deref(), &layer_ids,
@@ -259,18 +262,16 @@ pub(super) fn load_exl3<'a>(
         .map(|manifest| manifest.decoder_tiers())
         .unwrap_or(&[]);
     let exl3_directory = config.exl3_directory_for(exl3_tiers);
-    let partition = Exl3Worker::partition(&exl3_directory, config.capacity, config.rank,
+    Exl3Worker::validate_exports(&exl3_directory, config.capacity, config.rank,
         config.exl3_schedule)?;
-    ensure!(config.world == 4 || partition == cuteafd_loader::V41Exl3Partition::Disjoint,
-        "an implicit Spark TP2/TP3 group cannot use paired TP4 artifacts");
+
     let workspace = Exl3Worker::plan(&exl3_directory, config.capacity, config.exl3_schedule)
         .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
     let plans = config.resident_layers(catalog.routed_experts().layers)?
         .map(|layer| {
-            Exl3Weights::plan_with_layout(
+            Exl3Weights::plan(
                 catalog,
-                config.selection(layer)?,
-                partition,
+                config.exl3_selection(layer)?,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -300,12 +301,11 @@ pub(super) fn load_exl3<'a>(
     for (index, plan) in plans.iter().enumerate() {
         let layer = config.first_layer + index;
         let started = std::time::Instant::now();
-        let weight = Exl3Weights::load_with_layout(
+        let weight = Exl3Weights::load(
             library,
             catalog,
-            config.selection(layer)?,
+            config.exl3_selection(layer)?,
             remaining,
-            partition,
         )?;
         remaining = remaining
             .checked_sub(plan.resident_bytes)

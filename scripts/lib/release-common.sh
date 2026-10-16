@@ -294,8 +294,7 @@ release_exl3_package_identity() {
   layout="$(jq -er --arg revision "$revision" '
     if .schema == "cuteafd.exl3-package.v1" and .role == "spark"
       and .sparkinfer_revision == $revision
-      and ((has("paired_tp4") | not) or (.paired_tp4 | type) == "boolean")
-    then (if .paired_tp4 == true then "paired" else "disjoint" end)
+    then "disjoint"
     else error("invalid Spark EXL3 package identity") end
   ' <<<"$manifest")" || release_die "invalid Spark EXL3 package identity"
   digest="$(printf '%s' "$manifest" | sha256sum | awk '{print $1}')"
@@ -754,7 +753,7 @@ release_known_key() {
     GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
-    VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|EXL3_PAIRED_TP4|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
+    VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;
     GLM5_FLASH_DRAFT_LINEAR) return 0 ;;
     GLM5_FLASH_TARGET_HEAD) return 0 ;;
@@ -982,7 +981,6 @@ release_load_config() {
   SPARK_DEVICE_BUDGET_BYTES=107374182400
   SPARK_REDUCTION_MIN_ROWS=16
   SPARKINFER_EXL3=disable
-  EXL3_PAIRED_TP4=off
   if [[ -z "${_release_count_env_saved:-}" ]]; then
     _release_count_env="${SPARK_COUNT-}" _release_hosts_env="${SPARK_HOSTS-}"
     _release_count_env_saved=1
@@ -1096,7 +1094,6 @@ release_load_config() {
   case "$AUDIO" in auto|off) ;; *) release_die "AUDIO must be auto or off" ;; esac
   case "$MODEL_VARIANT" in flash|pro) ;; *) release_die "MODEL_VARIANT must be flash or pro" ;; esac
   case "$EXPERT_FORMAT" in native|exl3) ;; *) release_die "EXPERT_FORMAT must be native or exl3" ;; esac
-  case "$EXL3_PAIRED_TP4" in on|off) ;; *) release_die "EXL3_PAIRED_TP4 must be on or off" ;; esac
   if [[ "$mode" == launch ]]; then
     [[ "$MODEL_VARIANT" != pro || "$EXPERT_FORMAT" == exl3 ]] ||
       release_die "DeepSeek V4 Pro requires EXPERT_FORMAT=exl3"
@@ -1322,18 +1319,6 @@ release_spark_compact_active() {
   esac
 }
 
-release_validate_compact_spark() {
-  release_spark_compact_active || return 0
-  [[ "$EXL3_PAIRED_TP4" == off ]] || release_die "SPARK_COUNT=$SPARK_COUNT is incompatible with EXL3_PAIRED_TP4"
-}
-
-# Historical name kept for the ignored runs/ harnesses: it delegates to the
-# generic validator, so under this alias a SPARK_COUNT=3 launch with no
-# SPARK_TP/SPARK_EP keys is compact TP3, and an explicit native TP3EP1 launch
-# bypasses the compact rules entirely (release_spark_compact_active is false).
-release_validate_compact_tp2() {
-  release_validate_compact_spark
-}
 
 release_spark_values() {
   local field="$1" i name
@@ -1433,10 +1418,15 @@ release_validate_spark_topology() {
 
   [[ "$SPARK_COUNT" =~ ^[1-8]$ ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..8"
+  if [[ "$EXPERT_FORMAT" == exl3 ]]; then
+    [[ "$SPARK_TP" == 3 && "$SPARK_EP" == 1 && "$SPARK_COUNT" == 3 ]] ||
+      release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native except compact EXL3 TP3EP1"
+    [[ "$SPARKINFER_EXL3" != disable ]] ||
+      release_die "compact EXL3 TP3EP1 requires SPARKINFER_EXL3=auto or force"
+    return 0
+  fi
   [[ "$EXPERT_FORMAT" == native ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native"
-  [[ "$EXL3_PAIRED_TP4" == off ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP is a native topology; EXL3_PAIRED_TP4 must be off"
   [[ "$SPARKINFER_EXL3" == disable ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires SPARKINFER_EXL3=disable"
   ((SPARK_TP * SPARK_EP == SPARK_COUNT)) ||

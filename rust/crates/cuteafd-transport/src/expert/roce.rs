@@ -559,9 +559,9 @@ mod tests {
             }
         }
         assert_eq!(receiver.received_rows(), [2, 2, 0, 0]);
-        let mut paired = owned;
-        paired.header.flags |= super::super::V41_EXL3_PAIRED_REQUEST_FLAG;
-        assert!(V41Tp4ChunkReceiver::from_owned_ranks(&paired, 2, &[11, 27], 200_000).is_err());
+        let mut reserved = owned;
+        reserved.header.flags |= 1 << 17;
+        assert!(V41Tp4ChunkReceiver::from_owned_ranks(&reserved, 2, &[11, 27], 200_000).is_err());
         Ok(())
     }
 
