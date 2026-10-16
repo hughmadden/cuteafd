@@ -5235,7 +5235,8 @@ impl<'a> GlmfEngine<'a> {
         // All lane producers are queued before a terminal wait can block the
         // peer stream (in particular the next lane's fused TP2 publication).
         if let Some(peers) = &peer_workspaces {
-            for (lane, w) in workspaces.iter().enumerate() {
+            // Warm-up may have cached more workspaces than this request uses.
+            for (lane, w) in workspaces.iter().take(lanes.len()).enumerate() {
                 self.replicate_terminal(w, peers.get(lane)?, 0, count_of(lane))?;
             }
         }
@@ -5544,6 +5545,28 @@ mod tp2_tests {
 mod prefill_lane_tests {
     use super::{prefill_lane_capacity, prefill_lane_plan, KdaState, DEFAULT_PREFILL_LANES, MAX_PREFILL_LANES,
         MIN_LANE_ROWS, PAGE_ROWS};
+
+    #[test]
+    fn terminal_replication_uses_active_lanes_not_cached_workspaces() {
+        let workspaces = ["warmed-lane0", "warmed-lane1"];
+        let peers = ["peer-lane0", "peer-lane1"];
+        for lanes in [vec![17], vec![17, 31]] {
+            let replicated: Vec<_> = workspaces.iter().take(lanes.len()).enumerate()
+                .map(|(lane, w)| (*w, peers[lane], lanes[lane])).collect();
+            assert_eq!(replicated.len(), lanes.len());
+            assert_eq!(replicated[0], ("warmed-lane0", "peer-lane0", 17));
+            if lanes.len() == 2 {
+                assert_eq!(replicated[1], ("warmed-lane1", "peer-lane1", 31));
+            }
+        }
+        // Bind the CPU fixture to the terminal loop that must not visit a
+        // warmed but inactive lane (GPU buffers cannot be built in this test).
+        let source = include_str!("engine.rs").split("\n#[cfg(test)]").next().unwrap();
+        let terminal = source.split("// All lane producers are queued before a terminal wait").nth(1).unwrap()
+            .split("self.finish_route_checks()?").next().unwrap();
+        assert!(terminal.contains("workspaces.iter().take(lanes.len()).enumerate()"));
+        assert!(terminal.contains("self.replicate_terminal(w, peers.get(lane)?, 0, count_of(lane))?"));
+    }
 
     #[test]
     fn kda_state_selects_its_programs_and_element_size() {
