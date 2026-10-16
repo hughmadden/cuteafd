@@ -1417,6 +1417,20 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_matrix_resolves_one_pinned_card_per_pro_cell() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let placed = scan(&root).unwrap();
+        let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
+        let rows = select(&placed, &matrix).unwrap();
+        assert_eq!(rows.len(), 14);
+        for row in rows {
+            assert!(matches!(row.cells[0], Resolved::Pending(_)));
+            assert!(matches!(row.cells[1], Resolved::Card(_)));
+            assert!(matches!(row.cells[2], Resolved::Card(_)));
+        }
+    }
+
+    #[test]
     fn publication_rows_carry_a_hardware_label() {
         let mut labelled_row = marked("labelled-min", 1, None);
         marker(&mut labelled_row, "qualification.hardware-label", "vision on RTX0, fixed pool");
