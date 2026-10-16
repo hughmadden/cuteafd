@@ -169,9 +169,11 @@ impl BlockDsparkConfig {
     pub fn from_json(raw: &Value) -> Result<Self, DsparkConfigError> {
         use DsparkConfigError::Unsupported;
         let speculators = raw["speculators_model_type"] == "dspark";
-        let specforge = raw["architectures"]
-            .as_array()
-            .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel"));
+        // Speculators also advertises DSparkDraftModel; its explicit dialect wins.
+        let specforge = !speculators
+            && raw["architectures"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v == "DSparkDraftModel"));
         if !speculators && !specforge {
             return Err(Unsupported(
                 "expected DSparkDraftModel or speculators_model_type=dspark".into(),
@@ -329,6 +331,59 @@ mod tests {
             "markov_rank":256,"markov_head_type":"vanilla","enable_confidence_head":true,
             "confidence_head_with_markov":true,"num_target_layers":64,
             "dflash_config":{"projector_type":"dspark","mask_token_id":248077,"target_layer_ids":[4,16,28,40,52]}})
+    }
+
+    // RedHatAI/GLM-5.3-Flash-speculator.dspark-preview, revision 1972f1f0:
+    // both dialect markers are present in the checkpoint's own config.
+    fn glm_flash_speculators() -> Value {
+        json!({"architectures":["DSparkDraftModel"],
+            "speculators_model_type":"dspark","target_hidden_size":null,
+            "aux_hidden_state_layer_ids":[20,28,32,36,40,44],"block_size":8,
+            "confidence_head_with_markov":true,"draft_vocab_size":154880,
+            "enable_confidence_head":true,"markov_head_type":"vanilla","markov_rank":256,
+            "mask_token_id":154856,"sample_from_anchor":true,"sliding_window_non_causal":false,
+            "transformer_layer_config":{"attention_bias":false,"head_dim":64,
+                "hidden_act":"silu","hidden_size":4096,"intermediate_size":12288,
+                "layer_types":["sliding_attention","sliding_attention","sliding_attention",
+                    "sliding_attention","sliding_attention"],"max_position_embeddings":1048576,
+                "model_type":"qwen3","num_attention_heads":64,"num_hidden_layers":5,
+                "num_key_value_heads":64,"rms_norm_eps":1e-5,
+                "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},
+                "sliding_window":2048,"use_sliding_window":true,"vocab_size":154880}})
+    }
+
+    #[test]
+    fn speculators_architecture_marker_does_not_require_specforge_projector() {
+        let c = BlockDsparkConfig::from_json(&glm_flash_speculators()).unwrap();
+        assert_eq!((c.hidden, c.intermediate, c.layers), (4096, 12288, 5));
+        assert_eq!((c.heads, c.kv_heads, c.head_dim), (64, 64, 64));
+        assert_eq!(
+            (c.block, c.rank, c.vocab, c.mask_token),
+            (8, 256, 154880, 154856)
+        );
+        assert_eq!(c.taps, vec![19, 27, 31, 35, 39, 43]);
+        assert_eq!(c.window, Some(2048));
+        assert!(c.causal);
+        assert_eq!(
+            c.rope,
+            DsparkRope::Default {
+                rope_theta: 10000.0
+            }
+        );
+
+        // Dialect selection must not bypass Speculators' semantic checks.
+        for (field, value) in [
+            ("sample_from_anchor", json!(false)),
+            ("draft_vocab_size", json!(154879)),
+            ("confidence_head_with_markov", json!(false)),
+        ] {
+            let mut raw = glm_flash_speculators();
+            raw[field] = value;
+            assert!(BlockDsparkConfig::from_json(&raw).is_err(), "{field}");
+        }
+        let mut raw = glm_flash_speculators();
+        raw["transformer_layer_config"]["hidden_act"] = json!("gelu");
+        assert!(BlockDsparkConfig::from_json(&raw).is_err());
     }
 
     #[test]
