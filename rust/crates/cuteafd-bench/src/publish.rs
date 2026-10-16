@@ -387,7 +387,11 @@ fn card_for<'a>(placed: &'a [Placed], row: &MatrixRow, column: Column, pinned: O
         placed.iter().filter(|p| {
             let report = &p.report;
             let in_column = match column {
-                Column::Rtx5090 => report.server.column_5090(),
+                Column::Rtx5090 => report.server.column_5090()
+                    && report.server.hardware.used_gpus() == 1
+                    && report.server.hardware.gpus.iter()
+                        .filter(|g| g.used || !report.server.hardware.gpus.iter().any(|g| g.used))
+                        .all(|g| g.name.contains("RTX 5090")),
                 Column::OneRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 1,
                 Column::TwoRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 2,
             };
@@ -802,6 +806,11 @@ mod tests {
 
     /// A publication marker: cell selection reads report data, never a directory name.
     fn marker(p: &mut Placed, name: &str, value: &str) {
+        if name == "hardware.class" && value == "5090" {
+            for gpu in &mut p.report.server.hardware.gpus {
+                gpu.name = "NVIDIA GeForce RTX 5090".into();
+            }
+        }
         p.report.server.configuration.settings.push(crate::report::Setting {
             name: name.into(), value: Some(value.into()), default: None, source: "publication".into(),
         });
@@ -983,6 +992,12 @@ mod tests {
         let real = marked("real", 1, Some(("hardware.class", "5090")));
         let matrix = v41_row([Cell::current(), Cell::pending("no PRO card"), Cell::pending("no dual card")]);
         assert!(select(&[sim.clone()], &matrix).is_err());
+        let mut mislabelled = real.clone();
+        mislabelled.report.server.hardware.gpus[0].name = "NVIDIA RTX PRO 6000 Blackwell".into();
+        assert!(select(&[mislabelled], &matrix).is_err());
+        let mut dual = real.clone();
+        dual.report.server.hardware.gpus.push(dual.report.server.hardware.gpus[0].clone());
+        assert!(select(&[dual], &matrix).is_err());
         assert_eq!(cards(&select(&[sim.clone(), real], &matrix).unwrap()[0])[0], Some("real"));
         assert!(index(&[sim]).contains("sim/report.svg"));
     }

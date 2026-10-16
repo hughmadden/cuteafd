@@ -982,10 +982,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true
@@ -1029,10 +1028,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true
@@ -1066,10 +1064,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true
@@ -1109,10 +1106,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true
@@ -1146,10 +1142,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true
@@ -1183,10 +1178,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true
@@ -1220,10 +1214,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true
@@ -1257,10 +1250,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true
@@ -1291,10 +1283,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true
@@ -1328,10 +1319,9 @@
       },
       "precheck": {
         "argv": [
-          "nvidia-smi",
-          "--query-gpu=name",
-          "--format=csv,noheader",
-          "--id=0"
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
         ],
         "timeout_s": 30,
         "required": true

@@ -10,8 +10,8 @@ Usage: ./push-containers.sh [--config FILE] [--no-latest | --latest] TAG
 
 Tags and pushes the current coordinator and Spark inference images to GHCR.
 The supplied release tag is published for both images. Stable tags also update
-latest; tags containing -rc never do unless --latest is explicitly passed.
---no-latest disables latest for any tag. The
+latest; release-candidate tags (rc, case-insensitive) never update latest.
+--latest is refused for release candidates. --no-latest disables latest for any tag. The
 coordinator image is local; the Spark image is published from SPARK_0_HOST.
 The Spark image must advertise the V41 expert roles it carries (./build.sh bakes
 the universal tp2;tp3;tp6 set by default); a role-less legacy build is rejected.
@@ -82,9 +82,11 @@ done
   release_die "invalid Docker tag: $tag"
 [[ "$tag" != latest ]] ||
   release_die "provide a version tag, not latest"
-if [[ "$latest" == auto ]]; then
+if [[ "${tag,,}" == *rc* ]]; then
+  [[ "$latest" != on ]] || release_die "release-candidate tags cannot update latest"
+  latest=off
+elif [[ "$latest" == auto ]]; then
   latest=on
-  [[ "$tag" != *-rc* ]] || latest=off
 fi
 
 release_load_config "$config"

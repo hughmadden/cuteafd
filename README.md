@@ -53,8 +53,8 @@ Full notes: [v2.0.0 release](https://github.com/tpurtell/cuteafd/releases/tag/v2
 ## Models
 
 Basic profile per model and quant on the natural minimum (1× RTX + the fewest
-Sparks) and maximum (2× RTX + 4 or 6 Sparks). The 5090 column is simulated on a
-memory-capped RTX PRO 6000 until real cards arrive.
+Sparks) and maximum (2× RTX + 4 or 6 Sparks). The 5090 column publishes only
+real RTX 5090 measurements; cells stay pending until those exports arrive.
 
 <!-- results:begin -->
 <table>

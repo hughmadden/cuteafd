@@ -18,8 +18,7 @@ logs and build outputs outside Git. No dense Qwen, Step-5 or V4.1 EXL3 card.
    with both inference images tagged `v3.0.0-rc1` and both build roots on
    guarded NVMe. `./build.sh --config "$BUILD_CONFIG"` builds both legs.
    `./push-containers.sh --config "$BUILD_CONFIG" --no-latest v3.0.0-rc1`
-   publishes only the RC tags; RC tags default to no latest even without the
-   flag. `git tag -a v3.0.0-rc1 -m 'v3 release candidate 1' && git push origin v3.0.0-rc1`.
+   publishes only the RC tags; all RC spellings refuse `--latest`. `git tag -a v3.0.0-rc1 -m 'v3 release candidate 1' && git push origin v3.0.0-rc1`.
 3. **Smoke:** copy `scripts/bench/release-smoke-v3.json` to private
    `$MATRIX`; replace image/build placeholders and portable Spark names/lanes.
    Split it by hardware before running: 32 PRO/reference entries locally,
@@ -38,12 +37,18 @@ logs and build outputs outside Git. No dense Qwen, Step-5 or V4.1 EXL3 card.
    accepting exports; inability to admit the mixed reference blocks that card.
 4. **V4.1 parity (blocks cut):** in a fabric-quiet window, use private
    `$V2_CHECKOUT`/`$RC_CHECKOUT` configs pinned to the respective image pairs,
-   and the same prompts/config per layout. The existing runner uses ABBA
-   order; six launches give three matched pairs on each min/max layout.
+   and the same prompts/config per layout. Private `$V2_MIN`/`$RC_MIN`
+   configs use 1 RTX + 3 Sparks; `$V2_MAX`/`$RC_MAX` use 2 RTX + 4 Sparks.
+   The runner uses ABBA order; six launches give three matched pairs per layout.
    ```sh
-   scripts/bench/bench-ab.py --label v3-v41-parity \
-     --arm v2="$V2_CHECKOUT" --arm rc="$RC_CHECKOUT" \
-     --layouts 1 2 --sessions 6 --concurrency 1 16
+   scripts/bench/bench-ab.py --label v3-v41-parity-min \
+     --arm v2="$V2_CHECKOUT" --arm rc="$RC_CHECKOUT" --layouts 1 \
+     --arm-arg "v2=--config $V2_MIN" --arm-arg "rc=--config $RC_MIN" \
+     --sessions 6 --concurrency 1 16
+   scripts/bench/bench-ab.py --label v3-v41-parity-max \
+     --arm v2="$V2_CHECKOUT" --arm rc="$RC_CHECKOUT" --layouts 2 \
+     --arm-arg "v2=--config $V2_MAX" --arm-arg "rc=--config $RC_MAX" \
+     --sessions 6 --concurrency 1 16
    ```
    Bar (RC/v2.0.0): **C1 >= 0.99; C16 and 8K prefill >= 0.98; no fidelity
    regression**. `bench-ab.py` supplies decode only, not 8K/fidelity. For
@@ -56,9 +61,14 @@ logs and build outputs outside Git. No dense Qwen, Step-5 or V4.1 EXL3 card.
    `scripts/bench/bench-agentic-session.py record --base-url "$URL" --output "$RECORDING"`,
    then replay identical histories on both layouts:
    ```sh
-   scripts/bench/bench-ab.py --label v3-agentic --battery agentic \
+   scripts/bench/bench-ab.py --label v3-agentic-min --battery agentic \
      --agentic-recording "$RECORDING" --arm v2="$V2_CHECKOUT" \
-     --arm rc="$RC_CHECKOUT" --layouts 1 2 --sessions 6 --concurrency 1 4
+     --arm rc="$RC_CHECKOUT" --layouts 1 --sessions 6 --concurrency 1 4 \
+     --arm-arg "v2=--config $V2_MIN" --arm-arg "rc=--config $RC_MIN"
+   scripts/bench/bench-ab.py --label v3-agentic-max --battery agentic \
+     --agentic-recording "$RECORDING" --arm v2="$V2_CHECKOUT" \
+     --arm rc="$RC_CHECKOUT" --layouts 2 --sessions 6 --concurrency 1 4 \
+     --arm-arg "v2=--config $V2_MAX" --arm-arg "rc=--config $RC_MAX"
    ```
    Report prefix-cache hit tokens and admitted pool alongside session results.
 6. **Publish results:** update `benchmarks/current-matrix.json` PRO report

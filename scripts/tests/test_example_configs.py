@@ -294,6 +294,25 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
     assert not any(private in text for private in PRIVATE)
 
 
+@pytest.mark.parametrize("gpu_name,expected", [
+    ("NVIDIA GeForce RTX 5090", 0),
+    ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 1),
+])
+def test_v3_5090_precheck_requires_real_hardware(tmp_path: Path, gpu_name: str, expected: int) -> None:
+    matrix = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
+    probe = tmp_path / "nvidia-smi"
+    probe.write_text(f"#!/bin/sh\nprintf '%s\\n' '{gpu_name}'\n")
+    probe.chmod(0o755)
+    for entry in matrix["entries"]:
+        if not entry["name"].endswith("-5090"):
+            continue
+        hook = entry["precheck"]
+        assert hook["required"]
+        result = subprocess.run(hook["argv"], env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+                                timeout=hook["timeout_s"], check=False)
+        assert result.returncode == expected, entry["name"]
+
+
 def test_published_matrix_pins_current_reports_and_keeps_5090_pending() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     for row in matrix["cells"]:
