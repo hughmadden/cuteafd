@@ -126,7 +126,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     }
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
-        args.available_sparks = (0..8).take_while(|rank|
+        args.available_sparks = (0..6).take_while(|rank|
             cfg.get(&format!("SPARK_{rank}_HOST")).is_some_and(|host| !host.is_empty())).count();
         if args.spark_ranks.is_none() {
             let count = cfg.get("SPARK_COUNT").filter(|v| !v.is_empty())
@@ -319,7 +319,7 @@ fn launch_config(path: Option<&std::path::Path>) -> Result<std::collections::BTr
 
 fn spark_hosts_count(cfg: &std::collections::BTreeMap<String, String>) -> Result<Option<usize>> {
     let Some(hosts) = cfg.get("SPARK_HOSTS").filter(|value| !value.is_empty()) else { return Ok(None) };
-    let configured: std::collections::BTreeSet<&str> = (0..8)
+    let configured: std::collections::BTreeSet<&str> = (0..6)
         .filter_map(|rank| cfg.get(&format!("SPARK_{rank}_HOST")).map(String::as_str)).collect();
     let pool = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"];
     let mut seen = std::collections::BTreeSet::new();

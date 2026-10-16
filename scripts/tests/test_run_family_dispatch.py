@@ -516,7 +516,7 @@ report = json.loads(os.environ["STUB_ENCODER_PLAN"])
 report.update(spark_ranks=ranks)
 gpus = int(value("--rtx", "1"))
 print(json.dumps(dict(report, version=1, family=family, executable=True, rtx_gpus=gpus,
-    topology=dict(tp=tp, ep=ep, explicit=explicit,
+    topology=dict(tp=tp, ep=ep,
                   wire="native_ownership" if explicit else "canonical"), peers=peers,
     speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),

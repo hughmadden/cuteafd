@@ -20,18 +20,18 @@ class CompactSparkTopologyTest(unittest.TestCase):
                 'source scripts/lib/release-common.sh; release_load_config "$1"; ' + command,
                 'test', str(config)], cwd=ROOT, text=True, capture_output=True)
 
-    def test_planner_wire_is_mandatory_and_not_inferred_from_explicit(self):
+    def test_planner_wire_is_mandatory(self):
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         body = source.split('spark_wire="$(jq -er', 1)[1].split('\nrelease_validate_spark_topology', 1)[0]
         body = 'spark_wire="$(jq -er' + body
-        for wire, explicit, status, expected in [
-            ('canonical', True, 0, '0::'),
-            ('native_ownership', False, 0, '1:3:1'),
-            ('unqualified', True, 2, None),
-            (None, True, 1, None),
+        for wire, status, expected in [
+            ('canonical', 0, '0::'),
+            ('native_ownership', 0, '1:3:1'),
+            ('unqualified', 2, None),
+            (None, 1, None),
         ]:
-            with self.subTest(wire=wire, explicit=explicit):
-                topology = dict(tp=3, ep=1, explicit=explicit)
+            with self.subTest(wire=wire):
+                topology = dict(tp=3, ep=1)
                 if wire is not None:
                     topology['wire'] = wire
                 script = ('source scripts/lib/release-common.sh; count_plan="$1"; '

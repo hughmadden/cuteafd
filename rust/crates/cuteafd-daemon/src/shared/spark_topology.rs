@@ -57,7 +57,8 @@ pub(crate) fn world(topology: Option<SparkTopology>, ranks: usize) -> Result<Spa
         None => SparkWorld::canonical(ranks)?,
     };
     ensure!(world.topology().world_size() == ranks,
-        "Spark world differs from the declared physical rank count");
+        "declared Spark topology {}x{} needs {} physical ranks but {ranks} were given",
+        world.topology().tp(), world.topology().ep(), world.topology().world_size());
     Ok(world)
 }
 
@@ -76,7 +77,8 @@ pub(crate) fn require_supported(
         } else {
             catalog.nvfp4().is_none()
                 || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))
-        }, "unsupported Spark ownership wire for this checkpoint");
+        }, "unsupported Spark ownership wire {}x{} for this checkpoint; supported: native experts on TP2EP1, TP3EP1, TP4EP1, TP6EP1, TP2EP2, TP3EP2, TP2EP3; NVFP4 on TP3EP1, TP4EP1, TP6EP1; compact V4.1 EXL3 on TP3EP1",
+            topology.tp(), topology.ep());
         SparkWorld::owned(topology)?;
     }
     Ok(())
@@ -139,6 +141,25 @@ mod tests {
     }
 
     #[test]
+    fn ownership_refusal_names_requested_and_supported_layouts() -> Result<()> {
+        for exl3 in [false, true] {
+            let root = tempfile::tempdir()?;
+            if exl3 {
+                cuteafd_loader::plan::testing::write_v41_exl3_snapshot(root.path(), 3);
+            } else {
+                cuteafd_loader::plan::testing::write_v41_nvfp4_snapshot(root.path());
+            }
+            let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+            let error = require_supported(Some(SparkTopology::NATIVE_TP2_EP1), &catalog)
+                .unwrap_err().to_string();
+            assert!(error.contains("ownership wire 2x1"), "{error}");
+            assert!(error.contains("NVFP4 on TP3EP1, TP4EP1, TP6EP1"), "{error}");
+            assert!(error.contains("compact V4.1 EXL3 on TP3EP1"), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn checkpoint_recipe_refuses_unqualified_generic_world() -> Result<()> {
         use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
         let root = tempfile::tempdir()?;
@@ -170,7 +191,9 @@ mod tests {
         assert!(canonical.supports_device_exchange());
         assert_eq!(canonical.topology(), SparkTopology::NATIVE_TP4_EP1);
         assert!(!world(Some(SparkTopology::NATIVE_TP4_EP1), 4).unwrap().supports_device_exchange());
-        assert!(world(Some(SparkTopology::NATIVE_TP3_EP1), 4).is_err());
+        let error = world(Some(SparkTopology::NATIVE_TP3_EP1), 4).unwrap_err().to_string();
+        assert!(error.contains("topology 3x1"), "{error}");
+        assert!(error.contains("needs 3 physical ranks but 4 were given"), "{error}");
         for count in [0, 7, 8] { assert!(world(None, count).is_err()); }
     }
 

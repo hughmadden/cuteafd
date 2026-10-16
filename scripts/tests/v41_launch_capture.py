@@ -128,7 +128,7 @@ if tool == "docker":
                 report=report, spark_admission="coordinator_authoritative",
                 launch={"family": family, "first_expert_layer": int(os.environ.get("CAPTURE_FIRST_LAYER", "0")),
                         "last_expert_layer": json.loads(os.environ.get("CAPTURE_LAST_LAYER", "null"))},
-                topology={"tp": tp, "ep": ep, "explicit": explicit_topology,
+                topology={"tp": tp, "ep": ep,
                           "wire": "native_ownership" if explicit_topology else "canonical"},
                 artifact_requirements={"spark_tp_role": f"tp{tp}" if family == "deepseek_v41" and not exl3 and explicit_topology and tp != 4 else None},
                 speculator=value("--speculator"),
