@@ -1262,9 +1262,13 @@ mod tests {
     fn draft_inventory_keeps_dspark_local_and_category_separated() {
         use crate::families::glm5::draft_representation::GlmDraftRepresentation;
         let config = serde_json::json!({"speculators_model_type":"dspark", "block_size":4, "markov_rank":256,
-            "aux_hidden_state_layer_ids":[0,8,16,24,32], "transformer_layer_config":{
+            "aux_hidden_state_layer_ids":[1,9,17,25,33], "markov_head_type":"vanilla",
+            "sample_from_anchor":true, "enable_confidence_head":true, "confidence_head_with_markov":true,
+            "draft_vocab_size":154880, "mask_token_id":154000, "transformer_layer_config":{
                 "hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":3, "num_attention_heads":32,
-                "num_key_value_heads":8, "head_dim":64, "vocab_size":154880}});
+                "num_key_value_heads":8, "head_dim":64, "vocab_size":154880, "rms_norm_eps":1e-6,
+                "rope_parameters":{"rope_type":"default","rope_theta":10000.0}, "hidden_act":"silu",
+                "layer_types":["sliding_attention","sliding_attention","sliding_attention"], "sliding_window":2048}});
         let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);

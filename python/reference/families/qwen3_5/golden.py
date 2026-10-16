@@ -39,6 +39,33 @@ def verify_reference_source(source):
             "modeling_sha256": actual}
 
 
+def parse_tap_layers(value):
+    layers = [int(part) for part in value.split(",")] if value else []
+    if any(layer < 0 for layer in layers) or len(set(layers)) != len(layers):
+        raise argparse.ArgumentTypeError("tap layers must be distinct zero-based block ids")
+    return layers
+
+
+def capture_taps(model, layers, folder):
+    """Persist only requested post-block outputs, not all 64 target activations."""
+    import torch
+    blocks = model.model.language_model.layers
+    if any(layer >= len(blocks) for layer in layers):
+        raise ValueError("requested tap exceeds target decoder blocks")
+    handles = []
+    def capture(layer):
+        def save(_module, _inputs, output):
+            value = output[0] if isinstance(output, tuple) else output
+            if value.dtype != torch.bfloat16 or value.ndim != 3 or value.shape[0] != 1:
+                raise ValueError("dense taps require BF16 [1, tokens, hidden]")
+            value.detach().cpu().contiguous().view(torch.uint16).numpy().astype("<u2").tofile(
+                folder / f"layer{layer:02d}.bin")
+        return save
+    for layer in layers:
+        handles.append(blocks[layer].register_forward_hook(capture(layer)))
+    return handles
+
+
 def run_windows(args, model, identity, provenance):
     import numpy as np
     import torch
@@ -54,7 +81,15 @@ def run_windows(args, model, identity, provenance):
             ids = torch.tensor([window["tokens"]], dtype=torch.long, device="cuda:0")
             start = window["score_from"]
             positions = torch.arange(start - 1, len(window["tokens"]) - 1, device="cuda:0")
-            logits = model(input_ids=ids, use_cache=False, logits_to_keep=positions).logits[0].float()
+            folder = args.out / "windows" / window["id"]
+            folder.mkdir(parents=True, exist_ok=True)
+            taps = getattr(args, "tap_layers", [])
+            hooks = capture_taps(model, taps, folder) if taps else []
+            try:
+                logits = model(input_ids=ids, use_cache=False, logits_to_keep=positions).logits[0].float()
+            finally:
+                for hook in hooks:
+                    hook.remove()
             if not torch.isfinite(logits).all():
                 raise ValueError("non-finite golden logits")
             # Bound the FP64 scoring workspace, independently of reference inference.
@@ -63,6 +98,9 @@ def run_windows(args, model, identity, provenance):
                 reduction="sum").item() for i in range(0, len(logits), 32))
             entry = write_scored_logits(args.out, window, logits.cpu().numpy().astype(np.float32))
             entry.update(nll=total / len(logits), scored_tokens=len(logits))
+            if taps:
+                entry.update(tap_layers=taps, tap_streams=1, hidden=model.config.text_config.hidden_size,
+                             logits_start=start - 1, tap_dtype="bf16", tap_semantics="zero-based-post-block")
             folder = args.out / entry["path"]
             (folder / "meta.json").write_text(json.dumps(entry, sort_keys=True) + "\n")
             rows.append(entry)
@@ -81,6 +119,8 @@ def main():
     parser.add_argument("--windows", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--check-only", action="store_true", help="CPU-only snapshot/source preflight")
+    parser.add_argument("--tap-layers", type=parse_tap_layers, default=[],
+                        help="comma-separated zero-based post-block ids, e.g. 4,16,28,40,52")
     args = parser.parse_args()
     import torch
     import transformers
@@ -92,6 +132,10 @@ def main():
     qualification = qualification_reference()
     _, _, _, source = qualification.reference_identity(args.snapshot)
     source_pin = verify_reference_source(source)
+    text_config = json.loads((args.snapshot / "config.json").read_text())
+    text_config = text_config.get("text_config", text_config)
+    if any(layer >= text_config["num_hidden_layers"] for layer in args.tap_layers):
+        raise ValueError("requested tap exceeds target decoder blocks")
     if args.check_only:
         print(json.dumps({"preflight": "ok", "snapshot_identity": identity, "source_pin": source_pin}))
         return

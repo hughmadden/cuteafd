@@ -266,20 +266,32 @@ pub fn draft_resident_bytes_with_mode(config: &serde_json::Value, slots: usize, 
 
 fn dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
     representation: GlmDraftRepresentation, mode: u8) -> Result<(u64, u64), GlmDraftStorageError> {
-    let t = &config["transformer_layer_config"];
-    let field = |name: &str| t[name].as_u64().filter(|&v| v > 0)
-        .ok_or(GlmDraftStorageError::Unsupported("missing dSpark geometry"));
-    let (h, inter, layers, heads, kvh, dim, vocab) = (field("hidden_size")?, field("intermediate_size")?,
-        field("num_hidden_layers")?, field("num_attention_heads")?, field("num_key_value_heads")?,
-        field("head_dim")?, field("vocab_size")?);
-    let taps = config["aux_hidden_state_layer_ids"].as_array()
-        .ok_or(GlmDraftStorageError::Unsupported("missing dSpark taps"))?.len() as u64;
-    let block = config["block_size"].as_u64().filter(|&v| v > 0)
-        .ok_or(GlmDraftStorageError::Unsupported("missing dSpark block"))?;
+    block_dspark_resident_bytes(config, slots, sequences, sms, representation, mode, 2048)
+}
+
+/// Shared dSpark inventory for an explicitly admitted context capacity. The
+/// target embedding/head remain borrowed, never charged as owned draft weights.
+#[allow(clippy::too_many_arguments)]
+pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
+    representation: GlmDraftRepresentation, mode: u8, capacity: usize)
+    -> Result<(u64, u64), GlmDraftStorageError> {
+    if mode > 2 || sms == 0 || sms > 4096 {
+        return Err(GlmDraftStorageError::Unsupported("invalid draft scratch mode or SM count"));
+    }
+    let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)
+        .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark checkpoint"))?;
+    if capacity == 0 || cfg.window.is_some_and(|window| capacity != window)
+        || capacity.checked_add(cfg.block).is_none_or(|keys| keys > i32::MAX as usize)
+        || slots.checked_mul(capacity).is_none_or(|rows| rows > i32::MAX as usize) {
+        return Err(GlmDraftStorageError::Unsupported("invalid dSpark context admission"));
+    }
+    let (h, inter, layers, heads, kvh, dim, vocab) = (cfg.hidden as u64, cfg.intermediate as u64,
+        cfg.layers as u64, cfg.heads as u64, cfg.kv_heads as u64, cfg.head_dim as u64, cfg.vocab as u64);
+    let (taps, block, capacity) = (cfg.taps.len() as u64, cfg.block as u64, capacity as u64);
     if [h,inter,layers,heads,kvh,vocab,block,taps].iter().any(|&n| n > 1_000_000)
         || layers > 1024 || heads > 4096 || kvh > 4096 || taps > 1024 || block > 128
-        || dim != 64 || heads % kvh != 0 || heads / kvh * block > 32 || taps == 0
-        || config["markov_rank"] != 256 || sequences == 0 || sequences > slots {
+        || !matches!(dim, 64 | 128) || heads % kvh != 0 || taps == 0
+        || cfg.rank != 256 || sequences == 0 || sequences > 32 || sequences > slots {
         return Err(GlmDraftStorageError::Unsupported("invalid dSpark geometry or capacity"));
     }
     let q = mul(heads, dim)?;
@@ -293,9 +305,9 @@ fn dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: us
     }
     let weights = sum([mul(values, if fp8 { 1 } else { 2 })?, if fp8 { mul(values / 128,4)? } else { 0 },
         mul(2,add(mul(2,h)?,mul(layers,add(mul(2,h)?,mul(2,dim)?)?)?)?)?,
-        mul(4,mul(vocab,256)?)?, mul(vocab,4)?, mul(add(h,256)?,2)?.max(256),256])?;
+        mul(4,mul(vocab,256)?)?, mul(vocab,4)?, mul(add(h,256)?,2)?.max(256),256, if dim == 128 { dim * 2 } else { 0 }])?;
     let rows = mul(sequences as u64,block)?;
-    let owned = sum([mul(mul(mul(mul(4,layers)?,slots as u64)?,2048)?,kv)?,
+    let owned = sum([mul(mul(mul(mul(4,layers)?,slots as u64)?,capacity)?,kv)?,
         mul(2048,sum([mul(mul(taps,h)?,2)?,mul(h,4)?,mul(kv,4)?,12])?)?])?;
     let terms = [(rows,h,2),(rows,h,2),(rows,add(q,mul(2,kv)?)?,2),(rows,q,2),(rows,kv,2),
         (rows,kv,2),(rows,q,2),(rows,h,2),(rows,mul(2,inter)?,2),(rows,inter,2),(rows,vocab,4),
@@ -303,7 +315,7 @@ fn dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: us
     let mut workspace = 4 << 20;
     for (a,b,c) in terms { workspace = add(workspace,mul(mul(a,b)?,c)?.max(256))?; }
     let attention_scratch = crate::serving_capacity::draft_attention_workspace_bytes(
-        sequences as u64, kvh, 1, add(2048,block)?, 64, sms)
+        sequences as u64, kvh, (heads / kvh * block).div_ceil(32), add(capacity,block)?, dim, sms)
         .map_err(|_| GlmDraftStorageError::Overflow)?.max(256);
     workspace = add(workspace,add(mul(sequences as u64,296*8)?,mul(rows,4)?)?.max(256))?;
     let mut scratch_shapes = shapes.to_vec(); scratch_shapes.push((h,mul(2,kv)?));
@@ -323,6 +335,29 @@ mod tests {
             kv_heads: 8, head_dim: 128, taps: if flash { 5 } else { 6 }, vocab: 154880,
             conv_group: 16, selector_rank: 256,
         }
+    }
+
+    #[test]
+    fn full_context_dspark_inventory_scales_without_sliding_truncation() {
+        let config = serde_json::json!({"architectures":["DSparkDraftModel"],
+            "hidden_size":5120,"intermediate_size":10240,"num_hidden_layers":5,
+            "num_attention_heads":40,"num_key_value_heads":8,"head_dim":128,
+            "rms_norm_eps":1e-6,"rope_parameters":{"rope_type":"yarn","rope_theta":10000000.0,
+                "factor":32.0,"original_max_position_embeddings":8192,"beta_fast":32.0,"beta_slow":1.0},
+            "vocab_size":248320,"hidden_act":"silu","layer_types":vec!["full_attention";5],
+            "sliding_window":null,"block_size":7,"markov_rank":256,"markov_head_type":"vanilla",
+            "enable_confidence_head":true,"confidence_head_with_markov":true,"num_target_layers":64,
+            "dflash_config":{"projector_type":"dspark","mask_token_id":248077,
+                "target_layer_ids":[4,16,28,40,52]}});
+        let bytes = |capacity| block_dspark_resident_bytes(&config, 1, 1, 188,
+            GlmDraftRepresentation::Bf16Only, 0, capacity).unwrap();
+        let (small, _) = bytes(2048);
+        let (large, _) = bytes(8192);
+        assert_eq!(large - small, (8192 - 2048) * 5 * 2 * 8 * 128 * 2);
+        assert!(block_dspark_resident_bytes(&config, 1, 1, 188,
+            GlmDraftRepresentation::Bf16Only, 0, 0).is_err());
+        assert!(block_dspark_resident_bytes(&config, usize::MAX, 1, 188,
+            GlmDraftRepresentation::Bf16Only, 0, 8192).is_err());
     }
 
     #[test]
