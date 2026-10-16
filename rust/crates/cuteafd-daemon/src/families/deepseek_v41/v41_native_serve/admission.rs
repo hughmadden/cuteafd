@@ -5,7 +5,6 @@ use cuteafd_loader::placement::*;
 
 pub(super) const RUNTIME_HEADROOM: usize = 2 << 30;
 pub(super) const EXPERT_SETUP_HEADROOM: usize = 64 << 20;
-const SMALL_CARD_SAMPLE_MARGIN: usize = 32 << 20;
 
 pub(super) fn graph_reserve_bytes(total: usize, dual_gpu: Option<usize>) -> usize {
     assert!(dual_gpu.is_none_or(|gpu| gpu < 2));
@@ -25,40 +24,9 @@ pub(super) fn embedding_placement(
 }
 
 pub(super) fn measured_pool_memory(lib: &cuteafd_ffi::NativeLibrary) -> Result<(usize, usize)> {
-    let (free, total) = lib.cuda_memory_info()?;
-    if total > 32usize << 30 {
-        return Ok((free, total));
-    }
-    let device = lib.cuda_get_device()?;
-    let live = cuteafd_ffi::memory_ledger::snapshot()
-        .total(cuteafd_ffi::memory_ledger::Space::Device, device);
-    let occupied = total - free;
-    // Empirical small-card reserve, not a per-executable model: official V4.1 Flash,
-    // 31.8 GiB/C16 grew 1,107,296,256 bytes with six shapes, and 838,860,800
-    // with eight shapes plus bounded index selection, ready -> ten-batch plateau.
-    // The 2 GiB envelope also covers untracked driver/allocator growth;
-    // other shape sets still require their own warmed margin gate.
-    let graph_budget = std::env::var("CUTEAFD_V41_GRAPH_BUDGET_MIB")
-        .ok()
-        .map(|value| value.parse::<usize>())
-        .transpose()?
-        .unwrap_or(2048)
-        .checked_mul(1 << 20)
-        .context("V4.1 graph budget overflow")?;
-    let admitted_free = free
-        .checked_sub(SMALL_CARD_SAMPLE_MARGIN)
-        .and_then(|bytes| bytes.checked_sub(graph_budget))
-        .context("32 GB V4.1 startup leaves no room for the measured-pool and graph margins")?;
-    tracing::info!(
-        occupied_bytes = occupied,
-        tracked_owner_bytes = live,
-        measured_context_module_allocator_bytes = occupied.saturating_sub(live),
-        sample_margin_bytes = SMALL_CARD_SAMPLE_MARGIN,
-        graph_budget_bytes = graph_budget,
-        admitted_free_bytes = admitted_free,
-        "V4.1 measured CUDA occupancy charged before pool sizing"
-    );
-    Ok((admitted_free, total))
+    // The inventory is the raw CUDA observation. Graph/runtime growth and
+    // allocator margins are explicit solver demands, not fabricated occupancy.
+    Ok(lib.cuda_memory_info()?)
 }
 
 pub(super) fn startup_phase(
@@ -251,11 +219,6 @@ pub(super) fn admit_startup(
     // Geometry queries initialize native modules; sample their real CUDA cost
     // now, before reading weights, rather than using a card/driver constant.
     let (free, total) = measured_pool_memory(lib)?;
-    ensure!(
-        peak <= free,
-        "V4.1 startup refused before weights: peak {peak} bytes, free {free}, phases {loading_peaks:?}, owners {owners:?}; use --prefill-batch-tokens 256 or a larger coordinator"
-    );
-    let after = free.checked_sub(fixed).with_context(|| format!("V4.1 fixed startup owners need {fixed} bytes, free {free}; set --prefill-batch-tokens 256, --rtx-expert-layers 0 or use a larger coordinator; owners {owners:?}"))?;
     let expert_rows = cuteafd_core::coordinator_programs::v41_aot_rows(capacity)
         .context("invalid local expert capacity")?;
     let experts = if args.rtx_expert_layers == LocalLayers::Count(0) {
@@ -264,7 +227,14 @@ pub(super) fn admit_startup(
         expert_demands(lib, catalog, expert_rows, 1)?
     };
     let workspace = local_workspace(lib, catalog, args, expert_rows)?;
-    let pool = resolve(args, &[(after, total)], experts, workspace, &[0], 0)
+    let fixed_demands = owners.iter().map(|(name, bytes)| Demand::new(0,
+        cuteafd_core::memory_layout::Category::Workspace, *name, *bytes as u64,
+        cuteafd_core::memory_layout::Basis::Formula)).collect::<Vec<_>>();
+    let startup = loading_peaks.iter().map(|(name, bytes)| Demand::new(0,
+        cuteafd_core::memory_layout::Category::Staging, *name, *bytes as u64,
+        cuteafd_core::memory_layout::Basis::Formula)).collect::<Vec<_>>();
+    let pool = resolve_with_owners(args, &[(free, total)], experts, workspace, &[0], 0,
+        &fixed_demands, &startup, None)
         .with_context(|| format!("V4.1 startup refused before weights: fixed-owner bound {fixed}, owners {owners:?}; use --prefill-batch-tokens 256 or increase coordinator memory"))?;
     tracing::info!(fixed_owner_bound_bytes=fixed, startup_peak_bound_bytes=peak, loading_phases=?loading_peaks, owners=?owners, admitted_cache_bytes=?pool.cache_bytes,
         "V4.1 complete startup admission before weight loads");
@@ -389,6 +359,8 @@ pub(super) fn local_workspace(
         .context("local serving lanes overflow")? as u64)
 }
 
+/// With `draft`, the sample must precede all draft weights, runtime buffers and
+/// the draft-mark arena. `None` is for samples that already contain those owners.
 pub(super) fn resolve(
     args: &crate::cli::NativeServeArgs,
     memory: &[(usize, usize)],
@@ -396,6 +368,23 @@ pub(super) fn resolve(
     workspace: u64,
     deferred: &[u64],
     minimum: usize,
+    draft: Option<&families::deepseek_v41::DraftInventory>,
+) -> Result<Admitted> {
+    resolve_with_owners(args, memory, experts, workspace, deferred, minimum, &[], &[], draft)
+}
+
+/// `startup` contains full sequential peaks above `memory`, never staging-only
+/// deltas. Draft owners supplied separately must not also appear in `owners`.
+pub(super) fn resolve_with_owners(
+    args: &crate::cli::NativeServeArgs,
+    memory: &[(usize, usize)],
+    experts: Vec<ExpertCost>,
+    workspace: u64,
+    deferred: &[u64],
+    minimum: usize,
+    owners: &[Demand],
+    startup: &[Demand],
+    draft: Option<&families::deepseek_v41::DraftInventory>,
 ) -> Result<Admitted> {
     use cuteafd_core::memory_layout::{Basis, Category};
     let ranks = memory.len();
@@ -439,10 +428,7 @@ pub(super) fn resolve(
                 ceiling = ceiling.min((total as u128 * 97 / 100) as usize);
             }
             ceilings.push(ceiling);
-            let runtime =
-                families::deepseek_v41::runtime_reserve(total as u64, ranks, automatic) as usize;
-            let headroom =
-                total - ceiling + runtime + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
+            let headroom = total - ceiling;
             Ok(GpuBudget {
                 capacity_bytes: total as u64,
                 headroom_bytes: headroom as u64,
@@ -477,12 +463,11 @@ pub(super) fn resolve(
         pool.target = pool.target.max(pool.floor);
     }
     pool.ceiling = pool.requested.unwrap_or(pool.target).div_ceil(512) * 512;
-    let onboard = match args.rtx_expert_layers {
-        LocalLayers::Auto => Onboard::Auto,
-        LocalLayers::Count(n) => Onboard::Layers(n),
-    };
-    let mut fixed = Vec::new();
+    let onboard = args.rtx_expert_layers.onboard();
+    let mut fixed = owners.to_vec();
     for gpu in 0..ranks {
+        fixed.extend(families::deepseek_v41::growth_demands(memory[gpu].1 as u64, ranks,
+            automatic, gpu as u8));
         if deferred[gpu] > 0 {
             fixed.push(Demand::new(
                 gpu as u8,
@@ -507,6 +492,10 @@ pub(super) fn resolve(
         onboard,
     );
     req.fixed = fixed;
+    req.startup = startup.to_vec();
+    if let Some(draft) = draft {
+        req.movables.push(families::deepseek_v41::drafter(draft, ranks)?);
+    }
     req.minimum_expert_layers = minimum;
     let config = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
     families::deepseek_v41::cache_demands(
@@ -790,7 +779,7 @@ mod admission_tests {
                 .flat_map(|(k, n)| {
                     [1, 16, 80, 256, 1024, 4096].map(|c| {
                         json!({"capacity":c,"input_dim":k,
-                "output_dim":n,"scratch_bytes":c+1})
+                "output_dim":n,"label":format!("shared_{k}_{n}_m{c}"),"scratch_bytes":c+1})
                     })
                 })
                 .collect::<Vec<_>>();
@@ -898,7 +887,7 @@ mod admission_tests {
                         let fp8 = serde_json::from_slice(&std::fs::read(
                             share.join("V41_FP8_AOT.json"),
                         )?)?;
-                        workspace += families::deepseek_v41::shared_workspace(&fp8, 256)?
+                        workspace += families::deepseek_v41::shared_workspace(&fp8, 256, 188)?
                             + 256 * (10240 + 5280 + 24 + 24 + 10240);
                     }
                     let admitted = resolve(
@@ -907,7 +896,7 @@ mod admission_tests {
                         experts,
                         2 * workspace,
                         &vec![0; ranks],
-                        usize::from(ranks == 2),
+                        usize::from(ranks == 2), None,
                     )?;
                     assert_eq!(
                         layout.pool_tokens, admitted.placement.pool_tokens,
@@ -943,6 +932,98 @@ mod admission_tests {
     }
 
     #[test]
+    fn max_admits_experts_first_through_the_shared_solver() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"
+        )))?;
+        for ranks in [1, 2] {
+            let mut args = args(dir.path());
+            args.rtx_gpus = ranks as u32;
+            args.max_context_tokens = 262144;
+            args.rtx_expert_layers = "max".parse()?;
+            let experts = vec![ExpertCost {
+                whole: Bytes2 { resident: 1 << 30, staging: 64 << 20 },
+                half: [Bytes2 { resident: 1 << 30, staging: 64 << 20 }; 2],
+                tp2: ranks == 2,
+                spark_ok: true,
+            }; 40];
+            let memory = vec![(40usize << 30, 96usize << 30); ranks];
+            let max = resolve(&args, &memory, experts.clone(), 64 << 20,
+                &vec![0; ranks], usize::from(ranks == 2), None)?;
+            assert!(max.placement.onboard_layers >= 1);
+            assert!(max.placement.pool_tokens >= EXPERTS_FIRST_POOL_FLOOR);
+            args.rtx_expert_layers = LocalLayers::Auto;
+            let auto = resolve(&args, &memory, experts, 64 << 20,
+                &vec![0; ranks], usize::from(ranks == 2), None)?;
+            assert!(max.placement.onboard_layers > auto.placement.onboard_layers);
+            assert!(max.placement.pool_tokens < auto.placement.pool_tokens);
+            assert_eq!(max.placement.attention_placement,
+                if ranks == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pre_draft_admission_charges_weights_runtime_and_marks_once() -> Result<()> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        use families::deepseek_v41::DraftInventory;
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"
+        )))?;
+        for ranks in [1, 2] {
+            let mut args = args(dir.path());
+            args.rtx_gpus = ranks as u32;
+            args.max_context_tokens = 512;
+            args.pool_tokens = Some(512);
+            args.rtx_expert_layers = LocalLayers::Count(0);
+            let home = (ranks - 1) as u8;
+            let draft = DraftInventory {
+                resident: 8 << 30,
+                runtime: (0..ranks).map(|gpu| Demand::new(gpu as u8,
+                    Category::Workspace, "draft runtime", 64 << 20, Basis::Exact)).collect(),
+                marks: 32 << 20,
+                peer_half: if ranks == 2 { 512 << 20 } else { 0 },
+                // Staging is not a retained owner or a complete startup phase.
+                staging: [100 << 30; 2],
+            };
+            let memory = vec![(80usize << 30, 96usize << 30); ranks];
+            let moved = resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0, Some(&draft))?;
+            assert_eq!(draft::home(&moved.placement), Some(home));
+            assert_eq!(moved.placement.items[home as usize].iter()
+                .filter(|item| item.group == "dSpark weights").map(|item| item.bytes).sum::<u64>(), draft.resident);
+            assert_eq!(moved.placement.items[home as usize].iter()
+                .filter(|item| item.group == "dSpark marks").map(|item| item.bytes).sum::<u64>(), draft.marks);
+            for gpu in 0..ranks {
+                assert_eq!(moved.placement.items[gpu].iter().filter(|item| item.group == "draft runtime")
+                    .map(|item| item.bytes).sum::<u64>(), 64 << 20);
+            }
+            let movable = families::deepseek_v41::drafter(&draft, ranks)?;
+            let fixed = &movable.conditional.iter().find(|c| c.placement_gpu == home).unwrap().demands;
+            let original = resolve_with_owners(&args, &memory, vec![], 0, &vec![0; ranks], 0, fixed, &[], None)?;
+            assert_eq!(moved.cache_bytes, original.cache_bytes);
+            for gpu in 0..ranks {
+                let total = |items: &[cuteafd_core::memory_layout::Item]| items.iter().map(|i| i.bytes).sum::<u64>();
+                assert_eq!(total(&moved.placement.items[gpu]), total(&original.placement.items[gpu]));
+            }
+            // A pre-draft sample does not yet contain these bytes. Omitting
+            // the movable would incorrectly admit this constrained inventory.
+            let constrained = vec![(8usize << 30, 96usize << 30); ranks];
+            assert!(resolve(&args, &constrained, vec![], 0, &vec![0; ranks], 0, None).is_ok());
+            assert!(resolve(&args, &constrained, vec![], 0, &vec![0; ranks], 0, Some(&draft)).is_err());
+            // Only the caller's full coexistence peak gates the load phase.
+            let peak = [Demand::new(home, Category::Staging, "full draft load phase",
+                81 << 30, Basis::Exact)];
+            assert!(resolve_with_owners(&args, &memory, vec![], 0, &vec![0; ranks], 0,
+                &[], &peak, Some(&draft)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn logical_pool_excludes_snapshot_tails_and_charges_each_cache_owner() -> Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(
@@ -958,18 +1039,18 @@ mod admission_tests {
             args.tp2_attention = replicas;
             args.rtx_expert_layers = LocalLayers::Count(0);
             let memory = vec![(80usize << 30, 96usize << 30); ranks];
-            let admitted = resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0)?;
+            let admitted = resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0, None)?;
             assert_eq!(admitted.placement.pool_tokens, 2 << 20);
             assert_eq!(admitted.pages, [4152, 4152, 4152, 8304]);
             args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(
                 (4152 * 5 * 256 * 356) + 1,
             ));
-            let exact = resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0)?;
+            let exact = resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0, None)?;
             assert_eq!(exact.pages, admitted.pages);
             assert_eq!(exact.cache_bytes, admitted.cache_bytes);
             args.kv_pool_size = None;
             args.pool_tokens = Some(67_108_864);
-            assert!(resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0).is_err());
+            assert!(resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0, None).is_err());
             args.pool_tokens = Some(2 << 20);
             assert!(
                 resolve(
@@ -978,7 +1059,7 @@ mod admission_tests {
                     vec![],
                     0,
                     &vec![0; ranks],
-                    0
+                    0, None
                 )
                 .is_err()
             );
@@ -1006,7 +1087,7 @@ mod admission_tests {
             args.memory_reservation = Some("80.000001GiB".parse()?);
             let deferred = vec![64u64 << 20; ranks];
             let roomy = vec![(80usize << 30, total); ranks];
-            let admitted = resolve(&args, &roomy, vec![], 0, &deferred, 0)?;
+            let admitted = resolve(&args, &roomy, vec![], 0, &deferred, 0, None)?;
             let ceiling = args.memory_reservation.unwrap().bytes(total)?;
             let exact = admitted
                 .cache_bytes
@@ -1021,14 +1102,14 @@ mod admission_tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
-                resolve(&args, &exact, vec![], 0, &deferred, 0)?.pages,
+                resolve(&args, &exact, vec![], 0, &deferred, 0, None)?.pages,
                 admitted.pages
             );
             for gpu in 0..ranks {
                 let mut short = exact.clone();
                 short[gpu].0 -= 1;
                 assert!(
-                    resolve(&args, &short, vec![], 0, &deferred, 0).is_err(),
+                    resolve(&args, &short, vec![], 0, &deferred, 0, None).is_err(),
                     "rank {gpu} cannot borrow the other owner's free bytes"
                 );
             }
@@ -1041,12 +1122,12 @@ mod admission_tests {
                 .map(|&(free, total)| (free - occupied, total))
                 .collect::<Vec<_>>();
             assert_eq!(
-                resolve(&args, &with_snapshots, vec![], 0, &deferred, 0)?.pages,
+                resolve(&args, &with_snapshots, vec![], 0, &deferred, 0, None)?.pages,
                 admitted.pages
             );
             args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(1 << 20));
             args.pool_tokens = None;
-            assert!(resolve(&args, &roomy, vec![], 0, &deferred, 0).is_err());
+            assert!(resolve(&args, &roomy, vec![], 0, &deferred, 0, None).is_err());
         }
         Ok(())
     }
@@ -1073,25 +1154,25 @@ mod admission_tests {
             spark_ok: true,
         };
         let memory = [(80usize << 30, 96usize << 30)];
-        let admitted = resolve(&args, &memory, vec![expert; 40], 600 << 20, &[0], 0)?;
+        let admitted = resolve(&args, &memory, vec![expert; 40], 600 << 20, &[0], 0, None)?;
         assert_eq!(admitted.placement.onboard_layers, 3);
-        assert!(resolve(&args, &memory, vec![expert; 2], 600 << 20, &[0], 0).is_err());
+        assert!(resolve(&args, &memory, vec![expert; 2], 600 << 20, &[0], 0, None).is_err());
         args.rtx_expert_layers = LocalLayers::Count(0);
         for context in [0, 1_048_577, u32::MAX] {
             args.max_context_tokens = context;
-            assert!(resolve(&args, &memory, vec![], 0, &[0], 0).is_err());
+            assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
         }
         args.max_context_tokens = 262_144;
         for concurrency in [0, 17, u32::MAX] {
             args.concurrency = concurrency;
-            assert!(resolve(&args, &memory, vec![], 0, &[0], 0).is_err());
+            assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
         }
         args.concurrency = 16;
         args.prefix_cache_entries = 129;
-        assert!(resolve(&args, &memory, vec![], 0, &[0], 0).is_err());
+        assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
         args.prefix_cache_entries = 20;
-        assert!(resolve(&args, &[(97usize << 30, 96usize << 30)], vec![], 0, &[0], 0).is_err());
-        assert!(resolve(&args, &[(0, 0)], vec![], 0, &[0], 0).is_err());
+        assert!(resolve(&args, &[(97usize << 30, 96usize << 30)], vec![], 0, &[0], 0, None).is_err());
+        assert!(resolve(&args, &[(0, 0)], vec![], 0, &[0], 0, None).is_err());
         Ok(())
     }
 
@@ -1101,7 +1182,7 @@ mod admission_tests {
         for rank in [0, 1] {
             assert_eq!(graph_reserve_bytes(96usize << 30, Some(rank)), 1472 << 20);
         }
-        assert_eq!(graph_reserve_bytes(32usize << 30, None), 0);
+        assert_eq!(graph_reserve_bytes(32usize << 30, None), 2048 << 20);
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),
@@ -1113,13 +1194,13 @@ mod admission_tests {
         let mut args = args(dir.path());
         args.rtx_expert_layers = LocalLayers::Count(0);
         args.max_context_tokens = 262_144;
-        let admitted = resolve(&args, &[(30usize << 30, 32usize << 30)], vec![], 0, &[0], 0)?;
+        let admitted = resolve(&args, &[(30usize << 30, 32usize << 30)], vec![], 0, &[0], 0, None)?;
         assert_eq!(admitted.placement.pool_tokens, 1 << 20);
         assert_eq!(admitted.pages[0], 2048 + 56);
         args.memory_reservation = Some(crate::shared::memory::budget::Reservation::Percent(
             1_000_000,
         ));
-        assert!(resolve(&args, &[(30usize << 30, 32usize << 30)], vec![], 0, &[0], 0).is_err());
+        assert!(resolve(&args, &[(30usize << 30, 32usize << 30)], vec![], 0, &[0], 0, None).is_err());
         Ok(())
     }
 }

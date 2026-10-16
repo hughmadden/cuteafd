@@ -582,7 +582,7 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
     }
     let variants = [(5120,1152),(1152,5120)].into_iter().flat_map(|(k,n)|
         [1,16,80,256,1024,4096].map(|c| json!({"capacity":c,"input_dim":k,
-            "output_dim":n,"scratch_bytes":c+1}))).collect::<Vec<_>>();
+            "output_dim":n,"label":format!("shared_{k}_{n}_m{c}"),"scratch_bytes":c+1}))).collect::<Vec<_>>();
     fs::write(share.join("V41_FP8_AOT.json"), serde_json::to_vec(&json!({"variants":variants})).unwrap()).unwrap();
     programs
 }

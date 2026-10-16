@@ -193,8 +193,12 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 let owner = owners[index];
                 layer_whole_mode(request, layer, owner)
             }
-            Some(AttentionPlacement::Layers) => Some(LayerMode::HeadSplit),
-            // Heads is the established layout, including V4.1's ranges.
+            // Fixed whole-layer executors already encode their owner in the
+            // allowed modes; only flexible layers need the owner chooser.
+            Some(AttentionPlacement::Layers) => Some(layer.modes.iter().copied()
+                .find(|mode| matches!(mode, LayerMode::Whole { .. }) && executable(*mode, gpus, split)
+                    && executor.runs(*mode)).unwrap_or(LayerMode::HeadSplit)),
+            // Heads is the established replicated layout.
             Some(AttentionPlacement::Heads) => None,
             _ => None,
         };
@@ -355,12 +359,14 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 trial.pool.floor = floor;
                 solve_once(&trial, flips, frozen).is_ok()
             };
-            let (mut lo, mut hi) = (0usize, routed);
-            if !fits(0) {
+            let minimum = request.minimum_expert_layers;
+            if minimum > routed { return Err(PlacementError::Inventory("invalid mandatory expert prefix")); }
+            let (mut lo, mut hi) = (minimum, routed);
+            if !fits(minimum) {
                 // With Sparks an automatic pool may fall short of the context: no RTX layers and
                 // the largest pool above v2's floor, the serving context clamped to it (v2 served
                 // a 31.8 GiB V4 Flash card at 905K tokens).
-                let fallback = request.pool.requested.is_none() && !spark_free && pool_floor < floor && {
+                let fallback = minimum == 0 && request.pool.requested.is_none() && !spark_free && pool_floor < floor && {
                     let mut trial = request.clone();
                     trial.onboard = Onboard::Layers(0);
                     trial.pool.floor = pool_floor;
@@ -368,7 +374,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 };
                 if !fallback {
                     let mut trial = request.clone();
-                    trial.onboard = Onboard::Layers(0);
+                    trial.onboard = Onboard::Layers(minimum);
                     trial.pool.floor = floor;
                     return solve_once(&trial, flips, frozen);
                 }
@@ -517,7 +523,9 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         pool_tokens,
         pool_limits: limits,
         attention_placement: if context { AttentionPlacement::Context }
-            else if request.layers.iter().any(&layer_selected) {
+            else if request.layers.iter().zip(&modes).any(|(layer, mode)|
+                matches!(mode, LayerMode::Whole { .. })
+                    && selected_attention(request, flips, layer.kind) == AttentionPlacement::Layers) {
                 AttentionPlacement::Layers
             } else { AttentionPlacement::Heads },
         attention_by_kind: request.layers.iter().map(|layer| {

@@ -550,7 +550,7 @@ fn worker(
     let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
-    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0)?;
+    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0, None)?;
     pass.bind_execution_plan(&pool.placement)?;
     prefill_pass.bind_execution_plan(&pool.placement)?;
     tracing::info!(source_pages=?pool.pages,global_bytes=pool.global_bytes,cache_bytes=?pool.cache_bytes,

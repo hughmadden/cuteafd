@@ -39,11 +39,20 @@ pub fn packed_expert_bytes(package: &str, experts: u64, hidden: u64, intermediat
 /// Unsupported native format changes return None instead of an exact claim.
 pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
     -> Option<Vec<Vec<Item>>> {
-    let config = checkpoint.config.get("text_config").unwrap_or(&checkpoint.config);
+    resident_headers(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, dspark)
+}
+
+/// The serving catalog and the offline checkpoint enumerate the same source
+/// headers; neither caller needs to reopen payloads or reconstruct allocations.
+pub fn resident_headers<'a>(config: &serde_json::Value,
+    tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
+    ranks: usize, dspark: bool) -> Option<Vec<Vec<Item>>> {
+    let config = config.get("text_config").unwrap_or(config);
+    let tensors = tensors.into_iter().collect::<Vec<_>>();
     if ![1, 2].contains(&ranks) || config["num_hidden_layers"].as_u64() != Some(40)
         || config["hidden_size"].as_u64() != Some(5120)
-        || checkpoint.tensors.iter().any(|t| {
-            let name = &t.meta.name;
+        || tensors.iter().any(|t| {
+            let name = &t.name;
             let backbone_expert = name.starts_with("layers.") && name.contains(".ffn.experts.")
                 || name.starts_with("model.layers.") && name.contains(".mlp.experts.");
             !backbone_expert && !name.contains(".engram.embed.")
@@ -58,10 +67,10 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
         *totals[rank].entry((category, group.into(), format.into())).or_default() += bytes;
     };
     let mut draft_experts = false;
-    for tensor in &checkpoint.tensors {
-        let name = tensor.meta.name.as_str();
-        let mut bytes = tensor.meta.byte_length;
-        let format = format!("{:?}", tensor.meta.dtype).to_ascii_lowercase();
+    for tensor in tensors {
+        let name = tensor.name.as_str();
+        let mut bytes = tensor.byte_length;
+        let format = format!("{:?}", tensor.dtype).to_ascii_lowercase();
         if name.starts_with("mtp.") {
             if !dspark { continue; }
             if name.contains(".ffn.experts.") { draft_experts = true; continue; }
@@ -70,7 +79,7 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
             // every stage. Grouped wo_a uses its stored n*k/groups extent.
             if name.ends_with(".weight") && format.contains("e4m3")
                 && (!name.ends_with(".main_proj.weight") || name == "mtp.0.main_proj.weight") {
-                bytes += tensor.meta.shape.iter().product::<usize>() as u64 / 32;
+                bytes += tensor.shape.iter().product::<usize>() as u64 / 32;
             }
             add(decoder, Category::Drafter, "dspark-auxiliary", &format, bytes);
             continue;
@@ -103,7 +112,7 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
             else if rest.starts_with("attn.compressor.") { (Category::Weights, "compressor") }
             else { (Category::Weights, "attention") };
         if name.ends_with(".weight") && format.contains("e4m3") {
-            bytes += tensor.meta.shape.iter().product::<usize>() as u64 / 32;
+            bytes += tensor.shape.iter().product::<usize>() as u64 / 32;
         }
         if ranks == 2 && group == "shared_expert" {
             // Shared TP2 copies retain the packed scales only; checkpoint

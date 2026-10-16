@@ -166,6 +166,22 @@ fn experts_first_fills_layers_above_the_pool_floor() {
 }
 
 #[test]
+fn experts_first_keeps_a_mandatory_prefix() {
+    let mut req = request(2, 12 * GIB, 40, 4,
+        Onboard::ExpertsFirst { pool_floor: 262_144 });
+    req.minimum_expert_layers = 1;
+    let placed = solve(&req).unwrap();
+    assert!(placed.onboard_layers >= 1);
+    assert!(placed.pool_tokens >= 262_144);
+    req.minimum_expert_layers = 41;
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory("invalid mandatory expert prefix"))));
+    req.minimum_expert_layers = 1;
+    req.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: GIB };
+    req.expert_gpus = 1;
+    assert!(solve(&req).is_err());
+}
+
+#[test]
 fn startup_phases_are_independent_and_not_retained_with_the_pool() {
     use cuteafd_core::memory_layout::{Basis, Category};
     let mut req = request(1, 12 * GIB, 40, 4, Onboard::Layers(0));
@@ -465,7 +481,7 @@ fn attention_selectors_follow_declared_executor_capabilities() {
     for executor in families::EXECUTORS {
         // Auto is the recorded default on two peer GPUs (GLM 5.3: context, K3; GLM Flash: context,
         // #57), heads on one.
-        let recorded = if executor.family == "qwen4" { AttentionPlacement::Layers }
+        let recorded = if ["qwen4", "deepseek_v41"].contains(&executor.family) { AttentionPlacement::Layers }
             else if ["glm5", "glm5_flash"].contains(&executor.family) { AttentionPlacement::Context }
             else { AttentionPlacement::Heads };
         assert_eq!(executor.check_attention(None, 2, true).unwrap(), recorded);

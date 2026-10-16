@@ -22,7 +22,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         }
     }
     let minimum_expert_layers = match args.rtx_expert_layers {
-        admission::LocalLayers::Auto => 1,
+        admission::LocalLayers::Auto | admission::LocalLayers::ExpertsFirst => 1,
         admission::LocalLayers::Count(count) => {
             ensure!((1..=40).contains(&count), "dual RTX expert layers must be 1..=40");
             count as usize
@@ -329,7 +329,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let memory=admission::admission_memory(&lib,&inventory)?;
     let deferred=[admission::EXPERT_SETUP_HEADROOM as u64,
         (admission::EXPERT_SETUP_HEADROOM + 2*wave_bytes) as u64];
-    let pool=admission::resolve(&args,&memory,expert_demands, (2*per_lane) as u64,&deferred,minimum_expert_layers)?;
+    let pool=admission::resolve(&args,&memory,expert_demands, (2*per_lane) as u64,&deferred,minimum_expert_layers,None)?;
     pass.bind_execution_plan(&pool.placement)?;
     second.bind_execution_plan(&pool.placement)?;
     let expert_layers=pool.placement.onboard_layers;

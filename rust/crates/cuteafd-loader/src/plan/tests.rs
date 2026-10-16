@@ -253,7 +253,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             || item.group.starts_with("TP2 expert layer halves")).unwrap();
                         let (costs, workspace) = crate::placement::families::deepseek_v41::expert_inventory(
                             &catalog, &dir.path().join("share/PROGRAMS.json"),
-                            options.layout.as_ref().unwrap().prefill_rows.max(2048), gpus).unwrap();
+                            options.layout.as_ref().unwrap().prefill_rows.max(2048), gpus, 188).unwrap();
                         let cost = if gpus == 1 { costs[0].whole } else { costs[0].half[device.index as usize] };
                         assert_eq!(cost.resident, packed(gpus as u64));
                         assert_eq!(local.bytes, cost.resident + cost.staging + workspace);

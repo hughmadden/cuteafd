@@ -3,15 +3,30 @@ use super::super::*;
 pub mod owners;
 pub mod resident;
 
-/// Reserved lazy graph envelope; small cards charge their measured 2 GiB bank
-/// through the admission sample instead.
+/// Existing lazy-capture envelope, separate from qualified ready residency.
+/// Small cards previously hid this same growth allowance in the CUDA sample.
 pub fn graph_reserve(total: u64, ranks: usize) -> u64 {
-    if total <= 32 << 30 { 0 } else if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
+    if total <= 32 << 30 { 2048 << 20 } else if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
 }
 
 pub fn runtime_reserve(total: u64, ranks: usize, automatic: bool) -> u64 {
     if total <= 32 << 30 { 0 } else if automatic { 3 << 30 }
     else if ranks == 1 { 2 << 30 } else { 800 << 20 }
+}
+
+/// Future owners beside the pool; none of these bytes is live at ready.
+pub fn growth_demands(total: u64, ranks: usize, automatic: bool, gpu: u8) -> Vec<Demand> {
+    let mut demands = vec![GraphSet::budget(&[graph_reserve(total, ranks)]).demand(0).on(gpu)];
+    let runtime = runtime_reserve(total, ranks, automatic);
+    if runtime > 0 {
+        demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
+            "runtime growth", runtime, cuteafd_core::memory_layout::Basis::Calibrated));
+    }
+    if total <= 32 << 30 {
+        demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
+            "memory sample margin", 32 << 20, cuteafd_core::memory_layout::Basis::Calibrated));
+    }
+    demands
 }
 
 /// V4.1 requires its full admitted context; other Spark families may clamp it.
@@ -246,6 +261,7 @@ pub fn expert_inventory(
     programs: &std::path::Path,
     rows: u64,
     gpus: usize,
+    sms: u32,
 ) -> anyhow::Result<(Vec<ExpertCost>, u64)> {
     use anyhow::{ensure, Context};
     ensure!(matches!(gpus, 1 | 2), "V4.1 supports one or two RTX owners");
@@ -346,7 +362,7 @@ pub fn expert_inventory(
         let fp8: serde_json::Value =
             serde_json::from_slice(&std::fs::read(parent.join("V41_FP8_AOT.json"))?)?;
         routed
-            .checked_add(shared_workspace(&fp8, rows)?)
+            .checked_add(shared_workspace(&fp8, rows, sms)?)
             .and_then(|n| n.checked_add(rows * (10240 + 5280 + 24 + 24 + 10240)))
             .context("V4.1 FFN workspace overflow")?
     };
@@ -384,45 +400,12 @@ pub fn owner_workspace(rows: u64, hidden: u64, topk: u64) -> anyhow::Result<u64>
 
 /// The two TP2 FP8 projection plans keep each capacity's aligned arena, while
 /// routed experts share a maximum-sized scratch arena across capacities.
-pub fn shared_workspace(manifest: &serde_json::Value, rows: u64) -> anyhow::Result<u64> {
-    use anyhow::{ensure, Context};
-    let compiled = expert_capacities(rows, false)?
-        .into_iter()
-        .last()
-        .context("missing FP8 capacity")?;
-    let capacities: Vec<_> = [1, 16, 80]
-        .into_iter()
-        .filter(|&n| n < compiled)
-        .chain([compiled])
-        .collect();
-    let variants = manifest["variants"]
-        .as_array()
-        .context("missing V4.1 FP8 variants")?;
-    let mut scratch = 0u64;
-    for (k, n) in [(5120, 1152), (1152, 5120)] {
-        for &capacity in &capacities {
-            let matching: Vec<_> = variants
-                .iter()
-                .filter(|v| {
-                    v["capacity"].as_u64() == Some(capacity)
-                        && v["input_dim"].as_u64() == Some(k)
-                        && v["output_dim"].as_u64() == Some(n)
-                })
-                .collect();
-            ensure!(
-                matching.len() == 1,
-                "missing or duplicate V4.1 shared projection {k}x{n} m{capacity}"
-            );
-            let bytes = matching[0]["scratch_bytes"]
-                .as_u64()
-                .context("missing FP8 scratch extent")?;
-            scratch = scratch
-                .checked_add(bytes.checked_add(255).context("FP8 alignment overflow")? & !255)
-                .context("FP8 capacity arenas overflow")?;
-        }
-    }
-    scratch
-        .checked_add(16 + rows * ((3 * 1152 + 5120) * 2 + 5120 * 4))
+pub fn shared_workspace(manifest: &serde_json::Value, rows: u64, sms: u32) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    let programs = ProgramSet::v41_fp8(manifest, &[(5120, 1152), (1152, 5120)], rows, sms)?;
+    programs.scratch.into_iter().try_fold(0u64, |sum, (_, bytes)| {
+        sum.checked_add(bytes).context("FP8 capacity arenas overflow")
+    })?.checked_add(16 + rows * ((3 * 1152 + 5120) * 2 + 5120 * 4))
         .context("shared FFN workspace overflow")
 }
 
@@ -522,7 +505,7 @@ pub fn request(
     assert!(experts.len() <= 40, "V4.1 has exactly 40 backbone layers");
     PlacementRequest {
         inventory,
-        attention_placement: Some(AttentionPlacement::Heads),
+        attention_placement: Some(if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads }),
         context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0,
         pool,
@@ -652,6 +635,7 @@ mod tests {
             Onboard::Layers(3),
         ))
         .unwrap();
+        assert_eq!(placement.attention_placement, AttentionPlacement::Layers);
         assert_eq!(placement.onboard_layers, 3);
         for (layer, assignment) in placement.layers.iter().enumerate() {
             assert_eq!(
@@ -812,13 +796,13 @@ mod tests {
     fn shared_fp8_capacity_scratch_is_a_sum_not_a_maximum() {
         let variants = [(5120,1152),(1152,5120)].into_iter().flat_map(|(k,n)|
             [1,16,80,256,1024,4096].map(|c| serde_json::json!({"capacity":c,"input_dim":k,
-                "output_dim":n,"scratch_bytes":c+1}))).collect::<Vec<_>>();
+                "output_dim":n,"label":format!("shared_{k}_{n}_m{c}"),"scratch_bytes":c+1}))).collect::<Vec<_>>();
         let manifest = serde_json::json!({"variants":variants});
-        assert_eq!(shared_workspace(&manifest,257).unwrap(),
+        assert_eq!(shared_workspace(&manifest,257,188).unwrap(),
             2*(256+256+256+1280)+16+257*((3*1152+5120)*2+5120*4));
         let mut bad = manifest.clone();
         bad["variants"].as_array_mut().unwrap().remove(0);
-        assert!(shared_workspace(&bad,257).is_err());
+        assert!(shared_workspace(&bad,257,188).is_err());
     }
 
     #[test]

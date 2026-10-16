@@ -1209,7 +1209,9 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
                     let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
                     let manifest = options.workspace_manifest.as_deref()
                         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
-                    families::deepseek_v41::expert_inventory(&catalog, manifest, prefill_rows, active_gpus)
+                    let sms = options.physical_sms.unwrap_or_else(||
+                        ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms);
+                    families::deepseek_v41::expert_inventory(&catalog, manifest, prefill_rows, active_gpus, sms)
                 })();
                 let placement = exact.and_then(|(experts, workspace)| {
                     let mut request = families::deepseek_v41::request(inventory, pool,
