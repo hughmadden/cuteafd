@@ -251,7 +251,8 @@ def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVIS
         "sparkinfer_revision": revision,
         "compute": [12, 1],
         "layouts": {layout: {"input": input_kind, "capacities": [{"capacity": 80}],
-                             "weights": weights, "hidden": 4096, "experts": 256, "top_k": 8,
+                             "weights": weights, "abi_version": 5, "activation": "silu_bf16_product",
+                             "projection": "bf16", "hidden": 4096, "experts": 256, "top_k": 8,
                              "intermediate": 2048, "tp": 4, "slice": 512, "swiglu_limit": 0.0}},
         "files": {str(library.relative_to(path)): {
             "bytes": library.stat().st_size, "sha256": hashlib.sha256(library.read_bytes()).hexdigest()}},
@@ -465,3 +466,31 @@ def test_cmake_fp8_family_counts_only_apply_to_their_family(tmp_path):
         result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         assert expected in result.stderr and (family != "mimof" or "tp" not in result.stderr)
+
+
+@pytest.mark.parametrize("kind,storage", [("fp8", 1), ("mxfp4", 2), ("nvfp4a4", 4), ("bf16", 5)])
+@pytest.mark.parametrize("activation,code", [("silu_bf16_product", 1), ("silu_post_clamp_fp32_product", 2)])
+def test_explicit_activation_info_words(kind, storage, activation, code):
+    from types import SimpleNamespace
+    g = SimpleNamespace(kind=kind, weights="nvfp4" if kind == "nvfp4a4" else kind,
+                        activation=activation, projection="bf16", swiglu_limit=7.0,
+                        hidden=4096, slice=256, experts=352, top_k=8, intermediate=1536, tp=6)
+    words = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
+    assert len(words) == 16
+    assert words[0] == 5 | storage << 8 | code << 16 | 1 << 24
+    assert words[9:] == [6, 1, 16, 80, 256, 1024, 4096]
+    assert words[0] not in (1, 2, 3, 4)  # old runtimes reject rather than guess
+    for field, value in [("activation", "unknown"), ("projection", "fp32"), ("swiglu_limit", float("nan"))]:
+        bad = SimpleNamespace(**vars(g))
+        setattr(bad, field, value)
+        with pytest.raises(ValueError):
+            package_tool.info_words(bad, [16], False)
+
+
+def test_package_requires_explicit_activation_contract(tmp_path):
+    path = write_package(tmp_path / "package")
+    manifest = json.loads((path / "manifest.json").read_text())
+    del manifest["layouts"]["tp4"]["activation"]
+    (path / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="activation/projection ABI"):
+        package_tool.verify(path)

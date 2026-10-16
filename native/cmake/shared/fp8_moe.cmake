@@ -41,14 +41,19 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
 endforeach()
 list(REMOVE_DUPLICATES CUTEAFD_FP8_MOE_ENTRIES)
 foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
-  if(NOT entry MATCHES ":(fp8|nvfp4|nvfp4a4)$")
+  if(NOT entry MATCHES ":(fp8|nvfp4|nvfp4a4|bf16)$")
     continue()
   endif()
-  if(entry MATCHES "^(mimo|mimop|mimof|glm|glmf|qwen4):fp8$")
+  if(entry MATCHES "^(mimo|mimop|mimof|glm|glmf|qwen4|step5):fp8$")
     set(geometry "${CMAKE_MATCH_1}")
     set(count_family "${CMAKE_MATCH_1}")
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${geometry}")
-  elseif(entry MATCHES "^(glm|glmf|glmfdense|qwen4):(nvfp4|nvfp4a4)$")
+  elseif(entry STREQUAL "step5:bf16")
+    set(geometry "step5_bf16")
+    set(count_family "step5")
+    # -bf16 denotes BF16-input FP8; native BF16 weights have a distinct suffix.
+    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-step5-bf16-weights")
+  elseif(entry MATCHES "^(glm|glmf|glmfdense|qwen4|step5):(nvfp4|nvfp4a4)$")
     if(CMAKE_MATCH_1 STREQUAL "glmfdense" AND CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
       continue()  # dense MLPs run on the coordinator only
     endif()
@@ -84,7 +89,7 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts
     endif()
   endif()
   set(stamp "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_${geometry}.stamp")
-  file(GENERATE OUTPUT "${stamp}" CONTENT "role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}|${requested_layouts}\n")
+  file(GENERATE OUTPUT "${stamp}" CONTENT "abi=5|role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}|${requested_layouts}\n")
   add_custom_command(
     OUTPUT "${package}/manifest.json"
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
