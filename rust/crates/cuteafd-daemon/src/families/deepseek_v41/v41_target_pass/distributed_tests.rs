@@ -601,7 +601,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             {
                 // Invalidate the completed target producer after successful model
                 // execution, forcing a failure after dSpark publication starts.
-                pass.execution.restart();
+                pass.resources.execution.restart();
                 let accepted = (0..request_count)
                     .map(|i| (i % 2) as u32)
                     .collect::<Vec<_>>();

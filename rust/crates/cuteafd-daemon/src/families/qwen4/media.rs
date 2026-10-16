@@ -4,6 +4,11 @@ use cuteafd_api::openai::{media::MediaPreparer, NativeRequest};
 use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
 use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander}, plan::MediaMode};
 use std::sync::Arc;
+use crate::shared::qwen::scheduler::Prompt;
+
+impl crate::shared::qwen::scheduler::Encoder for Encoder {
+    fn available(&self) -> bool { self.available() }
+}
 
 fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<serde_json::Value>> {
     if mode == MediaMode::Off { return Ok(None); }
@@ -119,7 +124,7 @@ impl ReadyVision {
     }
 }
 
-pub(super) enum Encoder {
+pub(crate) enum Encoder {
     Local(crate::shared::vision::local::LocalEncoder),
     Remote(crate::shared::vision::remote::RemoteEncoder),
     Off,
@@ -144,20 +149,6 @@ impl cuteafd_engine::media::EncoderClient for Encoder {
     fn cancel(&mut self, ticket: cuteafd_engine::media::EncoderTicket) {
         match self { Self::Local(client) => client.cancel(ticket), Self::Remote(client) => client.cancel(ticket), Self::Off => () }
     }
-}
-pub(super) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
-    match error {
-        cuteafd_engine::media::MediaError::Encoder(_) => cuteafd_api::openai::NativeFailure::Unavailable("vision encoder unavailable".into()),
-        error @ (cuteafd_engine::media::MediaError::CacheFull { .. } | cuteafd_engine::media::MediaError::QueueFull) =>
-            cuteafd_api::openai::NativeFailure::Unavailable(error.to_string()),
-        error => cuteafd_api::openai::NativeFailure::BadRequest(error.to_string()),
-    }
-}
-
-pub(super) struct Prompt {
-    pub job: NativeRequest,
-    pub tokens: Vec<u32>,
-    pub keys: MediaKeys,
 }
 pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json::Value,
     vocabulary: usize, hidden: usize, max_context: usize) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)> {
@@ -355,17 +346,6 @@ mod tests {
         assert!(cache_capacity_warning(usize::MAX, usize::MAX, 2560).is_err());
     }
     #[test]
-    fn permanent_image_admission_and_transient_pressure_have_distinct_errors() {
-        use cuteafd_engine::media::MediaError;
-        let error = MediaError::ImageTooLarge { needed: 5242880, capacity: 2621440 };
-        assert!(matches!(failure(error), cuteafd_api::openai::NativeFailure::BadRequest(message)
-            if message == "image needs 5242880 bytes > media cache capacity 2621440"));
-        let error = MediaError::CacheFull { needed: 2621440, free: 0, capacity: 5242880 };
-        assert!(matches!(failure(error), cuteafd_api::openai::NativeFailure::Unavailable(message)
-            if message.contains("2621440") && message.contains("5242880")));
-        assert!(matches!(failure(MediaError::QueueFull), cuteafd_api::openai::NativeFailure::Unavailable(_)));
-    }
-    #[test]
     fn remote_options_require_complete_identity_and_valid_placement() {
         use clap::Parser;
         let make = |options: Vec<String>| {
@@ -393,8 +373,6 @@ mod tests {
         assert!(RemoteVision::from_args(&args).is_err());
         let mut args = make(complete); args.vision = MediaMode::Rtx(None);
         assert!(RemoteVision::from_args(&args).is_err());
-        assert!(matches!(failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
-            cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
     }
     fn request(images: Vec<Arc<PreparedImage>>) -> NativeRequest {
         NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),

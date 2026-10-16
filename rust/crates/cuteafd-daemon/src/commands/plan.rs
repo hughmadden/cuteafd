@@ -115,6 +115,15 @@ fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanErro
 }
 
 pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
+    if args.deployment {
+        args.layout = true;
+        if let Some(value) = &args.kv_pool_size {
+            value.parse::<crate::shared::memory::budget::ByteSize>()?;
+        }
+        if let Some(value) = &args.memory_reservation {
+            value.parse::<crate::shared::memory::budget::Reservation>()?;
+        }
+    }
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
         args.available_sparks = (0..8).take_while(|rank|
@@ -254,11 +263,23 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     }
     options.vision = glm_flash_vision(&args, family, &snapshot);
     let report = plan_spark_count(&snapshot, &options, args.available_sparks, args.spark_ranks)?;
-    if args.json {
+    if args.json || args.deployment {
         if let Some(warning) = &report.spark_count_warning { eprintln!("warning: {warning}"); }
         if let Some(selection) = &report.prefill_selection { eprintln!("{selection}"); }
     }
-    if args.json {
+    if args.deployment {
+        use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};
+        let deployment = DeploymentOptions {
+            rtx_gpus: args.rtx, spark_tp: args.spark_tp.map(usize::from),
+            spark_ep: args.spark_ep.map(usize::from), peers: args.deployment_peers.clone(),
+            speculator: args.speculator.clone(), placement_handshake: args.placement_handshake,
+            onboard: args.rtx_expert_layers.or(args.local_expert_layers.map(cuteafd_loader::placement::Onboard::Layers))
+                .unwrap_or_default(),
+            admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
+                memory_reservation: args.memory_reservation.clone(), pool_tokens: args.pool_tokens },
+        };
+        println!("{}", serde_json::to_string_pretty(&DeploymentSpec::from_report(&report, &deployment)?)?);
+    } else if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", render(&report));
@@ -641,6 +662,8 @@ mod tests {
             spark_budget_gib: 100.0,
             coordinator_weight_budget_gib: 80.0,
             json: true,
+            deployment: false, spark_tp: None, spark_ep: None, deployment_peers: vec![], placement_handshake: false,
+            kv_pool_size: None, memory_reservation: None,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             config: None, speculator: "auto".into(), no_speculator: false,

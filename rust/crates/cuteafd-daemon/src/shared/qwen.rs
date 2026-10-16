@@ -1,5 +1,6 @@
 //! Owner-local recurrent state and exact verify replay for hybrid Qwen families.
 pub(crate) mod weights;
+pub(crate) mod scheduler;
 use crate::shared::memory::device::{Allocation, Device};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar};

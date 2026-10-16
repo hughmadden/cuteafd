@@ -1,86 +1,9 @@
 //! Move completed adjacent-layer state directly into the next GPU's workspace.
 use super::*;
 use crate::families::deepseek_v41::v41_backbone_hc::BackboneHcWeights;
-use crate::shared::memory::device::{Device, Stream};
-
-/// One directed transfer stream per request lane. No intermediate device or
-/// host buffer is needed: both copies land in the destination block inputs.
-pub(crate) struct BlockTransfer<'a> {
-    source: Device<'a>,
-    destination: Stream<'a>,
-    /// Device-ordered passes (`CUTEAFD_V41_DEVICE`): an SM copy on the
-    /// destination GPU ordered by the stage chain, with no host wait.
-    sm: Option<cuteafd_ffi::V41PeerCopy<'a>>,
-}
-impl<'a> BlockTransfer<'a> {
-    pub fn new(source: Device<'a>, destination: Device<'a>) -> Result<Self> {
-        ensure!(
-            source.id != destination.id,
-            "block transfer requires different GPUs"
-        );
-        source.run(|| source.library.cuda_enable_peer(destination.id))?;
-        destination.run(|| destination.library.cuda_enable_peer(source.id))?;
-        let sm = crate::shared::memory::chain::device_enabled()
-            .then(|| destination.run(|| destination.library.v41_peer_copy())).transpose()?;
-        Ok(Self {
-            source,
-            destination: Stream::new(destination)?,
-            sm,
-        })
-    }
-    /// # Safety
-    /// Sources are complete and all buffers remain exclusively owned until the
-    /// copy finishes or cancellation drains. Never queue behind an unready
-    /// producer event: doing so can stall otherwise independent peer DMA work.
-    async unsafe fn copy(
-        &mut self,
-        sources: [CuteafdDeviceBuffer; 2],
-        destinations: [CuteafdDeviceBuffer; 2],
-    ) -> Result<()> {
-        ensure!(
-            sources
-                .iter()
-                .zip(destinations)
-                .all(|(s, d)| s.device_id == self.source.id
-                    && d.device_id == self.destination.device.id
-                    && s.bytes <= d.bytes),
-            "block transfer devices or extents differ"
-        );
-        let device = self.destination.device;
-        if let Some(sm) = self.sm.as_ref().filter(|_| crate::shared::memory::chain::deferred()) {
-            // The SM copy follows the chain head (the producers on the source
-            // GPU) on the device and becomes the new head: no host wait.
-            return device.run(|| unsafe {
-                crate::shared::memory::chain::join(device.library, self.destination.raw)?;
-                for (source, destination) in sources.into_iter().zip(destinations) {
-                    sm.launch(destination, source, source.bytes, self.destination.raw)?;
-                }
-                crate::shared::memory::chain::finish(device.library, self.destination.raw)
-            });
-        }
-        // Peer DMA never waits on an unresolved event; settle chained producers.
-        crate::shared::memory::chain::settle(device.library)?;
-        let queued = device.run(|| {
-            for (source, destination) in sources.into_iter().zip(destinations) {
-                unsafe {
-                    device.library.copy_peer_async(
-                        destination,
-                        source,
-                        source.bytes,
-                        self.destination.raw,
-                    )?;
-                }
-            }
-            Ok(())
-        });
-        if let Err(error) = queued {
-            self.destination.drain()?;
-            return Err(error);
-        }
-        // Stream::wait retains and drains the stream on failure/cancellation.
-        self.destination.wait().await
-    }
-}
+use crate::shared::peer_split::hop::DirectInputHop;
+#[cfg(test)]
+use crate::shared::memory::device::Device;
 
 impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     /// Rebind this GPU's reusable block and import a completed adjacent layer.
@@ -93,7 +16,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
         &mut self,
         next: &'w BackboneHcWeights<'a>,
         previous: &BlockOutput<'_>,
-        transfer: &mut BlockTransfer<'a>,
+        transfer: &mut DirectInputHop<'a>,
     ) -> Result<()> {
         self.reset();
         let rows = previous.tokens.len();
@@ -110,7 +33,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
             previous.layer, next.layer(), previous.binding.layer(), self.capacity,
             previous.residual.bytes, previous.pre.bytes
         );
-        let device = transfer.destination.device;
+        let device = transfer.destination();
         ensure!(
             self.inputs().iter().all(|b| b.device_id == device.id),
             "block transfer destination differs"
@@ -275,7 +198,7 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         let residual = Allocation::new(devices[0], 16 * 40960)?;
         let pre = Allocation::new(devices[0], 16 * 16)?;
-        let mut transfer = BlockTransfer::new(devices[0], devices[1])?;
+        let mut transfer = DirectInputHop::new(devices[0], devices[1])?;
         let addresses = blocks[1].inputs().map(|b| b.ptr);
         let token_capacity = blocks[1].tokens.capacity();
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
@@ -337,7 +260,7 @@ mod tests {
                     ensure!(
                         unsafe {
                             launch(
-                                transfer.destination.raw,
+                                transfer.stream_raw(),
                                 hold,
                                 (&release as *const AtomicBool).cast_mut().cast(),
                             )

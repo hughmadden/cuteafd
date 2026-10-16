@@ -475,6 +475,9 @@ shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on
 thermal_args=(-e CUTEAFD_THERMAL=on)
 v41_fp8_head_args=()
 {extra_setup}'''
+            setup += "\ncount_plan=$(if [[ $RELEASE_RTX_GPUS == 2 || $RTX_EXPERT_LAYERS != 0 ]]; then " \
+                "printf '%s' '{\"placement_handoff\":{\"kind\":\"runtime\",\"directory\":\"/tmp/cuteafd-home/placement\"}}'; " \
+                "else printf '%s' '{\"placement_handoff\":{\"kind\":\"fixed\",\"spark_first_layer\":0}}'; fi)\n"
             result = subprocess.run(
                 ["bash", "-c", setup + block, "test", str(gpus)],
                 env=env,
