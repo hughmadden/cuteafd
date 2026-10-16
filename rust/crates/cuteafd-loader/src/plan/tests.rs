@@ -1346,7 +1346,7 @@ fn spark_rank_options_follow_transport_and_packages() {
     let dsv41 = strict_v41_snapshot(false);
     for ranks in 0..=9 {
         let options = PlanOptions { layout: None, ..sparks(ranks) };
-        if ranks > 8 {
+        if ranks > 6 {
             let error = plan(flash.path(), &options).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
             continue;
@@ -1366,7 +1366,7 @@ fn spark_rank_options_follow_transport_and_packages() {
 #[test]
 fn qwen_empty_h128_spark_ranks_are_geometry_invalid_not_fit() {
     let qwen = qwen_snapshot(4);
-    for ranks in [6, 7, 8] {
+    for ranks in [6] {
         let options = sparks(ranks);
         let report = plan(qwen.path(), &options).unwrap();
         assert!(!report.fits && !report.placement_supported && !report.executable());
@@ -1419,7 +1419,7 @@ fn exl3_tp6_geometry_remains_supported_for_glm_and_flash() {
 }
 
 #[test]
-fn qwen_nvfp4_legacy_tp6_remains_valid_but_new_empty_h128_ranks_do_not() {
+fn qwen_nvfp4_tp6_remains_valid_but_deleted_worlds_refuse() {
     let mut config = qwen4_config(1);
     config["quantization_config"] = json!({"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16});
     let mut tensors = Vec::new();
@@ -1438,9 +1438,8 @@ fn qwen_nvfp4_legacy_tp6_remains_valid_but_new_empty_h128_ranks_do_not() {
     let legacy = plan(dir.path(), &sparks(6)).unwrap();
     assert!(legacy.placement_supported && legacy.fits && legacy.executable(), "{}", render(&legacy));
     for ranks in [7, 8] {
-        let report = plan(dir.path(), &sparks(ranks)).unwrap();
-        assert!(!report.placement_supported && !report.fits && !report.executable());
-        assert!(report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
+        let error = plan(dir.path(), &sparks(ranks)).unwrap_err();
+        assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
     }
 }
 

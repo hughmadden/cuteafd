@@ -788,7 +788,7 @@ release_spark_host_rows() {
     release_die "SPARK_HOSTS must be a comma-separated Spark pool host list"
   IFS=, read -r -a hosts <<<"$csv"
   if [[ "$mode" == launch ]]; then
-    [[ "$count" =~ ^[0-8]$ && "${#hosts[@]}" == "$count" ]] ||
+    [[ "$count" =~ ^[0-6]$ && "${#hosts[@]}" == "$count" ]] ||
       release_die "SPARK_HOSTS must name exactly SPARK_COUNT=$count hosts"
   fi
   for host in "${hosts[@]}"; do
@@ -1194,7 +1194,7 @@ release_load_config() {
   if [[ "$mode" == launch ]]; then
     release_validate_spark_topology
 
-    [[ "$SPARK_COUNT" =~ ^[0-8]$ ]] || release_die "SPARK_COUNT must be in 0..8"
+    [[ "$SPARK_COUNT" =~ ^[0-6]$ ]] || release_die "SPARK_COUNT must be in 0..6"
 
     local missing_b=0 present_b=0 spark_required="$SPARK_COUNT"
     for ((release_i = 0; release_i < spark_required; release_i++)); do
@@ -1415,8 +1415,8 @@ release_spark_rank_map() {
 
 release_validate_spark_topology() {
   case "$SPARK_TP" in
-    ""|[1-8]) ;;
-    *) release_die "SPARK_TP must be in 1..8" ;;
+    ""|[1-6]) ;;
+    *) release_die "SPARK_TP must be in 1..6" ;;
   esac
   case "$SPARK_EP" in
     ""|1|2|3) ;;
@@ -1426,8 +1426,8 @@ release_validate_spark_topology() {
     release_die "SPARK_TP and SPARK_EP must be set together or omitted together"
   release_spark_topology_explicit || return 0
 
-  [[ "$SPARK_COUNT" =~ ^[1-8]$ ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..8"
+  [[ "$SPARK_COUNT" =~ ^[1-6]$ ]] ||
+    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..6"
   if [[ "$EXPERT_FORMAT" == exl3 ]]; then
     [[ "$SPARK_TP" == 3 && "$SPARK_EP" == 1 && "$SPARK_COUNT" == 3 ]] ||
       release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native except compact EXL3 TP3EP1"
@@ -1442,8 +1442,8 @@ release_validate_spark_topology() {
   ((SPARK_TP * SPARK_EP == SPARK_COUNT)) ||
     release_die "SPARK_TP(${SPARK_TP}) * SPARK_EP(${SPARK_EP}) must equal SPARK_COUNT(${SPARK_COUNT})"
   case "${SPARK_TP}x${SPARK_EP}" in
-    [1-8]x1|2x2|3x2|2x3) ;;
-    *) release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}; approved: TP1..TP8 with EP1, TP2EP2, TP3EP2, TP2EP3" ;;
+    2x1|3x1|4x1|6x1|2x2|3x2|2x3) ;;
+    *) release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}; approved: TP2/TP3/TP4/TP6 with EP1, TP2EP2, TP3EP2, TP2EP3" ;;
   esac
 }
 

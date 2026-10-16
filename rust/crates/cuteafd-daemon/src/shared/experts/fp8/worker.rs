@@ -51,7 +51,7 @@ impl<'a> Fp8Worker<'a> {
             DeviceAllocation::new(library, capacity * topk * 4)?,
         ];
         let output = DeviceAllocation::new(library, capacity * hidden * 2)?;
-        let executor_id = cuteafd_transport::expert::v41_spark_executor_id(experts.tp, experts.rank)?;
+        let executor_id = cuteafd_transport::expert::SparkWorld::canonical(experts.tp)?.topology().executor_id(experts.rank)?;
         let timing = super::super::execution::timing::WorkerTiming::from_env(library, experts.rank)?;
         Ok(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },

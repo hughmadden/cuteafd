@@ -1109,22 +1109,17 @@ mod tests {
             map,
             BackboneCache::distributed_device_bytes(map, 2, pages)?,
         )?;
-        let peers = std::env::var("CUTEAFD_DUAL_PEERS")?
+        let peers: [std::net::SocketAddr; 4] = std::env::var("CUTEAFD_DUAL_PEERS")?
             .split(',')
             .map(str::parse)
             .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?
             .try_into()
             .ok()
             .context("four Spark endpoints required")?;
-        let roce = SparkExperts::new(
-            peers,
-            [1, 2, 3, 4],
-            16,
-            TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
+        let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
                 timeout: Duration::from_secs(120),
                 max_frame_bytes: 2 << 20,
-            },
-        )?;
+            })?;
         let mut transport =
             devices[1].own(|| NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?))?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
@@ -1310,15 +1305,10 @@ mod tests {
         let mut other_transport = devices[1].own(|| {
             NativeTp4Wave::new(
                 &lib,
-                SparkExperts::new(
-                    peers,
-                    [1, 2, 3, 4],
-                    16,
-                    TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
+                SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
                         timeout: Duration::from_secs(120),
                         max_frame_bytes: 2 << 20,
-                    },
-                )?,
+                    })?,
                 NativeTp4Wave::device_bytes(16)?,
             )
         })?;

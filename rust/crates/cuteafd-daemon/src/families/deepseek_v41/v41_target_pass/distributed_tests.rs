@@ -137,15 +137,10 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         )?,
         Duration::from_secs(120),
     )?;
-    let roce = SparkExperts::new(
-        peers,
-        [1, 2, 3, 4],
-        80,
-        TcpTransportConfig { timing: false,
+    let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
             timeout: Duration::from_secs(120),
             max_frame_bytes: 2 * 1024 * 1024,
-        },
-    )?;
+        })?;
     let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(80)?)?;
     if std::env::var_os("CUTEAFD_TARGET_PASS_ENCODER_PAIR").is_some()
         || std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
@@ -162,7 +157,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             Duration::from_secs(120),
         )?;
         let mut second_transport = NativeTp4Wave::new(&lib,
-            SparkExperts::new(peers, [1, 2, 3, 4], 80, TcpTransportConfig { timing: false,
+            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
                 timeout: Duration::from_secs(120), max_frame_bytes: 2 * 1024 * 1024,
             })?, NativeTp4Wave::device_bytes(80)?)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;

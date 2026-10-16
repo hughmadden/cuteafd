@@ -30,7 +30,7 @@ def test_all_spark_counts_own_unequal_whole_blocks(intermediate):
     layouts = package_tool.spark_layouts(intermediate)
     for tp in range(1, 9):
         widths = package_tool.exact_widths(intermediate, tp)
-        if tp > intermediate // 128:
+        if tp > 6 or tp > intermediate // 128:
             assert not widths
             assert f"tp{tp}" not in layouts
             continue
@@ -45,6 +45,14 @@ def test_all_spark_counts_own_unequal_whole_blocks(intermediate):
     assert package_tool.exact_widths(intermediate, 9) == []
 
 
+@pytest.mark.parametrize("tp", [7, 8])
+def test_packager_rejects_deleted_world_before_geometry_or_compilation(tp):
+    assert package_tool.exact_widths(2048, tp) == []
+    assert not any(layout.startswith(f"tp{tp}") for layout in package_tool.spark_layouts(2048))
+    with pytest.raises(SystemExit, match="Spark TP must be in 1..6"):
+        package_tool.layout_geometry(None, f"tp{tp}")
+
+
 def test_qwen_tp5_exact_slice_has_no_padding():
     assert package_tool.exact_widths(640, 5) == [128] * 5
     assert "tp5" in package_tool.spark_layouts(640)
@@ -52,7 +60,7 @@ def test_qwen_tp5_exact_slice_has_no_padding():
 
 
 @pytest.mark.parametrize("counts,expected", [("", ""), ("5", "--layouts;tp5"),
-                                            ("1;5;7;8", "--layouts;tp1,tp5,tp7,tp8")])
+                                            ("1;5;6", "--layouts;tp1,tp5,tp6")])
 def test_cmake_requested_counts_preserve_defaults_and_select_both_input_forms(tmp_path, counts, expected):
     source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     body = source.split("  set(requested_layouts)", 1)[1].split("  set(stamp ", 1)[0]
@@ -102,7 +110,7 @@ def test_step5_bf16_bypasses_native_slice_exporter(tmp_path):
     assert "NATIVE=\n" in result.stderr
 
 
-@pytest.mark.parametrize("counts", ["0", "9", "5;bad"])
+@pytest.mark.parametrize("counts", ["0", "7", "8", "9", "5;bad"])
 def test_cmake_requested_counts_fail_before_compilation(tmp_path, counts):
     source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     body = source.split("  set(requested_layouts)", 1)[1].split("  set(stamp ", 1)[0]
@@ -111,7 +119,7 @@ def test_cmake_requested_counts_fail_before_compilation(tmp_path, counts):
                       f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{counts}")\n' + body)
     result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
     assert result.returncode != 0
-    assert "requires counts 1..8" in result.stderr
+    assert "requires counts 1..6" in result.stderr
 
 
 @pytest.mark.parametrize("geometry,blocks", [("qwen4", 5), ("glm", 16), ("glmf", 16),
@@ -128,7 +136,7 @@ def test_cmake_exl3_requested_counts_match_packager_profiles(tmp_path, geometry,
                       + '\nmessage("LAYOUTS=${CUTEAFD_EXL3_GEOMETRY_LAYOUTS}")\n'
                       + 'message("PROFILES=${CUTEAFD_EXL3_PROFILE_ARGS}")\n')
     result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
-    if count > blocks:
+    if count > 6 or count > blocks:
         assert result.returncode != 0
         assert "requires a nonempty H128 slice" in result.stderr
         return

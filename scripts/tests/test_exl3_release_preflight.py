@@ -47,7 +47,8 @@ if tool == 'docker':
         gpus = int(value('--rtx', '1'))
         print(json.dumps(dict(spark_ranks=ranks, prefill_rows=rows or 1024,
             version=1, family='deepseek_v41', executable=True,
-            topology=dict(tp=tp, ep=ep, explicit=explicit),
+            topology=dict(tp=tp, ep=ep, explicit=explicit,
+                  wire="native_ownership" if explicit else "canonical"),
             artifact_requirements=dict(spark_tp_role=None),
             speculator=value('--speculator', 'off'),
             admission=dict(kv_pool_size=value('--kv-pool-size'), memory_reservation=value('--memory-reservation')),

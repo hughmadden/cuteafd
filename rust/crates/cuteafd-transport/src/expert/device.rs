@@ -12,7 +12,7 @@
 //! only after it waited for wave n, so one mailbox suffices, and the planes
 //! a wave lands in are free again once the stream passed that wave's reduce
 //! (the next wave's partials cannot arrive before its request is posted).
-use super::SparkExperts;
+use super::{SparkExperts, SparkWorld};
 use crate::{
     DeviceLanding, ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, TcpTransportConfig,
 };
@@ -189,7 +189,7 @@ const YIELD_AFTER: Duration = Duration::from_micros(500);
 const PARK_GUARD: Duration = Duration::from_millis(100);
 
 impl SparkDeviceLane {
-    /// Connects a [`SparkExperts::new_ranks`] transport on a new thread whose
+    /// Connects a [`SparkExperts::new_world`] transport on a new thread whose
     /// waves come from the GPU through `mailbox` (host address of
     /// [`mailbox::bytes`] pinned, device-mapped bytes, zeroed) and land in
     /// `landing` (one device range per rank). A rank that does not land in
@@ -202,10 +202,12 @@ impl SparkDeviceLane {
     /// dropped. The GPU publishes wave n+1 only after it waited for wave n's
     /// completion and finished reading its planes.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn spawn(peers: Vec<SocketAddr>, executors: Vec<u64>, capacity: u32, config: TcpTransportConfig,
+    pub unsafe fn spawn(world: SparkWorld, peers: Vec<SocketAddr>, capacity: u32, config: TcpTransportConfig,
         landing: Vec<DeviceLanding>, cuda_device: i32, mailbox_base: usize, mailbox_bytes: usize, topk: usize,
         wire_row_bytes: usize, warm: Option<ExpertProtocolV2Request>, write: Option<Vec<crate::DeviceWriteTarget>>,
         mut build: DeviceBuild) -> Result<Self> {
+        ensure!(world.wire() == super::SparkWire::Canonical, "device lanes require canonical Spark wire");
+        ensure!(world.topology().world_size() == peers.len(), "device lane peer count differs from declared world");
         ensure!(landing.len() == peers.len(), "a device lane needs one landing range per rank");
         ensure!(mailbox_base % 64 == 0 && mailbox_bytes >= mailbox::bytes(capacity as usize, topk, wire_row_bytes),
             "device lane mailbox is misaligned or smaller than {} bytes", mailbox::bytes(capacity as usize, topk,
@@ -232,7 +234,7 @@ impl SparkDeviceLane {
         let wave_timeout = config.timeout;
         let thread = std::thread::Builder::new().name("spark-device-lane".into()).spawn(move || {
             let setup = (|| -> Result<_> {
-                let mut transport = SparkExperts::new_ranks(&peers, &executors, capacity, config)?;
+                let mut transport = SparkExperts::new_world(world, &peers, capacity, config)?;
                 // SAFETY: forwarded from this constructor's contract.
                 match &write {
                     Some(targets) => unsafe { transport.set_write_targets(Some(targets.clone()))? },
@@ -455,6 +457,18 @@ impl Drop for SparkDeviceLane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_wire_refuses_before_touching_device_storage() -> Result<()> {
+        let world = SparkWorld::owned(super::super::SparkTopology::NATIVE_TP3_EP1)?;
+        // SAFETY: ownership wire is rejected before any device pointer is inspected.
+        let result = unsafe { SparkDeviceLane::spawn(world, vec![], 1,
+            TcpTransportConfig::default(), vec![], 0, 0, 0, 6, 0, None, None,
+            Box::new(|_, _, _| panic!("refused lane must not build requests"))) };
+        assert_eq!(result.err().expect("ownership lane must refuse").to_string(),
+            "device lanes require canonical Spark wire");
+        Ok(())
+    }
 
     #[test]
     fn mailbox_layout_keeps_routes_and_rows_apart() {

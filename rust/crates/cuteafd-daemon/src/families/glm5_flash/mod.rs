@@ -2017,13 +2017,11 @@ impl Opened {
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
         let remote = selected;
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-        let executors: Vec<u64> = (0..peers.len())
-            .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
-            .collect::<Result<_>>()?;
+        let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         // One transport per prefill lane: each lane's wave stays in flight on its own QPs. Each takes
         // waves of the widest step (`expert_rows`): a verify step may be wider than a prefill lane.
         let mut transports = (0..args.prefill_lanes).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
-            &peers, &executors, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
+            spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
             .collect::<Result<Vec<_>>>()?;
         for link in &mut transports { link.enable_terminal_ownership(self.library.clone())?; }

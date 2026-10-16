@@ -30,21 +30,53 @@ pub const V41_HIDDEN: u32 = 5120;
 pub const V41_BACKBONE_TOPK: u32 = 6;
 pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 
-/// Bind native Spark responses to their tensor-parallel topology without a wire
-/// ABI change. TP4 retains executor IDs 1..=4; TP2 uses the disjoint namespace
-/// 5..=6, so a two-peer coordinator rejects stale TP4 rank-0/rank-1 workers.
-/// Three-rank groups — the implicit single-RTX EXL3 compact profile — use the
-/// `TP3EP1` namespace 7..=9, exactly as the two-rank compact group already
-/// shares the `TP2EP1` namespace. This identifies topology and rank, not
-/// checkpoint or deployment identity.
-///
-/// This helper covers implicit worlds, including whole-expert TP1 (executor 33).
-/// Every explicit layout — including pure `TP6EP1` — must use
-/// [`SparkTopology::executor_id`], which owns the wider disjoint
-/// namespaces and rejects a legacy identity.
-pub fn v41_spark_executor_id(world: usize, rank: usize) -> Result<u64> {
-    ensure!((1..=8).contains(&world), "native Spark executor world must be in 1..=8, got {world}");
-    SparkTopology::new(world as u8, 1)?.executor_id(rank)
+/// A request encoding is independent of rank ownership. Canonical requests
+/// still bind every response to an explicit pure-TP topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparkWire {
+    Canonical,
+    NativeOwnership,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparkWorld {
+    topology: SparkTopology,
+    wire: SparkWire,
+}
+
+impl SparkWorld {
+    pub fn new(topology: SparkTopology, wire: SparkWire) -> Result<Self> {
+        ensure!(topology.world_size() <= 6, "Spark worlds above six ranks have no qualified package");
+        ensure!(wire != SparkWire::NativeOwnership || matches!((topology.tp(), topology.ep()),
+            (2, 1) | (3, 1) | (4, 1) | (6, 1) | (2, 2) | (3, 2) | (2, 3)),
+            "unqualified Spark ownership topology");
+        ensure!(wire != SparkWire::Canonical || topology.ep() == 1,
+            "canonical Spark wire requires a pure-TP topology");
+        Ok(Self { topology, wire })
+    }
+
+    pub fn canonical(ranks: usize) -> Result<Self> {
+        let tp = u8::try_from(ranks).context("Spark rank count exceeds topology range")?;
+        Self::new(SparkTopology::new(tp, 1)?, SparkWire::Canonical)
+    }
+
+    pub fn owned(topology: SparkTopology) -> Result<Self> {
+        Self::new(topology, SparkWire::NativeOwnership)
+    }
+
+    pub const fn topology(self) -> SparkTopology { self.topology }
+    pub const fn wire(self) -> SparkWire { self.wire }
+    pub const fn ownership_topology(self) -> Option<SparkTopology> {
+        match self.wire {
+            SparkWire::Canonical => None,
+            SparkWire::NativeOwnership => Some(self.topology),
+        }
+    }
+
+    /// The device producer emits canonical routes; TP4 is its qualified layout.
+    pub fn supports_device_exchange(self) -> bool {
+        self.wire == SparkWire::Canonical && self.topology == SparkTopology::NATIVE_TP4_EP1
+    }
 }
 
 // Shared by wire parsing on workers and validation of owned coordinator requests.
@@ -350,8 +382,8 @@ struct V41Executors {
 }
 impl V41Executors {
     fn new(executors: &[u64]) -> Result<Self> {
-        ensure!((1..=8).contains(&executors.len()),
-            "native TP/EP requires 1..=8 executors, got {}", executors.len());
+        ensure!((1..=6).contains(&executors.len()),
+            "native TP/EP requires 1..=6 executors, got {}", executors.len());
         let mut ids = [0; 8];
         ids[..executors.len()].copy_from_slice(executors);
         Ok(Self { ids, len: executors.len() })
@@ -361,7 +393,7 @@ impl V41Executors {
 }
 
 /// Collects complete native rank planes in rank order, independently of arrival
-/// order, for every validated world size (1..=8). Payloads are borrowed;
+/// order, for every validated world size (1..=6). Payloads are borrowed;
 /// keep their frame storage alive until GPU copies finish. Request IDs must
 /// uniquely identify in-flight waves within a placement version.
 pub struct V41Tp4Planes<'a> {
@@ -376,7 +408,7 @@ impl<'a> V41Tp4Planes<'a> {
     pub fn new(request: &BackboneRequest<'_>, executors: [u64; 4]) -> Result<Self> {
         Self::from_header(&request.view.header, executors)
     }
-    /// Generic constructor for the validated physical rank counts 1..=8.
+    /// Generic constructor for the validated physical rank counts 1..=6.
     pub fn new_ranks(request: &BackboneRequest<'_>, executors: &[u64]) -> Result<Self> {
         if let Some(topology) = request.native_topology() {
             ensure!(
@@ -391,8 +423,8 @@ impl<'a> V41Tp4Planes<'a> {
     }
     fn from_header_ranks(h: &crate::ExpertProtocolV2RequestHeader, executors: &[u64]) -> Result<Self> {
         ensure!(
-            (1..=8).contains(&executors.len()),
-            "native TP/EP requires 1..=8 executors"
+            (1..=6).contains(&executors.len()),
+            "native TP/EP requires 1..=6 executors"
         );
         for (rank, id) in executors.iter().enumerate() {
             ensure!(
@@ -492,20 +524,50 @@ mod tests {
         ExpertV2SourceKind, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
     };
     #[test]
+    fn declared_worlds_reject_unqualified_topologies() -> Result<()> {
+        for ranks in 1..=6 {
+            let world = SparkWorld::canonical(ranks)?;
+            assert_eq!(world.topology().world_size(), ranks);
+            assert_eq!(world.wire(), SparkWire::Canonical);
+        }
+        for ranks in [0, 7, 8, 9, usize::MAX] {
+            assert!(SparkWorld::canonical(ranks).is_err(), "TP{ranks}");
+        }
+        for (tp, ep) in [(1, 1), (5, 1)] {
+            assert!(SparkWorld::owned(SparkTopology::new(tp, ep)?).is_err());
+        }
+        assert!(SparkWorld::new(SparkTopology::NATIVE_TP2_EP2, SparkWire::Canonical).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_canonical_tp4_preserves_device_exchange() -> Result<()> {
+        let world = SparkWorld::new(SparkTopology::NATIVE_TP4_EP1, SparkWire::Canonical)?;
+        assert!(world.supports_device_exchange());
+        assert_eq!(world.topology().executor_ids(), [1, 2, 3, 4]);
+        assert_eq!(world.ownership_topology(), None);
+        assert!(!SparkWorld::owned(SparkTopology::NATIVE_TP4_EP1)?.supports_device_exchange());
+        for ranks in [1, 2, 3, 5, 6] {
+            assert!(!SparkWorld::canonical(ranks)?.supports_device_exchange());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn spark_executor_namespaces_reject_other_world_responses() -> Result<()> {
-        let tp4 = [0, 1, 2, 3].map(|rank| v41_spark_executor_id(4, rank).unwrap());
-        let tp2 = [0, 1].map(|rank| v41_spark_executor_id(2, rank).unwrap());
-        // The implicit three-rank EXL3 compact group answers in the TP3EP1
+        let tp4 = [0, 1, 2, 3].map(|rank| SparkWorld::canonical(4).unwrap().topology().executor_id(rank).unwrap());
+        let tp2 = [0, 1].map(|rank| SparkWorld::canonical(2).unwrap().topology().executor_id(rank).unwrap());
+        // The canonical three-rank EXL3 group answers in the TP3EP1
         // namespace, exactly as the two-rank group shares TP2EP1's 5..=6.
-        let tp3 = [0, 1, 2].map(|rank| v41_spark_executor_id(3, rank).unwrap());
+        let tp3 = [0, 1, 2].map(|rank| SparkWorld::canonical(3).unwrap().topology().executor_id(rank).unwrap());
         assert_eq!(tp4, [1, 2, 3, 4]);
         assert_eq!(tp2, [5, 6]);
         assert_eq!(tp3, [7, 8, 9]);
         assert_eq!(tp3.to_vec(), SparkTopology::new(3, 1)?.executor_ids());
-        // The implicit six-rank EXL3 group is TP6EP1's namespace.
-        let tp6: Vec<u64> = (0..6).map(|rank| v41_spark_executor_id(6, rank)).collect::<Result<_>>()?;
+        // The canonical six-rank EXL3 group is TP6EP1's namespace.
+        let tp6: Vec<u64> = (0..6).map(|rank| SparkWorld::canonical(6)?.topology().executor_id(rank)).collect::<Result<_>>()?;
         assert_eq!(tp6, SparkTopology::new(6, 1)?.executor_ids());
-        let tp1 = v41_spark_executor_id(1, 0)?;
+        let tp1 = SparkWorld::canonical(1)?.topology().executor_id(0)?;
         assert_eq!(tp1, 33);
         for topology in [SparkTopology::NATIVE_TP2_EP1, SparkTopology::NATIVE_TP3_EP1,
             SparkTopology::NATIVE_TP4_EP1, SparkTopology::NATIVE_TP2_EP2,
@@ -524,7 +586,7 @@ mod tests {
             (usize::MAX, 0),
             (2, usize::MAX),
         ] {
-            assert!(v41_spark_executor_id(world, rank).is_err());
+            assert!(SparkWorld::canonical(world).and_then(|world| world.topology().executor_id(rank)).is_err());
         }
         let frame = request(1).encode()?;
         let native = BackboneRequest::parse(&frame, 1)?;

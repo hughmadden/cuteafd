@@ -143,7 +143,7 @@ impl<'a> Weights<'a> {
                     remaining,
                     config.exl3_schedule,
                 )?;
-                execution.install_topology(config.topology)?;
+                execution.install_topology(config.spark_world()?.ownership_topology())?;
                 Execution::Exl3(execution)
             }
             Self::Fp8(experts) => {
@@ -289,6 +289,16 @@ fn fp8_worker_workspace(config: &NativeExpertServiceConfig) -> Result<usize> {
     }
 }
 
+// Installation can narrow the checkpoint's qualified recipe, never widen it.
+fn validate_fp8_recipe(package: &str, intermediate: usize, world: usize,
+    directory: &std::path::Path, rank: usize,
+    slicing: cuteafd_loader::formats::fp8_experts::Slicing, width: usize) -> Result<()> {
+    let recipe = cuteafd_loader::plan::experts::spark_recipe(package, intermediate, world)?;
+    let root = directory.parent().context("Spark package layout has no package root")?;
+    recipe.validate_installed(root, rank, slicing, width)
+        .context("installed Spark packages do not match the planner recipe; padded fallback cannot widen rank storage")
+}
+
 /// The checkpoint's own FP8 experts (E4M3 + FP32 128x128 block scales) for
 /// this rank's intermediate slice, run by the `fp8-<family>` package.
 pub(super) fn load_fp8<'a>(
@@ -301,24 +311,18 @@ pub(super) fn load_fp8<'a>(
     // whole 32-blocks padded to 128 (MiMo V2.6 Pro: TP6, TP2), NVFP4 ones whole
     // 16-blocks padded to 128 (TP3 as well). `slice` checks it; the package
     // directory has a layout per built world.
-    ensure!(config.topology.is_none() && (1..=8).contains(&config.world),
-        "FP8/MXFP4/NVFP4 experts require implicit Spark TP1..8 groups");
+    ensure!(config.spark_world()?.wire() == cuteafd_transport::expert::SparkWire::Canonical,
+        "FP8/MXFP4/NVFP4 programs require canonical Spark wire");
     tensors.slice(config.world)?;
     let directory = config.fp8_package.clone()
         .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&config.library, config.world, tensors.format()));
     let (directory, slicing) = crate::shared::experts::fp8::exact_layout(&directory, tensors, config.world, config.rank);
     let family = crate::shared::experts::fp8::package_family(cuteafd_core::expert_geometry().family(), tensors.format());
     let format = if tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4 { "nvfp4" } else { "fp8" };
-    // Known recipes must match admission bytes. Explicit unqualified packages
-    // remain runnable for their hardware gate, without widening planner support.
-    if let Ok(recipe) = cuteafd_loader::plan::experts::spark_recipe(
-        &format!("{family}:{format}"), tensors.shape().intermediate, config.world,
-    ) {
-        let root = directory.parent().context("Spark package layout has no package root")?;
-        recipe.validate_installed(root, config.rank, slicing, tensors.rank_width(config.world, config.rank, slicing)?)
-            .context("installed Spark packages do not match the planner recipe; padded fallback cannot widen rank storage")?;
-    }
-    if matches!(config.world, 5 | 7 | 8) {
+    validate_fp8_recipe(&format!("{family}:{format}"), tensors.shape().intermediate,
+        config.world, &directory, config.rank, slicing,
+        tensors.rank_width(config.world, config.rank, slicing)?)?;
+    if config.world == 5 {
         ensure!(
             slicing == cuteafd_loader::formats::fp8_experts::Slicing::Blocks(128)
                 || tensors.shape().intermediate as usize % (128 * config.world) == 0,
@@ -428,4 +432,43 @@ pub(super) fn load_exl3<'a>(
         weights.push(weight);
     }
     Ok((Weights::Exl3(Rc::new(weights)), remaining))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_loader::{formats::fp8_experts::Slicing,
+        plan::experts::{InstalledSparkRecipeRefusal, SparkRecipeRefusal}};
+
+    #[test]
+    fn fp8_load_recipe_refuses_unqualified_package_before_installation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("tp3");
+        std::fs::create_dir(&directory)?;
+        std::fs::write(directory.join("libcuteafd_fp8moe.so"), b"present")?;
+        let error = validate_fp8_recipe("qwen4:fp8", 640, 3, &directory, 0,
+            Slicing::Padded, 256).unwrap_err();
+        assert!(error.downcast_ref::<SparkRecipeRefusal>().is_some(), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_load_recipe_requires_installed_artifacts_and_exact_widths() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("tp6-w384");
+        for (slicing, width, expected) in [
+            (Slicing::Padded, 384, "padded"),
+            (Slicing::Blocks(128), 256, "width"),
+            (Slicing::Blocks(128), 384, "missing"),
+        ] {
+            let error = validate_fp8_recipe("mimo:fp8", 2048, 6, &directory, 0, slicing, width)
+                .unwrap_err();
+            let refusal = error.downcast_ref::<InstalledSparkRecipeRefusal>().unwrap();
+            assert!(matches!((expected, refusal),
+                ("padded", InstalledSparkRecipeRefusal::PaddedExactMismatch)
+                | ("width", InstalledSparkRecipeRefusal::WidthMismatch { .. })
+                | ("missing", InstalledSparkRecipeRefusal::MissingArtifact(_))), "{error:#}");
+        }
+        Ok(())
+    }
 }

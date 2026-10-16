@@ -47,17 +47,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // KV reservation or readiness publication.
     let topology = crate::shared::spark_topology::for_checkpoint(
         topology, args.peers.len(), catalog.exl3().is_some());
-    crate::shared::spark_topology::require_supported(topology, &catalog)?;
-    if let Some(topology) = topology {
-        // Fail before weights are loaded when the library cannot reduce this
-        // physical-rank count.
-        lib.v41_compact_reducer()?
-            .require_rank_count(topology.world_size() as u32)?;
-    } else if matches!(args.peers.len(), 3 | 6) {
-        lib.v41_compact_reducer()?.require_rank_count(args.peers.len() as u32)?;
-    }
-    ensure!(args.peers.len() == 4 || topology.is_some() || catalog.exl3().is_some(),
-        "implicit non-TP4 Spark layouts require an EXL3 checkpoint");
+    let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
+    crate::shared::spark_topology::require_world(spark_world, &catalog)?;
+    lib.v41_compact_reducer()?.require_rank_count(spark_world.topology().world_size() as u32)?;
     let map = CachePlacement::encoder_decoder();
     let started = Instant::now();
     // Sum resident storage plus the largest transient loading excess.
@@ -330,7 +322,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
     let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
-        && topology.is_none()
+        && spark_world.supports_device_exchange()
         && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native
         && expert_layers < 40;
     let spark_admission = admission::start_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
@@ -342,7 +334,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let mut make_transport = || {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {
-            let roce = super::spark_transport(&args.peers, capacity, timing, topology)?;
+            let roce = super::spark_transport(&args.peers, capacity, timing, spark_world)?;
             NativeTp4Wave::new(&lib, roce, wave_bytes)
         })?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;

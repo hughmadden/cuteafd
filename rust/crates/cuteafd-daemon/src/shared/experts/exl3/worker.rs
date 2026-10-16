@@ -186,8 +186,8 @@ impl<'a> Exl3Worker<'a> {
     }
 
     fn validate_rank(world: usize, rank: usize) -> Result<()> {
-        ensure!((1..=8).contains(&world) && rank < world,
-            "EXL3 worker requires implicit Spark TP1..8 weights and rank below world");
+        ensure!((1..=6).contains(&world) && rank < world,
+            "EXL3 worker requires declared Spark TP1..6 weights and rank below world");
         Ok(())
     }
 
@@ -261,7 +261,7 @@ impl<'a> Exl3Worker<'a> {
         let weights_offset = capacity as usize * topk * 4;
         let staging = HostAllocation::new(library, weights_offset + capacity as usize * topk * 4)?;
         let host_path = HostPath::from_env()?;
-        let executor_id = cuteafd_transport::expert::v41_spark_executor_id(first.layout.world, rank)?;
+        let executor_id = cuteafd_transport::expert::SparkWorld::canonical(first.layout.world)?.topology().executor_id(rank)?;
         let route_dump = RouteDump::from_env(executor_id)?;
         let inputs = [
             DeviceAllocation::new(library, capacity as usize * Self::wire_row_bytes())?,

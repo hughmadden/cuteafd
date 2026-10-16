@@ -15,11 +15,11 @@
 //!   6 when the intermediate has at least six 128-row blocks; Qwen also has TP1.
 //! - DeepSeek native experts (expertd-native MXFP4 / EXL3): 2, 3, 4 and 6.
 //!
-//! The expert transport (RoCE verbs, TCP) runs one through eight Spark ranks.
+//! The expert transport (RoCE verbs, TCP) runs one through six Spark ranks.
 //! Package coverage below is independent of transport capacity.
 
 /// Spark worlds the expert transport runs.
-pub const TRANSPORT_WORLDS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+pub const TRANSPORT_WORLDS: [usize; 6] = [1, 2, 3, 4, 5, 6];
 
 /// Default Spark layouts of an FP8 (E4M3, 128x128 scales) expert package.
 pub fn fp8_spark_worlds(intermediate: usize) -> Vec<usize> {
@@ -181,8 +181,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if family == "v41" && exl3 && world == 6 {
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
     }
-    let block = if nvfp4 && !native && !matches!(world, 1 | 5 | 7 | 8) { 16 } else { 128 };
-    if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
+    let block = if nvfp4 && !native && !matches!(world, 1 | 5) { 16 } else { 128 };
+    if !(1..=6).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
     }
     let packaged = if native { matches!(world, 2 | 3 | 4 | 6) }

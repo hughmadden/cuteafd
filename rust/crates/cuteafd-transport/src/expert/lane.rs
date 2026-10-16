@@ -4,7 +4,7 @@
 //! leaves it (its verbs endpoints are not `Send`); jobs carry `Send` closures
 //! that build the request and consume the response rows. One job is in
 //! flight per lane. The decode hot path keeps using [`SparkExperts`] inline.
-use super::{SparkExperts, SparkTopology};
+use super::{SparkExperts, SparkWorld};
 use crate::{DeviceLanding, ExpertProtocolV2Request, TcpTransportConfig, VerbsHostProtocolV2ResponsePayload};
 use anyhow::{anyhow, ensure, Context, Result};
 use std::net::SocketAddr;
@@ -50,25 +50,15 @@ pub struct SparkExpertLane {
 }
 
 impl SparkExpertLane {
-    /// Canonical transport whose rank payloads land in `landing`.
+    /// Transport bound to a declared world whose rank payloads land in `landing`.
     ///
     /// # Safety
     /// [`SparkExperts::set_gpu_landing`]'s contract, with a lane's wave running
     /// from [`Self::submit`] until [`Self::wait`] returns.
-    pub unsafe fn spawn_with_landing(peers: Vec<SocketAddr>, executors: Vec<u64>, capacity: u32,
+    pub unsafe fn spawn_world(world: SparkWorld, peers: Vec<SocketAddr>, capacity: u32,
         config: TcpTransportConfig, landing: Option<Vec<DeviceLanding>>) -> Result<Self> {
         // SAFETY: forwarded from this constructor's contract.
-        unsafe { Self::spawn_transport(move || SparkExperts::new_ranks(&peers, &executors, capacity, config), landing) }
-    }
-
-    /// Ownership-bound transport; rank identities come only from the topology.
-    ///
-    /// # Safety
-    /// The same landing lifetime and wave contract as [`Self::spawn_with_landing`].
-    pub unsafe fn spawn_topology_with_landing(topology: SparkTopology, peers: Vec<SocketAddr>, capacity: u32,
-        config: TcpTransportConfig, landing: Option<Vec<DeviceLanding>>) -> Result<Self> {
-        // SAFETY: forwarded from this constructor's contract.
-        unsafe { Self::spawn_transport(move || SparkExperts::new_topology(topology, &peers, capacity, config), landing) }
+        unsafe { Self::spawn_transport(move || SparkExperts::new_world(world, &peers, capacity, config), landing) }
     }
 
     unsafe fn spawn_transport(build: impl FnOnce() -> Result<SparkExperts> + Send + 'static,
@@ -160,6 +150,7 @@ impl Drop for SparkExpertLane {
 
 #[cfg(test)]
 mod tests {
+    use super::super::SparkTopology;
     use super::*;
 
     #[test]
@@ -169,7 +160,7 @@ mod tests {
             .collect::<std::result::Result<Vec<SocketAddr>, _>>()?;
         let config = TcpTransportConfig { timing: false, timeout: Duration::from_secs(1), max_frame_bytes: 64 << 20 };
         // SAFETY: no landing buffers are installed.
-        let mut lane = unsafe { SparkExpertLane::spawn_topology_with_landing(topology, peers.clone(), 1, config.clone(), None)? };
+        let mut lane = unsafe { SparkExpertLane::spawn_world(SparkWorld::owned(topology)?, peers.clone(), 1, config.clone(), None)? };
         assert_eq!(lane.world_size(), 3);
         lane.submit(Box::new(|| {
             let mut request = ExpertProtocolV2Request::new(1, 1, 0, 5120,
@@ -184,7 +175,7 @@ mod tests {
         let error = lane.wait(Duration::from_secs(2)).unwrap_err();
         assert!(error.to_string().contains("requires a native group request"), "{error:#}");
         // SAFETY: no landing buffers are installed; mismatched worlds fail setup.
-        assert!(unsafe { SparkExpertLane::spawn_topology_with_landing(topology, peers[..2].to_vec(), 1, config, None) }.is_err());
+        assert!(unsafe { SparkExpertLane::spawn_world(SparkWorld::owned(topology)?, peers[..2].to_vec(), 1, config, None) }.is_err());
         Ok(())
     }
 }
