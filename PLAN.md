@@ -6357,3 +6357,12 @@ activation banks were retired and the GPU process exited before publication.
 entry point while retaining the completed producer's immutable code identity;
 the launcher uses it for publication and the original checksum audit remains
 mandatory. The Hub 2 client removed the old `upload_large_folder` method.
+
+Published and anonymously accessible on 2026-10-18 (Taipei) at
+`wrldsuksgo2mars/Kimi-K3-EXL3-K2`, revision
+`acba35b61a672561652b16a96fca1be85c1bd875`. All 94 remote shard LFS hashes and
+the metadata hashes passed the producer's audit; the standard local HF cache
+resolves that revision through hardlinks without another weight copy. Completion
+records remain in the run root. No capture directories, packed candidate tensors
+or rolling frontiers remain. GPU ownership was released. Full-model generation
+and serving qualification remain separate, unperformed work.
