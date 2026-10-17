@@ -114,6 +114,10 @@ mod tests {
         let geometry = resource::geometry(&homes, 288, 8, 64, 7, COPY_EXTENSION).unwrap();
         let mut explicit = SharedPolicy::with_geometry(geometry, resource::Prior::Head,
             resource::seed()).unwrap();
+        // Constructor parity of the shared priced policy, whatever the default mode.
+        for policy in [&mut legacy.policy, &mut shared.policy, &mut explicit.policy] {
+            policy.set_draft_mode(cuteafd_core::DraftMode::Shared);
+        }
         let mut history = DraftHistory::default();
         let mut priced = 0;
         for round in 0..192 {
