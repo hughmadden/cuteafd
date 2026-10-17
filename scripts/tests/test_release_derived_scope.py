@@ -308,3 +308,13 @@ def test_format_counts_reach_nvfp4_but_not_exl3(fixture_repo, tmp_path):
         assert result.returncode == 0, result.stderr
         resolved = result.stderr.strip().removeprefix('COUNTS=').split(';')
         assert ('tp6' in resolved) if filename == 'fp8_moe.cmake' else ('6' not in resolved)
+
+
+def test_v2_v41_role_floor_requires_native_roles_not_nvfp4(tmp_path):
+    # v2.0.0 shipped native V4.1 Spark roles tp2/tp3/tp4/tp6 and no NVFP4 Spark
+    # roles; NVFP4 Spark roles are new in v3 and come from matrix entries.
+    repo = Path(__file__).resolve().parents[2]
+    matrix = repo / 'scripts/bench/release-smoke-v3.json'
+    floor = [e for e in SCOPE.requirements(repo, matrix, 'all') if e['name'].startswith('v2.0.0-v41-tp')]
+    assert sorted(e['spark_tp'] for e in floor) == [2, 3, 4, 6]
+    assert not any(e['nvfp4'] for e in floor)

@@ -202,10 +202,12 @@ def requirements(repo, matrix, scope):
         result.append(dict(name='v2.0.0-export-floor', family='release_floor', programs=sorted(PREVIOUS_RELEASE_FLOOR['MIMO_GEOMETRIES']),
                            experts=[], spark_experts=[], spark_count=1, context_split=False, audio=False,
                            packages=previous_release_packages()))
+        # v2.0.0 shipped native (MXFP4) V4.1 Spark roles only; NVFP4 Spark roles are
+        # new in v3 and come from the matrix entries that use them.
         for tp in (2, 3, 4, 6):
             result.append(dict(name=f'v2.0.0-v41-tp{tp}-floor', family='deepseek_v41', programs=[],
                                experts=[], spark_experts=[], spark_count=tp, spark_tp=tp, dual=True,
-                               roles=[] if tp == 4 else [f'tp{tp}'], nvfp4=True, audio=False, context_split=False))
+                               roles=[] if tp == 4 else [f'tp{tp}'], nvfp4=False, audio=False, context_split=False))
     return result
 
 
