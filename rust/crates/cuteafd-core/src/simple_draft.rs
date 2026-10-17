@@ -35,9 +35,9 @@ use super::{DraftCandidate, DraftRoundObservation, DraftSelection, Platt};
 /// Which length rule a [`DraftPolicy`](super::DraftPolicy) follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DraftMode {
-    /// The resource-priced shared policy (default).
+    /// The resource-priced shared policy (`DRAFT_POLICY=shared`).
     Shared,
-    /// Joint acceptance above one half.
+    /// Joint acceptance above one half (the default).
     Simple,
     /// Joint acceptance above the measured row price over cost per token.
     SimpleRc,
@@ -48,8 +48,8 @@ pub enum DraftMode {
 impl DraftMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "" | "shared" => Some(Self::Shared),
-            "simple" => Some(Self::Simple),
+            "shared" => Some(Self::Shared),
+            "" | "simple" => Some(Self::Simple),
             "simple-rc" => Some(Self::SimpleRc),
             "simple-derived" => Some(Self::SimpleDerived),
             _ => None,
@@ -509,8 +509,9 @@ mod tests {
     }
 
     #[test]
-    fn modes_parse_and_default_to_shared() {
-        assert_eq!(DraftMode::parse(""), Some(DraftMode::Shared));
+    fn modes_parse_and_default_to_simple() {
+        assert_eq!(DraftMode::parse(""), Some(DraftMode::Simple));
+        assert_eq!(DraftMode::parse("shared"), Some(DraftMode::Shared));
         assert_eq!(DraftMode::parse("simple-derived"), Some(DraftMode::SimpleDerived));
         assert_eq!(DraftMode::parse("fancy"), None);
         assert_eq!(DraftMode::Simple.label(), "simple");

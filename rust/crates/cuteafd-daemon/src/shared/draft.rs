@@ -29,9 +29,9 @@ pub(crate) mod timing;
 /// Apply the opt-in length rules: `CUTEAFD_DRAFT_SURVIVAL_LENGTHS` (launcher
 /// key `DRAFT_SURVIVAL_LENGTHS`) verifies drafts while their calibrated
 /// survival is at least one half, with width, skip and copy actions still
-/// resource priced; `CUTEAFD_DRAFT_POLICY` (launcher key `DRAFT_POLICY`,
-/// `shared` by default) selects the experimental simple rules
-/// (`cuteafd_core::DraftMode`).
+/// resource priced; `CUTEAFD_DRAFT_POLICY` (launcher key `DRAFT_POLICY`)
+/// selects the length rule (`cuteafd_core::DraftMode`): `simple` by default,
+/// `simple-rc` or `simple-derived`, or `shared` for the resource-priced policy.
 pub(crate) fn apply_length_rule(policy: &mut cuteafd_core::DraftPolicy) {
     let survival = super::draft_policy::enabled("CUTEAFD_DRAFT_SURVIVAL_LENGTHS");
     if survival { tracing::info!("draft lengths follow calibrated survival >= 0.5"); }
@@ -59,10 +59,10 @@ pub(crate) fn draft_mode() -> cuteafd_core::DraftMode {
     *MODE.get_or_init(|| {
         let value = std::env::var("CUTEAFD_DRAFT_POLICY").unwrap_or_default();
         let mode = cuteafd_core::DraftMode::parse(&value).unwrap_or_else(|| {
-            tracing::warn!(value, "unknown CUTEAFD_DRAFT_POLICY; using the shared policy");
-            cuteafd_core::DraftMode::Shared
+            tracing::warn!(value, "unknown CUTEAFD_DRAFT_POLICY; using simple");
+            cuteafd_core::DraftMode::Simple
         });
-        if mode != cuteafd_core::DraftMode::Shared { tracing::info!(mode = mode.label(), "simple draft policy selected"); }
+        tracing::info!(mode = mode.label(), "draft length policy selected");
         mode
     })
 }

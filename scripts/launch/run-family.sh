@@ -442,7 +442,8 @@ case "$(get DRAFT_SURVIVAL_LENGTHS off)" in
   off) trace_args+=(-e CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0) ;;
   *) echo "DRAFT_SURVIVAL_LENGTHS must be on or off" >&2; exit 2 ;;
 esac
-# Experimental simple draft policy (cuteafd_core::DraftMode); forwarded only when set.
+# Draft length policy (cuteafd_core::DraftMode): simple by default; simple-rc, simple-derived, or shared
+# for the resource-priced one. Forwarded only when set.
 case "$(get DRAFT_POLICY)" in
   "") ;;
   shared|simple|simple-rc|simple-derived) trace_args+=(-e "CUTEAFD_DRAFT_POLICY=$(get DRAFT_POLICY)") ;;
