@@ -220,6 +220,9 @@ before → after tables with conditions.
 
 ## Engineering rules
 
+- A qualification PR removes or relaxes its own launcher, default and docs
+  gates in the same PR, or explains in its body why each gate stays and links
+  the issue tracking its removal.
 - cuteafd is measured against itself, not a replaced engine (TJ,
   2026-10-08). Verify each change at the size it needs, as part of normal
   work; the release card set catches the rest. A regression found at release

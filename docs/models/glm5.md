@@ -25,8 +25,10 @@ placeholder Spark hosts and addresses): EXL3 K4 [min](../../examples/configs/glm
 - Router: sigmoid noaux_tc with `e_score_correction_bias`, routed scale 2.5,
   top-8 of the checkpoint's expert count.
 - Routed experts run on Spark TP x EP via `expertd-native`: FP8 128x128
-  blocks, EXL3 K4/K5, or ModelOpt NVFP4 (group 16); GLM 5.3 has no local
-  (RTX-resident) expert path.
+  blocks, EXL3 K4/K5, or ModelOpt NVFP4 (group 16). The solver can also place
+  a local RTX TP2 routed prefix through the shared expert backends
+  ([P9 qualification](https://github.com/tpurtell/cuteafd/pull/148)); its measured
+  qualification is EXL3 K4, not a blanket native NVFP4 hardware claim.
 - Speculator: the native MTP layer is not run — DFlash2 external drafters
   are the measured-best speculator for this family, with an adaptive policy
   priced by distinct Spark expert reads.
@@ -152,6 +154,12 @@ Context, with two lanes, plan rows 8, exactly 2,097,152 pool tokens, two
 RTX PRO 6000 GPUs and six expert ranks. Prompt hashes matched. Both passed
 quick fidelity, `cache_exact` and strict 10/10 IDs/raw-logit hashes.
 
+`ATTENTION_PLACEMENT=layers` is an explicit opt-in in release and WIP
+launches; `auto` still resolves to `context` on a supported two-GPU layout.
+The launcher logs the explicit choice, and image/program and memory admission
+remain mandatory. Older images without the executor/programs are not enabled
+by this launcher change.
+
 | Client measurement | Layers | Context | Layers / Context |
 | --- | ---: | ---: | ---: |
 | C1 code decode, tok/s | 45.77 | 47.70 | 0.96 |
@@ -178,20 +186,19 @@ are not qualified by this two-lane decision pair.
   exceed the six-Spark serving budget. EXL3 and NVFP4 cover this family in
   the release matrix.
 
-- No local (RTX-only) expert path — GLM 5.3 always needs at least one Spark
-  rank.
+- A local RTX TP2 expert prefix is supported (P9), but that is not a claim
+  that the entire model fits RTX-only; the reference layouts still use Sparks.
 - Speculative verify and plain decode, and C1/C4 greedy outputs, can differ.
   The current smoke gate permits verified numerical rounding; it does not
   establish byte-identical speculative output or batch invariance.
 - Prefill remains Spark-bound at both reference layouts; additional RTX
   head-split capacity does not remove the expert-wave bottleneck.
-- NVFP4 prefill chunks above 1,024 rows run W4A4 with each expert's own
-  `input_scale` and `weight_scale_2`; decode and verify run W4A16 (native W4A4
-  for these small-row shapes is deferred). Spark input arrives as FP8 K32 wire
-  rows, so W4A4 activations are quantized twice (FP8, then FP4). FC1 quantizes
-  with the gate projection's `input_scale` and dequantizes the up half with the
-  up projection's. They are bit-identical for every expert in
-  `nvidia/GLM-5.3-NVFP4`, but the loader does not yet check.
+- Declared NVFP4 routed experts use native W4A4 at every row count, including
+  decode and verify, with per-expert checkpoint calibration and BF16 Spark
+  ingress. The W4A16 serving fallback and intermediate FP8 wire quantization
+  were removed ([checkpoint-numerics change](https://github.com/tpurtell/cuteafd/commit/a69d81625c86119a2c239ac0c888d33e5c3010a1)).
+  Gate/up input scales must agree for the fused activation quantization;
+  small-row throughput tuning remains separate from arithmetic support.
 
 ## Changelog
 

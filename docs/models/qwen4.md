@@ -8,7 +8,7 @@ layer every fourth, a PLE n-gram memory table, and fused expert tensors.
 - `Qwen/Qwen3.8-Flash-Next` official release — FP8 128x128-block routed
   experts (`qwen4:fp8`).
 - EXL3 K4.25 PLE publications of the same checkpoint (`qwen4:exl3-k45`).
-- NVIDIA ModelOpt NVFP4 — routed experts run W4A16 (`qwen4:nvfp4`).
+- NVIDIA ModelOpt NVFP4 — routed experts run native W4A4 (`qwen4:nvfp4`).
 
 **Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
 placeholder Spark hosts and addresses): EXL3 K4.25 [min](../../examples/configs/qwen38-exl3-min.config); NVFP4 [min](../../examples/configs/qwen38-nvfp4-min.config).
@@ -122,8 +122,8 @@ readiness field measures only the coordinator process.
 - **Agentic-floor findings (rc3):** `qwen38-nvfp4-min` admits effective context 217,856 tokens and `qwen38-nvfp4-sim5090` 243,456, both with automatic pools, below the 262,144-token floor. C1/C8/~8K and quick fidelity/cache pass; these are capacity findings, not compiled-extent or quality failures.
 - **Vision on one RTX:** with automatic pool and media, admission keeps the 2M KV target and turns the vision tower off ("tower would reduce the requested KV target"), so the default 1× RTX cells `qwen38-exl3-min` and `qwen38-nvfp4-min` are text-only. The simulated-5090 cells place vision on a Spark. A fixed `POOL_TOKENS=262144` with `VISION=rtx:0` admits vision for EXL3: the separate "1× RTX, no Sparks (local experts)" card serves at C1 229 / C8 718 / 8K 6,393 with KL 0.015 and exact cache. NVFP4 at the same settings is refused at startup: "fixed Qwen KV pool of 262144 tokens does not fit with 30380 startup graphs (5003075616 graph reserve bytes)".
 - **Planner vs runtime pool:** the planner under-charges startup graphs (536,870,912 B planned vs 5,003,075,616 B reserved at runtime) and, for NVFP4, expert scratch (+1,063,126,016 B), so local planner pools (EXL3 541,696, NVFP4 436,480) exceed runtime pools (367,872, 218,112). Cards report the runtime value; closing the gap is v3 admission work.
-- **Memory vs. kernel support:** checkpoint and exported index extent are 262,144 tokens (clamped to Qwen geometry). The default effective context is also bounded by the admitted pool and reported on each card; below 262,144 is a per-cell agentic-floor finding. Local experts fit one PRO card, but the two-coordinator cache geometry remains unsupported; a second RTX is not a supported split.
-- No two-GPU split: the 2x RTX column is n/a rather than a duplicated one-GPU measurement. The minimum is local on one PRO card; small-card simulations may need Spark experts.
+- **Memory vs. kernel support:** checkpoint and exported index extent are 262,144 tokens (clamped to Qwen geometry). The default effective context is also bounded by the admitted pool and reported on each card; below 262,144 is a per-cell agentic-floor finding. The historical v2 cards use one coordinator; current Spark-free two-RTX layouts support whole-layer attention ownership and native TP2 local experts.
+- **Two-RTX qualification:** [P10](https://github.com/tpurtell/cuteafd/pull/147) qualified the Spark-free EXL3/MTP3 layout (strict 10/10 and exact prefix restore), now the default when two RTX are requested without Sparks. One-RTX, split-off and Spark layouts retain single-GPU attention. This does not add a head-split executor or qualify every quant.
 
 - FP8 experts have no Spark TP layout yet: 640 is not evenly divisible the
   way the FP8 MoE kernel currently tiles larger TP degrees. Spark supports
@@ -151,15 +151,17 @@ readiness field measures only the coordinator process.
 - Tool calls parse, reasoning is retained, and short reasoning-on code-agent
   sessions succeed. Chat-template tool-result re-render still differs from
   the original token prefix and is informational, not byte-exact.
-- There is no two-GPU coordinator head split; a two-RTX request serves from
-  the first GPU. Spark expert placement is slower than qualified local EXL3
-  at the reference configurations.
+- There is no two-GPU coordinator head split: the supported Spark-free pair
+  owns whole layers instead. Spark expert placement is slower than qualified
+  local EXL3 at the reference configurations.
 - One-RTX NVFP4 local experts must fit resident weight and serving
   reservations. Implicit paging was removed; `--expert-window` explicitly
   enables the slower paging fallback. The local automatic MTP default covers
   EXL3 and NVFP4.
-- NVFP4 decode/verify uses W4A16; native W4A4 for these small-row shapes is
-  deferred.
+- Declared NVFP4 routed experts use native W4A4 at every row count,
+  including decode and verify; the W4A16 serving fallback was removed
+  ([checkpoint-numerics change](https://github.com/tpurtell/cuteafd/commit/a69d81625c86119a2c239ac0c888d33e5c3010a1)).
+  Small-row throughput tuning remains separate from arithmetic support.
 
 ## Changelog
 

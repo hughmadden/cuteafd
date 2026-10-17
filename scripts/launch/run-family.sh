@@ -1382,10 +1382,10 @@ case "$attention_placement:$family" in
   # when built with the dev-v4-layers Cargo feature and refuses it otherwise.
   layers:deepseek_v4) [[ -n "$wip_slot" ]] ||
     release_die "deepseek_v4 attention placement layers is a dev-only executor; run it from a WIP slot built with CUTEAFD_WIP_CARGO_FEATURES=dev-v4-layers" ;;
-  # GLM 5.3 and GLM 5.3 Flash layers are under qualification (v3 K4, P7): a WIP slot may
-  # pass them to the daemon, which refuses them where its executor is absent.
-  layers:glm5|layers:glm5_flash) [[ -n "$wip_slot" ]] ||
-    release_die "$family attention placement layers is under qualification; run it from a WIP slot" ;;
+  # K4/P7 qualified explicit layers; context remains the recorded auto default.
+  # The planner still requires the selected image's executor and native programs.
+  layers:glm5|layers:glm5_flash)
+    echo "note: $family attention placement layers explicitly selected; auto remains context on two GPUs" >&2 ;;
   context:*|layers:*) release_die "$family cannot run attention placement $attention_placement: executor not implemented; only heads is qualified" ;;
   *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
 esac

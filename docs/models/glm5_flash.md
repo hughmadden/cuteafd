@@ -361,6 +361,13 @@ about 0.5 percentage point; small top-1 deltas need a larger fidelity set.
 
 ## Known limits
 
+`ATTENTION_PLACEMENT=layers` is available explicitly in release and WIP
+launches after [P7 qualification](https://github.com/tpurtell/cuteafd/pull/287)
+(EXL3 K3.25, two RTX, no Sparks: strict 10/10 and exact cache). `auto` stays
+`context` on a supported two-GPU layout. The launcher logs the opt-in and
+still enforces image/program and memory admission; this is not qualification
+of every quant, mixed placement or hardware combination.
+
 <!-- release-v2-limits -->
 - **Memory vs. kernel support:** checkpoint context and compiled index extent are 1,048,576 tokens. Default effective context is separately bounded by the admitted pool and reported on each card; below 262,144 is a per-cell agentic-floor finding. A memory-fitting layout alone does not qualify a full-length prompt.
 - The tr3 quant's bundled chat template has no image markers or base-model hint. `VISION=auto` (the default) serves it text only: the encoder plan turns vision off with one note naming the reason and the override, and no tower is placed or loaded. Corrected cards use `CHAT_TEMPLATE_FROM=zai-org/GLM-5.3-Flash` explicitly, which serves images with the official template. An explicit `VISION=spark[:rank]` or `rtx[:gpu]` without it still fails at start-up, naming the same gap and override. This is a configuration finding, not proof of a text-quality defect.
@@ -391,8 +398,10 @@ about 0.5 percentage point; small top-1 deltas need a larger fidelity set.
 - One-RTX NVFP4 local experts must fit resident weight and serving
   reservations. Implicit expert paging was removed; `--expert-window` is
   an explicit fallback with a substantial latency cost.
-- NVFP4 decode/verify uses W4A16; native W4A4 for these small-row shapes is
-  deferred.
+- Declared NVFP4 routed experts use native W4A4 at every row count,
+  including decode and verify; the W4A16 serving fallback was removed
+  ([checkpoint-numerics change](https://github.com/tpurtell/cuteafd/commit/a69d81625c86119a2c239ac0c888d33e5c3010a1)).
+  Small-row throughput tuning remains separate from arithmetic support.
 
 ## Changelog
 

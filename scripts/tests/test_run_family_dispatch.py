@@ -3192,6 +3192,28 @@ def test_pre_108_wip_seal_serves_with_hub_under_hf_home(tmp_path):
 
 
 @pytest.mark.parametrize("wip", [False, True])
+@pytest.mark.parametrize("family", ["glm5", "glm5_flash"])
+@pytest.mark.parametrize("mode", [None, "layers"])
+def test_glm_qualified_layers_release_and_wip_preserve_auto_default(tmp_path, wip, family, mode):
+    config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+              if family == "glm5" else SPLIT_CONFIGS["glm5_flash"])
+    keys = "RTX_GPUS=2\nVISION=off\nAUDIO=off\nSPECULATOR=off\n"
+    if family == "glm5_flash":
+        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
+    if mode is not None:
+        keys += f"ATTENTION_PLACEMENT={mode}\n"
+    result = _family_launch_result(tmp_path, config, "test/model", keys,
+                                  extra_args=("--wip", "slot-test") if wip else ())
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    assert f"CUTEAFD_ATTENTION_PLACEMENT={mode or 'auto'}" in launch
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert f"--attention-placement {mode or 'auto'}" in plan
+    assert "under qualification" not in result.stderr
+    assert ("layers explicitly selected; auto remains context on two GPUs" in result.stderr) == (mode == "layers")
+
+
+@pytest.mark.parametrize("wip", [False, True])
 def test_deepseek_v4_layers_is_dev_only_from_a_wip_slot(tmp_path, wip):
     # Release images refuse V4 layers here; a WIP slot reaches the daemon, which serves
     # it only when built with the dev-v4-layers Cargo feature.

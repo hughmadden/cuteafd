@@ -35,8 +35,9 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
   exact prefix cache — radix banks keyed by token ids, shared
   FP4 pages, a copied SWA "front", pinned-host tier in `cuteafd-hostcache`.
 - RTX/Spark layouts: the v2 native MXFP4 minimum is 1 RTX + 3 Sparks;
-  NVFP4 requires 4 Sparks with this launcher's kernel support. Maximum is 2 RTX +
-  4 Sparks. V4.1 keeps the coordinator layer-range split by default — the
+  the v2 NVFP4 cards use 4 Sparks. Current MXFP4 and NVFP4 support TP3 as a
+  fit-minimum option; TP4 remains the serving default (see the TP3 decision in
+  `PLAN.md`). The v2 maximum is 2 RTX + 4 Sparks. V4.1 keeps the coordinator layer-range split by default — the
   measured head-split hop cost on this fabric does not clear the bar its
   attention weights would need to win (see `PLAN.md` Phase 6).
 - Vocabulary head: RC1 and RC2 default to `CUTEAFD_V41_FP8_HEAD=all`, one
@@ -56,7 +57,7 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
 - **32 GB coordinator (resolved in rc3):** rc2's `v41-flash-sim5090` startup failure (a reconnecting expert session requested 419,495,936 B of Spark rings against a 302,120,960 B budget) is fixed: replaced endpoints release their rings before admission, and V4.1 ring admission is exact per Spark (1,024,851,968 B PRO MXFP4, 1,349,910,528 B PRO NVFP4, 302,120,960 B / 337,575,936 B at 31.8 GiB with 1,024 prefill rows). The rc3 simulated-5090 card passes.
 - Cold-prefill non-bit-reproducibility and prefill/decode stalls remain open; prefix snapshot restore exactness does not establish batch-invariant cold prefill.
 - A historical small-card host-heap abort was not reproduced or root-caused. The hunt is closed for v2 unless it recurs; MALLOC_CHECK_=3 serving soaks remain required and no memory-safety qualification is claimed. The fixed graph bank addresses graph residency, not the heap cause.
-- **Memory vs. kernel support:** NVFP4 fits by memory at 1x RTX + 3 Sparks (TP3), including the 31.8 GiB simulation. Kernel/launcher support requires TP4: the TP3 package is native-only and explicit TP3 rejects NVFP4 (`scripts/launch/run-family.sh`, `launch_deepseek_v41`). The NVFP4 reference cards therefore use four Sparks; the native MXFP4 minimum uses three.
+- **TP3 fit-minimum support:** current MXFP4 and NVFP4 runtimes accept TP3; the former native-only TP3 launcher restriction is gone. `PLAN.md` records matched MXFP4 measurements and independent NVFP4 correctness qualification against release TP4. TP3 is not a speed default; TP4 remains default. The historical v2 NVFP4 reference cards use four Sparks and retain their original fidelity findings.
 
 - The FP8 vocabulary head regressed short "hello" replies in its earlier
   comparison. The release C1 recheck covers the two-RTX code workload;
