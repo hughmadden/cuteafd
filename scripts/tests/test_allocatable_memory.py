@@ -50,12 +50,12 @@ def test_discrete_never_reads_host_files(tmp_path):
 
 
 @pytest.mark.parametrize('v1', [False, True])
-def test_every_visible_ancestor_bounds_admission(host_paths, v1):
+@pytest.mark.parametrize('limiting', ['parent/child', 'parent', ''])
+def test_every_visible_ancestor_bounds_admission(host_paths, v1, limiting):
     host_paths['membership'].write_text('7:cpu,memory:/parent/child\n' if v1 else '0::/parent/child\n')
     root = host_paths['cgroup_root'] / 'memory' if v1 else host_paths['cgroup_root']
-    group(root, 'parent/child', 9000, 1000, v1=v1)
-    group(root, 'parent', 5000, 2000, v1=v1)
-    group(root, '', 6000, 4000, v1=v1)
+    for relative in ['parent/child', 'parent', '']:
+        group(root, relative, 3000 if relative == limiting else 'max', 1000, v1=v1)
     assert memory.cuda_allocatable_memory_info(device(True), **host_paths)[0] == 2000
 
 
