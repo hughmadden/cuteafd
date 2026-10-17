@@ -282,7 +282,8 @@ mod tests {
     fn census_phases_isolate_context_and_retained_modules() {
         let source = include_str!("local.rs");
         let phases = ["census.sample(\"before_native_library\"", "let library = unsafe { NativeLibrary::load",
-            "census.sample(\"before_context\"", "library.cuda_device_synchronize()?",
+            "census.sample(\"before_context\"", "library.cuda_set_device(library.cuda_get_device()?)?",
+            "library.cuda_device_synchronize()?",
             "census.sample(\"after_context_before_media\"", "crate::shared::vision::worker::start_encoders(",
             "census.sample(\"before_expert_modules\"", "super::modules::WarmModules::load",
             "census.sample(\"after_expert_modules_before_weights\"", "load_weights(&library",
