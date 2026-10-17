@@ -67,7 +67,8 @@ def main():
                "--export", str(args.export.expanduser().resolve())]
     if args.resume:
         command.append("--resume")
-    publication_command = (["timeout", "--foreground", "--signal=TERM", "7d", *command, "--resume", "--publish-only"]
+    publication_command = (["timeout", "--foreground", "--signal=TERM", "7d", command[0],
+                            str(Path(__file__).with_name("publish.py")), *command[2:], "--publish-only"]
                            if args.publish else None)
     # GPU ownership ends when the quantizer process exits. Uploading runs in a
     # separate process with no CUDA device visible and no hardware lock held.

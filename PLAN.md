@@ -6349,3 +6349,11 @@ shape/dtype, complete inventory, byte-preserving native tensor assembly and Hub
 LFS checksums. Export standard EXL3 tensor_storage metadata and per-layer errors.
 Full-model generation and serving qualification are separate work; do not claim
 them from projection or structural checks.
+
+Quantization completed on 2026-10-18 (Taipei): 94 shards, 991,812 tensors,
+247,296 calibrated routed projections, 798,382,459,904 payload bytes. All rolling
+activation banks were retired and the GPU process exited before publication.
+`publish.py --publish-only` supplies the Hub 2/Xet streaming-upload compatibility
+entry point while retaining the completed producer's immutable code identity;
+the launcher uses it for publication and the original checksum audit remains
+mandatory. The Hub 2 client removed the old `upload_large_folder` method.
