@@ -34,7 +34,7 @@ REPO = Path(__file__).resolve().parents[2]
 SIBLING = REPO / "scripts" / "tests" / "test_release_artifact_build_paths.py"
 # Root NVMe, workspace-local and excluded from the release source inventory
 # (.cuteafd-cache is in the manifest tool's ignored names).
-SCRATCH = REPO / ".cuteafd-cache" / "test-release-build-root"
+SCRATCH = REPO / ".cuteafd-cache" / ("test-release-build-root-" + os.environ.get("PYTEST_XDIST_WORKER", "main"))
 
 
 def _load_harness():

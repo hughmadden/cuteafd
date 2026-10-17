@@ -105,6 +105,8 @@ before → after tables with conditions.
 
 ## Build and run
 
+- Release exports derive from the shipping matrix; `--scope` selects families/cards for dev builds, while release publication requires scope `all` and complete image inventories.
+
 - Build only under `~/.cache/cuteafd/builds/<task>` on root NVMe; run
   `scripts/build/assert-build-filesystem.py` on every path first. Never reuse a
   Cargo cache that has seen filesystem errors.

@@ -13,8 +13,8 @@ The supplied release tag is published for both images. Stable tags also update
 latest; release-candidate tags (rc, case-insensitive) never update latest.
 --latest is refused for release candidates. --no-latest disables latest for any tag. The
 coordinator image is local; the Spark image is published from SPARK_0_HOST.
-The Spark image must advertise the V41 expert roles it carries (./build.sh bakes
-the universal tp2;tp3;tp6 set by default); a role-less legacy build is rejected.
+Both images must carry matching release scope labels and pass the matrix inventory
+check. Versioned release/RC tags require scope all; narrowed scopes are dev-only.
 
 --config FILE selects the configuration that names the local image pair to
 publish (default: ./cuteafd.config, which after the v10 runtime promotion names
@@ -105,9 +105,6 @@ spark_repository="ghcr.io/tpurtell/cuteafd-spark-expert"
 spark_host="$SPARK_0_HOST"
 expected_source="https://github.com/tpurtell/cuteafd"
 
-# The published pair is universal: ./build.sh bakes the TP2/TP3/TP6 Spark expert
-# shards by default on top of the always-built TP4 shard, and the release launcher
-# refuses an explicit SPARK_TP/SPARK_EP topology without the matching role.
 # push-universal-role-guard:start
 push_require_universal_roles() {
   local advertised="$1" image="$2" role
@@ -177,7 +174,28 @@ docker image inspect \
 REMOTE
 )"
 [[ "$spark_roles" != "<no value>" ]] || spark_roles=
-push_require_universal_roles "$spark_roles" "$SPARK_EXPERT_DOCKER_INFERENCE"
+# Scope is build evidence, not the publisher's environment. Release tags always
+# re-check the whole current shipping matrix, never a caller-selected subset.
+coordinator_scope="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.release.scope"}}' "$COORDINATOR_DOCKER_INFERENCE")"
+spark_scope="$(release_ssh "$spark_host" docker image inspect -f \
+  "$(printf '%q' '{{index .Config.Labels "io.cuteafd.release.scope"}}')" "$SPARK_EXPERT_DOCKER_INFERENCE")"
+[[ -n "$coordinator_scope" && "$coordinator_scope" != '<no value>' && "$coordinator_scope" == "$spark_scope" ]] ||
+  release_die "image release scope labels are missing or disagree"
+if [[ "${tag,,}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-?rc[0-9]+)?$ ]]; then
+  [[ "$coordinator_scope" == all ]] || release_die "release tags require scope all; found $coordinator_scope"
+fi
+if [[ "$coordinator_scope" == all ]]; then
+  push_require_universal_roles "$spark_roles" "$SPARK_EXPERT_DOCKER_INFERENCE"
+fi
+release_matrix="${CUTEAFD_RELEASE_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v3.json}"
+release_scope_requirements="$(python3 "$repo_root/scripts/build/release-scope.py" requirements \
+  --matrix "$release_matrix" --scope "$coordinator_scope")"
+python3 "$repo_root/scripts/build/release-scope.py" check-image --role coordinator \
+  --image "$COORDINATOR_DOCKER_INFERENCE" --requirements "$release_scope_requirements"
+release_ssh "$spark_host" python3 - check-image --role expert \
+  --image "$SPARK_EXPERT_DOCKER_INFERENCE" --requirements "$(printf '%q' "$release_scope_requirements")" \
+  <"$repo_root/scripts/build/release-scope.py"
+
 
 echo "Publishing CUTEAFD containers"
 echo "  revision:    $coordinator_revision"

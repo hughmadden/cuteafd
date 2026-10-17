@@ -507,6 +507,7 @@ audio_aot=OFF
 spark_export_min_free_gib=90
 release_idle_wait_seconds=123
 release_export_gpu_poll_seconds=7
+release_scope_exports="export CUTEAFD_RELEASE_SCOPE=all"
 source_manifest_sha256={shlex.quote(digest)}
 spark_tp_roles={shlex.quote(roles)}
 native_build_jobs={shlex.quote(jobs)}
@@ -573,6 +574,7 @@ audio_aot=OFF
 spark_export_min_free_gib=90
 release_idle_wait_seconds=123
 release_export_gpu_poll_seconds=7
+release_scope_exports="export CUTEAFD_RELEASE_SCOPE=all"
 source_manifest_sha256=
 spark_tp_roles=
 '''

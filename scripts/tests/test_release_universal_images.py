@@ -234,6 +234,14 @@ def test_publisher_guard_runs_before_the_image_is_retagged():
     assert invoked < text.index("docker push"), "guard must run before any push"
 
 
+def test_publisher_checks_matrix_inventory_before_retag_or_push():
+    text = PUSH.read_text()
+    invoked = text.index('check-image --role coordinator')
+    assert invoked < text.index('docker tag ')
+    assert invoked < text.index('docker push')
+    assert 'release tags require scope all' in text
+
+
 def test_publisher_reads_spark_labels_over_ssh():
     """The Spark image lives on SPARK_0_HOST, not in the local daemon."""
     text = PUSH.read_text(encoding="utf-8")

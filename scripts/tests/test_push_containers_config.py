@@ -16,6 +16,7 @@ daemon is queried or any host is contacted.
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import textwrap
 from pathlib import Path
@@ -54,13 +55,19 @@ DOCKER_STUB = textwrap.dedent(
           case "$format" in
             *org.opencontainers.image.revision*) printf '%s\n' engine-revision ;;
             *org.opencontainers.image.source*) printf '%s\n' https://github.com/tpurtell/cuteafd ;;
+            *io.cuteafd.release.scope*) printf '%s\n' "${CUTEAFD_TEST_SCOPE:-all}" ;;
             *io.cuteafd.v41.spark_tp_roles*) printf '%s\n' 'tp2;tp3;tp6' ;;
             *) exit 1 ;;
           esac
         fi
         exit 0
         ;;
-      tag|push) exit 0 ;;
+      create) printf '%s\n' fake-container ;;
+      cp)
+        source="${2#*:/opt/cuteafd/}"
+        cp -a "$CUTEAFD_TEST_INVENTORY/$source" "$3"
+        ;;
+      rm|tag|push) exit 0 ;;
       *) exit 1 ;;
     esac
     """
@@ -85,7 +92,7 @@ SSH_STUB = textwrap.dedent(
       esac
     done
     [[ $# -gt 0 ]] || exit 0
-    exec "$@"
+    exec bash -c "$*"
     """
 )
 
@@ -98,12 +105,27 @@ def harness(tmp_path):
         path = bin_dir / name
         path.write_text(body, encoding="utf-8")
         path.chmod(0o755)
+    inventory = tmp_path / "inventory"
+    (inventory / "share/V41_EXPERT_WORKSPACES").mkdir(parents=True)
+    (inventory / "lib").mkdir()
+    for name in ("V41_EXPERT_AOT.json", "V41_FP8_AOT.json", "V41_EXPERT_WORKSPACES/mxfp4_rtx_backbone.json"):
+        (inventory / "share" / name).write_text(json.dumps({"variants": [{}]}))
+    (inventory / "lib/libcuteafd_native.so").write_bytes(b"fake")
+    nm = bin_dir / "nm"
+    nm.write_text("#!/bin/sh\nexit 0\n")
+    nm.chmod(0o755)
+    matrix = tmp_path / "matrix.json"
+    config = tmp_path / "matrix.config"
+    config.write_text("FAMILY=deepseek_v41\nSPARK_COUNT=0\nRTX_GPUS=1\n")
+    matrix.write_text(json.dumps({"entries": [{"name": "fixture-v41", "family": "deepseek_v41", "config": str(config)}]}))
     docker_log = tmp_path / "docker.log"
     ssh_log = tmp_path / "ssh.log"
     environment = {
         "PATH": f"{bin_dir}:/usr/bin:/bin:/usr/local/bin",
         "HOME": str(tmp_path),
         "CUTEAFD_TEST_DOCKER_LOG": str(docker_log),
+        "CUTEAFD_TEST_INVENTORY": str(inventory),
+        "CUTEAFD_RELEASE_RELEASE_MATRIX": str(matrix),
         "CUTEAFD_TEST_SSH_LOG": str(ssh_log),
     }
     for name in ("CUTEAFD_RELEASE_SSH_CONFIG", "CUTEAFD_RELEASE_SPARK_TP_ROLES"):
@@ -266,3 +288,28 @@ def test_options_may_precede_or_follow_the_tag(harness):
     assert _inspected_refs(docker_calls())[0] == f"{COORDINATOR}:v10"
 
 
+
+
+def test_push_refuses_incomplete_inventory_before_tagging(harness):
+    run, calls, _, root = harness
+    (root / "inventory/share/V41_FP8_AOT.json").unlink()
+    result = run("v3.0.0", config=V10_CONFIG)
+    assert result.returncode != 0
+    assert "fixture-v41" in result.stderr and "V41_FP8_AOT" in result.stderr
+    assert not _pushed_refs(calls()) and not _tagged_destinations(calls())
+
+
+@pytest.mark.parametrize("tag", ["v3.0.0", "v3.0.0-rc2"])
+def test_release_tags_refuse_narrow_build_scope(harness, tag):
+    run, calls, _, _ = harness
+    result = run(tag, config=V10_CONFIG, env={"CUTEAFD_TEST_SCOPE": "deepseek_v41"})
+    assert result.returncode == 2
+    assert "release tags require scope all" in result.stderr
+    assert not _pushed_refs(calls()) and not _tagged_destinations(calls())
+
+
+def test_dev_tag_accepts_selected_scope_after_inventory_check(harness):
+    run, calls, _, _ = harness
+    result = run("dev-fixture", config=V10_CONFIG, env={"CUTEAFD_TEST_SCOPE": "deepseek_v41"})
+    assert result.returncode == 0, result.stderr
+    assert _pushed_refs(calls())
