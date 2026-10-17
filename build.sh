@@ -76,7 +76,7 @@ Cargo target dirs and staging stay deletable without sudo. The home is
 BUILD_ROOT/container-home when a build root is set and /tmp/cuteafd-home inside
 the container otherwise.
 
-Release exports derive from CUTEAFD_RELEASE_RELEASE_MATRIX (default:
+Release exports derive from CUTEAFD_RELEASE_MATRIX (default:
 scripts/bench/release-smoke-v3.json). --scope / CUTEAFD_RELEASE_SCOPE selects all
 (default), comma-separated family or entry names, or explicit (raw knobs only).
 Raw CUTEAFD_RELEASE_* export knobs add to selected cards; OFF/empty cannot remove
@@ -140,12 +140,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 release_scope="${CUTEAFD_RELEASE_SCOPE:-all}"
-release_matrix="${CUTEAFD_RELEASE_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v3.json}"
+release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v3.json}"
+release_matrix_sha256="$(sha256sum "$release_matrix" | awk '{print $1}')"
 release_scope_exports="$(python3 "$repo_root/scripts/build/release-scope.py" derive \
   --matrix "$release_matrix" --scope "$release_scope" --shell)"
 eval "$release_scope_exports"
 printf -v release_scope_assignment 'export CUTEAFD_RELEASE_SCOPE=%q' "$release_scope"
 release_scope_exports+=$'\n'"$release_scope_assignment"
+printf -v release_matrix_assignment 'export CUTEAFD_RELEASE_MATRIX_SHA256=%q' "$release_matrix_sha256"
+release_scope_exports+=$'\n'"$release_matrix_assignment"
 release_scope_requirements="$(python3 "$repo_root/scripts/build/release-scope.py" requirements \
   --matrix "$release_matrix" --scope "$release_scope")"
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
@@ -362,6 +365,18 @@ complete_coordinator_image="$COORDINATOR_DOCKER_INFERENCE"
 complete_spark_image="$SPARK_EXPERT_DOCKER_INFERENCE"
 COORDINATOR_DOCKER_INFERENCE+="-pending-$$"
 SPARK_EXPERT_DOCKER_INFERENCE+="-pending-$$"
+# Keep a single parent EXIT cleanup through export, verification and promotion.
+release_pending_cleanup() {
+  [[ -z "${coordinator_container:-}" ]] || docker rm -f "$coordinator_container" >/dev/null 2>&1 || true
+  docker image rm "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 || true
+  local host
+  for host in "${RELEASE_BUILD_HOSTS[@]}"; do
+    timeout 30s ssh "${release_ssh_opts[@]}" "$host" docker image rm "$SPARK_EXPERT_DOCKER_INFERENCE" >/dev/null 2>&1 || true
+  done
+}
+trap release_pending_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
 
 prepare_pinned_source_dependencies() {
@@ -848,6 +863,7 @@ DOCKER_BUILDKIT=1 docker build \
   "${release_source_label_args[@]}" \
   "${release_dev_reuse_label_args[@]}" \
   --label "io.cuteafd.release.scope=$release_scope" \
+  --label "io.cuteafd.release.matrix.sha256=$release_matrix_sha256" \
   --build-arg CUTEAFD_ROLE=coordinator \
   --build-arg CUDA_ARCH=120 \
   --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
@@ -973,6 +989,7 @@ export CUTEAFD_RELEASE_IDLE_WAIT_SECONDS="${23:?}"
 export CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS="${24:?}"
 eval "$(printf '%s' "${25:?}" | base64 -d)"
 release_scope="$CUTEAFD_RELEASE_SCOPE"
+release_matrix_sha256="$CUTEAFD_RELEASE_MATRIX_SHA256"
 [[ "${15:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${15}"
 [[ "${17:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${17}"
 export CUTEAFD_SCCACHE_CUDA="${18:-1}"
@@ -1132,6 +1149,7 @@ DOCKER_BUILDKIT=1 docker build \
   "${release_source_label_args[@]}" \
   "${release_dev_reuse_label_args[@]}" \
   --label "io.cuteafd.release.scope=$release_scope" \
+  --label "io.cuteafd.release.matrix.sha256=$release_matrix_sha256" \
   --build-arg CUTEAFD_ROLE=expert \
   --build-arg CUDA_ARCH=121 \
   --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
@@ -1211,7 +1229,7 @@ release_ssh "$seed_host" python3 "$remote_dir/scripts/build/release-scope.py" ch
   --role expert --image "$SPARK_EXPERT_DOCKER_INFERENCE" --requirements "$(printf '%q' "$release_scope_requirements")"
 
 coordinator_container="$(docker create "$COORDINATOR_DOCKER_INFERENCE")"
-trap 'docker rm -f "$coordinator_container" >/dev/null 2>&1 || true' EXIT
+
 docker cp "$coordinator_container:/opt/cuteafd/bin/cuteafd" "$repo_root/dist/coordinator/cuteafd"
 docker cp "$coordinator_container:/opt/cuteafd/lib/libcuteafd_native.so" "$repo_root/dist/coordinator/libcuteafd_native.so"
 # Host-ISA variants (scripts/build/host-isa.sh): dist/coordinator/x86-64-v4/{cuteafd,libcuteafd_native.so}.
@@ -1248,7 +1266,7 @@ docker cp \
   "$coordinator_container:/opt/cuteafd/share/XGRAMMAR_SHA256SUMS" \
   "$repo_root/dist/coordinator/XGRAMMAR_SHA256SUMS"
 docker rm "$coordinator_container" >/dev/null
-trap - EXIT
+coordinator_container=""
 
 release_ssh "$seed_host" bash -s -- \
   "$SPARK_EXPERT_DOCKER_INFERENCE" "$remote_dir/dist/spark-expert" <<'REMOTE'

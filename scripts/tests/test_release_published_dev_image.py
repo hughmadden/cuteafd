@@ -117,7 +117,7 @@ def test_remote_leg_selects_and_reuses_exact_image_across_ssh_phases(tmp_path):
     ssh.write_text('#!/bin/bash\nshift\nexec bash -s -- "$@"\n')
     ssh.chmod(0o755)
     args = [str(staging), 'local-dev', 'release-image', 'fixture', 'pin', 'version'] + ['__legacy__'] * 5
-    args += ['dev', 'fixture-export', '__legacy__', '__legacy__', '__legacy__', '__legacy__', '0', 'registry', 'ON', 'on', '90', '123', '7', base64.b64encode(b'export CUTEAFD_RELEASE_SCOPE=all').decode()]
+    args += ['dev', 'fixture-export', '__legacy__', '__legacy__', '__legacy__', '__legacy__', '0', 'registry', 'ON', 'on', '90', '123', '7', base64.b64encode(b'export CUTEAFD_RELEASE_SCOPE=all; export CUTEAFD_RELEASE_MATRIX_SHA256=fixture').decode()]
     result = subprocess.run(['ssh', 'seed', *args], input=remote, env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     manifest_path = staging/'.cuteafd-release/fixture-export.dev-image.json'

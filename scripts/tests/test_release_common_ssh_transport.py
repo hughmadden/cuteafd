@@ -498,7 +498,7 @@ class TestPushContainersConsumer:
             if re.search(r"(?<![\w-])ssh\s+(?:-[A-Za-z]|[\"$])", line)
         ]
         assert offenders == [], f"route these through release_ssh: {offenders}"
-        assert push_text().count("release_ssh ") == 10
+        assert push_text().count("release_ssh ") == 11
 
     def test_delegates_the_transport_instead_of_copying_it(self):
         text = push_text()

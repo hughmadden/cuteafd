@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -53,8 +55,15 @@ DOCKER_STUB = textwrap.dedent(
         [[ -n "${1:-}" ]] || exit 1
         if [[ -n "$format" ]]; then
           case "$format" in
-            *org.opencontainers.image.revision*) printf '%s\n' engine-revision ;;
+            *org.opencontainers.image.revision*) printf '%s\n' "$CUTEAFD_TEST_REVISION" ;;
             *org.opencontainers.image.source*) printf '%s\n' https://github.com/tpurtell/cuteafd ;;
+            *io.cuteafd.release.matrix.sha256*)
+              if [[ "$1" == *spark* ]]; then
+                printf '%s\n' "${CUTEAFD_TEST_SPARK_MATRIX_SHA256-${CUTEAFD_TEST_MATRIX_SHA256-}}"
+              else
+                printf '%s\n' "${CUTEAFD_TEST_MATRIX_SHA256-}"
+              fi
+              ;;
             *io.cuteafd.release.scope*) printf '%s\n' "${CUTEAFD_TEST_SCOPE:-all}" ;;
             *io.cuteafd.v41.spark_tp_roles*) printf '%s\n' 'tp2;tp3;tp6' ;;
             *) exit 1 ;;
@@ -118,6 +127,21 @@ def harness(tmp_path):
     config = tmp_path / "matrix.config"
     config.write_text("FAMILY=deepseek_v41\nSPARK_COUNT=0\nRTX_GPUS=1\n")
     matrix.write_text(json.dumps({"entries": [{"name": "fixture-v41", "family": "deepseek_v41", "config": str(config)}]}))
+    revision_repo = tmp_path / "revision"
+    (revision_repo / "scripts/bench").mkdir(parents=True)
+    shutil.copytree(REPO / "scripts/lib", revision_repo / "scripts/lib", ignore=shutil.ignore_patterns('__pycache__'))
+    (revision_repo / "examples/configs").mkdir(parents=True)
+    shutil.copyfile(config, revision_repo / "examples/configs/fixture.config")
+    shutil.copyfile(config, revision_repo / "cuteafd.config")
+    shutil.copyfile(matrix, revision_repo / "scripts/bench/release-smoke-v3.json")
+    subprocess.run(["git", "init", "-q", str(revision_repo)], check=True)
+    subprocess.run(["git", "-C", str(revision_repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(revision_repo), "-c", "user.name=Fixture", "-c",
+                    "user.email=fixture@example.invalid", "commit", "-qm", "Fixture"], check=True)
+    revision = subprocess.check_output(["git", "-C", str(revision_repo), "rev-parse", "HEAD"], text=True).strip()
+    git = bin_dir / "git"
+    git.write_text('#!/bin/sh\nshift 2\nexec /usr/bin/git -C "$CUTEAFD_TEST_REVISION_REPO" "$@"\n')
+    git.chmod(0o755)
     docker_log = tmp_path / "docker.log"
     ssh_log = tmp_path / "ssh.log"
     environment = {
@@ -125,7 +149,10 @@ def harness(tmp_path):
         "HOME": str(tmp_path),
         "CUTEAFD_TEST_DOCKER_LOG": str(docker_log),
         "CUTEAFD_TEST_INVENTORY": str(inventory),
-        "CUTEAFD_RELEASE_RELEASE_MATRIX": str(matrix),
+        "CUTEAFD_RELEASE_MATRIX": str(matrix),
+        "CUTEAFD_TEST_MATRIX_SHA256": hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        "CUTEAFD_TEST_REVISION": revision,
+        "CUTEAFD_TEST_REVISION_REPO": str(revision_repo),
         "CUTEAFD_TEST_SSH_LOG": str(ssh_log),
     }
     for name in ("CUTEAFD_RELEASE_SSH_CONFIG", "CUTEAFD_RELEASE_SPARK_TP_ROLES"):
@@ -299,7 +326,7 @@ def test_push_refuses_incomplete_inventory_before_tagging(harness):
     assert not _pushed_refs(calls()) and not _tagged_destinations(calls())
 
 
-@pytest.mark.parametrize("tag", ["v3.0.0", "v3.0.0-rc2"])
+@pytest.mark.parametrize("tag", ["v3.0.0", "v3.0.0-rc2", "nightly", "3.0.0", "v3.0.1-hotfix", "v3.0.0-rc.1", "dev-fixture"])
 def test_release_tags_refuse_narrow_build_scope(harness, tag):
     run, calls, _, _ = harness
     result = run(tag, config=V10_CONFIG, env={"CUTEAFD_TEST_SCOPE": "deepseek_v41"})
@@ -310,6 +337,53 @@ def test_release_tags_refuse_narrow_build_scope(harness, tag):
 
 def test_dev_tag_accepts_selected_scope_after_inventory_check(harness):
     run, calls, _, _ = harness
-    result = run("dev-fixture", config=V10_CONFIG, env={"CUTEAFD_TEST_SCOPE": "deepseek_v41"})
+    result = run("dev-fixture", "--no-latest", config=V10_CONFIG, env={"CUTEAFD_TEST_SCOPE": "deepseek_v41"})
     assert result.returncode == 0, result.stderr
     assert _pushed_refs(calls())
+
+
+@pytest.mark.parametrize('tag', ['nightly', '3.0.0', 'v3.0.1-hotfix', 'v3.0.0-rc.1', 'dev', 'wip', 'DEV-fixture'])
+def test_non_dev_tags_require_full_scope_even_without_latest(harness, tag):
+    run, calls, _, _ = harness
+    result = run(tag, '--no-latest', config=V10_CONFIG, env={'CUTEAFD_TEST_SCOPE': 'deepseek_v41'})
+    assert result.returncode == 2
+    assert 'scope all' in result.stderr
+    assert not _pushed_refs(calls()) and not _tagged_destinations(calls())
+
+
+@pytest.mark.parametrize('digest', ['', '0' * 64, 'not-a-digest'])
+@pytest.mark.parametrize('tag', ['v3.0.0-rc1', 'nightly', 'dev-fixture'])
+def test_release_and_latest_reject_missing_or_swapped_matrix(harness, digest, tag):
+    run, calls, _, _ = harness
+    result = run(tag, config=V10_CONFIG, env={'CUTEAFD_TEST_MATRIX_SHA256': digest})
+    assert result.returncode == 2
+    assert 'matrix' in result.stderr and ('SHA256' in result.stderr or 'sha256' in result.stderr)
+    assert not _pushed_refs(calls()) and not _tagged_destinations(calls())
+
+
+def test_release_ignores_publisher_matrix_override(harness):
+    run, calls, _, root = harness
+    override = root / 'swapped.json'
+    override.write_text('{"entries": []}')
+    result = run('v3.0.0-rc1', config=V10_CONFIG, env={'CUTEAFD_RELEASE_MATRIX': str(override)})
+    assert result.returncode == 0, result.stderr
+    assert _pushed_refs(calls())
+
+
+def test_dev_matrix_override_cannot_skip_recorded_inventory(harness):
+    run, calls, _, root = harness
+    matrix = root / 'matrix.json'
+    matrix.write_text('{"entries": []}')
+    result = run('wip-fixture', '--no-latest', config=V10_CONFIG,
+                 env={'CUTEAFD_TEST_SCOPE': 'deepseek_v41'})
+    assert result.returncode == 2
+    assert 'matrix SHA256' in result.stderr
+    assert not _pushed_refs(calls()) and not _tagged_destinations(calls())
+
+
+def test_image_pair_requires_matching_matrix_digests(harness):
+    run, calls, _, _ = harness
+    result = run('v3.0.0-rc1', config=V10_CONFIG, env={'CUTEAFD_TEST_SPARK_MATRIX_SHA256': '0' * 64})
+    assert result.returncode == 2
+    assert 'SHA256 labels are missing or disagree' in result.stderr
+    assert not _pushed_refs(calls()) and not _tagged_destinations(calls())

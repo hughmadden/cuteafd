@@ -12,10 +12,30 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import io
+import re
+import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
 SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'AUDIO', 'CONTEXT_SPLIT')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES')
+# v2.0.0 shipped set: complete releases retain this previous-release floor.
+PREVIOUS_RELEASE_FLOOR = {
+    'EXPERT_FAMILIES': {'mimo:fp8'},
+    'MIMO_GEOMETRIES': {'mimo', 'mimo2'},
+    'MIMO_AOT': {'ON'},
+    'SPARK_TP_ROLES': {'tp2', 'tp3', 'tp6'},
+    'GENERIC_SPARK_COUNTS': {
+        f'{family}={count}'
+        for family, counts in {
+            'dsv4f': (2, 3, 4, 6), 'dsv4p': (2, 3, 4, 6),
+            'glm': (2, 3, 4, 6), 'glmf': (2, 3, 4, 6),
+            'mimo': (2, 4, 6), 'mimof': (2, 4), 'mimop': (2, 6),
+            'qwen4': (1, 2, 3, 4),
+        }.items() for count in counts
+    },
+}
+DEFAULT_MATRIX = 'scripts/bench/release-smoke-v3.json'
 
 
 def scopes_module(repo):
@@ -53,12 +73,7 @@ def entry_scopes(repo, entry):
     wip = scopes_module(repo)
     values = wip.read_config(repo / entry.get('config', 'cuteafd.config'))
     values.update({key: str(value) for key, value in entry['set'].items()})
-    # Smoke's set overlay wins over the base config. Hardware lists are fallbacks
-    # for matrices that specify topology only as resource reservations.
-    if 'SPARK_COUNT' not in entry['set'] and 'sparks' in entry:
-        values['SPARK_COUNT'] = str(len(entry['sparks']))
-    if 'RTX_GPUS' not in entry['set'] and 'gpus' in entry:
-        values['RTX_GPUS'] = str(len(entry['gpus']))
+    # Resource reservations do not override smoke's config/set topology.
     if entry.get('family'):
         values['FAMILY'] = entry['family']
     family, scopes = wip.config_scopes(values)
@@ -85,11 +100,14 @@ def derive(repo, matrix, scope='all', environ=None):
                 result[target] = 'ON'
             elif suffix in LISTS:
                 result[target] = ';'.join(sorted(tokens(result[target]) | tokens(value)))
-    # The complete release retains the universal V4.1 role floor. TP4 is the
-    # always-built unsuffixed Spark shard, not an extra role in this list.
+    # TP4 is the always-built unsuffixed V4.1 Spark shard, not a supplemental role.
     if scope == 'all':
-        result[PREFIX + 'SPARK_TP_ROLES'] = ';'.join(sorted(
-            tokens(result[PREFIX + 'SPARK_TP_ROLES']) | {'tp2', 'tp3', 'tp6'}))
+        for key, floor in PREVIOUS_RELEASE_FLOOR.items():
+            target = PREFIX + key
+            if key.endswith('_AOT'):
+                result[target] = 'ON'
+            else:
+                result[target] = ';'.join(sorted(tokens(result[target]) | floor))
     # Context-split programs are required by V4 as well as GLM's config scope.
     if result[PREFIX + 'DSV4_AOT'] == 'ON':
         result[PREFIX + 'CONTEXT_SPLIT_AOT'] = 'ON'
@@ -172,20 +190,20 @@ def check_package(root, package, layouts, role, verified=None):
         present = {v['directory'].split('/')[0] for v in manifest.get('variants', [])}
     else:
         present = set(manifest.get('layouts', {}))
-        # Uneven H128 Spark slices need the exact width siblings, not merely
-        # the padded tpN package, matching the loader's Spark recipe.
-        if role == 'expert':
-            exact = []
-            for layout in layouts:
-                info = manifest.get('layouts', {}).get(layout, {})
-                intermediate = info.get('intermediate', 0)
-                world = int(layout.removeprefix('tp'))
-                if intermediate and intermediate % 128 == 0 and intermediate // 128 >= world:
-                    blocks = intermediate // 128
-                    widths = {(blocks // world + int(rank < blocks % world)) * 128 for rank in range(world)}
-                    if len(widths) > 1:
-                        exact.extend(f'{layout}-w{width}' for width in widths)
-            layouts = [*layouts, *exact]
+        # Both Spark and coordinator H128 slices require exact-width siblings.
+        exact = []
+        for layout in layouts:
+            if '-w' in layout:
+                continue
+            info = manifest.get('layouts', {}).get(layout, {})
+            intermediate = info.get('intermediate', 0)
+            world = int(layout.removeprefix('tp'))
+            if intermediate and intermediate % 128 == 0 and intermediate // 128 >= world:
+                blocks = intermediate // 128
+                widths = {(blocks // world + int(rank < blocks % world)) * 128 for rank in range(world)}
+                if len(widths) > 1:
+                    exact.extend(f'{layout}-w{width}' for width in widths)
+        layouts = [*layouts, *exact]
     require(set(layouts) <= present, f'{package}: missing layouts {sorted(set(layouts) - present)}')
     files = manifest.get('files', {})
     require(bool(files), f'{package}: empty file inventory')
@@ -255,6 +273,8 @@ def check_inventory(root, role, wanted, symbols=None):
                     layouts = [f'tp{entry["spark_tp"]}'] if role == 'expert' else ['tp1']
                     if role == 'coordinator' and entry['dual'] and family != 'glmfdense':
                         layouts.append('tp2')
+                        if family == 'qwen4' and kind.startswith('nvfp4'):
+                            layouts.extend(['tp2-w384', 'tp2-w256'])
                     check_package(root, f'fp8/fp8-{family}{suffix}', layouts, role, verified)
                     if kind == 'nvfp4':
                         check_package(root, f'fp8/fp8-{family}-nvfp4a4', layouts, role, verified)
@@ -284,11 +304,26 @@ def check_image(image, role, wanted):
             subprocess.run(['docker', 'rm', '-f', container], check=True, stdout=subprocess.DEVNULL)
 
 
+def revision_requirements(repo, revision):
+    require(re.fullmatch(r'[0-9a-f]{40}', revision) is not None,
+            'release publication requires a clean full Git revision')
+    # Materialize the build revision's matrix, config and shared derivation, not
+    # the publisher's potentially different checkout or environment override.
+    archive = subprocess.check_output(['git', '-C', str(repo), 'archive', revision, '--',
+                                       'scripts/lib', 'examples/configs', 'cuteafd.config', DEFAULT_MATRIX])
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
+            tree.extractall(root, filter='data')
+        return requirements(root, root / DEFAULT_MATRIX, 'all')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('derive', 'requirements', 'check-image', 'check-files'))
-    parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument('--repo', type=Path, default=None)
     parser.add_argument('--matrix', type=Path)
+    parser.add_argument('--revision')
     parser.add_argument('--scope', default=os.environ.get(PREFIX + 'SCOPE', 'all'))
     parser.add_argument('--shell', action='store_true')
     parser.add_argument('--role', choices=('coordinator', 'expert'))
@@ -297,7 +332,11 @@ def main():
     parser.add_argument('--requirements')
     args = parser.parse_args()
     try:
-        matrix = args.matrix or Path(os.environ.get(PREFIX + 'RELEASE_MATRIX', args.repo / 'scripts/bench/release-smoke-v3.json'))
+        # Inventory checks supplied with requirements work when sent over stdin,
+        # without resolving __file__ or assuming a remote working directory.
+        if args.action in ('derive', 'requirements') or not args.requirements:
+            args.repo = args.repo or Path(__file__).resolve().parents[2]
+        matrix = args.matrix or Path(os.environ.get(PREFIX + 'MATRIX', str(args.repo / DEFAULT_MATRIX) if args.repo else DEFAULT_MATRIX))
         if args.action == 'derive':
             env, entries = derive(args.repo, matrix, args.scope)
             print(f'Release scope: {args.scope}; {len(entries)} matrix entries', file=sys.stderr)
@@ -309,7 +348,8 @@ def main():
             else:
                 print(json.dumps(env, indent=2, sort_keys=True))
         elif args.action == 'requirements':
-            print(json.dumps(requirements(args.repo, matrix, args.scope), separators=(',', ':')))
+            wanted = revision_requirements(args.repo, args.revision) if args.revision else requirements(args.repo, matrix, args.scope)
+            print(json.dumps(wanted, separators=(',', ':')))
         else:
             wanted = json.loads(args.requirements) if args.requirements else requirements(args.repo, matrix, args.scope)
             require(args.role is not None, '--role is required')

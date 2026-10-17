@@ -42,15 +42,14 @@ def test_union_equals_per_entry_derivation(fixture_repo):
     per_entry = [SCOPE.derive(repo, path, entry['name'], {})[0] for entry in entries]
     for key, value in union.items():
         if key.endswith('_AOT'):
-            assert value == ('ON' if any(e[key] == 'ON' for e in per_entry) else 'OFF')
+            assert value == ('ON' if any(e[key] == 'ON' for e in per_entry) or key.removeprefix(P) in SCOPE.PREVIOUS_RELEASE_FLOOR else 'OFF')
         else:
             expected = set().union(*(SCOPE.tokens(e[key]) for e in per_entry))
-            if key.endswith('SPARK_TP_ROLES'):
-                expected |= {'tp2', 'tp3', 'tp6'}
+            expected |= SCOPE.PREVIOUS_RELEASE_FLOOR.get(key.removeprefix(P), set())
             assert SCOPE.tokens(value) == expected
-    assert union[P + 'GENERIC_SPARK_COUNTS'] == 'glm=2'
-    assert union[P + 'EXPERT_FAMILIES'] == 'glm:fp8;glmf:nvfp4;glmfdense:nvfp4'
-    assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 2
+    assert SCOPE.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS'] <= SCOPE.tokens(union[P + 'GENERIC_SPARK_COUNTS'])
+    assert union[P + 'EXPERT_FAMILIES'] == 'glm:fp8;glmf:nvfp4;glmfdense:nvfp4;mimo:fp8'
+    assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 4
     assert not SCOPE.requirements(repo, path, 'glm-fp8')[0]['dual']  # set wins over gpus
 
 
@@ -59,10 +58,10 @@ def test_raw_environment_adds_but_does_not_shrink(fixture_repo):
     added, _ = SCOPE.derive(repo, path, environ={P + 'EXPERT_FAMILIES': 'qwen4:nvfp4', P + 'GLM_AOT': 'OFF',
                                                P + 'MIMO_GEOMETRIES': 'mimof,mimof2'})
     assert added[P + 'GLM_AOT'] == 'ON'
-    assert added[P + 'EXPERT_FAMILIES'] == 'glm:fp8;glmf:nvfp4;glmfdense:nvfp4;qwen4:nvfp4'
-    assert added[P + 'MIMO_GEOMETRIES'] == 'mimof;mimof2'
+    assert added[P + 'EXPERT_FAMILIES'] == 'glm:fp8;glmf:nvfp4;glmfdense:nvfp4;mimo:fp8;qwen4:nvfp4'
+    assert added[P + 'MIMO_GEOMETRIES'] == 'mimo;mimo2;mimof;mimof2'
     empty, _ = SCOPE.derive(repo, path, environ={P + 'EXPERT_FAMILIES': ''})
-    assert empty[P + 'EXPERT_FAMILIES'] == 'glm:fp8;glmf:nvfp4;glmfdense:nvfp4'
+    assert empty[P + 'EXPERT_FAMILIES'] == 'glm:fp8;glmf:nvfp4;glmfdense:nvfp4;mimo:fp8'
 
 
 def test_selectors_and_explicit(fixture_repo):
@@ -76,7 +75,8 @@ def test_selectors_and_explicit(fixture_repo):
     both, _ = SCOPE.derive(repo, path, 'glm-fp8,flash-nvfp4', {})
     all_scope = SCOPE.derive(repo, path, 'all', {})[0]
     assert all_scope[P + 'SPARK_TP_ROLES'] == 'tp2;tp3;tp6'
-    all_scope[P + 'SPARK_TP_ROLES'] = both[P + 'SPARK_TP_ROLES']
+    for key in SCOPE.PREVIOUS_RELEASE_FLOOR:
+        all_scope[P + key] = both[P + key]
     assert both == all_scope
     explicit, entries = SCOPE.derive(repo, path, 'explicit', {P + 'EXPERT_FAMILIES': 'glm:fp8', P + 'GLM_AOT': 'OFF'})
     assert not entries
@@ -152,3 +152,94 @@ def test_exact_spark_slices_are_not_satisfied_by_padded_package(tmp_path):
     write_json(path, manifest)
     with pytest.raises(ValueError, match='missing layouts.*tp6-w256.*tp6-w384'):
         SCOPE.check_package(root, 'fp8/fp8-glm', ['tp6'], 'expert')
+
+
+def test_resources_do_not_override_config_topology(fixture_repo):
+    repo, matrix = fixture_repo
+    entry = SCOPE.requirements(repo, matrix, 'flash-nvfp4')[0]
+    assert entry['spark_count'] == 4  # resource list is empty; config still wins
+    assert not entry['dual']
+
+
+def test_coordinator_requires_qwen_exact_width_siblings(tmp_path):
+    root = fake_inventory(tmp_path / 'images') / 'coordinator'
+    path = root / 'lib/fp8/fp8-glm/manifest.json'
+    manifest = json.loads(path.read_text())
+    manifest['layouts']['tp2'] = {'intermediate': 640}
+    write_json(path, manifest)
+    with pytest.raises(ValueError, match='missing layouts.*tp2-w256.*tp2-w384'):
+        SCOPE.check_package(root, 'fp8/fp8-glm', ['tp1', 'tp2'], 'coordinator')
+
+
+def test_stdin_checker_has_no_repository_or_working_directory_dependency(tmp_path):
+    import subprocess
+    helper = REPO / 'scripts/build/release-scope.py'
+    result = subprocess.run(['python3', '-', 'check-files', '--role', 'coordinator', '--root', str(tmp_path),
+                             '--requirements', '[]'], input=helper.read_text(), cwd='/', text=True,
+                            capture_output=True)
+    # It gets as far as the native inventory read, not __file__ resolution.
+    assert 'libcuteafd_native.so' in result.stderr
+    assert 'IndexError' not in result.stderr
+
+
+def test_qwen_dual_coordinator_requires_exact_layouts_without_geometry_metadata(tmp_path):
+    wanted = [dict(name='qwen-dual', family='qwen4', programs=['qwen4'], experts=['qwen4:nvfp4'],
+                   spark_experts=[], spark_count=0, dual=True, audio=False, context_split=False)]
+    root = fake_inventory(tmp_path / 'images', family='qwen4') / 'coordinator'
+    import shutil
+    base = root / 'lib/fp8/fp8-glm'
+    shutil.copytree(base, root / 'lib/fp8/fp8-qwen4-nvfp4')
+    with pytest.raises(ValueError, match='qwen-dual.*missing layouts.*tp2-w256.*tp2-w384'):
+        SCOPE.check_inventory(root, 'coordinator', wanted, symbols=set())
+
+
+def test_pending_tags_cleanup_runs_after_success_and_failure(tmp_path):
+    import subprocess
+    build = (REPO / 'build.sh').read_text()
+    cleanup = 'release_pending_cleanup() {' + build.split('release_pending_cleanup() {', 1)[1].split("trap 'exit 130' INT", 1)[0]
+    # The extraction retains the parent EXIT trap; image promotion never clears it.
+    assert 'trap - EXIT' not in build.split('coordinator_container="$(docker create', 1)[1].split('release_ssh "$seed_host" bash', 1)[0]
+    for status in (0, 2):
+        log = tmp_path / f'cleanup-{status}.log'
+        script = tmp_path / 'ssh'
+        script.write_text('#!/bin/sh\nprintf "%s\n" "$*" >> "$CLEANUP_LOG"\n')
+        script.chmod(0o755)
+        result = subprocess.run(['bash', '-c', f"""set -euo pipefail
+export PATH={tmp_path}:/usr/bin:/bin CLEANUP_LOG={log}
+COORDINATOR_DOCKER_INFERENCE=coordinator-pending-123
+SPARK_EXPERT_DOCKER_INFERENCE=spark-pending-123
+RELEASE_BUILD_HOSTS=(fixture-a fixture-b)
+release_ssh_opts=(-o BatchMode=yes)
+docker() {{ printf '%s\n' "$*" >> "$CLEANUP_LOG"; }}
+{cleanup}
+exit {status}
+"""], capture_output=True, text=True)
+        assert result.returncode == status, result.stderr
+        lines = log.read_text().splitlines()
+        assert lines == ['image rm coordinator-pending-123',
+                         '-o BatchMode=yes fixture-a docker image rm spark-pending-123',
+                         '-o BatchMode=yes fixture-b docker image rm spark-pending-123']
+
+
+def test_release_requirements_use_matrix_and_configs_at_build_revision(tmp_path):
+    import shutil
+    import subprocess
+    repo = tmp_path / 'revision-repo'
+    shutil.copytree(REPO / 'scripts/lib', repo / 'scripts/lib', ignore=shutil.ignore_patterns('__pycache__'))
+    config = repo / 'examples/configs/fixture.config'
+    config.parent.mkdir(parents=True)
+    config.write_text('FAMILY=glm5\nMODEL_ID=fixture/glm\nSPARK_COUNT=4\nRTX_GPUS=1\n')
+    matrix = repo / SCOPE.DEFAULT_MATRIX
+    write_json(matrix, dict(entries=[dict(name='glm-fixture', family='glm5',
+                                         config='examples/configs/fixture.config')]))
+    (repo / 'cuteafd.config').write_text('FAMILY=glm5\n')
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c',
+                    'user.email=fixture@example.invalid', 'commit', '-qm', 'Fixture'], check=True)
+    revision = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+    config.write_text('FAMILY=glm5\nMODEL_ID=fixture/glm\nSPARK_COUNT=0\nRTX_GPUS=2\n')
+    matrix.write_text('{"entries": []}')
+    wanted = SCOPE.revision_requirements(repo, revision)
+    assert wanted[0]['spark_count'] == 4
+    assert not wanted[0]['dual']
