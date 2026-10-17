@@ -330,10 +330,18 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             return unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
                 suffix, encoder, greedy).await };
         };
+        let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
             requests, batch, transport, placement, selected, suffix, encoder, greedy)) }).await;
+        let issued_us = timed.map(|t| t.elapsed().as_micros() as u64);
         let drained = self.drain_chain();
+        let drained_us = timed.map(|t| t.elapsed().as_micros() as u64);
         let result = result.and(drained).and_then(|()| transport.get().check_device());
+        if let (Some(t), Some(issued_us), Some(drained_us)) = (timed, issued_us, drained_us) {
+            tracing::debug!(target: "cuteafd::timing", issued_us, drain_us=drained_us-issued_us,
+                check_us=t.elapsed().as_micros() as u64-drained_us, "distributed verification chain");
+        }
+        let ring_timed = timed.map(|_| Instant::now());
         if result.is_ok() && self.resources.capture_routes && crate::shared::memory::chain::device_enabled() {
             // Device-ordered local layers left their routes in the routers' rings.
             for gpu in 0..self.resources.lanes.len() {
@@ -343,6 +351,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     self.resources.route_capture[layer].clone_from(&self.resources.lanes[gpu].captured_routes()[layer]);
                 }
             }
+        }
+        if let Some(t) = ring_timed {
+            tracing::debug!(target: "cuteafd::timing", route_ring_us=t.elapsed().as_micros() as u64,
+                "distributed route ring drain");
         }
         result
     }
@@ -405,6 +417,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         greedy: bool,
         flow: Option<EncoderFlow<'_, '_, 'a>>,
     ) -> Result<()> {
+        let begin_timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         requests.with_requests(|r| r.validate(batch))?;
         let stage = batch.cache()?.stage();
         let id = batch.cache()?.identity();
@@ -496,6 +509,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     })?;
                 }
             }
+        }
+        if let Some(t) = begin_timed {
+            tracing::debug!(target: "cuteafd::timing", rows, begin_us=t.elapsed().as_micros() as u64,
+                "distributed pass begin");
         }
         layer_schedule!(stage; layer, first; {
             if let Some(flow) = &flow {
@@ -799,7 +816,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             self.resources.taps.output(guard.batch.cache()?)?;
             let gpu = self.resources.map.attention(39)?;
             let output = self.resources.lanes[gpu].output()?;
+            let head_timed = begin_timed.map(|_| Instant::now());
             unsafe { self.resources.head.execute_block_with_greedy(&output, selected, greedy).await?; }
+            if let Some(t) = head_timed {
+                tracing::debug!(target: "cuteafd::timing", rows, greedy, head_us=t.elapsed().as_micros() as u64,
+                    "distributed pass head");
+            }
             self.state = State::Ready(id);
         }
         guard.completed = true;

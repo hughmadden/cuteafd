@@ -545,7 +545,8 @@ impl WindowWave<'_, '_> {
             && query.hidden.device_id == self.input.buffer.device_id
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
-        let forced_eager = crate::shared::decode_graph::census::eager("window");
+        let forced_eager = crate::shared::decode_graph::census::eager("window")
+            || !super::graph_policy::captures_shape(prepared.rows as u32);
         if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
         let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
@@ -633,6 +634,13 @@ impl WindowWave<'_, '_> {
                 self.stream.library.copy_d2d_async(
                     self.input.buffer, query.hidden, query.hidden.bytes, self.stream.raw,
                 )?;
+            }
+            if !super::graph_policy::captures_shape(prepared.rows as u32) {
+                // An uncached prefill tail: run it once eagerly, never capture it.
+                let launched = self.upload(&prepared).and_then(|()| unsafe { self.enqueue(prepared.rows) });
+                launched.and(self.synchronize())?;
+                self.ready = Some(prepared);
+                return Ok(());
             }
             self.select_graph(prepared.rows, state.owner, true)?;
             if self.graph.is_none() {
@@ -802,8 +810,10 @@ impl WindowWave<'_, '_> {
         }
         self.ready = None;
         if drain { self.synchronize()?; } else { self.stream.require_complete()?; }
-        if let Some(old) = self.graph.take() {
-            if old.0 > 64 { self.graphs.retire(&old); }
+        self.graph = None;
+        if rows > 64 && self.graphs.count(|&(r, _)| r > 64 && r != rows) >= crate::shared::decode_graph::LARGE_SHAPES {
+            // Keep the full prefill chunk and decoder replay across decode rounds.
+            self.graphs.retire_oldest(|&(r, _)| r > 64 && r != rows);
         }
         drop(self.graphs.drain_retired(|| Ok(()))?);
         self.graph = self.graphs.launch(&(rows, owner)).map(|_| (rows, owner));

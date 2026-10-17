@@ -305,6 +305,8 @@ fn worker(
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
     let rows = capacity as usize;
+    // Live requests capture decode shapes and the full prefill chunk only.
+    super::graph_policy::set_prefill_rows(args.prefill_batch_tokens)?;
     let mut catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot,
     )?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v41",

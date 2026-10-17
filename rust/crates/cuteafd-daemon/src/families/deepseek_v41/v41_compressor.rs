@@ -819,7 +819,8 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             && query.hidden.device_id == self.input.buffer.device_id
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
-        let forced_eager = crate::shared::decode_graph::census::eager("layer_row");
+        let forced_eager = crate::shared::decode_graph::census::eager("layer_row")
+            || !super::graph_policy::captures_shape(prepared.rows as u32);
         if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
         let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
@@ -917,6 +918,10 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         crate::shared::memory::chain::settle(self.stream.library)?;
         self.synchronize()?;
         self.stream.library.copy_d2d(self.input.buffer, query.hidden, query.hidden.bytes)?;
+        if !super::graph_policy::captures_shape(prepared.rows as u32) {
+            // An uncached prefill tail: run it once eagerly, never capture it.
+            return unsafe { self.execute(state, chunks) };
+        }
         self.select_graph(prepared.rows, state.owner, true)?;
         if self.graph.is_none() {
             unsafe { self.capture(state, chunks)?; }
@@ -1117,8 +1122,11 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         }
         self.ready = None;
         if drain { self.synchronize()?; } else { self.stream.require_complete()?; }
-        if let Some((_, old_rows, old_owner)) = self.graph.take() {
-            if old_rows > 64 { self.retained_graphs.retire(&(old_rows, old_owner)); }
+        self.graph = None;
+        if rows > 64 && self.retained_graphs.count(|&(r, _)| r > 64 && r != rows)
+            >= crate::shared::decode_graph::LARGE_SHAPES {
+            // Keep the full prefill chunk and decoder replay across decode rounds.
+            self.retained_graphs.retire_oldest(|&(r, _)| r > 64 && r != rows);
         }
         drop(self.retained_graphs.drain_retired(|| Ok(()))?);
         self.graph = self.retained_graphs.launch(&(rows, owner)).map(|exec| (exec.raw, rows, owner));

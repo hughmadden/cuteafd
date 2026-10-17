@@ -550,7 +550,9 @@ impl<'a> IndexSelectionWave<'a> {
             }
             staging[rows * 48 + i * 8..rows * 48 + i * 8 + 8].copy_from_slice(&m[1].to_ne_bytes());
         }
-        let forced_eager = crate::shared::decode_graph::census::eager("index");
+        // Prefill tails (and any other uncached large shape) bind eagerly.
+        let forced_eager = crate::shared::decode_graph::census::eager("index")
+            || !super::graph_policy::captures_shape(rows as u32);
         let capture = if forced_eager { false } else { self.select_graph(&fingerprint)? };
         if defer {
             self.in_flight = true;

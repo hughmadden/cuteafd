@@ -189,9 +189,12 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 // terminal, keeps the whole-round CPU path.
                 let mut round = None;
                 let next = if compact {
-                    ScoreRows::from_greedy(scores::VOCAB, unsafe {
-                        pass.execute_shared_greedy(requests, current, transport, 0, &selected).await?
-                    })?
+                    let greedy = unsafe { pass.execute_shared_greedy(requests, current, transport, 0, &selected).await? };
+                    if tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG) {
+                        tracing::debug!(target: "cuteafd::timing", lane,
+                            pass_us=started.elapsed().as_micros() as u64 - prepared_us, "independent greedy pass returned");
+                    }
+                    ScoreRows::from_greedy(scores::VOCAB, greedy)?
                 } else if use_sampled_terminal(P::SUPPORTS_SAMPLED_TERMINAL,
                     round_has_device_rows(&active.borrow(), &members)) {
                     let built = build_sampling_round(&active.borrow(), &members, &inputs,
@@ -237,8 +240,14 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                             Some(resolve_frontier(retain, &next, row, bytes, mask.as_deref())?);
                     }
                 }
+                let commit_timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
                 lanes::commit(&mut Commit { lane, pass: &mut *pass, requests, draft, batch: batch.as_mut().unwrap(),
                     accepted: &decision.accepted }).await?;
+                if let Some(t) = commit_timed {
+                    tracing::debug!(target: "cuteafd::timing", lane, commit_us=t.elapsed().as_micros() as u64,
+                        decide_us=t.duration_since(started).as_micros() as u64 - prepared_us - verify_us,
+                        "independent lane commit");
+                }
                 let (accepted, emitted, emissions, accepted_inputs) = publish_commit_lane(&mut active.borrow_mut(),
                     &members, &mut batch, decision)?;
                 let live = console::live();
