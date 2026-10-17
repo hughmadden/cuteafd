@@ -24,6 +24,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // AOT kernels keep their full scratch; row storage follows live capacity.
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
+    super::super::graph_policy::set_prefill_rows(args.prefill_batch_tokens)?;
     let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
     lib.cuda_set_device(0)?;
     let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];

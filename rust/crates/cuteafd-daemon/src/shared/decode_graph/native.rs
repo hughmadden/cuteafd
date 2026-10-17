@@ -5,6 +5,10 @@ use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
 
+/// Large (above-decode) shapes a bank retains per layer: the full prefill chunk
+/// and the decoder replay. Other large shapes are executed eagerly upstream.
+pub(crate) const LARGE_SHAPES: usize = 2;
+
 pub(crate) struct LayerGraphs<'w, 'a, W> {
     library: &'a NativeLibrary,
     bank: GraphBank<(usize, u32), GraphOwner<'a, &'w W>>,
@@ -36,8 +40,15 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
         if !self.retain_small || different_owner {
             // SAFETY: caller has drained all graph launches before replacing an owner.
             unsafe { self.remove(layer)?; }
-        } else if let Some(old) = self.current[layer] {
-            if old > self.decode_rows && old != rows { self.bank.retire(&(layer, old)); }
+        } else if rows > self.decode_rows {
+            // Large (prefill) graphs per layer: keep the most recent LARGE_SHAPES
+            // (a full chunk and the decoder replay), so neither decode rounds nor
+            // alternating prefill units recapture them on every request.
+            let decode_rows = self.decode_rows;
+            let large = self.bank.count(|&(l, r)| l == layer && r > decode_rows && r != rows);
+            if large >= LARGE_SHAPES {
+                self.bank.retire_oldest(|&(l, r)| l == layer && r > decode_rows && r != rows);
+            }
         }
         let device = self.library.cuda_get_device()?;
         // SAFETY: the weight borrow pins its storage and the containing wave pins workspace.
@@ -75,13 +86,12 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
 pub(crate) struct RowGraphs<'a> {
     library: &'a NativeLibrary,
     bank: GraphBank<usize, GraphOwner<'a, ()>>,
-    large: Option<usize>,
     decode_rows: usize,
     site: &'static str,
 }
 impl<'a> RowGraphs<'a> {
     pub fn new(library: &'a NativeLibrary, site: &'static str, decode_rows: usize) -> Self {
-        Self { library, bank: GraphBank::new(None), large: None, decode_rows, site }
+        Self { library, bank: GraphBank::new(None), decode_rows, site }
     }
     pub fn get(&self, rows: usize) -> Option<*mut c_void> { self.bank.get(&rows).map(|owner| owner.raw) }
     /// # Safety
@@ -93,7 +103,10 @@ impl<'a> RowGraphs<'a> {
         // SAFETY: the containing wave owns and pins every captured allocation.
         let owner = unsafe { GraphOwner::new(self.library, device, graph, ())? };
         if rows > self.decode_rows {
-            if let Some(old) = self.large.replace(rows) { self.bank.retire(&old); }
+            let decode_rows = self.decode_rows;
+            if self.bank.count(|&r| r > decode_rows && r != rows) >= LARGE_SHAPES {
+                self.bank.retire_oldest(|&r| r > decode_rows && r != rows);
+            }
         }
         self.bank.insert(rows, owner, None);
         drop(self.bank.drain_retired(|| Ok(()))?);
@@ -105,7 +118,6 @@ impl<'a> RowGraphs<'a> {
     /// Every queued use completed before releasing graph executables or storage.
     pub unsafe fn clear(&mut self) -> Result<()> {
         self.bank.retire_all();
-        self.large = None;
         drop(self.bank.drain_retired(|| Ok(()))?);
         Ok(())
     }

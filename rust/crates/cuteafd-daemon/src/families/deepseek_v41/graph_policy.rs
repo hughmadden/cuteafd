@@ -30,8 +30,31 @@ fn validate_fixed_shapes(mut shapes: Vec<u32>) -> Result<Vec<u32>> {
     Ok(shapes)
 }
 
+/// Rows of one full prefill chunk. Above the decode bank a live request captures
+/// only this and the 128-row decoder replay, the two large shapes every long
+/// prompt repeats. Unset (tests, tools), every shape keeps capturing.
+static PREFILL_ROWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Startup: register the serving prefill chunk. A prompt's tail chunk has an
+/// odd row count that no later request repeats, so it executes eagerly instead
+/// of instantiating one single-use graph per layer and site (#410 A).
+pub(super) fn set_prefill_rows(rows: u32) -> Result<()> {
+    ensure!(rows > 0, "prefill chunk rows must be positive");
+    match PREFILL_ROWS.get() {
+        Some(&set) => ensure!(set == rows, "prefill chunk rows already set to {set}"),
+        None => { let _ = PREFILL_ROWS.set(rows); }
+    }
+    Ok(())
+}
+
 pub(super) fn captures_shape(rows: u32) -> bool {
-    FIXED_SHAPES.get().is_none_or(|shapes| shapes.contains(&rows))
+    large_shape_captured(rows, PREFILL_ROWS.get().copied())
+        && FIXED_SHAPES.get().is_none_or(|shapes| shapes.contains(&rows))
+}
+
+fn large_shape_captured(rows: u32, prefill: Option<u32>) -> bool {
+    rows <= MAX_DECODE_ROWS || rows == cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS
+        || prefill.is_none_or(|chunk| rows == chunk)
 }
 
 pub(super) fn fixed_binding_limit() -> Option<usize> {
@@ -58,6 +81,19 @@ mod tests {
     }
 
     #[test]
+    fn prefill_tail_chunks_execute_eagerly_while_decode_and_full_chunks_capture() {
+        for rows in [1, 6, 38, MAX_DECODE_ROWS] {
+            assert!(large_shape_captured(rows, Some(2048)));
+        }
+        assert!(large_shape_captured(2048, Some(2048)));
+        assert!(large_shape_captured(128, Some(2048)));
+        for rows in [MAX_DECODE_ROWS + 1, 1982, 2047] {
+            assert!(!large_shape_captured(rows, Some(2048)));
+        }
+        assert!(large_shape_captured(1982, None));
+    }
+
+    #[test]
     fn fixed_shapes_preserve_c1_and_refuse_replacing_large_prefill_slots() {
         assert_eq!(validate_fixed_shapes(vec![48, 6, 1, 24, 32, 40, 6]).unwrap(),
             vec![1, 6, 24, 32, 40, 48]);
@@ -80,7 +116,7 @@ mod tests {
         let mut bank = RowGraphs::new(&library, "fixture", MAX_DECODE_ROWS as usize);
         let mut handles = BTreeMap::new();
         for (cycle, rows) in (1..=MAX_DECODE_ROWS as usize)
-            .chain([80, 128, 2, 6, 3, 48, 64, 56, 63, 64]).enumerate() {
+            .chain([80, 128, 2, 6, 96, 3, 48, 64, 56, 63, 64]).enumerate() {
             let expected = vec![(cycle + 1) as u8; 128 * 4];
             library.copy_h2d(input.buffer, &expected)?;
             if bank.get(rows).is_none() {
@@ -106,9 +142,10 @@ mod tests {
             library.copy_d2h(&mut actual, view)?;
             assert_eq!(actual, expected[..actual.len()]);
         }
+        // Two large shapes stay (chunk and decoder replay); a third evicts the oldest.
         assert!(bank.get(80).is_none());
-        assert!(bank.get(128).is_some());
-        assert_eq!(bank.len(), MAX_DECODE_ROWS as usize + 1);
+        assert!(bank.get(128).is_some() && bank.get(96).is_some());
+        assert_eq!(bank.len(), MAX_DECODE_ROWS as usize + crate::shared::decode_graph::LARGE_SHAPES);
         // SAFETY: every fixture launch was synchronized before destruction.
         unsafe { bank.clear()?; bank.clear()?; }
         assert_eq!(bank.len(), 0);
@@ -129,7 +166,7 @@ mod tests {
         let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS);
         bank.enable_small_shapes();
         let mut handles = BTreeMap::new();
-        for (cycle, rows) in (1..=MAX_DECODE_ROWS).chain([80, 128, 2, 6, 3, 2, 6, 48, 64, 56, 63, 64]).enumerate() {
+        for (cycle, rows) in (1..=MAX_DECODE_ROWS).chain([80, 128, 2, 6, 96, 3, 2, 6, 48, 64, 56, 63, 64]).enumerate() {
             let expected = vec![(cycle + 1) as u8; 128 * 4];
             library.copy_h2d(weights.buffer, &expected)?;
             if bank.get_shape(0, &weights, rows).is_none() {
@@ -154,10 +191,10 @@ mod tests {
             view.bytes = actual.len();
             library.copy_d2h(&mut actual, view)?;
             assert_eq!(actual, expected[..actual.len()]);
-            assert!(bank.len() <= MAX_DECODE_ROWS as usize + 1);
+            assert!(bank.len() <= MAX_DECODE_ROWS as usize + crate::shared::decode_graph::LARGE_SHAPES);
         }
         assert!(bank.get_shape(0, &weights, 80).is_none());
-        assert!(bank.get_shape(0, &weights, 128).is_some());
+        assert!(bank.get_shape(0, &weights, 128).is_some() && bank.get_shape(0, &weights, 96).is_some());
         unsafe {
             library.cuda_graph_begin_capture(stream.raw)?;
             library.copy_d2d_async(output.buffer, other.buffer, 8, stream.raw)?;

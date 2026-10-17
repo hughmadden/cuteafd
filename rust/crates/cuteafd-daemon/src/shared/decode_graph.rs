@@ -7,7 +7,7 @@ mod binding;
 pub(crate) use binding::BindingGraphs;
 mod watch;
 pub(crate) use watch::CaptureWatch;
-pub(crate) use native::{LayerGraphs, RowGraphs};
+pub(crate) use native::{LayerGraphs, RowGraphs, LARGE_SHAPES};
 pub(crate) use bank::{GraphBank, GraphDecision, GraphPolicy, GraphStats};
 pub(crate) use owner::GraphOwner;
 
