@@ -165,7 +165,7 @@ def test_docker_mounts_reach_each_entrypoint(tmp_path, entry, enabled):
                     '1', 'on' if enabled else 'off', 'abcd']
             result = subprocess.run(['bash', '-s', '--', *args], input=body, env=env, text=True, capture_output=True)
         else:
-            body = text.split('"${CUTEAFD_BUILD_CACHES:-on}" <<\'REMOTE\'\n', 1)[1].split('\nREMOTE', 1)[0]
+            body = text.split('build_spark_release_leg() {', 1)[1].split("<<'REMOTE'\n", 1)[1].split('\nREMOTE', 1)[0]
             # Cache setup + exact Docker export argv, omitting GPU admission and supervision.
             begin = body.index('container_home=/tmp/cuteafd-home')
             end = body.index('spark_export_container_pid=$!')

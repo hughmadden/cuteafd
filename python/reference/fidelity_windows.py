@@ -8,11 +8,15 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools/lib'))
+from allocatable_memory import cuda_allocatable_memory_info
 
 SET_SCHEMA = "cuteafd.fidelity.set/1"
 MAX_TOKENS = 16384
@@ -275,20 +279,18 @@ def log_reference_cuda_memory(cuda, label):
     stats.update({name: int(info[name].split()[0]) * 1024
                   for name in ("MemFree", "MemAvailable", "Cached", "AnonPages")})
     print(f"reference CUDA {label}: " + " ".join(
-        f"{name}={value / 2**30:.3f}GiB" for name, value in stats.items()), flush=True)
+        f"{name}={value / 2**30:.3f}GiB" for name, value in stats.items()) +
+        " (raw cudaMemGetInfo; GB10 under-reports reclaimable page cache)", flush=True)
     return stats
 
 
 def admit_reference_memory(cuda, required_peak_bytes, *, margin_bytes=4 * 2**30):
     """GB10 reclaims page cache; discrete devices retain CUDA free admission."""
     cuda.synchronize()
-    free, _ = cuda.mem_get_info()
-    info = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
-    host = int(info["MemAvailable"].split()[0]) * 1024
+    available, _, measure = cuda_allocatable_memory_info(cuda)
     required = required_peak_bytes + margin_bytes
-    print(f"reference admission CUDA_free={free / 2**30:.3f}GiB host_available={host / 2**30:.3f}GiB "
+    print(f"reference admission allocatable={available / 2**30:.3f}GiB measure={measure} "
           f"required={required / 2**30:.3f}GiB RSS={rss_bytes() / 2**30:.3f}GiB", flush=True)
-    available = host if cuda.get_device_capability() == (12, 1) else free
     if available < required:
         raise RuntimeError("reference unified CUDA/host admission failed before allocation")
 

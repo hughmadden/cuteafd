@@ -49,7 +49,8 @@ bounded by CUTEAFD_RELEASE_IDLE_WAIT_SECONDS (default 300), pins it by UUID,
 stops the export if the device grows past CUTEAFD_RELEASE_EXPORT_GPU_LIMIT_MIB
 (default 8192) while it runs, and logs host, device and time; a Spark export
 waits for a host with no serving worker container and at least
-CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB (default 100) of free CUDA memory. Set
+CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB (default 100) of allocatable memory
+(MemAvailable bounded by cgroups on integrated devices, CUDA free otherwise). Set
 CUTEAFD_RELEASE_EXPORT_TIMEOUT_SECONDS (default 7200) to bound each export, and
 CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS (default 15) to change how often the
 export's device is checked.
@@ -345,7 +346,7 @@ if ((dry_run)); then
   echo "  build container home: $(release_build_container_home "$release_build_root")"
   echo "  build lock: $HOME/.cache/cuteafd/build.lock (waited up to ${release_build_lock_timeout}s; no hardware lock is taken)"
   echo "  AOT export GPU guard: least-used RTX with <=${release_idle_gpu_limit_mib} MiB used, waited ${release_idle_wait_seconds}s, pinned by UUID, stopped past ${export_gpu_limit_mib} MiB"
-  echo "  Spark AOT export guard: no serving worker and >=${spark_export_min_free_gib} GiB free CUDA memory, same wait"
+  echo "  Spark AOT export guard: no serving worker and >=${spark_export_min_free_gib} GiB allocatable memory, same wait"
   cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry >/dev/null
   echo "  Spark cache plan (host HOME shown as template; states/admission rechecked on Spark, no SSH):"
   cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry aarch64 >/dev/null
@@ -834,7 +835,8 @@ build_spark_release_leg() {
   "$phase" "$export_container-expert" "${native_build_jobs:-__legacy__}" \
   "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__legacy__}")" \
   "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__legacy__}")" \
-  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${release_dev_image_source:-registry}" "$audio_aot" "${CUTEAFD_BUILD_CACHES:-on}" <<'REMOTE'
+  "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${release_dev_image_source:-registry}" "$audio_aot" "${CUTEAFD_BUILD_CACHES:-on}" \
+  "$spark_export_min_free_gib" "$release_idle_wait_seconds" "$release_export_gpu_poll_seconds" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -881,6 +883,9 @@ fi
 cd "$remote_dir"
 compiler_cache_args=()
 export CUTEAFD_BUILD_CACHES="${21:-on}"
+export CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB="${22:?}"
+export CUTEAFD_RELEASE_IDLE_WAIT_SECONDS="${23:?}"
+export CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS="${24:?}"
 [[ "${15:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${15}"
 [[ "${17:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${17}"
 export CUTEAFD_SCCACHE_CUDA="${18:-1}"
@@ -932,8 +937,8 @@ if [[ "$phase" == export ]]; then
 # AOT export outside the hardware locks (USING_AGENTS.md): it needs a GPU to
 # query at compile time, not a lock, and it may not run beside a serving job on
 # a Spark whose 121 GiB are the serving budget. Wait bounded for an idle host --
-# no serving worker container and at least 100 GiB of CUDA memory free, read
-# with CUDA because GB10 nvidia-smi memory reads are N/A -- then watch the host
+# no serving worker container and at least 100 GiB allocatable (MemAvailable
+# bounded by cgroups on integrated devices, CUDA free on discrete) -- watch the host
 # while the export runs and stop it if a serving container appears. Host and
 # time are logged so a concurrent measurement can be explained afterwards.
 spark_export_wait="${CUTEAFD_RELEASE_IDLE_WAIT_SECONDS:-300}"
@@ -949,7 +954,7 @@ spark_export_poll_seconds="${CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS:-15}"
 spark_export_deadline=$((SECONDS + spark_export_wait))
 # Release workers are named cuteafd-spark-expert-HOST-PORT; a persistent WIP slot
 # (cuteafd-spark-expert-wip) is idle by design and does not block an export --
-# the CUDA memory gate below is what catches a WIP container actually in use.
+# the allocatable memory gate below catches a WIP container actually in use.
 spark_serving_containers() {
   docker ps -q --filter 'name=^cuteafd-spark-expert-[a-z0-9_.-]+-[0-9]+$' 2>/dev/null || true
 }
@@ -959,19 +964,21 @@ while :; do
     spark_wait_reason="serving container(s) running: $(tr '\n' ' ' <<<"$spark_serving")"
   else
     cuteafd_cdi_gpu_args all || exit 2
-    spark_cuda_free="$(docker run --rm --name "$export_container-probe" "${CUTEAFD_CDI_ARGS[@]}" \
+    spark_memory_probe="$(docker run --rm --name "$export_container-probe" "${CUTEAFD_CDI_ARGS[@]}" \
+      --user "$(id -u):$(id -g)" \
       -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" -e HOME=/tmp/home \
       -e TORCHINDUCTOR_CACHE_DIR=/tmp/home/torchinductor -e TRITON_CACHE_DIR=/tmp/home/triton \
-      --entrypoint python3 "$dev_image" \
-      -c 'import torch; print(torch.cuda.mem_get_info()[0])' 2>/dev/null || true)"
-    if [[ "$spark_cuda_free" =~ ^[0-9]+$ ]] && (( spark_cuda_free >= spark_export_min_free_bytes )); then
-      echo "== Spark AOT export on $(hostname) at $(date -Is): ${spark_cuda_free} bytes CUDA memory free, no serving container, no hardware lock =="
+      -v "$remote_dir/python/tools/lib/allocatable_memory.py:/allocatable_memory.py:ro" \
+      --entrypoint python3 "$dev_image" /allocatable_memory.py 2>/dev/null || true)"
+    read -r spark_allocatable_free spark_memory_measure <<<"$spark_memory_probe"
+    if [[ "$spark_allocatable_free" =~ ^[0-9]+$ ]] && (( spark_allocatable_free >= spark_export_min_free_bytes )); then
+      echo "== Spark AOT export on $(hostname) at $(date -Is): ${spark_allocatable_free} bytes allocatable ($spark_memory_measure), no serving container, no hardware lock =="
       break
     fi
-    spark_wait_reason="CUDA memory free ${spark_cuda_free:-unreadable}, needs ${spark_export_min_free_bytes} bytes"
+    spark_wait_reason="allocatable memory ${spark_allocatable_free:-unreadable} (${spark_memory_measure:-unknown measure}), needs ${spark_export_min_free_bytes} bytes"
   fi
   (( SECONDS < spark_export_deadline )) || {
-    echo "$(hostname): no idle Spark within ${spark_export_wait}s ($spark_wait_reason); the export needs no serving container and ${spark_export_min_free_gib} GiB free CUDA memory" >&2
+    echo "$(hostname): no idle Spark within ${spark_export_wait}s ($spark_wait_reason); the export needs no serving container and ${spark_export_min_free_gib} GiB allocatable memory" >&2
     exit 2
   }
   echo "$(hostname): waiting for an idle Spark export host ($(date -Is)): $spark_wait_reason"

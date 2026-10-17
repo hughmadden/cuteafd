@@ -504,16 +504,19 @@ sparkinfer_commit=fork
 release_version=v5
 bf16_families=
 audio_aot=OFF
+spark_export_min_free_gib=90
+release_idle_wait_seconds=123
+release_export_gpu_poll_seconds=7
 source_manifest_sha256={shlex.quote(digest)}
 spark_tp_roles={shlex.quote(roles)}
 native_build_jobs={shlex.quote(jobs)}
 '''
                 harness += invocation + "<<'REMOTE'" + preamble
-                harness += 'printf "%s\\n" "$source_manifest_sha256" "$spark_tp_roles" "$native_build_jobs"\nREMOTE\n'
+                harness += 'printf "%s\\n" "$source_manifest_sha256" "$spark_tp_roles" "$native_build_jobs" "$CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB" "$CUTEAFD_RELEASE_IDLE_WAIT_SECONDS" "$CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS"\nREMOTE\n'
                 result = subprocess.run(['bash', '-c', harness],
                                         cwd=ROOT, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.splitlines(), expected)
+                self.assertEqual(result.stdout.splitlines(), expected + ['90', '123', '7'])
 
     def test_ssh_config_file_escaped_onto_child_command_line_is_never_reparsed(self) -> None:
         source = (ROOT / 'build.sh').read_text()
@@ -567,6 +570,9 @@ sparkinfer_commit=fork
 release_version=v5
 bf16_families=
 audio_aot=OFF
+spark_export_min_free_gib=90
+release_idle_wait_seconds=123
+release_export_gpu_poll_seconds=7
 source_manifest_sha256=
 spark_tp_roles=
 '''

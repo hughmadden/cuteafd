@@ -10,6 +10,8 @@ from pathlib import Path
 import time
 import uuid
 
+from allocatable_memory import host_allocatable_memory
+
 
 GB10_EXPORT_JOBS = 8  # each worker holds a CUDA context plus ~4 GiB; GB10 has 121 GiB unified
 
@@ -135,11 +137,8 @@ def context_admission():
                     except BlockingIOError:
                         existing.seek(0)
                         reserved += int(existing.read() or per_worker)
-            memory = {line.split(':')[0]: int(line.split()[1]) // 1024
-                      for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith(('MemFree:', 'MemAvailable:'))}
-            # GB10 allocations reclaim clean file cache; cudaMemGetInfo and
-            # MemFree under-report the usable unified-memory budget.
-            available = memory['MemAvailable']
+            # Reserve before CUDA initialization, using cgroup-bounded OS headroom.
+            available = host_allocatable_memory() // (1024 * 1024)
             baseline_path = root / 'context-baseline.json'
             if reserved == 0:
                 baseline_path.write_text(json.dumps({'available': available}))

@@ -1300,12 +1300,13 @@ def test_unified_admission_uses_reclaimable_host_availability(monkeypatch, cuda_
     from pathlib import Path
     from types import SimpleNamespace
     import fidelity_windows as fw
-    cuda = SimpleNamespace(synchronize=lambda: None, mem_get_info=lambda: (cuda_free * 2**30, 64 * 2**30),
-                           get_device_capability=lambda: capability)
+    cuda = SimpleNamespace(synchronize=lambda: None, current_device=lambda: 0, mem_get_info=lambda device=0: (cuda_free * 2**30, 64 * 2**30),
+                           get_device_properties=lambda device: SimpleNamespace(
+                               is_integrated=capability == (12, 1), total_memory=64 * 2**30))
     original = Path.read_text
     monkeypatch.setattr(Path, "read_text", lambda p, *a, **kw:
                         f"MemAvailable: {host_available * 2**20} kB\n" if str(p) == "/proc/meminfo"
-                        else original(p, *a, **kw))
+                        else "" if str(p) == "/proc/self/cgroup" else original(p, *a, **kw))
     if (host_available if capability == (12, 1) else cuda_free) < 20:
         with pytest.raises(RuntimeError, match="before allocation"):
             fw.admit_reference_memory(cuda, 16 * 2**30)

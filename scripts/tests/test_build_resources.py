@@ -5,11 +5,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'python/tools/lib'))
 
 
 def load(name, path):
@@ -182,6 +184,8 @@ def test_context_ram_reservation_precedes_cuda_and_includes_reclaimable_cache(tm
     monkeypatch.setenv('CUTEAFD_EXPORT_HOST_WORKERS', '20')
     original = Path.read_text
     def text(path, *args, **kwargs):
+        if str(path) == '/proc/self/cgroup':
+            return ''
         if str(path) == '/proc/meminfo':
             return 'MemFree: 6291456 kB\nMemAvailable: 125829120 kB\n'
         return original(path, *args, **kwargs)
@@ -207,6 +211,8 @@ def test_context_admission_accounts_live_reservations_across_worker_limits(tmp_p
     fcntl.flock(held, fcntl.LOCK_EX)
     original = Path.read_text
     def text(path, *args, **kwargs):
+        if str(path) == '/proc/self/cgroup':
+            return ''
         if str(path) == '/proc/meminfo':
             return f'MemFree: 512000 kB\nMemAvailable: {available * 1024} kB\n'
         return original(path, *args, **kwargs)

@@ -102,7 +102,7 @@ def test_remote_leg_selects_and_reuses_exact_image_across_ssh_phases(tmp_path):
     env = fixture(tmp_path, 'arm64')
     # Execute the actual build.sh SSH heredoc using stubs; never invoke an export.
     text = (ROOT/'build.sh').read_text()
-    remote = text.split('"${release_dev_image_source:-registry}" "$audio_aot" "${CUTEAFD_BUILD_CACHES:-on}" <<\'REMOTE\'\n', 1)[1].split('\nREMOTE', 1)[0]
+    remote = text.split('build_spark_release_leg() {', 1)[1].split("<<'REMOTE'\n", 1)[1].split('\nREMOTE', 1)[0]
     staging = tmp_path/'source'
     (staging/'scripts/build').mkdir(parents=True)
     for name in ('select-dev-image.py', 'dev-toolchain.py', 'install-dev-cache-tools.sh', 'build-caches.sh'):
@@ -116,7 +116,7 @@ def test_remote_leg_selects_and_reuses_exact_image_across_ssh_phases(tmp_path):
     ssh.write_text('#!/bin/bash\nshift\nexec bash -s -- "$@"\n')
     ssh.chmod(0o755)
     args = [str(staging), 'local-dev', 'release-image', 'fixture', 'pin', 'version'] + ['__legacy__'] * 5
-    args += ['dev', 'fixture-export', '__legacy__', '__legacy__', '__legacy__', '__legacy__', '0', 'registry', 'ON']
+    args += ['dev', 'fixture-export', '__legacy__', '__legacy__', '__legacy__', '__legacy__', '0', 'registry', 'ON', 'on', '90', '123', '7']
     result = subprocess.run(['ssh', 'seed', *args], input=remote, env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     manifest_path = staging/'.cuteafd-release/fixture-export.dev-image.json'
