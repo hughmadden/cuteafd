@@ -401,7 +401,7 @@ rows 14.3 ms/layer TP4 vs EXL3 9.1), SM121 route thresholds.
 
 **Phase 6 — placement planner (design 2026-09-30).** One planner for every
 family: (model, inventory of 1–2 coordinator GPUs — real or simulated by a
-memory budget — and 1–8 Sparks, KV target, objective) → a hashed
+memory budget — and 1–6 Sparks, KV target, objective) → a hashed
 `placement.json` that the loader, workers, engines and launchers all
 consume. It generalizes V4.1's startup handoff (`v41_native_serve/placement.rs`),
 live memory planner and 20/20 backbone split. Per MoE layer the experts are
@@ -475,7 +475,7 @@ reproduce today's layouts), S1 manifest handoff + workers, S2 router in the
 generic engines + GPU1 as expert host, S3 EP subsets (only if a quantized
 model needs them; GLM 5.3 official FP8 is out of scope — EXL3 and NVFP4
 quants cover it), S4 encoder service + multimodal input, S5 coordinator
-range split, S6 eight Sparks.
+range split, S6 six Sparks.
 
 **Memory audit and planner core (2026-10-03, `work/v1-memory`).** Every
 device, pinned and RDMA allocation now goes through a process-wide ledger

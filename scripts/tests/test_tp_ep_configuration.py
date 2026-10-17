@@ -84,6 +84,15 @@ class TopologyConfigTest(unittest.TestCase):
                 self.assertIn("unsupported native Spark topology" if count <= 6
                               else "SPARK_TP must be in 1..6", result.stderr)
 
+    def test_deleted_rank_inventory_keys_refuse(self) -> None:
+        for rank in (6, 7):
+            for suffix in ("HOST", "LANE_A", "LANE_B"):
+                key = f"SPARK_{rank}_{suffix}"
+                with self.subTest(key=key):
+                    result = load(f"{key}=unused")
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(f"unknown configuration key: {key}", result.stderr)
+
     def test_v41_accepts_explicit_vision_placement(self) -> None:
         for vision in ("auto", "off", "rtx", "rtx:0", "spark", "spark:3"):
             with self.subTest(vision=vision):
