@@ -71,10 +71,15 @@ DOCKER_STUB = textwrap.dedent(
         fi
         exit 0
         ;;
-      create) printf '%s\n' fake-container ;;
+      create) printf '%s\n' "fake-${2##*/}" ;;
       cp)
         source="${2#*:/opt/cuteafd/}"
         cp -a "$CUTEAFD_TEST_INVENTORY/$source" "$3"
+        if [[ "$source" == lib ]]; then
+          role=coordinator
+          [[ "$2" != *spark-expert* ]] || role=expert
+          cp -a "$CUTEAFD_TEST_INVENTORY/$role/lib/." "$3/"
+        fi
         ;;
       rm|tag|push) exit 0 ;;
       *) exit 1 ;;
@@ -120,8 +125,19 @@ def harness(tmp_path):
     for name in ("V41_EXPERT_AOT.json", "V41_FP8_AOT.json", "V41_EXPERT_WORKSPACES/mxfp4_rtx_backbone.json"):
         (inventory / "share" / name).write_text(json.dumps({"variants": [{}]}))
     (inventory / "lib/libcuteafd_native.so").write_bytes(b"fake")
+    from test_release_derived_scope import SCOPE, write_floor_packages
+    # One fake extraction serves both roles; choose package role via docker image.
+    for role in ('coordinator', 'expert'):
+        write_floor_packages(inventory / role, role, SCOPE.previous_release_packages()[role])
+    (inventory / 'share/PROGRAMS.json').write_text(json.dumps({'programs': [{'family': name} for name in SCOPE.PREVIOUS_RELEASE_FLOOR['MIMO_GEOMETRIES']]}))
+    for name in ('V41_EXPERT_WORKSPACES/mxfp4_rtx_tp2.json', 'V41_EXPERT_WORKSPACES/nvfp4_rtx_backbone.json',
+                 'V41_EXPERT_WORKSPACES/nvfp4_rtx_tp2.json'):
+        (inventory / 'share' / name).write_text(json.dumps({'variants': [{}]}))
+    (inventory / 'share/V41_EXPERT_TP_AOT.json').write_text(json.dumps({'spark_tp_roles': ['tp2', 'tp3', 'tp6']}))
     nm = bin_dir / "nm"
-    nm.write_text("#!/bin/sh\nexit 0\n")
+    nm.write_text("#!/bin/sh\nprintf '%s\\n' " + ' '.join(
+        f'cuteafd_v41{kind}{suffix}_expert_launch' for kind in ('', '_nvfp4')
+        for suffix in ('', '_spark_tp2', '_spark_tp3', '_spark_tp6')) + "\n")
     nm.chmod(0o755)
     matrix = tmp_path / "matrix.json"
     config = tmp_path / "matrix.config"

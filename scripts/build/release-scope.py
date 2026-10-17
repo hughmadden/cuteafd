@@ -18,12 +18,19 @@ import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
 SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'AUDIO', 'CONTEXT_SPLIT')
-LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES')
+LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
+         'FP8_MOE_BF16_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
 PREVIOUS_RELEASE_FLOOR = {
-    'EXPERT_FAMILIES': {'mimo:fp8'},
-    'MIMO_GEOMETRIES': {'mimo', 'mimo2'},
+    'EXPERT_FAMILIES': {'dsv4p:exl3-k23', 'glm:exl3-k45', 'glmf:exl3-k34', 'qwen4:exl3-k45',
+                        'glm:fp8', 'glmf:fp8', 'mimo:fp8', 'mimof:fp8', 'mimop:fp8',
+                        'glm:nvfp4', 'glmf:nvfp4', 'glmfdense:nvfp4', 'qwen4:nvfp4'},
+    'FP8_MOE_BF16_FAMILIES': {'mimo'},
+    'MIMO_GEOMETRIES': {'mimo', 'mimo2', 'mimof', 'mimof2', 'mimop', 'mimop2'},
     'MIMO_AOT': {'ON'},
+    'GLM_AOT': {'ON'},
+    'GLMF_AOT': {'ON'},
+    'QWEN4_AOT': {'ON'},
     'SPARK_TP_ROLES': {'tp2', 'tp3', 'tp6'},
     'GENERIC_SPARK_COUNTS': {
         f'{family}={count}'
@@ -33,9 +40,44 @@ PREVIOUS_RELEASE_FLOOR = {
             'mimo': (2, 4, 6), 'mimof': (2, 4), 'mimop': (2, 6),
             'qwen4': (1, 2, 3, 4),
         }.items() for count in counts
-    },
+    } | {'qwen4:nvfp4=6', 'qwen4:nvfp4a4=6'},
 }
 DEFAULT_MATRIX = 'scripts/bench/release-smoke-v3.json'
+
+
+# Package/layout evidence extracted from both stopped v2.0.0 images. Base V4.1
+# EXL3 packages are always built, separately from the named expert families.
+def previous_release_packages():
+    packages = {'coordinator': {}, 'expert': {}}
+    for name in ('exl3-k23', 'exl3-k34'):
+        packages['coordinator'][f'exl3/{name}'] = ['dspark', 'rtx-tp1', 'rtx-tp2']
+        packages['expert'][f'exl3/{name}'] = [f'tp{tp}-rank{rank}' for tp in (2, 3, 4) for rank in range(tp)]
+    for name in ('dsv4p-k23', 'glm-k45', 'glmf-k34', 'qwen4-k45'):
+        qwen = name.startswith('qwen4')
+        path = f'exl3/exl3-{name}'
+        packages['coordinator'][path] = ['rtx-tp1', 'rtx-tp2-rank0', 'rtx-tp2-rank1'] if qwen else ['rtx-tp1', 'rtx-tp2']
+        packages['expert'][path] = [f'tp{tp}-rank{rank}' for tp in ((1, 2, 3, 4) if qwen else (2, 3, 4, 6))
+                                    for rank in range(tp)]
+    for family in ('glm', 'glmf', 'glmfdense', 'mimo', 'mimof', 'mimop', 'qwen4'):
+        kinds = ('nvfp4', 'nvfp4a4') if family == 'glmfdense' else ('fp8', 'nvfp4', 'nvfp4a4') if family in ('glm', 'glmf', 'qwen4') else ('fp8',)
+        for kind in kinds:
+            path = f'fp8/fp8-{family}' + ('' if kind == 'fp8' else f'-{kind}')
+            packages['coordinator'][path] = ['tp1'] if family == 'glmfdense' or (family == 'qwen4' and kind == 'fp8') else ['tp1', 'tp2']
+            if family == 'qwen4' and kind.startswith('nvfp4'):
+                packages['coordinator'][path].extend(['tp2-w256', 'tp2-w384'])
+            if family == 'glmfdense' or (family == 'qwen4' and kind == 'fp8'):
+                continue
+            counts = sorted({int(item.split('=')[1]) for item in PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS']
+                             if item.split('=')[0] in (family, f'{family}:{kind}')})
+            layouts = [f'tp{tp}' for tp in counts]
+            intermediate = 640 if family == 'qwen4' else 2048
+            for tp in counts:
+                blocks = intermediate // 128
+                if blocks >= tp and blocks % tp:
+                    layouts.extend(f'tp{tp}-w{width}' for width in sorted({blocks // tp * 128, (blocks // tp + 1) * 128}))
+            packages['expert'][path] = layouts
+    packages['expert']['fp8/fp8-mimo-bf16'] = packages['expert']['fp8/fp8-mimo'][:]
+    return packages
 
 
 def scopes_module(repo):
@@ -156,6 +198,14 @@ def requirements(repo, matrix, scope):
                            nvfp4='nvfp4' in values.get('MODEL_ID', '').lower(),
                            audio=scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON',
                            context_split=family in ('deepseek_v4', 'glm5', 'glm5_flash') and dual))
+    if scope == 'all':
+        result.append(dict(name='v2.0.0-export-floor', family='release_floor', programs=sorted(PREVIOUS_RELEASE_FLOOR['MIMO_GEOMETRIES']),
+                           experts=[], spark_experts=[], spark_count=1, context_split=False, audio=False,
+                           packages=previous_release_packages()))
+        for tp in (2, 3, 4, 6):
+            result.append(dict(name=f'v2.0.0-v41-tp{tp}-floor', family='deepseek_v41', programs=[],
+                               experts=[], spark_experts=[], spark_count=tp, spark_tp=tp, dual=True,
+                               roles=[] if tp == 4 else [f'tp{tp}'], nvfp4=True, audio=False, context_split=False))
     return result
 
 
@@ -229,6 +279,8 @@ def check_inventory(root, role, wanted, symbols=None):
         if role == 'expert' and not entry['spark_count']:
             continue
         try:
+            for package, layouts in entry.get('packages', {}).get(role, {}).items():
+                check_package(root, package, layouts, role, verified)
             if role == 'coordinator' and entry['programs']:
                 manifest = read_json(share / 'PROGRAMS.json')
                 programs = manifest.get('programs', [])

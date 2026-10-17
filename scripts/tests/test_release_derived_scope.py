@@ -48,7 +48,7 @@ def test_union_equals_per_entry_derivation(fixture_repo):
             expected |= SCOPE.PREVIOUS_RELEASE_FLOOR.get(key.removeprefix(P), set())
             assert SCOPE.tokens(value) == expected
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS'] <= SCOPE.tokens(union[P + 'GENERIC_SPARK_COUNTS'])
-    assert union[P + 'EXPERT_FAMILIES'] == 'glm:fp8;glmf:nvfp4;glmfdense:nvfp4;mimo:fp8'
+    assert SCOPE.PREVIOUS_RELEASE_FLOOR['EXPERT_FAMILIES'] <= SCOPE.tokens(union[P + 'EXPERT_FAMILIES'])
     assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 4
     assert not SCOPE.requirements(repo, path, 'glm-fp8')[0]['dual']  # set wins over gpus
 
@@ -58,10 +58,10 @@ def test_raw_environment_adds_but_does_not_shrink(fixture_repo):
     added, _ = SCOPE.derive(repo, path, environ={P + 'EXPERT_FAMILIES': 'qwen4:nvfp4', P + 'GLM_AOT': 'OFF',
                                                P + 'MIMO_GEOMETRIES': 'mimof,mimof2'})
     assert added[P + 'GLM_AOT'] == 'ON'
-    assert added[P + 'EXPERT_FAMILIES'] == 'glm:fp8;glmf:nvfp4;glmfdense:nvfp4;mimo:fp8;qwen4:nvfp4'
-    assert added[P + 'MIMO_GEOMETRIES'] == 'mimo;mimo2;mimof;mimof2'
+    assert SCOPE.PREVIOUS_RELEASE_FLOOR['EXPERT_FAMILIES'] <= SCOPE.tokens(added[P + 'EXPERT_FAMILIES'])
+    assert SCOPE.PREVIOUS_RELEASE_FLOOR['MIMO_GEOMETRIES'] <= SCOPE.tokens(added[P + 'MIMO_GEOMETRIES'])
     empty, _ = SCOPE.derive(repo, path, environ={P + 'EXPERT_FAMILIES': ''})
-    assert empty[P + 'EXPERT_FAMILIES'] == 'glm:fp8;glmf:nvfp4;glmfdense:nvfp4;mimo:fp8'
+    assert SCOPE.PREVIOUS_RELEASE_FLOOR['EXPERT_FAMILIES'] <= SCOPE.tokens(empty[P + 'EXPERT_FAMILIES'])
 
 
 def test_selectors_and_explicit(fixture_repo):
@@ -243,3 +243,68 @@ def test_release_requirements_use_matrix_and_configs_at_build_revision(tmp_path)
     wanted = SCOPE.revision_requirements(repo, revision)
     assert wanted[0]['spark_count'] == 4
     assert not wanted[0]['dual']
+
+
+def write_floor_packages(root, role, packages):
+    import hashlib
+    for package, layouts in packages.items():
+        path = root / 'lib' / package
+        files = {}
+        for layout in layouts:
+            name = layout + '/libcuteafd_package.so'
+            file = path / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b'fake package')
+            files[name] = dict(bytes=file.stat().st_size, sha256=hashlib.sha256(file.read_bytes()).hexdigest())
+        manifest = dict(role='spark' if role == 'expert' else role, files=files)
+        if package.startswith('exl3/'):
+            manifest.update(schema='cuteafd.exl3-package.v1', variants=[dict(directory=layout + '/m1') for layout in layouts])
+        else:
+            manifest['layouts'] = {layout: {} for layout in layouts}
+        write_json(path / 'manifest.json', manifest)
+
+
+def test_floor_inventory_requires_qwen_tp6_and_mimo_bf16(fixture_repo, tmp_path):
+    repo, matrix = fixture_repo
+    floor = next(e for e in SCOPE.requirements(repo, matrix, 'all') if e['family'] == 'release_floor')
+    root = tmp_path / 'inventory'
+    packages = floor['packages']['expert']
+    assert 'tp6' in packages['fp8/fp8-qwen4-nvfp4']
+    assert 'tp6' in packages['fp8/fp8-qwen4-nvfp4a4']
+    assert not any(l.startswith('tp6') for l in packages['exl3/exl3-qwen4-k45'])
+    write_floor_packages(root, 'expert', packages)
+    SCOPE.check_inventory(root, 'expert', [floor], symbols=set())
+    path = root / 'lib/fp8/fp8-qwen4-nvfp4/manifest.json'
+    manifest = json.loads(path.read_text())
+    del manifest['layouts']['tp6']
+    write_json(path, manifest)
+    with pytest.raises(ValueError, match='v2.0.0-export-floor.*missing layouts.*tp6'):
+        SCOPE.check_inventory(root, 'expert', [floor], symbols=set())
+    write_floor_packages(root, 'expert', packages)
+    (root / 'lib/fp8/fp8-mimo-bf16/manifest.json').unlink()
+    with pytest.raises(ValueError, match='v2.0.0-export-floor.*manifest.json'):
+        SCOPE.check_inventory(root, 'expert', [floor], symbols=set())
+    env = SCOPE.derive(repo, matrix, 'all', {P + 'FP8_MOE_BF16_FAMILIES': ''})[0]
+    assert env[P + 'FP8_MOE_BF16_FAMILIES'] == 'mimo'
+    assert 'qwen4:nvfp4=6' in SCOPE.tokens(env[P + 'GENERIC_SPARK_COUNTS'])
+    assert 'qwen4=6' not in SCOPE.tokens(env[P + 'GENERIC_SPARK_COUNTS'])
+
+
+def test_format_counts_reach_nvfp4_but_not_exl3(fixture_repo, tmp_path):
+    import subprocess
+    env = SCOPE.derive(*fixture_repo, 'all', {})[0]
+    counts = env[P + 'GENERIC_SPARK_COUNTS']
+    for filename, start, end, extra, output in [
+        ('fp8_moe.cmake', '    foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)',
+         '    if(requested_layouts)', 'set(count_family qwen4)\nset(entry qwen4:nvfp4)', 'requested_layouts'),
+        ('exl3.cmake', '  foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)',
+         '  if(CUTEAFD_EXL3_ROLE', 'set(CUTEAFD_EXL3_GEOMETRY qwen4)', 'requested_counts'),
+    ]:
+        source = (REPO / 'native/cmake/shared' / filename).read_text()
+        block = start + source.split(start, 1)[1].split(end, 1)[0]
+        script = tmp_path / (filename + '.test')
+        script.write_text(f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{counts}")\n{extra}\n{block}\nmessage("COUNTS=${{{output}}}")\n')
+        result = subprocess.run(['cmake', '-P', str(script)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        resolved = result.stderr.strip().removeprefix('COUNTS=').split(';')
+        assert ('tp6' in resolved) if filename == 'fp8_moe.cmake' else ('6' not in resolved)
