@@ -96,14 +96,7 @@ impl ApiArgs {
             for file in [&self.api_key_file, &self.console_secret_file].into_iter().flatten() {
                 if let Ok(text) = std::fs::read_to_string(file) { secrets.push(text.trim().to_owned()); }
             }
-            if let Some(key) = &key { secrets.extend(key.secrets()); }
-            store.log.set_secrets(secrets.clone());
-            if let Some(key) = &key {
-                let log = store.log.clone();
-                key.on_reload(Arc::new(move |named| {
-                    let mut all = secrets.clone(); all.extend(named); log.set_secrets(all);
-                }));
-            }
+            store.log.set_secrets(secrets);
         }
         Ok(ApiPolicy { key, bench: self.enable_bench, usage, gate, gateway, bench_token: None, live: None })
     }
@@ -144,6 +137,7 @@ impl ApiPolicy {
             bench.set_console(hub);
             if let Some(store) = &self_.usage { bench.set_usage(usage_toggle(store.clone())); }
             bench.set_api_key(self_.key.clone().expect("validated benchmark key"));
+            bench.set_console_gate(self_.gate.clone());
             let witness = bench.clone();
             let internal: Arc<dyn Fn(&str, &axum::http::HeaderMap) -> bool + Send + Sync> = Arc::new(move |path, headers| {
                 matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/models" | "/v1/stats")
@@ -151,14 +145,16 @@ impl ApiPolicy {
             });
             let verify = bench.clone();
             (cuteafd_bench::http::mount(router, bench), Some((internal, verify)))
-        } else { (router, None) };
+        } else {
+            (router.route("/bench", axum::routing::get(cuteafd_api::openai::console::bench_off)), None)
+        };
         let mut policy = self_;
         let internal = internal.map(|(internal, verify)| {
             policy.bench_token = Some(Arc::new(move |token: &str| verify.accepts_internal(token)));
             internal
         });
         let router = policy.mount_console(router);
-        let router = router.layer(axum::middleware::from_fn_with_state(Auth { key: policy.key.clone(), internal },
+        let router = router.layer(axum::middleware::from_fn_with_state(Auth { key: policy.key.clone(), internal, console: Some(policy.gate.clone()) },
             cuteafd_api::openai::auth::require_key));
         policy.track(router)
     }
@@ -168,7 +164,7 @@ impl ApiPolicy {
             cuteafd_usage::http::mount_with_live(router, store.clone(), self.gate.clone(), self.live.clone())
         } else { router };
         tracing::info!("console: protected views unlock through the launcher's link");
-        self.gate.mount(cuteafd_api::agent::mount(router, self.gate.clone()))
+        self.gate.mount(router)
     }
     /// The outermost layer: request accounting and full-log capture.
     pub(crate) fn track(self, router: axum::Router) -> axum::Router {
@@ -221,8 +217,13 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let app = ApiArgs::default().load().unwrap().app(cuteafd_api::openai::router(tx),
             cuteafd_api::openai::ConsoleHub::disabled());
-        assert_eq!(app.oneshot(axum::http::Request::get("/v1/bench/status").body(Body::empty()).unwrap())
+        assert_eq!(app.clone().oneshot(axum::http::Request::get("/v1/bench/status").body(Body::empty()).unwrap())
             .await.unwrap().status(), StatusCode::NOT_FOUND);
+        // The page itself says the runner is off instead of 404.
+        let page = app.oneshot(axum::http::Request::get("/bench").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(page.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ENABLE_BENCH=on"));
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         let app = ApiPolicy { key: Some(ApiKey::new("secret").unwrap()), bench: false, usage: None, gate: cuteafd_api::console_gate::ConsoleGate::locked(), gateway: None, bench_token: None, live: None }.app(

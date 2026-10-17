@@ -608,10 +608,6 @@ release_require_owned_state "$bench_dir" "$fidelity_cache"
 mkdir -p "$fidelity_cache" "$bench_dir"
 release_require_writable_state "$bench_dir" "$fidelity_cache"
 api_args=() api_mount_args=()
-agent_home="${CUTEAFD_AGENT_HOME:-$HOME/.local/share/cuteafd/agent}"
-mkdir -p "$agent_home/dsh"; chmod 700 "$agent_home" "$agent_home/dsh"
-api_mount_args+=(--mount "type=bind,src=$(readlink -f "$agent_home/dsh"),dst=/run/cuteafd-agent-dsh,readonly"
-  -e CUTEAFD_AGENT_TOKEN_FILE=/run/cuteafd-agent-dsh/launch-token -e "CUTEAFD_AGENT_PORT=${CUTEAFD_AGENT_PORT:-3010}")
 API_KEY_FILE="$(get API_KEY_FILE "${API_KEY_FILE:-}")"
 ENABLE_BENCH="$(get ENABLE_BENCH off)"
 release_prepare_api_key "$ENABLE_BENCH" "$api_instance"
@@ -630,8 +626,6 @@ if [[ -n "$API_KEY_FILE" ]]; then
   API_KEY_FILE="$(readlink -f "$API_KEY_FILE")"
   api_mount_args+=(--mount "type=bind,src=$API_KEY_FILE,dst=/run/cuteafd-api-key,readonly")
   api_args+=(--api-key-file /run/cuteafd-api-key)
-  api_mount_args+=(--mount "type=bind,src=$(readlink -f "$(dirname "$API_KEY_FILE")"),dst=/run/cuteafd-key-directory,readonly"
-    -e CUTEAFD_API_KEYS_FILE=/run/cuteafd-key-directory/api-keys)
 fi
 case "$ENABLE_BENCH" in
   on) api_args+=(--enable-bench) ;;

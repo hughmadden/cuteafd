@@ -149,8 +149,9 @@ pub struct Bench {
     /// allows token text on it: the lockout makes the run's own prompts the
     /// only requests in.
     console: OnceLock<Arc<ConsoleHub>>,
-    /// Benchmark controls always require the configured API key.
+    /// Benchmark controls require the configured API key or the console cookie.
     pub api_key: OnceLock<cuteafd_api::openai::auth::ApiKey>,
+    pub(crate) console_gate: OnceLock<cuteafd_api::console_gate::ConsoleGate>,
     /// Whether benchmark requests are kept in the usage history (attached at mount).
     pub(crate) usage: OnceLock<UsageToggle>,
 }
@@ -174,12 +175,18 @@ impl Bench {
             events,
             console: OnceLock::new(),
             api_key: OnceLock::new(),
+            console_gate: OnceLock::new(),
             usage: OnceLock::new(),
         })
     }
 
     pub fn set_api_key(&self, key: cuteafd_api::openai::auth::ApiKey) {
         let _ = self.api_key.set(key);
+    }
+
+    /// The console unlock cookie also authorizes the bench page's controls.
+    pub fn set_console_gate(&self, gate: cuteafd_api::console_gate::ConsoleGate) {
+        let _ = self.console_gate.set(gate);
     }
 
     pub fn accepts_internal(&self, token: &str) -> bool {

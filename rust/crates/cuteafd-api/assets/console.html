@@ -13,7 +13,38 @@
 #mapped-tables caption { text-align: left; padding: 8px 0; }
 #mapped-tables th, #mapped-tables td { padding-right: 10px; }
 #mapped-tables th:first-child, #mapped-tables td:first-child { min-width: 160px; max-width: 300px; white-space: normal; overflow-wrap: anywhere; }
+/* lanes header: keys hint centered between legend and controls */
+#lanes .panel-head .legend { flex: 0 1 auto; }
+.lane-keys { flex: 1 1 auto; text-align: center; white-space: nowrap; }
+#lanes .ctl { margin-left: 0; }
+/* fabric chip */
+.fabric-chip-wrap { position: relative; display: inline-flex; }
+.fabric-chip { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px 3px 8px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line-2); background: var(--panel); color: var(--ink-2); font: 600 10.5px var(--mono); letter-spacing: .08em; }
+.fabric-chip:hover { border-color: var(--muted); color: var(--ink); }
+.fabric-chip:focus-visible { outline: 2px solid var(--target); outline-offset: 2px; }
+.fabric-chip i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.fabric-chip.ok i { background: var(--good); }
+.fabric-chip.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 50%, var(--line-2)); }
+.fabric-chip.warn i { background: var(--warn); }
+.fabric-chip.bad { color: var(--bad); border-color: color-mix(in oklab, var(--bad) 55%, var(--line-2)); }
+.fabric-chip.bad i { background: var(--bad); }
+.fabric-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20; min-width: 420px; max-width: min(560px, calc(100vw - 32px));
+  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px; box-shadow: 0 12px 32px rgba(0,0,0,.45); }
+.fabric-pop table { width: 100%; border-collapse: collapse; font: 11.5px var(--mono); }
+.fabric-pop th { color: var(--muted); font-weight: 500; text-align: right; padding: 3px 6px; border-bottom: 1px solid var(--line); }
+.fabric-pop td { text-align: right; padding: 3px 6px; color: var(--ink-2); white-space: nowrap; }
+.fabric-pop th:first-child, .fabric-pop td:first-child, .fabric-pop th:nth-child(2), .fabric-pop td:nth-child(2) { text-align: left; }
+.fabric-pop tr.spare td { color: var(--muted); }
+.fabric-pop tr.issue td { color: var(--bad); }
+.fabric-pop small { color: var(--muted); }
+.fabric-pop .note { margin: 8px 0 0; }
+.banner.lock { color: var(--ink-2); }
+.banner.lock b { color: var(--ink); }
+.banner.lock code { font: 12px var(--mono); color: var(--ink); }
 @media (max-width: 600px) {
+  .fabric-pop { min-width: 0; width: calc(100vw - 32px); left: auto; right: auto; position: fixed; top: auto; margin-top: 30px; }
+  .lane-keys { display: none; }
   .app { min-width: 0; padding-inline: 16px; }
   .app > * { min-width: 0; }
   .nav { flex-wrap: wrap; flex-shrink: 1; margin-left: 0; }
@@ -26,8 +57,8 @@
 <div class="app">
   <header id="top"></header>
   <template id="status-tpl"><span class="status" id="status"><i></i><span id="status-text">CONNECTING</span></span></template>
-  <template id="keys-tpl"><span class="keys"><kbd>space</kbd> pause · <kbd>t</kbd> text · <kbd>−</kbd><kbd>+</kbd> zoom</span></template>
   <div class="banner" id="banner" hidden></div>
+  <div class="banner lock" id="lock" role="status" hidden></div>
 
   <section class="kpis" id="kpis"></section>
 
@@ -53,7 +84,7 @@
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="lanes">
     <div class="panel-head">
       <h2>Execution lanes</h2>
       <div class="legend" id="legend">
@@ -65,6 +96,7 @@
         <span><i style="background:var(--prefill)"></i>prefill</span>
         <span><i style="background:var(--restore)"></i>restore</span>
       </div>
+      <span class="keys lane-keys" id="lane-keys" title="Keys act while the Execution lanes pane is on screen"><kbd>space</kbd> pause · <kbd>t</kbd> text · <kbd>−</kbd><kbd>+</kbd> zoom</span>
       <div class="ctl">
         <div class="seg" role="group" aria-label="View">
           <button type="button" id="v-time" aria-pressed="true">TIME</button>
@@ -83,14 +115,6 @@
     <div class="note" id="ticker-note"></div>
   </section>
 
-  <section class="panel" id="mapped-tables" hidden>
-    <div class="panel-head"><h2>Mapped tables</h2>
-      <select id="mapped-window" class="btn" aria-label="Mapped table counter interval"><option value="interval">Last 60 seconds</option><option value="cumulative">Since launch</option></select>
-    </div>
-    <div class="note">Engram / PLE demand reads. nowait-exact counts full NOWAIT completions. mincore is a pre-read residency snapshot (mmap, or io_uring files without NOWAIT); mixed files use mincore only where needed. io_uring miss time starts at batch submission and includes retries; mmap has no miss timer. Unclassified reads have one submission-to-final-reap makespan per bounded wave (at most 4K rows), including retries; batch tiers are not individual read-service latency. Demand and prefetch are separate. Device estimates count miss-row page spans; host-wide reads include unrelated I/O.</div>
-    <div class="tablewrap"><table><caption>Classified miss latency (rows) / unclassified makespan (batches)</caption><thead><tr><th>Table</th><th>&lt;5 us</th><th>5-10 us</th><th>10-50 us</th><th>50-200 us</th><th>200 us-1 ms</th><th>1-10 ms</th><th>&gt;=10 ms</th><th>Prefetch hits / misses</th><th>mincore overhead</th></tr></thead><tbody id="mapped-tiers"></tbody></table></div>
-    <div class="tablewrap"><table><thead><tr><th>Table / backend</th><th>Hit %</th><th>Hits / misses</th><th>Hit bytes</th><th>Miss-request bytes</th><th>Avg miss</th><th>Max miss (lifetime)</th><th>NOWAIT batch avg</th><th>Consumer wait ms / decode step (Engram pair on weight)</th><th>Device bytes (estimate)</th><th>Host-wide device reads (since sample)</th></tr></thead><tbody id="mapped-rows"></tbody></table></div>
-  </section>
 
   <div class="bottom">
     <section class="panel">
@@ -108,9 +132,18 @@
         <div class="facts" id="facts"></div>
       </div>
       <div class="panel-head" style="margin-top:4px"><h2>Recent requests</h2></div>
-      <div class="tablewrap"><table><thead><tr><th>Request</th><th>Input</th><th>Cached</th><th>Output</th><th>TTFT</th><th>Decode</th><th>Status</th></tr></thead><tbody id="recent"></tbody></table></div>
+      <div class="tablewrap"><table><thead><tr><th>Request</th><th>Input</th><th>Cached</th><th>Output</th><th>TTFT</th><th>Prefill</th><th>Decode</th><th>Status</th></tr></thead><tbody id="recent"></tbody></table></div>
     </section>
   </div>
+
+  <section class="panel" id="mapped-tables" hidden>
+    <div class="panel-head"><h2>Mapped tables</h2>
+      <select id="mapped-window" class="btn" aria-label="Mapped table counter interval"><option value="interval">Last 60 seconds</option><option value="cumulative">Since launch</option></select>
+    </div>
+    <div class="note">Engram / PLE demand reads. nowait-exact counts full NOWAIT completions. mincore is a pre-read residency snapshot (mmap, or io_uring files without NOWAIT); mixed files use mincore only where needed. io_uring miss time starts at batch submission and includes retries; mmap has no miss timer. Unclassified reads have one submission-to-final-reap makespan per bounded wave (at most 4K rows), including retries; batch tiers are not individual read-service latency. Demand and prefetch are separate. Device estimates count miss-row page spans; host-wide reads include unrelated I/O.</div>
+    <div class="tablewrap"><table><caption>Classified miss latency (rows) / unclassified makespan (batches)</caption><thead><tr><th>Table</th><th>&lt;5 us</th><th>5-10 us</th><th>10-50 us</th><th>50-200 us</th><th>200 us-1 ms</th><th>1-10 ms</th><th>&gt;=10 ms</th><th>Prefetch hits / misses</th><th>mincore overhead</th></tr></thead><tbody id="mapped-tiers"></tbody></table></div>
+    <div class="tablewrap"><table><thead><tr><th>Table / backend</th><th>Hit %</th><th>Hits / misses</th><th>Hit bytes</th><th>Miss-request bytes</th><th>Avg miss</th><th>Max miss (lifetime)</th><th>NOWAIT batch avg</th><th>Consumer wait ms / decode step (Engram pair on weight)</th><th>Device bytes (estimate)</th><th>Host-wide device reads (since sample)</th></tr></thead><tbody id="mapped-rows"></tbody></table></div>
+  </section>
 </div>
 <div class="tip" id="tip" hidden></div>
 
@@ -137,7 +170,8 @@ const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 // ---------------------------------------------------------------- state
 const top = CuteUI.header($('#top'), { page: 'console', subtitle: 'Engine console' });
 top.status.replaceWith($('#status-tpl').content.cloneNode(true));
-top.extra.replaceWith($('#keys-tpl').content.cloneNode(true));
+$('#status').after(fabricChip());
+top.extra.closest('.header-extra').remove();
 const S = {
   config: {}, textAllowed: false, textState: 'off', disabled: false, starting: false,
   requests: new Map(), recent: [], gauges: {}, totals: [], prefill: [], rounds: [],
@@ -304,53 +338,111 @@ function rate(key, windowMs) {
   return dt > 0.2 ? (last[key] - first[key]) / dt : NaN;
 }
 
-// ---------------------------------------------------------------- socket
-let retry = 500, apiKey = '';
-window.cuteafdAuthenticatedFetch = (path, init = {}) => {
-  const headers = new Headers(init.headers);
-  if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
-  return fetch(path, { ...init, headers });
-};
-const fabricHealth = document.createElement('div');
-fabricHealth.className = 'note';
-fabricHealth.style.cssText = 'order:11;flex-basis:100%;min-width:0;padding:0 0 10px;overflow-wrap:anywhere';
-$('#top').append(fabricHealth);
-async function pollFabricHealth() {
+// ---------------------------------------------------------------- feed
+// The console unlock cookie (from the launcher's /console/unlock link) authorizes
+// this page's own feeds; no key is typed here. Without it the page says which
+// link to open instead of prompting.
+let retry = 500;
+window.cuteafdAuthenticatedFetch = (path, init = {}) => fetch(path, { credentials: 'same-origin', ...init });
+function locked(on) {
+  const b = $('#lock');
+  b.hidden = !on;
+  if (on) b.innerHTML = 'This console is locked. Open the <b>console unlock</b> link the launcher printed ' +
+    '(<code>…/console/unlock?token=…</code>) in this browser, then reload. The API key is not used here.';
+}
+
+// ---------------------------------------------------------------- fabric chip
+// One chip in the header. Idle and unproven ports, and a Spark's unused second
+// rail being down, are normal and say nothing; only loss above the warning
+// threshold, an engine port that is down, or a link below the host's fastest
+// active port produce words. Details (host names, never addresses) on click.
+let fabric = null;
+function fabricChip() {
+  const wrap = document.createElement('span');
+  wrap.className = 'fabric-chip-wrap';
+  wrap.innerHTML = `<button type="button" class="fabric-chip unknown" id="fabric-chip" aria-expanded="false" aria-controls="fabric-pop" hidden>
+    <i></i><span id="fabric-text">Fabric</span></button>
+    <div class="fabric-pop" id="fabric-pop" role="dialog" aria-label="Fabric details" hidden></div>`;
+  const chip = wrap.querySelector('#fabric-chip'), pop = wrap.querySelector('#fabric-pop');
+  chip.onclick = () => { pop.hidden = !pop.hidden; chip.setAttribute('aria-expanded', String(!pop.hidden)); if (!pop.hidden) renderFabricPop(); };
+  addEventListener('click', (e) => { if (!wrap.contains(e.target)) { pop.hidden = true; chip.setAttribute('aria-expanded', 'false'); } });
+  addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pop.hidden) { pop.hidden = true; chip.setAttribute('aria-expanded', 'false'); chip.focus(); } });
+  return wrap;
+}
+function hostName(key, host) {
+  if (key === 'coordinator') return host.hostname || 'coordinator';
+  return host.hostname || `Spark ${key.replace(/:\d+$/, '').split('.').pop()}`;
+}
+function fabricModel(snapshot) {
+  const hosts = [], problems = [];
+  for (const [key, host] of Object.entries(snapshot.hosts || {})) {
+    const name = hostName(key, host);
+    const used = new Set((host.engine || []).map((e) => `${e.device}/${e.port}`));
+    const ports = host.ports || [];
+    const fastest = Math.max(0, ...ports.filter((p) => /ACTIVE/.test(p.state || '')).map((p) => p.link_gbps || 0));
+    const rows = ports.map((p) => {
+      const h = p.health_since_start || {};
+      const active = /ACTIVE/.test(p.state || ''), engine = used.has(`${p.device}/${p.port}`);
+      const loss = h.loss_events_per_gb, limit = h.loss_warning_threshold_per_gb ?? 100;
+      let issue = null;
+      if (engine && !active) issue = 'down';
+      else if (Number.isFinite(loss) && loss > limit) issue = 'high loss';
+      else if (active && engine && fastest && p.link_gbps && p.link_gbps < fastest) issue = 'slow link';
+      if (issue) problems.push({ host: name, issue });
+      return { port: `${p.device}/${p.port}`, state: active ? 'up' : (p.state || '').replace(/^\d+:\s*/, '').toLowerCase() || 'unknown',
+        rate: p.link_gbps, loss, engine, issue, verdict: h.verdict || 'unknown' };
+    });
+    hosts.push({ name, rows, coordinator: key === 'coordinator' });
+  }
+  hosts.sort((a, b) => (b.coordinator - a.coordinator) || a.name.localeCompare(b.name));
+  return { hosts, problems };
+}
+function renderFabricChip() {
+  const chip = $('#fabric-chip'), text = $('#fabric-text');
+  if (!chip) return;
+  if (!fabric || !fabric.hosts.length) { chip.hidden = true; return; }
+  chip.hidden = false;
+  const p = fabric.problems;
+  let cls = 'ok', label = 'Fabric OK';
+  if (p.length) {
+    const hosts = [...new Set(p.map((x) => x.host))];
+    const kinds = [...new Set(p.map((x) => x.issue))];
+    cls = p.some((x) => x.issue === 'down' || x.issue === 'high loss') ? 'bad' : 'warn';
+    label = hosts.length === 1 && kinds.length === 1 ? `Fabric: ${kinds[0]} on ${hosts[0]}`
+      : `Fabric: ${p.length} port${p.length === 1 ? '' : 's'} degraded`;
+  }
+  chip.className = 'fabric-chip ' + cls; text.textContent = label;
+  chip.title = 'Fabric health since this page started observing. Click for details.';
+  if (!$('#fabric-pop').hidden) renderFabricPop();
+}
+function renderFabricPop() {
+  const pop = $('#fabric-pop');
+  if (!fabric) { pop.textContent = 'No fabric observations yet.'; return; }
+  const gbps = (v) => Number.isFinite(v) ? `${n0(v)} Gb/s` : '–';
+  const loss = (v) => Number.isFinite(v) ? F.n1(v) : '–';
+  pop.innerHTML = `<table><thead><tr><th>Host</th><th>Port</th><th>State</th><th>Rate</th><th title="Loss signals per GB moved (overlapping counters, not lost bytes); warning above 100">Loss / GB</th><th></th></tr></thead><tbody>` +
+    fabric.hosts.map((h) => h.rows.map((r, i) => `<tr class="${r.issue ? 'issue' : r.engine ? '' : 'spare'}"><td>${i ? '' : esc(h.name)}</td>
+      <td>${esc(r.port)}${r.engine ? '' : ' <small>unused</small>'}</td><td>${esc(r.state)}</td><td>${gbps(r.rate)}</td><td>${loss(r.loss)}</td>
+      <td>${r.issue ? `<b>${esc(r.issue)}</b>` : r.engine && r.verdict === 'ok' ? 'ok' : ''}</td></tr>`).join('')).join('') +
+    `</tbody></table><p class="note">Since this page started observing. Idle, unproven and unused ports are normal.</p>`;
+}
+async function pollFabric() {
   if (!document.hidden && S.connected) {
     try {
-      const response = await window.cuteafdAuthenticatedFetch('/v1/fabric', { signal: AbortSignal.timeout(2500) });
-      if (!response.ok) throw new Error('fabric unavailable');
-      const snapshot = await response.json();
-      const lines = Object.entries(snapshot.hosts || {}).map(([name, host]) => {
-        const ports = (host.ports || []).map(p => {
-          const h = p.health_since_start;
-          const verdict = h?.verdict === 'ok' ? 'OK' : h?.verdict || 'unknown';
-          return `${p.device}/${p.port} ${p.state || 'unknown'} ${p.link_gbps ?? '?'} Gb/s MTU ${p.mtu ?? '?'}: ${verdict} - ${(h?.reasons || ['no continuous observation']).join('; ')}`;
-        });
-        const verdict = host.health_since_start === 'ok' ? 'OK' : host.health_since_start || 'unknown';
-        return `${name}: ${verdict} since observation start; ${ports.join(' | ') || 'no port evidence'}; pause not collected`;
-      });
-      fabricHealth.replaceChildren(...(lines.length ? lines : ['Fabric unknown: awaiting host observations']).map(text => {
-        const line = document.createElement('div'); line.textContent = text; return line;
-      }));
-    } catch (_) { fabricHealth.textContent = 'Fabric unknown: observation unavailable'; }
-  } else { fabricHealth.textContent = 'Fabric unknown: observation paused while hidden or disconnected'; }
-  setTimeout(pollFabricHealth, 2000);
+      const response = await fetch('/v1/fabric', { credentials: 'same-origin', signal: AbortSignal.timeout(2500) });
+      if (response.ok) { fabric = fabricModel(await response.json()); renderFabricChip(); }
+    } catch (_) { /* keep the last verdict */ }
+  }
+  setTimeout(pollFabric, 3000);
 }
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) fabricHealth.textContent = 'Fabric unknown: observation paused while hidden';
-});
-setTimeout(pollFabricHealth, 2000);
+setTimeout(pollFabric, 1500);
+
 async function connect() {
   try {
-    const headers = new Headers();
-    if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
-    let response = await fetch('/v1/console/events', { headers });
-    if (response.status === 401) {
-      const key = window.prompt('API key for this server (kept in memory for this tab only)');
-      if (key) { apiKey = key; headers.set('Authorization', `Bearer ${apiKey}`); response = await fetch('/v1/console/events', { headers }); }
-    }
+    const response = await fetch('/v1/console/events', { credentials: 'same-origin' });
+    if (response.status === 401) { locked(true); retry = 5000; throw new Error('locked'); }
     if (!response.ok) throw new Error(response.statusText);
+    locked(false);
     S.connected = true; retry = 500;
     const reader = response.body.getReader(), decoder = new TextDecoder();
     let pending = '';
@@ -367,7 +459,7 @@ async function connect() {
       }
     }
   } catch (_) {}
-  S.connected = false; retry = Math.min(retry * 2, 5000); setTimeout(connect, retry);
+  S.connected = false; retry = Math.min(Math.max(retry, 500) * 2, 5000); setTimeout(connect, retry);
 }
 
 // ---------------------------------------------------------------- header, status
@@ -403,10 +495,10 @@ function status() {
 
 // ---------------------------------------------------------------- KPI tiles
 const TILES = [
-  { key: 'out', label: 'Output tokens / s', c: COL.tgt, spark: true },
-  { key: 'acc', label: 'Accepted drafts / s', c: COL.acc, spark: true },
-  { key: 'drf', label: 'Proposed drafts / s', c: COL.spark, spark: true },
-  { key: 'pre', label: 'Prefill tokens / s', c: COL.pf, spark: true },
+  { key: 'out', label: 'Output tps', c: COL.tgt, spark: true },
+  { key: 'acc', label: 'Accepted draft tps', c: COL.acc, spark: true },
+  { key: 'drf', label: 'Proposed draft tps', c: COL.spark, spark: true },
+  { key: 'pre', label: 'Prefill tps', c: COL.pf, spark: true },
   { key: 'conc', label: 'Concurrent requests', c: COL.ink2, spark: true },
   { key: 'input', label: 'Input tokens', c: COL.rs },
   { key: 'output', label: 'Output tokens', c: COL.acc },
@@ -676,12 +768,15 @@ function renderRecent() {
     const ttft = x.first != null && x.admitted != null ? (x.first - x.admitted) : NaN;
     const dec = x.first != null ? (x.t - x.first) / 1000 : NaN;
     const tps = dec > 0 ? (x.gen - 1) / dec : NaN;
+    // Prefill throughput over the uncached rows, admission to first token.
+    const fresh = (x.prompt ?? 0) - (x.cached ?? 0);
+    const ptps = fresh > 0 && ttft > 0 ? fresh / (ttft / 1000) : NaN;
     const tag = x.reason === 'finished' ? '<span class="tag ok">DONE</span>' : x.reason === 'failed' ? '<span class="tag bad">FAILED</span>' : '<span class="tag gone">CANCELLED</span>';
     return `<tr><td><b>#${x.id}</b>${x.grammar ? ' <span style="color:var(--grammar)">{}</span>' : ''}</td><td>${compact(x.prompt)}</td><td>${compact(x.cached)}</td>
       <td><b>${compact(x.gen)}</b></td><td>${Number.isFinite(ttft) ? (ttft >= 1000 ? (ttft / 1000).toFixed(2) + ' s' : ttft.toFixed(0) + ' ms') : '–'}</td>
-      <td>${Number.isFinite(tps) ? nf1.format(tps) + ' tok/s' : '–'}</td><td>${tag}</td></tr>`;
+      <td>${Number.isFinite(ptps) ? compact(ptps) + ' tps' : '–'}</td><td>${Number.isFinite(tps) ? nf1.format(tps) + ' tps' : '–'}</td><td>${tag}</td></tr>`;
   });
-  $('#recent').innerHTML = rows.join('') || '<tr><td colspan="7" class="empty">No completed requests yet.</td></tr>';
+  $('#recent').innerHTML = rows.join('') || '<tr><td colspan="8" class="empty">No completed requests yet.</td></tr>';
 }
 
 // ---------------------------------------------------------------- ticker
@@ -725,8 +820,12 @@ function showText() {
 $('#v-text').onclick = showText;
 for (const b of document.querySelectorAll('#zoom button')) b.onclick = () => setZoom(+b.dataset.z);
 $('#pause').onclick = () => setPaused(!S.paused);
+// The keys drive only the Execution lanes pane, so they act only while it is on screen.
+let lanesVisible = true;
+new IntersectionObserver((entries) => { lanesVisible = entries.some((e) => e.isIntersecting); }).observe($('#lanes'));
 addEventListener('keydown', (e) => {
-  if (e.target.closest('input,select,textarea')) return;
+  if (!lanesVisible || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.target.closest('input,select,textarea,button,a,[contenteditable]')) return;
   if (e.key === ' ') { e.preventDefault(); setPaused(!S.paused); }
   else if (e.key === 't') { if (S.textAllowed && S.mode === 'text') setMode('time'); else showText(); }
   else if (e.key === '+' || e.key === '=') setZoom(Math.min(1200, S.pxPerS * 2));
@@ -947,7 +1046,7 @@ function tooltip(hit) {
   } else if (hit.kind === 'prefill') {
     const p = hit.p, d = p.t1 - p.t0;
     text = `${p.k === 'chunk' ? `prefill chunk ${p.i + 1}/${p.n}${laneCount() > 1 ? `, lane ${p.lane}` : ''}` : p.k === 'restore' ? 'prefix restore' : p.k === 'replay' ? 'decoder replay' : `prefill ${p.k}`}${p.id != null ? `  #${p.id}` : ''}\n` +
-      `${n0(p.rows)} rows · ${d.toFixed(1)} ms${p.k !== 'replay' && d > 0 ? ` · ${compact(p.rows / d * 1000)} tok/s` : ''}`;
+      `${n0(p.rows)} rows · ${d.toFixed(1)} ms${p.k !== 'replay' && d > 0 ? ` · ${compact(p.rows / d * 1000)} tps` : ''}`;
   } else {
     const r = hit.r, c = hit.c;
     const main = c.main.map(([k, s]) => (k === 'a' ? 'accepted ' : 'target   ') + JSON.stringify(s)).join('\n');

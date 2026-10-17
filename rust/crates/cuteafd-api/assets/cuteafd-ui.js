@@ -53,7 +53,6 @@ const fmt = {
 const PAGES = [
   { id: 'console', href: '/', label: 'LIVE CONSOLE' },
   { id: 'usage', href: '/usage', label: 'USAGE' },
-  { id: 'agent', href: '/agent', label: 'AGENT (EXPERIMENTAL)' },
   { id: 'bench', href: '/bench', label: 'BENCHMARK', primary: true },
 ];
 function header(el, opts = {}) {

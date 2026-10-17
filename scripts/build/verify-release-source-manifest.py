@@ -81,18 +81,7 @@ def source_inventory(source: Path) -> set[str]:
             if ignored_directory(relative):
                 continue
             if path.is_symlink():
-                # A pinned dependency may link one of its own directories
-                # (deepseek-harness .claude/skills -> .agents/skills). The
-                # target's files are inventoried through their real path, so
-                # don't walk the link; escaping or broken links stay unsupported.
-                try:
-                    resolved = path.resolve(strict=True)
-                    resolved.relative_to(source)
-                except (OSError, ValueError):
-                    unsupported.append(f"./{relative.as_posix()} (symlink directory escapes source tree)")
-                    continue
-                if not resolved.is_dir():
-                    unsupported.append(f"./{relative.as_posix()} (symlink directory target is not a directory)")
+                unsupported.append(f"./{relative.as_posix()} (symlink directory)")
                 continue
             kept_directories.append(name)
         directory_names[:] = kept_directories

@@ -72,11 +72,17 @@ pub fn local_network(ip: IpAddr) -> bool {
 fn authorized(bench: &Bench, peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
     let _ = peer;
     bench.api_key.get().is_some_and(|key| key.accepts(headers))
+        || bench.console_gate.get().is_some_and(|gate| gate.unlocked(headers))
+}
+
+/// The probe runs an arbitrary chat body, so only the API key starts it.
+fn keyed(bench: &Bench, headers: &HeaderMap) -> bool {
+    bench.api_key.get().is_some_and(|key| key.accepts(headers))
 }
 
 fn forbidden() -> Response {
     (StatusCode::FORBIDDEN, Json(json!({"error": {"message":
-        "benchmark controls require the server's API key",
+        "benchmark controls require the console unlock link or the server's API key",
         "type": "forbidden"}}))).into_response()
 }
 
@@ -190,7 +196,8 @@ fn probe_error(error: anyhow::Error) -> Response {
 
 async fn probe_request(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<SocketAddr>>, headers: HeaderMap,
     Json(request): Json<ProbeRequest>) -> Response {
-    if !authorized(&bench, peer(connect), &headers) { return forbidden(); }
+    let _ = peer(connect);
+    if !keyed(&bench, &headers) { return forbidden(); }
     match tokio::task::spawn_blocking(move || bench.probe(request.body, request.spec)).await {
         Ok(Ok(chat)) => Json(chat).into_response(),
         Ok(Err(error)) => probe_error(error),

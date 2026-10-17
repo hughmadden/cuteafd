@@ -3,10 +3,6 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
-if [[ "${1:-}" == --agent ]]; then
-  shift
-  exec "$repo_root/scripts/launch/agent.sh" "${@:-start}"
-fi
 
 usage() {
   cat <<'EOF'
@@ -34,7 +30,6 @@ cuteafd-coordinator-INSTANCE instead of the one shared cuteafd-coordinator, and
 ./stop.sh with the same configuration stops only that one. Accepts Docker's
 container-name characters, [A-Za-z0-9_.-].
 
-  --agent [start|stop|status]    independent experimental workspace sidecar
   --config FILE                 alternate complete configuration
   --set KEY=VALUE               override one configuration key for this launch
                                 (repeatable; e.g. --set RTX_GPUS=2,

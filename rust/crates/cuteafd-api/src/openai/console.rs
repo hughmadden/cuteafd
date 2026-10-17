@@ -240,6 +240,12 @@ pub fn asset_routes() -> axum::Router {
         .route("/assets/cuteafd-mark.svg", get(mark))
 }
 
+/// `/bench` on a server launched without the benchmark runner: say so instead of 404.
+pub const BENCH_OFF: &str = include_str!("../../assets/bench-off.html");
+pub async fn bench_off() -> Response {
+    ([(header::CACHE_CONTROL, "no-cache")], Html(BENCH_OFF)).into_response()
+}
+
 pub(super) async fn logo() -> Response {
     asset("cuteafd-logo.svg", LOGO, "image/svg+xml").await
 }
@@ -331,17 +337,23 @@ mod tests {
     }
 
     #[test]
-    fn fabric_health_poll_is_authenticated_bounded_and_visibility_gated() {
-        assert!(PAGE.contains("cuteafdAuthenticatedFetch('/v1/fabric'"));
+    fn fabric_chip_poll_is_cookie_authenticated_bounded_and_visibility_gated() {
+        assert!(PAGE.contains("fetch('/v1/fabric', { credentials: 'same-origin', signal: AbortSignal.timeout(2500) })"));
         assert!(PAGE.contains("!document.hidden && S.connected"));
-        assert!(PAGE.contains("AbortSignal.timeout(2500)"));
-        assert!(PAGE.contains("setTimeout(pollFabricHealth, 2000)"));
-        assert!(!PAGE.contains("setInterval(pollFabricHealth"));
-        assert!(PAGE.contains("health_since_start") && PAGE.contains("since observation start"));
-        assert!(PAGE.contains("pause not collected"));
-        assert!(PAGE.contains("line.textContent = text"));
+        assert!(PAGE.contains("setTimeout(pollFabric, 3000)"));
+        assert!(!PAGE.contains("setInterval(pollFabric"));
+        // A chip with details behind a click, named by host, never a text dump.
+        assert!(PAGE.contains("id=\"fabric-chip\"") && PAGE.contains("host.hostname"));
+        assert!(!PAGE.contains("congestion control not exercised"));
     }
 
+    #[test]
+    fn console_never_prompts_for_a_key() {
+        for page in [PAGE, BENCH_OFF] {
+            assert!(!page.contains("window.prompt") && !page.contains("Authorization"));
+        }
+        assert!(PAGE.contains("console unlock"));
+    }
     #[test]
     fn bench_text_toggles_text_and_a_disabled_hub_stays_off() {
         let hub = ConsoleHub::new(false);

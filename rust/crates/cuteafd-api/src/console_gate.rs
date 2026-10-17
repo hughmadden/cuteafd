@@ -1,4 +1,6 @@
-//! Console-only cookies grant no API authority. Secrets never implement Debug.
+//! The console cookie authorizes the built-in pages and their own reads
+//! (`openai::auth::console_read`), never inference or writes under `/v1`.
+//! Secrets never implement Debug.
 use crate::openai::auth::constant_time_eq;
 use axum::{
     extract::{Query, Request, State},
@@ -370,6 +372,7 @@ mod tests {
                 crate::openai::auth::Auth {
                     key: Some(crate::openai::auth::ApiKey::new("api-key").unwrap()),
                     internal: None,
+                    console: Some(gate.clone()),
                 },
                 crate::openai::auth::require_key,
             ));
@@ -388,6 +391,40 @@ mod tests {
             .status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+    /// The cookie reads the dashboard's own feeds; inference still needs the key.
+    #[tokio::test]
+    async fn cookie_reads_console_feeds_but_never_inference() {
+        let (_file, gate) = fixture();
+        let ok = || async { "ok" };
+        let app = Router::new()
+            .route("/v1/console/events", get(ok))
+            .route("/v1/fabric", get(ok).post(ok))
+            .route("/v1/models", get(ok))
+            .route("/v1/chat/completions", axum::routing::post(ok))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::openai::auth::Auth {
+                    key: Some(crate::openai::auth::ApiKey::new("api-key").unwrap()),
+                    internal: None,
+                    console: Some(gate.clone()),
+                },
+                crate::openai::auth::require_key,
+            ));
+        let cookie = format!("cuteafd_console={}", gate.cookie_value(4000000));
+        let status = |method: &str, path: &str, cookie: Option<&str>| {
+            let mut request = Request::builder().method(method).uri(path);
+            if let Some(cookie) = cookie { request = request.header("cookie", cookie); }
+            let app = app.clone();
+            let request = request.body(Body::empty()).unwrap();
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+        assert_eq!(status("GET", "/v1/console/events", Some(&cookie)).await, StatusCode::OK);
+        assert_eq!(status("GET", "/v1/fabric", Some(&cookie)).await, StatusCode::OK);
+        assert_eq!(status("GET", "/v1/console/events", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status("GET", "/v1/console/events", Some("cuteafd_console=v1.4000000.bad")).await, StatusCode::UNAUTHORIZED);
+        for (method, path) in [("GET", "/v1/models"), ("POST", "/v1/chat/completions"), ("POST", "/v1/fabric")] {
+            assert_eq!(status(method, path, Some(&cookie)).await, StatusCode::UNAUTHORIZED, "{method} {path}");
+        }
     }
     #[tokio::test]
     async fn unlock_query_never_traced() {

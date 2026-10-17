@@ -55,6 +55,9 @@ pub struct EngineSample {
 pub struct HostSample {
     /// Process incarnation; a restart must not be interpreted as a counter wrap.
     pub incarnation: String,
+    /// The host's own name (kernel hostname), for display; fabric keys stay addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     /// Seconds on this host's monotonic clock, never compared across hosts.
     pub sampled_s: f64,
     /// Start of the continuous demand-driven observation window, host-local.
@@ -359,6 +362,8 @@ fn start() {
             let clock = Instant::now();
             let incarnation = format!("{}-{}", std::process::id(), std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+            let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()
+                .map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
             let mut previous: Option<HostSample> = None;
             let mut idle = BTreeMap::new();
             let mut health_window = crate::fabric_health::Window::default();
@@ -380,7 +385,7 @@ fn start() {
                     let state = registry().lock().unwrap();
                     (state.counters.clone(), state.peers.clone(), state.sources.clone())
                 };
-                let mut local = HostSample { incarnation: incarnation.clone(), sampled_s: 0.0,
+                let mut local = HostSample { incarnation: incarnation.clone(), sampled_s: 0.0, hostname: hostname.clone(),
                     ports: read_ports(Path::new("/sys/class/infiniband")),
                     engine: counters.iter().map(|counter| counter.sample()).collect(),
                     sources: sources.iter().map(|s| (s.name().into(), s.sample())).collect(), ..Default::default() };

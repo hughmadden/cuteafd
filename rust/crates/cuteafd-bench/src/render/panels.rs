@@ -47,7 +47,7 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
 fn context_load(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let points = v["points"].as_array().cloned().unwrap_or_default();
     if points.is_empty() { return empty(doc, t, "no measurements yet"); }
-    let columns = ["context", "C", "agg tok/s", "med tok/s", "TTFT ms", "cached", "cold ms"];
+    let columns = ["context", "C", "agg tps", "med tps", "TTFT ms", "cached", "cold ms"];
     let widths = [0.16, 0.06, 0.16, 0.15, 0.15, 0.16, 0.16];
     let mut y = 16.0;
     let mut x = 0.0;
@@ -226,7 +226,7 @@ fn decode_content(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     if rows.is_empty() {
         return empty(doc, t, "no measurements yet");
     }
-    hbars(doc, t, 0.0, 0.0, w, &rows, "tok/s")
+    hbars(doc, t, 0.0, 0.0, w, &rows, "tps")
 }
 
 fn plot_height(w: f64) -> f64 {
@@ -245,7 +245,7 @@ fn concurrency(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let plot = Plot { x: 46.0, y: 26.0, w: w - 150.0, h, xs: Scale::Log2 { min: 1.0, max: max_c },
         ys: Scale::linear_from(agg.iter().chain(&per).map(|p| p.1), true) };
     legend(doc, t, 46.0, 10.0, &[("aggregate", t.series[0]), ("per request", t.series[1])]);
-    plot.axes(doc, t, "concurrent requests", "tok/s", &|x| format!("C{}", x as u64));
+    plot.axes(doc, t, "concurrent requests", "tps", &|x| format!("C{}", x as u64));
     plot.line(doc, &agg, t.series[0], agg.last().map(|p| rate(p.1)).as_deref());
     plot.line(doc, &per, t.series[1], per.last().map(|p| rate(p.1)).as_deref());
     26.0 + h + 36.0
@@ -285,7 +285,7 @@ fn retained(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let h = plot_height(w) * 0.85;
     let plot = Plot { x: 46.0, y: 18.0, w: w - 110.0, h,
         xs: Scale::linear_from(points.iter().map(|p| p.0), true), ys: Scale::linear_from(points.iter().map(|p| p.1), true) };
-    plot.axes(doc, t, "tokens of context", "decode tok/s", &|x| charts::tokens(x));
+    plot.axes(doc, t, "tokens of context", "decode tps", &|x| charts::tokens(x));
     plot.line(doc, &points, t.series[0], None);
     for (x, y) in &points {
         doc.text(plot.px(*x), plot.py(*y) - 9.0, Font::new(10.0, t.ink).anchor(Anchor::Middle), &rate(*y));
@@ -344,7 +344,7 @@ fn structured(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     if rows.is_empty() {
         return empty(doc, t, "no measurements yet");
     }
-    hbars(doc, t, 0.0, 0.0, w, &rows, "tok/s")
+    hbars(doc, t, 0.0, 0.0, w, &rows, "tps")
 }
 
 fn needle(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
@@ -571,7 +571,7 @@ fn agentic(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let rates: Vec<f64> = turns.iter().filter_map(|x| num(x, "decode_tok_s")).filter(|v| *v > 0.0).collect();
     let mean_rate = if rates.is_empty() { 0.0 } else { rates.iter().sum::<f64>() / rates.len() as f64 };
     doc.spans(0.0, 14.0, 12.0, Anchor::Start, &[(&format!("task {} · ", v["task"].as_str().unwrap_or("?")), t.ink2, 400),
-        (label, color, 700), (&format!(" · {} turns · {} reused whole · {} invalid tool calls · {} tok/s mean{}",
+        (label, color, 700), (&format!(" · {} turns · {} reused whole · {} invalid tool calls · {} tps mean{}",
             turns.len(), reused, invalid, rate(mean_rate),
             num(v, "seconds").map(|s| format!(" · {}", seconds(s))).unwrap_or_default()), t.ink2, 400)]);
     doc.group(0.0, 26.0);
@@ -631,7 +631,7 @@ mod context_load_tests {
         let mut doc = super::Doc::new(900.0, 300.0);
         assert!(super::context_load(&mut doc, &super::super::theme::NORMAL, &v, 900.0) > 0.0);
         let svg = doc.finish();
-        for label in ["32K", "128K", "32760", "agg tok/s", "shared_device_pages", "shared estimate exceeds KV pool"] {
+        for label in ["32K", "128K", "32760", "agg tps", "shared_device_pages", "shared estimate exceeds KV pool"] {
             assert!(svg.contains(label), "{label}");
         }
     }

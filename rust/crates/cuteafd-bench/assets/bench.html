@@ -26,6 +26,8 @@ body.scary .brand .logo { filter: hue-rotate(150deg) saturate(1.4); animation: g
   font: 700 15px var(--mono); letter-spacing: .2em; color: #ff3b4e; }
 .failure span { font: 500 12px var(--mono); letter-spacing: 0; color: #ffb020; margin-left: auto; }
 .dim { opacity: .55; }
+.banner.lock { color: var(--ink-2); }
+.banner.lock b, .banner.lock code { color: var(--ink); }
 
 /* live strip */
 .strip { display: grid; grid-template-columns: auto minmax(140px, 220px) repeat(2, auto) minmax(160px, 1fr) auto auto; gap: 12px;
@@ -126,11 +128,12 @@ html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --f
 <body>
 <div class="app">
   <header id="header"></header>
+  <div class="banner lock" id="locked" role="status" hidden>Benchmark controls are locked. Open the <b>console unlock</b> link the launcher printed (<code>…/console/unlock?token=…</code>) in this browser, then reload. The API key is not used here.</div>
   <div id="failure" hidden><div class="hazard"><div class="failure">⚠ FIDELITY FAILURE<span id="failure-detail"></span></div></div></div>
   <div class="strip" id="strip" hidden>
     <span class="pill">BENCHMARKING</span>
     <svg class="spark" id="strip-spark"></svg>
-    <span>output <b id="strip-rate">–</b> tok/s</span>
+    <span>output <b id="strip-rate">–</b> tps</span>
     <span>active <b id="strip-active">–</b></span>
     <span><span id="strip-panel">–</span> · <span id="strip-label"></span><div class="progress"><span id="strip-progress"></span></div></span>
     <span>ETA <b id="strip-eta">–</b></span>
@@ -186,7 +189,7 @@ const store = { get(k) { try { return localStorage.getItem(k); } catch (_) { ret
 let status = {}, catalog = { panels: [] }, profiles = [], runs = [], report = null, viewing = null;
 let follow = true;              // follow the active run
 const revs = {};                // panel id -> image revision
-const rates = [];               // live output tok/s
+const rates = [];               // live output tps
 let progress = null;            // last progress event
 
 const secs = (s) => {
@@ -196,19 +199,11 @@ const secs = (s) => {
   if (s < 3600) return `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`;
   return `${Math.floor(s / 3600)}h ${String(Math.floor(s / 60) % 60).padStart(2, '0')}m`;
 };
-let apiKey = '';
+// The console unlock cookie authorizes this page's controls; no key is typed here.
 const authenticatedFetch = async (path, init = {}) => {
-  const headers = new Headers(init.headers);
-  if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
-  let response = await fetch(path, { ...init, headers });
-  if (response.status === 401) {
-    const key = window.prompt('API key for this server (kept in memory for this tab only)');
-    if (key) {
-      apiKey = key;
-      headers.set('Authorization', `Bearer ${apiKey}`);
-      response = await fetch(path, { ...init, headers });
-    }
-  }
+  const response = await fetch(path, { credentials: 'same-origin', ...init });
+  if (response.status === 401 || response.status === 403) $('locked').hidden = false;
+  else if (response.ok && String(path).startsWith('/v1/bench/')) $('locked').hidden = true;
   return response;
 };
 window.cuteafdAuthenticatedFetch = authenticatedFetch;
@@ -427,17 +422,17 @@ function tableFor(id, comparedResult = null) {
       rows.push([`C${c.width} code, aggregate`, c.aggregate_tok_s, tokens, '', c.decode_s]);
     }
     if (b.card.prefill) { const p = b.card.prefill; rows.push(['8K prefill', p.tok_s, p.prompt_tokens, p.ttft_s * 1000, '']); }
-    const streams = sweep.map((c) => tableHtml(['stream', 'tok/s', 'tokens', 'sent s', 'TTFT ms', 'decode s'],
+    const streams = sweep.map((c) => tableHtml(['stream', 'tps', 'tokens', 'sent s', 'TTFT ms', 'decode s'],
       c.runs.map((r, i) => [i + 1, r.timing.decode_s > 0 ? Math.max(0, r.timing.completion_tokens - 1) / r.timing.decode_s : 0,
         r.timing.completion_tokens, r.sent_s, r.timing.ttft_s * 1000, r.timing.decode_s]))
-      + `<p class="note">C${c.width} per-request median ${fmt.n1(c.per_stream_median_tok_s)} tok/s · untimed warm-up ${secs(c.warmup_s)}</p>`).join('');
+      + `<p class="note">C${c.width} per-request median ${fmt.n1(c.per_stream_median_tok_s)} tps · untimed warm-up ${secs(c.warmup_s)}</p>`).join('');
     const checks = b.quality.checks.map((c) => [c.title, c.status, c.summary, c.seconds]);
     const cap = b.card.capacity || {};
     const capRows = [['KV pool', cap.kv_tokens != null ? `${fmt.n0(cap.kv_tokens)} tokens${cap.kv_pages != null ? ` · ${fmt.n0(cap.kv_pages)} pages` : ''}` : '—'],
       ['KV format', cap.kv_format || '—'], ['max requests', cap.max_requests ?? '—'],
       ['max context / output', `${cap.max_context ?? '—'} / ${cap.max_output ?? '—'}`],
       ['host prefix cache', cap.host_cache_bytes != null ? (cap.host_cache_bytes ? fmt.bytes(cap.host_cache_bytes) : 'off') : '—']];
-    return tableHtml(['capacity', ''], capRows) + tableHtml(['measurement', 'tok/s', 'tokens', 'TTFT ms', 'decode s'], rows)
+    return tableHtml(['capacity', ''], capRows) + tableHtml(['measurement', 'tps', 'tokens', 'TTFT ms', 'decode s'], rows)
       + streams + tableHtml(['check', 'status', 'result', 'seconds'], checks);
   }
   if (id === 'hardware') {

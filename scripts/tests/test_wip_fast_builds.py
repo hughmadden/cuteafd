@@ -226,7 +226,7 @@ def test_source_checkout_initializes_only_build_submodules_from_local_stores():
     text = (ROOT / 'scripts/build/wip-source-checkout.sh').read_text()
     for name in ('third_party/sparkinfer', 'third_party/transformers', 'third_party/xgrammar'):
         assert f'submodule_from_local "$dest" {name}' in text
-    assert 'deepseek-harness "' not in text and 'gptqmodel "' not in text
+    assert 'gptqmodel "' not in text and 'tool-eval-bench "' not in text
     assert 'remote set-url origin "$url"' in text
     assert 'verify-$name-source.py' in text
 
