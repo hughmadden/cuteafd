@@ -172,8 +172,8 @@ def cargo(source, root, args, env):
     totals = [tuple(map(int, m)) for m in CARGO_RESULT.findall(text)]
     if nextest:
         totals, nextest_ids = parse_nextest(report)
-        if not totals:
-            code = code or 1  # Passing doctests cannot mask a missing nextest report.
+        if not sum(t[0] + t[1] for t in totals):
+            code = code or 1  # Passing doctests cannot mask an empty/missing nextest run.
     passed, failed, ignored = (sum(t[i] for t in totals) for i in range(3))
     ids = nextest_ids if nextest else sorted(set(CARGO_FAIL.findall(text)))
     if nextest and code != 124:
