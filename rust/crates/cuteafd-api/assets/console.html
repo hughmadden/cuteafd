@@ -18,9 +18,11 @@
 .lane-keys { flex: 1 1 auto; text-align: center; white-space: nowrap; }
 #lanes .ctl { margin-left: 0; }
 /* GPU table */
+@media (min-width: 1300px) { .meters:has(#gpu-meter:not([hidden])) { grid-template-columns: repeat(3, minmax(240px, 1fr)) minmax(430px, 1.5fr); } }
+#gpu-meter { overflow-x: auto; }
 .gpu-table { width: 100%; border-collapse: collapse; font: 12px var(--mono); margin-top: 4px; font-variant-numeric: tabular-nums; }
 .gpu-table th { color: var(--muted); font-weight: 500; text-align: right; padding: 2px 6px; border-bottom: 1px solid var(--line); }
-.gpu-table td { text-align: right; padding: 3px 6px; color: var(--ink-2); white-space: nowrap; }
+.gpu-table td { text-align: right; padding: 2px 6px; color: var(--ink-2); white-space: nowrap; }
 .gpu-table th:first-child, .gpu-table td:first-child { text-align: left; padding-left: 0; }
 .gpu-table td:first-child { color: var(--ink); }
 .gpu-table small { color: var(--muted); }
