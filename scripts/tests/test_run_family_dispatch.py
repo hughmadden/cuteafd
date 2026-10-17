@@ -3301,3 +3301,39 @@ def test_expert_onboarding_rejects_more_than_checkpoint_routed_layers(tmp_path):
     assert result.returncode == 2
     assert "checkpoint has 60 routed layers" in result.stderr
     assert "docker run" not in result.stderr
+
+
+@pytest.mark.parametrize("value", [None, "off", "on"])
+def test_console_assets_serve_checkout_pages_only_for_wip(tmp_path: Path, value) -> None:
+    keys = "SPARK_COUNT=0\n" + (f"CONSOLE_ASSETS={value}\n" if value else "")
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B", keys,
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
+    pages = ("CUTEAFD_CONSOLE_PAGE=/run/cuteafd-assets/cuteafd-api/console.html",
+             "CUTEAFD_CONSOLE_ASSETS=/run/cuteafd-assets/cuteafd-api",
+             "CUTEAFD_BENCH_PAGE=/run/cuteafd-assets/cuteafd-bench/bench.html",
+             "CUTEAFD_USAGE_PAGE=/run/cuteafd-assets/cuteafd-usage/usage.html")
+    if value == "on":
+        for crate in ("cuteafd-api", "cuteafd-bench", "cuteafd-usage"):
+            assert f"rust/crates/{crate}/assets,dst=/run/cuteafd-assets/{crate},readonly" in launch
+        assert all(page in launch for page in pages)
+    else:
+        assert "/run/cuteafd-assets" not in launch and "CUTEAFD_CONSOLE_PAGE" not in launch
+
+
+def test_console_assets_refuse_release_images(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                                            "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash", "CONSOLE_ASSETS=on\n")
+    assert result.returncode != 0
+    assert "CONSOLE_ASSETS=on serves pages from a checkout and needs --wip SLOT" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+def test_console_assets_rejects_unknown_value(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        "SPARK_COUNT=0\nCONSOLE_ASSETS=maybe\n", extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode != 0
+    assert "CONSOLE_ASSETS must be on or off" in result.stderr
