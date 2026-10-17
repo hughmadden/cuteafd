@@ -20,6 +20,30 @@ class CompactSparkTopologyTest(unittest.TestCase):
                 'source scripts/lib/release-common.sh; release_load_config "$1"; ' + command,
                 'test', str(config)], cwd=ROOT, text=True, capture_output=True)
 
+    def test_planner_wire_is_mandatory(self):
+        source = (ROOT / 'scripts/launch/run-family.sh').read_text()
+        body = source.split('spark_wire="$(jq -er', 1)[1].split('\nrelease_validate_spark_topology', 1)[0]
+        body = 'spark_wire="$(jq -er' + body
+        for wire, status, expected in [
+            ('canonical', 0, '0::'),
+            ('native_ownership', 0, '1:3:1'),
+            ('unqualified', 2, None),
+            (None, 1, None),
+        ]:
+            with self.subTest(wire=wire):
+                topology = dict(tp=3, ep=1)
+                if wire is not None:
+                    topology['wire'] = wire
+                script = ('source scripts/lib/release-common.sh; count_plan="$1"; '
+                          'spark_tp=3; spark_ep=1; SPARK_TP=6; SPARK_EP=1; '
+                          + body + '\nprintf "%s:%s:%s" "$topology_explicit" "$SPARK_TP" "$SPARK_EP"')
+                result = subprocess.run(['bash', '-euc', script, 'test',
+                                         json.dumps(dict(topology=topology))], cwd=ROOT,
+                                        text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, status, result.stderr)
+                if expected is not None:
+                    self.assertEqual(result.stdout, expected)
+
     def test_blank_count_remains_implicit_across_config_reloads(self):
         result = self.config('SPARK_COUNT=\nSPARK_HOSTS=',
             'release_load_config "$1"; printf "%s %s\\n" "$SPARK_COUNT" "$RELEASE_SPARK_COUNT_EXPLICIT"')
@@ -166,12 +190,26 @@ release_stop_wip_containers
             ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=2', 'must equal SPARK_COUNT'),
             ('SPARK_COUNT=3\nSPARK_TP=1\nSPARK_EP=3', 'unsupported native Spark topology TP1EP3'),
             ('SPARK_COUNT=3\nSPARK_TP=2\nSPARK_EP=1', 'must equal SPARK_COUNT'),
-            ('SPARK_COUNT=9', 'SPARK_COUNT must be in 0..8'),
+            ('SPARK_COUNT=9', 'SPARK_COUNT must be in 0..6'),
         ]:
             with self.subTest(settings=settings):
                 result = self.config(settings)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(message, result.stderr)
+
+    def test_deleted_worlds_are_refused_before_launch(self):
+        for count in (7, 8):
+            for topology in ('', f'\nSPARK_TP={count}\nSPARK_EP=1'):
+                with self.subTest(count=count, topology=topology):
+                    result = self.config(f'SPARK_COUNT={count}{topology}')
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn('must be in', result.stderr)
+        # TP1 and NVFP4 TP5 remain canonical package contracts, not native
+        # ownership layouts.
+        for count in (1, 5):
+            result = self.config(f'SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1')
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn('unsupported native Spark topology', result.stderr)
 
     def test_compact_tp3_package_variants_admission(self):
         # 2304/3 = 768-column shards for every rank and worker capacity; a

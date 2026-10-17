@@ -40,12 +40,12 @@ mod selection_tests {
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
         std::fs::write(dir.path().join("model.safetensors.index.json"), "{}").unwrap();
         let geometry = cuteafd_core::ExpertGeometry::MIMO_V26_PRO;
-        let identity = WorkerIdentity::from_snapshot(dir.path(), geometry, 6, None).unwrap();
+        let identity = WorkerIdentity::from_snapshot(dir.path(), geometry, cuteafd_transport::expert::SparkWorld::canonical(6).unwrap()).unwrap();
         // Every backend consumes the same exact selected IDs within checkpoint bounds.
         let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
             snapshot: dir.path().into(), rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
-            rdma_endpoints: 3, topology: None, native_spark_tp2: false, bf16_ingress: false };
+            rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_tp2: false, bf16_ingress: false };
         let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80, compiled_capacity: 80,
             endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 80,
                 ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 } }],
@@ -150,7 +150,7 @@ impl Drop for Admission {
 
 pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
     ensure!(
-        config.rank < config.world && (1..=8).contains(&config.world),
+        config.rank < config.world && (1..=6).contains(&config.world),
         "native rank must be below the launched Spark world"
     );
     // The checkpoint fixes the process expert geometry before the native
@@ -163,8 +163,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         cuteafd_loader::read_expert_catalog(&config.snapshot)?
     };
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
-    config.topology = crate::shared::spark_topology::for_checkpoint(
-        config.topology, config.world, v41 && catalog.exl3().is_some());
+    let topology = crate::shared::spark_topology::for_checkpoint(
+        config.declared_world.ownership_topology(), config.world, v41 && catalog.exl3().is_some());
+    config.declared_world = crate::shared::spark_topology::world(topology, config.world)?;
+    validate_topology(&config, &catalog)?;
     let geometry = catalog.routed_experts().geometry()?;
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
         && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
@@ -211,7 +213,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         };
         let selected = (|| -> Result<_> {
             let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
-                &config.snapshot, geometry, config.world, config.topology)?;
+                &config.snapshot, geometry, config.spark_world()?)?;
             selection.validate_for(&identity)?;
             apply_worker_selection(&mut config, &selection, catalog.routed_experts().first_layer,
                 catalog.routed_experts().layers)?;
@@ -411,10 +413,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 }
             }
         })?;
-    let executor_id = match config.topology {
-        Some(topology) => topology.executor_id(config.rank)?,
-        None => cuteafd_transport::expert::v41_spark_executor_id(config.world, config.rank)?,
-    };
+    let spark_world = config.spark_world()?;
+    let executor_id = spark_world.topology().executor_id(config.rank)?;
     let mut connections = Vec::<LocalVerbsExpertConnection>::with_capacity(16);
     // Structured startup evidence: one line per rank naming the native role and
     // logical intermediate this worker actually loaded. A captured log can then
@@ -506,7 +506,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 // A topology-bound worker admits only the ownership-aware
                 // request contract; every other family is a protocol mismatch,
                 // not a silent fallback.
-                let request = match config.topology {
+                let request = match spark_world.ownership_topology() {
                     Some(topology) => BackboneRequest::parse_native_group(
                         view.frame_bytes(),
                         config.capacity,

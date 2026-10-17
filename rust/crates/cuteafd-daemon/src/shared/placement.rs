@@ -20,7 +20,8 @@ impl SparkAdmission {
         model: ModelAdmission) -> Result<Self> {
         ensure!(working.spark_layers.is_empty() || working.spark_ranks == world,
             "Spark admission working-set world differs from launched peers");
-        let identity = WorkerIdentity::from_snapshot(snapshot, geometry, world, topology)?;
+        let identity = WorkerIdentity::from_snapshot(snapshot, geometry,
+            crate::shared::spark_topology::world(topology, world)?)?;
         let selection = WorkerSelection::new(identity, &working.spark_layers)?.with_model(model.clone())?;
         // Idle workers still acknowledge the identity, but need no storage package.
         let assignments = if working.spark_layers.is_empty() {
@@ -31,8 +32,6 @@ impl SparkAdmission {
             ensure!(catalog.routed_experts().geometry()? == geometry,
                 "Spark admission catalog geometry differs from coordinator");
             crate::shared::spark_topology::require_supported(topology, catalog)?;
-            ensure!(topology.is_none() || catalog.fp8().is_none(),
-                "Spark FP8-family packages do not support replicated native topology");
             let tp = topology.map_or(world, |topology| topology.tp() as usize);
             let headers = cuteafd_loader::plan::files::open_role(snapshot,
                 cuteafd_loader::plan::files::ReadRole::Spark { rank: 0, world: tp })?;

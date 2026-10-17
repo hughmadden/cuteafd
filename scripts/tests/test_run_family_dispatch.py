@@ -643,7 +643,8 @@ report.update(spark_ranks=ranks)
 gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
-    topology=dict(tp=tp, ep=ep, explicit=explicit), peers=peers,
+    topology=dict(tp=tp, ep=ep,
+                  wire="native_ownership" if explicit else "canonical"), peers=peers,
     speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
@@ -1016,7 +1017,7 @@ def test_explicit_pool_hosts_reject_invalid_selection(tmp_path: Path, hosts: str
     assert "cuteafd serve-qwen4" not in result.stderr
 
 
-@pytest.mark.parametrize("count", [1, 5, 7, 8])
+@pytest.mark.parametrize("count", [1, 5])
 def test_explicit_custom_hosts_use_configured_rails_in_csv_order(count):
     hosts = [f"spark-{rank}.example" for rank in range(count)]
     script = ['set -eu', 'source "$1"']
@@ -1033,14 +1034,25 @@ def test_explicit_custom_hosts_use_configured_rails_in_csv_order(count):
         for rank, host in enumerate(reversed(hosts))]
 
 
+@pytest.mark.parametrize("count", [7, 8])
+def test_custom_hosts_reject_deleted_worlds(count):
+    hosts = ",".join(f"spark-{rank}.example" for rank in range(count))
+    result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows "$2" "$3"',
+                             "test", str(ROOT / "scripts/lib/release-common.sh"), hosts, str(count)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2
+    assert f"SPARK_HOSTS must name exactly SPARK_COUNT={count} hosts" in result.stderr
+    assert not result.stdout
+
+
 @pytest.mark.parametrize("host,lane_a,message", [
-    ("spark-7.example", "", "configure SPARK_<rank>_HOST and LANE_A"),
-    ("spark-7.example,spark-7.example", "192.0.2.8", "duplicate host"),
-    ("spark-7.example,", "192.0.2.8", "comma-separated Spark pool host list"),
-    ("spark;bad", "192.0.2.8", "comma-separated Spark pool host list"),
+    ("spark-5.example", "", "configure SPARK_<rank>_HOST and LANE_A"),
+    ("spark-5.example,spark-5.example", "192.0.2.6", "duplicate host"),
+    ("spark-5.example,", "192.0.2.6", "comma-separated Spark pool host list"),
+    ("spark;bad", "192.0.2.6", "comma-separated Spark pool host list"),
 ])
 def test_explicit_custom_hosts_fail_closed(host, lane_a, message):
-    env = {**os.environ, "SPARK_7_HOST": "spark-7.example", "SPARK_7_LANE_A": lane_a}
+    env = {**os.environ, "SPARK_5_HOST": "spark-5.example", "SPARK_5_LANE_A": lane_a}
     result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows "$2" "$3"',
                              "test", str(ROOT / "scripts/lib/release-common.sh"), host,
                              str(len(host.split(",")))], env=env,
@@ -1050,13 +1062,13 @@ def test_explicit_custom_hosts_fail_closed(host, lane_a, message):
 
 
 def test_explicit_custom_host_secondary_rail_is_optional():
-    env = {**os.environ, "SPARK_7_HOST": "spark-7.example", "SPARK_7_LANE_A": "192.0.2.8",
-           "SPARK_7_LANE_B": ""}
-    result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows spark-7.example 1',
+    env = {**os.environ, "SPARK_5_HOST": "spark-5.example", "SPARK_5_LANE_A": "192.0.2.6",
+           "SPARK_5_LANE_B": ""}
+    result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows spark-5.example 1',
                              "test", str(ROOT / "scripts/lib/release-common.sh")], env=env,
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "0 spark-7.example 192.0.2.8 \n"
+    assert result.stdout == "0 spark-5.example 192.0.2.6 \n"
 
 
 def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: str) -> str:

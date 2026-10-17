@@ -28,7 +28,14 @@ pub struct AdmissionArgs {
 pub struct Topology {
     pub tp: usize,
     pub ep: usize,
-    pub explicit: bool,
+    pub wire: SparkWire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SparkWire {
+    Canonical,
+    NativeOwnership,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -96,15 +103,31 @@ impl<'a> DeploymentSpec<'a> {
         let explicit = options.spark_tp.is_some()
             || (family == "deepseek_v41" && if exl3 { ranks == 3 } else { ranks != 0 && ranks != 4 });
         let topology = Topology { tp: options.spark_tp.unwrap_or(ranks),
-            ep: options.spark_ep.unwrap_or(1), explicit };
+            ep: options.spark_ep.unwrap_or(1),
+            wire: if explicit { SparkWire::NativeOwnership } else { SparkWire::Canonical } };
         if explicit {
-            ensure!(ranks > 0 && topology.tp > 0 && topology.tp <= 8 && topology.ep > 0
+            ensure!(ranks > 0 && topology.tp > 0 && topology.tp <= 6 && topology.ep > 0
                 && topology.ep <= 3 && topology.tp * topology.ep == ranks,
-                "Spark TP * EP must equal selected rank count");
+                "Spark topology {}x{} must match selected physical rank count {ranks} (TP 1..6, EP 1..3)",
+                topology.tp, topology.ep);
             ensure!(topology.ep == 1 || matches!((topology.tp, topology.ep), (2, 2) | (3, 2) | (2, 3)),
-                "unsupported replicated Spark topology");
+                "unsupported replicated Spark topology {}x{}; supported: TP2EP2, TP3EP2, TP2EP3",
+                topology.tp, topology.ep);
             ensure!(!exl3 || (family == "deepseek_v41" && topology.tp == 3 && topology.ep == 1),
                 "explicit Spark topology requires native experts or V4.1 compact EXL3 TP3EP1");
+        }
+        if ranks > 0 {
+            ensure!(!explicit || family == "deepseek_v41",
+                "native ownership wire requires V4.1 experts");
+            ensure!(!explicit || matches!((topology.tp, topology.ep),
+                (2, 1) | (3, 1) | (4, 1) | (6, 1) | (2, 2) | (3, 2) | (2, 3)),
+                "unqualified Spark ownership topology {}x{}; supported: TP2EP1, TP3EP1, TP4EP1, TP6EP1, TP2EP2, TP3EP2, TP2EP3",
+                topology.tp, topology.ep);
+            ensure!(ranks <= 6, "Spark worlds above six ranks have no qualified package");
+            let experts = report.experts.as_ref().context("Spark deployment requires an expert package")?;
+            let intermediate = report.spec.as_ref().and_then(|spec| spec.moe.as_ref())
+                .context("Spark deployment requires routed expert geometry")?.intermediate;
+            super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?;
         }
         ensure!(options.peers.is_empty() || options.peers.len() >= ranks,
             "deployment peer inventory does not cover selected Spark ranks");
@@ -167,12 +190,14 @@ mod tests {
                 ..Default::default() };
             let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
             assert_eq!(deployment.roles.len(), ranks);
-            assert_eq!(deployment.topology, Topology { tp: ranks, ep: 1, explicit: ranks != 4 });
+            assert_eq!(deployment.topology, Topology { tp: ranks, ep: 1, wire: if ranks != 4 { SparkWire::NativeOwnership } else { SparkWire::Canonical } });
             assert_eq!(deployment.spark_admission, SparkAdmission::CoordinatorAuthoritative);
             assert!(deployment.estimated_placement.is_some());
             assert_eq!(serde_json::to_value(deployment.estimated_placement).unwrap(),
                 serde_json::to_value(&report.solver_placement).unwrap());
             let value = serde_json::to_value(deployment).unwrap();
+            assert!(value["topology"].get("explicit").is_none());
+            assert_eq!(value["topology"]["wire"], if ranks != 4 { "native_ownership" } else { "canonical" });
             assert_eq!(value["spark_admission"], "coordinator_authoritative");
             assert!(value.get("placement_handoff").is_none());
             assert!(value.get("placement_handshake").is_none());
@@ -242,7 +267,7 @@ mod tests {
                 spark_tp: explicit.then_some(3), spark_ep: explicit.then_some(1),
                 ..Default::default() };
             let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
-            assert_eq!(deployment.topology, Topology { tp: 3, ep: 1, explicit: true });
+            assert_eq!(deployment.topology, Topology { tp: 3, ep: 1, wire: SparkWire::NativeOwnership });
             assert_eq!(deployment.roles.iter().map(|r| (r.group, r.tp_rank)).collect::<Vec<_>>(),
                 [(0, 0), (0, 1), (0, 2)]);
             assert!(deployment.artifact_requirements.verify_live_identity);
@@ -285,6 +310,58 @@ mod tests {
     }
 
     #[test]
+    fn canonical_deployment_retains_only_qualified_package_worlds() {
+        let (_dir, mut report) = fixture(1, 4);
+        let options = DeploymentOptions { rtx_gpus: 1, ..Default::default() };
+        for (family, package, intermediate, ranks) in [
+            ("deepseek_v41", "v41:mxfp4", 2304, 4),
+            ("deepseek_v41", "v41:nvfp4", 2304, 4),
+            ("qwen4", "qwen4:exl3-k45", 640, 1),
+            ("qwen4", "qwen4:exl3-k45", 640, 3),
+            ("glm5_flash", "glmf:nvfp4", 2048, 5),
+            ("glm5", "glm:nvfp4", 2048, 3),
+        ] {
+            report.family = Some(family.into());
+            report.experts.as_mut().unwrap().package = package.into();
+            report.spec.as_mut().unwrap().moe.as_mut().unwrap().intermediate = intermediate;
+            report.spark_ranks = ranks;
+            let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
+            assert_eq!(deployment.topology.wire, SparkWire::Canonical);
+            assert_eq!(deployment.roles.len(), ranks);
+            assert_eq!(deployment.topology.tp, ranks);
+            for unqualified in [7, 8] {
+                report.spark_ranks = unqualified;
+                assert!(DeploymentSpec::from_report(&report, &options).is_err());
+            }
+        }
+        for package in ["qwen4:nvfp4", "qwen4:fp8", "qwen4:exl3-k45"] {
+            report.family = Some("qwen4".into());
+            report.experts.as_mut().unwrap().package = package.into();
+            report.spark_ranks = 5;
+            assert!(DeploymentSpec::from_report(&report, &options).is_err());
+        }
+        report.family = Some("deepseek_v41".into());
+        report.experts.as_mut().unwrap().package = "v41:exl3-k23".into();
+        report.spark_ranks = 6;
+        assert!(DeploymentSpec::from_report(&report, &options).is_err());
+    }
+
+    #[test]
+    fn topology_refusals_name_requested_layout_and_physical_count() {
+        let (_dir, mut report) = fixture(1, 4);
+        let options = DeploymentOptions { rtx_gpus: 1,
+            spark_tp: Some(3), spark_ep: Some(1), ..Default::default() };
+        let error = DeploymentSpec::from_report(&report, &options).unwrap_err().to_string();
+        assert!(error.contains("topology 3x1"), "{error}");
+        assert!(error.contains("physical rank count 4"), "{error}");
+        report.spark_ranks = 1;
+        let options = DeploymentOptions { spark_tp: Some(1), ..options };
+        let error = DeploymentSpec::from_report(&report, &options).unwrap_err().to_string();
+        assert!(error.contains("ownership topology 1x1"), "{error}");
+        assert!(error.contains("supported: TP2EP1, TP3EP1, TP4EP1, TP6EP1"), "{error}");
+    }
+
+    #[test]
     fn deployment_validates_replicated_roles_endpoints_and_admission() {
         let (_dir, mut report) = fixture(1, 4);
         let mut options = DeploymentOptions { rtx_gpus: 1,
@@ -308,7 +385,8 @@ mod tests {
         report.experts.as_mut().unwrap().package = "v41:exl3-k23".into();
         assert!(DeploymentSpec::from_report(&report, &options).is_err());
         options.spark_tp = None; options.spark_ep = None;
-        assert!(!DeploymentSpec::from_report(&report, &options).unwrap().topology.explicit);
+        assert_eq!(DeploymentSpec::from_report(&report, &options).unwrap().topology.wire,
+            SparkWire::Canonical);
         report.memory_layout = None;
         assert!(DeploymentSpec::from_report(&report, &options).is_err());
     }

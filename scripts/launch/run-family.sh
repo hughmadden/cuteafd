@@ -893,11 +893,16 @@ SPARK_COUNT="$selected_count"
 PREFILL_BATCH_TOKENS="$(jq -er '.prefill_rows' <<<"$count_plan")"
 spark_tp="$(jq -er '.topology.tp' <<<"$count_plan")"
 spark_ep="$(jq -er '.topology.ep' <<<"$count_plan")"
+spark_wire="$(jq -er '.topology.wire' <<<"$count_plan")"
 topology_explicit=0
-if [[ "$(jq -r '.topology.explicit' <<<"$count_plan")" == true ]]; then
-  topology_explicit=1
-  SPARK_TP="$spark_tp" SPARK_EP="$spark_ep"
-fi
+case "$spark_wire" in
+  canonical) SPARK_TP= SPARK_EP= ;;
+  native_ownership)
+    topology_explicit=1
+    SPARK_TP="$spark_tp" SPARK_EP="$spark_ep"
+    ;;
+  *) release_die "unsupported planner Spark wire: $spark_wire" ;;
+esac
 release_validate_spark_topology
 spark_tp_roles_required="$(jq -r '.artifact_requirements.spark_tp_role // ""' <<<"$count_plan")"
 SPECULATOR="$(jq -er '.speculator' <<<"$count_plan")"
@@ -1411,7 +1416,7 @@ audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
 # An explicit count or host list is exact. Unspecified means the entire inventory.
 available_sparks=0
-for rank in {0..7}; do
+for rank in {0..5}; do
   [[ -n "$(get "SPARK_${rank}_HOST")" ]] || break
   available_sparks=$((available_sparks + 1))
 done

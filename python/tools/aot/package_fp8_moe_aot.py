@@ -294,15 +294,15 @@ def exact_widths(intermediate: int, tp: int) -> list[int]:
     """Stored widths of TP ranks owning whole 128-row blocks exactly (TP6 of
     2048: 384, 384, 384, 384, 256, 256), as the worker's exact layouts expect."""
     blocks = intermediate // 128
-    if not 1 <= tp <= 8 or intermediate % 128 or blocks < tp:
+    if not 1 <= tp <= 6 or intermediate % 128 or blocks < tp:
         return []
     return [(blocks // tp + (rank < blocks % tp)) * 128 for rank in range(tp)]
 
 
 def spark_layouts(intermediate: int, *, exact: bool = True) -> list[str]:
-    """Every meaningful TP1..8 layout, with unequal whole-H128 rank extents."""
+    """Every meaningful TP1..6 layout, with unequal whole-H128 rank extents."""
     layouts = []
-    for tp in range(1, 9):
+    for tp in range(1, 7):
         widths = exact_widths(intermediate, tp)
         if not widths:
             continue
@@ -334,9 +334,9 @@ def layout_geometry(base, layout: str):
     """``tp<n>`` (padded) or ``tp<n>-w<width>`` (exact) -> (tp, geometry)."""
     tp_part, _, width = layout.partition("-w")
     tp = int(tp_part.removeprefix("tp"))
-    if tp not in range(1, 9):
-        raise SystemExit(f"{layout}: Spark TP must be in 1..8")
-    if tp in (1, 5, 7, 8) and not exact_widths(base.intermediate, tp):
+    if tp not in range(1, 7):
+        raise SystemExit(f"{layout}: Spark TP must be in 1..6")
+    if tp in (1, 5) and not exact_widths(base.intermediate, tp):
         raise SystemExit(f"{layout}: intermediate {base.intermediate} needs a nonempty whole-H128 slice per rank")
     g = base.with_tp(tp)
     if width:
@@ -536,7 +536,7 @@ def main() -> None:
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")
     create.add_argument("--all-spark-counts", action="store_true",
-                        help="build TP1..8 with at least one H128 block per rank, including unequal exact slices")
+                        help="build TP1..6 with at least one H128 block per rank, including unequal exact slices")
     create.add_argument("--capacities", default="1,16,80,256,1024,4096")
     create.add_argument("--exact-slices", action="store_true",
                         help="also build tp<n>-w<width> layouts: ranks own whole 128-row blocks, each stored at its "

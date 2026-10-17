@@ -353,6 +353,33 @@ V41 = [p for p in starting_configs() if p.name.startswith("deepseek-v41-")]
 FAMILY = [p for p in starting_configs() if not p.name.startswith("deepseek-v41-")]
 
 
+@pytest.mark.parametrize("entry", json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())["entries"],
+                         ids=lambda entry: entry["name"])
+def test_v3_release_smoke_entry_passes_config_validation(entry: dict, tmp_path: Path) -> None:
+    matrix = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
+    values = {**keys(ROOT / entry["config"]), **matrix.get("defaults", {}).get("set", {}),
+              **entry.get("set", {})}
+    # These publication-only keys are stripped by bench smoke's write_config.
+    for key in ("BENCH_SIMULATED", "BENCH_HARDWARE_CLASS"):
+        values.pop(key, None)
+    path = tmp_path / "entry.config"
+    path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+    hf = _hub(tmp_path)
+    snapshot = hf / "hub" / f"models--{values['MODEL_ID'].replace('/', '--')}" / "snapshots/abc/config.json"
+    checkpoint = json.loads(snapshot.read_text())
+    if checkpoint["model_type"] == "glm5_next":
+        # The reference-half entry names 22 of this checkpoint's 45 routed layers.
+        checkpoint.update(num_hidden_layers=45, mlp_layer_types=["sparse"] * 45,
+                          layer_types=["linear_attention"] * 45)
+        snapshot.write_text(json.dumps(checkpoint))
+    _pin_snapshots(hf, values)
+    result = subprocess.run(
+        ["bash", "-euc", 'source scripts/lib/release-common.sh; release_load_config "$1"',
+         "test", str(path)], cwd=ROOT, env={**os.environ, "HF_HOME": str(hf)},
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize("path", V41, ids=lambda p: p.name)
 def test_v41_starting_config_passes_the_native_config_validation(path: Path, tmp_path: Path) -> None:
     """run.sh --dry-run's config stage: release_load_config validates every key, the

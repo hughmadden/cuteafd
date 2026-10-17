@@ -1856,7 +1856,7 @@ impl<'a> Engine<'a> {
 
     /// Connects the device-driven exchange for decode/verify steps (see
     /// [`Self::device_link`]); its transport is warmed with a full wave.
-    pub fn attach_device_link(&mut self, peers: &[std::net::SocketAddr], executors: &[u64],
+    pub fn attach_device_link(&mut self, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr],
         config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
         let (dim, topk, experts, rows) =
             (self.cfg.dim, self.cfg.n_activated_experts, self.cfg.n_routed_experts, self.decode_rows);
@@ -1867,8 +1867,7 @@ impl<'a> Engine<'a> {
             let kind = if wave.kind == DEVICE_DECODE { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
             spark_request(dim, topk, wave.layer as usize, wave.rows as usize, routes, wire, kind)
         });
-        self.device_link = Some(crate::shared::spark_intake::SparkDeviceLink::new(self.library, self.device, peers,
-            executors, rows, topk, dim + dim / 32, dim * 2, config, Some(warm), build)?);
+        self.device_link = Some(crate::shared::spark_intake::SparkDeviceLink::new(self.library, self.device, world, peers, rows, topk, dim + dim / 32, dim * 2, config, Some(warm), build)?);
         Ok(())
     }
 
