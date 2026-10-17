@@ -17,6 +17,8 @@
 #lanes .panel-head .legend { flex: 0 1 auto; }
 .lane-keys { flex: 1 1 auto; text-align: center; white-space: nowrap; }
 #lanes .ctl { margin-left: 0; }
+/* status pill + fabric chip stay together when the header wraps */
+.pills { display: inline-flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
 /* fabric chip */
 .fabric-chip-wrap { position: relative; display: inline-flex; }
 .fabric-chip { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px 3px 8px; border-radius: 999px; cursor: pointer;
@@ -169,8 +171,8 @@ const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // ---------------------------------------------------------------- state
 const top = CuteUI.header($('#top'), { page: 'console', subtitle: 'Engine console' });
-top.status.replaceWith($('#status-tpl').content.cloneNode(true));
-$('#status').after(fabricChip());
+{ const pills = document.createElement('span'); pills.className = 'pills';
+  pills.append($('#status-tpl').content.cloneNode(true), fabricChip()); top.status.replaceWith(pills); }
 top.extra.closest('.header-extra').remove();
 const S = {
   config: {}, textAllowed: false, textState: 'off', disabled: false, starting: false,
@@ -535,10 +537,10 @@ function renderKpis() {
   // Right-hand stats: the 60 s peak, and for lifetime totals the current rate.
   const peak = (k) => { const v = S.series[k].filter(Number.isFinite); return v.length ? Math.max(...v) : NaN; };
   const side = (k, html) => { $('#kx-' + k).innerHTML = html; };
-  for (const k of ['out', 'acc', 'drf', 'pre']) side(k, `<span>60 s max</span><b>${compact(peak(k))}/s</b>`);
+  for (const k of ['out', 'acc', 'drf', 'pre']) side(k, `<span>60 s max</span><b>${compact(peak(k))} tps</b>`);
   side('conc', `<span>60 s max</span><b>${n0(peak('conc'))}</b>`);
-  side('input', `<b>+${compact(rate('input_tokens', w))}/s</b><span>max ${compact(peak('inp'))}/s</span>`);
-  side('output', `<b>+${compact(out)}/s</b><span>max ${compact(peak('out'))}/s</span>`);
+  side('input', `<b>+${compact(rate('input_tokens', w))} tps</b><span>max ${compact(peak('inp'))} tps</span>`);
+  side('output', `<b>+${compact(out)} tps</b><span>max ${compact(peak('out'))} tps</span>`);
 }
 
 // ---------------------------------------------------------------- meters
@@ -924,7 +926,7 @@ function gutter(r, y0, h, tD) {
   // recent decode rate over the last two seconds
   let e = 0; for (let i = r.cols.length - 1; i >= 0 && r.cols[i].t1 > tD - 2000; i--) if (r.cols[i].t1 <= tD) e += r.cols[i].e;
   ctx.fillStyle = COL.muted; ctx.textAlign = 'right'; ctx.font = `10px ${MONO}`;
-  ctx.fillText(r.retired != null ? (r.reason === 'finished' ? 'done' : r.reason === 'failed' ? 'failed' : 'cancelled') : `${(e / 2).toFixed(0)}/s`, GUT - 14, mid);
+  ctx.fillText(r.retired != null ? (r.reason === 'finished' ? 'done' : r.reason === 'failed' ? 'failed' : 'cancelled') : `${(e / 2).toFixed(0)} tps`, GUT - 14, mid);
   ctx.textAlign = 'left';
 }
 function drawCells(r, y0, h, right, X, tD) {
