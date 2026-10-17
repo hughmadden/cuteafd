@@ -405,7 +405,7 @@ impl Opened {
                 self.library.cuda_set_device(device)?;
                 let sms = self.library.sm_count()?;
                 [0, self.cfg.heads / 2].into_iter().map(|begin| {
-                    let name = crate::shared::peer_split::context::partial_program(
+                    let name = cuteafd_core::coordinator_programs::attention_partial_program(
                         &manifest, "glm", begin, engine::DECODE_ROWS, sms, &attention_plan)?;
                     Ok(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0))
                 }).collect::<Result<Vec<_>>>().map(|sizes| sizes.into_iter().max().unwrap_or(0))

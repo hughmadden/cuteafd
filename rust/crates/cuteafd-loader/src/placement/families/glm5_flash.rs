@@ -706,7 +706,7 @@ fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context:
         configure(&mut req);
         candidate = solve(&req)?.pool_tokens;
     }
-    loop {
+    super::super::settle_pool((candidate, ()), |candidate, _| {
         let mut trial = i.clone();
         if i.graphs.lifetime == Lifetime::Startup {
             let context = glmf_graphs::admitted_graph_context(i.max_context as usize, candidate as usize, automatic_context);
@@ -722,11 +722,11 @@ fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context:
         req.pool.ceiling = candidate;
         configure(&mut req);
         let placed = solve(&req)?;
-        if i.requested_pool.is_some() || i.graphs.lifetime != Lifetime::Startup || placed.pool_tokens >= candidate {
-            return Ok((placed, trial.graphs));
-        }
-        candidate = placed.pool_tokens;
-    }
+        let tokens = if i.requested_pool.is_some() || i.graphs.lifetime != Lifetime::Startup {
+            candidate
+        } else { placed.pool_tokens };
+        Ok::<_, PlacementError>((tokens, (), (placed, trial.graphs)))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

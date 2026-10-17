@@ -86,9 +86,6 @@ pub(crate) fn combine_order<T>(rank: usize, own: T, received: T) -> [T; 2] {
     if rank == 0 { [own, received] } else { [received, own] }
 }
 
-pub(crate) use cuteafd_core::coordinator_programs::attention_partial_program as partial_program;
-#[cfg(test)]
-use cuteafd_core::coordinator_programs::attention_partial_programs as partial_programs;
 
 /// One cache plane within an ownership unit. Its row coordinates can differ
 /// from token coordinates (pooled index keys use one row per four tokens).
@@ -459,23 +456,23 @@ mod tests {
             {"name": "dsv4p_sparse_mla_partial_h64_s4_m128", "params": {"device_sm_counts": [188]}},
             {"name": "glm_sparse_mla_partial_h64_s4_m64", "params": {"device_sm_counts": [188]}},
             {"name": "dsv4p2_sparse_mla_partial_h64_s4_m64", "params": {"device_sm_counts": [188]}}]});
-        let plans = partial_programs(&manifest, "dsv4p", 64, 64, 188).unwrap();
+        let plans = cuteafd_core::coordinator_programs::attention_partial_programs(&manifest, "dsv4p", 64, 64, 188).unwrap();
         assert_eq!(plans, [(1, "dsv4p_sparse_mla_partial_h64_s16_m64".to_string()),
             (8, "dsv4p_sparse_mla_partial_h64_s16_m64".to_string()), (64, "dsv4p_sparse_mla_partial_h64_s2_m64".to_string())]);
         // Another row count selects only its own variants.
-        assert_eq!(partial_programs(&manifest, "dsv4p", 64, 128, 188).unwrap(),
+        assert_eq!(cuteafd_core::coordinator_programs::attention_partial_programs(&manifest, "dsv4p", 64, 128, 188).unwrap(),
             [(128, "dsv4p_sparse_mla_partial_h64_s4_m128".to_string())]);
-        assert!(partial_programs(&manifest, "dsv4p", 64, 128, 170).is_ok(), "the one variant serves any SM count");
-        assert!(partial_programs(&manifest, "dsv4p", 0, 64, 188).is_err(), "no head-0 variant");
-        assert!(partial_programs(&manifest, "dsv4f", 64, 64, 188).is_err(), "family prefixes do not cross");
+        assert!(cuteafd_core::coordinator_programs::attention_partial_programs(&manifest, "dsv4p", 64, 128, 170).is_ok(), "the one variant serves any SM count");
+        assert!(cuteafd_core::coordinator_programs::attention_partial_programs(&manifest, "dsv4p", 0, 64, 188).is_err(), "no head-0 variant");
+        assert!(cuteafd_core::coordinator_programs::attention_partial_programs(&manifest, "dsv4f", 64, 64, 188).is_err(), "family prefixes do not cross");
         for (drafts, chosen) in [(None, "dsv4p_sparse_mla_partial_h64_s16_m64"),
             (Some(7), "dsv4p_sparse_mla_partial_h64_s16_m64"),
             (Some(8), "dsv4p_sparse_mla_partial_h64_s2_m64")] {
             let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, drafts, None).unwrap();
-            assert_eq!(partial_program(&manifest, "dsv4p", 64, 64, 188, &plan).unwrap(), chosen);
+            assert_eq!(cuteafd_core::coordinator_programs::attention_partial_program(&manifest, "dsv4p", 64, 64, 188, &plan).unwrap(), chosen);
         }
         let wide = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(128, None, None).unwrap();
-        assert!(partial_program(&manifest, "dsv4p", 64, 64, 188, &wide).is_err());
+        assert!(cuteafd_core::coordinator_programs::attention_partial_program(&manifest, "dsv4p", 64, 64, 188, &wide).is_err());
     }
 
     #[test]

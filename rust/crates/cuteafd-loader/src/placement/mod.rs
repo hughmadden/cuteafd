@@ -80,6 +80,50 @@ pub struct PlacementRequest {
     pub executor: ExecutorModes,
 }
 
+impl PlacementRequest {
+    /// A whole-owner cache has one extra scratch page on its owner and a small
+    /// empty handle on every rank. Replace a formerly replicated scratch page.
+    pub fn owner_local_kv_scratch(&mut self, replicated_group: &str, handle_bytes: u64)
+        -> Result<(), PlacementError> {
+        self.fixed.retain(|d| d.group != replicated_group);
+        for gpu in 0..self.inventory.gpus.len() {
+            self.fixed.push(Demand::new(gpu as u8, Category::Kv, "nonowner KV handles",
+                (self.layers.len() as u64).checked_mul(handle_bytes)
+                    .ok_or(PlacementError::Overflow("nonowner KV handles"))?, Basis::Formula));
+        }
+        for layer in &mut self.layers {
+            layer.fixed_bytes = ModeBytes {
+                whole: layer.kv_unit.unit_bytes_whole.checked_sub(handle_bytes)
+                    .ok_or(PlacementError::Inventory("KV scratch page smaller than handle"))?,
+                split: [0; 2],
+            };
+        }
+        Ok(())
+    }
+}
+
+/// Descend through pool-dependent inventories until both capacity and the
+/// selected execution layout agree. A repeated layout is a refusal, not a
+/// license to choose a family-private fallback or change a pinned pool.
+pub fn settle_pool<K: Clone + PartialEq, T, E: From<PlacementError>>(
+    mut state: (u64, K),
+    mut trial: impl FnMut(u64, &K) -> Result<(u64, K, T), E>,
+) -> Result<T, E> {
+    let mut visited = Vec::new();
+    loop {
+        if visited.contains(&state) {
+            return Err(PlacementError::Inventory("pool-dependent inventory cycle").into());
+        }
+        visited.push(state.clone());
+        let (tokens, key, result) = trial(state.0, &state.1)?;
+        if tokens > state.0 {
+            return Err(PlacementError::Inventory("pool-dependent inventory did not descend").into());
+        }
+        if (tokens, &key) == (state.0, &state.1) { return Ok(result); }
+        state = (tokens, key);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inventory {
     pub gpus: Vec<GpuBudget>,

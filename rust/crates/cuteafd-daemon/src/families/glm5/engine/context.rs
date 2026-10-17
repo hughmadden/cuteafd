@@ -96,7 +96,7 @@ impl<'a> GlmContextSplit<'a> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
                 for (slot, begin) in partial.iter_mut().zip([0, cfg.heads / 2]) {
-                    *slot = crate::shared::peer_split::context::partial_program(
+                    *slot = cuteafd_core::coordinator_programs::attention_partial_program(
                         manifest, "glm", begin, DECODE_ROWS, sms, &engine.attention_plan)?;
                 }
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");
@@ -381,18 +381,17 @@ mod tests {
             {"name": "glm_sparse_mla_partial_h0_s32_m64", "params": {"device_sm_counts": [170, 188],
                 "row_caps": {"170": [1], "188": [1]}}},
             {"name": "glm_sparse_mla_partial_h32_s4_m64", "params": {"device_sm_counts": [188]}}]});
-        use crate::shared::peer_split::context::partial_program;
         let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, Some(7), None).unwrap();
-        assert_eq!(partial_program(&manifest, "glm", 0, DECODE_ROWS, 188, &plan).unwrap(),
+        assert_eq!(cuteafd_core::coordinator_programs::attention_partial_program(&manifest, "glm", 0, DECODE_ROWS, 188, &plan).unwrap(),
             "glm_sparse_mla_partial_h0_s11_m64");
-        assert_eq!(partial_program(&manifest, "glm", 0, DECODE_ROWS, 170, &plan).unwrap(),
+        assert_eq!(cuteafd_core::coordinator_programs::attention_partial_program(&manifest, "glm", 0, DECODE_ROWS, 170, &plan).unwrap(),
             "glm_sparse_mla_partial_h0_s8_m64");
         // A legacy single variant serves the plan on either card.
         for sms in [170, 188] {
-            assert_eq!(partial_program(&manifest, "glm", 32, DECODE_ROWS, sms, &plan).unwrap(),
+            assert_eq!(cuteafd_core::coordinator_programs::attention_partial_program(&manifest, "glm", 32, DECODE_ROWS, sms, &plan).unwrap(),
                 "glm_sparse_mla_partial_h32_s4_m64");
         }
-        assert!(partial_program(&serde_json::json!({"programs": []}), "glm", 0, DECODE_ROWS, 188, &plan).is_err());
+        assert!(cuteafd_core::coordinator_programs::attention_partial_program(&serde_json::json!({"programs": []}), "glm", 0, DECODE_ROWS, 188, &plan).is_err());
     }
 
     #[test]

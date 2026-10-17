@@ -119,10 +119,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     MemoryLayout { devices, pool_tokens, waste, notes }
 }
 
-pub fn resident(checkpoint: &Checkpoint, ranks: usize, layers: usize) -> anyhow::Result<Vec<Vec<(String, String, u64)>>> {
-    resident_owned(checkpoint, ranks, layers, None)
-}
-
 pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owners: Option<&[u8]>)
     -> anyhow::Result<Vec<Vec<(String, String, u64)>>> {
     anyhow::ensure!((1..=2).contains(&ranks), "GLM coordinator ranks");
@@ -338,8 +334,8 @@ mod tests {
         write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let layers = GlmDsaConfig::from_hf(&checkpoint.config).unwrap().layers;
-        let one = resident(&checkpoint, 1, layers).unwrap();
-        let two = resident(&checkpoint, 2, layers).unwrap();
+        let one = resident_owned(&checkpoint, 1, layers, None).unwrap();
+        let two = resident_owned(&checkpoint, 2, layers, None).unwrap();
         let bytes = |rank: &Vec<(String, String, u64)>, group: &str| rank.iter()
             .filter(|(g, _, _)| g == group).map(|(_, _, b)| *b).sum::<u64>();
         assert_eq!(bytes(&one[0], "router"), bytes(&two[0], "router"));
@@ -380,7 +376,7 @@ mod tests {
                 assert!(host.iter().zip(&previous).all(|(next, before)| next > before));
                 previous = host;
             }
-            assert!(resident(&checkpoint, ranks, layers + 1).is_err());
+            assert!(resident_owned(&checkpoint, ranks, layers + 1, None).is_err());
         }
     }
     #[test]
@@ -389,8 +385,8 @@ mod tests {
         write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let layers = GlmDsaConfig::from_hf(&checkpoint.config).unwrap().layers;
-        let one = resident(&checkpoint, 1, layers).unwrap();
-        let heads = resident(&checkpoint, 2, layers).unwrap();
+        let one = resident_owned(&checkpoint, 1, layers, None).unwrap();
+        let heads = resident_owned(&checkpoint, 2, layers, None).unwrap();
         let owners = crate::placement::families::glm5::attention_owners(
             &GlmDsaConfig::from_hf(&checkpoint.config).unwrap(), 2).unwrap();
         let owned = resident_owned(&checkpoint, 2, layers, Some(&owners)).unwrap();

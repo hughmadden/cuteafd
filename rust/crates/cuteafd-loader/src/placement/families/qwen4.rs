@@ -98,24 +98,18 @@ pub fn placement(inputs: &QwenInputs<'_>) -> anyhow::Result<Placement> {
         return Ok(result);
     };
     anyhow::ensure!(sequences <= 16, "Qwen startup graphs support at most 16 concurrent sequences");
-    let mut tokens = solve(&request(inputs, 0)?)?.pool_tokens;
-    loop {
+    let tokens = solve(&request(inputs, 0)?)?.pool_tokens;
+    super::super::settle_pool((tokens, ()), |tokens, _| {
         let graphs = qwen_startup_graphs(usize::try_from(inputs.max_context)?, usize::try_from(tokens)?,
             inputs.admission.cfg.dense_context(), sequences, speculation, inputs.admission.layers)
             .ok_or_else(|| anyhow::anyhow!("Qwen graph count overflow"))?;
         let mut req = request(inputs, graphs.bytes(0))?;
         req.pool.target = req.pool.target.min(tokens);
         let mut result = solve(&req)?;
-        if result.pool_tokens == tokens {
-            // Keep the ready ledger's measured set separate from its growth
-            // margin, while both remain charged during admission.
-            result.items[0].retain(|i| i.group != "startup graphs");
-            result.items[0].extend(graphs.items(0));
-            return Ok(result);
-        }
-        anyhow::ensure!(result.pool_tokens < tokens, "Qwen graph admission did not descend");
-        tokens = result.pool_tokens;
-    }
+        result.items[0].retain(|i| i.group != "startup graphs");
+        result.items[0].extend(graphs.items(0));
+        Ok::<_, anyhow::Error>((result.pool_tokens, (), result))
+    })
 }
 
 /// Header-only exact expert costs. Qwen TP2 owns complete H128 blocks: at
@@ -544,30 +538,24 @@ pub fn dual_placement(inputs: &QwenDualInputs<'_>) -> anyhow::Result<Placement> 
         return Ok(result);
     };
     anyhow::ensure!(sequences <= 16, "Qwen startup graphs support at most 16 concurrent sequences");
-    let mut result = solve(&dual_request(inputs, [0; 2])?)?;
-    let mut visited = std::collections::BTreeSet::new();
-    loop {
-        let layer_owners = owners(&result)?;
-        check_dual_layer_owners(&layer_owners)?;
-        anyhow::ensure!(visited.insert((result.pool_tokens, layer_owners.clone())),
-            "Qwen graph admission owner/pool cycle");
+    let result = solve(&dual_request(inputs, [0; 2])?)?;
+    super::super::settle_pool((result.pool_tokens, owners(&result)?), |tokens, layer_owners| {
+        check_dual_layer_owners(layer_owners)?;
         let graphs = qwen_startup_graphs_placed(usize::try_from(inputs.max_context)?,
-            usize::try_from(result.pool_tokens)?, inputs.admission.cfg.dense_context(), sequences, speculation, &layer_owners)
+            usize::try_from(tokens)?, inputs.admission.cfg.dense_context(), sequences, speculation, layer_owners)
             .ok_or_else(|| anyhow::anyhow!("Qwen owner graph count overflow"))?;
         let mut req = dual_request(inputs, [graphs.bytes(0), graphs.bytes(1)])?;
-        req.pool.target = req.pool.target.min(result.pool_tokens);
-        req.pool.ceiling = req.pool.ceiling.min(result.pool_tokens);
+        req.pool.target = req.pool.target.min(tokens);
+        req.pool.ceiling = req.pool.ceiling.min(tokens);
         let mut next = solve(&req)?;
-        if next.pool_tokens == result.pool_tokens && owners(&next)? == layer_owners {
-            for gpu in 0..2 {
-                next.items[gpu].retain(|item| item.group != "startup graphs");
-                next.items[gpu].extend(graphs.items(gpu));
-            }
-            return Ok(next);
+        let next_owners = owners(&next)?;
+        check_dual_layer_owners(&next_owners)?;
+        for gpu in 0..2 {
+            next.items[gpu].retain(|item| item.group != "startup graphs");
+            next.items[gpu].extend(graphs.items(gpu));
         }
-        anyhow::ensure!(next.pool_tokens <= result.pool_tokens, "Qwen graph admission did not descend");
-        result = next;
-    }
+        Ok::<_, anyhow::Error>((next.pool_tokens, next_owners, next))
+    })
 }
 
 #[cfg(test)]

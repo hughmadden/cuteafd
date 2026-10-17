@@ -32,10 +32,49 @@ use cuteafd_hostcache::copy::DeviceRange;
 const INDEX_KEY_BYTES: usize = 128;
 const INDEX_SCALES: usize = PAGE_ROWS * INDEX_KEY_BYTES;
 
+type PagedBuffers = (usize, CuteafdDeviceBuffer, Option<CuteafdDeviceBuffer>);
+
+fn locate_page(parity: bool, page: u32) -> (usize, usize) {
+    if parity { ((page & 1) as usize, (page >> 1) as usize) } else { (0, page as usize) }
+}
+
+fn page_segments(paged: &[PagedBuffers], parity: bool, layers: bool, page: u32) -> Vec<DeviceRange> {
+    let (owner, page) = locate_page(parity, page);
+    let record_page = PAGE_ROWS * RECORD_BYTES;
+    let mut out = Vec::new();
+    for &(_, records, index) in paged.iter().filter(|(rank, _, _)| layers || *rank == owner) {
+        out.push(DeviceRange { addr: records.ptr as u64 + (page * record_page) as u64, bytes: record_page });
+        if let Some(index) = index {
+            out.push(DeviceRange { addr: index.ptr as u64 + (page * INDEX_PAGE_BYTES) as u64, bytes: INDEX_PAGE_BYTES });
+        }
+    }
+    out
+}
+
+fn copy_rows(paged: &[PagedBuffers], parity: bool, copy: TailCopy,
+    mut submit: impl FnMut(usize, CuteafdDeviceBuffer, CuteafdDeviceBuffer) -> Result<()>) -> Result<()> {
+    let (rows, owner) = (copy.rows, copy.owner.map(usize::from));
+    let ((from_rank, from), (to_rank, to)) = (locate_page(parity, copy.from), locate_page(parity, copy.to));
+    anyhow::ensure!(rows <= PAGE_ROWS && from_rank == to_rank
+        && owner.is_none_or(|o| o == from_rank) && owner.is_some() == parity,
+        "tail copy {copy:?} crosses GPUs or exceeds a page");
+    let record_page = PAGE_ROWS * RECORD_BYTES;
+    for &(rank, records, index) in paged.iter().filter(|(rank, _, _)| owner.is_none_or(|o| o == *rank)) {
+        submit(rank, view(records, to * record_page, rows * RECORD_BYTES)?,
+            view(records, from * record_page, rows * RECORD_BYTES)?)?;
+        if let Some(index) = index {
+            let (from, to) = (from * INDEX_PAGE_BYTES, to * INDEX_PAGE_BYTES);
+            submit(rank, view(index, to, rows * INDEX_KEY_BYTES)?, view(index, from, rows * INDEX_KEY_BYTES)?)?;
+            submit(rank, view(index, to + INDEX_SCALES, rows * 4)?, view(index, from + INDEX_SCALES, rows * 4)?)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct GlmPrefix<'e, 'a> {
     engine: &'e GlmEngine<'a>,
     /// Per rank and layer: latent records and, on full-indexer layers, index keys.
-    paged: Vec<(usize, CuteafdDeviceBuffer, Option<CuteafdDeviceBuffer>)>,
+    paged: Vec<PagedBuffers>,
     partial: bool,
     /// The host tier's stand-in tail (one byte host restores overwrite and nothing reads).
     scratch: DeviceAllocation<'a>,
@@ -60,11 +99,6 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
     /// Whether pages are partitioned by parity (context attention).
     fn parity(&self) -> bool {
         self.engine.context_kv()
-    }
-
-    /// The GPU holding page `page`'s rows and its local page there.
-    fn locate(&self, page: u32) -> (usize, usize) {
-        if self.parity() { ((page & 1) as usize, (page >> 1) as usize) } else { (0, page as usize) }
     }
 
     /// Every allocation the host tier copies (both GPUs' pools and the stand-in tail), for the
@@ -122,23 +156,8 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
     }
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
-        let (rows, owner) = (copy.rows, copy.owner.map(usize::from));
-        let ((from_rank, from), (to_rank, to)) = (self.locate(copy.from), self.locate(copy.to));
-        if from_rank != to_rank || owner.is_some_and(|o| o != from_rank) || owner.is_some() != self.parity() {
-            return Err(format!("tail copy {copy:?} crosses GPUs").into());
-        }
-        let record_page = PAGE_ROWS * RECORD_BYTES;
-        // Under heads every GPU holds the page; under context only its owner does.
-        for &(rank, records, index) in self.paged.iter().filter(|(rank, _, _)| owner.is_none_or(|o| o == *rank)) {
-            self.copy(rank, view(records, to * record_page, rows * RECORD_BYTES)?,
-                view(records, from * record_page, rows * RECORD_BYTES)?)?;
-            if let Some(index) = index {
-                let (from, to) = (from * INDEX_PAGE_BYTES, to * INDEX_PAGE_BYTES);
-                self.copy(rank, view(index, to, rows * INDEX_KEY_BYTES)?, view(index, from, rows * INDEX_KEY_BYTES)?)?;
-                self.copy(rank, view(index, to + INDEX_SCALES, rows * 4)?, view(index, from + INDEX_SCALES, rows * 4)?)?;
-            }
-        }
-        Ok(())
+        copy_rows(&self.paged, self.parity(), copy, |rank, dst, src| self.copy(rank, dst, src))
+            .map_err(Into::into)
     }
 
     fn drain(&self) -> Result<(), BoxError> {
@@ -156,16 +175,7 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
-        let (owner, page) = self.locate(page);
-        let record_page = PAGE_ROWS * RECORD_BYTES;
-        let mut out = Vec::new();
-        for &(_, records, index) in self.paged.iter().filter(|(rank, _, _)| self.engine.layers_kv() || *rank == owner) {
-            out.push(DeviceRange { addr: records.ptr as u64 + (page * record_page) as u64, bytes: record_page });
-            if let Some(index) = index {
-                out.push(DeviceRange { addr: index.ptr as u64 + (page * INDEX_PAGE_BYTES) as u64, bytes: INDEX_PAGE_BYTES });
-            }
-        }
-        out
+        page_segments(&self.paged, self.parity(), self.engine.layers_kv(), page)
     }
 
     fn mark_segments(&self, _slot: MarkSlot) -> Vec<DeviceRange> {
@@ -237,7 +247,7 @@ fn paged_rows(family: &GlmPrefix<'_, '_>, placement: &GlmPlacement, len: usize) 
     let record_page = PAGE_ROWS * RECORD_BYTES;
     for (p, &page) in placement.pages.iter().enumerate().take(len.div_ceil(PAGE_ROWS)) {
         let rows = (len - p * PAGE_ROWS).min(PAGE_ROWS);
-        let (owner, page) = family.locate(page);
+        let (owner, page) = locate_page(family.parity(), page);
         for &(_, records, index) in family.paged.iter().filter(|(rank, _, _)| !family.parity() || *rank == owner) {
             out.extend_from_slice(&download(family.engine, records.ptr as u64 + (page * record_page) as u64,
                 rows * RECORD_BYTES, records)?);
@@ -345,4 +355,59 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
     ensure!(states_identical == repeat, "the restored state differs from the captured one");
     ensure!(identical == repeat, "the restored sequence's continuation differs from the straight one");
     Ok(())
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    fn buffer(addr: usize, bytes: usize, rank: usize) -> CuteafdDeviceBuffer {
+        CuteafdDeviceBuffer { ptr: addr as *mut std::ffi::c_void, bytes, device_id: rank as i32, flags: 0 }
+    }
+
+    #[test]
+    fn layers_page_segments_and_copy_rows_cover_each_owner_once() {
+        let record_page = PAGE_ROWS * RECORD_BYTES;
+        let paged = vec![
+            (0, buffer(0x100000, 4 * record_page, 0), Some(buffer(0x200000, 4 * INDEX_PAGE_BYTES, 0))),
+            (1, buffer(0x300000, 4 * record_page, 1), None),
+            (1, buffer(0x400000, 4 * record_page, 1), Some(buffer(0x500000, 4 * INDEX_PAGE_BYTES, 1))),
+        ];
+        let segments = page_segments(&paged, false, true, 2);
+        assert_eq!(segments.iter().map(|s| (s.addr, s.bytes)).collect::<Vec<_>>(), vec![
+            (0x100000 + (2 * record_page) as u64, record_page),
+            (0x200000 + (2 * INDEX_PAGE_BYTES) as u64, INDEX_PAGE_BYTES),
+            (0x300000 + (2 * record_page) as u64, record_page),
+            (0x400000 + (2 * record_page) as u64, record_page),
+            (0x500000 + (2 * INDEX_PAGE_BYTES) as u64, INDEX_PAGE_BYTES),
+        ]);
+        for rows in [1, 17, PAGE_ROWS] {
+            let mut copies = Vec::new();
+            copy_rows(&paged, false, TailCopy { from: 1, to: 2, rows, owner: None }, |rank, dst, src| {
+                assert_eq!((src.device_id, dst.device_id), (rank as i32, rank as i32));
+                copies.push((rank, dst.ptr as usize, src.ptr as usize, src.bytes));
+                Ok(())
+            }).unwrap();
+            let mut expected = Vec::new();
+            for &(rank, records, index) in &paged {
+                expected.push((rank, records.ptr as usize + 2 * record_page,
+                    records.ptr as usize + record_page, rows * RECORD_BYTES));
+                if let Some(index) = index {
+                    for (offset, bytes) in [(0, rows * INDEX_KEY_BYTES), (INDEX_SCALES, rows * 4)] {
+                        expected.push((rank, index.ptr as usize + 2 * INDEX_PAGE_BYTES + offset,
+                            index.ptr as usize + INDEX_PAGE_BYTES + offset, bytes));
+                    }
+                }
+            }
+            assert_eq!(copies, expected);
+        }
+        assert!(copy_rows(&paged, false, TailCopy { from: 1, to: 2, rows: 1, owner: Some(0) },
+            |_, _, _| panic!("invalid owner must not submit")).is_err());
+    }
+
+    #[test]
+    fn parity_tail_copy_rejects_cross_owner_pages() {
+        assert!(copy_rows(&[], true, TailCopy { from: 0, to: 1, rows: 1, owner: Some(0) },
+            |_, _, _| panic!("cross-owner copy must not submit")).is_err());
+    }
 }
