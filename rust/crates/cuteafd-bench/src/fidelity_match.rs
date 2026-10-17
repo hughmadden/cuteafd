@@ -24,6 +24,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "Qwen/Qwen3.8-27B", siblings: &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"], revision: dataset::QWEN_DENSE_REVISION, config: dataset::QWEN38_27B_CONFIG },
     Publication { root: "stepfun-ai/Step-5-Preview-BF16", siblings: &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"], revision: dataset::STEP5_REVISION, config: dataset::STEP5_CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4.1-Flash", siblings: &["deepseek-ai/DeepSeek-V4.1-Flash"], revision: dataset::REVISION, config: dataset::CONFIG },
+    Publication { root: "deepseek-ai/DeepSeek-V4.1-Flash-1017", siblings: &["deepseek-ai/DeepSeek-V4.1-Flash-1017"], revision: dataset::V41_1017_REVISION, config: dataset::V41_1017_CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4-Flash-0731", siblings: &["deepseek-ai/DeepSeek-V4-Flash-0731"], revision: dataset::V4FLASH_REVISION, config: dataset::V4FLASH_CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4-Pro-0813", siblings: &["deepseek-ai/DeepSeek-V4-Pro-0813"], revision: dataset::V4PRO_REVISION, config: dataset::V4PRO_CONFIG },
     Publication { root: "XiaomiMiMo/MiMo-V2.6-Flash-MOPD", siblings: &["XiaomiMiMo/MiMo-V2.6-Flash-MOPD"], revision: dataset::FLASH_REVISION, config: dataset::FLASH_CONFIG },
@@ -34,7 +35,6 @@ pub const PUBLICATIONS: &[Publication] = &[
 /// (unpublished roots deliberately have no PUBLICATIONS row).
 /// An instruct root's pretraining ancestry is not a precision upgrade.
 pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
-    ("deepseek-ai/DeepSeek-V4.1-Flash-1017", &["deepseek-ai/DeepSeek-V4.1-Flash-1017"]),
     ("stepfun-ai/Step-5-Preview-BF16", &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"]),
     ("Qwen/Qwen3.5-9B", &["Qwen/Qwen3.5-9B"]),
     ("Qwen/Qwen3.8-27B", &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"]),
@@ -310,6 +310,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap(); let hub = tmp.path();
         let root = "deepseek-ai/DeepSeek-V4.1-Flash-1017";
         assert_eq!(official_root(root), Some(root));
+        assert_eq!(official(root).map(|p| (p.revision, p.config)), Some((dataset::V41_1017_REVISION, dataset::V41_1017_CONFIG)));
         let quant = add(hub, "org/V41-1017-EXL3", "base_model: deepseek-ai/DeepSeek-V4.1-Flash-1017\nbase_model_relation: quantized");
         assert_eq!(lineage_in("org/V41-1017-EXL3", Some(&quant), hub), ["org/V41-1017-EXL3", root]);
         assert_eq!(lineage_in("deepseek-ai/DeepSeek-V4.1-Flash", None, hub), ["deepseek-ai/DeepSeek-V4.1-Flash"]);
