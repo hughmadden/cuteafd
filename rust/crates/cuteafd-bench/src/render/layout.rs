@@ -26,7 +26,7 @@ impl Span {
 /// text and timelines, half or a third for compact charts.
 pub fn span(id: &str) -> (Span, f64) {
     match id {
-        "decode_content" | "concurrency" | "retained" | "prefill" | "prefix_cache" | "tool_eval" | "structured" =>
+        "decode_content" | "concurrency" | "draft_mix" | "retained" | "prefill" | "prefix_cache" | "tool_eval" | "structured" =>
             (Span::Half, 420.0),
         "ifeval" | "code" | "math" => (Span::Third, 300.0),
         _ => (Span::Full, 600.0),

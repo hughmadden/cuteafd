@@ -26,6 +26,8 @@ body.scary .brand .logo { filter: hue-rotate(150deg) saturate(1.4); animation: g
   font: 700 15px var(--mono); letter-spacing: .2em; color: #ff3b4e; }
 .failure span { font: 500 12px var(--mono); letter-spacing: 0; color: #ffb020; margin-left: auto; }
 .dim { opacity: .55; }
+.mapped { margin: 6px 0 12px; }
+.mapped > summary { cursor: pointer; font: 11.5px var(--mono); color: var(--ink-2); }
 
 
 /* live strip */
@@ -121,6 +123,25 @@ html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --f
 .fabric-table { overflow-x: auto; }
 .fabric-table th, .fabric-table td { padding: 5px; font: 10px var(--mono); white-space: nowrap; text-align: right; }
 .fabric-assessments { font: 12px var(--mono); overflow-wrap: anywhere; }
+.run-fabric { padding: 12px 16px; }
+.run-fabric > summary { cursor: pointer; font: 12px var(--mono); color: var(--ink-2); list-style: none; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.run-fabric > summary::-webkit-details-marker { display: none; }
+.run-fabric > summary::before { content: '▸'; color: var(--muted); }
+.run-fabric[open] > summary::before { content: '▾'; }
+.run-fabric > summary .label { font: 600 11px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+.run-fabric .clean { color: var(--good); } .run-fabric .caveat { color: var(--warn); }
+.loading { grid-column: span 6; display: flex; align-items: center; gap: 12px; padding: 40px 18px; color: var(--ink-2); font: 13px var(--mono);
+  border: 1px dashed var(--line-2); border-radius: 10px; justify-content: center; }
+.spinner { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--target); animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+.banner.error, .dialog-error { color: var(--bad); border: 1px solid color-mix(in oklab, var(--bad) 50%, var(--line-2)); background: var(--panel-2);
+  border-radius: 8px; padding: 9px 12px; font: 12.5px var(--mono); }
+.dialog-error { margin: 0 16px; }
+.save-name { display: inline-flex; gap: 6px; }
+.save-name input { font: 12px var(--mono); color: var(--ink); background: var(--well); border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 8px; width: 160px; }
+.provenance { font: 10.5px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
+.provenance.live { color: var(--target); border-color: color-mix(in oklab, var(--target) 50%, var(--line)); }
 @media (forced-colors: active) { #fabric { --fabric-1: CanvasText; --fabric-2: CanvasText; --fabric-3: CanvasText; --fabric-4: CanvasText; } }
 </style>
 </head>
@@ -146,12 +167,15 @@ html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --f
     <span class="note" id="run-note"></span>
     <div class="menu"><button class="btn" id="export-report">EXPORT REPORT ▾</button><div id="export-menu" hidden></div></div>
   </div>
-  <section class="panel" id="fabric" hidden>
-    <h3>Fabric traffic <small>1 Hz · last 60 observations · Gb/s</small></h3>
-    <p class="note">One graph per host and physical RDMA rail. Traffic uses max(transmit, receive) with an autoscaled traffic axis; link capacity and utilization are labeled separately. Foreign is NIC minus engine and registered sources; protocol headers remain in NIC totals. Phase rates cover sampled windows with idle padding at 1 Hz, not exact request edges.</p>
-    <div class="fabric-plots"></div><p class="fabric-assessments" role="status"></p>
-  </section>
-  <div class="grid" id="panels"></div>
+  <div class="banner error" id="page-error" role="alert" hidden></div>
+  <div class="grid" id="panels"><div class="loading" id="loading" role="status"><span class="spinner"></span>Loading benchmark history…</div></div>
+  <details class="panel run-fabric" id="run-fabric" hidden>
+    <summary><span class="label">Fabric during this run</span> <span id="run-fabric-verdict"></span></summary>
+    <section id="fabric" hidden>
+      <p class="note">One graph per host and physical RDMA rail. Traffic uses max(transmit, receive) with an autoscaled traffic axis; link capacity and utilization are labeled separately. Foreign is NIC minus engine and registered sources; protocol headers remain in NIC totals. Phase rates cover sampled windows with idle padding at 1 Hz, not exact request edges.</p>
+      <div class="fabric-plots"></div><p class="fabric-assessments" role="status"></p>
+    </section>
+  </details>
   <p class="note">Benchmarks run inside this server and drive its own OpenAI API over loopback. While one runs, requests from
     other clients get 503 with Retry-After. The baseline (basic card and quick quality) runs once per server and configuration
     and every later run shares it; its rates set the ETAs. Charts are the same SVGs the exports contain.</p>
@@ -163,8 +187,10 @@ html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --f
     <div class="profiles" id="dialog-profiles"></div>
     <div class="picks" id="dialog-panels"></div>
   </div>
+  <div class="dialog-error" id="dialog-error" role="alert" hidden></div>
   <div class="foot">
     <button class="btn" id="dialog-save">SAVE AS CUSTOM…</button>
+    <span class="save-name" id="save-name" hidden><input id="save-name-input" placeholder="profile name" aria-label="Custom profile name" maxlength="40"><button class="btn" id="save-name-ok">SAVE</button></span>
     <span class="note" id="dialog-note"></span>
     <span class="spacer"></span>
     <button class="btn" id="dialog-cancel">CLOSE</button>
@@ -172,6 +198,8 @@ html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --f
   </div>
 </dialog>
 
+<dialog id="confirm" class="admin-dialog"><div><h2 id="confirm-title"></h2><p id="confirm-text"></p></div>
+  <form method="dialog" class="actions"><button class="btn" value="no">KEEP RUNNING</button> <button class="btn danger" value="yes" id="confirm-yes">CANCEL RUN</button></form></dialog>
 <script src="/assets/cuteafd-ui.js"></script>
 <script src="/bench/fabric.js"></script>
 <script>
@@ -181,6 +209,10 @@ const UI = window.CuteUI;
 const { fmt } = UI;
 const $ = (id) => document.getElementById(id);
 const shell = UI.header($('header'), { page: 'bench', subtitle: 'Benchmarks' });
+// Status pill + the server's live fabric chip (the console's, shared).
+const pillStatus = document.createElement('span');
+{ const pills = document.createElement('span'); pills.className = 'pills';
+  pills.append(pillStatus, UI.fabricChip()); shell.status.replaceWith(pills); }
 const store = { get(k) { try { return localStorage.getItem(k); } catch (_) { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} } };
 
@@ -233,7 +265,7 @@ loadUsageRecording();
 function renderHeader() {
   const s = report?.server || {};
   const active = status.active;
-  shell.status.innerHTML = `<span class="status ${active ? 'live' : ''}"><i></i>${active ? 'BENCHMARKING' : 'IDLE'}</span>`;
+  pillStatus.innerHTML = `<span class="status ${active ? 'live' : ''}"><i></i>${active ? 'BENCHMARKING' : 'IDLE'}</span>`;
   UI.facts(shell.meta, [
     ['model', fmt.esc(s.model || status.model || '–')],
     ['hardware', s.hardware ? fmt.esc(hardwareLine(s.hardware)) : null],
@@ -281,10 +313,28 @@ function panelIds() {
   return ids;
 }
 function info(id) { return catalog.panels.find((p) => p.id === id) || { id, title: id }; }
+// The run a panel's charts and exports come from: in the merged view each
+// panel carries its own run; the baseline its newest run; the rest the newest.
+function srcRun(id) {
+  if (!report) return null;
+  if (!report.merged) return report.id;
+  if (id === 'baseline') return report.baseline_run || report.id;
+  return result(id)?.run || report.id;
+}
+const when = (t) => t ? String(t).replace('T', ' ').slice(5, 16) : '';
+function provenance(id) {
+  if (!report?.merged || id === 'hardware' || id === 'configuration') return '';
+  const run = id === 'baseline' ? report.baseline_run : result(id)?.run;
+  if (!run) return '';
+  const created = id === 'baseline' ? report.baseline_created : result(id)?.run_created;
+  const live = status.active && status.active.id === run;
+  const row = runs.find((r) => r.id === run);
+  return `<span class="provenance${live ? ' live' : ''}" title="run ${fmt.esc(run)}">${live ? 'running now' : `${fmt.esc(when(created))} · ${fmt.esc(row?.profile || 'run')}`}</span>`;
+}
 function result(id) { return (report?.panels || []).find((p) => p.id === id); }
 
 function panelState(id) {
-  if (status.active && status.active.panel === id && report && status.active.id === report.id) return 'running';
+  if (status.active && status.active.panel === id && report && (status.active.id === report.id || status.active.id === srcRun(id))) return 'running';
   if (id === 'baseline') return report?.baseline ? (report.baseline.quality.status === 'pending' ? 'running' : 'done') : 'not run';
   if (id === 'hardware' || id === 'configuration') return report ? 'done' : 'not run';
   const r = result(id);
@@ -308,7 +358,7 @@ function renderPanels() {
       card = document.createElement('section');
       card.className = 'panel';
       card.dataset.id = id;
-      card.innerHTML = `<div class="panel-head"><h2></h2><span class="state"></span><span class="hint"></span>
+      card.innerHTML = `<div class="panel-head"><h2></h2><span class="state"></span><span class="hint"></span><span class="from"></span>
         <div class="ctl"><button class="btn icon play" title="Run one pass of this panel">▶</button>
         <span class="seg"><button data-mode="chart">CHART</button><button data-mode="table">TABLE</button></span>
         <div class="menu"><button class="btn icon exp" title="Export this panel">⤓</button><div hidden></div></div></div></div>
@@ -334,6 +384,7 @@ function renderPanels() {
     card.classList.toggle('span-third', span === 'third');
     card.classList.toggle('failed', id === 'baseline' && failed(report));
     card.querySelector('h2').textContent = title;
+    card.querySelector('.from').innerHTML = provenance(id);
     const state = panelState(id);
     const st = card.querySelector('.state');
     st.textContent = state + (result(id)?.passes?.length > 1 ? ` · ${result(id).passes.length} passes` : '');
@@ -367,14 +418,14 @@ function renderPanels() {
     const paired = pairSelect?.value ? `compare=${encodeURIComponent(pairSelect.value)}` : '';
     const exportMenu = card.querySelector('.exp + div');
     exportMenu.innerHTML = report && hasData(id) ? ['svg', 'png'].map((k) =>
-      `<a href="/v1/bench/runs/${report.id}/panel-${id}.${k}${paired ? '?' + paired : ''}" target="_blank" rel="noopener">panel-${id}.${k}</a>`).join('') : '<span class="empty">nothing to export yet</span>';
+      `<a href="/v1/bench/runs/${srcRun(id)}/panel-${id}.${k}${paired ? '?' + paired : ''}" target="_blank" rel="noopener">panel-${id}.${k}</a>`).join('') : '<span class="empty">nothing to export yet</span>';
     const chart = card.querySelector('.chart'), table = card.querySelector('.table');
     chart.hidden = mode !== 'chart' || !hasData(id);
     table.hidden = mode !== 'table' || !hasData(id);
     if (hasData(id)) {
       if (mode === 'chart') {
         const width = Math.max(320, Math.round((chart.clientWidth || card.clientWidth - 28) / 40) * 40);
-        const src = `/v1/bench/runs/${report.id}/panel-${id}.svg?bare=${width}&rev=${revs[id] || 0}${paired ? '&' + paired : ''}`;
+        const src = `/v1/bench/runs/${srcRun(id)}/panel-${id}.svg?bare=${width}&rev=${revs[id] || 0}${paired ? '&' + paired : ''}`;
         // Inline SVG (its <title> tooltips show on hover), swapped only once
         // the new version arrived, so a filling chart never flickers.
         if (chart.dataset.src !== src) {
@@ -386,7 +437,7 @@ function renderPanels() {
       } else {
         table.innerHTML = tableFor(id);
         if (paired) {
-          const src = `/v1/bench/runs/${report.id}/report.json?${paired}&rev=${revs[id] || 0}`;
+          const src = `/v1/bench/runs/${srcRun(id)}/report.json?${paired}&rev=${revs[id] || 0}`;
           table.dataset.src = src;
           authenticatedFetch(src).then((r) => r.ok ? r.json() : null).then((saved) => {
             const compared = saved?.panels?.find((p) => p.id === id);
@@ -481,7 +532,15 @@ function tableFor(id, comparedResult = null) {
   }
   return (r.passes || []).map((pass, i) => {
     const tables = pass?.mapped_tables || [];
-    const mapped = tables.length ? '<h3>Mapped tables</h3><p>Pass interval. Miss tiers count classified rows from submission through completion/retry. Unclassified makespan tiers count bounded submission waves (at most 4K rows), not individual reads; demand and prefetch are separate. Device bytes are estimates; host-wide reads include unrelated I/O.</p>'
+    // One summary line per pass; the full tables behind an expander. Nothing
+    // when no mapped table missed (not relevant to this panel).
+    const totals = tables.reduce((t, x) => { const n = x.interval || {};
+      t.hits += n.page_hits || 0; t.misses += n.page_misses || 0; t.stall += n.decode_stall_ns || 0; t.steps = Math.max(t.steps, n.decode_steps || 0); return t; },
+      { hits: 0, misses: 0, stall: 0, steps: 0 });
+    const kind = [...new Set(tables.map((x) => String(x.name).split('.')[0]))].join(' / ') || 'mapped tables';
+    const mapped = tables.length && totals.misses ? `<details class="mapped"><summary>${fmt.esc(kind)}: ${(100 * totals.hits / Math.max(1, totals.hits + totals.misses)).toFixed(1)}% hit`
+      + `${totals.steps ? ` · ${(totals.stall / totals.steps / 1e6).toFixed(3)} ms wait / decode step` : ''} · ${fmt.n0(totals.misses)} misses</summary>`
+      + '<h3>Mapped tables</h3><p>Pass interval. Miss tiers count classified rows from submission through completion/retry. Unclassified makespan tiers count bounded submission waves (at most 4K rows), not individual reads; demand and prefetch are separate. Device bytes are estimates; host-wide reads include unrelated I/O.</p>'
       + tableHtml(['table / backend', 'miss tiers: <5 / 5-10 / 10-50 / 50-200 us / 0.2-1 / 1-10 / >=10 ms', 'hit %', 'hits / misses', 'hit MiB', 'miss-request MiB', 'avg miss us', 'consumer wait ms / decode step (Engram pair on weight)', 'device MiB (estimate)'], tables.map(t => {
         const n = t.interval || {}, hits = n.page_hits || 0, misses = n.page_misses || 0, unknown = n.unclassified_rows || 0;
         return [`${t.name} / ${t.backend} (${t.accounting})`, t.backend !== 'mmap' ? (n.miss_histogram || []).join(' / ') : '-', hits + misses ? (100 * hits / (hits + misses)).toFixed(1) : '-',
@@ -500,7 +559,7 @@ function tableFor(id, comparedResult = null) {
             maximum == null ? '-' : (maximum / 1000).toFixed(1),
             Array.isArray(histogram) ? histogram.join(' / ') : 'unavailable (legacy)'];
         });
-      })) : '';
+      }))  + '</details>' : '';
     if (pass && pass.table) return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(pass.table.columns, pass.table.rows) + mapped;
     const rows = Object.entries(pass || {}).filter(([, v]) => typeof v !== 'object').map(([k, v]) => [k, v]);
     return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(['field', 'value'], rows) + mapped;
@@ -510,15 +569,18 @@ function tableFor(id, comparedResult = null) {
 // ---------------------------------------------------------------- runs, exports, import
 function renderRuns() {
   const select = $('runs');
+  const fp = currentFingerprint();
+  const merged = fp ? [`<option value="merged:${fmt.esc(fp)}">All panels · newest result each (this server)</option>`] : [];
   const options = runs.map((r) => `<option value="${r.id}">${fmt.esc(r.created.replace('T', ' ').slice(0, 16))} · ${fmt.esc(r.profile)} · ${fmt.esc(r.status)}${r.quality_failed ? ' · ⚠' : ''}</option>`);
-  select.innerHTML = options.join('') || '<option value="">no runs yet</option>';
-  if (report) select.value = report.id;
+  select.innerHTML = merged.concat(options).join('') || '<option value="">no runs yet</option>';
+  if (report) select.value = report.merged ? `merged:${report.fingerprint}` : report.id;
   const menu = $('export-menu');
   menu.innerHTML = report ? ['report.svg', 'report.png', 'card.png', 'card.svg', 'report.json'].map((f) =>
     `<a href="/v1/bench/runs/${report.id}/${f}" target="_blank" rel="noopener"${f.endsWith('json') ? ` download="report-${report.id.slice(0, 8)}.json"` : ''}>${f}</a>`).join('') : '<span class="empty">no report</span>';
-  $('run-note').textContent = report ? `${report.profile} · ${report.status}${report.error ? ' · ' + report.error : ''}` : '';
+  $('run-note').textContent = !report ? '' : report.merged ? 'newest result per panel; each panel names its run'
+    : `${report.profile} · ${report.status}${report.error ? ' · ' + report.error : ''}`;
 }
-$('runs').onchange = (e) => { follow = false; load(e.target.value); };
+$('runs').onchange = (e) => { follow = e.target.value.startsWith('merged:'); load(e.target.value); };
 $('export-report').onclick = (e) => { e.stopPropagation(); $('export-menu').hidden = !$('export-menu').hidden; };
 document.addEventListener('click', () => { $('export-menu').hidden = true; document.querySelectorAll('.exp + div').forEach((m) => m.hidden = true); });
 $('load-json').onchange = async (e) => {
@@ -526,31 +588,85 @@ $('load-json').onchange = async (e) => {
   try {
     const body = await api('/v1/bench/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: await file.text() });
     follow = false; await refreshRuns(); await load(body.id);
-  } catch (error) { alert(`Could not load ${file.name}: ${error.message}`); }
+  } catch (error) { pageError(`Could not load ${file.name}: ${error.message}`); }
   e.target.value = '';
 };
-$('cancel').onclick = async () => {
-  if (!status.active || !confirm('Cancel the running benchmark?')) return;
-  try { await api(`/v1/bench/runs/${status.active.id}/cancel`, { method: 'POST' }); } catch (error) { alert(error.message); }
+function pageError(message) {
+  const box = $('page-error');
+  box.textContent = message; box.hidden = !message;
+  if (message) { clearTimeout(pageError.timer); pageError.timer = setTimeout(() => { box.hidden = true; }, 12000); }
+}
+$('cancel').onclick = () => {
+  if (!status.active) return;
+  $('confirm-title').textContent = 'Cancel the running benchmark?';
+  $('confirm-text').textContent = `${status.active.panel || 'The run'} stops now; panels already finished keep their results.`;
+  $('confirm').returnValue = '';
+  $('confirm').showModal();
 };
+$('confirm').addEventListener('close', async () => {
+  if ($('confirm').returnValue !== 'yes' || !status.active) return;
+  try { await api(`/v1/bench/runs/${status.active.id}/cancel`, { method: 'POST' }); } catch (error) { pageError(error.message); }
+});
 
+function currentFingerprint() {
+  return report?.fingerprint || status.fingerprint || runs[0]?.fingerprint || null;
+}
+// `merged:FINGERPRINT` is the accumulated view; anything else one run alone.
 async function load(id) {
   if (!id) return;
-  try { report = await api(`/v1/bench/runs/${id}`); viewing = id; } catch (_) { return; }
+  try {
+    report = id.startsWith('merged:') ? await api(`/v1/bench/merged/${encodeURIComponent(id.slice(7))}`) : await api(`/v1/bench/runs/${id}`);
+    viewing = id;
+  } catch (error) { pageError(`Could not load the report: ${error.message}`); return; }
   render();
+}
+let mergeTimer = null;
+function reloadMerged() {
+  clearTimeout(mergeTimer);
+  mergeTimer = setTimeout(() => { if (report?.merged) load(`merged:${report.fingerprint}`); }, 400);
 }
 async function refreshRuns() { runs = (await api('/v1/bench/runs')).runs || []; renderRuns(); }
 async function refreshCatalog() { catalog = await api('/v1/bench/panels'); }
-function render() { window.CuteFabric?.report(report); renderHeader(); renderStrip(); renderRuns(); renderPanels(); }
+function render() {
+  $('loading')?.remove();
+  window.CuteFabric?.report(report); renderRunFabric(); renderHeader(); renderStrip(); renderRuns(); renderPanels();
+}
+// One line on the run's fabric: clean, or the caveats by host name.
+function renderRunFabric() {
+  const box = $('run-fabric');
+  const phases = (report?.fabric || []).filter((p) => p.timed !== false);
+  box.hidden = !phases.length;
+  if (!phases.length) return;
+  const hw = report.server?.hardware || {};
+  const names = new Map((hw.sparks || []).filter((s) => s.name).map((s) => [s.address, s.name]));
+  const named = (text) => text.replace(/\b(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?/g, (m, ip) => names.get(ip) || 'a Spark')
+    .replace(/\bcoordinator\b/g, hw.host || 'coordinator');
+  const caveats = [...new Set(phases.flatMap((p) => p.assessments || []).map((a) => named(a.replace(/\s*\(>.*?\)$/, '')
+    .replace(/\s+\S+\/\d+(?=:|\s|$)/, ''))))];
+  $('run-fabric-verdict').innerHTML = caveats.length
+    ? `<span class="caveat">caveat: ${fmt.esc(caveats.slice(0, 3).join('; '))}${caveats.length > 3 ? ` (+${caveats.length - 3} more)` : ''}</span>`
+    : `<span class="clean">fabric clean during this run</span>`;
+}
 
-async function start(body) {
+// POST, then hand over at once: the dialog closes, the run shows as starting,
+// and the event stream fills it in. Refreshing runs and the view follows.
+async function start(body, onError = pageError) {
+  let started;
   try {
-    const started = await api('/v1/bench/runs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-    follow = true; viewing = started.id;
-    status = await api('/v1/bench/status');
-    await refreshRuns(); await load(started.id);
-    return true;
-  } catch (error) { alert(`Could not start: ${error.message}`); return false; }
+    started = await api('/v1/bench/runs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  } catch (error) { onError(`Could not start: ${error.message}`); return false; }
+  follow = true;
+  status = { ...status, active: { id: started.id, panel: 'starting', fraction: 0 } };
+  render();
+  (async () => {
+    try {
+      status = await api('/v1/bench/status');
+      await refreshRuns();
+      const fp = status.fingerprint || report?.fingerprint;
+      await load(fp ? `merged:${fp}` : started.id);
+    } catch (_) { /* the event stream catches up */ }
+  })();
+  return true;
 }
 function runPanel(id) {
   if (id === 'baseline' || id === 'hardware' || id === 'configuration') return start({ profile: 'share' });
@@ -566,7 +682,8 @@ function openDialog() {
     + `<label><input type="radio" name="profile" value="custom"${choice.profile === 'custom' ? ' checked' : ''}><b>Custom</b><small>Tick panels and passes; save it for later.</small></label>`;
   host.querySelectorAll('input').forEach((i) => i.onchange = () => pickProfile(i.value));
   pickProfile(choice.profile);
-  $('dialog').showModal();
+  dialogError('');
+  if (!$('dialog').open) $('dialog').showModal();
 }
 function pickProfile(name) {
   choice.profile = name;
@@ -602,22 +719,29 @@ function renderEta() {
 }
 $('open-run').onclick = openDialog;
 $('dialog-cancel').onclick = () => $('dialog').close();
+function dialogError(message) { $('dialog-error').textContent = message; $('dialog-error').hidden = !message; }
 $('dialog-start').onclick = async () => {
   const passes = Object.fromEntries(selected().map((id) => [id, choice.passes[id] || 1]));
   const body = choice.profile !== 'custom' && profiles.some((p) => p.name === choice.profile)
     ? { profile: choice.profile, passes } : { panels: selected(), passes };
-  if (await start(body)) $('dialog').close();
+  dialogError('');
+  const button = $('dialog-start'); button.disabled = true;
+  if (await start(body, dialogError)) $('dialog').close();
+  button.disabled = false;
 };
-$('dialog-save').onclick = async () => {
-  const name = prompt('Name of the custom profile:');
-  if (!name) return;
+$('dialog-save').onclick = () => { $('save-name').hidden = false; $('dialog-save').hidden = true; $('save-name-input').focus(); };
+$('save-name-input').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); $('save-name-ok').click(); } else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); $('save-name').hidden = true; $('dialog-save').hidden = false; } };
+$('save-name-ok').onclick = async () => {
+  const name = $('save-name-input').value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$/.test(name)) { dialogError('Profile names are letters, digits, space, dot, dash or underscore.'); return; }
   const profile = { name, title: name, description: `Custom: ${selected().join(', ') || 'baseline only'}`,
     panels: selected().map((id) => ({ id, passes: choice.passes[id] || 1 })) };
   try {
     await api(`/v1/bench/profiles/${encodeURIComponent(name)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(profile) });
-    profiles = (await api('/v1/bench/profiles')).profiles; choice.profile = name; openDialog();
-    $('dialog-note').textContent = `saved ${name}`;
-  } catch (error) { alert(error.message); }
+    profiles = (await api('/v1/bench/profiles')).profiles; choice.profile = name;
+    $('save-name').hidden = true; $('dialog-save').hidden = false; $('save-name-input').value = ''; dialogError('');
+    openDialog(); $('dialog-note').textContent = `saved ${name}`;
+  } catch (error) { dialogError(error.message); }
 };
 
 // ---------------------------------------------------------------- events
@@ -627,8 +751,9 @@ async function connect() {
     if (event.type === 'status') {
       const was = status.active?.id;
       status = event.status;
-      if (status.active && follow && status.active.id !== viewing) load(status.active.id);
-      if (was && !status.active) { refreshRuns(); refreshCatalog().then(render); }
+      if (status.active && follow && !report?.merged && status.active.id !== viewing) load(status.active.id);
+      if (status.active && follow && report?.merged && status.active.id !== was) reloadMerged();
+      if (was && !status.active) { refreshRuns().then(() => { if (report?.merged) reloadMerged(); }); refreshCatalog().then(render); }
       render();
     } else if (event.type === 'fabric') {
       if (event.run === viewing || follow && status.active?.id === event.run) window.CuteFabric?.interval(event);
@@ -638,14 +763,28 @@ async function connect() {
       if (Number.isFinite(event.live?.tok_s)) { rates.push(event.live.tok_s); if (rates.length > 60) rates.shift(); }
       renderStrip(); renderPanels();
     } else if (event.type === 'report') {
-      if (event.run === viewing || (follow && status.active?.id === event.run)) {
+      if (report?.merged && event.report.fingerprint === report.fingerprint && follow) {
+        // Splice the live run's own panels into the accumulated view; the
+        // other panels keep their earlier results.
+        const live = event.report;
+        for (const p of live.panels || []) {
+          const isNew = p.status !== 'pending' || (p.passes || []).length;
+          const i = report.panels.findIndex((q) => q.id === p.id);
+          if (!isNew && i >= 0) continue;
+          const tagged = { ...p, run: live.id, run_created: live.created };
+          if (i >= 0) report.panels[i] = tagged; else report.panels.push(tagged);
+          revs[p.id] = (revs[p.id] || 0) + 1;
+        }
+        if (live.baseline) { report.baseline = live.baseline; report.baseline_run = live.id; report.baseline_created = live.created; revs.baseline = (revs.baseline || 0) + 1; }
+        render();
+      } else if (event.run === viewing || (follow && status.active?.id === event.run)) {
         report = event.report; viewing = report.id;
         for (const p of report.panels || []) revs[p.id] = (revs[p.id] || 0) + 1;
         revs.baseline = (revs.baseline || 0) + 1;
         render();
       }
     } else if (event.type === 'partial') {
-      if (event.run === viewing) {
+      if (event.run === viewing || (report?.merged && srcRun(event.panel) === event.run)) {
         revs[event.panel] = (revs[event.panel] || 0) + 1;
         if (event.panel === 'baseline' && report) report.baseline = event.value;
         renderPanels(); renderHeader();
@@ -683,7 +822,7 @@ document.addEventListener('click', async (event) => {
     const download = document.createElement('a'); download.href = url;
     download.download = anchor.download || new URL(anchor.href).pathname.split('/').pop();
     download.click(); setTimeout(() => URL.revokeObjectURL(url), 60000);
-  } catch (error) { alert(error.message); }
+  } catch (error) { pageError(error.message); }
 });
 
 let resizeTimer;
@@ -693,12 +832,13 @@ window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer
   if (!await CuteUI.adminGate(document.querySelector('.app'), 'Benchmarks',
     'Run benchmark profiles against this server (a run holds the server while it measures) and browse past reports.')) return;
   try {
-    [status, catalog] = await Promise.all([api('/v1/bench/status'), api('/v1/bench/panels')]);
-    profiles = (await api('/v1/bench/profiles')).profiles || [];
-    await refreshRuns();
+    const profileList = api('/v1/bench/profiles');
+    [status, catalog] = await Promise.all([api('/v1/bench/status'), api('/v1/bench/panels'), refreshRuns()]);
+    profiles = (await profileList).profiles || [];
     const wanted = new URLSearchParams(location.search).get('run');
-    await load(wanted || status.active?.id || runs[0]?.id);
-  } catch (error) { console.error(error); }
+    const fp = status.fingerprint || runs[0]?.fingerprint;
+    await load(wanted || (fp ? `merged:${fp}` : status.active?.id || runs[0]?.id));
+  } catch (error) { pageError(`Could not load benchmarks: ${error.message}`); }
   render();
   connect();
 })();

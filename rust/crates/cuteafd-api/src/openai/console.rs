@@ -338,15 +338,13 @@ mod tests {
 
     #[test]
     fn fabric_chip_poll_is_open_bounded_and_visibility_gated() {
-        assert!(PAGE.contains("fetch('/v1/fabric', { signal: AbortSignal.timeout(2500) })"));
-        assert!(PAGE.contains("!document.hidden && S.connected"));
-        assert!(PAGE.contains("setTimeout(pollFabric, 3000)"));
-        assert!(!PAGE.contains("setInterval(pollFabric"));
-        // A chip with details behind a click, named by host, never a text dump.
-        assert!(PAGE.contains("id=\"fabric-chip\"") && PAGE.contains("host.hostname"));
-        assert!(!PAGE.contains("congestion control not exercised"));
+        // The shared chip (console and bench) polls the open route, bounded, while visible.
+        assert!(UI_JS.contains("fetch('/v1/fabric', { signal: AbortSignal.timeout(2500) })"));
+        assert!(UI_JS.contains("!document.hidden && live()") && UI_JS.contains("setTimeout(poll, 3000)"));
+        assert!(PAGE.contains("CuteUI.fabricChip({ live: () => S.connected })"));
+        // Named by host, never a text dump.
+        assert!(UI_JS.contains("host.hostname") && !PAGE.contains("congestion control not exercised"));
     }
-
     #[test]
     fn console_never_prompts_and_locked_text_names_the_admin_link() {
         for page in [PAGE, BENCH_OFF] {

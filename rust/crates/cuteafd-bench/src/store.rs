@@ -33,15 +33,31 @@ pub struct RunRow {
     pub quality_failed: bool,
 }
 
-impl RunRow {
-    /// The row with the verdict its stored report earns under the rule in force
-    /// now. `stored` is the verdict the run was saved with, kept for a report
-    /// this build cannot parse.
-    fn with_current_verdict(mut self, text: &str, stored: bool) -> Self {
-        self.quality_failed = serde_json::from_str::<Report>(text)
-            .map_or(stored, |report| crate::quality::under_current_rule(&report).quality_failed());
-        self
-    }
+/// Version of the quality rule the stored `quality_failed` column was derived
+/// under. Bump it whenever `quality::under_current_rule` changes: opening the
+/// store then re-derives every row once (a backfill), and listings read only
+/// the stored columns, never the report JSON.
+pub const VERDICT_RULE: i64 = 1;
+
+/// The summary columns a run's report earns under the rule in force now.
+struct Summary { quality_failed: bool, panels: String, has_baseline: bool }
+fn summarize(report: &Report) -> Summary {
+    let current = crate::quality::under_current_rule(report);
+    let panels = report.panels.iter()
+        .filter(|p| p.status == crate::report::PanelStatus::Done || !p.passes.is_empty())
+        .map(|p| p.id.as_str()).collect::<Vec<_>>().join(",");
+    Summary { quality_failed: current.quality_failed(), panels, has_baseline: report.baseline.is_some() }
+}
+
+/// Where each panel of an accumulated view comes from: the newest run on the
+/// fingerprint holding it, and the newest run holding a baseline.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Sources {
+    pub baseline: Option<String>,
+    /// (panel id, run id), newest first by panel's run.
+    pub panels: Vec<(String, String)>,
+    /// The newest run on the fingerprint (server info, fabric).
+    pub newest: Option<String>,
 }
 
 impl Store {
@@ -77,8 +93,49 @@ impl Store {
                 status TEXT NOT NULL, model TEXT NOT NULL, hardware TEXT NOT NULL, quality_failed INTEGER NOT NULL,
                 report TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS runs_fingerprint ON runs(fingerprint, created);
+             CREATE INDEX IF NOT EXISTS runs_created ON runs(created);
              CREATE TABLE IF NOT EXISTS profiles (name TEXT PRIMARY KEY, profile TEXT NOT NULL);")?;
+        let columns: Vec<String> = self.connection.prepare("PRAGMA table_info(runs)")?
+            .query_map([], |row| row.get::<_, String>(1))?.collect::<std::result::Result<_, _>>()?;
+        for (name, kind) in [("verdict_rule", "INTEGER NOT NULL DEFAULT 0"), ("panels", "TEXT NOT NULL DEFAULT ''"),
+            ("has_baseline", "INTEGER NOT NULL DEFAULT 0")] {
+            if !columns.iter().any(|c| c == name) {
+                self.connection.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {name} {kind}"))?;
+            }
+        }
         Ok(())
+    }
+
+    /// Whether some rows still carry summaries from an older rule.
+    pub fn stale(&self) -> Result<bool> {
+        Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE verdict_rule != ?1)",
+            params![VERDICT_RULE], |row| row.get::<_, i64>(0))? != 0)
+    }
+
+    /// Re-derive the summary columns of rows stored under an older rule, once,
+    /// in short transactions (a concurrent save never waits long). Off the
+    /// serving path: the server runs it on a background thread after start.
+    pub fn backfill(&self) -> Result<usize> {
+        let stale: Vec<String> = self.connection.prepare("SELECT id FROM runs WHERE verdict_rule != ?1")?
+            .query_map(params![VERDICT_RULE], |row| row.get(0))?.collect::<std::result::Result<_, _>>()?;
+        if stale.is_empty() { return Ok(0); }
+        let started = std::time::Instant::now();
+        for chunk in stale.chunks(32) {
+        let transaction = self.connection.unchecked_transaction()?;
+        for id in chunk {
+            let text: String = transaction.query_row("SELECT report FROM runs WHERE id = ?1", params![id], |row| row.get(0))?;
+            // A report this build cannot parse keeps the verdict it was saved with.
+            let summary = serde_json::from_str::<Report>(&text).ok().map(|r| summarize(&r));
+            match summary {
+                Some(s) => transaction.execute("UPDATE runs SET quality_failed = ?2, panels = ?3, has_baseline = ?4, verdict_rule = ?5 WHERE id = ?1",
+                    params![id, s.quality_failed as i64, s.panels, s.has_baseline as i64, VERDICT_RULE])?,
+                None => transaction.execute("UPDATE runs SET verdict_rule = ?2 WHERE id = ?1", params![id, VERDICT_RULE])?,
+            };
+        }
+        transaction.commit()?;
+        }
+        tracing::info!(rows = stale.len(), seconds = started.elapsed().as_secs_f64(), "bench store: run summaries re-derived");
+        Ok(stale.len())
     }
 
     pub fn save(&self, report: &Report) -> Result<()> {
@@ -87,13 +144,17 @@ impl Store {
         // then, so the column is only the fallback for a report that will not
         // parse.
         let status = serde_json::to_value(report.status)?.as_str().unwrap_or("unknown").to_string();
+        let summary = summarize(report);
         self.connection.execute(
-            "INSERT INTO runs (id, created, fingerprint, profile, status, model, hardware, quality_failed, report)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO runs (id, created, fingerprint, profile, status, model, hardware, quality_failed, report,
+                verdict_rule, panels, has_baseline)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET status = excluded.status, quality_failed = excluded.quality_failed,
-                report = excluded.report",
+                report = excluded.report, verdict_rule = excluded.verdict_rule, panels = excluded.panels,
+                has_baseline = excluded.has_baseline",
             params![report.id, report.created, report.fingerprint, report.profile, status, report.server.model,
-                report.server.hardware.line(), report.quality_failed() as i64, serde_json::to_string(report)?])?;
+                report.server.hardware.line(), summary.quality_failed as i64, serde_json::to_string(report)?,
+                VERDICT_RULE, summary.panels, summary.has_baseline as i64])?;
         Ok(())
     }
 
@@ -103,27 +164,40 @@ impl Store {
         text.map(|t| serde_json::from_str(&t).context("stored report")).transpose()
     }
 
-    /// The run records, newest first.
+    /// The run records, newest first, from the stored summary columns only.
     ///
-    /// The row's verdict is derived here, from the report's own measured data
-    /// under the rule in force now, never from the status the run was stored
-    /// with: the dashboard lists this (the warning mark on a failed quality
-    /// gate) beside the run it renders, and a run measured before its
-    /// checkpoint was reclassified must not be the one surface still calling it
-    /// a failure. A report that will not parse keeps the verdict it was saved
-    /// with.
+    /// `quality_failed` is the verdict under the rule in force now: derived
+    /// when the run is saved and re-derived by the one-time backfill whenever
+    /// [`VERDICT_RULE`] moves, so a run measured before its checkpoint was
+    /// reclassified is not listed as a failure.
     pub fn list(&self, limit: usize) -> Result<Vec<RunRow>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, created, fingerprint, profile, status, model, hardware, quality_failed, report FROM runs
+            "SELECT id, created, fingerprint, profile, status, model, hardware, quality_failed FROM runs
              ORDER BY created DESC LIMIT ?1")?;
         let rows = statement.query_map(params![limit as i64], |row| {
-            let record = RunRow { id: row.get(0)?, created: row.get(1)?, fingerprint: row.get(2)?, profile: row.get(3)?,
+            Ok(RunRow { id: row.get(0)?, created: row.get(1)?, fingerprint: row.get(2)?, profile: row.get(3)?,
                 status: row.get(4)?, model: row.get(5)?, hardware: row.get(6)?,
-                quality_failed: row.get::<_, i64>(7)? != 0 };
-            let stored = record.quality_failed;
-            Ok(record.with_current_verdict(&row.get::<_, String>(8)?, stored))
+                quality_failed: row.get::<_, i64>(7)? != 0 })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The runs an accumulated view of `fingerprint` reads, from stored columns.
+    pub fn sources(&self, fingerprint: &str) -> Result<Sources> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, panels, has_baseline FROM runs WHERE fingerprint = ?1 ORDER BY created DESC")?;
+        let rows = statement.query_map(params![fingerprint], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? != 0)))?;
+        let mut sources = Sources::default();
+        for row in rows {
+            let (id, panels, baseline) = row?;
+            sources.newest.get_or_insert_with(|| id.clone());
+            if baseline && sources.baseline.is_none() { sources.baseline = Some(id.clone()); }
+            for panel in panels.split(',').filter(|p| !p.is_empty()) {
+                if !sources.panels.iter().any(|(p, _)| p == panel) { sources.panels.push((panel.into(), id.clone())); }
+            }
+        }
+        Ok(sources)
     }
 
     /// Reports on `fingerprint`, newest first (accumulating panels read them).
@@ -190,6 +264,69 @@ mod tests {
         assert!(row("cache").quality_failed);
         assert!(row("spec").quality_failed);
         assert_eq!(rows.len(), 4);
+    }
+
+    /// A row stored under an older rule (or before the summary columns) is
+    /// re-derived once on open; list() never reads the report again.
+    #[test]
+    fn backfill_rederives_old_rows_once_and_list_reads_columns_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut report = crate::sample::qwen_nvfp4_max(&dir.path().join("nvfp4"), "NVFP4", "");
+        report.id = "old".into();
+        store.save(&report).unwrap();
+        // As written by an older build: stored failure, no summary columns.
+        store.connection.execute("UPDATE runs SET quality_failed = 1, verdict_rule = 0, panels = '', has_baseline = 0", []).unwrap();
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.stale().unwrap());
+        assert_eq!(store.backfill().unwrap(), 1);
+        assert!(!store.stale().unwrap());
+        let row = store.list(10).unwrap().into_iter().next().unwrap();
+        assert!(!row.quality_failed, "re-derived under the rule in force now");
+        // A list never parses report JSON: corrupt it and the listing still works.
+        store.connection.execute("UPDATE runs SET report = 'not json'", []).unwrap();
+        assert_eq!(store.list(10).unwrap().len(), 1);
+        let rule: i64 = store.connection.query_row("SELECT verdict_rule FROM runs", [], |r| r.get(0)).unwrap();
+        assert_eq!(rule, VERDICT_RULE);
+    }
+
+    #[test]
+    fn sources_pick_the_newest_run_per_panel_and_baseline() {
+        use crate::report::{PanelResult, PanelStatus};
+        let store = Store::memory().unwrap();
+        let panel = |id: &str| PanelResult { id: id.into(), status: PanelStatus::Done, passes: vec![serde_json::json!({})], ..Default::default() };
+        let mut a = report("a", "f", "2026-10-01T00:00:00Z"); a.panels = vec![panel("speed"), panel("tools")];
+        let mut b = report("b", "f", "2026-10-02T00:00:00Z"); b.panels = vec![panel("speed")];
+        let c = report("c", "f", "2026-10-03T00:00:00Z");
+        for r in [&a, &b, &c] { store.save(r).unwrap(); }
+        let sources = store.sources("f").unwrap();
+        assert_eq!(sources.newest.as_deref(), Some("c"));
+        assert_eq!(sources.panels, vec![("speed".into(), "b".into()), ("tools".into(), "a".into())]);
+        assert!(sources.baseline.is_none());
+    }
+
+    /// Manual timing on a copy of a real store: `CUTEAFD_BENCH_STORE_COPY=DIR cargo test -- --ignored store_copy`.
+    #[test]
+    #[ignore]
+    fn store_copy_backfill_and_list_timing() {
+        let Some(dir) = std::env::var_os("CUTEAFD_BENCH_STORE_COPY") else { return };
+        let started = std::time::Instant::now();
+        let store = Store::open(Path::new(&dir)).unwrap();
+        eprintln!("open: {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+        let started = std::time::Instant::now();
+        eprintln!("backfill: {} rows in {:.2} s", store.backfill().unwrap(), started.elapsed().as_secs_f64());
+        let started = std::time::Instant::now();
+        let rows = store.list(200).unwrap();
+        eprintln!("list(200): {} rows in {:.1} ms", rows.len(), started.elapsed().as_secs_f64() * 1e3);
+        let started = std::time::Instant::now();
+        let sources = store.sources(&rows[0].fingerprint).unwrap();
+        eprintln!("sources: {} panels in {:.1} ms", sources.panels.len(), started.elapsed().as_secs_f64() * 1e3);
+        let started = std::time::Instant::now();
+        drop(store);
+        let store = Store::open(Path::new(&dir)).unwrap();
+        eprintln!("reopen (no backfill): {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+        drop(store);
     }
 
     #[test]

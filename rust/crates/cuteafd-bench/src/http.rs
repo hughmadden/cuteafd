@@ -344,6 +344,19 @@ async fn run_report(State(bench): State<Arc<Bench>>, Path(id): Path<String>) -> 
     }
 }
 
+/// Every panel's newest result on this server fingerprint (see `Bench::merged`).
+async fn merged(State(bench): State<Arc<Bench>>, Path(fingerprint): Path<String>) -> Response {
+    match tokio::task::spawn_blocking(move || bench.merged(&fingerprint)).await.ok().flatten() {
+        Some((report, baseline)) => {
+            let mut value = serde_json::to_value(crate::quality::under_current_rule(&report)).unwrap_or_default();
+            value["merged"] = json!(true);
+            if let Some((run, created)) = baseline { value["baseline_run"] = json!(run); value["baseline_created"] = json!(created); }
+            Json(value).into_response()
+        }
+        None => not_found("runs for this fingerprint"),
+    }
+}
+
 async fn events(State(bench): State<Arc<Bench>>) -> Response {
     let mut receiver = bench.subscribe();
     let first = json!({"type": "status", "status": bench.status()}).to_string();
@@ -412,6 +425,7 @@ pub fn routes(bench: Arc<Bench>) -> Router {
         .route("/v1/bench/profiles/:name", put(save_profile).delete(delete_profile))
         .route("/v1/bench/runs", get(runs).post(start))
         .route("/v1/bench/runs/:id", get(run_report))
+        .route("/v1/bench/merged/:fingerprint", get(merged))
         .route("/v1/bench/runs/:id/cancel", post(cancel))
         .route("/v1/bench/runs/:id/:file", get(run_file))
         .route("/v1/bench/import", post(import))

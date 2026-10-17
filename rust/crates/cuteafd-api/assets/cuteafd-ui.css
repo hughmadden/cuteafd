@@ -258,3 +258,33 @@ svg [data-i]:hover, svg [data-i]:focus-visible { filter: brightness(1.25); outli
 .admin-dialog .actions { display: flex; justify-content: flex-end; margin-top: 16px; }
 .admin-dialog > div { display: grid; gap: 12px; }
 @media (max-width: 600px) { .admin-gate { margin: 16px 0; padding: 22px 18px; } .admin-cmd { flex-direction: column; } }
+
+/* fabric chip */
+.fabric-chip-wrap { position: relative; display: inline-flex; }
+.fabric-chip { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px 3px 8px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line-2); background: var(--panel); color: var(--ink-2); font: 600 10.5px var(--mono); letter-spacing: .08em; }
+.fabric-chip:hover { border-color: var(--muted); color: var(--ink); }
+.fabric-chip:focus-visible { outline: 2px solid var(--target); outline-offset: 2px; }
+.fabric-chip i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.fabric-chip.ok i { background: var(--good); }
+.fabric-chip.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 50%, var(--line-2)); }
+.fabric-chip.warn i { background: var(--warn); }
+.fabric-chip.bad { color: var(--bad); border-color: color-mix(in oklab, var(--bad) 55%, var(--line-2)); }
+.fabric-chip.bad i { background: var(--bad); }
+.fabric-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20; min-width: 420px; max-width: min(560px, calc(100vw - 32px));
+  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px; box-shadow: 0 12px 32px rgba(0,0,0,.45); }
+.fabric-pop table { width: 100%; border-collapse: collapse; font: 11.5px var(--mono); }
+.fabric-pop th { color: var(--muted); font-weight: 500; text-align: right; padding: 3px 6px; border-bottom: 1px solid var(--line); }
+.fabric-pop td { text-align: right; padding: 3px 6px; color: var(--ink-2); white-space: nowrap; }
+.fabric-pop th:first-child, .fabric-pop td:first-child, .fabric-pop th:nth-child(2), .fabric-pop td:nth-child(2) { text-align: left; }
+.fabric-pop tr.spare td { color: var(--muted); }
+.fabric-pop tr.issue td { color: var(--bad); }
+.fabric-pop small { color: var(--muted); }
+.fabric-pop .note { margin: 8px 0 0; }
+@media (max-width: 600px) {
+  .fabric-pop { position: fixed; left: 16px; right: 16px; top: 120px; min-width: 0; width: auto; max-width: none; max-height: 70vh; overflow: auto; }
+  .fabric-pop td, .fabric-pop th { padding: 3px 4px; }
+}
+
+/* status pill + fabric chip stay together when the header wraps */
+.pills { display: inline-flex; align-items: center; gap: 8px; flex-wrap: nowrap; }

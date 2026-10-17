@@ -25,6 +25,7 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
     Some(match id {
         "decode_content" => decode_content(doc, t, latest, w),
         "concurrency" => concurrency(doc, t, latest, w),
+        "draft_mix" => draft_mix(doc, t, latest, w),
         "prefill" => prefill(doc, t, latest, w),
         "retained" => retained(doc, t, latest, w),
         "prefix_cache" => prefix_cache(doc, t, latest, w),
@@ -227,6 +228,50 @@ fn decode_content(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
         return empty(doc, t, "no measurements yet");
     }
     hbars(doc, t, 0.0, 0.0, w, &rows, "tps")
+}
+
+/// Two groups of bars: the C16 mixed waves (aggregate, with the per-request
+/// median as a tick) and the C1 rewrite passes (tokens/round and acceptance).
+fn draft_mix(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
+    let waves = v["waves"].as_array().cloned().unwrap_or_default();
+    let rewrites = v["rewrite"].as_array().cloned().unwrap_or_default();
+    if waves.is_empty() && rewrites.is_empty() { return empty(doc, t, "no measurements yet"); }
+    let mut y = 0.0;
+    if !waves.is_empty() {
+        doc.text(0.0, y + 12.0, Font::new(10.5, t.muted).weight(600), &format!("C{} MIXED PROMPTS · AGGREGATE", waves[0]["c"].as_u64().unwrap_or(16)));
+        y += 20.0;
+        let rows: Vec<(String, f64, &str, String)> = waves.iter().enumerate().map(|(i, wave)| {
+            let median = num(wave, "per_request_tok_s");
+            (format!("wave {}", i + 1), num(wave, "aggregate_tok_s").unwrap_or(0.0), t.series[0],
+                median.map(|m| format!("{} per request", rate(m))).unwrap_or_default())
+        }).collect();
+        let top = y;
+        y += hbars(doc, t, 0.0, y, w, &rows, "tps");
+        // Per-request median as a tick on the same scale as the bars.
+        let max = rows.iter().map(|r| r.1).fold(1e-9f64, f64::max) * 1.1;
+        let label_w = (w * 0.26).min(120.0);
+        let track = w - label_w - if w < 480.0 { 76.0 } else { 170.0 };
+        for (i, wave) in waves.iter().enumerate() {
+            if let Some(median) = num(wave, "per_request_tok_s") {
+                let x = label_w + track * (median / max).clamp(0.0, 1.0);
+                doc.line(x, top + 24.0 * i as f64 + 1.0, x, top + 24.0 * i as f64 + 19.0, t.series[1], 2.0);
+            }
+        }
+        legend(doc, t, 0.0, y + 10.0, &[("aggregate", t.series[0]), ("per-request median", t.series[1])]);
+        y += 26.0;
+    }
+    if !rewrites.is_empty() {
+        doc.text(0.0, y + 12.0, Font::new(10.5, t.muted).weight(600), "C1 COPY-HEAVY REWRITE");
+        y += 20.0;
+        let rows: Vec<(String, f64, &str, String)> = rewrites.iter().enumerate().map(|(i, r)| {
+            let mut note = Vec::new();
+            if let Some(per) = num(r, "tokens_per_round") { note.push(format!("{per:.1} tokens/round")); }
+            if let Some(a) = num(r, "acceptance") { note.push(format!("{:.0}% accepted", 100.0 * a)); }
+            (format!("pass {}", i + 1), num(r, "tok_s").unwrap_or(0.0), t.series[2], note.join(" · "))
+        }).collect();
+        y += hbars(doc, t, 0.0, y, w, &rows, "tps");
+    }
+    y + 6.0
 }
 
 fn plot_height(w: f64) -> f64 {
@@ -620,6 +665,19 @@ mod context_load_tests {
         let mut doc = super::Doc::new(900.0, 300.0);
         super::fidelity(&mut doc, &super::super::theme::NORMAL, &value, 900.0);
         assert!(doc.finish().contains("reference-only qualified"));
+    }
+
+    #[test]
+    fn draft_mix_charts_waves_and_rewrites() {
+        let v = serde_json::json!({"waves": [{"c":16,"aggregate_tok_s":640.0,"per_request_tok_s":41.0},
+            {"c":16,"aggregate_tok_s":610.0,"per_request_tok_s":39.5}],
+            "rewrite": [{"tok_s":212.0,"tokens_per_round":5.4,"acceptance":0.91},{"tok_s":208.0,"tokens_per_round":5.2,"acceptance":0.9}]});
+        let mut doc = super::Doc::new(700.0, 400.0);
+        assert!(super::draft_mix(&mut doc, &super::super::theme::NORMAL, &v, 700.0) > 100.0);
+        let svg = doc.finish();
+        for label in ["C16 MIXED PROMPTS", "per-request median", "C1 COPY-HEAVY REWRITE", "5.4 tokens/round", "91% accepted"] {
+            assert!(svg.contains(label), "{label}");
+        }
     }
 
     #[test]

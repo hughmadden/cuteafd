@@ -325,6 +325,91 @@ function heat(el, cells, opts = {}) {
   svg.innerHTML = out; marks(svg, cells, (c) => `${c.day} ${String(c.hour).padStart(2, '0')}:00\n${fmt.n0(c.value)} ${opts.unit || 'requests'}`, (c) => opts.onClick?.(c));
 }
 
+// ---------------------------------------------------------------- fabric chip
+// One chip: "Fabric OK", or the problem by host name. Idle and unproven ports,
+// and a Spark's unused second rail being down, are normal and say nothing; only
+// loss above the warning threshold, an engine port that is down, or an engine
+// link below the host's fastest active port produce words. Details (host names,
+// never addresses) open on click. Polls /v1/fabric every 3 s while the page is
+// visible and `opts.live()` holds.
+function fabricHost(key, host) {
+  if (key === 'coordinator') return host.hostname || 'coordinator';
+  return host.hostname || `Spark ${key.replace(/:\d+$/, '').split('.').pop()}`;
+}
+function fabricModel(snapshot) {
+  const hosts = [], problems = [];
+  for (const [key, host] of Object.entries(snapshot.hosts || {})) {
+    const name = fabricHost(key, host);
+    const used = new Set((host.engine || []).map((e) => `${e.device}/${e.port}`));
+    const ports = host.ports || [];
+    const fastest = Math.max(0, ...ports.filter((p) => /ACTIVE/.test(p.state || '')).map((p) => p.link_gbps || 0));
+    const rows = ports.map((p) => {
+      const h = p.health_since_start || {};
+      const active = /ACTIVE/.test(p.state || ''), engine = used.has(`${p.device}/${p.port}`);
+      const loss = h.loss_events_per_gb, limit = h.loss_warning_threshold_per_gb ?? 100;
+      let issue = null;
+      if (engine && !active) issue = 'down';
+      else if (Number.isFinite(loss) && loss > limit) issue = 'high loss';
+      else if (active && engine && fastest && p.link_gbps && p.link_gbps < fastest) issue = 'slow link';
+      if (issue) problems.push({ host: name, issue });
+      return { port: `${p.device}/${p.port}`, state: active ? 'up' : (p.state || '').replace(/^\d+:\s*/, '').toLowerCase() || 'unknown',
+        rate: p.link_gbps, loss, engine, issue, verdict: h.verdict || 'unknown' };
+    });
+    hosts.push({ name, rows, coordinator: key === 'coordinator' });
+  }
+  hosts.sort((a, b) => (b.coordinator - a.coordinator) || a.name.localeCompare(b.name));
+  return { hosts, problems };
+}
+function fabricChip(opts = {}) {
+  const live = opts.live || (() => true);
+  let model = null;
+  const wrap = document.createElement('span');
+  wrap.className = 'fabric-chip-wrap';
+  wrap.innerHTML = `<button type="button" class="fabric-chip unknown" id="fabric-chip" aria-expanded="false" aria-controls="fabric-pop" hidden>
+    <i></i><span id="fabric-text">Fabric</span></button>
+    <div class="fabric-pop" id="fabric-pop" role="dialog" aria-label="Fabric details" hidden></div>`;
+  const chip = wrap.querySelector('.fabric-chip'), text = wrap.querySelector('#fabric-text'), pop = wrap.querySelector('.fabric-pop');
+  const close = () => { pop.hidden = true; chip.setAttribute('aria-expanded', 'false'); };
+  chip.onclick = () => { pop.hidden = !pop.hidden; chip.setAttribute('aria-expanded', String(!pop.hidden)); if (!pop.hidden) popup(); };
+  addEventListener('click', (e) => { if (!wrap.contains(e.target)) close(); });
+  addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pop.hidden) { close(); chip.focus(); } });
+  function popup() {
+    if (!model) { pop.textContent = 'No fabric observations yet.'; return; }
+    const gbps = (v) => Number.isFinite(v) ? `${fmt.n0(v)} Gb/s` : '–';
+    const loss = (v) => Number.isFinite(v) ? fmt.n1(v) : '–';
+    pop.innerHTML = `<table><thead><tr><th>Host</th><th>Port</th><th>State</th><th>Rate</th><th title="Loss signals per GB moved (overlapping counters, not lost bytes); warning above 100">Loss / GB</th><th></th></tr></thead><tbody>` +
+      model.hosts.map((h) => h.rows.map((r, i) => `<tr class="${r.issue ? 'issue' : r.engine ? '' : 'spare'}"><td>${i ? '' : fmt.esc(h.name)}</td>
+        <td>${fmt.esc(r.port)}${r.engine ? '' : ' <small>unused</small>'}</td><td>${fmt.esc(r.state)}</td><td>${gbps(r.rate)}</td><td>${loss(r.loss)}</td>
+        <td>${r.issue ? `<b>${fmt.esc(r.issue)}</b>` : r.engine && r.verdict === 'ok' ? 'ok' : ''}</td></tr>`).join('')).join('') +
+      `</tbody></table><p class="note">Since this page started observing. Idle, unproven and unused ports are normal.</p>`;
+  }
+  function show() {
+    if (!model || !model.hosts.length) { chip.hidden = true; return; }
+    chip.hidden = false;
+    const p = model.problems;
+    let cls = 'ok', label = 'Fabric OK';
+    if (p.length) {
+      const hosts = [...new Set(p.map((x) => x.host))], kinds = [...new Set(p.map((x) => x.issue))];
+      cls = p.some((x) => x.issue === 'down' || x.issue === 'high loss') ? 'bad' : 'warn';
+      label = hosts.length === 1 && kinds.length === 1 ? `Fabric: ${kinds[0]} on ${hosts[0]}` : `Fabric: ${p.length} port${p.length === 1 ? '' : 's'} degraded`;
+    }
+    chip.className = 'fabric-chip ' + cls; text.textContent = label;
+    chip.title = 'Fabric health since this page started observing. Click for details.';
+    if (!pop.hidden) popup();
+  }
+  async function poll() {
+    if (!document.hidden && live()) {
+      try {
+        const response = await fetch('/v1/fabric', { signal: AbortSignal.timeout(2500) });
+        if (response.ok) { model = fabricModel(await response.json()); show(); }
+      } catch (_) { /* keep the last verdict */ }
+    }
+    setTimeout(poll, 3000);
+  }
+  setTimeout(poll, 1500);
+  return wrap;
+}
+
 // ---------------------------------------------------------------- admin access
 // The console unlock cookie gates admin views. `/console/status` (public) says
 // whether this browser holds it and how the operator prints the link.
@@ -364,5 +449,5 @@ async function adminGate(app, title, what) {
   return false;
 }
 
-window.CuteUI = { access, linkHelp, wireCopy, adminGate, token, color, fmt, header, facts, build, area, histogram, ribbons, strip, heat, svg: { sparkline, columns, timeline, meter, area, histogram, ribbons, strip, heat } };
+window.CuteUI = { fabricChip, fabricModel, access, linkHelp, wireCopy, adminGate, token, color, fmt, header, facts, build, area, histogram, ribbons, strip, heat, svg: { sparkline, columns, timeline, meter, area, histogram, ribbons, strip, heat } };
 })();

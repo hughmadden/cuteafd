@@ -30,33 +30,8 @@
 .gpu-table td.bad { color: var(--bad); font-weight: 600; }
 .gpu-total { color: var(--warn); font-weight: 600; }
 #gpu-title[title]:not([title=""]) { cursor: help; }
-/* status pill + fabric chip stay together when the header wraps */
-.pills { display: inline-flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
-/* fabric chip */
-.fabric-chip-wrap { position: relative; display: inline-flex; }
-.fabric-chip { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px 3px 8px; border-radius: 999px; cursor: pointer;
-  border: 1px solid var(--line-2); background: var(--panel); color: var(--ink-2); font: 600 10.5px var(--mono); letter-spacing: .08em; }
-.fabric-chip:hover { border-color: var(--muted); color: var(--ink); }
-.fabric-chip:focus-visible { outline: 2px solid var(--target); outline-offset: 2px; }
-.fabric-chip i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-.fabric-chip.ok i { background: var(--good); }
-.fabric-chip.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 50%, var(--line-2)); }
-.fabric-chip.warn i { background: var(--warn); }
-.fabric-chip.bad { color: var(--bad); border-color: color-mix(in oklab, var(--bad) 55%, var(--line-2)); }
-.fabric-chip.bad i { background: var(--bad); }
-.fabric-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20; min-width: 420px; max-width: min(560px, calc(100vw - 32px));
-  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px; box-shadow: 0 12px 32px rgba(0,0,0,.45); }
-.fabric-pop table { width: 100%; border-collapse: collapse; font: 11.5px var(--mono); }
-.fabric-pop th { color: var(--muted); font-weight: 500; text-align: right; padding: 3px 6px; border-bottom: 1px solid var(--line); }
-.fabric-pop td { text-align: right; padding: 3px 6px; color: var(--ink-2); white-space: nowrap; }
-.fabric-pop th:first-child, .fabric-pop td:first-child, .fabric-pop th:nth-child(2), .fabric-pop td:nth-child(2) { text-align: left; }
-.fabric-pop tr.spare td { color: var(--muted); }
-.fabric-pop tr.issue td { color: var(--bad); }
-.fabric-pop small { color: var(--muted); }
-.fabric-pop .note { margin: 8px 0 0; }
+
 @media (max-width: 600px) {
-  .fabric-pop { position: fixed; left: 16px; right: 16px; top: 120px; min-width: 0; width: auto; max-width: none; max-height: 70vh; overflow: auto; }
-  .fabric-pop td, .fabric-pop th { padding: 3px 4px; }
   .lane-keys { display: none; }
   header .meta { flex: 1 1 100%; order: 5; }
   header .nav { order: 6; }
@@ -184,7 +159,7 @@ const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 // ---------------------------------------------------------------- state
 const top = CuteUI.header($('#top'), { page: 'console', subtitle: 'Engine console' });
 { const pills = document.createElement('span'); pills.className = 'pills';
-  pills.append($('#status-tpl').content.cloneNode(true), fabricChip()); top.status.replaceWith(pills); }
+  pills.append($('#status-tpl').content.cloneNode(true), CuteUI.fabricChip({ live: () => S.connected })); top.status.replaceWith(pills); }
 top.extra.closest('.header-extra').remove();
 const S = {
   config: {}, textAllowed: false, textState: 'off', disabled: false, starting: false,
@@ -405,90 +380,8 @@ async function textLockedDialog() {
 }
 
 // ---------------------------------------------------------------- fabric chip
-// One chip in the header. Idle and unproven ports, and a Spark's unused second
-// rail being down, are normal and say nothing; only loss above the warning
-// threshold, an engine port that is down, or a link below the host's fastest
-// active port produce words. Details (host names, never addresses) on click.
-let fabric = null;
-function fabricChip() {
-  const wrap = document.createElement('span');
-  wrap.className = 'fabric-chip-wrap';
-  wrap.innerHTML = `<button type="button" class="fabric-chip unknown" id="fabric-chip" aria-expanded="false" aria-controls="fabric-pop" hidden>
-    <i></i><span id="fabric-text">Fabric</span></button>
-    <div class="fabric-pop" id="fabric-pop" role="dialog" aria-label="Fabric details" hidden></div>`;
-  const chip = wrap.querySelector('#fabric-chip'), pop = wrap.querySelector('#fabric-pop');
-  chip.onclick = () => { pop.hidden = !pop.hidden; chip.setAttribute('aria-expanded', String(!pop.hidden)); if (!pop.hidden) renderFabricPop(); };
-  addEventListener('click', (e) => { if (!wrap.contains(e.target)) { pop.hidden = true; chip.setAttribute('aria-expanded', 'false'); } });
-  addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pop.hidden) { pop.hidden = true; chip.setAttribute('aria-expanded', 'false'); chip.focus(); } });
-  return wrap;
-}
-function hostName(key, host) {
-  if (key === 'coordinator') return host.hostname || 'coordinator';
-  return host.hostname || `Spark ${key.replace(/:\d+$/, '').split('.').pop()}`;
-}
-function fabricModel(snapshot) {
-  const hosts = [], problems = [];
-  for (const [key, host] of Object.entries(snapshot.hosts || {})) {
-    const name = hostName(key, host);
-    const used = new Set((host.engine || []).map((e) => `${e.device}/${e.port}`));
-    const ports = host.ports || [];
-    const fastest = Math.max(0, ...ports.filter((p) => /ACTIVE/.test(p.state || '')).map((p) => p.link_gbps || 0));
-    const rows = ports.map((p) => {
-      const h = p.health_since_start || {};
-      const active = /ACTIVE/.test(p.state || ''), engine = used.has(`${p.device}/${p.port}`);
-      const loss = h.loss_events_per_gb, limit = h.loss_warning_threshold_per_gb ?? 100;
-      let issue = null;
-      if (engine && !active) issue = 'down';
-      else if (Number.isFinite(loss) && loss > limit) issue = 'high loss';
-      else if (active && engine && fastest && p.link_gbps && p.link_gbps < fastest) issue = 'slow link';
-      if (issue) problems.push({ host: name, issue });
-      return { port: `${p.device}/${p.port}`, state: active ? 'up' : (p.state || '').replace(/^\d+:\s*/, '').toLowerCase() || 'unknown',
-        rate: p.link_gbps, loss, engine, issue, verdict: h.verdict || 'unknown' };
-    });
-    hosts.push({ name, rows, coordinator: key === 'coordinator' });
-  }
-  hosts.sort((a, b) => (b.coordinator - a.coordinator) || a.name.localeCompare(b.name));
-  return { hosts, problems };
-}
-function renderFabricChip() {
-  const chip = $('#fabric-chip'), text = $('#fabric-text');
-  if (!chip) return;
-  if (!fabric || !fabric.hosts.length) { chip.hidden = true; return; }
-  chip.hidden = false;
-  const p = fabric.problems;
-  let cls = 'ok', label = 'Fabric OK';
-  if (p.length) {
-    const hosts = [...new Set(p.map((x) => x.host))];
-    const kinds = [...new Set(p.map((x) => x.issue))];
-    cls = p.some((x) => x.issue === 'down' || x.issue === 'high loss') ? 'bad' : 'warn';
-    label = hosts.length === 1 && kinds.length === 1 ? `Fabric: ${kinds[0]} on ${hosts[0]}`
-      : `Fabric: ${p.length} port${p.length === 1 ? '' : 's'} degraded`;
-  }
-  chip.className = 'fabric-chip ' + cls; text.textContent = label;
-  chip.title = 'Fabric health since this page started observing. Click for details.';
-  if (!$('#fabric-pop').hidden) renderFabricPop();
-}
-function renderFabricPop() {
-  const pop = $('#fabric-pop');
-  if (!fabric) { pop.textContent = 'No fabric observations yet.'; return; }
-  const gbps = (v) => Number.isFinite(v) ? `${n0(v)} Gb/s` : '–';
-  const loss = (v) => Number.isFinite(v) ? F.n1(v) : '–';
-  pop.innerHTML = `<table><thead><tr><th>Host</th><th>Port</th><th>State</th><th>Rate</th><th title="Loss signals per GB moved (overlapping counters, not lost bytes); warning above 100">Loss / GB</th><th></th></tr></thead><tbody>` +
-    fabric.hosts.map((h) => h.rows.map((r, i) => `<tr class="${r.issue ? 'issue' : r.engine ? '' : 'spare'}"><td>${i ? '' : esc(h.name)}</td>
-      <td>${esc(r.port)}${r.engine ? '' : ' <small>unused</small>'}</td><td>${esc(r.state)}</td><td>${gbps(r.rate)}</td><td>${loss(r.loss)}</td>
-      <td>${r.issue ? `<b>${esc(r.issue)}</b>` : r.engine && r.verdict === 'ok' ? 'ok' : ''}</td></tr>`).join('')).join('') +
-    `</tbody></table><p class="note">Since this page started observing. Idle, unproven and unused ports are normal.</p>`;
-}
-async function pollFabric() {
-  if (!document.hidden && S.connected) {
-    try {
-      const response = await fetch('/v1/fabric', { signal: AbortSignal.timeout(2500) });
-      if (response.ok) { fabric = fabricModel(await response.json()); renderFabricChip(); }
-    } catch (_) { /* keep the last verdict */ }
-  }
-  setTimeout(pollFabric, 3000);
-}
-setTimeout(pollFabric, 1500);
+// Shared with /bench (CuteUI.fabricChip): polls /v1/fabric while visible and connected.
+
 
 async function connect() {
   try {

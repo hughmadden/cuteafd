@@ -213,6 +213,15 @@ impl Bench {
                 tracing::warn!(%error, dir = %dir.display(), "benchmark history is not persisted");
                 Store::memory().expect("in-memory SQLite")
             });
+            // Re-derive summaries stored under an older verdict rule on a second
+            // connection, after start: readiness never waits on the history.
+            if store.stale().unwrap_or(false) {
+                let _ = std::thread::Builder::new().name("bench-backfill".into()).spawn(move || {
+                    if let Err(error) = Store::open(&dir).and_then(|s| s.backfill()) {
+                        tracing::warn!(%error, "bench store: summary backfill failed");
+                    }
+                });
+            }
             Self::new(store)
         }).clone()
     }
@@ -256,6 +265,50 @@ impl Bench {
             return live.lock().ok().map(|r| r.clone());
         }
         self.store(|s| s.load(id)).ok().flatten()
+    }
+
+    /// Every panel's newest result on `fingerprint`, each tagged with the run
+    /// it came from, under the newest baseline; the active run's live panels
+    /// replace their own sections. Reads only the runs that contribute.
+    pub fn merged(&self, fingerprint: &str) -> Option<(Report, Option<(String, String)>)> {
+        let sources = self.store(|s| s.sources(fingerprint)).ok()?;
+        let active = self.active().filter(|a| self.report(&a.id).is_some_and(|r| r.fingerprint == fingerprint));
+        let live = active.as_ref().and_then(|a| self.report(&a.id));
+        let newest = live.clone().or_else(|| sources.newest.as_deref().and_then(|id| self.report(id)))?;
+        let mut cache: HashMap<String, Report> = HashMap::new();
+        let mut fetch = |id: &str| -> Option<Report> {
+            if !cache.contains_key(id) { cache.insert(id.to_string(), self.report(id)?); }
+            cache.get(id).cloned()
+        };
+        let mut merged = newest.clone();
+        // The merged view keeps the newest run's id: server, hardware,
+        // configuration and fabric render from it; panels carry their own run.
+        merged.panels = Vec::new();
+        // The live run's own panels first (running, done or queued), then every
+        // other panel's newest stored result.
+        if let Some(live) = &live {
+            for panel in &live.panels {
+                if panel.status == crate::report::PanelStatus::Pending && panel.passes.is_empty()
+                    && sources.panels.iter().any(|(id, _)| id == &panel.id) { continue; }
+                let mut panel = panel.clone();
+                panel.run = Some(live.id.clone()); panel.run_created = Some(live.created.clone());
+                merged.panels.push(panel);
+            }
+        }
+        for (panel_id, run_id) in &sources.panels {
+            if merged.panels.iter().any(|p| &p.id == panel_id) { continue; }
+            let Some(report) = fetch(run_id) else { continue };
+            if let Some(panel) = report.panel(panel_id) {
+                let mut panel = panel.clone();
+                panel.run = Some(report.id.clone()); panel.run_created = Some(report.created.clone());
+                merged.panels.push(panel);
+            }
+        }
+        let baseline_run = live.as_ref().filter(|l| l.baseline.is_some()).map(|l| l.id.clone()).or(sources.baseline.clone());
+        let baseline = baseline_run.as_deref().and_then(&mut fetch);
+        merged.baseline = baseline.as_ref().and_then(|r| r.baseline.clone());
+        merged.plan = Vec::new();
+        Some((merged, baseline.map(|r| (r.id, r.created))))
     }
 
     /// The newest report (live first).
