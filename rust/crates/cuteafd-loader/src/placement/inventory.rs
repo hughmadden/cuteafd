@@ -199,6 +199,12 @@ pub fn glmf_local_tp2_runtime_items(rank: usize) -> Vec<cuteafd_core::memory_lay
 /// split peer: 2,283,798,528 / 13,500. Values retain P2's rounded arithmetic.
 pub const GLMF_GRAPH_BYTES_BY_ROLE: [u64; 3] = [141_027, 161_694, 169_171];
 
+/// GLM owned-phase SM120 executable mean, RTX PRO 6000, EXL3 K4, 2026-10-15.
+/// 49,416 executables/rank used 5,790,236,672 / 5,762,973,696 B on two launches.
+/// This is a phase-class calibration, not a whole-engine budget. Recheck ready
+/// deltas on RTX 5090 or after changing the phase/shape census.
+pub const GLM_OWNED_SM120_GRAPH_BYTES: u64 = 117_000;
+
 /// The table's family key of a program family (`dsv4f`, `mimop2`, ...).
 pub fn loaded_code_family(program_family: &str) -> &str {
     let base = program_family.trim_end_matches('2');

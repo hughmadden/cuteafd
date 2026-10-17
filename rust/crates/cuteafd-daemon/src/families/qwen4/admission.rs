@@ -549,7 +549,10 @@ mod tests {
             engine: super::super::EngineArgs,
         }
         let snapshot = tempfile::tempdir()?;
-        testing::write_snapshot(snapshot.path(), &testing::qwen4_config(48), &[], None);
+        // The coordinator headers serve-qwen4 loads: the planner charges their exact
+        // resident inventory and refuses a layout it cannot derive from them.
+        let config = testing::qwen4_config(48);
+        testing::write_snapshot(snapshot.path(), &config, &testing::qwen4_coordinator(&config, false), None);
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(snapshot.path())?;
         for (capacity, kv_format) in [32_u64 << 30, 101_973_491_712].into_iter().flat_map(|capacity|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (capacity, format))) {
@@ -560,8 +563,10 @@ mod tests {
                         pool_tokens: pool, qwen_kv: kv_format, concurrency: 8, state_slots: Some(8), prefix_slots: Some(0),
                         ..Default::default() }), ..Default::default()
                 })?;
+                assert!(report.placement_supported, "{}", cuteafd_loader::plan::render(&report));
                 let layout = report.memory_layout.unwrap();
                 let device = &layout.devices[0];
+                assert!(device.items.iter().any(|i| i.group == "target incl PLE projections" && i.bytes > 0));
                 let baseline = device.items.iter().filter(|i| !matches!(i.group.as_str(), "records" | "state" |
                     "marks" | "graphs" | "graph growth" | "decode step" | "prefill step"))
                     .map(|i| i.bytes).sum::<u64>();

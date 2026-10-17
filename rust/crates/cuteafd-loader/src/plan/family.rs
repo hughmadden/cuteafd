@@ -61,7 +61,9 @@ pub trait FamilyModel: Send + Sync {
     /// Resolve automatic vision to the mode this executor can actually admit.
     fn vision_mode(&self, mode: super::MediaMode) -> super::MediaMode { mode }
 
-    /// Native solver adapter. Returning None retains the legacy layout path.
+    /// The family's memory layout: its own adapter over the shared solver,
+    /// solving the same request its runtime admits. `None` means the family
+    /// has no adapter: `plan` refuses its layout.
     fn placement(&self, _input: &super::PlanInput, _report: &mut super::PlanReport,
         _options: &super::layout::LayoutOptions, _requested: super::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {

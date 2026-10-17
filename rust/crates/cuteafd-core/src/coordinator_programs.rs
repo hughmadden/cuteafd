@@ -221,6 +221,62 @@ impl std::fmt::Display for MissingCoordinatorProgram {
 
 impl std::error::Error for MissingCoordinatorProgram {}
 
+/// The `{family}_sparse_mla_partial_h{begin}_s{N}_m{rows}` variants a GPU with `sms` SMs runs,
+/// as (row cap, program) ascending: the exporter's split plan per (SM count, row cap)
+/// (`row_caps`; a variant without it serves the full `rows` of its `device_sm_counts`), else
+/// the one variant. These caps describe numerical plan alternatives, not live row limits.
+pub fn attention_partial_programs(manifest: &serde_json::Value, family: &str, begin: usize, rows: usize, sms: usize)
+    -> Result<Vec<(usize, String)>, AttentionPartialError> {
+    let programs = manifest["programs"].as_array().ok_or(AttentionPartialError::InvalidManifest("program manifest"))?;
+    let prefix = format!("{family}_sparse_mla_partial_h{begin}_s");
+    let suffix = format!("_m{rows}");
+    let variants: Vec<&serde_json::Value> = programs.iter()
+        .filter(|p| p["name"].as_str().is_some_and(|n| n.starts_with(&prefix) && n.ends_with(&suffix))).collect();
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for p in &variants {
+        let name = p["name"].as_str().ok_or(AttentionPartialError::InvalidManifest("program name"))?.to_string();
+        let caps: Vec<usize> = match p["params"]["row_caps"].get(sms.to_string()) {
+            Some(caps) => caps.as_array().ok_or(AttentionPartialError::InvalidManifest("row caps"))?.iter().filter_map(|c| c.as_u64().map(|c| c as usize)).collect(),
+            None if p["params"]["device_sm_counts"].as_array()
+                .is_some_and(|sm| sm.iter().any(|s| s.as_u64() == Some(sms as u64))) => vec![rows],
+            None => Vec::new(),
+        };
+        out.extend(caps.into_iter().map(|cap| (cap, name.clone())));
+    }
+    if out.is_empty() && variants.len() == 1 {
+        out.push((rows, variants[0]["name"].as_str().ok_or(AttentionPartialError::InvalidManifest("program name"))?.to_string()));
+    }
+    out.sort();
+    out.dedup_by_key(|(cap, _)| *cap);
+    if !out.last().is_some_and(|(cap, _)| *cap >= rows) {
+        return Err(AttentionPartialError::MissingVariant { prefix, suffix, sms, rows });
+    }
+    Ok(out)
+}
+
+/// Select once at load, using numerical plan rows rather than live execution rows.
+/// Every exported alternative has the same full execution capacity in its name.
+pub fn attention_partial_program(manifest: &serde_json::Value, family: &str, begin: usize,
+    execution_capacity_rows: usize, sms: usize,
+    plan: &AttentionReductionPlan) -> Result<String, AttentionPartialError> {
+    if plan.capacity_rows() > execution_capacity_rows { return Err(AttentionPartialError::NumericalDomain); }
+    let partials = attention_partial_programs(manifest, family, begin, execution_capacity_rows, sms)?;
+    partials.into_iter().find(|(cap, _)| *cap >= plan.rows()).map(|(_, name)| name)
+        .ok_or(AttentionPartialError::NoRecipe)
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AttentionPartialError {
+    #[error("invalid attention partial {0}")]
+    InvalidManifest(&'static str),
+    #[error("no {prefix}*{suffix} variant planned for {sms} SMs at {rows} rows")]
+    MissingVariant { prefix: String, suffix: String, sms: usize, rows: usize },
+    #[error("attention numerical domain exceeds execution capacity")]
+    NumericalDomain,
+    #[error("attention plan has no partial reduction recipe")]
+    NoRecipe,
+}
+
 /// Charge only the selected numerical recipe at full execution capacity.
 /// Export geometry owns recipe scratch; this helper is independent of family names.
 pub fn attention_plan_scratch(geometry: &serde_json::Value, plan: AttentionReductionPlan)
@@ -241,6 +297,32 @@ pub fn attention_plan_scratch(geometry: &serde_json::Value, plan: AttentionReduc
     }
     if previous != capacity { return Err(invalid()); }
     selected.map(Some).ok_or_else(invalid)
+}
+
+/// Narrow a parsed program's scratch using the immutable numerical recipe.
+pub fn select_attention_scratch(geometry: &serde_json::Value,
+    scratch: &mut std::collections::HashMap<String, u64>, plan: AttentionReductionPlan)
+    -> Result<(), AttentionScratchError> {
+    if let Some(bytes) = attention_plan_scratch(geometry, plan)? {
+        scratch.insert("scratch".into(), bytes);
+    }
+    Ok(())
+}
+
+/// Planner counterpart of runtime program selection; card plans must be selected first.
+pub fn select_attention_plans(manifest: &mut serde_json::Value, plan: AttentionReductionPlan,
+    keep: impl Fn(&str) -> bool) -> Result<(), AttentionScratchError> {
+    let Some(programs) = manifest["programs"].as_array_mut() else { return Ok(()) };
+    for program in programs {
+        if !program["name"].as_str().is_some_and(&keep)
+            || program["geometry"].get("attention_plan_scratch").is_none() { continue; }
+        let mut scratch = serde_json::from_value(program["scratch_bytes_at_capacity"].clone())
+            .map_err(|_| AttentionScratchError)?;
+        select_attention_scratch(&program["geometry"], &mut scratch, plan)?;
+        program["scratch_bytes_at_capacity"] = serde_json::to_value(scratch)
+            .map_err(|_| AttentionScratchError)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -404,6 +486,33 @@ mod tests {
                 _ => bad["attention_plan_scratch"][0]["scratch"] = (-1).into(),
             }
             assert!(attention_plan_scratch(&bad, plan).is_err());
+        }
+    }
+
+    #[test]
+    fn planner_and_runtime_attention_scratch_match_every_plan_on_both_cards() {
+        let geometry = |scale: u64| serde_json::json!({"attention_plan_capacity_rows": 64,
+            "attention_plan_scratch": [{"rows_cap": 1, "scratch": 134742016 * scale},
+                {"rows_cap": 8, "scratch": 46317568 * scale},
+                {"rows_cap": 64, "scratch": 8421376 * scale}]});
+        for sms in [170, 188] {
+            for rows in 1..=64 {
+                let plan = AttentionReductionPlan::new(64, None, Some(rows)).unwrap();
+                let mut manifest = serde_json::json!({"programs": [{"name": "glm_sparse_mla_decode_m64",
+                    "geometry": geometry(1), "scratch_bytes_at_capacity": {"scratch": 134742016},
+                    "card_plans": [
+                        {"sm_count": 170, "geometry": geometry(2), "scratch_bytes_at_capacity": {"scratch": 269484032}},
+                        {"sm_count": 188, "geometry": geometry(1), "scratch_bytes_at_capacity": {"scratch": 134742016}}
+                    ]}, {"name": "other_attention", "geometry": geometry(1),
+                        "scratch_bytes_at_capacity": {"scratch": 99}}]});
+                select_card_plans(&mut manifest, sms).unwrap();
+                let program = &manifest["programs"][0];
+                let mut runtime = serde_json::from_value(program["scratch_bytes_at_capacity"].clone()).unwrap();
+                select_attention_scratch(&program["geometry"], &mut runtime, plan).unwrap();
+                select_attention_plans(&mut manifest, plan, |name| name.starts_with("glm_")).unwrap();
+                assert_eq!(manifest["programs"][0]["scratch_bytes_at_capacity"], serde_json::to_value(runtime).unwrap());
+                assert_eq!(manifest["programs"][1]["scratch_bytes_at_capacity"]["scratch"], 99);
+            }
         }
     }
 

@@ -26,12 +26,12 @@ pub(crate) fn checkpoint_context(snapshot: &Path, manifest: &Path, family: &str,
 }
 
 pub(crate) fn pool_context(family: &str, context: usize, automatic: bool, pool: usize, unit: usize) -> Result<usize> {
-    if context <= pool { return Ok(context); }
-    ensure!(automatic, "{family}: explicit context {context} > admitted pool supports {pool}; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change");
-    let supported = pool.saturating_sub(unit.max(64));
-    ensure!(supported > 0, "{family}: admitted pool {pool} cannot hold one request plus its safety margin");
-    tracing::warn!(family, checkpoint_context = context, admitted_pool = pool, max_context = supported,
-        "checkpoint context exceeds admitted pool; serving reduced max_context; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change");
+    let supported = cuteafd_loader::serving_capacity::pool_context(context, automatic, pool, unit)
+        .map_err(|error| anyhow::anyhow!("{family}: {error}"))?;
+    if supported != context {
+        tracing::warn!(family, checkpoint_context = context, admitted_pool = pool, max_context = supported,
+            "checkpoint context exceeds admitted pool; serving reduced max_context; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change");
+    }
     Ok(supported)
 }
 

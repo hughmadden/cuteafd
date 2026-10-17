@@ -38,7 +38,9 @@ pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", 
 /// fails a chosen `context` closed (`glm5::solve_working_set`, #202); `heads` stays an
 /// explicit option.
 pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
-    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Context };
+    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true, attention: AttentionPlacement::Context };
 /// GLM Flash: every layer split over two GPUs; its MLA layers by heads (latent replicated) or by
 /// context (projections head-split, 256-token units owned by parity; #57), KDA always by heads.
 /// `context` is the recorded default on two GPUs (TJ: no context-scaling KV replicated; pool

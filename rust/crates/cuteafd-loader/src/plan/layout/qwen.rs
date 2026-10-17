@@ -263,7 +263,6 @@ fn exl3_arenas(input: &super::super::PlanInput, mtp: bool) -> Option<(u64, u64)>
 fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &LayoutOptions, rows: u64, concurrency: u64,
     context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> MemoryLayout {
-    let checkpoint = input.checkpoint();
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &capacity)| {
         let arch = crate::placement::ArchContext::for_device("sm_120", capacity);
         let modules = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &["qwen4"]).module_bytes())

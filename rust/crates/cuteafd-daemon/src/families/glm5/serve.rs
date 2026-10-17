@@ -370,7 +370,7 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs)
     // The pinned host tier: one GPU's pages, or under context each page from its owner
     // (both GPUs' pools registered, so every copy runs on its owner's copy streams). A heads
     // split keeps replicated pages on both GPUs and stays device-resident.
-    let host = if engine.ranks() > 1 && !engine.context_kv() {
+    let host = if engine.ranks() > 1 && !engine.context_kv() && !engine.layers_kv() {
         if args.host_cache_bytes.enabled() && args.prefix_cache_entries > 0 {
             tracing::warn!("GLM heads split: the prefix cache's host tier is off (device-resident snapshots only)");
         }
