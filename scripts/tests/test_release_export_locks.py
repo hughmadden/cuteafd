@@ -141,6 +141,130 @@ printf '%s\\n' "$pick"
     assert 'waiting for an idle RTX' in result.stderr
 
 
+@pytest.mark.parametrize(
+    'apps,cgroups,top,total,killed,warning,inspect_ok,query_ok',
+    [
+        # Parallel export contexts may exceed the limit without foreign work.
+        ('101, 4500, GPU-export\n102, 4392, GPU-export',
+         {101: 'own', 102: 'own'}, None, 8892, False, False, True, True),
+        ('101, 8892, GPU-export\n201, 8200, GPU-export',
+         {101: 'own', 201: 'foreign'}, None, 17092, True, False, True, True),
+        # The limit applies to the sum of foreign processes, not each one.
+        ('201, 4200, GPU-export\n202, 4200, GPU-export',
+         {201: 'foreign', 202: 'foreign'}, None, 8400, True, False, True, True),
+        ('101, 8892, GPU-export\n201, 8192, GPU-export',
+         {101: 'own', 201: 'foreign'}, None, 17084, False, False, True, True),
+        # Filter the UUID even if a driver returns rows from other devices.
+        ('101, 8892, GPU-export\n201, 20000, GPU-other',
+         {101: 'own', 201: 'foreign'}, None, 8892, False, False, True, True),
+        # Unreadable/disappeared cgroups cannot prove foreign ownership.
+        ('101, 8892, GPU-export', {}, None, 8892, False, True, True, True),
+        ('101, N/A, GPU-export', {101: 'own'}, None,
+         8892, False, True, True, True),
+        ('101, 8892, GPU-export', {101: 'own'}, None,
+         8892, False, True, True, False),
+        ('', {}, None, 8892, False, True, True, True),
+        # docker top provides host PIDs when inspect cannot identify cgroups.
+        ('101, 8892, GPU-export', {}, 'PID\n101',
+         8892, False, False, False, True),
+        ('101, 8892, GPU-export\n201, 8200, GPU-export',
+         {101: 'own', 201: 'foreign'}, 'PID\n101',
+         17092, True, False, False, True),
+        # A departed exporter absent from top must not be labeled foreign.
+        ('101, 8892, GPU-export', {}, 'PID',
+         8892, False, True, False, True),
+        # Partial process-memory support: total minus known export use.
+        ('101, 8892, GPU-export\n201, N/A, GPU-export',
+         {101: 'own', 201: 'foreign'}, None, 17092, True, False, True, True),
+        ('101, 8892, GPU-export\n201, N/A, GPU-export',
+         {101: 'own', 201: 'foreign'}, None, 9000, False, False, True, True),
+        # Never subtract incomplete export usage from a device-wide total.
+        ('101, N/A, GPU-export\n201, N/A, GPU-export',
+         {101: 'own', 201: 'foreign'}, None, 17092, False, True, True, True),
+        ('101, 8892, GPU-export\n201, N/A, GPU-export\n301, 10, GPU-export',
+         {101: 'own', 201: 'foreign'}, None, 17102, False, True, True, True),
+    ],
+    ids=[
+        'export-only-above-limit', 'foreign-above-limit', 'foreign-sum',
+        'foreign-at-limit', 'other-device-ignored', 'unattributable',
+        'export-memory-unavailable', 'process-query-unavailable', 'no-process-rows',
+        'docker-top-own', 'docker-top-foreign', 'departed-process',
+        'fallback-kills', 'fallback-excludes-own', 'fallback-unknown-own',
+        'fallback-unknown-owner',
+    ],
+)
+def test_export_watchdog_attributes_foreign_memory(
+    tmp_path, apps, cgroups, top, total, killed, warning, inspect_ok, query_ok,
+):
+    build = (ROOT / 'build.sh').read_text()
+    guard = build.split('# release-aot-export-guard:start', 1)[1].split(
+        '# release-aot-export-guard:end', 1,
+    )[0]
+    container_id = 'a' * 64
+    proc = tmp_path / 'proc'
+    proc.mkdir()
+    for pid, owner in cgroups.items():
+        entry = proc / str(pid)
+        entry.mkdir()
+        cgroup = f'0::/docker/{container_id}' if owner == 'own' else '0::/other-job'
+        (entry / 'cgroup').write_text(cgroup + '\n')
+    (tmp_path / 'apps').write_text(apps)
+    (tmp_path / 'top').write_text(top or '')
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    smi = bin_dir / 'nvidia-smi'
+    smi.write_text('''#!/usr/bin/env bash
+set -eu
+[[ $2 == --format=csv,noheader,nounits && $3 == -i && $4 == GPU-export ]] || exit 90
+case $1 in
+  --query-compute-apps=pid,used_memory,gpu_uuid)
+    [[ $QUERY_OK == 1 ]] || exit 1
+    cat "$FIXTURE/apps" ;;
+  --query-gpu=memory.used) printf '%s\\n' "$TOTAL" ;;
+  *) exit 91 ;;
+esac
+''')
+    smi.chmod(0o755)
+    docker = bin_dir / 'docker'
+    docker.write_text('''#!/usr/bin/env bash
+set -eu
+case $1 in
+  inspect)
+    [[ $INSPECT_OK == 1 ]] || exit 1
+    printf '%s\\n' "$CONTAINER_ID" ;;
+  top)
+    [[ $TOP_OK == 1 ]] || exit 1
+    cat "$FIXTURE/top" ;;
+  rm) printf '%s\\n' "$*" >>"$FIXTURE/killed" ;;
+  *) exit 92 ;;
+esac
+''')
+    docker.chmod(0o755)
+    script = f'''set -euo pipefail
+{guard}
+release_export_gpu_poll_seconds=15
+export_gpu_limit_mib=8192
+polls=0
+sleep() {{ polls=$((polls + 1)); ((polls == 1)); }}
+release_watch_export_gpu GPU-export export-fixture "$FIXTURE/proc"
+'''
+    result = subprocess.run(
+        ['bash', '-c', script], capture_output=True, text=True, timeout=5,
+        env={
+            **os.environ, 'PATH': f'{bin_dir}:' + os.environ['PATH'],
+            'FIXTURE': str(tmp_path), 'CONTAINER_ID': container_id,
+            'TOTAL': str(total), 'INSPECT_OK': str(int(inspect_ok)),
+            'TOP_OK': str(int(top is not None)), 'QUERY_OK': str(int(query_ok)),
+        },
+    )
+    assert result.returncode == int(killed), result.stderr
+    assert (tmp_path / 'killed').exists() == killed
+    if killed:
+        assert (tmp_path / 'killed').read_text() == 'rm -f export-fixture\n'
+        assert 'foreign process use' in result.stderr
+    assert ('WARNING:' in result.stderr) == warning, result.stderr
+
+
 def test_term_stops_the_export_before_releasing_locks(tmp_path):
     result = run_export(tmp_path, "bash -c 'kill -TERM \"$PPID\"'")
     assert result.returncode == 143, result.stderr
