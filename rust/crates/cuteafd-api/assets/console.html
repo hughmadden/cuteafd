@@ -45,8 +45,11 @@
 .banner.lock b { color: var(--ink); }
 .banner.lock code { font: 12px var(--mono); color: var(--ink); }
 @media (max-width: 600px) {
-  .fabric-pop { min-width: 0; width: calc(100vw - 32px); left: auto; right: auto; position: fixed; top: auto; margin-top: 30px; }
+  .fabric-pop { position: fixed; left: 16px; right: 16px; top: 120px; min-width: 0; width: auto; max-width: none; max-height: 70vh; overflow: auto; }
+  .fabric-pop td, .fabric-pop th { padding: 3px 4px; }
   .lane-keys { display: none; }
+  header .meta { flex: 1 1 100%; order: 5; }
+  header .nav { order: 6; }
   .app { min-width: 0; padding-inline: 16px; }
   .app > * { min-width: 0; }
   .nav { flex-wrap: wrap; flex-shrink: 1; margin-left: 0; }
@@ -907,7 +910,7 @@ function draw() {
   }
   if (!S.requests.size && !(S.prefill.length && S.prefill[S.prefill.length - 1].t1 > tD - 3000)) {
     ctx.font = `12px ${MONO}`; ctx.fillStyle = COL.muted; ctx.textAlign = 'center';
-    ctx.fillText(S.connected ? 'Waiting for requests' : 'Connecting to the engine…', (GUT + right) / 2, PAD + 15);
+    ctx.fillText(S.connected ? 'Waiting for requests' : !$('#lock').hidden ? 'Locked: open the console unlock link' : 'Connecting to the engine…', (GUT + right) / 2, PAD + 15);
   }
   tooltip(hit);
   requestAnimationFrame(draw);

@@ -337,7 +337,7 @@ impl Bench {
             "baseline": baseline.as_ref().map(|b| json!({"run": b.run_id, "quality": b.quality.status,
                 "badge": b.quality.badge()})),
             "quality_failed": baseline.as_ref().is_some_and(|b| b.quality.status == crate::report::CheckStatus::Fail),
-            "auth": "API key",
+            "auth": "console unlock or API key",
         })
     }
 

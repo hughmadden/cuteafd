@@ -704,9 +704,9 @@ window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer
     await refreshRuns();
     const wanted = new URLSearchParams(location.search).get('run');
     await load(wanted || status.active?.id || runs[0]?.id);
-  } catch (error) { console.error(error); }
+  } catch (error) { if ($('locked').hidden) console.error(error); }
   render();
-  connect();
+  if ($('locked').hidden) connect();
 })();
 })();
 </script>
