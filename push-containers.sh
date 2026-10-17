@@ -13,8 +13,10 @@ The supplied release tag is published for both images. Stable tags also update
 latest; release-candidate tags (rc, case-insensitive) never update latest.
 --latest is refused for release candidates. --no-latest disables latest for any tag. The
 coordinator image is local; the Spark image is published from SPARK_0_HOST.
-The Spark image must advertise the V41 expert roles it carries (./build.sh bakes
-the universal tp2;tp3;tp6 set by default); a role-less legacy build is rejected.
+Both images must carry matching release scope labels and pass the matrix inventory
+check. Only dev-* and wip-* tags with --no-latest may publish narrowed scopes.
+All other tags and every latest update require the complete default matrix at
+the image revision, corroborated by matching matrix SHA256 labels.
 
 --config FILE selects the configuration that names the local image pair to
 publish (default: ./cuteafd.config, which after the v10 runtime promotion names
@@ -105,9 +107,6 @@ spark_repository="ghcr.io/tpurtell/cuteafd-spark-expert"
 spark_host="$SPARK_0_HOST"
 expected_source="https://github.com/tpurtell/cuteafd"
 
-# The published pair is universal: ./build.sh bakes the TP2/TP3/TP6 Spark expert
-# shards by default on top of the always-built TP4 shard, and the release launcher
-# refuses an explicit SPARK_TP/SPARK_EP topology without the matching role.
 # push-universal-role-guard:start
 push_require_universal_roles() {
   local advertised="$1" image="$2" role
@@ -177,7 +176,49 @@ docker image inspect \
 REMOTE
 )"
 [[ "$spark_roles" != "<no value>" ]] || spark_roles=
-push_require_universal_roles "$spark_roles" "$SPARK_EXPERT_DOCKER_INFERENCE"
+# Scope and matrix digest are build evidence, not publisher environment overrides.
+coordinator_scope="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.release.scope"}}' "$COORDINATOR_DOCKER_INFERENCE")"
+spark_scope="$(release_ssh "$spark_host" docker image inspect -f \
+  "$(printf '%q' '{{index .Config.Labels "io.cuteafd.release.scope"}}')" "$SPARK_EXPERT_DOCKER_INFERENCE")"
+[[ -n "$coordinator_scope" && "$coordinator_scope" != '<no value>' && "$coordinator_scope" == "$spark_scope" ]] ||
+  release_die "image release scope labels are missing or disagree"
+require_full=1
+if [[ "$tag" =~ ^(dev|wip)-[A-Za-z0-9_][A-Za-z0-9_.-]*$ && "$latest" == off ]]; then
+  require_full=0
+fi
+if ((require_full)); then
+  [[ "$coordinator_scope" == all ]] ||
+    release_die "release tags require scope all (including latest and non-dev tags); found $coordinator_scope"
+fi
+if [[ "$coordinator_scope" == all ]]; then
+  push_require_universal_roles "$spark_roles" "$SPARK_EXPERT_DOCKER_INFERENCE"
+fi
+coordinator_matrix_sha256="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.release.matrix.sha256"}}' "$COORDINATOR_DOCKER_INFERENCE")"
+spark_matrix_sha256="$(release_ssh "$spark_host" docker image inspect -f \
+  "$(printf '%q' '{{index .Config.Labels "io.cuteafd.release.matrix.sha256"}}')" "$SPARK_EXPERT_DOCKER_INFERENCE")"
+[[ "$coordinator_matrix_sha256" =~ ^[0-9a-f]{64}$ && "$coordinator_matrix_sha256" == "$spark_matrix_sha256" ]] ||
+  release_die "image release matrix SHA256 labels are missing or disagree"
+if ((require_full)); then
+  [[ "$coordinator_revision" =~ ^[0-9a-f]{40}$ ]] || release_die "release publication requires a clean full Git revision"
+  default_matrix_sha256="$(git -C "$repo_root" show "$coordinator_revision:scripts/bench/release-smoke-v3.json" | sha256sum | awk '{print $1}')" ||
+    release_die "cannot read default release matrix at image revision"
+  [[ "$coordinator_matrix_sha256" == "$default_matrix_sha256" ]] ||
+    release_die "image matrix SHA256 differs from default matrix at image revision"
+  release_scope_requirements="$(python3 "$repo_root/scripts/build/release-scope.py" requirements \
+    --revision "$coordinator_revision")"
+else
+  release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v3.json}"
+  [[ "$(sha256sum "$release_matrix" | awk '{print $1}')" == "$coordinator_matrix_sha256" ]] ||
+    release_die "development matrix SHA256 differs from image matrix"
+  release_scope_requirements="$(python3 "$repo_root/scripts/build/release-scope.py" requirements \
+    --matrix "$release_matrix" --scope "$coordinator_scope")"
+fi
+python3 "$repo_root/scripts/build/release-scope.py" check-image --role coordinator \
+  --image "$COORDINATOR_DOCKER_INFERENCE" --requirements "$release_scope_requirements"
+release_ssh "$spark_host" python3 - check-image --role expert \
+  --image "$SPARK_EXPERT_DOCKER_INFERENCE" --requirements "$(printf '%q' "$release_scope_requirements")" \
+  <"$repo_root/scripts/build/release-scope.py"
+
 
 echo "Publishing CUTEAFD containers"
 echo "  revision:    $coordinator_revision"

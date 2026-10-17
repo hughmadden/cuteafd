@@ -7,21 +7,15 @@ source "$repo_root/scripts/lib/cdi-gpus.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
 source "$repo_root/scripts/build/build-caches.sh"
 cuteafd_build_cache_defaults
-bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
-audio_aot="${CUTEAFD_RELEASE_AUDIO_AOT:-ON}"
-case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_RELEASE_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
 native_build_jobs="${CUTEAFD_RELEASE_NATIVE_BUILD_JOBS:-}"
 [[ -z "$native_build_jobs" || "$native_build_jobs" =~ ^[1-9][0-9]*$ ]] ||
   release_die "CUTEAFD_RELEASE_NATIVE_BUILD_JOBS must be a positive integer"
 native_build_env_args=()
 [[ -z "$native_build_jobs" ]] || native_build_env_args=(-e "CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs")
-bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4)(;(mimo|mimop|mimof|glm|glmf|qwen4))*$'
-[[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
-  release_die "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, mimof, glm, glmf or qwen4"
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh [--config FILE] [--spark-hosts HOST,...] [--dry-run]
+Usage: ./build.sh [--config FILE] [--spark-hosts HOST,...] [--scope SCOPE] [--dry-run]
 
 The coordinator and Spark legs build concurrently: the coordinator image locally
 and the Spark image natively over SSH on the first configured Spark. Set
@@ -31,12 +25,9 @@ It exports both release artifact sets to dist/
 and distributes the Spark inference image to all configured Spark hosts.
 Use --spark-hosts ostrich,dodo to build and distribute only on available hosts;
 this does not change the serving topology.
-Release images are universal by default: the ARM64 (SM121) Spark expert image
-carries the TP2, TP3 and TP6 replicated-group shards on top of the always-built
-TP4 shard, so one pair serves every approved native topology and ./run.sh selects
-the mode with SPARK_TP/SPARK_EP. The x86_64 coordinator image needs no Spark role.
-Set CUTEAFD_RELEASE_SPARK_TP_ROLES to an explicit subset (for example tp6, or empty
-for the historical TP4-only shard) for a bounded topology A/B or a legacy rebuild.
+Release images derive the Spark TP roles required by the shipping matrix.
+CUTEAFD_RELEASE_SPARK_TP_ROLES adds extra roles; --scope selects a smaller
+family/card set or explicit for a raw-knob experimental build.
 --dry-run validates the configuration, host set and role plan without touching
 Docker, SSH, submodules, hardware locks or any image.
 The build takes ~/.cache/cuteafd/build.lock for its whole run, so two release
@@ -85,24 +76,13 @@ Cargo target dirs and staging stay deletable without sudo. The home is
 BUILD_ROOT/container-home when a build root is set and /tmp/cuteafd-home inside
 the container otherwise.
 
-Families beyond V4.1 are opt-in. CUTEAFD_RELEASE_{DSV4,GLM,MIMO,GLMF,QWEN4}_AOT=ON
-put each family's coordinator programs in the coordinator image, and
-CUTEAFD_RELEASE_EXPERT_FAMILIES (FAMILY:ROLE list, ';'-separated) adds routed-expert
-packages to both images, each keeping its architecture's entries.
-CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES (e.g. mimo, or mimo;glm) adds optional
-BF16-input Spark siblings for the requested FAMILY:fp8 packages. It does not
-change serving precision defaults. Empty builds the existing artifact set.
-CUTEAFD_RELEASE_AUDIO_AOT=OFF leaves the optional audio tower out of both images
-(default ON: AUDIO=auto serves it for the qualified MiMo V2.6 checkpoints).
-CUTEAFD_RELEASE_MIMO_GEOMETRIES picks the MiMo program geometries (default
-mimo,mimo2,mimop,mimop2: V2 Flash, V2.6 Pro and their two-GPU head splits). p7's set, everything scripts/launch/run-family.sh
-serves (V4 Pro EXL3 K2, GLM 5.3 EXL3 K4 and FP8, GLM 5.3 Flash, MiMo V2 Flash
-FP8, MiMo V2.6 Pro MXFP4 (tp1 coordinator, tp6/tp2 Spark), Qwen 3.8 Flash Next
-EXL3 K4.25):
-    CUTEAFD_RELEASE_GLM_AOT=ON CUTEAFD_RELEASE_GLMF_AOT=ON CUTEAFD_RELEASE_MIMO_AOT=ON
-    CUTEAFD_RELEASE_QWEN4_AOT=ON CUTEAFD_RELEASE_MIMO_GEOMETRIES=mimo,mimo2,mimop,mimop2
-    CUTEAFD_RELEASE_EXPERT_FAMILIES='dsv4f:rtx_backbone;dsv4f:rtx_tp2;dsv4p:rtx_backbone;dsv4p:rtx_tp2;dsv4p:exl3-k23;glm:exl3-k45;glm:fp8;mimo:fp8;mimop:fp8;qwen4:exl3-k45'
-(p6 was the same without QWEN4, mimop, mimop:fp8 and qwen4:exl3-k45.)
+Release exports derive from CUTEAFD_RELEASE_MATRIX (default:
+scripts/bench/release-smoke-v3.json). --scope / CUTEAFD_RELEASE_SCOPE selects all
+(default), comma-separated family or entry names, or explicit (raw knobs only).
+Raw CUTEAFD_RELEASE_* export knobs add to selected cards; OFF/empty cannot remove
+required exports. Narrow or explicit builds are for development, not release tags.
+Both image inventories must cover the selected cards before complete tags update.
+
 
 Images are labelled with the checkout's Git revision (HEAD), even when the
 tree has local changes. Dirty checkouts still get an automatic source manifest
@@ -141,6 +121,10 @@ while [[ $# -gt 0 ]]; do
       build_hosts_csv="${2:?--spark-hosts requires a comma-separated host list}"
       shift 2
       ;;
+    --scope)
+      export CUTEAFD_RELEASE_SCOPE="${2:?--scope requires all, explicit, families or entry names}"
+      shift 2
+      ;;
     --dry-run)
       dry_run=1
       shift
@@ -154,6 +138,26 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+release_scope="${CUTEAFD_RELEASE_SCOPE:-all}"
+release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v3.json}"
+release_matrix_sha256="$(sha256sum "$release_matrix" | awk '{print $1}')"
+release_scope_exports="$(python3 "$repo_root/scripts/build/release-scope.py" derive \
+  --matrix "$release_matrix" --scope "$release_scope" --shell)"
+eval "$release_scope_exports"
+printf -v release_scope_assignment 'export CUTEAFD_RELEASE_SCOPE=%q' "$release_scope"
+release_scope_exports+=$'\n'"$release_scope_assignment"
+printf -v release_matrix_assignment 'export CUTEAFD_RELEASE_MATRIX_SHA256=%q' "$release_matrix_sha256"
+release_scope_exports+=$'\n'"$release_matrix_assignment"
+release_scope_requirements="$(python3 "$repo_root/scripts/build/release-scope.py" requirements \
+  --matrix "$release_matrix" --scope "$release_scope")"
+bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
+audio_aot="${CUTEAFD_RELEASE_AUDIO_AOT:-ON}"
+case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_RELEASE_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
+bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4)(;(mimo|mimop|mimof|glm|glmf|qwen4))*$'
+[[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
+  release_die "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, mimof, glm, glmf or qwen4"
+
 
 release_load_config "$config"
 release_select_build_hosts "$build_hosts_csv"
@@ -320,6 +324,8 @@ case "$release_dev_image_source" in registry|build) ;; *) release_die "CUTEAFD_R
 
 if ((dry_run)); then
   release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
+  echo "  release scope: $release_scope"
+  printf '%s\n' "$release_scope_exports"
   echo "Build dry-run passed; no image, container, SSH or submodule was touched."
   echo "  config: $RELEASE_CONFIG"
   echo "  build hosts (${#RELEASE_BUILD_HOSTS[@]}): $(IFS=,; echo "${RELEASE_BUILD_HOSTS[*]}")"
@@ -354,6 +360,23 @@ if ((dry_run)); then
   exit 0
 fi
 
+# Build under temporary tags; a failed inventory never replaces a complete pair.
+complete_coordinator_image="$COORDINATOR_DOCKER_INFERENCE"
+complete_spark_image="$SPARK_EXPERT_DOCKER_INFERENCE"
+COORDINATOR_DOCKER_INFERENCE+="-pending-$$"
+SPARK_EXPERT_DOCKER_INFERENCE+="-pending-$$"
+# Keep a single parent EXIT cleanup through export, verification and promotion.
+release_pending_cleanup() {
+  [[ -z "${coordinator_container:-}" ]] || docker rm -f "$coordinator_container" >/dev/null 2>&1 || true
+  docker image rm "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 || true
+  local host
+  for host in "${RELEASE_BUILD_HOSTS[@]}"; do
+    timeout 30s ssh "${release_ssh_opts[@]}" "$host" docker image rm "$SPARK_EXPERT_DOCKER_INFERENCE" >/dev/null 2>&1 || true
+  done
+}
+trap release_pending_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
 
 prepare_pinned_source_dependencies() {
@@ -814,6 +837,7 @@ timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_expo
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
+  -e "CUTEAFD_RELEASE_DSV4_AOT=${CUTEAFD_RELEASE_DSV4_AOT:-ON}" \
   -e "CUTEAFD_RELEASE_DSV4_MAX_CONTEXT=${CUTEAFD_RELEASE_DSV4_MAX_CONTEXT:-1048576}" \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT=${CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT:-ON}" \
@@ -838,6 +862,8 @@ echo "== building coordinator inference image: $COORDINATOR_DOCKER_INFERENCE =="
 DOCKER_BUILDKIT=1 docker build \
   "${release_source_label_args[@]}" \
   "${release_dev_reuse_label_args[@]}" \
+  --label "io.cuteafd.release.scope=$release_scope" \
+  --label "io.cuteafd.release.matrix.sha256=$release_matrix_sha256" \
   --build-arg CUTEAFD_ROLE=coordinator \
   --build-arg CUDA_ARCH=120 \
   --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
@@ -911,7 +937,7 @@ build_spark_release_leg() {
   "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__legacy__}")" \
   "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__legacy__}")" \
   "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__legacy__}")" "${CUTEAFD_SCCACHE_CUDA:-0}" "${release_dev_image_source:-registry}" "$audio_aot" "${CUTEAFD_BUILD_CACHES:-on}" \
-  "$spark_export_min_free_gib" "$release_idle_wait_seconds" "$release_export_gpu_poll_seconds" <<'REMOTE'
+  "$spark_export_min_free_gib" "$release_idle_wait_seconds" "$release_export_gpu_poll_seconds" "$(printf '%s' "$release_scope_exports" | base64 -w0)" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -961,6 +987,9 @@ export CUTEAFD_BUILD_CACHES="${21:-on}"
 export CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB="${22:?}"
 export CUTEAFD_RELEASE_IDLE_WAIT_SECONDS="${23:?}"
 export CUTEAFD_RELEASE_EXPORT_GPU_POLL_SECONDS="${24:?}"
+eval "$(printf '%s' "${25:?}" | base64 -d)"
+release_scope="$CUTEAFD_RELEASE_SCOPE"
+release_matrix_sha256="$CUTEAFD_RELEASE_MATRIX_SHA256"
 [[ "${15:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE="${15}"
 [[ "${17:-__legacy__}" == __legacy__ ]] || export CUTEAFD_KACHE_CACHE_DIR="${17}"
 export CUTEAFD_SCCACHE_CUDA="${18:-1}"
@@ -1119,6 +1148,8 @@ mapfile -t release_dev_reuse_label_args <"$dev_manifest.labels"
 DOCKER_BUILDKIT=1 docker build \
   "${release_source_label_args[@]}" \
   "${release_dev_reuse_label_args[@]}" \
+  --label "io.cuteafd.release.scope=$release_scope" \
+  --label "io.cuteafd.release.matrix.sha256=$release_matrix_sha256" \
   --build-arg CUTEAFD_ROLE=expert \
   --build-arg CUDA_ARCH=121 \
   --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
@@ -1191,8 +1222,14 @@ echo "== exporting release binaries =="
 mkdir -p "$repo_root/dist/coordinator" "$repo_root/dist/spark-expert"
 find "$repo_root/dist/coordinator" "$repo_root/dist/spark-expert" \
   -mindepth 1 -delete
+echo "== checking selected release matrix against built image inventories =="
+python3 "$repo_root/scripts/build/release-scope.py" check-image --role coordinator \
+  --image "$COORDINATOR_DOCKER_INFERENCE" --requirements "$release_scope_requirements"
+release_ssh "$seed_host" python3 "$remote_dir/scripts/build/release-scope.py" check-image \
+  --role expert --image "$SPARK_EXPERT_DOCKER_INFERENCE" --requirements "$(printf '%q' "$release_scope_requirements")"
+
 coordinator_container="$(docker create "$COORDINATOR_DOCKER_INFERENCE")"
-trap 'docker rm -f "$coordinator_container" >/dev/null 2>&1 || true' EXIT
+
 docker cp "$coordinator_container:/opt/cuteafd/bin/cuteafd" "$repo_root/dist/coordinator/cuteafd"
 docker cp "$coordinator_container:/opt/cuteafd/lib/libcuteafd_native.so" "$repo_root/dist/coordinator/libcuteafd_native.so"
 # Host-ISA variants (scripts/build/host-isa.sh): dist/coordinator/x86-64-v4/{cuteafd,libcuteafd_native.so}.
@@ -1229,7 +1266,7 @@ docker cp \
   "$coordinator_container:/opt/cuteafd/share/XGRAMMAR_SHA256SUMS" \
   "$repo_root/dist/coordinator/XGRAMMAR_SHA256SUMS"
 docker rm "$coordinator_container" >/dev/null
-trap - EXIT
+coordinator_container=""
 
 release_ssh "$seed_host" bash -s -- \
   "$SPARK_EXPERT_DOCKER_INFERENCE" "$remote_dir/dist/spark-expert" <<'REMOTE'
@@ -1462,3 +1499,10 @@ echo "  expert roles: ${spark_tp_roles:-<none>} ($spark_tp_roles_note)"
 echo "  coordinator: $COORDINATOR_DOCKER_INFERENCE"
 echo "  spark:       $SPARK_EXPERT_DOCKER_INFERENCE"
 echo "  artifacts:   $repo_root/dist"
+
+# Publish the requested local tags only after both inventories and identity gates pass.
+docker tag "$COORDINATOR_DOCKER_INFERENCE" "$complete_coordinator_image"
+for host in "${RELEASE_BUILD_HOSTS[@]}"; do
+  release_ssh "$host" docker tag "$SPARK_EXPERT_DOCKER_INFERENCE" "$complete_spark_image"
+done
+echo "Release scope $release_scope verified; complete image tags updated."

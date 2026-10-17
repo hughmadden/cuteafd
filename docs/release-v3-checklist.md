@@ -16,7 +16,14 @@ logs and build outputs outside Git. No dense Qwen, Step-5 or V4.1 EXL3 card.
    No failing CPU test ids; review the object/cubin differences.
 2. **RC pair [TJ for publication/tag]:** prepare private `$BUILD_CONFIG`
    with both inference images tagged `v3.0.0-rc1` and both build roots on
-   guarded NVMe. `./build.sh --config "$BUILD_CONFIG"` builds both legs.
+   guarded NVMe. `./build.sh --config "$BUILD_CONFIG"` derives both legs' export
+   set from `scripts/bench/release-smoke-v3.json` (or
+   `CUTEAFD_RELEASE_MATRIX`), with no hand-set export environment.
+   Scope defaults to `all` and preserves the v2.0.0 export floor. Both images
+   record the selected matrix's SHA256. Family/entry `--scope` builds may publish
+   only `dev-*`/`wip-*` tags with `--no-latest`. Every other tag and any `latest`
+   update requires `all`, the default matrix digest at the image's Git revision,
+   and a passing full inventory check; a custom matrix cannot weaken publication.
    `./push-containers.sh --config "$BUILD_CONFIG" --no-latest v3.0.0-rc1`
    publishes only the RC tags; all RC spellings refuse `--latest`. `git tag -a v3.0.0-rc1 -m 'v3 release candidate 1' && git push origin v3.0.0-rc1`.
 3. **Smoke:** copy `scripts/bench/release-smoke-v3.json` to private

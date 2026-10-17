@@ -137,11 +137,16 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
     list(APPEND CUTEAFD_EXL3_GEOMETRY_LAYOUTS tp6-rank0 tp6-rank1 tp6-rank2 tp6-rank3 tp6-rank4 tp6-rank5)
   endif()
   set(CUTEAFD_EXL3_PROFILE_ARGS)
-  # Entries are COUNT (every family) or FAMILY=COUNT (only that family); a
+  # Entries are COUNT, FAMILY=COUNT or FAMILY:FORMAT=COUNT; a
   # family none of them names keeps its packaged default layouts.
   set(requested_counts)
   foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)
-    if(count MATCHES "^([a-z0-9]+)=(.*)$")
+    if(count MATCHES "^([a-z0-9]+):([a-z0-9]+)=(.*)$")
+      if(NOT CMAKE_MATCH_1 STREQUAL CUTEAFD_EXL3_GEOMETRY OR NOT CMAKE_MATCH_2 STREQUAL "exl3")
+        continue()
+      endif()
+      set(count "${CMAKE_MATCH_3}")
+    elseif(count MATCHES "^([a-z0-9]+)=(.*)$")
       if(NOT CMAKE_MATCH_1 STREQUAL CUTEAFD_EXL3_GEOMETRY)
         continue()
       endif()
