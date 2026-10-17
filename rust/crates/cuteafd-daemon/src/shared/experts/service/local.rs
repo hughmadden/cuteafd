@@ -179,6 +179,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let library = unsafe { NativeLibrary::load(&config.library) }?;
     census.identify_device(&library)?;
     census.sample("before_context", None)?;
+    // cudaGetDevice can report the default ordinal with no context current.
+    // Bind its runtime primary context on this execution owner before warming
+    // any backend's modules, even when the optional census is disabled.
+    library.cuda_set_device(library.cuda_get_device()?)?;
     if census.enabled() {
         library.cuda_device_synchronize()?;
         census.sample("after_context_before_media", Some(&library))?;

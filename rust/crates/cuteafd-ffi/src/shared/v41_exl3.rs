@@ -195,6 +195,13 @@ impl Drop for V41Exl3Kernel {
     }
 }
 
+fn check_route_initialization(status: i32) -> Result<()> {
+    ensure!(status != 201,
+        "EXL3 route initialization failed: no current CUDA context on the route-creating thread (CUDA_ERROR_INVALID_CONTEXT, 201)");
+    ensure!(status == 0, "EXL3 route initialization failed: {status}");
+    Ok(())
+}
+
 /// Native route preparation, owned on the creating CUDA thread/context.
 pub struct V41Exl3Routes {
     _library: Library,
@@ -216,7 +223,7 @@ impl V41Exl3Routes {
         let destroy = *library.get(b"cuteafd_exl3_routes_destroy")?;
         let mut context = std::ptr::null_mut();
         let status = create(&mut context);
-        ensure!(status == 0, "EXL3 route initialization failed: {status}");
+        check_route_initialization(status)?;
         Ok(Self {
             _library: library,
             context: NonNull::new(context).context("null EXL3 route context")?,
@@ -257,6 +264,16 @@ impl Drop for V41Exl3Routes {
 #[cfg(test)]
 mod info_tests {
     use super::*;
+
+    #[test]
+    fn route_initialization_reports_missing_current_context() {
+        assert!(check_route_initialization(0).is_ok());
+        let missing = check_route_initialization(201).unwrap_err().to_string();
+        assert!(missing.contains("no current CUDA context on the route-creating thread"));
+        assert!(missing.contains("201"));
+        assert_eq!(check_route_initialization(2).unwrap_err().to_string(),
+            "EXL3 route initialization failed: 2");
+    }
 
     #[test]
     #[ignore = "requires a CUDA GPU, CUTEAFD_NATIVE_LIB and four-tier CUTEAFD_EXL3_AOT"]

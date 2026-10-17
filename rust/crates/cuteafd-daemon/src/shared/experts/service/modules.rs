@@ -62,6 +62,24 @@ impl<'a> WarmModules<'a> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn owner_binds_primary_context_without_census_before_all_backends() {
+        let worker = include_str!("local.rs");
+        let context = worker.split("census.sample(\"before_context\", None)?;").nth(1).unwrap();
+        let first_statement = context.lines().map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//")).unwrap();
+        assert_eq!(first_statement, "library.cuda_set_device(library.cuda_get_device()?)?;");
+        let modules = context.find("let mut modules = match super::modules::WarmModules::load").unwrap();
+        let execution = context.find("weights.execution(&library").unwrap();
+        // Warm-up and execution stay on the synchronous GPU owner, not a
+        // separate census thread with a different thread-local context.
+        let owner = &context[..execution];
+        assert!(modules < execution);
+        for handoff in [".spawn(", "spawn_blocking(", ".await"] {
+            assert!(!owner.contains(handoff), "CUDA owner handed off through {handoff}");
+        }
+    }
+
+    #[test]
     fn module_phase_has_no_weight_or_arena_allocation() {
         let source = include_str!("modules.rs").split("#[cfg(test)]").next().unwrap();
         for forbidden in ["DeviceAllocation", "HostAllocation", "load_weights", "cuda_stream_create",

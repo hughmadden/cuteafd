@@ -24,7 +24,8 @@ impl<'a> Device<'a> {
     /// Scope a synchronous method body. Never retain this guard across a yield.
     pub fn enter(&self) -> Result<DeviceScope<'a>> {
         let previous = self.library.cuda_get_device()?;
-        if previous != self.id { self.library.cuda_set_device(self.id)?; }
+        // The runtime's default ordinal does not prove a context is current.
+        self.library.cuda_set_device(self.id)?;
         Ok(DeviceScope { library: self.library, previous, changed: previous != self.id })
     }
     /// Scope every poll and cancellation cleanup, never an entire async wait.
@@ -51,8 +52,8 @@ impl<'a> Device<'a> {
             }
         }
         let previous = self.library.cuda_get_device()?;
-        if previous == self.id { return work(); }
         self.library.cuda_set_device(self.id)?;
+        if previous == self.id { return work(); }
         let mut restore = Restore { library: self.library, previous, armed: true };
         let result = work();
         self.library.cuda_set_device(previous)?;
@@ -150,6 +151,18 @@ impl Drop for Allocation<'_> {
 mod allocation_lifetime_tests {
     use super::*;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    #[test]
+    fn scopes_bind_context_even_when_runtime_reports_the_owner_ordinal() {
+        let source = include_str!("device.rs").split("#[cfg(test)]\nmod allocation_lifetime_tests").next().unwrap();
+        let enter = source.split("pub fn enter(").nth(1).unwrap().split("pub fn future").next().unwrap();
+        assert!(enter.contains("self.library.cuda_set_device(self.id)?;"));
+        assert!(!enter.contains("if previous"));
+        let run = source.split("pub fn run<T>").nth(1).unwrap().split("pub(crate) struct DeviceScope").next().unwrap();
+        let bind = run.find("self.library.cuda_set_device(self.id)?;").unwrap();
+        let same_ordinal = run.find("if previous == self.id { return work(); }").unwrap();
+        assert!(bind < same_ordinal, "same-ordinal work must not bypass primary-context binding");
+    }
 
     fn failed_sync_aborts_before_free(path: &str) -> Result<()> {
         use std::os::unix::process::ExitStatusExt;
