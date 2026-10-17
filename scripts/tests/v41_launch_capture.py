@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from launcher_sandbox import copy_tree
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "scripts" / "tests" / "fixtures" / "v41-launch"
@@ -341,7 +342,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
             (cache / "hub").symlink_to(hub)
         # The same launcher tree at a fixed path inside the root, so paths compare.
         repo = root / "repo"
-        shutil.copytree(launcher_root, repo, symlinks=True,
+        copy_tree(launcher_root, repo, symlinks=True,
                         ignore=shutil.ignore_patterns(".git", "rust", "native", "third_party", "python", "docs",
                                                       "benchmarks", "assets", "quantization", "set", "target"))
         (repo / "rust/crates/cuteafd-core/src").mkdir(parents=True)

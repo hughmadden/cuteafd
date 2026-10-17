@@ -302,11 +302,13 @@ fn run_soak(order: EvictionOrder) {
 }
 
 #[test]
+#[ignore = "slow tier: 60-second host-cache leak/counter soak; cpu-gate --slow"]
 fn soak_has_no_leak_and_balances_the_counters() {
     run_soak(EvictionOrder::LeastRecent);
 }
 
 #[test]
+#[ignore = "slow tier: 60-second bank-order leak/counter soak; cpu-gate --slow"]
 fn soak_in_bank_order_has_no_leak_and_balances_the_counters() {
     run_soak(EvictionOrder::Banks);
 }

@@ -1,0 +1,7 @@
+[profile.cpu-gate]
+retries = 0
+fail-fast = false
+
+[profile.cpu-gate.junit]
+path = "junit.xml"
+report-skipped = "all"

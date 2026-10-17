@@ -37,8 +37,9 @@ GPU0: a compile, a download or an image assembly must not block serving. The two
 AOT exports take no lock at all. The coordinator export picks the least-used RTX
 with at most CUTEAFD_RELEASE_IDLE_GPU_LIMIT_MIB (default 512) in use, waiting
 bounded by CUTEAFD_RELEASE_IDLE_WAIT_SECONDS (default 300), pins it by UUID,
-stops the export if the device grows past CUTEAFD_RELEASE_EXPORT_GPU_LIMIT_MIB
-(default 8192) while it runs, and logs host, device and time; a Spark export
+stops the export if foreign processes exceed CUTEAFD_RELEASE_EXPORT_GPU_LIMIT_MIB
+(default 8192 MiB), excluding its own container, and logs host, device and time;
+a Spark export
 waits for a host with no serving worker container and at least
 CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB (default 100) of allocatable memory
 (MemAvailable bounded by cgroups on integrated devices, CUDA free otherwise). Set
@@ -348,7 +349,7 @@ if ((dry_run)); then
   echo "  build container user: $(id -un) ($(id -u):$(id -g))"
   echo "  build container home: $(release_build_container_home "$release_build_root")"
   echo "  build lock: $HOME/.cache/cuteafd/build.lock (waited up to ${release_build_lock_timeout}s; no hardware lock is taken)"
-  echo "  AOT export GPU guard: least-used RTX with <=${release_idle_gpu_limit_mib} MiB used, waited ${release_idle_wait_seconds}s, pinned by UUID, stopped past ${export_gpu_limit_mib} MiB"
+  echo "  AOT export GPU guard: least-used RTX with <=${release_idle_gpu_limit_mib} MiB used, waited ${release_idle_wait_seconds}s, pinned by UUID, stopped past ${export_gpu_limit_mib} MiB of foreign process use (export container excluded)"
   echo "  Spark AOT export guard: no serving worker and >=${spark_export_min_free_gib} GiB allocatable memory, same wait"
   cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry >/dev/null
   echo "  Spark cache plan (host HOME shown as template; states/admission rechecked on Spark, no SSH):"
@@ -461,21 +462,95 @@ release_select_idle_export_gpu() {
   release_die "no idle RTX (at most ${release_idle_gpu_limit_mib} MiB used) for the AOT export within ${release_idle_wait_seconds}s on $(hostname): ${last_report:-nvidia-smi unavailable}; stop the concurrent run or raise CUTEAFD_RELEASE_IDLE_WAIT_SECONDS"
 }
 
-# Stop the export when its device stops being idle. Backgrounded for the length
-# of the export; its stdout/stderr carry the reason the build failed.
+# Report foreign MiB and whether attribution was incomplete (0/1).
+# The optional proc root lets CPU-only tests exercise cgroup attribution.
+release_export_foreign_gpu_mib() {
+  local uuid="$1" container="$2" proc_root="${3:-/proc}"
+  local container_id top_pids="" top_known=0 apps pid used app_uuid cgroup owner
+  local own=0 foreign=0 unknown=0 own_unknown=0 foreign_unknown=0 total incomplete=0
+  if ! apps="$(nvidia-smi --query-compute-apps=pid,used_memory,gpu_uuid --format=csv,noheader,nounits -i "$uuid" 2>/dev/null)"; then
+    printf '0 1\n'
+    return 0
+  fi
+  container_id="$(docker inspect --format '{{.Id}}' "$container" 2>/dev/null || true)"
+  [[ "$container_id" =~ ^[a-f0-9]{64}$ ]] || container_id=""
+  if top_pids="$(docker top "$container" -eo pid 2>/dev/null)"; then
+    top_known=1
+    top_pids="$(awk '$1 ~ /^[0-9]+$/ {print $1}' <<<"$top_pids")"
+  fi
+  while IFS=',' read -r pid used app_uuid; do
+    pid="${pid//[[:space:]]/}"; used="${used//[[:space:]]/}"; app_uuid="${app_uuid//[[:space:]]/}"
+    [[ -n "$pid$used$app_uuid" ]] || continue
+    [[ "$app_uuid" == "$uuid" ]] || continue
+    owner=unknown
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      cgroup="$(cat "$proc_root/$pid/cgroup" 2>/dev/null || true)"
+      if [[ -n "$container_id" && -n "$cgroup" ]]; then
+        owner=foreign
+        [[ "$cgroup" != *"$container_id"* ]] || owner=own
+      elif ((top_known)); then
+        # An exited process may have disappeared from both proc and docker top.
+        # Only a positive top match can classify it without readable cgroups.
+        if [[ $'\n'"$top_pids"$'\n' == *$'\n'"$pid"$'\n'* ]]; then
+          owner=own
+        elif [[ -n "$cgroup" ]]; then
+          owner=foreign
+        fi
+      fi
+    fi
+    case "$owner" in
+      own)
+        if [[ "$used" =~ ^[0-9]+$ ]]; then own=$((own + used)); else own_unknown=1; fi ;;
+      foreign)
+        if [[ "$used" =~ ^[0-9]+$ ]]; then foreign=$((foreign + used)); else foreign_unknown=1; fi ;;
+      unknown) unknown=1 ;;
+    esac
+  done <<<"$apps"
+  # Some drivers omit per-process memory. Subtract our known usage only when
+  # every process is classified and all of the export's usage is known.
+  if ((foreign_unknown && !unknown && !own_unknown)); then
+    total="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$uuid" 2>/dev/null || true)"
+    total="${total//[[:space:]]/}"
+    if [[ "$total" =~ ^[0-9]+$ ]] && ((total >= own + foreign)); then
+      foreign=$((total - own))
+      foreign_unknown=0
+    fi
+  fi
+  if ((unknown || own_unknown || foreign_unknown)); then
+    incomplete=1
+  fi
+  printf '%s %s\n' "$foreign" "$incomplete"
+}
+
+release_export_watchdog_summary() {
+  printf 'AOT export GPU watchdog (%s): attribution incomplete %s times\n' \
+    "$1" "$2" >&"${release_export_summary_fd:-2}"
+}
+
+# Backgrounded for the export's lifetime; only foreign use can stop the build.
 release_watch_export_gpu() {
-  local uuid="$1" container="$2"
-  local used
+  local uuid="$1" container="$2" proc_root="${3:-/proc}"
+  local used incomplete incomplete_count=0 status=0
+  trap 'release_export_watchdog_summary "$uuid" "$incomplete_count"' EXIT
+  trap 'exit 0' TERM
   while sleep "$release_export_gpu_poll_seconds"; do
-    used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$uuid" 2>/dev/null || true)"
-    used="${used// /}"
-    [[ "$used" =~ ^[0-9]+$ ]] || continue
+    read -r used incomplete < <(release_export_foreign_gpu_mib "$uuid" "$container" "$proc_root")
+    if ((incomplete)); then
+      if ((incomplete_count == 0)); then
+        echo "WARNING: AOT export GPU memory attribution incomplete for $uuid; watchdog counts only known foreign use and will not stop $container for unattributed memory" >&2
+      fi
+      incomplete_count=$((incomplete_count + 1))
+    fi
     (( used <= export_gpu_limit_mib )) || {
-      echo "$(hostname): AOT export device $uuid now has ${used} MiB in use (limit ${export_gpu_limit_mib} MiB): a concurrent job took it; stopping $container" >&2
+      echo "$(hostname): AOT export device $uuid now has ${used} MiB of foreign process use (limit ${export_gpu_limit_mib} MiB, export container excluded): a concurrent job took it; stopping $container" >&2
       docker rm -f "$container" >/dev/null 2>&1 || true
-      return 1
+      status=1
+      break
     }
   done
+  release_export_watchdog_summary "$uuid" "$incomplete_count"
+  trap - EXIT TERM
+  return "$status"
 }
 
 release_stop_export_watchdog() {
@@ -1113,9 +1188,13 @@ CANCEL
 source "$repo_root/scripts/lib/build-supervision.sh"
 release_build_legs() {
   echo "== $release_leg_plan =="
+  # Preserve console stderr across the supervisor's per-leg log redirection.
+  local release_export_summary_fd
+  exec {release_export_summary_fd}>&2
   build_supervise 'release build' "$release_leg_log_dir" "$release_sequential" \
     coord build_coordinator_release release_cancel_coordinator_build coordinator.log \
     spark build_spark_release release_cancel_remote_build spark.log
+  exec {release_export_summary_fd}>&-
 }
 # release-build-supervision:end
 
