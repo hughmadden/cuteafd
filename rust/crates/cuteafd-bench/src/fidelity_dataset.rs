@@ -148,7 +148,9 @@ pub fn unavailable(model: &str) -> Option<String> {
 fn base_model(model: &str) -> Option<&'static str> {
     // Served IDs may retain the HF namespace or its cache-directory spelling.
     let name = model.rsplit('/').next()?.rsplit("--").next()?;
-    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4.1-Flash", "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
+    // Longer bases first: a DeepSeek-V4.1-Flash-1017 quant is not an original-V4.1 quant.
+    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4.1-Flash-1017", "DeepSeek-V4.1-Flash",
+        "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
         if name == base || name.strip_prefix(base).is_some_and(|suffix|
             suffix.starts_with('-') && !suffix.starts_with("-BF16") && !suffix.starts_with("-FP8")
                 && !(base == "GLM-5.3" && suffix.starts_with("-Flash")) && !suffix.to_ascii_lowercase().contains("speculator")
@@ -172,6 +174,9 @@ pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> 
         Some("DeepSeek-V4-Pro-0813") => return Some((V4PRO_REVISION, V4PRO_CONFIG)),
         Some("GLM-5.3") => return Some((GLM_REVISION, GLM_CONFIG)),
         Some("DeepSeek-V4.1-Flash") => return Some((REVISION, CONFIG)),
+        // Its own published reference, once pinned in PUBLICATIONS; never the original's.
+        Some("DeepSeek-V4.1-Flash-1017") => return crate::fidelity_match::official("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+            .map(|p| (p.revision, p.config)),
         _ => {},
     }
     match model {
@@ -445,6 +450,12 @@ mod tests {
         for quant in ["deepseek-ai/DeepSeek-V4.1-Flash", "nvidia/DeepSeek-V4.1-Flash-NVFP4",
             "nvidia--DeepSeek-V4.1-Flash-NVFP4", "wrldsuksgo2mars/DeepSeek-V4.1-Flash-EXL3-K3.25-v1"] {
             assert_eq!(default_publication(quant), Some((REVISION, CONFIG)), "{quant}");
+        }
+        // 1017 and 1017-named quants map to 1017's own publication, never the original's.
+        for quant in ["deepseek-ai/DeepSeek-V4.1-Flash-1017", "org/DeepSeek-V4.1-Flash-1017-EXL3"] {
+            assert_eq!(default_publication(quant), crate::fidelity_match::official("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+                .map(|p| (p.revision, p.config)), "{quant}");
+            assert_ne!(default_publication(quant), Some((REVISION, CONFIG)), "{quant}");
         }
         for other in ["deepseek-ai/DeepSeek-V4.1-Flashlight", "deepseek-ai/DeepSeek-V4.1",
             "other/DeepSeek-V4.1-Flash-speculator", "other/DeepSeek-V4.1-Flash-DFlash2"] {

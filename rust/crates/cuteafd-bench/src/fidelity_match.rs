@@ -34,6 +34,7 @@ pub const PUBLICATIONS: &[Publication] = &[
 /// (unpublished roots deliberately have no PUBLICATIONS row).
 /// An instruct root's pretraining ancestry is not a precision upgrade.
 pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
+    ("deepseek-ai/DeepSeek-V4.1-Flash-1017", &["deepseek-ai/DeepSeek-V4.1-Flash-1017"]),
     ("stepfun-ai/Step-5-Preview-BF16", &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"]),
     ("Qwen/Qwen3.5-9B", &["Qwen/Qwen3.5-9B"]),
     ("Qwen/Qwen3.8-27B", &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"]),
@@ -233,6 +234,30 @@ pub fn resolve(model: &str, snapshot: Option<&Path>) -> Result<Resolution> {
     resolve_in(model, snapshot, &hub())
 }
 
+/// `model` and every `base_model` ancestor its local model cards name, nearest
+/// first (the same offline upward walk the fidelity mapping uses; a missing or
+/// malformed card ends that branch). Depth-capped and cycle-free.
+pub fn lineage_in(model: &str, snapshot: Option<&Path>, hub: &Path) -> Vec<String> {
+    let mut seen = vec![model.to_owned()];
+    let mut frontier = vec![(model.to_owned(), served_snapshot(hub, model, snapshot), 0usize)];
+    while let Some((_, path, depth)) = frontier.pop() {
+        if depth >= 4 { continue; }
+        let Some(parents) = path.as_deref().and_then(|p| card(p).ok().flatten()).and_then(|c| c.base_model) else { continue };
+        for parent in match parents { Parents::One(p) => vec![p], Parents::Many(p) => p } {
+            if repo_parts(&parent).is_none() || seen.contains(&parent) { continue; }
+            seen.push(parent.clone());
+            let local = local_snapshot(hub, &parent);
+            frontier.push((parent, local, depth + 1));
+        }
+    }
+    seen
+}
+
+/// [`lineage_in`] against this host's hub cache.
+pub fn lineage(model: &str, snapshot: Option<&Path>) -> Vec<String> {
+    lineage_in(model, snapshot, &hub())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +303,37 @@ mod tests {
         }
         assert_eq!(official_root("Qwen/Qwen3.8-27B-FP8"), Some("Qwen/Qwen3.8-27B"));
         assert_eq!(official_root("Qwen/Qwen3.5-9B-FP8"), None);
+    }
+
+    #[test]
+    fn v41_1017_and_its_quants_never_score_against_the_original() {
+        let tmp = tempfile::tempdir().unwrap(); let hub = tmp.path();
+        let root = "deepseek-ai/DeepSeek-V4.1-Flash-1017";
+        assert_eq!(official_root(root), Some(root));
+        let quant = add(hub, "org/V41-1017-EXL3", "base_model: deepseek-ai/DeepSeek-V4.1-Flash-1017\nbase_model_relation: quantized");
+        assert_eq!(lineage_in("org/V41-1017-EXL3", Some(&quant), hub), ["org/V41-1017-EXL3", root]);
+        assert_eq!(lineage_in("deepseek-ai/DeepSeek-V4.1-Flash", None, hub), ["deepseek-ai/DeepSeek-V4.1-Flash"]);
+        for model in [root, "org/V41-1017-EXL3", "org/DeepSeek-V4.1-Flash-1017-NVFP4"] {
+            let path = local_snapshot(hub, model);
+            match (official(root), resolve_in(model, path.as_deref(), hub)) {
+                (Some(p), Ok(r)) => assert_eq!((r.reference_root.as_str(), r.config.as_str()), (root, p.config), "{model}"),
+                (None, result) => assert!(result.is_err(), "{model} must fail closed before 1017 is published"),
+                (Some(_), Err(e)) => panic!("{model}: {e}"),
+            }
+        }
+        let original = resolve_in("deepseek-ai/DeepSeek-V4.1-Flash", None, hub).unwrap();
+        assert_eq!((original.reference_root.as_str(), original.config.as_str()), ("deepseek-ai/DeepSeek-V4.1-Flash", dataset::CONFIG));
+    }
+
+    #[test]
+    fn lineage_follows_every_parent_without_cycles() {
+        let tmp = tempfile::tempdir().unwrap(); let hub = tmp.path();
+        add(hub, "a/merge", "base_model: [b/one, c/two]\nbase_model_relation: merge");
+        add(hub, "b/one", "base_model: d/root");
+        add(hub, "c/two", "base_model: a/merge");
+        let lineage = lineage_in("a/merge", None, hub);
+        for id in ["a/merge", "b/one", "c/two", "d/root"] { assert!(lineage.contains(&id.to_string()), "{id}"); }
+        assert_eq!(lineage.len(), 4);
     }
 
     #[test]
