@@ -3,9 +3,8 @@
 //! residency into a [`PlacementRequest`]. `plan --layout` and serve-dsv4
 //! both call [`request`]; they differ only in [`V4Inputs::baseline`].
 //!
-//! Folds V4's former `family_costs`/`layout.rs` branches (P13): the reserve
-//! envelope, the 262K legacy expert reserve and the per-device pool sizing
-//! now live here, once.
+//! V4's reserve envelope, the 262K legacy expert reserve and the per-device
+//! pool sizing live here, once.
 use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::placement::*;
 use crate::placement::inventory::GraphSet;

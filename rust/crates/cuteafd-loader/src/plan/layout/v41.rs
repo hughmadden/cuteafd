@@ -159,7 +159,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     working.spark_layers = (placement.onboard_layers..40).collect();
     if working.spark_layers.is_empty() { sparks.clear(); }
     update_sparks(catalog, &working, &mut sparks)?;
-    charge_spark_devices(report, model, checkpoint, options, SPARK, &working, 2, &mut sparks, &mut notes,
+    charge_spark_devices(report, model, checkpoint, options, SPARK, &working,
+        spark_endpoints("deepseek_v41", working.prefill_lanes), &mut sparks, &mut notes,
         |d| format!("Spark rank {} I/O admission", d.index));
     for spark in &mut sparks {
         for item in &mut spark.items {
