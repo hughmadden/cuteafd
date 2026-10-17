@@ -251,6 +251,24 @@ impl<'a> Fp8Layer<'a> {
     }
 }
 
+/// Code-only owners; no weights, scratch, streams or graph storage.
+pub(crate) struct Fp8Modules {
+    directory: PathBuf,
+    bf16_directory: Option<PathBuf>,
+    module: Fp8MoeModule,
+    bf16: Option<Fp8MoeModule>,
+}
+impl Fp8Modules {
+    pub(crate) fn load(directory: &Path, bf16_directory: Option<&Path>) -> Result<Self> {
+        // SAFETY: selected trusted AOT packages for the current owner device.
+        let module = unsafe { load_module(directory) }?;
+        // SAFETY: the sibling has the same trusted-package/current-device contract.
+        let bf16 = bf16_directory.map(|path| unsafe { load_module(path) }).transpose()?;
+        Ok(Self { directory: directory.into(), bf16_directory: bf16_directory.map(Path::to_owned),
+            module, bf16 })
+    }
+}
+
 /// Resident FP8 layers of one TP slice and the package that runs them.
 pub(crate) struct Fp8Experts<'a> {
     // Drop order: the module goes last; callers drain their streams first.
@@ -280,9 +298,16 @@ impl<'a> Fp8Experts<'a> {
     pub fn load_with_bf16(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         bf16_directory: Option<&Path>, layers: &[usize], tp: usize, rank: usize, capacity: usize,
         budget: usize) -> Result<Self> {
+        Self::load_with_modules(library, tensors, directory, bf16_directory, layers, tp, rank,
+            capacity, budget, None)
+    }
+
+    pub(crate) fn load_with_modules(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors,
+        directory: &Path, bf16_directory: Option<&Path>, layers: &[usize], tp: usize, rank: usize,
+        capacity: usize, budget: usize, modules: Option<Fp8Modules>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        let mut experts = Self::prepare(library, tensors, directory, bf16_directory, layers, tp,
-            rank, capacity, budget)?;
+        let mut experts = Self::prepare_with_modules(library, tensors, directory, bf16_directory,
+            layers, tp, rank, capacity, budget, modules)?;
         let slicing = if directory.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("-w")) {
             Slicing::Blocks(128)
         } else { Slicing::Padded };
@@ -299,6 +324,13 @@ impl<'a> Fp8Experts<'a> {
     fn prepare(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         bf16_directory: Option<&Path>, layers: &[usize], tp: usize, rank: usize, capacity: usize,
         budget: usize) -> Result<Self> {
+        Self::prepare_with_modules(library, tensors, directory, bf16_directory, layers, tp, rank,
+            capacity, budget, None)
+    }
+
+    fn prepare_with_modules(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
+        bf16_directory: Option<&Path>, layers: &[usize], tp: usize, rank: usize, capacity: usize,
+        budget: usize, modules: Option<Fp8Modules>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         validate_layer_ids(layers)?;
         // `tp<n>-w<width>` layouts store each rank's own whole 128-row blocks (see `exact_layout`).
@@ -309,11 +341,13 @@ impl<'a> Fp8Experts<'a> {
         for &layer in layers {
             tensors.validate_layer(layer)?;
         }
-        // SAFETY: a trusted package for the current device; the owner drains
-        // its streams before dropping.
-        let module = unsafe { load_module(directory) }
-            .with_context(|| format!("FP8 expert package {} (build it with package_fp8_moe_aot.py)",
-                directory.display()))?;
+        let modules = match modules {
+            Some(modules) => modules,
+            None => Fp8Modules::load(directory, bf16_directory)?,
+        };
+        ensure!(modules.directory == directory && modules.bf16_directory.as_deref() == bf16_directory,
+            "FP8 warmed package path mismatch");
+        let Fp8Modules { module, bf16, .. } = modules;
         let info = module.info().clone();
         let shape = tensors.shape();
         let weights = match tensors.format() {
@@ -330,11 +364,7 @@ impl<'a> Fp8Experts<'a> {
         let top = info.capacity_for(capacity)
             .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;
         let primary_scratch = module.scratch_bytes(top)?;
-        let bf16_module = bf16_directory.map(|directory| {
-            // SAFETY: a trusted package for the current device; the owner
-            // drains its streams before dropping either module.
-            let bf16 = unsafe { load_module(directory) }
-                .with_context(|| format!("BF16-input FP8 expert package {}", directory.display()))?;
+        let bf16_module = bf16.map(|bf16| {
             let top = validate_bf16_package(&info, bf16.info(), capacity)
                 .with_context(|| format!("incompatible BF16-input FP8 expert package {}", directory.display()))?;
             let scratch = bf16.scratch_bytes(top)?;

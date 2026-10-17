@@ -371,7 +371,7 @@ mod tests {
             io: SparkIoBytes { intake: 100, host_exchange: 200, row_indices: 400, mapped_rings: 800 } };
         let report = ModelAdmissionResponse { rank: 2, resident_bytes: assignment.resident_bytes,
             slices: assignment.slices.clone(), mapped_ring_bytes: 800, host_exchange_bytes: 200,
-            row_indices_bytes: 400, runtime: SparkRuntimeInventory {
+            row_indices_bytes: 400, runtime: SparkRuntimeInventory { detail: Default::default(),
                 sample: RuntimeSample { device: 0, total_bytes: 121 << 30, free_bytes: 100 << 30,
                     context_bytes: 1 << 30, module_bytes: 1 << 20, sms: 48,
                     arch: "sm_121".into(), driver: "test".into() },

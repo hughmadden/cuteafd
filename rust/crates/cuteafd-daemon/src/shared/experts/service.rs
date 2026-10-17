@@ -1,6 +1,8 @@
 //! Native GPU resources and inference QPs share one owning thread.
 mod local;
 mod backend;
+mod census;
+mod modules;
 
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
@@ -118,6 +120,7 @@ fn load_weights<'a>(
     library: &'a NativeLibrary,
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
+    modules: &mut modules::WarmModules<'a>,
 ) -> Result<(backend::Weights<'a>, usize)> {
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let first = catalog.routed_experts().first_layer;
@@ -125,7 +128,7 @@ fn load_weights<'a>(
         "coordinator selected experts before this checkpoint's routed boundary {first}");
     validate_topology(config, catalog)?;
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
-    if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config); }
+    if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config, modules.take_fp8()?); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);
     // NVFP4 backbone experts load through the format-aware ExpertWeights path.
     let nvfp4 = catalog.nvfp4().is_some();
@@ -347,12 +350,11 @@ fn worker_ring_budget(config: &NativeExpertServiceConfig, geometry: cuteafd_core
     Ok(cuteafd_transport::RingBudget::new(limit))
 }
 
-/// Optional explicit reserve for allocation granularity, the CUDA context and
-/// library state that the source cannot see. It defaults to zero: no arbitrary
-/// headroom is invented, and a real reserve is supplied from an actual
-/// measurement. `CUTEAFD_SPARK_RUNTIME_HEADROOM_BYTES` sets it.
+/// Shared ready-resident residual estimate from the seven-rank Spark census.
+/// It is separate from known context/modules and applies to every family.
 fn spark_runtime_headroom() -> Result<usize> {
-    env_usize("CUTEAFD_SPARK_RUNTIME_HEADROOM_BYTES", 0)
+    env_usize("CUTEAFD_SPARK_RUNTIME_HEADROOM_BYTES",
+        usize::try_from(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES)?)
 }
 
 fn spark_admission_budget(
@@ -698,8 +700,8 @@ mod tests {
         let _ = ExpertLayer::BackboneExl3Tp { layer: 0, rank: 0, world: 3 }.expert(0);
     }
 
-    /// The explicit-topology admission is exactly the source-known transient sum,
-    /// with no invented headroom when the override is unset.
+    /// Both phase peaks include the shared measured-residual estimate, alongside
+    /// their own disjoint source-known transient and retained owners.
     #[test]
     fn explicit_admission_counts_every_known_transient_exactly() {
         let topology = SparkTopology::new(2, 2).unwrap();
@@ -865,6 +867,52 @@ mod tests {
                             assert_eq!(actual, 3_239_837_696);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// CPU geometry/reservation coverage, not a substitute for measured live
+    /// registered-memory peaks on each min/max deployment.
+    #[test]
+    fn selected_endpoint_planner_runtime_and_peak_agree_across_family_layouts() {
+        use cuteafd_core::{ExpertGeometry as G, SparkEndpoint, SparkIngress};
+        use cuteafd_loader::placement::SparkWorkingSet;
+        for geometry in [G::DEEPSEEK_V41, G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO,
+            G::GLM5, G::GLM5_FLASH, G::QWEN4, G::MIMO_V2_FLASH, G::MIMO_V26_PRO] {
+            for world in [3, 4, 6] {
+                for rtx in [1, 2] {
+                    let mut config = config(world, 0, None);
+                    config.capacity = 4096;
+                    let mut endpoints = vec![SparkEndpoint { capacity: 4096,
+                        ingress: SparkIngress::Bf16Decode { rows: 80 } }];
+                    endpoints.extend(std::iter::repeat_n(SparkEndpoint { capacity: 80,
+                        ingress: SparkIngress::Fp8K32 }, rtx));
+                    endpoints.push(SparkEndpoint { capacity: 1024, ingress: SparkIngress::Fp8K32 });
+                    config.model_admission.as_mut().unwrap().endpoints = endpoints.clone();
+                    config.model_admission.as_mut().unwrap().capacity = 4096;
+                    config.model_admission.as_mut().unwrap().compiled_capacity = 4096;
+                    let model = config.model_admission.as_ref().unwrap();
+                    model.validate(geometry).unwrap();
+                    let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: world,
+                        prefill_lanes: 1, ..Default::default() };
+                    let planned = working.rank_endpoints_io(0, geometry, &endpoints, model.rings).unwrap();
+                    let budget = worker_ring_budget(&config, geometry).unwrap();
+                    let mut reservations = Vec::new();
+                    for endpoint in endpoints {
+                        let (request, response) = endpoint.wire_bytes(geometry).unwrap();
+                        let actual = cuteafd_transport::verbs_host_persistent_ring_bytes(
+                            model.rings.max_frame_bytes, request, response, model.rings.slot_bytes,
+                            model.rings.alignment, model.rings.depth).unwrap();
+                        reservations.push(budget.reserve(actual).unwrap());
+                    }
+                    assert_eq!(budget.limit() as u64, planned.mapped_rings);
+                    assert_eq!(budget.used(), budget.limit());
+                    assert_eq!(budget.peak(), budget.limit());
+                    assert!(budget.reserve(1).is_err());
+                    drop(reservations);
+                    assert_eq!(budget.used(), 0);
+                    assert_eq!(budget.peak() as u64, planned.mapped_rings);
                 }
             }
         }

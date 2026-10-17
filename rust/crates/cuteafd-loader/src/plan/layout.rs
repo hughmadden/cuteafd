@@ -305,8 +305,10 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
         .and_then(|bytes| bytes.checked_add(legacy.row_indices))
         .ok_or(crate::placement::PlacementError::Overflow("Spark legacy I/O"))?;
     device.items.retain(|item| !matches!(item.group.as_str(), "expert waves" | "expert intake"
-        | "host expert exchange" | "expert row indices" | "rdma rings"));
+        | "host expert exchange" | "expert row indices" | "rdma rings")
+        && item.group != cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP);
     if working.selected_ranks().contains(&rank) {
+        device.items.push(cuteafd_core::memory_layout::spark_runtime_residual());
         device.items.push(Item::new(Category::Workspace, "expert waves", "non-I/O residual",
             wave_allowance.saturating_sub(legacy_io), Basis::Calibrated));
         device.items.push(Item::new(Category::Workspace, "expert intake", if bf16 { "BF16" } else { "FP8 K32" },
@@ -341,6 +343,12 @@ mod selected_spark_io_tests {
                 capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
             charge_spark_io(&mut device, &working, geometry, 4096, false, rings, GIB).unwrap();
             assert_eq!(device.items.iter().find(|item| item.group == "rdma rings").unwrap().bytes, expected);
+            let residual = device.items.iter().find(|item|
+                item.group == cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP).unwrap();
+            assert_eq!(residual.bytes, 5 * (1 << 29));
+            assert_eq!(residual.basis, Basis::Estimated);
+            assert_eq!(residual.lifetime, cuteafd_core::memory_layout::ItemLifetime::ReadyResident);
+            assert!(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_SOURCE.contains("0a6fc7b1"));
         }
     }
 

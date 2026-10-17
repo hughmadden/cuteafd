@@ -50,10 +50,68 @@ pub struct RuntimeSample {
     pub driver: String,
 }
 
+/// A retained allocation delta from the process ledger. Aliases are not owners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkAllocationTerm {
+    pub space: String,
+    pub scope: String,
+    pub tensor: Option<String>,
+    pub format: Option<String>,
+    pub bytes: u64,
+    pub allocations: u64,
+    pub method: String,
+}
+
+#[path = "spark_census.rs"]
+mod spark_census;
+pub use spark_census::{spark_census_deltas, CensusDeviceKind, CensusDeviceWitness, SparkCensusDeltas, SparkCensusError};
+
+/// Same-process evidence: integrated CUDA uses system/cgroup phase deltas;
+/// process maps attribute host-only memory, never driver-owned CUDA UMA.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkProcessSample {
+    pub phase: String,
+    pub pid: u32,
+    pub monotonic_ns: u64,
+    pub rss_bytes: u64,
+    pub pss_bytes: u64,
+    pub private_bytes: u64,
+    pub tracked_device_bytes: u64,
+    pub tracked_pinned_bytes: u64,
+    pub raw_cuda_free_bytes: Option<u64>,
+    pub device_kind: Option<CensusDeviceKind>,
+    pub device_witness: Option<CensusDeviceWitness>,
+    pub cuda_mapping_pss_bytes: u64,
+    pub anonymous_pss_bytes: u64,
+    pub file_pss_bytes: u64,
+    pub system_available_bytes: u64,
+    pub system_total_bytes: u64,
+    pub system_headroom_bytes: u64,
+    pub allocatable_bytes: Option<u64>,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparkRuntimeDetail {
+    /// Checkpoint-derived, layer-sequential load-only owners, absent for backends
+    /// without a qualified load plan. Never added to the serving workspace.
+    pub load_transient: Vec<SparkAllocationTerm>,
+    pub allocations: Vec<SparkAllocationTerm>,
+    pub process_samples: Vec<SparkProcessSample>,
+    /// PostLoad's GB10 free-memory residual includes unrelated system/cache
+    /// state and must not become an offline context/modules calibration.
+    pub runtime_sample_method: String,
+    pub context_modules_qualified: bool,
+}
+
 /// Measurements made by the Spark owner, not coordinator-architecture estimates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SparkRuntimeInventory {
+    pub detail: SparkRuntimeDetail,
     pub sample: RuntimeSample,
     /// All retained native/AOT device workspace, including worker intake.
     pub workspace_bytes: u64,

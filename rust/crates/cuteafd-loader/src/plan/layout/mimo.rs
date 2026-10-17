@@ -38,7 +38,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }).collect::<Vec<_>>();
     let mut sparks = (0..spark_ranks).map(|rank| DeviceLayout { kind: DeviceKind::Spark,
         index: rank as u32, capacity_bytes: options.spark_bytes, kv_tokens: 0,
-        items: vec![Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] }).collect::<Vec<_>>();
+        items: vec![cuteafd_core::memory_layout::spark_runtime_residual(),
+            Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] }).collect::<Vec<_>>();
     // Media sees fixed target/pool demands and mandatory experts, not the
     // optional Auto prefix. Spark-free admission must reserve every expert.
     if report.encoder.is_none() {

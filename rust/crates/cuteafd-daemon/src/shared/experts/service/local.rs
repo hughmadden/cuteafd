@@ -125,7 +125,7 @@ fn retained_workspace(before_device: usize, after_device: usize, resident: u64,
 }
 
 fn measured_worker_runtime(library: &NativeLibrary,
-    baseline: &cuteafd_ffi::memory_ledger::Snapshot, resident: u64)
+    baseline: &cuteafd_ffi::memory_ledger::Snapshot, resident: u64, census: &super::census::Census)
     -> Result<cuteafd_core::SparkRuntimeInventory> {
     use cuteafd_ffi::memory_ledger::{self, Space};
     let device = library.cuda_get_device()?;
@@ -135,7 +135,7 @@ fn measured_worker_runtime(library: &NativeLibrary,
     let (workspace_bytes, pinned_workspace_bytes) = retained_workspace(
         baseline.total(Space::Device, device), retained.total(Space::Device, device), resident,
         baseline.total(Space::Pinned, -1), retained.total(Space::Pinned, -1))?;
-    Ok(cuteafd_core::SparkRuntimeInventory { sample: inventory.gpus.into_iter().next()
+    Ok(cuteafd_core::SparkRuntimeInventory { detail: census.detail(baseline, &retained, device)?, sample: inventory.gpus.into_iter().next()
         .context("worker runtime sample missing")?, workspace_bytes, pinned_workspace_bytes })
 }
 
@@ -173,11 +173,22 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;
+    let mut census = super::census::Census::new();
+    census.sample("before_native_library", None)?;
+    // SAFETY: this owner outlives media, weights, retained modules and executions.
+    let library = unsafe { NativeLibrary::load(&config.library) }?;
+    census.identify_device(&library)?;
+    census.sample("before_context", None)?;
+    if census.enabled() {
+        library.cuda_device_synchronize()?;
+        census.sample("after_context_before_media", Some(&library))?;
+    }
     // The vision owner loads in this process/device's primary CUDA context,
     // never beside expertd in a second process. Charge it before expert admission.
     let (_encoder, _audio_encoder, reserved) = crate::shared::vision::worker::start_encoders(
         config.encoder.as_ref(), config.audio_encoder.as_ref(), &config.snapshot,
         config.library.clone(), config.device_budget as u64)?;
+    census.sample("after_media_owners_before_expert_bootstrap", None)?;
     config.device_budget = config.device_budget.checked_sub(usize::try_from(reserved)?)
         .context("media reservation exceeds Spark budget")?;
     // Media may be admitted first, but expert allocation waits for the one
@@ -218,12 +229,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         if selection.ranges().is_empty() {
             let installed = (|| -> Result<_> {
                 let report = {
-                    // SAFETY: the library remains loaded until sampling completes; replay retains only data.
-                    let library = unsafe { NativeLibrary::load(&config.library) }?;
                     library.release_sync_h2d_staging()?;
                     let baseline = cuteafd_ffi::memory_ledger::snapshot();
                     Some(cuteafd_core::ModelAdmissionResponse { rank: u32::try_from(config.rank)?,
-                        resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0)?,
+                        resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0, &census)?,
                         mapped_ring_bytes: 0, host_exchange_bytes: 0, row_indices_bytes: 0 })
                 };
                 cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, report)
@@ -246,15 +255,22 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let ring_budget = worker_ring_budget(&config, geometry)?;
     tracing::info!(rdma_endpoints = config.rdma_endpoints, bf16_ingress = config.bf16_ingress,
         ring_budget_bytes = ring_budget.limit(), "Spark ring admission policy");
-    // SAFETY: this owner keeps the library loaded through weights/execution Drop.
-    let library = unsafe { NativeLibrary::load(&config.library) }?;
     // Remove upload transients left by media before taking the retained baseline.
     library.release_sync_h2d_staging()?;
     // Existing media owners belong to the baseline, not expert residency/workspace.
     let baseline = cuteafd_ffi::memory_ledger::snapshot();
+    census.sample("before_expert_modules", Some(&library))?;
+    let mut modules = match super::modules::WarmModules::load(&library, &catalog, &config) {
+        Ok(modules) => modules,
+        Err(error) => {
+            let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
+            return Err(error);
+        }
+    };
+    census.sample("after_expert_modules_before_weights", Some(&library))?;
     let loaded = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        load_weights(&library, &catalog, &config)
+        load_weights(&library, &catalog, &config, &mut modules)
     };
     let (weights, remaining) = match loaded {
         Ok(loaded) => loaded,
@@ -266,11 +282,13 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // The loaders' synchronous uploads grew the library's pinned staging buffer
     // to the largest projection (hundreds of MB of unified memory on GB10);
     // requests stage far smaller rows, so drop it and let them regrow it.
+    census.sample("after_expert_load_includes_weights_and_loader_code", Some(&library))?;
     let released = library.release_sync_h2d_staging()?;
     tracing::info!(released_bytes = released, "released load-time pinned upload staging");
+    census.sample("before_retained_arenas", Some(&library))?;
     let allocated = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
-        weights.execution(&library, &config, remaining)
+        weights.execution(&library, &config, remaining, &mut modules)
     };
     let mut execution = match allocated {
         Ok(execution) => execution,
@@ -279,6 +297,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             return Err(error);
         }
     };
+    census.sample("after_retained_arenas", Some(&library))?;
     let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];
     // Transport benchmarks only: answer each request with its response slot
@@ -298,6 +317,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         None,
         Some((ring_budget_log.used(), ring_budget_log.peak())),
     );
+    census.sample("serve_owners_before_endpoint_rings", Some(&library))?;
     let worker_selection = {
         if weights.layer_ids()? != selection.layers() {
             let error = anyhow::anyhow!("loaded worker layers do not match the solved selection");
@@ -309,7 +329,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 let model = selection.model().context("worker selection requires typed model admission")?;
                 weights.validate_ingress(&library, model)?;
                 let (resident_bytes, slices) = weights.loaded_residency(&library, config.compiled_capacity()?)?;
-                let runtime = measured_worker_runtime(&library, &baseline, resident_bytes)?;
+                let mut runtime = measured_worker_runtime(&library, &baseline, resident_bytes, &census)?;
+                runtime.detail.load_transient = weights.load_inventory();
+                tracing::info!(target: "cuteafd::spark_memory", rank = config.rank,
+                    record = %serde_json::to_string(&runtime)?, "Spark retained runtime inventory");
                 let host_exchange_bytes = exchange.ids.capacity().checked_mul(std::mem::size_of::<i32>())
                     .and_then(|bytes| bytes.checked_add(exchange.routing.capacity().checked_mul(std::mem::size_of::<f32>())?))
                     .and_then(|bytes| bytes.checked_add(exchange.partials.capacity()))

@@ -17,6 +17,10 @@ use cuteafd_core::memory_layout::{Basis, Category};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[path = "spark_inventory.rs"]
+mod spark_inventory;
+pub use spark_inventory::{v41_spark_inventory, QualifiedSparkRuntime, SparkExecutionInventory, SparkInventoryError, SparkLoadInventory, SparkManifestProvenance, SparkMemoryDomains, SparkRankInventory, SparkRuntimeMethod, SparkRuntimeProvenance, SparkRuntimeTerm};
+
 const MIB: u64 = 1 << 20;
 
 /// A coordinator GPU class the planner can lay out without a device.
