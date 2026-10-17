@@ -58,6 +58,10 @@ pub struct HostSample {
     /// The host's own name (kernel hostname), for display; fabric keys stay addresses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// This host's latest GPU readings (`thermal::current()["gpus"]`), attached
+    /// only to a worker's reply to the coordinator. Absent from older workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<serde_json::Value>,
     /// Seconds on this host's monotonic clock, never compared across hosts.
     pub sampled_s: f64,
     /// Start of the continuous demand-driven observation window, host-local.
@@ -186,7 +190,27 @@ pub fn snapshot() -> Snapshot {
 }
 pub fn local() -> HostSample {
     renew();
-    snapshot().hosts.remove("coordinator").unwrap_or_default()
+    let mut sample = snapshot().hosts.remove("coordinator").unwrap_or_default();
+    // Only on a peer's request (the coordinator's lease), never on a serving path.
+    sample.gpus = cuteafd_core::thermal::current().get("gpus").cloned().filter(|g| g.as_array().is_some_and(|g| !g.is_empty()));
+    sample
+}
+
+/// The Spark workers' GPU rows from the cached observation, named by host:
+/// `[{host, temperature_c, power_w, sm_clock_mhz, throttling, sampled_s}]`.
+/// Reads the cache only; the fabric lease (a console or `/v1/fabric` reader) keeps it fresh.
+pub fn peer_gpus(subscribe: bool) -> Vec<serde_json::Value> {
+    let snapshot = if subscribe { subscribed_snapshot() } else { snapshot() };
+    let mut rows: Vec<serde_json::Value> = snapshot.hosts.iter().filter(|(key, _)| key.as_str() != "coordinator")
+        .flat_map(|(key, host)| {
+            let name = host.hostname.clone().unwrap_or_else(|| key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h).to_string());
+            host.gpus.as_ref().and_then(|g| g.as_array()).into_iter().flatten().map(move |gpu| serde_json::json!({
+                "host": name, "temperature_c": gpu["temperature_c"], "power_w": gpu["power_w"],
+                "sm_clock_mhz": gpu["sm_clock_mhz"], "throttling": gpu["throttling"], "sampled_s": gpu["sampled_s"],
+            }))
+        }).collect();
+    rows.sort_by(|a, b| a["host"].as_str().cmp(&b["host"].as_str()));
+    rows
 }
 
 /// Read every port and every numeric counter; unsupported files simply disappear.
@@ -434,6 +458,17 @@ fn start() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_worker_samples_without_hostname_or_gpus_still_parse() {
+        let old = r#"{"incarnation":"1-2","sampled_s":3.5,"ports":[],"engine":[]}"#;
+        let sample: HostSample = serde_json::from_str(old).unwrap();
+        assert!(sample.hostname.is_none() && sample.gpus.is_none());
+        // And a new sample round-trips its optional fields.
+        let new = HostSample { hostname: Some("ostrich".into()), gpus: Some(serde_json::json!([{"temperature_c": 51}])), ..sample };
+        let back: HostSample = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back.hostname.as_deref(), Some("ostrich"));
+        assert_eq!(back.gpus.unwrap()[0]["temperature_c"], 51);
+    }
     #[test]
     fn sysfs_words_missing_and_bad_counters() {
         let root = std::env::temp_dir().join(format!("traffic-test-{}", std::process::id()));

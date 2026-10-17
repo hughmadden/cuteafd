@@ -17,6 +17,17 @@
 #lanes .panel-head .legend { flex: 0 1 auto; }
 .lane-keys { flex: 1 1 auto; text-align: center; white-space: nowrap; }
 #lanes .ctl { margin-left: 0; }
+/* GPU table */
+.gpu-table { width: 100%; border-collapse: collapse; font: 12px var(--mono); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.gpu-table th { color: var(--muted); font-weight: 500; text-align: right; padding: 2px 6px; border-bottom: 1px solid var(--line); }
+.gpu-table td { text-align: right; padding: 3px 6px; color: var(--ink-2); white-space: nowrap; }
+.gpu-table th:first-child, .gpu-table td:first-child { text-align: left; padding-left: 0; }
+.gpu-table td:first-child { color: var(--ink); }
+.gpu-table small { color: var(--muted); }
+.gpu-table td.warn { color: var(--warn); font-weight: 600; }
+.gpu-table td.bad { color: var(--bad); font-weight: 600; }
+.gpu-total { color: var(--warn); font-weight: 600; }
+#gpu-title[title]:not([title=""]) { cursor: help; }
 /* status pill + fabric chip stay together when the header wraps */
 .pills { display: inline-flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
 /* fabric chip */
@@ -80,8 +91,8 @@
       <div class="row"><span class="num">snapshots <b id="h-snaps">–</b> · hits <b id="h-hits">–</b> / <span id="h-look">–</span></span><span class="num"><span id="h-p50-label">restore p50</span> <b id="h-p50">–</b></span></div>
     </div>
     <div class="meter" id="gpu-meter" hidden>
-      <div class="row"><span class="label">GPUs · temperature, power, clock</span><span class="num" id="gpu-gov"></span></div>
-      <div id="gpu-rows"></div>
+      <div class="row"><span class="label" id="gpu-title">GPUs</span><span class="num gpu-total" id="gpu-total"></span></div>
+      <table class="gpu-table"><thead><tr><th>GPU</th><th>temp</th><th>power</th><th>clock</th><th>cap</th></tr></thead><tbody id="gpu-rows"></tbody></table>
     </div>
   </section>
 
@@ -337,6 +348,37 @@ function rate(key, windowMs) {
   let i = h.length - 2; while (i > 0 && h[i].t > last.t - windowMs) i--;
   const first = h[i]; const dt = (last.t - first.t) / 1000;
   return dt > 0.2 ? (last[key] - first[key]) / dt : NaN;
+}
+
+// ---------------------------------------------------------------- GPU table
+// One row per serving device: the coordinator's RTX cards, then each Spark by
+// host. RTX cap is the live power limit (yellow at the power cap); a thermally
+// throttled card not at its cap shows its temperature in red. GB10 has no power
+// limit, so a Spark's cap cell is its temperature, red when thermally throttled.
+const THERMAL = ['hw_thermal', 'sw_thermal', 'hw_slowdown'];
+function renderGpus(th) {
+  const rtx = th?.gpus || [], sparks = th?.sparks || [];
+  $('#gpu-meter').hidden = !rtx.length && !sparks.length;
+  if ($('#gpu-meter').hidden) return;
+  const f = (v, unit) => v == null ? '–' : `${Math.round(v)}${unit}`;
+  const hot = (x) => (x.throttling || []).some((r) => THERMAL.includes(r));
+  const capped = (x) => (x.throttling || []).includes('sw_power_cap');
+  const why = (x) => esc((x.throttling || []).join(', ') || 'not throttled');
+  const rows = rtx.map((x) => {
+    const cap = capped(x) ? `<td class="warn" title="${why(x)}">${f(x.power_limit_w, ' W')}</td>`
+      : hot(x) ? `<td class="bad" title="${why(x)}">${f(x.temperature_c, ' °C')}</td>`
+      : `<td title="${why(x)}">${f(x.power_limit_w, ' W')}</td>`;
+    return `<tr><td>${esc((x.name || 'GPU').replace(/^NVIDIA /, '').replace(/ Blackwell.*| Workstation.*/, ''))} <small>gpu${x.index}</small></td>`
+      + `<td>${f(x.temperature_c, ' °C')}</td><td>${f(x.power_w, ' W')}</td><td>${f(x.sm_clock_mhz, ' MHz')}</td>${cap}</tr>`;
+  }).concat(sparks.map((x) => `<tr><td>${esc(x.host)} <small>GB10</small></td><td>${f(x.temperature_c, ' °C')}</td>`
+    + `<td>${f(x.power_w, ' W')}</td><td>${f(x.sm_clock_mhz, ' MHz')}</td>`
+    + `<td class="${hot(x) ? 'bad' : ''}" title="${why(x)}">${f(x.temperature_c, ' °C')}</td></tr>`));
+  $('#gpu-rows').innerHTML = rows.join('');
+  const total = [...rtx, ...sparks].reduce((sum, x) => sum + (Number.isFinite(x.power_w) ? x.power_w : 0), 0);
+  $('#gpu-total').textContent = total ? `${Math.round(total)} W total` : '';
+  const reason = th?.governor?.reason;
+  $('#gpu-title').textContent = reason ? 'GPUs ⓘ' : 'GPUs';
+  $('#gpu-title').title = reason ? `Power governor: ${reason}` : '';
 }
 
 // ---------------------------------------------------------------- feed
@@ -620,15 +662,7 @@ function renderMeters() {
     $('#kv-a').style.width = (100 * active / kv.pages) + '%'; $('#kv-r').style.width = (100 * ret / kv.pages) + '%';
     $('#kv-tok').textContent = compact(used * kv.tokens_per_page); $('#kv-cap').textContent = compact(kv.pages * kv.tokens_per_page);
   }
-  const th = g.thermal;
-  $('#gpu-meter').hidden = !th?.gpus?.length;
-  if (th?.gpus?.length) {
-    const f = (v, unit) => v == null ? '–' : `${Math.round(v)}${unit}`;
-    $('#gpu-rows').innerHTML = th.gpus.map((x) => `<div class="row"><span class="num">gpu${x.index} <b>${f(x.temperature_c, ' °C')}</b>`
-      + ` · headroom ${f(x.tlimit_margin_c, ' °C')} · ${f(x.power_w, '')}/${f(x.power_limit_w, ' W')} · ${f(x.sm_clock_mhz, ' MHz')}</span>`
-      + `<span class="num">${esc((x.throttling || []).join(' ') || 'no throttle')}</span></div>`).join('');
-    $('#gpu-gov').textContent = th.governor ? `governor ${esc(String(th.governor.reason ?? ''))}` : '';
-  }
+  renderGpus(g.thermal);
   const h = g.host;
   if (h) {
     $('#h-used').textContent = bytes(h.bytes_used); $('#h-total').textContent = bytes(h.quota_bytes);
