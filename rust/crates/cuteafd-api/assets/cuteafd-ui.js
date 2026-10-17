@@ -325,5 +325,44 @@ function heat(el, cells, opts = {}) {
   svg.innerHTML = out; marks(svg, cells, (c) => `${c.day} ${String(c.hour).padStart(2, '0')}:00\n${fmt.n0(c.value)} ${opts.unit || 'requests'}`, (c) => opts.onClick?.(c));
 }
 
-window.CuteUI = { token, color, fmt, header, facts, build, area, histogram, ribbons, strip, heat, svg: { sparkline, columns, timeline, meter, area, histogram, ribbons, strip, heat } };
+// ---------------------------------------------------------------- admin access
+// The console unlock cookie gates admin views. `/console/status` (public) says
+// whether this browser holds it and how the operator prints the link.
+let consoleStatus = null;
+function access() {
+  consoleStatus ||= fetch('/console/status', { credentials: 'same-origin', cache: 'no-store' })
+    .then((r) => r.ok ? r.json() : { unlocked: false, link_command: null })
+    .catch(() => ({ unlocked: false, link_command: null }));
+  return consoleStatus;
+}
+// The "how to get the link" block as HTML: the one-liner, a copy button, never the secret.
+function linkHelp(command) {
+  const cmd = command
+    ? `<div class="admin-cmd"><code>${fmt.esc(command)}</code><button type="button" class="btn admin-copy">COPY</button></div>`
+    : '<div class="admin-cmd"><code>echo "http://HOST:PORT/console/unlock?token=$(cat ~/.cache/cuteafd/console/secret)"</code></div>';
+  return `<p>Run this on the host that launched the server, then open the URL it prints in this browser (one visit; the browser stays unlocked for a year):</p>${cmd}`;
+}
+function wireCopy(root, command) {
+  const button = root.querySelector('.admin-copy');
+  if (button) button.onclick = async () => {
+    try { await navigator.clipboard.writeText(command); button.textContent = 'COPIED'; }
+    catch (_) { button.textContent = 'SELECT + COPY'; }
+    setTimeout(() => { button.textContent = 'COPY'; }, 1600);
+  };
+}
+// An admin-only page: when locked, replace everything after the header with one
+// block saying what the page is and how to unlock it. Resolves to `unlocked`.
+async function adminGate(app, title, what) {
+  const { unlocked, link_command: command } = await access();
+  if (unlocked) return true;
+  for (const child of [...app.children]) if (child.tagName !== 'HEADER') child.hidden = true;
+  const block = document.createElement('section');
+  block.className = 'panel admin-gate';
+  block.innerHTML = `<h1>${fmt.esc(title)}</h1><p class="admin-what">${fmt.esc(what)}</p>
+    <p class="admin-need">This page needs the <b>admin console link</b>.</p>${linkHelp(command)}`;
+  app.append(block); wireCopy(block, command || '');
+  return false;
+}
+
+window.CuteUI = { access, linkHelp, wireCopy, adminGate, token, color, fmt, header, facts, build, area, histogram, ribbons, strip, heat, svg: { sparkline, columns, timeline, meter, area, histogram, ribbons, strip, heat } };
 })();

@@ -450,9 +450,13 @@ let resizeTimer; window.addEventListener('resize', () => { clearTimeout(resizeTi
 let liveFeed;
 // Live concurrency without subscribing to the console feed (a subscriber makes the engine build frames).
 async function liveCount() { try { const r = await fetch('/console/usage/live', { credentials: 'same-origin' }); if (r.ok) { const d = await r.json(); S.live = d.active; $('k-concurrency').textContent = d.active == null ? '-' : F.n0(d.active); } } catch (_) {} }
-liveCount(); setInterval(() => { if (!document.hidden) liveCount(); }, 5000);
 $('from').value = localDate(Date.now() - 86400000); $('to').value = localDate(Date.now());
-refresh(); setInterval(() => { if (!document.hidden && !S.loading) refresh(); }, 10000);
+UI.adminGate($('usage-app'), 'Usage',
+  'Retained request history for this server: traffic, latency, cache and speculation over time, sessions, the full log and retention settings.').then((unlocked) => {
+  if (!unlocked) { document.body.dataset.usageReady = 'true'; return; }
+  liveCount(); setInterval(() => { if (!document.hidden) liveCount(); }, 5000);
+  refresh(); setInterval(() => { if (!document.hidden && !S.loading) refresh(); }, 10000);
+});
 })();
 </script>
 </body>

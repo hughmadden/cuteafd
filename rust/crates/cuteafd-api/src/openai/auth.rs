@@ -68,30 +68,28 @@ pub fn constant_time_eq(secret: &[u8], sent: &[u8]) -> bool {
     std::hint::black_box(difference) == 0
 }
 /// A private in-process benchmark token may authorize only its inference/readback.
-/// The console cookie authorizes only the dashboard's own reads ([`console_read`]).
 #[derive(Clone, Default)]
 pub struct Auth {
     pub key: Option<ApiKey>,
     pub internal: Option<Arc<dyn Fn(&str, &HeaderMap) -> bool + Send + Sync>>,
-    pub console: Option<crate::console_gate::ConsoleGate>,
 }
-/// The `/v1` routes the built-in pages call for themselves: the live console
-/// feed and snapshot, fabric, stats and thermal reads, and the bench page's
-/// controls (which run only the bench's own synthetic prompts). Never
-/// inference, and never the bench probe, which takes an arbitrary chat body.
-pub fn console_read(method: &axum::http::Method, path: &str) -> bool {
+/// `/v1` routes the API key never guards: the live console's reads (open to
+/// anyone on the port, as before keys existed; token text inside them still
+/// needs the console cookie) and the benchmark controls, which the console
+/// cookie guards instead (`cuteafd_bench::http`).
+pub fn key_exempt(method: &axum::http::Method, path: &str) -> bool {
     (method == axum::http::Method::GET
         && matches!(path, "/v1/console" | "/v1/console/events" | "/v1/console/snapshot" | "/v1/fabric" | "/v1/stats" | "/v1/thermal"))
-        || (path.starts_with("/v1/bench/") && path != "/v1/bench/probe")
+        || path.starts_with("/v1/bench/")
 }
 pub async fn require_key(axum::extract::State(auth): axum::extract::State<Auth>,
     request: Request, next: Next) -> Response {
     let path = request.uri().path();
     // Every credential form the official clients send (Bearer, Claude Code's
     // `x-api-key`, the Realtime websocket subprotocol) carries the same key.
-    let refused = (path == "/v1" || path.starts_with("/v1/")) && auth.key.as_ref().is_some_and(|key|
-        !crate::gateway::auth::accepts(key, request.headers()) && !auth.internal.as_ref().is_some_and(|check| check(path, request.headers()))
-        && !(console_read(request.method(), path) && auth.console.as_ref().is_some_and(|gate| gate.unlocked(request.headers()))));
+    let refused = (path == "/v1" || path.starts_with("/v1/")) && !key_exempt(request.method(), path)
+        && auth.key.as_ref().is_some_and(|key| !crate::gateway::auth::accepts(key, request.headers())
+            && !auth.internal.as_ref().is_some_and(|check| check(path, request.headers())));
     if refused {
         if path.starts_with("/v1/messages") {
             return crate::gateway::GatewayError::new(crate::gateway::ErrorKind::Authentication,
@@ -136,7 +134,7 @@ mod tests {
     async fn auth_runs_before_json_and_leaves_health_open() {
         let app = Router::new().route("/v1/chat/completions", post(|_: Json<serde_json::Value>| async { StatusCode::OK }))
             .route("/health", get(|| async { StatusCode::OK }))
-            .layer(axum::middleware::from_fn_with_state(Auth { key: Some(ApiKey::new("secret").unwrap()), internal: None, console: None }, require_key));
+            .layer(axum::middleware::from_fn_with_state(Auth { key: Some(ApiKey::new("secret").unwrap()), internal: None }, require_key));
         for authorization in [None, Some("Bearer wrong"), Some("Bearer secret-long")] {
             let mut req = axum::http::Request::post("/v1/chat/completions").header("content-type", "application/json");
             if let Some(value) = authorization { req = req.header("Authorization", value); }

@@ -337,8 +337,8 @@ mod tests {
     }
 
     #[test]
-    fn fabric_chip_poll_is_cookie_authenticated_bounded_and_visibility_gated() {
-        assert!(PAGE.contains("fetch('/v1/fabric', { credentials: 'same-origin', signal: AbortSignal.timeout(2500) })"));
+    fn fabric_chip_poll_is_open_bounded_and_visibility_gated() {
+        assert!(PAGE.contains("fetch('/v1/fabric', { signal: AbortSignal.timeout(2500) })"));
         assert!(PAGE.contains("!document.hidden && S.connected"));
         assert!(PAGE.contains("setTimeout(pollFabric, 3000)"));
         assert!(!PAGE.contains("setInterval(pollFabric"));
@@ -348,11 +348,12 @@ mod tests {
     }
 
     #[test]
-    fn console_never_prompts_for_a_key() {
+    fn console_never_prompts_and_locked_text_names_the_admin_link() {
         for page in [PAGE, BENCH_OFF] {
-            assert!(!page.contains("window.prompt") && !page.contains("Authorization"));
+            assert!(!page.contains("window.prompt") && !page.contains("window.alert") && !page.contains("Authorization"));
         }
-        assert!(PAGE.contains("console unlock"));
+        assert!(PAGE.contains("textLockedDialog()") && PAGE.contains("Text view needs the admin console link"));
+        assert!(UI_JS.contains("fetch('/console/status'") && UI_JS.contains("adminGate"));
     }
     #[test]
     fn bench_text_toggles_text_and_a_disabled_hub_stays_off() {

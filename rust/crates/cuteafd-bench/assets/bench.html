@@ -26,8 +26,7 @@ body.scary .brand .logo { filter: hue-rotate(150deg) saturate(1.4); animation: g
   font: 700 15px var(--mono); letter-spacing: .2em; color: #ff3b4e; }
 .failure span { font: 500 12px var(--mono); letter-spacing: 0; color: #ffb020; margin-left: auto; }
 .dim { opacity: .55; }
-.banner.lock { color: var(--ink-2); }
-.banner.lock b, .banner.lock code { color: var(--ink); }
+
 
 /* live strip */
 .strip { display: grid; grid-template-columns: auto minmax(140px, 220px) repeat(2, auto) minmax(160px, 1fr) auto auto; gap: 12px;
@@ -128,7 +127,6 @@ html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --f
 <body>
 <div class="app">
   <header id="header"></header>
-  <div class="banner lock" id="locked" role="status" hidden>Benchmark controls are locked. Open the <b>console unlock</b> link the launcher printed (<code>…/console/unlock?token=…</code>) in this browser, then reload. The API key is not used here.</div>
   <div id="failure" hidden><div class="hazard"><div class="failure">⚠ FIDELITY FAILURE<span id="failure-detail"></span></div></div></div>
   <div class="strip" id="strip" hidden>
     <span class="pill">BENCHMARKING</span>
@@ -199,13 +197,8 @@ const secs = (s) => {
   if (s < 3600) return `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`;
   return `${Math.floor(s / 3600)}h ${String(Math.floor(s / 60) % 60).padStart(2, '0')}m`;
 };
-// The console unlock cookie authorizes this page's controls; no key is typed here.
-const authenticatedFetch = async (path, init = {}) => {
-  const response = await fetch(path, { credentials: 'same-origin', ...init });
-  if (response.status === 401 || response.status === 403) $('locked').hidden = false;
-  else if (response.ok && String(path).startsWith('/v1/bench/')) $('locked').hidden = true;
-  return response;
-};
+// The admin console cookie authorizes this page's controls (sent automatically).
+const authenticatedFetch = (path, init = {}) => fetch(path, { credentials: 'same-origin', ...init });
 window.cuteafdAuthenticatedFetch = authenticatedFetch;
 const api = async (path, init) => {
   const response = await authenticatedFetch(path, init);
@@ -247,7 +240,6 @@ function renderHeader() {
     ['build', s.build ? UI.build(s.build) : null],
     ['fingerprint', fmt.esc(report?.fingerprint || status.fingerprint || '–')],
     ['ready in', Number.isFinite(status.readiness_s) ? secs(status.readiness_s) : null],
-    ['controls', fmt.esc(status.auth || '')],
   ]);
   const scary = failed(report);
   document.body.classList.toggle('scary', scary);
@@ -698,15 +690,17 @@ let resizeTimer;
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderPanels, 200); });
 
 (async () => {
+  if (!await CuteUI.adminGate(document.querySelector('.app'), 'Benchmarks',
+    'Run benchmark profiles against this server (a run holds the server while it measures) and browse past reports.')) return;
   try {
     [status, catalog] = await Promise.all([api('/v1/bench/status'), api('/v1/bench/panels')]);
     profiles = (await api('/v1/bench/profiles')).profiles || [];
     await refreshRuns();
     const wanted = new URLSearchParams(location.search).get('run');
     await load(wanted || status.active?.id || runs[0]?.id);
-  } catch (error) { if ($('locked').hidden) console.error(error); }
+  } catch (error) { console.error(error); }
   render();
-  if ($('locked').hidden) connect();
+  connect();
 })();
 })();
 </script>

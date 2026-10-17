@@ -69,21 +69,18 @@ pub fn local_network(ip: IpAddr) -> bool {
     }
 }
 
+/// Benchmark controls change server state: the console unlock cookie, or the
+/// API key when the operator configured one. Never open on a keyless server.
 fn authorized(bench: &Bench, peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
     let _ = peer;
     bench.api_key.get().is_some_and(|key| key.accepts(headers))
         || bench.console_gate.get().is_some_and(|gate| gate.unlocked(headers))
 }
 
-/// The probe runs an arbitrary chat body, so only the API key starts it.
-fn keyed(bench: &Bench, headers: &HeaderMap) -> bool {
-    bench.api_key.get().is_some_and(|key| key.accepts(headers))
-}
-
 fn forbidden() -> Response {
     (StatusCode::FORBIDDEN, Json(json!({"error": {"message":
-        "benchmark controls require the console unlock link or the server's API key",
-        "type": "forbidden"}}))).into_response()
+        "benchmark controls need the admin console link (or the server's API key, when one is configured)",
+        "type": "console_locked"}}))).into_response()
 }
 
 fn not_found(what: &str) -> Response {
@@ -196,8 +193,9 @@ fn probe_error(error: anyhow::Error) -> Response {
 
 async fn probe_request(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<SocketAddr>>, headers: HeaderMap,
     Json(request): Json<ProbeRequest>) -> Response {
-    let _ = peer(connect);
-    if !keyed(&bench, &headers) { return forbidden(); }
+    // A running panel's own media probes carry its run token.
+    let own = headers.get(BENCH_HEADER).and_then(|v| v.to_str().ok()).is_some_and(|t| bench.accepts_internal(t));
+    if !own && !authorized(&bench, peer(connect), &headers) { return forbidden(); }
     match tokio::task::spawn_blocking(move || bench.probe(request.body, request.spec)).await {
         Ok(Ok(chat)) => Json(chat).into_response(),
         Ok(Err(error)) => probe_error(error),
@@ -391,7 +389,12 @@ async fn set_usage(State(bench): State<Arc<Bench>>, body: Result<Json<UsageSwitc
 }
 
 async fn require_control_key(State(bench): State<Arc<Bench>>, request: Request, next: Next) -> Response {
-    if request.uri().path().starts_with("/v1/bench/") && !authorized(&bench, None, request.headers()) {
+    // Status stays public: the BENCHMARKING banner on every page polls it.
+    let path = request.uri().path();
+    let public = request.method() == Method::GET && path == "/v1/bench/status";
+    let own_probe = path == "/v1/bench/probe" && request.headers().get(BENCH_HEADER)
+        .and_then(|v| v.to_str().ok()).is_some_and(|t| bench.accepts_internal(t));
+    if path.starts_with("/v1/bench/") && !public && !own_probe && !authorized(&bench, None, request.headers()) {
         return forbidden();
     }
     next.run(request).await
@@ -427,6 +430,43 @@ pub fn mount(router: Router, bench: Arc<Bench>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keyless bench server: inference open, controls need the console cookie.
+    /// With a key configured, the controls take either credential; status stays public.
+    #[tokio::test]
+    async fn bench_controls_take_the_console_cookie_or_a_configured_key() {
+        use tower::ServiceExt;
+        let secret = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret.path(), "c".repeat(64)).unwrap();
+        let gate = cuteafd_api::console_gate::ConsoleGate::from_file(secret.path(), false).unwrap();
+        for key in [None, Some("op-key")] {
+            let bench = Bench::new(crate::store::Store::memory().unwrap());
+            bench.set_console_gate(gate.clone());
+            let key = key.map(|k| cuteafd_api::openai::auth::ApiKey::new(k).unwrap());
+            if let Some(key) = &key { bench.set_api_key(key.clone()); }
+            let inner = Router::new().route("/v1/chat/completions", post(|| async { "chat" }));
+            let app = gate.mount(mount(inner, bench)).layer(axum::middleware::from_fn_with_state(
+                cuteafd_api::openai::auth::Auth { key: key.clone(), internal: None }, cuteafd_api::openai::auth::require_key));
+            let unlock = app.clone().oneshot(Request::get(format!("/console/unlock?token={}", "c".repeat(64))).body(Body::empty()).unwrap()).await.unwrap();
+            let cookie = unlock.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+            let call = |method: Method, path: &str, credential: Option<(&'static str, String)>| {
+                let mut request = Request::builder().method(method).uri(path).header("content-type", "application/json");
+                if let Some((name, value)) = credential { request = request.header(name, value); }
+                let request = request.body(Body::from("{}")).unwrap();
+                let app = app.clone();
+                async move { app.oneshot(request).await.unwrap().status() }
+            };
+            let chat = call(Method::POST, "/v1/chat/completions", None).await;
+            assert_eq!(chat == StatusCode::OK, key.is_none(), "keyless inference is open; a configured key guards it");
+            assert_eq!(call(Method::GET, "/v1/bench/status", None).await, StatusCode::OK);
+            for (method, path) in [(Method::GET, "/v1/bench/runs"), (Method::POST, "/v1/bench/probe"), (Method::PUT, "/v1/bench/usage")] {
+                assert_eq!(call(method.clone(), path, None).await, StatusCode::FORBIDDEN, "{path} without credentials");
+                assert_ne!(call(method.clone(), path, Some(("cookie", cookie.clone()))).await, StatusCode::FORBIDDEN, "{path} with the cookie");
+                let bearer = call(method.clone(), path, Some(("authorization", "Bearer op-key".into()))).await;
+                assert_eq!(bearer != StatusCode::FORBIDDEN, key.is_some(), "{path} with a bearer");
+            }
+        }
+    }
 
     /// A stored Qwen NVFP4 max run whose own `config.json` declares `algo` for
     /// its routed experts, with `failing` (a check id, or `""`) left failing

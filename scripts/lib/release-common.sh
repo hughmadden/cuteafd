@@ -416,18 +416,20 @@ release_print_console_link() {
   fi
 }
 
-# Benchmark opt-in provisions a reusable key, never exposing it in logs or argv.
+# The shell line that prints this host's console unlock link, for pages and logs
+# (never the secret itself): run it on the host that launched the server.
+release_console_link_command() {
+  local base="${CONSOLE_URL:-$1}" file="${CONSOLE_SECRET_FILE/#$HOME/\~}"
+  printf 'echo "%s/console/unlock?token=$(cat %s)"' "${base%/}" "$file"
+}
+
+# API keys are opt-in (API_KEY_FILE); the benchmark runs on the console cookie.
 release_prepare_api_key() {
   local enabled="${1:-off}" instance="${2:-default}"
   case "$enabled" in
     on|off) ;;
     *) release_die "ENABLE_BENCH must be on or off" ;;
   esac
-  if [[ "$enabled" == on && -z "${API_KEY_FILE:-}" ]]; then
-    [[ "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || release_die "invalid API key instance"
-    API_KEY_FILE="$(release_prepare_secret "$HOME/.cache/cuteafd/instances/$instance" api-key)" || release_die "could not provision benchmark API key"
-    printf 'Benchmark API key file: %s\n' "$API_KEY_FILE" >&2
-  fi
   if [[ -n "${API_KEY_FILE:-}" ]]; then
     [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || release_die "API_KEY_FILE must name a readable file"
   fi

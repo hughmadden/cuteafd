@@ -628,6 +628,9 @@ if release_console_supported "$image" "${wip_layout:+$wip_layout/bin/cuteafd}"; 
   release_require_writable_state "$USAGE_DIR"
   api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/run/cuteafd/usage")
   api_args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /run/cuteafd/usage --usage "$usage")
+  # Locked pages show the operator how to print the unlock link; never the secret.
+  console_port="${ADDR:-${addr:-0.0.0.0:8000}}"
+  api_mount_args+=(-e "CUTEAFD_CONSOLE_LINK_COMMAND=$(release_console_link_command "http://$(hostname):${console_port##*:}")")
 fi
 if [[ -n "$API_KEY_FILE" ]]; then
   [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || { echo "API_KEY_FILE must name a readable file" >&2; exit 2; }

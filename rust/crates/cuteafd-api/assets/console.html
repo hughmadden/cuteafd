@@ -41,9 +41,6 @@
 .fabric-pop tr.issue td { color: var(--bad); }
 .fabric-pop small { color: var(--muted); }
 .fabric-pop .note { margin: 8px 0 0; }
-.banner.lock { color: var(--ink-2); }
-.banner.lock b { color: var(--ink); }
-.banner.lock code { font: 12px var(--mono); color: var(--ink); }
 @media (max-width: 600px) {
   .fabric-pop { position: fixed; left: 16px; right: 16px; top: 120px; min-width: 0; width: auto; max-width: none; max-height: 70vh; overflow: auto; }
   .fabric-pop td, .fabric-pop th { padding: 3px 4px; }
@@ -63,7 +60,6 @@
   <header id="top"></header>
   <template id="status-tpl"><span class="status" id="status"><i></i><span id="status-text">CONNECTING</span></span></template>
   <div class="banner" id="banner" hidden></div>
-  <div class="banner lock" id="lock" role="status" hidden></div>
 
   <section class="kpis" id="kpis"></section>
 
@@ -236,8 +232,8 @@ function onSnapshot(m) {
   S.textState = state === true || state === 'on' ? 'on' : state === 'locked' ? 'locked' : 'off';
   S.textAllowed = S.textState === 'on';
   $('#v-text').disabled = S.textState === 'off';
-  $('#v-text').textContent = S.textState === 'locked' ? 'TEXT (unlock)' : S.textAllowed ? 'TEXT' : 'TEXT (off)';
-  $('#v-text').title = S.textState === 'locked' ? 'open the console unlock link the run script printed' : S.textAllowed ? 'Show generated text' : 'Start the server with --console-text (CUTEAFD_CONSOLE_TEXT=1) to stream token text';
+  $('#v-text').textContent = S.textState === 'locked' ? 'TEXT (locked)' : S.textAllowed ? 'TEXT' : 'TEXT (off)';
+  $('#v-text').title = S.textState === 'locked' ? 'Text view needs the admin console link' : S.textAllowed ? 'Show generated text' : 'Start the server with --console-text (CUTEAFD_CONSOLE_TEXT=1) to stream token text';
   if (!S.textAllowed && S.mode === 'text') setMode('time');
   const live = new Set();
   for (const x of m.requests || []) { live.add(x.id); fromSnapshotRequest(x); }
@@ -344,16 +340,24 @@ function rate(key, windowMs) {
 }
 
 // ---------------------------------------------------------------- feed
-// The console unlock cookie (from the launcher's /console/unlock link) authorizes
-// this page's own feeds; no key is typed here. Without it the page says which
-// link to open instead of prompting.
+// The console's reads are open; the admin console cookie only adds token text.
 let retry = 500;
-window.cuteafdAuthenticatedFetch = (path, init = {}) => fetch(path, { credentials: 'same-origin', ...init });
-function locked(on) {
-  const b = $('#lock');
-  b.hidden = !on;
-  if (on) b.innerHTML = 'This console is locked. Open the <b>console unlock</b> link the launcher printed ' +
-    '(<code>…/console/unlock?token=…</code>) in this browser, then reload. The API key is not used here.';
+// Text view while locked: a small dialog naming the admin link and how to print it.
+async function textLockedDialog() {
+  let dialog = $('#text-locked');
+  if (!dialog) {
+    const { link_command: command } = await CuteUI.access();
+    dialog = document.createElement('dialog');
+    dialog.id = 'text-locked'; dialog.className = 'admin-dialog';
+    dialog.setAttribute('aria-labelledby', 'text-locked-title');
+    dialog.innerHTML = `<div><h2 id="text-locked-title">Text view needs the admin console link</h2>
+      <p>The live token text is shown only to a browser holding the <b>admin console link</b>; everything else on this page works without it.</p>
+      ${CuteUI.linkHelp(command)}</div><form method="dialog" class="actions"><button class="btn" value="close">CLOSE</button></form>`;
+    document.body.append(dialog);
+    CuteUI.wireCopy(dialog, command || '');
+    dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
+  }
+  if (!dialog.open) dialog.showModal();
 }
 
 // ---------------------------------------------------------------- fabric chip
@@ -434,7 +438,7 @@ function renderFabricPop() {
 async function pollFabric() {
   if (!document.hidden && S.connected) {
     try {
-      const response = await fetch('/v1/fabric', { credentials: 'same-origin', signal: AbortSignal.timeout(2500) });
+      const response = await fetch('/v1/fabric', { signal: AbortSignal.timeout(2500) });
       if (response.ok) { fabric = fabricModel(await response.json()); renderFabricChip(); }
     } catch (_) { /* keep the last verdict */ }
   }
@@ -444,10 +448,8 @@ setTimeout(pollFabric, 1500);
 
 async function connect() {
   try {
-    const response = await fetch('/v1/console/events', { credentials: 'same-origin' });
-    if (response.status === 401) { locked(true); retry = 5000; throw new Error('locked'); }
+    const response = await fetch('/v1/console/events');
     if (!response.ok) throw new Error(response.statusText);
-    locked(false);
     S.connected = true; retry = 500;
     const reader = response.body.getReader(), decoder = new TextDecoder();
     let pending = '';
@@ -819,7 +821,7 @@ function setZoom(z) { S.pxPerS = z; for (const b of document.querySelectorAll('#
 function setPaused(p) { S.paused = p; S.frozenAt = p ? displayNow() : null; $('#pause').setAttribute('aria-pressed', p); $('#pause').textContent = p ? 'RESUME' : 'PAUSE'; }
 $('#v-time').onclick = () => setMode('time');
 function showText() {
-  if (S.textState === 'locked') $('#ticker-note').textContent = 'open the console unlock link the run script printed';
+  if (S.textState === 'locked') textLockedDialog();
   else if (S.textAllowed) setMode('text');
 }
 $('#v-text').onclick = showText;
@@ -910,7 +912,7 @@ function draw() {
   }
   if (!S.requests.size && !(S.prefill.length && S.prefill[S.prefill.length - 1].t1 > tD - 3000)) {
     ctx.font = `12px ${MONO}`; ctx.fillStyle = COL.muted; ctx.textAlign = 'center';
-    ctx.fillText(S.connected ? 'Waiting for requests' : !$('#lock').hidden ? 'Locked: open the console unlock link' : 'Connecting to the engine…', (GUT + right) / 2, PAD + 15);
+    ctx.fillText(S.connected ? 'Waiting for requests' : 'Connecting to the engine…', (GUT + right) / 2, PAD + 15);
   }
   tooltip(hit);
   requestAnimationFrame(draw);
