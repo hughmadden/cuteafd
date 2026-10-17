@@ -163,7 +163,9 @@ printf '%s\\n' "$pick"
          8892, False, True, True, True),
         ('101, 8892, GPU-export', {101: 'own'}, None,
          8892, False, True, True, False),
-        ('', {}, None, 8892, False, True, True, True),
+        ('', {}, None, 8892, False, False, True, True),
+        ('101, 8892, GPU-export', {101: 'own-systemd'}, None,
+         8892, False, False, True, True),
         # docker top provides host PIDs when inspect cannot identify cgroups.
         ('101, 8892, GPU-export', {}, 'PID\n101',
          8892, False, False, False, True),
@@ -188,6 +190,7 @@ printf '%s\\n' "$pick"
         'export-only-above-limit', 'foreign-above-limit', 'foreign-sum',
         'foreign-at-limit', 'other-device-ignored', 'unattributable',
         'export-memory-unavailable', 'process-query-unavailable', 'no-process-rows',
+        'systemd-scope-own',
         'docker-top-own', 'docker-top-foreign', 'departed-process',
         'fallback-kills', 'fallback-excludes-own', 'fallback-unknown-own',
         'fallback-unknown-owner',
@@ -206,7 +209,11 @@ def test_export_watchdog_attributes_foreign_memory(
     for pid, owner in cgroups.items():
         entry = proc / str(pid)
         entry.mkdir()
-        cgroup = f'0::/docker/{container_id}' if owner == 'own' else '0::/other-job'
+        cgroup = {
+            'own': f'0::/docker/{container_id}',
+            'own-systemd': f'0::/system.slice/docker-{container_id}.scope',
+            'foreign': '0::/other-job',
+        }[owner]
         (entry / 'cgroup').write_text(cgroup + '\n')
     (tmp_path / 'apps').write_text(apps)
     (tmp_path / 'top').write_text(top or '')
@@ -245,7 +252,7 @@ esac
 release_export_gpu_poll_seconds=15
 export_gpu_limit_mib=8192
 polls=0
-sleep() {{ polls=$((polls + 1)); ((polls == 1)); }}
+sleep() {{ polls=$((polls + 1)); ((polls <= 3)); }}
 release_watch_export_gpu GPU-export export-fixture "$FIXTURE/proc"
 '''
     result = subprocess.run(
@@ -262,7 +269,60 @@ release_watch_export_gpu GPU-export export-fixture "$FIXTURE/proc"
     if killed:
         assert (tmp_path / 'killed').read_text() == 'rm -f export-fixture\n'
         assert 'foreign process use' in result.stderr
-    assert ('WARNING:' in result.stderr) == warning, result.stderr
+    assert result.stderr.count('WARNING:') == int(warning), result.stderr
+    incomplete_count = 3 if warning else 0
+    assert result.stderr.count('AOT export GPU watchdog (GPU-export):') == 1, result.stderr
+    assert f'attribution incomplete {incomplete_count} times' in result.stderr
+
+
+@pytest.mark.parametrize('stop', ['return', 'term', 'background'])
+def test_export_watchdog_summary_reaches_console_outside_leg_log(tmp_path, stop):
+    build = (ROOT / 'build.sh').read_text()
+    guard = build.split('# release-aot-export-guard:start', 1)[1].split(
+        '# release-aot-export-guard:end', 1,
+    )[0]
+    script = f'''set -euo pipefail
+{guard}
+release_export_foreign_gpu_mib() {{ printf '0 1\\n'; }}
+release_export_gpu_poll_seconds=15
+export_gpu_limit_mib=8192
+polls=0
+sleep() {{
+  polls=$((polls + 1))
+  if ((polls > 3)); then
+    if [[ {stop} == background ]]; then
+      : >"$LEG_LOG.ready"
+      command sleep 0.1
+    fi
+    [[ {stop} != term ]] || kill -TERM "$BASHPID"
+    return 1
+  fi
+}}
+exec {{release_export_summary_fd}}>&2
+if [[ {stop} == background ]]; then
+  release_watch_export_gpu GPU-export export-fixture >"$LEG_LOG" 2>&1 &
+  export_watchdog_pid=$!
+  until [[ -e "$LEG_LOG.ready" ]]; do command sleep 0.01; done
+  release_stop_export_watchdog
+else
+  release_watch_export_gpu GPU-export export-fixture >"$LEG_LOG" 2>&1
+fi
+'''
+    log = tmp_path / 'coordinator.log'
+    result = subprocess.run(
+        ['bash', '-c', script], capture_output=True, text=True, timeout=5,
+        env={**os.environ, 'LEG_LOG': str(log)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == (
+        'AOT export GPU watchdog (GPU-export): attribution incomplete 3 times\n'
+    )
+    assert log.read_text().count('WARNING:') == 1
+    assert 'times' not in log.read_text()
+    supervisor = build.split('release_build_legs() {', 1)[1].split('\n}', 1)[0]
+    assert supervisor.index('exec {release_export_summary_fd}>&2') < supervisor.index(
+        'build_supervise',
+    )
 
 
 def test_term_stops_the_export_before_releasing_locks(tmp_path):
