@@ -96,6 +96,10 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         assert after["mounts"] == sorted(before["mounts"] + governor + fidelity + storage), where
         assert after["image"] == before["image"], where
         added = {key: value for key, value in after["env"].items() if key not in before["env"]}
+        # Locked dashboard pages show how to print the unlock link (never the secret).
+        link = added.pop("CUTEAFD_CONSOLE_LINK_COMMAND", None)
+        if role == "coordinator":
+            assert link and link.startswith('echo "http://') and "$(cat ~/.cache/cuteafd/console/secret)" in link, where
         assert added == INTENDED[role], where
         assert {key: after["env"][key] for key in before["env"]} == before["env"], where
         # The serve command is the same set of flags and values (clap ignores order;
