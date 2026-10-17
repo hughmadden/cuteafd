@@ -1613,7 +1613,12 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         for key in list(values):
             if key in BUILD_DROP or re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
                 del values[key]
-        values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPU='1', RTX_GPUS='1')
+        # The staging container binds to the card's own coordinator GPU (default
+        # 1), so a build can stay off a GPU another session holds.
+        gpu = values.get('COORDINATOR_GPU', '1')
+        if gpu not in ('0', '1'):
+            raise ValueError(f'staging COORDINATOR_GPU must be 0 or 1, got {gpu}')
+        values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPU=gpu, RTX_GPUS='1')
         if len(hosts) in (2, 3):
             # Two or three ranks without explicit keys are the compact EXL3 layout.
             values.update(EXPERT_FORMAT='exl3', SPARKINFER_EXL3='force')

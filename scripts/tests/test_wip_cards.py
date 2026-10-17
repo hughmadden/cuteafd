@@ -1084,6 +1084,27 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
                                       'tp_role': None, 'nvfp4': False}
 
 
+def test_build_staging_follows_card_coordinator_gpu(tmp_path, monkeypatch):
+    # A card pinned to GPU0 (GPU1 held by another session) stages its WIP build
+    # container on GPU0 too; without the key the default stays GPU1.
+    kit = ROOT / 'scripts/bench/kits/gate'
+    card = cards.load_cards(kit, ['v41-flash-min'])[0]
+    monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
+    arms = cards.arms_from(['base=x:a'])
+    for sub in ('gpu0', 'default', 'bad'):
+        (tmp_path / sub).mkdir()
+    card['set']['COORDINATOR_GPU'] = '0'
+    cards.build_arms({'base': 'HEAD'}, arms, [card], tmp_path / 'gpu0', 'task', True)
+    assert cards.config(tmp_path / 'gpu0/build-base.config')['COORDINATOR_GPU'] == '0'
+    card['set'].pop('COORDINATOR_GPU')
+    base = cards.config(ROOT / card['config']).get('COORDINATOR_GPU', '1')
+    cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'default', 'task', True)
+    assert cards.config(tmp_path / 'default/build-base.config')['COORDINATOR_GPU'] == base
+    card['set']['COORDINATOR_GPU'] = '2'
+    with pytest.raises(ValueError, match='must be 0 or 1'):
+        cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'bad', 'task', True)
+
+
 def _fake_slot(packages=(), audio=True):
     return lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='art',
                                              contents=dict(packages=list(packages), audio=audio)))
