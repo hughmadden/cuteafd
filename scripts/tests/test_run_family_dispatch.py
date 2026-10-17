@@ -4,11 +4,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+from launcher_sandbox import copy_input
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -17,9 +17,9 @@ def _repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     (repo / "scripts" / "lib").mkdir(parents=True)
     (repo / "scripts" / "launch").mkdir(parents=True)
-    shutil.copy(ROOT / "run.sh", repo / "run.sh")
+    copy_input(ROOT / "run.sh", repo / "run.sh")
     for name in ("release-common.sh", "checkpoint-family.py", "cdi-gpus.sh"):
-        shutil.copy(ROOT / "scripts" / "lib" / name, repo / "scripts" / "lib" / name)
+        copy_input(ROOT / "scripts" / "lib" / name, repo / "scripts" / "lib" / name)
     fake = repo / "scripts" / "launch" / "run-family.sh"
     fake.write_text('#!/usr/bin/env bash\nprintf "run-family %s\\n" "$*"\n')
     fake.chmod(0o755)
@@ -523,20 +523,20 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     repo = tmp_path / "repo"
     (repo / "scripts" / "lib").mkdir(parents=True)
     (repo / "scripts" / "launch").mkdir(parents=True)
-    shutil.copy(launcher_source or ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
-    shutil.copy(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
-    shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
-    shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
-    shutil.copy(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
+    copy_input(launcher_source or ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
+    copy_input(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
+    copy_input(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
+    copy_input(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
+    copy_input(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
     capacity = Path("rust/crates/cuteafd-core/src/serving_capacity.rs")
     (repo / capacity.parent).mkdir(parents=True)
-    shutil.copy(ROOT / capacity, repo / capacity)
+    copy_input(ROOT / capacity, repo / capacity)
     native_v41 = family_config.get("model_type") == "deepseek_v41"
     if native_v41:
         programs = Path("rust/crates/cuteafd-core/src/coordinator_programs.rs")
         (repo / programs.parent).mkdir(parents=True, exist_ok=True)
-        shutil.copy(ROOT / programs, repo / programs)
-        shutil.copy(ROOT / "scripts" / "launch" / "select-release-gpus.py", repo / "scripts" / "launch")
+        copy_input(ROOT / programs, repo / programs)
+        copy_input(ROOT / "scripts" / "launch" / "select-release-gpus.py", repo / "scripts" / "launch")
         (repo / "scripts" / "build").mkdir(exist_ok=True)
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     wip = "--wip" in extra_args

@@ -27,3 +27,12 @@ def no_shell_startup_files(monkeypatch: pytest.MonkeyPatch) -> None:
 def no_real_cdi_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     """Launcher tests mock docker and name fake GPUs; the machine's CDI spec is not theirs to check."""
     monkeypatch.setenv("CUTEAFD_CDI_CHECK", "off")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def launcher_inputs(tmp_path_factory):
+    """One private template per xdist worker; sandbox directory entries stay test-local."""
+    import launcher_sandbox
+    launcher_sandbox.configure(tmp_path_factory.mktemp("launcher-inputs"))
+    yield
+    launcher_sandbox.configure(None)

@@ -1023,6 +1023,7 @@ fn audio_defaults_off_without_qualified_bundle_and_explicit_placement_refuses() 
 }
 
 #[test]
+#[ignore = "slow tier: scans mounted multimodal checkpoint inventories (>60s); cpu-gate --slow"]
 fn mounted_mimo_audio_inventory_is_independently_admitted() {
     use encoder::EncoderKind;
     use cuteafd_core::memory_layout::DeviceKind;
