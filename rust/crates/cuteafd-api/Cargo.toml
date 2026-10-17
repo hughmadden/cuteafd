@@ -24,6 +24,7 @@ cuteafd-core = { path = "../cuteafd-core" }
 cuteafd-transport = { path = "../cuteafd-transport" }
 cuteafd-loader = { path = "../cuteafd-loader" }
 sha2.workspace = true
+thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 jiter = { version = "=0.17.0", default-features = false }
