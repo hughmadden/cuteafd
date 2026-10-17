@@ -191,8 +191,10 @@ tok/s; C1 decode and concurrent code aggregate with thinking off (C1/C4/C8/C16 o
 - **Qwen 1× RTX** default cells are text-only, and NVFP4 admits less than
   262,144 tokens of context. A fixed 262,144-token pool turns vision on for EXL3.
   [Details](docs/models/qwen4.md#known-limits)
-- **V4 on one RTX** is pool-limited (Flash 663K, Pro 455K tokens) and leaves
-  GPU1 underused on two; TP2 placement is v3 work.
+- **V4 v2 cards** are pool-limited on one RTX (Flash 663K, Pro 455K tokens)
+  and underuse GPU1 on two. Current placement supports pool-first admission
+  and TP2 local experts; the linked v2 measurements remain historical.
+  [Details](docs/models/deepseek_v4.md#known-limits)
 - **MiMo sliced checkpoints:** copy the checkpoint's `dflash/` directory into
   the slice by hand until the next release.
   [Details](docs/sliced-checkpoints.md#known-limit-v200)

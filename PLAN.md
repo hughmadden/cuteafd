@@ -66,10 +66,11 @@ Extend (new families; kernels largely exist in b12x already):
 Speculation: one best speculator per family (native MTP/nextn, dSpark,
 DFlash2). Adaptive width with calibrated confidence and cost model, as in
 ds41rt `dspark_policy` and glmrt `dflash2_confidence`.
-Qwen's launcher defaults to MTP3 only for local EXL3 (`ranks == 0`);
-TP4's shipped default uses copy-window drafts. Enabling native MTP on TP4
-with coordinator-local draft experts is a separate policy question, not a
-requirement of vision or decode-bucket qualification.
+Qwen's launcher defaults to MTP3 for qualified local EXL3 and NVFP4
+(`ranks == 0`); explicit overrides win. Spark-backed layouts leave the
+speculator off unless selected explicitly. Native MTP with coordinator-local
+draft experts is an explicit Spark option, not a requirement of vision or
+decode-bucket qualification.
 Qwen TP4's former 32,768-token KV pool admitted only seven fresh requests
 at the qualified C16 output budget; scheduler and EXL3 slots were not the
 limit. Full-width distinct-prompt qualification and default auto admission
@@ -6235,9 +6236,8 @@ Ideas TJ wants kept for later; not v2 work.
   and dispatch.
 - **Dual-GPU lock starvation** is fixed by the fair FIFO queue
   (`scripts/hw/hwlock.py`, smoke's `fair` ticket).
-- **Qualify the opt-in shelf (audit 2026-10-11).** Each item needs one
-  hardware decision:
-  - mapped-table uring/mincore;
+- **Qualify the opt-in shelf (audit 2026-10-11).** Remaining items need one
+  hardware decision (mapped-table routing is decided below, not still gated):
   - GLM Flash split-KDA FP8 rows (already passed 3 pairs on K3.25);
   - GLM Flash GB10 schedule (bit-identical);
   - MiMo prefill chunk and snapshot wait (C16 TTFT 91 -> 67 ms);
