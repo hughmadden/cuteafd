@@ -10,6 +10,9 @@ use std::cell::RefCell;
 pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
     type Transport;
     fn set_route_capture(&mut self, enabled: bool) -> Result<()>;
+    /// Keep decode-row graph shapes once captured, for speculative rounds
+    /// whose row count varies (route capture also enables it).
+    fn retain_small_graph_shapes(&mut self) -> Result<()>;
     /// Whether the next pass may run device-ordered (`CUTEAFD_V41_DEVICE`).
     fn set_device_order(&mut self, on: bool);
     fn captured_routes(&self) -> &[Vec<[u32; 6]>];
@@ -73,6 +76,9 @@ impl<'a> VerificationTarget<'a> for TargetPass<'_, 'a> {
     fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
         TargetPass::set_route_capture(self, enabled); Ok(())
     }
+    fn retain_small_graph_shapes(&mut self) -> Result<()> {
+        TargetPass::retain_small_graph_shapes(self); Ok(())
+    }
     fn captured_routes(&self) -> &[Vec<[u32; 6]>] { TargetPass::captured_routes(self) }
     fn captured_layer_us(&self) -> Vec<Option<f64>> { TargetPass::captured_layer_us(self) }
     fn captured_ffn_split(&self) -> crate::families::deepseek_v41::v41_backbone_lane::FfnSplit { TargetPass::captured_ffn_split(self) }
@@ -135,6 +141,9 @@ impl<'a> VerificationTarget<'a> for DistributedTargetPass<'_, 'a> {
     }
     fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
         DistributedTargetPass::set_route_capture(self, enabled)
+    }
+    fn retain_small_graph_shapes(&mut self) -> Result<()> {
+        DistributedTargetPass::retain_small_graph_shapes(self)
     }
     fn captured_routes(&self) -> &[Vec<[u32; 6]>] { DistributedTargetPass::captured_routes(self) }
     fn captured_layer_us(&self) -> Vec<Option<f64>> { DistributedTargetPass::captured_layer_us(self) }

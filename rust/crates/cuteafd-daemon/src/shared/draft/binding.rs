@@ -95,16 +95,25 @@ impl Observation<'_> {
 /// Build one round's observation. `native_width` is the narrow draft-cost
 /// width (`policy.widths()[0]`), independent of the neural-confidence boundary.
 pub(crate) fn build<'a>(record: &RoundRecord<'a>, native_width: usize) -> Result<Observation<'a>, ObserveError> {
+    build_round(record, native_width, true)
+}
+
+/// `resources`: complete and check the round's routes and keep them with the
+/// layer times (the priced policy and the replay trace); otherwise the light
+/// record carries only what the simple and fixed modes read.
+fn build_round<'a>(record: &RoundRecord<'a>, native_width: usize, resources: bool) -> Result<Observation<'a>, ObserveError> {
     let rows: usize = record.requests.iter().map(|request| request.rows).sum();
-    record.routes.complete()?;
-    if record.routes.rows() != rows {
-        return Err(ObserveError::Rows { routes: record.routes.rows(), requests: rows });
+    if resources {
+        record.routes.complete()?;
+        if record.routes.rows() != rows {
+            return Err(ObserveError::Rows { routes: record.routes.rows(), requests: rows });
+        }
     }
     let requests = record.requests.iter().map(|request| ObservedDraftRequest {
         id: request.id, rows: request.rows, accepted: request.accepted,
         confidence: confidence(request),
     }).collect();
-    let layer_us = (0..record.routes.layers())
+    let layer_us = (0..if resources { record.routes.layers() } else { 0 })
         .map(|layer| record.layer_us.get(layer).copied().flatten()).collect();
     let copied = record.requests.iter().any(|request| request.source == DraftSource::Copy);
     let total = record.times.total_us;
@@ -115,7 +124,7 @@ pub(crate) fn build<'a>(record: &RoundRecord<'a>, native_width: usize) -> Result
         (true, true) => (total.saturating_sub(draft) as f64, f64::NAN),
         (false, _) => (total as f64, f64::NAN),
     };
-    Ok(Observation { shared: record.shared, requests, routes: record.routes.flat(), layer_us, total_us, draft_us,
+    Ok(Observation { shared: record.shared, requests, routes: if resources { record.routes.flat() } else { &[] }, layer_us, total_us, draft_us,
         drafted_requests: record.draft.and_then(|pass| pass.requests),
         wide: record.draft.is_some_and(|pass| pass.width > native_width),
         predicted_us: if copied { None } else { record.predicted } })
@@ -134,12 +143,22 @@ fn confidence<'a>(request: &RoundRequest<'a>) -> Option<&'a [f64]> {
 
 /// Feed one completed round to the policy.
 pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Result<(), ObserveError> {
-    let observation = build(record, policy.widths()[0])?;
+    let observation = build_round(record, policy.widths()[0], needs_routes(policy))?;
     trace_round(policy, record);
     let _timing = super::clock::HostSpan::new(super::clock::HostStage::Observe);
     policy.observe(observation.view())?;
     trace_simple(policy);
     Ok(())
+}
+
+/// Trace capture retains complete resources even when selection does not use them.
+pub(crate) fn needs_routes(policy: &DraftPolicy) -> bool {
+    policy.needs_routes() || replay_trace().is_some()
+}
+
+/// Probes are allocated before some families bind their policy.
+pub(crate) fn configured_needs_routes() -> bool {
+    super::draft_mode() == cuteafd_core::DraftMode::Shared || replay_trace().is_some()
 }
 
 /// The simple rule's round: the cutoff with its row price and token cost,
@@ -643,6 +662,57 @@ mod tests {
         assert_eq!(selection["requests"][0]["calibrated_confidence"].as_array().unwrap().len(), 5);
         assert_eq!(selection["requests"][1]["raw_confidence"], serde_json::json!([]));
         assert_eq!(selection["drafted_requests"], 1);
+    }
+
+    #[test]
+    fn simple_full_and_light_records_replay_identically() {
+        use cuteafd_core::{DraftCandidate, DraftMode, LayerResource, PolicyGeometry, PolicySeed,
+            ResourceClass, RowCost};
+        let geometry = PolicyGeometry { layers: vec![LayerResource {
+            class: Some(0), slice_bytes: 1e6, group_rows: 2, timed: true }; 2],
+            experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![3, 5],
+            classes: vec![ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 2 };
+        for mode in [DraftMode::Simple, DraftMode::SimpleRc, DraftMode::SimpleDerived] {
+            for cost in [RowCost::Linear, RowCost::Power, RowCost::Log] {
+                let mut full = DraftPolicy::seeded(geometry.clone(), PolicySeed::weak(5)).unwrap();
+                full.set_draft_mode(mode);
+                full.set_row_cost(cost);
+                let mut light = full.clone();
+                for round in 0..160 {
+                    let count = [1, 4, 8, 16][round % 4];
+                    let prior = [0.95, 0.85, 0.75, 0.65, 0.55];
+                    let candidates: Vec<_> = (0..count).map(|id| DraftCandidate { id: id as u64, confidence: &prior }).collect();
+                    let budget = count * (2 + round % 4);
+                    let a = full.select_drafted_within(round % 2 == 0, &candidates, 5, budget, count).unwrap().unwrap();
+                    let b = light.select_drafted_within(round % 2 == 0, &candidates, 5, budget, count).unwrap().unwrap();
+                    assert_eq!(a.lengths, b.lengths);
+                    assert_eq!(a.predicted_us.to_bits(), b.predicted_us.to_bits());
+                    let requests: Vec<_> = a.lengths.iter().enumerate().map(|(id, &drafts)| {
+                        let rows = drafts + 1;
+                        request(id as u64, rows, rows.min(1 + (round + id) % 6),
+                            if id % 5 == 4 { DraftSource::Copy } else { DraftSource::Neural },
+                            Some(Evidence::Head(&prior)), (round % 7 == 0).then_some(Censor::OutputLimit))
+                    }).collect();
+                    let routes = routes(requests.iter().map(|r| r.rows).sum());
+                    let mut record = record(&requests, &routes, (round % 9 != 0)
+                        .then_some(DraftPass { width: 5, requests: Some(count) }));
+                    record.times.total_us = (2000 + round * 17) as u64;
+                    let full_observation = build(&record, 3).unwrap();
+                    // Missing routes and layer clocks must not block simple's evidence.
+                    let missing = RoundRoutes::new(2, 2);
+                    let light_observation = build_round(&RoundRecord { routes: &missing, layer_us: &[], ..record }, 3, false).unwrap();
+                    assert!(light_observation.view().routes.is_empty());
+                    assert!(light_observation.view().layer_us.is_empty());
+                    full.observe(full_observation.view()).unwrap();
+                    light.observe(light_observation.view()).unwrap();
+                    assert_eq!(full.simple_calibration(), light.simple_calibration());
+                    for candidate in &candidates {
+                        assert_eq!(full.probabilities(count, *candidate), light.probabilities(count, *candidate));
+                    }
+                    assert_eq!(format!("{:?}", full.stats()), format!("{:?}", light.stats()));
+                }
+            }
+        }
     }
 
     #[test]

@@ -1567,6 +1567,10 @@ impl<'a> Qwen4Engine<'a> {
         &[Option<f64>]) -> T) -> Option<T> {
         let mut probes = self.draft_probes.borrow_mut();
         if probes.is_empty() { return None; }
+        if !probes[0].collects_routes() {
+            for probe in probes.iter_mut() { probe.finish()?; }
+            return Some(observe(&crate::shared::draft::routes::RoundRoutes::new(0, 0), &[]));
+        }
         if probes.len() == 1 {
             let probe = &mut probes[0];
             let _scope = probe.device.enter().ok()?;

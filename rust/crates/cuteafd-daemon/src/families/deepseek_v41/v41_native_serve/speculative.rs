@@ -147,7 +147,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.draft_limit = limit as usize;
         Ok(())
     }
-    /// Verify every available draft; the policy still fits and reports.
+    /// Verify every available draft; the policy still records statistics.
     pub fn set_fixed(&mut self, fixed: bool) {
         self.fixed = fixed;
         if let Some(policy) = &mut self.policy {
@@ -174,8 +174,14 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.policy = Some(policy);
         Ok(())
     }
-    /// Routes and layer timings feed the policy on every verification round.
-    pub fn capture_routes(&self) -> bool { self.policy.is_some() }
+    /// A length policy is bound (it observes every verification round).
+    pub fn has_policy(&self) -> bool { self.policy.is_some() }
+    /// Capture routes and layer times only for resource pricing, replay
+    /// traces, or a connected console (its layer and FFN stage times).
+    pub fn capture_routes(&self) -> bool {
+        self.policy.as_ref().is_some_and(|policy| crate::shared::draft::binding::needs_routes(policy)
+            || super::console::live().is_some())
+    }
     fn wants_confidence(&self) -> bool {
         self.policy.is_some() || tracing::enabled!(target: "cuteafd::draft_policy", tracing::Level::DEBUG)
     }

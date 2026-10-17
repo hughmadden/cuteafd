@@ -137,7 +137,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             }
             let proposal = console::Proposal::capture(&inputs, console::live());
             let shared = active.borrow().iter().flatten().any(|r| r.lane() != lane);
-            let (inputs, mut batch, capture_routes) = {
+            let (inputs, mut batch, capture_routes, retain_shapes) = {
                 let active = active.borrow();
                 let mut requests = requests.borrow_mut();
                 let mut draft = draft.borrow_mut();
@@ -159,13 +159,15 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 }
                 bound_inputs(&mut inputs);
                 let batch = prepare_decode_lane(&mut requests, &active, &members, &inputs, draft.is_some())?;
-                (inputs, Some(batch), draft.as_deref().is_some_and(DraftRuntime::capture_routes))
+                (inputs, Some(batch), draft.as_deref().is_some_and(DraftRuntime::capture_routes),
+                    draft.as_deref().is_some_and(DraftRuntime::has_policy))
             };
             let prepared_us = started.elapsed().as_micros() as u64;
             round_id += 1;
             tracing::debug!(target: "cuteafd::lane_schedule", lane, round_id, requests=members.len(),
                 "independent verifier issued");
             let operation: Result<()> = async {
+                if retain_shapes { pass.retain_small_graph_shapes()?; }
                 pass.set_route_capture(capture_routes)?;
                 // Device-ordered passes only while the other lane is idle (two
                 // busy lanes interleave on host waits; see PLAN.md).
@@ -281,7 +283,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     }
                 }
                 let layer_us = pass.captured_layer_us();
-                observe_lane_round(draft.borrow_mut().as_deref_mut(), capture_routes, lane, shared,
+                observe_lane_round(draft.borrow_mut().as_deref_mut(), lane, shared,
                     pass.captured_routes(), &layer_us, &active.borrow(), &members, &inputs,
                     &accepted_inputs, &copied, &clock);
                 if let Some(live) = live {

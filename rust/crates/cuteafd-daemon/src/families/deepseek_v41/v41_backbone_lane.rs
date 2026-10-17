@@ -519,6 +519,8 @@ pub(crate) struct BackboneLane<'w, 'a> {
     layer: usize,
     phase: Phase,
     capture_routes: bool,
+    /// Decode-row graph shapes are retained (see `retain_small_graph_shapes`).
+    retain_small_shapes: bool,
     route_capture: Vec<Vec<[u32; 6]>>,
     /// Host FFN stage times summed over the captured pass.
     ffn_split: FfnSplit,
@@ -580,6 +582,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             layer: first_layer,
             phase: Phase::Idle,
             capture_routes: false,
+            retain_small_shapes: false,
             route_capture: Vec::new(),
             ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?,
@@ -928,16 +931,22 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     }
     #[cfg(test)]
     pub fn trace_stream(&self) -> *mut std::ffi::c_void { self.block.trace_stream() }
+    /// Keep every decode-row graph shape once captured (sticky): speculative
+    /// verification varies its row count every round, with or without route capture.
+    pub fn retain_small_graph_shapes(&mut self) {
+        self.retain_small_shapes = true;
+        self.query.enable_small_graph_shapes();
+        if let Some(sparse)=&mut self.sparse { sparse.enable_small_graph_shapes(); }
+        if let Some(dual)=&mut self.dual_sparse { dual.enable_small_graph_shapes(); }
+        self.projection.enable_small_graph_shapes();
+        if let Some(shared) = &mut self.shared { shared.enable_small_graph_shapes(); }
+        self.router.enable_small_graph_shapes();
+    }
     pub fn set_route_capture(&mut self, enabled: bool) {
         self.capture_routes = enabled;
         self.router.set_ring_capture(enabled);
         if enabled {
-            self.query.enable_small_graph_shapes();
-            if let Some(sparse)=&mut self.sparse { sparse.enable_small_graph_shapes(); }
-            if let Some(dual)=&mut self.dual_sparse { dual.enable_small_graph_shapes(); }
-            self.projection.enable_small_graph_shapes();
-            if let Some(shared) = &mut self.shared { shared.enable_small_graph_shapes(); }
-            self.router.enable_small_graph_shapes();
+            self.retain_small_graph_shapes();
             self.route_capture.resize_with(40, Vec::new);
             for rows in &mut self.route_capture { rows.clear(); }
             self.layer_clock.reset();
@@ -994,7 +1003,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         ensure!(self.phase==Phase::Idle && self.dual_sparse.is_none(),"dual attention requires an unused lane");
         let source=Device { library:self.weights.library,id:self.query.input().device_id };
         let mut dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
-        if self.capture_routes { dual.enable_small_graph_shapes(); }
+        if self.retain_small_shapes { dual.enable_small_graph_shapes(); }
         source.run(|| { self.sparse=None; Ok(()) })?;
         self.dual_sparse=Some(dual);Ok(())
     }

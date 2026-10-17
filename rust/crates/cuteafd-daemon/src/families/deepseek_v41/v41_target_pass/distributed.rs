@@ -207,6 +207,18 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             sampled: None,
         })
     }
+    /// Retain decode-row graph shapes on both owning devices (sticky).
+    pub fn retain_small_graph_shapes(&mut self) -> Result<()> {
+        ensure!(self.state == State::Idle, "cannot change graph retention during a target pass");
+        for lane in &mut self.resources.lanes {
+            let device = lane.device;
+            device.run(|| { lane.retain_small_graph_shapes(); Ok(()) })?;
+        }
+        for index in self.resources.indices.iter_mut().flatten() {
+            index.get_mut().enable_small_graph_shapes();
+        }
+        Ok(())
+    }
     pub fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
         ensure!(!enabled || self.state == State::Idle,
             "cannot reset route capture during a target pass");

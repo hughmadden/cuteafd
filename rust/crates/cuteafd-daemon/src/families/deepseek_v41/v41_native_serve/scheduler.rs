@@ -1352,6 +1352,9 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
     let speculative = draft.is_some();
     let capture_routes = draft.as_deref().is_some_and(DraftRuntime::capture_routes);
+    // Speculative rows vary every round: keep each decode shape's graphs,
+    // whether or not this policy captures routes.
+    if draft.as_deref().is_some_and(DraftRuntime::has_policy) { pass.retain_small_graph_shapes(); }
     let seeds = members.iter().map(|&slot| {
         let r = active[slot].as_ref().unwrap();
         Ok((r.id(), r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
@@ -1436,7 +1439,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             }
         }
         let layer_us = pass.captured_layer_us();
-        observe_lane_round(draft.as_deref_mut(), capture_routes, lane, false, pass.captured_routes(),
+        observe_lane_round(draft.as_deref_mut(), lane, false, pass.captured_routes(),
             &layer_us, active, members, &inputs, &accepted_inputs, &copied, &clock);
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, verified_us,
@@ -1477,7 +1480,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             }
         }
         let layer_us = pass.captured_layer_us();
-        observe_lane_round(draft.as_deref_mut(), capture_routes, lane, false, pass.captured_routes(),
+        observe_lane_round(draft.as_deref_mut(), lane, false, pass.captured_routes(),
             &layer_us, active, members, &inputs, &accepted_inputs, &copied, &clock);
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, executed_us - prepared_us,
@@ -1943,13 +1946,12 @@ pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<
     console::Event::Gauges(gauges)
 }
 
-fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>, capture_routes: bool,
+fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     lane: usize, shared: bool, routes: &[Vec<[u32; 6]>], layer_us: &[Option<f64>],
     active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], copied: &[bool],
     clock: &RoundClock,
 ) {
     let Some(draft) = draft else { return };
-    if !capture_routes { return; }
     let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).zip(copied)
         .filter_map(|(((&slot, input), &count), &copied)|
             active[slot].as_ref().map(|r| super::speculative::LaneRequest { id: r.id(), rows: input.len(),
