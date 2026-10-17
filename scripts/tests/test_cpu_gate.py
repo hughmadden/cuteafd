@@ -26,7 +26,7 @@ def _fake(monkeypatch, outputs):
         calls.append(cmd)
         Path(log_path).write_text(text)
         return code, 1.0
-    monkeypatch.setattr(gate.shutil, 'which', lambda *a, **k: None)
+    monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: '')
     return calls
@@ -240,7 +240,7 @@ def test_suites_overlap_without_changing_receipt_order(tmp_path, monkeypatch):
 def test_missing_nextest_report_cannot_be_masked_by_passing_doctests(tmp_path, monkeypatch):
     (tmp_path / 'logs').mkdir()
     calls = _fake(monkeypatch, [(0, ''), (0, ''), (0, 'test result: ok. 2 passed; 0 failed; 0 ignored\n')])
-    monkeypatch.setattr(gate.shutil, 'which', lambda *a, **k: '/tools/cargo-nextest')
+    monkeypatch.setattr(gate, 'nextest_for', lambda env: '/tools/cargo-nextest')
     result = gate.cargo(ROOT, tmp_path, ARGS, {})
     assert calls[1][4:6] == ['nextest', 'run']
     config = tmp_path / 'nextest.toml'

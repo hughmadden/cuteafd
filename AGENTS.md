@@ -146,9 +146,10 @@ before → after tables with conditions.
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
   (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
   `scripts/dev/cpu-gate --task NAME --jobs N` runs both suites concurrently
-  (or set `CUTEAFD_TEST_JOBS`; default half the logical CPUs). Put an optional
-  `cargo-nextest` on PATH for cross-binary Rust parallelism; Cargo remains the
-  fallback. Release cuts also run `cpu-gate --slow` for the explicit slow CPU
+  (or set `CUTEAFD_TEST_JOBS`; default half the logical CPUs). The gate uses
+  nextest when present on PATH or in the persistent architecture Cargo home,
+  with cargo test as fallback. Install without root:
+  `CARGO_HOME="$HOME/.cache/cuteafd/cargo-home/$(uname -m)" cargo install --locked cargo-nextest`. Release cuts also run `cpu-gate --slow` for the explicit slow CPU
   tier, not arbitrary ignored GPU/network tests. Add no failing ids.
 - Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
   From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path

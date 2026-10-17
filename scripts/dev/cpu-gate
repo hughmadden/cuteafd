@@ -6,8 +6,8 @@
 --jobs is the total worker budget: split evenly between Cargo and pytest when
 both run, otherwise given entirely to the requested suite. --slow adds the
 explicit CPU slow tier and is required at release cuts. Install cargo-nextest
-without root with `cargo install --locked cargo-nextest --root BUILD/cargo-home`
-and put BUILD/cargo-home/bin on PATH; cargo test remains the fallback.
+without root into the persistent architecture Cargo home (see AGENTS.md).
+The gate finds it on PATH or there automatically; cargo test remains the fallback.
 
 With none of --cargo, --scripts, --benches the first two run. --benches runs
 the release host-cost bounds (BENCHES: the draft policy's select median at the
@@ -36,6 +36,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import subprocess
@@ -127,6 +128,14 @@ def run_logged(cmd, log_path, env, cwd, timeout):
     return code, time.monotonic() - started
 
 
+def nextest_for(env):
+    found = shutil.which('cargo-nextest', path=env.get('PATH'))
+    if found:
+        return found
+    persistent = Path.home() / '.cache/cuteafd/cargo-home' / platform.machine() / 'bin/cargo-nextest'
+    return str(persistent) if persistent.is_file() and os.access(persistent, os.X_OK) else None
+
+
 def cargo(source, root, args, env):
     target = root / 'target-cpu-gate'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
@@ -149,7 +158,7 @@ def cargo(source, root, args, env):
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
     if skips:
         test_args.append('--exact')
-    nextest = shutil.which('cargo-nextest', path=env.get('PATH'))
+    nextest = nextest_for(env)
     # nextest's store is workspace-relative, independent of CARGO_TARGET_DIR.
     report = root / 'logs/nextest/cpu-gate/junit.xml'
     if nextest:
