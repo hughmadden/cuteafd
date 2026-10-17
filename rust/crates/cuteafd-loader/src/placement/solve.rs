@@ -568,18 +568,8 @@ fn layer_owners(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> 
             Ok((0..request.layers.len()).map(|index| if index < switch { request.layers_first_gpu }
                 else { 1 - request.layers_first_gpu }).collect())
         }
-        LayerOwnership::Alternating => {
-            let mut groups = std::collections::BTreeMap::new();
-            let mut next = request.layers_first_gpu;
-            Ok(request.layers.iter().map(|layer| {
-                if !selected(layer) { return 0; }
-                if let Some(owner) = layer.colocate.and_then(|group| groups.get(&group).copied()) { return owner; }
-                let owner = next;
-                next = 1 - next;
-                if let Some(group) = layer.colocate { groups.insert(group, owner); }
-                owner
-            }).collect())
-        }
+        LayerOwnership::Alternating => attention::alternating_owners(
+            request.layers.iter().map(|layer| (selected(layer), layer.colocate)), request.layers_first_gpu),
     }
 }
 

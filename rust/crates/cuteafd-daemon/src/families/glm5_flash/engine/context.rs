@@ -32,7 +32,7 @@
 //! **Tables.** A step's per-rank tables are built on the host and uploaded once at the step's
 //! start, after both streams drained, so no queued kernel reads a table the host rewrites.
 use super::*;
-use crate::shared::peer_split::context::{commit_blocks, local_pages, page_owner, partial_program,
+use crate::shared::peer_split::context::{commit_blocks, local_pages, page_owner,
     CommitPlane, ContextExchange};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::placement::families::glm5_flash::{context_buffers, context_commit_units, context_workspace,
@@ -104,7 +104,7 @@ impl<'a> GlmfContextSplit<'a> {
         let rank = |rank: usize| -> Result<(ContextRank<'a>, Dev<'a>, [String; 2])> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
-                let partial = [0, cfg.heads / 2].map(|begin| partial_program(
+                let partial = [0, cfg.heads / 2].map(|begin| cuteafd_core::coordinator_programs::attention_partial_program(
                     manifest, "glmf", begin, DECODE_ROWS, sms, &engine.attention_plan));
                 let [a, b] = partial;
                 let partial = [a?, b?];

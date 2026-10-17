@@ -1634,7 +1634,7 @@ impl Opened {
                     let sms = self.library.sm_count()?;
                     let mut bytes = 0;
                     for begin in [0, self.cfg.heads / 2] {
-                        let name = crate::shared::peer_split::context::partial_program(
+                        let name = cuteafd_core::coordinator_programs::attention_partial_program(
                             &manifest, "glmf", begin, engine::DECODE_ROWS, sms, &attention_plan)?;
                         bytes = bytes.max(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0));
                     }

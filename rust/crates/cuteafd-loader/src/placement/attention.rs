@@ -43,6 +43,23 @@ pub enum LayerOwnership {
     Alternating,
 }
 
+/// Pure alternating ownership of selected colocate groups, independent of
+/// budgets, weight loading, expert onboarding and pool admission.
+pub fn alternating_owners(groups: impl IntoIterator<Item = (bool, Option<u16>)>, first: u8)
+    -> Result<Vec<u8>, PlacementError> {
+    if first > 1 { return Err(PlacementError::Inventory("alternating first owner")); }
+    let mut owners = std::collections::BTreeMap::new();
+    let mut next = first;
+    Ok(groups.into_iter().map(|(selected, group)| {
+        if !selected { return 0; }
+        if let Some(owner) = group.and_then(|group| owners.get(&group).copied()) { return owner; }
+        let owner = next;
+        next = 1 - next;
+        if let Some(group) = group { owners.insert(group, owner); }
+        owner
+    }).collect())
+}
+
 /// Pool bytes per logical unit. A context unit is charged at half its bytes
 /// on each GPU; the solver reserves an even number of units for the half pools.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

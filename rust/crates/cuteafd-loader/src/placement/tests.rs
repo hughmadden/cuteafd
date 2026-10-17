@@ -1541,3 +1541,29 @@ fn drafter_home_refusal_names_the_family_and_gpu() {
     assert_eq!(error, PlacementError::DrafterHome { family: "GLM Flash", gpu: 1 });
     assert_eq!(error.to_string(), "GLM Flash drafter was placed on rtx1, where this build has no executor for it");
 }
+
+#[test]
+fn pool_inventory_settle_requires_pool_and_layout_fixed_point() {
+    let mut calls = Vec::new();
+    let result = settle_pool((128, 0u8), |pool, &layout| {
+        calls.push((pool, layout));
+        let next = match (pool, layout) { (128, 0) => (64, 1), _ => (64, 2) };
+        Ok::<_, PlacementError>((next.0, next.1, next))
+    }).unwrap();
+    assert_eq!(result, (64, 2));
+    assert_eq!(calls, [(128, 0), (64, 1), (64, 2)]);
+    assert!(matches!(settle_pool((64, 0u8), |pool, &layout|
+        Ok::<_, PlacementError>((pool, 1 - layout, ()))), Err(PlacementError::Inventory("pool-dependent inventory cycle"))));
+    assert!(matches!(settle_pool((64, ()), |pool, _|
+        Ok::<_, PlacementError>((pool + 1, (), ()))), Err(PlacementError::Inventory("pool-dependent inventory did not descend"))));
+}
+
+#[test]
+fn alternating_owner_function_preserves_noncontiguous_colocate_groups() {
+    for first in [0, 1] {
+        assert_eq!(attention::alternating_owners([
+            (true, Some(7)), (false, None), (true, Some(8)), (true, Some(7)), (true, None)], first).unwrap(),
+            [first, 0, 1 - first, first, first]);
+    }
+    assert!(attention::alternating_owners([], 2).is_err());
+}

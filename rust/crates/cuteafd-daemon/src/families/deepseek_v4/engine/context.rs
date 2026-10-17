@@ -32,7 +32,7 @@
 //! words); graphs capture only its persistent buffers.
 use super::*;
 use crate::shared::peer_split::attention::{context_decode, Candidates, ContextKernels, Partial, Query};
-use crate::shared::peer_split::context::{local_pages, partial_program, ContextExchange};
+use crate::shared::peer_split::context::{local_pages, ContextExchange};
 use cuteafd_core::coordinator_programs::AttentionReductionPlan;
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::placement::families::deepseek_v4::{context_buffers, context_commit_units, context_workspace,
@@ -114,7 +114,7 @@ impl<'a> V4ContextSplit<'a> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
                 for (slot, begin) in partial[rank].iter_mut().zip([0, cfg.n_heads / 2]) {
-                    let program = partial_program(manifest, engine.family, begin, engine.decode_rows, sms, plan)?;
+                    let program = cuteafd_core::coordinator_programs::attention_partial_program(manifest, engine.family, begin, engine.decode_rows, sms, plan)?;
                     *slot = program.strip_prefix(engine.family).and_then(|p| p.strip_prefix('_'))
                         .context("partial program of another family")?.to_string();
                 }
@@ -469,14 +469,14 @@ mod tests {
         assert_eq!(dspark.rows(), 6);
         for sms in [170, 188] {
             for begin in [0, 32] {
-                assert_eq!(partial_program(&manifest, "dsv4f", begin, 64, sms, &dspark).unwrap(),
+                assert_eq!(cuteafd_core::coordinator_programs::attention_partial_program(&manifest, "dsv4f", begin, 64, sms, &dspark).unwrap(),
                     format!("dsv4f_sparse_mla_partial_h{begin}_s10_m64"));
             }
         }
         let plain = AttentionReductionPlan::new(64, None, None).unwrap();
-        assert_eq!(partial_program(&manifest, "dsv4f", 0, 64, 188, &plain).unwrap(), "dsv4f_sparse_mla_partial_h0_s10_m64");
+        assert_eq!(cuteafd_core::coordinator_programs::attention_partial_program(&manifest, "dsv4f", 0, 64, 188, &plain).unwrap(), "dsv4f_sparse_mla_partial_h0_s10_m64");
         let wide = AttentionReductionPlan::new(64, Some(5), Some(48)).unwrap();
-        assert_eq!(partial_program(&manifest, "dsv4f", 0, 64, 188, &wide).unwrap(), "dsv4f_sparse_mla_partial_h0_s4_m64");
+        assert_eq!(cuteafd_core::coordinator_programs::attention_partial_program(&manifest, "dsv4f", 0, 64, 188, &wide).unwrap(), "dsv4f_sparse_mla_partial_h0_s4_m64");
     }
 
     /// Every decode/verify C4 write lands inside a GPU's local pool or its scratch page: the
