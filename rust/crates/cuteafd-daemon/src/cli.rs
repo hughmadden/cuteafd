@@ -363,7 +363,7 @@ pub(crate) struct PlanArgs {
     /// MiMo and GLM 5.3 Flash device positional-mark budget for --layout, MiB.
     #[arg(long, default_value_t = 2048)]
     pub(crate) prefix_cache_mark_mib: u64,
-    /// MiMo warm DFlash prefix context marks (off until qualified).
+    /// Experimental MiMo warm DFlash prefix context marks (default off; qualification: https://github.com/tpurtell/cuteafd/issues/41).
     #[arg(long)]
     pub(crate) mimo_prefix_draft: bool,
     /// MiMo target ring count for --layout (at least concurrency).
@@ -566,6 +566,19 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plan_mimo_prefix_marks_stay_experimental_and_off() {
+        use clap::{CommandFactory, Parser};
+        let super::Commands::Plan(args) = super::Cli::try_parse_from(
+            ["cuteafd", "plan", "/model"]).unwrap().command else { panic!("expected plan"); };
+        assert!(!args.mimo_prefix_draft);
+        let mut cli = super::Cli::command();
+        let help = cli.find_subcommand_mut("plan").unwrap().render_long_help().to_string();
+        assert!(help.contains("Experimental MiMo warm DFlash"), "{help}");
+        assert!(help.contains("https://github.com/tpurtell/cuteafd/issues/41"), "{help}");
+        assert!(!help.contains("off until qualified"), "{help}");
+    }
+
     #[test]
     fn plan_qwen_kv_defaults_to_fp8_and_keeps_explicit_bf16() {
         use clap::Parser;
@@ -856,6 +869,7 @@ pub(crate) struct NativeServeArgs {
     /// Force one RTX or the distributed two-RTX layout (automatic launcher selection is pending).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
     pub rtx_gpus: u32,
+    // Per-switch promotion/deletion evidence: https://github.com/tpurtell/cuteafd/issues/404.
     /// Experimental TP2 attention with replicated KV; requires two RTX GPUs.
     #[arg(long)]
     pub tp2_attention: bool,

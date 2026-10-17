@@ -250,16 +250,12 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
                         'family="$1"; attention_placement="$2"; wip_slot="$3"; ' + block,
                         'test', family, mode, wip_slot], cwd=ROOT, text=True, capture_output=True)
                     # GLM and V4 run context; Qwen layers requires a Spark-free pair (checked later).
-                    # V4 layers is a dev executor: only a WIP slot may pass it to the daemon.
                     runs = mode in ['auto', 'heads'] or (family, mode) in [
                         ('glm5', 'context'), ('glm5_flash', 'context'), ('deepseek_v4', 'context'), ('qwen4', 'layers')]
-                    runs = runs or (family, mode, bool(wip_slot)) == ('deepseek_v4', 'layers', True)
                     # K4/P7 qualified explicit GLM layers in release and WIP images.
                     runs = runs or (mode == 'layers' and family in ['glm5', 'glm5_flash'])
                     self.assertEqual(result.returncode == 0, runs, result.stderr)
-                    if (family, mode) == ('deepseek_v4', 'layers') and not runs:
-                        self.assertIn('dev-only executor', result.stderr)
-                    elif mode == 'layers' and family in ['glm5', 'glm5_flash']:
+                    if mode == 'layers' and family in ['glm5', 'glm5_flash']:
                         self.assertIn('layers explicitly selected; auto remains context on two GPUs', result.stderr)
                     elif mode in ['context', 'layers'] and not runs:
                         self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)

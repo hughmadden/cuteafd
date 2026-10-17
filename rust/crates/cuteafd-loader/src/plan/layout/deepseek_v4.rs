@@ -42,6 +42,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         format!("attention placement {}", report.attention_placement)];
     shape.select_card_plans(report, options, &mut notes);
+    // Retain estimated-allowance warnings pending census proof coverage: https://github.com/tpurtell/cuteafd/issues/388.
     notes.push("deepseek_v4: workspace/runtime/Spark allowances are unqualified; validate against the allocation ledger before using this layout for admission".into());
     mapped_table_note(report, &mut notes);
     let dspark = shape.native_layers > 0;

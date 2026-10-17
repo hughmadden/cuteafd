@@ -6240,9 +6240,13 @@ Ideas TJ wants kept for later; not v2 work.
   hardware decision (mapped-table routing is decided below, not still gated):
   - GLM Flash split-KDA FP8 rows (already passed 3 pairs on K3.25);
   - GLM Flash GB10 schedule (bit-identical);
-  - MiMo prefill chunk and snapshot wait (C16 TTFT 91 -> 67 ms);
+  - MiMo prefill chunk, snapshot wait and host tier (C16 TTFT 91 -> 67 ms;
+    promote-or-delete decision [#403](https://github.com/tpurtell/cuteafd/issues/403),
+    current defaults retained; not a v3 promotion requirement);
   - GLM Flash BF16 KDA state and pool prefix marks (memory to KV);
-  - MiMo warm drafter marks and host tier;
+  - MiMo warm drafter marks remain experimental and off by default
+    (qualification [#41](https://github.com/tpurtell/cuteafd/issues/41),
+    not pending promotion in v3);
   - GLM Flash packed admission (the private likelihood policy was removed for v3, #346).
   Also: revive the deterministic Spark prefill reducer; delete
   `work/mxfp4-tails` and `work/v41-exact`, and the old draft-policy switches

@@ -387,6 +387,16 @@ fn e4m3_and_e5m2_are_distinct_operands() {
 }
 
 #[test]
+fn glm5_local_contract_distinguishes_tp2_prefix_from_standalone_placement() {
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    let reason = report.experts.as_ref().unwrap().local.as_ref().unwrap_err();
+    assert!(reason.contains("solver-selected local RTX TP2 prefix"), "{reason}");
+    assert!(reason.contains("not standalone --local-experts placement"), "{reason}");
+    assert!(!reason.contains("has no local expert path"), "{reason}");
+}
+
+#[test]
 fn glm5_layout_matches_runtime_request_from_header_baseline() {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
     use cuteafd_core::memory_layout::Category;
