@@ -184,7 +184,8 @@ def write_reference_meta(out: Path, snapshot: Path, run_platform: dict | None = 
                                         capability=list(torch.cuda.get_device_capability(0)) if gpu else None)
     meta.update(
         nll=total / count, scored_tokens=count, mtp=False, use_cache=False, attention="eager", dtype="checkpoint-native",
-        source_pin={"model_py_sha256": digest(snapshot / "inference" / "model.py"),
+        source_pin={"revision": snapshot.name,
+                    "model_py_sha256": digest(snapshot / "inference" / "model.py"),
                     "kernel_torch_sha256": digest(HERE / "kernel_torch.py"),
                     "golden_sha256": digest(Path(__file__)),
                     "inference_config_sha256": digest(snapshot / "inference" / "config.json")},

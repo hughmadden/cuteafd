@@ -390,6 +390,11 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                 && launch["official_launch_configuration"] == false && launch["num_stages"] == 1
                 && launch["block_regions"] == 16 && launch["kernel"] == "_sparse_attn_prefill_kernel"
                 && manifest["reference_execution"]["sparse_attention_launch"] == *launch
+        } else if manifest["family"] == "deepseek_v41" {
+            // The checkpoint's own inference/model.py, the kernel emulation and the harness.
+            source["revision"] == manifest["root_checkpoint"]["revision"]
+                && ["model_py_sha256", "kernel_torch_sha256", "golden_sha256", "inference_config_sha256"]
+                    .iter().all(|key| hash(&source[key], 64))
         } else {
             hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
         };
@@ -883,6 +888,22 @@ mod tests {
         assert!(qualification_label(&bad, &native_manifest).is_err());
         let mut bad = native_manifest.clone(); bad["reference_execution"]["sparse_attention_launch"]["num_stages"] = json!(3);
         assert!(qualification_label(&native, &bad).is_err());
+        // V4.1 pins the checkpoint's own model.py, the kernel emulation and the harness.
+        let mut v41_manifest = manifest.clone();
+        v41_manifest["family"] = json!("deepseek_v41");
+        v41_manifest["root_checkpoint"]["id"] = json!("deepseek-ai/DeepSeek-V4.1-Flash-1017");
+        let mut v41 = qualification.clone();
+        v41["reference_provenance"]["snapshot_identity"]["checkpoint"] = v41_manifest["root_checkpoint"]["id"].clone();
+        v41["prefix_qualification"]["snapshot_identity"] = v41["reference_provenance"]["snapshot_identity"].clone();
+        v41["reference_provenance"]["source_pin"] = json!({"revision":"a".repeat(40), "model_py_sha256":"1".repeat(64),
+            "kernel_torch_sha256":"2".repeat(64), "golden_sha256":"3".repeat(64), "inference_config_sha256":"4".repeat(64)});
+        assert_eq!(qualification_label(&v41, &v41_manifest).unwrap(), "reference-only qualified");
+        for key in ["revision", "model_py_sha256", "kernel_torch_sha256", "golden_sha256", "inference_config_sha256"] {
+            let mut bad = v41.clone(); bad["reference_provenance"]["source_pin"][key] = Value::Null;
+            assert!(qualification_label(&bad, &v41_manifest).is_err(), "{key}");
+        }
+        let mut bad = v41.clone(); bad["reference_provenance"]["source_pin"]["revision"] = json!("9".repeat(40));
+        assert!(qualification_label(&bad, &v41_manifest).is_err(), "pinned source must be the root revision");
         let mut rounded = qualification.clone(); rounded["reference_validation"]["nll"] = json!(1.2 + 1e-15);
         assert!(qualification_label(&rounded, &manifest).is_ok());
         rounded["reference_validation"]["nll"] = json!(1.21);
