@@ -17,6 +17,72 @@ use deepseek_recipe_encoding::{v4::dsv41::DeepseekV41Encoding, PromptEncoding, R
 
 /// The checkpoint whose own encoding introduced the turn-scoped rule.
 pub const V41_1017_MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash-1017";
+/// The original V4.1 checkpoint.
+pub const V41_ORIGINAL_MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
+
+/// Why a V4.1 history could not be rendered.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RenderError {
+    #[error("request text contains a reserved private-use sequence")]
+    ReservedSequence,
+    #[error("V4.1 history rendering left a dropped-turn marker")]
+    UnresolvedMarker,
+}
+
+/// Why a served V4.1 checkpoint could not be identified.
+#[derive(Debug, thiserror::Error)]
+pub enum IdentifyError {
+    #[error("reading {path}: {source}")]
+    Read { path: std::path::PathBuf, source: std::io::Error },
+    #[error("cannot identify the V4.1 checkpoint at {snapshot}: its path names no Hugging Face repository, \
+             its model card has no base_model, and encoding/encoding.py (sha256 {encoding}) matches no known \
+             V4.1 release; pass --model-id with the checkpoint's repository id")]
+    Unknown { snapshot: std::path::PathBuf, encoding: String },
+}
+
+/// Official V4.1 releases by the sha256 of their own `encoding/encoding.py`,
+/// read from the conformance fixtures that pin each release's rendering.
+fn release_by_encoding(sha256: &str) -> Option<&'static str> {
+    const FIXTURES: [&str; 2] = [
+        include_str!("../../../../tests/fixtures/v41-encoding/deepseek-v4.1-flash.json"),
+        include_str!("../../../../tests/fixtures/v41-encoding/deepseek-v4.1-flash-1017.json"),
+    ];
+    #[derive(serde::Deserialize)]
+    struct Fixture { checkpoint: String, encoding_sha256: String }
+    FIXTURES.iter().map(|text| serde_json::from_str::<Fixture>(text).expect("checked-in V4.1 encoding fixture"))
+        .find(|f| f.encoding_sha256 == sha256)
+        .map(|f| match f.checkpoint.as_str() {
+            V41_1017_MODEL_ID => V41_1017_MODEL_ID,
+            V41_ORIGINAL_MODEL_ID => V41_ORIGINAL_MODEL_ID,
+            other => unreachable!("unexpected fixture checkpoint {other}"),
+        })
+}
+
+/// The checkpoint a snapshot directory holds, from the checkpoint's own files:
+/// the Hugging Face id its hub path names, else (with `lineage` listing the
+/// base_model ancestors its own model card names) that ancestry, else its
+/// `encoding/encoding.py` matched against the known V4.1 releases. `explicit`
+/// (`--model-id`) names the checkpoint when none of these can.
+pub fn identify(snapshot: &std::path::Path, hub_id: Option<String>, card_ancestors: &[String],
+    explicit: Option<&str>) -> Result<Vec<String>, IdentifyError> {
+    if let Some(id) = hub_id { return Ok(vec![id]); }
+    if !card_ancestors.is_empty() { return Ok(card_ancestors.to_vec()); }
+    let path = snapshot.join("encoding").join("encoding.py");
+    let encoding = match std::fs::read(&path) {
+        Ok(bytes) => {
+            use sha2::Digest;
+            let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+            if let Some(release) = release_by_encoding(&hash) { return Ok(vec![release.to_owned()]); }
+            hash
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_owned(),
+        Err(source) => return Err(IdentifyError::Read { path, source }),
+    };
+    match explicit {
+        Some(id) => Ok(vec![id.to_owned()]),
+        None => Err(IdentifyError::Unknown { snapshot: snapshot.to_owned(), encoding }),
+    }
+}
 
 /// How a V4.1 checkpoint renders thinking-mode history.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -42,7 +108,7 @@ impl V41Turns {
 const DROPPED: &str = "\u{e000}\u{e001}cuteafd-v41-dropped-turn\u{e002}";
 
 /// Render `conversation` for a V4.1 checkpoint with the given turn rule.
-pub fn render(conversation: &Conversation, turns: V41Turns) -> Result<RenderedPrompt, String> {
+pub fn render(conversation: &Conversation, turns: V41Turns) -> Result<RenderedPrompt, RenderError> {
     let encoding = DeepseekV41Encoding::new();
     // `encoding.py` keeps every turn's reasoning when tools are rendered.
     let tools_rendered = conversation.tool_choice != ToolChoice::None && !conversation.tools.is_empty();
@@ -59,7 +125,7 @@ pub fn render(conversation: &Conversation, turns: V41Turns) -> Result<RenderedPr
     // `<｜Assistant｜></think>{content}`. Mark each dropped turn's reasoning
     // with a sentinel the request cannot contain and rewrite exactly those.
     if contains_sentinel(conversation) {
-        return Err("request text contains a reserved private-use sequence".into());
+        return Err(RenderError::ReservedSequence);
     }
     let mut marked = conversation.clone();
     for message in &mut marked.messages[..boundary] {
@@ -71,7 +137,7 @@ pub fn render(conversation: &Conversation, turns: V41Turns) -> Result<RenderedPr
     let marker = format!("<｜Assistant｜><think>{DROPPED}</think>");
     rendered.prompt = rendered.prompt.replace(&marker, "<｜Assistant｜></think>");
     if rendered.prompt.contains(DROPPED) {
-        return Err("V4.1 history rendering left a dropped-turn marker".into());
+        return Err(RenderError::UnresolvedMarker);
     }
     Ok(rendered)
 }
@@ -117,10 +183,13 @@ mod tests {
     use crate::openai::{build, ModelEncoding, ModelProfile, NativeLimits};
     use serde_json::{json, Value};
 
-    fn cases(name: &str) -> Vec<Value> {
+    fn cases_file(name: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v41-encoding").join(name);
-        let fixture: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        fixture["cases"].as_array().unwrap().clone()
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn cases(name: &str) -> Vec<Value> {
+        cases_file(name)["cases"].as_array().unwrap().clone()
     }
 
     fn rendered(profile: &ModelProfile, request: &Value) -> String {
@@ -173,6 +242,37 @@ mod tests {
                 }
                 assert_eq!(rendered(&profile, &case["request"]), expected, "{name} {}", case["id"]);
             }
+        }
+    }
+
+    /// A plain directory copy is identified by its own encoding.py; one that
+    /// matches no release, with no hub id or card ancestry, fails closed.
+    #[test]
+    fn plain_directory_is_identified_by_its_own_encoding_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let unknown = identify(path, None, &[], None).unwrap_err();
+        assert!(matches!(unknown, IdentifyError::Unknown { ref encoding, .. } if encoding == "absent"));
+        assert!(unknown.to_string().contains("--model-id"), "{unknown}");
+        std::fs::create_dir(path.join("encoding")).unwrap();
+        std::fs::write(path.join("encoding/encoding.py"), "# edited\n").unwrap();
+        assert!(identify(path, None, &[], None).unwrap_err().to_string().contains("--model-id"));
+        assert_eq!(identify(path, None, &[], Some("org/served")).unwrap(), ["org/served"]);
+        // Each fixture's recorded encoding sha256 identifies its release.
+        for (fixture, release) in [("deepseek-v4.1-flash-1017.json", V41_1017_MODEL_ID),
+            ("deepseek-v4.1-flash.json", V41_ORIGINAL_MODEL_ID)] {
+            let hash = cases_file(fixture)["encoding_sha256"].as_str().unwrap().to_owned();
+            assert_eq!(release_by_encoding(&hash), Some(release));
+        }
+        assert_eq!(release_by_encoding(&"0".repeat(64)), None);
+        // Hub id and card ancestry come first; an alias never overrides the checkpoint's own evidence.
+        assert_eq!(identify(path, Some("org/hub".into()), &[], Some("alias")).unwrap(), ["org/hub"]);
+        assert_eq!(identify(path, None, &[V41_1017_MODEL_ID.into()], Some("alias")).unwrap(), [V41_1017_MODEL_ID]);
+        // The real 1017 encoding.py, when cached, identifies 1017.
+        let real = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170");
+        if real.join("encoding/encoding.py").is_file() {
+            std::fs::copy(real.join("encoding/encoding.py"), path.join("encoding/encoding.py")).unwrap();
+            assert_eq!(identify(path, None, &[], Some("alias")).unwrap(), [V41_1017_MODEL_ID]);
         }
     }
 

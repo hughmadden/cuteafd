@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use cuteafd_loader::{
     read_official_v41_catalog, resolve_snapshot, OfficialV41Catalog, V41ExpertSelection,
-    V41ExpertStaging, V41TensorPlacement, OFFICIAL_V41_MODEL_ID,
+    V41ExpertStaging, V41TensorPlacement,
 };
 
 const HIDDEN: usize = 5120;
@@ -164,7 +164,7 @@ fn official_snapshot() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("CUTEAFD_OFFICIAL_SNAPSHOT") {
         return Some(PathBuf::from(path));
     }
-    resolve_snapshot(OFFICIAL_V41_MODEL_ID, None)
+    resolve_snapshot("deepseek-ai/DeepSeek-V4.1-Flash", None)
         .ok()?
         .snapshot_path
 }

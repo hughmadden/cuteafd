@@ -24,7 +24,7 @@ pub use families::deepseek_v41::v41_image::{V41Image, V41ImageGrid, V41ImageSpan
     V41_IMAGE_TOKEN_ID, V41_MAX_IMAGES};
 pub use families::deepseek_v41::v41_config::{
     read_official_v41_config, OfficialV41Config, V41QuantizationConfig, V41RopeScaling,
-    V41TextConfig, V41VisionConfig, OFFICIAL_V41_MODEL_ID, OFFICIAL_V41_REVISION,
+    V41TextConfig, V41VisionConfig,
 };
 pub use families::deepseek_v41::engram_tokenizer::EngramTokenMap;
 pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramPrefetcher, EngramTable, PrefetchOutcome, PrefetchTicket};

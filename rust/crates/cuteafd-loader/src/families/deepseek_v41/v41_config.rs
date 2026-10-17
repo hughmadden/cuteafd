@@ -8,8 +8,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{fs::File, io::Read, path::Path};
 
-pub const OFFICIAL_V41_MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
-pub const OFFICIAL_V41_REVISION: &str = "df42c109f1defefcbfcedbe7d905718a12266e40";
 const OFFICIAL_CONFIG: &str = include_str!("official-v41-config.json");
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
