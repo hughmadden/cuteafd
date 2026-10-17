@@ -80,11 +80,11 @@ def test_sparse_launch_disclosure_preserves_tiles_and_rejects_missing_parameters
 def test_dense_root_wording_is_unchanged_and_v41_root_comes_from_the_manifest():
     # Dense/Step-5 goldens record no root arithmetic: their cards keep the original text byte for byte.
     assert packager.root_description({}, {'reference_snapshot': {'precision': 'official BF16'}}) == (
-        'BF16', 'Checkpoint-native BF16/F32 tensors and family activation arithmetic, bounded attention, '
+        'BF16 root', 'Checkpoint-native BF16/F32 tensors and family activation arithmetic, bounded attention, '
         'fixed GEMM rows 128, MTP/cache off.', 'Transformers source')
     # V4.1 has no BF16 master: the root precision is the set manifest's, the arithmetic the golden's own.
     meta = {'root_arithmetic': {'arithmetic': 'Official inference/model.py block by block.', 'source': 'official inference/model.py'}}
     panel = {'reference_snapshot': {'precision': 'official FP8 block dense + MXFP4 experts (no vendor BF16 master)'}}
     precision, arithmetic, source = packager.root_description(meta, panel)
-    assert precision == panel['reference_snapshot']['precision'] and 'BF16 root' not in f'Official {precision} root'
+    assert precision == 'root (official FP8 block dense + MXFP4 experts (no vendor BF16 master))'
     assert (arithmetic, source) == ('Official inference/model.py block by block.', 'official inference/model.py')
