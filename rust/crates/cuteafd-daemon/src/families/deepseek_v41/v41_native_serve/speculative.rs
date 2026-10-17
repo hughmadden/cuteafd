@@ -176,11 +176,10 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     }
     /// A length policy is bound (it observes every verification round).
     pub fn has_policy(&self) -> bool { self.policy.is_some() }
-    /// Capture routes and layer times only for resource pricing, replay
-    /// traces, or a connected console (its layer and FFN stage times).
+    /// Capture routes and layer times only for resource pricing or the replay
+    /// trace. The console's per-layer and FFN stage times come with them.
     pub fn capture_routes(&self) -> bool {
-        self.policy.as_ref().is_some_and(|policy| crate::shared::draft::binding::needs_routes(policy)
-            || super::console::live().is_some())
+        self.policy.as_ref().is_some_and(crate::shared::draft::binding::needs_routes)
     }
     fn wants_confidence(&self) -> bool {
         self.policy.is_some() || tracing::enabled!(target: "cuteafd::draft_policy", tracing::Level::DEBUG)
