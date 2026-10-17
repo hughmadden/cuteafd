@@ -15,7 +15,7 @@ SPEC = importlib.util.spec_from_loader('cpu_gate', LOADER)
 gate = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(gate)
 
-ARGS = SimpleNamespace(cargo_build_timeout=60, cargo_timeout=60, scripts_timeout=60, skip_live_planners=False)
+ARGS = SimpleNamespace(cargo_build_timeout=60, cargo_timeout=60, scripts_timeout=60, skip_live_planners=False, cargo_jobs=4, pytest_jobs=4)
 
 
 def _fake(monkeypatch, outputs):
@@ -26,6 +26,7 @@ def _fake(monkeypatch, outputs):
         calls.append(cmd)
         Path(log_path).write_text(text)
         return code, 1.0
+    monkeypatch.setattr(gate.shutil, 'which', lambda *a, **k: None)
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: '')
     return calls
@@ -180,3 +181,89 @@ def test_gate_records_the_starting_head_and_fails_when_it_moves(tmp_path, monkey
     args = SimpleNamespace(cargo=False, scripts=True, benches=False)
     record = gate.gate(ROOT, tmp_path, args)
     assert record['head'] == 'aaaa' and record['moved'] and record['status'] == 'failed'
+
+
+def test_nextest_machine_report_includes_crashes_and_skips(tmp_path):
+    report = tmp_path / 'junit.xml'
+    report.write_text('''<testsuites><testsuite name="crate">
+      <testcase name="ok"/><testcase name="bad"><failure/></testcase>
+      <testcase name="crash"><error/></testcase><testcase name="ignored"><skipped/></testcase>
+    </testsuite></testsuites>''')
+    assert gate.parse_nextest(report) == ([(1, 2, 1)], ['bad', 'crash'])
+    assert gate.parse_nextest(tmp_path / 'missing') == ([], [])
+    report.write_text('<testsuites>')
+    assert gate.parse_nextest(report) == ([], [])
+
+
+def test_worker_budget_reaches_both_runners(tmp_path, monkeypatch):
+    (tmp_path / 'logs').mkdir()
+    calls = _fake(monkeypatch, [(0, ''), (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
+    envs = []
+    run_logged = gate.run_logged
+    def capture_env(cmd, path, env, cwd, timeout):
+        envs.append(env)
+        return run_logged(cmd, path, env, cwd, timeout)
+    monkeypatch.setattr(gate, 'run_logged', capture_env)
+    gate.cargo(ROOT, tmp_path, ARGS, {})
+    assert all(env['CARGO_BUILD_JOBS'] == env['RUST_TEST_THREADS'] == '4' for env in envs)
+    monkeypatch.setattr(gate, 'python_for', lambda source: Path('/usr/bin/python3'))
+    calls = _fake(monkeypatch, [(0, '1 passed in 1.00s\n')])
+    gate.scripts(ROOT, tmp_path, ARGS, {})
+    assert calls[0][calls[0].index('-n', 3) + 1] == '4'
+
+
+def test_slow_runs_only_explicit_cpu_tests(tmp_path, monkeypatch):
+    (tmp_path / 'logs').mkdir()
+    ok = 'test result: ok. 1 passed; 0 failed; 0 ignored\n'
+    calls = _fake(monkeypatch, [(0, ''), (0, ok), *[(0, ok)] * len(gate.SLOW_TESTS)])
+    args = SimpleNamespace(**vars(ARGS), slow=True)
+    result = gate.cargo(ROOT, tmp_path, args, {})
+    assert result['status'] == 'pass'
+    assert len(calls) == 2 + len(gate.SLOW_TESTS)
+    assert all('--ignored' in call and '--include-ignored' not in call for call in calls[2:])
+
+
+def test_suites_overlap_without_changing_receipt_order(tmp_path, monkeypatch):
+    import threading
+    barrier = threading.Barrier(2, timeout=5)
+    monkeypatch.setattr(gate, 'prepare', lambda *a, **k: None)
+    monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'abc' if 'rev-parse' in cmd else '')
+    def run(name):
+        barrier.wait()
+        return {'suite': name, 'status': 'pass'}
+    monkeypatch.setattr(gate, 'cargo', lambda *a: run('cargo'))
+    monkeypatch.setattr(gate, 'scripts', lambda *a: run('scripts'))
+    args = SimpleNamespace(cargo=True, scripts=True, benches=False)
+    assert [s['suite'] for s in gate.gate(ROOT, tmp_path, args)['suites']] == ['cargo', 'scripts']
+
+
+def test_missing_nextest_report_cannot_be_masked_by_passing_doctests(tmp_path, monkeypatch):
+    (tmp_path / 'logs').mkdir()
+    calls = _fake(monkeypatch, [(0, ''), (0, ''), (0, 'test result: ok. 2 passed; 0 failed; 0 ignored\n')])
+    monkeypatch.setattr(gate.shutil, 'which', lambda *a, **k: '/tools/cargo-nextest')
+    result = gate.cargo(ROOT, tmp_path, ARGS, {})
+    assert calls[1][4:6] == ['nextest', 'run']
+    config = tmp_path / 'nextest.toml'
+    assert str(tmp_path / 'logs/nextest') in config.read_text()
+    assert calls[1][calls[1].index('--config-file') + 1] == str(config)
+    assert result['status'] == 'failed' and result['exit'] != 0
+
+
+def test_launcher_inputs_link_readonly_files_but_copy_mutable_tree_files(tmp_path, monkeypatch):
+    import launcher_sandbox
+    source, cache, clone = (tmp_path / name for name in ('source', 'cache', 'clone'))
+    source.mkdir()
+    cache.mkdir()
+    (source / 'readonly.py').write_text('original')
+    (source / 'mutable.sh').write_text('original')
+    with monkeypatch.context() as patch:
+        patch.setattr(launcher_sandbox, '_ROOT', cache)
+        patch.setattr(launcher_sandbox, '_TEMPLATES', {})
+        launcher_sandbox.copy_tree(source, clone)
+        other = tmp_path / 'other'
+        launcher_sandbox.copy_tree(source, other)
+        assert (clone / 'readonly.py').stat().st_ino == (other / 'readonly.py').stat().st_ino
+        (clone / 'mutable.sh').write_text('edited')
+        assert (other / 'mutable.sh').read_text() == (source / 'mutable.sh').read_text() == 'original'
+        launcher_sandbox.copy_input(source / 'readonly.py', tmp_path / 'input')
+        assert (tmp_path / 'input').stat().st_ino != (source / 'readonly.py').stat().st_ino

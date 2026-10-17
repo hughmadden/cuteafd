@@ -462,10 +462,14 @@ def test_final_snapshot_survives_driver_and_is_first_idle_only(cli):
     call('send', name, 'first assistant result')
     call('wait', name, '--until', 'idle', '--timeout', '8')
     deadline = time.monotonic() + 3
-    while not final.exists():
+    # Publication creates the file before writing it; existence alone races
+    # the supervisor under parallel CPU load. Wait for the completed payload.
+    while True:
+        first = final.read_text() if final.exists() else ''
+        if 'DONE first assistant result' in first and 'Idle:' in first:
+            break
         assert time.monotonic() < deadline
         time.sleep(0.1)
-    first = final.read_text()
     assert 'State: idle' in first and 'Submitted:' in first and 'Idle:' in first
     assert 'DONE first assistant result' in first
     call('send', name, 'later result')

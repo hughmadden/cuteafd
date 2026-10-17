@@ -144,8 +144,12 @@ before → after tables with conditions.
 - Host checks: `cargo check/test --workspace` from `rust/` with
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
-  (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
-  no failing ids since the codex/v1 merge (808 pass); add none.
+  (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
+  `scripts/dev/cpu-gate --task NAME --jobs N` runs both suites concurrently
+  (or set `CUTEAFD_TEST_JOBS`; default half the logical CPUs). Put an optional
+  `cargo-nextest` on PATH for cross-binary Rust parallelism; Cargo remains the
+  fallback. Release cuts also run `cpu-gate --slow` for the explicit slow CPU
+  tier, not arbitrary ignored GPU/network tests. Add no failing ids.
 - Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
   From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
   (`cd /home/tj/Developer/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:

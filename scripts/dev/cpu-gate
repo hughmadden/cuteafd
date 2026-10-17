@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """One CPU gate for a checkout: cargo workspace tests and the script suite.
 
-  scripts/dev/cpu-gate --task NAME [--cargo] [--scripts] [--benches] [--skip-live-planners] [--base REV]
+  scripts/dev/cpu-gate --task NAME [--jobs N] [--slow] [--cargo] [--scripts] [--benches] [--skip-live-planners] [--base REV]
+
+--jobs is the total worker budget: split evenly between Cargo and pytest when
+both run, otherwise given entirely to the requested suite. --slow adds the
+explicit CPU slow tier and is required at release cuts. Install cargo-nextest
+without root with `cargo install --locked cargo-nextest --root BUILD/cargo-home`
+and put BUILD/cargo-home/bin on PATH; cargo test remains the fallback.
 
 With none of --cargo, --scripts, --benches the first two run. --benches runs
 the release host-cost bounds (BENCHES: the draft policy's select median at the
@@ -27,11 +33,14 @@ requested suite passed (or, with --base, introduced no new failing ids).
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import shutil
+import xml.etree.ElementTree as ET
 import sys
 import time
 
@@ -40,6 +49,9 @@ BUILDS = Path.home() / '.cache/cuteafd/builds'
 # Real-checkpoint V4 placement tests: minutes each, need sparknest snapshots.
 LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4',
                  'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package')
+SLOW_TESTS = (('cuteafd-hostcache', 'soak_has_no_leak_and_balances_the_counters'),
+              ('cuteafd-hostcache', 'soak_in_bank_order_has_no_leak_and_balances_the_counters'),
+              ('cuteafd-loader', 'mounted_mimo_audio_inventory_is_independently_admitted'))
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 CARGO_RESULT = re.compile(r'^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored', re.M)
 CARGO_FAIL = re.compile(r'^test (\S+) \.\.\. FAILED$', re.M)
@@ -118,13 +130,13 @@ def run_logged(cmd, log_path, env, cwd, timeout):
 def cargo(source, root, args, env):
     target = root / 'target-cpu-gate'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
-    env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': env.get('CARGO_BUILD_JOBS', '16'),
-           'RUST_TEST_THREADS': env.get('RUST_TEST_THREADS', '16')}
+    env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16)),
+           'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
     for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
         env.pop(key, None)  # Plain rustc: never share a target with kache's read-only outputs.
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
-    code, build_s = run_logged([str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
+    code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
                                 '--no-run'], build_log, env, source / 'rust', args.cargo_build_timeout)
     result = dict(suite='cargo', build_exit=code, build_s=round(build_s), build_log=str(build_log))
     if code:
@@ -137,13 +149,59 @@ def cargo(source, root, args, env):
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
     if skips:
         test_args.append('--exact')
-    log('cargo: running tests (no build slot)')
+    nextest = shutil.which('cargo-nextest', path=env.get('PATH'))
+    # nextest's store is workspace-relative, independent of CARGO_TARGET_DIR.
+    report = root / 'logs/nextest/cpu-gate/junit.xml'
+    if nextest:
+        config = root / 'nextest.toml'
+        profile = source / 'rust/.config/nextest.toml'
+        if not profile.is_file():  # --base may predate nextest support.
+            profile = REPO / 'rust/.config/nextest.toml'
+        config.write_text('[store]\ndir = ' + json.dumps(str(root / 'logs/nextest')) + '\n' + profile.read_text())
+        test_args = ['nice', '-n', '19', nextest, 'nextest', 'run', '--workspace', '--locked',
+                     '--config-file', str(config), '--profile', 'cpu-gate', '--no-fail-fast', '--test-threads',
+                     env['RUST_TEST_THREADS']]
+        if args.skip_live_planners:
+            test_args += ['-E', ' & '.join(f'not test(={name})' for name in LIVE_PLANNERS)]
+    if nextest:
+        report.unlink(missing_ok=True)
+    log(f"cargo: running tests ({'nextest' if nextest else 'cargo test'}, {env['RUST_TEST_THREADS']} workers, no build slot)")
     test_log = root / 'logs/cargo-test.log'
     code, test_s = run_logged(test_args, test_log, env, source / 'rust', args.cargo_timeout)
     text = test_log.read_text(errors='replace')
     totals = [tuple(map(int, m)) for m in CARGO_RESULT.findall(text)]
+    if nextest:
+        totals, nextest_ids = parse_nextest(report)
+        if not totals:
+            code = code or 1  # Passing doctests cannot mask a missing nextest report.
     passed, failed, ignored = (sum(t[i] for t in totals) for i in range(3))
-    ids = sorted(set(CARGO_FAIL.findall(text)))
+    ids = nextest_ids if nextest else sorted(set(CARGO_FAIL.findall(text)))
+    if nextest and code != 124:
+        doc_log = root / 'logs/cargo-doc.log'
+        doc_code, doc_s = run_logged(['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--doc'],
+                                    doc_log, env, source / 'rust', args.cargo_timeout)
+        doc_text = doc_log.read_text(errors='replace')
+        doc_totals = [tuple(map(int, m)) for m in CARGO_RESULT.findall(doc_text)]
+        passed += sum(t[0] for t in doc_totals)
+        failed += sum(t[1] for t in doc_totals)
+        ignored += sum(t[2] for t in doc_totals)
+        ids = sorted(set(ids + CARGO_FAIL.findall(doc_text)))
+        totals.extend(doc_totals)
+        code = code or doc_code
+        test_s += doc_s
+    if getattr(args, 'slow', False):
+        for crate, name in SLOW_TESTS:
+            slow_log = root / f'logs/slow-{name}.log'
+            slow_code, seconds = run_logged(['nice', '-n', '19', 'cargo', 'test', '--locked', '-p', crate,
+                                             name, '--', '--ignored'], slow_log, env, source / 'rust', args.cargo_timeout)
+            slow_text = slow_log.read_text(errors='replace')
+            slow_totals = [tuple(map(int, m)) for m in CARGO_RESULT.findall(slow_text)]
+            passed += sum(t[0] for t in slow_totals)
+            ignored = max(0, ignored - min(1, sum(t[0] + t[1] for t in slow_totals)))
+            failed += sum(t[1] for t in slow_totals)
+            ids = sorted(set(ids + CARGO_FAIL.findall(slow_text)))
+            code = code or slow_code or (0 if sum(t[0] + t[1] for t in slow_totals) == 1 else 1)
+            test_s += seconds
     result.update(exit=code, test_s=round(test_s), log=str(test_log), passed=passed, failed=failed, ignored=ignored,
                   binaries=len(totals), failing=ids, skipped_live_planners=list(LIVE_PLANNERS) if skips else [])
     if code == 124:
@@ -157,11 +215,29 @@ def cargo(source, root, args, env):
     return result
 
 
+def parse_nextest(report):
+    """Use nextest's machine report, including crashes/timeouts, not its progress lines."""
+    if not report.is_file():
+        return [], []
+    try:
+        suites = ET.parse(report).getroot().findall('testsuite')
+    except ET.ParseError:
+        return [], []
+    totals, ids = [], []
+    for suite in suites:
+        cases = suite.findall('testcase')
+        failed = [c for c in cases if c.find('failure') is not None or c.find('error') is not None]
+        skipped = sum(c.find('skipped') is not None for c in cases)
+        totals.append((len(cases) - len(failed) - skipped, len(failed), skipped))
+        ids.extend(c.attrib['name'] for c in failed)
+    return totals, sorted(set(ids))
+
+
 def benches(source, root, args, env):
     """Release-mode bound checks: each bench passes only when its test ran and passed."""
     target = root / 'target-cpu-gate-release'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
-    env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': env.get('CARGO_BUILD_JOBS', '16')}
+    env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16))}
     for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
         env.pop(key, None)
     result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[])
@@ -207,9 +283,10 @@ def benches(source, root, args, env):
 def scripts(source, root, args, env):
     python = python_for(source)
     test_log = root / 'logs/pytest.log'
-    log(f'scripts: pytest ({python})')
+    log(f"scripts: pytest ({python}, {getattr(args, 'pytest_jobs', 16)} workers)")
     cmd = ['nice', '-n', '19', str(python), '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '--basetemp',
-           str(root / 'tmp/pytest'), 'scripts/tests']
+           str(root / 'tmp/pytest'), '-n', str(getattr(args, 'pytest_jobs', 16)),
+           '-p', 'no:randomly', 'scripts/tests']
     code, seconds = run_logged(cmd, test_log, env, source, args.scripts_timeout)
     text = test_log.read_text(errors='replace')
     summary = PYTEST_SUMMARY.findall(text)
@@ -235,13 +312,18 @@ def gate(source, root, args, owned=False):
     # gate would otherwise be credited with tests that ran against older source.
     head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
     env = {**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
-    suites = []
-    if args.cargo:
-        suites.append(cargo(source, root, args, env))
-    if args.scripts:
-        suites.append(scripts(source, root, args, env))
-    if args.benches:
-        suites.append(benches(source, root, args, env))
+    requested = [fn for enabled, fn in ((args.cargo, cargo), (args.scripts, scripts),
+                                         (args.benches, benches)) if enabled]
+    # Cargo and its release benches share compiler resources; only pytest overlaps them.
+    def rust_suites():
+        return [fn(source, root, args, env) for fn in requested if fn is not scripts]
+    with ThreadPoolExecutor(max_workers=1 if getattr(args, 'jobs', 2) == 1 else 2) as pool:
+        rust = pool.submit(rust_suites)
+        python = pool.submit(scripts, source, root, args, env) if args.scripts else None
+        suites = rust.result()
+        if python is not None:
+            suites.append(python.result())
+    suites.sort(key=lambda suite: ('cargo', 'scripts', 'benches').index(suite['suite']))
     moved = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip() != head
     dirty = bool(checked(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).strip())
     passed = suites and all(s['status'] == 'pass' for s in suites) and not moved
@@ -274,6 +356,9 @@ def render(record):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--jobs', type=int, default=os.environ.get('CUTEAFD_TEST_JOBS', max(1, (os.cpu_count() or 2) // 2)),
+                        help='total CPU worker budget (default: CUTEAFD_TEST_JOBS or half logical CPUs)')
+    parser.add_argument('--slow', action='store_true', help='also run the explicit slow CPU tier (required at release cuts; never enables GPU tests)')
     parser.add_argument('--task', required=True, help='build directory name under ~/.cache/cuteafd/builds')
     parser.add_argument('--cargo', action='store_true')
     parser.add_argument('--scripts', action='store_true')
@@ -289,6 +374,11 @@ def main():
         parser.error('--task must be a plain name')
     if not (args.cargo or args.scripts or args.benches):
         args.cargo = args.scripts = True
+    if args.jobs < 1:
+        parser.error('--jobs must be positive')
+    concurrent = args.scripts and (args.cargo or args.benches)
+    args.cargo_jobs = max(1, args.jobs // 2) if concurrent else args.jobs
+    args.pytest_jobs = max(1, args.jobs - args.cargo_jobs) if concurrent else args.jobs
     root = BUILDS / args.task
     root.mkdir(parents=True, exist_ok=True)
     record = {'task': args.task, 'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
