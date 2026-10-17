@@ -3214,18 +3214,13 @@ def test_glm_qualified_layers_release_and_wip_preserve_auto_default(tmp_path, wi
 
 
 @pytest.mark.parametrize("wip", [False, True])
-def test_deepseek_v4_layers_is_dev_only_from_a_wip_slot(tmp_path, wip):
-    # Release images refuse V4 layers here; a WIP slot reaches the daemon, which serves
-    # it only when built with the dev-v4-layers Cargo feature.
+def test_deepseek_v4_layers_is_unsupported_in_release_and_wip(tmp_path, wip):
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4",
                                   "ATTENTION_PLACEMENT=layers\n",
                                   extra_args=("--wip", "slot-test") if wip else ())
-    if wip:
-        assert "dev-only executor" not in result.stderr
-        assert "executor not implemented" not in result.stderr
-    else:
-        assert result.returncode != 0
-        assert "dev-only executor" in result.stderr and "dev-v4-layers" in result.stderr
+    assert result.returncode != 0
+    assert "deepseek_v4 cannot run attention placement layers: executor not implemented" in result.stderr
+    assert "docker run" not in result.stderr
 
 
 @pytest.mark.parametrize("keys,expected", [

@@ -13,7 +13,7 @@ pub(crate) use cuda_copy::CudaCopyEngine;
 /// The prefix cache's knobs.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct PrefixArgs {
-    /// MiMo only: retain the DFlash context in positional prefix marks (experimental).
+    /// Experimental MiMo DFlash context in positional prefix marks (default off; qualification: https://github.com/tpurtell/cuteafd/issues/41).
     #[arg(long, env = "CUTEAFD_MIMO_PREFIX_DRAFT", default_value_t = false)]
     pub mimo_prefix_draft: bool,
     #[arg(skip)]
@@ -215,6 +215,15 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         prefix: PrefixArgs,
+    }
+
+    #[test]
+    fn mimo_prefix_marks_help_links_experimental_qualification() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Experimental MiMo DFlash"), "{help}");
+        assert!(help.contains("https://github.com/tpurtell/cuteafd/issues/41"), "{help}");
+        assert!(!Cli::parse_from(["serve"]).prefix.mimo_prefix_draft);
     }
 
     #[test]

@@ -15,7 +15,7 @@ A core CuteAFD reference family. Releases are checked against this engine's own 
   limits); use the official MXFP4 release.
 
 **Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
-placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/configs/deepseek-v41-mxfp4-min.config) · [max](../../examples/configs/deepseek-v41-mxfp4-max.config); NVFP4 (not recommended) [min](../../examples/configs/deepseek-v41-nvfp4-min.config) · [max](../../examples/configs/deepseek-v41-nvfp4-max.config).
+placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/configs/deepseek-v41-mxfp4-min.config) · [max](../../examples/configs/deepseek-v41-mxfp4-max.config); NVFP4 [min](../../examples/configs/deepseek-v41-nvfp4-min.config) · [max](../../examples/configs/deepseek-v41-nvfp4-max.config).
 
 ## Engineering summary
 
@@ -52,8 +52,9 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
 ## Known limits
 
 <!-- release-v2-limits -->
-- **V4.1 NVFP4 (`nvidia/DeepSeek-V4.1-Flash-NVFP4`): FAIL, not recommended right now.** It fails the calibrated confident-top-1 fidelity check against the official V4.1 Flash reference (`deepseek_v41-v2_20261005`): 96.7% (1 RTX + 4 Sparks), 97.1% (2 RTX + 4 Sparks) and 96.5% (simulated 5090) against 98%. The recommended V4.1 quant is the official MXFP4 checkpoint `deepseek-ai/DeepSeek-V4.1-Flash`, which passes every check on the same images (confident top-1 98.3% / 99.1%). Details: the same card failed the same check before the rc3 Spark ring fix (96.4–97.0%, when KL 0.061–0.066 also exceeded 0.06); in rc3, KL is 0.054–0.057 against 0.06, top-1 93.4–94.4% and top-3 99.6–99.7%, and KL varies across 0.06 between launches. Cause: the Spark FC1 path uses each layer's maximum static `input_scale` for every expert instead of each expert's own calibration (per-layer spread up to 56.6×); FC2 keeps per-expert scales. Per-expert FC1 calibration is v3 work. The cards report measured speed and exact-cache results and stay marked FAIL.
-- **Fidelity gate:** every V4.1 card applies the shared floor (KL ≤ 0.06, top-1 ≥ 90%, the reference's own floor) and the bench's default tripwires (confident top-1 ≥ 98%, top-3 ≥ 99%; the V4.1 reference sets no tripwire of its own). PLAN's calibrated V4.1 expectation (top-1 ≥ 94%, KL ≤ 0.04) is a quality target from repeated baselines, not the gate these cards apply.
+- **V4.1 NVFP4 (`nvidia/DeepSeek-V4.1-Flash-NVFP4`): current calibrated W4A4.** Per-expert FC1 calibration replaced the old layer-maximum scale in `268e2ebd`; native W4A4 runs at every row count. [The fidelity policy (#230)](https://github.com/tpurtell/cuteafd/pull/230) treats absolute BF16-root KL/top-1 as informational for this calibrated checkpoint, not a pass/fail bar. The 2026-10-15 cards at `bac064ac` report KL 0.06235 / top-1 93.79% (one RTX + four Sparks) and KL 0.06551 / top-1 93.60% (two RTX + four Sparks); both pass exact cache and lossless speculation. See the [minimum report](../../benchmarks/deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/report.svg) and [maximum report](../../benchmarks/deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/report.svg). This is not a claim of BF16 parity or batch invariance.
+- **Historical v2 NVFP4 FAIL:** rc3 confident top-1 was 96.7% / 97.1% / 96.5% (one RTX / two RTX / simulated 5090) against the then-required 98%; KL was 0.054-0.057. Those images used layer-maximum FC1 scales, unlike today's per-expert calibration. Their original FAIL cards and v2 recommendation remain historical findings, not a current arithmetic description or a new measurement.
+- **Fidelity gate:** historical v2 cards applied the shared floor (KL ≤ 0.06, top-1 ≥ 90%, the reference's own floor) and default tripwires (confident top-1 ≥ 98%, top-3 ≥ 99%). Current calibrated NVFP4 cards report these absolute reference metrics as informational under #230; exact cache and lossless speculation still gate. Other V4.1 formats retain their fidelity gates. PLAN's calibrated V4.1 expectation (top-1 ≥ 94%, KL ≤ 0.04) is a quality target, not a replacement gate.
 - **32 GB coordinator (resolved in rc3):** rc2's `v41-flash-sim5090` startup failure (a reconnecting expert session requested 419,495,936 B of Spark rings against a 302,120,960 B budget) is fixed: replaced endpoints release their rings before admission, and V4.1 ring admission is exact per Spark (1,024,851,968 B PRO MXFP4, 1,349,910,528 B PRO NVFP4, 302,120,960 B / 337,575,936 B at 31.8 GiB with 1,024 prefill rows). The rc3 simulated-5090 card passes.
 - Cold-prefill non-bit-reproducibility and prefill/decode stalls remain open; prefix snapshot restore exactness does not establish batch-invariant cold prefill.
 - A historical small-card host-heap abort was not reproduced or root-caused. The hunt is closed for v2 unless it recurs; MALLOC_CHECK_=3 serving soaks remain required and no memory-safety qualification is claimed. The fixed graph bank addresses graph residency, not the heap cause.
@@ -70,10 +71,11 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
   between encoder and replay shapes, so warmed requests can recapture graphs.
 - Device-driven exchange remains opt-in (`CUTEAFD_V41_DEVICE=1`); write mode
   (`CUTEAFD_SPARK_WRITE=1`) can stall on written flags and is unqualified.
-- NVFP4 uses W4A4 for prefill, decode and speculative verification. FC1
-  currently substitutes the layer's maximum static `input_scale` for each
-  expert's calibration; FC2 retains per-expert scales. Checkpoint-exact FC1
-  calibration, smaller wire rows and decode-kernel occupancy remain follow-ups.
+- NVFP4 uses W4A4 for prefill, decode and speculative verification, with
+  per-expert checkpoint `input_scale` calibration for FC1 and FC2. The old
+  FC1 layer-maximum substitution is gone; BF16 wire rows preserve the
+  expert-specific activation quantization. Smaller wire rows and small-row
+  kernel occupancy remain optimization work, not missing calibration support.
 - One-RTX startup still waits on slow Spark layer reads after the
   coordinator-first placement handoff; further load-speed work is open.
 

@@ -58,6 +58,7 @@ pub(crate) struct ServeArgs {
     /// Time a caller waits for a pending-queue permit.
     #[arg(long, env = "CUTEAFD_HTTP_QUEUE_WAIT_MS", default_value_t = 25_000)]
     pub http_queue_wait_ms: u64,
+    // Keep these opt-in defaults; promote-or-delete decision: https://github.com/tpurtell/cuteafd/issues/403.
     /// Target seconds per long prefill chunk while another request decodes (experimental).
     #[arg(long, env = "CUTEAFD_MIMO_PREFILL_CHUNK_S")]
     pub prefill_chunk_s: Option<f64>,

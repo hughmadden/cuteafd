@@ -764,7 +764,7 @@ source "$repo_root/scripts/build/host-isa.sh"
 wip_coordinator_host_isa="$(cuteafd_host_isa_list wip "${CUTEAFD_WIP_HOST_ISA:-}")" ||
   release_die "CUTEAFD_WIP_HOST_ISA: ${CUTEAFD_WIP_HOST_ISA:-}"
 wip_coordinator_host_isa="${wip_coordinator_host_isa//$'\n'/ }"
-# Dev-only Cargo features for the coordinator daemon (e.g. dev-v4-layers): a
+# Dev-only Cargo features for the coordinator daemon: a
 # space- or comma-separated list of dev-* names, keyed into the build and
 # recorded in the slot's build phases. Production features are never set here.
 wip_cargo_features="${CUTEAFD_WIP_CARGO_FEATURES:-}"

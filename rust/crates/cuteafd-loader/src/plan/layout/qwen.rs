@@ -61,6 +61,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     if reference {
         notes.push("Runtime allowances calibrated at the natural-minimum reference layout after an 8K prefill and C4 decode; other layouts remain estimates".into());
     } else {
+        // Retain estimated-allowance warnings pending census proof coverage: https://github.com/tpurtell/cuteafd/issues/388.
         notes.push("qwen4: workspace/runtime/Spark allowances are unqualified; validate against the allocation ledger before using this layout for admission".into());
     }
     if gpus == 2 {

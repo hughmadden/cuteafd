@@ -158,6 +158,6 @@ def test_wip_dev_cargo_features_are_dev_only_keyed_and_reach_cargo():
     assert 'features=%s' in build.split('wip_rust_fingerprint=')[1].split('\n')[0]
     assert "'^CUTEAFD_WIP_(CARGO_FEATURES|" in build
     check = 'wip_cargo_features="{}"; for feature in ${{wip_cargo_features//,/ }}; do [[ "$feature" =~ ^dev-[a-z0-9-]+$ ]] || exit 3; done'
-    assert subprocess.run(['bash', '-c', check.format('dev-v4-layers,dev-x')]).returncode == 0
-    for bad in ('prod', 'dev-v4-layers default', 'dev_x'):
+    assert subprocess.run(['bash', '-c', check.format('dev-test,dev-x')]).returncode == 0
+    for bad in ('prod', 'dev-test default', 'dev_x'):
         assert subprocess.run(['bash', '-c', check.format(bad)]).returncode == 3, bad

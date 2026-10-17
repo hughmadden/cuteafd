@@ -570,7 +570,7 @@ impl FamilyModel for GlmModel {
             return None;
         }
         let local = if self.id == "glm5" {
-            Err("serve-glm has no local expert path (no --local-experts)".to_string())
+            Err("serve-glm supports a solver-selected local RTX TP2 prefix, not standalone --local-experts placement".to_string())
         } else {
             Ok("serve-glmf --local-experts (TP1 FP8, NVFP4 or EXL3 package)".to_string())
         };
