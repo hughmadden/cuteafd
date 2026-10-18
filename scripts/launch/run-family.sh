@@ -602,9 +602,11 @@ bench_dir="$HOME/.cache/cuteafd/bench"
 # there makes Docker create root-owned parents, and the non-root coordinator
 # can then no longer create its placement handoff under that home.
 fidelity_cache="$HOME/.cache/cuteafd/fidelity"
-mkdir -p "$fidelity_cache"
-mkdir -p "$bench_dir"
-release_require_writable_state "$bench_dir"
+# A store deleted under a running container comes back root-owned (Docker
+# recreates missing bind sources) and the dashboard then fails with EACCES.
+release_require_owned_state "$bench_dir" "$fidelity_cache"
+mkdir -p "$fidelity_cache" "$bench_dir"
+release_require_writable_state "$bench_dir" "$fidelity_cache"
 api_args=() api_mount_args=()
 agent_home="${CUTEAFD_AGENT_HOME:-$HOME/.local/share/cuteafd/agent}"
 mkdir -p "$agent_home/dsh"; chmod 700 "$agent_home" "$agent_home/dsh"

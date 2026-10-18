@@ -5249,9 +5249,9 @@ sentinel never appears in the metadata file's bytes.
 
 - **Location.** Both files live in `/root/.cache/cuteafd/usage/` in the
   coordinator container, a bind mount of
-  `~/.cache/cuteafd/<instance>/usage/` on the host (beside the instance's
+  `~/.cache/cuteafd/instances/<instance>/usage/` on the host (beside the instance's
   `api-key`, which `release_prepare_api_key` already creates under
-  `~/.cache/cuteafd/<instance>/`; `run.sh` uses `default`). The bench does
+  `~/.cache/cuteafd/instances/<instance>/`; `run.sh` uses `default`). The bench does
   the same with `~/.cache/cuteafd/bench`. A restart, `--restart`, a WIP slot
   or a new image all mount the same directory, so history survives all of
   them; `--usage off` disables recording; no directory (tests, `cuteafd
@@ -5350,7 +5350,7 @@ sentinel never appears in the metadata file's bytes.
 - **Clear now.** The dashboard's "Clear full log" (`POST
   /console/usage/log/clear`, cookie) makes the log writer `DELETE FROM log`
   + `incremental_vacuum` within one tick; with the server stopped, `rm
-  ~/.cache/cuteafd/<instance>/usage/usage-log.sqlite*` is equivalent.
+  ~/.cache/cuteafd/instances/<instance>/usage/usage-log.sqlite*` is equivalent.
   "Clear everything" does both files.
 - **Security.** Readable only through `/console/usage/log/:rid` behind the
   cookie; no `/v1/*` route reads it; an API key does not unlock it. README

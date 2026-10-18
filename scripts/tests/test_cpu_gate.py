@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -267,3 +269,80 @@ def test_launcher_inputs_link_readonly_files_but_copy_mutable_tree_files(tmp_pat
         assert (other / 'mutable.sh').read_text() == (source / 'mutable.sh').read_text() == 'original'
         launcher_sandbox.copy_input(source / 'readonly.py', tmp_path / 'input')
         assert (tmp_path / 'input').stat().st_ino != (source / 'readonly.py').stat().st_ino
+
+
+def test_scratch_report_groups_by_test_and_stem(tmp_path):
+    tmp = tmp_path / 'tmp'
+    for worker, repeat in (('popen-gw0', 0), ('popen-gw3', 1)):
+        path = tmp / 'pytest' / worker / f'test_big_fixture{repeat}' / 'blob'
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'x' * (1 << 20))
+    (tmp / 'pytest/popen-gw1/test_small0').mkdir(parents=True)
+    (tmp / 'pytest/popen-gw1/test_small0/a').write_bytes(b'x' * 4096)
+    for pid in (11, 12):
+        (tmp / f'cuteafd-fabric-{pid}').mkdir(parents=True)
+        (tmp / f'cuteafd-fabric-{pid}/f').write_bytes(b'x' * 65536)
+    (tmp / 'tmpab12cd34').write_bytes(b'x' * 8192)
+    rows = gate.scratch_usage(tmp, top=3)
+    assert [row['name'] for row in rows] == ['pytest:test_big_fixture', 'cuteafd-fabric', 'tmp*']
+    assert rows[0]['bytes'] >= 2 << 20
+    assert gate.scratch_usage(tmp_path / 'missing') == []
+    text = gate.render({'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [], 'scratch': rows})
+    assert 'Largest scratch consumers' in text and 'pytest:test_big_fixture' in text
+
+
+def _scratch_tree(root):
+    for side in ('head', 'base'):
+        for name in gate.SCRATCH:
+            (root / side / name / 'deep').mkdir(parents=True)
+            (root / side / name / 'deep/file').write_text('x')
+        (root / side / 'logs').mkdir()
+        (root / side / 'logs/pytest.log').write_text('kept')
+    (root / 'head/tmp/deep').chmod(0o500)  # tests leave read-only directories behind
+
+
+@pytest.mark.parametrize('keep, outcome', [(False, 'pass'), (False, 'raise'), (True, 'pass')])
+def test_scratch_is_removed_on_every_exit_unless_kept(tmp_path, monkeypatch, keep, outcome):
+    root = tmp_path / 'builds/task'
+    _scratch_tree(root)
+    monkeypatch.setattr(gate, 'BUILDS', tmp_path / 'builds')
+    monkeypatch.setattr(gate.signal, 'signal', lambda *a: None)
+
+    def run_gate(args, root):
+        if outcome == 'raise':
+            raise KeyboardInterrupt('signal 15')
+        return 0
+    monkeypatch.setattr(gate, 'run_gate', run_gate)
+    monkeypatch.setattr(sys, 'argv', ['cpu-gate', '--task', 'task'] + (['--keep'] if keep else []))
+    if outcome == 'raise':
+        with pytest.raises(KeyboardInterrupt):
+            gate.main()
+    else:
+        assert gate.main() == 0
+    for side in ('head', 'base'):
+        assert (root / side / 'logs/pytest.log').read_text() == 'kept'
+        for name in gate.SCRATCH:
+            assert (root / side / name).exists() == keep
+    if keep:
+        (root / 'head/tmp/deep').chmod(0o700)  # let pytest's basetemp cleanup remove it
+
+
+def test_interrupt_stops_running_suites(tmp_path):
+    log_path = tmp_path / 'log'
+    import threading
+    result = {}
+    worker = threading.Thread(target=lambda: result.update(code=gate.run_logged(
+        ['sh', '-c', 'sleep 60 & wait'], log_path, dict(os.environ), tmp_path, 120)))
+    gate.STOPPING.clear()
+    worker.start()
+    try:
+        deadline = time.time() + 10
+        while not gate.CHILDREN and time.time() < deadline:
+            time.sleep(0.01)
+        with pytest.raises(KeyboardInterrupt):
+            gate.interrupt(15, None)
+        worker.join(10)
+        assert not worker.is_alive() and result['code'][0] != 0
+        assert gate.run_logged(['true'], log_path, dict(os.environ), tmp_path, 10)[0] == 130
+    finally:
+        gate.STOPPING.clear()
