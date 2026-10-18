@@ -229,7 +229,7 @@ pub(super) mod tests {
 
     pub(super) fn layout() -> Step5CacheLayout { layout_at(65) }
 
-    pub(super) fn layout_at(context: u64) -> Step5CacheLayout {
+    pub(in crate::families::step5) fn layout_at(context: u64) -> Step5CacheLayout {
         let config = cuteafd_loader::plan::families::step5::Config {
             norm_eps: 1e-5, hidden: 4096, vocab: 128896, layers: 92, mtp: 3,
             dense: 13824, experts: 352, intermediate: 1536, shared: 1536, topk: 8,

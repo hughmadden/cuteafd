@@ -98,7 +98,9 @@ impl PrefixFamily<Frontier> for Step5Prefix<'_, '_> {
 
     fn capture_meta(&self, placement: &Placement, len: usize) -> Result<Frontier, BoxError> {
         self.validate(placement, len)?;
-        ensure!(len == placement.committed, "Step-5 capture must be at the committed frontier");
+        if len != placement.committed {
+            return Err("Step-5 capture must be at the committed frontier".into());
+        }
         Ok(Frontier { committed: len })
     }
 
@@ -124,10 +126,12 @@ impl PrefixFamily<Frontier> for Step5Prefix<'_, '_> {
 
     fn restore_with(&self, mark: Option<&Mark>, saved: Option<&Frontier>, placement: &mut Placement,
         plan: &RestorePlan, _context: &RestoreContext<'_>) -> Result<(), BoxError> {
-        ensure!(plan.exact() && plan.resume() == plan.snapshot_end,
-            "Step-5 does not reconstruct approximate prefix state");
-        ensure!(saved.is_some_and(|f| f.committed == plan.resume()),
-            "Step-5 retained mark frontier mismatch");
+        if !plan.exact() || plan.resume() != plan.snapshot_end {
+            return Err("Step-5 does not reconstruct approximate prefix state".into());
+        }
+        if !saved.is_some_and(|f| f.committed == plan.resume()) {
+            return Err("Step-5 retained mark frontier mismatch".into());
+        }
         let Some(Mark::Slot(slot)) = mark else {
             return Err("Step-5 exact restore requires an arena mark".into());
         };
@@ -136,7 +140,7 @@ impl PrefixFamily<Frontier> for Step5Prefix<'_, '_> {
     }
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
-        ensure!(copy.owner.is_none(), "Step-5 uses uniform head-split pages");
+        if copy.owner.is_some() { return Err("Step-5 uses uniform head-split pages".into()); }
         for owner in &self.ranks {
             owner.borrow().copy_page_rows(copy.from, copy.to, copy.rows)?;
         }
@@ -168,7 +172,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
-    fn native_shared_prefix_restores_marks_and_csa_partial_pages() -> Result<()> {
+    fn native_shared_prefix_restores_marks_and_csa_partial_pages() -> std::result::Result<(), BoxError> {
         // SAFETY: the selected library implements the native CUDA ABI.
         let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = cache_test_device(&library)?;
