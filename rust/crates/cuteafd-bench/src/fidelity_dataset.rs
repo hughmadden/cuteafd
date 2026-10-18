@@ -185,7 +185,8 @@ pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> 
     match model {
         "XiaomiMiMo/MiMo-V2.6-Flash-MOPD" => Some((FLASH_REVISION, FLASH_CONFIG)),
         "XiaomiMiMo/MiMo-V2.6-Pro-MOPD" => Some((MIMO_PRO_REVISION, MIMO_PRO_CONFIG)),
-        _ => None,
+        _ => crate::fidelity_match::lineage(model, None).into_iter().skip(1)
+            .find_map(|ancestor| crate::fidelity_match::official(&ancestor).map(|p| (p.revision, p.config))),
     }
 }
 
