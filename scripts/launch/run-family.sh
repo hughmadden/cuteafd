@@ -105,6 +105,8 @@ release_reject_unused_keys() {
   local -A allowed=()
   local key
   for key in "$@"; do allowed[$key]=1; done
+  # Site build settings share the config file with launch; the launch path ignores them.
+  for key in CUTEAFD_EXPORT_HOST WIP_BUILD_SEED; do allowed[$key]=1; done
   local -a unused=()
   for key in "${!cfg_file[@]}"; do
     [[ -n "${allowed[$key]:-}" ]] || unused+=("$key")
