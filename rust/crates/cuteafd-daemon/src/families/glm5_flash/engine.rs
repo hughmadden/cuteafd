@@ -5623,8 +5623,9 @@ mod prefill_lane_tests {
             // projection routes and capacity-based thresholds are unchanged.
             ("integration/cuteafd/glmf.py", 0xb51f_2224_6aff_2bd4_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
-            ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
-            ("integration/cuteafd/_fp8_weights.py", 0x622a_1b45_96e9_71da),
+            // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
+            ("integration/cuteafd/_glm_kernels.py", 0x7f20_e05f_fd23_f141),
+            ("integration/cuteafd/_fp8_weights.py", 0xab87_f59d_f17b_3556),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // Only the CUDA-independent KDAGeometry import/export was added since
