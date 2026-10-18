@@ -201,6 +201,8 @@ PROFILE_NCU_KERNEL
 PROFILE_NCU_COUNT
 PROFILE_NCU_SET
 PROFILE_NSYS_GPU_METRICS
+PROFILE_EXPERT_INPUT_SAMPLE
+PROFILE_EXPERT_ROUTE_WEIGHTS
 EOF
   _spark_slot_keys HOST LANE_A
   case "$1" in
@@ -365,6 +367,8 @@ PREFIX_CACHE_ENTRIES
 PROBE_DUMP_ROOT
 PROFILE
 PROFILE_DIR
+PROFILE_EXPERT_INPUT_SAMPLE
+PROFILE_EXPERT_ROUTE_WEIGHTS
 PROFILE_NCU_COUNT
 PROFILE_NCU_KERNEL
 PROFILE_NCU_SET
@@ -546,6 +550,15 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 #                     /tmp/cuteafd-graph-census-captures.jsonl in the container).
 #   transport-timing  CUTEAFD_PROTOCOL_V2_TCP_TIMING=1 (expert exchange timing)
 #   expert-timing     CUTEAFD_EXPERT_TIMING=1 (Spark worker expert compute timing)
+#   expert-routes     CUTEAFD_EXPERT_ROUTES=1 (needs PROFILE_DIR): the coordinator logs every
+#                     serving Spark wave's top-k expert ids, one JSONL record per (step,
+#                     MoE layer), to PROFILE_DIR/expert-routes-HOST.jsonl (format: the
+#                     cuteafd-transport route_log module; scored offline by
+#                     scripts/bench/expert-route-balance.py). GLM 5.3 also saves the MoE
+#                     input rows (BF16, up to 64 per layer-step) of the first
+#                     PROFILE_EXPERT_INPUT_SAMPLE (default 64, 0 = none) serving
+#                     layer-steps as PROFILE_DIR/expert-input-HOST-NNNNN.safetensors.
+#                     PROFILE_EXPERT_ROUTE_WEIGHTS=on adds each narrow wave's gate weights.
 #   draft-timing      CUTEAFD_DRAFT_TIMING=1 (drafter device and host launch spans)
 #   nsys              the coordinator runs under `nsys profile` (cuda, nvtx, osrt, CUDA
 #                     graph nodes; no CPU sampling), collection paused until
@@ -578,6 +591,8 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 shared_profile_args() {
 release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)"
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
+release_profile_sample_args "$(get PROFILE)" "$(get PROFILE_EXPERT_INPUT_SAMPLE)" "$(get PROFILE_EXPERT_ROUTE_WEIGHTS)"
+profile_args+=(${RELEASE_PROFILE_SAMPLE_ARGS[@]+"${RELEASE_PROFILE_SAMPLE_ARGS[@]}"})
 release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator \
   "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)" "$(get PROFILE_NSYS_GPU_METRICS)"
 profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})

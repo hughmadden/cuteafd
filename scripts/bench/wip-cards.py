@@ -960,6 +960,12 @@ def summarize_job(job, exit_code):
         for switch, suffix in PROFILER_REPORTS.items():
             if switch in profile['switches'] and not any(r['name'].endswith(suffix) and r['bytes'] for r in profile['reports']):
                 fail(row, f'PROFILE={switch} produced no {suffix} report in {profile["dir"]}', 'measurement')
+        if 'expert-routes' in profile['switches']:
+            logs = sorted(Path(profile['dir']).glob('expert-routes-*.jsonl'))
+            profile['expert_routes'] = [{'name': p.name, 'bytes': p.stat().st_size} for p in logs]
+            profile['expert_inputs'] = len(list(Path(profile['dir']).glob('expert-input-*.safetensors')))
+            if not any(p.stat().st_size for p in logs):
+                fail(row, f'PROFILE=expert-routes wrote no route log in {profile["dir"]}', 'measurement')
     trace_path = job['entry']['set'].get('SPECULATION_TRACE')
     if trace_path and job.get('trace'):
         path = Path(trace_path)
@@ -1486,7 +1492,7 @@ BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_E
               'COORDINATOR_GPU_UUID', 'COORDINATOR_GPU_PCI_BUS_ID', 'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
               'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS',
-              'COORDINATOR_DOCKER_INFERENCE', 'SPARK_EXPERT_DOCKER_INFERENCE'}
+              'PROFILE_EXPERT_INPUT_SAMPLE', 'PROFILE_EXPERT_ROUTE_WEIGHTS', 'COORDINATOR_DOCKER_INFERENCE', 'SPARK_EXPERT_DOCKER_INFERENCE'}
 
 
 def build_lock_mode(revision):

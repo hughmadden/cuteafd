@@ -25,6 +25,7 @@ pub mod health {
 }
 mod debug_json;
 pub mod protocol_v2;
+pub mod route_log;
 pub mod expert;
 pub mod worker_selection;
 // Old module path, kept for one release (naming pass).

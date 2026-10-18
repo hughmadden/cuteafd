@@ -609,6 +609,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let chunk = &p.tokens[p.done..end];
                 let start = p.placement.len;
+                cuteafd_transport::route_log::step(|| vec![(p.id, chunk.len() as u32)]);
                 let logits = engine.prefill_device(&mut p.placement, chunk,
                     transport.as_deref_mut().map(|t| (t, runtime)))?;
                 if end == p.tokens.len() {
@@ -841,6 +842,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             poisoned[i] = batch.push_sequence_isolated(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1);
         }
         phases[2] += timer.elapsed().as_secs_f64();
+        cuteafd_transport::route_log::step(|| active.iter().zip(&sequences).map(|(a, s)| (a.id, s.len() as u32)).collect());
         let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         let timer = Instant::now();

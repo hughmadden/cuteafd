@@ -1037,6 +1037,24 @@ def test_profiler_reports_are_summarized_by_name_and_size(entry, tmp_path, monke
     assert 'nsys-raptor.nsys-rep (3.0 MiB)' in (tmp_path / 'summary.md').read_text()
 
 
+def test_expert_routes_profile_needs_a_route_log(entry, tmp_path):
+    entry = {**entry, 'sparks': [], 'set': {**entry['set'], 'SPARK_COUNT': '0'}, 'levels': [1], 'profile': 'panels:'}
+    job = cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key',
+                         {'PROFILE': 'expert-routes'}, set(), None, 1)
+    profile = Path(job['entry']['set']['PROFILE_DIR'])
+    sweep = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name'] / 'sweep.json'
+    sweep.parent.mkdir(parents=True)
+    sweep.write_text(json.dumps({'points': [{'c': 1, 'phase': 'levels', 'aggregate_tok_s': 50.0}]}))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and 'PROFILE=expert-routes wrote no route log' in row['error']
+    (profile / 'expert-routes-raptor.jsonl').write_text('{"event": "expert_routes"}\n')
+    (profile / 'expert-input-raptor-00000.safetensors').write_bytes(b'x')
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'pass', row
+    assert row['profile']['expert_routes'] == [{'name': 'expert-routes-raptor.jsonl', 'bytes': 27}]
+    assert row['profile']['expert_inputs'] == 1
+
+
 def test_sweep_rows_and_sweep_only_jobs(entry, tmp_path):
     entry = {**entry, 'profile': 'panels:', 'levels': [1, 16], 'post_load_c1': True}
     job = make(entry, tmp_path)
