@@ -23,6 +23,10 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     if h % 128 != 0 || field("fc1_splits")? != h.div_ceil(1024) {
         return Err(invalid("hidden alignment or FC1 split count"));
     }
+    // Launch residency hint: the caller passes cta_limit = SM count (cudaDevAttr) * this.
+    if field("ctas_per_sm")? > 32 {
+        return Err(invalid("ctas_per_sm out of range"));
+    }
     let expected = ["x", "pointers", "bits", "group_expert", "route_slots",
         "route_group_lane", "route_weights", "fc1", "intermediate", "fc2", "output"];
     if !spec.pointers.iter().map(String::as_str).eq(expected) || spec.scalar_kinds != b"iii" {
@@ -86,7 +90,8 @@ mod tests {
              "route_weights", "fc1", "intermediate", "fc2", "output"].map(String::from).to_vec(),
             scalar_kinds: b"iii".to_vec(), capacity_rows: 64,
             geometry: serde_json::json!({"abi_version":1,"hidden":6144,"units":16,"top_k":8,
-                "max_groups":512,"max_rows":64,"split_k_blocks":8,"fc1_splits":6}),
+                "max_groups":512,"max_rows":64,"split_k_blocks":8,"fc1_splits":6,
+                "ctas_per_sm":4}),
             scratch: HashMap::from([("fc1".into(), 805306368),
                 ("intermediate".into(),33554432),("fc2".into(),201326592)]) }
     }
@@ -126,7 +131,7 @@ mod tests {
     #[test]
     fn rejects_stale_geometry() {
         for key in ["abi_version", "hidden", "units", "top_k", "max_groups", "max_rows",
-                    "split_k_blocks", "fc1_splits"] {
+                    "split_k_blocks", "fc1_splits", "ctas_per_sm"] {
             let mut s = spec(); s.geometry[key] = serde_json::json!(0);
             assert!(validate(&s).is_err(), "{key}");
         }

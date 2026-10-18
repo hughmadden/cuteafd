@@ -13,7 +13,7 @@ def contract():
     # The geometry helpers deliberately have no torch/CUDA dependence.
     tree = ast.parse((FORK / "b12x/integration/cuteafd/exlr8.py").read_text())
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("geometry", "scratch_bytes")]
-    namespace = {"ABI_VERSION": 1}
+    namespace = {"ABI_VERSION": 1, "CTAS_PER_SM": 4}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "exlr8_contract", "exec"), namespace)
     return namespace
 
@@ -22,7 +22,7 @@ def test_capacity_scratch_matches_native_v1():
     api = contract()
     g = api["geometry"]()
     assert g == dict(abi_version=1, hidden=6144, units=16, top_k=8, max_groups=512,
-                     max_rows=64, split_k_blocks=8, fc1_splits=6)
+                     max_rows=64, split_k_blocks=8, fc1_splits=6, ctas_per_sm=4)
     assert api["scratch_bytes"](g) == dict(fc1=805306368, intermediate=33554432, fc2=201326592)
 
 
