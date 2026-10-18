@@ -67,7 +67,9 @@ impl ExpertSource {
 /// fits beside them.
 pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>,
     source: ExpertSource) -> Result<usize> {
-    let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", source.code_key())?;
+    let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", source.code_key(),
+        &inputs.manifest.map(|m| cuteafd_loader::placement::ProgramSet::from_manifest(m, &["qwen4"]))
+            .unwrap_or_else(|| cuteafd_loader::placement::ProgramSet::from_names(&["qwen4"], [])))?;
     let enabled = super::engine::startup_graphs_enabled(
         std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
         std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());

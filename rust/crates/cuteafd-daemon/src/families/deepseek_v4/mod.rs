@@ -367,7 +367,9 @@ pub(crate) fn with_engine<T>(
         } else { 0 };
         let gpus = devices.iter().enumerate().map(|(rank, &device)| {
             let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
-                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog))?;
+                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog),
+                &cuteafd_loader::placement::ProgramSet::from_manifest(&loaded.manifest,
+                    &[loaded.family, &format!("{}2", loaded.family)]))?;
             crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
                 Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending)
@@ -444,7 +446,9 @@ pub(crate) fn with_engine<T>(
         // silently relocate a loaded layer or shrink the promised pool.
         let measured_gpus = devices.iter().enumerate().map(|(rank, &device)| {
             let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
-                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog))?;
+                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog),
+                &cuteafd_loader::placement::ProgramSet::from_manifest(&loaded.manifest,
+                    &[loaded.family, &format!("{}2", loaded.family)]))?;
             crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
                 Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))

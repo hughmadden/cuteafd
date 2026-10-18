@@ -337,18 +337,10 @@ pub(super) fn preflight(
         // The code still to load before ready: the serving thread's cuBLAS handle, lazily loaded
         // functions and transport mappings (`placement::inventory::LOADED_CODE`, which the planner
         // charges in its baseline), instead of another context/module envelope.
-        let info = library.cuda_device_info(device)?;
-        let arch = format!("sm_{}{}", info.compute_capability_major, info.compute_capability_minor);
         let pending = crate::shared::inventory::pending_code(library, device, rank, ranks == 2,
-            cfg.program_family()?, "*")?;
-        let cublas = MemoryReservation {
-            name: "runtime.loaded_code".into(),
-            bytes: if cuteafd_loader::placement::loaded_code(cfg.program_family()?, "*", ranks == 2, rank as u8).is_some() {
-                pending
-            } else {
-                cuteafd_loader::placement::inventory::ArchContext::for_device(&arch, total as u64).cublas_bytes
-            },
-        };
+            cfg.program_family()?, "*", &cuteafd_loader::placement::ProgramSet::from_names(
+                &[cfg.program_family()?, &format!("{}2", cfg.program_family()?)], programs.names()))?;
+        let cublas = MemoryReservation { name: "runtime.loaded_code".into(), bytes: pending };
         let mut additional = vec![cublas.clone()];
         additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
             cfg, ranks, rank, args.prefill_rows, transport_lanes, 0)?);

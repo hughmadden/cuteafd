@@ -344,8 +344,10 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         if rank == 0 { items.push(Item::new(Category::Weights, "shared_expert", "exlr8", shared_bytes, Basis::Exact)); }
         let mut programs = program_families("glm", true);
         if rank == 0 { programs.push("exlr8".into()); }
-        items.push(runtime_item(Some(&manifest), &programs, "glm:exlr8", true,
-            rank, options.rtx_bytes[rank]));
+        let mut runtime = runtime_item(Some(&manifest), &programs, "glm:exlr8", true,
+            rank, options.rtx_bytes[rank]);
+        if rank == 0 { runtime.group = "EXLR8 context+modules".into(); }
+        items.push(runtime);
         devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
             capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes), items, kv_tokens: 0 });
     }

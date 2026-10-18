@@ -127,13 +127,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let mut baselines = Vec::new();
         for rank in 0..ranks {
             let total = options.rtx_bytes[rank];
-            let arch = placement::ArchContext::coordinator(total, None);
-            let code = placement::loaded_code("glmf", if local_tp2_exl3 { "exl3-tp2-local" } else if catalog.exl3().is_some() { "exl3" } else { "fp8" }, ranks == 2, rank as u8)
-                .map_or_else(|| planned_context(manifest, &if ranks == 2 { vec!["glmf".into(), "glmf2".into()] } else { vec!["glmf".into()] }, total), |c| arch.context_bytes + c.bytes);
+            let runtime = runtime_item(manifest, &program_families("glmf", ranks == 2),
+                if local_tp2_exl3 { "exl3-tp2-local" } else if catalog.exl3().is_some() { "exl3" } else { "fp8" },
+                ranks == 2, rank, total);
+            let code = runtime.bytes;
             if local_tp2_exl3 {
                 devices[rank].items.extend(placement::inventory::glmf_local_tp2_runtime_items(rank));
             } else {
-                devices[rank].items.push(Item::new(Category::Runtime, "context+modules", "", code, Basis::Calibrated));
+                devices[rank].items.push(runtime);
             }
             baselines.push((total, Baseline::Planned { context_bytes: code, loaded_bytes: 0 }));
         }

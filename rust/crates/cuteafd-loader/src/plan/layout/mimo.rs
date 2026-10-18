@@ -27,12 +27,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let cfg = MimoV2Config::from_hf(&checkpoint.config).ok();
         let base = cfg.as_ref().and_then(|cfg| cfg.program_family().ok()).unwrap_or("mimo");
         let families = std::iter::once(base.to_string()).chain((ranks == 2).then(|| format!("{base}2"))).collect::<Vec<_>>();
-        let runtime = match crate::placement::loaded_code(base, "*", ranks == 2, rank as u8) {
-            Some(code) => Item::new(Category::Runtime, "context+modules", "",
-                crate::placement::ArchContext::coordinator(total, None).context_bytes + code.bytes, Basis::Calibrated),
-            None => Item::new(Category::Runtime, "context+modules", "", planned_context(manifest, &families, total)
-                + if ranks == 2 { crate::placement::ArchContext::for_device("sm_120", total).peer_context_bytes } else { 0 }, Basis::Formula),
-        };
+        let runtime = runtime_item(manifest, &families, "*", ranks == 2, rank, total);
         DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total,
             items: vec![runtime], kv_tokens: 0 }
     }).collect::<Vec<_>>();

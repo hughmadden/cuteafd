@@ -102,6 +102,21 @@ mod phase_tests {
     use super::InventoryPhase;
 
     #[test]
+    fn unknown_package_live_reservation_uses_same_positive_formula_as_plan() {
+        use cuteafd_loader::placement::{inventory::loaded_code_allowance, ArchContext, ProgramSet};
+        let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}]});
+        let arch = ArchContext::for_device("sm_120", 96 << 30);
+        let programs = ProgramSet::from_manifest(&manifest, &["qwen4"]);
+        let allowance = loaded_code_allowance("qwen4", "unmeasured", false, 0, arch, Some(&programs));
+        let planned = cuteafd_loader::plan::layout::runtime_item(Some(&manifest), &["qwen4".into()],
+            "unmeasured", false, 0, 96 << 30);
+        let pending = allowance.pending(arch.context_bytes, arch.context_bytes);
+        assert!(pending > 0);
+        assert_eq!(pending + arch.context_bytes, planned.bytes);
+        assert_eq!(allowance.basis, cuteafd_core::memory_layout::Basis::Formula);
+    }
+
+    #[test]
     fn only_pre_weight_samples_attribute_module_growth() {
         assert_eq!(InventoryPhase::PreWeight.module_bytes(100, 60), 40);
         assert_eq!(InventoryPhase::PreWeight.module_bytes(60, 100), 0);
@@ -134,16 +149,10 @@ pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &st
     result
 }
 
-/// Native code still to arrive on `device` (coordinator `rank` of a `split`
-/// layout) before ready ([`cuteafd_loader::placement::LoadedCode::pending`]):
-/// the measured loaded code of `program_family` with `experts` less what the
-/// device already holds beyond the arch context and this process's tracked
-/// allocations. Samples the device now: call it at the admission sample. 0 for
-/// a family the table does not measure (it keeps its module formula).
+/// Ready code still missing from the current sample, using the same calibrated
+/// or manifest-derived allowance as offline planning.
 pub(crate) fn pending_code(library: &NativeLibrary, device: i32, rank: usize, split: bool, program_family: &str,
-    experts: &str) -> Result<u64> {
-    let Some(code) = cuteafd_loader::placement::loaded_code(program_family, experts, split, rank as u8)
-        else { return Ok(0) };
+    experts: &str, programs: &cuteafd_loader::placement::ProgramSet) -> Result<u64> {
     let current = library.cuda_get_device()?;
     library.cuda_set_device(device)?;
     let sample = (|| -> Result<_> { Ok((library.cuda_memory_info()?, library.cuda_device_info(device)?)) })();
@@ -152,9 +161,11 @@ pub(crate) fn pending_code(library: &NativeLibrary, device: i32, rank: usize, sp
     let tracked = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
     let untracked = (total.saturating_sub(free) as u64).saturating_sub(tracked as u64);
     let arch = format!("sm_{}{}", info.compute_capability_major, info.compute_capability_minor);
-    let context = cuteafd_loader::placement::ArchContext::for_device(&arch, total as u64).context_bytes;
-    let pending = code.pending(untracked, context);
+    let context = cuteafd_loader::placement::ArchContext::for_device(&arch, total as u64);
+    let code = cuteafd_loader::placement::inventory::loaded_code_allowance(program_family, experts,
+        split, rank as u8, context, Some(programs));
+    let pending = code.pending(untracked, context.context_bytes);
     tracing::info!(device, family = program_family, experts, loaded_code_bytes = code.bytes, untracked_bytes = untracked,
-        pending_bytes = pending, "loaded code reserved beside admission (placement::inventory::LOADED_CODE)");
+        basis = ?code.basis, pending_bytes = pending, "loaded code reserved beside admission");
     Ok(pending)
 }

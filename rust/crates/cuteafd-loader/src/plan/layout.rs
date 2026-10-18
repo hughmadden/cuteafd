@@ -247,6 +247,16 @@ mod scoring_workspace_tests {
     use super::*;
 
     #[test]
+    fn unknown_package_runtime_item_uses_manifest_formula() {
+        let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}]});
+        let item = runtime_item(Some(&manifest), &["qwen4".into()], "unmeasured", false, 0, 96 << 30);
+        let arch = crate::placement::ArchContext::for_device("sm_120", 96 << 30);
+        assert_eq!(item.basis, Basis::Formula);
+        assert_eq!(item.bytes, arch.context_bytes + arch.cublas_bytes + 34 * MIB);
+        assert!(item.bytes > arch.context_bytes);
+    }
+
+    #[test]
     fn full_rows_are_opt_in_and_reserve_the_family_output_delta() {
         assert!(!LayoutOptions::default().full_prefill_logits);
         assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
@@ -519,13 +529,12 @@ impl Shape {
 /// peer context under a split.
 pub fn runtime_item(manifest: Option<&serde_json::Value>, programs: &[String], package: &str, split: bool,
     rank: usize, total_bytes: u64) -> Item {
-    match crate::placement::loaded_code(&programs[0], package, split, rank as u8) {
-        Some(code) => Item::new(Category::Runtime, "context+modules", "",
-            crate::placement::ArchContext::coordinator(total_bytes, None).context_bytes + code.bytes, Basis::Calibrated),
-        None => Item::new(Category::Runtime, "context+modules", "", planned_context(manifest, programs, total_bytes)
-            + if split { crate::placement::ArchContext::for_device("sm_120", total_bytes).peer_context_bytes } else { 0 },
-            Basis::Formula),
-    }
+    let arch = crate::placement::ArchContext::coordinator(total_bytes, None);
+    let families = programs.iter().map(String::as_str).collect::<Vec<_>>();
+    let set = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &families));
+    let allowance = crate::placement::inventory::loaded_code_allowance(&programs[0], package,
+        split, rank as u8, &arch, set.as_ref());
+    Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
 }
 
 /// Program families (manifest name prefixes) a coordinator GPU loads: `base`
@@ -688,14 +697,6 @@ pub(crate) fn local_package(report: &PlanReport) -> &'static str {
     let package = report.experts.as_ref().map(|e| e.package.as_str()).unwrap_or("");
     if report.placement != ExpertPlacement::Local { "none" }
     else if package.contains("exl3") { "exl3" } else { "fp8" }
-}
-
-/// The planner's runtime baseline on a GPU of `total_bytes`: arch context + the selected modules.
-fn planned_context(manifest: Option<&serde_json::Value>, families: &[String], total_bytes: u64) -> u64 {
-    let names = families.iter().map(String::as_str).collect::<Vec<_>>();
-    let modules = manifest.map_or(32 * MIB, |m| crate::placement::ProgramSet::from_manifest(m, &names).module_bytes());
-    let arch = crate::placement::ArchContext::coordinator(total_bytes, None);
-    arch.context_bytes + arch.cublas_bytes + modules
 }
 
 /// GLM 5.3 Flash's step workspaces on one GPU from its program manifest: the bytes its engine

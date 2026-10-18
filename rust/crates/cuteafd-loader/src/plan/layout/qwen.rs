@@ -266,11 +266,13 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> MemoryLayout {
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &capacity)| {
         let arch = crate::placement::ArchContext::for_device("sm_120", capacity);
-        let modules = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &["qwen4"]).module_bytes())
-            .unwrap_or(34 * MIB);
+        let programs = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &["qwen4"]))
+            .unwrap_or_else(|| crate::placement::ProgramSet::from_names(&["qwen4"], []));
+        let allowance = crate::placement::inventory::loaded_code_allowance("qwen4", local_package(report),
+            true, rank as u8, arch, Some(&programs));
         DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: capacity,
             items: vec![Item::new(Category::Runtime, "context+modules", "SM120",
-                arch.context_bytes + arch.cublas_bytes + arch.peer_context_bytes + modules, Basis::Formula)], kv_tokens: 0 }
+                arch.context_bytes + allowance.bytes, allowance.basis)], kv_tokens: 0 }
     }).collect::<Vec<_>>();
     let mut notes = vec![format!("resolved context {context} tokens"),
         "Qwen whole-layer attention ranges; all routed experts native TP2; head and MTP on rtx0".into()];
