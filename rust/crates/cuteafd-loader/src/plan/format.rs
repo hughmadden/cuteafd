@@ -37,9 +37,17 @@ pub enum Encoding {
     /// EXL3 trellis codes at `bits` per weight (mcg codebook, Hadamard
     /// sign vectors `suh`/`svh`).
     Exl3 { bits: usize },
+    /// Unit-major experts, E4M3-rounded MCG with shared hidden rotation.
+    Exlr8 { bits: usize },
+    /// Family-independent dense trellis with a file-local rotation id.
+    Trellis { k: usize, codebook: TrellisCodebook, rotation: usize },
+    Int4 { group: usize },
     /// Integer data (hash-route tables, offsets); `bits` wide.
     Int { bits: usize },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum TrellisCodebook { E4M3, Fp16 }
 
 /// How a scale tensor stores its values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -153,6 +161,9 @@ impl QuantOperand {
             Encoding::F32 => return "f32".into(),
             Encoding::Int { .. } => return "int".into(),
             Encoding::Exl3 { bits } => return format!("exl3-k{bits}"),
+            Encoding::Exlr8 { bits } => return format!("exlr8-k{bits}"),
+            Encoding::Trellis { k, codebook, rotation } => return format!("trellis-k{k}-{codebook:?}-rotation{rotation}"),
+            Encoding::Int4 { group } => return format!("int4-g{group}"),
             Encoding::E4m3 => "fp8",
             Encoding::E5m2 => "fp8e5m2",
             Encoding::E2m1 => {

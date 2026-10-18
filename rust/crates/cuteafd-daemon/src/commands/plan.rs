@@ -170,6 +170,26 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
+    if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+        anyhow::ensure!(!(args.files || args.fetch || args.role.is_some() || args.deployment),
+            "EXLR8 is planner-only: file/deployment manifests and fetching are not supported");
+        let dense = args.exlr8_dense_from.as_deref().map(|source| -> Result<PathBuf> {
+            if PathBuf::from(source).is_dir() { return Ok(PathBuf::from(source)); }
+            let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
+            resolve_snapshot_at_revision(source, Some(&home), None)?.snapshot_path
+                .with_context(|| format!("no local snapshot for dense source {source}"))
+        }).transpose()?;
+        let report = cuteafd_loader::plan::exlr8::inspect(&snapshot,
+            args.exlr8_manifest.as_deref().unwrap_or("bit325"), dense.as_deref(),
+            args.spark_ranks.unwrap_or(args.available_sparks), args.rtx,
+            options.spark_budget_bytes, options.coordinator_budget_bytes)?;
+        if args.json { println!("{}", serde_json::to_string_pretty(&report)?); }
+        else { print!("{}", report.render()); }
+        anyhow::ensure!(!args.require_ready, "EXLR8 is unsupported: add the kernels listed in the plan");
+        return Ok(());
+    }
+    anyhow::ensure!(args.exlr8_manifest.is_none() && args.exlr8_dense_from.is_none(),
+        "--exlr8-manifest/--exlr8-dense-from require an EXLR8 checkpoint");
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
     validate_glmf_precision(&args, family)?;
@@ -648,8 +668,29 @@ mod tests {
     use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors,
         write_snapshot};
 
+    #[test]
+    fn exlr8_mounted_cli_reports_fit_and_refuses_serving_modes() {
+        use clap::Parser;
+        let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else { return; };
+        let root = std::path::Path::new(&snapshot);
+        let cli = crate::cli::Cli::try_parse_from([
+            "cuteafd", "plan", root.to_str().unwrap(), "--exlr8-manifest", "up1",
+            "--spark-ranks", "4", "--rtx", "1", "--json",
+        ]).unwrap();
+        let crate::cli::Commands::Plan(plan) = cli.command else { panic!("plan command"); };
+        run_plan(plan).unwrap();
+        let refusal = run_plan(args(root, 6, true)).unwrap_err().to_string();
+        assert!(refusal.contains("EXLR8 is unsupported") && refusal.contains("kernels"));
+        let invalid = PlanArgs { exlr8_manifest: Some("../bad".into()), ..args(root, 6, false) };
+        assert!(run_plan(invalid).unwrap_err().to_string().contains("published name"));
+        let files = PlanArgs { files: true, ..args(root, 6, false) };
+        assert!(run_plan(files).unwrap_err().to_string().contains("planner-only"));
+    }
+
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            exlr8_manifest: None,
+            exlr8_dense_from: None,
             mapped_scale_preload_gib: 0.0,
             vision_replicas: 1,
             vision: cuteafd_loader::plan::MediaMode::Auto,
