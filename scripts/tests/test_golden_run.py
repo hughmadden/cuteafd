@@ -60,7 +60,8 @@ if args[:2] == ['run', '-d']:
     key, _, value = args[args.index('--label') + 1].partition('=')
     fail = os.environ.get('STUB_WORKER_FAIL') == host
     log = 'expert worker loading\n' + ('error: CUDA context creation failed NV_ERR_NO_MEMORY\n' if fail else
-                                        'INFO native worker bootstrap ready rank=0\n')
+                                        'INFO native worker bootstrap ready rank=0\n'
+                                        'WARN native RoCE peer removed error=native RoCE peer closed\n')
     if os.environ.get('STUB_WORKER_SLOW') == host:
         log = 'expert worker loading\n'
     names['id-' + name] = {'name': name, 'labels': {key: value}, 'log': log, 'running': not fail}; save()
@@ -570,7 +571,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
     assert set(record['spark_packages']) == {'fp8/fp8-step5/manifest.json'}
     summary = (out.parent / 'summary.md').read_text()
     assert 'Spark expert ranks: 0=dodo, 1=emu, 2=rhea, 3=moa' in summary
-    assert 'test result: ok. 1 passed' in summary and 'dodo: ready' in summary
+    assert 'test result: ok. 1 passed' in summary and 'dodo: ready; 0 error lines' in summary
 
 
 @pytest.mark.parametrize('output,problem', [

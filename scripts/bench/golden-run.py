@@ -961,7 +961,9 @@ def worker_lines(directory, limit=6):
     for log in sorted(Path(directory).glob('*.log')):
         text = ANSI.sub('', log.read_text(errors='replace'))
         ready = [l for l in text.splitlines() if WORKER_READY in l]
-        errors = [l.strip()[:300] for l in text.splitlines() if re.search(r'(?i)\berror\b|panicked|NV_ERR|out of memory', l)]
+        # Error-level lines only: workers log `WARN ... peer closed` when the coordinator exits.
+        errors = [l.strip()[:300] for l in text.splitlines()
+                  if re.search(r'\bERROR\b|^\S*\s*[Ee]rror:|panicked|NV_ERR|out of memory', l)]
         lines.append(f"{log.stem}: {'ready' if ready else 'NOT ready'}; {len(errors)} error lines")
         lines += [f'  {l}' for l in errors[-limit:]]
     return lines
