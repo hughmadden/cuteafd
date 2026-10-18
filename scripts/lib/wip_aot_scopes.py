@@ -17,7 +17,7 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
-                        qwen3_5='QWEN_DENSE')
+                        qwen3_5='QWEN_DENSE', step5='STEP5')
 
 
 def require_mapping(family):
@@ -80,10 +80,10 @@ def family_scopes(cards, config_reader):
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             if 'exl3' in card['name']:
                 scopes.add(tag + ':exl3-k23')
-        for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4')]:
+        for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4'), ('step5', 'step5', 'STEP5')]:
             if family == fam:
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
-                if count:
+                if count and fam != 'step5':
                     counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")
                 # Qwen's FP8 package has no Spark TP layout (intermediate 640): request the NVFP4 family,
                 # which CMake expands to nvfp4, nvfp4a4 and, on the coordinator only, the FP8 MTP sibling
@@ -92,6 +92,12 @@ def family_scopes(cards, config_reader):
                 nvfp4 = any('nvfp4' in str(value).lower() for value in
                             (card['name'], checkpoint_id, values.get('EXPERT_FORMAT', '')))
                 scopes.add(tag + (':nvfp4' if tag == 'qwen4' or nvfp4 else ':fp8'))
+                if fam == 'step5':
+                    # Both official quants retain a native BF16 routed layer.
+                    # Format keys keep the min/max card TP layouts independent.
+                    scopes.add('step5:bf16')
+                    if count:
+                        counts.update(f"{scope}={int(values.get('SPARK_TP', count))}" for scope in scopes)
                 if fam == 'glm5_flash' and nvfp4:
                     scopes.add('glmfdense:nvfp4')
                 if 'exl3' in card['name'] or 'tr3' in card['name']:

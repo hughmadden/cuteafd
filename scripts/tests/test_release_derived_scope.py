@@ -318,3 +318,30 @@ def test_v2_v41_role_floor_requires_native_roles_not_nvfp4(tmp_path):
     floor = [e for e in SCOPE.requirements(repo, matrix, 'all') if e['name'].startswith('v2.0.0-v41-tp')]
     assert sorted(e['spark_tp'] for e in floor) == [2, 3, 4, 6]
     assert not any(e['nvfp4'] for e in floor)
+
+
+@pytest.mark.parametrize('quant,count,gpus', [('nvfp4', 4, 1), ('fp8', 6, 2)])
+def test_step5_release_derives_native_mixed_packages(tmp_path, monkeypatch, quant, count, gpus):
+    real = SCOPE.scopes_module(REPO)
+    monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
+    (tmp_path / 'step.config').write_text(
+        f'FAMILY=step5\nMODEL_ID=fixture/step5-{quant}\nSPARK_COUNT={count}\nRTX_GPUS={gpus}\n')
+    matrix = tmp_path / 'matrix.json'
+    matrix.write_text(json.dumps(dict(entries=[dict(name='step5', family='step5', config='step.config')])))
+    derived, _ = SCOPE.derive(tmp_path, matrix, 'step5', {})
+    assert derived[P + 'STEP5_AOT'] == 'ON'
+    assert SCOPE.tokens(derived[P + 'EXPERT_FAMILIES']) == {f'step5:{quant}', 'step5:bf16'}
+    requirement = SCOPE.requirements(tmp_path, matrix, 'step5')[0]
+    assert requirement['programs'] == (['step5', 'step52'] if gpus == 2 else ['step5'])
+    checked = []
+    monkeypatch.setattr(SCOPE, 'check_package', lambda root, package, layouts, role, verified: checked.append((package, layouts)))
+    root = tmp_path / 'image'
+    write_json(root / 'share/PROGRAMS.json', dict(programs=[dict(family=family) for family in requirement['programs']]))
+    SCOPE.check_inventory(root, 'coordinator', [requirement], symbols=set())
+    suffix = '' if quant == 'fp8' else '-nvfp4'
+    assert sorted(checked) == sorted([(f'fp8/fp8-step5{suffix}', ['tp1', 'tp2'] if gpus == 2 else ['tp1']),
+                                      ('fp8/fp8-step5-bf16-weights', ['tp1', 'tp2'] if gpus == 2 else ['tp1'])])
+    checked.clear()
+    SCOPE.check_inventory(root, 'expert', [requirement], symbols=set())
+    assert sorted(checked) == sorted([(f'fp8/fp8-step5{suffix}', [f'tp{count}']),
+                                      ('fp8/fp8-step5-bf16-weights', [f'tp{count}'])])
