@@ -59,6 +59,11 @@ and the supervisor. It cannot undo already executed commands or stop detached
 remote work; the worker must clean up its hardware/container jobs through the
 project's tools before stop.
 
+All runs share one tmux server. After `stop`, never kill a leftover tmux
+process by PID (`tmux wait-for`, the server, or anything whose argv is a
+`new-session` line): that ends every other agent's run. If a session
+survives `stop`, use `tmux kill-session -t ext-<name>` only.
+
 ## Resume after a restart
 
 The tmux worker and detached supervisor survive a Claude Code restart, but
