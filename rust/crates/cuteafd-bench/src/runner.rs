@@ -57,6 +57,8 @@ pub enum StartError {
     UnknownProfile(String),
     #[error("the server is not ready")]
     NotReady,
+    #[error("the server is stopping ({0})")]
+    Stopping(String),
     #[error("invalid lossless set: {0}")]
     InvalidSet(String),
     #[error("invalid context-load options: {0}")]
@@ -154,6 +156,8 @@ pub struct Bench {
     pub(crate) console_gate: OnceLock<cuteafd_api::console_gate::ConsoleGate>,
     /// Whether benchmark requests are kept in the usage history (attached at mount).
     pub(crate) usage: OnceLock<UsageToggle>,
+    /// Why the server is stopping, once it is (see `crate::stopping`).
+    stopping: OnceLock<String>,
 }
 
 /// The usage store's `record_bench` setting, as the bench page toggles it.
@@ -177,6 +181,7 @@ impl Bench {
             api_key: OnceLock::new(),
             console_gate: OnceLock::new(),
             usage: OnceLock::new(),
+            stopping: OnceLock::new(),
         })
     }
 
@@ -267,6 +272,14 @@ impl Bench {
         self.store(|s| s.load(id)).ok().flatten()
     }
 
+    /// One panel of a live or stored run; a stored one is extracted on its own.
+    pub fn panel(&self, id: &str, panel: &str) -> Option<crate::report::PanelResult> {
+        if let Some(live) = self.live.lock().ok()?.get(id) {
+            return live.lock().ok()?.panel(panel).cloned();
+        }
+        self.store(|s| s.panel(id, panel)).ok().flatten()
+    }
+
     /// Every panel's newest result on `fingerprint`, each tagged with the run
     /// it came from, under the newest baseline; the active run's live panels
     /// replace their own sections. Reads only the runs that contribute.
@@ -347,8 +360,8 @@ impl Bench {
         if let Some(b) = self.baselines.lock().ok().and_then(|b| b.get(fingerprint).cloned()) {
             return Rates::from_baseline(&b);
         }
-        self.store(|s| s.reports_for(fingerprint, 5)).ok().into_iter().flatten()
-            .find_map(|r| r.baseline).map(|b| Rates::from_baseline(&b)).unwrap_or_default()
+        self.store(|s| s.latest_baseline(fingerprint)).ok().flatten()
+            .map(|b| Rates::from_baseline(&b)).unwrap_or_default()
     }
 
     /// The panel catalog with per-pass estimates on this server.
@@ -392,6 +405,20 @@ impl Bench {
             "quality_failed": baseline.as_ref().is_some_and(|b| b.quality.status == crate::report::CheckStatus::Fail),
             "auth": "console unlock or API key",
         })
+    }
+
+    /// The server is shutting down: refuse new runs and stop the active one,
+    /// which then records `reason` instead of the connection errors that follow.
+    pub fn stopping(&self, reason: &str) {
+        let _ = self.stopping.set(reason.to_string());
+        if let Some(active) = self.active() {
+            tracing::warn!(run = %active.id, reason, "server stopping: interrupting the running benchmark");
+            active.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn interrupted(&self) -> Option<String> {
+        self.stopping.get().map(|reason| format!("interrupted: the server stopped ({reason}) during this run"))
     }
 
     pub fn cancel(&self, id: &str) -> bool {
@@ -444,6 +471,7 @@ impl Bench {
 
     /// Starts a run; returns its id.
     pub fn start(self: &Arc<Self>, request: RunRequest) -> Result<String, StartError> {
+        if let Some(reason) = self.stopping.get() { return Err(StartError::Stopping(reason.clone())); }
         let base = crate::context::loopback().ok_or(StartError::NotReady)?;
         let lossless_set = request.lossless_set.clone().map(|set| set.validated()).transpose()
             .map_err(StartError::InvalidSet)?;
@@ -531,7 +559,13 @@ impl Bench {
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
+            let interrupted = self.interrupted();
             match outcome {
+                Ok(()) if interrupted.is_none() => r.status = RunStatus::Done,
+                _ if interrupted.is_some() => {
+                    r.status = RunStatus::Cancelled;
+                    r.error = interrupted.clone();
+                }
                 Ok(()) => r.status = RunStatus::Done,
                 Err(error) if active.cancel.load(Ordering::Relaxed)
                     || error.downcast_ref::<crate::client::Cancelled>().is_some() => r.status = RunStatus::Cancelled,
@@ -541,6 +575,7 @@ impl Bench {
                 }
             }
             for panel in r.panels.iter_mut().filter(|p| matches!(p.status, PanelStatus::Pending | PanelStatus::Running)) {
+                if panel.status == PanelStatus::Running && interrupted.is_some() { panel.error = interrupted.clone(); }
                 panel.status = PanelStatus::Cancelled;
             }
             if let Err(error) = self.store(|s| s.save(&r)) {
@@ -618,7 +653,6 @@ impl Bench {
         }
         Self::record_power(&client, run_mark, report);
         self.emit(json!({"type": "report", "run": active.id, "report": report.lock().expect("report lock").clone()}));
-        let history = self.store(|s| s.reports_for(&fingerprint, 50)).unwrap_or_default();
         for (index, planned) in plan.iter().enumerate() {
             let Some(panel) = panels::find(&planned.id) else { continue };
             let estimate = panel.estimate_s(&rates, &info);
@@ -629,8 +663,10 @@ impl Bench {
                 remaining -= estimate * f64::from(planned.passes);
                 continue;
             }
-            let earlier: Vec<Value> = history.iter().filter_map(|r| r.panel(panel.id()))
-                .flat_map(|p| p.passes.iter().cloned()).collect();
+            // This panel's earlier passes on the server, newest run first;
+            // SQLite extracts the one panel, never whole reports.
+            let earlier: Vec<Value> = self.store(|s| s.panel_history(&fingerprint, panel.id(), 50)).unwrap_or_default()
+                .into_iter().flat_map(|p| p.passes).collect();
             {
                 let mut r = report.lock().expect("report lock");
                 r.panels[index].status = PanelStatus::Running;
@@ -683,7 +719,9 @@ impl Bench {
                         r.panels[index].partial = None;
                     }
                     Err(error) => {
-                        if error.downcast_ref::<crate::client::Cancelled>().is_some() {
+                        if error.downcast_ref::<crate::client::Cancelled>().is_some() || self.stopping.get().is_some() {
+                            if let Some(reason) = self.interrupted() { r.panels[index].error = Some(reason); }
+                            r.panels[index].status = PanelStatus::Cancelled;
                             return Err(error);
                         }
                         r.panels[index].status = PanelStatus::Failed;

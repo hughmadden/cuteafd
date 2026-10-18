@@ -278,9 +278,11 @@ struct FileQuery {
     compare: Option<String>,
 }
 
-fn attach_fidelity_comparison(report: &mut Report, earlier: Option<&Report>, earlier_id: &str) {
+/// `earlier(panel id)`: that panel of the saved run, read on its own (never the whole report).
+fn attach_fidelity_comparison(report: &mut Report, earlier: impl Fn(&str) -> Option<crate::report::PanelResult>, earlier_id: &str) {
     for panel in report.panels.iter_mut().filter(|p| matches!(p.id.as_str(), "fidelity" | "fidelity_full")) {
-        let previous = earlier.and_then(|r| r.panel(&panel.id)).and_then(|p| p.latest())
+        let earlier_panel = earlier(&panel.id);
+        let previous = earlier_panel.as_ref().and_then(|p| p.latest())
             .and_then(|v| serde_json::from_value::<crate::fidelity::Run>(v["decode"].clone()).ok());
         let latest = if let Some(partial) = &mut panel.partial { Some(partial) } else { panel.passes.last_mut() };
         let Some(latest) = latest else { continue };
@@ -292,7 +294,7 @@ fn attach_fidelity_comparison(report: &mut Report, earlier: Option<&Report>, ear
         latest["paired"] = paired;
         latest["paired"]["earlier_run"] = json!(earlier_id);
         if latest["tier"] == crate::fidelity_dataset::STANDARD_TIER && !latest["prefill"].is_null() {
-            let previous = earlier.and_then(|r| r.panel(&panel.id)).and_then(|p| p.latest())
+            let previous = earlier_panel.as_ref().and_then(|p| p.latest())
                 .and_then(|v| serde_json::from_value::<crate::fidelity::Run>(v["prefill"].clone()).ok());
             latest["paired_prefill"] = match (&previous, serde_json::from_value::<crate::fidelity::Run>(latest["prefill"].clone())) {
                 (Some(previous), Ok(current)) => crate::panels::fidelity::record(&current, Some(previous))["paired"].clone(),
@@ -309,7 +311,7 @@ async fn run_file(State(bench): State<Arc<Bench>>, Path((id, file)): Path<(Strin
     let report = if id == "latest" { bench.latest() } else { bench.report(&id) };
     let Some(mut report) = report else { return not_found("run") };
     if let Some(earlier_id) = &query.compare {
-        attach_fidelity_comparison(&mut report, bench.report(earlier_id).as_ref(), earlier_id);
+        attach_fidelity_comparison(&mut report, |panel| bench.panel(earlier_id, panel), earlier_id);
     }
     // The two surfaces below render the report itself rather than one of its
     // exports; `export` applies the same rule to everything else.
@@ -670,7 +672,7 @@ mod tests {
             baseline: None, panels: vec![crate::report::PanelResult {
                 id: "fidelity".into(), passes: vec![json!({"saved":true})], partial: Some(json!({"decode":null})),
                 ..Default::default() }], fabric: vec![], error: None };
-        attach_fidelity_comparison(&mut report, None, "missing");
+        attach_fidelity_comparison(&mut report, |_| None, "missing");
         let panel = report.panel("fidelity").unwrap();
         assert_eq!(panel.latest().unwrap()["paired"]["earlier_run"], "missing");
         assert!(panel.latest().unwrap()["paired"]["unavailable"].as_str().unwrap().contains("no matching"));
@@ -682,13 +684,13 @@ mod tests {
         let mut current = crate::sample::full_report();
         current.panels.retain(|p| p.id == "fidelity");
         let mut earlier = current.clone();
-        attach_fidelity_comparison(&mut current,Some(&earlier),"earlier");
+        attach_fidelity_comparison(&mut current,|id| earlier.panel(id).cloned(),"earlier");
         let latest = current.panel("fidelity").unwrap().latest().unwrap();
         assert_eq!(latest["paired"]["comparison"]["pass"],true);
         assert_eq!(latest["paired_prefill"]["comparison"]["pass"],true);
         let old = earlier.panels[0].passes.last_mut().unwrap();
         old["decode"]["tier"] = json!("standard"); old["prefill"]["tier"] = json!("standard");
-        attach_fidelity_comparison(&mut current,Some(&earlier),"legacy");
+        attach_fidelity_comparison(&mut current,|id| earlier.panel(id).cloned(),"legacy");
         let latest = current.panel("fidelity").unwrap().latest().unwrap();
         assert!(latest["paired"]["unavailable"].as_str().unwrap().contains("different tiers"));
         assert!(latest["paired_prefill"]["unavailable"].as_str().unwrap().contains("different tiers"));

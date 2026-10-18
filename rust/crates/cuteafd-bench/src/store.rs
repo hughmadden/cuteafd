@@ -31,20 +31,25 @@ pub struct RunRow {
     pub model: String,
     pub hardware: String,
     pub quality_failed: bool,
+    /// Panels with results in this run (stored column; comma-separated ids).
+    pub panels: String,
 }
 
 /// Version of the quality rule the stored `quality_failed` column was derived
 /// under. Bump it whenever `quality::under_current_rule` changes: opening the
 /// store then re-derives every row once (a backfill), and listings read only
-/// the stored columns, never the report JSON.
-pub const VERDICT_RULE: i64 = 1;
+/// the stored columns, never the report JSON. 2: summaries of runs saved by
+/// a build without these columns after an earlier backfill are re-derived.
+pub const VERDICT_RULE: i64 = 2;
 
 /// The summary columns a run's report earns under the rule in force now.
 struct Summary { quality_failed: bool, panels: String, has_baseline: bool }
 fn summarize(report: &Report) -> Summary {
     let current = crate::quality::under_current_rule(report);
     let panels = report.panels.iter()
-        .filter(|p| p.status == crate::report::PanelStatus::Done || !p.passes.is_empty())
+        // Results, and attempts that ended with a reason (the merged view shows
+        // the newest attempt, so a failure is never hidden behind an older pass).
+        .filter(|p| p.status == crate::report::PanelStatus::Done || !p.passes.is_empty() || p.error.is_some())
         .map(|p| p.id.as_str()).collect::<Vec<_>>().join(",");
     Summary { quality_failed: current.quality_failed(), panels, has_baseline: report.baseline.is_some() }
 }
@@ -103,6 +108,13 @@ impl Store {
                 self.connection.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {name} {kind}"))?;
             }
         }
+        // Covering indexes: the run list and an accumulated view's sources read
+        // only these columns, never the row's report (which sits in overflow
+        // pages, so a table scan for a later column pages the whole store in).
+        self.connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS runs_listing ON runs(created, id, fingerprint, profile, status, model, hardware, quality_failed, panels);
+             CREATE INDEX IF NOT EXISTS runs_sources ON runs(fingerprint, created, id, panels, has_baseline);
+             CREATE INDEX IF NOT EXISTS runs_rule ON runs(verdict_rule);")?;
         Ok(())
     }
 
@@ -125,10 +137,13 @@ impl Store {
         for id in chunk {
             let text: String = transaction.query_row("SELECT report FROM runs WHERE id = ?1", params![id], |row| row.get(0))?;
             // A report this build cannot parse keeps the verdict it was saved with.
-            let summary = serde_json::from_str::<Report>(&text).ok().map(|r| summarize(&r));
-            match summary {
+            let report = serde_json::from_str::<Report>(&text).ok();
+            // A run still going (perhaps under an older build that will save it
+            // again without these columns) stays stale until it has finished.
+            let rule = if report.as_ref().is_some_and(|r| !r.status.finished()) { 0 } else { VERDICT_RULE };
+            match report.map(|r| summarize(&r)) {
                 Some(s) => transaction.execute("UPDATE runs SET quality_failed = ?2, panels = ?3, has_baseline = ?4, verdict_rule = ?5 WHERE id = ?1",
-                    params![id, s.quality_failed as i64, s.panels, s.has_baseline as i64, VERDICT_RULE])?,
+                    params![id, s.quality_failed as i64, s.panels, s.has_baseline as i64, rule])?,
                 None => transaction.execute("UPDATE runs SET verdict_rule = ?2 WHERE id = ?1", params![id, VERDICT_RULE])?,
             };
         }
@@ -172,12 +187,12 @@ impl Store {
     /// reclassified is not listed as a failure.
     pub fn list(&self, limit: usize) -> Result<Vec<RunRow>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, created, fingerprint, profile, status, model, hardware, quality_failed FROM runs
+            "SELECT id, created, fingerprint, profile, status, model, hardware, quality_failed, panels FROM runs
              ORDER BY created DESC LIMIT ?1")?;
         let rows = statement.query_map(params![limit as i64], |row| {
             Ok(RunRow { id: row.get(0)?, created: row.get(1)?, fingerprint: row.get(2)?, profile: row.get(3)?,
                 status: row.get(4)?, model: row.get(5)?, hardware: row.get(6)?,
-                quality_failed: row.get::<_, i64>(7)? != 0 })
+                quality_failed: row.get::<_, i64>(7)? != 0, panels: row.get(8)? })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -200,12 +215,33 @@ impl Store {
         Ok(sources)
     }
 
-    /// Reports on `fingerprint`, newest first (accumulating panels read them).
-    pub fn reports_for(&self, fingerprint: &str, limit: usize) -> Result<Vec<Report>> {
+    /// Panel `panel`'s stored results on `fingerprint`, newest run first, at
+    /// most `limit` runs: SQLite extracts the one panel object from each run
+    /// that lists it, so neither the other panels nor other runs are parsed.
+    pub fn panel_history(&self, fingerprint: &str, panel: &str, limit: usize) -> Result<Vec<crate::report::PanelResult>> {
         let mut statement = self.connection.prepare(
-            "SELECT report FROM runs WHERE fingerprint = ?1 ORDER BY created DESC LIMIT ?2")?;
-        let texts = statement.query_map(params![fingerprint, limit as i64], |row| row.get::<_, String>(0))?;
+            "SELECT p.value FROM (SELECT report, created FROM runs WHERE fingerprint = ?1 AND (',' || panels || ',') LIKE ?2
+                 ORDER BY created DESC LIMIT ?3) r, json_each(r.report, '$.panels') p
+             WHERE json_extract(p.value, '$.id') = ?4 ORDER BY r.created DESC")?;
+        let pattern = format!("%,{panel},%");
+        let texts = statement.query_map(params![fingerprint, pattern, limit as i64, panel], |row| row.get::<_, String>(0))?;
         Ok(texts.filter_map(|t| t.ok()).filter_map(|t| serde_json::from_str(&t).ok()).collect())
+    }
+
+    /// One panel of one stored run, extracted by SQLite (comparisons read this).
+    pub fn panel(&self, id: &str, panel: &str) -> Result<Option<crate::report::PanelResult>> {
+        let text: Option<String> = self.connection.query_row(
+            "SELECT p.value FROM runs r, json_each(r.report, '$.panels') p WHERE r.id = ?1 AND json_extract(p.value, '$.id') = ?2",
+            params![id, panel], |row| row.get(0)).optional()?;
+        text.map(|t| serde_json::from_str(&t).context("stored panel")).transpose()
+    }
+
+    /// The newest stored baseline on `fingerprint`, extracted by SQLite.
+    pub fn latest_baseline(&self, fingerprint: &str) -> Result<Option<crate::report::Baseline>> {
+        let text: Option<String> = self.connection.query_row(
+            "SELECT json_extract(report, '$.baseline') FROM runs WHERE fingerprint = ?1 AND has_baseline = 1
+             ORDER BY created DESC LIMIT 1", params![fingerprint], |row| row.get(0)).optional()?.flatten();
+        text.map(|t| serde_json::from_str(&t).context("stored baseline")).transpose()
     }
 
     pub fn save_profile(&self, profile: &Profile) -> Result<()> {
@@ -341,7 +377,22 @@ mod tests {
         store.save(&c).unwrap();
         assert_eq!(store.list(10).unwrap().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["c", "b", "a"]);
         assert_eq!(store.load("c").unwrap().unwrap().status, RunStatus::Cancelled);
-        assert_eq!(store.reports_for("f1", 10).unwrap().len(), 2);
+        // History and baselines come out of SQLite one panel at a time.
+        let mut d = report("d", "f1", "2026-10-04T00:00:00Z");
+        let panel = |id: &str, passes: Vec<serde_json::Value>| -> crate::report::PanelResult { serde_json::from_value(serde_json::json!(
+            {"id": id, "title": id, "status": if passes.is_empty() { "pending" } else { "done" }, "passes": passes})).unwrap() };
+        d.panels = vec![panel("code", vec![]), panel("math", vec![serde_json::json!({"correct": 3})])];
+        d.baseline = crate::sample::report(false).baseline;
+        store.save(&d).unwrap();
+        let history = store.panel_history("f1", "math", 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].passes[0]["correct"], 3);
+        assert!(store.panel_history("f1", "code", 10).unwrap().is_empty(), "pending, no passes: not listed");
+        assert!(store.panel_history("f2", "math", 10).unwrap().is_empty());
+        assert!(store.latest_baseline("f1").unwrap().is_some());
+        assert_eq!(store.panel("d", "math").unwrap().unwrap().passes.len(), 1);
+        assert!(store.panel("d", "nope").unwrap().is_none() && store.panel("zz", "math").unwrap().is_none());
+        assert!(store.latest_baseline("f2").unwrap().is_none());
         let profile = Profile { fabric: false, name: "mine".into(), title: "Mine".into(), description: String::new(),
             panels: vec![], builtin: false };
         store.save_profile(&profile).unwrap();
@@ -349,6 +400,6 @@ mod tests {
         assert!(store.delete_profile("mine").unwrap());
         drop(store);
         // Reopening keeps the runs.
-        assert_eq!(Store::open(dir.path()).unwrap().list(10).unwrap().len(), 3);
+        assert_eq!(Store::open(dir.path()).unwrap().list(10).unwrap().len(), 4);
     }
 }

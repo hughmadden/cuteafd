@@ -53,12 +53,7 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(),
         api.serve(profile, &snapshot)?);
     axum::serve(listener, api.app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(async {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("install SIGTERM handler");
-            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
-        })
+        .with_graceful_shutdown(cuteafd_bench::shutdown_signal())
         .await?;
     tokio::task::spawn_blocking(move || worker_thread.join())
         .await?
