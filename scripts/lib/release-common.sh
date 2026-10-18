@@ -995,7 +995,7 @@ release_load_config() {
   PROFILE_NSYS_GPU_METRICS=
   ADDR=0.0.0.0:8000
   EXPERT_PORT=19441
-  CUTEAFD_EXPORT_HOST=oliver
+  CUTEAFD_EXPORT_HOST=
   WIP_BUILD_SEED=kakapo
   COORDINATOR_DOCKER_DEV=cuteafd-coordinator-dev
   COORDINATOR_DOCKER_INFERENCE=cuteafd-coordinator

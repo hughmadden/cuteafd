@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize('configured,override,expected', [
-    ('', None, 'oliver'), ('CUTEAFD_EXPORT_HOST=other\n', None, 'other'),
+    ('', None, ''), ('CUTEAFD_EXPORT_HOST=other\n', None, 'other'),
     ('CUTEAFD_EXPORT_HOST=other\n', 'explicit', 'explicit'),
     ('CUTEAFD_EXPORT_HOST=other\n', '', ''),
 ])

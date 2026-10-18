@@ -119,9 +119,6 @@ wip_export_host_set="${CUTEAFD_EXPORT_HOST+x}"
 release_load_config "$config"
 [[ -z "$wip_export_host_set" ]] || CUTEAFD_EXPORT_HOST="$wip_export_host_env"
 export CUTEAFD_EXPORT_HOST
-if [[ "$CUTEAFD_EXPORT_HOST" == oliver && -z "${CUTEAFD_EXPORT_HOST_ADDR:-}" ]]; then
-  export CUTEAFD_EXPORT_HOST_ADDR=oliver.birds.vimoin.com
-fi
 # Resolve once for direct builds too; explicit card/environment scopes win,
 # including an empty expert list or Spark role override.
 wip_scopes="$(python3 "$repo_root/scripts/lib/wip_aot_scopes.py" --config "$config" \
