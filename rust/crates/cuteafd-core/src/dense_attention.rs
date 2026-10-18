@@ -58,6 +58,83 @@ pub fn rms_norm(
         .collect())
 }
 
+/// Affine norm boundary independent of checkpoint storage. Indexer norms load
+/// F32 parameters but materialize BF16 operands; model norms retain F32.
+#[derive(Debug, Clone, Copy)]
+pub struct AffineNorm {
+    pub weight: NormWeight,
+    pub parameter_precision: OutputPrecision,
+    pub subtract_mean: bool,
+    pub eps: f32,
+}
+
+impl AffineNorm {
+    /// Scalar reduction oracle, not a claim about a native reduction tree.
+    /// LayerNorm uses E[x^2] - E[x]^2, not mean((x - mean)^2).
+    pub fn evaluate(
+        self,
+        x: &[f32],
+        weight: &[f32],
+        bias: Option<&[f32]>,
+        output: OutputPrecision,
+    ) -> Result<Vec<f32>, ContractError> {
+        if x.is_empty() || x.len() != weight.len()
+            || bias.is_some_and(|b| b.len() != x.len())
+            || !self.eps.is_finite() || self.eps <= 0.0
+        {
+            return Err(ContractError("affine norm dimensions or epsilon"));
+        }
+        let mean = if self.subtract_mean { x.iter().sum::<f32>() / x.len() as f32 } else { 0.0 };
+        let variance = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 - mean * mean;
+        let inv = (variance + self.eps).sqrt().recip();
+        Ok(x.iter().zip(weight).enumerate().map(|(i, (&v, &w))| {
+            let w = self.parameter_precision.round(w);
+            let scale = match self.weight {
+                NormWeight::Conventional => w,
+                NormWeight::ZeroCentered => w + 1.0,
+            };
+            let normalized = ((v - mean) * inv) * scale;
+            output.round(match bias {
+                Some(b) => normalized + self.parameter_precision.round(b[i]),
+                None => normalized,
+            })
+        }).collect())
+    }
+
+    /// Normalized Q/K materialize in BF16 before rotary arithmetic. The
+    /// unrotated tail is that same BF16 result, not the raw input tail.
+    pub fn norm_rope(
+        self,
+        x: &[f32],
+        weight: &[f32],
+        bias: Option<&[f32]>,
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<Vec<f32>, ContractError> {
+        let normalized = self.evaluate(x, weight, bias, OutputPrecision::Bf16)?;
+        let cos: Vec<_> = cos.iter().map(|&v| OutputPrecision::Bf16.round(v)).collect();
+        let sin: Vec<_> = sin.iter().map(|&v| OutputPrecision::Bf16.round(v)).collect();
+        RotaryArithmetic::FusedImaginary.evaluate(&normalized, &cos, &sin, OutputPrecision::Bf16)
+    }
+}
+
+/// Indexer score projection: F32 checkpoint weights are rounded to BF16 for
+/// GEMM, its result materializes BF16, then widens before the F32 prescale.
+pub fn bf16_linear_scaled(
+    x: &[f32],
+    weight: &[f32],
+    rows: usize,
+    prescale: f32,
+) -> Result<Vec<f32>, ContractError> {
+    if !prescale.is_finite() || prescale <= 0.0 {
+        return Err(ContractError("projection prescale"));
+    }
+    let x: Vec<_> = x.iter().map(|&v| OutputPrecision::Bf16.round(v)).collect();
+    let weight: Vec<_> = weight.iter().map(|&v| OutputPrecision::Bf16.round(v)).collect();
+    Ok(linear(&x, &weight, rows, OutputPrecision::Bf16)?
+        .into_iter().map(|v| v * prescale).collect())
+}
+
 /// Each delta has already been rounded by its producer. Deltas are added in
 /// the supplied order; combine parallel FFN branches before residual addition.
 pub fn residual_add(
@@ -410,6 +487,50 @@ mod tests {
             out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             [0x3f67_0000, 0xbed2_0000]
         );
+    }
+
+    #[test]
+    fn indexer_norm_casts_parameters_but_model_norm_retains_f32() {
+        let norm = AffineNorm {
+            weight: NormWeight::ZeroCentered,
+            parameter_precision: BF,
+            subtract_mean: false,
+            eps: 1e-5,
+        };
+        let x = [0.625, -1.5, 2.25, 0.125];
+        let w = [0.00391, 0.00783, -0.1253, 0.0313];
+        let cast_w = w.map(|v| BF.round(v));
+        assert_eq!(norm.evaluate(&x, &w, None, BF).unwrap(),
+            rms_norm(&x, &cast_w, norm.eps, norm.weight, BF).unwrap());
+        let model = AffineNorm { parameter_precision: OutputPrecision::F32, ..norm };
+        assert_eq!(model.evaluate(&x, &w, None, BF).unwrap(),
+            rms_norm(&x, &w, norm.eps, norm.weight, BF).unwrap());
+        let ln = AffineNorm { weight: NormWeight::Conventional, subtract_mean: true, ..norm };
+        let bias = [1.003, 0.00783, -0.1253, 0.0313];
+        let expected = ln.evaluate(&x, &cast_w, Some(&bias.map(|v| BF.round(v))), BF).unwrap();
+        assert_eq!(ln.evaluate(&x, &w, Some(&bias), BF).unwrap(), expected);
+        assert!(ln.evaluate(&x, &w, Some(&[]), BF).is_err());
+        // Position zero makes the rotary span identity; its tail must still
+        // contain normalized values, and retain negative zero when present.
+        for (dim, rotary) in [(192, 192), (192, 64), (256, 32)] {
+            let x: Vec<_> = (0..dim).map(|i| BF.round(i as f32 / 32.0 - 2.0)).collect();
+            let w = vec![0.0313; dim];
+            let out = norm.norm_rope(&x, &w, None, &vec![1.0; rotary / 2], &vec![0.0; rotary / 2]).unwrap();
+            assert_eq!(out, norm.evaluate(&x, &w, None, BF).unwrap());
+        }
+    }
+
+    #[test]
+    fn indexer_score_projection_rounds_weight_and_output_before_prescale() {
+        let x = [1.125, -2.25, 0.625];
+        let w = [0.0313, 0.1273, -0.2539, -0.0723, 0.503, 0.00197];
+        let cast_w = w.map(|v| BF.round(v));
+        let expected = linear(&x, &cast_w, 2, BF).unwrap();
+        let scaled = bf16_linear_scaled(&x, &w, 2, 0.5).unwrap();
+        assert_eq!(scaled, expected.iter().map(|v| v * 0.5).collect::<Vec<_>>());
+        let wrong = linear(&x, &w, 2, OutputPrecision::F32).unwrap();
+        assert_ne!(scaled, wrong.iter().map(|v| v * 0.5).collect::<Vec<_>>());
+        assert!(bf16_linear_scaled(&x, &w, 2, f32::NAN).is_err());
     }
 
     #[test]
