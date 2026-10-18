@@ -78,8 +78,10 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
                 let spans = layout.snapshot_spans(rank, frontier).unwrap();
                 assert!(spans.iter().all(|s| s.offset.checked_add(s.bytes).unwrap() <= state.bytes));
                 let summary_bytes = if rank == 0 { 23 * (frontier / REGION_ROWS) * 256 } else { 0 };
-                let expected = state.bytes - if rank == 0 { summaries - summary_bytes } else { 0 };
+                let maximum: u64 = layout.snapshot_spans(rank, 1 << 20).unwrap().iter().map(|s| s.bytes).sum();
+                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 };
                 assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
+                assert!(spans.iter().all(|s| s.offset % 256 == 0));
                 assert!(state.regions.iter().all(|region| spans.contains(&region.pending_key)
                     && spans.contains(&region.pending_z)));
                 for ring in &state.sliding {

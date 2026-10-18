@@ -65,7 +65,8 @@ fn mul(values: &[u64]) -> Result<u64, CacheGeometryError> {
 impl RankState {
     fn reserve(&mut self, bytes: u64) -> Result<ByteSpan, CacheGeometryError> {
         let span = ByteSpan { offset: self.bytes, bytes };
-        self.bytes = self.bytes.checked_add(bytes)
+        self.bytes = self.bytes.checked_add(bytes).and_then(|end| end.checked_add(255))
+            .map(|end| end & !255)
             .ok_or(CacheGeometryError::Overflow("Step-5 sequence state"))?;
         Ok(span)
     }
