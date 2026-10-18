@@ -43,7 +43,11 @@ def test_seed_admission_after_reuse_and_no_gpu_queue():
     text = (ROOT / 'wip.sh').read_text()
     assert text.index('((wip_build_expert == 0)) || wip_build_resource_acquire') > text.index('wip_reused_expert=1')
     capped = text[text.index('wip_capped_export() {'):text.index('wip_capped_export_on() (')]
-    assert capped.index('wip_build_resource_dir/granted') < capped.index('export-placement.py" hold')
+    # The only GPU-lock path is the non-blocking placement hold, so it may run
+    # while the Spark leg holds its seed lease: nothing here can wait on a lock.
+    assert capped.count('export-placement.py" hold') == 1
+    assert 'wip_hwlock' not in capped and 'flock' not in capped and 'hwlock.py' not in capped
+    assert 'wip_build_resource_dir' not in capped
     dispatch = text[text.index('    local mode exported=0'):text.index('    ((exported)) || release_die')]
     assert 'wip_hwlock' not in dispatch and 'wait-remote)' in dispatch
     assert '[[ "$seed_host" != kakapo ]]' not in capped

@@ -1125,8 +1125,10 @@ native_store_has() {
 wip_seed_lock() {
   case "$1" in rhea|moa|kakapo) printf '%s\n' "$1" ;; *) printf 'sparks\n' ;; esac
 }
-# Auto never queues on a raptor GPU: capped admission is nonblocking, then
-# remote retries are bounded. A live seed lease excludes every GPU-lock probe.
+# Auto never queues on a raptor GPU: capped admission probes the GPU locks
+# without blocking (a held lock falls through to the next mode), then remote
+# retries are bounded. It may run while the Spark leg holds its seed lease:
+# a non-blocking probe can never wait on a lock, so it cannot deadlock.
 wip_coordinator_export_modes() {
   case "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" in
     auto|capped) printf 'capped remote wait-remote\n' ;;
@@ -1167,8 +1169,6 @@ wip_remote_export() {
 # that GPU (the WIP container is bound to COORDINATOR_GPU), admitted by the
 # host's nvidia-smi and stopped by the watchdog if it outgrows its cap.
 wip_capped_export() {
-  # Never take a GPU mutex while any seed lease is live, including kakapo.
-  [[ -z "${wip_build_resource_dir:-}" || ! -e "$wip_build_resource_dir/granted" ]] || return 75
   local status=0
   CUTEAFD_CAPPED_BUILD="$(printf '%q ' "$@")" \
     python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" -- \
