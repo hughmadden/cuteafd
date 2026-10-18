@@ -280,6 +280,16 @@ mod tests {
     }
 
     #[test]
+    fn lowercase_exlr8_walks_its_published_bf16_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = "kindlingai/glm-5.3-exlr8-k2-k3-k4";
+        let quant = add(tmp.path(), model, "base_model: zai-org/GLM-5.3-BF16\nbase_model_relation: quantized");
+        let result = resolve_in(model, Some(&quant), tmp.path()).unwrap();
+        assert_eq!(result.reference_root, "zai-org/GLM-5.3-BF16");
+        assert_eq!(result.resolved_chain, vec![vec![model.to_string(), "zai-org/GLM-5.3-BF16".to_string()]]);
+    }
+
+    #[test]
     fn scoring_root_does_not_follow_pretraining_base() {
         let tmp = tempfile::tempdir().unwrap();
         let root = "Qwen/Qwen3.8-Flash-Next";

@@ -170,6 +170,24 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
+    if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+        let dense = args.exlr8_dense_from.as_deref().map(|source| -> Result<PathBuf> {
+            if PathBuf::from(source).is_dir() { return Ok(PathBuf::from(source)); }
+            let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
+            resolve_snapshot_at_revision(source, Some(&home), None)?.snapshot_path
+                .with_context(|| format!("no local snapshot for dense source {source}"))
+        }).transpose()?;
+        let report = cuteafd_loader::plan::exlr8::inspect(&snapshot,
+            args.exlr8_manifest.as_deref().unwrap_or("bit325"), dense.as_deref(),
+            args.spark_ranks.unwrap_or(args.available_sparks), args.rtx,
+            options.spark_budget_bytes, options.coordinator_budget_bytes)?;
+        if args.json { println!("{}", serde_json::to_string_pretty(&report)?); }
+        else { print!("{}", report.render()); }
+        anyhow::ensure!(!args.require_ready, "EXLR8 is unsupported: add the kernels listed in the plan");
+        return Ok(());
+    }
+    anyhow::ensure!(args.exlr8_manifest.is_none() && args.exlr8_dense_from.is_none(),
+        "--exlr8-manifest/--exlr8-dense-from require an EXLR8 checkpoint");
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
     validate_glmf_precision(&args, family)?;
@@ -650,6 +668,8 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            exlr8_manifest: None,
+            exlr8_dense_from: None,
             mapped_scale_preload_gib: 0.0,
             vision_replicas: 1,
             vision: cuteafd_loader::plan::MediaMode::Auto,

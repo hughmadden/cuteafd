@@ -166,6 +166,33 @@ def expert_unit(snapshot, layer, k, expert, unit, projection, shared=False):
     return weight, trellis, f"{actual:016x}"
 
 
+def dense_trellis_unit(snapshot, layer, stem, unit):
+    """One dense 128-channel sharding unit, including its native checksum."""
+    tensors = Tensors(Path(snapshot) / "dense" / f"exlr8-dense-{layer:03}.safetensors")
+    record = tensors.array(stem + ".record")
+    fmt, out, inp, k, side, _channels, _rotation, _solve = map(int, record)
+    if fmt != 1:
+        raise ValueError("dense oracle sample must be a trellis operand")
+    desc = tensors.meta[stem + ".trellis"]
+    length = desc["shape"][1]
+    data = tensors.raw(stem + ".trellis", unit * length, length)
+    suh, svh = tensors.array(stem + ".suh"), tensors.array(stem + ".svh")
+    if side == 2:
+        checksum_data = data + suh[128*unit:128*(unit+1)].tobytes() + svh.tobytes()
+        trellis = decode_unit(data, k, "down", out)
+        suh = suh[128*unit:128*(unit+1)]
+    else:
+        checksum_data = data + svh[128*unit:128*(unit+1)].tobytes() + suh.tobytes()
+        trellis = decode_unit(data, k, "gate", inp)
+        svh = svh[128*unit:128*(unit+1)]
+    checksum = xxhash64(checksum_data)
+    expected = int(tensors.array(stem + ".checksum")[unit])
+    if checksum != expected:
+        raise ValueError(f"dense checksum mismatch: {checksum:016x} != {expected:016x}")
+    weight = hadamard128(hadamard128(trellis, 0), 1) * suh[:, None] * svh[None, :]
+    return weight, trellis, f"{checksum:016x}"
+
+
 def mxfp8(values):
     x = np.asarray(values, dtype=np.float32)
     blocks = x.reshape(*x.shape[:-1], -1, 32)

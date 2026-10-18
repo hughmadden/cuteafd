@@ -3,6 +3,7 @@
 pub mod checkpoint;
 pub mod deployment;
 pub mod experts;
+pub mod exlr8;
 pub mod encoder;
 pub mod families;
 pub mod family;
