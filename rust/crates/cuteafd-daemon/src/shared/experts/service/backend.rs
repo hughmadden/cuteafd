@@ -332,6 +332,8 @@ impl<'w, 'a> Execution<'w, 'a> {
 
 fn supports_ingress(ingress: cuteafd_core::SparkIngress, fp8: bool, bf16: bool) -> bool {
     match ingress {
+        // Rotated-domain kernels are a distinct backend, never BF16 aliases.
+        cuteafd_core::SparkIngress::Exlr8Rotated => false,
         cuteafd_core::SparkIngress::Fp8K32 => fp8,
         cuteafd_core::SparkIngress::Bf16 => bf16,
         // FP8 remains legal at every row count, including the BF16 decode extent.

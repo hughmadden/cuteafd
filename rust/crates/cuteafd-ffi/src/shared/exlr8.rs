@@ -17,7 +17,8 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
             .filter(|&v| v > 0 && v <= i32::MAX as u64)
             .ok_or_else(|| invalid(format!("missing or invalid geometry.{name}")))
     };
-    let serving = spec.name == "exlr8_a16_serving";
+    let shared = spec.name == "exlr8_shared_a16_serving";
+    let serving = shared || spec.name == "exlr8_a16_serving";
     if (!serving && spec.name != "exlr8_a16_decode")
         || field("abi_version")? != if serving { 2 } else { 1 }
         || field("max_rows")? != 64
@@ -32,6 +33,9 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     let u = field("units")?;
     let t = field("top_k")?;
     let g = field("max_groups")?;
+    if shared && (t != 1 || g != 4) {
+        return Err(invalid("shared expert requires top_k=1 and max_groups=4"));
+    }
     if h % 128 != 0 || field("fc1_splits")? != h.div_ceil(1024) {
         return Err(invalid("hidden alignment or FC1 split count"));
     }
@@ -97,7 +101,7 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
 pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), ManifestError> {
     if matches!(
         spec.name.as_str(),
-        "exlr8_group" | "exlr8_rotate" | "exlr8_reduce"
+        "exlr8_group" | "exlr8_shared_group" | "exlr8_rotate" | "exlr8_reduce"
     ) {
         return validate_glue(spec, entry);
     }
@@ -129,7 +133,10 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
         "float16", "int64", "int32", "int32", "int32", "int32", "float32", "float32", "float16",
         "float32", "float32",
     ];
-    if spec.name == "exlr8_a16_serving" {
+    if matches!(
+        spec.name.as_str(),
+        "exlr8_a16_serving" | "exlr8_shared_a16_serving"
+    ) {
         shapes.push("[1]".into());
         dtypes.push("int32");
     }
@@ -184,52 +191,63 @@ fn validate_glue(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), Ma
     {
         return Err(invalid("glue ABI, capacity, scratch or card plan"));
     }
-    let descriptors: Vec<(&str, &str, String, &str)> = if spec.name == "exlr8_group" {
-        let e = field("experts")?;
-        let t = field("top_k")?;
-        let g = field("max_groups")?;
-        if rows != 64 || e > 256 || t > 32 || g > i32::MAX as u64 / 16 || spec.scalar_kinds != b"i"
-        {
-            return Err(invalid("grouping geometry or scalar ABI"));
-        }
-        vec![
-            ("ids", "int32", format!("[rows,{t}]"), "in"),
-            ("group_expert", "int32", format!("[{g}]"), "out"),
-            ("route_slots", "int32", format!("[{g},16]"), "out"),
-            ("route_group_lane", "int32", format!("[rows,{t}]"), "out"),
-            ("group_count", "int32", "[1]".into(), "out"),
-        ]
-    } else {
-        let h = field("hidden")?;
-        if h % 128 != 0 || rows * (h / 128) > i32::MAX as u64 / 2 || field("ctas_per_sm")? > 32 {
-            return Err(invalid("transform geometry"));
-        }
-        if spec.name == "exlr8_rotate" {
-            if spec.scalar_kinds != b"ii" {
-                return Err(invalid("rotation scalar ABI"));
+    let descriptors: Vec<(&str, &str, String, &str)> =
+        if matches!(spec.name.as_str(), "exlr8_group" | "exlr8_shared_group") {
+            let e = field("experts")?;
+            let t = field("top_k")?;
+            let g = field("max_groups")?;
+            if spec.name == "exlr8_shared_group" && (e != 1 || t != 1 || g != 4) {
+                return Err(invalid(
+                    "shared grouping requires experts=1, top_k=1, max_groups=4",
+                ));
+            }
+            if rows != 64
+                || e > 256
+                || t > 32
+                || g > i32::MAX as u64 / 16
+                || spec.scalar_kinds != b"i"
+            {
+                return Err(invalid("grouping geometry or scalar ABI"));
             }
             vec![
-                ("x", "bfloat16", format!("[rows,{h}]"), "in"),
-                ("signs", "int8", format!("[{h}]"), "in"),
-                ("output", "float16", format!("[rows,{h}]"), "out"),
+                ("ids", "int32", format!("[rows,{t}]"), "in"),
+                ("group_expert", "int32", format!("[{g}]"), "out"),
+                ("route_slots", "int32", format!("[{g},16]"), "out"),
+                ("route_group_lane", "int32", format!("[rows,{t}]"), "out"),
+                ("group_count", "int32", "[1]".into(), "out"),
             ]
         } else {
-            let ranks = spec.geometry["max_ranks"]
-                .as_u64()
-                .filter(|&v| v <= i32::MAX as u64)
-                .ok_or_else(|| invalid("rank capacity"))?;
-            if spec.scalar_kinds != b"iii" {
-                return Err(invalid("reduction scalar ABI"));
+            let h = field("hidden")?;
+            if h % 128 != 0 || rows * (h / 128) > i32::MAX as u64 / 2 || field("ctas_per_sm")? > 32
+            {
+                return Err(invalid("transform geometry"));
             }
-            vec![
-                ("planes", "int64", format!("[{ranks}]"), "in"),
-                ("shared", "float32", format!("[rows,{h}]"), "in"),
-                ("signs", "int8", format!("[{h}]"), "in"),
-                ("residual", "bfloat16", format!("[rows,{h}]"), "in"),
-                ("output", "bfloat16", format!("[rows,{h}]"), "out"),
-            ]
-        }
-    };
+            if spec.name == "exlr8_rotate" {
+                if spec.scalar_kinds != b"ii" {
+                    return Err(invalid("rotation scalar ABI"));
+                }
+                vec![
+                    ("x", "bfloat16", format!("[rows,{h}]"), "in"),
+                    ("signs", "int8", format!("[{h}]"), "in"),
+                    ("output", "float16", format!("[rows,{h}]"), "out"),
+                ]
+            } else {
+                let ranks = spec.geometry["max_ranks"]
+                    .as_u64()
+                    .filter(|&v| v <= i32::MAX as u64)
+                    .ok_or_else(|| invalid("rank capacity"))?;
+                if spec.scalar_kinds != b"iii" {
+                    return Err(invalid("reduction scalar ABI"));
+                }
+                vec![
+                    ("planes", "int64", format!("[{ranks}]"), "in"),
+                    ("shared", "float32", format!("[rows,{h}]"), "in"),
+                    ("signs", "int8", format!("[{h}]"), "in"),
+                    ("residual", "bfloat16", format!("[rows,{h}]"), "in"),
+                    ("output", "bfloat16", format!("[rows,{h}]"), "out"),
+                ]
+            }
+        };
     let pointers = entry["pointers"]
         .as_array()
         .ok_or_else(|| invalid("glue pointers"))?;
@@ -404,6 +422,54 @@ mod tests {
         assert!(validate(&invalid).is_err());
         e["pointers"][11]["dtype"] = serde_json::json!("int64");
         assert!(validate_entry(&s, &e).is_err());
+    }
+    #[test]
+    fn shared_serving_requires_single_route_and_four_groups() {
+        let mut s = spec();
+        s.name = "exlr8_shared_a16_serving".into();
+        s.geometry["abi_version"] = serde_json::json!(2);
+        s.geometry["top_k"] = serde_json::json!(1);
+        s.geometry["max_groups"] = serde_json::json!(4);
+        s.pointers.push("group_count".into());
+        s.scalar_kinds = b"ii".to_vec();
+        for size in s.scratch.values_mut() {
+            *size /= 128;
+        }
+        validate(&s).unwrap();
+        for (key, value) in [("top_k", 8), ("max_groups", 512), ("abi_version", 1)] {
+            let mut bad = s.clone();
+            bad.geometry[key] = serde_json::json!(value);
+            assert!(validate(&bad).is_err(), "{key}");
+        }
+    }
+    #[test]
+    fn shared_group_requires_one_expert() {
+        let names = [
+            "ids",
+            "group_expert",
+            "route_slots",
+            "route_group_lane",
+            "group_count",
+        ];
+        let shapes = ["[rows,1]", "[4]", "[4,16]", "[rows,1]", "[1]"];
+        let s = ProgramSpec {
+            name: "exlr8_shared_group".into(),
+            pointers: names.map(String::from).to_vec(),
+            scalar_kinds: b"i".to_vec(),
+            capacity_rows: 64,
+            scratch: HashMap::new(),
+            geometry: serde_json::json!({"abi_version":1,"max_rows":64,"experts":1,"top_k":1,"max_groups":4}),
+        };
+        let e = serde_json::json!({"capacity_rows":64,"scratch_bytes_at_capacity":{},
+            "pointers": names.iter().enumerate().map(|(i, name)| serde_json::json!({
+                "name":name,"dtype":"int32","shape":shapes[i],"role":if i==0 {"in"} else {"out"}
+            })).collect::<Vec<_>>()});
+        validate_entry(&s, &e).unwrap();
+        for (key, value) in [("experts", 256), ("top_k", 8), ("max_groups", 512)] {
+            let mut bad = s.clone();
+            bad.geometry[key] = serde_json::json!(value);
+            assert!(validate_entry(&bad, &e).is_err(), "{key}");
+        }
     }
     #[test]
     fn rejects_malformed_entry() {

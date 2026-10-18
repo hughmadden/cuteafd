@@ -42,7 +42,19 @@ impl SparkWorkingSet {
             let ring = SparkRingGeometry { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment, endpoints: 1 };
             let bf16 = endpoint.ingress == cuteafd_core::SparkIngress::Bf16;
-            let io = self.rank_io(rank, geometry, endpoint.capacity, bf16, ring)?;
+            let io = if endpoint.ingress == cuteafd_core::SparkIngress::Exlr8Rotated {
+                let rows = endpoint.capacity as u64;
+                let hidden = geometry.hidden as u64;
+                let routes = geometry.topk as u64 * 8;
+                let multiply = |stride: u64| rows.checked_mul(stride)
+                    .ok_or(PlacementError::Overflow("Spark rotated intake/exchange"));
+                SparkIoBytes {
+                    intake: multiply(hidden * 6 + routes)?,
+                    host_exchange: multiply(routes + hidden * 4)?,
+                    row_indices: multiply(4)?,
+                    mapped_rings: 0,
+                }
+            } else { self.rank_io(rank, geometry, endpoint.capacity, bf16, ring)? };
             bytes.intake = bytes.intake.max(io.intake);
             if let cuteafd_core::SparkIngress::Bf16Decode { rows } = endpoint.ingress {
                 let decode = self.rank_io(rank, geometry, rows, true, ring)?;
@@ -398,6 +410,25 @@ mod tests {
         let mut larger = report;
         larger.runtime.workspace_bytes = 1 << 30;
         assignment.validate(&larger).unwrap();
+    }
+
+    #[test]
+    fn exlr8_rotated_endpoint_io_charges_f32_partials_without_bf16_aliasing() {
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let set = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
+            ..Default::default() };
+        let geometry = ExpertGeometry::GLM5;
+        let endpoint = SparkEndpoint { capacity: 64, ingress: SparkIngress::Exlr8Rotated };
+        let rings = SparkRings { max_frame_bytes: 4 << 20, depth: 2,
+            slot_bytes: 1 << 20, alignment: 4096 };
+        let io = set.rank_endpoints_io(0, geometry, &[endpoint], rings).unwrap();
+        assert_eq!(io.intake, 64 * (6144 * 6 + 8 * 8));
+        assert_eq!(io.host_exchange, 64 * (6144 * 4 + 8 * 8));
+        assert_eq!(io.row_indices, 64 * 4);
+        assert_eq!(io.mapped_rings, endpoint.ring_bytes(geometry, rings).unwrap() as u64);
+        assert_eq!(set.rank_endpoints_io(4, geometry, &[endpoint], rings).unwrap(), SparkIoBytes::default());
+        assert!(set.rank_endpoints_io(0, geometry, &[endpoint], SparkRings {
+            max_frame_bytes: 64 * (6144 * 4 + 4) + 95, ..rings }).is_err());
     }
 
     #[test]

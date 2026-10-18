@@ -16,6 +16,9 @@ pub const PROTOCOL_V2_SYNTHETIC_ROUTE_EXECUTOR: &str =
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProtocolV2RequestDevicePayload {
+    /// Validated interleaved wire records: row_index, expert_id, F32 gate_weight.
+    /// The transport retains this view until response emission completes.
+    pub routes: CuteafdDeviceBuffer,
     pub hidden_payload: CuteafdDeviceBuffer,
     pub response_slot: Option<CuteafdDeviceBuffer>,
     pub execution_lane: u32,

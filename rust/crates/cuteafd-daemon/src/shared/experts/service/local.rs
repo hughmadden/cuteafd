@@ -23,7 +23,8 @@ fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
         config.max_frame_bytes = model.rings.max_frame_bytes;
         config.rdma_endpoints = model.endpoints.len();
         config.bf16_ingress = model.endpoints.iter().any(|endpoint|
-            !matches!(endpoint.ingress, cuteafd_core::SparkIngress::Fp8K32));
+            matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16
+                | cuteafd_core::SparkIngress::Bf16Decode { .. }));
         config.model_admission = Some(model.clone());
     }
     config.selected_layers = Some(selected);

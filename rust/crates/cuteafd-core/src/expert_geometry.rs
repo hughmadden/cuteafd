@@ -18,6 +18,8 @@ pub struct SparkEndpoint {
 pub enum SparkIngress {
     Fp8K32,
     Bf16,
+    /// EXLR8 normalized H128 F16 inputs and unrounded F32 rank partials.
+    Exlr8Rotated,
     /// Decode rows are unquantized; prefill uses FP8 K32 on the same QP.
     Bf16Decode { rows: u32 },
 }
@@ -143,6 +145,14 @@ pub struct SparkRings {
 impl SparkEndpoint {
     pub fn wire_bytes(self, geometry: ExpertGeometry) -> Option<(usize, usize)> {
         if !(1..=4096).contains(&self.capacity) { return None; }
+        if self.ingress == SparkIngress::Exlr8Rotated {
+            if geometry.hidden == 0 || geometry.hidden % 128 != 0 { return None; }
+            let rows = self.capacity as usize;
+            let hidden = geometry.hidden as usize;
+            let request = rows.checked_mul(40 + geometry.topk as usize * 12 + hidden * 2)?.checked_add(96)?;
+            let response = rows.checked_mul(4 + hidden * 4)?.checked_add(96)?;
+            return Some((request, response));
+        }
         let (request, response) = geometry.compact_wire_bytes(self.capacity,
             self.ingress == SparkIngress::Bf16)?;
         let request = match self.ingress {
@@ -345,6 +355,26 @@ mod tests {
             assert_eq!(Exl3RowPolicy::Nearest.capacities(rows).unwrap(), [1, 16, 80]);
         }
         assert_eq!(policy.capacities(4096).unwrap(), [1, 16, 80, 256, 1024, 4096]);
+    }
+
+    #[test]
+    fn exlr8_endpoint_sizes_f16_ingress_f32_partial_and_frame_limit() {
+        let geometry = ExpertGeometry::GLM5;
+        for rows in [1, 16, 64, 4096] {
+            let endpoint = SparkEndpoint { capacity: rows, ingress: SparkIngress::Exlr8Rotated };
+            let request = 96 + rows as usize * (40 + 8 * 12 + 6144 * 2);
+            let response = 96 + rows as usize * (4 + 6144 * 4);
+            assert_eq!(endpoint.wire_bytes(geometry), Some((request, response)));
+            let rings = SparkRings { max_frame_bytes: response.max(request), depth: 2,
+                slot_bytes: 1 << 20, alignment: 4096 };
+            assert!(endpoint.ring_bytes(geometry, rings).is_some());
+            assert!(endpoint.ring_bytes(geometry, SparkRings { max_frame_bytes: response - 1, ..rings }).is_none());
+        }
+        for capacity in [0, 4097] {
+            assert!(SparkEndpoint { capacity, ingress: SparkIngress::Exlr8Rotated }.wire_bytes(geometry).is_none());
+        }
+        assert!(SparkEndpoint { capacity: 1, ingress: SparkIngress::Exlr8Rotated }
+            .wire_bytes(ExpertGeometry { hidden: 127, ..geometry }).is_none());
     }
 
     #[test]

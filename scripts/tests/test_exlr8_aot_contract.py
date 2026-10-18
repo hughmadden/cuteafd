@@ -43,13 +43,27 @@ def test_exlr8_has_separate_comparison_group():
 
 
 def test_serving_and_glue_export_inventory():
-    tree = ast.parse((ROOT / "python/tools/aot/export_b12x_exlr8_aot.py").read_text())
-    builders = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "programs")
-    result = next(n for n in builders.body if isinstance(n, ast.Return))
-    assert [item.elts[0].value for item in result.value.elts] == [
-        "a16_decode", "a16_serving", "group", "rotate", "reduce"]
-    serving = result.value.elts[1].elts[-1].body
-    assert any(k.arg == "device_count" and k.value.value is True for k in serving.keywords)
+    tree = ast.parse((FORK / "b12x/integration/cuteafd/exlr8_glue.py").read_text())
+    builder = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "exlr8_export_programs")
+    result = next(n.value for n in builder.body if isinstance(n, ast.Assign) and n.targets[0].id == "result")
+    assert [item.elts[0].value for item in result.elts] == [
+        "a16_decode", "a16_serving", "group", "rotate", "reduce", "shared_a16_serving", "shared_group"]
+    for index in (5, 6):
+        shared = {k.arg: k.value.value for k in result.elts[index].elts[-1].body.keywords
+                  if isinstance(k.value, ast.Constant)}
+        assert shared["shared_expert"] is True
+        assert shared["top_k"] == 1 and shared["max_groups"] == 4
+    assert shared["experts"] == 1
+    namespace = {name: lambda **kwargs: None for name in (
+        "compile_exlr8_group_aot", "compile_exlr8_rotate_aot", "compile_exlr8_reduce_aot")}
+    # Drop the local CUDA-dependent import; constructing the lambdas compiles nothing.
+    builder.body = [node for node in builder.body if not isinstance(node, ast.ImportFrom)]
+    exec(compile(ast.Module(body=[builder], type_ignores=[]), "exlr8_inventory", "exec"), namespace)
+    inventory = namespace["exlr8_export_programs"]
+    assert [p[0] for p in inventory("spark")] == ["a16_serving", "group"]
+    assert [p[0] for p in inventory("coordinator")] == ["rotate", "reduce", "shared_a16_serving", "shared_group"]
+    with pytest.raises(ValueError):
+        inventory("unknown")
 
 
 def test_no_changes_to_existing_export_builders():
