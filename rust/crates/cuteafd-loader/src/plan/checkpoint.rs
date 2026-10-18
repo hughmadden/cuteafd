@@ -10,6 +10,22 @@ use std::path::{Path, PathBuf};
 
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
+pub mod identity;
+
+/// Storage discovery is shared by inventories, catalogs and bootstrap identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointFormat { HfIndexed, HfSingle, Exlr8 }
+
+impl CheckpointFormat {
+    pub fn detect(snapshot: &Path) -> Result<Self> {
+        if super::exlr8::recognizes(snapshot)? { return Ok(Self::Exlr8); }
+        if snapshot.join("model.safetensors.index.json").is_file() { return Ok(Self::HfIndexed); }
+        ensure!(snapshot.join("model.safetensors").is_file(),
+            "checkpoint has no recognized tensor inventory");
+        Ok(Self::HfSingle)
+    }
+}
+
 /// Arithmetic declared by the checkpoint, independent of optional load optimizations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +131,9 @@ impl Checkpoint {
 
     fn open_filtered(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool) -> Result<Self> {
         let config = read_json(&snapshot.join("config.json"))?;
+        if CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
+            return super::exlr8::inventory(snapshot, config, needed);
+        }
         let quantize_config = ["quantize_config.json", "quantization_config.json", "hf_quant_config.json"]
             .iter()
             .map(|name| snapshot.join(name))

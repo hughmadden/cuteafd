@@ -465,6 +465,9 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Official local snapshot directory, including all shard headers.
     #[arg(long)]
     pub(crate) snapshot: PathBuf,
+    /// Published native EXLR8 manifest; binds the worker bootstrap identity.
+    #[arg(long)]
+    pub(crate) exlr8_manifest: Option<String>,
     /// Spark-role native library built with V4.1 expert AOT kernels.
     #[arg(long)]
     pub(crate) native_lib: PathBuf,

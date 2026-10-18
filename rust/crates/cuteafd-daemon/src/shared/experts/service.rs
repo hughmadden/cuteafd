@@ -62,6 +62,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         exl3_schedule: args.exl3_schedule,
         fp8_package: args.fp8_package,
         snapshot: args.snapshot,
+        exlr8_manifest: args.exlr8_manifest,
         rank: args.rank as usize,
         world: args.world as usize,
         model_admission: None,
@@ -92,6 +93,7 @@ pub(crate) struct NativeExpertServiceConfig {
     /// FP8 package layout directory (default `<libdir>/fp8/fp8-<family>/tp<world>`).
     pub fp8_package: Option<PathBuf>,
     pub snapshot: PathBuf,
+    pub exlr8_manifest: Option<String>,
     pub rank: usize,
     pub world: usize,
     model_admission: Option<cuteafd_transport::worker_selection::ModelAdmission>,
@@ -518,6 +520,7 @@ mod tests {
             exl3_schedule: Default::default(),
             fp8_package: None,
             snapshot: PathBuf::from("/model"),
+            exlr8_manifest: None,
             rank,
             world,
             model_admission: Some(cuteafd_transport::worker_selection::ModelAdmission {

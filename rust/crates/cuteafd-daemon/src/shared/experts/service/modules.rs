@@ -63,6 +63,8 @@ impl Fp8Group {
 impl<'a> WarmModules<'a> {
     pub(super) fn load(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         config: &NativeExpertServiceConfig) -> Result<Self> {
+        ensure!(catalog.format() != cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8,
+            "EXLR8 routed service execution is not wired");
         if catalog.fp8().is_some() {
             let mut groups = Fp8Group::plan(catalog, config)?;
             for group in &mut groups {

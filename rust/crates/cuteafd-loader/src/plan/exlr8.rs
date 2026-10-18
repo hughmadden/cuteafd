@@ -102,6 +102,70 @@ pub fn recognizes(snapshot: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Native header sources; payload shards are deliberately not scanned.
+pub(crate) fn catalog_headers(snapshot: &Path) -> Result<Vec<PathBuf>> {
+    let mut headers = files(snapshot, "dense")?;
+    ensure!(!headers.is_empty(), "EXLR8 dense inventory is empty");
+    let indices = files(snapshot, "experts")?.into_iter().filter(|path|
+        path.file_name().and_then(|name| name.to_str()).is_some_and(|name|
+            name.starts_with("exlr8-layer-") && name.ends_with(".index.safetensors")))
+        .collect::<Vec<_>>();
+    ensure!(!indices.is_empty(), "EXLR8 expert index inventory is empty");
+    headers.extend(indices);
+    headers.sort();
+    for path in &headers { Header::open(path)?.validate()?; }
+    Ok(headers)
+}
+
+pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) -> bool)
+    -> Result<super::checkpoint::Checkpoint> {
+    use super::checkpoint::{Checkpoint, CheckpointTensor};
+    let mut weight_map = BTreeMap::new();
+    let mut tensors = Vec::new();
+    let mut shard_bytes = 0u64;
+    for path in catalog_headers(snapshot)? {
+        let shard = path.strip_prefix(snapshot)?.to_str().context("non-UTF8 native shard")?.to_owned();
+        shard_bytes = shard_bytes.checked_add(path.metadata()?.len()).context("native inventory overflow")?;
+        for mut meta in crate::read_safetensors_metadata(&path)? {
+            // Local native names repeat across shards. Preserve their physical
+            // namespace instead of pretending these are HF weight tensors.
+            let name = format!("{shard}::{}", meta.name);
+            weight_map.insert(name.clone(), shard.clone());
+            if needed(&name) {
+                meta.name = name;
+                tensors.push(CheckpointTensor { shard: shard.clone(), meta });
+            }
+        }
+    }
+    tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+    Ok(Checkpoint { snapshot: snapshot.to_path_buf(), config, quantize_config: None,
+        weight_map, tensors, missing_shards: Vec::new(), shard_bytes })
+}
+
+/// Bundled draft layers come from native index headers, not HF name inference.
+pub(crate) fn draft_layers(snapshot: &Path, config: &Value) -> Result<Vec<usize>> {
+    let backbone = number(config, "num_hidden_layers")?;
+    let stages = usize::try_from(config["num_nextn_predict_layers"].as_u64().unwrap_or(0))?;
+    let first = number(config, "first_k_dense_replace")?;
+    let end = backbone.checked_add(stages).context("EXLR8 draft layer overflow")?;
+    let mut layers = Vec::new();
+    for path in files(snapshot, "experts")?.into_iter().filter(|path|
+        path.to_string_lossy().ends_with(".index.safetensors")) {
+        let header = Header::open(&path)?;
+        header.validate()?;
+        let layer: usize = header.value["__metadata__"]["layer"].as_str()
+            .context("EXLR8 expert index missing layer")?.parse()?;
+        ensure!(path.file_name().and_then(|name| name.to_str()) ==
+            Some(format!("exlr8-layer-{layer:03}.index.safetensors").as_str()),
+            "EXLR8 native layer filename disagrees with header");
+        layers.push(layer);
+    }
+    layers.sort_unstable();
+    ensure!(layers.iter().copied().eq(first..end),
+        "EXLR8 native backbone/MTP layer inventory disagrees with config");
+    Ok(layers.into_iter().filter(|&layer| layer >= backbone).collect())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DenseOperand {
     pub tensor: String,
@@ -411,6 +475,22 @@ struct Layer {
     widths: BTreeSet<usize>,
     shared_widths: BTreeSet<usize>,
 }
+pub(crate) fn manifest_identity(snapshot: &Path, name: &str) -> Result<(Value, String)> {
+    use sha2::{Digest, Sha256};
+    ensure!(!name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+        "manifest must be a published name, not a path");
+    let mut bytes = Vec::new();
+    File::open(snapshot.join(format!("manifests/exlr8-manifest-{name}.json")))?
+        .take((64 << 20) + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 64 << 20, "oversized EXLR8 manifest");
+    let value: Value = serde_json::from_slice(&bytes)?;
+    ensure!(value["format"] == "exlr8-v2-manifest" && value["name"] == name,
+        "invalid EXLR8 manifest identity");
+    let set_id = value["set_id"].as_str().context("missing manifest set_id")?;
+    ensure!(set_id.len() == 64 && set_id.bytes().all(|c| c.is_ascii_hexdigit()), "invalid EXLR8 set_id");
+    Ok((value, format!("{:x}", Sha256::digest(&bytes))))
+}
+
 fn manifest(
     snapshot: &Path,
     name: &str,
@@ -419,18 +499,7 @@ fn manifest(
     experts: usize,
     layers: &[Layer],
 ) -> Result<ManifestPlan> {
-    ensure!(
-        !name.is_empty()
-            && name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
-        "manifest must be a published name, not a path"
-    );
-    let value = read_json(&snapshot.join(format!("manifests/exlr8-manifest-{name}.json")))?;
-    ensure!(
-        value["format"] == "exlr8-v2-manifest" && value["name"] == name,
-        "invalid EXLR8 manifest identity"
-    );
+    let value = manifest_identity(snapshot, name)?.0;
     let set_id = value["set_id"]
         .as_str()
         .context("missing manifest set_id")?

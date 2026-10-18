@@ -6,12 +6,20 @@ use std::{collections::BTreeMap, io::{BufRead, BufReader, Read, Write}, net::{So
     path::Path, sync::{Mutex, OnceLock}, time::Duration};
 
 const CONTROL_LIMIT: usize = 64 * 1024;
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+
+fn check_version(actual: u64, expected: u32) -> Result<()> {
+    ensure!(actual == u64::from(expected),
+        "unsupported worker selection version {actual}; expected {expected}; rebuild coordinator and workers together");
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerIdentity {
     checkpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest: Option<cuteafd_loader::plan::checkpoint::identity::ManifestIdentity>,
     geometry: [u32; 5],
     world: u32,
     topology: [u8; 2],
@@ -23,26 +31,14 @@ impl WorkerIdentity {
     /// bytes, not a local pathname or a separately computed plan, identify it.
     pub fn from_snapshot(snapshot: &Path, geometry: cuteafd_core::ExpertGeometry,
         selected: crate::expert::SparkWorld) -> Result<Self> {
+        Self::from_snapshot_manifest(snapshot, geometry, selected, None)
+    }
+
+    pub fn from_snapshot_manifest(snapshot: &Path, geometry: cuteafd_core::ExpertGeometry,
+        selected: crate::expert::SparkWorld, manifest: Option<&str>) -> Result<Self> {
         let world = selected.topology().world_size();
-        let mut hash = Sha256::new();
-        for name in ["config.json", "model.safetensors.index.json"] {
-            let mut file = std::fs::File::open(snapshot.join(name))
-                .with_context(|| format!("worker checkpoint identity {name}"))?;
-            let length = file.metadata()?.len();
-            ensure!(length <= 64 * 1024 * 1024, "worker identity file {name} is too large");
-            hash.update(length.to_le_bytes());
-            let mut buffer = [0u8; 64 * 1024];
-            let mut read_bytes = 0u64;
-            loop {
-                let count = file.read(&mut buffer)?;
-                if count == 0 { break; }
-                read_bytes += count as u64;
-                ensure!(read_bytes <= length, "worker identity file {name} changed while reading");
-                hash.update(&buffer[..count]);
-            }
-            ensure!(read_bytes == length, "worker identity file {name} changed while reading");
-        }
-        Ok(Self { checkpoint: format!("{:x}", hash.finalize()),
+        let identity = cuteafd_loader::plan::checkpoint::identity::CheckpointIdentity::from_snapshot(snapshot, manifest)?;
+        Ok(Self { checkpoint: identity.fingerprint, manifest: identity.manifest,
             geometry: [geometry.hidden, geometry.experts, geometry.topk, geometry.intermediate, geometry.layers],
             world: u32::try_from(world)?, topology: [selected.topology().tp(), selected.topology().ep()],
             ownership_wire: selected.ownership_topology().is_some() })
@@ -138,9 +134,14 @@ impl WorkerSelection {
     pub fn digest(&self) -> Result<String> { Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?))) }
 
     fn validate(&self) -> Result<()> {
-        ensure!(self.version == VERSION, "unsupported worker selection version");
+        check_version(u64::from(self.version), VERSION)?;
         ensure!(self.identity.checkpoint.len() == 64 && self.identity.checkpoint.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid worker checkpoint digest");
+        if let Some(manifest) = &self.identity.manifest {
+            ensure!(!manifest.name.is_empty() && manifest.name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+                && manifest.sha256.len() == 64 && manifest.sha256.bytes().all(|c| c.is_ascii_hexdigit()),
+                "invalid worker manifest identity");
+        }
         ensure!((1..=6).contains(&self.identity.world), "unsupported worker world");
         ensure!(self.identity.geometry.iter().all(|&value| value > 0), "invalid worker geometry");
         let [tp, ep] = self.identity.topology;
@@ -471,13 +472,22 @@ fn read<T: serde::de::DeserializeOwned>(stream: &TcpStream) -> Result<T> {
     if value["message"] == "protocol_v2_bootstrap_error" {
         anyhow::bail!("worker selection rejected: {}", value["error"]);
     }
+    if matches!(value["message"].as_str(), Some("worker_selection_start" | "worker_selection_ready")) {
+        check_version(value["selection"]["version"].as_u64().context("missing worker selection version")?, VERSION)?;
+    }
     Ok(serde_json::from_value(value)?)
 }
 
 pub fn receive_worker_selection(stream: &TcpStream, rank: usize, timeout: Duration) -> Result<WorkerSelection> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let value: serde_json::Value = read(stream)?;
+    let value: serde_json::Value = match read(stream) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = reject_worker_selection(&mut stream.try_clone()?, &error);
+            return Err(error);
+        }
+    };
     if value["message"] == "fabric_traffic" {
             crate::traffic::control_phase(&value);
         write(&mut stream.try_clone()?, &serde_json::json!({"message": "fabric_traffic", "sample": crate::traffic::local()}))?;
@@ -801,7 +811,134 @@ impl Drop for EndpointReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), geometry: [6144, 384, 8, 2048, 70], world: 2, topology: [2, 1], ownership_wire: false } }
+    fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), manifest: None, geometry: [6144, 384, 8, 2048, 70], world: 2, topology: [2, 1], ownership_wire: false } }
+    #[test]
+    fn exlr8_bootstrap_refuses_different_manifest_name_or_content() {
+        use cuteafd_loader::plan::checkpoint::identity::ManifestIdentity;
+        let mut coordinator = identity();
+        coordinator.manifest = Some(ManifestIdentity { name: "up1".into(), sha256: "a".repeat(64) });
+        let selection = WorkerSelection::new(coordinator.clone(), &[13]).unwrap();
+        // Exercise the serialized bootstrap seal, not just the digest helper.
+        let selection: WorkerSelection = serde_json::from_slice(&serde_json::to_vec(&selection).unwrap()).unwrap();
+        selection.validate_for(&coordinator).unwrap();
+        let mut worker = coordinator.clone();
+        worker.manifest.as_mut().unwrap().name = "bit325".into();
+        assert!(selection.validate_for(&worker).is_err());
+        worker = coordinator.clone();
+        worker.manifest.as_mut().unwrap().sha256 = "b".repeat(64);
+        assert!(selection.validate_for(&worker).is_err());
+        worker = coordinator.clone();
+        worker.checkpoint = "c".repeat(64);
+        assert!(selection.validate_for(&worker).is_err());
+        worker = coordinator;
+        worker.manifest = None;
+        assert!(selection.validate_for(&worker).is_err());
+    }
+
+    #[test]
+    fn exlr8_manifest_mismatch_rejects_control_handshake_without_publishing_seal() -> Result<()> {
+        use cuteafd_loader::plan::checkpoint::identity::ManifestIdentity;
+        let mut coordinator = WorkerIdentity { world: 1, topology: [1, 1], ..identity() };
+        coordinator.manifest = Some(ManifestIdentity { name: "up1".into(), sha256: "a".repeat(64) });
+        for content_mismatch in [false, true] {
+            let mut worker = coordinator.clone();
+            if content_mismatch { worker.manifest.as_mut().unwrap().sha256 = "b".repeat(64); }
+            else { worker.manifest.as_mut().unwrap().name = "bit325".into(); }
+            let selection = WorkerSelection::new(coordinator.clone(), &[13])?
+                .with_model(admission_selection().model().unwrap().clone())?;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let peer = listener.local_addr()?;
+            let pending = start_model_admission(&[peer], &selection, Duration::from_secs(3))?;
+            let (mut stream, _) = listener.accept()?;
+            let received = receive_worker_selection(&stream, 0, Duration::from_secs(3))?;
+            let error = received.validate_for(&worker).unwrap_err();
+            reject_worker_selection(&mut stream, &error)?;
+            assert!(pending.wait().is_err());
+            assert!(peer_selection_digest(peer)?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn worker_selection_versions_refuse_before_decoding_identity() -> Result<()> {
+        for (actual, expected) in [(1, 2), (2, 1)] {
+            let error = check_version(actual, expected).unwrap_err().to_string();
+            assert!(error.contains(&format!("version {actual}; expected {expected}")));
+        }
+        for message in ["worker_selection_start", "worker_selection_ready"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let mut client = TcpStream::connect(listener.local_addr()?)?;
+            let (server, _) = listener.accept()?;
+            server.set_read_timeout(Some(Duration::from_secs(3)))?;
+            // Deliberately undecodable identity: version must win over schema errors.
+            write(&mut client, &serde_json::json!({"message":message,
+                "selection":{"version":1,"identity":{"legacy":true}}}))?;
+            let error = read::<serde_json::Value>(&server).unwrap_err().to_string();
+            assert!(error.contains("version 1; expected 2"), "{error}");
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept()?;
+        write(&mut client, &serde_json::json!({"message":"worker_selection_start",
+            "selection":{"version":1}}))?;
+        let error = receive_worker_selection(&server, 0, Duration::from_secs(3)).unwrap_err();
+        assert!(error.to_string().contains("version 1; expected 2"));
+        let rejection = read::<serde_json::Value>(&client).unwrap_err();
+        assert!(rejection.to_string().contains("version 1; expected 2"));
+        // A v1 decoder accepts the unchanged HF envelope shape far enough to
+        // issue its own clear version refusal when presented with v2.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1Identity {
+            checkpoint: String, geometry: [u32; 5], world: u32,
+            topology: [u8; 2], ownership_wire: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1Selection {
+            version: u32, identity: V1Identity, ranges: Vec<LayerRange>, model: Option<ModelAdmission>,
+        }
+        let envelope = serde_json::to_value(admission_selection())?;
+        assert!(envelope["identity"].get("manifest").is_none());
+        let legacy: V1Selection = serde_json::from_value(envelope)?;
+        assert_eq!(legacy.identity.checkpoint.len(), 64);
+        assert_eq!((legacy.identity.world, legacy.identity.topology, legacy.identity.ownership_wire), (1, [1, 1], false));
+        assert_eq!(legacy.identity.geometry[0], 6144);
+        assert!(!legacy.ranges.is_empty() && legacy.model.is_some());
+        assert!(check_version(u64::from(legacy.version), 1).unwrap_err()
+            .to_string().contains("version 2; expected 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn hf_indexed_glm_worker_bootstrap_identity_is_stable() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_snapshot(root.path(),
+            &cuteafd_loader::plan::testing::glm5_config(),
+            &[cuteafd_loader::plan::testing::t("model.norm.weight", "BF16", &[6144])], None);
+        let geometry = cuteafd_core::ExpertGeometry::GLM5;
+        let world = crate::expert::SparkWorld::canonical(1)?;
+        let coordinator = WorkerIdentity::from_snapshot(root.path(), geometry, world)?;
+        let worker = WorkerIdentity::from_snapshot(root.path(), geometry, world)?;
+        assert_eq!(coordinator, worker);
+        let selection = WorkerSelection::new(coordinator, &[1])?;
+        selection.validate_for(&worker)?;
+        assert_eq!(selection.digest()?, WorkerSelection::new(worker.clone(), &[1])?.digest()?);
+        let selection = selection.with_model(admission_selection().model().unwrap().clone())?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let peer = listener.local_addr()?;
+        let pending = start_model_admission(&[peer], &selection, Duration::from_secs(3))?;
+        let (mut stream, _) = listener.accept()?;
+        let received = receive_worker_selection(&stream, 0, Duration::from_secs(3))?;
+        received.validate_for(&worker)?;
+        let mut report = admission_report(&selection);
+        report.slices[0].layer = 1;
+        acknowledge_model_admission(&mut stream, 0, &received, Some(&report))?;
+        assert_eq!(pending.wait()?, [report]);
+        assert_eq!(peer_selection_digest(peer)?, Some(selection.digest()?));
+        Ok(())
+    }
+
     fn grouping(rank: usize, compact: usize) -> InstalledExpertGrouping {
         let loaded = WorkerSelection::new(identity(), &[13, 14, 15]).unwrap();
         let variants = [1, 80, 256].into_iter().map(|capacity|

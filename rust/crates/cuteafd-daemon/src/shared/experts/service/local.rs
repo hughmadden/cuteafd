@@ -45,7 +45,7 @@ mod selection_tests {
         // Every backend consumes the same exact selected IDs within checkpoint bounds.
         let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
-            snapshot: dir.path().into(), rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
+            snapshot: dir.path().into(), exlr8_manifest: None, rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
             rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_tp2: false, bf16_ingress: false };
         let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80, compiled_capacity: 80,
             endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 80,
@@ -217,8 +217,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             }
         };
         let selected = (|| -> Result<_> {
-            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
-                &config.snapshot, geometry, config.spark_world()?)?;
+            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot_manifest(
+                &config.snapshot, geometry, config.spark_world()?, config.exlr8_manifest.as_deref())?;
             selection.validate_for(&identity)?;
             apply_worker_selection(&mut config, &selection, catalog.routed_experts().first_layer,
                 catalog.routed_experts().layers)?;

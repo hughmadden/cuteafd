@@ -828,6 +828,7 @@ dependencies = [
  "bytes",
  "cuteafd-core",
  "cuteafd-ffi",
+ "cuteafd-loader",
  "futures",
  "serde",
  "serde_json",
