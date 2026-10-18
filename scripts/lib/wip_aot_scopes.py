@@ -17,7 +17,7 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
-                        qwen3_5='QWEN_DENSE', step5='STEP5')
+                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3')
 
 
 def require_mapping(family):
@@ -80,9 +80,15 @@ def family_scopes(cards, config_reader):
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             if 'exl3' in card['name']:
                 scopes.add(tag + ':exl3-k23')
-        # EXLR8 checkpoints (EXLR8_MANIFEST names the published manifest) keep every
-        # family coordinator program, add the EXLR8 programs on both roles and serve
-        # their routed experts from EXLR8 units: no routed FP8/NVFP4/EXL3 packages.
+        if family == 'kimi_k3':
+            # The max card only: TP6 width 512 EXL3 K2 experts (#273); no local-only layout.
+            tp = int(values.get('SPARK_TP', count))
+            if tp != 6:
+                raise ValueError(f'kimi_k3 has no Spark layout for SPARK_TP={tp} (TP6 only)')
+            env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
+            scopes.add('kimik3:exl3-k23')
+            counts.add('kimik3=6')
+        # EXLR8 checkpoints retain family coordinator programs without expert packages.
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:
             if family != 'glm5':
