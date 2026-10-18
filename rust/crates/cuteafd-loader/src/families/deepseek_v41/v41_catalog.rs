@@ -1019,11 +1019,16 @@ fn nvfp4_catalog(snapshot: &Path, config: &serde_json::Value, shape: RoutedExper
     if !modelopt.experts_nvfp4() {
         return Ok(None);
     }
-    let mut catalog = fp8_catalog(snapshot, shape)?;
+    let catalog = fp8_catalog(snapshot, shape)?;
     let tensors = catalog.fp8().context("NVFP4 catalog")?;
     ensure!(tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4,
         "{} declares NVFP4 routed experts, but layer {} stores {:?}", modelopt.source, shape.first_layer,
         tensors.format());
+    Ok(Some(catalog))
+}
+
+fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41Catalog> {
+    let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read(snapshot, shape)?;
     // The coordinator's tensors (serve-glm reads its weights through the catalog):
     // everything but the backbone's routed experts, which Fp8ExpertTensors serves.
     #[derive(Deserialize)]
@@ -1038,17 +1043,11 @@ fn nvfp4_catalog(snapshot: &Path, config: &serde_json::Value, shape: RoutedExper
         .map(|(shard, metadata)| V41Tensor { shard, metadata, placement: V41TensorPlacement::CoordinatorRtx })
         .collect();
     coordinator.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    catalog.tensors = coordinator;
-    Ok(Some(catalog))
-}
-
-fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41Catalog> {
-    let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read(snapshot, shape)?;
     Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: shape,
         snapshot: snapshot.to_path_buf(),
-        tensors: Vec::new(),
+        tensors: coordinator,
         exl3: None,
         nvfp4: None,
         fp8: Some(fp8),
@@ -1383,6 +1382,56 @@ mod tests {
         OfficialV41Config::from_json(include_bytes!("official-v41-config.json"))
             .unwrap()
     }
+    fn assert_glm_coordinator_tensors(catalog: &OfficialV41Catalog) {
+        for name in ["model.embed_tokens.weight", "lm_head.weight", "model.norm.weight"] {
+            let tensor = catalog.tensor(name).unwrap();
+            assert_eq!(tensor.placement, V41TensorPlacement::CoordinatorRtx);
+            assert_eq!(tensor.metadata.dtype, DType::Bf16);
+        }
+    }
+
+    #[test]
+    fn glm_fp8_catalog_keeps_coordinator_tensors_before_and_after_draft_selection() {
+        use crate::plan::testing::{fp8, glm5_config, t, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let mut tensors = vec![
+            t("model.embed_tokens.weight", "BF16", &[64, 6144]),
+            t("lm_head.weight", "BF16", &[64, 6144]),
+            t("model.norm.weight", "BF16", &[6144]),
+            t("model.layers.2.enorm.weight", "BF16", &[6144]),
+        ];
+        for layer in [1, 2] {
+            for (projection, rows, cols) in [("gate_proj", 2048, 6144),
+                ("up_proj", 2048, 6144), ("down_proj", 6144, 2048)] {
+                tensors.extend(fp8(&format!("model.layers.{layer}.mlp.experts.0.{projection}"), rows, cols, None));
+            }
+        }
+        write_snapshot(dir.path(), &glm5_config(), &tensors, None);
+        let mut catalog = read_expert_catalog(dir.path()).unwrap();
+        assert_glm_coordinator_tensors(&catalog);
+        assert!(catalog.tensor("model.layers.1.mlp.experts.0.gate_proj.weight").is_err());
+        assert!(catalog.tensor("model.layers.2.enorm.weight").is_ok());
+        catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
+        assert_glm_coordinator_tensors(&catalog);
+        assert!(catalog.tensor("model.layers.2.enorm.weight").is_err());
+        assert!(catalog.fp8().unwrap().has_layer(1));
+        assert!(!catalog.fp8().unwrap().has_layer(2));
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_GLM_FP8_SNAPSHOT and CUTEAFD_GLM_EXL3_SNAPSHOT"]
+    fn mounted_glm_fp8_and_exl3_keep_coordinator_tensors() {
+        for key in ["CUTEAFD_GLM_FP8_SNAPSHOT", "CUTEAFD_GLM_EXL3_SNAPSHOT"] {
+            let snapshot = std::env::var_os(key).expect(key);
+            let mut catalog = read_expert_catalog(Path::new(&snapshot)).unwrap();
+            assert_eq!(catalog.fp8().is_some(), key == "CUTEAFD_GLM_FP8_SNAPSHOT");
+            assert_eq!(catalog.exl3().is_some(), key == "CUTEAFD_GLM_EXL3_SNAPSHOT");
+            assert_glm_coordinator_tensors(&catalog);
+            catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
+            assert_glm_coordinator_tensors(&catalog);
+        }
+    }
+
     #[test]
     fn checkpoint_contract_keeps_native_types_and_local_draft_experts() {
         let tensors = expected_tensors().unwrap();
