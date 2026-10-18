@@ -252,8 +252,8 @@ _ADMIT_CHILD = """
 import json, os, sys, time
 sys.path.insert(0, sys.argv[1])
 import _export_jobs
-_export_jobs.context_admission()
-admitted = time.monotonic()
+# The guard's own spaced stamp; a post-return clock read adds scheduler jitter.
+admitted = _export_jobs.context_admission()
 time.sleep(float(sys.argv[2]))
 print(json.dumps([admitted, time.monotonic()]), flush=True)
 """

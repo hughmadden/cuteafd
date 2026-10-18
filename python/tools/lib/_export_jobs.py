@@ -131,6 +131,7 @@ def export_slot():
 
 
 _context_lease = None
+_context_admitted_at = None
 _gpu_lease = None
 
 
@@ -211,7 +212,7 @@ def context_admission():
                 admitted = _admit_locked(root, per_worker, count, spacing)
         if admitted is not None:
             print(admitted, flush=True)
-            return
+            return _context_admitted_at
         if time.monotonic() >= deadline:
             raise TimeoutError('CUDA context waited 7200s for host RAM admission')
         time.sleep(1)
@@ -266,7 +267,9 @@ def _admit_locked(root, per_worker, count, spacing):
         now = time.monotonic()
         if last is not None and 0 <= now - last < spacing:
             time.sleep(spacing - (now - last))
-        last_path.write_text(repr(time.monotonic()))
+        global _context_admitted_at
+        _context_admitted_at = time.monotonic()
+        last_path.write_text(repr(_context_admitted_at))
         handle.seek(0)
         handle.truncate()
         handle.write(str(per_worker))
