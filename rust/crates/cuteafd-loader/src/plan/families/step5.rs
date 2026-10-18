@@ -1,4 +1,4 @@
-//! Step-5 release metadata only. Native kernels are deliberately not advertised.
+//! Step-5 release contracts. Whole-model serving remains fail-closed.
 use std::collections::BTreeMap;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{DType, FfnActivation};
@@ -387,12 +387,28 @@ impl FamilyModel for Model {
     fn activation(&self, layer: usize, shared: bool) -> Option<FfnActivation> {
         if shared { self.cfg.shared_activation.get(layer) } else { self.cfg.activation.get(layer) }.copied()
     }
-    fn accepts(&self, role: &TensorRole, stem: &str, _operand: &mut QuantOperand) -> Result<(), String> {
+    fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         if !self.tensors.contains_key(stem) && !self.tensors.contains_key(&format!("{stem}.weight")) {
             return Err(format!("{stem}: unknown Step-5 tensor; add a validated header contract"));
         }
+        if role.component == Component::RoutedExpert {
+            let contract = self.tensors.get(&format!("{stem}.weight"));
+            if role.layer.is_some_and(|layer| (3..88).contains(&layer))
+                && contract.is_some_and(|tensor| tensor.role == *role && tensor.dtype == DType::F8E4M3
+                    && tensor.shape == operand.logical && tensor.shape == operand.stored)
+                && operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
+                return Ok(());
+            }
+        }
         let hint = STEP5.component_hint(role.component).expect("every component has a hint");
         Err(format!("{stem}: {}: {}", hint.what, hint.how))
+    }
+    fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
+        operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]).then(|| ExpertContract {
+            package: "step5:fp8".into(), block: 128,
+            spark_worlds: crate::plan::experts::spark_worlds("step5:fp8", self.cfg.intermediate),
+            local: Err("Step-5 coordinator-local routed experts are not qualified".into()),
+        })
     }
     fn placement(&self, _input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
