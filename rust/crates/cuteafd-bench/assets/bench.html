@@ -600,14 +600,14 @@ function renderRuns() {
   // "this configuration" only for the fingerprint this server reports; an
   // older configuration's accumulated view says so.
   const here = status.fingerprint && fp === status.fingerprint;
-  const merged = fp ? [`<option value="merged:${fmt.esc(fp)}">All panels · newest result each (${here ? 'this configuration' : 'an earlier configuration'})</option>`] : [];
+  const merged = hasRuns(fp) ? [`<option value="merged:${fmt.esc(fp)}">All panels · newest result each (${here ? 'this configuration' : 'an earlier configuration'})</option>`] : [];
   const options = runs.map((r) => `<option value="${r.id}">${fmt.esc(r.created.replace('T', ' ').slice(0, 16))} · ${fmt.esc(r.profile)} · ${fmt.esc(r.status)}${r.quality_failed ? ' · ⚠' : ''}</option>`);
   select.innerHTML = merged.concat(options).join('') || '<option value="">no runs yet</option>';
   if (report) select.value = report.merged ? `merged:${report.fingerprint}` : report.id;
   const menu = $('export-menu');
   menu.innerHTML = report ? ['report.svg', 'report.png', 'card.png', 'card.svg', 'report.json'].map((f) =>
     `<a href="/v1/bench/runs/${report.id}/${f}" target="_blank" rel="noopener"${f.endsWith('json') ? ` download="report-${report.id.slice(0, 8)}.json"` : ''}>${f}</a>`).join('') : '<span class="empty">no report</span>';
-  $('run-note').textContent = !report ? '' : report.merged ? 'newest result per panel; each panel names its run'
+  $('run-note').textContent = !report ? (runs.length ? '' : 'no runs yet for this configuration: RUN… starts the basic card') : report.merged ? 'newest result per panel; each panel names its run'
     : `${report.profile} · ${report.status}${report.error ? ' · ' + report.error : ''}`;
 }
 $('runs').onchange = (e) => { follow = e.target.value.startsWith('merged:'); load(e.target.value); };
@@ -638,12 +638,19 @@ $('confirm').addEventListener('close', async () => {
   try { await api(`/v1/bench/runs/${status.active.id}/cancel`, { method: 'POST' }); } catch (error) { pageError(error.message); }
 });
 
+// An accumulated view exists only once a run on that configuration is stored
+// or running here; an empty history is a normal state, not an error.
+function hasRuns(fp) {
+  return !!fp && (runs.some((r) => r.fingerprint === fp) || (!!status.active && fp === status.fingerprint));
+}
+// The accumulated view of `fp` when it has runs, else `fallback`.
+const mergedOr = (fp, fallback) => hasRuns(fp) ? `merged:${fp}` : fallback;
 function currentFingerprint() {
   return report?.fingerprint || status.fingerprint || runs[0]?.fingerprint || null;
 }
 // `merged:FINGERPRINT` is the accumulated view; anything else one run alone.
 async function load(id) {
-  if (!id) return;
+  if (!id || (id.startsWith('merged:') && !hasRuns(id.slice(7)))) { report = null; viewing = null; render(); return; }
   try {
     report = id.startsWith('merged:') ? await api(`/v1/bench/merged/${encodeURIComponent(id.slice(7))}`) : await api(`/v1/bench/runs/${id}`);
     viewing = id;
@@ -696,7 +703,7 @@ async function start(body, onError = pageError) {
       status = await api('/v1/bench/status');
       await refreshRuns();
       const fp = status.fingerprint || report?.fingerprint;
-      await load(fp ? `merged:${fp}` : started.id);
+      await load(mergedOr(fp, started.id));
     } catch (_) { /* the event stream catches up */ }
   })();
   return true;
@@ -870,7 +877,7 @@ window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer
     profiles = (await profileList).profiles || [];
     const wanted = new URLSearchParams(location.search).get('run');
     const fp = status.fingerprint || runs[0]?.fingerprint;
-    await load(wanted || (fp ? `merged:${fp}` : status.active?.id || runs[0]?.id));
+    await load(wanted || mergedOr(fp, status.active?.id || runs[0]?.id));
   } catch (error) { pageError(`Could not load benchmarks: ${error.message}`); }
   render();
   connect();
