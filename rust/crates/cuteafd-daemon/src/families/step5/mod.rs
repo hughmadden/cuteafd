@@ -2,6 +2,8 @@
 mod cache;
 mod csa;
 mod ffn;
+#[cfg(test)]
+mod norm_accuracy;
 mod prefix;
 mod rope;
 mod swa;

@@ -35,6 +35,32 @@ def test_reference_uses_official_kernels_and_target_layers_only():
     assert "num_nextn_predict_layers" not in names
 
 
+def test_norm_accuracy_oracle_preserves_dtype_mean_and_rotary_boundary():
+    torch = pytest.importorskip("torch")
+    x = torch.tensor([[[1., -2., 3., 0.5]]], dtype=torch.bfloat16)
+    weight = torch.tensor([0.1, -0.2, 0.3, 0.4], dtype=torch.bfloat16)
+    bias = torch.tensor([0.5, -0.5, 1., -1.], dtype=torch.bfloat16)
+    eps = float(torch.tensor(1e-5, dtype=torch.float32))
+    v = x.double()
+    mean = v.mean(-1, keepdim=True)
+    expected = (v - mean) * torch.rsqrt(v.square().mean(-1, keepdim=True) - mean.square() + eps)
+    expected = expected * weight.double() + bias.double()
+    actual = golden.norm_accuracy_fp64(x, weight, eps, zero_centered=False,
+        bias=bias, subtract_mean=True)
+    assert torch.equal(actual, expected)
+    rounded = expected.bfloat16().double()
+    cos, sin = torch.tensor([[0.5]]), torch.tensor([[0.25]])
+    rotated = golden.norm_accuracy_fp64(x, weight, eps, zero_centered=False,
+        bias=bias, subtract_mean=True, cos=cos, sin=sin)
+    assert torch.equal(rotated[..., :1], rounded[..., :1] * 0.5 - rounded[..., 1:2] * 0.25)
+    assert torch.equal(rotated[..., 1:2], rounded[..., :1] * 0.25 + rounded[..., 1:2] * 0.5)
+    assert torch.equal(rotated[..., 2:], expected[..., 2:])
+    f32 = x.float() + 0.0001
+    rms = golden.norm_accuracy_fp64(f32, weight.float(), eps)
+    expected = f32.double() * torch.rsqrt(f32.double().square().mean(-1, keepdim=True) + eps)
+    assert torch.equal(rms, expected * (weight.float().double() + 1.))
+
+
 def test_sparse_launch_override_changes_stages_only():
     calls = []
 

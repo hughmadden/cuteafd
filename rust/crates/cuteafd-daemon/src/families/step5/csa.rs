@@ -764,65 +764,6 @@ mod tests {
         Ok((error / norm).sqrt())
     }
 
-    fn check_rms(actual: &[u8], official: &[u8], fp64: &[u8], width: usize) -> Result<()> {
-        let a = values(actual, 2)?;
-        let b = values(official, 2)?;
-        let r = values(fp64, 8)?;
-        ensure!(
-            a.len() == b.len() && a.len() == r.len(),
-            "CSA RMS oracle extent"
-        );
-        let error = |a: &[f64], r: &[f64]| {
-            a.iter()
-                .zip(r)
-                .map(|(a, r)| (a - r).powi(2))
-                .sum::<f64>()
-                .sqrt()
-        };
-        let native = error(&a, &r);
-        let reference = error(&b, &r);
-        let flips = actual
-            .chunks_exact(2)
-            .zip(official.chunks_exact(2))
-            .filter_map(|(a, b)| {
-                let a = u16::from_le_bytes([a[0], a[1]]);
-                let b = u16::from_le_bytes([b[0], b[1]]);
-                (a != b).then_some(a.abs_diff(b))
-            })
-            .collect::<Vec<_>>();
-        eprintln!(
-            "CSA RMS native/official FP64 error ratio={} flips={}/{} max_ulp={}",
-            native / reference,
-            flips.len(),
-            a.len(),
-            flips.iter().max().copied().unwrap_or(0)
-        );
-        ensure!(
-            native <= reference * 1.01,
-            "CSA global RMS FP64 accuracy bar"
-        );
-        let mut worst = 0f64;
-        for (row, ((a, b), r)) in a
-            .chunks_exact(width)
-            .zip(b.chunks_exact(width))
-            .zip(r.chunks_exact(width))
-            .enumerate()
-        {
-            let maximum = r.iter().map(|v| v.abs()).fold(0f64, f64::max);
-            let bits = (maximum as f32).to_bits() & 0x7f80_0000;
-            let ulp = f32::from_bits(bits.max(0x0080_0000)) as f64 / 128.;
-            let native = error(a, r);
-            let reference = error(b, r);
-            worst = worst.max(native / (reference * 1.01 + ulp));
-            ensure!(
-                native <= reference * 1.01 + ulp,
-                "CSA RMS row {row} FP64 accuracy bar"
-            );
-        }
-        eprintln!("CSA RMS worst row error/allowed={worst}");
-        Ok(())
-    }
-
     fn read(chain: &CsaLayer<'_>, plane: usize, offset: usize, bytes: usize) -> Result<Vec<u8>> {
         let source = chain.planes[plane].buffer;
         ensure!(offset + bytes <= source.bytes, "CSA read extent");
@@ -887,28 +828,6 @@ mod tests {
         }
         Ok(())
     }
-    #[test]
-    fn rms_accuracy_checks_global_and_each_row() -> Result<()> {
-        let bf16 = |v: &[f32]| {
-            v.iter()
-                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
-                .collect::<Vec<_>>()
-        };
-        let fp64 = |v: &[f64]| v.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-        let reference = fp64(&[1.003, 2.003]);
-        assert!(check_rms(&bf16(&[1., 2.]), &bf16(&[1., 2.]), &reference, 1).is_ok());
-        assert!(check_rms(&bf16(&[1.0625, 2.]), &bf16(&[1., 2.]), &reference, 1).is_err());
-        // A large accurate row must not hide a bad small row in the global norm.
-        assert!(check_rms(
-            &bf16(&[1.03125, 1000.]),
-            &bf16(&[1., 1004.]),
-            &fp64(&[1., 1000.]),
-            1
-        )
-        .is_err());
-        Ok(())
-    }
-
     #[test]
     fn csa_admission_bounds_query_workspace_independently_of_prefill() -> Result<()> {
         let short = Admission::new(513, &[1000], 3000, u64::MAX, &[])?;
@@ -1009,7 +928,12 @@ mod tests {
                 eprintln!("CSA chained rows={rows} boundary={name}");
                 metrics(&actual, &load(name)?, size, size, width)?;
                 if name == "norm" {
-                    check_rms(&actual, &load(name)?, &load("norm_fp64")?, width)?;
+                    super::super::norm_accuracy::check(
+                        &actual,
+                        &load(name)?,
+                        &load("norm_fp64")?,
+                        width,
+                    )?;
                 }
                 eager.push((plane, offset * width * size, actual));
             }
@@ -1127,25 +1051,13 @@ mod tests {
                 chain.stream.drain()?;
                 let actual = read(&chain, out, 0, rows * width * 2)?;
                 let expected = load(name)?;
-                if actual != expected {
-                    eprintln!("CSA isolated norm/RoPE mismatch rows={rows} name={name}");
-                    let error = metrics(&actual, &expected, 2, 2, width)?;
-                    let mismatches = actual
-                        .chunks_exact(2)
-                        .zip(expected.chunks_exact(2))
-                        .enumerate()
-                        .filter(|(_, (a, b))| a != b)
-                        .collect::<Vec<_>>();
-                    eprintln!(
-                        "mismatched_elements={} first={:?}",
-                        mismatches.len(),
-                        &mismatches[..mismatches.len().min(12)]
-                    );
-                    ensure!(name == "iq", "CSA isolated norm/RoPE {name}: {error}");
-                }
-                if name == "iq" {
-                    check_rms(&actual, &expected, &load("iq_fp64")?, 256)?;
-                }
+                metrics(&actual, &expected, 2, 2, width)?;
+                super::super::norm_accuracy::check(
+                    &actual,
+                    &expected,
+                    &load(&format!("{name}_fp64"))?,
+                    if indexer { 256 } else { 192 },
+                )?;
             }
             upload(&chain, NORM, 0, &load("norm")?)?;
             chain.launch(

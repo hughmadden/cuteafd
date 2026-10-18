@@ -54,8 +54,8 @@ def test_official_layer3_csa_fixtures():
                 "weights_sha256": sources, "torch": torch.__version__, "cuda": torch.version.cuda,
                 "files": {}, "cases": {}, "scope": "attention branch only; layer3 FFN is routed",
                 "attention_error_ratio_bound": 1.01, "gemm_error_ratio_bound": 1.01,
-                "rms_error_ratio_bound": 1.01, "rms_row_max_ulp_slack": 1,
-                "rms_oracle": "unrounded FP64 RMS; F32 residual or BF16 iqraw input; IQ rotary preserves BF16 producer boundary",
+                "norm_error_ratio_bound": 1.01, "norm_row_max_ulp_slack": 1,
+                "norm_oracle": "unrounded FP64 RMS/LayerNorm; native input/affine dtypes; BF16 normalization before RoPE",
                 "score_relative_l2_bound": 1e-5, "score_max_abs_bound": 1e-4,
                 "attention_oracle": "same BF16 QKV, FP32 scale; online tiles32 BF16 P, unrounded denominator"}
 
@@ -83,24 +83,19 @@ def test_official_layer3_csa_fixtures():
             ikraw = a.sparse_indexer_k(hidden)
             iz = a.sparse_indexer_z(hidden)
             iq, ik, iz, weights = a.indexer.project(hidden, positions)
-            epsilon64 = float(torch.tensor(config.rms_norm_eps, dtype=torch.float32))
-            x64 = x.double()
-            norm64 = x64 * torch.rsqrt(x64.square().mean(-1, keepdim=True) + epsilon64)
-            norm64 *= norm.weight.double() + 1.
-            save(f"r{rows}_norm_fp64", norm64)
-            iq64 = iqraw.double().view(rows, 16, 256)
-            iq64 = iq64 * torch.rsqrt(iq64.square().mean(-1, keepdim=True) + epsilon64)
-            iq64 *= a.sparse_indexer_q_norm.weight.to(torch.bfloat16).double() + 1.
-            # Preserve the required BF16 normalization boundary before rotary,
-            # while leaving the final reference output unrounded.
-            normalized = iq64.to(torch.bfloat16).double()
-            half = config.sparse_config.sparse_indexer_rope_dim // 2
-            cos = a.sparse_indexer_rope_cos[positions].double().unsqueeze(1)
-            sin = a.sparse_indexer_rope_sin[positions].double().unsqueeze(1)
-            real, imaginary = normalized[..., :half], normalized[..., half:2 * half]
-            iq64[..., :half] = real * cos - imaginary * sin
-            iq64[..., half:2 * half] = real * sin + imaginary * cos
-            save(f"r{rows}_iq_fp64", iq64)
+            save(f"r{rows}_norm_fp64", golden.norm_accuracy_fp64(x, norm.weight, config.rms_norm_eps))
+            for name, operand, weight, bias, centered, mean, cos, sin in [
+                ("query", qraw, a.q_norm.weight, None, True, False, a.rope_cos, a.rope_sin),
+                ("key", kraw, a.k_norm.weight, None, True, False, a.rope_cos, a.rope_sin),
+                ("iq", iqraw.view(rows, 16, 256), a.sparse_indexer_q_norm.weight.to(torch.bfloat16),
+                 None, True, False, a.sparse_indexer_rope_cos, a.sparse_indexer_rope_sin),
+                ("ik", ikraw.view(rows, 1, 256), a.sparse_indexer_k_norm.weight.to(torch.bfloat16),
+                 a.sparse_indexer_k_norm.bias.to(torch.bfloat16), False, True,
+                 a.sparse_indexer_rope_cos, a.sparse_indexer_rope_sin),
+            ]:
+                save(f"r{rows}_{name}_fp64", golden.norm_accuracy_fp64(operand, weight,
+                    config.rms_norm_eps, zero_centered=centered, bias=bias, subtract_mean=mean,
+                    cos=cos[positions], sin=sin[positions]))
             logits = a.g_proj(hidden[start:])
             cache = kernel.DSALayerCache(batch=1, max_tokens=rows, num_kv_groups=4,
                 head_dim=192, geometry=a.indexer.geometry, device=x.device, dtype=torch.bfloat16)

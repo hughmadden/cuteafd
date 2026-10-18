@@ -56,6 +56,7 @@ def test_official_layer0_dense_fixtures():
         "epsilon": config.rms_norm_eps, "limit": layer.mlp.limit, "weights_sha256": sources,
         "torch": torch.__version__, "cuda": torch.version.cuda, "files": {},
         "primary": "official_native", "secondary": "official_f32",
+        "norm_error_ratio_bound": 1.01, "norm_row_max_ulp_slack": 1,
         "secondary_activation": "official_cpu_f32_branch_cuda_bf16_only",
         "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
     }
@@ -89,6 +90,8 @@ def test_official_layer0_dense_fixtures():
                     gate64 = torch.nn.functional.linear(hidden.double(), layer.mlp.gate_proj.weight.double())
                     up64 = torch.nn.functional.linear(hidden.double(), layer.mlp.up_proj.weight.double())
                     down64 = torch.nn.functional.linear(activated.double(), layer.mlp.down_proj.weight.double())
+                    save(f"fp64_r{rows}_norm", golden.norm_accuracy_fp64(
+                        x, layer.post_attention_layernorm.weight, config.rms_norm_eps))
                     save(f"fp64_r{rows}_gate_up", torch.cat((gate64, up64), dim=-1))
                     save(f"fp64_r{rows}_down", down64)
                 for name, tensor in {"residual": x, "norm": hidden,

@@ -104,6 +104,34 @@ def load_release(snapshot):
     return modules["model"], modules["kernel"]
 
 
+def norm_accuracy_fp64(x, weight, epsilon, *, zero_centered=True, bias=None,
+                       subtract_mean=False, cos=None, sin=None):
+    """Same-input unrounded oracle for component qualification, not model execution.
+
+    Preserve the declared operand dtypes and the BF16 normalized producer before
+    optional RoPE; only the reference reductions and affine arithmetic use FP64.
+    """
+    import torch
+    value = x.double()
+    mean = value.mean(-1, keepdim=True) if subtract_mean else 0.
+    variance = value.square().mean(-1, keepdim=True) - mean * mean
+    epsilon = float(torch.tensor(epsilon, dtype=torch.float32))
+    value = (value - mean) * torch.rsqrt(variance + epsilon)
+    value *= weight.double() + float(zero_centered)
+    if bias is not None:
+        value += bias.double()
+    if cos is not None:
+        if sin is None or x.ndim != 3:
+            raise ValueError("rotary norm oracle requires paired tables and token/head/dim input")
+        half = cos.shape[-1]
+        rounded = value.to(torch.bfloat16).double()
+        real, imaginary = rounded[..., :half], rounded[..., half:2 * half]
+        c, s = cos.double().unsqueeze(1), sin.double().unsqueeze(1)
+        value[..., :half] = real * c - imaginary * s
+        value[..., half:2 * half] = real * s + imaginary * c
+    return value
+
+
 def sliding_attention(query, key, value, window):
     """Fixed 128-query, (window+127)-key SDPA, without quadratic masks."""
     import torch
