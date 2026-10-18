@@ -116,9 +116,20 @@ def test_native_key_includes_the_switch_through_the_environment():
     assert "grep -E '^CUTEAFD_WIP_[A-Z0-9_]+='" in block
     excluded = re.search(r"grep -vE '\^CUTEAFD_WIP_\(([^)]*)\)='", block).group(1).split('|')
     assert 'EXLR8_AOT' not in excluded
-    # OFF adds no CMake argument, so an OFF build configures exactly as before.
-    assert 'exlr8_cmake_args=()' in build and '[[ "$exlr8_aot" != ON ]] || exlr8_cmake_args=(-DCUTEAFD_ENABLE_EXLR8_AOT=ON)' in build
+    # Always explicit: a reused build tree's CMake cache must not keep an earlier ON.
+    assert '-DCUTEAFD_ENABLE_EXLR8_AOT="$exlr8_aot"' in build and 'exlr8_cmake_args' not in build
     assert 'CUTEAFD_WIP_EXLR8_AOT must be ON or OFF' in build
+
+
+def test_every_aot_switch_is_explicit_on_cmake():
+    # CMake caches -D values in a reused build tree: a switch passed only when ON
+    # survives into a later OFF build (an EXLR8 table appeared in a plain GLM slot).
+    for script in ('build-wip-artifacts.sh', 'build-release-artifacts.sh'):
+        text = (ROOT / 'scripts/build' / script).read_text()
+        cmake = text[text.index('\ncmake \\\n'):]
+        cmake = cmake[:cmake.index('\n', cmake.index('-DCUTEAFD_CUDA_ARCHITECTURES'))]
+        assert '-DCUTEAFD_ENABLE_EXLR8_AOT=' in cmake
+        assert '[@]+' not in cmake, f'{script}: conditional CMake argument arrays can leave cached values'
 
 
 def test_wip_artifacts_rejects_invalid_override(tmp_path):
@@ -179,7 +190,7 @@ def test_release_derives_exlr8_and_passes_it_to_both_legs(tmp_path, monkeypatch)
     build = (ROOT / 'build.sh').read_text()
     assert build.count('-e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}"') == 2
     artifacts = (ROOT / 'scripts/build/build-release-artifacts.sh').read_text()
-    assert '${exlr8_cmake_args[@]+"${exlr8_cmake_args[@]}"}' in artifacts
+    assert '-DCUTEAFD_ENABLE_EXLR8_AOT="${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}"' in artifacts
 
 
 def write_programs(root, family_programs, exlr8_role=None, exlr8=(), recorded=None):

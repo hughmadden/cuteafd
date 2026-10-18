@@ -54,10 +54,9 @@ if ! test -w "$build_root_parent"; then
 fi
 
 # EXLR8 programs (release-scope.py derives ON from an EXLR8 matrix entry): both
-# roles, each with its own program set; OFF leaves the CMake arguments unchanged.
+# roles, each with its own program set. Always explicit, so a reused CMake cache
+# cannot keep an earlier ON.
 case "${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" in ON|OFF) ;; *) echo "CUTEAFD_RELEASE_EXLR8_AOT must be ON or OFF" >&2; exit 2 ;; esac
-exlr8_cmake_args=()
-[[ "${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" != ON ]] || exlr8_cmake_args=(-DCUTEAFD_ENABLE_EXLR8_AOT=ON)
 case "$role" in
   coordinator)
     coordinator_aot=ON
@@ -254,7 +253,7 @@ cmake \
   -DCUTEAFD_ENABLE_QWEN4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_QWEN_DENSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_STEP5_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_STEP5_AOT:-OFF}" || echo OFF)" \
-  ${exlr8_cmake_args[@]+"${exlr8_cmake_args[@]}"} \
+  -DCUTEAFD_ENABLE_EXLR8_AOT="${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
