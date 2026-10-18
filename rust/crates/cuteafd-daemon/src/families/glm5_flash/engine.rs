@@ -5628,9 +5628,9 @@ mod prefill_lane_tests {
             ("integration/cuteafd/_fp8_weights.py", 0xab87_f59d_f17b_3556),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
-            // Only the CUDA-independent KDAGeometry import/export was added since
-            // the dense-Qwen portability audit; existing geometry is unchanged.
-            ("integration/cuteafd/_common.py", 0xa13f_44c0_514d_ab99),
+            // KDAGeometry import/export and signed-byte operand registration only;
+            // 34317cc1 adds Int8 without changing BF16/FP8 mappings or projection routes.
+            ("integration/cuteafd/_common.py", 0x7e63_b6fc_ae75_9f0a),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
             ("gemm/bf16_gemv/_skinny.py", 0x3351_3301_8c37_3f8f),
