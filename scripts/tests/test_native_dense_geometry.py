@@ -18,15 +18,29 @@ def geometry(module):
 @pytest.mark.parametrize("module,k,n,kwargs,splits", [
     ("trellis_linear", 2048, 16384, {}, 2),
     ("trellis_linear", 16384, 6144, {"sharded_side": 2}, 16),
-    ("scaled_linear", 6144, 576, {}, 6),
-    ("scaled_linear", 16384, 6144, {"encoding": "int4_g32", "sharded_side": 2}, 16),
-    ("scaled_linear", 6144, 154880, {"encoding": "fp8_row"}, 6),
 ])
 def test_real_dense_geometry(module, k, n, kwargs, splits):
     g = geometry(module)(k, n, **kwargs)
     assert g["input_features"] == k and g["output_features"] == n
     assert g["max_rows"] == 4096 and g["splits"] == splits
     assert g["ctas_per_sm"] == 4
+
+
+@pytest.mark.parametrize("k,n,kwargs,segments", [
+    (6144, 2048, {}, 8),
+    (6144, 576, {}, 8),
+    (2048, 4096, {}, 4),
+    (6144, 128, {}, 8),
+    (2048, 16384, {"encoding": "int4_g32"}, 1),
+    (16384, 6144, {"encoding": "int4_g32", "sharded_side": 2}, 4),
+    (6144, 154880, {"encoding": "fp8_row"}, 1),
+])
+def test_scaled_tile_geometry(k, n, kwargs, segments):
+    # Tile core: shape-only K segments, no split-K partial scratch.
+    g = geometry("scaled_linear")(k, n, **kwargs)
+    assert g["core"] == "tile" and g["splits"] == 1 and g["segments"] == segments
+    assert (k // 128) % segments == 0
+    assert g["max_rows"] == 4096 and g["ctas_per_sm"] == 4
 
 
 @pytest.mark.parametrize("module", ["trellis_linear", "scaled_linear"])
