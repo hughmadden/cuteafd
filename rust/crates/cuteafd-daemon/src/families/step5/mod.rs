@@ -7,4 +7,5 @@ mod norm_accuracy;
 mod prefix;
 mod rope;
 mod swa;
+mod transaction;
 mod weights;

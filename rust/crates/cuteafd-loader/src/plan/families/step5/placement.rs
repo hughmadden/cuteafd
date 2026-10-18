@@ -80,14 +80,22 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         per_token as f64*FLOOR as f64/GIB as f64, per_token as f64*(1<<20) as f64/GIB as f64));
     memory.notes.push(format!("Proposed FP8 K/V ideal lower bound only (NOT selected or quality-qualified): {} bytes/token plus scales/padding", full*(tokens_per_layer/2+256/8)));
     let slots = opts.concurrency.max(1);
+    // Header-only plan uses the minimum 64-row step. Runtime charges its actual
+    // prefill/verify extent before allocating, never treating slack as pool-fixed.
+    let ring_rows = 576u64;
+    let slack_per_sequence = ((cfg.layers as u64-full)+cfg.mtp as u64)
+        * (ring_rows-cfg.window as u64)*tokens_per_layer;
+    memory.notes.push(format!("Append-only SWA/MTP slack lower bound: {slack_per_sequence} bytes per admitted sequence across coordinator ranks at step64; {slots} sequences charge {} bytes. Runtime charges larger prefill steps separately.", slack_per_sequence*slots));
     let mut fixed = Vec::new();
     for gpu in 0..gpus {
         fixed.push(Demand::new(gpu as u8, Category::Weights, "target + 3 MTP stages, vision conservatively replicated", per_gpu, Basis::Formula));
         // SWA target and MTP rings retain original BF16 rows. CSA pending K/Z
         // is shared across provider groups, so replicated on both head owners.
-        let rings = ((cfg.layers as u64-full)+cfg.mtp as u64)*cfg.window as u64*tokens_per_layer*slots/gpus as u64;
-        fixed.push(Demand::new(gpu as u8, Category::Kv, "SWA512 target + MTP rings, no speculative slack", rings, Basis::Formula));
-        fixed.push(Demand::new(gpu as u8, Category::Kv, "pending CSA-8 index K/Z FP32 lower bound", full*8*256*2*4*slots, Basis::Formula));
+        let target_rings = (cfg.layers as u64-full)*ring_rows*tokens_per_layer*slots/gpus as u64;
+        let mtp_rings = if gpu == 0 { cfg.mtp as u64*ring_rows*tokens_per_layer*slots } else { 0 };
+        let rings = target_rings + mtp_rings;
+        fixed.push(Demand::new(gpu as u8, Category::Kv, "SWA512 target + MTP rings with per-sequence step64 slack", rings, Basis::Formula));
+        fixed.push(Demand::new(gpu as u8, Category::Kv, "CSA-8 pending BF16 K/Z, two banks per sequence", full*8*256*2*2*2*slots, Basis::Formula));
     }
     let mode = if gpus == 1 { SINGLE } else { LayerMode::HeadSplit };
     let layers = (0..cfg.layers).map(|layer| {

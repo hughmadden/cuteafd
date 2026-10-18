@@ -56,7 +56,7 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
     let cp = Checkpoint::open(dir.path()).unwrap();
     let cfg = Model::open(&cp).unwrap().cfg;
     for ranks in [1, 2] {
-        let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3).unwrap();
+        let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3, 64).unwrap();
         assert_eq!(layout.mtp_hidden_rows, 516);
         assert_eq!(layout.window(), 512);
         assert_eq!(layout.capture_reach(), 0);
@@ -79,13 +79,22 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
                 assert!(spans.iter().all(|s| s.offset.checked_add(s.bytes).unwrap() <= state.bytes));
                 let summary_bytes = if rank == 0 { 23 * (frontier / REGION_ROWS) * 256 } else { 0 };
                 let maximum: u64 = layout.snapshot_spans(rank, 1 << 20).unwrap().iter().map(|s| s.bytes).sum();
-                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 };
+                let missing_rings: u64 = state.sliding.iter().filter(|s| !s.mtp)
+                    .map(|s| 2 * (512 - frontier.min(512)) * s.key.bytes / layout.ring.rows).sum();
+                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 } - missing_rings;
                 assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
-                assert!(spans.iter().all(|s| s.offset % 256 == 0));
                 assert!(state.regions.iter().all(|region| spans.contains(&region.pending_key)
                     && spans.contains(&region.pending_z)));
                 for ring in &state.sliding {
-                    assert!(spans.contains(&ring.key) && spans.contains(&ring.value));
+                    for component in [ring.key, ring.value] {
+                        let retained: u64 = spans.iter().filter(|s| s.offset >= component.offset
+                            && s.offset < component.offset + component.bytes).map(|s| s.bytes).sum();
+                        assert_eq!(retained, if ring.mtp { component.bytes }
+                            else { frontier.min(512) * component.bytes / layout.ring.rows });
+                    }
+                }
+                for region in &state.regions {
+                    assert!(!spans.contains(&region.next_key) && !spans.contains(&region.next_z));
                 }
                 assert_eq!(layout.csa_tail_bytes(rank, frontier % PAGE_ROWS).unwrap(),
                     geometry.persistent_unit_bytes / PAGE_ROWS * (frontier % PAGE_ROWS));
@@ -105,7 +114,8 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
             let spans = layout.snapshot_spans(0, 65).unwrap();
             assert_eq!(copies.len(), spans.len());
             for (copy, span) in copies.iter().zip(spans) {
-                assert_eq!(copy.mark.offset, sequence * layout.ranks[0].bytes + span.offset);
+                assert!(copy.mark.offset >= sequence * layout.ranks[0].bytes
+                    && copy.mark.offset + copy.mark.bytes <= (sequence + 1) * layout.ranks[0].bytes);
                 assert_eq!(copy.active.bytes, span.bytes);
                 assert_eq!(copy.mark.bytes, span.bytes);
                 occupied.push((copy.active.offset, copy.active.offset + copy.active.bytes));
@@ -121,9 +131,9 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         assert!(layout.snapshot_copies(0, 0, 3, 0, 4, 4).is_err());
         assert!(layout.snapshot_copies(0, 0, u64::MAX, 0, 4, 0).is_err());
     }
-    assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0).is_err());
-    assert!(Step5CacheLayout::new(&cfg, 1, 0, 0).is_err());
-    assert!(Step5CacheLayout::new(&cfg, 1, 1024, 4).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0, 64).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 0, 0, 64).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 1024, 4, 64).is_err());
 }
 
 #[test]
@@ -187,6 +197,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert!(memory.notes.iter().any(|n| n.contains("71392 bytes/token")));
     assert!(memory.notes.iter().any(|n| n.contains("36064 bytes/token")));
     assert!(memory.notes.iter().any(|n| n.contains("Maximum request 1048576")));
+    assert!(memory.notes.iter().any(|n| n.contains("14155776 bytes per admitted sequence")));
 }
 
 #[test]

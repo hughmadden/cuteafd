@@ -3,6 +3,7 @@ use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::serving_capacity::step5::{ByteSpan, Step5CacheLayout};
+use std::cell::Cell;
 
 /// Checked cache-only reservations. Weights, code, workspace and transport must
 /// be subtracted before supplying the available bytes to `CacheRank::new`.
@@ -47,6 +48,9 @@ pub(super) struct CacheRank<'a> {
     sequences: u64,
     slots: u64,
     marks_at: Vec<Option<u64>>,
+    pending_bank: Vec<Cell<bool>>,
+    pub(super) poisoned: Cell<bool>,
+    pub(super) busy: Vec<Cell<bool>>,
     reservation: Reservation,
 }
 
@@ -70,7 +74,7 @@ impl<'a> CacheRank<'a> {
         let marks = if reservation.marks > 0 { Some(Allocation::new(device, reservation.marks)?) } else { None };
         let pages = Allocation::new(device, reservation.pages)?;
         let owner = Self { stream, active, marks, pages, layout, rank, sequences, slots,
-            marks_at, reservation };
+            marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
         let mut guard = owner.stream.cancellation_guard("Step-5 cache initialization");
         device.run(|| {
             // SAFETY: the active allocation is live through completion on the owned stream.
@@ -149,10 +153,10 @@ impl<'a> CacheRank<'a> {
     /// full admitted capacity even when a snapshot retains fewer complete rows.
     pub fn component(&self, span: ByteSpan) -> Result<CuteafdDeviceBuffer> {
         let state = &self.layout.ranks[self.rank];
-        let declared = span == state.length || state.mtp_hidden == Some(span)
+        let declared = span == state.length || span == state.next_length || state.mtp_hidden == Some(span)
             || state.mtp_lengths.contains(&span)
             || state.sliding.iter().any(|s| s.key == span || s.value == span)
-            || state.regions.iter().any(|r| r.pending_key == span || r.pending_z == span || r.summaries == Some(span));
+            || state.regions.iter().any(|r| r.pending_key == span || r.pending_z == span || r.next_key == span || r.next_z == span || r.summaries == Some(span));
         ensure!(declared, "Step-5 component is not part of this rank's cache layout");
         view(self.active.buffer, ByteSpan {
             offset: span.offset.checked_mul(self.sequences).context("Step-5 component offset overflow")?,
@@ -160,11 +164,58 @@ impl<'a> CacheRank<'a> {
         })
     }
 
+    pub fn request_component(&self, span: ByteSpan, sequence: u64) -> Result<CuteafdDeviceBuffer> {
+        ensure!(sequence < self.sequences, "Step-5 sequence outside cache");
+        view(self.component(span)?, ByteSpan { offset: sequence * span.bytes, bytes: span.bytes })
+    }
+
+    pub fn pending(&self, layer: usize, sequence: u64, next: bool)
+        -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
+        ensure!(sequence < self.sequences, "Step-5 sequence outside cache");
+        let region = self.layout.ranks[self.rank].regions.iter().find(|r| r.layer == layer)
+            .context("Step-5 layer is not CSA")?;
+        let bank = self.pending_bank[sequence as usize].get() ^ next;
+        let (key, z) = if bank { (region.next_key, region.next_z) }
+            else { (region.pending_key, region.pending_z) };
+        Ok((self.request_component(key, sequence)?, self.request_component(z, sequence)?))
+    }
+
+    pub fn length(&self, sequence: u64, next: bool) -> Result<CuteafdDeviceBuffer> {
+        ensure!(sequence < self.sequences, "Step-5 sequence outside cache");
+        let state = &self.layout.ranks[self.rank];
+        let bank = self.pending_bank[sequence as usize].get() ^ next;
+        self.request_component(if bank { state.next_length } else { state.length }, sequence)
+    }
+
+    fn snapshot_copies(&self, sequence: u64, slot: u64, frontier: u64)
+        -> Result<Vec<cuteafd_loader::serving_capacity::step5::SnapshotCopy>> {
+        let mut copies = self.layout.snapshot_copies(self.rank, frontier, self.sequences,
+            sequence, self.slots, slot)?;
+        if self.pending_bank[sequence as usize].get() {
+            let state = &self.layout.ranks[self.rank];
+            let pairs = std::iter::once((state.length, state.next_length)).chain(state.regions.iter()
+                .flat_map(|r| [(r.pending_key, r.next_key), (r.pending_z, r.next_z)]));
+            for (canonical, selected) in pairs {
+                let at = canonical.offset * self.sequences + sequence * canonical.bytes;
+                if let Some(copy) = copies.iter_mut().find(|c| c.active.offset == at) {
+                    copy.active.offset = selected.offset * self.sequences + sequence * selected.bytes;
+                }
+            }
+        }
+        Ok(copies)
+    }
+
+    /// Called only after all ranks have drained, with exclusive step ownership.
+    pub fn publish_bank(&self, sequence: u64) {
+        let bank = &self.pending_bank[sequence as usize];
+        bank.set(!bank.get());
+    }
+
     /// CSA page references/COW are handled by the shared prefix pool separately.
     /// This captures every nonpaged byte at the exact committed frontier only.
     pub fn capture(&mut self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
-        let copies = self.layout.snapshot_copies(self.rank, frontier, self.sequences,
-            sequence, self.slots, slot)?;
+        self.check_idle(sequence)?;
+        let copies = self.snapshot_copies(sequence, slot, frontier)?;
         let marks = self.marks.as_ref().context("Step-5 prefix retention is disabled")?.buffer;
         self.marks_at[usize::try_from(slot)?] = None;
         let mut guard = self.stream.cancellation_guard("Step-5 cache capture");
@@ -186,8 +237,8 @@ impl<'a> CacheRank<'a> {
     }
 
     pub fn restore(&mut self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
-        let copies = self.layout.snapshot_copies(self.rank, frontier, self.sequences,
-            sequence, self.slots, slot)?;
+        self.check_idle(sequence)?;
+        let copies = self.snapshot_copies(sequence, slot, frontier)?;
         ensure!(self.marks_at[usize::try_from(slot)?] == Some(frontier),
             "Step-5 mark is absent or belongs to a different frontier");
         self.restore_copies(copies)
@@ -196,9 +247,15 @@ impl<'a> CacheRank<'a> {
     /// Shared prefix metadata identifies host-restored marks; local capture
     /// bookkeeping cannot identify a slot that the host tier just overwrote.
     pub fn restore_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
-        let copies = self.layout.snapshot_copies(self.rank, frontier, self.sequences,
-            sequence, self.slots, slot)?;
+        self.check_idle(sequence)?;
+        let copies = self.snapshot_copies(sequence, slot, frontier)?;
         self.restore_copies(copies)
+    }
+
+    fn check_idle(&self, sequence: u64) -> Result<()> {
+        ensure!(!self.poisoned.get() && sequence < self.sequences
+            && !self.busy[sequence as usize].get(), "Step-5 cache sequence unavailable");
+        Ok(())
     }
 
     fn restore_copies(&self, copies: Vec<cuteafd_loader::serving_capacity::step5::SnapshotCopy>) -> Result<()> {
@@ -230,6 +287,10 @@ pub(super) mod tests {
     pub(super) fn layout() -> Step5CacheLayout { layout_at(65) }
 
     pub(in crate::families::step5) fn layout_at(context: u64) -> Step5CacheLayout {
+        layout_for(context, 1, 3, 64)
+    }
+
+    pub(in crate::families::step5) fn layout_for(context: u64, ranks: usize, mtp: usize, step: u64) -> Step5CacheLayout {
         let config = cuteafd_loader::plan::families::step5::Config {
             norm_eps: 1e-5, hidden: 4096, vocab: 128896, layers: 92, mtp: 3,
             dense: 13824, experts: 352, intermediate: 1536, shared: 1536, topk: 8,
@@ -239,7 +300,7 @@ pub(super) mod tests {
             rope_scaling: None, scale_full: false, scale_sliding: false,
             activation: Vec::new(), shared_activation: Vec::new(),
         };
-        Step5CacheLayout::new(&config, 1, context, 3).unwrap()
+        Step5CacheLayout::new(&config, ranks, context, mtp, step).unwrap()
     }
 
     #[test]
@@ -278,37 +339,26 @@ pub(super) mod tests {
         let mut cache = CacheRank::new(device, layout.clone(), 0, 2, 2, 1, usize::MAX)?;
         assert_eq!(cache.bytes(), Reservation::new(&layout, 0, 2, 2, 1, usize::MAX)?.total);
         assert!(cache.page_pool().bytes > 0);
-        let components = layout.snapshot_spans(0, 65)?;
-        for (i, span) in components.iter().enumerate() {
-            // Include the full-capacity summary plane, not just the copied prefix.
-            let full = layout.ranks[0].regions.iter().filter_map(|r| r.summaries)
-                .find(|s| s.offset == span.offset).unwrap_or(*span);
-            let plane = cache.component(full)?;
+        let copies = layout.snapshot_copies(0, 65, 2, 0, 2, 0)?;
+        for (i, copy) in copies.iter().enumerate() {
+            let plane = view(cache.active.buffer, copy.active)?;
             let data: Vec<u8> = (0..plane.bytes).map(|n| (n.wrapping_mul(37) + i) as u8).collect();
             device.run(|| library.copy_h2d(plane, &data))?;
         }
         assert!(cache.restore(0, 0, 65).is_err());
         cache.capture(0, 0, 65)?;
         assert!(cache.restore(1, 0, 64).is_err());
-        for span in &components {
-            let full = layout.ranks[0].regions.iter().filter_map(|r| r.summaries)
-                .find(|s| s.offset == span.offset).unwrap_or(*span);
-            let plane = cache.component(full)?;
-            device.run(|| library.copy_h2d(plane, &vec![0xa5; plane.bytes]))?;
-        }
+        device.run(|| library.copy_h2d(cache.active.buffer, &vec![0xa5; cache.active.buffer.bytes]))?;
         cache.restore(1, 0, 65)?;
-        for (i, span) in components.iter().enumerate() {
-            let full = layout.ranks[0].regions.iter().filter_map(|r| r.summaries)
-                .find(|s| s.offset == span.offset).unwrap_or(*span);
-            let plane = cache.component(full)?;
-            let mut data = vec![0; plane.bytes];
-            device.run(|| library.copy_d2h(&mut data, plane))?;
-            let stride = full.bytes as usize;
-            assert!(data[..stride].iter().all(|b| *b == 0xa5));
-            let expected: Vec<u8> = (0..span.bytes as usize).map(|n| (n.wrapping_mul(37) + i) as u8).collect();
-            assert_eq!(&data[stride..stride + expected.len()], expected);
-            assert!(data[stride + expected.len()..].iter().all(|b| *b == 0xa5));
+        let restored = layout.snapshot_copies(0, 65, 2, 1, 2, 0)?;
+        let mut actual = vec![0; cache.active.buffer.bytes];
+        device.run(|| library.copy_d2h(&mut actual, cache.active.buffer))?;
+        let mut expected = vec![0xa5; actual.len()];
+        for (i, copy) in restored.iter().enumerate() {
+            let at = copy.active.offset as usize;
+            for n in 0..copy.active.bytes as usize { expected[at + n] = (n.wrapping_mul(37) + i) as u8; }
         }
+        assert_eq!(actual, expected);
         assert!(cache.capture(2, 0, 65).is_err());
         assert!(cache.capture(0, 2, 65).is_err());
         Ok(())

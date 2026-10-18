@@ -34,6 +34,8 @@ pub struct RegionState {
     /// BF16 [8,256], including deterministic unused slots, on every head rank.
     pub pending_key: ByteSpan,
     pub pending_z: ByteSpan,
+    pub next_key: ByteSpan,
+    pub next_z: ByteSpan,
     /// Published complete-region summaries; only the lead rank owns the table.
     pub summaries: Option<ByteSpan>,
 }
@@ -46,6 +48,7 @@ pub struct RankState {
     pub sliding: Vec<SlidingState>,
     pub regions: Vec<RegionState>,
     pub length: ByteSpan,
+    pub next_length: ByteSpan,
     pub mtp_lengths: Vec<ByteSpan>,
     pub mtp_hidden: Option<ByteSpan>,
     pub bytes: u64,
@@ -57,6 +60,7 @@ pub struct Step5CacheLayout {
     pub geometry: FamilyCacheGeometry,
     pub context: u64,
     pub mtp_hidden_rows: u64,
+    pub ring: cuteafd_core::prefix::AppendRing,
     window: u64,
 }
 
@@ -89,7 +93,7 @@ impl RankState {
 impl Step5CacheLayout {
     /// BF16 K/V, BF16 pending K/Z, E4M3-byte dense summaries. MTP is owned by
     /// rank 0 with all heads; target K/V is head-split. No 256-row MiMo limits.
-    pub fn new(cfg: &Config, ranks: usize, context: u64, mtp: usize) -> Result<Self, CacheGeometryError> {
+    pub fn new(cfg: &Config, ranks: usize, context: u64, mtp: usize, max_step: u64) -> Result<Self, CacheGeometryError> {
         if ![1, 2].contains(&ranks) || cfg.groups % ranks != 0 || cfg.heads % ranks != 0
             || (cfg.window, cfg.groups, cfg.dim, cfg.hidden) != (512, 4, 192, 4096)
             || cfg.full.len() != cfg.layers + cfg.mtp || cfg.layers != 92
@@ -104,6 +108,8 @@ impl Step5CacheLayout {
         let full = cfg.full[..cfg.layers].iter().filter(|full| **full).count() as u64;
         let half_record = mul(&[cfg.groups as u64 / ranks as u64, cfg.dim as u64, 2])?;
         let window = cfg.window as u64;
+        let ring = cuteafd_core::prefix::AppendRing::new(window, max_step, PAGE_ROWS)
+            .ok_or_else(|| invalid("append-only ring step or extent"))?;
         let mtp_hidden_rows = if mtp == 0 { 0 } else { window + mtp as u64 + 1 };
         let mut states = Vec::with_capacity(ranks);
         let mut costs = Vec::with_capacity(ranks);
@@ -111,25 +117,29 @@ impl Step5CacheLayout {
             let mut state = RankState {
                 sliding: Vec::new(), regions: Vec::new(),
                 length: ByteSpan { offset: 0, bytes: 0 },
+                next_length: ByteSpan { offset: 0, bytes: 0 },
                 mtp_lengths: Vec::new(), mtp_hidden: None, bytes: 0,
             };
             state.length = state.reserve(8)?;
+            state.next_length = state.reserve(8)?;
             for layer in 0..cfg.layers {
                 if cfg.full[layer] {
                     let pending_key = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
                     let pending_z = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
+                    let next_key = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
+                    let next_z = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
                     let summaries = if rank == 0 {
                         Some(state.reserve(mul(&[capacity, PROXY_DIM])?)?)
                     } else { None };
-                    state.regions.push(RegionState { layer, pending_key, pending_z, summaries });
+                    state.regions.push(RegionState { layer, pending_key, pending_z, next_key, next_z, summaries });
                 } else {
-                    state.ring(layer, false, mul(&[window, half_record])?)?;
+                    state.ring(layer, false, mul(&[ring.rows, half_record])?)?;
                 }
             }
             if rank == 0 && mtp > 0 {
                 for stage in 0..mtp {
                     state.ring(cfg.layers + stage, true,
-                        mul(&[window, cfg.groups as u64, cfg.dim as u64, 2])?)?;
+                        mul(&[ring.rows, cfg.groups as u64, cfg.dim as u64, 2])?)?;
                     let length = state.reserve(8)?;
                     state.mtp_lengths.push(length);
                 }
@@ -151,34 +161,49 @@ impl Step5CacheLayout {
                 placement: if ranks == 1 { KvPlacement::SingleDevice } else { KvPlacement::PartitionedHeads },
                 ranks: costs,
             },
-            context, mtp_hidden_rows, window,
+            context, mtp_hidden_rows, ring, window,
         })
     }
 
-    /// Copy all physical SWA/MTP ring bytes and pending K/Z, but only completed
-    /// summary rows. Unfinished-region K/V remains in the paged CSA tail.
-    /// Stage lengths and hidden history are copied, not reset/replayed.
+    /// Canonical mark spans exclude target ring slack and the inactive pending
+    /// bank. MTP state is retained whole until its independent executor exists.
+    /// Only complete summaries are visible; unfinished K/V stays in CSA pages.
     pub fn snapshot_spans(&self, rank: usize, frontier: u64) -> Result<Vec<ByteSpan>, CacheGeometryError> {
-        if frontier > self.context {
-            return Err(invalid("snapshot frontier outside admitted context"));
-        }
+        Ok(self.snapshot_parts(rank, frontier)?.into_iter().map(|(component, offset, _, bytes)|
+            ByteSpan { offset: component.offset + offset, bytes }).collect())
+    }
+
+    // (component, physical offset, canonical mark offset, bytes).
+    fn snapshot_parts(&self, rank: usize, frontier: u64)
+        -> Result<Vec<(ByteSpan, u64, u64, u64)>, CacheGeometryError> {
+        if frontier > self.context { return Err(invalid("snapshot frontier outside admitted context")); }
         let state = self.ranks.get(rank).ok_or_else(|| invalid("snapshot rank"))?;
-        let mut spans = vec![state.length];
+        let mut parts = vec![(state.length, 0, 0, state.length.bytes)];
         for ring in &state.sliding {
-            spans.extend([ring.key, ring.value]);
-        }
-        for region in &state.regions {
-            spans.extend([region.pending_key, region.pending_z]);
-            if let Some(summary) = region.summaries {
-                let bytes = mul(&[frontier / REGION_ROWS, PROXY_DIM])?;
-                if bytes > 0 {
-                    spans.push(ByteSpan { offset: summary.offset, bytes });
+            for component in [ring.key, ring.value] {
+                if ring.mtp {
+                    parts.push((component, 0, 0, component.bytes));
+                } else {
+                    let row = component.bytes / self.ring.rows;
+                    for run in self.ring.visible(frontier) {
+                        parts.push((component, run.slot * row, run.offset * row, run.rows * row));
+                    }
                 }
             }
         }
-        spans.extend(&state.mtp_lengths);
-        if let Some(hidden) = state.mtp_hidden { spans.push(hidden); }
-        Ok(spans)
+        for region in &state.regions {
+            for component in [region.pending_key, region.pending_z] {
+                parts.push((component, 0, 0, component.bytes));
+            }
+            if let Some(summary) = region.summaries {
+                let bytes = mul(&[frontier / REGION_ROWS, PROXY_DIM])?;
+                if bytes > 0 { parts.push((summary, 0, 0, bytes)); }
+            }
+        }
+        for component in state.mtp_lengths.iter().copied().chain(state.mtp_hidden) {
+            parts.push((component, 0, 0, component.bytes));
+        }
+        Ok(parts)
     }
 
     /// Bind exact copies to active component-major request planes and slot-major
@@ -191,26 +216,24 @@ impl Step5CacheLayout {
         let state = self.ranks.get(rank).ok_or_else(|| invalid("snapshot rank"))?;
         let total_active = mul(&[state.bytes, sequences])?;
         let total_marks = mul(&[state.bytes, slots])?;
-        let spans = self.snapshot_spans(rank, frontier)?;
-        spans.into_iter().map(|span| {
-            // Summary copies may be shorter than the request's full capacity.
-            let component_bytes = state.regions.iter().filter_map(|r| r.summaries)
-                .find(|s| s.offset == span.offset).map_or(span.bytes, |s| s.bytes);
-            let active = mul(&[span.offset, sequences])?.checked_add(mul(&[sequence, component_bytes])?)
+        self.snapshot_parts(rank, frontier)?.into_iter().map(|(component, offset, canonical, bytes)| {
+            let active = mul(&[component.offset, sequences])?.checked_add(mul(&[sequence, component.bytes])?)
+                .and_then(|at| at.checked_add(offset))
                 .ok_or(CacheGeometryError::Overflow("Step-5 active copy offset"))?;
-            let mark = mul(&[slot, state.bytes])?.checked_add(span.offset)
+            let mark = mul(&[slot, state.bytes])?.checked_add(component.offset)
+                .and_then(|at| at.checked_add(canonical))
                 .ok_or(CacheGeometryError::Overflow("Step-5 mark copy offset"))?;
-            if active.checked_add(span.bytes).is_none_or(|end| end > total_active)
-                || mark.checked_add(span.bytes).is_none_or(|end| end > total_marks) {
+            if active.checked_add(bytes).is_none_or(|end| end > total_active)
+                || mark.checked_add(bytes).is_none_or(|end| end > total_marks) {
                 return Err(invalid("snapshot byte extent"));
             }
-            Ok(SnapshotCopy { active: ByteSpan { offset: active, bytes: span.bytes },
-                mark: ByteSpan { offset: mark, bytes: span.bytes } })
+            Ok(SnapshotCopy { active: ByteSpan { offset: active, bytes },
+                mark: ByteSpan { offset: mark, bytes } })
         }).collect()
     }
 
-    /// The window has no spare committed history: snapshot at the exact current
-    /// frontier before another commit can overwrite it.
+    /// Pending buffers describe only the current frontier, even though rings
+    /// retain extra rows. Capture exact frontiers, not reconstructed history.
     pub fn capture_reach(&self) -> u64 { 0 }
 
     pub fn window(&self) -> u64 { self.window }

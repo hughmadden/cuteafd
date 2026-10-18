@@ -14,6 +14,86 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Position-addressed window with enough append-only space for one uncommitted step.
+/// Snapshots retain only `window` visible rows, never speculative slack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendRing {
+    pub window: u64,
+    pub step: u64,
+    pub rows: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingRun {
+    pub slot: u64,
+    pub offset: u64,
+    pub rows: u64,
+}
+
+impl AppendRing {
+    pub fn new(window: u64, step: u64, alignment: u64) -> Option<Self> {
+        if window == 0 || step == 0 || alignment == 0 { return None; }
+        let rows = window.checked_add(step)?.checked_add(alignment - 1)?
+            .checked_div(alignment)?.checked_mul(alignment)?;
+        Some(Self { window, step, rows })
+    }
+
+    /// At most two contiguous copies, with offsets in logical position order.
+    pub fn runs(self, start: u64, rows: u64) -> Option<Vec<RingRun>> {
+        start.checked_add(rows)?;
+        if rows > self.rows { return None; }
+        if rows == 0 { return Some(Vec::new()); }
+        let slot = start % self.rows;
+        let first = rows.min(self.rows - slot);
+        let mut runs = vec![RingRun { slot, offset: 0, rows: first }];
+        if first < rows { runs.push(RingRun { slot: 0, offset: first, rows: rows - first }); }
+        Some(runs)
+    }
+
+    pub fn visible(self, frontier: u64) -> Vec<RingRun> {
+        let rows = frontier.min(self.window);
+        self.runs(frontier - rows, rows).expect("visible window fits the ring")
+    }
+
+    pub fn proposal(self, base: u64, rows: u64) -> Option<Vec<RingRun>> {
+        if rows > self.step { return None; }
+        self.runs(base, rows)
+    }
+}
+
+#[cfg(test)]
+mod append_ring_tests {
+    use super::*;
+
+    #[test]
+    fn proposal_never_overwrites_visible_rows_including_wraps() {
+        for step in [1, 7, 64, 513, 4096] {
+            let ring = AppendRing::new(512, step, 64).unwrap();
+            assert!(ring.rows >= 512 + step && ring.rows % 64 == 0);
+            for base in [0, 1, 511, 512, 513, ring.rows - 1, ring.rows, 2 * ring.rows + 7] {
+                let mut bytes = vec![0u8; ring.rows as usize];
+                for run in ring.visible(base) {
+                    bytes[run.slot as usize..(run.slot + run.rows) as usize].fill(19);
+                }
+                let saved = bytes.clone();
+                for run in ring.proposal(base, step).unwrap() {
+                    bytes[run.slot as usize..(run.slot + run.rows) as usize].fill(29);
+                }
+                for run in ring.visible(base) {
+                    let range = run.slot as usize..(run.slot + run.rows) as usize;
+                    assert_eq!(bytes[range.clone()], saved[range]);
+                }
+                assert!(ring.proposal(base, step + 1).is_none());
+            }
+        }
+        assert!(AppendRing::new(0, 1, 64).is_none());
+        assert!(AppendRing::new(512, 0, 64).is_none());
+        assert!(AppendRing::new(512, 1, 0).is_none());
+        assert!(AppendRing::new(u64::MAX, 1, 64).is_none());
+        assert!(AppendRing::new(512, 64, 64).unwrap().proposal(u64::MAX, 1).is_none());
+    }
+}
+
 /// Device mark slots: two per active lane plus two, retaining both snapshot banks
 /// within the byte budget. Disabled retention takes no arena.
 pub fn mark_slots_for(lanes: u64, entries: u64, slot_bytes: u64, budget_bytes: u64) -> u64 {
