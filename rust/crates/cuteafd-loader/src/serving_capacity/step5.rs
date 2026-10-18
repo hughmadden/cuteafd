@@ -14,6 +14,12 @@ pub struct ByteSpan {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotCopy {
+    pub active: ByteSpan,
+    pub mark: ByteSpan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlidingState {
     pub layer: usize,
@@ -32,8 +38,9 @@ pub struct RegionState {
     pub summaries: Option<ByteSpan>,
 }
 
-/// Offsets within one sequence's active allocation and within one mark slot.
-/// Keeping the same offsets makes snapshots byte copies, never reconstruction.
+/// Component offsets in one mark slot. Active storage is component-major:
+/// component.offset * sequences, followed by contiguous request-sized records.
+/// Marks are slot-major, so snapshot copies use explicit source/destination offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankState {
     pub sliding: Vec<SlidingState>,
@@ -172,6 +179,34 @@ impl Step5CacheLayout {
         spans.extend(&state.mtp_lengths);
         if let Some(hidden) = state.mtp_hidden { spans.push(hidden); }
         Ok(spans)
+    }
+
+    /// Bind exact copies to active component-major request planes and slot-major
+    /// marks. The kernel ABI has no sequence stride between a component's rows.
+    pub fn snapshot_copies(&self, rank: usize, frontier: u64, sequences: u64, sequence: u64,
+        slots: u64, slot: u64) -> Result<Vec<SnapshotCopy>, CacheGeometryError> {
+        if sequences == 0 || sequence >= sequences || slot >= slots {
+            return Err(invalid("snapshot sequence or mark slot"));
+        }
+        let state = self.ranks.get(rank).ok_or_else(|| invalid("snapshot rank"))?;
+        let total_active = mul(&[state.bytes, sequences])?;
+        let total_marks = mul(&[state.bytes, slots])?;
+        let spans = self.snapshot_spans(rank, frontier)?;
+        spans.into_iter().map(|span| {
+            // Summary copies may be shorter than the request's full capacity.
+            let component_bytes = state.regions.iter().filter_map(|r| r.summaries)
+                .find(|s| s.offset == span.offset).map_or(span.bytes, |s| s.bytes);
+            let active = mul(&[span.offset, sequences])?.checked_add(mul(&[sequence, component_bytes])?)
+                .ok_or(CacheGeometryError::Overflow("Step-5 active copy offset"))?;
+            let mark = mul(&[slot, state.bytes])?.checked_add(span.offset)
+                .ok_or(CacheGeometryError::Overflow("Step-5 mark copy offset"))?;
+            if active.checked_add(span.bytes).is_none_or(|end| end > total_active)
+                || mark.checked_add(span.bytes).is_none_or(|end| end > total_marks) {
+                return Err(invalid("snapshot byte extent"));
+            }
+            Ok(SnapshotCopy { active: ByteSpan { offset: active, bytes: span.bytes },
+                mark: ByteSpan { offset: mark, bytes: span.bytes } })
+        }).collect()
     }
 
     /// The window has no spare committed history: snapshot at the exact current

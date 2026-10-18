@@ -99,6 +99,27 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         assert!(layout.snapshot_spans(ranks, 0).is_err());
         assert!(layout.snapshot_spans(0, (1 << 20) + 1).is_err());
         assert!(layout.csa_tail_bytes(0, 65).is_err());
+        let mut occupied = Vec::new();
+        for sequence in 0..3 {
+            let copies = layout.snapshot_copies(0, 65, 3, sequence, 4, sequence).unwrap();
+            let spans = layout.snapshot_spans(0, 65).unwrap();
+            assert_eq!(copies.len(), spans.len());
+            for (copy, span) in copies.iter().zip(spans) {
+                assert_eq!(copy.mark.offset, sequence * layout.ranks[0].bytes + span.offset);
+                assert_eq!(copy.active.bytes, span.bytes);
+                assert_eq!(copy.mark.bytes, span.bytes);
+                occupied.push((copy.active.offset, copy.active.offset + copy.active.bytes));
+            }
+            let summary = layout.ranks[0].regions[0].summaries.unwrap();
+            let copy = copies.iter().find(|c| c.mark.offset == sequence * layout.ranks[0].bytes + summary.offset).unwrap();
+            assert_eq!(copy.active.offset, summary.offset * 3 + sequence * summary.bytes);
+            assert_eq!(copy.active.bytes, 8 * 256); // Never copy the unfinished ninth region.
+        }
+        occupied.sort_unstable();
+        assert!(occupied.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+        assert!(layout.snapshot_copies(0, 0, 3, 3, 4, 0).is_err());
+        assert!(layout.snapshot_copies(0, 0, 3, 0, 4, 4).is_err());
+        assert!(layout.snapshot_copies(0, 0, u64::MAX, 0, 4, 0).is_err());
     }
     assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0).is_err());
     assert!(Step5CacheLayout::new(&cfg, 1, 0, 0).is_err());
