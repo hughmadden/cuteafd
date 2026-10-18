@@ -187,3 +187,29 @@ def test_native_template_keeps_unfinished_reasoning_open(release):
     assert "</think>" not in rendered
     assert rendered.endswith("reason " * 600)
     assert result["roles"][-1] == "gen"
+
+
+@pytest.mark.parametrize("epsilon", [1e-5, 1e-6, 0.001])
+def test_official_target_norms_all_forward_checkpoint_epsilon(release, monkeypatch, epsilon):
+    import json
+    import torch
+    snapshot = Path(os.environ["STEP5_REFERENCE_SNAPSHOT"])
+    config = json.loads((snapshot / "config.json").read_text())["text_config"]
+    assert config["rms_norm_eps"] == 1e-5
+    config["rms_norm_eps"] = epsilon
+    config = release.Step5Config(**config)
+    # Only constructors are needed. Never materialize model weights for a CPU contract.
+    with torch.device("meta"):
+        attention = release.Step5Attention(config, 3, device="meta", dtype=torch.bfloat16)
+        monkeypatch.setattr(release, "Step5Attention", lambda *args, **kwargs: torch.nn.Identity())
+        monkeypatch.setattr(release, "Step5MoE", lambda *args, **kwargs: torch.nn.Identity())
+        decoder = release.Step5DecoderLayer(config, 3, device="meta", dtype=torch.bfloat16)
+        monkeypatch.setattr(release, "Step5DecoderLayer", lambda *args, **kwargs: torch.nn.Identity())
+        model = release.Step5Model(config)
+    assert attention.q_norm.variance_epsilon == epsilon
+    assert attention.k_norm.variance_epsilon == epsilon
+    assert attention.sparse_indexer_q_norm.variance_epsilon == epsilon
+    assert attention.sparse_indexer_k_norm.eps == epsilon
+    assert decoder.input_layernorm.variance_epsilon == epsilon
+    assert decoder.post_attention_layernorm.variance_epsilon == epsilon
+    assert model.norm.variance_epsilon == epsilon
