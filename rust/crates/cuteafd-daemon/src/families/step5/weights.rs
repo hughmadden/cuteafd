@@ -74,6 +74,27 @@ fn pack(
     Ok(packed)
 }
 
+pub(super) fn load_operand<'a>(
+    device: Device<'a>,
+    checkpoint: &'a Checkpoint,
+    layout: &RankWeightLayout,
+    operand: &WeightOperand,
+) -> Result<Allocation<'a>> {
+    let _scope = cuteafd_ffi::memory_ledger::scope("step5_target_weights");
+    cuteafd_ffi::memory_ledger::tensor(&operand.name);
+    let _format = cuteafd_ffi::memory_ledger::format(if operand.dtype == DType::Bf16 {
+        "bf16"
+    } else {
+        "f32"
+    });
+    let reader = WeightReader {
+        library: device.library,
+        checkpoint,
+    };
+    let bytes = pack(operand, layout, |name| reader.raw(name))?;
+    device.run(|| reader.upload(&bytes))
+}
+
 pub(super) struct RankWeights<'a> {
     pub embedding: TokenEmbedding<'a>,
     operands: BTreeMap<String, Allocation<'a>>,
@@ -102,10 +123,6 @@ impl<'a> RankWeights<'a> {
             .context("Step-5 embedding source")?;
         let embedding = EmbedSource::new(&checkpoint.snapshot, &source.shard, &source.meta, 4096)?;
         device.run(|| {
-            let reader = WeightReader {
-                library: device.library,
-                checkpoint,
-            };
             let (embedding, operands) =
                 TokenEmbedding::load(device.library, embedding, EmbedPlacement::Gpu, || {
                     let mut operands = BTreeMap::new();
@@ -113,16 +130,10 @@ impl<'a> RankWeights<'a> {
                         if operand.name == EMBEDDING {
                             continue;
                         }
-                        let _scope = cuteafd_ffi::memory_ledger::scope("step5_target_weights");
-                        cuteafd_ffi::memory_ledger::tensor(&operand.name);
-                        let _format =
-                            cuteafd_ffi::memory_ledger::format(if operand.dtype == DType::Bf16 {
-                                "bf16"
-                            } else {
-                                "f32"
-                            });
-                        let bytes = pack(operand, &layout, |name| reader.raw(name))?;
-                        operands.insert(operand.name.clone(), reader.upload(&bytes)?);
+                        operands.insert(
+                            operand.name.clone(),
+                            load_operand(device, checkpoint, &layout, operand)?,
+                        );
                     }
                     Ok(operands)
                 })?;

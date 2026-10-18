@@ -53,6 +53,8 @@ impl TargetNormEps {
 #[derive(Debug, Clone)]
 pub struct LayerContract {
     pub layer: usize,
+    /// Dense FFN only; routed/shared branches have separate ownership.
+    pub dense_activation: Option<cuteafd_core::FfnActivation>,
     pub geometry: GqaGeometry,
     pub theta: f64,
     pub rope: crate::plan::rope::Recipe,
@@ -85,6 +87,7 @@ impl CoordinatorContract {
             .map(|layer| {
                 Ok(LayerContract {
                     layer,
+                    dense_activation: (!cfg.moe[layer]).then_some(cfg.activation[layer]),
                     geometry: GqaGeometry {
                         query_heads: cfg.heads,
                         kv_heads: cfg.groups,
@@ -95,7 +98,9 @@ impl CoordinatorContract {
                     .validate()?,
                     theta: cfg.theta[layer],
                     rope: cfg.rope_recipe(layer, false)?,
-                    indexer_rope: cfg.full[layer].then(|| cfg.rope_recipe(layer, true)).transpose()?,
+                    indexer_rope: cfg.full[layer]
+                        .then(|| cfg.rope_recipe(layer, true))
+                        .transpose()?,
                     rotary_arithmetic: RotaryArithmetic::FusedImaginary,
                     sliding: (!cfg.full[layer]).then_some(SlidingWindow {
                         window: cfg.window as u64,
@@ -287,6 +292,16 @@ mod tests {
         assert_eq!(c.layers.len(), 92);
         assert_eq!(c.layers.iter().filter(|l| l.sliding.is_some()).count(), 69);
         for layer in &c.layers {
+            assert_eq!(
+                layer.dense_activation.is_some(),
+                layer.layer < 3 || layer.layer == 91
+            );
+            if let Some(activation) = layer.dense_activation {
+                assert!(matches!(
+                    activation,
+                    cuteafd_core::FfnActivation::SiluPostClampFp32Product { .. }
+                ));
+            }
             assert_eq!(layer.geometry.value_dim, 192);
             assert_eq!(layer.rotary_arithmetic, RotaryArithmetic::FusedImaginary);
             assert_eq!(
