@@ -7,6 +7,7 @@ import atexit
 import json
 import os
 from pathlib import Path
+import platform
 import time
 import uuid
 
@@ -14,6 +15,27 @@ from allocatable_memory import host_allocatable_memory
 
 
 GB10_EXPORT_JOBS = 8  # each worker holds a CUDA context plus ~4 GiB; GB10 has 121 GiB unified
+# GB10 context creation fails in the driver (NV_ERR_NO_MEMORY) when ~16
+# contexts start within seconds, even with ~100 GiB MemAvailable (mostly page
+# cache that the burst cannot reclaim). Cap live export contexts host-wide and
+# space their creation.
+GB10_EXPORT_CONTEXTS = 8
+CONTEXT_SPACING_S = 1.5  # GB10 only; discrete GPUs never showed the burst failure
+
+
+def _gb10_host() -> bool:
+    # Release builds do not set the host class; every aarch64 builder is a GB10.
+    return (os.environ.get('CUTEAFD_EXPORT_HOST_CLASS', 'raptor') != 'raptor'
+            or platform.machine() == 'aarch64')
+
+
+def host_context_cap() -> int:
+    """Concurrent CUDA export contexts on this host, across steps and builds."""
+    value = os.environ.get('CUTEAFD_EXPORT_HOST_CONTEXTS')
+    if value:
+        return int(value)
+    workers = int(os.environ.get('CUTEAFD_EXPORT_HOST_WORKERS', os.cpu_count() or 1))
+    return min(workers, GB10_EXPORT_CONTEXTS) if _gb10_host() else workers
 
 
 def export_jobs() -> int:
@@ -115,15 +137,23 @@ def gpu_admission():
 
 
 def context_admission():
-    """Reserve RAM before CUDA creates a context; hold until process exit."""
+    """Reserve RAM before CUDA creates a context; hold until process exit.
+
+    One host-wide lease set (``context.<index>.lock``, at most
+    host_context_cap()) covers every Ninja step and every pool worker inside a
+    step, and consecutive admissions are spaced so contexts are created one
+    at a time rather than in a burst.
+    """
     global _context_lease
     if _context_lease is not None or not os.environ.get('CUTEAFD_EXPORT_HOST_SLOT_DIR'):
         return
     root = Path(os.environ['CUTEAFD_EXPORT_HOST_SLOT_DIR'])
     root.mkdir(parents=True, exist_ok=True)
     per_worker = int(os.environ.get('CUTEAFD_EXPORT_WORKER_RAM_MIB', '1536'))
-    count = int(os.environ.get('CUTEAFD_EXPORT_HOST_WORKERS', os.cpu_count() or 1))
-    if per_worker < 1 or count < 1:
+    count = host_context_cap()
+    spacing = float(os.environ.get('CUTEAFD_EXPORT_CONTEXT_SPACING_S',
+                                   CONTEXT_SPACING_S if _gb10_host() else 0))
+    if per_worker < 1 or count < 1 or spacing < 0:
         raise ValueError('export worker RAM and count must be positive')
     deadline = time.monotonic() + 7200
     while True:
@@ -134,6 +164,8 @@ def context_admission():
                 with path.open('a+') as existing:
                     try:
                         fcntl.flock(existing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        if path.name.startswith('context.parked-'):
+                            path.unlink()  # its process exited
                     except BlockingIOError:
                         existing.seek(0)
                         reserved += int(existing.read() or per_worker)
@@ -154,18 +186,53 @@ def context_admission():
                     except BlockingIOError:
                         handle.close()
                         continue
+                    # Spacing holds the admission lock, so waiters queue behind it.
+                    last_path = root / 'context-last-admit'
+                    try:
+                        last = float(last_path.read_text())
+                    except (FileNotFoundError, ValueError):
+                        last = None
+                    now = time.monotonic()
+                    if last is not None and 0 <= now - last < spacing:
+                        time.sleep(spacing - (now - last))
+                    last_path.write_text(repr(time.monotonic()))
                     handle.seek(0)
                     handle.truncate()
                     handle.write(str(per_worker))
                     handle.flush()
                     _context_lease = handle
                     atexit.register(handle.close)
-                    print(f'AOT context admitted: {per_worker} MiB reservation, {available} MiB free, '
-                          f'{reserved} MiB already reserved', flush=True)
+                    print(f'AOT context admitted: lease {index}/{count}, {per_worker} MiB reservation, '
+                          f'{available} MiB free, {reserved} MiB already reserved', flush=True)
                     return
         if time.monotonic() >= deadline:
             raise TimeoutError('CUDA context waited 7200s for host RAM admission')
-        time.sleep(60)
+        time.sleep(1)
+
+
+def park_context_lease():
+    """Free this process's counted lease while keeping its RAM reservation.
+
+    A planner whose own context idles while its pool workers run must not
+    hold one of the host's context leases: concurrent planners would starve
+    (or, at the cap, deadlock) the workers they wait on.
+    """
+    global _context_lease
+    root = os.environ.get('CUTEAFD_EXPORT_HOST_SLOT_DIR')
+    if _context_lease is None or not root:
+        return
+    root = Path(root)
+    with (root / 'context-admission.lock').open('a') as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        _context_lease.seek(0)
+        reservation = _context_lease.read()
+        parked = (root / f'context.parked-{uuid.uuid4().hex}.lock').open('x+')
+        fcntl.flock(parked, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        parked.write(reservation)
+        parked.flush()
+        _context_lease.close()
+        _context_lease = parked
+        atexit.register(parked.close)
 
 
 def install_context_admission():

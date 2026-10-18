@@ -773,8 +773,10 @@ def build(args: argparse.Namespace) -> None:
                 for schedule, raw, run_options in exports:
                     pending.append((raw, width, experts, capacity, topk, dtype, run_options,
                                     destinations, schedule, requested))
-        from _export_jobs import export_jobs
+        from _export_jobs import export_jobs, park_context_lease
         jobs = min(export_jobs(), len(pending))
+        # The planner's context idles while its workers run; free its host lease.
+        park_context_lease()
         print(f'EXL3 variants: {len(pending)} independent exports, {jobs} workers', flush=True)
         payloads = [(args, expected_compute, *item[:7]) for item in pending]
         # Spawn never inherits a CUDA context; successful manifests retain order.
