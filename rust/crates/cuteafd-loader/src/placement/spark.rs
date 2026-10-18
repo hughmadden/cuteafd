@@ -49,7 +49,9 @@ impl SparkWorkingSet {
                 let multiply = |stride: u64| rows.checked_mul(stride)
                     .ok_or(PlacementError::Overflow("Spark rotated intake/exchange"));
                 SparkIoBytes {
-                    intake: multiply(hidden * 6 + routes)?,
+                    intake: rows.min(cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS as u64)
+                        .checked_mul(hidden * 6 + routes)
+                        .ok_or(PlacementError::Overflow("Spark rotated device intake"))?,
                     host_exchange: multiply(routes + hidden * 4)?,
                     row_indices: multiply(4)?,
                     mapped_rings: 0,
@@ -423,6 +425,15 @@ mod tests {
             slot_bytes: 1 << 20, alignment: 4096 };
         let io = set.rank_endpoints_io(0, geometry, &[endpoint], rings).unwrap();
         assert_eq!(io.intake, 64 * (6144 * 6 + 8 * 8));
+        for capacity in [1, 16, 64, 65, 4096] {
+            let endpoint = SparkEndpoint { capacity, ..endpoint };
+            let rings = SparkRings { max_frame_bytes: 128 << 20, ..rings };
+            let bounded = set.rank_endpoints_io(0, geometry, &[endpoint], rings).unwrap();
+            assert_eq!(bounded.intake, u64::from(capacity.min(64)) * (6144 * 6 + 8 * 8));
+            assert_eq!(bounded.host_exchange, u64::from(capacity) * (6144 * 4 + 8 * 8));
+            assert_eq!(bounded.row_indices, u64::from(capacity) * 4);
+            assert_eq!(bounded.mapped_rings, endpoint.ring_bytes(geometry, rings).unwrap() as u64);
+        }
         assert_eq!(io.host_exchange, 64 * (6144 * 4 + 8 * 8));
         assert_eq!(io.row_indices, 64 * 4);
         assert_eq!(io.mapped_rings, endpoint.ring_bytes(geometry, rings).unwrap() as u64);

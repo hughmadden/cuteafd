@@ -4,6 +4,7 @@ mod backend;
 mod census;
 mod modules;
 mod routes;
+mod exlr8;
 
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
@@ -130,6 +131,9 @@ fn load_weights<'a>(
     ensure!(layers.iter().all(|&layer| layer >= first),
         "coordinator selected experts before this checkpoint's routed boundary {first}");
     validate_topology(config, catalog)?;
+    if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        return exlr8::load(library, catalog, config, modules.exlr8()?);
+    }
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
     if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config, modules.take_fp8()?); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);
@@ -368,7 +372,7 @@ fn spark_admission_budget(
     read_scratch: usize,
     workspace: usize,
 ) -> Result<SparkAdmissionBudget> {
-    let (exchange, row_indices) = if config.bf16_ingress {
+    let (exchange, row_indices) = if config.bf16_ingress || config.exlr8_manifest.is_some() {
         let io = selected_spark_io(config, cuteafd_core::expert_geometry(),
             worker_ring_geometry(config)?)?;
         (usize::try_from(io.host_exchange)?, usize::try_from(io.row_indices)?)

@@ -18,15 +18,46 @@ impl SparkAdmission {
         catalog: Option<&cuteafd_loader::OfficialV41Catalog>, working: &SparkWorkingSet,
         world: usize, topology: Option<SparkTopology>,
         model: ModelAdmission) -> Result<Self> {
+        Self::plan_manifest(snapshot, geometry, catalog, working, world, topology, model, None)
+    }
+
+    pub(crate) fn plan_manifest(snapshot: &Path, geometry: ExpertGeometry,
+        catalog: Option<&cuteafd_loader::OfficialV41Catalog>, working: &SparkWorkingSet,
+        world: usize, topology: Option<SparkTopology>, model: ModelAdmission,
+        manifest: Option<&str>) -> Result<Self> {
         ensure!(working.spark_layers.is_empty() || working.spark_ranks == world,
             "Spark admission working-set world differs from launched peers");
-        let identity = WorkerIdentity::from_snapshot(snapshot, geometry,
-            crate::shared::spark_topology::world(topology, world)?)?;
+        let identity = WorkerIdentity::from_snapshot_manifest(snapshot, geometry,
+            crate::shared::spark_topology::world(topology, world)?, manifest)?;
         let selection = WorkerSelection::new(identity, &working.spark_layers)?.with_model(model.clone())?;
         // Idle workers still acknowledge the identity, but need no storage package.
         let assignments = if working.spark_layers.is_empty() {
             (0..world).map(|rank| Ok(SparkAssignment { rank: u32::try_from(rank)?, resident_bytes: 0,
                 slices: vec![], io: Default::default() })).collect::<Result<Vec<_>>>()?
+        } else if let Some(manifest) = manifest {
+            use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
+            let catalog = catalog.context("EXLR8 Spark admission needs native catalog")?;
+            ensure!(catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8
+                && catalog.routed_experts().geometry()? == geometry,
+                "EXLR8 Spark admission catalog differs from coordinator");
+            crate::shared::spark_topology::require_world(
+                crate::shared::spark_topology::world(topology, world)?, catalog, &working.spark_layers)?;
+            ensure!(model.endpoints.iter().all(|endpoint|
+                endpoint.ingress == cuteafd_core::SparkIngress::Exlr8Rotated),
+                "EXLR8 Spark admission requires rotated endpoints");
+            (0..world).map(|rank| {
+                let mut assignment = SparkAssignment { rank: u32::try_from(rank)?, resident_bytes: 0,
+                    slices: vec![], io: working.rank_endpoints_io(rank, geometry, &model.endpoints, model.rings)? };
+                for &layer in &working.spark_layers {
+                    ensure!(layer >= catalog.routed_experts().first_layer && layer < geometry.layers as usize,
+                        "EXLR8 selected layer outside native backbone");
+                    let layout = Residency::plan(snapshot, manifest, layer, world, rank, ExpertSet::Routed)?;
+                    assignment.resident_bytes = assignment.resident_bytes.checked_add(layout.resident_bytes as u64)
+                        .context("EXLR8 Spark assignment resident overflow")?;
+                    assignment.slices.push(layout.spark_slice()?);
+                }
+                Ok(assignment)
+            }).collect::<Result<Vec<_>>>()?
         } else {
             let catalog = catalog.context("Spark admission needs routed checkpoint headers")?;
             ensure!(catalog.routed_experts().geometry()? == geometry,
@@ -149,6 +180,40 @@ mod tests {
             }
             assert!(plan.reconcile(&changed).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn exlr8_spark_plan_reconciles_native_manifest_when_supplied() -> Result<()> {
+        let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else { return Ok(()); };
+        let snapshot = Path::new(&snapshot);
+        let mut catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        for ranks in 1..=6 {
+            crate::shared::spark_topology::require_world(
+                cuteafd_transport::expert::SparkWorld::canonical(ranks)?, &catalog)?;
+        }
+        assert!(crate::shared::spark_topology::require_world(
+            cuteafd_transport::expert::SparkWorld::owned(SparkTopology::NATIVE_TP4_EP1)?, &catalog).is_err());
+        let geometry = catalog.routed_experts().geometry()?;
+        let working = SparkWorkingSet { spark_layers: vec![catalog.routed_experts().first_layer],
+            spark_ranks: 4, prefill_lanes: 1, ..Default::default() };
+        let mut model = fixture_model();
+        model.endpoints.iter_mut().for_each(|endpoint| endpoint.ingress = SparkIngress::Exlr8Rotated);
+        let plan = SparkAdmission::plan_manifest(snapshot, geometry, Some(&catalog), &working,
+            4, None, model.clone(), Some("up1"))?;
+        assert_eq!(plan.selection.layers(), working.spark_layers);
+        for assignment in &plan.assignments {
+            assert!(assignment.resident_bytes > 0);
+            assert_eq!(assignment.slices[0].first, 0);
+            assert_eq!(assignment.slices[0].width, 2048);
+            assert_eq!(assignment.slices[0].tiers, [2, 3, 4]);
+            assert_eq!(assignment.slices[0].projection_counts.iter().flatten().sum::<u32>(), 256 * 16 * 3 / 4);
+        }
+        check_reports(&plan)?;
+        model.endpoints[0].ingress = SparkIngress::Bf16;
+        assert!(SparkAdmission::plan_manifest(snapshot, geometry, Some(&catalog), &working,
+            4, None, model, Some("up1")).is_err());
         Ok(())
     }
 

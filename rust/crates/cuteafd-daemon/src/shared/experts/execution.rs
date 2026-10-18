@@ -561,22 +561,24 @@ pub(crate) struct HostExpertExchange {
     pub(crate) partials: Vec<u8>,
 }
 impl HostExpertExchange {
-    /// Exact bytes `new` allocates for this capacity. Admission uses this figure
-    /// instead of re-deriving the three extents.
+    /// Exact bytes owned by the reusable exchange at its admitted capacity.
     pub fn bytes_for(capacity: u32) -> Result<usize> {
-        ensure!(
-            capacity > 0 && capacity <= 4096,
-            "unsupported native host exchange capacity"
-        );
+        Self::bytes_for_output(capacity, false)
+    }
+    pub(crate) fn bytes_for_output(capacity: u32, rotated: bool) -> Result<usize> {
+        ensure!((1..=4096).contains(&capacity), "unsupported native host exchange capacity");
         let geometry = cuteafd_core::expert_geometry();
         let routes = capacity as usize * geometry.topk as usize;
-        routes
-            .checked_mul(8)
-            .and_then(|routes| routes.checked_add(capacity as usize * geometry.row_bytes() as usize))
+        let row_bytes = geometry.hidden as usize * if rotated { 4 } else { 2 };
+        routes.checked_mul(8)
+            .and_then(|routes| routes.checked_add(capacity as usize * row_bytes))
             .context("native host exchange size overflow")
     }
     pub fn new(capacity: u32) -> Result<Self> {
-        let bytes = Self::bytes_for(capacity)?;
+        Self::with_output(capacity, false)
+    }
+    pub(crate) fn with_output(capacity: u32, rotated: bool) -> Result<Self> {
+        let bytes = Self::bytes_for_output(capacity, rotated)?;
         let routes = capacity as usize * cuteafd_core::expert_geometry().topk as usize;
         Ok(Self {
             ids: vec![0; routes],
@@ -888,5 +890,28 @@ mod timing_role_tests {
             crate::shared::spark_topology::SPARK_TP6_ROLE
         ));
         assert_eq!(crate::shared::spark_topology::SPARK_TP6_ROLE, 7);
+    }
+}
+
+#[cfg(test)]
+mod exchange_tests {
+    use super::HostExpertExchange;
+    #[test]
+    fn exlr8_exchange_charges_f32_rows_and_keeps_route_extents() {
+        let geometry = cuteafd_core::expert_geometry();
+        for capacity in [1, 16, 64, 65, 4096] {
+            let ordinary = HostExpertExchange::new(capacity).unwrap();
+            let rotated = HostExpertExchange::with_output(capacity, true).unwrap();
+            assert_eq!(ordinary.ids.len(), rotated.ids.len());
+            assert_eq!(ordinary.routing.len(), rotated.routing.len());
+            assert_eq!(rotated.partials.len(), 2 * ordinary.partials.len());
+            assert_eq!(rotated.partials.len(), capacity as usize * geometry.hidden as usize * 4);
+            assert_eq!(HostExpertExchange::bytes_for_output(capacity, true).unwrap(),
+                rotated.ids.len() * 4 + rotated.routing.len() * 4 + rotated.partials.len());
+        }
+        for capacity in [0, 4097, u32::MAX] {
+            assert!(HostExpertExchange::with_output(capacity, true).is_err());
+            assert!(HostExpertExchange::bytes_for_output(capacity, false).is_err());
+        }
     }
 }

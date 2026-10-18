@@ -85,6 +85,12 @@ pub(crate) fn require_supported(
 }
 
 pub(crate) fn require_wire(world: SparkWorld, catalog: &OfficialV41Catalog) -> Result<()> {
+    if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        ensure!(world.ownership_topology().is_none(),
+            "EXLR8 unit ownership requires canonical Spark wire");
+        ensure!((1..=6).contains(&world.topology().world_size()), "EXLR8 requires 1..=6 ranks");
+        return Ok(());
+    }
     require_supported(world.ownership_topology(), catalog)?;
     let family = catalog.routed_experts().geometry()?.family();
     if world.ownership_topology().is_none() && catalog.exl3().is_none() && catalog.fp8().is_none() {
@@ -97,6 +103,13 @@ pub(crate) fn require_wire(world: SparkWorld, catalog: &OfficialV41Catalog) -> R
 
 pub(crate) fn require_world(world: SparkWorld, catalog: &OfficialV41Catalog, layers: &[usize]) -> Result<()> {
     require_wire(world, catalog)?;
+    if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        let shape = catalog.routed_experts();
+        ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1])
+            && layers.iter().all(|&layer| layer >= shape.first_layer && layer < shape.layers),
+            "EXLR8 hosted layers must be nonempty, sorted, unique routed target layers");
+        return Ok(());
+    }
     let tp = world.topology().tp() as usize;
     let headers = cuteafd_loader::plan::files::open_role(catalog.snapshot(),
         cuteafd_loader::plan::files::ReadRole::Spark { rank: 0, world: tp })?;

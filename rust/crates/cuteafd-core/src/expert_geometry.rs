@@ -5,6 +5,9 @@
 use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
+/// Native EXLR8 workers reuse one device arena across serial request chunks.
+pub const EXLR8_EXECUTION_ROWS: usize = 64;
+
 /// One persistent coordinator-to-Spark connection, resolved before allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
