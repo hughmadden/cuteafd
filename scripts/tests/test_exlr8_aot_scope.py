@@ -133,7 +133,7 @@ def test_wip_artifacts_rejects_invalid_override(tmp_path):
 def test_spark_programs_manifest_is_installed_on_both_roles():
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     final = build[build.index('# Generic-family tables must come from this build'):]
-    assert '|| "$exlr8_aot" == ON ]]; then' in final.split('\n')[4]
+    assert '|| "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then' in final.split('\n')[4]
 
 
 def test_cmake_appends_exlr8_last_with_role_by_architecture():
