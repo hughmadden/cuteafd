@@ -824,7 +824,7 @@ compiler_cache_args=()
 cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$release_source_parent}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash")" || release_die "cache plan failed"
 mapfile -t compiler_cache_args <<<"$cache_plan"
 cuteafd_cdi_gpu_args "$export_gpu_uuid" || exit 2
-timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_export_container" \
+timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_export_container" \
   "${CUTEAFD_CDI_ARGS[@]}" \
   --ipc=host \
   --ulimit memlock=-1:-1 \
@@ -926,7 +926,7 @@ release_prepare_build_root "$seed_host" "$remote_dir"
 echo "== building Spark development and inference images natively on $seed_host =="
 build_spark_release_leg() {
   local phase="$1"
-  timeout "$export_timeout" --foreground ssh "${release_ssh_opts[@]}" "$seed_host" setsid --wait bash -s -- \
+  timeout --foreground "$export_timeout" ssh "${release_ssh_opts[@]}" "$seed_host" setsid --wait bash -s -- \
   "$remote_dir" "$SPARK_EXPERT_DOCKER_DEV" "$SPARK_EXPERT_DOCKER_INFERENCE" \
   "$engine_commit" "$sparkinfer_commit" "$release_version" \
   "${source_manifest_sha256:-__legacy__}" "$(r="${spark_tp_roles//;/,}"; echo "${r:-__legacy__}")" \
