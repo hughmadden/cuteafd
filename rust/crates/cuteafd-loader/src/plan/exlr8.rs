@@ -14,6 +14,8 @@ use super::format::{
     BlockScale, Encoding, RowTiling, ScaleDirection, ScaleEncoding, TrellisCodebook,
 };
 
+pub mod residency;
+
 const FORMAT: &str = "exlr8-v2";
 const SCHEME: &str = "exlr8-e4m3-v2";
 
