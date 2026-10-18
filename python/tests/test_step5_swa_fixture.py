@@ -54,7 +54,7 @@ def test_official_layer0_swa_fixtures():
                 "attention_bf16_p_error_ratio_bound": 1.01,
                 "attention_bf16_p": "FP64 online tiles32; unnormalized P BF16; denominator unrounded; output BF16",
                 "gemm_error_ratio_bound": 1.01,
-                "rms_relative_l2_bound": 1e-5}
+                "norm_error_ratio_bound": 1.01, "norm_row_max_ulp_slack": 1}
 
     def save(name, tensor):
         value = tensor.detach().contiguous().cpu()
@@ -74,6 +74,11 @@ def test_official_layer0_swa_fixtures():
             packed = a._project_packed_qkv(hidden)
             qraw, kraw, v = a._split_packed_qkv(packed)
             query, key, value = a._project(hidden, positions)
+            save(f"r{rows}_norm_fp64", golden.norm_accuracy_fp64(
+                x, layer.input_layernorm.weight, config.rms_norm_eps))
+            for name, operand, weight in [("query", qraw, a.q_norm.weight), ("key", kraw, a.k_norm.weight)]:
+                save(f"r{rows}_{name}_fp64", golden.norm_accuracy_fp64(operand, weight,
+                    config.rms_norm_eps, cos=a.rope_cos[positions], sin=a.rope_sin[positions]))
             attention = a._sliding_prefill_chunked(query, key, value, 512)
             logits = a.g_proj(hidden)
             gated = attention * logits.sigmoid().unsqueeze(-1)

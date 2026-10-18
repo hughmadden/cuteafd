@@ -481,13 +481,12 @@ mod tests {
                     if oracle == "official_native" {
                         exact = actual == expected;
                         if *name == "norm" {
-                            // Torch and the warp reduce squares in different orders.
-                            // Real weights measured one differing BF16 value at M128,
-                            // relative L2 3.89e-6; scaling/epsilon/order stay unchanged.
-                            ensure!(
-                                rel_l2 <= 1e-5,
-                                "dense RMS reduction exceeds qualified reordering bound"
-                            );
+                            super::super::norm_accuracy::check(
+                                &actual,
+                                &expected,
+                                &fixture(&root, &manifest, &format!("fp64_r{rows}_norm"))?,
+                                HIDDEN,
+                            )?;
                         }
                     }
                 }

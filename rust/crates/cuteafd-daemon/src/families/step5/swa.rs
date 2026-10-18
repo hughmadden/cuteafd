@@ -575,9 +575,14 @@ mod tests {
             for (name, plane, width, size) in boundaries {
                 let actual = read(&chain, chain.planes[plane].buffer, rows * width * size)?;
                 eprintln!("SWA chained rows={rows} boundary={name}");
-                let error = metrics(&actual, &load(name)?, size, size, width)?;
+                metrics(&actual, &load(name)?, size, size, width)?;
                 if name == "norm" {
-                    ensure!(error <= 1e-5, "SWA RMS reduction bound");
+                    super::super::norm_accuracy::check(
+                        &actual,
+                        &load(name)?,
+                        &load("norm_fp64")?,
+                        width,
+                    )?;
                 }
                 eager.push((chain.planes[plane].buffer, actual));
             }
@@ -671,10 +676,12 @@ mod tests {
                 chain.stream.drain()?;
                 let expected = load(name)?;
                 let actual = read(&chain, chain.planes[output].buffer, expected.len())?;
-                ensure!(
-                    actual == expected,
-                    "SWA isolated Q/K norm/RoPE differs at {name}"
-                );
+                super::super::norm_accuracy::check(
+                    &actual,
+                    &expected,
+                    &load(&format!("{name}_fp64"))?,
+                    192,
+                )?;
             }
             for (plane, name) in [(QUERY, "query"), (KPAGES, "key"), (VPAGES, "value")] {
                 device.run(|| library.copy_h2d(chain.planes[plane].buffer, &load(name)?))?;
