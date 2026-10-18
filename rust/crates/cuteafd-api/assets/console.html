@@ -13,11 +13,26 @@
 #mapped-tables caption { text-align: left; padding: 8px 0; }
 #mapped-tables th, #mapped-tables td { padding-right: 10px; }
 #mapped-tables th:first-child, #mapped-tables td:first-child { min-width: 160px; max-width: 300px; white-space: normal; overflow-wrap: anywhere; }
+/* lanes header: keys hint centered between legend and controls */
+#lanes .panel-head .legend { flex: 0 1 auto; }
+.lane-keys { flex: 1 1 auto; text-align: center; white-space: nowrap; }
+#lanes .ctl { margin-left: 0; }
+/* GPU table */
+@media (min-width: 1300px) { .meters:has(#gpu-meter:not([hidden])) { grid-template-columns: repeat(3, minmax(240px, 1fr)) minmax(430px, 1.5fr); } }
+#gpu-meter { overflow-x: auto; }
+.gpu-table { width: 100%; border-collapse: collapse; font: 12px var(--mono); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.gpu-table th { color: var(--muted); font-weight: 500; text-align: right; padding: 2px 6px; border-bottom: 1px solid var(--line); }
+.gpu-table td { text-align: right; padding: 2px 6px; color: var(--ink-2); white-space: nowrap; }
+.gpu-table th:first-child, .gpu-table td:first-child { text-align: left; padding-left: 0; }
+.gpu-table td:first-child { color: var(--ink); }
+.gpu-table small { color: var(--muted); }
+.gpu-table td.warn { color: var(--warn); font-weight: 600; }
+.gpu-table td.bad { color: var(--bad); font-weight: 600; }
+.gpu-total { color: var(--warn); font-weight: 600; }
+#gpu-title[title]:not([title=""]) { cursor: help; }
+
 @media (max-width: 600px) {
-  .app { min-width: 0; padding-inline: 16px; }
-  .app > * { min-width: 0; }
-  .nav { flex-wrap: wrap; flex-shrink: 1; margin-left: 0; }
-  .brand { flex-wrap: wrap; }
+  .lane-keys { display: none; }
   #mapped-tables th:first-child, #mapped-tables td:first-child { min-width: 110px; max-width: 130px; }
 }
 </style>
@@ -26,7 +41,6 @@
 <div class="app">
   <header id="top"></header>
   <template id="status-tpl"><span class="status" id="status"><i></i><span id="status-text">CONNECTING</span></span></template>
-  <template id="keys-tpl"><span class="keys"><kbd>space</kbd> pause · <kbd>t</kbd> text · <kbd>−</kbd><kbd>+</kbd> zoom</span></template>
   <div class="banner" id="banner" hidden></div>
 
   <section class="kpis" id="kpis"></section>
@@ -48,12 +62,12 @@
       <div class="row"><span class="num">snapshots <b id="h-snaps">–</b> · hits <b id="h-hits">–</b> / <span id="h-look">–</span></span><span class="num"><span id="h-p50-label">restore p50</span> <b id="h-p50">–</b></span></div>
     </div>
     <div class="meter" id="gpu-meter" hidden>
-      <div class="row"><span class="label">GPUs · temperature, power, clock</span><span class="num" id="gpu-gov"></span></div>
-      <div id="gpu-rows"></div>
+      <div class="row"><span class="label" id="gpu-title">GPUs</span><span class="num gpu-total" id="gpu-total"></span></div>
+      <table class="gpu-table"><thead><tr><th>GPU</th><th>temp</th><th>power</th><th>clock</th><th>cap</th></tr></thead><tbody id="gpu-rows"></tbody></table>
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="lanes">
     <div class="panel-head">
       <h2>Execution lanes</h2>
       <div class="legend" id="legend">
@@ -65,6 +79,7 @@
         <span><i style="background:var(--prefill)"></i>prefill</span>
         <span><i style="background:var(--restore)"></i>restore</span>
       </div>
+      <span class="keys lane-keys" id="lane-keys" title="Keys act while the Execution lanes pane is on screen"><kbd>space</kbd> pause · <kbd>t</kbd> text · <kbd>−</kbd><kbd>+</kbd> zoom</span>
       <div class="ctl">
         <div class="seg" role="group" aria-label="View">
           <button type="button" id="v-time" aria-pressed="true">TIME</button>
@@ -83,14 +98,6 @@
     <div class="note" id="ticker-note"></div>
   </section>
 
-  <section class="panel" id="mapped-tables" hidden>
-    <div class="panel-head"><h2>Mapped tables</h2>
-      <select id="mapped-window" class="btn" aria-label="Mapped table counter interval"><option value="interval">Last 60 seconds</option><option value="cumulative">Since launch</option></select>
-    </div>
-    <div class="note">Engram / PLE demand reads. nowait-exact counts full NOWAIT completions. mincore is a pre-read residency snapshot (mmap, or io_uring files without NOWAIT); mixed files use mincore only where needed. io_uring miss time starts at batch submission and includes retries; mmap has no miss timer. Unclassified reads have one submission-to-final-reap makespan per bounded wave (at most 4K rows), including retries; batch tiers are not individual read-service latency. Demand and prefetch are separate. Device estimates count miss-row page spans; host-wide reads include unrelated I/O.</div>
-    <div class="tablewrap"><table><caption>Classified miss latency (rows) / unclassified makespan (batches)</caption><thead><tr><th>Table</th><th>&lt;5 us</th><th>5-10 us</th><th>10-50 us</th><th>50-200 us</th><th>200 us-1 ms</th><th>1-10 ms</th><th>&gt;=10 ms</th><th>Prefetch hits / misses</th><th>mincore overhead</th></tr></thead><tbody id="mapped-tiers"></tbody></table></div>
-    <div class="tablewrap"><table><thead><tr><th>Table / backend</th><th>Hit %</th><th>Hits / misses</th><th>Hit bytes</th><th>Miss-request bytes</th><th>Avg miss</th><th>Max miss (lifetime)</th><th>NOWAIT batch avg</th><th>Consumer wait ms / decode step (Engram pair on weight)</th><th>Device bytes (estimate)</th><th>Host-wide device reads (since sample)</th></tr></thead><tbody id="mapped-rows"></tbody></table></div>
-  </section>
 
   <div class="bottom">
     <section class="panel">
@@ -108,9 +115,18 @@
         <div class="facts" id="facts"></div>
       </div>
       <div class="panel-head" style="margin-top:4px"><h2>Recent requests</h2></div>
-      <div class="tablewrap"><table><thead><tr><th>Request</th><th>Input</th><th>Cached</th><th>Output</th><th>TTFT</th><th>Decode</th><th>Status</th></tr></thead><tbody id="recent"></tbody></table></div>
+      <div class="tablewrap"><table><thead><tr><th>Request</th><th>Input</th><th>Cached</th><th>Output</th><th>TTFT</th><th>Prefill</th><th>Decode</th><th>Status</th></tr></thead><tbody id="recent"></tbody></table></div>
     </section>
   </div>
+
+  <section class="panel" id="mapped-tables" hidden>
+    <div class="panel-head"><h2>Mapped tables</h2>
+      <select id="mapped-window" class="btn" aria-label="Mapped table counter interval"><option value="interval">Last 60 seconds</option><option value="cumulative">Since launch</option></select>
+    </div>
+    <div class="note">Engram / PLE demand reads. nowait-exact counts full NOWAIT completions. mincore is a pre-read residency snapshot (mmap, or io_uring files without NOWAIT); mixed files use mincore only where needed. io_uring miss time starts at batch submission and includes retries; mmap has no miss timer. Unclassified reads have one submission-to-final-reap makespan per bounded wave (at most 4K rows), including retries; batch tiers are not individual read-service latency. Demand and prefetch are separate. Device estimates count miss-row page spans; host-wide reads include unrelated I/O.</div>
+    <div class="tablewrap"><table><caption>Classified miss latency (rows) / unclassified makespan (batches)</caption><thead><tr><th>Table</th><th>&lt;5 us</th><th>5-10 us</th><th>10-50 us</th><th>50-200 us</th><th>200 us-1 ms</th><th>1-10 ms</th><th>&gt;=10 ms</th><th>Prefetch hits / misses</th><th>mincore overhead</th></tr></thead><tbody id="mapped-tiers"></tbody></table></div>
+    <div class="tablewrap"><table><thead><tr><th>Table / backend</th><th>Hit %</th><th>Hits / misses</th><th>Hit bytes</th><th>Miss-request bytes</th><th>Avg miss</th><th>Max miss (lifetime)</th><th>NOWAIT batch avg</th><th>Consumer wait ms / decode step (Engram pair on weight)</th><th>Device bytes (estimate)</th><th>Host-wide device reads (since sample)</th></tr></thead><tbody id="mapped-rows"></tbody></table></div>
+  </section>
 </div>
 <div class="tip" id="tip" hidden></div>
 
@@ -136,8 +152,9 @@ const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // ---------------------------------------------------------------- state
 const top = CuteUI.header($('#top'), { page: 'console', subtitle: 'Engine console' });
-top.status.replaceWith($('#status-tpl').content.cloneNode(true));
-top.extra.replaceWith($('#keys-tpl').content.cloneNode(true));
+{ const pills = document.createElement('span'); pills.className = 'pills';
+  pills.append($('#status-tpl').content.cloneNode(true), CuteUI.fabricChip({ live: () => S.connected })); top.status.replaceWith(pills); }
+top.extra.closest('.header-extra').remove();
 const S = {
   config: {}, textAllowed: false, textState: 'off', disabled: false, starting: false,
   requests: new Map(), recent: [], gauges: {}, totals: [], prefill: [], rounds: [],
@@ -197,8 +214,8 @@ function onSnapshot(m) {
   S.textState = state === true || state === 'on' ? 'on' : state === 'locked' ? 'locked' : 'off';
   S.textAllowed = S.textState === 'on';
   $('#v-text').disabled = S.textState === 'off';
-  $('#v-text').textContent = S.textState === 'locked' ? 'TEXT (unlock)' : S.textAllowed ? 'TEXT' : 'TEXT (off)';
-  $('#v-text').title = S.textState === 'locked' ? 'open the console unlock link the run script printed' : S.textAllowed ? 'Show generated text' : 'Start the server with --console-text (CUTEAFD_CONSOLE_TEXT=1) to stream token text';
+  $('#v-text').textContent = S.textState === 'locked' ? 'TEXT (locked)' : S.textAllowed ? 'TEXT' : 'TEXT (off)';
+  $('#v-text').title = S.textState === 'locked' ? 'Text view needs the admin console link' : S.textAllowed ? 'Show generated text' : 'Start the server with --console-text (CUTEAFD_CONSOLE_TEXT=1) to stream token text';
   if (!S.textAllowed && S.mode === 'text') setMode('time');
   const live = new Set();
   for (const x of m.requests || []) { live.add(x.id); fromSnapshotRequest(x); }
@@ -304,52 +321,65 @@ function rate(key, windowMs) {
   return dt > 0.2 ? (last[key] - first[key]) / dt : NaN;
 }
 
-// ---------------------------------------------------------------- socket
-let retry = 500, apiKey = '';
-window.cuteafdAuthenticatedFetch = (path, init = {}) => {
-  const headers = new Headers(init.headers);
-  if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
-  return fetch(path, { ...init, headers });
-};
-const fabricHealth = document.createElement('div');
-fabricHealth.className = 'note';
-fabricHealth.style.cssText = 'order:11;flex-basis:100%;min-width:0;padding:0 0 10px;overflow-wrap:anywhere';
-$('#top').append(fabricHealth);
-async function pollFabricHealth() {
-  if (!document.hidden && S.connected) {
-    try {
-      const response = await window.cuteafdAuthenticatedFetch('/v1/fabric', { signal: AbortSignal.timeout(2500) });
-      if (!response.ok) throw new Error('fabric unavailable');
-      const snapshot = await response.json();
-      const lines = Object.entries(snapshot.hosts || {}).map(([name, host]) => {
-        const ports = (host.ports || []).map(p => {
-          const h = p.health_since_start;
-          const verdict = h?.verdict === 'ok' ? 'OK' : h?.verdict || 'unknown';
-          return `${p.device}/${p.port} ${p.state || 'unknown'} ${p.link_gbps ?? '?'} Gb/s MTU ${p.mtu ?? '?'}: ${verdict} - ${(h?.reasons || ['no continuous observation']).join('; ')}`;
-        });
-        const verdict = host.health_since_start === 'ok' ? 'OK' : host.health_since_start || 'unknown';
-        return `${name}: ${verdict} since observation start; ${ports.join(' | ') || 'no port evidence'}; pause not collected`;
-      });
-      fabricHealth.replaceChildren(...(lines.length ? lines : ['Fabric unknown: awaiting host observations']).map(text => {
-        const line = document.createElement('div'); line.textContent = text; return line;
-      }));
-    } catch (_) { fabricHealth.textContent = 'Fabric unknown: observation unavailable'; }
-  } else { fabricHealth.textContent = 'Fabric unknown: observation paused while hidden or disconnected'; }
-  setTimeout(pollFabricHealth, 2000);
+// ---------------------------------------------------------------- GPU table
+// One row per serving device: the coordinator's RTX cards, then each Spark by
+// host. RTX cap is the live power limit (yellow at the power cap); a thermally
+// throttled card not at its cap shows its temperature in red. GB10 has no power
+// limit, so a Spark's cap cell is its temperature, red when thermally throttled.
+const THERMAL = ['hw_thermal', 'sw_thermal', 'hw_slowdown'];
+function renderGpus(th) {
+  const rtx = th?.gpus || [], sparks = th?.sparks || [];
+  $('#gpu-meter').hidden = !rtx.length && !sparks.length;
+  if ($('#gpu-meter').hidden) return;
+  const f = (v, unit) => v == null ? '–' : `${Math.round(v)}${unit}`;
+  const hot = (x) => (x.throttling || []).some((r) => THERMAL.includes(r));
+  const capped = (x) => (x.throttling || []).includes('sw_power_cap');
+  const why = (x) => esc((x.throttling || []).join(', ') || 'not throttled');
+  const rows = rtx.map((x) => {
+    const cap = capped(x) ? `<td class="warn" title="${why(x)}">${f(x.power_limit_w, ' W')}</td>`
+      : hot(x) ? `<td class="bad" title="${why(x)}">${f(x.temperature_c, ' °C')}</td>`
+      : `<td title="${why(x)}">${f(x.power_limit_w, ' W')}</td>`;
+    return `<tr><td>${esc((x.name || 'GPU').replace(/^NVIDIA /, '').replace(/ Blackwell.*| Workstation.*/, ''))} <small>gpu${x.index}</small></td>`
+      + `<td>${f(x.temperature_c, ' °C')}</td><td>${f(x.power_w, ' W')}</td><td>${f(x.sm_clock_mhz, ' MHz')}</td>${cap}</tr>`;
+  }).concat(sparks.map((x) => `<tr><td>${esc(x.host)} <small>GB10</small></td><td>${f(x.temperature_c, ' °C')}</td>`
+    + `<td>${f(x.power_w, ' W')}</td><td>${f(x.sm_clock_mhz, ' MHz')}</td>`
+    + `<td class="${hot(x) ? 'bad' : ''}" title="${why(x)}">${f(x.temperature_c, ' °C')}</td></tr>`));
+  $('#gpu-rows').innerHTML = rows.join('');
+  const total = [...rtx, ...sparks].reduce((sum, x) => sum + (Number.isFinite(x.power_w) ? x.power_w : 0), 0);
+  $('#gpu-total').textContent = total ? `${Math.round(total)} W total` : '';
+  const reason = th?.governor?.reason;
+  $('#gpu-title').textContent = reason ? 'GPUs ⓘ' : 'GPUs';
+  $('#gpu-title').title = reason ? `Power governor: ${reason}` : '';
 }
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) fabricHealth.textContent = 'Fabric unknown: observation paused while hidden';
-});
-setTimeout(pollFabricHealth, 2000);
+
+// ---------------------------------------------------------------- feed
+// The console's reads are open; the admin console cookie only adds token text.
+let retry = 500;
+// Text view while locked: a small dialog naming the admin link and how to print it.
+async function textLockedDialog() {
+  let dialog = $('#text-locked');
+  if (!dialog) {
+    const { link_command: command } = await CuteUI.access();
+    dialog = document.createElement('dialog');
+    dialog.id = 'text-locked'; dialog.className = 'admin-dialog';
+    dialog.setAttribute('aria-labelledby', 'text-locked-title');
+    dialog.innerHTML = `<div><h2 id="text-locked-title">Text view needs the admin console link</h2>
+      <p>The live token text is shown only to a browser holding the <b>admin console link</b>; everything else on this page works without it.</p>
+      ${CuteUI.linkHelp(command)}</div><form method="dialog" class="actions"><button class="btn" value="close">CLOSE</button></form>`;
+    document.body.append(dialog);
+    CuteUI.wireCopy(dialog, command || '');
+    dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
+  }
+  if (!dialog.open) dialog.showModal();
+}
+
+// ---------------------------------------------------------------- fabric chip
+// Shared with /bench (CuteUI.fabricChip): polls /v1/fabric while visible and connected.
+
+
 async function connect() {
   try {
-    const headers = new Headers();
-    if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`);
-    let response = await fetch('/v1/console/events', { headers });
-    if (response.status === 401) {
-      const key = window.prompt('API key for this server (kept in memory for this tab only)');
-      if (key) { apiKey = key; headers.set('Authorization', `Bearer ${apiKey}`); response = await fetch('/v1/console/events', { headers }); }
-    }
+    const response = await fetch('/v1/console/events');
     if (!response.ok) throw new Error(response.statusText);
     S.connected = true; retry = 500;
     const reader = response.body.getReader(), decoder = new TextDecoder();
@@ -367,7 +397,7 @@ async function connect() {
       }
     }
   } catch (_) {}
-  S.connected = false; retry = Math.min(retry * 2, 5000); setTimeout(connect, retry);
+  S.connected = false; retry = Math.min(Math.max(retry, 500) * 2, 5000); setTimeout(connect, retry);
 }
 
 // ---------------------------------------------------------------- header, status
@@ -403,10 +433,10 @@ function status() {
 
 // ---------------------------------------------------------------- KPI tiles
 const TILES = [
-  { key: 'out', label: 'Output tokens / s', c: COL.tgt, spark: true },
-  { key: 'acc', label: 'Accepted drafts / s', c: COL.acc, spark: true },
-  { key: 'drf', label: 'Proposed drafts / s', c: COL.spark, spark: true },
-  { key: 'pre', label: 'Prefill tokens / s', c: COL.pf, spark: true },
+  { key: 'out', label: 'Output tps', c: COL.tgt, spark: true },
+  { key: 'acc', label: 'Accepted draft tps', c: COL.acc, spark: true },
+  { key: 'drf', label: 'Proposed draft tps', c: COL.spark, spark: true },
+  { key: 'pre', label: 'Prefill tps', c: COL.pf, spark: true },
   { key: 'conc', label: 'Concurrent requests', c: COL.ink2, spark: true },
   { key: 'input', label: 'Input tokens', c: COL.rs },
   { key: 'output', label: 'Output tokens', c: COL.acc },
@@ -443,10 +473,10 @@ function renderKpis() {
   // Right-hand stats: the 60 s peak, and for lifetime totals the current rate.
   const peak = (k) => { const v = S.series[k].filter(Number.isFinite); return v.length ? Math.max(...v) : NaN; };
   const side = (k, html) => { $('#kx-' + k).innerHTML = html; };
-  for (const k of ['out', 'acc', 'drf', 'pre']) side(k, `<span>60 s max</span><b>${compact(peak(k))}/s</b>`);
+  for (const k of ['out', 'acc', 'drf', 'pre']) side(k, `<span>60 s max</span><b>${compact(peak(k))} tps</b>`);
   side('conc', `<span>60 s max</span><b>${n0(peak('conc'))}</b>`);
-  side('input', `<b>+${compact(rate('input_tokens', w))}/s</b><span>max ${compact(peak('inp'))}/s</span>`);
-  side('output', `<b>+${compact(out)}/s</b><span>max ${compact(peak('out'))}/s</span>`);
+  side('input', `<b>+${compact(rate('input_tokens', w))} tps</b><span>max ${compact(peak('inp'))} tps</span>`);
+  side('output', `<b>+${compact(out)} tps</b><span>max ${compact(peak('out'))} tps</span>`);
 }
 
 // ---------------------------------------------------------------- meters
@@ -521,15 +551,7 @@ function renderMeters() {
     $('#kv-a').style.width = (100 * active / kv.pages) + '%'; $('#kv-r').style.width = (100 * ret / kv.pages) + '%';
     $('#kv-tok').textContent = compact(used * kv.tokens_per_page); $('#kv-cap').textContent = compact(kv.pages * kv.tokens_per_page);
   }
-  const th = g.thermal;
-  $('#gpu-meter').hidden = !th?.gpus?.length;
-  if (th?.gpus?.length) {
-    const f = (v, unit) => v == null ? '–' : `${Math.round(v)}${unit}`;
-    $('#gpu-rows').innerHTML = th.gpus.map((x) => `<div class="row"><span class="num">gpu${x.index} <b>${f(x.temperature_c, ' °C')}</b>`
-      + ` · headroom ${f(x.tlimit_margin_c, ' °C')} · ${f(x.power_w, '')}/${f(x.power_limit_w, ' W')} · ${f(x.sm_clock_mhz, ' MHz')}</span>`
-      + `<span class="num">${esc((x.throttling || []).join(' ') || 'no throttle')}</span></div>`).join('');
-    $('#gpu-gov').textContent = th.governor ? `governor ${esc(String(th.governor.reason ?? ''))}` : '';
-  }
+  renderGpus(g.thermal);
   const h = g.host;
   if (h) {
     $('#h-used').textContent = bytes(h.bytes_used); $('#h-total').textContent = bytes(h.quota_bytes);
@@ -676,12 +698,15 @@ function renderRecent() {
     const ttft = x.first != null && x.admitted != null ? (x.first - x.admitted) : NaN;
     const dec = x.first != null ? (x.t - x.first) / 1000 : NaN;
     const tps = dec > 0 ? (x.gen - 1) / dec : NaN;
+    // Prefill throughput over the uncached rows, admission to first token.
+    const fresh = (x.prompt ?? 0) - (x.cached ?? 0);
+    const ptps = fresh > 0 && ttft > 0 ? fresh / (ttft / 1000) : NaN;
     const tag = x.reason === 'finished' ? '<span class="tag ok">DONE</span>' : x.reason === 'failed' ? '<span class="tag bad">FAILED</span>' : '<span class="tag gone">CANCELLED</span>';
     return `<tr><td><b>#${x.id}</b>${x.grammar ? ' <span style="color:var(--grammar)">{}</span>' : ''}</td><td>${compact(x.prompt)}</td><td>${compact(x.cached)}</td>
       <td><b>${compact(x.gen)}</b></td><td>${Number.isFinite(ttft) ? (ttft >= 1000 ? (ttft / 1000).toFixed(2) + ' s' : ttft.toFixed(0) + ' ms') : '–'}</td>
-      <td>${Number.isFinite(tps) ? nf1.format(tps) + ' tok/s' : '–'}</td><td>${tag}</td></tr>`;
+      <td>${Number.isFinite(ptps) ? compact(ptps) + ' tps' : '–'}</td><td>${Number.isFinite(tps) ? nf1.format(tps) + ' tps' : '–'}</td><td>${tag}</td></tr>`;
   });
-  $('#recent').innerHTML = rows.join('') || '<tr><td colspan="7" class="empty">No completed requests yet.</td></tr>';
+  $('#recent').innerHTML = rows.join('') || '<tr><td colspan="8" class="empty">No completed requests yet.</td></tr>';
 }
 
 // ---------------------------------------------------------------- ticker
@@ -719,14 +744,18 @@ function setZoom(z) { S.pxPerS = z; for (const b of document.querySelectorAll('#
 function setPaused(p) { S.paused = p; S.frozenAt = p ? displayNow() : null; $('#pause').setAttribute('aria-pressed', p); $('#pause').textContent = p ? 'RESUME' : 'PAUSE'; }
 $('#v-time').onclick = () => setMode('time');
 function showText() {
-  if (S.textState === 'locked') $('#ticker-note').textContent = 'open the console unlock link the run script printed';
+  if (S.textState === 'locked') textLockedDialog();
   else if (S.textAllowed) setMode('text');
 }
 $('#v-text').onclick = showText;
 for (const b of document.querySelectorAll('#zoom button')) b.onclick = () => setZoom(+b.dataset.z);
 $('#pause').onclick = () => setPaused(!S.paused);
+// The keys drive only the Execution lanes pane, so they act only while it is on screen.
+let lanesVisible = true;
+new IntersectionObserver((entries) => { lanesVisible = entries.some((e) => e.isIntersecting); }).observe($('#lanes'));
 addEventListener('keydown', (e) => {
-  if (e.target.closest('input,select,textarea')) return;
+  if (!lanesVisible || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.target.closest('input,select,textarea,button,a,[contenteditable]')) return;
   if (e.key === ' ') { e.preventDefault(); setPaused(!S.paused); }
   else if (e.key === 't') { if (S.textAllowed && S.mode === 'text') setMode('time'); else showText(); }
   else if (e.key === '+' || e.key === '=') setZoom(Math.min(1200, S.pxPerS * 2));
@@ -825,7 +854,7 @@ function gutter(r, y0, h, tD) {
   // recent decode rate over the last two seconds
   let e = 0; for (let i = r.cols.length - 1; i >= 0 && r.cols[i].t1 > tD - 2000; i--) if (r.cols[i].t1 <= tD) e += r.cols[i].e;
   ctx.fillStyle = COL.muted; ctx.textAlign = 'right'; ctx.font = `10px ${MONO}`;
-  ctx.fillText(r.retired != null ? (r.reason === 'finished' ? 'done' : r.reason === 'failed' ? 'failed' : 'cancelled') : `${(e / 2).toFixed(0)}/s`, GUT - 14, mid);
+  ctx.fillText(r.retired != null ? (r.reason === 'finished' ? 'done' : r.reason === 'failed' ? 'failed' : 'cancelled') : `${(e / 2).toFixed(0)} tps`, GUT - 14, mid);
   ctx.textAlign = 'left';
 }
 function drawCells(r, y0, h, right, X, tD) {
@@ -947,7 +976,7 @@ function tooltip(hit) {
   } else if (hit.kind === 'prefill') {
     const p = hit.p, d = p.t1 - p.t0;
     text = `${p.k === 'chunk' ? `prefill chunk ${p.i + 1}/${p.n}${laneCount() > 1 ? `, lane ${p.lane}` : ''}` : p.k === 'restore' ? 'prefix restore' : p.k === 'replay' ? 'decoder replay' : `prefill ${p.k}`}${p.id != null ? `  #${p.id}` : ''}\n` +
-      `${n0(p.rows)} rows · ${d.toFixed(1)} ms${p.k !== 'replay' && d > 0 ? ` · ${compact(p.rows / d * 1000)} tok/s` : ''}`;
+      `${n0(p.rows)} rows · ${d.toFixed(1)} ms${p.k !== 'replay' && d > 0 ? ` · ${compact(p.rows / d * 1000)} tps` : ''}`;
   } else {
     const r = hit.r, c = hit.c;
     const main = c.main.map(([k, s]) => (k === 'a' ? 'accepted ' : 'target   ') + JSON.stringify(s)).join('\n');

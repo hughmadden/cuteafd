@@ -1202,17 +1202,17 @@ def write_summary(state, rows, arms):
                               ('sparknest_sent_bytes','sparknest_received_bytes'), ('estimated_header_sent_bytes','estimated_header_received_bytes'),
                               ('foreign_sent_bytes','foreign_received_bytes')]]
                     text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {cell(phase.get('name'))} | {cell(p.get('host'))} {cell(p.get('device'))}/{p.get('port')} | " + ' | '.join(map(cell, values)) + ' |\n'
-        text += '\n### Fabric Health By Arm And Phase\n\n| Card | Arm | Phase | Host / port | Verdict | Loss events/GB | Sequence events/GB | Adapter retransmits/GB | Reason |\n| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |\n'
+        text += '\n### Fabric Health By Arm And Phase\n\n| Card | Arm | Phase | Host / port | Verdict | Retransmits (% of packets) | Judged | Reason |\n| --- | --- | --- | --- | --- | ---: | --- | --- |\n'
         for r in rows:
             for phase in r.get('fabric', []):
                 for p in phase.get('ports', []):
                     h = p.get('health') or {}
                     values = [r['card'], r['arm'], phase.get('name'), f"{p.get('host')} {p.get('device')}/{p.get('port')}",
-                              h.get('verdict', 'unknown'), h.get('loss_events_per_gb', 'unknown'),
-                              h.get('sequence_events_per_gb', 'unknown'), h.get('adapter_retransmits_per_gb', 'unknown'),
+                              h.get('verdict', 'unknown'), h.get('retransmit_pct', 'unknown'),
+                              'yes' if h.get('retransmit_judged') else 'no (under 2 GB)',
                               '; '.join(h.get('reasons') or ['no continuous observation'])]
                     text += '| ' + ' | '.join(map(cell, values)) + ' |\n'
-        text += '\nPause: not collected. Loss signals overlap; they are not lost packets or retransmitted bytes.\n\n'
+        text += '\nPause: not collected. Retransmits are go-back-N resends (one per sequence gap or timeout); no data is lost.\n\n'
     text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |\n'
     for r in rows:
         trace = r.get('trace') or {}

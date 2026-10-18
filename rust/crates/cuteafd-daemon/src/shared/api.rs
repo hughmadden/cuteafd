@@ -8,7 +8,7 @@ pub(crate) struct ApiArgs {
     /// Require a bearer key from this file on /v1/* (health stays open).
     #[arg(long, env = "API_KEY_FILE")]
     pub api_key_file: Option<PathBuf>,
-    /// Mount benchmark controls and lockout; requires --api-key-file.
+    /// Mount benchmark controls and lockout; the console cookie (or --api-key-file's key) runs them.
     #[arg(long, env = "CUTEAFD_ENABLE_BENCH")]
     pub enable_bench: bool,
     /// Usage history directory; absent uses an in-memory store.
@@ -72,7 +72,6 @@ struct GatewayPolicy {
 impl ApiArgs {
     pub fn load(&self) -> anyhow::Result<ApiPolicy> {
         let key = self.api_key_file.as_deref().map(ApiKey::from_file).transpose()?;
-        anyhow::ensure!(!self.enable_bench || key.is_some(), "--enable-bench requires --api-key-file");
         let usage = if self.usage.as_deref() == Some("off") { None } else { Some(cuteafd_usage::Store::open(self.usage_dir.as_deref())?) };
         let gate = self.console_secret_file.as_deref().map(|p| cuteafd_api::console_gate::ConsoleGate::from_file(p, self.console_cookie_secure)).transpose()?.unwrap_or_else(cuteafd_api::console_gate::ConsoleGate::locked);
         let gateway = if self.gateway == "on" {
@@ -96,14 +95,7 @@ impl ApiArgs {
             for file in [&self.api_key_file, &self.console_secret_file].into_iter().flatten() {
                 if let Ok(text) = std::fs::read_to_string(file) { secrets.push(text.trim().to_owned()); }
             }
-            if let Some(key) = &key { secrets.extend(key.secrets()); }
-            store.log.set_secrets(secrets.clone());
-            if let Some(key) = &key {
-                let log = store.log.clone();
-                key.on_reload(Arc::new(move |named| {
-                    let mut all = secrets.clone(); all.extend(named); log.set_secrets(all);
-                }));
-            }
+            store.log.set_secrets(secrets);
         }
         Ok(ApiPolicy { key, bench: self.enable_bench, usage, gate, gateway, bench_token: None, live: None })
     }
@@ -143,15 +135,21 @@ impl ApiPolicy {
             let bench = cuteafd_bench::Bench::global();
             bench.set_console(hub);
             if let Some(store) = &self_.usage { bench.set_usage(usage_toggle(store.clone())); }
-            bench.set_api_key(self_.key.clone().expect("validated benchmark key"));
+            if let Some(key) = &self_.key { bench.set_api_key(key.clone()); }
+            bench.set_console_gate(self_.gate.clone());
             let witness = bench.clone();
             let internal: Arc<dyn Fn(&str, &axum::http::HeaderMap) -> bool + Send + Sync> = Arc::new(move |path, headers| {
                 matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/models" | "/v1/stats")
                     && cuteafd_api::openai::auth::bearer(headers).is_some_and(|token| witness.accepts_internal(token))
             });
             let verify = bench.clone();
+            // Learn the served configuration in the background once the API answers.
+            let discovering = bench.clone();
+            let _ = std::thread::Builder::new().name("bench-discover".into()).spawn(move || discovering.discover());
             (cuteafd_bench::http::mount(router, bench), Some((internal, verify)))
-        } else { (router, None) };
+        } else {
+            (router.route("/bench", axum::routing::get(cuteafd_api::openai::console::bench_off)), None)
+        };
         let mut policy = self_;
         let internal = internal.map(|(internal, verify)| {
             policy.bench_token = Some(Arc::new(move |token: &str| verify.accepts_internal(token)));
@@ -167,8 +165,8 @@ impl ApiPolicy {
         let router = if let Some(store) = &self.usage {
             cuteafd_usage::http::mount_with_live(router, store.clone(), self.gate.clone(), self.live.clone())
         } else { router };
-        tracing::info!("console: protected views unlock through the launcher's link");
-        self.gate.mount(cuteafd_api::agent::mount(router, self.gate.clone()))
+        self.gate.log_location();
+        self.gate.mount(router)
     }
     /// The outermost layer: request accounting and full-log capture.
     pub(crate) fn track(self, router: axum::Router) -> axum::Router {
@@ -221,8 +219,13 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let app = ApiArgs::default().load().unwrap().app(cuteafd_api::openai::router(tx),
             cuteafd_api::openai::ConsoleHub::disabled());
-        assert_eq!(app.oneshot(axum::http::Request::get("/v1/bench/status").body(Body::empty()).unwrap())
+        assert_eq!(app.clone().oneshot(axum::http::Request::get("/v1/bench/status").body(Body::empty()).unwrap())
             .await.unwrap().status(), StatusCode::NOT_FOUND);
+        // The page itself says the runner is off instead of 404.
+        let page = app.oneshot(axum::http::Request::get("/bench").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(page.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ENABLE_BENCH=on"));
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         let app = ApiPolicy { key: Some(ApiKey::new("secret").unwrap()), bench: false, usage: None, gate: cuteafd_api::console_gate::ConsoleGate::locked(), gateway: None, bench_token: None, live: None }.app(
@@ -352,8 +355,7 @@ mod tests {
         assert_eq!(catch_scheduler_panic(|| anyhow::bail!("worker failed")).unwrap_err().to_string(), "worker failed");
     }
     #[test]
-    fn benchmark_controls_require_a_key() {
-        assert!(ApiArgs { enable_bench: true, api_key_file: None, ..Default::default() }.load().is_err());
-        assert!(ApiArgs::default().load().is_ok());
+    fn benchmark_controls_need_no_api_key() {
+        assert!(ApiArgs { enable_bench: true, api_key_file: None, ..Default::default() }.load().is_ok());
     }
 }

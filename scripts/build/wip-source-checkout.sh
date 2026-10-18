@@ -5,7 +5,7 @@
 # module object stores when they hold the pinned commit (no network, ~1 s each),
 # keep their real origin URL, and are verified against their tree locks; a
 # missing commit falls back to the network. Publishing-only submodules
-# (deepseek-harness, gptqmodel, tool-eval-bench) are left uninitialized.
+# (gptqmodel, tool-eval-bench) are left uninitialized.
 set -euo pipefail
 
 [[ $# -eq 3 ]] || { echo "usage: wip-source-checkout.sh REPO REV DEST" >&2; exit 2; }

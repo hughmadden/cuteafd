@@ -933,6 +933,11 @@ pub struct PanelResult {
     /// The running pass's record so far (charts fill progressively).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<Value>,
+    /// In an accumulated view: the run this result came from, and when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_created: Option<String>,
 }
 
 impl PanelResult {

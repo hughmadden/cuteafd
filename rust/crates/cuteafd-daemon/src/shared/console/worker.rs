@@ -123,7 +123,13 @@ impl Worker {
         object.insert("totals".into(), totals::snapshot());
         let tables = cuteafd_loader::mapped_table_stats();
         if !tables.is_empty() { object.insert("mapped_tables".into(), json!(tables)); }
-        let thermal = cuteafd_core::thermal::current();
+        let mut thermal = cuteafd_core::thermal::current();
+        // Spark GPUs from the cached fabric observation (the page's fabric poll keeps it leased).
+        let sparks = cuteafd_transport::traffic::peer_gpus(false);
+        if !sparks.is_empty() {
+            if thermal.is_null() { thermal = json!({"gpus": []}); }
+            thermal["sparks"] = json!(sparks);
+        }
         if !thermal.is_null() { object.insert("thermal".into(), thermal); }
         object.insert("active".into(), json!(self.requests.len()));
         object.insert("ids".into(), json!(self.requests.keys().collect::<Vec<_>>()));

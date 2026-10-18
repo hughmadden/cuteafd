@@ -129,7 +129,7 @@ async function refresh() {
   if (generation !== S.generation) return;
   S.loading = false; $('usage-app').classList.remove('refreshing'); document.body.dataset.usageReady = 'true';
 }
-const tileDefs = [['requests', 'Requests', 'target'], ['tokens', 'Tokens in / cached / out', 'prefill'], ['errors', 'Error rate', 'rejected'], ['ttft', 'TTFT p50 / p95', 'target'], ['decode', 'Decode p50 / tok/s', 'target'], ['cache', 'Cache hit', 'accepted'], ['acceptance', 'Acceptance', 'accepted'], ['concurrency', 'Concurrency now', 'grammar']];
+const tileDefs = [['requests', 'Requests', 'target'], ['tokens', 'Tokens in / cached / out', 'prefill'], ['errors', 'Error rate', 'rejected'], ['ttft', 'TTFT p50 / p95', 'target'], ['decode', 'Decode p50 / tps', 'target'], ['cache', 'Cache hit', 'accepted'], ['acceptance', 'Acceptance', 'accepted'], ['concurrency', 'Concurrency now', 'grammar']];
 $('kpis').innerHTML = tileDefs.map(([key, label, color]) => '<div class="tile" style="--c:var(--' + color + ')"><div class="label">' + label + '</div><div class="v" id="k-' + key + '">-</div><div class="sub" id="ks-' + key + '"></div><svg class="spark" id="spark-' + key + '"></svg></div>').join('');
 function renderOverview() {
   const d = S.data.summary || {}, latency = d.latency || {};
@@ -200,11 +200,11 @@ function renderSeries() {
 }
 function renderLatency(previous = null) {
   const d = S.data.latency || {};
-  for (const [name, color, unit, field] of [['ttft', 'target', 'ms', 't_ttft_ms'], ['decode', 'accepted', 'tok/s', 'decode_tps']]) {
+  for (const [name, color, unit, field] of [['ttft', 'target', 'ms', 't_ttft_ms'], ['decode', 'accepted', 'tps', 'decode_tps']]) {
     const m = d[name] || {};
     UI.histogram($(name + '-chart'), m.histogram || [], { ...m, color, unit, ghost: previous?.[name]?.histogram, onClick: (bin) => metricFilter(field, bin) });
   }
-  $('prefill-note').textContent = 'Prefill tok/s p50 ' + F.n1(d.prefill?.p50) + ' / p95 ' + F.n1(d.prefill?.p95);
+  $('prefill-note').textContent = 'Prefill tps p50 ' + F.n1(d.prefill?.p50) + ' / p95 ' + F.n1(d.prefill?.p95);
   $('latency-facets').innerHTML = (d.prompt_facets || []).map((f, i) => '<div><button class="btn" data-prompt="' + esc(f.prompt) + '">' + esc(f.prompt) + ' input</button><div id="facet-' + i + '" class="usage-chart"></div></div>').join('');
   for (const [i, f] of (d.prompt_facets || []).entries()) UI.histogram($('facet-' + i), f.latency?.ttft?.histogram || [], { ...f.latency?.ttft, color: 'target', unit: 'ms', height: 95, onClick: (bin) => { metricFilter('t_ttft_ms', bin, { prompt: f.prompt }); } });
   $('latency-facets').querySelectorAll('button').forEach((b) => { b.onclick = () => addFilter('prompt', b.dataset.prompt); });
@@ -277,7 +277,7 @@ function timeSplit(times = {}) {
 }
 function perfBlock(perf) {
   const p = perf || {};
-  return '<div class="performance"><p class="chart-title">Performance / tok/s / total = token sum over time sum</p><div class="small-multiples"><div class="chart-note">Prefill ' + esc(ratePair(p.prefill)) + '<br>' + compact(p.prefill?.computed_tokens) + ' computed / ' + compact(p.prefill?.cached_tokens) + ' cached tokens</div><div class="chart-note">Decode ' + esc(ratePair(p.decode)) + '<br>' + compact(p.decode?.tokens) + ' tokens after first token</div><div class="chart-note">Cache hit ' + pct(p.cache_hit) + '</div></div>' + timeSplit(p.time_ms) + '</div>';
+  return '<div class="performance"><p class="chart-title">Performance / tps / total = token sum over time sum</p><div class="small-multiples"><div class="chart-note">Prefill ' + esc(ratePair(p.prefill)) + '<br>' + compact(p.prefill?.computed_tokens) + ' computed / ' + compact(p.prefill?.cached_tokens) + ' cached tokens</div><div class="chart-note">Decode ' + esc(ratePair(p.decode)) + '<br>' + compact(p.decode?.tokens) + ' tokens after first token</div><div class="chart-note">Cache hit ' + pct(p.cache_hit) + '</div></div>' + timeSplit(p.time_ms) + '</div>';
 }
 function requestTimes(r) {
   const diff = (end, start) => Number.isFinite(end) && Number.isFinite(start) ? Math.max(0, end - start) : null;
@@ -286,7 +286,7 @@ function requestTimes(r) {
 function renderSessions() {
   const all = S.data.sessions || [], rows = all.slice(0, S.sessionRows);
   $('sessions-show-more').hidden = rows.length >= all.length;
-  $('sessions-table').innerHTML = '<table><thead><tr><th>Client / session</th><th>Model</th><th>Turns</th>' + sortHeading('sessions', 'time', 'Last activity') + sortHeading('sessions', 'prefill_tps', 'Prefill tok/s') + sortHeading('sessions', 'decode_tps', 'Decode tok/s') + '<th>Cache hit</th><th>Time split / ms</th><th>Per-turn tokens</th></tr></thead><tbody>' + (rows.length ? rows.map((r, i) => '<tr data-session="' + esc(r.session_id) + '" tabindex="0" class="' + (r.source === 'prefix' ? 'inferred' : '') + '"><td class="wrap">' + esc(r.client) + '<br>' + esc(r.session_id) + (r.source === 'prefix' ? ' / prefix inferred' : '') + '</td><td class="wrap">' + esc(r.model) + '</td><td>' + compact(r.summary?.requests) + '</td><td>' + esc(time(r.last_ms)) + '</td><td class="wrap">' + esc(ratePair(r.perf?.prefill)) + '<br>' + compact(r.perf?.prefill?.computed_tokens) + ' computed tokens</td><td class="wrap">' + esc(ratePair(r.perf?.decode)) + '</td><td>' + pct(r.perf?.cache_hit) + '</td><td class="wrap">' + timeSplit(r.perf?.time_ms) + '</td><td><div class="session-strip" id="session-strip-' + i + '"></div></td></tr>').join('') : '<tr><td colspan="9" class="empty">No retained sessions</td></tr>') + '</tbody></table>';
+  $('sessions-table').innerHTML = '<table><thead><tr><th>Client / session</th><th>Model</th><th>Turns</th>' + sortHeading('sessions', 'time', 'Last activity') + sortHeading('sessions', 'prefill_tps', 'Prefill tps') + sortHeading('sessions', 'decode_tps', 'Decode tps') + '<th>Cache hit</th><th>Time split / ms</th><th>Per-turn tokens</th></tr></thead><tbody>' + (rows.length ? rows.map((r, i) => '<tr data-session="' + esc(r.session_id) + '" tabindex="0" class="' + (r.source === 'prefix' ? 'inferred' : '') + '"><td class="wrap">' + esc(r.client) + '<br>' + esc(r.session_id) + (r.source === 'prefix' ? ' / prefix inferred' : '') + '</td><td class="wrap">' + esc(r.model) + '</td><td>' + compact(r.summary?.requests) + '</td><td>' + esc(time(r.last_ms)) + '</td><td class="wrap">' + esc(ratePair(r.perf?.prefill)) + '<br>' + compact(r.perf?.prefill?.computed_tokens) + ' computed tokens</td><td class="wrap">' + esc(ratePair(r.perf?.decode)) + '</td><td>' + pct(r.perf?.cache_hit) + '</td><td class="wrap">' + timeSplit(r.perf?.time_ms) + '</td><td><div class="session-strip" id="session-strip-' + i + '"></div></td></tr>').join('') : '<tr><td colspan="9" class="empty">No retained sessions</td></tr>') + '</tbody></table>';
   bindSort('sessions');
   rows.forEach((r, i) => UI.strip($('session-strip-' + i), r.turns || [], { color: 'prefill', onClick: (turn) => { openSession(r.session_id); openRequest(turn.rid); } }));
   $('sessions-table').querySelectorAll('[data-session]').forEach((tr) => { tr.onclick = (e) => { if (!e.target.closest('svg')) openSession(tr.dataset.session); }; tr.onkeydown = (e) => { if (e.key === 'Enter' && e.target === tr) openSession(tr.dataset.session); }; });
@@ -298,11 +298,11 @@ async function openSession(id) {
   try {
     const d = await api('sessions/' + encodeURIComponent(id)); if (S.session !== id) return;
     const turns = d.turns || [], first = turns[0]?.ts_ms || 0, last = turns.at(-1)?.ts_ms || first;
-    detail.innerHTML = '<h3 class="chart-title">' + esc(id) + ' / turn timeline</h3>' + perfBlock(d.perf) + '<div id="session-timeline" class="usage-chart"></div><div class="small-multiples"><div><p class="chart-title">TTFT / ms</p><div id="session-ttft"></div></div><div><p class="chart-title">Decode / tok/s</p><div id="session-decode"></div></div><div><p class="chart-title">Cache reuse / %</p><div id="session-cache"></div></div></div><div id="session-turns" class="tablewrap"></div>';
+    detail.innerHTML = '<h3 class="chart-title">' + esc(id) + ' / turn timeline</h3>' + perfBlock(d.perf) + '<div id="session-timeline" class="usage-chart"></div><div class="small-multiples"><div><p class="chart-title">TTFT / ms</p><div id="session-ttft"></div></div><div><p class="chart-title">Decode / tps</p><div id="session-decode"></div></div><div><p class="chart-title">Cache reuse / %</p><div id="session-cache"></div></div></div><div id="session-turns" class="tablewrap"></div>';
     UI.svg.timeline($('session-timeline'), [{ label: 'turns', segments: turns.map((r, i) => ({ t0: r.ts_ms, t1: Math.min(last + 1000, r.ts_ms + Math.max(500, r.t_retire_ms ?? r.t_total_ms ?? 0)), color: i % 2 ? 'prefill' : 'target', title: r.rid })) }], { t0: first, t1: last + 1000, gutter: 60 });
     UI.svg.columns($('session-ttft'), turns.map((r) => r.t_ttft_ms), { label: (i) => i + 1 }); UI.svg.columns($('session-decode'), turns.map((r) => r.decode_tps), { label: (i) => i + 1 });
     UI.area($('session-cache'), [{ name: 'cache reuse %', color: 'accepted', values: turns.map((r) => 100 * (r.tokens_cached || 0) / Math.max(1, r.tokens_in || 0)) }], { times: turns.map((r) => r.ts_ms), max: 100, height: 80, stacked: false });
-    $('session-turns').innerHTML = table(['Request', 'Time', 'Input', 'Cached', 'Output', 'TTFT', 'Prefill tok/s', 'Decode tok/s'], turns.map((r) => [r.rid, time(r.ts_ms), r.tokens_in, r.tokens_cached, r.tokens_out, F.ms(r.t_ttft_ms), F.n1(r.prefill_tps), F.n1(r.decode_tps)]));
+    $('session-turns').innerHTML = table(['Request', 'Time', 'Input', 'Cached', 'Output', 'TTFT', 'Prefill tps', 'Decode tps'], turns.map((r) => [r.rid, time(r.ts_ms), r.tokens_in, r.tokens_cached, r.tokens_out, F.ms(r.t_ttft_ms), F.n1(r.prefill_tps), F.n1(r.decode_tps)]));
     $('session-turns').querySelectorAll('tbody tr').forEach((tr, i) => { if (turns[i]) { tr.tabIndex = 0; tr.onclick = () => openRequest(turns[i].rid); tr.onkeydown = (e) => { if (e.key === 'Enter') tr.onclick(); }; } });
   } catch (e) { detail.textContent = e.message; }
 }
@@ -335,7 +335,7 @@ function renderRequests() {
   const rows = S.requests.slice(0, S.requestRows);
   $('requests-show-more').hidden = rows.length >= S.requests.length;
   $('request-note').textContent = rows.length + ' shown / ' + S.requests.length + ' fetched' + ' / cursor-paged retained metadata';
-  $('requests-table').innerHTML = '<table><thead><tr>' + sortHeading('requests', 'time', 'Request / time') + '<th>Client / protocol</th><th>Model</th><th>Output</th><th>TTFT</th>' + sortHeading('requests', 'prefill_tps', 'Prefill tok/s') + sortHeading('requests', 'decode_tps', 'Decode tok/s') + '<th>Outcome</th></tr></thead><tbody>' + (rows.length ? rows.map((r) => '<tr data-rid="' + esc(r.rid) + '" tabindex="0"><td>' + esc(r.rid) + '<br>' + esc(time(r.ts_ms)) + '</td><td>' + esc(r.client_kind) + ' / ' + esc(r.protocol) + '</td><td class="wrap">' + esc(r.model_served || r.model_requested) + '</td><td>' + compact(r.tokens_out) + '</td><td>' + F.ms(r.t_ttft_ms) + '</td><td class="wrap">' + F.n1(r.prefill_tps) + ' tok/s<br>' + compact(r.tokens_cached) + ' of ' + compact(r.tokens_in) + ' cached</td><td>' + F.n1(r.decode_tps) + ' tok/s</td><td>' + esc(r.outcome) + ' / ' + esc(r.status) + '</td></tr>').join('') : '<tr><td colspan="8" class="empty">No matching retained requests</td></tr>') + '</tbody></table>';
+  $('requests-table').innerHTML = '<table><thead><tr>' + sortHeading('requests', 'time', 'Request / time') + '<th>Client / protocol</th><th>Model</th><th>Output</th><th>TTFT</th>' + sortHeading('requests', 'prefill_tps', 'Prefill tps') + sortHeading('requests', 'decode_tps', 'Decode tps') + '<th>Outcome</th></tr></thead><tbody>' + (rows.length ? rows.map((r) => '<tr data-rid="' + esc(r.rid) + '" tabindex="0"><td>' + esc(r.rid) + '<br>' + esc(time(r.ts_ms)) + '</td><td>' + esc(r.client_kind) + ' / ' + esc(r.protocol) + '</td><td class="wrap">' + esc(r.model_served || r.model_requested) + '</td><td>' + compact(r.tokens_out) + '</td><td>' + F.ms(r.t_ttft_ms) + '</td><td class="wrap">' + F.n1(r.prefill_tps) + ' tps<br>' + compact(r.tokens_cached) + ' of ' + compact(r.tokens_in) + ' cached</td><td>' + F.n1(r.decode_tps) + ' tps</td><td>' + esc(r.outcome) + ' / ' + esc(r.status) + '</td></tr>').join('') : '<tr><td colspan="8" class="empty">No matching retained requests</td></tr>') + '</tbody></table>';
   bindSort('requests');
   $('requests-table').querySelectorAll('[data-rid]').forEach((tr) => { tr.onclick = () => openRequest(tr.dataset.rid); tr.onkeydown = (e) => { if (e.key === 'Enter') tr.onclick(); }; });
   $('requests-more').hidden = !S.requestCursor;
@@ -450,9 +450,13 @@ let resizeTimer; window.addEventListener('resize', () => { clearTimeout(resizeTi
 let liveFeed;
 // Live concurrency without subscribing to the console feed (a subscriber makes the engine build frames).
 async function liveCount() { try { const r = await fetch('/console/usage/live', { credentials: 'same-origin' }); if (r.ok) { const d = await r.json(); S.live = d.active; $('k-concurrency').textContent = d.active == null ? '-' : F.n0(d.active); } } catch (_) {} }
-liveCount(); setInterval(() => { if (!document.hidden) liveCount(); }, 5000);
 $('from').value = localDate(Date.now() - 86400000); $('to').value = localDate(Date.now());
-refresh(); setInterval(() => { if (!document.hidden && !S.loading) refresh(); }, 10000);
+UI.adminGate($('usage-app'), 'Usage',
+  'Retained request history for this server: traffic, latency, cache and speculation over time, sessions, the full log and retention settings.').then((unlocked) => {
+  if (!unlocked) { document.body.dataset.usageReady = 'true'; return; }
+  liveCount(); setInterval(() => { if (!document.hidden) liveCount(); }, 5000);
+  refresh(); setInterval(() => { if (!document.hidden && !S.loading) refresh(); }, 10000);
+});
 })();
 </script>
 </body>

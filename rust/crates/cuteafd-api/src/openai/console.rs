@@ -240,6 +240,12 @@ pub fn asset_routes() -> axum::Router {
         .route("/assets/cuteafd-mark.svg", get(mark))
 }
 
+/// `/bench` on a server launched without the benchmark runner: say so instead of 404.
+pub const BENCH_OFF: &str = include_str!("../../assets/bench-off.html");
+pub async fn bench_off() -> Response {
+    ([(header::CACHE_CONTROL, "no-cache")], Html(BENCH_OFF)).into_response()
+}
+
 pub(super) async fn logo() -> Response {
     asset("cuteafd-logo.svg", LOGO, "image/svg+xml").await
 }
@@ -331,17 +337,22 @@ mod tests {
     }
 
     #[test]
-    fn fabric_health_poll_is_authenticated_bounded_and_visibility_gated() {
-        assert!(PAGE.contains("cuteafdAuthenticatedFetch('/v1/fabric'"));
-        assert!(PAGE.contains("!document.hidden && S.connected"));
-        assert!(PAGE.contains("AbortSignal.timeout(2500)"));
-        assert!(PAGE.contains("setTimeout(pollFabricHealth, 2000)"));
-        assert!(!PAGE.contains("setInterval(pollFabricHealth"));
-        assert!(PAGE.contains("health_since_start") && PAGE.contains("since observation start"));
-        assert!(PAGE.contains("pause not collected"));
-        assert!(PAGE.contains("line.textContent = text"));
+    fn fabric_chip_poll_is_open_bounded_and_visibility_gated() {
+        // The shared chip (console and bench) polls the open route, bounded, while visible.
+        assert!(UI_JS.contains("fetch('/v1/fabric', { signal: AbortSignal.timeout(2500) })"));
+        assert!(UI_JS.contains("!document.hidden && live()") && UI_JS.contains("setTimeout(poll, 3000)"));
+        assert!(PAGE.contains("CuteUI.fabricChip({ live: () => S.connected })"));
+        // Named by host, never a text dump.
+        assert!(UI_JS.contains("host.hostname") && !PAGE.contains("congestion control not exercised"));
     }
-
+    #[test]
+    fn console_never_prompts_and_locked_text_names_the_admin_link() {
+        for page in [PAGE, BENCH_OFF] {
+            assert!(!page.contains("window.prompt") && !page.contains("window.alert") && !page.contains("Authorization"));
+        }
+        assert!(PAGE.contains("textLockedDialog()") && PAGE.contains("Text view needs the admin console link"));
+        assert!(UI_JS.contains("fetch('/console/status'") && UI_JS.contains("adminGate"));
+    }
     #[test]
     fn bench_text_toggles_text_and_a_disabled_hub_stays_off() {
         let hub = ConsoleHub::new(false);

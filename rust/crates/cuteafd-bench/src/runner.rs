@@ -57,6 +57,8 @@ pub enum StartError {
     UnknownProfile(String),
     #[error("the server is not ready")]
     NotReady,
+    #[error("the server is stopping ({0})")]
+    Stopping(String),
     #[error("invalid lossless set: {0}")]
     InvalidSet(String),
     #[error("invalid context-load options: {0}")]
@@ -149,10 +151,13 @@ pub struct Bench {
     /// allows token text on it: the lockout makes the run's own prompts the
     /// only requests in.
     console: OnceLock<Arc<ConsoleHub>>,
-    /// Benchmark controls always require the configured API key.
+    /// Benchmark controls require the configured API key or the console cookie.
     pub api_key: OnceLock<cuteafd_api::openai::auth::ApiKey>,
+    pub(crate) console_gate: OnceLock<cuteafd_api::console_gate::ConsoleGate>,
     /// Whether benchmark requests are kept in the usage history (attached at mount).
     pub(crate) usage: OnceLock<UsageToggle>,
+    /// Why the server is stopping, once it is (see `crate::stopping`).
+    stopping: OnceLock<String>,
 }
 
 /// The usage store's `record_bench` setting, as the bench page toggles it.
@@ -174,12 +179,19 @@ impl Bench {
             events,
             console: OnceLock::new(),
             api_key: OnceLock::new(),
+            console_gate: OnceLock::new(),
             usage: OnceLock::new(),
+            stopping: OnceLock::new(),
         })
     }
 
     pub fn set_api_key(&self, key: cuteafd_api::openai::auth::ApiKey) {
         let _ = self.api_key.set(key);
+    }
+
+    /// The console unlock cookie also authorizes the bench page's controls.
+    pub fn set_console_gate(&self, gate: cuteafd_api::console_gate::ConsoleGate) {
+        let _ = self.console_gate.set(gate);
     }
 
     pub fn accepts_internal(&self, token: &str) -> bool {
@@ -197,6 +209,27 @@ impl Bench {
         let _ = self.console.set(console);
     }
 
+    /// Learns the served model and this server's configuration once, off the
+    /// request path, so the page's fingerprint, its accumulated view and panel
+    /// availability are right before any run. Serving calls it when the bench
+    /// is mounted; it waits for the API to answer (bounded) and is a no-op
+    /// once a run has learned the same.
+    pub fn discover(&self) {
+        let mut last = None;
+        for attempt in 0..60 {
+            if self.info.lock().is_ok_and(|i| i.is_some()) { return; }
+            if let Some(base) = crate::context::loopback() {
+                let mut client = Client::new(&base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned());
+                match client.discover() {
+                    Ok(_) => { self.server_info(&client.model); return; }
+                    Err(error) => last = Some(error),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(if attempt < 10 { 200 } else { 1000 }));
+        }
+        if let Some(error) = last { tracing::debug!(%error, "bench: server discovery deferred to the first run"); }
+    }
+
     /// The process-wide instance (SQLite under `store::default_dir()`, in memory if unwritable).
     pub fn global() -> Arc<Self> {
         static BENCH: OnceLock<Arc<Bench>> = OnceLock::new();
@@ -206,6 +239,15 @@ impl Bench {
                 tracing::warn!(%error, dir = %dir.display(), "benchmark history is not persisted");
                 Store::memory().expect("in-memory SQLite")
             });
+            // Re-derive summaries stored under an older verdict rule on a second
+            // connection, after start: readiness never waits on the history.
+            if store.stale().unwrap_or(false) {
+                let _ = std::thread::Builder::new().name("bench-backfill".into()).spawn(move || {
+                    if let Err(error) = Store::open(&dir).and_then(|s| s.backfill()) {
+                        tracing::warn!(%error, "bench store: summary backfill failed");
+                    }
+                });
+            }
             Self::new(store)
         }).clone()
     }
@@ -251,6 +293,58 @@ impl Bench {
         self.store(|s| s.load(id)).ok().flatten()
     }
 
+    /// One panel of a live or stored run; a stored one is extracted on its own.
+    pub fn panel(&self, id: &str, panel: &str) -> Option<crate::report::PanelResult> {
+        if let Some(live) = self.live.lock().ok()?.get(id) {
+            return live.lock().ok()?.panel(panel).cloned();
+        }
+        self.store(|s| s.panel(id, panel)).ok().flatten()
+    }
+
+    /// Every panel's newest result on `fingerprint`, each tagged with the run
+    /// it came from, under the newest baseline; the active run's live panels
+    /// replace their own sections. Reads only the runs that contribute.
+    pub fn merged(&self, fingerprint: &str) -> Option<(Report, Option<(String, String)>)> {
+        let sources = self.store(|s| s.sources(fingerprint)).ok()?;
+        let active = self.active().filter(|a| self.report(&a.id).is_some_and(|r| r.fingerprint == fingerprint));
+        let live = active.as_ref().and_then(|a| self.report(&a.id));
+        let newest = live.clone().or_else(|| sources.newest.as_deref().and_then(|id| self.report(id)))?;
+        let mut cache: HashMap<String, Report> = HashMap::new();
+        let mut fetch = |id: &str| -> Option<Report> {
+            if !cache.contains_key(id) { cache.insert(id.to_string(), self.report(id)?); }
+            cache.get(id).cloned()
+        };
+        let mut merged = newest.clone();
+        // The merged view keeps the newest run's id: server, hardware,
+        // configuration and fabric render from it; panels carry their own run.
+        merged.panels = Vec::new();
+        // The live run's own panels first (running, done or queued), then every
+        // other panel's newest stored result.
+        if let Some(live) = &live {
+            for panel in &live.panels {
+                if panel.status == crate::report::PanelStatus::Pending && panel.passes.is_empty()
+                    && sources.panels.iter().any(|(id, _)| id == &panel.id) { continue; }
+                let mut panel = panel.clone();
+                panel.run = Some(live.id.clone()); panel.run_created = Some(live.created.clone());
+                merged.panels.push(panel);
+            }
+        }
+        for (panel_id, run_id) in &sources.panels {
+            if merged.panels.iter().any(|p| &p.id == panel_id) { continue; }
+            let Some(report) = fetch(run_id) else { continue };
+            if let Some(panel) = report.panel(panel_id) {
+                let mut panel = panel.clone();
+                panel.run = Some(report.id.clone()); panel.run_created = Some(report.created.clone());
+                merged.panels.push(panel);
+            }
+        }
+        let baseline_run = live.as_ref().filter(|l| l.baseline.is_some()).map(|l| l.id.clone()).or(sources.baseline.clone());
+        let baseline = baseline_run.as_deref().and_then(&mut fetch);
+        merged.baseline = baseline.as_ref().and_then(|r| r.baseline.clone());
+        merged.plan = Vec::new();
+        Some((merged, baseline.map(|r| (r.id, r.created))))
+    }
+
     /// The newest report (live first).
     pub fn latest(&self) -> Option<Report> {
         if let Some(active) = self.active() {
@@ -287,8 +381,8 @@ impl Bench {
         if let Some(b) = self.baselines.lock().ok().and_then(|b| b.get(fingerprint).cloned()) {
             return Rates::from_baseline(&b);
         }
-        self.store(|s| s.reports_for(fingerprint, 5)).ok().into_iter().flatten()
-            .find_map(|r| r.baseline).map(|b| Rates::from_baseline(&b)).unwrap_or_default()
+        self.store(|s| s.latest_baseline(fingerprint)).ok().flatten()
+            .map(|b| Rates::from_baseline(&b)).unwrap_or_default()
     }
 
     /// The panel catalog with per-pass estimates on this server.
@@ -330,8 +424,22 @@ impl Bench {
             "baseline": baseline.as_ref().map(|b| json!({"run": b.run_id, "quality": b.quality.status,
                 "badge": b.quality.badge()})),
             "quality_failed": baseline.as_ref().is_some_and(|b| b.quality.status == crate::report::CheckStatus::Fail),
-            "auth": "API key",
+            "auth": "console unlock or API key",
         })
+    }
+
+    /// The server is shutting down: refuse new runs and stop the active one,
+    /// which then records `reason` instead of the connection errors that follow.
+    pub fn stopping(&self, reason: &str) {
+        let _ = self.stopping.set(reason.to_string());
+        if let Some(active) = self.active() {
+            tracing::warn!(run = %active.id, reason, "server stopping: interrupting the running benchmark");
+            active.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn interrupted(&self) -> Option<String> {
+        self.stopping.get().map(|reason| format!("interrupted: the server stopped ({reason}) during this run"))
     }
 
     pub fn cancel(&self, id: &str) -> bool {
@@ -384,6 +492,7 @@ impl Bench {
 
     /// Starts a run; returns its id.
     pub fn start(self: &Arc<Self>, request: RunRequest) -> Result<String, StartError> {
+        if let Some(reason) = self.stopping.get() { return Err(StartError::Stopping(reason.clone())); }
         let base = crate::context::loopback().ok_or(StartError::NotReady)?;
         let lossless_set = request.lossless_set.clone().map(|set| set.validated()).transpose()
             .map_err(StartError::InvalidSet)?;
@@ -471,7 +580,13 @@ impl Bench {
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
+            let interrupted = self.interrupted();
             match outcome {
+                Ok(()) if interrupted.is_none() => r.status = RunStatus::Done,
+                _ if interrupted.is_some() => {
+                    r.status = RunStatus::Cancelled;
+                    r.error = interrupted.clone();
+                }
                 Ok(()) => r.status = RunStatus::Done,
                 Err(error) if active.cancel.load(Ordering::Relaxed)
                     || error.downcast_ref::<crate::client::Cancelled>().is_some() => r.status = RunStatus::Cancelled,
@@ -481,6 +596,7 @@ impl Bench {
                 }
             }
             for panel in r.panels.iter_mut().filter(|p| matches!(p.status, PanelStatus::Pending | PanelStatus::Running)) {
+                if panel.status == PanelStatus::Running && interrupted.is_some() { panel.error = interrupted.clone(); }
                 panel.status = PanelStatus::Cancelled;
             }
             if let Err(error) = self.store(|s| s.save(&r)) {
@@ -558,7 +674,6 @@ impl Bench {
         }
         Self::record_power(&client, run_mark, report);
         self.emit(json!({"type": "report", "run": active.id, "report": report.lock().expect("report lock").clone()}));
-        let history = self.store(|s| s.reports_for(&fingerprint, 50)).unwrap_or_default();
         for (index, planned) in plan.iter().enumerate() {
             let Some(panel) = panels::find(&planned.id) else { continue };
             let estimate = panel.estimate_s(&rates, &info);
@@ -569,8 +684,10 @@ impl Bench {
                 remaining -= estimate * f64::from(planned.passes);
                 continue;
             }
-            let earlier: Vec<Value> = history.iter().filter_map(|r| r.panel(panel.id()))
-                .flat_map(|p| p.passes.iter().cloned()).collect();
+            // This panel's earlier passes on the server, newest run first;
+            // SQLite extracts the one panel, never whole reports.
+            let earlier: Vec<Value> = self.store(|s| s.panel_history(&fingerprint, panel.id(), 50)).unwrap_or_default()
+                .into_iter().flat_map(|p| p.passes).collect();
             {
                 let mut r = report.lock().expect("report lock");
                 r.panels[index].status = PanelStatus::Running;
@@ -623,7 +740,9 @@ impl Bench {
                         r.panels[index].partial = None;
                     }
                     Err(error) => {
-                        if error.downcast_ref::<crate::client::Cancelled>().is_some() {
+                        if error.downcast_ref::<crate::client::Cancelled>().is_some() || self.stopping.get().is_some() {
+                            if let Some(reason) = self.interrupted() { r.panels[index].error = Some(reason); }
+                            r.panels[index].status = PanelStatus::Cancelled;
                             return Err(error);
                         }
                         r.panels[index].status = PanelStatus::Failed;

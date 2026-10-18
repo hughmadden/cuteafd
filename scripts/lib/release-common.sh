@@ -416,49 +416,22 @@ release_print_console_link() {
   fi
 }
 
-# Common configured/benchmark key resolution; sidecars never invent a second default.
-release_resolve_api_key() {
-  local enabled="${1:-off}" instance="${2:-default}"
-  if [[ -z "${API_KEY_FILE:-}" && -f "$HOME/.config/cuteafd/api-key" ]]; then
-    API_KEY_FILE="$HOME/.config/cuteafd/api-key"
-  fi
-  if [[ -z "${API_KEY_FILE:-}" && "$enabled" == on && -f "$HOME/.cache/cuteafd/instances/$instance/api-key" ]]; then
-    API_KEY_FILE="$HOME/.cache/cuteafd/instances/$instance/api-key"
-  fi
+# The shell line that prints this host's console unlock link, for pages and logs
+# (never the secret itself): run it on the host that launched the server.
+release_console_link_command() {
+  local base="${CONSOLE_URL:-$1}" file="${CONSOLE_SECRET_FILE/#$HOME/\~}"
+  printf 'echo "%s/console/unlock?token=$(cat %s)"' "${base%/}" "$file"
 }
 
-# Benchmark opt-in provisions a reusable key, never exposing it in logs or argv.
+# API keys are opt-in (API_KEY_FILE); the benchmark runs on the console cookie.
 release_prepare_api_key() {
   local enabled="${1:-off}" instance="${2:-default}"
-  release_resolve_api_key off "$instance"
   case "$enabled" in
     on|off) ;;
     *) release_die "ENABLE_BENCH must be on or off" ;;
   esac
-  if [[ "$enabled" == on && -z "${API_KEY_FILE:-}" ]]; then
-    [[ "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || release_die "invalid API key instance"
-    API_KEY_FILE="$(release_prepare_secret "$HOME/.cache/cuteafd/instances/$instance" api-key)" || release_die "could not provision benchmark API key"
-    printf 'Benchmark API key file: %s\n' "$API_KEY_FILE" >&2
-  fi
   if [[ -n "${API_KEY_FILE:-}" ]]; then
     [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || release_die "API_KEY_FILE must name a readable file"
-    python3 - "$API_KEY_FILE" <<'PY_KEYS'
-import json, os, pathlib, secrets, tempfile
-legacy = pathlib.Path(__import__('sys').argv[1])
-path = legacy.with_name("api-keys")
-if not path.exists():
-    key = legacy.read_text().rstrip("\r\n")
-    fd, tmp = tempfile.mkstemp(prefix=".api-keys-", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as stream:
-            json.dump({"default": key, "agent": secrets.token_urlsafe(32)}, stream)
-            stream.write("\n")
-        # Do not replace a concurrently provisioned key set.
-        try: os.link(tmp, path)
-        except FileExistsError: pass
-    finally: os.unlink(tmp)
-PY_KEYS
   fi
 }
 
@@ -758,7 +731,7 @@ release_known_key() {
     FAMILY) return 0 ;; # Optional build family when checkpoint metadata is not local.
     SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE) return 0 ;;
     DRAFT_SURVIVAL_LENGTHS|DRAFT_POLICY|DRAFT_ROW_COST) return 0 ;;
-    FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|USAGE|GATEWAY) return 0 ;;
+    FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|GATEWAY) return 0 ;;
     GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;

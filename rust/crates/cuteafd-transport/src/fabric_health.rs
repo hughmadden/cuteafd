@@ -3,15 +3,32 @@ use crate::traffic::PortSample;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const LOSS_EVENTS_PER_GB_WARN: f64 = 100.0;
+/// Retransmit recoveries as a share of packets moved: RoCE recovers a gap by
+/// go-back-N, resending the window, and that starts to cost measurable goodput
+/// around 0.5% of packets. Below it the fabric is healthy; above it, a warning.
+pub const RETRANSMIT_WARN_PCT: f64 = 0.5;
+/// A window that moved less than this on a port is too small to judge its
+/// retransmit rate (a handful of events on a short phase reads as a big share).
+pub const RETRANSMIT_MIN_GB: f64 = 2.0;
 pub const HIGH_UTILIZATION: f64 = 0.30;
-const LOSS: [&str; 5] = [
+/// RoCE sequence and recovery counters, reported raw. They overlap: one gap
+/// raises out_of_sequence at the receiver and packet_seq_err at the sender, and
+/// roce_adp_retrans counts the resulting resend; rnr_nak_retry_err is
+/// receiver-not-ready flow control, not a gap.
+const RETRANSMIT: [&str; 5] = [
     "out_of_sequence",
     "packet_seq_err",
     "roce_adp_retrans",
     "local_ack_timeout_err",
     "rnr_nak_retry_err",
 ];
+
+/// The RoCE (InfiniBand) MTU a port's Ethernet MTU carries: the largest IB MTU
+/// that fits beside the RoCEv2 headers; 4096 when the netdev MTU is unknown.
+pub fn roce_mtu(netdev_mtu: Option<u32>) -> u32 {
+    let Some(mtu) = netdev_mtu else { return 4096 };
+    [4096, 2048, 1024, 512, 256].into_iter().find(|ib| ib + 58 <= mtu).unwrap_or(256)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +42,7 @@ pub enum Verdict {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Health {
     pub verdict: Verdict,
     pub reasons: Vec<String>,
@@ -35,13 +53,18 @@ pub struct Health {
     pub ecn_marked_packets: Option<u64>,
     pub cnp_handled: Option<u64>,
     pub ecn_active: Option<bool>,
-    /// The events overlap and are not lost packets or retransmitted bytes.
-    pub loss_events: BTreeMap<String, Option<u64>>,
-    pub loss_events_per_gb: Option<f64>,
-    pub loss_events_per_gb_by_counter: BTreeMap<String, Option<f64>>,
-    pub sequence_events_per_gb: Option<f64>,
-    pub adapter_retransmits_per_gb: Option<f64>,
-    pub loss_warning_threshold_per_gb: f64,
+    /// The raw sequence/recovery counters over the window (overlapping; see `RETRANSMIT`).
+    pub retransmit_counters: BTreeMap<String, Option<u64>>,
+    /// Go-back-N recoveries without double counting: the larger of
+    /// out_of_sequence (receiver) and packet_seq_err (sender) for the same gaps,
+    /// plus local_ack_timeout_err (sender timeouts, a separate trigger).
+    pub retransmit_events: Option<u64>,
+    /// `retransmit_events` as a percentage of packets moved (bytes ÷ `roce_mtu`).
+    pub retransmit_pct: Option<f64>,
+    pub retransmit_warn_pct: f64,
+    /// False when the window moved under `RETRANSMIT_MIN_GB`: shown, never judged.
+    pub retransmit_judged: bool,
+    pub roce_mtu: u32,
     pub missing_or_reset: Vec<String>,
     pub pause: String,
 }
@@ -58,7 +81,8 @@ fn counter(port: &PortSample, key: &str) -> Option<u64> {
 
 pub fn evaluate(before: &PortSample, after: &PortSample, seconds: f64) -> Health {
     let mut h = Health {
-        loss_warning_threshold_per_gb: LOSS_EVENTS_PER_GB_WARN,
+        retransmit_warn_pct: RETRANSMIT_WARN_PCT,
+        roce_mtu: roce_mtu(after.mtu),
         pause: "not collected".into(),
         ..Default::default()
     };
@@ -86,34 +110,18 @@ pub fn evaluate(before: &PortSample, after: &PortSample, seconds: f64) -> Health
     let rx = difference("port_rcv_data");
     h.ecn_marked_packets = difference("np_ecn_marked_roce_packets");
     h.cnp_handled = difference("rp_cnp_handled");
-    h.loss_events = LOSS
+    h.retransmit_counters = RETRANSMIT
         .into_iter()
         .map(|key| (key.into(), difference(key)))
         .collect();
     h.moved_gb = tx.zip(rx).map(|(tx, rx)| (tx as f64 + rx as f64) / 1e9);
-    h.sequence_events_per_gb = h.moved_gb.filter(|gb| *gb > 0.0).and_then(|gb| {
-        Some(
-            (h.loss_events.get("out_of_sequence")?.as_ref().copied()? as f64
-                + h.loss_events.get("packet_seq_err")?.as_ref().copied()? as f64)
-                / gb,
-        )
-    });
-    h.adapter_retransmits_per_gb = h
-        .moved_gb
-        .filter(|gb| *gb > 0.0)
-        .and_then(|gb| Some(h.loss_events.get("roce_adp_retrans")?.as_ref().copied()? as f64 / gb));
-    h.loss_events_per_gb_by_counter = h
-        .loss_events
-        .iter()
-        .map(|(key, n)| {
-            (
-                key.clone(),
-                h.moved_gb
-                    .filter(|gb| *gb > 0.0)
-                    .and_then(|gb| Some((*n)? as f64 / gb)),
-            )
-        })
-        .collect();
+    let count = |key: &str| h.retransmit_counters.get(key).copied().flatten();
+    // One gap per sequence error pair, plus timeouts; never the overlapping sum.
+    h.retransmit_events = count("out_of_sequence").zip(count("packet_seq_err"))
+        .map(|(rx, tx)| rx.max(tx)).zip(count("local_ack_timeout_err")).map(|(gaps, timeouts)| gaps + timeouts);
+    let packets = h.moved_gb.filter(|gb| *gb > 0.0).map(|gb| gb * 1e9 / f64::from(h.roce_mtu));
+    h.retransmit_pct = h.retransmit_events.zip(packets).map(|(n, packets)| 100.0 * n as f64 / packets);
+    h.retransmit_judged = h.moved_gb.is_some_and(|gb| gb >= RETRANSMIT_MIN_GB);
     // A changed link rate cannot describe one utilization envelope reliably.
     h.utilization = after
         .link_gbps
@@ -123,19 +131,10 @@ pub fn evaluate(before: &PortSample, after: &PortSample, seconds: f64) -> Health
         .ecn_marked_packets
         .zip(h.cnp_handled)
         .map(|(m, c)| m > 0 && c > 0);
-    h.loss_events_per_gb = h.moved_gb.filter(|gb| *gb > 0.0).and_then(|gb| {
-        h.loss_events
-            .values()
-            .try_fold(0.0, |sum, n| Some(sum + (*n)? as f64))
-            .map(|n| n / gb)
-    });
-    if h.loss_events_per_gb
-        .is_some_and(|n| n > LOSS_EVENTS_PER_GB_WARN)
-    {
+    if h.retransmit_judged && h.retransmit_pct.is_some_and(|p| p > RETRANSMIT_WARN_PCT) {
         h.reasons.push(format!(
-            "loss signals {:.1} events/GB exceed {:.0}/GB (overlapping events, not lost bytes)",
-            h.loss_events_per_gb.unwrap(),
-            LOSS_EVENTS_PER_GB_WARN
+            "retransmits {} of packets exceed {} (go-back-N resends cost goodput; no data is lost)",
+            pct(h.retransmit_pct), pct(Some(RETRANSMIT_WARN_PCT))
         ));
     }
     let loaded = h.utilization.is_some_and(|u| u > HIGH_UTILIZATION);
@@ -164,20 +163,26 @@ pub fn evaluate(before: &PortSample, after: &PortSample, seconds: f64) -> Health
     } else if h.ecn_active == Some(true) {
         h.verdict = Verdict::Ok;
         h.reasons
-            .push("ECN marks and handled CNPs observed; loss below warning threshold".into());
+            .push("ECN marks and handled CNPs observed; retransmits below the warning rate".into());
     } else {
         h.verdict = Verdict::Unproven;
         h.reasons
             .push("low load; ECN/backoff not demonstrated in this window".into());
     }
-    h.reasons.push(format!("loss {} events/GB; sequence/reordering {}; adapter retransmits {} (warning >{LOSS_EVENTS_PER_GB_WARN:.0}/GB combined)",
-        rate(h.loss_events_per_gb), rate(h.sequence_events_per_gb), rate(h.adapter_retransmits_per_gb)));
+    h.reasons.push(format!("retransmits {} of packets{} (warning above {})", pct(h.retransmit_pct),
+        if h.retransmit_judged || h.moved_gb.is_none() { "" } else { ", too little traffic to judge" }, pct(Some(RETRANSMIT_WARN_PCT))));
     h
 }
 
-fn rate(n: Option<f64>) -> String {
-    n.map(|n| format!("{n:.1}"))
-        .unwrap_or_else(|| "unknown".into())
+/// A percentage with two significant digits ("unknown" when absent).
+pub fn pct(n: Option<f64>) -> String {
+    match n {
+        None => "unknown".into(),
+        Some(v) if !v.is_finite() => "unknown".into(),
+        Some(v) if v == 0.0 => "0%".into(),
+        Some(v) if v < 1e-4 => "<0.0001%".into(),
+        Some(v) => format!("{}%", format!("{v:.1e}").parse::<f64>().unwrap_or(v)),
+    }
 }
 
 impl Verdict {
@@ -195,11 +200,9 @@ impl Verdict {
 impl Health {
     pub fn line(&self) -> String {
         format!(
-            "{}: loss {} / sequence {} / retransmit {} events/GB; {}",
+            "{}: retransmits {} of packets; {}",
             self.verdict.label(),
-            rate(self.loss_events_per_gb),
-            rate(self.sequence_events_per_gb),
-            rate(self.adapter_retransmits_per_gb),
+            pct(self.retransmit_pct),
             self.reasons
                 .first()
                 .map(String::as_str)
@@ -291,7 +294,7 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn port(bytes: u64, marks: u64, cnp: u64, loss: u64) -> PortSample {
+    fn port(bytes: u64, marks: u64, cnp: u64, gaps: u64) -> PortSample {
         let mut p = PortSample {
             device: "nic".into(),
             port: 1,
@@ -306,9 +309,9 @@ mod tests {
         ] {
             p.counters.insert(k.into(), n);
         }
-        for (i, k) in LOSS.into_iter().enumerate() {
+        for (i, k) in RETRANSMIT.into_iter().enumerate() {
             p.counters
-                .insert(format!("hw_counters/{k}"), if i == 0 { loss } else { 0 });
+                .insert(format!("hw_counters/{k}"), if i == 0 { gaps } else { 0 });
         }
         p
     }
@@ -317,13 +320,10 @@ mod tests {
         let b = port(0, 0, 0, 0);
         let healthy = evaluate(&b, &port(25_000_000_000, 300_000, 4_000, 2_000), 10.0);
         assert_eq!(healthy.verdict, Verdict::Ok);
-        assert_eq!(healthy.loss_events_per_gb, Some(40.0));
+        // 2000 gaps over 50 GB at a 4 KB RoCE MTU: 0.016% of packets.
+        assert_eq!(healthy.retransmit_events, Some(2_000));
         assert_eq!(healthy.pause, "not collected");
-        assert_eq!(healthy.sequence_events_per_gb, Some(40.0));
-        assert_eq!(healthy.adapter_retransmits_per_gb, Some(0.0));
-        assert!(healthy
-            .line()
-            .contains("loss 40.0 / sequence 40.0 / retransmit 0.0 events/GB"));
+        assert!(healthy.line().contains("retransmits 0.016% of packets"), "{}", healthy.line());
         let bad = evaluate(&b, &port(25_000_000_000, 0, 4_000, 2_000_000), 2.0);
         assert_eq!(bad.verdict, Verdict::Warn);
         assert!(bad
@@ -339,14 +339,20 @@ mod tests {
             Verdict::Unproven
         );
         assert_eq!(evaluate(&b, &b, 1.0).verdict, Verdict::Idle);
+        // 2 GB moved (the minimum to judge) is 488,281 packets at 4 KB; 0.5% is 2441 gaps.
         assert_eq!(
-            evaluate(&b, &port(1_000_000_000, 1, 1, 200), 1.0).verdict,
+            evaluate(&b, &port(1_000_000_000, 1, 1, 2_441), 1.0).verdict,
             Verdict::Ok
         );
         assert_eq!(
-            evaluate(&b, &port(1_000_000_000, 1, 1, 201), 1.0).verdict,
+            evaluate(&b, &port(1_000_000_000, 1, 1, 2_442), 1.0).verdict,
             Verdict::Warn
         );
+        // Under 2 GB moved: shown, never judged, however high the share.
+        let small = evaluate(&b, &port(500_000_000, 1, 1, 100_000), 1.0);
+        assert_eq!(small.verdict, Verdict::Ok);
+        assert!(!small.retransmit_judged && small.retransmit_pct.unwrap() > 0.5);
+        assert!(small.line().contains("too little traffic to judge") || small.reasons.iter().any(|r| r.contains("too little traffic")));
         let mut a = port(1_000_000_000, 1, 1, 0);
         a.counters.remove("hw_counters/packet_seq_err");
         assert_eq!(evaluate(&b, &a, 1.0).verdict, Verdict::Unknown);
@@ -360,6 +366,24 @@ mod tests {
             evaluate(&b, &port(3_750_000_001, 0, 0, 0), 1.0).verdict,
             Verdict::Warn
         );
+    }
+    #[test]
+    fn one_gap_counts_once_and_the_mtu_follows_the_netdev() {
+        let b = port(0, 0, 0, 0);
+        let mut a = port(10_000_000_000, 1, 1, 0);
+        // The same 300 gaps seen at both ends, their resends, 20 timeouts and RNR flow control.
+        for (key, n) in [("out_of_sequence", 300), ("packet_seq_err", 280), ("roce_adp_retrans", 300),
+            ("local_ack_timeout_err", 20), ("rnr_nak_retry_err", 5_000)] {
+            a.counters.insert(format!("hw_counters/{key}"), n);
+        }
+        let h = evaluate(&b, &a, 10.0);
+        assert_eq!(h.retransmit_events, Some(320));
+        assert_eq!(h.roce_mtu, 4096);
+        assert_eq!(roce_mtu(Some(9000)), 4096);
+        assert_eq!(roce_mtu(Some(1500)), 1024);
+        assert_eq!(pct(h.retransmit_pct), "0.0066%");
+        assert_eq!(pct(Some(0.019)), "0.019%");
+        assert_eq!(pct(Some(12.34)), "12%");
     }
     #[test]
     fn reset_inside_window_stays_unknown_and_aggregation_is_conservative() {
@@ -421,11 +445,8 @@ mod tests {
             p.counters.insert("hw_counters/port_xmit_data".into(), 99);
         }
         let h = evaluate(&b, &a, 1.0);
-        assert_eq!(h.loss_events_per_gb, Some(5.0));
-        assert_eq!(
-            h.loss_events_per_gb_by_counter["out_of_sequence"],
-            Some(5.0)
-        );
+        assert_eq!(h.retransmit_counters["out_of_sequence"], Some(10));
+        assert_eq!(h.retransmit_events, Some(10));
         assert_eq!(h.moved_gb, Some(2.0));
         let a = port(5_000_000_000, 1, 0, 0);
         assert_eq!(evaluate(&b, &a, 1.0).verdict, Verdict::Warn);

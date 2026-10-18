@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUTEAFD Benchmarks</title>
+<link rel="icon" type="image/svg+xml" href="/assets/cuteafd-mark.svg">
+<link rel="stylesheet" href="/assets/cuteafd-ui.css">
+<style>
+.off { max-width: 640px; }
+.off h2 { margin: 0 0 8px; font: 600 14px var(--sans); color: var(--ink); }
+.off p { margin: 8px 0; color: var(--ink-2); font: 13px/1.55 var(--sans); }
+.off code { font: 12px var(--mono); color: var(--ink); background: var(--well); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header id="top"></header>
+  <section class="panel off">
+    <h2>Benchmarks are off on this server</h2>
+    <p>This server was launched without the benchmark runner, so there is nothing to run or browse here. A benchmark holds the whole server while it runs, so it is opt-in per launch.</p>
+    <p>To enable it, set <code>ENABLE_BENCH=on</code> in the launch configuration and relaunch (<code>./run.sh --restart</code>, or <code>./run.sh --wip SLOT --restart</code> for a WIP slot).</p>
+  </section>
+</div>
+<script src="/assets/cuteafd-ui.js"></script>
+<script>CuteUI.header(document.getElementById('top'), { page: 'bench', subtitle: 'Benchmarks' });</script>
+</body>
+</html>

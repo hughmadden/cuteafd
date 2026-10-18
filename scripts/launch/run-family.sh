@@ -72,6 +72,12 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
 [[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# Refused before anything starts: a release never serves pages from a checkout.
+case "$(get CONSOLE_ASSETS off)" in
+  on) [[ -n "$wip_slot" ]] || release_die "CONSOLE_ASSETS=on serves pages from a checkout and needs --wip SLOT; release images serve their compiled-in pages" ;;
+  off) ;;
+  *) release_die "CONSOLE_ASSETS must be on or off" ;;
+esac
 # Owner-indexed plans name entry/head first; CDI exposes physical device order.
 dual_owner_media_device() {
   local mode="$1" entry_device="$2" peer_device="$3"
@@ -146,6 +152,7 @@ MAX_OUTPUT_TOKENS
 THERMAL
 API_KEY_FILE
 ENABLE_BENCH
+CONSOLE_ASSETS
 USAGE
 GATEWAY
 EOF
@@ -315,6 +322,7 @@ ATTENTION_PLACEMENT
 ATTENTION_PLAN_ROWS
 AUDIO
 CONCURRENCY
+CONSOLE_ASSETS
 CONSOLE_TEXT
 COORDINATOR_DOCKER_DEV
 COORDINATOR_DOCKER_INFERENCE
@@ -608,10 +616,6 @@ release_require_owned_state "$bench_dir" "$fidelity_cache"
 mkdir -p "$fidelity_cache" "$bench_dir"
 release_require_writable_state "$bench_dir" "$fidelity_cache"
 api_args=() api_mount_args=()
-agent_home="${CUTEAFD_AGENT_HOME:-$HOME/.local/share/cuteafd/agent}"
-mkdir -p "$agent_home/dsh"; chmod 700 "$agent_home" "$agent_home/dsh"
-api_mount_args+=(--mount "type=bind,src=$(readlink -f "$agent_home/dsh"),dst=/run/cuteafd-agent-dsh,readonly"
-  -e CUTEAFD_AGENT_TOKEN_FILE=/run/cuteafd-agent-dsh/launch-token -e "CUTEAFD_AGENT_PORT=${CUTEAFD_AGENT_PORT:-3010}")
 API_KEY_FILE="$(get API_KEY_FILE "${API_KEY_FILE:-}")"
 ENABLE_BENCH="$(get ENABLE_BENCH off)"
 release_prepare_api_key "$ENABLE_BENCH" "$api_instance"
@@ -624,14 +628,28 @@ if release_console_supported "$image" "${wip_layout:+$wip_layout/bin/cuteafd}"; 
   release_require_writable_state "$USAGE_DIR"
   api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/run/cuteafd/usage")
   api_args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /run/cuteafd/usage --usage "$usage")
+  # Locked pages show the operator how to print the unlock link; never the secret.
+  console_port="${ADDR:-${addr:-0.0.0.0:8000}}"
+  api_mount_args+=(-e "CUTEAFD_CONSOLE_LINK_COMMAND=$(release_console_link_command "http://$(hostname):${console_port##*:}")")
 fi
 if [[ -n "$API_KEY_FILE" ]]; then
   [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || { echo "API_KEY_FILE must name a readable file" >&2; exit 2; }
   API_KEY_FILE="$(readlink -f "$API_KEY_FILE")"
   api_mount_args+=(--mount "type=bind,src=$API_KEY_FILE,dst=/run/cuteafd-api-key,readonly")
   api_args+=(--api-key-file /run/cuteafd-api-key)
-  api_mount_args+=(--mount "type=bind,src=$(readlink -f "$(dirname "$API_KEY_FILE")"),dst=/run/cuteafd-key-directory,readonly"
-    -e CUTEAFD_API_KEYS_FILE=/run/cuteafd-key-directory/api-keys)
+fi
+# CONSOLE_ASSETS=on (WIP launches only) serves the dashboard pages and their
+# shared assets from this checkout, re-read on every page load: edit, save,
+# reload the browser, with no rebuild or restart. A release image always serves
+# its compiled-in pages.
+if [[ "$(get CONSOLE_ASSETS off)" == on ]]; then
+  for asset_dir in cuteafd-api cuteafd-bench cuteafd-usage; do
+    api_mount_args+=(--mount "type=bind,src=$repo_root/rust/crates/$asset_dir/assets,dst=/run/cuteafd-assets/$asset_dir,readonly")
+  done
+  api_mount_args+=(-e CUTEAFD_CONSOLE_PAGE=/run/cuteafd-assets/cuteafd-api/console.html
+    -e CUTEAFD_CONSOLE_ASSETS=/run/cuteafd-assets/cuteafd-api
+    -e CUTEAFD_BENCH_PAGE=/run/cuteafd-assets/cuteafd-bench/bench.html
+    -e CUTEAFD_USAGE_PAGE=/run/cuteafd-assets/cuteafd-usage/usage.html)
 fi
 case "$ENABLE_BENCH" in
   on) api_args+=(--enable-bench) ;;

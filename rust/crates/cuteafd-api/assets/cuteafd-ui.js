@@ -53,7 +53,6 @@ const fmt = {
 const PAGES = [
   { id: 'console', href: '/', label: 'LIVE CONSOLE' },
   { id: 'usage', href: '/usage', label: 'USAGE' },
-  { id: 'agent', href: '/agent', label: 'AGENT (EXPERIMENTAL)' },
   { id: 'bench', href: '/bench', label: 'BENCHMARK', primary: true },
 ];
 function header(el, opts = {}) {
@@ -326,5 +325,170 @@ function heat(el, cells, opts = {}) {
   svg.innerHTML = out; marks(svg, cells, (c) => `${c.day} ${String(c.hour).padStart(2, '0')}:00\n${fmt.n0(c.value)} ${opts.unit || 'requests'}`, (c) => opts.onClick?.(c));
 }
 
-window.CuteUI = { token, color, fmt, header, facts, build, area, histogram, ribbons, strip, heat, svg: { sparkline, columns, timeline, meter, area, histogram, ribbons, strip, heat } };
+// ---------------------------------------------------------------- fabric chip
+// One chip: "Fabric OK", or the problem by host name. Idle and unproven ports,
+// and a Spark's unused second rail being down, are normal and say nothing; only
+// retransmits above the warning rate (yellow), an engine port that is down (red), or an engine
+// link below the host's fastest active port produce words. Details (host names,
+// never addresses) open on click. Polls /v1/fabric every 3 s while the page is
+// visible and `opts.live()` holds.
+// Retransmits: go-back-N resends as a share of packets moved (the server's
+// fabric health: one count per gap, packets = bytes ÷ the RoCE MTU). No data
+// is lost. A rate above the server's warning is yellow, and only on a window
+// that moved enough to judge; red is only an engine port that is down.
+const JUDGE_MIN_GB = 2;
+// Two significant digits; "<0.0001%" below that.
+function pct2(v) {
+  if (!Number.isFinite(v)) return '–';
+  if (v === 0) return '0%';
+  if (v < 1e-4) return '<0.0001%';
+  return `${Number(v.toPrecision(2)).toString()}%`;
+}
+// Per-port cumulative (events, GB) samples over the last 60 s, so the chip can
+// judge a recent window instead of since launch (which includes load bursts).
+const RECENT_S = 60;
+const fabricHistory = new Map();
+function recentRetransmits(key, h, now) {
+  const events = h?.retransmit_events, gb = h?.moved_gb;
+  if (!Number.isFinite(events) || !Number.isFinite(gb)) return null;
+  const list = fabricHistory.get(key) || [];
+  // A counter reset (smaller totals) starts the window over.
+  if (list.length && (events < list.at(-1).events || gb < list.at(-1).gb)) list.length = 0;
+  list.push({ t: now, events, gb });
+  while (list.length > 1 && now - list[1].t >= RECENT_S) list.shift();
+  fabricHistory.set(key, list);
+  const first = list[0];
+  if (now - first.t < RECENT_S * 0.75) return null;
+  const moved = gb - first.gb;
+  return { pct: moved > 0 ? 100 * (events - first.events) * (h.roce_mtu || 4096) / (moved * 1e9) : 0, gb: moved };
+}
+function fabricHost(key, host) {
+  if (key === 'coordinator') return host.hostname || 'coordinator';
+  return host.hostname || `Spark ${key.replace(/:\d+$/, '').split('.').pop()}`;
+}
+function fabricModel(snapshot, now = performance.now() / 1000) {
+  const hosts = [], problems = [];
+  for (const [key, host] of Object.entries(snapshot.hosts || {})) {
+    const name = fabricHost(key, host);
+    const used = new Set((host.engine || []).map((e) => `${e.device}/${e.port}`));
+    const ports = host.ports || [];
+    const fastest = Math.max(0, ...ports.filter((p) => /ACTIVE/.test(p.state || '')).map((p) => p.link_gbps || 0));
+    const rows = ports.map((p) => {
+      const h = p.health_since_start || {};
+      const active = /ACTIVE/.test(p.state || ''), engine = used.has(`${p.device}/${p.port}`);
+      const limit = h.retransmit_warn_pct > 0 ? h.retransmit_warn_pct : 0.5;
+      const since = Number.isFinite(h.retransmit_pct) ? h.retransmit_pct : null;
+      const window = recentRetransmits(`${key} ${p.device}/${p.port}`, h, now);
+      const recent = window ? window.pct : null;
+      // The last minute judges once the page has one (and it moved enough); since launch until then.
+      const high = window ? window.gb >= JUDGE_MIN_GB && recent > limit : !!h.retransmit_judged && since > limit;
+      let issue = null;
+      if (engine && !active) issue = 'down';
+      else if (high) issue = 'retransmits';
+      else if (active && engine && fastest && p.link_gbps && p.link_gbps < fastest) issue = 'slow link';
+      if (issue) problems.push({ host: name, issue });
+      return { port: `${p.device}/${p.port}`, state: active ? 'up' : (p.state || '').replace(/^\d+:\s*/, '').toLowerCase() || 'unknown',
+        rate: p.link_gbps, recent, since, limit, engine, issue, verdict: h.verdict || 'unknown' };
+    });
+    hosts.push({ name, rows, coordinator: key === 'coordinator' });
+  }
+  hosts.sort((a, b) => (b.coordinator - a.coordinator) || a.name.localeCompare(b.name));
+  return { hosts, problems };
+}
+function fabricChip(opts = {}) {
+  const live = opts.live || (() => true);
+  let model = null;
+  const wrap = document.createElement('span');
+  wrap.className = 'fabric-chip-wrap';
+  wrap.innerHTML = `<button type="button" class="fabric-chip unknown" id="fabric-chip" aria-expanded="false" aria-controls="fabric-pop" hidden>
+    <i></i><span id="fabric-text">Fabric</span></button>
+    <div class="fabric-pop" id="fabric-pop" role="dialog" aria-label="Fabric details" hidden></div>`;
+  const chip = wrap.querySelector('.fabric-chip'), text = wrap.querySelector('#fabric-text'), pop = wrap.querySelector('.fabric-pop');
+  const close = () => { pop.hidden = true; chip.setAttribute('aria-expanded', 'false'); };
+  chip.onclick = () => { pop.hidden = !pop.hidden; chip.setAttribute('aria-expanded', String(!pop.hidden)); if (!pop.hidden) popup(); };
+  addEventListener('click', (e) => { if (!wrap.contains(e.target)) close(); });
+  addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pop.hidden) { close(); chip.focus(); } });
+  function popup() {
+    if (!model) { pop.textContent = 'No fabric observations yet.'; return; }
+    const gbps = (v) => Number.isFinite(v) ? `${fmt.n0(v)} Gb/s` : '–';
+    const limit = model.hosts.flatMap((h) => h.rows).find((r) => Number.isFinite(r.limit))?.limit;
+    pop.innerHTML = `<table><thead><tr><th>Host</th><th>Port</th><th>State</th><th>Rate</th>
+      <th title="Go-back-N retransmits as a share of packets moved in the last 60 s (no data is lost)">Retransmits · 60 s</th>
+      <th title="The same since the server started observing (includes load-time bursts)">since launch</th><th></th></tr></thead><tbody>` +
+      model.hosts.map((h) => h.rows.map((r, i) => `<tr class="${r.issue === 'down' ? 'issue' : r.issue ? 'warn' : r.engine ? '' : 'spare'}"><td>${i ? '' : fmt.esc(h.name)}</td>
+        <td>${fmt.esc(r.port)}${r.engine ? '' : ' <small>unused</small>'}</td><td>${fmt.esc(r.state)}</td><td>${gbps(r.rate)}</td>
+        <td>${r.recent == null ? '<small>…</small>' : pct2(r.recent)}</td><td class="muted">${pct2(r.since)}</td>
+        <td>${r.issue ? `<b>${fmt.esc(r.issue)}</b>` : r.engine && r.verdict === 'ok' ? 'ok' : ''}</td></tr>`).join('')).join('') +
+      `</tbody></table><p class="note">Retransmits are go-back-N resends as a share of packets moved; no data is lost. A warning above ${pct2(limit)},
+      judged on at least 2 GB; the last 60 s judges once the page has watched that long. Idle, unproven and unused ports are normal.</p>`;
+  }
+  function show() {
+    if (!model || !model.hosts.length) { chip.hidden = true; return; }
+    chip.hidden = false;
+    const p = model.problems;
+    let cls = 'ok', label = 'Fabric OK';
+    if (p.length) {
+      const hosts = [...new Set(p.map((x) => x.host))], kinds = [...new Set(p.map((x) => x.issue))];
+      // Red only for an engine port that is down; retransmits and slow links are warnings.
+      cls = p.some((x) => x.issue === 'down') ? 'bad' : 'warn';
+      const words = { down: 'port down', retransmits: 'retransmits', 'slow link': 'slow link' };
+      label = hosts.length === 1 && kinds.length === 1 ? `Fabric: ${words[kinds[0]] || kinds[0]} on ${hosts[0]}` : `Fabric: ${p.length} port${p.length === 1 ? '' : 's'} degraded`;
+    }
+    chip.className = 'fabric-chip ' + cls; text.textContent = label;
+    chip.title = 'Fabric health over the last 60 s (since launch until then). Click for details.';
+    if (!pop.hidden) popup();
+  }
+  async function poll() {
+    if (!document.hidden && live()) {
+      try {
+        const response = await fetch('/v1/fabric', { signal: AbortSignal.timeout(2500) });
+        if (response.ok) { model = fabricModel(await response.json()); show(); }
+      } catch (_) { /* keep the last verdict */ }
+    }
+    setTimeout(poll, 3000);
+  }
+  setTimeout(poll, 1500);
+  return wrap;
+}
+
+// ---------------------------------------------------------------- admin access
+// The console unlock cookie gates admin views. `/console/status` (public) says
+// whether this browser holds it and how the operator prints the link.
+let consoleStatus = null;
+function access() {
+  consoleStatus ||= fetch('/console/status', { credentials: 'same-origin', cache: 'no-store' })
+    .then((r) => r.ok ? r.json() : { unlocked: false, link_command: null })
+    .catch(() => ({ unlocked: false, link_command: null }));
+  return consoleStatus;
+}
+// The "how to get the link" block as HTML: the one-liner, a copy button, never the secret.
+function linkHelp(command) {
+  const cmd = command
+    ? `<div class="admin-cmd"><code>${fmt.esc(command)}</code><button type="button" class="btn admin-copy">COPY</button></div>`
+    : '<div class="admin-cmd"><code>echo "http://HOST:PORT/console/unlock?token=$(cat ~/.cache/cuteafd/console/secret)"</code></div>';
+  return `<p>Run this on the host that launched the server, then open the URL it prints in this browser (one visit; the browser stays unlocked for a year):</p>${cmd}`;
+}
+function wireCopy(root, command) {
+  const button = root.querySelector('.admin-copy');
+  if (button) button.onclick = async () => {
+    try { await navigator.clipboard.writeText(command); button.textContent = 'COPIED'; }
+    catch (_) { button.textContent = 'SELECT + COPY'; }
+    setTimeout(() => { button.textContent = 'COPY'; }, 1600);
+  };
+}
+// An admin-only page: when locked, replace everything after the header with one
+// block saying what the page is and how to unlock it. Resolves to `unlocked`.
+async function adminGate(app, title, what) {
+  const { unlocked, link_command: command } = await access();
+  if (unlocked) return true;
+  for (const child of [...app.children]) if (child.tagName !== 'HEADER') child.hidden = true;
+  const block = document.createElement('section');
+  block.className = 'panel admin-gate';
+  block.innerHTML = `<h1>${fmt.esc(title)}</h1><p class="admin-what">${fmt.esc(what)}</p>
+    <p class="admin-need">This page needs the <b>admin console link</b>.</p>${linkHelp(command)}`;
+  app.append(block); wireCopy(block, command || '');
+  return false;
+}
+
+window.CuteUI = { fabricChip, fabricModel, pct2, access, linkHelp, wireCopy, adminGate, token, color, fmt, header, facts, build, area, histogram, ribbons, strip, heat, svg: { sparkline, columns, timeline, meter, area, histogram, ribbons, strip, heat } };
 })();

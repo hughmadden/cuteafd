@@ -7,6 +7,7 @@ pub mod bodies;
 pub mod report;
 pub mod card;
 pub mod charts;
+pub mod fabric;
 pub mod layout;
 pub mod panels;
 pub mod png;
@@ -64,6 +65,13 @@ pub fn date(rfc3339: &str) -> &str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn wrap_breaks_a_word_longer_than_the_line() {
+        let lines = super::bodies::wrap("dev · https://github.com/tpurtell/cuteafd @ 9db3e0b7", 12.0, 120.0);
+        assert!(lines.iter().all(|l| l.chars().count() <= 16), "{lines:?}");
+        assert_eq!(lines.concat().replace(' ', ""), "dev·https://github.com/tpurtell/cuteafd@9db3e0b7");
+    }
+
+    #[test]
     fn number_formats() {
         assert_eq!(super::grouped(2415.3), "2,415");
         assert_eq!(super::grouped(1234567.0), "1,234,567");
@@ -78,19 +86,21 @@ mod tests {
         let mut report = crate::sample::full_report();
         let h = cuteafd_transport::fabric_health::Health {
             verdict: cuteafd_transport::fabric_health::Verdict::Ok,
-            loss_events_per_gb: Some(60.0), adapter_retransmits_per_gb: Some(1.0),
-            sequence_events_per_gb: Some(59.0), reasons: vec!["ECN and CNP observed".into()],
+            retransmit_events: Some(600), retransmit_pct: Some(0.025), retransmit_judged: true,
+            retransmit_warn_pct: 0.5, reasons: vec!["ECN and CNP observed".into()],
             ..Default::default()
         };
         report.fabric = vec![crate::fabric::Phase { name: "decode".into(), timed: true,
             ports: vec![crate::fabric::Port { host: "coordinator".into(), device: "nic".into(), port: 1,
+                state: Some("4: ACTIVE".into()), seconds: 1.0, sent_bytes: Some(1_000_000_000), received_bytes: Some(0),
+                engine_sent_bytes: Some(900_000_000), engine_received_bytes: Some(0),
                 health: Some(h.clone()), health_since_start: Some(h), mtu: Some(9000), ..Default::default() }], ..Default::default() }];
         let card = super::card::card_svg(&report);
-        assert!(card.contains("Fabric OK: peak loss 60.0 / retransmit 1.0"));
+        assert!(card.contains("Fabric OK: peak retransmits 0.025% of packets"));
         assert!(card.contains("pause not collected"));
         let report = super::report::report_svg(&report);
-        assert!(report.contains("loss 60.0 / sequence 59.0 / retransmit 1.0"));
-        assert!(report.contains("Since observation start") && report.contains("MTU 9000"));
+        // The report draws the port as a small multiple with its loss verdict.
+        assert!(report.contains("Fabric during this run") && report.contains("retransmits 0.025%"));
     }
 
 }

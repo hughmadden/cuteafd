@@ -69,15 +69,18 @@ pub fn local_network(ip: IpAddr) -> bool {
     }
 }
 
+/// Benchmark controls change server state: the console unlock cookie, or the
+/// API key when the operator configured one. Never open on a keyless server.
 fn authorized(bench: &Bench, peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
     let _ = peer;
     bench.api_key.get().is_some_and(|key| key.accepts(headers))
+        || bench.console_gate.get().is_some_and(|gate| gate.unlocked(headers))
 }
 
 fn forbidden() -> Response {
     (StatusCode::FORBIDDEN, Json(json!({"error": {"message":
-        "benchmark controls require the server's API key",
-        "type": "forbidden"}}))).into_response()
+        "benchmark controls need the admin console link (or the server's API key, when one is configured)",
+        "type": "console_locked"}}))).into_response()
 }
 
 fn not_found(what: &str) -> Response {
@@ -97,13 +100,22 @@ async fn page() -> Response {
     ([(header::CACHE_CONTROL, "no-cache")], axum::response::Html(page)).into_response()
 }
 
+/// A page script, or for page development (`CUTEAFD_BENCH_PAGE` set) the
+/// same-named file beside that page, re-read on every load.
+async fn script(name: &str, builtin: &'static str) -> Response {
+    let body = match std::env::var_os("CUTEAFD_BENCH_PAGE").map(std::path::PathBuf::from) {
+        Some(page) => tokio::fs::read_to_string(page.with_file_name(name)).await.unwrap_or_else(|_| builtin.to_string()),
+        None => builtin.to_string(),
+    };
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+}
+
 async fn fabric_script() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../assets/fabric.js")).into_response()
+    script("fabric.js", include_str!("../assets/fabric.js")).await
 }
 
 async fn banner() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], BANNER)
-        .into_response()
+    script("banner.js", BANNER).await
 }
 
 async fn status(State(bench): State<Arc<Bench>>) -> Json<serde_json::Value> {
@@ -190,7 +202,9 @@ fn probe_error(error: anyhow::Error) -> Response {
 
 async fn probe_request(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<SocketAddr>>, headers: HeaderMap,
     Json(request): Json<ProbeRequest>) -> Response {
-    if !authorized(&bench, peer(connect), &headers) { return forbidden(); }
+    // A running panel's own media probes carry its run token.
+    let own = headers.get(BENCH_HEADER).and_then(|v| v.to_str().ok()).is_some_and(|t| bench.accepts_internal(t));
+    if !own && !authorized(&bench, peer(connect), &headers) { return forbidden(); }
     match tokio::task::spawn_blocking(move || bench.probe(request.body, request.spec)).await {
         Ok(Ok(chat)) => Json(chat).into_response(),
         Ok(Err(error)) => probe_error(error),
@@ -273,9 +287,11 @@ struct FileQuery {
     compare: Option<String>,
 }
 
-fn attach_fidelity_comparison(report: &mut Report, earlier: Option<&Report>, earlier_id: &str) {
+/// `earlier(panel id)`: that panel of the saved run, read on its own (never the whole report).
+fn attach_fidelity_comparison(report: &mut Report, earlier: impl Fn(&str) -> Option<crate::report::PanelResult>, earlier_id: &str) {
     for panel in report.panels.iter_mut().filter(|p| matches!(p.id.as_str(), "fidelity" | "fidelity_full")) {
-        let previous = earlier.and_then(|r| r.panel(&panel.id)).and_then(|p| p.latest())
+        let earlier_panel = earlier(&panel.id);
+        let previous = earlier_panel.as_ref().and_then(|p| p.latest())
             .and_then(|v| serde_json::from_value::<crate::fidelity::Run>(v["decode"].clone()).ok());
         let latest = if let Some(partial) = &mut panel.partial { Some(partial) } else { panel.passes.last_mut() };
         let Some(latest) = latest else { continue };
@@ -287,7 +303,7 @@ fn attach_fidelity_comparison(report: &mut Report, earlier: Option<&Report>, ear
         latest["paired"] = paired;
         latest["paired"]["earlier_run"] = json!(earlier_id);
         if latest["tier"] == crate::fidelity_dataset::STANDARD_TIER && !latest["prefill"].is_null() {
-            let previous = earlier.and_then(|r| r.panel(&panel.id)).and_then(|p| p.latest())
+            let previous = earlier_panel.as_ref().and_then(|p| p.latest())
                 .and_then(|v| serde_json::from_value::<crate::fidelity::Run>(v["prefill"].clone()).ok());
             latest["paired_prefill"] = match (&previous, serde_json::from_value::<crate::fidelity::Run>(latest["prefill"].clone())) {
                 (Some(previous), Ok(current)) => crate::panels::fidelity::record(&current, Some(previous))["paired"].clone(),
@@ -304,7 +320,7 @@ async fn run_file(State(bench): State<Arc<Bench>>, Path((id, file)): Path<(Strin
     let report = if id == "latest" { bench.latest() } else { bench.report(&id) };
     let Some(mut report) = report else { return not_found("run") };
     if let Some(earlier_id) = &query.compare {
-        attach_fidelity_comparison(&mut report, bench.report(earlier_id).as_ref(), earlier_id);
+        attach_fidelity_comparison(&mut report, |panel| bench.panel(earlier_id, panel), earlier_id);
     }
     // The two surfaces below render the report itself rather than one of its
     // exports; `export` applies the same rule to everything else.
@@ -336,6 +352,19 @@ async fn run_report(State(bench): State<Arc<Bench>>, Path(id): Path<String>) -> 
     match report {
         Some(report) => Json(crate::quality::under_current_rule(&report)).into_response(),
         None => not_found("run"),
+    }
+}
+
+/// Every panel's newest result on this server fingerprint (see `Bench::merged`).
+async fn merged(State(bench): State<Arc<Bench>>, Path(fingerprint): Path<String>) -> Response {
+    match tokio::task::spawn_blocking(move || bench.merged(&fingerprint)).await.ok().flatten() {
+        Some((report, baseline)) => {
+            let mut value = serde_json::to_value(crate::quality::under_current_rule(&report)).unwrap_or_default();
+            value["merged"] = json!(true);
+            if let Some((run, created)) = baseline { value["baseline_run"] = json!(run); value["baseline_created"] = json!(created); }
+            Json(value).into_response()
+        }
+        None => not_found("runs for this fingerprint"),
     }
 }
 
@@ -384,7 +413,12 @@ async fn set_usage(State(bench): State<Arc<Bench>>, body: Result<Json<UsageSwitc
 }
 
 async fn require_control_key(State(bench): State<Arc<Bench>>, request: Request, next: Next) -> Response {
-    if request.uri().path().starts_with("/v1/bench/") && !authorized(&bench, None, request.headers()) {
+    // Status stays public: the BENCHMARKING banner on every page polls it.
+    let path = request.uri().path();
+    let public = request.method() == Method::GET && path == "/v1/bench/status";
+    let own_probe = path == "/v1/bench/probe" && request.headers().get(BENCH_HEADER)
+        .and_then(|v| v.to_str().ok()).is_some_and(|t| bench.accepts_internal(t));
+    if path.starts_with("/v1/bench/") && !public && !own_probe && !authorized(&bench, None, request.headers()) {
         return forbidden();
     }
     next.run(request).await
@@ -402,6 +436,7 @@ pub fn routes(bench: Arc<Bench>) -> Router {
         .route("/v1/bench/profiles/:name", put(save_profile).delete(delete_profile))
         .route("/v1/bench/runs", get(runs).post(start))
         .route("/v1/bench/runs/:id", get(run_report))
+        .route("/v1/bench/merged/:fingerprint", get(merged))
         .route("/v1/bench/runs/:id/cancel", post(cancel))
         .route("/v1/bench/runs/:id/:file", get(run_file))
         .route("/v1/bench/import", post(import))
@@ -420,6 +455,43 @@ pub fn mount(router: Router, bench: Arc<Bench>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keyless bench server: inference open, controls need the console cookie.
+    /// With a key configured, the controls take either credential; status stays public.
+    #[tokio::test]
+    async fn bench_controls_take_the_console_cookie_or_a_configured_key() {
+        use tower::ServiceExt;
+        let secret = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret.path(), "c".repeat(64)).unwrap();
+        let gate = cuteafd_api::console_gate::ConsoleGate::from_file(secret.path(), false).unwrap();
+        for key in [None, Some("op-key")] {
+            let bench = Bench::new(crate::store::Store::memory().unwrap());
+            bench.set_console_gate(gate.clone());
+            let key = key.map(|k| cuteafd_api::openai::auth::ApiKey::new(k).unwrap());
+            if let Some(key) = &key { bench.set_api_key(key.clone()); }
+            let inner = Router::new().route("/v1/chat/completions", post(|| async { "chat" }));
+            let app = gate.mount(mount(inner, bench)).layer(axum::middleware::from_fn_with_state(
+                cuteafd_api::openai::auth::Auth { key: key.clone(), internal: None }, cuteafd_api::openai::auth::require_key));
+            let unlock = app.clone().oneshot(Request::get(format!("/console/unlock?token={}", "c".repeat(64))).body(Body::empty()).unwrap()).await.unwrap();
+            let cookie = unlock.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+            let call = |method: Method, path: &str, credential: Option<(&'static str, String)>| {
+                let mut request = Request::builder().method(method).uri(path).header("content-type", "application/json");
+                if let Some((name, value)) = credential { request = request.header(name, value); }
+                let request = request.body(Body::from("{}")).unwrap();
+                let app = app.clone();
+                async move { app.oneshot(request).await.unwrap().status() }
+            };
+            let chat = call(Method::POST, "/v1/chat/completions", None).await;
+            assert_eq!(chat == StatusCode::OK, key.is_none(), "keyless inference is open; a configured key guards it");
+            assert_eq!(call(Method::GET, "/v1/bench/status", None).await, StatusCode::OK);
+            for (method, path) in [(Method::GET, "/v1/bench/runs"), (Method::POST, "/v1/bench/probe"), (Method::PUT, "/v1/bench/usage")] {
+                assert_eq!(call(method.clone(), path, None).await, StatusCode::FORBIDDEN, "{path} without credentials");
+                assert_ne!(call(method.clone(), path, Some(("cookie", cookie.clone()))).await, StatusCode::FORBIDDEN, "{path} with the cookie");
+                let bearer = call(method.clone(), path, Some(("authorization", "Bearer op-key".into()))).await;
+                assert_eq!(bearer != StatusCode::FORBIDDEN, key.is_some(), "{path} with a bearer");
+            }
+        }
+    }
 
     /// A stored Qwen NVFP4 max run whose own `config.json` declares `algo` for
     /// its routed experts, with `failing` (a check id, or `""`) left failing
@@ -609,7 +681,7 @@ mod tests {
             baseline: None, panels: vec![crate::report::PanelResult {
                 id: "fidelity".into(), passes: vec![json!({"saved":true})], partial: Some(json!({"decode":null})),
                 ..Default::default() }], fabric: vec![], error: None };
-        attach_fidelity_comparison(&mut report, None, "missing");
+        attach_fidelity_comparison(&mut report, |_| None, "missing");
         let panel = report.panel("fidelity").unwrap();
         assert_eq!(panel.latest().unwrap()["paired"]["earlier_run"], "missing");
         assert!(panel.latest().unwrap()["paired"]["unavailable"].as_str().unwrap().contains("no matching"));
@@ -621,13 +693,13 @@ mod tests {
         let mut current = crate::sample::full_report();
         current.panels.retain(|p| p.id == "fidelity");
         let mut earlier = current.clone();
-        attach_fidelity_comparison(&mut current,Some(&earlier),"earlier");
+        attach_fidelity_comparison(&mut current,|id| earlier.panel(id).cloned(),"earlier");
         let latest = current.panel("fidelity").unwrap().latest().unwrap();
         assert_eq!(latest["paired"]["comparison"]["pass"],true);
         assert_eq!(latest["paired_prefill"]["comparison"]["pass"],true);
         let old = earlier.panels[0].passes.last_mut().unwrap();
         old["decode"]["tier"] = json!("standard"); old["prefill"]["tier"] = json!("standard");
-        attach_fidelity_comparison(&mut current,Some(&earlier),"legacy");
+        attach_fidelity_comparison(&mut current,|id| earlier.panel(id).cloned(),"legacy");
         let latest = current.panel("fidelity").unwrap().latest().unwrap();
         assert!(latest["paired"]["unavailable"].as_str().unwrap().contains("different tiers"));
         assert!(latest["paired_prefill"]["unavailable"].as_str().unwrap().contains("different tiers"));

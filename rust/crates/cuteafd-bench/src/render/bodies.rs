@@ -23,7 +23,14 @@ pub fn wrap(text: &str, size: f64, width: f64) -> Vec<String> {
         if !line.is_empty() {
             line.push(' ');
         }
-        line.push_str(word);
+        // A word longer than a line (a URL, a hash) breaks at the edge instead of running past it.
+        let mut rest: Vec<char> = word.chars().collect();
+        while line.chars().count() + rest.len() > max {
+            let take = max.saturating_sub(line.chars().count()).max(1);
+            line.extend(rest.drain(..take.min(rest.len())));
+            lines.push(std::mem::take(&mut line));
+        }
+        line.extend(rest);
     }
     if !line.is_empty() {
         lines.push(line);
@@ -101,10 +108,10 @@ pub fn decode_scaling(doc: &mut Doc, theme: &Theme, report: &Report, x: f64, y: 
             let highlight = point.width == 8;
             let (cx, cy) = (px(point.width), py(point.aggregate_tok_s));
             doc.group_attrs(&format!(r#"aria-label="{}""#, super::svg::escape(&format!(
-                "C{}: {} aggregate tok/s, {} median tok/s per request", point.width,
+                "C{}: {} aggregate tps, {} median tps per request", point.width,
                 rate(point.aggregate_tok_s), rate(point.per_stream_median_tok_s)))));
             doc.raw(&format!("<title>{}</title>", super::svg::escape(&format!(
-                "C{}: {} aggregate tok/s; {} per request (median)", point.width,
+                "C{}: {} aggregate tps; {} per request (median)", point.width,
                 rate(point.aggregate_tok_s), rate(point.per_stream_median_tok_s)))));
             doc.raw(&format!(r#"<circle cx="{cx}" cy="{cy}" r="{}" fill="{}" stroke="{}" stroke-width="{}"/>"#,
                 if highlight { 6.5 * scale } else { 4.5 * scale },
@@ -114,8 +121,8 @@ pub fn decode_scaling(doc: &mut Doc, theme: &Theme, report: &Report, x: f64, y: 
             doc.end();
         }
     }
-    let caption = baseline.card.concurrent_at(8).map_or_else(|| "aggregate tok/s · C8 not measured".into(),
-        |point| format!("aggregate tok/s · {}/stream at C8", rate(point.per_stream_median_tok_s)));
+    let caption = baseline.card.concurrent_at(8).map_or_else(|| "aggregate tps · C8 not measured".into(),
+        |point| format!("aggregate tps · {}/stream at C8", rate(point.per_stream_median_tok_s)));
     doc.text(x, y + 140.0 * scale, Font::new(13.0 * scale, theme.ink2), &fit(&caption, 13.0 * scale, width));
 }
 
@@ -137,10 +144,32 @@ impl<'a> View<'a> {
             "hardware" => self.hardware(&mut doc, width),
             "configuration" => self.configuration(&mut doc, width),
             "baseline" => self.baseline(&mut doc, width),
-            _ => match self.report.panel(id).and_then(|p| super::panels::body(&mut doc, &self.theme, id, p, width)) {
-                Some(height) => height,
-                None => self.generic(&mut doc, width, self.report.panel(id)),
-            },
+            _ => {
+                // A failed or interrupted panel says why above whatever partial chart it has.
+                let panel = self.report.panel(id);
+                let banner = match panel.and_then(|p| p.error.as_deref().map(|e| (p, e))) {
+                    Some((p, error)) if !p.passes.is_empty() || p.partial.is_some() => {
+                        let t = &self.theme;
+                        let label = if p.status == crate::report::PanelStatus::Failed { "failed" } else { "stopped" };
+                        let lines = wrap(error, 11.5, width - 24.0);
+                        let h = 14.0 + 16.0 * lines.len() as f64 + 8.0;
+                        doc.rect_attrs(0.0, 0.0, width, h, 6.0, &format!(r#"fill="{}" stroke="{}""#, t.panel2, t.bad));
+                        doc.text(12.0, 16.0, Font::new(10.0, t.bad).weight(700).spacing(1.2), &label.to_uppercase());
+                        for (i, line) in lines.iter().enumerate() {
+                            doc.text(12.0, 32.0 + 16.0 * i as f64, Font::new(11.5, t.ink), line);
+                        }
+                        h + 12.0
+                    }
+                    _ => 0.0,
+                };
+                if banner > 0.0 { doc.group(0.0, banner); }
+                let height = match panel.and_then(|p| super::panels::body(&mut doc, &self.theme, id, p, width)) {
+                    Some(height) => height,
+                    None => self.generic(&mut doc, width, panel),
+                };
+                if banner > 0.0 { doc.end(); }
+                banner + height
+            }
         };
         (doc.into_parts().1, height)
     }
@@ -336,12 +365,12 @@ impl<'a> View<'a> {
             doc.text(x, 80.0, Font::new(11.0, t.ink2), &fit(sub, 11.0, headline_width));
         };
         let code_tokens = b.card.decode_of("code").and_then(|d| d.runs.first()).map_or(0, |r| r.completion_tokens);
-        big(doc, 0.0, "C1 CODE DECODE", &rate(code), "tok/s", &format!("thinking off · {code_tokens} tokens"),
+        big(doc, 0.0, "C1 CODE DECODE", &rate(code), "tps", &format!("thinking off · {code_tokens} tokens"),
             t.series[0]);
         decode_scaling(doc, t, self.report, headline_width + 24.0, 12.0, headline_width, 0.48);
         let prefill_x = 2.0 * (headline_width + 24.0);
         match prefill {
-            Some(p) => big(doc, prefill_x, "8K PREFILL", &rate(p.tok_s), "tok/s",
+            Some(p) => big(doc, prefill_x, "8K PREFILL", &rate(p.tok_s), "tps",
                 &format!("TTFT {} · {} tokens", seconds(p.ttft_s), super::grouped(p.prompt_tokens as f64)), t.series[3]),
             None => big(doc, prefill_x, "8K PREFILL", "—", "", "not measured", t.series[3]),
         }

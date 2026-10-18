@@ -735,6 +735,14 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         }.validate().map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
         entries.push(entry);
     }
+    // Benchmark controls and inference on the launched servers take an API key:
+    // an entry's own API_KEY_FILE is used unchanged, else one private key per
+    // state directory (created on the first real run, never printed).
+    let smoke_key = assign_api_keys(&mut entries, &state_dir);
+    if !args.dry_run && entries.iter().any(|e| e.set.get("API_KEY_FILE").is_some_and(|f| Path::new(f) == smoke_key)) {
+        ensure_key_file(&smoke_key)?;
+        eprintln!("smoke API key file: {}", smoke_key.display());
+    }
     let mut state = load_state(&paths.state);
     let pending: Vec<Entry> = entries.iter().filter(|e| {
         let done = state.get(&e.name).is_some_and(|o| o.status == "done" && o.key == e.key() && o.build == build);
@@ -746,8 +754,8 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
-                e.name, e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
+                e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.fabric.unwrap_or(true), e.set);
         }
@@ -849,6 +857,36 @@ fn summary(entries: &[Entry], state: &BTreeMap<String, Outcome>, build: &str, se
         }
     }
     out
+}
+
+/// Every entry serves an API key: its own API_KEY_FILE, else `<state>/api-key`
+/// (returned). Keys only; the file is created by [`ensure_key_file`].
+fn assign_api_keys(entries: &mut [Entry], state_dir: &Path) -> PathBuf {
+    let smoke_key = state_dir.join("api-key");
+    for entry in entries {
+        entry.set.entry("API_KEY_FILE".into()).or_insert_with(|| smoke_key.display().to_string());
+    }
+    smoke_key
+}
+
+/// A private (0600) random key at `path`, created once and then reused; refuses a
+/// symlink or a file other users can read.
+fn ensure_key_file(path: &Path) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+        Ok(mut file) => {
+            let key = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+            file.write_all(format!("{key}\n").as_bytes())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("{}", path.display())),
+    }
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || meta.permissions().mode() & 0o077 != 0 {
+        bail!("{} must be a private (0600) regular file", path.display());
+    }
+    Ok(())
 }
 
 /// A config for the entry: the base file plus the entry's keys (later lines win).
@@ -1019,7 +1057,9 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             Some(list) => (None, Some(list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())),
             None => (Some(profile.to_string()), None),
         };
-        let api_key = std::env::var("CUTEAFD_API_KEY").ok();
+        // An explicit CUTEAFD_API_KEY wins; otherwise the key file this launch serves.
+        let api_key = std::env::var("CUTEAFD_API_KEY").ok().or_else(|| config.get("API_KEY_FILE")
+            .and_then(|file| std::fs::read_to_string(file).ok()).map(|key| key.trim().to_string()).filter(|k| !k.is_empty()));
         let sweeping = entry.levels.is_some() || entry.prefill_lengths.is_some();
         let run_sweep = || -> Result<crate::sweep::Sweep> {
             let open: crate::sweep::OnTimed = entry.window.as_ref().map(|window| -> Box<dyn FnOnce() -> Result<()> + '_> {
@@ -1193,6 +1233,33 @@ pub fn describe(matrix: &Matrix) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_smoke_entries_all_serve_an_api_key() {
+        use super::*;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for matrix in ["scripts/bench/release-smoke-v3.json", "scripts/bench/release-smoke.example.json"] {
+            let matrix: Matrix = serde_json::from_str(&std::fs::read_to_string(root.join(matrix)).unwrap()).unwrap();
+            let mut entries: Vec<Entry> = matrix.entries.iter().map(|e| e.merged(&matrix.defaults)).collect();
+            let state = tempfile::tempdir().unwrap();
+            let key = assign_api_keys(&mut entries, state.path());
+            assert!(!entries.is_empty());
+            for entry in &entries {
+                assert_eq!(entry.set.get("API_KEY_FILE").map(PathBuf::from), Some(key.clone()), "{}", entry.name);
+            }
+            // An entry's own key file is kept.
+            let mut own = entries[0].clone();
+            own.set.insert("API_KEY_FILE".into(), "/operator/key".into());
+            assign_api_keys(std::slice::from_mut(&mut own), state.path());
+            assert_eq!(own.set["API_KEY_FILE"], "/operator/key");
+            ensure_key_file(&key).unwrap();
+            let first = std::fs::read_to_string(&key).unwrap();
+            ensure_key_file(&key).unwrap();
+            assert_eq!(std::fs::read_to_string(&key).unwrap(), first, "reused, not rotated");
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
     #[test]
     fn post_load_repeat_needs_post_load_c1_and_merges() {
         let named = |name: &str| Entry { name: name.into(), levels: Some(vec![1, 16]), ..Entry::default() };

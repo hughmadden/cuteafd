@@ -989,7 +989,7 @@ mod tests {
         assert!(html.contains("no-fit-5090/report.json"));
         let card = crate::render::card::card_svg(&rejection.report);
         assert!(card.contains("Doesn&#39;t fit"));
-        assert!(!card.contains("tok/s"));
+        assert!(!card.contains("tps"));
         let report = crate::render::report::report_svg(&rejection.report);
         assert!(report.contains("Doesn&#39;t fit"));
         assert!(!crate::render::report::shown(&rejection.report).contains(&"baseline".into()));

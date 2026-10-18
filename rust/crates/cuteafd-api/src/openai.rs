@@ -375,7 +375,9 @@ struct ThermalWindow { from: Option<f64>, to: Option<f64> }
 async fn thermal_route(axum::extract::Query(q): axum::extract::Query<ThermalWindow>) -> Json<Value> {
     let now = cuteafd_core::thermal::now_s();
     let mut value = json!({"now_s": now, "available": cuteafd_core::thermal::active(),
-        "current": cuteafd_core::thermal::current()});
+        "current": cuteafd_core::thermal::current(),
+        // Spark GPUs ride the fabric observation (lease-gated: this read renews it).
+        "sparks": tokio::task::spawn_blocking(|| cuteafd_transport::traffic::peer_gpus(true)).await.unwrap_or_default()});
     if let Some(from) = q.from {
         value["window"] = cuteafd_core::thermal::window(from, q.to.unwrap_or(now).min(now));
     }

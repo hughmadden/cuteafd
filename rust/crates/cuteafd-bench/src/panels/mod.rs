@@ -138,9 +138,11 @@ pub trait Panel: Send + Sync {
 
 /// Every panel this build runs, in display order.
 pub fn catalog() -> Vec<&'static dyn Panel> {
+    // Page order packs whole rows: halves in pairs, the three thirds together.
     vec![&info::HARDWARE, &info::CONFIGURATION, &speed::DECODE_CONTENT, &speed::CONCURRENCY, &speed::DRAFT_MIX, &speed::PREFILL,
-        &speed::RETAINED, &speed::PREFIX_CACHE, &context_load::CONTEXT_LOAD, &agentic::AGENTIC, &quality::STRUCTURED, &quality::NEEDLE, &quality::IFEVAL,
-        &fidelity::STANDARD, &fidelity::FULL, &quality::CODE, &quality::MATH, &reasoning::REASONING, &tools::TOOL_EVAL, &lossless::LOSSLESS_SET, &info::STARTUP]
+        &speed::RETAINED, &speed::PREFIX_CACHE, &context_load::CONTEXT_LOAD, &agentic::AGENTIC, &quality::STRUCTURED, &tools::TOOL_EVAL,
+        &quality::NEEDLE, &fidelity::STANDARD, &fidelity::FULL, &quality::IFEVAL, &quality::CODE, &quality::MATH, &reasoning::REASONING,
+        &lossless::LOSSLESS_SET, &info::STARTUP]
 }
 
 pub fn find(id: &str) -> Option<&'static dyn Panel> {

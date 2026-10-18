@@ -25,6 +25,7 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
     Some(match id {
         "decode_content" => decode_content(doc, t, latest, w),
         "concurrency" => concurrency(doc, t, latest, w),
+        "draft_mix" => draft_mix(doc, t, latest, w),
         "prefill" => prefill(doc, t, latest, w),
         "retained" => retained(doc, t, latest, w),
         "prefix_cache" => prefix_cache(doc, t, latest, w),
@@ -47,9 +48,20 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
 fn context_load(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let points = v["points"].as_array().cloned().unwrap_or_default();
     if points.is_empty() { return empty(doc, t, "no measurements yet"); }
-    let columns = ["context", "C", "agg tok/s", "med tok/s", "TTFT ms", "cached", "cold ms"];
+    // Aggregate tps per measured (context, C), one bar each; the table below has the rest.
+    let bars: Vec<(String, f64, &str, String)> = points.iter().filter(|p| p["status"] == "ok").filter_map(|p| {
+        let label = format!("{} · C{}", crate::report::short_tokens(p["context"].as_u64()?), p["c"].as_u64()?);
+        let note = num(p, "ttft_s").map(|s| format!("TTFT {:.0} ms", s * 1e3)).unwrap_or_default();
+        Some((label, num(p, "aggregate_tok_s")?, t.series[0], note))
+    }).collect();
+    let mut y = 0.0;
+    if !bars.is_empty() {
+        doc.text(0.0, 12.0, Font::new(10.5, t.muted).weight(600), "AGGREGATE DECODE AT SHARED CONTEXT");
+        y = 20.0 + hbars(doc, t, 0.0, 20.0, w, &bars, "tps") + 14.0;
+    }
+    let columns = ["context", "C", "agg tps", "med tps", "TTFT ms", "cached", "cold ms"];
     let widths = [0.16, 0.06, 0.16, 0.15, 0.15, 0.16, 0.16];
-    let mut y = 16.0;
+    y += 16.0;
     let mut x = 0.0;
     for (name, fraction) in columns.iter().zip(widths) {
         doc.text(x, y, Font::new(10.0, t.ink2).weight(600), name);
@@ -93,64 +105,47 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let dataset = &v["dataset"];
     let config = dataset["config"].as_str().unwrap_or("unpublished");
     let revision = dataset["revision"].as_str().unwrap_or("?");
-    let identity = format!("{config} · {}", revision.chars().take(12).collect::<String>());
-    doc.titled(&identity);
-    doc.text(0.0, 14.0, Font::new(11.0, t.ink2), &super::svg::fit(&identity, 11.0, w));
+    // Where the numbers come from, said once and plainly: whose logits are
+    // the reference, and whose generated text the windows replay.
+    let scored = v["decode"]["checkpoint"].as_str().or_else(|| v["prefill"]["checkpoint"].as_str());
+    let short = |id: &str| id.rsplit('/').next().unwrap_or(id).to_string();
+    let reference = v["reference_root"].as_str();
+    let text = v["text_checkpoint"].as_str().or_else(|| dataset["text_checkpoint"].as_str());
+    let reference_only = dataset["qualification"] == "reference-only qualified";
+    let mut sources = Vec::new();
+    if let Some(reference) = reference {
+        sources.push(format!("Reference logits: {}{}", short(reference), if reference_only { " (reference-only)" } else { "" }));
+    }
+    if let Some(text) = text {
+        let shared = scored.is_some_and(|s| s != text);
+        sources.push(format!("prompt text: {}", if shared { format!("shared {} set", short(text)) } else { short(text) }));
+    }
+    let label = if sources.is_empty() { format!("{config} · {}", revision.chars().take(12).collect::<String>()) } else { sources.join(" · ") };
+    doc.titled(&format!("dataset {config} @ {revision}{}", reference.map(|r| format!(" · reference {r} via {}",
+        v["reference_match"].as_str().unwrap_or("?"))).unwrap_or_default()));
+    doc.text(0.0, 14.0, Font::new(11.0, t.ink2), &super::svg::fit(&label, 11.0, w));
     doc.end();
-    y += 28.0;
-    if dataset["qualification"] == "reference-only qualified" {
-        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), "reference-only qualified");
-        y += 22.0;
+    y += 22.0;
+    let mut notes = Vec::new();
+    if reference_only {
+        notes.push("reference-only qualified: reference logits without paired engine calibration, so the verdict uses the common floors".to_string());
     }
-    if let Some(how) = v["reference_match"].as_str() {
-        let label = format!("Reference via {how}: {}", v["reference_root"].as_str().unwrap_or("?"));
-        doc.titled(&label);
-        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &super::svg::fit(&label, 11.0, w));
-        doc.end(); y += 22.0;
-        if let Some(chains) = v["resolved_chain"].as_array() {
-            for chain in chains {
-                let label = chain.as_array().map(|c| c.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" -> ")).unwrap_or_default();
-                doc.titled(&label);
-                doc.text(0.0, y + 12.0, Font::new(10.0, t.ink2), &super::svg::fit(&label, 10.0, w));
-                doc.end(); y += 20.0;
-            }
-        }
-        if let Some(source) = v["text_checkpoint"].as_str() {
-            let label = format!("Window text from {source}");
-            doc.titled(&label);
-            doc.text(0.0, y + 12.0, Font::new(10.0, t.ink2), &super::svg::fit(&label, 10.0, w));
-            doc.end(); y += 20.0;
+    if let (Some(text), Some(scored)) = (text, scored) {
+        if text != scored {
+            notes.push(format!("provisional: window text was generated by {}, not by the scored checkpoint", short(text)));
         }
     }
-    for (path, verdict) in [("decode", &v["verdict"]), ("prefill", &v["prefill_verdict"])] {
+    for (i, note) in notes.iter().enumerate() {
+        let color = if note.starts_with("provisional") { t.warn } else { t.muted };
+        doc.titled(note);
+        doc.text(0.0, y + 11.0, Font::new(10.0, color), &super::svg::fit(note, 10.0, w));
+        doc.end();
+        y += if i + 1 == notes.len() { 22.0 } else { 16.0 };
+    }
+    if notes.is_empty() { y += 6.0; }
+    for (path, verdict, windows) in [("decode", &v["verdict"], &v["per_window"]), ("prefill", &v["prefill_verdict"], &v["prefill_per_window"])] {
         if verdict.is_null() { continue; }
-        let status = if verdict["pass"] == true { "PASS" } else { "FAIL" };
-        let score = &verdict["generated"];
-        doc.text(0.0, y + 12.0, Font::new(12.0, t.ink).weight(600), &format!("{path} · {status} · {} · n={}",
-            seconds(num(&v[path], "seconds").unwrap_or(0.0)), score["positions"]));
-        y += 22.0;
-        if let Some(label) = verdict["label"].as_str() {
-            doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), label);
-            y += 22.0;
-        }
-        // Different units never share an axis. Percent metrics and KL get separate rows.
-        for (label, metric, bound, percent) in [("top-1", "top1", "top1_min", true),
-            ("KL", "kl", "kl_max", false), ("confident top-1", "confident_top1", "confident_top1_min", true),
-            ("top-3", "top3_contained", "top3_min", true)] {
-            let val = num(score, metric).map(|x| if percent { format!("{:.2}%", x*100.0) } else { format!("{x:.5} nat") })
-                .unwrap_or_else(|| "N/A".into());
-            let limit = num(verdict, bound).unwrap_or(0.0);
-            doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), label);
-            if w < 420.0 { y += 18.0; }
-            doc.text(w, y + 12.0, Font::new(11.0, t.ink).anchor(Anchor::End), &format!("{val} · {} {}",
-                if metric == "kl" { "max" } else { "min" },
-                if percent { format!("{:.1}%", limit*100.0) } else { format!("{limit:.3}") }));
-            y += 20.0;
-        }
-        if let Some(reasons) = verdict["reasons"].as_array() {
-            for reason in reasons { doc.text(0.0, y + 11.0, Font::new(10.0, t.ink2), reason.as_str().unwrap_or("?")); y += 18.0; }
-        }
-        y += 10.0;
+        y += fidelity_path(doc, t, 0.0, y, w, path, verdict, windows, num(&v[path], "seconds"));
     }
     if let Some(error) = v["paired"]["unavailable"].as_str() {
         doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &format!("Pair unavailable: {}", super::svg::fit(error, 11.0, w - 110.0)));
@@ -194,23 +189,90 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
             if pair.get("pass") == Some(&Value::Bool(true)) { "PASS" } else { "FAIL" }, pair["positions"]));
         y += 26.0;
     }
-    for (path, key) in [("decode", "per_window"), ("prefill", "prefill_per_window")] {
-        if let Some(groups) = v[key].as_object() {
-            doc.titled("Per-window top-1 / KL across all rows; table includes counts");
-            doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &format!("{path} window · top-1 / KL (all rows)"));
-            doc.end();
-            y += 24.0;
-            for (id, score) in groups {
-                doc.titled(&format!("{id}: {} rows, top-1 {:.2}%, KL {:.6}", score["positions"],
-                    num(score,"top1").unwrap_or(0.0)*100.0, num(score,"kl").unwrap_or(0.0)));
-                doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2), id);
-                doc.text(w, y + 12.0, Font::new(10.5, t.ink).anchor(Anchor::End), &format!("{:.2}% / {:.5}",
-                    num(score,"top1").unwrap_or(0.0)*100.0, num(score,"kl").unwrap_or(0.0)));
-                doc.end(); y += 18.0;
-            }
-        }
-    }
     y
+}
+
+/// One scoring path: a headline (PASS/FAIL and the four metrics against their
+/// floors), then per-window KL bars with top-1 as dots on its own scale, each
+/// with its floor as a dashed reference line.
+#[allow(clippy::too_many_arguments)]
+fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, verdict: &Value, windows: &Value,
+    seconds_taken: Option<f64>) -> f64 {
+    let mut y = y0;
+    let pass = verdict["pass"] == true;
+    let score = &verdict["generated"];
+    let (status, color) = if pass { ("PASS", t.good) } else { ("FAIL", t.bad) };
+    doc.spans(x, y + 13.0, 12.5, Anchor::Start, &[(&format!("{path} "), t.ink, 600), (status, color, 700),
+        (&format!("  {} generated rows{}", score["positions"], seconds_taken.map(|s| format!(" · {}", seconds(s))).unwrap_or_default()), t.ink2, 400)]);
+    y += 22.0;
+    // Headline: one cell per metric, measured over its bound.
+    let metrics = [("KL", "kl", "kl_max", false), ("top-1", "top1", "top1_min", true),
+        ("confident top-1", "confident_top1", "confident_top1_min", true), ("top-3", "top3_contained", "top3_min", true)];
+    let columns = if w < 520.0 { 2 } else { 4 };
+    let cell = w / columns as f64;
+    for (i, (label, metric, bound, percent)) in metrics.iter().enumerate() {
+        let cx = x + cell * (i % columns) as f64;
+        let cy = y + 40.0 * (i / columns) as f64;
+        let value = num(score, metric);
+        let limit = num(verdict, bound);
+        let ok = match (value, limit) { (Some(v), Some(l)) => if *metric == "kl" { v <= l } else { v + 1e-12 >= l }, _ => true };
+        let show = |v: f64| if *percent { format!("{:.2}%", v * 100.0) } else { format!("{v:.4}") };
+        doc.text(cx, cy + 10.0, Font::new(10.0, t.muted), label);
+        doc.spans(cx, cy + 28.0, 15.0, Anchor::Start, &[(&value.map_or("N/A".into(), show), if ok { t.ink } else { t.bad }, 600),
+            (&limit.map(|l| format!("  {} {}", if *metric == "kl" { "≤" } else { "≥" }, show(l))).unwrap_or_default(), t.muted, 400)]);
+    }
+    y += 40.0 * (metrics.len().div_ceil(columns)) as f64 + 4.0;
+    if let Some(reasons) = verdict["reasons"].as_array().filter(|r| !r.is_empty()) {
+        let line = reasons.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ");
+        doc.text(x, y + 11.0, Font::new(10.0, t.bad), &super::svg::fit(&line, 10.0, w));
+        y += 18.0;
+    }
+    let Some(windows) = windows.as_object().filter(|w| !w.is_empty()) else { return y - y0 + 10.0 };
+    // Per-window: two aligned strips on one window axis (never two y-scales):
+    // KL bars above, top-1 dots below, each with its floor dashed.
+    let kl_max = num(verdict, "kl_max").unwrap_or(0.06);
+    let top1_min = num(verdict, "top1_min").unwrap_or(0.9);
+    let kls: Vec<f64> = windows.values().map(|s| num(s, "kl").unwrap_or(0.0)).collect();
+    let tops: Vec<f64> = windows.values().map(|s| num(s, "top1").unwrap_or(0.0)).collect();
+    let kl_top = kls.iter().cloned().fold(kl_max * 1.25, f64::max) * 1.08;
+    let top_lo = ((tops.iter().cloned().fold(top1_min, f64::min) - 0.02) * 50.0).floor() / 50.0;
+    let (px, pw) = (x + 44.0, w - 44.0);
+    let n = windows.len() as f64;
+    let step = pw / n;
+    let bw = (step * 0.7).clamp(1.5, 18.0);
+    let strip = |doc: &mut Doc, y: f64, h: f64, title: &str, ticks: [(f64, String); 2]| {
+        doc.text(x, y - 10.0, Font::new(10.0, t.muted).weight(600), title);
+        for (frac, label) in ticks {
+            let gy = y + h - frac * h;
+            doc.line(px, gy, px + pw, gy, t.line, 1.0);
+            doc.text(px - 6.0, gy + 3.5, Font::new(9.5, t.muted).anchor(Anchor::End), &label);
+        }
+    };
+    let (kh, th) = (72.0, 56.0);
+    let ktop = y + 26.0;
+    let ttop = ktop + kh + 36.0;
+    strip(doc, ktop, kh, &format!("{} · KL PER WINDOW (nat)", path.to_uppercase()), [(0.0, "0".into()), (1.0, format!("{kl_top:.2}"))]);
+    strip(doc, ttop, th, "TOP-1 PER WINDOW", [(0.0, format!("{:.0}%", top_lo * 100.0)), (1.0, "100%".into())]);
+    let ky = |v: f64| ktop + kh - (v / kl_top).clamp(0.0, 1.0) * kh;
+    let ty = |v: f64| ttop + th - ((v - top_lo) / (1.0 - top_lo)).clamp(0.0, 1.0) * th;
+    for (i, (id, s)) in windows.iter().enumerate() {
+        let cx = px + step * (i as f64 + 0.5);
+        let (kl, top1) = (num(s, "kl").unwrap_or(0.0), num(s, "top1").unwrap_or(0.0));
+        doc.titled(&format!("{path} window {id}: KL {kl:.5} nat · top-1 {:.2}% · {} rows", top1 * 100.0, s["positions"]));
+        doc.rect(cx - bw / 2.0, ky(kl), bw, (ktop + kh - ky(kl)).max(1.0), (bw / 4.0).min(2.0), if kl > kl_max { t.bad } else { t.series[0] });
+        doc.circle(cx, ty(top1), 3.2, if top1 + 1e-12 < top1_min { t.bad } else { t.series[1] });
+        doc.rect_attrs(cx - step / 2.0, ktop, step, ttop + th - ktop, 0.0, r#"fill="transparent""#);
+        doc.end();
+    }
+    for (gy, label, anchor_x, anchor) in [(ky(kl_max), format!("floor {kl_max:.3}"), px + pw, Anchor::End),
+        (ty(top1_min), format!("floor {:.0}%", top1_min * 100.0), px + pw, Anchor::End)] {
+        doc.raw(&format!(r#"<line x1="{px}" x2="{}" y1="{gy}" y2="{gy}" stroke="{}" stroke-width="1" stroke-dasharray="4 3"/>"#, px + pw, t.ink2));
+        doc.text(anchor_x, gy - 4.0, Font::new(9.5, t.ink2).anchor(anchor), &label);
+    }
+    let note = if w < 480.0 { format!("{} windows · red: past its floor", windows.len()) }
+        else { format!("{} windows · red: past its floor · hover a window for values", windows.len()) };
+    doc.text(px, ttop + th + 14.0, Font::new(9.5, t.muted), &super::svg::fit(&note, 9.5, pw));
+    ttop + th + 24.0 - y0
 }
 
 fn decode_content(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
@@ -226,7 +288,51 @@ fn decode_content(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     if rows.is_empty() {
         return empty(doc, t, "no measurements yet");
     }
-    hbars(doc, t, 0.0, 0.0, w, &rows, "tok/s")
+    hbars(doc, t, 0.0, 0.0, w, &rows, "tps")
+}
+
+/// Two groups of bars: the C16 mixed waves (aggregate, with the per-request
+/// median as a tick) and the C1 rewrite passes (tokens/round and acceptance).
+fn draft_mix(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
+    let waves = v["waves"].as_array().cloned().unwrap_or_default();
+    let rewrites = v["rewrite"].as_array().cloned().unwrap_or_default();
+    if waves.is_empty() && rewrites.is_empty() { return empty(doc, t, "no measurements yet"); }
+    let mut y = 0.0;
+    if !waves.is_empty() {
+        doc.text(0.0, y + 12.0, Font::new(10.5, t.muted).weight(600), &format!("C{} MIXED PROMPTS · AGGREGATE", waves[0]["c"].as_u64().unwrap_or(16)));
+        y += 20.0;
+        let rows: Vec<(String, f64, &str, String)> = waves.iter().enumerate().map(|(i, wave)| {
+            let median = num(wave, "per_request_tok_s");
+            (format!("wave {}", i + 1), num(wave, "aggregate_tok_s").unwrap_or(0.0), t.series[0],
+                median.map(|m| format!("{} per request", rate(m))).unwrap_or_default())
+        }).collect();
+        let top = y;
+        y += hbars(doc, t, 0.0, y, w, &rows, "tps");
+        // Per-request median as a tick on the same scale as the bars.
+        let max = rows.iter().map(|r| r.1).fold(1e-9f64, f64::max) * 1.1;
+        let label_w = (w * 0.26).min(120.0);
+        let track = w - label_w - charts::hbar_value_width(w, &rows, "tps");
+        for (i, wave) in waves.iter().enumerate() {
+            if let Some(median) = num(wave, "per_request_tok_s") {
+                let x = label_w + track * (median / max).clamp(0.0, 1.0);
+                doc.line(x, top + 24.0 * i as f64 + 1.0, x, top + 24.0 * i as f64 + 19.0, t.series[1], 2.0);
+            }
+        }
+        legend(doc, t, 0.0, y + 10.0, &[("aggregate", t.series[0]), ("per-request median", t.series[1])]);
+        y += 26.0;
+    }
+    if !rewrites.is_empty() {
+        doc.text(0.0, y + 12.0, Font::new(10.5, t.muted).weight(600), "C1 COPY-HEAVY REWRITE");
+        y += 20.0;
+        let rows: Vec<(String, f64, &str, String)> = rewrites.iter().enumerate().map(|(i, r)| {
+            let mut note = Vec::new();
+            if let Some(per) = num(r, "tokens_per_round") { note.push(format!("{per:.1} tokens/round")); }
+            if let Some(a) = num(r, "acceptance") { note.push(format!("{:.0}% accepted", 100.0 * a)); }
+            (format!("pass {}", i + 1), num(r, "tok_s").unwrap_or(0.0), t.series[2], note.join(" · "))
+        }).collect();
+        y += hbars(doc, t, 0.0, y, w, &rows, "tps");
+    }
+    y + 6.0
 }
 
 fn plot_height(w: f64) -> f64 {
@@ -245,7 +351,7 @@ fn concurrency(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let plot = Plot { x: 46.0, y: 26.0, w: w - 150.0, h, xs: Scale::Log2 { min: 1.0, max: max_c },
         ys: Scale::linear_from(agg.iter().chain(&per).map(|p| p.1), true) };
     legend(doc, t, 46.0, 10.0, &[("aggregate", t.series[0]), ("per request", t.series[1])]);
-    plot.axes(doc, t, "concurrent requests", "tok/s", &|x| format!("C{}", x as u64));
+    plot.axes(doc, t, "concurrent requests", "tps", &|x| format!("C{}", x as u64));
     plot.line(doc, &agg, t.series[0], agg.last().map(|p| rate(p.1)).as_deref());
     plot.line(doc, &per, t.series[1], per.last().map(|p| rate(p.1)).as_deref());
     26.0 + h + 36.0
@@ -264,7 +370,9 @@ fn prefill(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let h = plot_height(w);
     let plot = Plot { x: 46.0, y: 26.0, w: w - 130.0, h, xs: Scale::Log2 { min: 1024.0, max: max_x * 1.05 },
         ys: Scale::Log10 { min: 10f64.powf(lo.log10().floor()), max: 10f64.powf(hi.log10().ceil()) } };
-    legend(doc, t, 46.0, 10.0, &[("cold", t.series[3]), ("cached prefix (last 256 tokens new)", t.series[1])]);
+    // The legend starts after the y-axis title ("TTFT s"), never under it.
+    legend(doc, t, 12.0 + super::svg::text_width("TTFT s", 10.0) + 14.0, 10.0,
+        &[("cold", t.series[3]), (if w < 420.0 { "cached prefix" } else { "cached prefix (last 256 tokens new)" }, t.series[1])]);
     plot.axes(doc, t, "prompt tokens", "TTFT s", &|x| charts::tokens(x));
     plot.line(doc, &cold, t.series[3], None);
     plot.line(doc, &cached, t.series[1], None);
@@ -277,20 +385,33 @@ fn prefill(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
 }
 
 fn retained(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
+    // Each point sits at its nominal retained context (prompt tokens for older reports).
     let points: Vec<(f64, f64)> = v["points"].as_array().map(|p| p.iter()
-        .filter_map(|p| Some((num(p, "prompt_tokens")?, num(p, "decode_tok_s")?))).collect()).unwrap_or_default();
+        .filter_map(|p| Some((num(p, "context").or_else(|| num(p, "prompt_tokens"))?, num(p, "decode_tok_s")?))).collect())
+        .unwrap_or_default();
     if points.is_empty() {
         return empty(doc, t, "no measurements yet");
     }
     let h = plot_height(w) * 0.85;
-    let plot = Plot { x: 46.0, y: 18.0, w: w - 110.0, h,
-        xs: Scale::linear_from(points.iter().map(|p| p.0), true), ys: Scale::linear_from(points.iter().map(|p| p.1), true) };
-    plot.axes(doc, t, "tokens of context", "decode tok/s", &|x| charts::tokens(x));
+    // Contexts double (0, 4K, 16K, ... 256K): a log2 axis spreads them evenly;
+    // the empty context sits at the axis start, labelled 0. Ticks are only the
+    // measured contexts, never powers of two nobody ran.
+    let first = points.iter().map(|p| p.0).filter(|x| *x > 0.0).fold(f64::INFINITY, f64::min);
+    let min = if first.is_finite() { (first / 2.0).max(256.0) } else { 1024.0 };
+    let max = points.iter().map(|p| p.0).fold(min * 2.0, f64::max) * 1.05;
+    let points: Vec<(f64, f64)> = points.into_iter().map(|(x, y)| (x.max(min), y)).collect();
+    // Headroom above the top point keeps its value label inside the plot.
+    let top = points.iter().map(|p| p.1).fold(0.0, f64::max) * 1.15;
+    // The axis starts a little before the zero point so its label clears the y ticks.
+    let plot = Plot { x: 46.0, y: 30.0, w: w - 110.0, h, xs: Scale::Log2 { min: min / 1.6, max },
+        ys: Scale::linear_from(points.iter().map(|p| p.1).chain([top]), true) };
+    let ticks: Vec<f64> = points.iter().map(|p| p.0).collect();
+    plot.axes_at(doc, t, &ticks, "tokens of context", "decode tps", &|x| if x <= min * 1.0001 { "0".into() } else { charts::tokens(x) });
     plot.line(doc, &points, t.series[0], None);
     for (x, y) in &points {
         doc.text(plot.px(*x), plot.py(*y) - 9.0, Font::new(10.0, t.ink).anchor(Anchor::Middle), &rate(*y));
     }
-    18.0 + h + 36.0
+    30.0 + h + 36.0
 }
 
 fn prefix_cache(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
@@ -300,7 +421,8 @@ fn prefix_cache(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     }
     let max = turns.iter().filter_map(|x| num(x, "prompt_tokens")).fold(1.0, f64::max);
     let h = 150.0;
-    let top = 22.0;
+    // Room above the tallest bar for its TTFT label, clear of the legend row.
+    let top = 36.0;
     legend(doc, t, 0.0, 10.0, &[("restored from cache", t.series[1]), ("prefilled", t.series[3])]);
     let slot = w / turns.len().max(6) as f64;
     for (i, turn) in turns.iter().enumerate() {
@@ -344,7 +466,7 @@ fn structured(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     if rows.is_empty() {
         return empty(doc, t, "no measurements yet");
     }
-    hbars(doc, t, 0.0, 0.0, w, &rows, "tok/s")
+    hbars(doc, t, 0.0, 0.0, w, &rows, "tps")
 }
 
 fn needle(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
@@ -378,9 +500,6 @@ fn scored(doc: &mut Doc, t: &Theme, v: &Value, w: f64, count: &str, list: &str, 
     let total = items.len() as f64;
     doc.text(0.0, 34.0, Font::new(32.0, t.series[0]).bold(), &format!("{good:.0}/{total:.0}"));
     doc.text(0.0, 54.0, Font::new(11.0, t.ink2), &format!("{:.0}%", 100.0 * good / total.max(1.0)));
-    if let Some(sandbox) = v["sandbox"].as_str() {
-        doc.text(60.0, 54.0, Font::new(10.0, t.muted), &super::svg::fit(sandbox, 10.0, w - 60.0));
-    }
     let (size, gap, cell) = (18.0, 6.0, 136.0);
     let (x0, y0) = if w >= 520.0 { (150.0, 0.0) } else { (0.0, 70.0) };
     let per_row = ((w - x0 + 6.0) / cell).floor().max(1.0) as usize;
@@ -397,7 +516,13 @@ fn scored(doc: &mut Doc, t: &Theme, v: &Value, w: f64, count: &str, list: &str, 
         doc.end();
     }
     let rows = items.len().div_ceil(per_row) as f64;
-    (y0 + rows * (size + gap)).max(64.0)
+    let mut h = (y0 + rows * (size + gap)).max(64.0);
+    // How the items ran, on its own line under the grid (never over the names).
+    if let Some(sandbox) = v["sandbox"].as_str() {
+        doc.text(0.0, h + 12.0, Font::new(10.0, t.muted), &super::svg::fit(sandbox, 10.0, w));
+        h += 20.0;
+    }
+    h
 }
 
 fn ifeval(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
@@ -460,32 +585,51 @@ fn reasoning(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
         Some((l.clone(), tokens.max(1.0), k / n, lo, hi))
     }).collect();
     doc.text(0.0, 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2), "EFFORT LADDER");
+    // The token axis spans the decades the levels actually used.
     let max_tokens = stats.iter().map(|s| s.1).fold(10.0, f64::max);
+    let min_tokens = stats.iter().map(|s| s.1).fold(max_tokens, f64::min);
     let h = 170.0;
-    let plot = Plot { x: 46.0, y: 30.0, w: w * 0.55 - 60.0, h, xs: Scale::Log10 { min: 1.0, max: 10f64.powf(max_tokens.log10().ceil()) },
+    // Phone width: the tier heatmap goes under the ladder instead of beside it.
+    let narrow = w < 520.0;
+    let ladder_w = if narrow { w } else { w * 0.55 };
+    let plot = Plot { x: 46.0, y: 44.0, w: ladder_w - 60.0, h, xs: Scale::Log10 {
+            min: 10f64.powf(min_tokens.log10().floor()).min(max_tokens / 10.0), max: 10f64.powf(max_tokens.log10().ceil()) },
         ys: Scale::Linear { min: 0.0, max: 1.0 } };
     plot.axes(doc, t, "mean reasoning tokens", "accuracy", &|x| short(x));
     let line: Vec<(f64, f64)> = stats.iter().map(|s| (s.1, s.2)).collect();
     plot.line(doc, &line, t.series[0], None);
+    // Level labels: right of each point, moved below it when they would
+    // overlap the previous label.
+    let mut placed: Vec<(f64, f64, f64)> = Vec::new();
     for (i, (label, tokens, acc, lo, hi)) in stats.iter().enumerate() {
         let color = t.series[i % t.series.len()];
         plot.range(doc, *tokens, *lo, *acc, *hi, color);
-        doc.text(plot.px(*tokens) + 7.0, plot.py(*acc) - 6.0, Font::new(10.0, color).weight(600), label);
+        let (x, width) = (plot.px(*tokens) + 7.0, super::svg::text_width(label, 10.0));
+        let overlaps = |y: f64| placed.iter().any(|(px, py, pw)| x < px + pw + 4.0 && *px < x + width + 4.0 && (y - py).abs() < 12.0);
+        let above = plot.py(*acc) - 6.0;
+        let y = [above, plot.py(*acc) + 15.0, above - 13.0, plot.py(*acc) + 28.0].into_iter()
+            .find(|y| !overlaps(*y)).unwrap_or(above);
+        doc.text(x, y, Font::new(10.0, color).weight(600), label);
+        placed.push((x, y, width));
     }
     // 2. Accuracy by tier per level (right of the ladder).
     let tiers = ["medium", "hard", "brutal", "aime"];
-    let hx = w * 0.55 + 10.0;
-    doc.text(hx, 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2), "ACCURACY BY TIER");
+    let (hx, hy) = if narrow { (0.0, 44.0 + h + 40.0) } else { (w * 0.55 + 10.0, 0.0) };
+    doc.text(hx, hy + 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2), "ACCURACY BY TIER");
     let cell = |i: usize, j: usize| {
         let cells: Vec<&Value> = of(&rows, &levels[j]).filter(|r| r["tier"].as_str() == Some(tiers[i])).collect();
         (!cells.is_empty()).then(|| cells.iter().filter(|r| r["correct"] == true).count() as f64 / cells.len() as f64)
     };
     let xs: Vec<String> = tiers.iter().map(|s| s.to_string()).collect();
-    charts::heatmap(doc, t, hx, 26.0, w - hx, &xs, &levels, &cell, t.good, t.bad);
-    y += 30.0 + h + 40.0;
+    let heat_h = charts::heatmap(doc, t, hx, hy + 26.0, w - hx, &xs, &levels, &cell, t.good, t.bad);
+    y += if narrow { hy + 26.0 + heat_h + 18.0 } else { 44.0 + h + 40.0 };
     // 3. Time to solve: solo-equivalent seconds, solved and failed, per level.
-    doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2),
-        "TIME TO SOLVE · solo-equivalent (reasoning tokens ÷ C1 decode) · solved vs failed");
+    doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2), "TIME TO SOLVE · solved vs failed");
+    // How the time is derived, right-aligned where it fits beside the title.
+    let note = if narrow { "solo-equivalent" } else { "solo-equivalent: reasoning tokens ÷ C1 decode" };
+    if w >= 300.0 + super::svg::text_width(note, 10.0) {
+        doc.text(w, y + 12.0, Font::new(10.0, t.muted).anchor(Anchor::End), note);
+    }
     let times: Vec<f64> = rows.iter().filter_map(|r| num(r, "solo_s")).filter(|v| *v > 0.0).collect();
     let (lo, hi) = (times.iter().cloned().fold(f64::INFINITY, f64::min).max(0.05), times.iter().cloned().fold(1.0, f64::max));
     let vh = 160.0;
@@ -504,12 +648,24 @@ fn reasoning(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
         charts::violin(doc, &vplot, i as f64 - 0.18, slot * 0.17, &solved, t.good);
         charts::violin(doc, &vplot, i as f64 + 0.18, slot * 0.17, &failed, t.bad);
         let caps = of(&rows, level).filter(|r| r["hit_cap"] == true).count();
-        doc.text(vplot.px(i as f64), vplot.y + vh + 16.0, Font::new(10.5, t.ink2).anchor(Anchor::Middle),
-            &format!("{level}{}", if caps > 0 { format!(" · {caps} cap") } else { String::new() }));
+        // Narrow slots stack the level name over its cap count.
+        let cap = if caps > 0 { format!("{caps} cap") } else { String::new() };
+        let size = if slot < 70.0 { 9.5 } else { 10.5 };
+        if slot < 70.0 || super::svg::text_width(&format!("{level} · {cap}"), size) > slot - 4.0 {
+            doc.text(vplot.px(i as f64), vplot.y + vh + 16.0, Font::new(size, t.ink2).anchor(Anchor::Middle),
+                &super::svg::fit(level, size, slot - 2.0));
+            if !cap.is_empty() {
+                doc.text(vplot.px(i as f64), vplot.y + vh + 28.0, Font::new(size, t.muted).anchor(Anchor::Middle), &cap);
+            }
+        } else {
+            doc.text(vplot.px(i as f64), vplot.y + vh + 16.0, Font::new(size, t.ink2).anchor(Anchor::Middle),
+                &format!("{level}{}", if cap.is_empty() { String::new() } else { format!(" · {cap}") }));
+        }
     }
-    y += 28.0 + vh + 30.0;
+    y += 28.0 + vh + 42.0;
     // 4. Overthinking: reasoning tokens on the easy (medium) tier.
-    doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2), "OVERTHINKING · reasoning tokens on easy items");
+    doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2),
+        if w < 420.0 { "OVERTHINKING · easy items" } else { "OVERTHINKING · reasoning tokens on easy items" });
     let bars: Vec<(String, f64, &str, String)> = levels.iter().enumerate().map(|(i, level)| {
         let easy: Vec<f64> = of(&rows, level).filter(|r| r["tier"].as_str() == Some("medium")).filter_map(|r| num(r, "reasoning_tokens")).collect();
         let mean = if easy.is_empty() { 0.0 } else { easy.iter().sum::<f64>() / easy.len() as f64 };
@@ -570,14 +726,23 @@ fn agentic(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let invalid: u64 = turns.iter().filter_map(|x| x["invalid_tool_calls"].as_u64()).sum();
     let rates: Vec<f64> = turns.iter().filter_map(|x| num(x, "decode_tok_s")).filter(|v| *v > 0.0).collect();
     let mean_rate = if rates.is_empty() { 0.0 } else { rates.iter().sum::<f64>() / rates.len() as f64 };
-    doc.spans(0.0, 14.0, 12.0, Anchor::Start, &[(&format!("task {} · ", v["task"].as_str().unwrap_or("?")), t.ink2, 400),
-        (label, color, 700), (&format!(" · {} turns · {} reused whole · {} invalid tool calls · {} tok/s mean{}",
-            turns.len(), reused, invalid, rate(mean_rate),
-            num(v, "seconds").map(|s| format!(" · {}", seconds(s))).unwrap_or_default()), t.ink2, 400)]);
-    doc.group(0.0, 26.0);
+    // The verdict leads; the counts follow on the same line when they fit, else on a second line.
+    let head = format!("task {} · ", v["task"].as_str().unwrap_or("?"));
+    let detail = format!("{} turns · {} reused whole · {} invalid tool calls · {} tps mean{}",
+        turns.len(), reused, invalid, rate(mean_rate), num(v, "seconds").map(|s| format!(" · {}", seconds(s))).unwrap_or_default());
+    let one_line = super::svg::text_width(&format!("{head}{label} · {detail}"), 12.0) <= w;
+    let top = if one_line {
+        doc.spans(0.0, 14.0, 12.0, Anchor::Start, &[(&head, t.ink2, 400), (label, color, 700), (&format!(" · {detail}"), t.ink2, 400)]);
+        26.0
+    } else {
+        doc.spans(0.0, 14.0, 12.0, Anchor::Start, &[(&head, t.ink2, 400), (label, color, 700)]);
+        doc.text(0.0, 32.0, Font::new(11.0, t.ink2), &super::svg::fit(&detail, 11.0, w));
+        44.0
+    };
+    doc.group(0.0, top);
     let h = prefix_cache(doc, t, v, w);
     doc.end();
-    26.0 + h
+    top + h
 }
 
 fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
@@ -586,7 +751,10 @@ fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let ready = num(v, "readiness_s").or_else(|| phases.last().map(|p| p.1)).unwrap_or(0.0);
     let warmup = num(v, "warmup_s").unwrap_or(0.0);
     let end = (ready + warmup).max(1.0);
-    let (x0, bar_w) = (210.0, w - 290.0);
+    // Phone width: labels above their bars, the bars full width.
+    let narrow = w < 520.0;
+    let (x0, bar_w) = if narrow { (0.0, w - 70.0) } else { (210.0, w - 290.0) };
+    let row = if narrow { 40.0 } else { 26.0 };
     let px = |s: f64| x0 + bar_w * s / end;
     let mut segments: Vec<(String, f64, f64, &str)> = Vec::new();
     let mut last = 0.0;
@@ -599,12 +767,13 @@ fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
         segments.push(("first requests (warm-up)".into(), ready, ready + warmup, t.series[1]));
     }
     for (i, (name, a, b, color)) in segments.iter().enumerate() {
-        let y = 6.0 + 26.0 * i as f64;
+        let y = 6.0 + row * i as f64;
+        let bar_y = if narrow { y + 16.0 } else { y };
         doc.text(0.0, y + 13.0, Font::new(11.0, t.ink2), name);
-        doc.rect(px(*a), y + 2.0, (px(*b) - px(*a)).max(2.0), 16.0, 3.0, color);
-        doc.text(px(*b) + 6.0, y + 14.0, Font::new(10.5, t.ink), &seconds(b - a));
+        doc.rect(px(*a), bar_y + 2.0, (px(*b) - px(*a)).max(2.0), 16.0, 3.0, color);
+        doc.text(px(*b) + 6.0, bar_y + 14.0, Font::new(10.5, t.ink), &seconds(b - a));
     }
-    let y = 6.0 + 26.0 * segments.len() as f64 + 4.0;
+    let y = 6.0 + row * segments.len() as f64 + 4.0;
     doc.line(x0, y, x0 + bar_w, y, t.line2, 1.0);
     doc.text(x0, y + 14.0, Font::new(10.0, t.muted), "process start");
     doc.text(x0 + bar_w, y + 14.0, Font::new(10.0, t.muted).anchor(Anchor::End), &format!("{} after start", seconds(end)));
@@ -623,6 +792,62 @@ mod context_load_tests {
     }
 
     #[test]
+    fn fidelity_names_sources_marks_borrowed_text_and_charts_windows() {
+        let window = |kl: f64, top1: f64| serde_json::json!({"positions": 512, "kl": kl, "top1": top1});
+        let verdict = serde_json::json!({"pass": false, "kl_max": 0.06, "top1_min": 0.9, "confident_top1_min": 0.98, "top3_min": 0.99,
+            "generated": {"positions": 1024, "kl": 0.07, "top1": 0.91, "confident_top1": 0.985, "top3_contained": 0.995},
+            "reasons": ["generated KL above expect/floor"]});
+        let v = serde_json::json!({"dataset": {"config": "deepseek_v41-v2", "revision": "9fc394f9b7e8",
+                "qualification": "reference-only qualified", "text_checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash"},
+            "reference_match": "name", "reference_root": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "text_checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "decode": {"checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "seconds": 160.0},
+            "verdict": verdict, "per_window": {"a00": window(0.24, 0.86), "a01": window(0.03, 0.95)}});
+        let mut doc = super::Doc::new(900.0, 900.0);
+        assert!(super::fidelity(&mut doc, &super::super::theme::NORMAL, &v, 900.0) > 200.0);
+        let svg = doc.finish();
+        for label in ["Reference logits: DeepSeek-V4.1-Flash-1017 (reference-only)", "prompt text: shared DeepSeek-V4.1-Flash set",
+            "provisional: window text was generated by DeepSeek-V4.1-Flash", "reference-only qualified:", "KL PER WINDOW",
+            "TOP-1 PER WINDOW", "floor 0.060", "floor 90%", "decode window a00: KL 0.24000"] {
+            assert!(svg.contains(label), "{label}");
+        }
+        assert!(!svg.contains("Window text from"), "no ambiguous source line");
+    }
+
+    #[test]
+    fn retained_ticks_only_the_measured_contexts() {
+        let point = |context: u64, rate: f64| serde_json::json!({"context": context, "prompt_tokens": context + 40, "decode_tok_s": rate});
+        let v = serde_json::json!({"points": [point(0, 75.0), point(4096, 70.0), point(65536, 67.0), point(262144, 54.0)]});
+        let mut doc = super::Doc::new(640.0, 400.0);
+        super::retained(&mut doc, &super::super::theme::NORMAL, &v, 640.0);
+        let svg = doc.finish();
+        for label in [">0<", ">4K<", ">64K<", ">256K<"] { assert!(svg.contains(label), "{label}"); }
+        for unmeasured in [">512<", ">1K<", ">2K<", ">16K<"] { assert!(!svg.contains(unmeasured), "{unmeasured}"); }
+    }
+
+    #[test]
+    fn narrow_reasoning_stacks_the_tier_heatmap_under_the_ladder() {
+        let rows: Vec<_> = ["off", "low", "high"].iter().flat_map(|level| ["medium", "hard"].iter().map(move |tier|
+            serde_json::json!({"level": level, "tier": tier, "correct": true, "reasoning_tokens": 300, "solo_s": 2.0}))).collect();
+        let v = serde_json::json!({"levels": ["off", "low", "high"], "rows": rows});
+        let height = |w: f64| { let mut doc = super::Doc::new(w, 900.0); super::reasoning(&mut doc, &super::super::theme::NORMAL, &v, w) };
+        assert!(height(360.0) > height(900.0) + 100.0, "the heatmap moves below the ladder on a phone");
+    }
+
+    #[test]
+    fn draft_mix_charts_waves_and_rewrites() {
+        let v = serde_json::json!({"waves": [{"c":16,"aggregate_tok_s":640.0,"per_request_tok_s":41.0},
+            {"c":16,"aggregate_tok_s":610.0,"per_request_tok_s":39.5}],
+            "rewrite": [{"tok_s":212.0,"tokens_per_round":5.4,"acceptance":0.91},{"tok_s":208.0,"tokens_per_round":5.2,"acceptance":0.9}]});
+        let mut doc = super::Doc::new(700.0, 400.0);
+        assert!(super::draft_mix(&mut doc, &super::super::theme::NORMAL, &v, 700.0) > 100.0);
+        let svg = doc.finish();
+        for label in ["C16 MIXED PROMPTS", "per-request median", "C1 COPY-HEAVY REWRITE", "5.4 tokens/round", "91% accepted"] {
+            assert!(svg.contains(label), "{label}");
+        }
+    }
+
+    #[test]
     fn context_table_renders_results_and_skips() {
         let v = serde_json::json!({"points": [
             {"context":32768,"c":8,"status":"ok","aggregate_tok_s":123.4,"per_request_tok_s":20.0,
@@ -631,7 +856,8 @@ mod context_load_tests {
         let mut doc = super::Doc::new(900.0, 300.0);
         assert!(super::context_load(&mut doc, &super::super::theme::NORMAL, &v, 900.0) > 0.0);
         let svg = doc.finish();
-        for label in ["32K", "128K", "32760", "agg tok/s", "shared_device_pages", "shared estimate exceeds KV pool"] {
+        for label in ["32K", "128K", "32760", "agg tps", "shared_device_pages", "shared estimate exceeds KV pool",
+            "AGGREGATE DECODE AT SHARED CONTEXT", "32K · C8"] {
             assert!(svg.contains(label), "{label}");
         }
     }

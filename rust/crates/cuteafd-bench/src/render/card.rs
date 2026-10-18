@@ -49,10 +49,10 @@ pub fn card_svg(report: &Report) -> String {
         doc.text(x, 246.0, Font::new(15.0, t.muted).spacing(3.0).weight(600), label);
         let shown = format!("{warn}{value}");
         let count = shown.chars().count() as f64;
-        let size = max_size.min((column_width - text_width("tok/s", 24.0) - 14.0 + 3.0 * count) / (0.6 * count));
+        let size = max_size.min((column_width - text_width("tps", 24.0) - 14.0 + 3.0 * count) / (0.6 * count));
         doc.text(x, 352.0, Font::new(size, color).bold().opacity(dim).spacing(-3.0), &shown);
         let width = text_width(&shown, size) - 3.0 * count;
-        doc.text(x + width + 14.0, 352.0, Font::new(24.0, t.ink2), "tok/s");
+        doc.text(x + width + 14.0, 352.0, Font::new(24.0, t.ink2), "tps");
         doc.text(x, 386.0, Font::new(sub_size, t.ink2), &fit(sub, sub_size, column_width));
     };
     if let Some(reason) = r.no_fit_reason() {
@@ -82,7 +82,7 @@ pub fn card_svg(report: &Report) -> String {
             doc.rect_attrs(bx + 90.0, y + 4.0, track * (d.tok_s / max).clamp(0.0, 1.0), 16.0, 4.0,
                 &format!(r#"fill="{color}" opacity="{dim}""#));
             doc.text(bx + bw, y + 18.0, Font::new(16.0, t.ink).anchor(Anchor::End).bold().opacity(dim),
-                &format!("{} tok/s", rate(d.tok_s)));
+                &format!("{} tps", rate(d.tok_s)));
         }
     }
     // Hardware, options, build and badge.

@@ -1,7 +1,6 @@
 """CPU contracts for optional keyed API and benchmark launcher wiring."""
 from pathlib import Path
 import os
-import json
 import stat
 import subprocess
 
@@ -54,62 +53,28 @@ def test_supplied_key_is_preserved_without_provisioning(tmp_path):
     assert not (tmp_path / ".cache").exists()
 
 
-def test_generated_key_is_private_atomic_reused_and_path_only(tmp_path):
+def test_enabled_benchmark_provisions_no_key(tmp_path):
+    # The benchmark runs on the console cookie; inference stays keyless unless
+    # the operator sets API_KEY_FILE.
     result = prepare_key(tmp_path, "on")
     assert result.returncode == 0, result.stderr
-    path = tmp_path / ".cache/cuteafd/instances/test/api-key"
-    assert result.stdout == str(path)
-    assert result.stderr == f"Benchmark API key file: {path}\n"
-    key = path.read_text()
-    assert len(key.strip()) == 64
-    assert key.strip() not in result.stdout + result.stderr
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
-    named = path.with_name("api-keys")
-    assert set(path.parent.iterdir()) == {path, named}
-    assert stat.S_IMODE(named.stat().st_mode) == 0o600
-    keys = json.loads(named.read_text())
-    assert keys["default"] == path.read_text().strip()
-    assert keys["agent"] != keys["default"]
-    again = prepare_key(tmp_path, "on")
-    assert again.returncode == 0, again.stderr
-    assert path.read_text() == key
-    assert again.stdout == str(path)
-    named = path.with_name("api-keys")
-    assert set(path.parent.iterdir()) == {path, named}
-    assert stat.S_IMODE(named.stat().st_mode) == 0o600
-    keys = json.loads(named.read_text())
-    assert keys["default"] == path.read_text().strip()
-    assert keys["agent"] != keys["default"]
+    assert result.stdout == result.stderr == ""
+    assert not (tmp_path / ".cache").exists()
 
 
-def test_concurrent_key_provisioning_preserves_one_key(tmp_path):
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda _: prepare_key(tmp_path, "on"), range(8)))
-    assert all(result.returncode == 0 for result in results), results
-    assert len({result.stdout for result in results}) == 1
-    path = Path(results[0].stdout)
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    named = path.with_name("api-keys")
-    assert set(path.parent.iterdir()) == {path, named}
-    assert stat.S_IMODE(named.stat().st_mode) == 0o600
-    keys = json.loads(named.read_text())
-    assert keys["default"] == path.read_text().strip()
-    assert keys["agent"] != keys["default"]
-
-
-def test_generated_key_refuses_unsafe_existing_file(tmp_path):
-    path = tmp_path / ".cache/cuteafd/instances/test/api-key"
-    path.parent.mkdir(parents=True)
-    path.parent.chmod(0o700)
-    path.write_text("existing-key\n")
-    path.chmod(0o644)
-    result = prepare_key(tmp_path, "on")
-    assert result.returncode != 0
-    assert "0600" in result.stderr
-    assert path.read_text() == "existing-key\n"
+def test_console_link_command_names_the_file_never_the_secret(tmp_path):
+    script = f'''set -euo pipefail
+source "{COMMON}"
+release_prepare_console test
+release_console_link_command http://host:8391
+'''
+    result = subprocess.run(["bash", "-c", script], env={**os.environ, "HOME": str(tmp_path)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    secret = (tmp_path / ".cache/cuteafd/console/secret").read_text().strip()
+    assert result.stdout == 'echo "http://host:8391/console/unlock?token=$(cat ~/.cache/cuteafd/console/secret)"'
+    assert secret not in result.stdout
+    printed = subprocess.run(["bash", "-c", result.stdout], env={**os.environ, "HOME": str(tmp_path)}, capture_output=True, text=True)
+    assert printed.stdout == f"http://host:8391/console/unlock?token={secret}\n"
 
 
 def test_probe_credentials_use_stdin_not_curl_argv(tmp_path):

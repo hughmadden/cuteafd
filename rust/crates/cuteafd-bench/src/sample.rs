@@ -157,7 +157,7 @@ mod tests {
             if let Some(third) = baseline.card.concurrent_at(8) {
                 assert!(card.contains(r##"r="6.5" fill="#d66086""##));
                 // Median is 118, deliberately not the aggregate / width (120).
-                assert!(card.contains(&format!("aggregate tok/s · {}/stream at C8",
+                assert!(card.contains(&format!("aggregate tps · {}/stream at C8",
                     render::rate(third.per_stream_median_tok_s))));
                 assert!(!card.contains("120/stream"));
             } else {

@@ -163,9 +163,15 @@ fn dynamic(policy: &Value, dspark: bool) -> Value {
             if shared == Some(true) { "warm" } else { "cold" }),
         _ => "fit: –".into(),
     };
-    let error = policy.get("prediction").and_then(|p| p.get("mean_abs_relative_error")).and_then(Value::as_f64)
-        .map_or_else(|| "–".into(), |e| format!("{:.1}%", 100.0 * e));
-    let mut value = json!({"facts": [["Policy", mode, fit], ["Cost model error", error, "mean abs, per round"]]});
+    // Simple and fixed modes price no rounds: no fit, no cost model to report.
+    let priced = !matches!(mode, "simple" | "fixed" | "off");
+    let mut facts = vec![json!(["Policy", mode, if priced { fit } else { "no cost model".into() }])];
+    if priced {
+        let error = policy.get("prediction").and_then(|p| p.get("mean_abs_relative_error")).and_then(Value::as_f64)
+            .map_or_else(|| "–".into(), |e| format!("{:.1}%", 100.0 * e));
+        facts.push(json!(["Cost model error", error, "mean abs, per round"]));
+    }
+    let mut value = json!({"facts": facts});
     if let Some(local) = policy.get("local_layers").and_then(Value::as_u64) {
         value["layer_class"] = json!(layer_classes(local as usize));
     }
@@ -175,6 +181,14 @@ fn dynamic(policy: &Value, dspark: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpriced_draft_modes_show_no_cost_model() {
+        let simple = dynamic(&json!({"mode": "simple", "prediction": {"mean_abs_relative_error": 1.0}}), true);
+        assert_eq!(simple["facts"], json!([["Policy", "simple", "no cost model"]]));
+        let priced = dynamic(&json!({"mode": "bandwidth", "prediction": {"mean_abs_relative_error": 0.04}}), true);
+        assert_eq!(priced["facts"][1], json!(["Cost model error", "4.0%", "mean abs, per round"]));
+    }
 
     #[test]
     fn tally_derives_counts_from_round_shapes() {

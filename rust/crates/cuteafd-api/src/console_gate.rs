@@ -1,4 +1,5 @@
-//! Console-only cookies grant no API authority. Secrets never implement Debug.
+//! The console cookie unlocks admin views (token text, usage, benchmark
+//! controls); it never authorizes inference. Secrets never implement Debug.
 use crate::openai::auth::constant_time_eq;
 use axum::{
     extract::{Query, Request, State},
@@ -152,9 +153,28 @@ impl ConsoleGate {
         router.merge(
             Router::new()
                 .route("/console/unlock", get(unlock))
+                .route("/console/status", get(status))
                 .with_state(self.clone()),
         )
     }
+    /// Startup: where the unlock link lives (token redacted) and how to print it.
+    pub fn log_location(&self) {
+        match link_command() {
+            Some(command) => tracing::info!("console: admin views unlock at /console/unlock?token=<redacted>; on the launching host print the link with: {command}"),
+            None => tracing::info!("console: admin views unlock at /console/unlock?token=<redacted> (token: the console secret file)"),
+        }
+    }
+}
+/// The launcher's shell line that prints the unlock link (`CUTEAFD_CONSOLE_LINK_COMMAND`);
+/// it names the secret file, never the secret.
+fn link_command() -> Option<String> {
+    std::env::var("CUTEAFD_CONSOLE_LINK_COMMAND").ok().filter(|c| !c.trim().is_empty())
+}
+/// Public: whether this browser holds the cookie, and how an operator gets the link.
+async fn status(State(gate): State<ConsoleGate>, headers: HeaderMap) -> Response {
+    let mut response = Json(serde_json::json!({"unlocked": gate.unlocked(&headers), "link_command": link_command()})).into_response();
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 fn read_secret(path: &Path) -> std::io::Result<Vec<u8>> {
     let text = std::fs::read_to_string(path)?;
@@ -388,6 +408,37 @@ mod tests {
             .status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+    /// Console reads are open with or without a key; the cookie never stands in for the key.
+    #[tokio::test]
+    async fn console_reads_open_and_cookie_never_authorizes_inference() {
+        let (_file, gate) = fixture();
+        let ok = || async { "ok" };
+        let app = Router::new()
+            .route("/v1/console/events", get(ok))
+            .route("/v1/fabric", get(ok).post(ok))
+            .route("/v1/models", get(ok))
+            .route("/v1/chat/completions", axum::routing::post(ok))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::openai::auth::Auth {
+                    key: Some(crate::openai::auth::ApiKey::new("api-key").unwrap()),
+                    internal: None,
+                },
+                crate::openai::auth::require_key,
+            ));
+        let cookie = format!("cuteafd_console={}", gate.cookie_value(4000000));
+        let status = |method: &str, path: &str, cookie: Option<&str>| {
+            let mut request = Request::builder().method(method).uri(path);
+            if let Some(cookie) = cookie { request = request.header("cookie", cookie); }
+            let app = app.clone();
+            let request = request.body(Body::empty()).unwrap();
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+        assert_eq!(status("GET", "/v1/console/events", None).await, StatusCode::OK);
+        assert_eq!(status("GET", "/v1/fabric", None).await, StatusCode::OK);
+        for (method, path) in [("GET", "/v1/models"), ("POST", "/v1/chat/completions"), ("POST", "/v1/fabric")] {
+            assert_eq!(status(method, path, Some(&cookie)).await, StatusCode::UNAUTHORIZED, "{method} {path}");
+        }
     }
     #[tokio::test]
     async fn unlock_query_never_traced() {
