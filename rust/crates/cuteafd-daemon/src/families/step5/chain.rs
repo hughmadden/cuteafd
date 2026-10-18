@@ -565,6 +565,7 @@ mod tests {
     }
 
     fn native(count: usize) -> Result<()> {
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
             .map_err(|_| anyhow::anyhow!("chain gate needs its own Step-5 process"))?;
         let root = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);

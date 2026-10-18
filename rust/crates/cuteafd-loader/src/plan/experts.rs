@@ -75,7 +75,7 @@ pub enum InstalledSparkRecipeRefusal {
 
 impl SparkRecipe {
     /// Validate an explicit Spark package root, never the coordinator tree.
-    /// Installation can narrow a qualified recipe but cannot create one.
+    /// Installation can narrow a registered recipe but cannot create one.
     pub fn validate_installed(&self, root: &std::path::Path, rank: usize,
         selected_slicing: crate::formats::fp8_experts::Slicing, selected_width: usize)
         -> Result<(), InstalledSparkRecipeRefusal> {
@@ -177,7 +177,8 @@ pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize, lay
     selected.context("Spark admission: missing routed expert storage recipe")
 }
 
-/// Qualified recipes only: optional installation checks cannot widen this set.
+/// Registered recipes only: optional installation checks cannot widen this set.
+/// Step-5 TP6 geometry is registered for qualification; its hardware gate is pending.
 /// TP5 support is added per format only after its hardware gate passes.
 pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<SparkRecipe, SparkRecipeRefusal> {
     use crate::formats::fp8_experts::Slicing;
@@ -199,7 +200,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(1..=6).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
     }
-    let packaged = if family == "step5" { world == 4 }
+    let packaged = if family == "step5" { matches!(world, 4 | 6) }
         else if native { matches!(world, 2 | 3 | 4 | 6) }
         else if exl3 { matches!(world, 2 | 3 | 4 | 6) || (family == "qwen4" && world == 1) }
         else if nvfp4 { matches!(world, 2 | 3 | 4 | 6) || (family == "glmf" && world == 5) }
@@ -301,9 +302,14 @@ mod tests {
         assert_eq!(step5.slicing, Slicing::Blocks(128));
         assert_eq!(step5.widths, [384; 4]);
         assert_eq!(step5.required_layouts, ["tp4"]);
-        assert_eq!(spark_worlds("step5:fp8", 1536), [4]);
+        let step5_tp6 = spark_recipe("step5:fp8", 1536, 6).unwrap();
+        assert_eq!(step5_tp6.slicing, Slicing::Blocks(128));
+        assert_eq!(step5_tp6.widths, [256; 6]);
+        assert_eq!(step5_tp6.widths.iter().sum::<usize>(), 1536);
+        assert_eq!(step5_tp6.required_layouts, ["tp6"]);
+        assert_eq!(spark_worlds("step5:fp8", 1536), [4, 6]);
         for world in 0..=8 {
-            if world != 4 { assert!(spark_recipe("step5:fp8", 1536, world).is_err()); }
+            if !matches!(world, 4 | 6) { assert!(spark_recipe("step5:fp8", 1536, world).is_err()); }
             for format in ["nvfp4", "nvfp4a4", "bf16", "mxfp4", "exl3-k34"] {
                 assert!(spark_recipe(&format!("step5:{format}"), 1536, world).is_err());
             }
