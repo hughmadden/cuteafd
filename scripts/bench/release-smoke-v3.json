@@ -511,7 +511,6 @@
         "SPARK_2_LANE_B": "198.51.100.3",
         "SPECULATOR": "dspark",
         "COORDINATOR_GPU_BUDGET_GIB": "31.8",
-        "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090"
       },
       "precheck": {
