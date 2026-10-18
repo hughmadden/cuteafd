@@ -76,6 +76,12 @@ def jobs(scope):
         ("v41-router", "export_b12x_v41_router_aot.py", []),
         ("v41-attention", "export_b12x_v41_attention_aot.py", []),
         ("v41-attention-tp2", "export_b12x_v41_attention_aot.py", ["--heads", "32"]),
+        ("step5-pointwise", "export_b12x_step5_aot.py", ["--heads", "64"]),
+        ("step5-pointwise-tp2", "export_b12x_step5_aot.py", ["--heads", "32"]),
+        ("step5-attention", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "attention"]),
+        ("step5-attention-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "attention"]),
+        ("step5-metadata", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "metadata"]),
+        ("step5-metadata-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "metadata"]),
     ])
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
         args = ["--role", role, "--rows", CAPACITIES, "--width", "192", "--standard-names"]
