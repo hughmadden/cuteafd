@@ -5621,9 +5621,10 @@ mod prefill_lane_tests {
         for (path, expected) in [
             // canon-fp8-decode: the threshold is the programs' capacity, not the thin tile.
             ("integration/cuteafd/glmf.py", 0x80a2_3e92_49ed_5766_u64),
-            // b729115b uses canonical BF16 MMA at every positive row count.
-            ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
-            ("integration/cuteafd/_fp8_weights.py", 0x622a_1b45_96e9_71da),
+            // Proxy fences only: canonical BF16/FP8 MMA geometry, arithmetic
+            // routes and capacity thresholds are unchanged.
+            ("integration/cuteafd/_glm_kernels.py", 0x7f20_e05f_fd23_f141),
+            ("integration/cuteafd/_fp8_weights.py", 0xab87_f59d_f17b_3556),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // Dense Qwen geometry only: glmf/glmf2 retain all 88 objects and 90 headers
