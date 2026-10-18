@@ -30,7 +30,7 @@ pub(crate) struct L2PrefetchArgs {
     /// L2 prefetch of the next layer's weights during a decode step's expert
     /// exchange: off, auto (3/4 of the device L2) or a budget in MiB. The
     /// default is the family's: [`GLM_DEFAULT`] for GLM 5.3 and GLM 5.3 Flash,
-    /// [`OTHER_DEFAULT`] for MiMo and Qwen.
+    /// [`OTHER_DEFAULT`] for MiMo, Qwen and DeepSeek V4.1.
     #[arg(long, env = "CUTEAFD_L2_PREFETCH")]
     pub l2_prefetch: Option<String>,
 }

@@ -62,6 +62,10 @@ impl<'a> BackboneRouterWeights<'a> {
         })
     }
 
+    /// The buffers a decode step reads (L2 prefetch): gate weight and biases.
+    pub(crate) fn decode_reads(&self) -> Vec<CuteafdDeviceBuffer> {
+        Self::names(self.layer).into_iter().flatten().filter_map(|name| self.tensors.get(&name).ok()).collect()
+    }
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<BackboneRouterWave<'_, 'a>> {
         ensure!(
             BackboneRouterWave::device_bytes(capacity)? <= budget,

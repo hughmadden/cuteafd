@@ -91,6 +91,13 @@ impl<'a> AttentionOutputWeights<'a> {
             scales,
         })
     }
+    /// The buffers a decode step reads, in order (L2 prefetch): grouped wo_a and
+    /// its packed scales, then wo_b and its scales unless TP2 splits it.
+    pub(crate) fn decode_reads(&self) -> Vec<CuteafdDeviceBuffer> {
+        [self.tensors.get(&self.names[0]).ok(), Some(self.grouped_scales.buffer),
+            self.tensors.get(&self.names[2]).ok(), self.scales.as_ref().map(|scales| scales.buffer)]
+            .into_iter().flatten().collect()
+    }
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<AttentionOutputWave<'_, 'a>> {
         ensure!(
             AttentionOutputWave::device_bytes_with_split(self.library, capacity,self.scales.is_none())? <= budget,
