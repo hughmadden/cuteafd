@@ -882,6 +882,42 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn step_experts_ignore_empty_rtx_ranges() -> Result<()> {
+        use cuteafd_loader::placement::{AttentionPlacement, ExpertHome, ExpertRange, FfnMode,
+            LayerAssignment, LayerMode, Placement, PoolLimits};
+        let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(45))?;
+        cfg.dense = (0..45).map(|layer| layer < 3).collect();
+        // The small-budget NVFP4 placement retains one empty range per RTX GPU.
+        let mut placement = Placement {
+            pool_tokens: 1 << 20, pool_limits: PoolLimits(vec![]), attention_placement: AttentionPlacement::Heads,
+            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0,
+            layers: (0..45).map(|layer| LayerAssignment {
+                mode: LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
+                experts: if cfg.dense[layer] { ExpertHome::Dense } else { ExpertHome::Spark },
+            }).collect(),
+            movables: vec![], expert_ranges: vec![ExpertRange { first: 3, layers: 0, peak_bytes: 0 }],
+            residual: vec![], hops: vec![], tp2: None, items: vec![],
+        };
+        assert_eq!(admitted_step_experts(&cfg, &placement, false, true)?,
+            engine::StepExperts { local_fp8: false, spark: true, tp2: false });
+        // Local buffers follow actual layer homes, not the catalog's format alone.
+        placement.layers[3].experts = ExpertHome::RtxWhole { gpu: 0 };
+        placement.expert_ranges[0].layers = 1;
+        assert_eq!(admitted_step_experts(&cfg, &placement, false, true)?,
+            engine::StepExperts { local_fp8: true, spark: true, tp2: false });
+        assert_eq!(admitted_step_experts(&cfg, &placement, false, false)?,
+            engine::StepExperts { local_fp8: false, spark: true, tp2: false });
+        placement.layers[3].experts = ExpertHome::RtxTp2;
+        assert_eq!(admitted_step_experts(&cfg, &placement, false, true)?,
+            engine::StepExperts { local_fp8: false, spark: true, tp2: true });
+        assert_eq!(admitted_step_experts(&cfg, &placement, true, true)?,
+            engine::StepExperts { local_fp8: false, spark: false, tp2: false });
+        assert_eq!(admitted_step_experts(&cfg, &Placement { layers: placement.layers[..3].to_vec(), ..placement }, false, true)?,
+            engine::StepExperts { local_fp8: false, spark: false, tp2: false });
+        Ok(())
+    }
+
+    #[test]
     fn sparse_admission_partitions_backends_without_loading_gaps() -> Result<()> {
         use crate::shared::placement::layers::{BackendLayers, ExpertRouting};
         use cuteafd_loader::placement::{ExpertHome, LayerAssignment, LayerMode};
@@ -1269,6 +1305,17 @@ fn admitted_expert_layers(cfg: &GlmNextConfig, assignments: &[cuteafd_loader::pl
 fn admitted_spark_layers(cfg: &GlmNextConfig, layers: &[cuteafd_loader::placement::LayerAssignment],
     skip: bool) -> Result<Vec<usize>> {
     admitted_expert_layers(cfg, layers, cuteafd_loader::placement::ExpertHome::Spark, skip)
+}
+
+fn admitted_step_experts(cfg: &GlmNextConfig, placement: &cuteafd_loader::placement::Placement,
+    skip: bool, fp8: bool) -> Result<engine::StepExperts> {
+    Ok(engine::StepExperts {
+        local_fp8: fp8 && !admitted_expert_layers(cfg, &placement.layers,
+            cuteafd_loader::placement::ExpertHome::RtxWhole { gpu: 0 }, skip)?.is_empty(),
+        spark: !admitted_spark_layers(cfg, &placement.layers, skip)?.is_empty(),
+        tp2: !admitted_expert_layers(cfg, &placement.layers,
+            cuteafd_loader::placement::ExpertHome::RtxTp2, skip)?.is_empty(),
+    })
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -1785,14 +1832,11 @@ impl Opened {
                 "GLM Flash decode graphs captured lazily within the graph budget, not at startup");
         }
         let max_context = crate::shared::context::pool_context("glm5_flash", args.max_context, automatic_context, pool_tokens, 256)?;
+        let step_experts = admitted_step_experts(&self.cfg, &placement, args.skip_experts, self.fp8().is_some())?;
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
             let mut settings = step_settings(args, index_cache, self.checkpoint.spark_input_is_bf16());
             settings.max_context = max_context;
-            let spark = !spark_layers.is_empty();
-            let local = !args.skip_experts && !placement.expert_ranges.is_empty() && self.fp8().is_some();
-            let tp2 = !args.skip_experts && placement.tp2.is_some();
-            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None, settings)
-                .with_experts(local, spark, tp2);
+            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, step_experts, settings);
             let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
         } else { None };
@@ -1801,7 +1845,8 @@ impl Opened {
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool, &execution)?;
+            args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
+            &execution, step_experts)?;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
 
