@@ -272,7 +272,21 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // Existing media owners belong to the baseline, not expert residency/workspace.
     let baseline = cuteafd_ffi::memory_ledger::snapshot();
     census.sample("before_expert_modules", Some(&library))?;
-    let mut modules = match super::modules::WarmModules::load(&library, &catalog, &config) {
+    let programs = (|| -> Result<_> {
+        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+            let path = config.library.parent().context("native library directory")?
+                .join("../share/PROGRAMS.json");
+            Ok(Some(library.programs()?.with_manifest(&path)?))
+        } else { Ok(None) }
+    })();
+    let programs = match programs {
+        Ok(programs) => programs,
+        Err(error) => {
+            let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
+            return Err(error);
+        }
+    };
+    let mut modules = match super::modules::WarmModules::load(&library, &catalog, &config, programs.as_ref()) {
         Ok(modules) => modules,
         Err(error) => {
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
@@ -310,7 +324,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         }
     };
     census.sample("after_retained_arenas", Some(&library))?;
-    let mut exchange = HostExpertExchange::new(config.capacity)?;
+    let mut exchange = HostExpertExchange::with_output(config.capacity, config.exlr8_manifest.is_some())?;
     let mut row_indices = vec![0; config.capacity as usize];
     // Transport benchmarks only: answer each request with its response slot
     // as it is, without running the experts.
@@ -343,6 +357,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 let (resident_bytes, slices) = weights.loaded_residency(&library, config.compiled_capacity()?)?;
                 let mut runtime = measured_worker_runtime(&library, &baseline, resident_bytes, &census)?;
                 runtime.detail.load_transient = weights.load_inventory();
+                runtime.detail.allocations.extend(weights.retained_host_inventory()?);
                 tracing::info!(target: "cuteafd::spark_memory", rank = config.rank,
                     record = %serde_json::to_string(&runtime)?, "Spark retained runtime inventory");
                 let host_exchange_bytes = exchange.ids.capacity().checked_mul(std::mem::size_of::<i32>())
@@ -432,15 +447,18 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // logical intermediate this worker actually loaded. A captured log can then
     // be hashed and checked against the declared topology, instead of trusting a
     // hand-written value; the role comes from the same selection the loader used.
-    let loaded = if catalog.exl3().is_some() {
-        config.exl3_selection(resident[0])?
+    let role = if config.exlr8_manifest.is_some() {
+        None
+    } else if catalog.exl3().is_some() {
+        Some(config.exl3_selection(resident[0])?.role())
     } else {
-        config.selection(resident[0])?
+        Some(config.selection(resident[0])?.role())
     };
     tracing::info!(
         rank = config.rank,
         world = config.world,
-        role = loaded.role(),
+        role,
+        format = ?catalog.format(),
         intermediate = weights.intermediate(),
         capacity = config.capacity,
         layer_ids = ?resident,
@@ -547,11 +565,12 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 let layer = resident.binary_search(&(request.layer() as usize))
                     .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
                 execution.bind_layer(&weights, layer)?;
-                if let Some(slot) = mapped.response_slot {
+                if mapped.response_slot.is_some() {
                     // The mapped frame's hidden rows are device-visible, so the
                     // worker copies them on its stream instead of uploading.
-                    let response = unsafe { execution.execute_mapped_request(&request,
-                        executor_id, &mut exchange, slot, Some(mapped.hidden_payload)) };
+                    // SAFETY: the transport retains the mapped slots through execution and emission.
+                    let response = unsafe { execution.execute_mapped(&request,
+                        executor_id, &mut exchange, mapped) };
                     let response = match response {
                         Ok(response) => response,
                         Err(error) => { execution_failed = true; return Err(error); }

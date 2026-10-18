@@ -6,7 +6,9 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::Residency;
 
 mod execution;
+mod transforms;
 pub(crate) use execution::Exlr8Execution;
+pub(crate) use transforms::Exlr8Transforms;
 
 const BANKS: usize = 2;
 
@@ -16,9 +18,9 @@ pub(crate) struct Exlr8Weights<'a> {
     pub(crate) budget: ExpertLoadBudget,
 }
 
-fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+pub(crate) fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(
-        offset.checked_add(bytes).is_some_and(|n| n <= buffer.bytes),
+        !buffer.ptr.is_null() && offset.checked_add(bytes).is_some_and(|n| n <= buffer.bytes),
         "EXLR8 arena view outside allocation"
     );
     // SAFETY: checked byte extent is inside the live arena owned by the caller.
@@ -36,10 +38,14 @@ impl<'a> Exlr8Weights<'a> {
             .checked_mul(layout.units)
             .and_then(|n| n.checked_mul(3 * (3 * 8 + 4) * 2))
             .context("EXLR8 descriptor staging overflow")?;
+        let descriptor_upload = layout.experts.checked_mul(layout.units)
+            .and_then(|n| n.checked_mul(3 * 3 * 8))
+            .context("EXLR8 descriptor upload overflow")?;
         let bank_bytes = layout
             .staging_bytes
             .max(16)
             .checked_mul(EXPERT_READ_LANES * BANKS)
+            .and_then(|bytes| bytes.checked_add(descriptor_upload.max(layout.hidden)))
             .context("EXLR8 pinned staging overflow")?;
         Ok(ExpertLoadBudget {
             resident_bytes: layout.resident_bytes,
@@ -185,5 +191,34 @@ impl<'a> Exlr8Weights<'a> {
             layout,
             budget,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_loader::plan::exlr8::residency::ExpertSet;
+
+    #[test]
+    fn exlr8_loader_admits_both_sixteen_lane_banks_and_descriptor_upload() {
+        let layout = Residency { layer: 3, world: 4, rank: 0, hidden: 6144,
+            experts: 256, units: 16, set: ExpertSet::Routed, set_id: String::new(),
+            manifest: String::new(), loads: vec![], signs: [vec![], vec![]],
+            signs_offsets: [0, 0], pointers_offset: 0, bits_offset: 0,
+            resident_bytes: 4096, payload_bytes: 0, staging_bytes: 400_000 };
+        assert_eq!((BANKS, EXPERT_READ_LANES), (2, 16));
+        let budget = Exlr8Weights::plan(&layout).unwrap();
+        let upload = 256 * 16 * 3 * 3 * 8;
+        assert_eq!(budget.pinned_host_bytes, 2 * 16 * 400_000 + upload);
+        assert_eq!(budget.read_scratch_bytes - layout.host_bytes(),
+            256 * 16 * 3 * (3 * 8 + 4) * 2);
+        // Each bank must drain its previous DMA before readers overwrite it;
+        // the final drain precedes returning the arena and dropping both banks.
+        let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
+        let reuse = source.find("library.cuda_stream_synchronize(streams[bank].raw)").unwrap();
+        let readers = source.find("unit.read_verified(bytes)").unwrap();
+        let upload = source.find("library.copy_host_buffer_h2d_async(").unwrap();
+        let final_drain = source.find("library.cuda_stream_synchronize(stream.raw)").unwrap();
+        assert!(reuse < readers && readers < upload && upload < final_drain);
     }
 }

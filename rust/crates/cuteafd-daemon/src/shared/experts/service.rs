@@ -4,6 +4,7 @@ mod backend;
 mod census;
 mod modules;
 mod routes;
+mod exlr8;
 
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
@@ -130,6 +131,9 @@ fn load_weights<'a>(
     ensure!(layers.iter().all(|&layer| layer >= first),
         "coordinator selected experts before this checkpoint's routed boundary {first}");
     validate_topology(config, catalog)?;
+    if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        return exlr8::load(library, catalog, config, modules.exlr8()?);
+    }
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
     if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config, modules.take_fp8()?); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);
@@ -368,7 +372,7 @@ fn spark_admission_budget(
     read_scratch: usize,
     workspace: usize,
 ) -> Result<SparkAdmissionBudget> {
-    let (exchange, row_indices) = if config.bf16_ingress {
+    let (exchange, row_indices) = if config.bf16_ingress || config.exlr8_manifest.is_some() {
         let io = selected_spark_io(config, cuteafd_core::expert_geometry(),
             worker_ring_geometry(config)?)?;
         (usize::try_from(io.host_exchange)?, usize::try_from(io.row_indices)?)
@@ -566,6 +570,41 @@ mod tests {
         let error = admit(5).unwrap_err();
         assert!(error.downcast_ref::<cuteafd_loader::plan::experts::SparkRecipeRefusal>().is_some(),
             "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn exlr8_worker_admits_only_selected_routed_layers_when_supplied() -> Result<()> {
+        use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
+        let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else { return Ok(()); };
+        let snapshot = PathBuf::from(snapshot);
+        let mut catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        let shape = catalog.routed_experts();
+        let mut worker = config(4, 0, None);
+        worker.snapshot = snapshot.clone();
+        worker.exlr8_manifest = Some("up1".into());
+        for endpoint in &mut worker.model_admission.as_mut().unwrap().endpoints {
+            endpoint.ingress = cuteafd_core::SparkIngress::Exlr8Rotated;
+        }
+        let identity = WorkerIdentity::from_snapshot_manifest(&snapshot, shape.geometry()?,
+            worker.spark_world()?, Some("up1"))?;
+        let selection = |layers: &[usize]| -> Result<WorkerSelection> {
+            Ok(WorkerSelection::new(identity.clone(), layers)?
+                .with_model(worker.model_admission.clone().unwrap())?)
+        };
+        let valid = selection(&[shape.first_layer, shape.first_layer + 2])?;
+        let idle = selection(&[])?;
+        let dense = selection(&[0])?;
+        assert!(selection(&[shape.layers]).is_err());
+        local::admit_worker_selection(&mut worker, &valid, &catalog)?;
+        assert_eq!(worker.resident_layers(shape.layers)?, valid.layers());
+        assert!(local::admit_worker_selection(&mut worker, &dense, &catalog).is_err());
+        let mut owned = config(4, 0, Some(SparkTopology::NATIVE_TP4_EP1));
+        assert!(local::admit_worker_selection(&mut owned, &valid, &catalog).is_err());
+        // Idle identity acknowledgement intentionally needs no storage recipe.
+        local::admit_worker_selection(&mut worker, &idle, &catalog)?;
+        assert!(worker.resident_layers(shape.layers)?.is_empty());
         Ok(())
     }
 

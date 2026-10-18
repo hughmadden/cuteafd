@@ -9,6 +9,7 @@ pub(super) enum WarmModules<'a> {
     Native { _kernels: Vec<cuteafd_ffi::V41ExpertKernel<'a>> },
     Exl3(Option<Vec<Exl3Modules<'a>>>),
     Fp8(Option<Vec<Fp8Group>>),
+    Exlr8(&'a cuteafd_ffi::programs::Programs<'a>),
 }
 /// Code and immutable preflight for one homogeneous native group. The module
 /// phase validates every package before warming any of them or loading weights.
@@ -62,9 +63,16 @@ impl Fp8Group {
 
 impl<'a> WarmModules<'a> {
     pub(super) fn load(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
-        config: &NativeExpertServiceConfig) -> Result<Self> {
-        ensure!(catalog.format() != cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8,
-            "EXLR8 routed service execution is not wired");
+        config: &NativeExpertServiceConfig,
+        programs: Option<&'a cuteafd_ffi::programs::Programs<'a>>) -> Result<Self> {
+        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+            let programs = programs.context("EXLR8 module owner requires validated programs")?;
+            crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes(programs,
+                (config.capacity as usize).min(cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS),
+                cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed)?;
+            programs.program("exlr8_group", &["ids", "group_expert", "route_slots", "route_group_lane", "group_count"])?;
+            return Ok(Self::Exlr8(programs));
+        }
         if catalog.fp8().is_some() {
             let mut groups = Fp8Group::plan(catalog, config)?;
             for group in &mut groups {
@@ -97,6 +105,10 @@ impl<'a> WarmModules<'a> {
         Ok(Self::Native { _kernels: kernels })
     }
 
+    pub(super) fn exlr8(&self) -> Result<&'a cuteafd_ffi::programs::Programs<'a>> {
+        match self { Self::Exlr8(programs) => Ok(*programs),
+            _ => anyhow::bail!("EXLR8 module owner/backend mismatch") }
+    }
     pub(super) fn take_fp8(&mut self) -> Result<Vec<Fp8Group>> {
         match self {
             Self::Fp8(modules) => modules.take().context("FP8 modules already consumed"),

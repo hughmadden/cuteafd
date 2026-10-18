@@ -59,6 +59,16 @@ pub(super) unsafe fn copy_mapped_routes(library: &NativeLibrary,
     ensure!(!request.is_native_group(), "ownership-tagged routes need an ownership-aware device adapter");
     let count = (request.rows() as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize)
         .context("canonical route count overflow")?;
+    // SAFETY: the caller retains the validated canonical request and stream.
+    unsafe { copy_route_records(library, source, ids, weights, count, stream) }
+}
+
+/// # Safety
+/// `source` contains exactly `count` canonical route records from an admitted
+/// request. Its owner and the destination owners outlive the stream drain.
+pub(super) unsafe fn copy_route_records(library: &NativeLibrary,
+    source: CuteafdDeviceBuffer, ids: CuteafdDeviceBuffer,
+    weights: CuteafdDeviceBuffer, count: usize, stream: *mut c_void) -> Result<()> {
     let plan = RouteCopies::plan(source, ids, weights, count)?;
     for index in 0..2 {
         // SAFETY: planning validates both source and destination extents before

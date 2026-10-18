@@ -491,6 +491,24 @@ impl Residency {
                 .sum::<usize>()
     }
 
+    /// Noncontiguous unit ownership spans the full logical intermediate domain;
+    /// counts describe this rank's actual native projection units by trellis tier.
+    pub fn spark_slice(&self) -> Result<cuteafd_core::SparkSlice> {
+        self.spark_slice_inner().map_err(Into::into)
+    }
+    fn spark_slice_inner(&self) -> anyhow::Result<cuteafd_core::SparkSlice> {
+        let mut counts = [[0u32; 3]; 3];
+        for unit in &self.loads {
+            ensure!((2..=4).contains(&unit.bits) && unit.projection < 3,
+                "invalid EXLR8 projection tier");
+            let count = &mut counts[(unit.bits - 2) as usize][unit.projection];
+            *count = count.checked_add(1).context("EXLR8 projection count overflow")?;
+        }
+        let width = u32::try_from(self.units.checked_mul(128).context("EXLR8 slice width overflow")?)?;
+        Ok(cuteafd_core::SparkSlice { layer: u32::try_from(self.layer)?, first: 0,
+            width, stored_width: width, tiers: vec![2, 3, 4], projection_counts: counts.to_vec() })
+    }
+
     /// Includes alignment and both descriptor tables, unlike weight-only plan.
     /// Callers supply workspace, graph, staging and other device reservations.
     pub fn check_budget(&self, ceiling: usize, reservations: &[usize]) -> Result<usize> {
@@ -774,6 +792,17 @@ mod tests {
                     for rank in 0..world {
                         let plan =
                             Residency::plan(root.path(), "mixed", 3, world, rank, set).unwrap();
+                        let slice = plan.spark_slice().unwrap();
+                        assert_eq!(slice.layer, 3);
+                        assert_eq!((slice.first, slice.width, slice.stored_width), (0, 384, 384));
+                        assert_eq!(slice.tiers, [2, 3, 4]);
+                        assert_eq!(slice.projection_counts.iter().flatten().sum::<u32>() as usize, plan.loads.len());
+                        for (tier, counts) in slice.tiers.iter().zip(&slice.projection_counts) {
+                            for (projection, &count) in counts.iter().enumerate() {
+                                assert_eq!(count as usize, plan.loads.iter().filter(|unit|
+                                    unit.bits as u32 == *tier && unit.projection == projection).count());
+                            }
+                        }
                         let (ptrs, bits) = plan.descriptors(0x10000).unwrap();
                         assert_eq!(plan.resident_bytes % 256, 0);
                         assert_eq!(

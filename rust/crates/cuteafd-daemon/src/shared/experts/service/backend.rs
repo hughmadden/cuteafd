@@ -12,6 +12,7 @@ pub(super) enum Weights<'a> {
     Full(Vec<ExpertWeights<'a>>),
     Exl3(Rc<Vec<Exl3Weights<'a>>>),
     Fp8(Vec<Rc<Fp8Experts<'a>>>),
+    Exlr8(Vec<crate::shared::experts::exlr8::Exlr8Weights<'a>>),
 }
 
 impl<'a> Weights<'a> {
@@ -20,6 +21,11 @@ impl<'a> Weights<'a> {
             Self::Full(weights) => weights.iter().map(|w| w.budget).collect(),
             Self::Exl3(weights) => weights.iter().map(|w| w.budget).collect(),
             Self::Fp8(_) => return vec![],
+            Self::Exlr8(weights) => weights.iter().map(|weight| {
+                let mut budget = weight.budget;
+                budget.read_scratch_bytes -= weight.layout.host_bytes();
+                budget
+            }).collect(),
         };
         let terms = [
             ("device", "expert_load_staging", budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)),
@@ -33,9 +39,15 @@ impl<'a> Weights<'a> {
         }).collect()
     }
 
+    pub(super) fn retained_host_inventory(&self) -> Result<Vec<cuteafd_core::expert_geometry::SparkAllocationTerm>> {
+        let Self::Exlr8(weights) = self else { return Ok(vec![]); };
+        retained_host_terms(weights.iter().map(|weight| weight.layout.host_bytes()))
+    }
+
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Full(weights) => weights.len(),
+            Self::Exlr8(weights) => weights.len(),
             Self::Exl3(weights) => weights.len(),
             Self::Fp8(experts) => experts.iter().map(|group| group.layers.len()).sum(),
         }
@@ -43,6 +55,7 @@ impl<'a> Weights<'a> {
     pub(super) fn layer_ids(&self) -> Result<Vec<usize>> {
         match self {
             Self::Full(weights) => Ok(weights.iter().map(|weight| weight.layer.layer()).collect()),
+            Self::Exlr8(weights) => Ok(weights.iter().map(|weight| weight.layout.layer).collect()),
             Self::Exl3(weights) => weights.iter().map(|weight| match weight.layout.layer {
                 cuteafd_loader::V41Exl3Layer::Backbone(layer) => Ok(layer),
                 _ => anyhow::bail!("draft layer in resident Spark backbone"),
@@ -91,6 +104,11 @@ impl<'a> Weights<'a> {
                         u32::try_from(counts[0])?, u32::try_from(counts[1])?, u32::try_from(counts[2])?,
                     ])).collect::<Result<_, std::num::TryFromIntError>>()? });
             },
+            Self::Exlr8(weights) => for weight in weights {
+                let layout = &weight.layout;
+                resident = resident.checked_add(layout.resident_bytes as u64).context("EXLR8 resident sum overflow")?;
+                slices.push(layout.spark_slice()?);
+            },
             Self::Fp8(experts) => {
                 for group in experts {
                     resident = resident.checked_add(u64::try_from(group.resident_bytes())?)
@@ -108,6 +126,11 @@ impl<'a> Weights<'a> {
 
     pub(super) fn validate_ingress(&self, library: &NativeLibrary,
         model: &cuteafd_transport::worker_selection::ModelAdmission) -> Result<()> {
+        if matches!(self, Self::Exlr8(_)) {
+            ensure!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Exlr8Rotated),
+                "EXLR8 backend requires rotated ingress");
+            return Ok(());
+        }
         let (fp8, bf16) = match self {
             Self::Full(weights) => {
                 let first = weights.first().context("sealed native worker has no weights")?;
@@ -116,6 +139,7 @@ impl<'a> Weights<'a> {
                     input == cuteafd_transport::ExpertV2Dtype::Bf16 as u32)
             }
             Self::Exl3(_) => (true, false),
+            Self::Exlr8(_) => unreachable!("validated above"),
             Self::Fp8(experts) => (
                 experts.iter().all(|group| group.wire_input()),
                 experts.iter().all(|group| !group.wire_input() || group.bf16_module.is_some())),
@@ -135,7 +159,7 @@ impl<'a> Weights<'a> {
             Self::Full(weights) => weights.first().map(|weight| weight.intermediate()),
             // EXL3 packs its own tiered layout; the logical intermediate is the
             // checkpoint's own value, reported by the EXL3 weights themselves.
-            Self::Exl3(_) => None,
+            Self::Exl3(_) | Self::Exlr8(_) => None,
             Self::Fp8(experts) => experts.first().map(|group| group.module.info().slice)
                 .filter(|width| experts.iter().all(|group| group.module.info().slice == *width)),
         }
@@ -148,6 +172,8 @@ impl<'a> Weights<'a> {
         modules: &mut super::modules::WarmModules<'a>,
     ) -> Result<Execution<'_, 'a>> {
         Ok(match self {
+            Self::Exlr8(weights) => Execution::Exlr8(super::exlr8::Worker::new(library,
+                modules.exlr8()?, weights, config, remaining)?),
             Self::Full(weights) => {
                 let mut execution = weights[0].execution(config.compiled_capacity()?, config.capacity, remaining)?;
                 execution.install_native_group(config.native_group()?)?;
@@ -189,6 +215,29 @@ impl<'a> Weights<'a> {
     }
 }
 
+fn retained_host_terms(mut bytes: impl Iterator<Item = usize>)
+    -> Result<Vec<cuteafd_core::expert_geometry::SparkAllocationTerm>> {
+    let bytes = bytes.try_fold(0usize, |total, bytes|
+        total.checked_add(bytes).context("EXLR8 retained host inventory overflow"))?;
+    Ok(vec![cuteafd_core::expert_geometry::SparkAllocationTerm {
+        space: "host".into(), scope: "experts/weights/exlr8_plan".into(),
+        tensor: None, format: Some("exlr8".into()), bytes: u64::try_from(bytes)?,
+        allocations: 0,
+        method: "checkpoint residency host payload; sum across retained layers; admitted separately from native device/pinned workspace; allocation count not sampled".into(),
+    }])
+}
+
+#[cfg(test)]
+#[test]
+fn exlr8_retained_host_inventory_sums_layers_instead_of_transient_max() {
+    let terms = retained_host_terms([7, 11, 13].into_iter()).unwrap();
+    assert_eq!(terms.len(), 1);
+    assert_eq!(terms[0].space, "host");
+    assert_eq!(terms[0].bytes, 31);
+    assert!(terms[0].method.contains("retained layers"));
+    assert!(retained_host_terms([usize::MAX, 1].into_iter()).is_err());
+}
+
 /// One shared worker per homogeneous native package, indexed by absolute layer.
 /// Each worker owns its stream and input/output buffers; admission sums all of them.
 pub(super) struct Fp8Groups<'a> {
@@ -222,7 +271,7 @@ impl<'a> Fp8Groups<'a> {
     }
 }
 
-fn conservative_grouping(loaded: cuteafd_transport::worker_selection::WorkerSelection,
+pub(super) fn conservative_grouping(loaded: cuteafd_transport::worker_selection::WorkerSelection,
     rank: usize, capacity: usize, read_bytes: usize)
     -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
     use cuteafd_transport::worker_selection::{ExpertGroupingSelector, ExpertTrafficContract,
@@ -254,6 +303,7 @@ pub(super) enum Execution<'w, 'a> {
     Full(ExpertExecution<'w, 'a>),
     Exl3(Exl3Worker<'a>),
     Fp8(Fp8Groups<'a>),
+    Exlr8(super::exlr8::Worker<'w, 'a>),
 }
 impl<'w, 'a> Execution<'w, 'a> {
     pub(super) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
@@ -262,6 +312,7 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Full(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Exl3(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Fp8(execution) => execution.installed_grouping(loaded, rank).map(Some),
+            Self::Exlr8(execution) => execution.grouping(loaded, rank).map(Some),
         }
     }
     pub(super) fn bind_layer(&mut self, weights: &'w Weights<'a>, index: usize) -> Result<()> {
@@ -273,7 +324,23 @@ impl<'w, 'a> Execution<'w, 'a> {
             ),
             (Self::Exl3(execution), Weights::Exl3(_)) => execution.bind_layer(index),
             (Self::Fp8(execution), Weights::Fp8(_)) => execution.bind_layer(index),
+            (Self::Exlr8(execution), Weights::Exlr8(_)) => execution.bind_layer(index),
             _ => anyhow::bail!("expert backend/weight mismatch"),
+        }
+    }
+    /// # Safety
+    /// The transport retains all mapped views until execution drains and emission completes.
+    pub(super) unsafe fn execute_mapped(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
+        exchange: &mut HostExpertExchange, mapped: cuteafd_transport::ProtocolV2RequestDevicePayload)
+        -> Result<Option<ExpertProtocolV2DeviceResponseRef<'static>>> {
+        match self {
+            // SAFETY: the caller retains every mapped owner through the worker drain.
+            Self::Exlr8(execution) => unsafe { execution.execute_mapped(request, executor_id, exchange, mapped) },
+            _ => match mapped.response_slot {
+                // SAFETY: existing backends receive the same retained mapped views.
+                Some(slot) => unsafe { self.execute_mapped_request(request, executor_id, exchange, slot, Some(mapped.hidden_payload)) },
+                None => Ok(None),
+            }
         }
     }
     pub(super) unsafe fn execute_mapped_request(
@@ -292,6 +359,7 @@ impl<'w, 'a> Execution<'w, 'a> {
                 execution.execute_mapped_request(request, executor_id, exchange, slot, hidden)
             }
             Self::Fp8(execution) => execution.execute_mapped_request(request, executor_id, exchange, slot, hidden),
+            Self::Exlr8(_) => Ok(None),
         }
     }
     pub(super) fn execute_host_chunks<F>(
@@ -326,6 +394,8 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Fp8(execution) => {
                 execution.execute_host_chunks(request, executor_id, exchange, row_indices, max_frame_bytes, sink)
             }
+            Self::Exlr8(execution) => execution.execute_host_chunks(request, executor_id, exchange,
+                row_indices, max_frame_bytes, sink),
         }
     }
 }
