@@ -1192,7 +1192,7 @@ mod tests {
             }
             write_snapshot(dir.path(), &serde_json::json!({}), &fixtures, None);
             let tensors = Fp8ExpertTensors::read(dir.path(), shape)?;
-            for (name, located) in &tensors.tensors {
+            for (name, located) in tensors.tensors.iter() {
                 let bytes = if name.ends_with("_scale_2") || name.ends_with(".input_scale") {
                     0.25f32.to_le_bytes().to_vec()
                 } else {
