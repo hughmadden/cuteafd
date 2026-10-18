@@ -123,6 +123,12 @@ elif [[ "$role" != cpu ]]; then
   release_load_config "${CUTEAFD_CONFIG:-$repo_root/cuteafd.config}"
   release_need nvidia-smi
   release_resolve_coordinator_gpu_identity
+  # Under hwlock, the GPU this container gets must be one the caller holds: the
+  # config (not the environment) selects it, so a mismatch is a wrong config.
+  if [[ -n "${CUTEAFD_HW_LOCKS_HELD:-}" && ",$CUTEAFD_HW_LOCKS_HELD," != *",gpu$RELEASE_COORDINATOR_GPU_HOST_INDEX,"* ]]; then
+    echo "coordinator GPU $RELEASE_COORDINATOR_GPU_HOST_INDEX is not among held locks ($CUTEAFD_HW_LOCKS_HELD); set COORDINATOR_GPU in CUTEAFD_CONFIG" >&2
+    exit 2
+  fi
   source "$repo_root/scripts/lib/cdi-gpus.sh"
   cuteafd_cdi_gpu_args "$RELEASE_COORDINATOR_GPU_UUID" || exit 2
   docker_args+=(
