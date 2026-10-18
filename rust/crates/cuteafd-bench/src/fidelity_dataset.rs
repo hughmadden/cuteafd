@@ -223,12 +223,23 @@ fn fetch(agent: &ureq::Agent, root: &Path, repo: &str, commit: &str, path: &str,
     agent.get(&url).call()?.into_reader().take(32 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 32 * 1024 * 1024, "oversized dataset file");
     if let Some(hash) = hash { ensure!(digest(&bytes) == hash, "download checksum differs: {path}"); }
+    store(&local, &bytes)?;
+    Ok(bytes)
+}
+
+/// Writes one immutable cache file atomically. A concurrent fetch of the same file
+/// may land first (parallel smoke entries share the cache): keep its identical copy
+/// rather than failing the run on EEXIST.
+fn store(local: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(local.parent().context("dataset parent")?)?;
     // No partially downloaded file can become a valid cache hit.
     let mut file = tempfile::NamedTempFile::new_in(local.parent().unwrap())?;
-    std::io::Write::write_all(&mut file, &bytes)?;
-    file.persist_noclobber(&local).map_err(|e| e.error)?;
-    Ok(bytes)
+    std::io::Write::write_all(&mut file, bytes)?;
+    if let Err(error) = file.persist_noclobber(local) {
+        ensure!(error.error.kind() == std::io::ErrorKind::AlreadyExists, error.error);
+        ensure!(std::fs::read(local)? == bytes, "concurrent dataset download differs: {}", local.display());
+    }
+    Ok(())
 }
 
 pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, config: &str)
@@ -440,6 +451,16 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_store_keeps_an_identical_copy_and_refuses_a_different_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("cfg/windows.json");
+        super::store(&local, b"same").unwrap();
+        super::store(&local, b"same").unwrap();
+        assert_eq!(std::fs::read(&local).unwrap(), b"same");
+        assert!(super::store(&local, b"other").unwrap_err().to_string().contains("concurrent dataset download differs"));
+    }
+
     use super::*;
     #[test]
     fn publications_and_retired_mimo_fail_closed() {
