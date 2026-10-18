@@ -1,16 +1,17 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use super::{
-    checked_u32, checked_usize, debug_checksum_enabled, expert_protocol_v2_compact_id, push_u16,
-    push_u32, push_u64, read_u16, read_u32, read_u64, response_header_len_from_flags,
-    response_more_chunks_enabled, response_row_indices_enabled, validate_common_header,
-    validate_flags, validate_header_len, ExpertProtocolV2DeviceResponseRef,
+    CHECKSUM_LEN, EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
+    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES,
+    EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, ExpertProtocolV2DeviceResponseRef,
     ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseRef,
-    ExpertProtocolV2Status, ExpertProtocolV2WireStats, ExpertV2Dtype, CHECKSUM_LEN,
-    EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS,
-    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, MAGIC,
-    RESPONSE_CHECKSUM_OFFSET, RESPONSE_EXECUTOR_ID_OFFSET, RESPONSE_KIND, VERSION,
+    ExpertProtocolV2Status, ExpertProtocolV2WireStats, ExpertV2Dtype, MAGIC,
+    RESPONSE_CHECKSUM_OFFSET, RESPONSE_EXECUTOR_ID_OFFSET, RESPONSE_KIND, VERSION, checked_u32,
+    checked_usize, debug_checksum_enabled, expert_protocol_v2_compact_id, push_u16, push_u32,
+    push_u64, read_u16, read_u32, read_u64, response_header_len_from_flags,
+    response_more_chunks_enabled, response_row_indices_enabled, validate_common_header,
+    validate_flags, validate_header_len,
 };
 
 impl ExpertProtocolV2Response {
@@ -305,14 +306,34 @@ impl ExpertProtocolV2Response {
 
 impl ExpertProtocolV2ResponseHeader {
     pub(super) fn validate_row_capacity_error(&self) -> Result<()> {
+        let rotated = self.flags & super::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0;
+        if rotated
+            && (self.output_dtype != ExpertV2Dtype::F32
+                || self.output_dim.checked_mul(4) != Some(self.output_row_stride_bytes)
+                || (self.flags & super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR == 0
+                    && (self.output_dim == 0 || self.output_dim % 128 != 0)))
+        {
+            bail!("EXLR8 rotated response requires contiguous F32 H128 rows");
+        }
         if self.flags & super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR != 0 {
             let allowed = super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
                 | super::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+                | super::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
-            if self.status != ExpertProtocolV2Status::Error || self.row_count != 0
-                || self.output_payload_bytes != 0 || self.flags & !allowed != 0
-                || self.output_dtype != ExpertV2Dtype::Bf16 || self.output_dim == 0
-                || self.output_dim.checked_mul(2) != Some(self.output_row_stride_bytes) {
+            if self.status != ExpertProtocolV2Status::Error
+                || self.row_count != 0
+                || self.output_payload_bytes != 0
+                || self.flags & !allowed != 0
+                || self.output_dtype
+                    != if rotated {
+                        ExpertV2Dtype::F32
+                    } else {
+                        ExpertV2Dtype::Bf16
+                    }
+                || self.output_dim == 0
+                || self.output_dim.checked_mul(if rotated { 4 } else { 2 })
+                    != Some(self.output_row_stride_bytes)
+            {
                 bail!("invalid final row capacity error response");
             }
         }
@@ -323,10 +344,16 @@ impl ExpertProtocolV2ResponseHeader {
     pub(crate) fn ensure_success(&self, requested_rows: u32) -> Result<()> {
         if self.status == ExpertProtocolV2Status::Error {
             if self.flags & super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR != 0 {
-                bail!("expert worker rejected {requested_rows} rows: capacity {}", self.output_dim);
+                bail!(
+                    "expert worker rejected {requested_rows} rows: capacity {}",
+                    self.output_dim
+                );
             }
-            bail!("expert worker rejected {requested_rows} rows (request {}, layer {})",
-                self.request_id, self.layer_id);
+            bail!(
+                "expert worker rejected {requested_rows} rows (request {}, layer {})",
+                self.request_id,
+                self.layer_id
+            );
         }
         Ok(())
     }
@@ -334,14 +361,33 @@ impl ExpertProtocolV2ResponseHeader {
 
 impl<'a> ExpertProtocolV2ResponseRef<'a> {
     /// Reject an admitted wire request without allocating or executing its rows.
-    pub fn row_capacity_error(request: &super::ExpertProtocolV2RequestHeader,
-        capacity: u32, executor_id: u64) -> Result<Self> {
-        let mut response = Self::new_with_output_stride(request.request_id,
-            request.placement_version, request.layer_id, 0, capacity, ExpertV2Dtype::Bf16,
-            capacity.checked_mul(2).context("row capacity error stride overflow")?,
-            ExpertProtocolV2Status::Error, &[])?;
+    pub fn row_capacity_error(
+        request: &super::ExpertProtocolV2RequestHeader,
+        capacity: u32,
+        executor_id: u64,
+    ) -> Result<Self> {
+        let rotated = request.flags & super::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0;
+        let mut response = Self::new_with_output_stride(
+            request.request_id,
+            request.placement_version,
+            request.layer_id,
+            0,
+            capacity,
+            if rotated {
+                ExpertV2Dtype::F32
+            } else {
+                ExpertV2Dtype::Bf16
+            },
+            capacity
+                .checked_mul(if rotated { 4 } else { 2 })
+                .context("row capacity error stride overflow")?,
+            ExpertProtocolV2Status::Error,
+            &[],
+        )?;
         response.header.executor_id = executor_id;
-        response.header.flags = (request.flags & super::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16)
+        response.header.flags = (request.flags
+            & (super::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+                | super::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED))
             | super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR;
         response.validate()?;
         Ok(response)

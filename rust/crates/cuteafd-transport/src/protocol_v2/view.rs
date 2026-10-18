@@ -1,7 +1,15 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use super::{
+    CHECKSUM_LEN, EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
+    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
+    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
+    EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN,
+    EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN, ExpertProtocolV2RequestHeader,
+    ExpertProtocolV2ResponseHeader, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
+    ExpertProtocolV2Status, ExpertProtocolV2WireStats, ExpertV2Dtype, REQUEST_CHECKSUM_OFFSET,
+    REQUEST_KIND, RESPONSE_CHECKSUM_OFFSET, RESPONSE_EXECUTOR_ID_OFFSET, RESPONSE_KIND,
     checked_usize, debug_checksum_enabled, decode_route_entry, decode_row_descriptor,
     payload_checksum, precompile_warmup_enabled, read_u16, read_u32, read_u64,
     request_header_len_from_flags, response_fp8_e4m3_row_scaled_enabled,
@@ -9,14 +17,7 @@ use super::{
     response_nvfp4_e2m1_fp8_e4m3_enabled, response_row_indices_enabled,
     spark_collective_part_count, spark_reduction_enabled, spark_row_sharded_reduction_enabled,
     stream_data_enabled, stream_final_enabled, stream_plan_enabled, validate_common_header,
-    validate_flags, validate_header_len, ExpertProtocolV2RequestHeader,
-    ExpertProtocolV2ResponseHeader, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
-    ExpertProtocolV2Status, ExpertProtocolV2WireStats, ExpertV2Dtype, CHECKSUM_LEN,
-    EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
-    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
-    EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN,
-    EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN, REQUEST_CHECKSUM_OFFSET, REQUEST_KIND,
-    RESPONSE_CHECKSUM_OFFSET, RESPONSE_EXECUTOR_ID_OFFSET, RESPONSE_KIND,
+    validate_flags, validate_header_len,
 };
 
 #[derive(Debug, Clone)]
@@ -327,6 +328,7 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
     }
 
     fn validate(&self) -> Result<()> {
+        self.header.validate_rotated()?;
         let stream_plan = self.stream_plan_enabled();
         let stream_data = self.stream_data_enabled();
         if stream_data {
@@ -507,7 +509,10 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
     /// the header, so the payload's first byte is the landing range's first byte.
     pub fn parse_landed_header(bytes: &[u8]) -> Result<ExpertProtocolV2ResponseHeader> {
         if bytes.len() < EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN {
-            bail!("ExpertProtocolV2 landed response header too short: {}", bytes.len());
+            bail!(
+                "ExpertProtocolV2 landed response header too short: {}",
+                bytes.len()
+            );
         }
         let header_len = validate_common_header(bytes, RESPONSE_KIND)?;
         let row_count = read_u32(bytes, 36, "row_count")?;
@@ -539,13 +544,17 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
         if header.output_dim == 0 {
             bail!("ExpertProtocolV2 response output_dim must be non-zero");
         }
-        let logical_row_bytes = header.output_dtype.row_bytes(header.output_dim as usize)
+        let logical_row_bytes = header
+            .output_dtype
+            .row_bytes(header.output_dim as usize)
             .context("ExpertProtocolV2 response output row byte count")?;
         if (header.output_row_stride_bytes as usize) < logical_row_bytes {
             bail!("ExpertProtocolV2 response output row stride is smaller than a row");
         }
         let expected = u64::from(row_count) * u64::from(header.output_row_stride_bytes);
-        if expected != output_payload_bytes || wire_bytes != header_len as u64 + output_payload_bytes {
+        if expected != output_payload_bytes
+            || wire_bytes != header_len as u64 + output_payload_bytes
+        {
             bail!(
                 "ExpertProtocolV2 landed response extent mismatch: rows={row_count} payload={output_payload_bytes} wire={wire_bytes}"
             );

@@ -1,15 +1,12 @@
-//! Bounded chunks carry compact BF16 rank partials in token order.
-use super::{
-    BackboneRequest, SparkTopology, V41Tp4Planes, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
-    V41_NATIVE_GROUP_REQUEST_FLAG,
-};
+//! Bounded chunks carry request-selected rank partials in token order.
+use super::{BackboneRequest, SparkTopology, V41_NATIVE_GROUP_REQUEST_FLAG, V41Tp4Planes};
 use crate::{
-    ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseRef, ExpertProtocolV2ResponseView,
-    ExpertProtocolV2Status, ExpertV2Dtype, EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
-    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES,
-    EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
+    EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS,
+    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN,
+    EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, ExpertProtocolV2ResponseHeader,
+    ExpertProtocolV2ResponseRef, ExpertProtocolV2ResponseView, ExpertProtocolV2Status,
 };
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 
 impl BackboneRequest<'_> {
     fn response_header_bytes(&self) -> usize {
@@ -24,7 +21,7 @@ impl BackboneRequest<'_> {
         let payload = max_frame_bytes
             .checked_sub(self.response_header_bytes())
             .context("response frame cannot fit header")?;
-        let rows = payload / (cuteafd_core::expert_geometry().row_bytes() as usize + 4);
+        let rows = payload / (self.output_row_bytes()? as usize + 4);
         ensure!(rows > 0, "response frame cannot fit one native token row");
         Ok(rows.min(self.rows() as usize) as u32)
     }
@@ -43,10 +40,10 @@ impl BackboneRequest<'_> {
             "native response needs an executor identity"
         );
         ensure!(
-            partials.len() % cuteafd_core::expert_geometry().row_bytes() as usize == 0,
+            partials.len() % self.output_row_bytes()? as usize == 0,
             "native response chunk has a partial token row"
         );
-        let rows = u32::try_from(partials.len() / cuteafd_core::expert_geometry().row_bytes() as usize)?;
+        let rows = u32::try_from(partials.len() / self.output_row_bytes()? as usize)?;
         ensure!(
             rows > 0 && rows <= self.response_chunk_rows(max_frame_bytes)?,
             "native response chunk exceeds frame budget"
@@ -73,12 +70,11 @@ impl BackboneRequest<'_> {
                 layer_id: request.layer_id,
                 row_count: rows,
                 output_dim: cuteafd_core::expert_geometry().hidden,
-                output_dtype: ExpertV2Dtype::Bf16,
-                output_row_stride_bytes: cuteafd_core::expert_geometry().row_bytes(),
+                output_dtype: self.output_dtype(),
+                output_row_stride_bytes: self.output_row_bytes()?,
                 output_payload_bytes: partials.len() as u64,
                 status: ExpertProtocolV2Status::Ok,
-                flags: (request.flags
-                    & !V41_NATIVE_GROUP_REQUEST_FLAG)
+                flags: (request.flags & !V41_NATIVE_GROUP_REQUEST_FLAG)
                     | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
                     | if end < self.rows() {
                         EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
@@ -174,17 +170,22 @@ impl V41Tp4ChunkReceiver {
             "native group ownership requires a topology-bound receiver"
         );
         BackboneRequest::validate_owned(request, max_rows)?;
-        ensure!(request.wire_stats().wire_bytes <= max_frame_bytes,
-            "native request exceeds RoCE frame budget");
+        ensure!(
+            request.wire_stats().wire_bytes <= max_frame_bytes,
+            "native request exceeds RoCE frame budget"
+        );
         let header_bytes = if request.header.flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM != 0 {
             EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN
         } else {
             EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
         };
-        ensure!(max_frame_bytes >= header_bytes + cuteafd_core::expert_geometry().row_bytes() as usize + 4,
-            "response frame cannot fit one native token row");
+        let identity = V41Tp4Planes::from_header_ranks(&request.header, executors)?;
+        ensure!(
+            max_frame_bytes >= header_bytes + identity.output_row_bytes as usize + 4,
+            "response frame cannot fit one native token row"
+        );
         Ok(Self {
-            identity: V41Tp4Planes::from_header_ranks(&request.header, executors)?,
+            identity,
             received: [0; 8],
             finished: [false; 8],
             max_frame_bytes,
@@ -217,7 +218,11 @@ impl V41Tp4ChunkReceiver {
             EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
         };
         ensure!(
-            max_frame_bytes >= header_bytes + cuteafd_core::expert_geometry().row_bytes() as usize + 4,
+            max_frame_bytes
+                >= header_bytes
+                    + V41Tp4Planes::from_header_ranks(&request.header, executors)?.output_row_bytes
+                        as usize
+                    + 4,
             "response frame cannot fit one native token row"
         );
         Ok(Self {
@@ -228,11 +233,18 @@ impl V41Tp4ChunkReceiver {
         })
     }
     pub fn complete(&self) -> bool {
-        self.finished[..self.identity.world_size()].iter().all(|value| *value)
+        self.finished[..self.identity.world_size()]
+            .iter()
+            .all(|value| *value)
     }
     /// Legacy four-rank row counters; ranks past four are always zero.
     pub fn received_rows(&self) -> [u32; 4] {
-        [self.received[0], self.received[1], self.received[2], self.received[3]]
+        [
+            self.received[0],
+            self.received[1],
+            self.received[2],
+            self.received[3],
+        ]
     }
     /// Row counters for every physical rank in rank order.
     pub fn received_rows_slice(&self) -> &[u32] {
@@ -267,18 +279,36 @@ impl V41Tp4ChunkReceiver {
 
     /// A rank's whole plane, received straight into its device landing range
     /// (the verbs session validated the header's extent and request identity).
-    pub(crate) fn push_landed(&mut self, chunk: &crate::VerbsHostProtocolV2ResponseChunk) -> Result<usize> {
-        ensure!(chunk.landed && chunk.row_indices.is_none(), "not a GPU-landed whole-plane response");
-        ensure!(chunk.wire_bytes <= self.max_frame_bytes, "native response exceeds receive frame budget");
+    pub(crate) fn push_landed(
+        &mut self,
+        chunk: &crate::VerbsHostProtocolV2ResponseChunk,
+    ) -> Result<usize> {
+        ensure!(
+            chunk.landed && chunk.row_indices.is_none(),
+            "not a GPU-landed whole-plane response"
+        );
+        ensure!(
+            chunk.wire_bytes <= self.max_frame_bytes,
+            "native response exceeds receive frame budget"
+        );
         let h = &chunk.header;
         let rank = self.identity.response_rank(h)?;
-        ensure!(!self.finished[rank] && self.received[rank] == 0, "native TP rank already completed");
-        let allowed = EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        ensure!(h.flags & !allowed == 0, "unsupported GPU-landed response flags");
-        ensure!(h.row_count == self.identity.rows, "GPU-landed response must contain the entire plane");
+        ensure!(
+            !self.finished[rank] && self.received[rank] == 0,
+            "native TP rank already completed"
+        );
+        let allowed = self.identity.partial_flag;
+        ensure!(
+            h.flags & !allowed == 0,
+            "unsupported GPU-landed response flags"
+        );
+        ensure!(
+            h.row_count == self.identity.rows,
+            "GPU-landed response must contain the entire plane"
+        );
         ensure!(
             h.output_payload_bytes
-                == u64::from(h.row_count) * u64::from(cuteafd_core::expert_geometry().row_bytes()),
+                == u64::from(h.row_count) * u64::from(self.identity.output_row_bytes),
             "native payload size mismatch"
         );
         self.received[rank] = h.row_count;
@@ -287,7 +317,7 @@ impl V41Tp4ChunkReceiver {
     }
 
     /// Validate before invoking the sink, then commit progress only if it succeeds.
-    /// The sink receives (rank, first token row, contiguous BF16 rank-partial bytes).
+    /// The sink receives (rank, first token row, contiguous request-selected rank-partial bytes).
     /// It must copy the bytes or keep their storage alive until asynchronous writes
     /// finish; `complete()` does not itself synchronize GPU copies.
     /// On sink error no progress is committed, but destination bytes may be partial.
@@ -329,7 +359,7 @@ impl V41Tp4ChunkReceiver {
     {
         let rank = self.identity.response_rank(h)?;
         ensure!(!self.finished[rank], "native TP rank already completed");
-        let allowed = EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+        let allowed = self.identity.partial_flag
             | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
             | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
             | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS;
