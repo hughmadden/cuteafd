@@ -255,8 +255,9 @@ before → after tables with conditions.
   level; DeepSeek engram tables and first-use workspaces make the first wide
   batch after a launch ~10% slow — explain, don't re-run). Releases run the
   card set, not a multi-session parity campaign. Release images are built for
-  release cuts, not to verify branches; agentic benches gate with 1–2 short
-  sessions, the full bench runs at release.
+  release cuts, not to verify branches. Releases carry no parity or agentic
+  campaign against earlier versions (TJ, 2026-10-18); release notes list
+  features only.
 - Every bench report says whether, why and how much the GPUs throttled:
   `/v1/thermal` windows (NVML, `THERMAL=on` default) land in `sweep.json`
   per point and phase and in each panel pass. Read seconds of power-cap vs

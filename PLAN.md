@@ -2054,8 +2054,9 @@ RTX experts and solver-planned memory and attention: V4 (P4, done),
 GLM Flash (P6/P7), MiMo (P8), GLM 5.3 (P9 plus its K-step), Qwen (P10) and
 V4.1 (P12). The shared adaptive draft policy is the default for every family,
 with the old per-family policies deleted (D3 GLM Flash, D4 the rest, D5 the
-remains). There are no intermediate v3 cuts. Full V4.1 parity and the agentic
-bench run at that one cut.
+remains). There are no intermediate v3 cuts. The cut runs the smoke card set
+only; parity and agentic campaigns against v2.0.0 were dropped (TJ,
+2026-10-18).
 
 **v3 reference cards (TJ, 2026-10-10).** Besides each family's min/max, these
 cards are in the regular test set for the unification steps and are v3
