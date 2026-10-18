@@ -17,6 +17,7 @@ pub struct CoordinatorContract {
     pub weights: NativeDenseLayout,
     pub norm_weight: NormWeight,
     pub norms: TargetNormEps,
+    pub rope_tables: crate::plan::rope::Tables,
     pub router: SigmoidRouter,
     pub layers: Vec<LayerContract>,
 }
@@ -54,6 +55,8 @@ pub struct LayerContract {
     pub layer: usize,
     pub geometry: GqaGeometry,
     pub theta: f64,
+    pub rope: crate::plan::rope::Recipe,
+    pub indexer_rope: Option<crate::plan::rope::Recipe>,
     pub rotary_arithmetic: RotaryArithmetic,
     /// None means full-history sparse attention, not dense causal attention.
     pub sliding: Option<SlidingWindow>,
@@ -91,6 +94,8 @@ impl CoordinatorContract {
                     }
                     .validate()?,
                     theta: cfg.theta[layer],
+                    rope: cfg.rope_recipe(layer, false)?,
+                    indexer_rope: cfg.full[layer].then(|| cfg.rope_recipe(layer, true)).transpose()?,
                     rotary_arithmetic: RotaryArithmetic::FusedImaginary,
                     sliding: (!cfg.full[layer]).then_some(SlidingWindow {
                         window: cfg.window as u64,
@@ -106,6 +111,7 @@ impl CoordinatorContract {
             weights,
             norm_weight: NormWeight::ZeroCentered,
             norms: TargetNormEps::from_config(cfg),
+            rope_tables: cfg.rope_tables()?,
             router: SigmoidRouter {
                 topk: cfg.topk,
                 factor: 3.0,

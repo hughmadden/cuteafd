@@ -12,6 +12,7 @@ pub mod format;
 pub mod launch;
 pub mod layout;
 pub mod names;
+pub mod rope;
 pub mod spec;
 #[doc(hidden)]
 pub mod testing;

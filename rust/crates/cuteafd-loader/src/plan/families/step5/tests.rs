@@ -371,3 +371,47 @@ fn official_nvfp4_layer30_headers_keep_router_and_stacked_parameters_distinct() 
     testing::write_snapshot(dir.path(), &config, &partial, None);
     assert!(Fp8ExpertTensors::read_layers(dir.path(), shape, &selected).unwrap_err().to_string().contains("input_scale"));
 }
+
+#[test]
+fn native_rope_plan_honors_checkpoint_layer_policy_and_factor_one() -> Result<()> {
+    for quant in ["fp8", "nvfp4"] {
+        let dir = snapshot(quant);
+        let cp = Checkpoint::open(dir.path())?;
+        let cfg = Config::parse(&cp)?;
+        let tables = cfg.rope_tables()?;
+        assert_eq!(tables.recipes.len(), 3);
+        assert_eq!(tables.extent, 1048576);
+        assert_eq!(tables.allocation_bytes, 576 << 20);
+        let contract = coordinator::CoordinatorContract::from_checkpoint(&cp)?;
+        assert_eq!(contract.rope_tables, tables);
+        for layer in 0..cfg.layers + cfg.mtp {
+            let recipe = cfg.rope_recipe(layer, false)?;
+            assert!(tables.recipes.contains(&recipe));
+            assert_eq!(recipe.span, if cfg.full[layer] { 64 } else { 192 });
+            assert_eq!(recipe.theta, if cfg.full[layer] { 10000000.0 } else { 10000.0 });
+            assert_eq!(recipe.scaling.is_some(), cfg.full[layer]);
+            if let Some(scaling) = recipe.scaling { assert_eq!(scaling.factor, 1.0); }
+            if cfg.full[layer] {
+                let indexer = cfg.rope_recipe(layer, true)?;
+                assert_eq!(indexer.span, 32);
+                assert_eq!(indexer.scaling, recipe.scaling);
+                assert!(tables.recipes.contains(&indexer));
+            } else { assert!(cfg.rope_recipe(layer, true).is_err()); }
+        }
+        for policy in [serde_json::json!([]), serde_json::json!(["sliding_attention"]),
+                       serde_json::json!(["full_attention", "sliding_attention"])] {
+            let mut changed = Checkpoint::open(dir.path())?;
+            changed.config["text_config"]["yarn_only_types"] = policy.clone();
+            let cfg = Config::parse(&changed)?;
+            assert!(cfg.rope_recipe(0, false)?.scaling.is_some());
+            assert_eq!(cfg.rope_recipe(3, false)?.scaling.is_some(), policy.as_array().unwrap().len() != 1);
+        }
+        for invalid in [serde_json::json!({"rope_type":"unknown"}),
+                        serde_json::json!({"rope_type":"llama3", "factor":0})] {
+            let mut changed = Checkpoint::open(dir.path())?;
+            changed.config["text_config"]["rope_scaling"] = invalid;
+            assert!(Config::parse(&changed).is_err());
+        }
+    }
+    Ok(())
+}

@@ -76,6 +76,12 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
         "head_gate": lambda: p.compile_head_gate_aot(heads=heads, dim=192),
         "route_weights": lambda: p.compile_route_weights_aot(experts=352, topk=8),
     }
+    for span in (32, 64, 192):
+        for scaling in (False, True):
+            def table(span=span, scaling=scaling):
+                from b12x.integration.cuteafd.rope import compile_rope_tables_aot
+                return compile_rope_tables_aot(rotary_span=span, llama3=scaling)
+            result[f"rope_s{span}_{'llama3' if scaling else 'plain'}"] = table
     for kind, rotary in (("swa", 192), ("csa", 64)):
         for name, count in (("q", heads), ("k", groups)):
             result[f"{kind}_{name}_norm_rope"] = lambda count=count, rotary=rotary: p.compile_affine_norm_aot(

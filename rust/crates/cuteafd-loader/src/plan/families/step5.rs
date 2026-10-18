@@ -33,6 +33,9 @@ pub struct Config {
     pub moe: Vec<bool>,
     pub theta: Vec<f64>,
     pub rotary: Vec<usize>,
+    pub rope_scaling: Option<crate::plan::rope::Llama3>,
+    pub scale_full: bool,
+    pub scale_sliding: bool,
     pub activation: Vec<FfnActivation>,
     pub shared_activation: Vec<FfnActivation>,
 }
@@ -94,11 +97,22 @@ impl Config {
             .context("Step-5 requires positive finite rms_norm_eps")? as f32;
         ensure!(norm_eps.is_finite() && norm_eps > 0.0 && v["norm_dtype"] == "float32",
             "Step-5 requires representable positive epsilon and norm_dtype=float32");
+        let rope_scaling = v.get("rope_scaling").filter(|v| !v.is_null())
+            .map(crate::plan::rope::Llama3::parse).transpose()?;
+        let types = v.get("yarn_only_types").filter(|v| !v.is_null())
+            .map(|v| v.as_array().context("Step-5 yarn_only_types must be an array")).transpose()?;
+        if let Some(types) = types {
+            ensure!(types.iter().all(|v| v == "full_attention" || v == "sliding_attention"),
+                "unsupported Step-5 yarn_only_types");
+        }
+        let enabled = |kind: &str| types.is_none_or(|types| types.is_empty()
+            || types.iter().any(|v| v == kind));
         let cfg = Self { norm_eps, hidden: int("hidden_size")?, vocab: int("vocab_size")?, layers, mtp,
             dense: int("intermediate_size")?, experts: int("moe_num_experts")?, intermediate: int("moe_intermediate_size")?,
             shared: int("share_expert_dim")?, topk: int("moe_top_k")?, heads: int("num_attention_heads")?,
             groups: int("num_attention_groups")?, dim, window: int("sliding_window")?,
             max_context: int("max_position_embeddings")? as u64, full, moe, theta, rotary,
+            rope_scaling, scale_full: enabled("full_attention"), scale_sliding: enabled("sliding_attention"),
             activation: activations("swiglu_limits")?, shared_activation: activations("swiglu_limits_shared")? };
         ensure!((cfg.hidden, cfg.experts, cfg.intermediate, cfg.heads, cfg.groups, cfg.dim, cfg.window)
             == (4096, 352, 1536, 64, 4, 192, 512), "unsupported Step-5 release geometry");
@@ -118,6 +132,23 @@ impl Config {
         ensure!(cfg.full[..layers].iter().filter(|v| **v).count() == 23
             && cfg.full.iter().enumerate().all(|(l, full)| *full == (l < layers && l % 4 == 3)), "unsupported Step-5 full/SWA layer map");
         Ok(cfg)
+    }
+
+    pub fn rope_recipe(&self, layer: usize, indexer: bool) -> Result<crate::plan::rope::Recipe> {
+        ensure!(layer < self.layers + self.mtp, "Step-5 rotary layer out of range");
+        ensure!(!indexer || self.full[layer], "Step-5 indexer requires full attention");
+        let scaled = if self.full[layer] { self.scale_full } else { self.scale_sliding };
+        crate::plan::rope::Recipe::new(if indexer { 32 } else { self.rotary[layer] }, self.theta[layer],
+            if scaled { self.rope_scaling } else { None })
+    }
+
+    pub fn rope_tables(&self) -> Result<crate::plan::rope::Tables> {
+        let mut recipes = Vec::new();
+        for layer in 0..self.layers + self.mtp {
+            recipes.push(self.rope_recipe(layer, false)?);
+            if self.full[layer] { recipes.push(self.rope_recipe(layer, true)?); }
+        }
+        crate::plan::rope::Tables::new(self.max_context as usize, recipes)
     }
 }
 

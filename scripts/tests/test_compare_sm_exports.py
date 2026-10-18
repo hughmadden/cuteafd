@@ -438,3 +438,25 @@ def test_step5_norms_take_runtime_epsilon_and_keep_final_bf16_boundary(monkeypat
         for name, count in (("q", heads), ("k", heads // 16)):
             assert calls[f"{kind}_{name}_norm_rope"] == dict(width=192, heads=count,
                 rotary=rotary, zero_centered=True, eps=None, input_dtype="bf16")
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_step5_rope_builders_cover_all_policy_modes_without_recipe_specialization(monkeypatch, heads):
+    import types
+    spec = importlib.util.spec_from_file_location("step5_rope_exports",
+        ROOT / "python/tools/aot/export_b12x_step5_aot.py")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16", float32="f32"))
+    monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
+    monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=SimpleNamespace()))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.rope", SimpleNamespace(
+        compile_rope_tables_aot=lambda **kwargs: kwargs))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    builders = module.builders(heads, "pointwise")
+    calls = {name: build() for name, build in builders.items() if name.startswith("rope_s")}
+    assert calls == {f"rope_s{span}_{'llama3' if scaling else 'plain'}":
+                     dict(rotary_span=span, llama3=scaling)
+                     for span in (32, 64, 192) for scaling in (False, True)}
