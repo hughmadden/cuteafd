@@ -3290,29 +3290,20 @@ fn protocol_v2_request_device_payload(
     execution_lane: u32,
 ) -> Result<ProtocolV2RequestDevicePayload> {
     let storage_start = request_storage.as_ptr() as usize;
-    let hidden_start = request.hidden_payload().as_ptr() as usize;
-    anyhow::ensure!(
-        hidden_start >= storage_start,
-        "ProtocolV2 hidden payload starts before its mapped frame"
-    );
-    let hidden_offset = hidden_start - storage_start;
-    let hidden_end = hidden_offset
-        .checked_add(request.hidden_payload().len())
-        .context("ProtocolV2 mapped hidden payload end overflow")?;
-    anyhow::ensure!(
-        hidden_end <= request_storage.len() && hidden_end <= frame.bytes,
-        "ProtocolV2 mapped hidden payload [{hidden_offset}, {hidden_end}) exceeds frame bytes {}",
-        frame.bytes
-    );
+    let mapped = |bytes: &[u8], label: &str| -> Result<CuteafdDeviceBuffer> {
+        let offset = (bytes.as_ptr() as usize).checked_sub(storage_start)
+            .with_context(|| format!("ProtocolV2 {label} starts before its mapped frame"))?;
+        let end = offset.checked_add(bytes.len())
+            .context("ProtocolV2 mapped payload end overflow")?;
+        anyhow::ensure!(end <= request_storage.len(),
+            "ProtocolV2 mapped {label} exceeds host frame bytes");
+        protocol_v2_device_buffer_slice(frame, offset, bytes.len(), label)
+    };
     Ok(ProtocolV2RequestDevicePayload {
         execution_lane,
         response_slot,
-        hidden_payload: CuteafdDeviceBuffer {
-            ptr: unsafe { frame.ptr.cast::<u8>().add(hidden_offset).cast() },
-            bytes: request.hidden_payload().len(),
-            device_id: frame.device_id,
-            flags: frame.flags,
-        },
+        routes: mapped(request.route_bytes(), "route records")?,
+        hidden_payload: mapped(request.hidden_payload(), "hidden payload")?,
     })
 }
 
@@ -5501,6 +5492,38 @@ mod persistent_tests {
             payload.hidden_payload.flags,
             CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST
         );
+    }
+
+    #[test]
+    fn mapped_request_device_payload_preserves_routes_and_refuses_short_frames() {
+        let mut owned = persistent_chunk_request(3);
+        owned.routes = (0..3).map(|row| crate::ExpertProtocolV2RouteEntry {
+            row_index: row, expert_id: row + 7, gate_weight: 0.125 * (row + 1) as f32,
+        }).collect();
+        for (row, descriptor) in owned.rows.iter_mut().enumerate() {
+            descriptor.route_offset = row as u32;
+            descriptor.route_count = 1;
+        }
+        owned.header.route_count = 3;
+        owned.header.route_bytes = 36;
+        let frame = owned.encode().unwrap();
+        let request = ExpertProtocolV2RequestView::parse(&frame).unwrap();
+        let offset = request.route_bytes().as_ptr() as usize - frame.as_ptr() as usize;
+        let buffer = CuteafdDeviceBuffer {
+            ptr: 0x100000_usize as *mut std::ffi::c_void, bytes: frame.len(), device_id: 2,
+            flags: CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST,
+        };
+        let mapped = protocol_v2_request_device_payload(&frame, &request, buffer, None, 0).unwrap();
+        assert_eq!(mapped.routes.ptr as usize, 0x100000 + offset);
+        assert_eq!(mapped.routes.bytes, 36);
+        assert_eq!(mapped.routes.device_id, 2);
+        assert_eq!(mapped.routes.flags, CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST);
+        for bytes in [offset + 35, frame.len() - 1] {
+            assert!(protocol_v2_request_device_payload(&frame, &request,
+                CuteafdDeviceBuffer { bytes, ..buffer }, None, 0).is_err());
+        }
+        assert!(protocol_v2_request_device_payload(&frame[..offset + 35], &request,
+            buffer, None, 0).is_err());
     }
 
     fn persistent_chunk_request(row_count: usize) -> ExpertProtocolV2Request {

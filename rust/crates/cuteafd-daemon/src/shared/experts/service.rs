@@ -3,6 +3,7 @@ mod local;
 mod backend;
 mod census;
 mod modules;
+mod routes;
 
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
