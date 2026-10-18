@@ -6,7 +6,7 @@
    "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
    "5090": {
     "status": "current",
-    "report": "benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090"
+    "report": "benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-rtx5090-v41-flash-5090"
    },
    "1rtx": {
     "status": "current",

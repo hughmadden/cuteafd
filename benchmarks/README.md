@@ -41,6 +41,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## DeepSeek V4.1
 
+- 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · 1× GeForce RTX 5090 @ 600 W + 3× DGX Spark · 31.8 GiB budget · build v3.0.0-rc5 · [report](deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-rtx5090-v41-flash-5090/report.svg)
 - 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 3 Spark · build v3.0.0-rc4 · [report](deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090/report.svg)
 - 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · 1× RTX PRO 6000 @ gpu-powerd 550 W (500–600) + 3× DGX Spark · build v3.0.0-rc4 · [report](deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min/report.svg)
 - 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · 1× RTX PRO 6000 @ gpu-powerd 510 W (320–585) + 4× DGX Spark · build v3.0.0-rc4 · [report](deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-4spark-v41-flash-reference-tp4/report.svg)

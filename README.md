@@ -55,17 +55,18 @@ Full notes: [v3.0.0 release](https://github.com/tpurtell/cuteafd/releases/tag/v3
 ## Models
 
 One basic-profile card per model and quant on this release: the natural minimum
-(1× RTX + the fewest Sparks) or maximum (2× RTX + 4 or 6 Sparks). The 5090
-column is simulated on an RTX PRO 6000 capped at 31.8 GiB (memory only, not
-SM count or clocks) until real RTX 5090 cards replace it. Earlier releases and
-every other report: [benchmarks](benchmarks/README.md).
+(1× RTX + the fewest Sparks) or maximum (2× RTX + 4 or 6 Sparks). In the 5090
+column, cards labelled "simulated 5090" ran on an RTX PRO 6000 capped at
+31.8 GiB (memory only, not SM count or clocks) until real RTX 5090 cards replace
+them; the others ran on a GeForce RTX 5090. Earlier releases and every other
+report: [benchmarks](benchmarks/README.md).
 
 <!-- results:begin -->
 <table>
 <tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/deepseek_v41.md"><b>DeepSeek V4.1</b></a><br><sub>deepseek-ai/DeepSeek-V4.1-Flash-1017</sub><br><sub>mxfp4-g32</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090/card.svg"><img src="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash-1017 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 3 Spark"></a><br><sub>simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 3 Spark</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-rtx5090-v41-flash-5090/card.svg"><img src="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-rtx5090-v41-flash-5090/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash-1017 on 1× GeForce RTX 5090 @ 600 W + 3× DGX Spark · 31.8 GiB budget"></a><br><sub>RTX 5090 (31.8 GiB budget) + 3× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min/card.svg"><img src="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash-1017 on 1× RTX PRO 6000 @ gpu-powerd 550 W (500–600) + 3× DGX Spark"></a><br><sub>1× RTX + 3× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-2rtx-4spark-v41-flash-max/card.svg"><img src="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-2rtx-4spark-v41-flash-max/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash-1017 on 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
