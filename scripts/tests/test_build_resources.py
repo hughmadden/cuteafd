@@ -218,7 +218,7 @@ def test_context_admission_accounts_live_reservations_across_worker_limits(tmp_p
         return original(path, *args, **kwargs)
     monkeypatch.setattr(Path, 'read_text', text)
     def stop_wait(seconds):
-        assert seconds == 60
+        assert seconds == 1
         raise TimeoutError('test stops the bounded admission wait')
     monkeypatch.setattr(export.time, 'sleep', stop_wait)
     try:
@@ -235,6 +235,83 @@ def test_context_admission_accounts_live_reservations_across_worker_limits(tmp_p
         if export._context_lease:
             export._context_lease.close()
         export._context_lease = None
+
+
+_ADMIT_CHILD = """
+import json, os, sys, time
+sys.path.insert(0, sys.argv[1])
+import _export_jobs
+_export_jobs.context_admission()
+admitted = time.monotonic()
+time.sleep(float(sys.argv[2]))
+print(json.dumps([admitted, time.monotonic()]), flush=True)
+"""
+
+
+def _admit_processes(tmp_path, count, hold, extra_env):
+    env = {**os.environ, 'CUTEAFD_EXPORT_HOST_SLOT_DIR': str(tmp_path),
+           'CUTEAFD_EXPORT_WORKER_RAM_MIB': '1', **extra_env}
+    processes = [subprocess.Popen([sys.executable, '-c', _ADMIT_CHILD, str(ROOT / 'python/tools/lib'), str(hold)],
+                                  env=env, stdout=subprocess.PIPE, text=True) for _ in range(count)]
+    spans = []
+    for process in processes:
+        out, _ = process.communicate(timeout=60)
+        assert process.returncode == 0
+        spans.append(json.loads(out.strip().splitlines()[-1]))
+    return sorted(spans)
+
+
+def test_context_cap_and_spacing_hold_across_processes(tmp_path):
+    spans = _admit_processes(tmp_path, 5, 0.6, {'CUTEAFD_EXPORT_HOST_CONTEXTS': '2',
+                                                 'CUTEAFD_EXPORT_CONTEXT_SPACING_S': '0.25'})
+    starts = [start for start, _ in spans]
+    assert all(b - a >= 0.24 for a, b in zip(starts, starts[1:]))
+    for start, _ in spans:
+        live = sum(1 for other_start, other_end in spans if other_start <= start < other_end)
+        assert live <= 2
+    # Every lease was released on exit: all are lockable again.
+    leases = sorted(tmp_path.glob('context.*.lock'))
+    assert [path.name for path in leases] == ['context.0.lock', 'context.1.lock']
+    for path in leases:
+        assert resource.try_lock(path) is not None
+
+
+@pytest.mark.parametrize('cls,machine,workers,expected', [
+    ('remote', 'x86_64', '20', 8), ('raptor', 'aarch64', '20', 8),
+    ('raptor', 'x86_64', '64', 64), ('remote', 'x86_64', '4', 4)])
+def test_host_context_cap_defaults(monkeypatch, cls, machine, workers, expected):
+    import platform
+    monkeypatch.delenv('CUTEAFD_EXPORT_HOST_CONTEXTS', raising=False)
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_CLASS', cls)
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_WORKERS', workers)
+    monkeypatch.setattr(platform, 'machine', lambda: machine)
+    assert export.host_context_cap() == expected
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_CONTEXTS', '3')
+    assert export.host_context_cap() == 3
+
+
+def test_parked_planner_frees_its_lease_but_keeps_its_reservation(tmp_path, monkeypatch):
+    monkeypatch.setattr(export, '_context_lease', None)
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_CONTEXTS', '1')
+    monkeypatch.setenv('CUTEAFD_EXPORT_CONTEXT_SPACING_S', '0')
+    monkeypatch.setenv('CUTEAFD_EXPORT_WORKER_RAM_MIB', '1024')
+    export.context_admission()
+    try:
+        export.park_context_lease()
+        assert resource.try_lock(tmp_path / 'context.0.lock') is not None
+        parked = list(tmp_path.glob('context.parked-*.lock'))
+        assert len(parked) == 1 and parked[0].read_text() == '1024'
+        # A worker still gets the single lease while the planner is parked.
+        _admit_processes(tmp_path, 1, 0, {'CUTEAFD_EXPORT_HOST_CONTEXTS': '1',
+                                          'CUTEAFD_EXPORT_CONTEXT_SPACING_S': '0'})
+    finally:
+        export._context_lease.close()
+        export._context_lease = None
+    # The next admission reaps the exited planner's parked file.
+    _admit_processes(tmp_path, 1, 0, {'CUTEAFD_EXPORT_HOST_CONTEXTS': '1',
+                                      'CUTEAFD_EXPORT_CONTEXT_SPACING_S': '0'})
+    assert not list(tmp_path.glob('context.parked-*.lock'))
 
 
 def test_weighted_gpu_budget_shared_across_package_workers(tmp_path, monkeypatch):

@@ -125,6 +125,7 @@ class PackageProfileTests(unittest.TestCase):
         jobs = ModuleType('_export_jobs')
         jobs.export_jobs = lambda: 1
         jobs.export_slot = nullcontext
+        jobs.park_context_lease = lambda: None
         image = bytearray(64)
         image[:6] = b'\x7fELF\x02\x01'
         struct.pack_into('<H', image, 18, 190)
