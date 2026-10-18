@@ -8,17 +8,67 @@ use crate::shared::experts::{
 pub(super) enum WarmModules<'a> {
     Native { _kernels: Vec<cuteafd_ffi::V41ExpertKernel<'a>> },
     Exl3(Option<Vec<Exl3Modules<'a>>>),
-    Fp8(Option<Fp8Modules>),
+    Fp8(Option<Vec<Fp8Group>>),
 }
+/// Code and immutable preflight for one homogeneous native group. The module
+/// phase validates every package before warming any of them or loading weights.
+pub(super) struct Fp8Group {
+    pub tensors: cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors,
+    pub layers: Vec<usize>,
+    pub directory: std::path::PathBuf,
+    pub bf16_directory: Option<std::path::PathBuf>,
+    pub slicing: cuteafd_loader::formats::fp8_experts::Slicing,
+    pub scratch: usize,
+    pub modules: Option<Fp8Modules>,
+}
+
+impl Fp8Group {
+    fn plan(catalog: &OfficialV41Catalog, config: &NativeExpertServiceConfig) -> Result<Vec<Self>> {
+        use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Slicing};
+        let tensors = catalog.fp8().context("native expert groups require checkpoint tensors")?;
+        ensure!(config.spark_world()?.wire() == cuteafd_transport::expert::SparkWire::Canonical,
+            "native expert packages require canonical Spark wire");
+        let layers = config.resident_layers(catalog.routed_experts().layers)?;
+        tensors.homogeneous_layers(&layers)?.into_iter().map(|(tensors, layers)| {
+            tensors.slice(config.world)?;
+            let directory = config.fp8_package.clone().unwrap_or_else(||
+                fp8::package_directory(&config.library, config.world, tensors.format()));
+            let (directory, slicing) = fp8::exact_layout(&directory, &tensors, config.world, config.rank);
+            let family = fp8::package_family(cuteafd_core::expert_geometry().family(), tensors.format());
+            let format = match tensors.format() {
+                ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", _ => "fp8",
+            };
+            super::backend::validate_fp8_recipe(&format!("{family}:{format}"), tensors.shape().intermediate,
+                config.world, &directory, config.rank, slicing,
+                tensors.rank_width(config.world, config.rank, slicing)?)?;
+            if config.world == 5 {
+                ensure!(slicing == Slicing::Blocks(128) || tensors.shape().intermediate % (128 * config.world) == 0,
+                    "Spark TP5 requires whole-H128 rank-width packages");
+            }
+            let metadata = fp8::package_metadata(&directory, &tensors, &layers, config.world, config.rank, slicing)?;
+            let capacity = config.capacity as usize;
+            let mut scratch = metadata.scratch_for(capacity)?.max(256);
+            let bf16_directory = metadata.info.wire_input.then(|| fp8::bf16_sibling(&directory))
+                .flatten().filter(|path| path.is_dir());
+            if let Some(path) = &bf16_directory {
+                let sibling = fp8::package_metadata(path, &tensors, &layers, config.world, config.rank, slicing)?;
+                fp8::validate_bf16_package(&metadata.info, &sibling.info, capacity)?;
+                scratch = scratch.max(sibling.scratch_for(capacity)?);
+            }
+            Ok(Self { tensors, layers, directory, bf16_directory, slicing, scratch, modules: None })
+        }).collect()
+    }
+}
+
 impl<'a> WarmModules<'a> {
     pub(super) fn load(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         config: &NativeExpertServiceConfig) -> Result<Self> {
-        if let Some(tensors) = catalog.fp8() {
-            let directory = config.fp8_package.clone().unwrap_or_else(||
-                fp8::package_directory(&config.library, config.world, tensors.format()));
-            let (directory, _) = fp8::exact_layout(&directory, tensors, config.world, config.rank);
-            let bf16 = fp8::bf16_sibling(&directory).filter(|path| path.is_dir());
-            return Ok(Self::Fp8(Some(Fp8Modules::load(&directory, bf16.as_deref())?)));
+        if catalog.fp8().is_some() {
+            let mut groups = Fp8Group::plan(catalog, config)?;
+            for group in &mut groups {
+                group.modules = Some(Fp8Modules::load(&group.directory, group.bf16_directory.as_deref())?);
+            }
+            return Ok(Self::Fp8(Some(groups)));
         }
         if let Some(manifest) = catalog.exl3() {
             let directory = config.exl3_directory_for(manifest.decoder_tiers());
@@ -45,7 +95,7 @@ impl<'a> WarmModules<'a> {
         Ok(Self::Native { _kernels: kernels })
     }
 
-    pub(super) fn take_fp8(&mut self) -> Result<Fp8Modules> {
+    pub(super) fn take_fp8(&mut self) -> Result<Vec<Fp8Group>> {
         match self {
             Self::Fp8(modules) => modules.take().context("FP8 modules already consumed"),
             _ => anyhow::bail!("FP8 module owner/backend mismatch"),
