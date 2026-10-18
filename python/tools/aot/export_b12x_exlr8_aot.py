@@ -10,23 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import _pinned_sparkinfer
 
 
-def programs(hidden=6144, units=16, top_k=8, max_groups=512):
-    from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
-    from b12x.integration.cuteafd.exlr8_glue import (
-        compile_exlr8_group_aot, compile_exlr8_rotate_aot, compile_exlr8_reduce_aot,
-    )
-    return [("a16_decode", "exlr8_a16", {"max_rows": 64},
-             lambda: compile_exlr8_a16_aot(hidden=hidden, units=units,
-                                          top_k=top_k, max_groups=max_groups)),
-            ("a16_serving", "exlr8_a16", {"max_rows": 64},
-             lambda: compile_exlr8_a16_aot(hidden=hidden, units=units,
-                                          top_k=top_k, max_groups=max_groups, device_count=True)),
-            ("group", "exlr8_group", {"max_rows": 64},
-             lambda: compile_exlr8_group_aot(top_k=top_k, max_groups=max_groups)),
-            ("rotate", "exlr8_rotate", {"max_rows": 4096},
-             lambda: compile_exlr8_rotate_aot(hidden=hidden)),
-            ("reduce", "exlr8_reduce", {"max_rows": 4096},
-             lambda: compile_exlr8_reduce_aot(hidden=hidden))]
+def programs(hidden=6144, units=16, top_k=8, max_groups=512, role="all"):
+    from b12x.integration.cuteafd.exlr8_glue import exlr8_export_programs
+    return exlr8_export_programs(role, hidden=hidden, units=units,
+                                  top_k=top_k, max_groups=max_groups)
 
 
 def main():
