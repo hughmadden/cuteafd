@@ -17,7 +17,7 @@ import re
 import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
-SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'AUDIO', 'CONTEXT_SPLIT')
+SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'AUDIO', 'CONTEXT_SPLIT')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
          'FP8_MOE_BF16_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
@@ -191,6 +191,8 @@ def requirements(repo, matrix, scope):
             programs = {'qwen4'}
         elif family == 'qwen3_5':
             programs = {'qwen35' if '9b' in values['MODEL_ID'].lower() else 'qwen38'}
+        elif family == 'step5':
+            programs = {'step5', 'step52'} if dual else {'step5'}
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
                            experts=sorted(experts), spark_experts=sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'])),
                            spark_count=count, spark_tp=tp, dual=dual,
@@ -322,15 +324,15 @@ def check_inventory(root, role, wanted, symbols=None):
                     if role == 'coordinator' and entry['dual']:
                         layouts.extend(['rtx-tp2-rank0', 'rtx-tp2-rank1'] if family == 'qwen4' else ['rtx-tp2'])
                     check_package(root, f'exl3/exl3-{family}-{kind[5:]}', layouts, role, verified)
-                elif kind in ('fp8', 'nvfp4', 'nvfp4a4'):
-                    suffix = '' if kind == 'fp8' else '-' + kind
+                elif kind in ('fp8', 'nvfp4', 'nvfp4a4') or item == 'step5:bf16':
+                    suffix = '-bf16-weights' if item == 'step5:bf16' else '' if kind == 'fp8' else '-' + kind
                     layouts = [f'tp{entry["spark_tp"]}'] if role == 'expert' else ['tp1']
                     if role == 'coordinator' and entry['dual'] and family != 'glmfdense':
                         layouts.append('tp2')
                         if family == 'qwen4' and kind.startswith('nvfp4'):
                             layouts.extend(['tp2-w384', 'tp2-w256'])
                     check_package(root, f'fp8/fp8-{family}{suffix}', layouts, role, verified)
-                    if kind == 'nvfp4':
+                    if kind == 'nvfp4' and family != 'step5':
                         check_package(root, f'fp8/fp8-{family}-nvfp4a4', layouts, role, verified)
                     if family == 'qwen4' and kind.startswith('nvfp4') and role == 'coordinator':
                         check_package(root, 'fp8/fp8-qwen4', ['tp1'], role, verified)

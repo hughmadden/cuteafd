@@ -31,6 +31,8 @@ FAMILIES = {
     "mimo_v2": "mimo_v2",
     "qwen4_exp": "qwen4",
     "qwen3_5": "qwen3_5",
+    "step5_vl": "step5",
+    "step5": "step5",
 }
 
 
@@ -71,6 +73,16 @@ def _dense_prefix(text: dict, layers: int) -> int:
     return first
 
 
+def _step5_routed(text: dict) -> list[int]:
+    routed = text.get("moe_layer_list")
+    if (text.get("model_type") != "step5" or type(text.get("num_hidden_layers")) is not int
+            or text["num_hidden_layers"] != 92 or not isinstance(routed, list)
+            or any(type(layer) is not int for layer in routed)
+            or sorted(routed) != list(range(3, 91))):
+        raise SystemExit("unsupported Step-5 routed layer map")
+    return sorted(routed)
+
+
 def describe(config: dict) -> tuple[str, str, int, int]:
     text = config.get("text_config", config)
     kind = config.get("model_type", "?")
@@ -82,7 +94,10 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
-    if family == "glm5":
+    if family == "step5":
+        routed = _step5_routed(text)
+        first, last = routed[0], routed[-1]
+    elif family == "glm5":
         first = _dense_prefix(text, layers)
     elif family == "glm5_flash":
         kinds = {"linear_attention": "kda", "deepseek_sparse_attention": "mla"}
@@ -123,6 +138,8 @@ def routed_layers(config: dict) -> int | None:
     if type(layers) is not int or layers <= 0:
         raise SystemExit("invalid num_hidden_layers")
     family = FAMILIES.get(config.get("model_type"))
+    if family == "step5":
+        return len(_step5_routed(text))
     if family in ("deepseek_v41", "deepseek_v4", "qwen4"):
         return layers
     if family == "glm5":

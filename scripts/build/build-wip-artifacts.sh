@@ -61,7 +61,7 @@ bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
 IFS=';' read -ra bf16_family_list <<<"$bf16_families"
 for bf16_family in "${bf16_family_list[@]}"; do
   case "$bf16_family" in
-    mimo|mimop|mimof|glm|glmf|qwen4) ;;
+    mimo|mimop|mimof|glm|glmf|qwen4|step5) ;;
     *) echo "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES: unknown family $bf16_family" >&2; exit 2 ;;
   esac
   [[ ";$expert_families;" == *";$bf16_family:fp8;"* ]] ||
@@ -299,6 +299,7 @@ cmake \
   -DCUTEAFD_GLMF_WIDE_DECODE_ROWS="${CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS:-128}" \
   -DCUTEAFD_ENABLE_QWEN4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_QWEN4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_STEP5_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_STEP5_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
@@ -441,7 +442,7 @@ fi
 # A native-cache hit restored the table with the rest of the native outputs.
 if ((${native_hit:-0})); then
   :
-elif [[ "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF}" == *ON* ]]; then
+elif [[ "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF}" == *ON* ]]; then
   install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else
   printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"

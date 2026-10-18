@@ -63,6 +63,7 @@ def exporter(monkeypatch):
     ("qwen4", "Qwen/Qwen3.8-Flash-Next", 262144),
     ("qwen35", "Qwen/Qwen3.5-9B", 262144),
     ("qwen38", "Qwen/Qwen3.8-27B", 262144),
+    ("step5", "stepfun-ai/Step-5-Preview", 1048576),
 ])
 def test_checkpoint_extent_table_and_head_splits(exporter, geometry, checkpoint, limit):
     assert exporter.CHECKPOINT_CONTEXTS[geometry] == (checkpoint, limit)

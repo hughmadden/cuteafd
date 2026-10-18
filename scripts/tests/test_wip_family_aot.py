@@ -26,6 +26,8 @@ CASES = [
     ('mimo_v2', 'MiMo-V2.6-Flash', 4, 'MIMO', 'mimof:fp8'),
     ('mimo_v2', 'MiMo-V2.6-Pro', 6, 'MIMO', 'mimop:fp8'),
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3-K4.25', 0, 'QWEN4', 'qwen4:exl3-k45'),
+    ('step5', 'Step-5-Preview-NVFP4', 4, 'STEP5', 'step5:nvfp4'),
+    ('step5', 'Step-5-Preview', 6, 'STEP5', 'step5:fp8'),
 ]
 
 
@@ -55,6 +57,10 @@ def test_config_scopes_match_equivalent_single_card(tmp_path, family, model, cou
         assert derived['CUTEAFD_WIP_CONTEXT_SPLIT_AOT'] == 'ON'
     if count == 0:
         assert derived['CUTEAFD_WIP_EXPERT_FAMILIES'] == ''
+    if family == 'step5':
+        assert set(derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')) == {scope, 'step5:bf16'}
+        assert set(derived['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')) == {scope, 'step5:bf16'}
+        assert set(derived['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {f'{scope}={count}', f'step5:bf16={count}'}
 
 
 def dry_run(tmp_path, path, overrides=None):
@@ -236,3 +242,46 @@ def test_existing_family_scope_outputs_are_unchanged(family, model, count, progr
     if program:
         expected[f'CUTEAFD_WIP_{program}_AOT'] = 'ON'
     assert aot.family_scopes([dict(family=family, name=model.lower(), config=None)], lambda _: values) == expected
+
+
+@pytest.mark.parametrize('kind', ['step5_vl', 'step5'])
+def test_step5_metadata_build_scope_and_routed_extent(tmp_path, monkeypatch, kind):
+    monkeypatch.setenv('HF_HOME', str(tmp_path))
+    text = dict(model_type='step5', num_hidden_layers=92, moe_layer_list=list(range(3, 91)))
+    config = dict(model_type=kind, text_config=text) if kind == 'step5_vl' else text
+    snapshot = tmp_path / 'hub/models--test--step5/snapshots/revision'
+    snapshot.mkdir(parents=True)
+    (snapshot / 'config.json').write_text(json.dumps(config))
+    family, scopes = aot.config_scopes(dict(MODEL_ID='test/step5', MODEL_REVISION='revision', SPARK_COUNT='6'))
+    assert family == 'step5'
+    assert scopes['CUTEAFD_WIP_STEP5_AOT'] == 'ON'
+    assert aot.checkpoint_family.describe(config) == ('step5', kind, 3, 90)
+    assert aot.checkpoint_family.routed_layers(config) == 88
+    text['moe_layer_list'][-1] = 91
+    with pytest.raises(SystemExit, match='routed layer map'):
+        aot.checkpoint_family.describe(config)
+
+
+def test_step5_bf16_input_sibling_is_allowed_in_wip(tmp_path):
+    config = config_file(tmp_path, 'step5', 'Step-5-Preview', 6)
+    output = dry_run(tmp_path, config, {'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES': 'step5'})
+    assert 'WIP AOT scopes (step5)' in output
+    wip = (ROOT / 'wip.sh').read_text()
+    pattern = wip.split("bf16_family_pattern='^(", 1)[1].split(')', 1)[0]
+    build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    allowed = build.split('case "$bf16_family" in', 1)[1].split(') ;;', 1)[0].strip()
+    assert set(pattern.split('|')) == set(allowed.split('|'))
+    assert 'step5' in allowed.split('|')
+    with pytest.raises(AssertionError, match='must be a semicolon list'):
+        dry_run(tmp_path, config, {'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES': 'step5;unknown'})
+
+
+def test_step5_card_union_keeps_native_format_tp_counts():
+    cards = [dict(family='step5', name='step5-nvfp4', config='min'),
+             dict(family='step5', name='step5-fp8', config='max')]
+    configs = {'min': dict(MODEL_ID='stepfun-ai/Step-5-Preview-NVFP4', SPARK_COUNT='4', RTX_GPUS='1'),
+               'max': dict(MODEL_ID='stepfun-ai/Step-5-Preview', SPARK_COUNT='6', RTX_GPUS='2')}
+    scopes = aot.family_scopes(cards, configs.__getitem__)
+    assert scopes['CUTEAFD_WIP_STEP5_AOT'] == 'ON'
+    assert set(scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {
+        'step5:nvfp4=4', 'step5:fp8=6', 'step5:bf16=4', 'step5:bf16=6'}

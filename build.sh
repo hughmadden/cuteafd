@@ -846,6 +846,7 @@ timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_expo
   -e "CUTEAFD_RELEASE_GLMF_AOT=${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_QWEN4_AOT=${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_QWEN_DENSE_AOT=${CUTEAFD_RELEASE_QWEN_DENSE_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_STEP5_AOT=${CUTEAFD_RELEASE_STEP5_AOT:-OFF}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$release_source_dir:/source:ro" \
   -v "$artifact_dir:/output" \

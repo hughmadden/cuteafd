@@ -24,7 +24,7 @@ import time
 
 ROOT = Path(os.environ.get("CUTEAFD_SOURCE_ROOT", Path(__file__).resolve().parents[2])).resolve()
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
-              "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38")
+              "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
@@ -76,6 +76,14 @@ def jobs(scope):
         ("v41-router", "export_b12x_v41_router_aot.py", []),
         ("v41-attention", "export_b12x_v41_attention_aot.py", []),
         ("v41-attention-tp2", "export_b12x_v41_attention_aot.py", ["--heads", "32"]),
+        ("step5-pointwise", "export_b12x_step5_aot.py", ["--heads", "64"]),
+        ("step5-pointwise-tp2", "export_b12x_step5_aot.py", ["--heads", "32"]),
+        ("step5-attention", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "attention"]),
+        ("step5-attention-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "attention"]),
+        ("step5-region-scores", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "region-scores"]),
+        ("step5-region-scores-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "region-scores"]),
+        ("step5-metadata", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "metadata"]),
+        ("step5-metadata-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "metadata"]),
     ])
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
         args = ["--role", role, "--rows", CAPACITIES, "--width", "192", "--standard-names"]
