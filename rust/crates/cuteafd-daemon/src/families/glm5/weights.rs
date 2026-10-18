@@ -662,7 +662,8 @@ impl<'a> GlmLoader<'a> {
     /// latent/indexer operands or loaded whole on `owner`. Residual norms stay
     /// replicated and routers live on rank 0 until local TP2 admission.
     fn layer(&self, cfg: &GlmDsaConfig, layer: usize,
-        checkpoint: &cuteafd_loader::plan::checkpoint::Checkpoint, owner: Option<u8>) -> Result<Vec<GlmLayer<'a>>> {
+        checkpoint: &cuteafd_loader::plan::checkpoint::Checkpoint, owner: Option<u8>,
+        native_shared: bool) -> Result<Vec<GlmLayer<'a>>> {
         let ranks = self.ranks();
         let p = format!("model.layers.{layer}");
         let dense = layer < cfg.first_moe_layer;
@@ -704,7 +705,10 @@ impl<'a> GlmLoader<'a> {
             for (ops, attention) in ops.iter_mut().zip(attention) { ops.extend(attention); }
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-        let mlp_numerics = checkpoint.module_numerics(&format!("{mlp}.gate_proj"))?;
+        let mlp_numerics = if native_shared && !dense {
+            cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision
+        } else { checkpoint.module_numerics(&format!("{mlp}.gate_proj"))? };
+        if dense || !native_shared {
         for projection in ["up_proj", "down_proj"] {
             ensure!(checkpoint.module_numerics(&format!("{mlp}.{projection}"))? == mlp_numerics,
                 "{mlp}: mixed declared MLP arithmetic is unsupported");
@@ -726,6 +730,7 @@ impl<'a> GlmLoader<'a> {
                 put(&mut ops, "w_down_tscale", self.upload_all(ranks, &d)?);
             }
         }
+        }
         if !dense {
             ops[0].insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops[0].insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
@@ -742,14 +747,14 @@ impl<'a> GlmLoader<'a> {
     /// weights (its layer shares, the norm and head) and with a head split the
     /// other rank's layer shares.
     #[allow(clippy::type_complexity)]
-    pub fn model(&self, cfg: &GlmDsaConfig, layers: usize, owners: Option<&[u8]>)
+    pub fn model(&self, cfg: &GlmDsaConfig, layers: usize, owners: Option<&[u8]>, native_shared: bool)
         -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
         ensure!(owners.is_none_or(|o| o.len() == layers && self.ranks() == 2 && o.iter().all(|&r| r < 2)),
             "whole attention needs one owner per layer and two ranks");
         let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())?;
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
-            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer, &checkpoint, owners.map(|o| o[layer]))?) {
+            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer, &checkpoint, owners.map(|o| o[layer]), native_shared)?) {
                 share.push(part);
             }
         }
