@@ -6,6 +6,9 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## DeepSeek V4
 
+- 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4-Flash-0731 · 1× RTX PRO 6000 @ gpu-powerd 460/435 W (395–500) + 2× DGX Spark · build v3.0.0-rc5 · [report](deepseek_v4/2026-10-18-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min/report.svg)
+- 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4-Flash-0731 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v3.0.0-rc4 · [report](deepseek_v4/2026-10-18-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-5090/report.svg)
+- 2026-10-18 · Release smoke · wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 · 2× RTX PRO 6000 @ gpu-powerd 450/445 W (300–550) + 6× DGX Spark · build v3.0.0-rc4 · [report](deepseek_v4/2026-10-18-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 · 2× RTX PRO 6000 @ gpu-powerd 450/445 W (300–550) + 6× DGX Spark · build 92ad5b03d029 · [report](deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 · 1× RTX PRO 6000 @ gpu-powerd 440/455 W (300–550) + 4× DGX Spark · build 92ad5b03d029 · [report](deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark-v4-pro-exl3-min/report.svg)
 - 2026-10-14 · Release smoke · deepseek-ai/DeepSeek-V4-Flash-0731 · 2× RTX PRO 6000 @ gpu-powerd 445/450 W (300–550) + 4× DGX Spark · build 92ad5b03d029 · [report](deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-2rtx-4spark-v4-flash-max/report.svg)
@@ -38,6 +41,11 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## DeepSeek V4.1
 
+- 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 3 Spark · build v3.0.0-rc4 · [report](deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090/report.svg)
+- 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · 1× RTX PRO 6000 @ gpu-powerd 550 W (500–600) + 3× DGX Spark · build v3.0.0-rc4 · [report](deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min/report.svg)
+- 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · 1× RTX PRO 6000 @ gpu-powerd 510 W (320–585) + 4× DGX Spark · build v3.0.0-rc4 · [report](deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-4spark-v41-flash-reference-tp4/report.svg)
+- 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 4× DGX Spark · build v3.0.0-rc4 · [report](deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-2rtx-4spark-v41-flash-max/report.svg)
+- 2026-10-18 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W + 6× DGX Spark · build v3.0.0-rc4 · [report](deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-2rtx-6spark-v41-flash-reference-tp6/report.svg)
 - 2026-10-15 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 2× RTX PRO 6000 @ gpu-powerd 455/390 W (240–545) + 4× DGX Spark · build bac064ac2cf5 · [report](deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/report.svg)
 - 2026-10-15 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 450 W + 4× DGX Spark · build bac064ac2cf5 · [report](deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/report.svg)
 - 2026-10-14 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 2× RTX PRO 6000 @ gpu-powerd 455/445 W (300–550) + 4× DGX Spark · build 92ad5b03d029 · [report](deepseek_v41/2026-10-14-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/report.svg)
@@ -70,6 +78,8 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## GLM 5.3
 
+- 2026-10-18 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 · 1× RTX PRO 6000 @ gpu-powerd 335/510 W (265–600) + 4× DGX Spark · build v3.0.0-rc4 · [report](glm5/2026-10-18-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min/report.svg)
+- 2026-10-18 · Release smoke · nvidia/GLM-5.3-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 480/405 W (200–600) + 4× DGX Spark · build v3.0.0-rc4 · [report](glm5/2026-10-18-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min/report.svg)
 - 2026-10-15 · Release smoke · nvidia/GLM-5.3-NVFP4 · 2× RTX PRO 6000 @ gpu-powerd 450/445 W (395–500) + 6× DGX Spark · build 78d27e34a349 · [report](glm5/2026-10-15-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max/report.svg)
 - 2026-10-15 · Release smoke · nvidia/GLM-5.3-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 435/460 W (380–495) + 4× DGX Spark · build 78d27e34a349 · [report](glm5/2026-10-15-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (405–490) + 6× DGX Spark · build 92ad5b03d029 · [report](glm5/2026-10-14-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max/report.svg)
@@ -103,6 +113,13 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## GLM 5.3 Flash
 
+- 2026-10-18 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v3.0.0-rc5 · [report](glm5_flash/2026-10-18-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090/report.svg)
+- 2026-10-18 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v3.0.0-rc5 · [report](glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090/report.svg)
+- 2026-10-18 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · 1× RTX PRO 6000 @ gpu-powerd 300/585 W (240–600) + 2× DGX Spark · build v3.0.0-rc4 · [report](glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min/report.svg)
+- 2026-10-18 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 355/535 W (255–600) + 2× DGX Spark · build v3.0.0-rc4 · [report](glm5_flash/2026-10-18-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/report.svg)
+- 2026-10-18 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 1× RTX PRO 6000 @ gpu-powerd 415/465 W (300–600) + 2× DGX Spark · build v3.0.0-rc4 · [report](glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-min/report.svg)
+- 2026-10-18 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v3.0.0-rc4 · [report](glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090/report.svg)
+- 2026-10-18 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 2× RTX PRO 6000 @ gpu-powerd 455/440 W (300–570) · build v3.0.0-rc4 · [report](glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-2rtx-glm53f-exl3-max/report.svg)
 - 2026-10-14 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · 2× RTX PRO 6000 @ gpu-powerd 450/445 W (435–460) + 2× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-2rtx-2spark-glm53f-tr3-max/report.svg)
 - 2026-10-14 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W + 2× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-2rtx-2spark-glm53f-nvfp4-max/report.svg)
 - 2026-10-14 · Release smoke · zai-org/GLM-5.3-Flash · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (395–500) + 4× DGX Spark · build 92ad5b03d029 · [report](glm5_flash/2026-10-14-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max/report.svg)
@@ -166,6 +183,9 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## MiMo V2
 
+- 2026-10-18 · Release smoke · XiaomiMiMo/MiMo-V2.6-Flash-MOPD · 1× RTX PRO 6000 @ gpu-powerd 310/570 W (240–600) + 2× DGX Spark · build v3.0.0-rc4 · [report](mimo_v2/2026-10-18-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min/report.svg)
+- 2026-10-18 · Release smoke · XiaomiMiMo/MiMo-V2.6-Flash-MOPD · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v3.0.0-rc4 · [report](mimo_v2/2026-10-18-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-5090/report.svg)
+- 2026-10-18 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-MOPD · 2× RTX PRO 6000 @ gpu-powerd 435/380 W (200–535) + 6× DGX Spark · build v3.0.0-rc4 · [report](mimo_v2/2026-10-18-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/report.svg)
 - 2026-10-14 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-MOPD · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build 92ad5b03d029 · [report](mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/report.svg)
 - 2026-10-14 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-MOPD · 1× RTX PRO 6000 @ gpu-powerd 450/450 W (345–545) + 6× DGX Spark · build 92ad5b03d029 · [report](mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min/report.svg)
 - 2026-10-14 · Release smoke · XiaomiMiMo/MiMo-V2.6-Flash-MOPD · 2× RTX PRO 6000 @ gpu-powerd 445/445 W (300–550) + 4× DGX Spark · build 92ad5b03d029 · [report](mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-2rtx-4spark-mimo26-flash-max/report.svg)
@@ -200,6 +220,10 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## Qwen 3.8
 
+- 2026-10-18 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 450/450 W + 2× DGX Spark · build v3.0.0-rc5 · [report](qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min/report.svg)
+- 2026-10-18 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 1 Spark · build v3.0.0-rc5 · [report](qwen4/2026-10-18-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-1spark-qwen38-exl3-5090/report.svg)
+- 2026-10-18 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 1× RTX PRO 6000 @ gpu-powerd 325/565 W (260–600) · build v3.0.0-rc4 · [report](qwen4/2026-10-18-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/report.svg)
+- 2026-10-18 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v3.0.0-rc4 · [report](qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090/report.svg)
 - 2026-10-15 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 390/465 W (370–500) + 2× DGX Spark · build 3672f5c21e41 · [report](qwen4/2026-10-15-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min/report.svg)
 - 2026-10-14 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (355–540) · build 92ad5b03d029 · [report](qwen4/2026-10-14-smoke-qwen3-8-flash-next-nvfp4-2rtx-qwen38-nvfp4-max/report.svg)
 - 2026-10-14 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 2× RTX PRO 6000 @ gpu-powerd 440/455 W (300–550) · build 92ad5b03d029 · [report](qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-2rtx-qwen38-exl3-max/report.svg)

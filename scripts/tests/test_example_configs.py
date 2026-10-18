@@ -313,11 +313,13 @@ def test_v3_5090_precheck_requires_real_hardware(tmp_path: Path, gpu_name: str, 
 
 def test_published_matrix_pins_current_reports_and_keeps_5090_pending() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
+    assert len(matrix["cells"]) == 12
     for row in matrix["cells"]:
         assert row["5090"]["status"] == "pending"
-        for column in ("1rtx", "2rtx"):
-            cell = row[column]
-            assert cell["status"] == "current"
+        current = [row[c] for c in ("1rtx", "2rtx") if row[c]["status"] == "current"]
+        # v3 publishes one card per checkpoint (two for V4.1 and GLM Flash EXL3).
+        assert current and all(row[c]["status"] in ("current", "na") for c in ("1rtx", "2rtx"))
+        for cell in current:
             assert (ROOT / cell["report"] / "report.json").is_file()
     assert "simulated-5090" not in json.dumps(matrix)
 
