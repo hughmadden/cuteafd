@@ -123,15 +123,29 @@ pub fn spark_worlds(package: &str, intermediate: usize) -> Vec<usize> {
     TRANSPORT_WORLDS.into_iter().filter(|&world| spark_recipe(package, intermediate, world).is_ok()).collect()
 }
 
-/// Validate every routed operand against its checkpoint family and derive one
-/// qualified storage recipe without inspecting any installed package tree.
-pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize) -> anyhow::Result<SparkRecipe> {
+/// Validate every hosted routed operand against its checkpoint family and derive
+/// one qualified storage recipe without inspecting any installed package tree.
+pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize, layers: &[usize]) -> anyhow::Result<SparkRecipe> {
     use anyhow::{ensure, Context};
     let family = super::family::detect(checkpoint).context("Spark admission: unsupported checkpoint family")?;
     let model = family.open(checkpoint)?;
     let intermediate = model.spec().moe.as_ref().context("Spark admission: checkpoint has no routed experts")?.intermediate;
+    ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1]),
+        "Spark admission: hosted layers must be nonempty, sorted and unique");
+    for &layer in layers {
+        ensure!(model.spec().layers.get(layer).is_some_and(|spec| spec.ffn == super::spec::FfnKind::Moe),
+            "Spark admission: hosted layer {layer} is not a routed target layer");
+    }
     let modelopt = crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config)?;
-    let required = super::files::required_tensors(checkpoint, super::files::ReadRole::Spark { rank: 0, world })?;
+    let required = super::files::required_tensors(checkpoint, super::files::ReadRole::Spark { rank: 0, world })?
+        .into_iter().filter(|name| family.classify(model.spec(), name)
+            .and_then(|role| role.layer).is_some_and(|layer| layers.binary_search(&layer).is_ok()))
+        .collect::<std::collections::BTreeSet<_>>();
+    for &layer in layers {
+        ensure!(required.iter().any(|name| family.classify(model.spec(), name)
+            .is_some_and(|role| role.layer == Some(layer))),
+            "Spark admission: hosted layer {layer} has no routed expert headers");
+    }
     let tensors = checkpoint.tensors.iter().filter(|tensor| required.contains(&tensor.meta.name))
         .cloned().collect::<Vec<_>>();
     let present = tensors.iter().map(|tensor| tensor.meta.name.as_str()).collect::<std::collections::BTreeSet<_>>();
@@ -173,7 +187,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let exl3 = format.starts_with("exl3-k") && matches!(family, "v41" | "dsv4f" | "dsv4p" | "glm" | "glmf" | "qwen4");
     let nvfp4 = matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
-    let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4");
+    let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4" | "step5");
     if !(exl3 || nvfp4 || mxfp4 || fp8) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
@@ -185,7 +199,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(1..=6).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
     }
-    let packaged = if native { matches!(world, 2 | 3 | 4 | 6) }
+    let packaged = if family == "step5" { world == 4 }
+        else if native { matches!(world, 2 | 3 | 4 | 6) }
         else if exl3 { matches!(world, 2 | 3 | 4 | 6) || (family == "qwen4" && world == 1) }
         else if nvfp4 { matches!(world, 2 | 3 | 4 | 6) || (family == "glmf" && world == 5) }
         else if mxfp4 { if family == "mimof" { matches!(world, 2 | 4) } else { matches!(world, 2 | 6) } }
@@ -213,6 +228,14 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checkpoint_spark_recipe(checkpoint: &super::super::Checkpoint, world: usize) -> anyhow::Result<SparkRecipe> {
+        let family = super::super::family::detect(checkpoint).unwrap();
+        let model = family.open(checkpoint)?;
+        let layers = model.spec().layers.iter().enumerate()
+            .filter_map(|(layer, spec)| (spec.ffn == super::super::spec::FfnKind::Moe).then_some(layer)).collect::<Vec<_>>();
+        super::checkpoint_spark_recipe(checkpoint, world, &layers)
+    }
 
     #[test]
     fn checkpoint_recipes_follow_headers_without_installed_packages() {
@@ -274,6 +297,17 @@ mod tests {
     #[test]
     fn recipes_preserve_exact_tp6_and_legacy_nvfp4() {
         use crate::formats::fp8_experts::Slicing;
+        let step5 = spark_recipe("step5:fp8", 1536, 4).unwrap();
+        assert_eq!(step5.slicing, Slicing::Blocks(128));
+        assert_eq!(step5.widths, [384; 4]);
+        assert_eq!(step5.required_layouts, ["tp4"]);
+        assert_eq!(spark_worlds("step5:fp8", 1536), [4]);
+        for world in 0..=8 {
+            if world != 4 { assert!(spark_recipe("step5:fp8", 1536, world).is_err()); }
+            for format in ["nvfp4", "nvfp4a4", "bf16", "mxfp4", "exl3-k34"] {
+                assert!(spark_recipe(&format!("step5:{format}"), 1536, world).is_err());
+            }
+        }
         for package in ["mimo:fp8", "mimop:fp8 (MXFP4)", "glm:nvfp4", "glmf:exl3-k34"] {
             let recipe = spark_recipe(package, 2048, 6).unwrap();
             assert_eq!(recipe.slicing, Slicing::Blocks(128));

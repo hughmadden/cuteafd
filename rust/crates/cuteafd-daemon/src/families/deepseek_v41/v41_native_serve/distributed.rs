@@ -50,7 +50,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let topology = crate::shared::spark_topology::for_checkpoint(
         topology, args.peers.len(), catalog.exl3().is_some());
     let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
-    crate::shared::spark_topology::require_world(spark_world, &catalog)?;
+    crate::shared::spark_topology::require_world(spark_world, &catalog,
+        &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;
     lib.v41_compact_reducer()?.require_rank_count(spark_world.topology().world_size() as u32)?;
     let map = CachePlacement::encoder_decoder();
     let started = Instant::now();

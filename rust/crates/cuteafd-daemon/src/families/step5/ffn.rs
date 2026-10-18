@@ -94,6 +94,10 @@ impl DensePlan {
         self.admission.bytes
     }
 
+    pub fn workspace_bytes(&self) -> u64 {
+        self.admission.planes.iter().map(|&n| n as u64).sum()
+    }
+
     pub fn prepare(
         programs: &Programs<'_>,
         checkpoint: &Checkpoint,
@@ -402,13 +406,29 @@ mod tests {
     #[test]
     #[ignore = "requires sealed native library, pinned real-weight component fixtures and CUDA"]
     fn native_dense_ffn_official_boundaries_and_graph_replay() -> Result<()> {
-        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_FFN_FIXTURE_DIR")?);
+        native_dense_component(0)
+    }
+
+    #[test]
+    #[ignore = "requires pinned dense layer-1/2 fixtures, sealed native library and CUDA"]
+    fn native_dense_layers1_2_boundaries_and_graph_replay() -> Result<()> {
+        for layer in 1..3 {
+            native_dense_component(layer)?;
+        }
+        Ok(())
+    }
+
+    fn native_dense_component(layer: usize) -> Result<()> {
+        let mut root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_FFN_FIXTURE_DIR")?);
+        if layer > 0 {
+            root.push(format!("layer{layer}"));
+        }
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
         ensure!(
             manifest["schema"] == 1
                 && manifest["seed"] == 274
-                && manifest["layer"] == 0
+                && manifest["layer"] == layer
                 && manifest["checkpoint"] == "stepfun-ai/Step-5-Preview-BF16"
                 && manifest["revision"] == "7734b7ffac118d70d8398bfa3eb0fab007eb45b1"
                 && manifest["rows"] == serde_json::json!([1, 7, 128]),
@@ -430,14 +450,16 @@ mod tests {
                 == manifest["revision"].as_str(),
             "native checkpoint revision differs from fixture"
         );
-        let mut chain = DenseFfn::load(device, &programs, &checkpoint, 0, 128, u64::MAX, &[])?;
+        let mut chain = DenseFfn::load(device, &programs, &checkpoint, layer, 128, u64::MAX, &[])?;
         ensure!(
             manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.epsilon),
             "fixture epsilon differs"
         );
         let bytes = chain.admission.bytes;
-        assert!(DenseFfn::load(device, &programs, &checkpoint, 0, 128, bytes - 1, &[]).is_err());
-        assert!(DenseFfn::load(device, &programs, &checkpoint, 0, 128, bytes, &[1]).is_err());
+        assert!(
+            DenseFfn::load(device, &programs, &checkpoint, layer, 128, bytes - 1, &[]).is_err()
+        );
+        assert!(DenseFfn::load(device, &programs, &checkpoint, layer, 128, bytes, &[1]).is_err());
         assert!(chain.enqueue(129).is_err());
         let mut elementwise_exact = true;
         let mut gemms_accurate = true;

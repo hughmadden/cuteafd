@@ -84,7 +84,7 @@ pub(crate) fn require_supported(
     Ok(())
 }
 
-pub(crate) fn require_world(world: SparkWorld, catalog: &OfficialV41Catalog) -> Result<()> {
+pub(crate) fn require_wire(world: SparkWorld, catalog: &OfficialV41Catalog) -> Result<()> {
     require_supported(world.ownership_topology(), catalog)?;
     let family = catalog.routed_experts().geometry()?.family();
     if world.ownership_topology().is_none() && catalog.exl3().is_none() && catalog.fp8().is_none() {
@@ -92,10 +92,15 @@ pub(crate) fn require_world(world: SparkWorld, catalog: &OfficialV41Catalog) -> 
             || (family == Some("dsv4f") && world.topology().tp() == 2),
             "native Spark experts outside TP4 require ownership wire (except V4 Flash TP2)");
     }
+    Ok(())
+}
+
+pub(crate) fn require_world(world: SparkWorld, catalog: &OfficialV41Catalog, layers: &[usize]) -> Result<()> {
+    require_wire(world, catalog)?;
     let tp = world.topology().tp() as usize;
     let headers = cuteafd_loader::plan::files::open_role(catalog.snapshot(),
         cuteafd_loader::plan::files::ReadRole::Spark { rank: 0, world: tp })?;
-    cuteafd_loader::plan::experts::checkpoint_spark_recipe(&headers, tp)?;
+    cuteafd_loader::plan::experts::checkpoint_spark_recipe(&headers, tp, layers)?;
     Ok(())
 }
 
@@ -115,6 +120,11 @@ pub(crate) const SPARK_TP6_ROLE: u32 = 7;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn require_world(world: SparkWorld, catalog: &OfficialV41Catalog) -> Result<()> {
+        let shape = catalog.routed_experts();
+        super::require_world(world, catalog, &(shape.first_layer..shape.layers).collect::<Vec<_>>())
+    }
 
     #[test]
     fn native_world_requires_owned_wire_outside_tp4() -> Result<()> {

@@ -15,12 +15,15 @@ spec.loader.exec_module(golden)
 ROWS = (1, 7, 128, 513)
 
 
-def test_official_layer0_swa_fixtures():
+@pytest.mark.parametrize("layer_id", (0, 1, 2))
+def test_official_first_three_swa_fixtures(layer_id):
     destination = os.environ.get("CUTEAFD_STEP5_SWA_FIXTURE_DIR")
     if not destination:
         pytest.skip("set CUTEAFD_STEP5_SWA_FIXTURE_DIR for real-weight CUDA fixtures")
     torch = pytest.importorskip("torch")
     root = Path(destination).resolve()
+    if layer_id:
+        root = root / f"layer{layer_id}"
     assert root.is_relative_to(Path(os.environ["CARGO_TARGET_DIR"]).resolve())
     root.mkdir(parents=True, exist_ok=True)
     snapshot = Path(os.environ["STEP5_REFERENCE_SNAPSHOT"])
@@ -30,13 +33,13 @@ def test_official_layer0_swa_fixtures():
     config_values["tp_size"] = 1
     config = ref.Step5Config(**config_values)
     with torch.device("meta"):
-        layer = ref.Step5DecoderLayer(config, 0, dtype=torch.bfloat16)
+        layer = ref.Step5DecoderLayer(config, layer_id, dtype=torch.bfloat16)
     layer.to_empty(device="cuda")
     reader = golden.Weights(snapshot)
     sources = {}
     with torch.no_grad():
         for name, parameter in layer.named_parameters():
-            value = reader.get("model.layers.0." + name)
+            value = reader.get(f"model.layers.{layer_id}." + name)
             assert value.dtype == parameter.dtype and value.shape == parameter.shape
             sources[name] = hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
             parameter.copy_(value)
@@ -46,7 +49,7 @@ def test_official_layer0_swa_fixtures():
     generator = torch.Generator(device="cpu").manual_seed(274)
     residual = torch.randn((max(ROWS), config.hidden_size), generator=generator).cuda()
     manifest = {"schema": 1, "checkpoint": golden.CHECKPOINT, "revision": golden.REVISION,
-                "source_pins": golden.SOURCE_PINS, "seed": 274, "layer": 0,
+                "source_pins": golden.SOURCE_PINS, "seed": 274, "layer": layer_id,
                 "rows": list(ROWS), "epsilon": config.rms_norm_eps,
                 "weights_sha256": sources, "torch": torch.__version__,
                 "cuda": torch.version.cuda, "files": {},

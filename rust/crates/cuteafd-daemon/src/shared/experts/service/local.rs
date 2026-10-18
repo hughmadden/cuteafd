@@ -31,6 +31,14 @@ fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
     Ok(())
 }
 
+pub(super) fn admit_worker_selection(config: &mut NativeExpertServiceConfig,
+    selection: &cuteafd_transport::worker_selection::WorkerSelection, catalog: &OfficialV41Catalog) -> Result<()> {
+    apply_worker_selection(config, selection, catalog.routed_experts().first_layer,
+        catalog.routed_experts().layers)?;
+    if !selection.ranges().is_empty() { validate_topology(config, catalog)?; }
+    Ok(())
+}
+
 #[cfg(test)]
 mod selection_tests {
     use super::*;
@@ -167,7 +175,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let topology = crate::shared::spark_topology::for_checkpoint(
         config.declared_world.ownership_topology(), config.world, v41 && catalog.exl3().is_some());
     config.declared_world = crate::shared::spark_topology::world(topology, config.world)?;
-    validate_topology(&config, &catalog)?;
+    crate::shared::spark_topology::require_wire(config.spark_world()?, &catalog)?;
     let geometry = catalog.routed_experts().geometry()?;
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
         && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
@@ -220,8 +228,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot_manifest(
                 &config.snapshot, geometry, config.spark_world()?, config.exlr8_manifest.as_deref())?;
             selection.validate_for(&identity)?;
-            apply_worker_selection(&mut config, &selection, catalog.routed_experts().first_layer,
-                catalog.routed_experts().layers)?;
+            admit_worker_selection(&mut config, &selection, &catalog)?;
             Ok(selection)
         })();
         let selection = match selected {

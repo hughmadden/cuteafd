@@ -35,7 +35,7 @@ impl SparkAdmission {
             let tp = topology.map_or(world, |topology| topology.tp() as usize);
             let headers = cuteafd_loader::plan::files::open_role(snapshot,
                 cuteafd_loader::plan::files::ReadRole::Spark { rank: 0, world: tp })?;
-            let recipe = cuteafd_loader::plan::experts::checkpoint_spark_recipe(&headers, tp)?;
+            let recipe = cuteafd_loader::plan::experts::checkpoint_spark_recipe(&headers, tp, &working.spark_layers)?;
             (0..world).map(|rank| {
                 let shard = topology.map(|topology| topology.tp_rank(rank)).transpose()?
                     .map_or(rank, usize::from);

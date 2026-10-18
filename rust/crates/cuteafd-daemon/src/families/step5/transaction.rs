@@ -346,6 +346,33 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         result
     }
 
+    /// Pin non-attention owners and order chain copies/FFNs on the cache stream.
+    pub fn compose<O, T>(
+        &mut self,
+        rank: usize,
+        owner: &'e O,
+        work: impl FnOnce(&'e O, StepInputs<'_, 'a>) -> Result<T>,
+    ) -> Result<T> {
+        ensure!(!self.failed, "Step-5 failed step cannot compose");
+        let cache = self.ranks.get(rank).context("Step-5 composition rank")?.borrow();
+        self.failed = true;
+        let mut guard = cache.stream.cancellation_guard("Step-5 composition callback");
+        let stage = self.staging[rank];
+        let result = work(owner, StepInputs {
+            stream: &cache.stream,
+            positions: stage.positions.buffer,
+            requests: stage.requests.buffer,
+            rows: self.rows,
+            base: self.base,
+            heads: 64 / self.ranks.len(),
+        });
+        if result.is_ok() {
+            self.failed = false;
+            guard.complete = true;
+        }
+        result
+    }
+
     pub fn attend<O, T>(
         &mut self,
         rank: usize,
@@ -889,6 +916,40 @@ pub(super) mod tests {
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
+            {
+                let mut step = Step::begin(refs.clone(), lanes.clone(), &mut pool, &mut placement, 64)?;
+                assert!(step.compose(2, &key, |_, _| Ok(())).is_err());
+                step.compose(0, &key, |_, meta| {
+                    assert_eq!(meta.rows, 64);
+                    assert_eq!(meta.base, base);
+                    assert_eq!(meta.heads, 32);
+                    Ok(())
+                })?;
+                let failed: Result<()> = step.compose(0, &key, |owner, meta| {
+                    meta.stream.device.run(|| {
+                        // SAFETY: the transaction retains both disjoint owners through failure drainage.
+                        unsafe { library.copy_d2d_async(value.buffer, owner.buffer,
+                            owner.buffer.bytes, meta.stream.raw) }
+                    })?;
+                    anyhow::bail!("injected composition error")
+                });
+                assert!(failed.is_err());
+                assert!(step.compose(0, &key, |_, _| Ok(())).is_err());
+                assert!(step.publish(1).is_err());
+            }
+            assert_eq!(placement.pages, old_pages);
+            assert_eq!(placement.committed, base);
+            assert_eq!(pool.pool().free(), old_free);
+            let compose_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                let mut step = Step::begin(refs.clone(), lanes.clone(), &mut pool, &mut placement, 64)?;
+                step.compose(0, &key, |_, _| -> Result<()> {
+                    panic!("injected composition panic");
+                })
+            }));
+            assert!(compose_panic.is_err());
+            assert_eq!(placement.pages, old_pages);
+            assert_eq!(placement.committed, base);
+            assert_eq!(pool.pool().free(), old_free);
             let killed =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                     let mut step =

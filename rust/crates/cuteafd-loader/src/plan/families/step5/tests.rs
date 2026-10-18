@@ -426,3 +426,58 @@ fn native_rope_plan_honors_checkpoint_layer_policy_and_factor_one() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn spark_admission_is_scoped_to_qualified_native_layers() {
+    use crate::plan::experts::{checkpoint_spark_recipe, spark_recipe};
+    for kind in ["fp8", "nvfp4", "bf16"] {
+        let dir = snapshot(kind);
+        let cp = Checkpoint::open(dir.path()).unwrap();
+        if kind == "fp8" {
+            assert_eq!(checkpoint_spark_recipe(&cp, 4, &[3]).unwrap(), spark_recipe("step5:fp8", 1536, 4).unwrap());
+            assert!(checkpoint_spark_recipe(&cp, 4, &(3..88).collect::<Vec<_>>()).is_ok());
+            for world in [1, 2, 3, 5, 6, 7, 8] {
+                assert!(checkpoint_spark_recipe(&cp, world, &[3]).is_err(), "TP{world}");
+            }
+        } else {
+            assert!(checkpoint_spark_recipe(&cp, 4, &[3]).is_err(), "{kind}");
+        }
+        for layers in [vec![88], vec![89], vec![90], (3..91).collect()] {
+            let error = format!("{:#}", checkpoint_spark_recipe(&cp, 4, &layers).unwrap_err());
+            assert!(error.contains("BF16-tail"), "{error}");
+        }
+        for layers in [vec![], vec![3, 3], vec![4, 3], vec![0], vec![91], vec![95]] {
+            assert!(checkpoint_spark_recipe(&cp, 4, &layers).is_err());
+        }
+        let r = report(dir.path(), 2, 96, 6, Some(262_144));
+        assert!(!r.executable() && !r.wip_launchable() && !r.native_serving_admitted);
+        for component in ["dense_ffn", "attention", "routed_expert"] {
+            assert!(r.hints.iter().any(|hint| hint.what.contains(component)), "{component}: {:?}", r.hints);
+        }
+    }
+}
+
+#[test]
+fn routed_admission_rechecks_operand_shape_scale_and_role() {
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let model = Model::open(&cp).unwrap();
+    let groups = format::group_by_stem(&cp.tensors);
+    let stem = "model.layers.3.moe.gate_proj";
+    let operand = format::detect(&groups[stem]).unwrap();
+    let role = TensorRole::layer(Component::RoutedExpert, 3);
+    assert!(model.accepts(&role, stem, &mut operand.clone()).is_ok());
+    for mutation in 0..5 {
+        let mut wrong = operand.clone();
+        match mutation {
+            0 => wrong.logical[0] -= 1,
+            1 => wrong.stored[0] -= 1,
+            2 => wrong.scale = None,
+            3 => wrong.scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+            _ => wrong.scale.as_mut().unwrap().cols = 64,
+        }
+        assert!(model.accepts(&role, stem, &mut wrong).is_err());
+    }
+    assert!(model.accepts(&TensorRole::layer(Component::RoutedExpert, 4), stem, &mut operand.clone()).is_err());
+    assert!(model.accepts(&TensorRole::layer(Component::DenseFfn, 3), stem, &mut operand.clone()).is_err());
+}

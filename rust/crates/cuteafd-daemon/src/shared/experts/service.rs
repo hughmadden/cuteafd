@@ -544,14 +544,26 @@ mod tests {
     }
 
     #[test]
-    fn worker_refuses_unqualified_checkpoint_header_recipe() -> Result<()> {
+    fn worker_refuses_unqualified_recipe_after_selection_before_weight_load() -> Result<()> {
         use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
         let root = tempfile::tempdir()?;
         let (tensors, _) = qwen4_exl3(3, 4);
         write_snapshot(root.path(), &qwen4_config(3), &tensors, None);
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-        validate_topology(&config(3, 0, None), &catalog)?;
-        let error = validate_topology(&config(5, 0, None), &catalog).unwrap_err();
+        use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
+        let admit = |world| -> Result<()> {
+            let mut config = config(world, 0, None);
+            // Sparse header fixture and no native library: this is the production
+            // admission boundary before package warming or weight allocation.
+            assert!(!config.library.exists());
+            let identity = WorkerIdentity::from_snapshot(root.path(), catalog.routed_experts().geometry()?,
+                config.spark_world()?)?;
+            let selection = WorkerSelection::new(identity, &[0, 1, 2])?
+                .with_model(config.model_admission.clone().unwrap())?;
+            local::admit_worker_selection(&mut config, &selection, &catalog)
+        };
+        admit(3)?;
+        let error = admit(5).unwrap_err();
         assert!(error.downcast_ref::<cuteafd_loader::plan::experts::SparkRecipeRefusal>().is_some(),
             "{error:#}");
         Ok(())
@@ -996,7 +1008,8 @@ mod tests {
 /// Native V4 Flash TP2 retains the generic coordinator's canonical protocol.
 fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Catalog) -> Result<()> {
     let world = config.spark_world()?;
-    crate::shared::spark_topology::require_world(world, catalog)?;
+    let layers = config.resident_layers(catalog.routed_experts().layers)?;
+    crate::shared::spark_topology::require_world(world, catalog, &layers)?;
     ensure!(config.world == world.topology().world_size() && config.rank < config.world,
         "Spark worker rank/world differs from its declared topology");
     Ok(())

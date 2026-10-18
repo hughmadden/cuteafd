@@ -55,6 +55,7 @@ pub struct LayerContract {
     pub layer: usize,
     /// Dense FFN only; routed/shared branches have separate ownership.
     pub dense_activation: Option<cuteafd_core::FfnActivation>,
+    pub shared_activation: Option<cuteafd_core::FfnActivation>,
     pub geometry: GqaGeometry,
     pub theta: f64,
     pub rope: crate::plan::rope::Recipe,
@@ -88,6 +89,7 @@ impl CoordinatorContract {
                 Ok(LayerContract {
                     layer,
                     dense_activation: (!cfg.moe[layer]).then_some(cfg.activation[layer]),
+                    shared_activation: cfg.moe[layer].then_some(cfg.shared_activation[layer]),
                     geometry: GqaGeometry {
                         query_heads: cfg.heads,
                         kv_heads: cfg.groups,
@@ -499,6 +501,20 @@ mod tests {
             let operand = get(&format!("model.layers.3.{suffix}"));
             assert_eq!(operand.dtype, DType::F32);
             assert_eq!(operand.slice, WeightSlice::Replicated);
+        }
+        for (rank, ranks) in [(0, 1), (0, 2), (1, 2)] {
+            let layout = RankWeightLayout::from_checkpoint(&cp, rank, ranks).unwrap();
+            for layer in CoordinatorContract::from_checkpoint(&cp).unwrap().layers.iter()
+                .filter(|layer| layer.shared_activation.is_some()) {
+                let name = format!("model.layers.{}.moe.gate.weight", layer.layer);
+                let gate = layout.operands.iter().find(|w| w.name == name).unwrap();
+                assert_eq!(gate.dtype, DType::Bf16);
+                assert_eq!(gate.shape, [352, 4096]);
+                assert_eq!(gate.slice, WeightSlice::Replicated);
+                assert_eq!(gate.allocation_bytes, 352 * 4096 * 2);
+                assert_eq!(gate.sources.len(), 1);
+                assert_eq!(gate.sources[0].meta.dtype, DType::Bf16);
+            }
         }
         let covered: Vec<_> = two
             .operands

@@ -161,6 +161,10 @@ pub(super) struct SwaLayer<'a> {
 }
 
 impl<'a> SwaLayer<'a> {
+    pub fn workspace_bytes(rows: usize) -> Result<u64> {
+        Ok(Admission::new(rows, &[], 0, 0, u64::MAX, &[])?.bytes)
+    }
+
     pub fn load(
         device: Device<'a>,
         programs: &'a Programs<'a>,
@@ -691,13 +695,29 @@ mod tests {
     #[test]
     #[ignore = "requires pinned layer-0 fixtures, sealed native library and CUDA"]
     fn native_swa_layer0_boundaries_and_graph_replay() -> Result<()> {
-        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_SWA_FIXTURE_DIR")?);
+        native_swa_component(0)
+    }
+
+    #[test]
+    #[ignore = "requires pinned SWA layer-1/2 fixtures, sealed native library and CUDA"]
+    fn native_swa_layers1_2_boundaries_and_graph_replay() -> Result<()> {
+        for layer in 1..3 {
+            native_swa_component(layer)?;
+        }
+        Ok(())
+    }
+
+    fn native_swa_component(layer: usize) -> Result<()> {
+        let mut root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_SWA_FIXTURE_DIR")?);
+        if layer > 0 {
+            root.push(format!("layer{layer}"));
+        }
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
         ensure!(
             manifest["schema"] == 1
                 && manifest["seed"] == 274
-                && manifest["layer"] == 0
+                && manifest["layer"] == layer
                 && manifest["checkpoint"] == "stepfun-ai/Step-5-Preview-BF16"
                 && manifest["revision"] == "7734b7ffac118d70d8398bfa3eb0fab007eb45b1"
                 && manifest["rows"] == serde_json::json!([1, 7, 128, 513]),
@@ -719,8 +739,16 @@ mod tests {
                 == manifest["revision"].as_str(),
             "SWA snapshot revision mismatch"
         );
-        let mut chain =
-            SwaLayer::load(device, &programs, &checkpoint, 0, 513, None, u64::MAX, &[])?;
+        let mut chain = SwaLayer::load(
+            device,
+            &programs,
+            &checkpoint,
+            layer,
+            513,
+            None,
+            u64::MAX,
+            &[],
+        )?;
         ensure!(
             manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.epsilon),
             "SWA epsilon mismatch"
@@ -729,7 +757,7 @@ mod tests {
             device,
             &programs,
             &checkpoint,
-            0,
+            layer,
             513,
             None,
             chain.admission.bytes - 1,
@@ -845,7 +873,7 @@ mod tests {
             {
                 let source = if stage == 4 { "qraw" } else { "kraw" };
                 device.run(|| library.copy_h2d(chain.planes[input].buffer, &load(source)?))?;
-                let (cos, sin) = chain.rope.layers[0].attention.buffers();
+                let (cos, sin) = chain.rope.layers[layer].attention.buffers();
                 chain.launch(
                     stage,
                     &[
