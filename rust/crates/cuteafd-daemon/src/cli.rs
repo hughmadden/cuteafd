@@ -784,6 +784,28 @@ mod tests {
             assert_eq!(super::Cli::try_parse_from(command).is_ok(), valid);
         }
     }
+
+    #[test]
+    fn native_l2_prefetch_is_the_shared_opt_in_flag() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--peers", "127.0.0.1:19441"];
+        if std::env::var_os("CUTEAFD_L2_PREFETCH").is_none() {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command else {
+                panic!("expected native serving");
+            };
+            // Unset falls back to the family default, which is off for V4.1.
+            assert_eq!(args.l2.l2_prefetch, None);
+            assert_eq!(crate::shared::l2_prefetch::OTHER_DEFAULT, "off");
+        }
+        for value in ["off", "auto", "48"] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+                base.into_iter().chain(["--l2-prefetch", value])).unwrap().command else {
+                panic!("expected native serving");
+            };
+            assert_eq!(args.l2.l2_prefetch.as_deref(), Some(value));
+        }
+    }
     use super::*;
 
     #[test]
@@ -1020,6 +1042,10 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, env = "CUTEAFD_CONSOLE_TEXT", num_args = 0..=1, default_value = "true",
         default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub console_text: bool,
+    // `--l2-prefetch` (off by default for V4.1): one-lane decode/verify passes
+    // prefetch the next layer's weights into L2 while a layer's experts are out.
+    #[command(flatten)]
+    pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
 

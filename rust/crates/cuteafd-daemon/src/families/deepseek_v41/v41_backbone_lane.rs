@@ -77,6 +77,57 @@ impl<'a> BackboneLaneWeights<'a> {
         );
         Self::load_placed(library, catalog, staging, None)
     }
+    /// Layer `layer`'s lane weights in the order a decode step reads them (L2
+    /// prefetch): mHC attention, query, output projection, mHC FFN, router and
+    /// shared expert. Window, compressor and index weights are not lane weights.
+    fn decode_read_order(&self, layer: usize) -> Vec<crate::shared::l2_prefetch::Range> {
+        let weights = &self.layers[layer];
+        let mut reads = weights.hc.decode_reads(true);
+        reads.extend(weights.query.decode_reads());
+        reads.extend(weights.projection.decode_reads());
+        reads.extend(weights.hc.decode_reads(false));
+        reads.extend(weights.router.decode_reads());
+        if let Some(shared) = &weights.shared { reads.extend(shared.decode_reads()); }
+        reads.into_iter().map(|buffer| (buffer.ptr.cast_const(), buffer.bytes)).collect()
+    }
+}
+
+/// Per layer L of a lane on `device`, what to prefetch while L's routed experts
+/// are out: layer L+1's weights (`ranges`) when that GPU holds both layers.
+/// The last layer and layers before a GPU handoff prefetch nothing.
+fn next_layer_plan(devices: &[i32], device: i32,
+    ranges: impl Fn(usize) -> Vec<crate::shared::l2_prefetch::Range>) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
+    (0..devices.len()).map(|layer| match devices.get(layer + 1) {
+        Some(&next) if next == device && devices[layer] == device => ranges(layer + 1),
+        _ => Vec::new(),
+    }).collect()
+}
+
+/// This lane's `--l2-prefetch` (the GLM facility, `shared::l2_prefetch`): in a
+/// decode or verify step, once a layer's routed experts are on their way to the
+/// Sparks, one kernel loads the first `budget` bytes of the next layer's weights
+/// through L2 while the GPU would otherwise wait for the replies. It runs on its
+/// own stream after the chain head (the shared expert, where that is queued
+/// first) and nothing joins it: no stage waits for it or finds its work on a
+/// stage stream. It writes nothing, so outputs are bit-identical, and it
+/// launches between graph launches (the exchange is never captured).
+struct LaneL2<'a> {
+    plan: crate::shared::l2_prefetch::L2Prefetch,
+    stream: crate::shared::memory::device::Stream<'a>,
+    /// The pass is a decode or verify step ([`BackboneLane::set_attention_decode`]).
+    decode: bool,
+    /// The other request lane is idle ([`BackboneLane::set_l2_prefetch`]).
+    solo: bool,
+}
+impl LaneL2<'_> {
+    /// Queues the prefetch planned for layer `layer`'s exchange window.
+    fn issue(&self, layer: usize) -> Result<()> {
+        // In a stage chain: after everything queued so far (the shared expert
+        // where it runs before this call).
+        self.stream.join_chain()?;
+        let device = self.stream.device;
+        device.run(|| self.plan.issue(device.library, layer, self.stream.raw))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +271,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
             library: lane.weights.library, phase: &mut lane.phase,
             route_capture: if lane.capture_routes { Some(&mut lane.route_capture) } else { None },
             ffn_split: if lane.capture_timing { Some(&mut lane.ffn_split) } else { None },
+            l2: lane.l2.as_ref().filter(|l2| l2.decode && l2.solo),
  })
     }
 }
@@ -248,6 +300,8 @@ pub(crate) struct LaneFfn<'s, 'w, 'a> {
     phase: &'s mut Phase,
     route_capture: Option<&'s mut Vec<Vec<[u32; 6]>>>,
     ffn_split: Option<&'s mut FfnSplit>,
+    /// This pass prefetches the next layer during Spark exchanges (`--l2-prefetch`).
+    l2: Option<&'s LaneL2<'a>>,
 }
 
 /// Host-clock split of a captured pass's FFN stages, summed over its layers.
@@ -349,6 +403,7 @@ impl LaneFfn<'_, '_, '_> {
         let library = self.library;
         let route_capture = &mut self.route_capture;
         let ffn_split = &mut self.ffn_split;
+        let l2 = self.l2;
         if crate::shared::memory::chain::deferred() {
             // Attention preparation only enqueues its uploads. The pending
             // attention tail has now joined the chain, so this fence includes
@@ -417,6 +472,7 @@ impl LaneFfn<'_, '_, '_> {
                 let shared = shared.as_mut().context("decoder shared expert workspace absent")?;
                 let binding = unsafe { transport.device_dispatch(&routed, placement, rows)? };
                 let contribution = unsafe { shared.execute_ffn_cooperative(input).await? };
+                if let Some(l2) = l2 { l2.issue(input.layer)?; }
                 return unsafe { transport.device_collect(binding, contribution.values, routed.rows,
                     input.values.device_id).await };
             }
@@ -434,6 +490,8 @@ impl LaneFfn<'_, '_, '_> {
             let pending = transport.dispatch_ffn(&request).await?;
             let dispatched_us = timing.elapsed().as_micros() as u64;
             if tp2_shared {
+                // The TP2 shared halves are queued inside `finish_tp2`, beside the prefetch.
+                if let Some(l2) = l2 { l2.issue(input.layer)?; }
                 let result = unsafe { pending.finish_tp2(input).await };
                 if let Some(split) = ffn_split.as_deref_mut() {
                     split.remote_layers += 1;
@@ -450,6 +508,7 @@ impl LaneFfn<'_, '_, '_> {
             let contribution = unsafe { if cooperative { shared.execute_ffn_cooperative(input).await? }
                     else { shared.execute_ffn(input)? } };
             let shared_us = timing.elapsed().as_micros() as u64;
+            if let Some(l2) = l2 { l2.issue(input.layer)?; }
             let result = unsafe { if cooperative { pending.finish_cooperative(&contribution).await }
                 else { pending.finish(&contribution).await } }?;
             if let Some(split) = ffn_split.as_deref_mut() {
@@ -539,6 +598,8 @@ pub(crate) struct BackboneLane<'w, 'a> {
     /// captured; consecutive marks give each layer's device time, and an
     /// entry mark times the first layer after a GPU handoff.
     layer_clock: LayerClock<'a>,
+    /// `--l2-prefetch` ([`Self::enable_l2_prefetch`]); off by default.
+    l2: Option<LaneL2<'a>>,
 }
 
 impl<'w, 'a> BackboneLane<'w, 'a> {
@@ -598,7 +659,29 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             route_capture: Vec::new(),
             ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?,
+            l2: None,
         })
+    }
+    /// `--l2-prefetch`: in this lane's decode and verify steps, while a layer's
+    /// routed experts are on the Sparks, load the first `budget` bytes of the
+    /// next layer's weights into L2 when this GPU holds that layer.
+    pub fn enable_l2_prefetch(&mut self, budget: usize) -> Result<()> {
+        let device = Device { library: self.weights.library, id: self.block.inputs()[0].device_id };
+        let devices: Vec<i32> = self.weights.layers.iter().map(|layer| layer.device.id).collect();
+        let order = next_layer_plan(&devices, device.id, |layer| self.weights.decode_read_order(layer));
+        let largest = order.iter().map(|ranges| ranges.iter().map(|range| range.1).sum::<usize>()).max().unwrap_or(0);
+        tracing::info!(gpu = device.id, next_layer_mib = largest >> 20, budget_mib = budget >> 20,
+            "V4.1 L2 prefetch: next layer's lane weights per Spark exchange");
+        let plan = device.run(|| crate::shared::l2_prefetch::L2Prefetch::new(device.library, budget, &order))?;
+        let stream = crate::shared::memory::device::Stream::new(device)?;
+        self.l2 = Some(LaneL2 { plan, stream, decode: false, solo: true });
+        Ok(())
+    }
+    /// Whether this lane's next pass may prefetch ([`Self::enable_l2_prefetch`]):
+    /// only while the other request lane is idle, whose work would otherwise
+    /// fill the exchange and evict the prefetched lines.
+    pub fn set_l2_prefetch(&mut self, on: bool) {
+        if let Some(l2) = &mut self.l2 { l2.solo = on; }
     }
     fn enter(&mut self, expected: Phase) -> Result<()> {
         let prior = std::mem::replace(&mut self.phase, Phase::Invalid);
@@ -798,6 +881,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             phase: &mut self.phase,
             route_capture: if self.capture_routes { Some(&mut self.route_capture) } else { None },
             ffn_split: if self.capture_timing { Some(&mut self.ffn_split) } else { None },
+            l2: self.l2.as_ref().filter(|l2| l2.decode && l2.solo),
         })
     }
     /// # Safety
@@ -1020,6 +1104,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn set_attention_decode(&mut self, decode: bool) {
         if let Some(dual) = &mut self.dual_sparse { dual.set_decode(decode); }
         else if let Some(sparse) = &mut self.sparse { sparse.set_decode(decode); }
+        // Prefill never prefetches: its own work fills the exchange.
+        if let Some(l2) = &mut self.l2 { l2.decode = decode; }
     }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
         if let Some(dual)=&mut self.dual_sparse { dual.reserve_decode_rows(rows) }
@@ -1080,6 +1166,26 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
 mod tests {
     use super::*;
     use cuteafd_loader::read_official_v41_catalog;
+
+    #[test]
+    fn l2_plan_prefetches_the_next_layer_only_on_the_gpu_holding_both() {
+        let ranges = |layer: usize| vec![((0x1000_0000 + (layer << 24)) as *const std::ffi::c_void, layer << 20)];
+        // One RTX: every layer but the last prefetches its successor.
+        let one = next_layer_plan(&[0; 40], 0, ranges);
+        assert_eq!(one.len(), 40);
+        assert!((0..39).all(|layer| one[layer] == ranges(layer + 1)));
+        assert!(one[39].is_empty());
+        // Two RTX split at layer 20: GPU0's lane stops before the handoff and
+        // never plans GPU1's layers; GPU1's lane starts at the handoff.
+        let devices: Vec<i32> = (0..40).map(|layer| i32::from(layer >= 20)).collect();
+        let first = next_layer_plan(&devices, 0, ranges);
+        assert!((0..19).all(|layer| first[layer] == ranges(layer + 1)));
+        assert!((19..40).all(|layer| first[layer].is_empty()));
+        let second = next_layer_plan(&devices, 1, ranges);
+        assert!((0..20).all(|layer| second[layer].is_empty()));
+        assert!((20..39).all(|layer| second[layer] == ranges(layer + 1)));
+        assert!(second[39].is_empty());
+    }
 
     #[test]
     fn lane_ffn_cancellation_and_failure_do_not_publish_completion() {

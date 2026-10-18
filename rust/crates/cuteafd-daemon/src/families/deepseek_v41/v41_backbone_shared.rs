@@ -85,6 +85,14 @@ impl<'a> BackboneSharedWeights<'a> {
             scales,
         })
     }
+    /// The buffers a decode step reads, in order (L2 prefetch): w1, w3 (gate
+    /// and up) and w2 (down), each followed by its packed scales.
+    pub(crate) fn decode_reads(&self) -> Vec<CuteafdDeviceBuffer> {
+        ["w1", "w3", "w2"].into_iter().zip(&self.scales).flat_map(|(name, scales)| [
+            self.tensors.get(&format!("layers.{}.ffn.shared_experts.{name}.weight", self.layer)).ok(),
+            Some(scales.buffer),
+        ]).flatten().collect()
+    }
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<BackboneSharedWave<'_, 'a>> {
         ensure!(
             BackboneSharedWave::device_bytes(self.library, capacity)? <= budget,
