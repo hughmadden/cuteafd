@@ -210,9 +210,7 @@ def context_admission():
             else:
                 admitted = _admit_locked(root, per_worker, count, spacing)
         if admitted is not None:
-            # Every admission names the live contexts (parked planners included),
-            # so a later driver failure carries the host's context census.
-            print(f'{admitted}; host compute: {live_cuda_processes()}', flush=True)
+            print(admitted, flush=True)
             return
         if time.monotonic() >= deadline:
             raise TimeoutError('CUDA context waited 7200s for host RAM admission')
@@ -255,6 +253,10 @@ def _admit_locked(root, per_worker, count, spacing):
         except BlockingIOError:
             handle.close()
             continue
+        # Every admission names the live contexts (parked planners included),
+        # so a later driver failure carries the host's context census. Taken
+        # before the spacing wait: CUDA init must follow the spaced admission.
+        census = live_cuda_processes()
         # Spacing holds the admission lock, so waiters queue behind it.
         last_path = root / 'context-last-admit'
         try:
@@ -273,7 +275,8 @@ def _admit_locked(root, per_worker, count, spacing):
         atexit.register(handle.close)
         return (f'AOT context admitted: lease {index}/{count}, {per_worker} MiB reservation, '
                 f'{available} MiB free, {reserved} MiB already reserved; live contexts '
-                f'{leased} leased + {parked} parked before this one; memory PSI some avg10={memory_pressure():.2f}')
+                f'{leased} leased + {parked} parked before this one; memory PSI some avg10={memory_pressure():.2f}; '
+                f'host compute: {census}')
     return None
 
 
