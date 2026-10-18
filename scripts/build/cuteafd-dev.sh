@@ -38,6 +38,14 @@ docker_args=(
   -v "$hf_home:$hf_home:ro"
   -v "$hf_home:/root/.cache/huggingface:ro"
   -e HF_HOME="$hf_home"
+)
+# The host hub is usually a symlink into the shared store; mount its target too,
+# or the link dangles inside the container.
+if [[ -L "$hf_home/hub" ]]; then
+  hub_target="$(readlink -f "$hf_home/hub")"
+  [[ -d "$hub_target" ]] && docker_args+=(-v "$hub_target:$hub_target:ro")
+fi
+docker_args+=(
   -e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
   -e TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
   -e CUTEAFD_MODEL_ID="${CUTEAFD_MODEL_ID:-deepseek-ai/DeepSeek-V4.1-Flash}"
