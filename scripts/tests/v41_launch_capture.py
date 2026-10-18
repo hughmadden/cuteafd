@@ -41,7 +41,7 @@ HOSTS = ("ostrich", "dodo", "emu", "kiwi", "rhea", "moa")
 # The gate kit's two V4.1 cards (scripts/bench/kits/gate/matrix-gate.json), as
 # wip-cards.py generates their configs for a WIP arm.
 KIT_CARDS = ("v41-flash-max", "v41-flash-min")
-EXAMPLES = ("deepseek-v41-mxfp4-max", "deepseek-v41-mxfp4-min", "deepseek-v41-nvfp4-max", "deepseek-v41-nvfp4-min")
+EXAMPLES = ("deepseek-v41-mxfp4-max", "deepseek-v41-mxfp4-min")
 CASES = EXAMPLES + KIT_CARDS
 WIP_SLOT = "gate"
 

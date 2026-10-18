@@ -1472,7 +1472,7 @@ mod tests {
         let placed = scan(&root).unwrap();
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let rows = select(&placed, &matrix).unwrap();
-        assert_eq!(rows.len(), 14);
+        assert_eq!(rows.len(), 13);
         for row in rows {
             assert!(matches!(row.cells[0], Resolved::Pending(_)));
             assert!(matches!(row.cells[1], Resolved::Card(_)));

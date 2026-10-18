@@ -188,7 +188,7 @@ LOCAL_PLAN = {**SPARK_PLAN, "spark_ranks": 0, "encoder": {"kind": {"kind": "off"
 def test_one_starting_config_per_release_card() -> None:
     names = {p.name for p in starting_configs()}
     expected = {f"{model}-{profile}.config" for model in (
-        "deepseek-v41-mxfp4", "deepseek-v41-nvfp4", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
+        "deepseek-v41-mxfp4", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
         "glm53-exl3", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-nvfp4",
         "glm53-flash-tr3", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
     # Qwen fits one RTX: the 2x RTX column is n/a, so only min exists.
@@ -202,7 +202,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
     assert matrix["profile"] == "smoke"
     entries = matrix["entries"]
-    assert len(entries) == 28
+    assert len(entries) == 26
     assert len({entry["name"] for entry in entries}) == len(entries)
     defaults = matrix["defaults"]["set"]
     stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
@@ -238,7 +238,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
             assert values[key] not in ports
             ports.add(values[key])
         models.setdefault(values["MODEL_ID"], set()).add(len(entry["gpus"]))
-    assert len(models) == 14
+    assert len(models) == 13
     assert all(columns == {1, 2} for columns in models.values())
 
 
@@ -250,7 +250,7 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
     assert all("REPLACE-ME-v3-rc" in defaults[key] for key in
                ("COORDINATOR_DOCKER_INFERENCE", "SPARK_EXPERT_DOCKER_INFERENCE"))
     entries = {entry["name"]: entry for entry in matrix["entries"]}
-    assert len(entries) == len(matrix["entries"]) == 42
+    assert len(entries) == len(matrix["entries"]) == 39
     columns = {}
     ports = set()
     for name, entry in entries.items():
@@ -275,9 +275,9 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
             assert values["BENCH_HARDWARE_CLASS"] == "5090"
             assert len(entry["gpus"]) == 1
             assert "BENCH_SIMULATED" not in entry["set"]
-    assert len(columns) == 14
+    assert len(columns) == 13
     assert all(columns == {"min", "max"} for columns in columns.values())
-    assert len([name for name in entries if name.endswith("-5090")]) == 10
+    assert len([name for name in entries if name.endswith("-5090")]) == 9
     assert len(entries["v41-flash-reference-tp4"]["sparks"]) == 4
     assert len(entries["v41-flash-reference-tp6"]["sparks"]) == 6
     for name in ("glm53f-exl3-max", "qwen38-exl3-min", "qwen38-exl3-max", "qwen38-nvfp4-max"):

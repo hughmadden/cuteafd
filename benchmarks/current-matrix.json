@@ -18,22 +18,6 @@
       }
     },
     {
-      "family": "deepseek_v41",
-      "checkpoint": "nvidia/DeepSeek-V4.1-Flash-NVFP4",
-      "5090": {
-        "status": "pending",
-        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
-      },
-      "1rtx": {
-        "status": "current",
-        "report": "benchmarks/deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min"
-      },
-      "2rtx": {
-        "status": "current",
-        "report": "benchmarks/deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max"
-      }
-    },
-    {
       "family": "deepseek_v4",
       "checkpoint": "deepseek-ai/DeepSeek-V4-Flash-0731",
       "5090": {
