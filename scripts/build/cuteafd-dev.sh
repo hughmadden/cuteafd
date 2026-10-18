@@ -136,8 +136,9 @@ if [[ "$repo_root" != "/workspace/cuteafd" ]]; then
   docker_args+=(-v "$repo_root:$repo_root")
 fi
 # Worktree and submodule gitfiles resolve through the original checkout's metadata.
-git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)"
-if [[ "$git_common_dir" != "$repo_root/.git" ]]; then
+# A staged copy without Git metadata (verified against the lock above) mounts as is.
+if git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    && [[ "$git_common_dir" != "$repo_root/.git" ]]; then
   docker_args+=(-v "$git_common_dir:$git_common_dir:ro")
 fi
 # Relative gitfiles (worktrees, submodules) resolve only from the checkout's real
