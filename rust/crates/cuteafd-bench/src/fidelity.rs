@@ -4,6 +4,7 @@ use crate::reference::{Fidelity, Position};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
@@ -57,6 +58,35 @@ pub struct Comparison {
     pub tripwires: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibrated_tripwires: Option<CalibratedTripwires>,
+    /// Two quants of one reference root, not a precision switch on one checkpoint.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cross_checkpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<CrossCheckpoints>,
+}
+
+/// One arm's served checkpoint: its id and the snapshot revision that served it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointIdentity {
+    pub checkpoint: String,
+    pub revision: String,
+}
+
+/// Both checkpoints of a cross-checkpoint pair and the reference root both resolve to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CrossCheckpoints {
+    pub reference_root: String,
+    pub candidate: CheckpointIdentity,
+    pub baseline: CheckpointIdentity,
+}
+
+/// How two runs pair. `SameCheckpoint` is a precision switch on one checkpoint;
+/// `CrossCheckpoint` pairs two quants of one reference root on the same pinned set,
+/// resolving each checkpoint's ancestry through `fidelity_match` against `hub`.
+#[derive(Debug, Clone, Copy)]
+pub enum Pairing<'a> {
+    SameCheckpoint,
+    CrossCheckpoint { hub: &'a Path },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +108,10 @@ pub struct CalibratedTripwires {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullComparison {
     pub pass: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cross_checkpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<CrossCheckpoints>,
     pub decode: Comparison,
     pub prefill: Comparison,
 }
@@ -86,6 +120,14 @@ pub struct FullComparison {
 pub fn compare_full(
     a_decode: &Run, b_decode: &Run, a_prefill: &Run, b_prefill: &Run,
     bootstrap: usize, seed: u64,
+) -> Result<FullComparison> {
+    compare_full_paired(a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, Pairing::SameCheckpoint)
+}
+
+/// [`compare_full`] under an explicit pairing; each arm still keeps one checkpoint on both paths.
+pub fn compare_full_paired(
+    a_decode: &Run, b_decode: &Run, a_prefill: &Run, b_prefill: &Run,
+    bootstrap: usize, seed: u64, pairing: Pairing,
 ) -> Result<FullComparison> {
     for (decode, prefill) in [(a_decode, a_prefill), (b_decode, b_prefill)] {
         ensure!(decode.tier == "full" && prefill.tier == "full", "both paths must use the full tier");
@@ -98,9 +140,11 @@ pub fn compare_full(
         ensure!(decode.tripwire_expect == prefill.tripwire_expect,
             "scoring paths use different calibrated tripwire expectations");
     }
-    let decode = compare(a_decode, b_decode, 0.005, 0.005, bootstrap, seed)?;
-    let prefill = compare(a_prefill, b_prefill, 0.005, 0.005, bootstrap, seed)?;
-    Ok(FullComparison { pass: decode.pass && prefill.pass, decode, prefill })
+    let decode = compare_paired(a_decode, b_decode, 0.005, 0.005, bootstrap, seed, pairing)?;
+    let prefill = compare_paired(a_prefill, b_prefill, 0.005, 0.005, bootstrap, seed, pairing)?;
+    ensure!(decode.checkpoints == prefill.checkpoints, "scoring paths resolve to different checkpoints");
+    Ok(FullComparison { pass: decode.pass && prefill.pass, cross_checkpoint: decode.cross_checkpoint,
+        checkpoints: decode.checkpoints.clone(), decode, prefill })
 }
 
 /// Cluster-robust SE of a ratio-of-sums token mean, using whole windows as clusters.
@@ -235,7 +279,28 @@ fn absolute(run: &Run) -> bool {
         && score.groups("window").values().all(|w| w.top1 + 1e-12 >= 0.80)
 }
 
-fn comparison_settings(server: &serde_json::Value) -> Result<serde_json::Value> {
+/// Precision switches: the only settings a same-checkpoint pair may change. Scheduling,
+/// layout and unknown knobs stay fixed. GLM 5.3 Flash's kda-state (its KDA recurrent
+/// state's storage) and target-head (the target LM head's GEMM) change numerics only.
+const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-fp8", "fp8-prefill",
+    "fp8-decode", "mtp-fp8-head", "kv-cache", "kv-format", "expert-input", "kda-state", "target-head"];
+
+/// Quant selection: settings a cross-checkpoint pair may also change, beside the precision
+/// switches. Exact names only; each one picks which weights serve, nothing else.
+const QUANT_SELECTION_SETTINGS: &[&str] = &[
+    // The served checkpoint snapshot (the same path as the server's top-level snapshot).
+    "snapshot",
+    // Which published EXLR8 expert manifest (per-expert bit allocation) the native arm loads.
+    "exlr8-manifest",
+    // The official snapshot the native EXLR8 arm takes its dense (non-expert) operands from.
+    "exlr8-dense-from",
+];
+
+/// Top-level server fields naming the checkpoint, which differ between two checkpoints by
+/// definition: the served model id and the snapshot path.
+const QUANT_SELECTION_SERVER_FIELDS: &[&str] = &["model", "snapshot"];
+
+fn comparison_settings(server: &serde_json::Value, cross_checkpoint: bool) -> Result<serde_json::Value> {
     let mut normalized = server.clone();
     ensure!(normalized.is_object(), "missing server settings");
     if let Some(settings) = normalized.get_mut("settings") {
@@ -253,20 +318,67 @@ fn comparison_settings(server: &serde_json::Value) -> Result<serde_json::Value> 
                 continue;
             }
             seen.insert(name.to_owned(), value.clone());
-            // Only precision switches may differ; scheduling, layout and unknown knobs stay fixed.
-            // GLM 5.3 Flash's kda-state (its KDA recurrent state's storage) and target-head (the
-            // target LM head's GEMM) change numerics only.
-            if !matches!(name, "CUTEAFD_V41_FP8_HEAD" | "fp8-head" | "kda-fp8" | "fp8-prefill"
-                | "fp8-decode" | "mtp-fp8-head" | "kv-cache" | "kv-format" | "expert-input" | "kda-state" | "target-head") {
+            // A listed name may also be absent on one arm (an option only one checkpoint takes).
+            if !PRECISION_SETTINGS.contains(&name) && !(cross_checkpoint && QUANT_SELECTION_SETTINGS.contains(&name)) {
                 fixed.insert(name.to_owned(), value.clone());
             }
         }
         *settings = serde_json::to_value(fixed)?;
     }
+    if cross_checkpoint {
+        let object = normalized.as_object_mut().unwrap();
+        for field in QUANT_SELECTION_SERVER_FIELDS { object.remove(*field); }
+    }
     Ok(normalized)
 }
 
+/// The snapshot revision a run's server reports: the hub `snapshots/<revision>` leaf.
+fn snapshot_revision(run: &Run) -> Result<String> {
+    let snapshot = run.settings["snapshot"].as_str()
+        .with_context(|| format!("{} records no served snapshot", run.checkpoint))?;
+    let path = Path::new(snapshot);
+    ensure!(path.parent().and_then(Path::file_name).is_some_and(|name| name == "snapshots"),
+        "{} snapshot {snapshot} is not a hub snapshots/<revision> path", run.checkpoint);
+    Ok(path.file_name().context("snapshot revision")?.to_string_lossy().into_owned())
+}
+
+/// Both checkpoints must resolve through `fidelity_match` to one reference root, and that
+/// root must be the logit root of the pinned publication both runs scored against.
+fn cross_checkpoints(a: &Run, b: &Run, hub: &Path) -> Result<CrossCheckpoints> {
+    let dataset = a.dataset.as_ref().context("cross-checkpoint pairing requires a pinned published dataset")?;
+    let publication = crate::fidelity_match::PUBLICATIONS.iter()
+        .find(|p| dataset["repository"] == crate::fidelity_dataset::REPOSITORY
+            && dataset["revision"] == p.revision && dataset["config"] == p.config)
+        .with_context(|| format!("cross-checkpoint pairing requires a pinned publication, not {}@{} {}",
+            dataset["repository"], dataset["revision"], dataset["config"]))?;
+    let mut sides = Vec::new();
+    for run in [a, b] {
+        let snapshot = run.settings["snapshot"].as_str().map(Path::new);
+        let resolved = crate::fidelity_match::resolve_in(&run.checkpoint, snapshot, hub)
+            .with_context(|| format!("cannot resolve {} through fidelity_match", run.checkpoint))?;
+        if let Some(recorded) = &run.reference_selection {
+            ensure!(recorded.reference_root == resolved.reference_root,
+                "{} scored against reference root {} but resolves to {}", run.checkpoint,
+                recorded.reference_root, resolved.reference_root);
+        }
+        sides.push((CheckpointIdentity { checkpoint: run.checkpoint.clone(), revision: snapshot_revision(run)? },
+            resolved.reference_root));
+    }
+    let (baseline, baseline_root) = sides.pop().unwrap();
+    let (candidate, candidate_root) = sides.pop().unwrap();
+    ensure!(candidate_root == publication.root && baseline_root == publication.root,
+        "cross-checkpoint runs must resolve to the dataset's reference root {}: candidate {} resolves to {}, baseline {} resolves to {}",
+        publication.root, candidate.checkpoint, candidate_root, baseline.checkpoint, baseline_root);
+    Ok(CrossCheckpoints { reference_root: publication.root.into(), candidate, baseline })
+}
+
 pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: usize, seed: u64) -> Result<Comparison> {
+    compare_paired(a, b, top1_margin, kl_margin, bootstrap, seed, Pairing::SameCheckpoint)
+}
+
+/// [`compare`] under an explicit pairing. Statistics and bars are the same for both.
+pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: usize, seed: u64,
+    pairing: Pairing) -> Result<Comparison> {
     ensure!(top1_margin.is_finite() && top1_margin > 0.0 && kl_margin.is_finite() && kl_margin > 0.0,
         "margins must be positive and finite");
     ensure!(bootstrap >= 100, "at least 100 bootstrap replicates required");
@@ -282,14 +394,25 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
         }
     }
     ensure!(!a.checkpoint.is_empty() && !a.set_sha256.is_empty() && !a.reference_sha256.is_empty(), "missing provenance");
-    ensure!(a.checkpoint == b.checkpoint && a.set_sha256 == b.set_sha256 && a.reference_sha256 == b.reference_sha256,
-        "runs use different checkpoints, sets or references");
+    let cross = matches!(pairing, Pairing::CrossCheckpoint { .. });
+    if cross {
+        ensure!(!b.checkpoint.is_empty() && a.set_sha256 == b.set_sha256 && a.reference_sha256 == b.reference_sha256,
+            "runs use different sets or references");
+    } else {
+        ensure!(a.checkpoint == b.checkpoint && a.set_sha256 == b.set_sha256 && a.reference_sha256 == b.reference_sha256,
+            "runs use different checkpoints, sets or references");
+    }
     ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows && a.dataset == b.dataset,
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
     ensure!(a.engine == b.engine && a.settings.get("build") == b.settings.get("build")
-        && a.settings.get("snapshot") == b.settings.get("snapshot"), "runs use different engines, builds or snapshots");
-    ensure!(comparison_settings(&a.settings)? == comparison_settings(&b.settings)?,
-        "runs use different nonprecision server settings");
+        && (cross || a.settings.get("snapshot") == b.settings.get("snapshot")), "runs use different engines, builds or snapshots");
+    let checkpoints = match pairing {
+        Pairing::SameCheckpoint => None,
+        Pairing::CrossCheckpoint { hub } => Some(cross_checkpoints(a, b, hub)?),
+    };
+    ensure!(comparison_settings(&a.settings, cross)? == comparison_settings(&b.settings, cross)?, "{}",
+        if cross { "runs use different server settings outside the precision and quant-selection lists" }
+        else { "runs use different nonprecision server settings" });
     ensure!(matches!(a.path_shape.as_str(), "decode-shaped" | "prefill-shaped"), "unknown scoring shape");
     ensure!(matches!(a.tier.as_str(), "full" | "standard-v2") || a.path_shape == "decode-shaped",
         "Quick and legacy Standard must be decode-shaped");
@@ -398,7 +521,8 @@ pub fn compare(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootstrap: us
         top1_se_bootstrap: se, kl_delta, kl_upper95: kl_upper,
         kl_se_clustered: clustered_se(&stats.iter().map(|s| s[1]).collect::<Vec<_>>(), &counts),
         mcnemar_p: if discordant == 0 { 1.0 } else { erfc((chi2 / 2.0).sqrt()) },
-        top1_margin, kl_margin, bootstrap, seed, absolute_pass, tripwires, calibrated_tripwires })
+        top1_margin, kl_margin, bootstrap, seed, absolute_pass, tripwires, calibrated_tripwires,
+        cross_checkpoint: cross, checkpoints })
 }
 
 #[cfg(test)]
@@ -690,6 +814,154 @@ mod tests {
         conflict.settings["settings"][4]["value"] = serde_json::json!("auto");
         let error = compare(&conflict, &baseline, 0.005, 0.005, 100, 1).unwrap_err().to_string();
         assert!(error.contains("attention-placement") && error.contains("conflicting values"), "{error}");
+    }
+
+    const EXLR8: &str = "kindlingai/glm-5.3-exlr8-k2-k3-k4";
+    const EXL3: &str = "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1";
+
+    /// A hub snapshot with a model card, as the published quants ship it.
+    fn card(hub: &Path, model: &str, revision: &str, yaml: &str) -> String {
+        let path = hub.join(format!("models--{}", model.replace('/', "--"))).join("snapshots").join(revision);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("config.json"), r#"{"architectures":["GlmMoeDsaForCausalLM"]}"#).unwrap();
+        std::fs::write(path.join("README.md"), format!("---\n{yaml}\n---\n# Model\n")).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// One GLM 5.3 arm scored on the pinned EXL3-K4/BF16-root set, as its server reports it.
+    fn glm_arm(model: &str, snapshot: &str, native: bool) -> Run {
+        let mut r = run(3, 8);
+        r.checkpoint = model.into();
+        r.dataset = Some(serde_json::json!({"repository": crate::fidelity_dataset::REPOSITORY,
+            "revision": crate::fidelity_dataset::GLM_REVISION, "config": crate::fidelity_dataset::GLM_CONFIG,
+            "qualification": "paired qualified", "text_checkpoint": "zai-org/GLM-5.3"}));
+        let mut settings = vec![
+            serde_json::json!({"name": "snapshot", "value": snapshot, "source": "cli"}),
+            serde_json::json!({"name": "pool-tokens", "value": "0", "default": "262144", "source": "cli"}),
+            serde_json::json!({"name": "attention-placement", "value": "context", "source": "resolved"}),
+        ];
+        if native {
+            settings.push(serde_json::json!({"name": "exlr8-manifest", "value": "up1", "source": "cli"}));
+            settings.push(serde_json::json!({"name": "exlr8-dense-from",
+                "value": "/hub/models--zai-org--GLM-5.3/snapshots/abc", "source": "cli"}));
+        }
+        r.settings = serde_json::json!({"model": model, "family": "glm5", "snapshot": snapshot,
+            "build": {"version": "3.0.1", "commit": "0123abc", "dirty": false}, "settings": settings});
+        r
+    }
+
+    /// The EXLR8 candidate and the EXL3 K4 baseline, each from its own local card.
+    fn exlr8_exl3_pair(hub: &Path) -> (Run, Run) {
+        let native = card(hub, EXLR8, "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80",
+            "base_model: zai-org/GLM-5.3-BF16\nbase_model_relation: quantized");
+        let exl3 = card(hub, EXL3, "47af23347db743b4666d952e2eb48f2b01c3fede", "base_model: zai-org/GLM-5.3");
+        (glm_arm(EXLR8, &native, true), glm_arm(EXL3, &exl3, false))
+    }
+
+    #[test]
+    fn cross_checkpoint_pairs_two_quants_of_one_reference_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path();
+        let cross = Pairing::CrossCheckpoint { hub };
+        let (a, b) = exlr8_exl3_pair(hub);
+        let c = compare_paired(&a, &b, 0.005, 0.005, 100, 1, cross).unwrap();
+        assert!(c.pass && c.cross_checkpoint);
+        let checkpoints = c.checkpoints.as_ref().unwrap();
+        assert_eq!(checkpoints.reference_root, "zai-org/GLM-5.3-BF16");
+        assert_eq!(checkpoints.candidate, CheckpointIdentity { checkpoint: EXLR8.into(),
+            revision: "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80".into() });
+        assert_eq!(checkpoints.baseline, CheckpointIdentity { checkpoint: EXL3.into(),
+            revision: "47af23347db743b4666d952e2eb48f2b01c3fede".into() });
+        let saved = serde_json::to_value(&c).unwrap();
+        assert_eq!(saved["cross_checkpoint"], true);
+        assert_eq!(saved["checkpoints"]["candidate"]["checkpoint"], EXLR8);
+        assert_eq!(saved["checkpoints"]["baseline"]["revision"], "47af23347db743b4666d952e2eb48f2b01c3fede");
+        // The same pair as a full decision, on both scoring shapes.
+        let (mut a_prefill, mut b_prefill) = (a.clone(), b.clone());
+        for r in [&mut a_prefill, &mut b_prefill] { r.path_shape = "prefill-shaped".into(); r.verify_rows = None; }
+        let full = compare_full_paired(&a, &b, &a_prefill, &b_prefill, 100, 1, cross).unwrap();
+        assert!(full.pass && full.cross_checkpoint);
+        assert_eq!(full.checkpoints.as_ref(), Some(checkpoints));
+        let saved = serde_json::to_value(&full).unwrap();
+        assert_eq!(saved["cross_checkpoint"], true);
+        assert_eq!(saved["checkpoints"]["candidate"]["checkpoint"], EXLR8);
+        // Precision switches may still differ alongside quant selection.
+        let mut precision = a.clone();
+        precision.settings["settings"].as_array_mut().unwrap()
+            .push(serde_json::json!({"name": "expert-input", "value": "rotated"}));
+        assert!(compare_paired(&precision, &b, 0.005, 0.005, 100, 1, cross).unwrap().pass);
+        // A same-checkpoint report carries no cross-checkpoint fields.
+        let same = serde_json::to_value(compare(&b, &b, 0.005, 0.005, 100, 1).unwrap()).unwrap();
+        assert!(same.get("cross_checkpoint").is_none() && same.get("checkpoints").is_none());
+    }
+
+    #[test]
+    fn without_the_flag_a_cross_quant_pair_is_refused_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = exlr8_exl3_pair(tmp.path());
+        let error = compare(&a, &b, 0.005, 0.005, 100, 1).unwrap_err().to_string();
+        assert_eq!(error, "runs use different checkpoints, sets or references");
+        let (mut a_prefill, mut b_prefill) = (a.clone(), b.clone());
+        for r in [&mut a_prefill, &mut b_prefill] { r.path_shape = "prefill-shaped".into(); r.verify_rows = None; }
+        let error = compare_full(&a, &b, &a_prefill, &b_prefill, 100, 1).unwrap_err().to_string();
+        assert_eq!(error, "runs use different checkpoints, sets or references");
+    }
+
+    #[test]
+    fn cross_checkpoint_refuses_other_roots_sets_references_builds_and_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path();
+        let cross = Pairing::CrossCheckpoint { hub };
+        let (a, b) = exlr8_exl3_pair(hub);
+        let refused = |a: &Run, b: &Run| compare_paired(a, b, 0.005, 0.005, 100, 1, cross).unwrap_err().to_string();
+        // A quant of another root, on the GLM 5.3 set: both resolved roots are named.
+        let flash = "org/GLM-5.3-Flash-EXL3";
+        let path = card(hub, flash, "f".repeat(40).as_str(), "base_model: zai-org/GLM-5.3-Flash\nbase_model_relation: quantized");
+        let other = glm_arm(flash, &path, false);
+        let error = refused(&a, &other);
+        assert!(error.contains("zai-org/GLM-5.3-BF16") && error.contains("zai-org/GLM-5.3-Flash-BF16"), "{error}");
+        // Both arms on another root's checkpoints still fail against this set's root.
+        let error = refused(&other, &other);
+        assert!(error.contains("dataset's reference root zai-org/GLM-5.3-BF16"), "{error}");
+        // A different set, reference, build or unpinned dataset.
+        let mut changed = a.clone(); changed.set_sha256 = "other".into();
+        assert_eq!(refused(&changed, &b), "runs use different sets or references");
+        changed = a.clone(); changed.reference_sha256 = "other".into();
+        assert_eq!(refused(&changed, &b), "runs use different sets or references");
+        changed = a.clone(); changed.settings["build"]["commit"] = serde_json::json!("4567def");
+        assert_eq!(refused(&changed, &b), "runs use different engines, builds or snapshots");
+        changed = a.clone(); changed.engine = "other".into();
+        assert_eq!(refused(&changed, &b), "runs use different engines, builds or snapshots");
+        let (mut a_set, mut b_set) = (a.clone(), b.clone());
+        for r in [&mut a_set, &mut b_set] {
+            r.dataset.as_mut().unwrap()["config"] = serde_json::json!(crate::fidelity_dataset::GLMF_CONFIG);
+        }
+        assert!(refused(&a_set, &b_set).contains("requires a pinned publication"));
+        for r in [&mut a_set, &mut b_set] { r.dataset = None; }
+        assert!(refused(&a_set, &b_set).contains("requires a pinned published dataset"));
+        // A setting outside both lists, including one sharing a listed name's prefix.
+        for (name, value) in [("pool-tokens", "32768"), ("attention-placement", "heads"), ("exlr8-manifest-extra", "x")] {
+            changed = a.clone();
+            let settings = changed.settings["settings"].as_array_mut().unwrap();
+            settings.retain(|s| s["name"] != name);
+            settings.push(serde_json::json!({"name": name, "value": value}));
+            assert!(refused(&changed, &b).contains("outside the precision and quant-selection lists"), "{name}");
+        }
+        // A top-level server field other than the checkpoint's model id and snapshot.
+        changed = a.clone(); changed.settings["family"] = serde_json::json!("glm5_flash");
+        assert!(refused(&changed, &b).contains("outside the precision and quant-selection lists"));
+        // A recorded reference selection that disagrees with the resolved root.
+        changed = a.clone();
+        changed.reference_selection = Some(crate::fidelity_match::Resolution { reference_match: "base_model".into(),
+            reference_root: "zai-org/GLM-5.3-Flash-BF16".into(), text_checkpoint: None, resolved_chain: Vec::new(),
+            revision: String::new(), config: String::new() });
+        assert!(refused(&changed, &b).contains("scored against reference root"));
+        // A local snapshot outside the hub's snapshots/<revision> layout cannot name its revision.
+        let loose = hub.join("weights/exlr8");
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::write(loose.join("README.md"), "---\nbase_model: zai-org/GLM-5.3-BF16\nbase_model_relation: quantized\n---\n").unwrap();
+        changed = a.clone(); changed.settings["snapshot"] = serde_json::json!(loose.to_string_lossy());
+        assert!(refused(&changed, &b).contains("hub snapshots/<revision> path"));
     }
 
     #[test]
