@@ -56,81 +56,82 @@ Full notes: [v3.0.0 release](https://github.com/tpurtell/cuteafd/releases/tag/v3
 
 One basic-profile card per model and quant on this release: the natural minimum
 (1× RTX + the fewest Sparks) or maximum (2× RTX + 4 or 6 Sparks). The 5090
-column publishes only real RTX 5090 measurements. Earlier releases, simulated
-5090 cards and every other report: [benchmarks](benchmarks/README.md).
+column is simulated on an RTX PRO 6000 capped at 31.8 GiB (memory only, not
+SM count or clocks) until real RTX 5090 cards replace it. Earlier releases and
+every other report: [benchmarks](benchmarks/README.md).
 
 <!-- results:begin -->
 <table>
 <tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/deepseek_v41.md"><b>DeepSeek V4.1</b></a><br><sub>deepseek-ai/DeepSeek-V4.1-Flash-1017</sub><br><sub>mxfp4-g32</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090/card.svg"><img src="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash-1017 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 3 Spark"></a><br><sub>simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 3 Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min/card.svg"><img src="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash-1017 on 1× RTX PRO 6000 @ gpu-powerd 550 W (500–600) + 3× DGX Spark"></a><br><sub>1× RTX + 3× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-2rtx-4spark-v41-flash-max/card.svg"><img src="benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-2rtx-4spark-v41-flash-max/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash-1017 on 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/deepseek_v4.md"><b>DeepSeek V4</b></a><br><sub>deepseek-ai/DeepSeek-V4-Flash-0731</sub><br><sub>mxfp4-g32</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-5090/card.svg"><img src="benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-5090/card.svg" alt="deepseek-ai/DeepSeek-V4-Flash-0731 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark"></a><br><sub>simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min/card.svg"><img src="benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min/card.svg" alt="deepseek-ai/DeepSeek-V4-Flash-0731 on 1× RTX PRO 6000 @ gpu-powerd 460/435 W (395–500) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/deepseek_v4.md"><b>DeepSeek V4</b></a><br><sub>wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1</sub><br><sub>exl3-k2</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top">n/a<br><sub>Doesn&#39;t fit one 32 GB card with this checkpoint.</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max/card.svg"><img src="benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max/card.svg" alt="wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 on 2× RTX PRO 6000 @ gpu-powerd 450/445 W (300–550) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5.md"><b>GLM 5.3</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1</sub><br><sub>exl3-k4</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top">n/a<br><sub>Doesn&#39;t fit one 32 GB card with this checkpoint.</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5/2026-10-18-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min/card.svg"><img src="benchmarks/glm5/2026-10-18-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min/card.svg" alt="wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 on 1× RTX PRO 6000 @ gpu-powerd 335/510 W (265–600) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5.md"><b>GLM 5.3</b></a><br><sub>nvidia/GLM-5.3-NVFP4</sub><br><sub>nvfp4-g16</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top">n/a<br><sub>Doesn&#39;t fit one 32 GB card with this checkpoint.</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5/2026-10-18-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min/card.svg"><img src="benchmarks/glm5/2026-10-18-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min/card.svg" alt="nvidia/GLM-5.3-NVFP4 on 1× RTX PRO 6000 @ gpu-powerd 480/405 W (200–600) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1</sub><br><sub>exl3-k3+exl3-k4</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090/card.svg"><img src="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark"></a><br><sub>simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-min/card.svg"><img src="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-min/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 on 1× RTX PRO 6000 @ gpu-powerd 415/465 W (300–600) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-2rtx-glm53f-exl3-max/card.svg"><img src="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-2rtx-glm53f-exl3-max/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 on 2× RTX PRO 6000 @ gpu-powerd 455/440 W (300–570)"></a><br><sub>2× RTX</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>nvidia/GLM-5.3-Flash-NVFP4</sub><br><sub>nvfp4-g16</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090/card.svg"><img src="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090/card.svg" alt="nvidia/GLM-5.3-Flash-NVFP4 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark"></a><br><sub>simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/card.svg"><img src="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/card.svg" alt="nvidia/GLM-5.3-Flash-NVFP4 on 1× RTX PRO 6000 @ gpu-powerd 355/535 W (255–600) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>brandonmusic/GLM-5.3-Flash-tr3-4bpw</sub><br><sub>exl3-k4</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090/card.svg"><img src="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090/card.svg" alt="brandonmusic/GLM-5.3-Flash-tr3-4bpw on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark"></a><br><sub>simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min/card.svg"><img src="benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min/card.svg" alt="brandonmusic/GLM-5.3-Flash-tr3-4bpw on 1× RTX PRO 6000 @ gpu-powerd 300/585 W (240–600) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/mimo_v2.md"><b>MiMo V2</b></a><br><sub>XiaomiMiMo/MiMo-V2.6-Flash-MOPD</sub><br><sub>mxfp4-g32</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-5090/card.svg"><img src="benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-5090/card.svg" alt="XiaomiMiMo/MiMo-V2.6-Flash-MOPD on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark"></a><br><sub>simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min/card.svg"><img src="benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min/card.svg" alt="XiaomiMiMo/MiMo-V2.6-Flash-MOPD on 1× RTX PRO 6000 @ gpu-powerd 310/570 W (240–600) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/mimo_v2.md"><b>MiMo V2</b></a><br><sub>XiaomiMiMo/MiMo-V2.6-Pro-MOPD</sub><br><sub>mxfp4-g32</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top">n/a<br><sub>Doesn&#39;t fit one 32 GB card with this checkpoint.</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/card.svg"><img src="benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/card.svg" alt="XiaomiMiMo/MiMo-V2.6-Pro-MOPD on 2× RTX PRO 6000 @ gpu-powerd 435/380 W (200–535) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/qwen4.md"><b>Qwen 3.8</b></a><br><sub>wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1</sub><br><sub>exl3-k4+exl3-k5</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-1spark-qwen38-exl3-5090/card.svg"><img src="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-1spark-qwen38-exl3-5090/card.svg" alt="wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 1 Spark"></a><br><sub>simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 1 Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg"><img src="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg" alt="wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 on 1× RTX PRO 6000 @ gpu-powerd 325/565 W (260–600)"></a><br><sub>1× RTX</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/qwen4.md"><b>Qwen 3.8</b></a><br><sub>nvidia/Qwen3.8-Flash-Next-NVFP4</sub><br><sub>nvfp4-g16</sub></td>
-<td width="27%" valign="top">pending<br><sub>Awaiting real RTX 5090 exports; simulated cards are in benchmarks/.</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090/card.svg"><img src="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090/card.svg" alt="nvidia/Qwen3.8-Flash-Next-NVFP4 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark"></a><br><sub>simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min/card.svg"><img src="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min/card.svg" alt="nvidia/Qwen3.8-Flash-Next-NVFP4 on 1× RTX PRO 6000 @ gpu-powerd 450/450 W + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 </tr>

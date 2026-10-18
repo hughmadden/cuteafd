@@ -386,24 +386,31 @@ fn card_for<'a>(placed: &'a [Placed], row: &MatrixRow, column: Column, pinned: O
         placed.iter().filter(|p| {
             let report = &p.report;
             let in_column = match column {
+                // A real RTX 5090, or our simulated one (a PRO 6000 capped at 31.8 GiB),
+                // which the card and caption label as simulated.
                 Column::Rtx5090 => report.server.column_5090()
                     && report.server.hardware.used_gpus() == 1
-                    && report.server.hardware.gpus.iter()
+                    && (report.server.simulated_5090() || report.server.hardware.gpus.iter()
                         .filter(|g| g.used || !report.server.hardware.gpus.iter().any(|g| g.used))
-                        .all(|g| g.name.contains("RTX 5090")),
+                        .all(|g| g.name.contains("RTX 5090"))),
                 Column::OneRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 1,
                 Column::TwoRtx => !report.server.column_5090() && report.server.hardware.used_gpus() == 2,
             };
             accepted(report) && in_column
                 && report.server.family.as_deref().unwrap_or("unknown") == row.family
                 && report.server.checkpoint() == row.checkpoint
-                && !report.server.simulated_5090()
+                && (column == Column::Rtx5090 || !report.server.simulated_5090())
                 && pinned.is_none_or(|dir| p.dir == dir)
         }).collect()
     };
     let reports = candidates();
-    if pinned.is_some() || column == Column::Rtx5090 {
+    if pinned.is_some() {
         return newest(reports);
+    }
+    if column == Column::Rtx5090 {
+        // Real 5090 hardware supersedes our simulated card whenever one exists.
+        let (simulated, real): (Vec<_>, Vec<_>) = reports.into_iter().partition(|p| p.report.server.simulated_5090());
+        return newest(if real.is_empty() { simulated } else { real });
     }
     if let Some(reference) = column.reference() {
         if reports.iter().any(|p| reference_layout(p) == Some(reference)) {
@@ -947,11 +954,14 @@ mod tests {
     }
 
     #[test]
-    fn simulated_cards_never_fill_a_current_cell() {
+    fn simulated_cards_fill_only_the_5090_column() {
         let sim = marked("sim", 1, Some(("simulated", "5090")));
         let real = marked("real", 1, Some(("hardware.class", "5090")));
         let matrix = v41_row([Cell::current(), Cell::pending("no PRO card"), Cell::pending("no dual card")]);
-        assert!(select(&[sim.clone()], &matrix).is_err());
+        assert_eq!(cards(&select(&[sim.clone()], &matrix).unwrap()[0])[0], Some("sim"));
+        // A simulated card never fills a PRO column.
+        let pro = v41_row([Cell::pending("no 5090"), Cell::current(), Cell::pending("no dual card")]);
+        assert!(select(&[sim.clone()], &pro).is_err());
         let mut mislabelled = real.clone();
         mislabelled.report.server.hardware.gpus[0].name = "NVIDIA RTX PRO 6000 Blackwell".into();
         assert!(select(&[mislabelled], &matrix).is_err());
@@ -1433,7 +1443,7 @@ mod tests {
         let rows = select(&placed, &matrix).unwrap();
         assert_eq!(rows.len(), 12);
         for row in rows {
-            assert!(matches!(row.cells[0], Resolved::Pending(_)));
+            assert!(matches!(row.cells[0], Resolved::Card(_) | Resolved::Na(_)));
             // One release card per checkpoint; the other PRO column is n/a.
             assert!(row.cells[1..].iter().any(|c| matches!(c, Resolved::Card(_))));
             assert!(row.cells[1..].iter().all(|c| matches!(c, Resolved::Card(_) | Resolved::Na(_))));

@@ -5,8 +5,8 @@
    "family": "deepseek_v41",
    "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "current",
+    "report": "benchmarks/deepseek_v41/2026-10-18-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090"
    },
    "1rtx": {
     "status": "current",
@@ -21,8 +21,8 @@
    "family": "deepseek_v4",
    "checkpoint": "deepseek-ai/DeepSeek-V4-Flash-0731",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "current",
+    "report": "benchmarks/deepseek_v4/2026-10-18-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-5090"
    },
    "1rtx": {
     "status": "current",
@@ -37,8 +37,8 @@
    "family": "deepseek_v4",
    "checkpoint": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "na",
+    "reason": "Doesn't fit one 32 GB card with this checkpoint."
    },
    "1rtx": {
     "status": "na",
@@ -53,8 +53,8 @@
    "family": "glm5",
    "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "na",
+    "reason": "Doesn't fit one 32 GB card with this checkpoint."
    },
    "1rtx": {
     "status": "current",
@@ -69,8 +69,8 @@
    "family": "glm5",
    "checkpoint": "nvidia/GLM-5.3-NVFP4",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "na",
+    "reason": "Doesn't fit one 32 GB card with this checkpoint."
    },
    "1rtx": {
     "status": "current",
@@ -85,8 +85,8 @@
    "family": "glm5_flash",
    "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "current",
+    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090"
    },
    "1rtx": {
     "status": "current",
@@ -101,8 +101,8 @@
    "family": "glm5_flash",
    "checkpoint": "nvidia/GLM-5.3-Flash-NVFP4",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "current",
+    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090"
    },
    "1rtx": {
     "status": "current",
@@ -117,8 +117,8 @@
    "family": "glm5_flash",
    "checkpoint": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "current",
+    "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090"
    },
    "1rtx": {
     "status": "current",
@@ -133,8 +133,8 @@
    "family": "mimo_v2",
    "checkpoint": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "current",
+    "report": "benchmarks/mimo_v2/2026-10-18-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-5090"
    },
    "1rtx": {
     "status": "current",
@@ -149,8 +149,8 @@
    "family": "mimo_v2",
    "checkpoint": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "na",
+    "reason": "Doesn't fit one 32 GB card with this checkpoint."
    },
    "1rtx": {
     "status": "na",
@@ -165,8 +165,8 @@
    "family": "qwen4",
    "checkpoint": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "current",
+    "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-1spark-qwen38-exl3-5090"
    },
    "1rtx": {
     "status": "current",
@@ -181,8 +181,8 @@
    "family": "qwen4",
    "checkpoint": "nvidia/Qwen3.8-Flash-Next-NVFP4",
    "5090": {
-    "status": "pending",
-    "reason": "Awaiting real RTX 5090 exports; simulated cards are in benchmarks/."
+    "status": "current",
+    "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090"
    },
    "1rtx": {
     "status": "current",

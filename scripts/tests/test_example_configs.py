@@ -311,11 +311,14 @@ def test_v3_5090_precheck_requires_real_hardware(tmp_path: Path, gpu_name: str, 
         assert result.returncode == expected, entry["name"]
 
 
-def test_published_matrix_pins_current_reports_and_keeps_5090_pending() -> None:
+def test_published_matrix_pins_current_reports() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     assert len(matrix["cells"]) == 12
     for row in matrix["cells"]:
-        assert row["5090"]["status"] == "pending"
+        # The 5090 column carries our simulated card where the checkpoint fits 32 GB.
+        assert row["5090"]["status"] in ("current", "na")
+        if row["5090"]["status"] == "current":
+            assert row["5090"]["report"].endswith("-5090")
         current = [row[c] for c in ("1rtx", "2rtx") if row[c]["status"] == "current"]
         # v3 publishes one card per checkpoint (two for V4.1 and GLM Flash EXL3).
         assert current and all(row[c]["status"] in ("current", "na") for c in ("1rtx", "2rtx"))
