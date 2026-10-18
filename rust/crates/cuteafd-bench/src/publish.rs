@@ -2,7 +2,6 @@
 //! matrix, each cell resolved to one accepted report) and the
 //! `benchmarks/README.md` index, both rebuilt from the `report.json` files
 //! under `benchmarks/<family>/<date>-<profile>-<hardware>/`.
-use crate::render::{rate, seconds};
 use crate::report::{CheckStatus, Report};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -472,11 +471,12 @@ pub fn select<'a>(placed: &'a [Placed], matrix: &Matrix) -> Result<Vec<Row<'a>>>
     Ok(rows)
 }
 
-fn quality_cell(b: &crate::report::Baseline) -> String {
-    match b.quality.status {
-        CheckStatus::Fail => format!("⚠ **FAILED** {}", crate::render::bodies::quality_line(b)),
-        CheckStatus::Pass => format!("✓ {}", b.quality.badge()),
-        _ => b.quality.badge(),
+// A failed quality gate stays visible under its card; a passing one is on the card.
+fn quality_note(p: &Placed) -> String {
+    match p.report.baseline.as_ref() {
+        Some(b) if b.quality.status == CheckStatus::Fail =>
+            format!("<br><sub>⚠ <b>FAILED</b> {}</sub>", crate::render::svg::escape(&crate::render::bodies::quality_line(b))),
+        _ => String::new(),
     }
 }
 
@@ -519,9 +519,11 @@ fn grid_cell(cell: &Resolved) -> String {
                     crate::render::svg::escape(reason), caveat(p));
             }
             let svg = link(&p.dir, "card.svg");
+            let hardware = p.report.server.setting("qualification.hardware-label").map(str::to_string)
+                .unwrap_or_else(|| short_hardware(&p.report));
             format!("<td width=\"27%\" valign=\"top\"><a href=\"{svg}\"><img src=\"{svg}\" alt=\"{} on {}\"></a>\
-                <br><sub>{}</sub>{}</td>", p.report.server.checkpoint(), p.report.server.hardware_line(),
-                short_hardware(&p.report), caveat(p))
+                <br><sub>{}</sub>{}{}</td>", p.report.server.checkpoint(), p.report.server.hardware_line(),
+                crate::render::svg::escape(&hardware), quality_note(p), caveat(p))
         }
         Resolved::Held(reason) => status_cell("held", reason),
         Resolved::Pending(reason) => status_cell("pending", reason),
@@ -530,40 +532,10 @@ fn grid_cell(cell: &Resolved) -> String {
     }
 }
 
-/// One compact-table row: the same data as the cell's card, or why it has none.
-fn table_row(row: &Row, column: Column, cell: &Resolved) -> String {
-    let head = format!("| [{}](docs/models/{}.md) | {} | ", family_title(&row.family), row.family, row.label);
-    match cell {
-        Resolved::Held(reason) => format!("{head}— ({}) | — | — | — | — | — | — | — | held: {} | — |\n",
-            column.title(), reason.replace('|', "\\|")),
-        Resolved::Card(p) => {
-            let r = &p.report;
-            if let Some(reason) = r.no_fit_reason() {
-                return format!("{head}{} ({}) | — | — | — | — | — | — | — | doesn't fit: {} | [planner report]({}) |\n",
-                    short_hardware(r), column.title(), reason.replace('|', "\\|"), link(&p.dir, "report.json"));
-            }
-            let b = r.baseline.as_ref().expect("accepted");
-            let decode = |content: &str| b.card.decode_of(content).map_or("—".into(), |d| rate(d.tok_s));
-            let concurrent = r.server.card_levels().iter().filter_map(|width| b.card.concurrent_at(*width))
-                .map(|c| format!("C{}: {}", c.width, rate(c.aggregate_tok_s))).collect::<Vec<_>>().join(" · ");
-            let concurrent = if concurrent.is_empty() { "—".into() } else { concurrent };
-            let (prefill, ttft) = b.card.prefill.as_ref()
-                .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
-            let hardware = r.server.setting("qualification.hardware-label").map(str::to_string)
-                .unwrap_or_else(|| format!("{} ({})", short_hardware(r), column.title()));
-            format!("{head}{hardware} | {} | {} | {concurrent} | {} | {} | {prefill} | {ttft} | {} | \
-                [{} · {}]({}) |\n", r.capacity().compact(), decode("code"), decode("prose"),
-                decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
-                link(&p.dir, "report.svg"))
-        }
-        Resolved::Pending(_) | Resolved::Na(_) | Resolved::Missing => String::new(),
-    }
-}
-
 /// The root README's results: one row per checkpoint of the published matrix
 /// (the checkpoint and quant linking to its family page, then its three
-/// reference-column cards, each linking to the card SVG), then the same rows as
-/// a compact table.
+/// reference-column cards, each linking to the card SVG), then a link to the
+/// benchmarks index for everything older.
 pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     let rows = select(placed, matrix)?;
     if rows.is_empty() {
@@ -586,18 +558,9 @@ pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
         out.push_str("</tr>\n");
     }
     out.push_str("</table>\n\n");
-    out.push_str("| Family | Checkpoint | Hardware | KV / req | C1 code | Concurrent code (aggregate) | prose | JSON | 8K prefill | TTFT | Quality | Report |\n");
-    out.push_str("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
-    for row in &rows {
-        for (column, cell) in Column::ALL.iter().zip(&row.cells) {
-            out.push_str(&table_row(row, *column, cell));
-        }
-    }
-    out.push_str("\ntok/s; C1 decode and concurrent code aggregate with thinking off (C1/C4/C8/C16 on PRO 6000; through C8 at ≤32 GiB, within server admission), \
-        8K prefill cold. Quality: logit fidelity against the family golden \
-        reference, prefix-cache restore exactness, lossless speculation. Every row is \
-        `benchmarks/current-matrix.json` resolved against the reports under `benchmarks/`; a held or \
-        pending cell renders why it has no card. The 5090 column publishes real hardware only.\n");
+    out.push_str("Each card is one launch of the basic profile: tok/s for C1 decode and concurrent code with thinking \
+        off, cold 8K prefill, logit fidelity against the family golden reference, prefix-cache restore exactness \
+        and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).\n");
     Ok(out)
 }
 
@@ -915,25 +878,22 @@ mod tests {
     }
 
     #[test]
-    fn held_cells_render_their_reason_and_keep_a_compact_row() {
+    fn held_cells_render_their_reason() {
         let reports = vec![marked("sim", 1, Some(("hardware.class", "5090"))), marked("one", 1, None), marked("two", 2, None)];
         let held = "W4A4 small-M path costs 13% per verify row vs the rc3 W4A16 card (#233)";
         let matrix = v41_row([Cell::current(), Cell::held(held), Cell::current()]);
         let html = results(&reports, &matrix).unwrap();
-        let (grid, table) = html.split_once("</table>").unwrap();
+        let grid = &html;
         assert!(grid.contains(&format!("held<br><sub>{held}</sub>")), "{grid}");
         assert!(!grid.contains("one/card.svg"), "a held cell publishes no card");
         // The 5090 cell of the same row still publishes: holding is per cell.
         assert!(grid.contains("sim/card.svg"));
         assert_eq!(html.matches("<img src=").count(), 2);
-        let row = table.lines().find(|line| line.contains("held: ")).unwrap();
-        assert!(row.contains(&format!("| — (1× RTX) | — | — | — | — | — | — | — | held: {held} | — |")), "{row}");
-        assert!(!table.contains("one/report.svg"), "{table}");
-        // Escaped, and pipe-escaped for the table, like every other cell.
+        assert!(html.contains("benchmarks/README.md"), "{html}");
+        // Escaped like every other cell.
         let matrix = v41_row([Cell::current(), Cell::held("weights < layout | over budget"), Cell::current()]);
         let html = results(&reports, &matrix).unwrap();
         assert!(html.contains("weights &lt; layout | over budget"), "{html}");
-        assert!(html.contains("held: weights < layout \\| over budget"), "{html}");
     }
 
     #[test]
@@ -1026,7 +986,6 @@ mod tests {
         let html = results(&[rejection.clone()], &matrix).unwrap();
         assert!(html.contains("doesn't fit 1× 5090 (32 GB) + 4 Sparks"));
         assert!(html.contains("weights &lt; layout"));
-        assert!(html.contains("layout \\| over budget"));
         assert!(html.contains("no-fit-5090/report.json"));
         let card = crate::render::card::card_svg(&rejection.report);
         assert!(card.contains("Doesn&#39;t fit"));
@@ -1307,9 +1266,9 @@ mod tests {
             "publishing rewrote the run's data");
         assert_ne!(std::fs::read(dir.join("card.png")).unwrap(), fixture["card.png"],
             "the stale card PNG was kept");
-        // The README row and the caption under its image both follow.
+        // The caption under its image follows: no stored failure is republished.
         let published = std::fs::read_to_string(&readme).unwrap();
-        assert!(published.contains("top-1 93.7% (info: calibrated W4A4)"), "{published}");
+        assert!(!published.contains("FAILED"), "{published}");
         assert!(published.contains("<img src=\"benchmarks/qwen4/2026-10-14-smoke-qwen38-nvfp4-max/card.svg\""), "{published}");
         assert!(!published.contains("FAIL: not recommended."), "{published}");
         assert!(!published.contains("FAILED"), "{published}");
@@ -1366,7 +1325,7 @@ mod tests {
         // The README: the cell names the gate that failed, never the one the
         // rule reclassified, and the caption keeps the failure sentence.
         let published = std::fs::read_to_string(&readme).unwrap();
-        assert!(published.contains(&format!("⚠ **FAILED** failed: {title}")), "{published}");
+        assert!(published.contains(&format!("⚠ <b>FAILED</b> failed: {title}")), "{published}");
         assert!(!published.contains("failed: Logit fidelity"), "{published}");
         // The caption keeps the failure sentence AND the note's prose, which
         // loses the verdict sentence it was stored with.
@@ -1428,7 +1387,7 @@ mod tests {
         assert!(card.contains("QUALITY GATE FAILED"), "{card}");
         let readme = std::fs::read_to_string(readme).unwrap();
         assert!(readme.contains("<b>FAIL: not recommended.</b> KL &gt; 0.04 on a calibrated quant."), "{readme}");
-        assert!(readme.contains("⚠ **FAILED** failed: Logit fidelity"), "{readme}");
+        assert!(readme.contains("⚠ <b>FAILED</b> failed: Logit fidelity"), "{readme}");
     }
 
     #[test]
@@ -1484,7 +1443,7 @@ mod tests {
     fn publication_rows_carry_a_hardware_label() {
         let mut labelled_row = marked("labelled-min", 1, None);
         marker(&mut labelled_row, "qualification.hardware-label", "vision on RTX0, fixed pool");
-        assert!(results(&[labelled_row], &v41_row(v41())).unwrap().contains("| vision on RTX0, fixed pool |"));
+        assert!(results(&[labelled_row], &v41_row(v41())).unwrap().contains("<sub>vision on RTX0, fixed pool</sub>"));
     }
 
     #[test]
@@ -1591,14 +1550,15 @@ mod tests {
         let readme = std::fs::read_to_string(readme).unwrap();
         assert!(readme.contains("<img src=\"benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/card.svg\""), "{readme}");
         // One row per checkpoint: the newest accepted report fills it.
-        assert_eq!(readme.matches("| DeepSeek-V4.1-Flash (mxfp4) |").count(), 1, "{readme}");
+        assert_eq!(readme.matches("<img src=").count(), 1, "{readme}");
+        assert!(!readme.contains("2026-10-01-smoke-deepseek-v4-1-flash-1rtx-4spark/card.svg"), "{readme}");
         let placed = scan(root.path()).unwrap();
         let published: BTreeSet<PathBuf> = placed.iter().map(|p| p.dir.clone()).collect();
         let rows = select(&placed, &Matrix::load(&matrix).unwrap()).unwrap();
         assert!(family_cards(&rows, &published, "deepseek_v41").contains("../../benchmarks/"));
         let page = std::fs::read_to_string(root.path().join("docs/models/deepseek_v41.md")).unwrap();
         assert!(page.contains("| v0 | 2026-10-02 | First release | <a href=\"../../benchmarks/"), "{page}");
-        assert!(readme.contains("benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/report.svg"));
+        assert!(readme.contains("benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/card.svg"));
         assert!(readme.ends_with("rest\n"));
         let index = std::fs::read_to_string(index).unwrap();
         let first = index.find("2026-10-02").unwrap();

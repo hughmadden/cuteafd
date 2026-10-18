@@ -107,8 +107,6 @@ mod tests {
             "../../../../benchmarks/mimo_v2/2026-10-09-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min-rc3/report.json")).unwrap();
         assert!((report.baseline.as_ref().unwrap().card.concurrent_at(8).unwrap().aggregate_tok_s - 171.12859).abs() < 0.001);
         assert!(render::card::card_svg(&report).contains(">171</text>"));
-        let placed = crate::publish::Placed { dir: "benchmarks/history/card".into(), report };
-        assert!(crate::publish::results(&[placed.clone()], &crate::publish::one_row_of(&placed)).unwrap().contains("C8: 171"));
     }
 
     #[test]
@@ -165,11 +163,6 @@ mod tests {
             } else {
                 assert!(card.contains("C8 not measured"));
                 assert!(!card.contains(r#"r="6.5""#));
-            }
-            let placed = crate::publish::Placed { dir: "benchmarks/sample/card".into(), report: report.clone() };
-            let readme = crate::publish::results(&[placed.clone()], &crate::publish::one_row_of(&placed)).unwrap();
-            for level in report.server.card_levels() {
-                assert_eq!(readme.contains(&format!("C{level}: ")), measured.contains(level), "{case} table C{level}");
             }
             if let Some(dir) = &dir {
                 std::fs::create_dir_all(dir).unwrap();

@@ -244,13 +244,14 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
 
 def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090() -> None:
     matrix = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
+    values_of = lambda entry: {**keys(ROOT / entry["config"]), **matrix["defaults"]["set"], **entry["set"]}
     assert matrix["profile"] == "smoke"
     assert matrix["build"] == "REPLACE-ME-v3-rc"
     defaults = matrix["defaults"]["set"]
     assert all("REPLACE-ME-v3-rc" in defaults[key] for key in
                ("COORDINATOR_DOCKER_INFERENCE", "SPARK_EXPERT_DOCKER_INFERENCE"))
     entries = {entry["name"]: entry for entry in matrix["entries"]}
-    assert len(entries) == len(matrix["entries"]) == 39
+    assert len(entries) == len(matrix["entries"]) == 24
     columns = {}
     ports = set()
     for name, entry in entries.items():
@@ -275,22 +276,18 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
             assert values["BENCH_HARDWARE_CLASS"] == "5090"
             assert len(entry["gpus"]) == 1
             assert "BENCH_SIMULATED" not in entry["set"]
-    assert len(columns) == 13
-    assert all(columns == {"min", "max"} for columns in columns.values())
-    assert len([name for name in entries if name.endswith("-5090")]) == 9
+    # v3 publishes one column per checkpoint, except V4.1 and GLM Flash EXL3 (both).
+    assert len(columns) == 12
+    assert {model: sorted(sides) for model, sides in columns.items() if len(sides) == 2} == {
+        values_of(entries["v41-flash-min"])["MODEL_ID"]: ["max", "min"],
+        values_of(entries["glm53f-exl3-min"])["MODEL_ID"]: ["max", "min"]}
+    assert len([name for name in entries if name.endswith("-5090")]) == 8
     assert len(entries["v41-flash-reference-tp4"]["sparks"]) == 4
     assert len(entries["v41-flash-reference-tp6"]["sparks"]) == 6
-    for name in ("glm53f-exl3-max", "qwen38-exl3-min", "qwen38-exl3-max", "qwen38-nvfp4-max"):
+    for name in ("glm53f-exl3-max", "qwen38-exl3-min"):
         assert not entries[name]["sparks"]
         assert entries[name]["set"]["EXPERT_BACKEND"] == "local"
-    for name in ("glm53f-nvfp4-max", "glm53f-tr3-max"):
-        assert len(entries[name]["sparks"]) == 2
-        assert entries[name]["set"]["EXPERT_BACKEND"] == "spark"
-    assert entries["glm53f-exl3-reference-all-spark"]["set"]["RTX_EXPERT_LAYERS"] == "0"
-    half = entries["glm53f-exl3-reference-half"]["set"]
-    assert half["RTX_EXPERT_LAYERS"] == "22"
-    assert half["POOL_TOKENS"] == "2097152"
-    assert half["CONCURRENCY"] == "16"
+    assert not any("reference-all-spark" in name or "reference-half" in name for name in entries)
     text = json.dumps(matrix)
     assert not any(private in text for private in PRIVATE)
 
