@@ -2,11 +2,15 @@
 //! Reuses the planner inventory and shared dense header/admission validator.
 use super::{Config, Model};
 use crate::formats::native_dense::NativeDenseLayout;
-use crate::plan::{checkpoint::Checkpoint, spec::Component};
+use crate::plan::{
+    checkpoint::{Checkpoint, CheckpointTensor},
+    spec::Component,
+};
 use anyhow::{ensure, Result};
 use cuteafd_core::dense_attention::{
     GqaGeometry, NormWeight, RotaryArithmetic, RouterBiasOrder, SigmoidRouter, SlidingWindow,
 };
+use cuteafd_core::DType;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorContract {
@@ -82,6 +86,152 @@ impl CoordinatorContract {
             },
             layers,
         })
+    }
+}
+
+/// Native operand storage, derived before CUDA initialization. This excludes
+/// routed experts and MTP, and is not a complete serving admission contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightSlice {
+    Replicated,
+    Rows,
+    Cols,
+}
+
+#[derive(Debug, Clone)]
+pub struct WeightOperand {
+    pub name: String,
+    pub sources: Vec<CheckpointTensor>,
+    pub dtype: DType,
+    pub shape: Vec<usize>,
+    pub slice: WeightSlice,
+    pub allocation_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RankWeightLayout {
+    pub rank: usize,
+    pub ranks: usize,
+    pub operands: Vec<WeightOperand>,
+    pub resident_bytes: u64,
+}
+
+impl RankWeightLayout {
+    pub fn from_checkpoint(checkpoint: &Checkpoint, rank: usize, ranks: usize) -> Result<Self> {
+        ensure!(
+            matches!(ranks, 1 | 2) && rank < ranks,
+            "Step-5 coordinator rank geometry"
+        );
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        let sources: std::collections::BTreeMap<_, _> = contract
+            .weights
+            .tensors
+            .iter()
+            .map(|t| (t.meta.name.as_str(), t))
+            .collect();
+        let mut operands = Vec::new();
+        let mut resident_bytes = 0u64;
+        for source in &contract.weights.tensors {
+            let name = &source.meta.name;
+            if name.ends_with(".up_proj.weight") {
+                continue;
+            }
+            let mut selected = vec![source.clone()];
+            let mut shape = source.meta.shape.clone();
+            let mut output_name = name.clone();
+            if let Some(base) = name.strip_suffix(".gate_proj.weight") {
+                let up = format!("{base}.up_proj.weight");
+                let up = sources
+                    .get(up.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing packed up operand"))?;
+                ensure!(
+                    up.meta.shape == shape && up.meta.dtype == source.meta.dtype,
+                    "Step-5 gate/up operands disagree"
+                );
+                shape[0] = shape[0]
+                    .checked_mul(2)
+                    .ok_or_else(|| anyhow::anyhow!("packed rows overflow"))?;
+                selected.push((*up).clone());
+                output_name = format!("{base}.gate_up_proj.weight");
+            }
+            let index_bf16 = [
+                ".sparse_indexer_w.weight",
+                ".sparse_indexer_q_norm.weight",
+                ".sparse_indexer_k_norm.weight",
+                ".sparse_indexer_k_norm.bias",
+            ]
+            .iter()
+            .any(|suffix| name.ends_with(suffix));
+            let dtype = if index_bf16 {
+                DType::Bf16
+            } else {
+                source.meta.dtype.clone()
+            };
+            let slice = if [
+                ".self_attn.q_proj.weight",
+                ".self_attn.k_proj.weight",
+                ".self_attn.v_proj.weight",
+                ".self_attn.g_proj.weight",
+                ".sparse_indexer_q.weight",
+                ".sparse_indexer_w.weight",
+            ]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+            {
+                WeightSlice::Rows
+            } else if name.ends_with(".self_attn.o_proj.weight") {
+                WeightSlice::Cols
+            } else {
+                WeightSlice::Replicated
+            };
+            if slice != WeightSlice::Replicated {
+                ensure!(shape.len() == 2, "Step-5 split operand must be a matrix");
+                let axis = if slice == WeightSlice::Rows { 0 } else { 1 };
+                ensure!(shape[axis] % ranks == 0, "Step-5 uneven head split");
+                shape[axis] /= ranks;
+            }
+            let element_bytes = match dtype {
+                DType::Bf16 => 2u64,
+                DType::F32 => 4u64,
+                _ => anyhow::bail!("Step-5 unsupported coordinator operand precision"),
+            };
+            let bytes = shape
+                .iter()
+                .try_fold(element_bytes, |n, dim| n.checked_mul(*dim as u64))
+                .ok_or_else(|| anyhow::anyhow!("Step-5 operand size overflow"))?
+                .max(256);
+            resident_bytes = resident_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow::anyhow!("Step-5 rank weight size overflow"))?;
+            operands.push(WeightOperand {
+                name: output_name,
+                sources: selected,
+                dtype,
+                shape,
+                slice,
+                allocation_bytes: bytes,
+            });
+        }
+        Ok(Self {
+            rank,
+            ranks,
+            operands,
+            resident_bytes,
+        })
+    }
+
+    /// Caller must supply every non-weight cost before constructing an owner.
+    /// This method does not infer missing workspace/module costs as zero.
+    pub fn check_budget(&self, available: u64, reservations: &[u64]) -> Result<u64> {
+        let total = reservations
+            .iter()
+            .try_fold(self.resident_bytes, |n, v| n.checked_add(*v))
+            .ok_or_else(|| anyhow::anyhow!("Step-5 coordinator reservation overflow"))?;
+        ensure!(
+            total <= available,
+            "Step-5 coordinator weights and reservations need {total} bytes, available {available}"
+        );
+        Ok(total)
     }
 }
 
@@ -178,6 +328,130 @@ mod tests {
                 .resident_bytes,
             exact
         );
+    }
+
+    #[test]
+    fn native_rank_operands_split_attention_and_replicate_ffns() {
+        let dir = snapshot("fp8");
+        let cp = Checkpoint::open(dir.path()).unwrap();
+        let one = RankWeightLayout::from_checkpoint(&cp, 0, 1).unwrap();
+        let two = RankWeightLayout::from_checkpoint(&cp, 1, 2).unwrap();
+        assert_eq!(
+            two.resident_bytes,
+            RankWeightLayout::from_checkpoint(&cp, 0, 2)
+                .unwrap()
+                .resident_bytes
+        );
+        assert_eq!(one.resident_bytes, 27_648_912_640);
+        assert_eq!(two.resident_bytes, 17_397_574_912);
+        let get = |name: &str| two.operands.iter().find(|t| t.name == name).unwrap();
+        for (suffix, shape, slice) in [
+            (
+                "self_attn.q_proj.weight",
+                vec![6144, 4096],
+                WeightSlice::Rows,
+            ),
+            (
+                "self_attn.k_proj.weight",
+                vec![384, 4096],
+                WeightSlice::Rows,
+            ),
+            (
+                "self_attn.v_proj.weight",
+                vec![384, 4096],
+                WeightSlice::Rows,
+            ),
+            ("self_attn.g_proj.weight", vec![32, 4096], WeightSlice::Rows),
+            (
+                "self_attn.o_proj.weight",
+                vec![4096, 6144],
+                WeightSlice::Cols,
+            ),
+            (
+                "self_attn.sparse_indexer_q.weight",
+                vec![2048, 4096],
+                WeightSlice::Rows,
+            ),
+            (
+                "self_attn.sparse_indexer_w.weight",
+                vec![8, 4096],
+                WeightSlice::Rows,
+            ),
+            (
+                "share_expert.gate_up_proj.weight",
+                vec![3072, 4096],
+                WeightSlice::Replicated,
+            ),
+            (
+                "share_expert.down_proj.weight",
+                vec![4096, 1536],
+                WeightSlice::Replicated,
+            ),
+        ] {
+            let operand = get(&format!("model.layers.3.{suffix}"));
+            assert_eq!(operand.shape, shape, "{suffix}");
+            assert_eq!(operand.slice, slice, "{suffix}");
+            assert_eq!(operand.dtype, DType::Bf16);
+        }
+        assert_eq!(
+            get("model.layers.0.mlp.gate_up_proj.weight").shape,
+            [27648, 4096]
+        );
+        let packed = get("model.layers.3.share_expert.gate_up_proj.weight");
+        assert_eq!(packed.sources.len(), 2);
+        assert!(packed.sources[0].meta.name.ends_with("gate_proj.weight"));
+        assert!(packed.sources[1].meta.name.ends_with("up_proj.weight"));
+        for suffix in [
+            "self_attn.sparse_indexer_q_norm.weight",
+            "self_attn.sparse_indexer_k_norm.weight",
+            "self_attn.sparse_indexer_k_norm.bias",
+            "self_attn.sparse_indexer_w.weight",
+        ] {
+            let operand = get(&format!("model.layers.3.{suffix}"));
+            assert_eq!(operand.sources[0].meta.dtype, DType::F32);
+            assert_eq!(operand.dtype, DType::Bf16);
+        }
+        for suffix in [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+            "self_attn.ssmax_s",
+            "moe.router_bias",
+        ] {
+            let operand = get(&format!("model.layers.3.{suffix}"));
+            assert_eq!(operand.dtype, DType::F32);
+            assert_eq!(operand.slice, WeightSlice::Replicated);
+        }
+        let covered: Vec<_> = two
+            .operands
+            .iter()
+            .flat_map(|o| o.sources.iter().map(|s| s.meta.name.clone()))
+            .collect();
+        let unique: std::collections::BTreeSet<_> = covered.iter().collect();
+        assert_eq!(covered.len(), 1467);
+        assert_eq!(unique.len(), covered.len());
+        assert_eq!(two.operands.len(), 1375);
+        for layout in [&one, &two] {
+            let exact: u64 = layout.operands.iter().map(|o| o.allocation_bytes).sum();
+            assert_eq!(layout.resident_bytes, exact);
+            assert_eq!(
+                layout.check_budget(exact + 12, &[5, 7]).unwrap(),
+                exact + 12
+            );
+            assert!(layout.check_budget(exact + 11, &[5, 7]).is_err());
+            assert!(layout.check_budget(u64::MAX, &[u64::MAX]).is_err());
+        }
+        let nv = snapshot("nvfp4");
+        assert_eq!(
+            two.resident_bytes,
+            RankWeightLayout::from_checkpoint(&Checkpoint::open(nv.path()).unwrap(), 0, 2)
+                .unwrap()
+                .resident_bytes
+        );
+        for (rank, ranks) in [(0, 0), (0, 3), (2, 2), (1, 1)] {
+            assert!(RankWeightLayout::from_checkpoint(&cp, rank, ranks).is_err());
+        }
     }
 
     #[test]
