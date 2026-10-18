@@ -76,8 +76,8 @@ pub struct V4Inputs<'a> {
     pub onboard: Onboard,
     /// Probe-only all-row logits on the lead GPU.
     pub full_prefill_logits: u64,
-    /// Per GPU, the measured code it holds at ready (`placement::inventory::loaded_code`, 0 without an
-    /// entry). Part of the baseline on both sides; on a PRO card the reserve envelope covers it
+    /// Per GPU, the calibrated or formula-based code it holds at ready. Part of the baseline on
+    /// both sides; on a PRO card the reserve envelope covers it
     /// (it always did: the code loads after the runtime's sample), so it does not shrink the pool twice.
     pub code_bytes: Vec<u64>,
     /// The build's C4 token-split programs (`manifest_context`): `None` keeps every layer
@@ -328,8 +328,9 @@ pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
 /// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs.
 pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
     let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
-    (0..gpus).map(|rank| crate::placement::loaded_code(family, experts, gpus == 2, rank as u8).map_or(0, |c| c.bytes))
-        .collect()
+    let arch = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES);
+    (0..gpus).map(|rank| crate::placement::inventory::loaded_code_allowance(
+        family, experts, gpus == 2, rank as u8, arch, None).bytes).collect()
 }
 
 /// V4 defaults uniformly to pool-first placement. Explicit `max` remains

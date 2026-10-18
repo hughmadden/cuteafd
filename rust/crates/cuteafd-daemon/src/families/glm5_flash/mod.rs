@@ -1429,7 +1429,8 @@ impl Opened {
             && self.experts.as_ref().is_some_and(|c| c.exl3().is_some());
         let code_package = if local_tp2_exl3 { "exl3-tp2-local" } else { "*" };
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
-            crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", code_package))
+            crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", code_package,
+                &placement::ProgramSet::from_names(&["glmf", "glmf2"], programs.names())))
             .collect::<Result<Vec<_>>>()?;
         let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
