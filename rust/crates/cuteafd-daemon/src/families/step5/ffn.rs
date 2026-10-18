@@ -81,11 +81,22 @@ pub(super) struct DenseFfn<'a> {
     epsilon: f32,
 }
 
-impl<'a> DenseFfn<'a> {
-    pub fn load(
-        device: Device<'a>,
-        programs: &'a Programs<'a>,
-        checkpoint: &'a Checkpoint,
+pub(super) struct DensePlan {
+    layout: RankWeightLayout,
+    weights: Vec<WeightOperand>,
+    admission: Admission,
+    activation: String,
+    epsilon: f32,
+}
+
+impl DensePlan {
+    pub fn bytes(&self) -> u64 {
+        self.admission.bytes
+    }
+
+    pub fn prepare(
+        programs: &Programs<'_>,
+        checkpoint: &Checkpoint,
         layer: usize,
         rows: usize,
         available: u64,
@@ -187,13 +198,66 @@ impl<'a> DenseFfn<'a> {
                 && programs.spec("step5_residual_bf16")?.geometry["width"] == HIDDEN,
             "dense pointwise geometry mismatch"
         );
+        let weights = weights.into_iter().cloned().collect();
+        Ok(Self {
+            layout,
+            weights,
+            admission,
+            activation,
+            epsilon: contract.norms.post_attention,
+        })
+    }
+}
+
+impl<'a> DenseFfn<'a> {
+    pub fn load(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        layer: usize,
+        rows: usize,
+        available: u64,
+        reservations: &[u64],
+    ) -> Result<Self> {
+        Self::load_plan(
+            device,
+            programs,
+            checkpoint,
+            DensePlan::prepare(programs, checkpoint, layer, rows, available, reservations)?,
+        )
+    }
+
+    pub fn load_plan(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        plan: DensePlan,
+    ) -> Result<Self> {
+        let DensePlan {
+            layout,
+            weights,
+            admission,
+            activation,
+            epsilon,
+        } = plan;
+        let definitions: [(&str, &[&str], &[u8]); 5] = [
+            (
+                "step5_hidden_norm",
+                &["x", "weight", "bias", "cos", "sin", "positions", "out"],
+                b"if",
+            ),
+            ("step5_dense_gate_up", &["x", "w", "out"], b"i"),
+            (&activation, &["gate_up", "out"], b"i"),
+            ("step5_dense_down", &["x", "w", "out"], b"i"),
+            ("step5_residual_bf16", &["residual", "delta", "out"], b"i"),
+        ];
         let resolved = definitions
             .iter()
             .map(|(name, pointers, _)| device.run(|| programs.program(name, pointers)))
             .collect::<Result<Vec<_>>>()?;
         let loaded = weights
             .into_iter()
-            .map(|w| load_operand(device, checkpoint, &layout, w))
+            .map(|w| load_operand(device, checkpoint, &layout, &w))
             .collect::<Result<Vec<_>>>()?;
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_dense_workspace");
         let planes = admission
@@ -208,7 +272,7 @@ impl<'a> DenseFfn<'a> {
             planes,
             programs: resolved,
             admission,
-            epsilon: contract.norms.post_attention,
+            epsilon,
         })
     }
 
@@ -223,7 +287,31 @@ impl<'a> DenseFfn<'a> {
         Ok(())
     }
 
-    fn enqueue_stage(&mut self, stage: usize, rows: usize) -> Result<()> {
+    pub fn input(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        self.planes[0].buffer
+    }
+    pub fn output(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        self.planes[5].buffer
+    }
+
+    // The containing layer owns this stream ahead of the FFN fields and drains
+    // it before releasing us. Standalone callers keep using the owned stream.
+    pub fn enqueue_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        ensure!(
+            stream.device.id == self.stream.device.id,
+            "dense stream device mismatch"
+        );
+        for stage in 0..5 {
+            self.stage_on(stage, rows, stream)?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_stage(&self, stage: usize, rows: usize) -> Result<()> {
+        self.stage_on(stage, rows, &self.stream)
+    }
+
+    fn stage_on(&self, stage: usize, rows: usize, stream: &Stream<'a>) -> Result<()> {
         ensure!(
             stage < 5 && rows > 0 && rows <= self.admission.rows,
             "dense stage/capacity mismatch"
@@ -249,7 +337,7 @@ impl<'a> DenseFfn<'a> {
             // SAFETY: all buffers are admitted, owned on this device, and retained
             // beyond the stream drain. Ignored nonrotary norm operands are never read.
             unsafe {
-                self.programs[stage].launch(&pointers[stage], &scalars, self.stream.raw)?;
+                self.programs[stage].launch(&pointers[stage], &scalars, stream.raw)?;
             }
             Ok(())
         })

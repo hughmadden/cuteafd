@@ -3,4 +3,5 @@ mod cache;
 mod ffn;
 mod prefix;
 mod rope;
+mod swa;
 mod weights;
