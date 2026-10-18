@@ -7,6 +7,9 @@
 //! the BF16 `[rows, H]` route sum of the slice: the Spark rank partial of the
 //! compact BF16 response, or the whole layer at TP1 on the coordinator.
 pub(crate) mod worker;
+#[cfg(test)]
+#[path = "fp8/checkpoint_tests.rs"]
+mod checkpoint_tests;
 
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};

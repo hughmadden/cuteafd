@@ -11,9 +11,9 @@ wip_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
 audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
 case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
 bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
-bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4)(;(mimo|mimop|mimof|glm|glmf|qwen4))*$'
+bf16_family_pattern='^(mimo|mimop|mimof|glm|glmf|qwen4|step5)(;(mimo|mimop|mimof|glm|glmf|qwen4|step5))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
-  release_die "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, mimof, glm, glmf or qwen4"
+  release_die "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, mimof, glm, glmf, qwen4 or step5"
 
 usage() {
   cat <<'EOF'
