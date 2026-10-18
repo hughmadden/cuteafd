@@ -174,7 +174,7 @@ def test_list_includes_dense_qwen_export_groups():
 
 
 @pytest.mark.parametrize("heads,suffix", [(64, ""), (32, "-tp2")])
-@pytest.mark.parametrize("group", ["pointwise", "attention", "metadata"])
+@pytest.mark.parametrize("group", ["pointwise", "attention", "metadata", "region-scores"])
 def test_step5_export_groups_bind_native_geometry(heads, suffix, group):
     job = next(job for job in compare_sm.jobs("all") if job[0] == f"step5-{group}{suffix}")
     expected = ["--heads", str(heads)]

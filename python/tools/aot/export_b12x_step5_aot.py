@@ -17,8 +17,11 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
     if heads not in (32, 64) or min(summary_capacity, max_staged_regions) <= 0:
         raise ValueError("Step-5 requires heads32/64 and positive summary capacities")
     groups = heads // 16
-    if group == "attention":
+    if group in ("attention", "region-scores"):
         from b12x.integration.cuteafd import region_attention as a
+        if group == "region-scores":
+            return {"region_scores": lambda: a.compile_region_scores_aot(
+                groups=groups, capacity=summary_capacity)}
         return {
             "region_compress": a.compile_region_compress_aot,
             "region_scores": lambda: a.compile_region_scores_aot(groups=groups, capacity=summary_capacity),
@@ -77,7 +80,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--heads", type=int, choices=(32, 64), default=64)
-    parser.add_argument("--group", choices=("pointwise", "attention", "metadata"), default="pointwise")
+    parser.add_argument("--group", choices=("pointwise", "attention", "metadata", "region-scores"), default="pointwise")
     parser.add_argument("--summary-capacity", type=int, default=131072)
     parser.add_argument("--max-staged-regions", type=int, default=513)
     args = parser.parse_args()

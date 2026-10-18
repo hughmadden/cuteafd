@@ -80,6 +80,8 @@ def jobs(scope):
         ("step5-pointwise-tp2", "export_b12x_step5_aot.py", ["--heads", "32"]),
         ("step5-attention", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "attention"]),
         ("step5-attention-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "attention"]),
+        ("step5-region-scores", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "region-scores"]),
+        ("step5-region-scores-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "region-scores"]),
         ("step5-metadata", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "metadata"]),
         ("step5-metadata-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "metadata"]),
     ])
