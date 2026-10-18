@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One CPU gate for a checkout: cargo workspace tests and the script suite.
 
-  scripts/dev/cpu-gate --task NAME [--jobs N] [--slow] [--cargo] [--scripts] [--benches] [--skip-live-planners] [--base REV]
+  scripts/dev/cpu-gate --task NAME [--jobs N] [--slow] [--cargo] [--scripts] [--benches] [--skip-live-planners] [--base REV] [--keep]
 
 --jobs is the total worker budget: split evenly between Cargo and pytest when
 both run, otherwise given entirely to the requested suite. --slow adds the
@@ -29,10 +29,16 @@ tests (real checkpoints + manifests) and records that choice.
 
 Writes NAME/cpu-gate.json and NAME/cpu-gate.md; exit 0 only when every
 requested suite passed (or, with --base, introduced no new failing ids).
+Both list the largest scratch consumers (bytes allocated under TMPDIR when the
+suites end, grouped by pytest test or by top-level entry). The scratch (tmp/)
+and the Cargo targets (tens of GB per run) are deleted on every exit, failure
+and interrupt included; --keep leaves them for inspection. Logs and receipts
+stay.
 """
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
@@ -41,6 +47,9 @@ from pathlib import Path
 import re
 import subprocess
 import shutil
+import signal
+import stat
+import threading
 import xml.etree.ElementTree as ET
 import sys
 import time
@@ -63,6 +72,16 @@ PYTEST_FAIL = re.compile(r'^(?:FAILED|ERROR) (\S+)', re.M)
 BENCHES = (('cuteafd-core', 'draft_policy_bench', {'CUTEAFD_POLICY_BENCH_MAX_US': '1200'}),)
 BENCH_MEDIANS = re.compile(r'medians: (.*?)(?:, total|$)', re.M)
 BENCH_VALUE = re.compile(r'(\w+) ([\d.]+) us')
+# Per-run scratch under head/ and base/, deleted on exit unless --keep.
+SCRATCH = ('tmp', 'target-cpu-gate', 'target-cpu-gate-release')
+SCRATCH_TOP = 10
+PYTEST_WORKER = re.compile(r'(?:popen-)?gw\d+\Z')
+ANONYMOUS_TEMP = re.compile(r'(\.?tmp)[A-Za-z0-9_]{6,}')
+RUN_SUFFIX = re.compile(r'(?:[-_.](?:\d+|[0-9a-f]{8,}))+\Z')
+# Running suite processes (own sessions), so an interrupt can stop them before cleanup.
+CHILDREN = set()
+CHILDREN_LOCK = threading.Lock()
+STOPPING = threading.Event()
 
 
 def log(message):
@@ -120,12 +139,111 @@ def pin_changes(source):
 def run_logged(cmd, log_path, env, cwd, timeout):
     started = time.monotonic()
     with open(log_path, 'w') as output:
+        if STOPPING.is_set():
+            output.write('cpu-gate: interrupted before start\n')
+            return 130, 0.0
+        # Own session: an interrupt or timeout stops the whole tree (rustc, test binaries, xdist workers).
+        process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        with CHILDREN_LOCK:
+            CHILDREN.add(process)
         try:
-            code = subprocess.run(cmd, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, timeout=timeout).returncode
+            code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            stop_tree(process)
             code = 124
             output.write(f'\ncpu-gate: timed out after {timeout} s\n')
+        finally:
+            stop_tree(process)
+            with CHILDREN_LOCK:
+                CHILDREN.discard(process)
     return code, time.monotonic() - started
+
+
+def stop_tree(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    process.wait()
+
+
+def interrupt(signum, frame):
+    if STOPPING.is_set():
+        return  # already unwinding toward cleanup
+    STOPPING.set()
+    with CHILDREN_LOCK:
+        running = list(CHILDREN)
+    for process in running:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    raise KeyboardInterrupt(f'signal {signum}')
+
+
+def scratch_usage(tmp, top=SCRATCH_TOP):
+    """Largest consumers under TMPDIR: allocated bytes per pytest test (its tmp_path, all
+    workers and repeats summed) or per other top-level entry; hard links counted once."""
+    totals, seen = Counter(), set()
+    pytest_root = tmp / 'pytest'
+
+    def owner(path):
+        relative = path.relative_to(tmp).parts
+        if path.is_relative_to(pytest_root) and len(relative) >= 2:
+            index = 2 if PYTEST_WORKER.fullmatch(relative[1]) and len(relative) >= 3 else 1
+            return 'pytest:' + re.sub(r'\d+\Z', '', relative[index])
+        # Leaked per-process entries (name-<pid>, name-<uuid>, tempfile's tmpXXXXXXXX) group by stem.
+        anonymous = ANONYMOUS_TEMP.fullmatch(relative[0])
+        if anonymous:
+            return anonymous[1] + '*'
+        return RUN_SUFFIX.sub('', relative[0]) or relative[0]
+
+    for directory, dirs, files in os.walk(tmp, onerror=lambda error: None):
+        for name in dirs + files:
+            path = Path(directory) / name
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if (info.st_dev, info.st_ino) in seen:
+                continue
+            seen.add((info.st_dev, info.st_ino))
+            totals[owner(path)] += info.st_blocks * 512
+    return [{'name': name, 'bytes': size} for name, size in totals.most_common(top) if size]
+
+
+def remove_tree(path):
+    """rmtree that first restores u+rwx on our own read-only directories (tests chmod them)."""
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+        return
+
+    def writable(directory):
+        try:
+            info = os.lstat(directory)
+            if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) & 0o700 != 0o700:
+                os.chmod(directory, stat.S_IMODE(info.st_mode) | 0o700)
+        except OSError:
+            pass
+
+    writable(path)
+    for directory, dirs, _ in os.walk(path):  # top-down: fix each child before descending
+        for name in dirs:
+            writable(os.path.join(directory, name))
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def clean_scratch(root):
+    removed = []
+    for side in ('head', 'base'):
+        for name in SCRATCH:
+            path = root / side / name
+            if path.exists() or path.is_symlink():
+                remove_tree(path)
+                removed.append(str(path))
+    return removed
 
 
 def nextest_for(env):
@@ -333,10 +451,11 @@ def gate(source, root, args, owned=False):
         if python is not None:
             suites.append(python.result())
     suites.sort(key=lambda suite: ('cargo', 'scripts', 'benches').index(suite['suite']))
+    scratch = scratch_usage(root / 'tmp')
     moved = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip() != head
     dirty = bool(checked(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).strip())
     passed = suites and all(s['status'] == 'pass' for s in suites) and not moved
-    return dict(source=str(source), head=head, dirty=dirty, moved=moved, suites=suites,
+    return dict(source=str(source), head=head, dirty=dirty, moved=moved, suites=suites, scratch=scratch,
                 status='pass' if passed else 'failed')
 
 
@@ -357,6 +476,9 @@ def render(record):
     for suite in record['suites']:
         if suite.get('failing'):
             lines += ['', f"## Failing {suite['suite']} ids", *[f'- {i}' for i in suite['failing']]]
+    if record.get('scratch'):
+        lines += ['', '## Largest scratch consumers (TMPDIR at suite end)', '', '| Bytes | Owner |', '| ---: | --- |']
+        lines += [f"| {entry['bytes'] / (1 << 20):,.0f} MiB | {entry['name']} |" for entry in record['scratch']]
     if record.get('new_failing') is not None:
         lines += ['', '## New against base']
         lines += [f'- {suite}: {i}' for suite, ids in record['new_failing'].items() for i in ids] or ['- none']
@@ -375,6 +497,7 @@ def main():
     parser.add_argument('--skip-live-planners', action='store_true', help='skip the live-inventory V4 planner tests (recorded)')
     parser.add_argument('--base', metavar='REV', help='also gate REV in a detached worktree; fail only on new failing ids')
     parser.add_argument('--source', type=Path, default=REPO, help='checkout to gate (default: this one)')
+    parser.add_argument('--keep', action='store_true', help='keep tmp/ and the Cargo targets after the run (default: delete)')
     parser.add_argument('--cargo-build-timeout', type=int, default=7200)
     parser.add_argument('--cargo-timeout', type=int, default=5400)
     parser.add_argument('--scripts-timeout', type=int, default=3600)
@@ -390,6 +513,22 @@ def main():
     args.pytest_jobs = max(1, args.jobs - args.cargo_jobs) if concurrent else args.jobs
     root = BUILDS / args.task
     root.mkdir(parents=True, exist_ok=True)
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGHUP, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
+    try:
+        return run_gate(args, root)
+    finally:
+        if args.keep:
+            log(f'--keep: scratch and Cargo targets left under {root}')
+        else:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)  # finish cleaning on a second ^C
+            removed = clean_scratch(root)
+            if removed:
+                log('removed scratch: ' + ', '.join(removed))
+
+
+def run_gate(args, root):
     record = {'task': args.task, 'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
               'skip_live_planners': args.skip_live_planners, **gate(args.source.resolve(), root / 'head', args)}
     if args.base:

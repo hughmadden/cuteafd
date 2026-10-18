@@ -10,7 +10,7 @@ is on and for how long.
 
 ## What is stored, where, how long
 
-Both tiers live in `~/.cache/cuteafd/<instance>/usage/` on the launch host
+Both tiers live in `~/.cache/cuteafd/instances/<instance>/usage/` on the launch host
 (`run.sh` uses `default`), mounted into the coordinator, so restarts, WIP
 slots and new images keep the history.
 
@@ -98,7 +98,7 @@ viewers.
   `Sec-Fetch-Site`, a matching `Origin`, or the `x-cuteafd-console: 1` header.
 - Without a browser: `cuteafd usage clear-log`, `cuteafd usage clear` and
   `cuteafd usage export-csv [--range 7d] [--bench] [--out FILE]` (metadata
-  only), each with `--dir ~/.cache/cuteafd/<instance>/usage`. Stop the
+  only), each with `--dir ~/.cache/cuteafd/instances/<instance>/usage`. Stop the
   coordinator first or the running writer may recreate rows.
 - With the coordinator stopped, deleting `usage-log.sqlite*` and `media/`
   clears only payloads.

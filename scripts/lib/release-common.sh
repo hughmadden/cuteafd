@@ -401,7 +401,7 @@ release_console_supported() {
 }
 release_prepare_console() {
   CONSOLE_SECRET_FILE="$(release_prepare_secret "$HOME/.cache/cuteafd/console" secret)" || release_die "could not provision console secret"
-  USAGE_DIR="$HOME/.cache/cuteafd/${1:-default}/usage"
+  USAGE_DIR="$HOME/.cache/cuteafd/instances/${1:-default}/usage"
   mkdir -p "$USAGE_DIR"
   chmod 700 "$USAGE_DIR"
 }
@@ -422,8 +422,8 @@ release_resolve_api_key() {
   if [[ -z "${API_KEY_FILE:-}" && -f "$HOME/.config/cuteafd/api-key" ]]; then
     API_KEY_FILE="$HOME/.config/cuteafd/api-key"
   fi
-  if [[ -z "${API_KEY_FILE:-}" && "$enabled" == on && -f "$HOME/.cache/cuteafd/$instance/api-key" ]]; then
-    API_KEY_FILE="$HOME/.cache/cuteafd/$instance/api-key"
+  if [[ -z "${API_KEY_FILE:-}" && "$enabled" == on && -f "$HOME/.cache/cuteafd/instances/$instance/api-key" ]]; then
+    API_KEY_FILE="$HOME/.cache/cuteafd/instances/$instance/api-key"
   fi
 }
 
@@ -437,7 +437,7 @@ release_prepare_api_key() {
   esac
   if [[ "$enabled" == on && -z "${API_KEY_FILE:-}" ]]; then
     [[ "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || release_die "invalid API key instance"
-    API_KEY_FILE="$(release_prepare_secret "$HOME/.cache/cuteafd/$instance" api-key)" || release_die "could not provision benchmark API key"
+    API_KEY_FILE="$(release_prepare_secret "$HOME/.cache/cuteafd/instances/$instance" api-key)" || release_die "could not provision benchmark API key"
     printf 'Benchmark API key file: %s\n' "$API_KEY_FILE" >&2
   fi
   if [[ -n "${API_KEY_FILE:-}" ]]; then
@@ -534,6 +534,17 @@ release_serving_docker_args() {
   # Docker's numeric --user otherwise drops groups used by host access checks.
   for group in "${groups[@]}"; do
     [[ "$group" == "$primary_group" ]] || RELEASE_SERVING_ARGS+=(--group-add "$group")
+  done
+}
+
+# Shared host stores mounted into the coordinator must be ours: a missing bind
+# source is recreated by Docker as root, which a non-root server cannot write.
+release_require_owned_state() {
+  local path owner
+  for path in "$@"; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    owner="$(stat -c %u "$path")"
+    [[ "$owner" == "$(id -u)" && ! -L "$path" ]] || release_die "$path is owned by uid $owner, not $(id -u) (Docker recreates a deleted bind-mount source as root); fix with: sudo chown -R $(id -u):$(id -g) $path"
   done
 }
 

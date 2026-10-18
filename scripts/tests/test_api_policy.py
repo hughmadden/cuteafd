@@ -57,7 +57,7 @@ def test_supplied_key_is_preserved_without_provisioning(tmp_path):
 def test_generated_key_is_private_atomic_reused_and_path_only(tmp_path):
     result = prepare_key(tmp_path, "on")
     assert result.returncode == 0, result.stderr
-    path = tmp_path / ".cache/cuteafd/test/api-key"
+    path = tmp_path / ".cache/cuteafd/instances/test/api-key"
     assert result.stdout == str(path)
     assert result.stderr == f"Benchmark API key file: {path}\n"
     key = path.read_text()
@@ -101,7 +101,7 @@ def test_concurrent_key_provisioning_preserves_one_key(tmp_path):
 
 
 def test_generated_key_refuses_unsafe_existing_file(tmp_path):
-    path = tmp_path / ".cache/cuteafd/test/api-key"
+    path = tmp_path / ".cache/cuteafd/instances/test/api-key"
     path.parent.mkdir(parents=True)
     path.parent.chmod(0o700)
     path.write_text("existing-key\n")
@@ -208,3 +208,27 @@ def test_every_serve_path_uses_explicit_keyed_policy():
     # V4.1 provisions keys only after a dry run has returned, before its coordinator.
     assert native_launcher.index("if ((dry_run)); then") < native_launcher.index("shared_api_state")
     assert native_launcher.index("shared_api_state") < native_launcher.index("start_coordinator()")
+
+
+def test_shared_stores_must_be_owned_by_the_launching_user(tmp_path):
+    """bench/ and fidelity/ recreated root-owned by Docker fail the launch with a clear message."""
+    bench, fidelity = tmp_path / "bench", tmp_path / "fidelity"
+    bench.mkdir()
+    script = f'source "{COMMON}"; release_require_owned_state "$@"; echo ok'
+    run = lambda *paths, env=None: subprocess.run(["bash", "-c", script, "test", *map(str, paths)],
+                                                  capture_output=True, text=True, env=env)
+    result = run(bench, fidelity)  # ours, and missing (created afterwards)
+    assert result.returncode == 0 and result.stdout == "ok\n", result.stderr
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "stat").write_text("#!/bin/sh\necho 0\n")  # what a root-owned directory reports
+    (shim / "stat").chmod(0o755)
+    result = run(bench, env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"})
+    assert result.returncode == 2 and "ok" not in result.stdout
+    assert f"{bench} is owned by uid 0" in result.stderr and "chown" in result.stderr
+    fidelity.symlink_to(bench)
+    assert run(fidelity).returncode == 2
+    family = (ROOT / "scripts/launch/run-family.sh").read_text()
+    shared = family[family.index("shared_api_state() {"):]
+    assert shared.index('release_require_owned_state "$bench_dir" "$fidelity_cache"') < shared.index('mkdir -p "$fidelity_cache"')
+    assert 'release_require_writable_state "$bench_dir" "$fidelity_cache"' in shared

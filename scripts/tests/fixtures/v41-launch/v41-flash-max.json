@@ -76,7 +76,7 @@
     "--mount",
     "type=bind,src=<root>/hosts/raptor/.cache/cuteafd/console/secret,dst=/run/cuteafd-console-secret,readonly",
     "-v",
-    "<root>/hosts/raptor/.cache/cuteafd/cap-v41-flash-max-r1/usage:/run/cuteafd/usage",
+    "<root>/hosts/raptor/.cache/cuteafd/instances/cap-v41-flash-max-r1/usage:/run/cuteafd/usage",
     "--mount",
     "type=bind,src=<root>/config/api-key,dst=/run/cuteafd-api-key,readonly",
     "--mount",

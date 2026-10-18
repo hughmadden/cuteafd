@@ -60,7 +60,7 @@
     "--mount",
     "type=bind,src=<root>/hosts/raptor/.cache/cuteafd/console/secret,dst=/run/cuteafd-console-secret,readonly",
     "-v",
-    "<root>/hosts/raptor/.cache/cuteafd/default/usage:/run/cuteafd/usage",
+    "<root>/hosts/raptor/.cache/cuteafd/instances/default/usage:/run/cuteafd/usage",
     "-e",
     "CUTEAFD_IMAGE=ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0",
     "-v",

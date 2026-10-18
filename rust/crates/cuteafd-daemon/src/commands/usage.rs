@@ -27,7 +27,7 @@ enum UsageCommand {
 
 #[derive(Debug, Args)]
 struct Dir {
-    /// The usage directory (`~/.cache/cuteafd/<instance>/usage`; run.sh uses `default`).
+    /// The usage directory (`~/.cache/cuteafd/instances/<instance>/usage`; run.sh uses `default`).
     #[arg(long, default_value_os_t = default_dir())]
     dir: PathBuf,
 }
@@ -60,7 +60,7 @@ struct DemoArgs {
 }
 
 fn default_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".cache/cuteafd/default/usage")
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".cache/cuteafd/instances/default/usage")
 }
 
 fn open(dir: &std::path::Path) -> Result<Arc<cuteafd_usage::Store>> {

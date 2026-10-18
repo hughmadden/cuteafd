@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""Delete idle build scratch under ~/.cache/cuteafd (run daily).
+
+  scripts/dev/cache-gc [--days 7] [--dry-run] [--root DIR] [--no-docker-prune]
+
+Candidates, each judged by the newest mtime of anything inside it (the entry
+itself, every file and directory, symlinks not followed):
+
+- every entry of builds/ except the shared stores PROTECTED_BUILDS;
+- cpu-gate leftovers inside a still-active task: builds/*/{head,base}/
+  {tmp,target-cpu-gate,target-cpu-gate-release};
+- staged WIP run layouts in wip-run/ (a directory holding bin/, lib/ or
+  share/, or a *.tmp staging directory), then empty wip-run directories.
+
+A candidate idle for at least --days is deleted unless any of these holds:
+
+- it is, contains, or sits inside the source of a mount of any Docker
+  container, running or stopped (deleting a mounted directory makes Docker
+  recreate it root-owned on the next start, which breaks the service);
+- a process has its cwd, root, executable, an open file or a mapped file in
+  it, or names a path inside it on its command line or in its environment
+  (cmdline is readable for every user's processes; the rest only for ours);
+- a file inside it is held by a flock or POSIX lock (/proc/locks);
+- part of it cannot be read, or a directory in it is neither ours nor
+  writable (a partial delete is worse than none).
+
+Holders of the ~/.cache/cuteafd/*.lock hardware and build locks are covered
+by the process checks: the lock files carry no owner, but every process that
+holds one (and every child it runs) is scanned. Docker unreachable while the
+docker CLI exists aborts the run without deleting anything.
+
+Never touched: the shared stores beside builds/ (bench, fidelity, console,
+instances, jit, kache, sccache, cargo-home, hwq, tools, lock files, ...) -
+only the directories listed above are scanned at all. Also prunes Docker's
+build cache older than --days. Freed space is measured with statvfs before
+and after (builds/ is a btrfs reflink/hardlink farm, so per-entry sizes
+overstate what a delete frees). Appends one summary line per run to
+ROOT/cache-gc.log; --dry-run prints what would go and logs nothing.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import fcntl
+import functools
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+PROTECTED_BUILDS = frozenset({'compiler-cache', 'codex-runs'})
+CPU_GATE_SCRATCH = ('tmp', 'target-cpu-gate', 'target-cpu-gate-release')
+LAYOUT_CHILDREN = ('bin', 'lib', 'share')
+
+
+@dataclass
+class Candidate:
+    path: Path
+    kind: str
+    newest: float = 0.0
+    allocated: int = 0
+    inodes: set = field(default_factory=set)
+    reason: str = ''
+
+
+@dataclass
+class Environment:
+    """What protects a path: mount sources, process-referenced paths, held lock inodes."""
+    mounts: list = field(default_factory=list)
+    busy: list = field(default_factory=list)
+    held_inodes: set = field(default_factory=set)
+
+
+def log(message):
+    print(f'cache-gc: {message}', file=sys.stderr, flush=True)
+
+
+@functools.lru_cache(maxsize=65536)
+def real(path):
+    return Path(os.path.realpath(path))
+
+
+def related(a, b):
+    """True when a and b are the same path or one contains the other."""
+    return a == b or a.is_relative_to(b) or b.is_relative_to(a)
+
+
+def inside(path, root):
+    return path == root or path.is_relative_to(root)
+
+
+def scan(candidate, cutoff, stop_early=True):
+    """Fill newest mtime, allocated bytes and inodes; stop at the first fresh entry."""
+    me = os.getuid()
+    stack = [candidate.path]
+    seen = set()
+    while stack:
+        path = stack.pop()
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        candidate.newest = max(candidate.newest, info.st_mtime)
+        candidate.inodes.add(info.st_ino)
+        if (info.st_dev, info.st_ino) not in seen:
+            seen.add((info.st_dev, info.st_ino))
+            candidate.allocated += info.st_blocks * 512
+        if stop_early and candidate.newest >= cutoff:
+            return
+        if stat.S_ISDIR(info.st_mode):
+            if info.st_uid != me and not os.access(path, os.W_OK | os.X_OK):
+                candidate.reason = f'directory owned by uid {info.st_uid} and not writable: {path}'
+                return
+            try:
+                with os.scandir(path) as entries:
+                    stack.extend(Path(entry.path) for entry in entries)
+            except OSError as error:
+                candidate.reason = f'unreadable: {error.filename or path}'
+                return
+
+
+def candidates(root):
+    builds = root / 'builds'
+    found = []
+    if builds.is_dir():
+        for entry in sorted(builds.iterdir()):
+            if entry.name in PROTECTED_BUILDS:
+                continue
+            found.append(Candidate(entry, 'build'))
+            for side in ('head', 'base'):
+                for name in CPU_GATE_SCRATCH:
+                    path = entry / side / name
+                    if path.is_dir() and not path.is_symlink():
+                        found.append(Candidate(path, 'cpu-gate'))
+    wip_run = root / 'wip-run'
+    if wip_run.is_dir():
+        found.extend(Candidate(path, 'wip-run') for path in layouts(wip_run))
+    return found
+
+
+def layouts(directory, depth=0):
+    """Staged WIP layouts and *.tmp staging directories, at most four levels down."""
+    try:
+        entries = sorted(p for p in directory.iterdir() if p.is_dir() and not p.is_symlink())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.name.endswith('.tmp') or any((entry / child).is_dir() for child in LAYOUT_CHILDREN):
+            yield entry
+        elif depth < 3:
+            yield from layouts(entry, depth + 1)
+
+
+def protection(candidate, env):
+    """Why this candidate must stay, or '' when nothing protects it."""
+    target = real(candidate.path)
+    for source in env.mounts:
+        if related(target, source):
+            return f'mounted by a Docker container: {source}'
+    for path in env.busy:
+        if inside(path, target):
+            return f'in use by a process: {path}'
+    held = candidate.inodes & env.held_inodes
+    if held:
+        return f'holds a locked file (inode {min(held)})'
+    return ''
+
+
+def plan(root, days, now, env):
+    """Decide every candidate: (to delete, kept with a reason)."""
+    cutoff = now - days * 86400
+    chosen, kept = [], []
+    for candidate in candidates(root):
+        if any(inside(candidate.path, c.path) for c in chosen):
+            continue  # already going with its build directory
+        scan(candidate, cutoff)
+        if not candidate.reason and candidate.newest >= cutoff:
+            continue  # recently used: not a candidate
+        candidate.reason = candidate.reason or protection(candidate, env)
+        (kept if candidate.reason else chosen).append(candidate)
+    return chosen, kept
+
+
+def docker_available():
+    return shutil.which('docker') is not None
+
+
+def docker_mounts():
+    """Mount sources of every container, stopped ones included: `docker start` would recreate a
+    deleted source root-owned (None: docker failed)."""
+    if not docker_available():
+        return []
+    listed = subprocess.run(['docker', 'ps', '-a', '-q', '--no-trunc'], capture_output=True, text=True, timeout=60)
+    if listed.returncode:
+        return None
+    ids = listed.stdout.split()
+    if not ids:
+        return []
+    inspected = subprocess.run(['docker', 'inspect', '--format',
+                                '{{range .Mounts}}{{.Source}}{{"\\n"}}{{end}}', *ids],
+                               capture_output=True, text=True, timeout=60)
+    if inspected.returncode:
+        return None
+    return sorted({real(line) for line in inspected.stdout.splitlines() if line.startswith('/')})
+
+
+def path_tokens(text):
+    """Absolute paths in NUL/whitespace-separated text, including VAR=/a:/b lists and --opt=/a."""
+    for token in text.replace('\0', ' ').split():
+        for piece in token.replace('=', ':').split(':'):
+            if piece.startswith('/'):
+                yield piece
+
+
+def process_paths(root):
+    """Paths under root that any process uses, and how many of our own processes could only be
+    partly read. Other users' processes expose only their cmdline; their cwd and open files under
+    our home are not visible without root, but our cache is only written by us and our containers."""
+    root = real(root)
+    found, partial = set(), 0
+
+    def keep(text):
+        text = text.removesuffix(' (deleted)')
+        if text.startswith('/'):
+            path = Path(os.path.normpath(text))
+            if inside(path, root) or inside(real(path), root):
+                found.add(real(path))
+
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            for token in path_tokens((proc / 'cmdline').read_bytes().decode(errors='replace')):
+                keep(token)
+        except OSError:
+            continue  # exited
+        readable = True
+        for link in ('cwd', 'root', 'exe'):
+            try:
+                keep(os.readlink(proc / link))
+            except OSError:
+                readable = False
+        try:
+            for fd in os.scandir(proc / 'fd'):
+                try:
+                    keep(os.readlink(fd.path))
+                except OSError:
+                    pass
+        except OSError:
+            readable = False
+        for name, parse in (('maps', lambda t: (l.split(None, 5)[5] for l in t.splitlines() if len(l.split(None, 5)) == 6)),
+                            ('environ', path_tokens)):
+            try:
+                for token in parse((proc / name).read_bytes().decode(errors='replace')):
+                    keep(token)
+            except OSError:
+                readable = False
+        if not readable:
+            try:
+                partial += proc.stat().st_uid == os.getuid()
+            except OSError:
+                pass
+    return sorted(found), partial
+
+
+def held_lock_inodes():
+    """Inode numbers of every file with a held flock/POSIX/OFD lock (device ignored: conservative)."""
+    inodes = set()
+    try:
+        text = Path('/proc/locks').read_text()
+    except OSError:
+        return inodes
+    for line in text.splitlines():
+        fields = line.split()
+        for value in fields:
+            if value.count(':') == 2:
+                try:
+                    inodes.add(int(value.rsplit(':', 1)[1]))
+                except ValueError:
+                    pass
+                break
+    return inodes
+
+
+def remove(path):
+    """Delete path; our own read-only directories (Go module caches, tests) get u+rwx first."""
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+        return
+    me = os.getuid()
+    info = os.lstat(path)
+    if info.st_uid == me:
+        os.chmod(path, stat.S_IMODE(info.st_mode) | stat.S_IRWXU)
+    for current, dirs, _ in os.walk(path):
+        for name in dirs:
+            child = os.path.join(current, name)
+            info = os.lstat(child)
+            if stat.S_ISDIR(info.st_mode) and info.st_uid == me and stat.S_IMODE(info.st_mode) & stat.S_IRWXU != stat.S_IRWXU:
+                os.chmod(child, stat.S_IMODE(info.st_mode) | stat.S_IRWXU)
+    shutil.rmtree(path)
+
+
+def prune_empty(directory, cutoff, emptied=()):
+    """Remove empty directories under wip-run, never wip-run itself: idle ones anywhere, and the
+    parents of what this run deleted (their mtime just changed). A fresh empty directory elsewhere
+    may be a launcher's staging parent between its mkdir and its first file."""
+    removed = 0
+    for current, dirs, files in os.walk(directory, topdown=False):
+        path = Path(current)
+        if path == directory or files:
+            continue
+        try:
+            if not any(path.iterdir()) and (path.lstat().st_mtime < cutoff or path in emptied):
+                path.rmdir()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def free_bytes(path):
+    info = os.statvfs(path)
+    return info.f_bavail * info.f_frsize
+
+
+def gib(value):
+    return f'{value / (1 << 30):.1f} GiB'
+
+
+def builder_prune(days, dry_run):
+    if not docker_available():
+        return 'docker absent'
+    command = ['docker', 'builder', 'prune', '--filter', f'until={int(days * 24)}h', '-f']
+    if dry_run:
+        return 'would run: ' + ' '.join(command)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=1800)
+    if result.returncode:
+        return f'builder prune failed (exit {result.returncode})'
+    total = [line for line in result.stdout.splitlines() if line.lower().startswith('total')]
+    return 'builder ' + (total[-1].split(':', 1)[-1].strip() if total else 'nothing') + ' reclaimed'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--days', type=float, default=7.0, help='minimum idle age (default 7)')
+    parser.add_argument('--dry-run', action='store_true', help='print what would be deleted and its allocated size')
+    parser.add_argument('--root', type=Path, default=Path.home() / '.cache/cuteafd')
+    parser.add_argument('--no-docker-prune', action='store_true', help='skip docker builder prune')
+    args = parser.parse_args()
+    if args.days <= 0:
+        parser.error('--days must be positive')
+    root = args.root.expanduser().resolve()
+    if not root.is_dir():
+        log(f'{root} does not exist; nothing to do')
+        return 0
+    with open(root / 'cache-gc.lock', 'a') as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log('another cache-gc is running')
+            return 0
+        return collect(root, args)
+
+
+def gather(root):
+    mounts = docker_mounts()
+    if mounts is None:
+        return None, 0
+    busy, partial = process_paths(root)
+    return Environment(mounts=mounts, busy=busy, held_inodes=held_lock_inodes()), partial
+
+
+def collect(root, args):
+    now = time.time()
+    cutoff = now - args.days * 86400
+    env, partial = gather(root)
+    gathered = time.time()
+    if env is None:
+        log('docker is installed but its containers could not be listed; deleting nothing')
+        return 2
+    if partial:
+        log(f'{partial} of our processes could only be partly read; their cwd/open files are not checked')
+    chosen, kept = plan(root, args.days, now, env)
+    before = free_bytes(root)
+    deleted, errors, emptied = 0, [], set()
+    for candidate in chosen:
+        age = (now - candidate.newest) / 86400
+        line = f'{candidate.kind:8} {gib(candidate.allocated):>10}  idle {age:5.1f} d  {candidate.path}'
+        if args.dry_run:
+            print('would delete ' + line)
+            continue
+        # Re-check right before deleting: a task may have resumed since the plan.
+        if time.time() - gathered > 60:
+            env, _ = gather(root)
+            gathered = time.time()
+        fresh = Candidate(candidate.path, candidate.kind)
+        scan(fresh, cutoff)
+        reason = 'docker query failed' if env is None else fresh.reason or (
+            'used again' if fresh.newest >= cutoff else protection(fresh, env))
+        if reason:
+            kept.append(Candidate(candidate.path, candidate.kind, reason=reason))
+            continue
+        try:
+            remove(candidate.path)
+            deleted += 1
+            emptied.update(candidate.path.parents)
+            print('deleted ' + line)
+        except OSError as error:
+            errors.append(f'{candidate.path}: {error}')
+            log(f'could not delete {candidate.path}: {error}')
+    for candidate in kept:
+        print(f'kept     {candidate.kind:8} {candidate.path}: {candidate.reason}')
+    if not args.dry_run and (root / 'wip-run').is_dir():
+        prune_empty(root / 'wip-run', cutoff, emptied)
+    docker = 'docker prune skipped' if args.no_docker_prune else builder_prune(args.days, args.dry_run)
+    freed = free_bytes(root) - before
+    allocated = sum(c.allocated for c in chosen)
+    summary = (f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} days={args.days:g} "
+               + (f'would delete {len(chosen)} ({gib(allocated)} allocated, shared extents not freed)'
+                  if args.dry_run else f'deleted {deleted}/{len(chosen)} freed {gib(freed)} (df)')
+               + f' kept {len(kept)} errors {len(errors)}; {docker}')
+    print(summary)
+    if not args.dry_run:
+        with open(root / 'cache-gc.log', 'a') as stream:
+            stream.write(summary + '\n')
+    return 1 if errors else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

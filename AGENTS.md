@@ -11,7 +11,14 @@ before → after tables with conditions.
 - Disk: builds live on raptor's root NVMe and fill it fast (1.4 TB of
   `builds/` once filled the disk and crashed runs). When a task finishes,
   delete its Cargo `target*` directories and release staging; keep sources,
-  logs and results. Check `df -h /` before large builds.
+  logs and results. Check `df -h /` before large builds. `cpu-gate` deletes
+  its scratch and targets on exit (`--keep` to inspect); `scripts/dev/cache-gc`
+  runs daily and deletes `builds/` entries, cpu-gate leftovers and WIP run
+  layouts idle for 7 days, never anything a running container mounts or a
+  process uses. Per-instance state (usage, API keys) lives in
+  `~/.cache/cuteafd/instances/<instance>/`; never delete the shared stores
+  beside `builds/` (`bench`, `fidelity`, `console`, `instances`, caches):
+  Docker recreates a missing bind source root-owned and breaks the server.
 - Profiling with root: run Nsight Compute directly as
   `agent-sudo -n --agent-context "<why>" /usr/local/cuda/bin/ncu <args> <program>`
   with the full command line visible. Never put ncu (or anything else) under
