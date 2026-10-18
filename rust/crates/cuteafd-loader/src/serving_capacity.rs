@@ -10,6 +10,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod deepseek;
+pub mod step5;
 mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
 pub mod glm_graphs;

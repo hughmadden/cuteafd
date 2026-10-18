@@ -347,6 +347,12 @@ impl Family for Step5 {
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
+    fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
+        -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        let layout = crate::serving_capacity::step5::Step5CacheLayout::new(
+            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers)?;
+        Ok(Some(layout.geometry))
+    }
     fn activation(&self, layer: usize, shared: bool) -> Option<FfnActivation> {
         if shared { self.cfg.shared_activation.get(layer) } else { self.cfg.activation.get(layer) }.copied()
     }
