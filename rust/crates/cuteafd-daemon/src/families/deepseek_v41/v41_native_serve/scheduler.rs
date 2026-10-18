@@ -9,6 +9,7 @@ use layout::ServingTarget;
 use super::scores::{ScoreRows, VOCAB};
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
+use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use super::prefix::{draft_id, keyed, ImageKeys, V41Cache as PrefixCache, SnapshotKind};
 use super::console;
 use crate::shared::draft::clock::RoundClock;
@@ -1290,10 +1291,10 @@ pub(crate) fn admit_device_rows(round: &SamplingRound,
 
 async fn execute_logits<'a>(lib: &'a NativeLibrary, pass: &mut TargetPass<'_, 'a>,
     requests: &Requests<'a>, batch: &mut Option<RequestBatch>, transport: &mut NativeTp4Wave<'a>,
-    capture_routes: bool, compact: bool,
+    capture: Capture, compact: bool,
 ) -> Result<ScoreRows> {
     let Some(batch) = batch else { return ScoreRows::new(VOCAB, Vec::new()); };
-    pass.set_route_capture(capture_routes);
+    pass.set_capture(capture);
     let result = async {
         let selected: Vec<_> = (0..batch.cache()?.positions().len()).collect();
         if compact {
@@ -1351,7 +1352,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let started = Instant::now();
     ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
     let speculative = draft.is_some();
-    let capture_routes = draft.as_deref().is_some_and(DraftRuntime::capture_routes);
+    let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
     // Speculative rows vary every round: keep each decode shape's graphs,
     // whether or not this policy captures routes.
     if draft.as_deref().is_some_and(DraftRuntime::has_policy) { pass.retain_small_graph_shapes(); }
@@ -1411,7 +1412,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     if !compact && round_has_device_rows(active, members) {
         let round = build_sampling_round(active, members, &inputs,
             tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG))?;
-        pass.set_route_capture(capture_routes);
+        pass.set_capture(capture);
         let next = runtime.block_on(execute_sampled_rows(pass, requests,
             batch.as_mut().unwrap(), transport, &round));
         pass.set_route_capture(false);
@@ -1458,7 +1459,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     // must say. Counting the rows that merely *would have been* servable would
     // make the export claim device work that never happened.
     sampling_stats::record_round(false, 0, 0);
-    let next = runtime.block_on(execute_logits(lib, pass, requests, &mut batch, transport, capture_routes, compact));
+    let next = runtime.block_on(execute_logits(lib, pass, requests, &mut batch, transport, capture, compact));
     let executed_us = started.elapsed().as_micros() as u64;
     let result = (|| -> Result<()> {
         let next = next?;

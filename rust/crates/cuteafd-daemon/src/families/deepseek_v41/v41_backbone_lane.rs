@@ -219,7 +219,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
         Ok(LaneFfn { input, cooperative: true, shared: &mut lane.shared, router: &mut lane.router,
             library: lane.weights.library, phase: &mut lane.phase,
             route_capture: if lane.capture_routes { Some(&mut lane.route_capture) } else { None },
-            ffn_split: if lane.capture_routes { Some(&mut lane.ffn_split) } else { None },
+            ffn_split: if lane.capture_timing { Some(&mut lane.ffn_split) } else { None },
  })
     }
 }
@@ -252,8 +252,8 @@ pub(crate) struct LaneFfn<'s, 'w, 'a> {
 
 /// Host-clock split of a captured pass's FFN stages, summed over its layers.
 ///
-/// Every `Instant` here is taken on every layer regardless; while routes are
-/// captured the values are also summed per pass instead of only reaching the
+/// Every `Instant` here is taken on every layer regardless; while pass timing
+/// is captured the values are also summed per pass instead of only reaching the
 /// `cuteafd::timing` trace. `routed` for a remote layer includes the router's
 /// host wait for its route ids, so it tracks device progress; `collect` is the
 /// wait for every Spark rank's reply plus the reduction.
@@ -502,6 +502,15 @@ async fn complete_ffn<T>(
     Ok(result)
 }
 
+/// What a verification pass records besides its outputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Capture {
+    /// Route ids per layer (router ring, staged ids): the priced policy and the replay trace.
+    pub routes: bool,
+    /// Per-layer CUDA-event times and the FFN stage split (implied by `routes`).
+    pub timing: bool,
+}
+
 pub(crate) struct BackboneLane<'w, 'a> {
     tp2_ffn_graphs: Option<Tp2FfnGraphs<'w,'a>>,
     // Destroy containing graphs before their captured consumer allocations.
@@ -519,6 +528,8 @@ pub(crate) struct BackboneLane<'w, 'a> {
     layer: usize,
     phase: Phase,
     capture_routes: bool,
+    /// Layer clock marks and the FFN stage split (routes or a live console).
+    capture_timing: bool,
     /// Decode-row graph shapes are retained (see `retain_small_graph_shapes`).
     retain_small_shapes: bool,
     route_capture: Vec<Vec<[u32; 6]>>,
@@ -582,6 +593,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             layer: first_layer,
             phase: Phase::Idle,
             capture_routes: false,
+            capture_timing: false,
             retain_small_shapes: false,
             route_capture: Vec::new(),
             ffn_split: FfnSplit::default(),
@@ -785,7 +797,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             library: self.weights.library,
             phase: &mut self.phase,
             route_capture: if self.capture_routes { Some(&mut self.route_capture) } else { None },
-            ffn_split: if self.capture_routes { Some(&mut self.ffn_split) } else { None },
+            ffn_split: if self.capture_timing { Some(&mut self.ffn_split) } else { None },
         })
     }
     /// # Safety
@@ -942,16 +954,32 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         if let Some(shared) = &mut self.shared { shared.enable_small_graph_shapes(); }
         self.router.enable_small_graph_shapes();
     }
+    /// Route ids (router ring and per-layer capture) and, with them, the
+    /// pass timing: per-layer CUDA events and the FFN stage split. Disabling
+    /// after a pass keeps that pass's routes and marks for reading.
     pub fn set_route_capture(&mut self, enabled: bool) {
-        self.capture_routes = enabled;
-        self.router.set_ring_capture(enabled);
-        if enabled {
-            self.retain_small_graph_shapes();
+        if enabled { return self.set_capture(Capture { routes: true, timing: true }); }
+        self.capture_routes = false;
+        self.capture_timing = false;
+        self.router.set_ring_capture(false);
+    }
+    /// Before a pass: route ids only for the priced policy or the replay
+    /// trace; timing also while a console viewer is connected (its layer and
+    /// expert-stage panels). Always clears the previous pass's marks, so an
+    /// untimed pass reports no layer times rather than stale ones.
+    pub fn set_capture(&mut self, capture: Capture) {
+        let Capture { routes, timing } = capture;
+        let timing = timing || routes;
+        self.capture_routes = routes;
+        self.capture_timing = timing;
+        self.router.set_ring_capture(routes);
+        if timing { self.retain_small_graph_shapes(); }
+        if routes {
             self.route_capture.resize_with(40, Vec::new);
             for rows in &mut self.route_capture { rows.clear(); }
-            self.layer_clock.reset();
-            self.ffn_split = FfnSplit::default();
         }
+        self.layer_clock.reset();
+        self.ffn_split = FfnSplit::default();
     }
     pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { &self.route_capture }
     /// After a device-ordered pass drained: the ring-captured local layers'
@@ -971,7 +999,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn layer_clock(&self) -> &LayerClock<'a> { &self.layer_clock }
     /// Mark the arrival of the current layer's input from the other GPU.
     pub(crate) fn record_layer_entry(&mut self) {
-        if !self.capture_routes { return; }
+        if !self.capture_timing { return; }
         let stream = self.block.finish_stream();
         // SAFETY: the FFN-finish stream is live on this lane's device; marks
         // are read only after the pass completes. Unchained passes drained
@@ -979,7 +1007,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         unsafe { self.layer_clock.mark_entry(self.layer, stream, !crate::shared::memory::chain::active()); }
     }
     fn record_layer_finish(&mut self) {
-        if !self.capture_routes { return; }
+        if !self.capture_timing { return; }
         let stream = self.block.finish_stream();
         // SAFETY: as `record_layer_entry`.
         unsafe { self.layer_clock.mark(self.layer, stream, !crate::shared::memory::chain::active()); }

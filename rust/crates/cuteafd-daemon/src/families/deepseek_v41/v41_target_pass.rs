@@ -190,6 +190,11 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         self.resources.lane.set_route_capture(enabled);
         if enabled { self.resources.index.enable_small_graph_shapes(); }
     }
+    /// Route ids and/or pass timing for the next pass (see `BackboneLane::set_capture`).
+    pub fn set_capture(&mut self, capture: crate::families::deepseek_v41::v41_backbone_lane::Capture) {
+        self.resources.lane.set_capture(capture);
+        if capture.routes || capture.timing { self.resources.index.enable_small_graph_shapes(); }
+    }
     /// Retain decode-row graph shapes for speculative verification (sticky).
     pub fn retain_small_graph_shapes(&mut self) {
         self.resources.lane.retain_small_graph_shapes();

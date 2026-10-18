@@ -10,6 +10,8 @@ use std::cell::RefCell;
 pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
     type Transport;
     fn set_route_capture(&mut self, enabled: bool) -> Result<()>;
+    /// Route ids and/or pass timing (layer clock, FFN stage split).
+    fn set_capture(&mut self, capture: crate::families::deepseek_v41::v41_backbone_lane::Capture) -> Result<()>;
     /// Keep decode-row graph shapes once captured, for speculative rounds
     /// whose row count varies (route capture also enables it).
     fn retain_small_graph_shapes(&mut self) -> Result<()>;
@@ -76,6 +78,9 @@ impl<'a> VerificationTarget<'a> for TargetPass<'_, 'a> {
     fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
         TargetPass::set_route_capture(self, enabled); Ok(())
     }
+    fn set_capture(&mut self, capture: crate::families::deepseek_v41::v41_backbone_lane::Capture) -> Result<()> {
+        TargetPass::set_capture(self, capture); Ok(())
+    }
     fn retain_small_graph_shapes(&mut self) -> Result<()> {
         TargetPass::retain_small_graph_shapes(self); Ok(())
     }
@@ -141,6 +146,9 @@ impl<'a> VerificationTarget<'a> for DistributedTargetPass<'_, 'a> {
     }
     fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
         DistributedTargetPass::set_route_capture(self, enabled)
+    }
+    fn set_capture(&mut self, capture: crate::families::deepseek_v41::v41_backbone_lane::Capture) -> Result<()> {
+        DistributedTargetPass::set_capture(self, capture)
     }
     fn retain_small_graph_shapes(&mut self) -> Result<()> {
         DistributedTargetPass::retain_small_graph_shapes(self)
