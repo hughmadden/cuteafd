@@ -20,6 +20,7 @@ impl Reservation {
         ensure!(sequences > 0 && pages > 0, "empty Step-5 cache capacity");
         let state = layout.ranks.get(rank).context("Step-5 cache rank")?;
         let geometry = layout.geometry.ranks.get(rank).context("Step-5 cache geometry rank")?;
+        ensure!(geometry.persistent_unit_bytes > 0, "Step-5 cache requires CSA page geometry");
         let bytes = |unit: u64, count: u64| -> Result<usize> {
             Ok(usize::try_from(unit.checked_mul(count).context("Step-5 cache allocation overflow")?)?)
         };
@@ -84,6 +85,65 @@ impl<'a> CacheRank<'a> {
 
     pub fn bytes(&self) -> usize { self.reservation.total }
     pub fn page_pool(&self) -> CuteafdDeviceBuffer { self.pages.buffer }
+    pub fn layout(&self) -> &Step5CacheLayout { &self.layout }
+    pub fn rank(&self) -> usize { self.rank }
+    pub fn sequences(&self) -> u64 { self.sequences }
+    pub fn slots(&self) -> u64 { self.slots }
+    pub fn page_count(&self) -> u64 {
+        self.reservation.pages as u64 / self.layout.geometry.ranks[self.rank].persistent_unit_bytes
+    }
+
+    /// Native selected-GQA planes: [physical_page,64,local_kv_heads,192].
+    pub fn csa_planes(&self, layer: usize) -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
+        let at = self.layout.ranks[self.rank].regions.iter().position(|r| r.layer == layer)
+            .context("Step-5 layer is not CSA")?;
+        let layers = self.layout.ranks[self.rank].regions.len();
+        ensure!(layers > 0, "Step-5 has no CSA layers");
+        let bytes = self.reservation.pages / layers / 2;
+        let plane = |index: usize| view(self.pages.buffer, ByteSpan {
+            offset: (index * bytes) as u64, bytes: bytes as u64,
+        });
+        Ok((plane(at * 2)?, plane(at * 2 + 1)?))
+    }
+
+    pub fn page_views(&self, page: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
+        ensure!(u64::from(page) < self.page_count(), "Step-5 CSA page outside pool");
+        let mut result = Vec::new();
+        for region in &self.layout.ranks[self.rank].regions {
+            let (key, value) = self.csa_planes(region.layer)?;
+            for plane in [key, value] {
+                let bytes = plane.bytes as u64 / self.page_count();
+                result.push(view(plane, ByteSpan { offset: u64::from(page) * bytes, bytes })?);
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn mark_view(&self, slot: u32) -> Result<CuteafdDeviceBuffer> {
+        ensure!(u64::from(slot) < self.slots, "Step-5 mark outside arena");
+        let bytes = self.layout.ranks[self.rank].bytes;
+        view(self.marks.as_ref().context("Step-5 prefix retention is disabled")?.buffer,
+            ByteSpan { offset: u64::from(slot).checked_mul(bytes).context("Step-5 mark offset overflow")?, bytes })
+    }
+
+    pub fn copy_page_rows(&self, from: u32, to: u32, rows: usize) -> Result<()> {
+        ensure!(rows <= cuteafd_loader::serving_capacity::step5::PAGE_ROWS as usize,
+            "Step-5 CSA tail longer than a page");
+        ensure!(from != to, "Step-5 CSA COW requires distinct pages");
+        let source = self.page_views(from)?;
+        let target = self.page_views(to)?;
+        let mut guard = self.stream.cancellation_guard("Step-5 CSA tail copy");
+        for (source, target) in source.into_iter().zip(target) {
+            let bytes = source.bytes / 64 * rows;
+            if bytes > 0 {
+                self.copy(view(target, ByteSpan { offset: 0, bytes: bytes as u64 })?,
+                    view(source, ByteSpan { offset: 0, bytes: bytes as u64 })?)?;
+            }
+        }
+        self.stream.drain()?;
+        guard.complete = true;
+        Ok(())
+    }
 
     /// Full contiguous request plane for one declared component; summaries use
     /// full admitted capacity even when a snapshot retains fewer complete rows.
@@ -108,6 +168,12 @@ impl<'a> CacheRank<'a> {
         let marks = self.marks.as_ref().context("Step-5 prefix retention is disabled")?.buffer;
         self.marks_at[usize::try_from(slot)?] = None;
         let mut guard = self.stream.cancellation_guard("Step-5 cache capture");
+        let mark = self.mark_view(u32::try_from(slot)?)?;
+        self.stream.device.run(|| {
+            // SAFETY: this owned slot is unpublished, and the stream drains below.
+            // Host snapshots store the full slot, including unused summary capacity.
+            unsafe { self.stream.device.library.cuda_zero_bytes_async(mark, mark.bytes, self.stream.raw) }
+        })?;
         for copy in copies {
             let source = view(self.active.buffer, copy.active)?;
             let target = view(marks, copy.mark)?;
@@ -124,6 +190,18 @@ impl<'a> CacheRank<'a> {
             sequence, self.slots, slot)?;
         ensure!(self.marks_at[usize::try_from(slot)?] == Some(frontier),
             "Step-5 mark is absent or belongs to a different frontier");
+        self.restore_copies(copies)
+    }
+
+    /// Shared prefix metadata identifies host-restored marks; local capture
+    /// bookkeeping cannot identify a slot that the host tier just overwrote.
+    pub fn restore_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
+        let copies = self.layout.snapshot_copies(self.rank, frontier, self.sequences,
+            sequence, self.slots, slot)?;
+        self.restore_copies(copies)
+    }
+
+    fn restore_copies(&self, copies: Vec<cuteafd_loader::serving_capacity::step5::SnapshotCopy>) -> Result<()> {
         let marks = self.marks.as_ref().context("Step-5 prefix retention is disabled")?.buffer;
         let mut guard = self.stream.cancellation_guard("Step-5 cache restore");
         for copy in copies {
@@ -146,10 +224,12 @@ impl<'a> CacheRank<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn layout() -> Step5CacheLayout {
+    pub(super) fn layout() -> Step5CacheLayout { layout_at(65) }
+
+    pub(super) fn layout_at(context: u64) -> Step5CacheLayout {
         let config = cuteafd_loader::plan::families::step5::Config {
             norm_eps: 1e-5, hidden: 4096, vocab: 128896, layers: 92, mtp: 3,
             dense: 13824, experts: 352, intermediate: 1536, shared: 1536, topk: 8,
@@ -158,7 +238,7 @@ mod tests {
             moe: Vec::new(), theta: Vec::new(), rotary: Vec::new(),
             activation: Vec::new(), shared_activation: Vec::new(),
         };
-        Step5CacheLayout::new(&config, 1, 65, 3).unwrap()
+        Step5CacheLayout::new(&config, 1, context, 3).unwrap()
     }
 
     #[test]
