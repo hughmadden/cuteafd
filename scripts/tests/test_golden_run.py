@@ -718,7 +718,8 @@ def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
 
 def test_raw_family_requires_raw_mode(env, capsys):
     write_slot(env['home'], 'i1')
-    assert golden.main(SPARK_BASE + ['--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']) == 2
+    argv = ['--task', 'gr', '--family', 'kimi', '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
+    assert golden.main(argv) == 2
     assert 'has no golden subcommand' in capsys.readouterr().err
 
 
