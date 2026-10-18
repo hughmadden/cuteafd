@@ -16,9 +16,37 @@ use cuteafd_core::DType;
 pub struct CoordinatorContract {
     pub weights: NativeDenseLayout,
     pub norm_weight: NormWeight,
-    pub norm_eps: f32,
+    pub norms: TargetNormEps,
     pub router: SigmoidRouter,
     pub layers: Vec<LayerContract>,
+}
+
+/// Official target norms all receive config.rms_norm_eps, including the
+/// indexer LayerNorm (whose fused kernel's default is not the model value).
+/// Extra MTP enorm/hnorm/shared-head norms remain unqualified and unbound.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetNormEps {
+    pub input: f32,
+    pub post_attention: f32,
+    pub attention_q: f32,
+    pub attention_k: f32,
+    pub indexer_q: f32,
+    pub indexer_k: f32,
+    pub final_norm: f32,
+}
+
+impl TargetNormEps {
+    fn from_config(cfg: &Config) -> Self {
+        Self {
+            input: cfg.norm_eps,
+            post_attention: cfg.norm_eps,
+            attention_q: cfg.norm_eps,
+            attention_k: cfg.norm_eps,
+            indexer_q: cfg.norm_eps,
+            indexer_k: cfg.norm_eps,
+            final_norm: cfg.norm_eps,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +105,7 @@ impl CoordinatorContract {
         Ok(Self {
             weights,
             norm_weight: NormWeight::ZeroCentered,
-            norm_eps: cfg.norm_eps,
+            norms: TargetNormEps::from_config(cfg),
             router: SigmoidRouter {
                 topk: cfg.topk,
                 factor: 3.0,
@@ -246,7 +274,8 @@ mod tests {
         let dir = snapshot("fp8");
         let cp = Checkpoint::open(dir.path()).unwrap();
         let c = CoordinatorContract::from_checkpoint(&cp).unwrap();
-        assert_eq!(c.norm_eps, 1e-5);
+        assert_eq!(c.norms.indexer_q, 1e-5);
+        assert_eq!(c.norms.indexer_k, 1e-5);
         assert_eq!(c.norm_weight, NormWeight::ZeroCentered);
         assert_eq!(c.router.bias_order, RouterBiasOrder::SubtractSelected);
         assert_eq!(c.layers.len(), 92);
@@ -328,6 +357,33 @@ mod tests {
                 .resident_bytes,
             exact
         );
+    }
+
+    #[test]
+    fn every_target_norm_uses_the_served_config_not_kernel_defaults() {
+        for quant in ["fp8", "nvfp4"] {
+            let dir = snapshot(quant);
+            let mut cp = Checkpoint::open(dir.path()).unwrap();
+            assert_eq!(
+                cp.config["text_config"]["rms_norm_eps"],
+                serde_json::json!(1e-5)
+            );
+            for epsilon in [1e-5f32, 1e-6, 0.001] {
+                cp.config["text_config"]["rms_norm_eps"] = serde_json::json!(epsilon);
+                let norms = CoordinatorContract::from_checkpoint(&cp).unwrap().norms;
+                for actual in [
+                    norms.input,
+                    norms.post_attention,
+                    norms.attention_q,
+                    norms.attention_k,
+                    norms.indexer_q,
+                    norms.indexer_k,
+                    norms.final_norm,
+                ] {
+                    assert_eq!(actual.to_bits(), epsilon.to_bits());
+                }
+            }
+        }
     }
 
     #[test]

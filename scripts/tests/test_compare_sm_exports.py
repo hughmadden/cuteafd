@@ -407,3 +407,34 @@ def test_failed_group_does_not_discard_other_completed_reports(tmp_path, monkeyp
     report = json.loads((tmp_path / "comparison.json").read_text())
     assert [group["group"] for group in report["groups"]] == ["good"]
     assert report["failures"] == [{"group": "bad", "error": "missing pair"}]
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_step5_norms_take_runtime_epsilon_and_keep_final_bf16_boundary(monkeypatch, heads):
+    import types
+    spec = importlib.util.spec_from_file_location("step5_norm_exports",
+        ROOT / "python/tools/aot/export_b12x_step5_aot.py")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16", float32="f32"))
+    pointwise = SimpleNamespace(compile_affine_norm_aot=lambda **kwargs: kwargs)
+    monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
+    monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=pointwise))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = {name: build() for name, build in module.builders(heads, "pointwise").items()
+             if "norm" in name}
+    assert set(calls) == {"hidden_norm", "final_norm", "index_q_norm", "index_k_norm",
+        "swa_q_norm_rope", "swa_k_norm_rope", "csa_q_norm_rope", "csa_k_norm_rope"}
+    assert all("eps" in call and call["eps"] is None for call in calls.values())
+    assert calls["hidden_norm"].get("input_dtype", "f32") == "f32"
+    assert calls["final_norm"] == dict(width=4096, zero_centered=True, eps=None, input_dtype="bf16")
+    for name in ("index_q_norm", "index_k_norm"):
+        assert calls[name]["input_dtype"] == calls[name]["parameter_dtype"] == "bf16"
+    assert calls["index_k_norm"]["subtract_mean"] and calls["index_k_norm"]["bias"]
+    assert calls["index_q_norm"]["zero_centered"]
+    for kind, rotary in (("swa", 192), ("csa", 64)):
+        for name, count in (("q", heads), ("k", heads // 16)):
+            assert calls[f"{kind}_{name}_norm_rope"] == dict(width=192, heads=count,
+                rotary=rotary, zero_centered=True, eps=None, input_dtype="bf16")

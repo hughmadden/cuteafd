@@ -63,11 +63,13 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
     result = {
         "residual_bf16": lambda: p.compile_residual_add_aot(width=4096),
         "residual_f32": lambda: p.compile_residual_add_aot(width=4096, delta_dtype=torch.float32),
-        "hidden_norm": lambda: p.compile_affine_norm_aot(width=4096, zero_centered=True),
+        "hidden_norm": lambda: p.compile_affine_norm_aot(width=4096, zero_centered=True, eps=None),
+        "final_norm": lambda: p.compile_affine_norm_aot(width=4096, zero_centered=True,
+            eps=None, input_dtype=torch.bfloat16),
         "index_q_norm": lambda: p.compile_affine_norm_aot(width=256, heads=groups * 4,
-            eps=1e-6, zero_centered=True, rotary=32,
+            eps=None, zero_centered=True, rotary=32,
             input_dtype=torch.bfloat16, parameter_dtype=torch.bfloat16),
-        "index_k_norm": lambda: p.compile_affine_norm_aot(width=256, eps=1e-6,
+        "index_k_norm": lambda: p.compile_affine_norm_aot(width=256, eps=None,
             subtract_mean=True, bias=True, rotary=32,
             input_dtype=torch.bfloat16, parameter_dtype=torch.bfloat16),
         "index_weight": lambda: p.compile_bf16_scaled_projection_aot(width=4096, outputs=groups * 4, prescale=0.5),
@@ -77,7 +79,7 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
     for kind, rotary in (("swa", 192), ("csa", 64)):
         for name, count in (("q", heads), ("k", groups)):
             result[f"{kind}_{name}_norm_rope"] = lambda count=count, rotary=rotary: p.compile_affine_norm_aot(
-                width=192, heads=count, rotary=rotary, zero_centered=True, input_dtype=torch.bfloat16)
+                width=192, heads=count, rotary=rotary, zero_centered=True, eps=None, input_dtype=torch.bfloat16)
     for width in (1536, 13824):
         for limit in (7.0, 10.0):
             result[f"post_silu_w{width}_c{int(limit)}"] = lambda width=width, limit=limit: p.compile_post_silu_aot(
