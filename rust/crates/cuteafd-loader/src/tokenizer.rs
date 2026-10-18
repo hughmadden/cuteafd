@@ -31,6 +31,53 @@ pub struct LoadedTokenizer {
     /// Long texts by pieces between added tokens; `None` when this tokenizer does not extract
     /// its added tokens by content alone.
     pieces: Option<pieces::Pieces>,
+    literal: OnceLock<tokenizers::Tokenizer>,
+}
+
+/// Byte ranges in a rendered prompt originating from literal token spellings.
+pub type LiteralSpans = Vec<std::ops::Range<usize>>;
+
+/// Checkpoint spellings that must not become control tokens in message text.
+pub struct LiteralTokens {
+    all: Option<daachorse::DoubleArrayAhoCorasick<u32>>,
+    media: Option<daachorse::DoubleArrayAhoCorasick<u32>>,
+}
+
+impl std::fmt::Debug for LiteralTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiteralTokens").finish_non_exhaustive()
+    }
+}
+
+impl LiteralTokens {
+    pub fn from_snapshot(snapshot: &Path) -> Result<Self> {
+        let tokenizer = cached_tokenizer(snapshot)?;
+        Ok(Self::new(tokenizer.tokenizer.get_added_tokens_decoder().into_values()
+            .map(|token| token.content)))
+    }
+
+    pub fn new(tokens: impl IntoIterator<Item = String>) -> Self {
+        let mut tokens: Vec<_> = tokens.into_iter().filter(|token| !token.is_empty()).collect();
+        // The recipe's protocol placeholder is not in the checkpoint vocabulary.
+        tokens.push("<｜image｜>".into());
+        tokens.sort();
+        tokens.dedup();
+        let matcher = |tokens: Vec<String>| {
+            if tokens.is_empty() { return None; }
+            Some(daachorse::DoubleArrayAhoCorasickBuilder::new()
+                .match_kind(daachorse::MatchKind::LeftmostLongest).build(tokens)
+                .expect("nonempty distinct literal token spellings"))
+        };
+        let media = tokens.iter().filter(|token| ["image", "audio", "video", "vision"]
+            .iter().any(|word| token.contains(word))).cloned().collect();
+        Self { all: matcher(tokens), media: matcher(media) }
+    }
+
+    pub fn spans(&self, text: &str, media_only: bool) -> LiteralSpans {
+        let matcher = if media_only { &self.media } else { &self.all };
+        matcher.as_ref().map_or_else(Vec::new, |matcher| matcher.leftmost_find_iter(text)
+            .map(|found| found.start()..found.end()).collect())
+    }
 }
 
 /// Stateful decoder for token-by-token generation.
@@ -88,6 +135,7 @@ impl LoadedTokenizer {
             tokenizer_path: tokenizer_path.display().to_string(),
             tokenizer,
             pieces,
+            literal: OnceLock::new(),
         })
     }
 
@@ -108,6 +156,30 @@ impl LoadedTokenizer {
             Some(pieces) if text.len() >= pieces::LONG_TEXT => pieces.encode(text, whole),
             _ => whole(text),
         }
+    }
+
+    /// Encode template control tokens normally, and literal spans with no added
+    /// vocabulary. `add_special_tokens=false` only disables BOS/EOS insertion;
+    /// it still recognizes added tokens, including GLM's non-special image token.
+    pub fn encode_prompt(&self, text: &str, literals: &[std::ops::Range<usize>]) -> Result<Vec<u32>> {
+        if literals.is_empty() { return self.encode_ids(text); }
+        let literal = self.literal.get_or_init(|| {
+            let mut tokenizer = self.tokenizer.clone();
+            tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
+            tokenizer
+        });
+        let mut ids = Vec::new();
+        let mut end = 0;
+        for span in literals {
+            anyhow::ensure!(span.start >= end && span.end >= span.start && text.get(span.clone()).is_some(),
+                "invalid literal prompt span");
+            ids.extend(self.encode_ids(&text[end..span.start])?);
+            ids.extend_from_slice(literal.encode_fast(&text[span.clone()], false)
+                .map_err(|error| anyhow::anyhow!("encoding literal prompt text: {error}"))?.get_ids());
+            end = span.end;
+        }
+        ids.extend(self.encode_ids(&text[end..])?);
+        Ok(ids)
     }
 
     pub fn encode_text(
@@ -185,6 +257,10 @@ pub fn encode_tokenizer_text(
     add_special_tokens: bool,
 ) -> Result<TokenizerEncodingSummary> {
     cached_tokenizer(snapshot_path)?.encode_text(text, add_special_tokens)
+}
+
+pub fn encode_tokenizer_prompt(snapshot: &Path, text: &str, literals: &[std::ops::Range<usize>]) -> Result<Vec<u32>> {
+    cached_tokenizer(snapshot)?.encode_prompt(text, literals)
 }
 
 pub fn decode_tokenizer_ids(

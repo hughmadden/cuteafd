@@ -104,6 +104,7 @@ impl ApiPolicy {
     /// Install the gateway mount on a family's profile (`--gateway on`).
     /// `snapshot` holds the tokenizer `count_tokens` uses.
     pub(crate) fn serve(&self, profile: ModelProfile, snapshot: &std::path::Path) -> anyhow::Result<ModelProfile> {
+        let profile = if snapshot.join("tokenizer.json").is_file() { profile.with_tokenizer(snapshot)? } else { profile };
         let mut profile = profile_with_health(profile);
         if let Some(policy) = &self.gateway {
             use cuteafd_api::gateway::ModelMap;

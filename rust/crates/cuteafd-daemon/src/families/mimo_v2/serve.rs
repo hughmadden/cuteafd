@@ -580,7 +580,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             continue;
                         }
                         let tokens = match probe::prompt_ids(&job.probe,
-                            || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids)) {
+                            || Ok(job.encode_prompt(&tokenizer)?)) {
                             Ok(tokens) => tokens,
                             Err(error) => {
                                 let _ = job.events.send(Err(NativeFailure::BadRequest(format!("prompt tokenization: {error:#}"))));

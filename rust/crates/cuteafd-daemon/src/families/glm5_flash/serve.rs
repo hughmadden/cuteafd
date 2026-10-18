@@ -956,7 +956,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             continue;
                         }
                         let tokens = match probe::prompt_ids(&job.probe,
-                            || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids)) {
+                            || Ok(job.encode_prompt(&tokenizer)?)) {
                             Ok(tokens) => tokens,
                             Err(error) => {
                                 let _ = job.events.send(Err(NativeFailure::BadRequest(format!("prompt tokenization: {error:#}"))));

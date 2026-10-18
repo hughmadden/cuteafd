@@ -93,6 +93,7 @@ pub fn vision_input_enabled() -> bool {
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    pub literal_tokens: Arc<cuteafd_loader::LiteralTokens>,
     pub engine_health: Option<health::HealthWitness>,
     /// Live readiness for remote vision; absent on existing local serving paths.
     pub vision_health: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -139,7 +140,19 @@ impl ModelProfile {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
         Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
-            audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default() }
+            audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
+            literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
+                "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
+                "<｜User｜>", "<｜Assistant｜>", "<｜System｜>", "<think>", "</think>",
+                "<|image_pad|>", "<|image|>", "<|audio_pad|>", "<|im_start|>", "<|im_end|>",
+            ].into_iter().map(str::to_owned))) }
+    }
+
+    /// Load the complete added-token vocabulary, including non-special media
+    /// markers. Serving installs this independently of gateway availability.
+    pub fn with_tokenizer(mut self, snapshot: &std::path::Path) -> anyhow::Result<Self> {
+        self.literal_tokens = Arc::new(cuteafd_loader::LiteralTokens::from_snapshot(snapshot)?);
+        Ok(self)
     }
 
     /// Select the V4.1 history rule from the checkpoint's own lineage.
@@ -198,6 +211,7 @@ use chat::{deepseek, glm5, qwen4};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
+mod literals;
 pub mod console;
 pub use console::ConsoleHub;
 pub mod probe;
@@ -229,6 +243,7 @@ const SSE_KEEPALIVE: std::time::Duration =
 
 pub struct NativeRequest {
     pub prompt: String,
+    pub literal_spans: cuteafd_loader::LiteralSpans,
     pub constraint: Option<NativeConstraint>,
     pub images: Vec<cuteafd_loader::V41Image>,
     /// Generic-family media, in template order. V4.1 only uses `images`.
@@ -247,6 +262,12 @@ pub struct NativeRequest {
     /// Benchmark diagnostics for this request (`probe::HEADER`); `None` for every ordinary client.
     pub probe: Option<Arc<probe::Probe>>,
     pub usage: Option<crate::usage::UsageHandle>,
+}
+impl NativeRequest {
+    /// The single encoding boundary for every family's rendered chat requests.
+    pub fn encode_prompt(&self, tokenizer: &cuteafd_loader::LoadedTokenizer) -> anyhow::Result<Vec<u32>> {
+        tokenizer.encode_prompt(&self.prompt, &self.literal_spans)
+    }
 }
 /// Serving statistics the CUDA owner publishes (a JSON object; `null` until the first publish).
 pub type SharedStats = Arc<Mutex<Value>>;
@@ -583,6 +604,7 @@ struct MediaWork {
 /// chat route and the gateway engine backend.
 pub(crate) struct Built {
     prompt: String,
+    literal_spans: cuteafd_loader::LiteralSpans,
     constraint: Option<NativeConstraint>,
     max_tokens: usize,
     sampling: TargetSamplingParams,
@@ -630,6 +652,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             return Err(Rejection::bad("probe audio requires a loaded encoder"));
         }
     }
+    let mut shield = literals::Shield::new(&body);
+    shield.messages(&mut body, &profile.literal_tokens);
     let audio_sources = if profile.capabilities.audio {
         if profile.audio_preparer.is_none() { return Err(Rejection::unavailable("audio processor unavailable")); }
         media::audio::take_audio_sources(&mut body).map_err(Rejection::bad)?
@@ -858,7 +882,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     if image_sources.len() > cuteafd_loader::V41_MAX_IMAGES {
         return Err(Rejection::bad("at most 16 images are supported"));
     }
-    Ok(Built { prompt, constraint, max_tokens, sampling, stop_token_ids, processor, validator,
+    let (prompt, literal_spans) = shield.finish(prompt, matches!(profile.encoding, ModelEncoding::DeepseekV41));
+    Ok(Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, validator,
         work: MediaWork { images: image_sources, media: media_sources, audio: audio_sources },
         probe, streaming, include_usage, id, model, stop_sequences, tap })
 }
@@ -983,7 +1008,7 @@ impl Submitter {
     /// handle; the gateway accounts its own turns from their events instead.
     pub(crate) async fn submit(&self, profile: &ModelProfile, built: Built, usage: Option<crate::usage::UsageHandle>,
         chat_accounting: bool) -> Result<Running, Rejection> {
-        let Built { prompt, constraint, max_tokens, sampling, stop_token_ids, processor, mut validator, work, probe,
+        let Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, mut validator, work, probe,
             streaming, include_usage, id, model, tap, .. } = built;
         let queue_started = std::time::Instant::now();
         let permit = match self.admission.reserve(self.queue.clone()).await {
@@ -999,14 +1024,11 @@ impl Submitter {
         // client that stops reading cannot stall the shared scheduler. A request's
         // backlog is bounded by its own max_tokens.
         let (events, mut receive) = mpsc::unbounded_channel();
-        // Recipe 0.1.0 uses a protocol placeholder; the pinned model tokenizer
-        // spells token 129264 differently. Preserve the text-only prompt verbatim.
-        let prompt = if prepared.images.is_empty() { prompt }
-            else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
         let job = NativeRequest {
             audio: prepared.audio,
             media: prepared.media,
             prompt,
+            literal_spans,
             constraint,
             images: prepared.images,
             max_tokens,
@@ -1082,7 +1104,7 @@ impl Submitter {
 /// them. Families whose media expand past the API
 /// (encoder-prepared images and audio) refuse rather than undercount.
 pub(crate) async fn count_prompt(state: &NativeState, built: Built, snapshot: std::path::PathBuf) -> Result<u32, Rejection> {
-    let Built { prompt, work, .. } = built;
+    let Built { prompt, literal_spans, work, .. } = built;
     if !work.media.is_empty() || !work.audio.is_empty() {
         return Err(Rejection::bad("count_tokens with image or audio input is not supported for this model yet (its media rows are counted by the encoder)"));
     }
@@ -1096,12 +1118,9 @@ pub(crate) async fn count_prompt(state: &NativeState, built: Built, snapshot: st
             Err(e) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     };
-    // The same spelling the job carries (see `Submitter::submit`).
-    let prompt = if images.is_empty() { prompt } else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
-    let ids = tokio::task::spawn_blocking(move || cuteafd_loader::encode_tokenizer_text(&snapshot, &prompt, false))
+    let ids = tokio::task::spawn_blocking(move || cuteafd_loader::encode_tokenizer_prompt(&snapshot, &prompt, &literal_spans))
         .await.map_err(|e| Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .map_err(|e| Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, format!("token counting failed: {e:#}")))?
-        .token_ids;
+        .map_err(|e| Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, format!("token counting failed: {e:#}")))?;
     // Each placeholder becomes the image's full span (`V41VisionPrompt::expand`).
     let placeholders = ids.iter().filter(|&&id| id == cuteafd_loader::V41_IMAGE_TOKEN_ID).count();
     if placeholders != images.len() { return Err(Rejection::bad("image placeholder count differs from supplied images")); }
