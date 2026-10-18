@@ -102,6 +102,31 @@ def test_decoded_experts_preserve_unit_axes_widths_and_shared_identity():
     assert torch.all(shared["gate"][:128] == 4)
 
 
+def test_up1_width_inventory_matches_mounted_checkpoint_headers():
+    configured = os.environ.get("CUTEAFD_EXLR8_TEST_SNAPSHOT")
+    if not configured:
+        pytest.skip("set CUTEAFD_EXLR8_TEST_SNAPSHOT for the real up1 header contract")
+    snapshot = Path(configured)
+    assert snapshot.name == EXLR8_REVISION
+    selected = json.loads((snapshot / "manifests/exlr8-manifest-up1.json").read_text())
+    oracle = load_reference("exlr8_fixture_header_oracle", "python/reference/exlr8.py")
+    layer = selected["layers"]["3"]
+    assert len(layer["down"]) == 256 and all(isinstance(k, int) for k in layer["down"])
+    assert isinstance(layer["shared"]["down"], int)
+    widths = layer_widths(layer)
+    assert widths == {4}
+    index, _ = oracle.header(snapshot / "experts/exlr8-layer-003.index.safetensors")
+    for k in widths:
+        for prefix, experts in (("", 256), ("shared.", 1)):
+            assert index[f"{prefix}k{k}.index"]["shape"] == [experts, 3, 16, 2]
+            assert index[f"{prefix}k{k}.checksum"]["shape"] == [experts, 3, 16]
+        payload, _ = oracle.header(snapshot / f"experts/exlr8-layer-003.k{k}.safetensors")
+        assert payload["__metadata__"]["k"] == str(k)
+        assert payload["__metadata__"]["index_file"] == "exlr8-layer-003.index.safetensors"
+        for projection in ("gate", "up", "down"):
+            assert payload[f"trellis.{projection}"]["dtype"] == "U8"
+
+
 def official_moe(ref, bank, config, hidden, routes, ids):
     """Use vendor expert visitation, BF16 boundaries and index_add without reimplementing them."""
     import torch
