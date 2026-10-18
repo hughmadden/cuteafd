@@ -1,9 +1,14 @@
 //! A model-free server for working on the /bench page: the real OpenAI router
 //! and console assets in front of a fake engine (2 ms tokens, probes honoured
-//! with fake rows), with two sample reports (one failed) in a scratch store.
+//! with fake rows), with three sample reports (one failed, one with every
+//! panel) in a scratch store.
 //!
-//!     cargo run -p cuteafd-bench --example fake_server -- 8399
+//!     cargo run -p cuteafd-bench --example fake_server -- 8399 [STORE_DIR]
 //!     open http://127.0.0.1:8399/bench
+//!
+//! STORE_DIR (a copy of a real `bench.sqlite` directory) shows real reports
+//! instead of the samples; `CUTEAFD_BENCH_PAGE` / `CUTEAFD_CONSOLE_ASSETS`
+//! serve the pages from a checkout as on a WIP launch.
 use cuteafd_api::openai::{router_with_console, ConsoleHub, InferenceChunk, InferenceFinishReason, NativeLimits,
     NativeRequest, PromptUsage};
 use std::sync::{Arc, Mutex};
@@ -50,15 +55,35 @@ async fn main() {
     fake_engine(receive);
     let router = router_with_console(queue, NativeLimits::default(), Arc::new(Mutex::new(serde_json::Value::Null)),
         Duration::from_secs(5), ConsoleHub::disabled());
-    let dir = std::env::temp_dir().join(format!("cuteafd-bench-fake-{port}"));
+    let given = std::env::args().nth(2).map(std::path::PathBuf::from);
+    let dir = given.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("cuteafd-bench-fake-{port}")));
     let store = cuteafd_bench::store::Store::open(&dir).expect("store");
-    for (failed, created) in [(true, "2026-10-01T09:00:00Z"), (false, "2026-10-01T10:00:00Z")] {
+    for (failed, created) in [(true, "2026-10-01T09:00:00Z"), (false, "2026-10-01T10:00:00Z")].into_iter().filter(|_| given.is_none()) {
         let mut report = cuteafd_bench::sample::report(failed);
         report.id = format!("sample-{}", if failed { "failed" } else { "ok" });
         report.created = created.into();
         store.save(&report).expect("sample");
     }
+    // Every measurement panel with synthetic passes, newest, for chart work.
+    if given.is_none() {
+        let mut report = cuteafd_bench::sample::full_report();
+        report.id = "sample-full".into();
+        report.created = "2026-10-01T11:00:00Z".into();
+        store.save(&report).expect("full sample");
+    }
+    // As the serving bench does after start (here inline: the store is a small copy).
+    if store.stale().unwrap_or(false) { store.backfill().expect("backfill"); }
     let bench = cuteafd_bench::Bench::new(store);
+    // CUTEAFD_CONSOLE_SECRET_FILE: the admin cookie flow as on a real server
+    // (`/console/unlock?token=<file contents>`).
+    let router = match std::env::var_os("CUTEAFD_CONSOLE_SECRET_FILE") {
+        Some(path) => {
+            let gate = cuteafd_api::console_gate::ConsoleGate::from_file(std::path::Path::new(&path), false).expect("console secret");
+            bench.set_console_gate(gate.clone());
+            gate.mount(router)
+        }
+        None => router,
+    };
     let app = cuteafd_bench::http::mount(router, bench);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind");
     cuteafd_bench::ready(&listener);

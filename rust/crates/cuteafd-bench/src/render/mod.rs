@@ -7,6 +7,7 @@ pub mod bodies;
 pub mod report;
 pub mod card;
 pub mod charts;
+pub mod fabric;
 pub mod layout;
 pub mod panels;
 pub mod png;
@@ -84,13 +85,15 @@ mod tests {
         };
         report.fabric = vec![crate::fabric::Phase { name: "decode".into(), timed: true,
             ports: vec![crate::fabric::Port { host: "coordinator".into(), device: "nic".into(), port: 1,
+                state: Some("4: ACTIVE".into()), seconds: 1.0, sent_bytes: Some(1_000_000_000), received_bytes: Some(0),
+                engine_sent_bytes: Some(900_000_000), engine_received_bytes: Some(0),
                 health: Some(h.clone()), health_since_start: Some(h), mtu: Some(9000), ..Default::default() }], ..Default::default() }];
         let card = super::card::card_svg(&report);
         assert!(card.contains("Fabric OK: peak loss 60.0 / retransmit 1.0"));
         assert!(card.contains("pause not collected"));
         let report = super::report::report_svg(&report);
-        assert!(report.contains("loss 60.0 / sequence 59.0 / retransmit 1.0"));
-        assert!(report.contains("Since observation start") && report.contains("MTU 9000"));
+        // The report draws the port as a small multiple with its loss verdict.
+        assert!(report.contains("Fabric during this run") && report.contains("loss 60.0/GB"));
     }
 
 }

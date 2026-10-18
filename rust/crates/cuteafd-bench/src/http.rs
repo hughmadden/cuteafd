@@ -100,13 +100,22 @@ async fn page() -> Response {
     ([(header::CACHE_CONTROL, "no-cache")], axum::response::Html(page)).into_response()
 }
 
+/// A page script, or for page development (`CUTEAFD_BENCH_PAGE` set) the
+/// same-named file beside that page, re-read on every load.
+async fn script(name: &str, builtin: &'static str) -> Response {
+    let body = match std::env::var_os("CUTEAFD_BENCH_PAGE").map(std::path::PathBuf::from) {
+        Some(page) => tokio::fs::read_to_string(page.with_file_name(name)).await.unwrap_or_else(|_| builtin.to_string()),
+        None => builtin.to_string(),
+    };
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+}
+
 async fn fabric_script() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../assets/fabric.js")).into_response()
+    script("fabric.js", include_str!("../assets/fabric.js")).await
 }
 
 async fn banner() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], BANNER)
-        .into_response()
+    script("banner.js", BANNER).await
 }
 
 async fn status(State(bench): State<Arc<Bench>>) -> Json<serde_json::Value> {

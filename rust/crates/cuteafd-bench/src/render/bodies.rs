@@ -137,10 +137,32 @@ impl<'a> View<'a> {
             "hardware" => self.hardware(&mut doc, width),
             "configuration" => self.configuration(&mut doc, width),
             "baseline" => self.baseline(&mut doc, width),
-            _ => match self.report.panel(id).and_then(|p| super::panels::body(&mut doc, &self.theme, id, p, width)) {
-                Some(height) => height,
-                None => self.generic(&mut doc, width, self.report.panel(id)),
-            },
+            _ => {
+                // A failed or interrupted panel says why above whatever partial chart it has.
+                let panel = self.report.panel(id);
+                let banner = match panel.and_then(|p| p.error.as_deref().map(|e| (p, e))) {
+                    Some((p, error)) if !p.passes.is_empty() || p.partial.is_some() => {
+                        let t = &self.theme;
+                        let label = if p.status == crate::report::PanelStatus::Failed { "failed" } else { "stopped" };
+                        let lines = wrap(error, 11.5, width - 24.0);
+                        let h = 14.0 + 16.0 * lines.len() as f64 + 8.0;
+                        doc.rect_attrs(0.0, 0.0, width, h, 6.0, &format!(r#"fill="{}" stroke="{}""#, t.panel2, t.bad));
+                        doc.text(12.0, 16.0, Font::new(10.0, t.bad).weight(700).spacing(1.2), &label.to_uppercase());
+                        for (i, line) in lines.iter().enumerate() {
+                            doc.text(12.0, 32.0 + 16.0 * i as f64, Font::new(11.5, t.ink), line);
+                        }
+                        h + 12.0
+                    }
+                    _ => 0.0,
+                };
+                if banner > 0.0 { doc.group(0.0, banner); }
+                let height = match panel.and_then(|p| super::panels::body(&mut doc, &self.theme, id, p, width)) {
+                    Some(height) => height,
+                    None => self.generic(&mut doc, width, panel),
+                };
+                if banner > 0.0 { doc.end(); }
+                banner + height
+            }
         };
         (doc.into_parts().1, height)
     }

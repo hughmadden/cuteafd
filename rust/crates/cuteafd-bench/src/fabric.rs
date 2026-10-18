@@ -17,6 +17,9 @@ pub struct Phase {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Port {
     pub host: String,
+    /// The host's own name (kernel hostname) when its sampler reports one; `host` stays the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub device: String,
     pub port: u32,
     pub state: Option<String>,
@@ -160,6 +163,7 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
             let mut health = cuteafd_transport::fabric_health::evaluate(sample, sample, 0.0);
             health.reasons = vec!["missing/restarted host or port, or nonadvancing observation".into()];
             phase.ports.push(Port { host: host.clone(), device: device.into(), port: number,
+                hostname: a.or(b).and_then(|h| h.hostname.clone()),
                 state: new.and_then(|p| p.state.clone()), link_gbps: new.and_then(|p| p.link_gbps),
                 mtu: new.and_then(|p| p.mtu), health: Some(health), ..Default::default() });
         }
@@ -274,6 +278,7 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
                 "unattributed/retry overhead"
             } else { "unattributed (headers/ACK/skew or foreign)" }.into();
             phase.ports.push(Port { host: host.clone(), device: port.device.clone(), port: port.port,
+                hostname: a.hostname.clone(),
                 mtu: port.mtu, health: Some(health), health_since_start: port.health_since_start.clone(),
                 sampled_start_s: b.sampled_s, sampled_end_s: a.sampled_s, state: port.state.clone(), link_gbps: port.link_gbps, seconds, sent_bytes, received_bytes,
                 engine_sent_bytes, engine_received_bytes, foreign_sent_bytes, foreign_received_bytes,

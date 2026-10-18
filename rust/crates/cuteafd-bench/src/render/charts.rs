@@ -138,12 +138,17 @@ impl Plot {
 
     /// Grid, ticks and axis titles.
     pub fn axes(&self, doc: &mut Doc, t: &Theme, x_title: &str, y_title: &str, x_label: &dyn Fn(f64) -> String) {
+        self.axes_at(doc, t, &self.xs.ticks(), x_title, y_title, x_label);
+    }
+
+    /// [`Plot::axes`] with explicit x ticks (e.g. only the measured points).
+    pub fn axes_at(&self, doc: &mut Doc, t: &Theme, x_ticks: &[f64], x_title: &str, y_title: &str, x_label: &dyn Fn(f64) -> String) {
         for tick in self.ys.ticks() {
             let y = self.py(tick);
             doc.line(self.x, y, self.x + self.w, y, t.line, 1.0);
             doc.text(self.x - 6.0, y + 3.5, Font::new(10.0, t.muted).anchor(Anchor::End), &short(tick));
         }
-        for tick in self.xs.ticks() {
+        for &tick in x_ticks {
             let x = self.px(tick);
             doc.line(x, self.y + self.h, x, self.y + self.h + 4.0, t.line2, 1.0);
             doc.text(x, self.y + self.h + 16.0, Font::new(10.0, t.muted).anchor(Anchor::Middle), &x_label(tick));
@@ -191,12 +196,20 @@ pub fn legend(doc: &mut Doc, t: &Theme, x: f64, y: f64, items: &[(&str, &str)]) 
     if items.is_empty() { 0.0 } else { 18.0 }
 }
 
+/// Width of [`hbars`]' value column: the value and its note sit right of the
+/// track, measured, never over the bars.
+pub fn hbar_value_width(w: f64, rows: &[(String, f64, &str, String)], unit: &str) -> f64 {
+    if w < 480.0 { return 76.0; }
+    rows.iter().map(|(_, v, _, note)| text_width(&format!("{} {unit}", super::rate(*v)), 11.5)
+        + if note.is_empty() { 0.0 } else { text_width(&format!("  {note}"), 11.5) }).fold(90.0, f64::max).min(w * 0.5) + 12.0
+}
+
 /// Horizontal bars: rows of (label, value, color, annotation); returns height.
 pub fn hbars(doc: &mut Doc, t: &Theme, x: f64, y: f64, w: f64, rows: &[(String, f64, &str, String)], unit: &str) -> f64 {
     let max = rows.iter().map(|r| r.1).fold(1e-9f64, f64::max) * 1.1;
     let label_w = (w * 0.26).min(120.0);
     let narrow = w < 480.0;
-    let value_w = if narrow { 76.0 } else { 170.0 };
+    let value_w = hbar_value_width(w, rows, unit);
     for (i, (label, value, color, note)) in rows.iter().enumerate() {
         let ry = y + 24.0 * i as f64;
         doc.titled(&format!("{label}: {} {unit}{}", super::rate(*value),

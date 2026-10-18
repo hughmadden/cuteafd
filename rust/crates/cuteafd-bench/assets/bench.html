@@ -79,6 +79,9 @@ select { color: var(--ink); background: var(--panel-2); border: 1px solid var(--
 .panel .state.done { color: var(--good); } .panel .state.running { color: var(--target); } .panel .state.failed { color: var(--bad); }
 .panel .pbar { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; font: 11px var(--mono); color: var(--ink-2); }
 .panel .desc { font: 12px var(--sans); color: var(--muted); }
+.panel .why { font: 12px var(--mono); color: var(--ink); border: 1px solid color-mix(in oklab, var(--bad) 55%, var(--line-2)); background: var(--panel-2);
+  border-radius: 8px; padding: 8px 11px; overflow-wrap: anywhere; }
+.panel .why b { color: var(--bad); font-weight: 700; }
 .icon { font: 600 12px var(--mono); padding: 4px 9px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { font: 11px var(--mono); border: 1px solid var(--line-2); border-radius: 999px; padding: 2px 9px; color: var(--ink); background: var(--panel-2); }
@@ -106,23 +109,40 @@ dialog h3 { margin: 0; font: 600 12px var(--sans); letter-spacing: .14em; text-t
 .eta { font: 600 13px var(--mono); color: var(--ink); }
 .eta small { color: var(--muted); font-weight: 400; }
 /* Traffic is identity-coded with line patterns as well as color. */
-#fabric { --fabric-1: #3987e5; --fabric-2: #d95926; --fabric-3: #199e70; --fabric-4: #c98500; padding: 16px; }
-html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --fabric-3: #1baf7a; --fabric-4: #eda100; }
-.fabric-plots { display: grid; gap: 20px; }
-.fabric-host { min-width: 0; }
-.fabric-host > h4 { font: 600 13px var(--mono); margin: 10px 0; }
-.fabric-host-ports { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 390px), 1fr)); gap: 20px; }
-.fabric-port { min-width: 0; }
-.fabric-port h4 { margin: 10px 0; font: 600 12px var(--mono); overflow-wrap: anywhere; }
-.fabric-port small, .fabric-port summary { color: var(--ink-2); font: 11px var(--mono); }
-.fabric-legend { display: flex; flex-wrap: wrap; gap: 12px; font: 11px var(--mono); }
-.fabric-legend span { display: inline-flex; align-items: center; gap: 5px; }
-.fabric-plot { position: relative; }
-.fabric-plot > svg { width: 100%; display: block; }
-.fabric-tooltip { position: absolute; left: 46px; top: 4px; max-width: calc(100% - 50px); padding: 6px; background: var(--panel-2); border: 1px solid var(--line-2); font: 11px var(--mono); pointer-events: none; }
-.fabric-table { overflow-x: auto; }
-.fabric-table th, .fabric-table td { padding: 5px; font: 10px var(--mono); white-space: nowrap; text-align: right; }
-.fabric-assessments { font: 12px var(--mono); overflow-wrap: anywhere; }
+#fabric { --fabric-engine: #3987e5; --fabric-storage: #199e70; --fabric-foreign: #d95926; --fabric-other: #3a4760; padding: 4px 0 0; }
+html[data-theme="light"] #fabric { --fabric-engine: #2a78d6; --fabric-storage: #1baf7a; --fabric-foreign: #eb6834; --fabric-other: #b9c0cc; }
+.fabric-plots { display: grid; gap: 10px; }
+.fx-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font: 11px var(--mono); color: var(--ink-2); align-items: center; }
+.fx-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.fx-legend i, .fx-tip i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.fx-legend .unit { color: var(--muted); margin-left: auto; }
+@media (max-width: 600px) { .fx-legend .unit { margin-left: 0; flex-basis: 100%; } }
+/* All ports in one row at desktop width; a grid on narrower screens. */
+.fx-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 240px)); gap: 10px; }
+@media (max-width: 600px) { .fx-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.fx { position: relative; margin: 0; min-width: 0; background: var(--well); border: 1px solid var(--line); border-radius: 8px; padding: 8px 9px 6px; }
+.fx.issue { border-color: color-mix(in oklab, var(--bad) 55%, var(--line)); }
+.fx figcaption { display: grid; grid-template-columns: 1fr auto; gap: 1px 6px; font: 11px var(--mono); color: var(--ink-2); margin-bottom: 6px; }
+.fx figcaption .host { font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fx figcaption .peak { color: var(--ink); font-variant-numeric: tabular-nums; }
+.fx figcaption .sub { grid-column: span 2; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fx figcaption .bad { color: var(--bad); }
+/* Two narrow cells per row: host, peak and port each get their own line. */
+@media (max-width: 600px) { .fx figcaption { grid-template-columns: minmax(0, 1fr); } .fx figcaption .sub { grid-column: auto; white-space: normal; } }
+.fx > svg { display: block; width: 100%; height: 84px; }
+.fx-foot { display: flex; justify-content: space-between; font: 10px var(--mono); color: var(--muted); margin-top: 3px; }
+.fx-tip { position: absolute; z-index: 4; top: 34px; min-width: 150px; padding: 6px 8px; background: var(--panel-2); border: 1px solid var(--line-2);
+  border-radius: 6px; font: 11px var(--mono); color: var(--ink-2); pointer-events: none; box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+.fx-tip b { color: var(--ink); }
+.fx-tip div { display: flex; align-items: center; gap: 6px; }
+.fx-tip div span { margin-left: auto; color: var(--ink); font-variant-numeric: tabular-nums; }
+.fx-tip .total { border-top: 1px solid var(--line); margin-top: 3px; padding-top: 3px; }
+.fx-quiet { margin: 0; font: 11px var(--mono); color: var(--muted); }
+.fx-details > summary { cursor: pointer; font: 11px var(--mono); color: var(--ink-2); }
+.fx-table { overflow-x: auto; }
+.fx-table th, .fx-table td { padding: 4px 6px; font: 11px var(--mono); white-space: nowrap; text-align: right; }
+.fx-table th:nth-child(-n+3), .fx-table td:nth-child(-n+3) { text-align: left; }
+.fx-table tr.spare td { color: var(--muted); } .fx-table tr.issue td { color: var(--bad); }
 .run-fabric { padding: 12px 16px; }
 .run-fabric > summary { cursor: pointer; font: 12px var(--mono); color: var(--ink-2); list-style: none; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
 .run-fabric > summary::-webkit-details-marker { display: none; }
@@ -142,7 +162,7 @@ html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --f
 .save-name input { font: 12px var(--mono); color: var(--ink); background: var(--well); border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 8px; width: 160px; }
 .provenance { font: 10.5px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
 .provenance.live { color: var(--target); border-color: color-mix(in oklab, var(--target) 50%, var(--line)); }
-@media (forced-colors: active) { #fabric { --fabric-1: CanvasText; --fabric-2: CanvasText; --fabric-3: CanvasText; --fabric-4: CanvasText; } }
+@media (forced-colors: active) { #fabric { --fabric-engine: CanvasText; --fabric-storage: GrayText; --fabric-foreign: Highlight; --fabric-other: Canvas; } }
 </style>
 </head>
 <body>
@@ -171,10 +191,7 @@ html[data-theme="light"] #fabric { --fabric-1: #2a78d6; --fabric-2: #eb6834; --f
   <div class="grid" id="panels"><div class="loading" id="loading" role="status"><span class="spinner"></span>Loading benchmark history…</div></div>
   <details class="panel run-fabric" id="run-fabric" hidden>
     <summary><span class="label">Fabric during this run</span> <span id="run-fabric-verdict"></span></summary>
-    <section id="fabric" hidden>
-      <p class="note">One graph per host and physical RDMA rail. Traffic uses max(transmit, receive) with an autoscaled traffic axis; link capacity and utilization are labeled separately. Foreign is NIC minus engine and registered sources; protocol headers remain in NIC totals. Phase rates cover sampled windows with idle padding at 1 Hz, not exact request edges.</p>
-      <div class="fabric-plots"></div><p class="fabric-assessments" role="status"></p>
-    </section>
+    <section id="fabric" hidden><div class="fabric-plots"></div></section>
   </details>
   <p class="note">Benchmarks run inside this server and drive its own OpenAI API over loopback. While one runs, requests from
     other clients get 503 with Retry-After. The baseline (basic card and quick quality) runs once per server and configuration
@@ -398,7 +415,9 @@ function renderPanels() {
     const pairSelect = card.querySelector('.fidelity-pair');
     if (pairSelect) {
       const selectedPair = store.get(`bench.compare.${id}`) || '';
-      pairSelect.innerHTML = '<option value="">No paired comparison</option>' + runs.filter((r) => r.id !== report?.id)
+      // Only runs that stored this panel (the listing's summary column; no report is read).
+      pairSelect.innerHTML = '<option value="">No paired comparison</option>' + runs.filter((r) => r.id !== srcRun(id)
+        && (r.panels || '').split(',').includes(id))
         .map((r) => `<option value="${fmt.esc(r.id)}">${fmt.esc(r.created.slice(0,16))} · ${fmt.esc(r.profile)}</option>`).join('');
       pairSelect.value = selectedPair;
     }
@@ -413,8 +432,14 @@ function renderPanels() {
       pbar.querySelector('.pl').textContent = `${progress.label || ''} · ETA ${secs(progress.panel_eta_s ?? progress.eta_s)}`;
     }
     const desc = card.querySelector('.desc');
-    desc.textContent = hasData(id) ? '' : (meta.unavailable ? `Unavailable: ${meta.unavailable}` : (meta.description || ''));
+    const error = result(id)?.error;
+    desc.textContent = error && !hasData(id) ? '' : hasData(id) ? '' : (meta.unavailable ? `Unavailable: ${meta.unavailable}` : (meta.description || ''));
     desc.hidden = !desc.textContent;
+    // A failed or stopped panel always says why, with or without partial charts.
+    let why = card.querySelector('.why');
+    if (!why) { why = document.createElement('div'); why.className = 'why'; why.setAttribute('role', 'status'); desc.before(why); }
+    why.hidden = !error || (hasData(id) && mode === 'chart');
+    if (error) why.innerHTML = `<b>${state === 'failed' ? 'Failed' : 'Stopped'}:</b> ${fmt.esc(error)}`;
     const paired = pairSelect?.value ? `compare=${encodeURIComponent(pairSelect.value)}` : '';
     const exportMenu = card.querySelector('.exp + div');
     exportMenu.innerHTML = report && hasData(id) ? ['svg', 'png'].map((k) =>
@@ -499,7 +524,7 @@ function tableFor(id, comparedResult = null) {
   const r = comparedResult || result(id);
   if (id === 'fidelity' || id === 'fidelity_full') {
     const pass = r.partial || r.passes?.[r.passes.length - 1];
-    if (!pass) return `<p>${fmt.esc(r.error || 'No scored windows yet')}</p>`;
+    if (!pass) return r.error ? '' : '<p>No scored windows yet</p>';
     const sections = [['decode', pass.verdict, pass.per_window], ['prefill', pass.prefill_verdict, pass.prefill_per_window]];
     const pair = pass.paired;
     const pairedTable = pair?.unavailable ? `<p>Pair unavailable: ${fmt.esc(pair.unavailable)}</p>`
@@ -563,7 +588,7 @@ function tableFor(id, comparedResult = null) {
     if (pass && pass.table) return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(pass.table.columns, pass.table.rows) + mapped;
     const rows = Object.entries(pass || {}).filter(([, v]) => typeof v !== 'object').map(([k, v]) => [k, v]);
     return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(['field', 'value'], rows) + mapped;
-  }).join('') + (r.error ? `<p class="banner">${fmt.esc(r.error)}</p>` : '');
+  }).join('');
 }
 
 // ---------------------------------------------------------------- runs, exports, import
@@ -631,21 +656,24 @@ function render() {
   $('loading')?.remove();
   window.CuteFabric?.report(report); renderRunFabric(); renderHeader(); renderStrip(); renderRuns(); renderPanels();
 }
-// One line on the run's fabric: clean, or the caveats by host name.
+// One chip on the run's fabric: OK, or each real problem by host name. The
+// full assessments (host names, never addresses) are the chip's tooltip.
 function renderRunFabric() {
   const box = $('run-fabric');
   const phases = (report?.fabric || []).filter((p) => p.timed !== false);
-  box.hidden = !phases.length;
-  if (!phases.length) return;
-  const hw = report.server?.hardware || {};
-  const names = new Map((hw.sparks || []).filter((s) => s.name).map((s) => [s.address, s.name]));
-  const named = (text) => text.replace(/\b(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?/g, (m, ip) => names.get(ip) || 'a Spark')
-    .replace(/\bcoordinator\b/g, hw.host || 'coordinator');
-  const caveats = [...new Set(phases.flatMap((p) => p.assessments || []).map((a) => named(a.replace(/\s*\(>.*?\)$/, '')
-    .replace(/\s+\S+\/\d+(?=:|\s|$)/, ''))))];
-  $('run-fabric-verdict').innerHTML = caveats.length
-    ? `<span class="caveat">caveat: ${fmt.esc(caveats.slice(0, 3).join('; '))}${caveats.length > 3 ? ` (+${caveats.length - 3} more)` : ''}</span>`
-    : `<span class="clean">fabric clean during this run</span>`;
+  const live = window.CuteFabric?.observed() || 0;
+  box.hidden = !phases.length && !live;
+  if (box.hidden) return;
+  const keys = new Map();
+  for (const p of phases.flatMap((x) => x.ports || [])) keys.set(p.host, window.CuteFabric?.name(p) || 'a host');
+  const named = (text) => [...keys].sort((a, b) => b[0].length - a[0].length).reduce((t, [k, n]) => t.split(k).join(n), text)
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?/g, 'a host');
+  const caveats = [...new Set(phases.flatMap((p) => p.assessments || []).map((a) => named(a)))];
+  const problems = window.CuteFabric?.problems() || [];
+  const title = caveats.length ? ` title="${fmt.esc(caveats.join('\n'))}"` : '';
+  $('run-fabric-verdict').innerHTML = problems.length
+    ? `<span class="caveat"${title}>${fmt.esc(problems.join(' · '))}</span>`
+    : `<span class="clean"${title}>Fabric OK</span>`;
 }
 
 // POST, then hand over at once: the dialog closes, the run shows as starting,
@@ -756,7 +784,7 @@ async function connect() {
       if (was && !status.active) { refreshRuns().then(() => { if (report?.merged) reloadMerged(); }); refreshCatalog().then(render); }
       render();
     } else if (event.type === 'fabric') {
-      if (event.run === viewing || follow && status.active?.id === event.run) window.CuteFabric?.interval(event);
+      if (event.run === viewing || follow && status.active?.id === event.run) { window.CuteFabric?.interval(event); renderRunFabric(); }
     } else if (event.type === 'progress') {
       progress = event;
       if (status.active) { status.active.panel = event.panel; status.active.eta_s = event.eta_s; status.active.fraction = event.fraction; }
