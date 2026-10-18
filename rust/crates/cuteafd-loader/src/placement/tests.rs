@@ -40,7 +40,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
 
 /// V4 as `deepseek_v4::request` builds it without the C4 context programs: heads or GPU0 only.
 const V4_HEADS: ExecutorModes = ExecutorModes { modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
-    ..families::DEEPSEEK_V4 };
+    attention: AttentionPlacement::Heads, ..families::DEEPSEEK_V4 };
 
 #[test]
 fn v4_defaults_to_pool_first_and_retains_explicit_max() {
@@ -480,9 +480,9 @@ fn experts_first_falls_back_to_a_spark_pool_below_the_context() {
 fn attention_selectors_follow_declared_executor_capabilities() {
     for executor in families::EXECUTORS {
         // Auto is the recorded default on two peer GPUs (GLM 5.3: context, K3; GLM Flash: context,
-        // #57), heads on one.
+        // #57; V4: context, #58), heads on one.
         let recorded = if ["qwen4", "deepseek_v41"].contains(&executor.family) { AttentionPlacement::Layers }
-            else if ["glm5", "glm5_flash"].contains(&executor.family) { AttentionPlacement::Context }
+            else if ["glm5", "glm5_flash", "deepseek_v4"].contains(&executor.family) { AttentionPlacement::Context }
             else { AttentionPlacement::Heads };
         assert_eq!(executor.check_attention(None, 2, true).unwrap(), recorded);
         assert_eq!(executor.check_attention(None, 1, false).unwrap(), AttentionPlacement::Heads);
@@ -830,11 +830,6 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
             layer.kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
         }
         req.pool_overhead = vec![0; 2];
-        // A family whose context mode is not yet its recorded default pins auto to heads in its
-        // request (V4 until #58's gates pass: `deepseek_v4::request`).
-        if executor.family == "deepseek_v4" {
-            req.policy.attention = vec![(AttentionClass::Csa, AttentionPlacement::Heads)];
-        }
         let auto = solve(&req).unwrap();
         req.attention_placement = Some(AttentionPlacement::Heads);
         let heads = solve(&req).unwrap();

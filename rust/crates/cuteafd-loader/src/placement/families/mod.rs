@@ -23,10 +23,10 @@ const WHOLE1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
 /// `context` the C4 layers token-split their compressed records (#58; C128,
 /// window rings and carry stay replicated). Its only hop is the entry
 /// broadcast of the embedding rows into GPU1. Per-layer ownership (`Whole{gpu}`
-/// mixes, ranges) waits for its per-layer executor (P7). `heads` stays the
-/// recorded default until `context` passes its gates.
+/// mixes, ranges) waits for its per-layer executor (P7). `context` is the
+/// default (TJ 2026-10-18: no context-scaling KV replicated); `heads` stays an explicit option.
 pub const DEEPSEEK_V4: ExecutorModes = ExecutorModes { family: "deepseek_v4",
-    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Heads };
+    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Context };
 /// V4.1: layer ranges, layers 0-19 / 20-39 whole on each GPU with one boundary
 /// hop (`DirectInputHop`) and the owner-reduce FFN; direct-input storage is V4.1-only today.
 pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", modes: &[WHOLE0, WHOLE1], hops: true, attention: AttentionPlacement::Layers };
@@ -34,7 +34,7 @@ pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", 
 /// by context (heads for the projections, KV pages owned by parity; K3).
 /// `context` is its recorded default (K3, TJ: GLM 5.3 must not replicate KV; pool first
 /// is not C1-gated): at max it admits 2,097,152 tokens against heads' 1,321,216, C8 1.015x,
-/// 8K prefill 1.027x, C1 0.965x (2026-10-11). A build without the context programs
+/// 8K prefill 1.027x; C1 parity after the per-row-bucket split plans (7689c8c3: 1.043x). A build without the context programs
 /// fails a chosen `context` closed (`glm5::solve_working_set`, #202); `heads` stays an
 /// explicit option.
 pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",

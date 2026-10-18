@@ -3266,7 +3266,8 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             // manifest cannot run: the solve fails closed naming the programs (#202).
             let default = if matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) && peer {
                 AttentionPlacement::Context
-            } else if !peer || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) {
+            // V4 without its C4 context programs builds a heads-only executor.
+            } else if !peer || matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash" | "deepseek_v4")) {
                 AttentionPlacement::Heads
             } else { executor.attention };
             assert_eq!(auto.attention_placement, default);

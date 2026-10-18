@@ -302,10 +302,10 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         onboard: inputs.onboard,
         minimum_expert_layers: 0,
         expert_gpus: if gpus == 2 && inputs.experts_half.is_empty() { 0 } else { 1 },
-        // `heads` is V4's recorded decision until `context` passes its gates (#58): auto must not
-        // reach for the C4 split as a memory lever; `--attention-placement context` selects it.
+        // `context` is V4's default on two GPUs (#58/#59: no context-scaling KV replicated): the C4
+        // layers token-split their records; `--attention-placement heads` stays an explicit option.
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
-            by_kind: Vec::new(), attention: if context.is_some() { vec![(AttentionClass::Csa, AttentionPlacement::Heads)] }
+            by_kind: Vec::new(), attention: if context.is_some() { vec![(AttentionClass::Csa, AttentionPlacement::Context)] }
                 else { Vec::new() }, ..LayerPolicy::default() },
         // The mHC streams `[T,4,H]` BF16; V4's only hop is the entry
         // broadcast of the embedding rows into GPU1's step input.

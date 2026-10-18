@@ -243,8 +243,8 @@ fn synthetic_context(dir: &Path) -> PathBuf {
     path
 }
 
-/// C4 token-split admission (#58): the planner and serve-dsv4 agree under `context`, auto stays
-/// `heads` even where the build carries the programs, only C4 layers split, and the context
+/// C4 token-split admission (#58): the planner and serve-dsv4 agree under `context`, auto resolves
+/// `context` where the build carries the programs, only C4 layers split, and the context
 /// buffers are charged on both GPUs while the C4 records halve.
 #[test]
 fn planner_equals_runtime_deepseek_v4_fixture_context() {
@@ -256,8 +256,9 @@ fn planner_equals_runtime_deepseek_v4_fixture_context() {
         budget: 24 << 30, onboard: None, dspark: false, exchange_f32: false, peer_budget: None, attention };
     let heads = assert_equal(&shared, &case(Some(AttentionPlacement::Heads)), "context fixture heads");
     let auto = assert_equal(&shared, &case(None), "context fixture auto");
-    assert_eq!(auto, heads, "auto keeps heads until context passes its gates");
     let context = assert_equal(&shared, &case(Some(AttentionPlacement::Context)), "context fixture context");
+    assert_eq!(auto, context, "auto is context where the build carries the programs");
+    assert_ne!(auto, heads);
     assert_eq!(context.attention_placement, AttentionPlacement::Context);
     let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 1).unwrap();
     for (layer, (a, &ratio)) in context.layers.iter().zip(&cfg.compress_ratios).enumerate() {
