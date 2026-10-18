@@ -8,3 +8,4 @@ pub(crate) mod glm5_flash;
 pub(crate) mod mimo_v2;
 pub(crate) mod qwen4;
 pub(crate) mod qwen3_5;
+pub(crate) mod step5;
