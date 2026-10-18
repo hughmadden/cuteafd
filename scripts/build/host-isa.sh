@@ -111,3 +111,12 @@ cuteafd_host_isa_install() {
     install -D -m 0755 "$native/$isa/libcuteafd_native.so" "$output/lib-variants/$isa/libcuteafd_native.so"
   done
 }
+
+# cuteafd_native_build_args: extra Ninja arguments for `cmake --build DIR --`.
+# GB10 (every aarch64 builder) has 10 Cortex-X925 + 10 Cortex-A725 cores, about
+# 15 X925-equivalents; -j stays CMAKE_BUILD_PARALLEL_LEVEL (or Ninja's default)
+# and -l 14 stops starting compiles and exports while the host is already
+# loaded, a brake on the overload behind GB10 driver NV_ERR_NO_MEMORY failures.
+cuteafd_native_build_args() {
+  [[ "$(uname -m)" != aarch64 ]] || printf '%s\n' -l 14
+}

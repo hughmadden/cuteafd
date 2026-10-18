@@ -25,6 +25,17 @@ resource = load('build_resource', ROOT / 'scripts/build/build-resource.py')
 export = load('export_jobs', ROOT / 'python/tools/lib/_export_jobs.py')
 
 
+@pytest.fixture(autouse=True)
+def quiet_host(tmp_path_factory, monkeypatch):
+    # In-process admissions never read the gate host's live PSI or nvidia-smi.
+    monkeypatch.setattr(export, 'PRESSURE_PATH', tmp_path_factory.mktemp('psi') / 'absent')
+    monkeypatch.setattr(export, 'live_cuda_processes', lambda: 'stubbed')
+    yield
+
+
+LIVE_CUDA_PROCESSES = export.live_cuda_processes
+
+
 def test_seed_capacity_uses_cores_and_memory():
     assert resource.capacity(20, 124608) == 3
     assert resource.capacity(64, 65536) == 2
@@ -393,3 +404,146 @@ def test_gpu_lease_pid_collision_never_truncates_live_reservation(tmp_path, monk
         if export._gpu_lease:
             export._gpu_lease.close()
         export._gpu_lease = None
+
+
+def _pressure(tmp_path, monkeypatch, some):
+    path = tmp_path / 'pressure'
+    path.write_text(f'some avg10={some} avg60=0.00 avg300=0.00 total=1\n'
+                    'full avg10=0.00 avg60=0.00 avg300=0.00 total=1\n')
+    monkeypatch.setattr(export, 'PRESSURE_PATH', path)
+    return path
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('some avg10=12.50 avg60=3.00 avg300=1.00 total=9\nfull avg10=4.00 avg60=0 avg300=0 total=1\n', 12.5),
+    ('full avg10=40.00 avg60=0 avg300=0 total=1\n', 0.0), ('garbage\n', 0.0), (None, 0.0)])
+def test_memory_pressure_reads_some_avg10(tmp_path, monkeypatch, text, expected):
+    path = tmp_path / 'pressure'
+    if text is not None:
+        path.write_text(text)
+    monkeypatch.setattr(export, 'PRESSURE_PATH', path)  # absent file: a kernel without PSI
+    assert export.memory_pressure() == expected
+
+
+def test_context_admission_waits_out_memory_pressure_then_logs_census(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(export, '_context_lease', None)
+    slots = tmp_path / 'slots'
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(slots))
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_CONTEXTS', '4')
+    monkeypatch.setenv('CUTEAFD_EXPORT_CONTEXT_SPACING_S', '0')
+    monkeypatch.setenv('CUTEAFD_EXPORT_WORKER_RAM_MIB', '1024')
+    monkeypatch.setattr(export, 'live_cuda_processes', lambda: '2 compute processes (11:900 12:700)')
+    pressure = _pressure(tmp_path, monkeypatch, '25.00')
+    slots.mkdir()
+    (slots / 'context-baseline.json').write_text(json.dumps({'available': 1 << 30}))
+    # One leased worker and one parked planner already hold contexts.
+    held = []
+    for name in ('context.0.lock', 'context.parked-abc.lock'):
+        handle = (slots / name).open('w+')
+        handle.write('1024')
+        handle.flush()
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        held.append(handle)
+    waits = []
+    def sleep(seconds):
+        waits.append(seconds)
+        if len(waits) == 3:  # pressure subsides after three one-second checks
+            pressure.write_text('some avg10=4.00 avg60=0 avg300=0 total=1\n')
+    monkeypatch.setattr(export.time, 'sleep', sleep)
+    try:
+        export.context_admission()
+        assert waits == [1, 1, 1]
+        assert (slots / 'context.1.lock').read_text() == '1024'
+        out = capsys.readouterr().out
+        assert out.count('AOT context waits: memory pressure some avg10=25.00 > 10') == 1
+        assert 'live contexts 1 leased + 1 parked before this one' in out
+        assert 'host compute: 2 compute processes (11:900 12:700)' in out
+    finally:
+        for handle in held:
+            handle.close()
+        if export._context_lease:
+            export._context_lease.close()
+        export._context_lease = None
+
+
+def test_memory_pressure_at_threshold_still_admits(tmp_path, monkeypatch):
+    monkeypatch.setattr(export, '_context_lease', None)
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path / 'slots'))
+    monkeypatch.setenv('CUTEAFD_EXPORT_CONTEXT_SPACING_S', '0')
+    monkeypatch.setattr(export, 'live_cuda_processes', lambda: 'none')
+    _pressure(tmp_path, monkeypatch, '10.00')
+    def no_wait(seconds):
+        raise AssertionError('admission at the threshold must not wait')
+    monkeypatch.setattr(export.time, 'sleep', no_wait)
+    export.context_admission()
+    try:
+        assert export._context_lease
+    finally:
+        export._context_lease.close()
+        export._context_lease = None
+
+
+def test_live_cuda_processes_formats_nvidia_smi(monkeypatch):
+    monkeypatch.setattr(export.shutil, 'which', lambda name: '/usr/bin/nvidia-smi')
+    class Done:
+        stdout = '4242, 3072\n4243, 812\n'
+    monkeypatch.setattr(export.subprocess, 'run', lambda *a, **k: Done())
+    assert LIVE_CUDA_PROCESSES() == '2 compute processes (4242:3072 4243:812)'
+    monkeypatch.setattr(export.shutil, 'which', lambda name: None)
+    assert LIVE_CUDA_PROCESSES() == 'nvidia-smi unavailable'
+
+
+@pytest.mark.parametrize('cls,machine,jobs,expected', [
+    ('remote', 'aarch64', 8, 4), ('remote', 'aarch64', 2, 2), ('raptor', 'aarch64', 8, 4),
+    ('raptor', 'x86_64', 16, 16), ('remote', 'x86_64', 8, 4)])
+def test_gpu_workers_cap_gb10_packages(monkeypatch, cls, machine, jobs, expected):
+    import platform
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_CLASS', cls)
+    monkeypatch.setattr(platform, 'machine', lambda: machine)
+    assert export.gpu_workers(jobs) == expected
+
+
+_POOL_CHILD = """
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import package_exl3_aot as package
+pids = package.compile_variants([None] * 9, 2)
+# Each worker set up its session once and served several variants.
+assert len(set(pids)) <= 2 and len(pids) == 9, pids
+print(len(set(pids)))
+"""
+
+
+def test_exl3_variant_workers_persist_across_variants(tmp_path):
+    # A variant stand-in that reports its worker pid: the real pool, spawn
+    # context and initializer, without CUDA.
+    shim = tmp_path / 'shim.py'
+    shim.write_text('import os, time\n'
+                    'def variant(payload):\n'
+                    '    assert os.environ["CUTEAFD_EXPORT_WORKER_RAM_MIB"] == "4096"\n'
+                    '    assert os.getsid(0) == os.getpid()\n'
+                    '    time.sleep(0.05)\n'
+                    '    return os.getpid()\n')
+    child = _POOL_CHILD.replace('import package_exl3_aot as package\n',
+                                'import package_exl3_aot as package\nimport shim\n'
+                                'package.compile_variant = shim.variant\n')
+    env = {**os.environ, 'PYTHONPATH': str(tmp_path)}
+    result = subprocess.run([sys.executable, '-c', child, str(ROOT / 'python/tools/aot')], env=env,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert int(result.stdout.strip()) in (1, 2)
+    text = (ROOT / 'python/tools/aot/package_exl3_aot.py').read_text()
+    assert 'max_tasks_per_child' not in text
+    assert 'initializer=init_variant_worker' in text
+
+
+def test_spark_native_builds_brake_ninja_on_load():
+    host_isa = ROOT / 'scripts/build/host-isa.sh'
+    for machine, expected in (('aarch64', ['-l', '14']), ('x86_64', [])):
+        out = subprocess.run(['bash', '-c', f'uname() {{ echo {machine}; }}; source "$1"; cuteafd_native_build_args',
+                              'host-isa', str(host_isa)], capture_output=True, text=True, check=True).stdout
+        assert out.split() == expected
+    for script, root in (('build-wip-artifacts.sh', 'build_dir'), ('build-release-artifacts.sh', 'build_root')):
+        text = (ROOT / 'scripts/build' / script).read_text()
+        assert f'cmake --build "${root}/native" -- "${{native_build_args[@]}}"' in text
+        assert text.index('cuteafd_native_build_args') < text.index('cmake --build')

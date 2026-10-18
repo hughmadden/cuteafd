@@ -124,6 +124,7 @@ class PackageProfileTests(unittest.TestCase):
             empty_cache=Mock())
         jobs = ModuleType('_export_jobs')
         jobs.export_jobs = lambda: 1
+        jobs.gpu_workers = lambda requested: requested
         jobs.export_slot = nullcontext
         jobs.park_context_lease = lambda: None
         image = bytearray(64)
