@@ -2092,8 +2092,15 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let expected_response_wire_bytes = verbs_host_expected_response_wire_bytes(request)?;
         let (request_wire_bytes, expected_response_wire_bytes) = match capacity {
             Some(rows) => {
-                let (max_request, max_response) = crate::protocol_v2::compact_expert_wire_bytes(
-                    cuteafd_core::expert_geometry(), rows, request.header.hidden_dtype == ExpertV2Dtype::Bf16)?;
+                let ingress = if request.header.flags & crate::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0 {
+                    cuteafd_core::SparkIngress::Exlr8Rotated
+                } else if request.header.hidden_dtype == ExpertV2Dtype::Bf16 {
+                    cuteafd_core::SparkIngress::Bf16
+                } else {
+                    cuteafd_core::SparkIngress::Fp8K32
+                };
+                let (max_request, max_response) = cuteafd_core::SparkEndpoint { capacity: rows, ingress }
+                    .wire_bytes(cuteafd_core::expert_geometry()).context("invalid expert endpoint wire geometry")?;
                 (request_wire_bytes.max(max_request), expected_response_wire_bytes.max(max_response))
             }
             None => (request_wire_bytes, expected_response_wire_bytes),
@@ -4358,7 +4365,9 @@ fn verbs_host_expected_response_for_request(
 fn verbs_host_expected_response_wire_bytes(request: &ExpertProtocolV2Request) -> Result<usize> {
     let hidden_dim = request.header.hidden_dim as usize;
     let bf16_row_bytes = ExpertV2Dtype::Bf16.row_bytes(hidden_dim)?;
-    let negotiated_row_bytes = if request.nvfp4_e2m1_fp8_e4m3_response_enabled() {
+    let negotiated_row_bytes = if request.header.flags & crate::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0 {
+        ExpertV2Dtype::F32.row_bytes(hidden_dim)?
+    } else if request.nvfp4_e2m1_fp8_e4m3_response_enabled() {
         ExpertV2Dtype::Nvfp4E2m1Fp8E4m3.row_bytes(hidden_dim)?
     } else if request.fp8_e4m3_row_scaled_response_enabled() {
         ExpertV2Dtype::Fp8E4m3RowScaled.row_bytes(hidden_dim)?
@@ -5457,6 +5466,34 @@ mod persistent_tests {
                 expected.wire_stats().wire_bytes
             );
         }
+    }
+
+    #[test]
+    fn expected_exlr8_response_wire_bytes_cover_f32_at_each_capacity() -> Result<()> {
+        let geometry = cuteafd_core::ExpertGeometry::GLM5;
+        for capacity in [1, 64, 4096] {
+            let mut request = persistent_chunk_request(1);
+            // Only the header is used by this size calculation; no large allocation.
+            request.header.row_count = capacity;
+            request.header.hidden_dim = geometry.hidden;
+            request.header.hidden_dtype = ExpertV2Dtype::F16;
+            request.header.hidden_row_stride_bytes = geometry.hidden * 2;
+            request.header.flags = crate::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED;
+            let endpoint = cuteafd_core::SparkEndpoint { capacity,
+                ingress: cuteafd_core::SparkIngress::Exlr8Rotated };
+            let (_, response) = endpoint.wire_bytes(geometry).unwrap();
+            for debug in [false, true] {
+                if debug { request.header.flags |= crate::EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM; }
+                let expected = response + if debug { 32 } else { 0 };
+                assert_eq!(verbs_host_expected_response_wire_bytes(&request)?, expected);
+                let budget = crate::expert::native_frame_budget(geometry, capacity)?;
+                assert!(expected <= budget);
+                let (_, ring) = persistent_ring_geometry(budget, 128, expected, 8 << 20, 4096, 8)?;
+                assert!(ring.slot_capacity_bytes >= expected);
+                assert!(persistent_ring_geometry(expected - 1, 128, expected, 8 << 20, 4096, 8).is_err());
+            }
+        }
+        Ok(())
     }
 
     #[test]

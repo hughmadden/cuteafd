@@ -33,6 +33,33 @@ pub const V41_HIDDEN: u32 = 5120;
 pub const V41_BACKBONE_TOPK: u32 = 6;
 pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 
+/// Per-endpoint ceiling for native frames, including indexed F32 rank partials.
+/// Each peer carries one rank plane; rank count multiplies retained intake/rings,
+/// never this frame bound. Keep the ordinary transport default as the floor.
+pub fn native_frame_budget(geometry: cuteafd_core::ExpertGeometry, capacity: u32) -> Result<usize> {
+    let endpoint = cuteafd_core::SparkEndpoint {
+        capacity, ingress: cuteafd_core::SparkIngress::Exlr8Rotated,
+    };
+    let (request, response) = endpoint.wire_bytes(geometry)
+        .context("invalid native frame capacity or geometry")?;
+    let debug_bytes = crate::EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN
+        - crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+    Ok(request.max(response).checked_add(debug_bytes)
+        .context("native frame budget overflow")?.max(crate::DEFAULT_MAX_FRAME_BYTES))
+}
+
+fn validate_frame_budget(capacity: u32, max_frame_bytes: usize) -> Result<()> {
+    let geometry = cuteafd_core::expert_geometry();
+    let minimum = crate::protocol_v2::EXPERT_PROTOCOL_V2_REQUEST_DEBUG_HEADER_LEN
+        + crate::EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN
+        + geometry.topk as usize * crate::EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN
+        + geometry.hidden as usize * 2;
+    let maximum = native_frame_budget(geometry, capacity)?;
+    ensure!((minimum..=maximum).contains(&max_frame_bytes),
+        "invalid native frame budget {max_frame_bytes}: expected {minimum}..={maximum} for capacity {capacity}");
+    Ok(())
+}
+
 /// A request encoding is independent of rank ownership. Canonical requests
 /// still bind every response to an explicit pure-TP topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,6 +675,72 @@ mod tests {
         EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED, ExpertProtocolV2Request,
         ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2SourceKind,
     };
+    #[test]
+    fn native_frame_budget_tracks_capacity_and_one_rank_plane() -> Result<()> {
+        for geometry in [cuteafd_core::ExpertGeometry::GLM5, cuteafd_core::ExpertGeometry::DEEPSEEK_V41] {
+            for capacity in [1, 64, 4096] {
+                let rows = capacity as usize;
+                let indexed_reply = 128 + rows * (geometry.hidden as usize * 4 + 4);
+                let request = 128 + rows * (40 + geometry.topk as usize * 12 + geometry.hidden as usize * 2);
+                let budget = native_frame_budget(geometry, capacity)?;
+                assert_eq!(budget, indexed_reply.max(request).max(crate::DEFAULT_MAX_FRAME_BYTES));
+                let endpoint = cuteafd_core::SparkEndpoint { capacity,
+                    ingress: cuteafd_core::SparkIngress::Exlr8Rotated };
+                let (input, output) = endpoint.wire_bytes(geometry).unwrap();
+                assert_eq!(output + 32, indexed_reply);
+                assert!(input + 32 <= budget && output + 32 <= budget);
+                // Rank aggregation belongs to retained storage, not a peer frame.
+                for ranks in [1, 4, 6] {
+                    assert_eq!(rows * geometry.hidden as usize * 4 * ranks,
+                        (output - 96 - rows * 4) * ranks);
+                }
+            }
+        }
+        assert_eq!(native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)?, 100_679_808);
+        for capacity in [0, 4097, u32::MAX] {
+            assert!(native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, capacity).is_err());
+        }
+        assert_eq!(crate::TcpTransportConfig::default().max_frame_bytes, 64 << 20);
+        Ok(())
+    }
+
+    #[test]
+    fn native_frame_budget_constructor_boundaries_match_tcp_and_roce() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_TEST_FRAME_GEOMETRY";
+        let Ok(family) = std::env::var(CHILD) else {
+            // Geometry is process-wide; isolate both real constructor arms.
+            for family in ["glm", "v41"] {
+                let status = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "expert::tests::native_frame_budget_constructor_boundaries_match_tcp_and_roce", "--nocapture"])
+                    .env(CHILD, family).status()?;
+                ensure!(status.success(), "{family} constructor boundary child failed");
+            }
+            return Ok(());
+        };
+        let geometry = if family == "glm" { cuteafd_core::ExpertGeometry::GLM5 }
+            else { cuteafd_core::ExpertGeometry::DEEPSEEK_V41 };
+        cuteafd_core::set_expert_geometry(geometry).unwrap();
+        for capacity in [1, 64, 4096] {
+            let maximum = native_frame_budget(geometry, capacity)?;
+            let minimum = 128 + 40 + geometry.topk as usize * 12 + geometry.hidden as usize * 2;
+            for ranks in [1, 4, 6] {
+                let peers = (0..ranks).map(|rank| format!("127.0.0.1:{}", 19441 + rank).parse())
+                    .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+                for (bytes, valid) in [(minimum - 1, false), (minimum, true),
+                    (crate::DEFAULT_MAX_FRAME_BYTES, true), (maximum, true), (maximum + 1, false)] {
+                    let config = crate::TcpTransportConfig { max_frame_bytes: bytes,
+                        ..crate::TcpTransportConfig::default() };
+                    let world = SparkWorld::canonical(ranks)?;
+                    assert_eq!(SparkExperts::new_world(world, &peers, capacity, config.clone()).is_ok(), valid,
+                        "RoCE capacity={capacity} ranks={ranks} frame={bytes}");
+                    assert_eq!(V41Tp4Tcp::new_world(world, &peers, capacity, config).is_ok(), valid,
+                        "TCP capacity={capacity} ranks={ranks} frame={bytes}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn declared_worlds_reject_unqualified_topologies() -> Result<()> {
         for ranks in 1..=6 {

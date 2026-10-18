@@ -90,11 +90,7 @@ impl SparkExperts {
             !config.timeout.is_zero(),
             "native RoCE timeout must be positive"
         );
-        ensure!(
-            config.max_frame_bytes >= 128 + 10240 + 40 + 6 * 12
-                && config.max_frame_bytes <= 64 * 1024 * 1024,
-            "invalid native RoCE frame budget"
-        );
+        super::validate_frame_budget(capacity, config.max_frame_bytes)?;
         for rank in 0..peers.len() {
             ensure!(
                 executors[rank] != 0 && !executors[..rank].contains(&executors[rank]),

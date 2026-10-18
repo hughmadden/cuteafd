@@ -115,7 +115,7 @@ fn spark_model(lanes: usize, bf16: bool, native: bool) -> Result<cuteafd_transpo
     Ok(cuteafd_transport::worker_selection::ModelAdmission {
         capacity: 4096, compiled_capacity: 4096,
         endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 4096, ingress }; endpoints],
-        rings: crate::shared::placement::spark_rings(if native { 128 << 20 } else { 64 << 20 })?,
+        rings: crate::shared::placement::spark_rings(if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)? } else { 64 << 20 })?,
     })
 }
 
@@ -146,7 +146,8 @@ mod draft_cli_tests {
         native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
         assert_eq!(native.endpoints.len(), 1);
         assert_eq!(native.endpoints[0].ingress, cuteafd_core::SparkIngress::Exlr8Rotated);
-        assert_eq!(native.rings.max_frame_bytes, 128 << 20);
+        assert_eq!(native.rings.max_frame_bytes,
+            cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity)?);
         assert!(spark_model(2, false, true).is_err());
         assert!(spark_model(0, false, false).is_err());
         Ok(())
@@ -627,7 +628,7 @@ impl Opened {
             Ok((peers, world))
         };
         let config = cuteafd_transport::TcpTransportConfig { timing: false,
-            timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { 128 << 20 } else { 64 << 20 } };
+            timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)? } else { 64 << 20 } };
         let row_bytes = self.cfg.hidden * if native { 4 } else { 2 };
         crate::shared::memory_report::release_load_staging(&self.library);
         // Connect every rank and register full-size buffers now: the first
