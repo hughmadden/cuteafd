@@ -315,7 +315,8 @@ cmake \
 # One process budget shared by variant workers across all Ninja package jobs.
 export CUTEAFD_EXPORT_SLOT_DIR="${CUTEAFD_EXPORT_SLOT_DIR:-$build_dir/cache/export-slots}"
 export CUTEAFD_EXPORT_HOST_CLASS="${CUTEAFD_EXPORT_HOST_CLASS:-$( [[ "$role" == coordinator ]] && echo raptor || echo remote )}"
-cmake --build "$build_dir/native"
+mapfile -t native_build_args < <(cuteafd_native_build_args)
+cmake --build "$build_dir/native" -- "${native_build_args[@]}"
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
 
 install -m 0755 "$build_dir/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"

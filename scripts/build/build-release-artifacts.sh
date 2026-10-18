@@ -261,7 +261,8 @@ cmake \
   -DCUTEAFD_XGRAMMAR_LOCK_FILE="$build_root/source/third_party/xgrammar.lock.json" \
   -DPython3_EXECUTABLE="$(command -v python3)" \
   -DCUTEAFD_CUDA_ARCHITECTURES="$cuda_arch"
-cmake --build "$build_root/native"
+mapfile -t native_build_args < <(cuteafd_native_build_args)
+cmake --build "$build_root/native" -- "${native_build_args[@]}"
 
 install -d "$output_dir"
 cuteafd_host_isa_install "$output_dir" "$build_root/native" "$cargo_target_dir" "${host_isas[@]}"

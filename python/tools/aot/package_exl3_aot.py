@@ -598,10 +598,15 @@ def tile_overrides(values: list[str], capacities: list[int], role: str,
     return result
 
 
-def compile_variant(payload):
+def init_variant_worker():
+    """Once per long-lived worker: its own session (so a failure can kill the
+    compilers it started) and the reservation its one CUDA context takes."""
     os.setsid()
     os.environ['CUTEAFD_EXPORT_WORKER_RAM_MIB'] = '4096'
     os.environ['CUTEAFD_EXPORT_WORKER_GPU_MIB'] = '2688'
+
+
+def compile_variant(payload):
     args, target_compute, raw, width, experts, capacity, topk, dtype, run_options = payload
     import _pinned_sparkinfer
     from export_b12x_exl3_aot import export
@@ -644,8 +649,12 @@ def compile_variant(payload):
 
 def compile_variants(payloads, jobs):
     """Observe failures in completion order, assemble successes in input order."""
+    # Workers live for the whole package and reuse one CUDA context across
+    # variants: a context per variant meant 24-30 create/destroy cycles per
+    # package, and GB10 context creation fails (NV_ERR_NO_MEMORY) under the
+    # build's own load. Each variant still frees its tensors and cache.
     pool = ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context('spawn'),
-                               max_tasks_per_child=1)
+                               initializer=init_variant_worker)
     try:
         futures = {pool.submit(compile_variant, payload): index for index, payload in enumerate(payloads)}
         results = [None] * len(payloads)
@@ -773,8 +782,8 @@ def build(args: argparse.Namespace) -> None:
                 for schedule, raw, run_options in exports:
                     pending.append((raw, width, experts, capacity, topk, dtype, run_options,
                                     destinations, schedule, requested))
-        from _export_jobs import export_jobs, park_context_lease
-        jobs = min(export_jobs(), len(pending))
+        from _export_jobs import export_jobs, gpu_workers, park_context_lease
+        jobs = min(gpu_workers(export_jobs()), len(pending))
         # The planner's context idles while its workers run; free its host lease.
         park_context_lease()
         print(f'EXL3 variants: {len(pending)} independent exports, {jobs} workers', flush=True)
