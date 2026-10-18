@@ -5,6 +5,9 @@ use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::Residency;
 
+mod execution;
+pub(crate) use execution::Exlr8Execution;
+
 const BANKS: usize = 2;
 
 pub(crate) struct Exlr8Weights<'a> {
