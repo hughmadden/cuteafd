@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const DEFAULT_CAP_BYTES: u64 = 8 << 30;
+/// Off by default: #419 measured flat decode tok/s with all V4.1 scales preloaded.
+pub const DEFAULT_CAP_BYTES: u64 = 0;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MappedPlacement {
@@ -82,10 +83,11 @@ mod tests {
     #[test]
     fn all_or_nothing_cap_and_host_admission() {
         let bytes = 6 << 30;
-        let admitted = MappedPlacement::resolve(4, 2, bytes, DEFAULT_CAP_BYTES, bytes);
+        let cap = 8 << 30;
+        let admitted = MappedPlacement::resolve(4, 2, bytes, cap, bytes);
         assert_eq!(admitted.label(), "PLE 2 mapped / 2 preloaded");
         assert_eq!(admitted.preloaded_bytes, bytes);
-        for (cap, host) in [(0, bytes), (bytes - 1, bytes), (DEFAULT_CAP_BYTES, bytes - 1)] {
+        for (cap, host) in [(DEFAULT_CAP_BYTES, bytes), (bytes - 1, bytes), (cap, bytes - 1)] {
             let rejected = MappedPlacement::resolve(4, 2, bytes, cap, host);
             assert_eq!(rejected.label(), "PLE 4 mapped");
             assert_eq!(rejected.preloaded_bytes, 0);

@@ -142,7 +142,7 @@ pub(crate) struct FabricArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
-    #[arg(long, default_value_t = 8.0, value_parser = parse_scale_preload_gib)]
+    #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
     pub(crate) vision_replicas: u32,
@@ -570,9 +570,9 @@ pub(crate) struct TransportCapabilitiesArgs {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn mapped_scale_cap_defaults_to_eight_and_accepts_zero() {
+    fn mapped_scale_cap_defaults_to_zero_and_accepts_a_cap() {
         use clap::Parser;
-        for (flags, cap) in [(vec![], 8.0), (vec!["--mapped-scale-preload-gib", "0"], 0.0),
+        for (flags, cap) in [(vec![], 0.0), (vec!["--mapped-scale-preload-gib", "8"], 8.0),
             (vec!["--mapped-scale-preload-gib", "0.5"], 0.5)] {
             let super::Commands::Plan(args) = super::Cli::try_parse_from(
                 ["cuteafd", "plan", "/model"].into_iter().chain(flags)).unwrap().command
@@ -881,7 +881,7 @@ mod tests {
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
-    #[arg(long, default_value_t = 8.0, value_parser = parse_scale_preload_gib)]
+    #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
     /// Checked Spark vision replicas; omitted for local RTX fallback.
     #[arg(long)]

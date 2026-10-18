@@ -650,7 +650,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
-            mapped_scale_preload_gib: 8.0,
+            mapped_scale_preload_gib: 0.0,
             vision_replicas: 1,
             vision: cuteafd_loader::plan::MediaMode::Auto,
             audio: cuteafd_loader::plan::MediaMode::Off,

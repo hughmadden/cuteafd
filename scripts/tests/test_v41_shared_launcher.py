@@ -105,7 +105,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The serve command is the same set of flags and values (clap ignores order;
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
-        expected_command = before["command"] + (["--mapped-scale-preload-gib", "8"] if role == "coordinator" else [])
+        expected_command = before["command"] + (["--mapped-scale-preload-gib", "0"] if role == "coordinator" else [])
         assert flag_values(after["command"]) == flag_values(expected_command), where
     # S5 replaces report JSON with the planner-owned deployment. Only the
     # preflight argv changes; all serving commands and fingerprint env above
@@ -126,7 +126,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
                       "--deployment-peers", command[command.index("--peers") + 1]]
         expected[expected.index("--rtx"):expected.index("--rtx")] = additions
         index = expected.index("--available-sparks") + 2
-        expected[index:index] = ["--mapped-scale-preload-gib", "8"]
+        expected[index:index] = ["--mapped-scale-preload-gib", "0"]
         expected_plans.append(expected)
     assert current["plans"] == expected_plans, case
 

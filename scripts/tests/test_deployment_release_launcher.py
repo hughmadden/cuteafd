@@ -36,7 +36,7 @@ def test_deployment_preserves_release_container_commands(entry: dict) -> None:
         # resolved-config fingerprint today; adding a fabricated one is a failure.
         if entry["family"] == "deepseek_v41" and "serve-native" in before["command"]:
             position = before["command"].index("--max-output-tokens") + 2
-            before["command"][position:position] = ["--mapped-scale-preload-gib", "8"]
+            before["command"][position:position] = ["--mapped-scale-preload-gib", "0"]
         assert after == before, (entry["name"], old["host"])
     assert all("--deployment" in plan for plan in current["plans"])
 
