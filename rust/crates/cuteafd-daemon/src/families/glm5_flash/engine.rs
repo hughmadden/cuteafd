@@ -876,6 +876,14 @@ pub(crate) struct StepPlan<'p, 'a> {
     spark_bf16: bool,
 }
 
+/// Expert buffers required by the admitted routed-layer homes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StepExperts {
+    pub local_fp8: bool,
+    pub spark: bool,
+    pub tp2: bool,
+}
+
 /// The engine settings a step plan depends on besides its layers and experts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StepSettings {
@@ -901,7 +909,7 @@ pub(crate) struct StepSettings {
 impl<'p, 'a> StepPlan<'p, 'a> {
     /// The plan of an engine over `layers` with `experts` and `settings` (rank 0's shape).
     pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: &'p GlmNextConfig,
-        layers: &[GlmfLayer<'_>], experts: Option<&Experts<'_>>, settings: StepSettings) -> Self {
+        layers: &[GlmfLayer<'_>], experts: StepExperts, settings: StepSettings) -> Self {
         let split = layers.first().is_some_and(|l| l.split);
         let (table_pages, table_pool_pages) = glmf_table_pages(settings.max_context as u64);
         // As `GlmfEngine::new` resolves it: without an MLA layer there is no index cache.
@@ -924,9 +932,9 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             shape: GlmfStepShape {
                 lead: true,
                 split,
-                tp2_experts: false,
-                local_experts: matches!(experts, Some(Experts::Local(_))),
-                spark: matches!(experts, Some(Experts::Spark { .. })),
+                tp2_experts: experts.tp2,
+                local_experts: experts.local_fp8,
+                spark: experts.spark,
                 partial_bytes: if settings.kda_fp32_partials { 4 } else { 2 },
                 output_shard: settings.kda_output_shard,
                 full_prefill_logits: settings.full_prefill_logits,
@@ -937,15 +945,6 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             shared_records,
             spark_bf16: settings.spark_bf16,
         }
-    }
-
-    /// Routed experts as the plan's shape will have them (a plan made before its experts exist:
-    /// the admission's).
-    pub(crate) fn with_experts(mut self, local: bool, spark: bool, tp2: bool) -> Self {
-        self.shape.local_experts = local;
-        self.shape.spark = spark;
-        self.shape.tp2_experts = tp2;
-        self
     }
 
     /// Device bytes of rank `rank`'s step workspaces: the decode workspace of the plan's decode rows,
@@ -1319,6 +1318,8 @@ fn output_rows(rows: usize, rank: usize) -> (usize, usize) {
 }
 
 pub(crate) struct GlmfEngine<'a> {
+    /// The same admitted homes used to allocate early workspaces; validated against installed backends.
+    step_experts: StepExperts,
     pub(crate) spark_bf16: bool,
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
@@ -1712,7 +1713,7 @@ impl<'a> GlmfEngine<'a> {
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool,
-        execution: &cuteafd_loader::placement::LayerExecutionPlan) -> Result<Self> {
+        execution: &cuteafd_loader::placement::LayerExecutionPlan, step_experts: StepExperts) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let sms = library.sm_count()?;
         let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
@@ -1764,7 +1765,7 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
+        Ok(Self { step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
             pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),
@@ -2201,6 +2202,14 @@ impl<'a> GlmfEngine<'a> {
                 BackendLayers { home: ExpertHome::Spark, layers: spark_layers },
             ])?
         };
+        let installed = StepExperts {
+            local_fp8: matches!(self.experts, Some(Experts::Local(_)))
+                || self.local.as_ref().is_some_and(|(_, e)| matches!(e, Experts::Local(_))),
+            spark: matches!(self.experts, Some(Experts::Spark { .. })),
+            tp2: self.tp2.is_some(),
+        };
+        ensure!(self.step_experts == installed,
+            "GLM Flash step expert buffers differ from admission: planned {:?}, installed {installed:?}", self.step_experts);
         self.expert_routing = Some(routes);
         Ok(())
     }
@@ -3036,21 +3045,20 @@ impl<'a> GlmfEngine<'a> {
 
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
-        let mut plan = StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.experts.as_ref(),
+        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.step_experts,
             StepSettings { spark_bf16: self.spark_bf16, kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
-                replay_records: self.replay_records, decode_rows: self.decode_rows });
-        plan.shape.tp2_experts = self.tp2.is_some();
-        plan.shape.local_experts |= self.local.as_ref().is_some_and(|(_, e)| matches!(e, Experts::Local(_)));
-        plan
+                replay_records: self.replay_records, decode_rows: self.decode_rows })
     }
 
     /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
     /// what its step plan holds.
     pub(crate) fn install_workspaces(&self, workspaces: StepWorkspaces<'a>) -> Result<()> {
-        ensure!(workspaces.key == self.step_plan().key() && workspaces.rows == self.prefill_rows,
-            "step workspaces allocated for another plan");
+        let key = self.step_plan().key();
+        ensure!(workspaces.key == key && workspaces.rows == self.prefill_rows,
+            "step workspaces allocated for another plan: allocated {:?} ({} prefill rows), engine {key:?} ({} prefill rows)",
+            workspaces.key, workspaces.rows, self.prefill_rows);
         ensure!(self.decode_workspace.borrow().is_none() && self.lane_workspaces.borrow().is_empty(),
             "step workspaces already allocated");
         *self.decode_workspace.borrow_mut() = Some(workspaces.decode);
