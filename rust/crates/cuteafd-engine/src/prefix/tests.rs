@@ -109,6 +109,8 @@ struct Fake {
     slots: usize,
     queue: RefCell<Vec<Op>>,
     fail_restore: Cell<bool>,
+    fail_copy: Cell<bool>,
+    fail_drain: Cell<bool>,
     record_format: Cell<&'static str>,
     drains: Cell<usize>,
     rule: ReuseRule,
@@ -125,7 +127,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0 }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
@@ -265,6 +267,7 @@ impl PrefixFamily for Fake {
         Ok(())
     }
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
+        if self.fail_copy.get() { return Err("injected copy failure".into()); }
         for row in 0..copy.rows {
             self.queue.borrow_mut().push(Op::Copy(self.page_row(copy.from, row), self.page_row(copy.to, row)));
         }
@@ -272,6 +275,7 @@ impl PrefixFamily for Fake {
     }
     fn drain(&self) -> Result<(), BoxError> {
         self.drains.set(self.drains.get() + 1);
+        if self.fail_drain.get() { return Err("injected drain failure".into()); }
         self.flush();
         Ok(())
     }
@@ -1110,4 +1114,39 @@ fn usage_provenance_survives_device_and_host_restore() {
         assert_eq!(source.host,host);
         cache.release(&fake,&admitted.placement.pages).unwrap();
     }
+}
+
+#[test]
+fn private_step_forks_cow_abort_and_failures_preserve_live_lease() {
+    let fake = Fake::new(8, 2, 0);
+    let mut cache = cache(&fake, 0, 0);
+    let mut placement = cache.admit_cold(&fake, 5, 5,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    let tokens = seq(1, 5);
+    fake.forward(&mut placement, &tokens).unwrap();
+    let free = cache.pool().free();
+    assert!(cache.fork_step(&fake, &[], 5, 6).is_err());
+    assert!(cache.fork_step(&fake, &placement.pages, 5, 4).is_err());
+    assert!(cache.fork_step(&fake, &placement.pages, 5, 100).is_err());
+    assert_eq!(cache.pool().free(), free);
+    let proposal = cache.fork_step(&fake, &placement.pages, 5, 9).unwrap();
+    assert_eq!(proposal[0], placement.pages[0]);
+    assert_ne!(proposal[1], placement.pages[1]);
+    assert_eq!(cache.pool().refs(placement.pages[0]), 2);
+    cache.release(&fake, &proposal).unwrap();
+    assert_eq!(cache.pool().free(), free);
+    fake.forward(&mut placement, &tokens).unwrap();
+    fake.fail_copy.set(true);
+    assert!(cache.fork_step(&fake, &placement.pages, 5, 9).is_err());
+    assert_eq!(cache.pool().free(), free);
+    assert_eq!(cache.pool().refs(placement.pages[0]), 1);
+    fake.fail_drain.set(true);
+    assert!(cache.fork_step(&fake, &placement.pages, 5, 9).is_err());
+    assert_eq!(cache.stats().quarantined, 1);
+    assert_eq!(cache.pool().free(), free - 2);
+    assert_eq!(cache.pool().refs(placement.pages[0]), 2);
+    fake.fail_drain.set(false);
+    fake.fail_copy.set(false);
+    fake.forward(&mut placement, &tokens).unwrap();
+    cache.release(&fake, &placement.pages).unwrap();
 }

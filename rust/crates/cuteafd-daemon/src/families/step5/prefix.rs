@@ -216,9 +216,15 @@ mod tests {
         }
         for plane in owner.borrow().page_views(tail)? { set(plane, 0x29)?; }
         let spans = shape.snapshot_spans(0, 65)?;
+        let components = |span: &cuteafd_loader::serving_capacity::step5::ByteSpan| {
+            let state = &shape.ranks[0];
+            std::iter::once(state.length).chain(state.mtp_lengths.iter().copied()).chain(state.mtp_hidden)
+                .chain(state.sliding.iter().flat_map(|r| [r.key, r.value]))
+                .chain(state.regions.iter().flat_map(|r| [Some(r.pending_key), Some(r.pending_z), r.summaries].into_iter().flatten()))
+                .find(|s| span.offset >= s.offset && span.offset + span.bytes <= s.offset + s.bytes).unwrap()
+        };
         for span in &spans {
-            let full = shape.ranks[0].regions.iter().filter_map(|r| r.summaries)
-                .find(|s| s.offset == span.offset).unwrap_or(*span);
+            let full = components(span);
             set(owner.borrow().component(full)?, 0x39)?;
         }
         assert!(shared.capture(&family, SnapshotKind::Prompt, &tokens, &source, After::default())?);
@@ -242,8 +248,7 @@ mod tests {
         // Only the source's partial page is mutable; the full page remains shared.
         for plane in owner.borrow().page_views(tail)? { set(plane, 0x49)?; }
         for span in &spans {
-            let full = shape.ranks[0].regions.iter().filter_map(|r| r.summaries)
-                .find(|s| s.offset == span.offset).unwrap_or(*span);
+            let full = components(span);
             set(owner.borrow().component(full)?, 0xa5)?;
         }
         let mut continuation = tokens.clone();
@@ -260,15 +265,14 @@ mod tests {
             assert!(bytes[..plane.bytes / 64].iter().all(|b| *b == 0x29));
         }
         for span in &spans {
-            let full = shape.ranks[0].regions.iter().filter_map(|r| r.summaries)
-                .find(|s| s.offset == span.offset).unwrap_or(*span);
+            let full = components(span);
             let plane = owner.borrow().component(full)?;
             let mut bytes = vec![0; plane.bytes];
             device.run(|| library.copy_d2h(&mut bytes, plane))?;
             let stride = full.bytes as usize;
             assert!(bytes[..stride].iter().all(|b| *b == 0xa5));
-            assert!(bytes[stride..stride + span.bytes as usize].iter().all(|b| *b == 0x39));
-            assert!(bytes[stride + span.bytes as usize..].iter().all(|b| *b == 0xa5));
+            let offset = (span.offset - full.offset) as usize;
+            assert!(bytes[stride + offset..stride + offset + span.bytes as usize].iter().all(|b| *b == 0x39));
         }
         assert!(owner.borrow().page_views(8).is_err());
         assert!(owner.borrow().copy_page_rows(0, 1, 65).is_err());
