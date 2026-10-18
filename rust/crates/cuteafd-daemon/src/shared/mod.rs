@@ -24,6 +24,7 @@ pub(crate) mod prefill_share;
 pub(crate) mod prefix;
 pub(crate) mod probe;
 pub(crate) mod qwen;
+pub(crate) mod rope;
 pub(crate) mod sampler;
 pub(crate) mod serve;
 pub(crate) mod speculation;
