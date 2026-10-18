@@ -189,12 +189,21 @@ mod tests {
         let snapshot = Path::new(&snapshot);
         let mut catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        let shape = catalog.routed_experts();
+        let selected = [shape.first_layer];
         for ranks in 1..=6 {
             crate::shared::spark_topology::require_world(
-                cuteafd_transport::expert::SparkWorld::canonical(ranks)?, &catalog)?;
+                cuteafd_transport::expert::SparkWorld::canonical(ranks)?, &catalog, &selected)?;
         }
         assert!(crate::shared::spark_topology::require_world(
-            cuteafd_transport::expert::SparkWorld::owned(SparkTopology::NATIVE_TP4_EP1)?, &catalog).is_err());
+            cuteafd_transport::expert::SparkWorld::owned(SparkTopology::NATIVE_TP4_EP1)?, &catalog, &selected).is_err());
+        let canonical = cuteafd_transport::expert::SparkWorld::canonical(4)?;
+        crate::shared::spark_topology::require_wire(canonical, &catalog)?;
+        for layers in [vec![], vec![shape.first_layer, shape.first_layer],
+            vec![shape.first_layer + 1, shape.first_layer], vec![0], vec![shape.layers]] {
+            let error = crate::shared::spark_topology::require_world(canonical, &catalog, &layers).unwrap_err();
+            assert!(error.to_string().contains("hosted layers"), "{layers:?}: {error:#}");
+        }
         let geometry = catalog.routed_experts().geometry()?;
         let working = SparkWorkingSet { spark_layers: vec![catalog.routed_experts().first_layer],
             spark_ranks: 4, prefill_lanes: 1, ..Default::default() };

@@ -573,6 +573,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn exlr8_worker_admits_only_selected_routed_layers_when_supplied() -> Result<()> {
+        use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
+        let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else { return Ok(()); };
+        let snapshot = PathBuf::from(snapshot);
+        let mut catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        let shape = catalog.routed_experts();
+        let mut worker = config(4, 0, None);
+        worker.snapshot = snapshot.clone();
+        worker.exlr8_manifest = Some("up1".into());
+        for endpoint in &mut worker.model_admission.as_mut().unwrap().endpoints {
+            endpoint.ingress = cuteafd_core::SparkIngress::Exlr8Rotated;
+        }
+        let identity = WorkerIdentity::from_snapshot_manifest(&snapshot, shape.geometry()?,
+            worker.spark_world()?, Some("up1"))?;
+        let selection = |layers: &[usize]| -> Result<WorkerSelection> {
+            Ok(WorkerSelection::new(identity.clone(), layers)?
+                .with_model(worker.model_admission.clone().unwrap())?)
+        };
+        let valid = selection(&[shape.first_layer, shape.first_layer + 2])?;
+        let idle = selection(&[])?;
+        let dense = selection(&[0])?;
+        assert!(selection(&[shape.layers]).is_err());
+        local::admit_worker_selection(&mut worker, &valid, &catalog)?;
+        assert_eq!(worker.resident_layers(shape.layers)?, valid.layers());
+        assert!(local::admit_worker_selection(&mut worker, &dense, &catalog).is_err());
+        let mut owned = config(4, 0, Some(SparkTopology::NATIVE_TP4_EP1));
+        assert!(local::admit_worker_selection(&mut owned, &valid, &catalog).is_err());
+        // Idle identity acknowledgement intentionally needs no storage recipe.
+        local::admit_worker_selection(&mut worker, &idle, &catalog)?;
+        assert!(worker.resident_layers(shape.layers)?.is_empty());
+        Ok(())
+    }
+
     fn set_model(config: &mut NativeExpertServiceConfig, capacity: u32, bf16: bool, endpoints: usize) {
         config.model_admission = Some(cuteafd_transport::worker_selection::ModelAdmission {
             capacity, compiled_capacity: capacity,
