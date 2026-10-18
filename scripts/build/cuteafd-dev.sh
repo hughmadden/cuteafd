@@ -89,6 +89,14 @@ if [[ -n "${CUTEAFD_DEV_TARGET_DIR:-}" ]]; then
   docker_args+=(--mount "type=bind,src=$CUTEAFD_DEV_TARGET_DIR,dst=/opt/cuteafd-target"
                 -e CARGO_TARGET_DIR=/opt/cuteafd-target)
 fi
+# Sealed WIP artifacts for tests that need a built native library and packages:
+# mounted read-only at the same absolute path, so package paths resolve unchanged.
+if [[ -n "${CUTEAFD_DEV_ARTIFACTS:-}" ]]; then
+  [[ -d "$CUTEAFD_DEV_ARTIFACTS" ]] || { echo "CUTEAFD_DEV_ARTIFACTS is not a directory: $CUTEAFD_DEV_ARTIFACTS" >&2; exit 2; }
+  artifacts="$(cd "$CUTEAFD_DEV_ARTIFACTS" && pwd -P)"
+  docker_args+=(--mount "type=bind,src=$artifacts,dst=$artifacts,readonly"
+                -e CUTEAFD_DEV_ARTIFACTS="$artifacts")
+fi
 source "$repo_root/scripts/build/compiler-cache.sh"
 source "$repo_root/scripts/build/build-caches.sh"
 export CUTEAFD_KACHE="${CUTEAFD_KACHE-}" CUTEAFD_SCCACHE_CUDA="${CUTEAFD_SCCACHE_CUDA-0}"
