@@ -28,6 +28,7 @@ pub fn report(failed: bool) -> Report {
             QuantGroup { group: "shared expert".into(), formats: vec!["fp8_block".into()] }],
         speculator: Some("dSpark (≤5 drafts)".into()),
         layout: Some("1 RTX · experts TP4 over 4 Sparks".into()),
+        mapped_placement: None,
         settings: vec![setting("dspark", "true", Some("false"), "cli"), setting("concurrency", "16", Some("16"), "cli"),
             setting("prefill-batch-tokens", "4096", Some("2048"), "cli"),
             setting("CUTEAFD_NVFP4_ACTIVATIONS", "a16", None, "env")],

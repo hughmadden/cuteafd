@@ -105,7 +105,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The serve command is the same set of flags and values (clap ignores order;
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
-        assert flag_values(after["command"]) == flag_values(before["command"]), where
+        expected_command = before["command"] + (["--mapped-scale-preload-gib", "8"] if role == "coordinator" else [])
+        assert flag_values(after["command"]) == flag_values(expected_command), where
     # S5 replaces report JSON with the planner-owned deployment. Only the
     # preflight argv changes; all serving commands and fingerprint env above
     # remain byte-identical to the original captures.
@@ -124,8 +125,28 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         additions += ["--speculator", "dspark" if "--dspark" in command else "off",
                       "--deployment-peers", command[command.index("--peers") + 1]]
         expected[expected.index("--rtx"):expected.index("--rtx")] = additions
+        index = expected.index("--available-sparks") + 2
+        expected[index:index] = ["--mapped-scale-preload-gib", "8"]
         expected_plans.append(expected)
     assert current["plans"] == expected_plans, case
+
+
+@pytest.mark.parametrize("cap", ["0", "5", "8"])
+def test_scale_preload_cap_reaches_plan_and_native_serve(tmp_root, monkeypatch, cap) -> None:
+    import v41_launch_capture as capture_module
+    original = capture_module.example_config
+
+    def with_cap(name, directory):
+        config = original(name, directory)
+        config.write_text(config.read_text() + f"MAPPED_SCALE_PRELOAD_GIB={cap}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_cap)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    for args in [command, *result["plans"]]:
+        assert args.count("--mapped-scale-preload-gib") == 1
+        assert args[args.index("--mapped-scale-preload-gib") + 1] == cap
 
 
 def test_goldens_cover_every_v41_example_and_gate_card() -> None:

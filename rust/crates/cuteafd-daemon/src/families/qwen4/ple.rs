@@ -93,6 +93,8 @@ impl<'a> PleTable<'a> {
         let mapped = MappedTableDevice::new(library, "ple", mapped, args, max_rows * cfg.ple_rows())?;
         tracing::info!(gib = total as f64 / (1u64 << 30) as f64, fp8, parts = shards.len(),
             elapsed_ms = started.elapsed().as_millis() as u64, "PLE n-gram table ready");
+        cuteafd_bench::context::set_mapped_placement(cuteafd_loader::formats::mapped_preload::MappedPlacement::resolve(
+            cfg.ple_layers.len(), 0, 0, cuteafd_loader::formats::mapped_preload::DEFAULT_CAP_BYTES, 0));
         Ok(Self { mapped, scale: scale_dev, fp8, rows, row_bytes, hasher })
     }
 }

@@ -498,6 +498,10 @@ function renderMappedTables() {
   const escape = text => String(text).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const rows = [], tiers = [];
   for (const table of tables) {
+    if (table.backend === 'resident') {
+      rows.push(`<tr><td>${escape(table.name)} / resident (preloaded)</td><td colspan="10">Resident host RAM; no page-in or random-read submissions</td></tr>`);
+      continue;
+    }
     const total = table.cumulative || {};
     const oldTable = earlier.find(t => t.name === table.name);
     const before = oldTable?.cumulative || {};

@@ -20,6 +20,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
     let options = PlanOptions {
+        mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
+        mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
         attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(|reason| PlanError::InvalidOption { option: "--attention-placement", reason })?,
@@ -648,6 +650,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            mapped_scale_preload_gib: 8.0,
             vision_replicas: 1,
             vision: cuteafd_loader::plan::MediaMode::Auto,
             audio: cuteafd_loader::plan::MediaMode::Off,

@@ -680,7 +680,7 @@ mod tests {
         let catalog =
             cuteafd_loader::read_official_v41_catalog(&model)?;
         let map = cuteafd_loader::EngramTokenMap::from_file(&model.join("tokenizer.json"))?;
-        let pipeline = unsafe { EngramPipeline::new(&catalog, map, 80, 2, 8 * 1024 * 1024)? };
+        let pipeline = unsafe { EngramPipeline::new(&catalog, map, 80, 2, 8 * 1024 * 1024, 0)? };
         let mut requests = Requests::new(
             &lib,
             pipeline,
