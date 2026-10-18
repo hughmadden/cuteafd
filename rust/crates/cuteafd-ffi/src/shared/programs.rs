@@ -213,11 +213,16 @@ impl<'a> Programs<'a> {
             }
             if name.starts_with("exlr8_") {
                 super::exlr8::validate_entry(spec, entry)?;
-                let expected = [("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")];
+                let expected: &[(&str, &str)] = match name {
+                    "exlr8_a16_serving" | "exlr8_rotate" => &[("rows", "int32"), ("cta_limit", "int32")],
+                    "exlr8_group" => &[("rows", "int32")],
+                    "exlr8_reduce" => &[("rows", "int32"), ("ranks", "int32"), ("cta_limit", "int32")],
+                    _ => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
+                };
                 let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;
                 ensure!(scalars.len() == expected.len() && scalars.iter().zip(expected).all(
-                    |(s, (n, t))| s["name"].as_str() == Some(n) && s["type"].as_str() == Some(t)),
-                    "EXLR8 scalar names or types disagree with ABI v1");
+                    |(s, (n, t))| s["name"].as_str() == Some(*n) && s["type"].as_str() == Some(*t)),
+                    "EXLR8 scalar names or types disagree with ABI");
             }
         }
         Ok(self)
