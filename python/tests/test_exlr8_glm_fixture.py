@@ -144,7 +144,7 @@ def official_moe(ref, bank, config, hidden, routes, ids):
         def __getitem__(self, expert):
             return weight(expert, self.projection)
 
-    experts = SimpleNamespace(num_experts=config.num_local_experts,
+    experts = SimpleNamespace(config=config, num_experts=config.num_local_experts,
                               gate_up_proj=Projection("gate_up"), down_proj=Projection("down"),
                               act_fn=torch.nn.functional.silu)
     shared = bank.get(0, shared=True)
@@ -157,6 +157,111 @@ def official_moe(ref, bank, config, hidden, routes, ids):
         experts=lambda x, i, w: ref.GlmMoeDsaExperts.forward(experts, x, i, w),
         shared_experts=lambda x: ref.GlmMoeDsaMLP.forward(mlp, x))
     return ref.GlmMoeDsaMoE.forward(moe, hidden)
+
+
+def test_official_moe_binding_matches_pinned_module_on_cpu(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.syspath_prepend(str(ROOT / "third_party/transformers/src"))
+    from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as ref
+
+    config = ref.GlmMoeDsaConfig(hidden_size=4, moe_intermediate_size=4,
+                                num_local_experts=2, n_shared_experts=1,
+                                num_experts_per_tok=2, experts_implementation="eager")
+    generator = torch.Generator().manual_seed(SEED)
+    operands = {(e, shared): {p: torch.randn(4, 4, generator=generator) / 8
+                             for p in ("gate", "up", "down")}
+                for e, shared in ((0, False), (1, False), (0, True))}
+    bank = SimpleNamespace(get=lambda e, shared=False: operands[int(e), shared])
+    hidden = torch.randn(3, 4, generator=generator).bfloat16()
+    ids = torch.tensor([[0, 1], [1, 0], [0, 1]])
+    routes = torch.tensor([[0.6, 0.4], [0.7, 0.3], [0.2, 0.8]])
+    for dtype in (torch.bfloat16, torch.float64):
+        module = ref.GlmMoeDsaMoE(config).to(dtype=dtype)
+        with torch.no_grad():
+            for expert in range(2):
+                weights = bank.get(expert)
+                module.experts.gate_up_proj[expert].copy_(torch.cat((weights["gate"], weights["up"])))
+                module.experts.down_proj[expert].copy_(weights["down"])
+            for projection, weight in bank.get(0, shared=True).items():
+                getattr(module.shared_experts, projection + "_proj").weight.copy_(weight)
+            routing = routes.double() if dtype == torch.float64 else routes
+            monkeypatch.setattr(module.gate, "forward", lambda x: (None, routing, ids))
+            expected = module(hidden.to(dtype))
+            actual = official_moe(ref, bank, config, hidden.to(dtype), routes, ids)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def save_fixture(root, manifest, name, tensor):
+    import torch
+    value = tensor.detach().contiguous().cpu()
+    data = value.view(torch.uint8).numpy().tobytes()
+    (root / (name + ".bin")).write_bytes(data)
+    manifest["files"][name] = {"dtype": str(value.dtype), "shape": list(value.shape),
+                               "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def generate_outputs(ref, bank, config, router, norm, root, manifest, device):
+    import torch
+    with torch.inference_mode():
+        residual = torch.randn((max(ROWS), config.hidden_size),
+                               generator=torch.Generator().manual_seed(SEED)).bfloat16().to(device)
+        hidden = norm(residual).bfloat16()
+        _, routes, ids = router(hidden)
+        official = (residual + official_moe(ref, bank, config, hidden, routes, ids)).float()
+        fp64 = residual.double() + official_moe(ref, bank, config, hidden.double(), routes, ids)
+        assert torch.isfinite(official).all() and torch.isfinite(fp64).all()
+        for rows in ROWS:
+            for name, value in {"residual": residual, "hidden": hidden, "ids": ids.int(),
+                                "routes": routes, "official_output": official, "fp64_output": fp64}.items():
+                save_fixture(root, manifest, f"r{rows}_{name}", value[:rows])
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def test_generator_cpu_end_to_end_with_real_layer_operands(monkeypatch, tmp_path):
+    configured = os.environ.get("CUTEAFD_EXLR8_TEST_SNAPSHOT")
+    dense = os.environ.get("CUTEAFD_EXLR8_DENSE_SNAPSHOT")
+    if not configured or not dense:
+        pytest.skip("set real EXLR8 and dense snapshots for the CPU generator qualification")
+    import copy
+    torch = pytest.importorskip("torch")
+    monkeypatch.syspath_prepend(str(ROOT / "third_party/transformers/src"))
+    monkeypatch.syspath_prepend(str(ROOT / "python/reference"))
+    from transformers import AutoConfig
+    from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as ref
+    from shape_invariant import install
+
+    monkeypatch.setattr(torch.nn.functional, "linear", torch.nn.functional.linear)
+    monkeypatch.setattr(torch, "einsum", torch.einsum)
+    install()
+    config = copy.deepcopy(AutoConfig.from_pretrained(dense))
+    config._experts_implementation = "eager"
+    config.num_local_experts, config.num_experts_per_tok = 2, 2
+    config.n_group, config.topk_group, config.moe_intermediate_size = 1, 1, 128
+    selected = json.loads((Path(configured) / "manifests/exlr8-manifest-up1.json").read_text())
+    layer = selected["layers"]["3"]
+    for projection in ("gate", "up"):
+        layer[projection] = [choices[:1] for choices in layer[projection][:2]]
+        layer["shared"][projection] = layer["shared"][projection][:1]
+    layer["down"] = layer["down"][:2]
+    oracle = load_reference("exlr8_cpu_generator_oracle", "python/reference/exlr8.py")
+    golden = load_reference("exlr8_cpu_generator_glm", "python/reference/families/glm5/golden.py")
+    reader = golden.Weights(Path(dense))
+    router = ref.GlmMoeDsaTopkRouter(config)
+    norm = ref.GlmMoeDsaRMSNorm(config.hidden_size, config.rms_norm_eps)
+    with torch.no_grad():
+        router.weight.copy_(reader.get("model.layers.3.mlp.gate.weight", device="cpu")[:2])
+        router.e_score_correction_bias.copy_(reader.get(
+            "model.layers.3.mlp.gate.e_score_correction_bias", device="cpu")[:2])
+        norm.weight.data = reader.get("model.layers.3.post_attention_layernorm.weight", device="cpu")
+    bank = DecodedExperts(Path(configured), selected, oracle, torch)
+    generate_outputs(ref, bank, config, router, norm, tmp_path, {"files": {}}, "cpu")
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert len(manifest["files"]) == len(ROWS) * 6
+    for name, entry in manifest["files"].items():
+        data = (tmp_path / (name + ".bin")).read_bytes()
+        assert len(data) == entry["bytes"] and hashlib.sha256(data).hexdigest() == entry["sha256"]
+        rows = int(name.split("_")[0][1:])
+        assert entry["shape"] == [rows, 2 if name.endswith(("_ids", "_routes")) else config.hidden_size]
 
 
 def test_layer3_same_quant_fixtures(monkeypatch):
@@ -182,6 +287,7 @@ def test_layer3_same_quant_fixtures(monkeypatch):
     assert selected["name"] == "up1" and selected["format"] == "exlr8-v2-manifest"
     assert sha256(Path(ref.__file__)) == sha256(ROOT / SOURCES[-1]), "official control-flow source differs"
     config = AutoConfig.from_pretrained(dense)
+    config._experts_implementation = "eager"
     assert config.hidden_size == 6144 and config.moe_intermediate_size == 2048
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
@@ -204,13 +310,6 @@ def test_layer3_same_quant_fixtures(monkeypatch):
     paths += [f"experts/exlr8-layer-003.k{k}.safetensors" for k in sorted(widths)]
     manifest["checkpoint_files_sha256"] = {p: sha256(snapshot / p) for p in paths}
 
-    def save(name, tensor):
-        value = tensor.detach().contiguous().cpu()
-        data = value.view(torch.uint8).numpy().tobytes()
-        (root / (name + ".bin")).write_bytes(data)
-        manifest["files"][name] = {"dtype": str(value.dtype), "shape": list(value.shape),
-                                   "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-
     reader = golden.Weights(dense)
 
     def dense_operand(name):
@@ -228,17 +327,5 @@ def test_layer3_same_quant_fixtures(monkeypatch):
         router.e_score_correction_bias.copy_(dense_operand("model.layers.3.mlp.gate.e_score_correction_bias"))
         norm = ref.GlmMoeDsaRMSNorm(config.hidden_size, config.rms_norm_eps).cuda()
         norm.weight.data = dense_operand("model.layers.3.post_attention_layernorm.weight")
-        residual = torch.randn((max(ROWS), config.hidden_size),
-                               generator=torch.Generator().manual_seed(SEED)).bfloat16().cuda()
-        hidden = norm(residual).bfloat16()
-        _, routes, ids = router(hidden)
         bank = DecodedExperts(snapshot, selected, oracle, torch)
-        official = (residual + official_moe(ref, bank, config, hidden, routes, ids)).float()
-        fp64 = residual.double() + official_moe(ref, bank, config, hidden.double(), routes, ids)
-        assert torch.isfinite(official).all() and torch.isfinite(fp64).all()
-        for rows in ROWS:
-            for name, value in {"residual": residual, "hidden": hidden, "ids": ids.int(),
-                                "routes": routes, "official_output": official, "fp64_output": fp64}.items():
-                save(f"r{rows}_{name}", value[:rows])
-    # Publish identity only after every fixture byte is durable and hashed.
-    (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        generate_outputs(ref, bank, config, router, norm, root, manifest, "cuda")
