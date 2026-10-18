@@ -655,6 +655,29 @@ fn geometry(
     Ok(layers)
 }
 
+fn dense_source_members<'a>(
+    group: &BTreeMap<String, &'a super::checkpoint::CheckpointTensor>,
+    suffix: &str,
+) -> Result<BTreeMap<String, &'a super::checkpoint::CheckpointTensor>> {
+    ensure!(
+        group.contains_key(suffix),
+        "missing source tensor suffix {suffix}"
+    );
+    // Bias vectors have their own inventory rows; do not count them with weights
+    // or accidentally decode a sibling weight when replacing the bias row.
+    Ok(group
+        .iter()
+        .filter(|(key, _)| {
+            if suffix == "bias" {
+                key.as_str() == "bias"
+            } else {
+                key.as_str() != "bias"
+            }
+        })
+        .map(|(key, tensor)| (key.clone(), *tensor))
+        .collect())
+}
+
 pub fn inspect(
     snapshot: &Path,
     selected: &str,
@@ -724,11 +747,13 @@ pub fn inspect(
         let mut replacements = Vec::new();
         let groups = super::format::group_by_stem(&original.tensors);
         for item in &dense {
-            let stem = item.tensor.strip_suffix(".weight").unwrap_or(&item.tensor);
-            let members = groups
+            let (stem, suffix) = super::format::split_stem(&item.tensor);
+            let group = groups
                 .get(stem)
                 .with_context(|| format!("dense source missing {stem}"))?;
-            let operand = super::format::detect(members)?;
+            let members = dense_source_members(group, suffix)
+                .with_context(|| format!("dense source missing {}", item.tensor))?;
+            let operand = super::format::detect(&members)?;
             ensure!(
                 operand.logical == item.shape,
                 "dense source shape mismatch for {stem}"
@@ -981,6 +1006,43 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("future-scheme") && error.contains("decoder"));
+    }
+
+    #[test]
+    fn official_dense_weight_and_bias_are_independent_native_operands() {
+        use super::super::testing::{t, write_snapshot};
+        let temp = tempfile::tempdir().unwrap();
+        write_snapshot(
+            temp.path(),
+            &json!({}),
+            &[
+                t("norm.weight", "BF16", &[128]),
+                t("norm.bias", "F32", &[128]),
+                t("proj.weight", "F8_E4M3", &[128, 128]),
+                t("proj.weight_scale_inv", "F32", &[1, 1]),
+                t("proj.bias", "BF16", &[128]),
+            ],
+            None,
+        );
+        let source = super::super::Checkpoint::open(temp.path()).unwrap();
+        let groups = super::super::format::group_by_stem(&source.tensors);
+        for (name, encoding, bytes) in [
+            ("norm.weight", Encoding::Bf16, 256),
+            ("norm.bias", Encoding::F32, 512),
+            ("proj.weight", Encoding::E4m3, 16388),
+            ("proj.bias", Encoding::Bf16, 256),
+        ] {
+            let (stem, suffix) = super::super::format::split_stem(name);
+            let members = dense_source_members(&groups[stem], suffix).unwrap();
+            let operand = super::super::format::detect(&members).unwrap();
+            assert_eq!(operand.encoding, encoding);
+            assert_eq!(
+                members.values().map(|m| m.meta.byte_length).sum::<u64>(),
+                bytes
+            );
+            assert!(operand.companions.is_empty() || suffix == "bias");
+        }
+        assert!(dense_source_members(&groups["norm"], "scale").is_err());
     }
 
     #[test]
