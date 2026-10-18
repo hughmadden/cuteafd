@@ -460,3 +460,17 @@ def test_step5_rope_builders_cover_all_policy_modes_without_recipe_specializatio
     assert calls == {f"rope_s{span}_{'llama3' if scaling else 'plain'}":
                      dict(rotary_span=span, llama3=scaling)
                      for span in (32, 64, 192) for scaling in (False, True)}
+def test_source_comparison_requires_same_sm_and_allows_only_source_changes(tmp_path):
+    left, right = exports(tmp_path)
+    with pytest.raises(ValueError, match="same SM count"):
+        compare_sm.compare(left, right, source_comparison=True)
+    context_file = right / "comparison-context.json"
+    context = json.loads(context_file.read_text())
+    context.update(sms=188, sparkinfer_revision="candidate", source_tree_sha256="new-tree",
+                   exporter_sha256="new-exporter", export_sources_sha256={"export.py": "new"})
+    context_file.write_text(json.dumps(context))
+    assert compare_sm.compare(left, right, source_comparison=True)["programs"][0]["object_identical"]
+    context["toolchain"] = {"torch": "other"}
+    context_file.write_text(json.dumps(context))
+    with pytest.raises(ValueError, match="toolchain"):
+        compare_sm.compare(left, right, source_comparison=True)
