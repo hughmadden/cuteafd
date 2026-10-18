@@ -1,0 +1,47 @@
+"""Dense operand export catalog checks without importing CUDA."""
+import ast
+from functools import partial
+import importlib.util
+from pathlib import Path
+import sys
+import types
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def catalog(monkeypatch):
+    path = ROOT / "python/tools/aot/export_b12x_exlr8_dense_aot.py"
+    tree = ast.parse(path.read_text())
+    namespace = {"partial": partial}
+    nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.Assign))]
+    fake = types.ModuleType("b12x.integration.cuteafd.trellis_linear")
+    fake.compile_trellis_linear_aot = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["programs"]()
+
+
+def test_dense_trellis_catalog_has_native_full_shapes(monkeypatch):
+    entries = catalog(monkeypatch)
+    assert [name for name, _, _, _ in entries] == [
+        "trellis_q_b", "trellis_o", "trellis_gate_up", "trellis_down"]
+    assert [(p["input_features"], p["output_features"], p["sharded_side"])
+            for _, _, p, _ in entries] == [
+        (2048, 16384, 1), (16384, 6144, 2), (6144, 12288, 1), (12288, 6144, 2)]
+    for _, op, params, thunk in entries:
+        assert op == "trellis_linear"
+        assert params["max_rows"] == 4096
+        assert params["bits"] == 4 and params["codebook"] == "e4m3"
+        assert params["rotation_count"] == 4
+        assert thunk() == params
+
+
+def test_dense_has_opt_in_sm_comparison_group(monkeypatch):
+    spec = importlib.util.spec_from_file_location("sm_exports", ROOT / "scripts/build/compare-sm-exports.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    name, exporter, args = next(j for j in module.jobs("all") if j[0] == "exlr8-dense-trellis")
+    assert exporter == "export_b12x_dsv4_aot.py"
+    assert args[:2] == ["--geometry", "exlr8_dense"]
+    assert args[3].split(",") == [name for name, _, _, _ in catalog(monkeypatch)]
+    assert "exlr8_dense" not in module.GEOMETRIES

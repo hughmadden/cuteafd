@@ -640,7 +640,8 @@ def main() -> None:
                              "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), mimof/mimof2 (V2.6 Flash MOPD), "
                              "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
                              "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
-                             "step5/step52 (Step-5 full/two-GPU head split), exlr8 (EXLR8 A16 ABI v1)")
+                             "step5/step52 (Step-5 full/two-GPU head split), exlr8 (EXLR8 A16 ABI v1), "
+                             "exlr8_dense (shared native dense operands)")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
                         help="with glmf: also the decode and verify programs at this many rows (serve "
@@ -666,9 +667,9 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52 and/or exlr8")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8 and/or exlr8_dense")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     props = torch.cuda.get_device_properties(0)
@@ -690,6 +691,11 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
+        if name == "exlr8_dense":
+            from export_b12x_exlr8_dense_aot import programs as dense_programs
+            manifest["families"][name] = {"abi_version": 1}
+            work += [(name, *item) for item in dense_programs()]
+            continue
         if name == "exlr8":
             from export_b12x_exlr8_aot import programs as exlr8_programs
             manifest["families"][name] = {"hidden": 6144, "units": 16, "top_k": 8}

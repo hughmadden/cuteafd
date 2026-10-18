@@ -123,6 +123,9 @@ def jobs(scope):
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
+        ("exlr8-dense-trellis", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only",
+          "trellis_q_b,trellis_o,trellis_gate_up,trellis_down"]),
         ("audio", "export_b12x_audio_aot.py", ["--capability", "120"]),
         ("vision-attention", "export_b12x_vision_attention_aot.py", ["--capability", "120"]),
     ])
