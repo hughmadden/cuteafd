@@ -816,7 +816,7 @@ pub struct DraftPolicy {
 }
 
 impl DraftPolicy {
-    /// Every binding supplies priors; fixed mode still fits and reports.
+    /// Every binding supplies priors; fixed mode only records statistics.
     pub fn new(geometry: PolicyGeometry, seed: PolicySeed, fixed: bool) -> Result<Self, DraftPolicyError> {
         geometry.validate()?;
         let finite = seed.round.iter().chain(&seed.draft).chain([&seed.samples, &seed.warm_error]).all(|v| v.is_finite());
@@ -884,8 +884,7 @@ impl DraftPolicy {
         self.survival_lengths
     }
     /// Switch the length rule. The simple modes (`simple_draft`) replace
-    /// selection, width and action choice and calibration; the priced fits
-    /// keep running for reports only.
+    /// selection, width and action choice and calibration.
     pub fn set_draft_mode(&mut self, mode: DraftMode) {
         let native = self.native_confidence_positions.max(*self.geometry.widths.last().unwrap());
         self.simple = (mode != DraftMode::Shared)
@@ -901,6 +900,9 @@ impl DraftPolicy {
     pub fn draft_mode(&self) -> DraftMode {
         self.simple.as_ref().map_or(DraftMode::Shared, SimpleDraft::mode)
     }
+    /// Only the resource-priced policy learns from expert routes and layer times.
+    pub fn needs_routes(&self) -> bool { !self.fixed && self.simple.is_none() }
+
     /// The simple rule's per-position predicted against realized acceptance,
     /// `[group][native, tail][position]` with groups [`REPORT_GROUPS`].
     pub fn simple_reliability(&self) -> Option<&[[Vec<Reliability>; 2]; 4]> {
@@ -1611,12 +1613,22 @@ impl DraftPolicy {
 
     /// Record a completed round: timings update the cost fit, accepted rows'
     /// routes extend each request's history, acceptance updates statistics.
+    ///
+    /// The simple and fixed modes learn nothing from routes, layer times or
+    /// costs ([`needs_routes`](Self::needs_routes) is false): they record
+    /// statistics and the simple rule's own evidence only.
     pub fn observe(&mut self, round: DraftRoundObservation<'_>) -> Result<(), DraftPolicyError> {
+        self.observe_with(round, self.needs_routes())
+    }
+
+    /// `resources`: run the priced policy's learning (cost fits, health,
+    /// calibration, route history), as every mode did before simple skipped it.
+    fn observe_with(&mut self, round: DraftRoundObservation<'_>, resources: bool) -> Result<(), DraftPolicyError> {
         let layers = self.geometry.layers.len();
         let topk = usize::from(self.geometry.topk);
         let positions = self.geometry.max_positions;
         let rows: usize = round.requests.iter().map(|r| r.rows).sum();
-        if round.routes.len() != layers * rows * topk {
+        if resources && round.routes.len() != layers * rows * topk {
             return Err(DraftPolicyError::RouteShape);
         }
         if rows > self.geometry.verify_capacity() { return Err(DraftPolicyError::RequestExtent); }
@@ -1631,6 +1643,33 @@ impl DraftPolicy {
         for r in round.requests {
             self.selected_requests.remove(&r.id);
             self.selected_rows.remove(&r.id);
+        }
+        if !resources {
+            let bucket = draft_concurrency_bucket(round.requests.len());
+            if round.draft_us.is_finite() { self.stats.width_rounds[usize::from(round.wide)] += 1; }
+            for request in round.requests {
+                self.selected_draft_room.remove(&request.id);
+                let drafts = request.rows - 1;
+                let accepted = request.accepted - 1;
+                self.stats.verified_drafts += drafts as u64;
+                self.stats.accepted_drafts += accepted as u64;
+                self.stats.emitted_requests += 1;
+                self.stats.draft_rows[drafts.min(positions)] += 1;
+                if let Some(confidence) = request.confidence.filter(|_| drafts > 0) {
+                    let reached = drafts.min(confidence.len()).min(accepted + 1).min(positions);
+                    let calibrated = self.simple.as_ref().map(|simple| simple.probabilities(request.id, confidence));
+                    for position in 0..reached {
+                        self.stats.position_reached[position] += 1;
+                        self.stats.position_confidence[position] += calibrated.as_ref()
+                            .map_or_else(|| self.calibrated(bucket, position, confidence[position]), |p| p[position]);
+                        self.stats.position_raw_confidence[position] += confidence[position];
+                        self.stats.position_accepted[position] += u64::from(position < accepted);
+                    }
+                }
+            }
+            if let Some(simple) = &mut self.simple { simple.observe(&round); }
+            self.observe_stats(&round, rows);
+            return Ok(());
         }
         let bucket = draft_concurrency_bucket(round.requests.len());
         let drafted_requests = round.drafted_requests.unwrap_or(round.requests.len()) as f64;
@@ -1759,6 +1798,11 @@ impl DraftPolicy {
             }
         }
         if let Some(simple) = &mut self.simple { simple.observe(&round); }
+        self.observe_stats(&round, rows);
+        Ok(())
+    }
+
+    fn observe_stats(&mut self, round: &DraftRoundObservation<'_>, rows: usize) {
         self.stats.rounds += 1;
         self.stats.verified_rows += rows as u64;
         if let Some(predicted) = round.predicted_us {
@@ -1770,7 +1814,6 @@ impl DraftPolicy {
                 self.stats.observed_us += round.total_us;
             }
         }
-        Ok(())
     }
 }
 
@@ -1811,6 +1854,102 @@ mod tests {
             group_rows_by_rows: (0..=16).map(|rows| vec![if (1..=4).contains(&rows) { 1 } else { 4 }; 2]).collect(),
             experts: 4, topk: 1, max_requests: 4, max_positions: 7, widths: vec![5, 7],
             classes: vec![ResourceClass::rtx()], regimes: 1,
+        }
+    }
+
+    #[test]
+    fn simple_and_fixed_rounds_keep_stats_without_legacy_learning() {
+        for fixed in [false, true] {
+            for mode in [DraftMode::Shared, DraftMode::Simple, DraftMode::SimpleRc, DraftMode::SimpleDerived] {
+                if !fixed && mode == DraftMode::Shared { continue; }
+                let mut policy = DraftPolicy::new(hybrid_geometry(), PolicySeed::weak(5), fixed).unwrap();
+                policy.set_draft_mode(mode);
+                assert!(!policy.needs_routes());
+                let before = format!("{:?}", policy.cost_snapshot(false, 1));
+                let calibration = policy.simple_calibration();
+                let p = [0.8; 7];
+                let requests = [ObservedDraftRequest { id: 1, rows: 6, accepted: 3, confidence: Some(&p) }];
+                for _ in 0..40 {
+                    policy.observe(DraftRoundObservation { shared: false, requests: &requests,
+                        routes: &[], layer_us: &[], total_us: 8000., draft_us: 2600.,
+                        drafted_requests: Some(1), wide: true, predicted_us: None }).unwrap();
+                }
+                assert_eq!(format!("{:?}", policy.cost_snapshot(false, 1)), before);
+                assert!(policy.history.is_empty() && policy.skipped.is_empty());
+                assert!(policy.confidence.iter().all(|c| c.recent.is_empty() && c.outcomes.is_empty()
+                    && c.reached.iter().all(|&n| n == 0)));
+                assert!(policy.timed.iter().all(|&(n, _)| n == 0));
+                assert_eq!(policy.stats.rounds, 40);
+                assert_eq!(policy.stats.verified_rows, 240);
+                assert_eq!(policy.stats.verified_drafts, 200);
+                assert_eq!(policy.stats.accepted_drafts, 80);
+                assert_eq!(policy.stats.emitted_requests, 40);
+                assert_eq!(policy.stats.width_rounds, [0, 40]);
+                assert_eq!(policy.stats.position_reached[..4], [40, 40, 40, 0]);
+                // The simple rule keeps learning its calibration in fixed mode (reported in stats).
+                if mode == DraftMode::Shared { assert_eq!(policy.simple_calibration(), None); }
+                else { assert_ne!(policy.simple_calibration(), calibration); }
+            }
+        }
+    }
+
+    /// Skipping the priced policy's learning never changes the simple rule:
+    /// the same rounds through today's full observation and the light one
+    /// give identical selections, calibration, probabilities and stats
+    /// (`position_confidence` aside: it now reports simple's calibrated
+    /// confidence, which the skipped priced Platt no longer tracks).
+    #[test]
+    fn simple_selection_is_identical_with_and_without_priced_learning() {
+        for mode in [DraftMode::Simple, DraftMode::SimpleRc, DraftMode::SimpleDerived] {
+            for cost in [RowCost::Linear, RowCost::Power, RowCost::Log] {
+                let mut full = DraftPolicy::new(hybrid_geometry(), PolicySeed::weak(5), false).unwrap();
+                full.set_draft_mode(mode);
+                full.set_row_cost(cost);
+                let mut light = full.clone();
+                let layers = full.geometry.layers.len();
+                let topk = usize::from(full.geometry.topk);
+                let experts = full.geometry.experts;
+                for round in 0..240usize {
+                    let count = [1usize, 2, 3, 4][round % 4];
+                    let confidence: Vec<Vec<f64>> = (0..count).map(|id| (0..7)
+                        .map(|p| 0.97 - 0.07 * p as f64 - 0.01 * ((round + id) % 5) as f64).collect()).collect();
+                    let candidates: Vec<_> = confidence.iter().enumerate()
+                        .map(|(id, c)| DraftCandidate { id: (id + round / 60 * 100) as u64, confidence: c }).collect();
+                    let budget = (count * (2 + round % 5)).min(16);
+                    let a = full.select_drafted_within(round % 2 == 0, &candidates, 7, budget, count).unwrap().unwrap();
+                    let b = light.select_drafted_within(round % 2 == 0, &candidates, 7, budget, count).unwrap().unwrap();
+                    assert_eq!(a.lengths, b.lengths);
+                    assert_eq!(a.expected_tokens.to_bits(), b.expected_tokens.to_bits());
+                    assert_eq!(format!("{:?}", full.simple_pending()), format!("{:?}", light.simple_pending()));
+                    let requests: Vec<_> = candidates.iter().zip(&a.lengths).enumerate().map(|(i, (c, &drafts))| {
+                        let rows = drafts + 1;
+                        ObservedDraftRequest { id: c.id, rows, accepted: rows.min(1 + (round * 7 + i) % 6),
+                            confidence: (i % 5 != 4).then_some(c.confidence) }
+                    }).collect();
+                    let rows: usize = requests.iter().map(|r| r.rows).sum();
+                    let routes: Vec<u16> = (0..layers * rows * topk).map(|i| ((i * 37 + round) % usize::from(experts)) as u16).collect();
+                    let layer_us: Vec<_> = (0..layers).map(|l| (l > 0 && round % 3 != 0).then_some(700. + l as f64)).collect();
+                    let total_us = if round % 11 == 5 { f64::NAN } else { 9000. + 140. * rows as f64 };
+                    let draft_us = if round % 9 == 0 { f64::NAN } else { 2400. };
+                    let observation = DraftRoundObservation {
+                        shared: round % 2 == 0, requests: &requests, routes: &routes, layer_us: &layer_us, total_us,
+                        draft_us, drafted_requests: Some(count), wide: round % 4 == 1, predicted_us: None };
+                    full.observe_with(observation, true).unwrap();
+                    light.observe(DraftRoundObservation { routes: &[], layer_us: &[], ..observation }).unwrap();
+                    assert_eq!(full.simple_calibration(), light.simple_calibration());
+                    assert_eq!(format!("{:?}", full.simple_round()), format!("{:?}", light.simple_round()));
+                    for c in &candidates {
+                        assert_eq!(full.probabilities(count, *c), light.probabilities(count, *c));
+                    }
+                    let (mut f, mut l) = (full.stats().clone(), light.stats().clone());
+                    f.position_confidence = Default::default();
+                    l.position_confidence = Default::default();
+                    assert_eq!(format!("{f:?}"), format!("{l:?}"));
+                    // The priced path learned route history; the light one did not.
+                    assert!(!full.history.is_empty() && light.history.is_empty());
+                    if round % 60 == 59 { for c in &candidates { full.release(c.id); light.release(c.id); } }
+                }
+            }
         }
     }
 
@@ -2110,7 +2249,8 @@ mod tests {
         let truth = truth();
         let mut token = 0;
         for _ in 0..300 { run_round(&mut fixed, &truth, &mut token, 6, 3, None); }
-        assert!(fixed.warm(false, 1));
+        // Fixed mode records statistics only; its cost fits never learn.
+        assert!(!fixed.warm(false, 1));
         assert_eq!(fixed.select(false, &[DraftCandidate { id: 1, confidence: &[0.1; 5] }], 5), Ok(None));
         assert_eq!(fixed.stats().draft_rows[5], 300);
         assert_eq!(fixed.stats().accepted_drafts, 600);
@@ -2700,7 +2840,11 @@ mod tests {
     /// shrunk bucket offsets, per-bucket draft pass): a rewrite, so no
     /// attribution audit against the segmented fingerprint (98,217 records);
     /// `decision_rule_is_unchanged_given_identical_costs` checks the rule.
-    /// A change here is a decision or fitted-state change.
+    /// A change here is a decision or fitted-state change. Re-pinned when
+    /// fixed mode stopped learning: the four priced scenarios' 32,830 records
+    /// are unchanged, and the fixed scenario keeps every width, length and
+    /// observation record; only its (unused) fits, calibration, predictions
+    /// and prediction counters differ.
     #[test]
     fn replay_reproduces_recorded_decisions_and_fits() {
         let mut transcript = Transcript::new();
@@ -2708,7 +2852,7 @@ mod tests {
         if let (Some(dump), Some(path)) = (&transcript.dump, std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP")) {
             std::fs::write(path, dump).unwrap();
         }
-        assert_eq!((transcript.records, transcript.hash), (39_389, 4_805_264_383_091_156_835));
+        assert_eq!((transcript.records, transcript.hash), (39_389, 9_524_643_052_079_295_059));
     }
 
     fn seed() -> PolicySeed {

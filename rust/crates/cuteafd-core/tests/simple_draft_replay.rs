@@ -231,3 +231,86 @@ fn arms_probabilities(policy: &Option<DraftPolicy>, requests: usize, id: u64, ra
         None => Vec::new(),
     }
 }
+
+/// Live decisions, re-derived: a trace recorded under a simple mode (the
+/// `draft_round` and `simple_draft_round` records of a serving run) is
+/// replayed through a fresh policy of that mode that observes each round
+/// without routes or layer times. Everything the simple rule learns (Platt
+/// calibration, per-request offsets, `r` and `c`) must reproduce the
+/// recorded selection's calibrated conditionals, joint survivals, passing
+/// counts and cutoff at every round whose selection the record carries; the
+/// remaining choice (budget trimming, the exploration row) is a fixed
+/// function of those and the selection's own random stream, which observation
+/// never touches. The recording ran the observation path of its build, so a
+/// match shows that path's other work never reached the simple rule.
+/// (With two lanes, one lane's record can carry the other lane's newer
+/// selection; such rounds are skipped.)
+/// Run: `CUTEAFD_SIMPLE_DECISIONS=trace.jsonl cargo test -p cuteafd-core
+/// --release --test simple_draft_replay -- --ignored --nocapture recorded_simple`
+#[test]
+#[ignore]
+fn recorded_simple_decisions_replay_exactly() {
+    let Ok(path) = std::env::var("CUTEAFD_SIMPLE_DECISIONS") else { return };
+    let records: Vec<Value> = std::io::BufReader::new(std::fs::File::open(&path).unwrap()).lines()
+        .map_while(Result::ok).filter_map(|l| serde_json::from_str::<Value>(&l).ok())
+        .filter(|r| r["type"] == "draft_round" || r["type"] == "simple_draft_round").collect();
+    let first = records.iter().find(|r| r["type"] == "draft_round").expect("no draft_round records");
+    let mode = DraftMode::parse(records.iter().find_map(|r| r["mode"].as_str()).expect("no simple records")).unwrap();
+    let positions = records.iter().filter(|r| r["type"] == "draft_round")
+        .flat_map(|r| r["requests"].as_array().unwrap().iter())
+        .filter_map(|q| q["raw_confidence"].as_array().map(Vec::len)).max().unwrap_or(5).max(1);
+    let native = records.iter().filter_map(|r| r["draft_width"].as_u64()).max().unwrap_or(positions as u64) as usize;
+    let mut policy = DraftPolicy::new(geometry(first, positions, native), PolicySeed::weak(native), false).unwrap();
+    policy.set_draft_mode(mode);
+    assert!(!policy.needs_routes());
+    // The trace's raw confidences round-trip through JSON text: continuous
+    // values agree to rounding, counts exactly.
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * a.abs().max(1.);
+    let (mut compared, mut skipped, mut positions_checked) = (0usize, 0usize, 0usize);
+    for pair in records.windows(2) {
+        let [round, simple] = pair else { unreachable!() };
+        if round["type"] != "draft_round" || simple["type"] != "simple_draft_round" { continue; }
+        assert_eq!(round["total_us"].as_f64(), simple["total_us"].as_f64(), "unpaired round {}", round["round"]);
+        let requests = round["requests"].as_array().unwrap();
+        let raw: Vec<Vec<f64>> = requests.iter().map(|q| if q["source"] == "Neural" {
+            q["raw_confidence"].as_array().map_or_else(Vec::new, |c| c.iter().map(|v| v.as_f64().unwrap()).collect())
+        } else { Vec::new() }).collect();
+        let ids: Vec<u64> = requests.iter().map(|q| q["id"].as_u64().unwrap()).collect();
+        if let Some(selection) = simple["selection"].as_object() {
+            let decisions = selection["requests"].as_array().unwrap();
+            if decisions.iter().map(|d| d["id"].as_u64().unwrap()).eq(ids.iter().copied()) {
+                let cutoff = policy.simple_cutoff(ids.len()).unwrap();
+                assert!(close(cutoff.value, selection["cutoff"]["value"].as_f64().unwrap()), "cutoff, round {}", round["round"]);
+                for ((decision, &id), raw) in decisions.iter().zip(&ids).zip(&raw) {
+                    let conditional: Vec<f64> = decision["conditional"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+                    let n = conditional.len();
+                    assert!(n <= raw.len(), "selection longer than drafted, round {}", round["round"]);
+                    let mine = policy.probabilities(ids.len(), DraftCandidate { id, confidence: &raw[..n] });
+                    assert!(mine.iter().zip(&conditional).all(|(&a, &b)| close(a, b)),
+                        "conditional, round {}: {mine:?} vs {conditional:?}", round["round"]);
+                    let mut product = 1.;
+                    let joint: Vec<f64> = mine.iter().map(|p| { product *= p; product }).collect();
+                    let passing = joint.iter().take_while(|&&q| q > cutoff.value).count();
+                    assert_eq!(passing as u64, decision["passing"].as_u64().unwrap(), "passing, round {}", round["round"]);
+                    positions_checked += n;
+                }
+                compared += 1;
+            } else { skipped += 1; }
+        }
+        let verified: Vec<usize> = requests.iter().map(|q| q["verified_rows"].as_u64().unwrap() as usize).collect();
+        let accepted: Vec<usize> = requests.iter().map(|q| q["accepted_rows"].as_u64().unwrap() as usize).collect();
+        let confidences: Vec<Option<&[f64]>> = requests.iter().zip(&raw).zip(&accepted).map(|((q, c), &a)|
+            (!c.is_empty()).then(|| if q["censor"].is_null() { &c[..] } else { &c[..c.len().min(a - 1)] })).collect();
+        let observed: Vec<_> = ids.iter().zip(&verified).zip(&accepted).zip(&confidences)
+            .map(|(((&id, &rows), &accepted), &confidence)| ObservedDraftRequest { id, rows, accepted, confidence }).collect();
+        policy.observe(DraftRoundObservation { shared: false, requests: &observed, routes: &[], layer_us: &[],
+            total_us: round["total_us"].as_f64().unwrap_or(f64::NAN), draft_us: f64::NAN,
+            drafted_requests: None, wide: false, predicted_us: None }).unwrap();
+        for request in requests.iter().filter(|q| q["finished"].as_bool() == Some(true)) {
+            policy.release(request["id"].as_u64().unwrap());
+        }
+    }
+    eprintln!("{path}: {} rounds reproduced ({compared} compared, {positions_checked} positions; {skipped} carried \
+        the other lane's selection)", mode.label());
+    assert!(compared > 0);
+}

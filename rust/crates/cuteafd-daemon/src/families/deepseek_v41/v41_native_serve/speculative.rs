@@ -5,6 +5,7 @@ use cuteafd_ffi::CuteafdDeviceBuffer;
 pub(crate) const DRAFT_MARK_BYTES: usize = 3 * cuteafd_ffi::V41DsparkCache::SLOT_BYTES;
 use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkMainContext, DsparkWeights};
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
+use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use crate::shared::draft::binding::LaneRound;
 use crate::shared::draft::clock::RoundTimes;
 use crate::shared::draft::evidence::sigmoid;
@@ -147,7 +148,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.draft_limit = limit as usize;
         Ok(())
     }
-    /// Verify every available draft; the policy still fits and reports.
+    /// Verify every available draft; the policy still records statistics.
     pub fn set_fixed(&mut self, fixed: bool) {
         self.fixed = fixed;
         if let Some(policy) = &mut self.policy {
@@ -174,8 +175,12 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.policy = Some(policy);
         Ok(())
     }
-    /// Routes and layer timings feed the policy on every verification round.
-    pub fn capture_routes(&self) -> bool { self.policy.is_some() }
+    /// A length policy is bound (it observes every verification round).
+    pub fn has_policy(&self) -> bool { self.policy.is_some() }
+    /// What a verification round records: see [`round_capture`].
+    pub fn capture(&self) -> Capture {
+        round_capture(self.policy.as_ref(), super::console::live().is_some())
+    }
     fn wants_confidence(&self) -> bool {
         self.policy.is_some() || tracing::enabled!(target: "cuteafd::draft_policy", tracing::Level::DEBUG)
     }
@@ -680,9 +685,44 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
 
 }
 
+/// A policy-bound verification round captures route ids only for resource
+/// pricing or the replay trace, whatever the draft mode; simple and fixed modes
+/// skip them. Per-layer CUDA-event times and the FFN stage split come with the
+/// routes and also whenever a console viewer is connected (its layer profile
+/// and expert-stage panels), so a default launch keeps them while watched and
+/// skips them while nobody is.
+pub(crate) fn round_capture(policy: Option<&cuteafd_core::DraftPolicy>, console_live: bool) -> Capture {
+    let Some(policy) = policy else { return Capture::default() };
+    let routes = crate::shared::draft::binding::needs_routes(policy);
+    Capture { routes, timing: routes || console_live }
+}
+
 #[cfg(test)]
 mod restored_prefix_tests {
     use super::*;
+
+    /// Simple and fixed rounds never capture route ids; a connected console
+    /// still gets per-layer times and the FFN stage split in every mode, and an
+    /// unwatched simple or fixed round records neither. The priced policy
+    /// captures both, watched or not.
+    #[test]
+    fn console_keeps_layer_times_in_every_draft_mode() {
+        use cuteafd_core::{DraftMode, DraftPolicy, PolicySeed};
+        assert_eq!(round_capture(None, true), Capture::default());
+        let geometry = super::policy::remote_geometry(7);
+        for (mode, fixed, priced) in [(DraftMode::Simple, false, false), (DraftMode::SimpleRc, false, false),
+            (DraftMode::SimpleDerived, false, false), (DraftMode::Shared, true, false), (DraftMode::Shared, false, true)] {
+            let mut policy = DraftPolicy::new(geometry.clone(), PolicySeed::weak(7), fixed).unwrap();
+            policy.set_draft_mode(mode);
+            // The replay trace (SPECULATION_TRACE) forces routes; this test runs without it.
+            let traced = crate::shared::draft::binding::needs_routes(&policy) && !priced;
+            assert!(!traced, "{mode:?} fixed={fixed}: unexpected route need");
+            let watched = round_capture(Some(&policy), true);
+            let unwatched = round_capture(Some(&policy), false);
+            assert_eq!(watched, Capture { routes: priced, timing: true }, "{mode:?} fixed={fixed} watched");
+            assert_eq!(unwatched, Capture { routes: priced, timing: priced }, "{mode:?} fixed={fixed} unwatched");
+        }
+    }
     #[test]
     fn long_tail_stats_count_only_judged_positions() {
         assert_eq!(tail_outcome(38, 1, 5), (32, 0, 0));

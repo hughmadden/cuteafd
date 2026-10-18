@@ -137,7 +137,7 @@ pub(super) fn observe(policy: &mut DraftPolicy, confidence_trace: &BTreeMap<u64,
         censor: None,
     }).collect();
     let rows = requests.iter().map(|request| request.rows).sum();
-    lane.routes.fill(capture, rows, ROUTE_EXPERT_MASK)?;
+    if binding::needs_routes(policy) { lane.routes.fill(capture, rows, ROUTE_EXPERT_MASK)?; }
     binding::observe(policy, &RoundRecord { shared, requests: &round, routes: &lane.routes,
         layer_us, times, draft: (lane.width > 0).then_some(DraftPass { width: lane.width, requests: Some(lane.drafted_requests) }), predicted })
 }

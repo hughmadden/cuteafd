@@ -207,14 +207,39 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             sampled: None,
         })
     }
+    /// Retain decode-row graph shapes on both owning devices (sticky).
+    pub fn retain_small_graph_shapes(&mut self) -> Result<()> {
+        ensure!(self.state == State::Idle, "cannot change graph retention during a target pass");
+        for lane in &mut self.resources.lanes {
+            let device = lane.device;
+            device.run(|| { lane.retain_small_graph_shapes(); Ok(()) })?;
+        }
+        for index in self.resources.indices.iter_mut().flatten() {
+            index.get_mut().enable_small_graph_shapes();
+        }
+        Ok(())
+    }
     pub fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
+        if enabled {
+            return self.set_capture(crate::families::deepseek_v41::v41_backbone_lane::Capture { routes: true, timing: true });
+        }
+        for lane in &mut self.resources.lanes {
+            let device = lane.device;
+            device.run(|| { lane.set_route_capture(false); Ok(()) })?;
+        }
+        self.resources.capture_routes = false;
+        Ok(())
+    }
+    /// Route ids and/or pass timing on both owning devices (see `BackboneLane::set_capture`).
+    pub fn set_capture(&mut self, capture: crate::families::deepseek_v41::v41_backbone_lane::Capture) -> Result<()> {
+        let enabled = capture.routes || capture.timing;
         ensure!(!enabled || self.state == State::Idle,
             "cannot reset route capture during a target pass");
         for lane in &mut self.resources.lanes {
             let device = lane.device;
-            device.run(|| { lane.set_route_capture(enabled); Ok(()) })?;
+            device.run(|| { lane.set_capture(capture); Ok(()) })?;
         }
-        self.resources.capture_routes = enabled;
+        self.resources.capture_routes = capture.routes;
         if enabled {
             // Match the single-GPU pass: adaptive row changes must retain the
             // index projection and selection graphs on both owning devices.

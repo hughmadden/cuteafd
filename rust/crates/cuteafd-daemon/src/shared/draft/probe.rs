@@ -34,6 +34,7 @@ pub(crate) struct RingCheck {
 }
 
 pub(crate) struct RoundProbe<'a> {
+    collect_routes: bool,
     clock: LayerClock<'a>,
     routes: RoundRoutes,
     /// Pinned `[layer][row][slot]` u32 ids, packed to this round's row stride.
@@ -69,7 +70,8 @@ impl<'a> RoundProbe<'a> {
         // Initialize padding once: the single contiguous download includes unused row slots.
         library.copy_h2d(device_ring.buffer, ring.bytes())?;
         let last_owned = dense.iter().rposition(|&dense| !dense);
-        Ok(Self { clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring,
+        Ok(Self { collect_routes: super::binding::configured_needs_routes(),
+            clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring,
             device_ring, last_owned, downloaded: false, capacity,
             topk, ringed: vec![false; layers], staged: vec![false; layers], dense,
             check: std::env::var("CUTEAFD_GLMF_ROUTE_RING_CHECK").is_ok_and(|v| v == "1"),
@@ -78,6 +80,7 @@ impl<'a> RoundProbe<'a> {
 
     /// Start a verify step of `rows` rows.
     pub fn begin(&mut self, rows: usize) {
+        if !self.collect_routes { self.pending = true; return; }
         self.routes.begin(rows);
         for (layer, &dense) in self.dense.iter().enumerate() {
             if dense { let _ = self.routes.dense(layer); }
@@ -96,6 +99,7 @@ impl<'a> RoundProbe<'a> {
     pub fn end(&mut self) { self.active = false; }
 
     pub fn active(&self) -> bool { self.active }
+    pub fn collects_routes(&self) -> bool { self.collect_routes }
 
     /// Whether a layer's ids go through the ring: every local layer, and
     /// Spark layers too under the ring check.
@@ -172,6 +176,7 @@ impl<'a> RoundProbe<'a> {
         let _timing = super::clock::HostSpan::new(super::clock::HostStage::Routes);
         self.active = false;
         if !std::mem::take(&mut self.pending) { return None; }
+        if !self.collect_routes { return Some((&self.routes, Vec::new())); }
         if self.ringed.iter().any(|&queued| queued) && !self.downloaded {
             tracing::debug!("draft policy route arena was not downloaded before verifier sync");
             return None;
