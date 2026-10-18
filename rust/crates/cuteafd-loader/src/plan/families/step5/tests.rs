@@ -50,6 +50,83 @@ fn report(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Opti
 }
 
 #[test]
+fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
+    use crate::serving_capacity::step5::{Step5CacheLayout, PAGE_ROWS, REGION_ROWS};
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Model::open(&cp).unwrap().cfg;
+    for ranks in [1, 2] {
+        let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3).unwrap();
+        assert_eq!(layout.mtp_hidden_rows, 516);
+        assert_eq!(layout.window(), 512);
+        assert_eq!(layout.capture_reach(), 0);
+        assert_eq!(layout.geometry.logical_unit_rows, PAGE_ROWS);
+        let summaries: u64 = layout.ranks[0].regions.iter().map(|r| r.summaries.unwrap().bytes).sum();
+        assert_eq!(summaries, 736 << 20);
+        assert_eq!(layout.ranks[0].sliding.len(), 72);
+        assert_eq!(layout.ranks[0].regions.len(), 23);
+        if ranks == 2 {
+            assert_eq!(layout.ranks[1].sliding.len(), 69);
+            assert!(layout.ranks[1].regions.iter().all(|r| r.summaries.is_none()));
+            assert!(layout.ranks[1].mtp_hidden.is_none());
+        }
+        for (rank, state) in layout.ranks.iter().enumerate() {
+            let geometry = layout.geometry.ranks[rank];
+            assert_eq!(geometry.retained_mark_bytes, state.bytes);
+            assert_eq!(geometry.active_state_per_sequence_bytes, state.bytes);
+            for frontier in [0, 1, 7, 8, 63, 64, 65, 511, 512, 513, 1 << 20] {
+                let spans = layout.snapshot_spans(rank, frontier).unwrap();
+                assert!(spans.iter().all(|s| s.offset.checked_add(s.bytes).unwrap() <= state.bytes));
+                let summary_bytes = if rank == 0 { 23 * (frontier / REGION_ROWS) * 256 } else { 0 };
+                let maximum: u64 = layout.snapshot_spans(rank, 1 << 20).unwrap().iter().map(|s| s.bytes).sum();
+                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 };
+                assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
+                assert!(spans.iter().all(|s| s.offset % 256 == 0));
+                assert!(state.regions.iter().all(|region| spans.contains(&region.pending_key)
+                    && spans.contains(&region.pending_z)));
+                for ring in &state.sliding {
+                    assert!(spans.contains(&ring.key) && spans.contains(&ring.value));
+                }
+                assert_eq!(layout.csa_tail_bytes(rank, frontier % PAGE_ROWS).unwrap(),
+                    geometry.persistent_unit_bytes / PAGE_ROWS * (frontier % PAGE_ROWS));
+            }
+        }
+        let (slots, arena) = layout.prefix_arena_bytes(16, 20, 2 << 30).unwrap();
+        assert_eq!(slots, 34);
+        assert!(arena.iter().sum::<u64>() > 2 << 30);
+        assert_eq!(arena[0], slots * layout.ranks[0].bytes);
+        assert_eq!(layout.prefix_arena_bytes(16, 0, 2 << 30).unwrap(), (0, vec![0; ranks]));
+        assert!(layout.snapshot_spans(ranks, 0).is_err());
+        assert!(layout.snapshot_spans(0, (1 << 20) + 1).is_err());
+        assert!(layout.csa_tail_bytes(0, 65).is_err());
+        let mut occupied = Vec::new();
+        for sequence in 0..3 {
+            let copies = layout.snapshot_copies(0, 65, 3, sequence, 4, sequence).unwrap();
+            let spans = layout.snapshot_spans(0, 65).unwrap();
+            assert_eq!(copies.len(), spans.len());
+            for (copy, span) in copies.iter().zip(spans) {
+                assert_eq!(copy.mark.offset, sequence * layout.ranks[0].bytes + span.offset);
+                assert_eq!(copy.active.bytes, span.bytes);
+                assert_eq!(copy.mark.bytes, span.bytes);
+                occupied.push((copy.active.offset, copy.active.offset + copy.active.bytes));
+            }
+            let summary = layout.ranks[0].regions[0].summaries.unwrap();
+            let copy = copies.iter().find(|c| c.mark.offset == sequence * layout.ranks[0].bytes + summary.offset).unwrap();
+            assert_eq!(copy.active.offset, summary.offset * 3 + sequence * summary.bytes);
+            assert_eq!(copy.active.bytes, 8 * 256); // Never copy the unfinished ninth region.
+        }
+        occupied.sort_unstable();
+        assert!(occupied.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+        assert!(layout.snapshot_copies(0, 0, 3, 3, 4, 0).is_err());
+        assert!(layout.snapshot_copies(0, 0, 3, 0, 4, 4).is_err());
+        assert!(layout.snapshot_copies(0, 0, u64::MAX, 0, 4, 0).is_err());
+    }
+    assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 0, 0).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 1024, 4).is_err());
+}
+
+#[test]
 fn official_nested_inventory_separates_target_tail_mtp_vision() {
     let dir = snapshot("fp8");
     // Poisoned sidecar must have no effect on config/header-only planning.

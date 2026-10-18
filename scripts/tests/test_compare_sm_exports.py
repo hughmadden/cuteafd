@@ -174,13 +174,46 @@ def test_list_includes_dense_qwen_export_groups():
 
 
 @pytest.mark.parametrize("heads,suffix", [(64, ""), (32, "-tp2")])
-@pytest.mark.parametrize("group", ["pointwise", "attention", "metadata", "region-scores"])
+@pytest.mark.parametrize("group", ["pointwise", "projections", "attention", "metadata", "region-scores"])
 def test_step5_export_groups_bind_native_geometry(heads, suffix, group):
     job = next(job for job in compare_sm.jobs("all") if job[0] == f"step5-{group}{suffix}")
     expected = ["--heads", str(heads)]
     if group != "pointwise":
         expected += ["--group", group]
     assert job == (f"step5-{group}{suffix}", "export_b12x_step5_aot.py", expected)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(monkeypatch, heads):
+    import types
+    module_path = ROOT / "python/tools/aot/export_b12x_step5_aot.py"
+    spec = importlib.util.spec_from_file_location("step5_projection_exports", module_path)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16", float32="f32"))
+    pointwise = SimpleNamespace(compile_bf16_projection_aot=lambda **kwargs: kwargs)
+    monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
+    monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=pointwise))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = {name: build() for name, build in module.builders(heads, "projections").items()}
+    assert len(calls) == 12
+    for name, (width, outputs, dtype) in {
+        "attn_q": (4096, heads * 192, "bf16"),
+        "attn_kv": (4096, heads // 16 * 192, "bf16"),
+        "attn_gate": (4096, heads, "bf16"),
+        "attn_out": (heads * 192, 4096, "bf16"),
+        "attn_out_partial": (heads * 192, 4096, "f32"),
+        "index_q": (4096, heads // 16 * 4 * 256, "bf16"),
+        "index_kz": (4096, 256, "bf16"),
+        "router": (4096, 352, "f32"),
+        "dense_gate_up": (4096, 27648, "bf16"),
+        "dense_down": (13824, 4096, "bf16"),
+        "shared_gate_up": (4096, 3072, "bf16"),
+        "shared_down": (1536, 4096, "bf16"),
+    }.items():
+        assert calls[name] == dict(width=width, outputs=outputs, output_dtype=dtype)
 
 
 def test_catalog_includes_all_geometries_and_fused_suspects():

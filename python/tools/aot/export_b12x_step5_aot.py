@@ -38,10 +38,28 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
             "region_commit": lambda: c.compile_region_commit_aot(
                 max_staged_regions=max_staged_regions, capacity=summary_capacity),
         }
-    if group != "pointwise":
+    if group not in ("pointwise", "projections"):
         raise ValueError(f"unknown Step-5 export group: {group}")
     import torch
     from b12x.integration.cuteafd import pointwise as p
+    if group == "projections":
+        shapes = {
+            "attn_q": (4096, heads * 192, torch.bfloat16),
+            "attn_kv": (4096, groups * 192, torch.bfloat16),
+            "attn_gate": (4096, heads, torch.bfloat16),
+            "attn_out": (heads * 192, 4096, torch.bfloat16),
+            "attn_out_partial": (heads * 192, 4096, torch.float32),
+            "index_q": (4096, groups * 4 * 256, torch.bfloat16),
+            "index_kz": (4096, 256, torch.bfloat16),
+            "router": (4096, 352, torch.float32),
+            "dense_gate_up": (4096, 2 * 13824, torch.bfloat16),
+            "dense_down": (13824, 4096, torch.bfloat16),
+            "shared_gate_up": (4096, 2 * 1536, torch.bfloat16),
+            "shared_down": (1536, 4096, torch.bfloat16),
+        }
+        return {name: (lambda width=width, outputs=outputs, dtype=dtype:
+                p.compile_bf16_projection_aot(width=width, outputs=outputs, output_dtype=dtype))
+                for name, (width, outputs, dtype) in shapes.items()}
     result = {
         "residual_bf16": lambda: p.compile_residual_add_aot(width=4096),
         "residual_f32": lambda: p.compile_residual_add_aot(width=4096, delta_dtype=torch.float32),
@@ -72,7 +90,7 @@ def programs(heads, max_rows, max_context):
     capacity = (max_context + 7) // 8
     maximum = (max_rows + 14) // 8
     return [(name, name, {"max_rows": max_rows}, build)
-            for group in ("pointwise", "attention", "metadata")
+            for group in ("pointwise", "projections", "attention", "metadata")
             for name, build in builders(heads, group, capacity, maximum).items()]
 
 
@@ -80,7 +98,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--heads", type=int, choices=(32, 64), default=64)
-    parser.add_argument("--group", choices=("pointwise", "attention", "metadata", "region-scores"), default="pointwise")
+    parser.add_argument("--group", choices=("pointwise", "projections", "attention", "metadata", "region-scores"), default="pointwise")
     parser.add_argument("--summary-capacity", type=int, default=131072)
     parser.add_argument("--max-staged-regions", type=int, default=513)
     args = parser.parse_args()
