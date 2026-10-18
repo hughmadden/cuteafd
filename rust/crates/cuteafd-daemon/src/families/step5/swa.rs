@@ -1,7 +1,8 @@
-//! Single-request layer-0 prefill composition. No committed ring is published.
+//! Layer-selected SWA projections and transaction-owned cache reads.
 use super::{
     ffn::{DenseFfn, DensePlan},
     rope::TargetTables,
+    transaction::{AttentionRead, Step, StepInputs},
     weights::load_operand,
 };
 use crate::shared::memory::device::{Allocation, Device, Stream};
@@ -34,11 +35,12 @@ const POSITIONS: usize = 11;
 const REQUESTS: usize = 12;
 const TABLE: usize = 13;
 const SELECTED: usize = 14;
+const POST: usize = 15;
 
 struct Admission {
     rows: usize,
     pages: usize,
-    planes: [usize; 15],
+    planes: [usize; 16],
     bytes: u64,
 }
 impl Admission {
@@ -71,6 +73,7 @@ impl Admission {
             rows * 4,
             pages * 4,
             rows * 512 * 4,
+            rows * H * 4,
         ]
         .map(|n| n.max(256));
         let bytes = planes
@@ -147,8 +150,9 @@ const DEFS: [(&str, &[&str], &[u8]); 11] = [
 pub(super) struct SwaLayer<'a> {
     // This stream drains before every composed owner, including the FFN.
     stream: Stream<'a>,
-    ffn: DenseFfn<'a>,
-    rope: TargetTables<'a>,
+    ffn: Option<DenseFfn<'a>>,
+    rope: std::rc::Rc<TargetTables<'a>>,
+    layer: usize,
     weights: Vec<Allocation<'a>>,
     planes: Vec<Allocation<'a>>,
     programs: Vec<Program<'a>>,
@@ -161,19 +165,38 @@ impl<'a> SwaLayer<'a> {
         device: Device<'a>,
         programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint,
+        layer_id: usize,
         rows: usize,
+        rope: Option<std::rc::Rc<TargetTables<'a>>>,
         available: u64,
         reservations: &[u64],
     ) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let layer = &contract.layers[0];
+        let layer = contract
+            .layers
+            .get(layer_id)
+            .context("SWA layer outside target")?;
+        if let Some(rope) = &rope {
+            ensure!(
+                rope.tables.plan == contract.rope_tables,
+                "SWA rotary plan mismatch"
+            );
+            ensure!(
+                rope.layers[layer_id].attention.cos.device.id == device.id
+                    && std::ptr::eq(
+                        rope.layers[layer_id].attention.cos.device.library,
+                        device.library
+                    ),
+                "SWA rotary device mismatch"
+            );
+        }
         ensure!(
             layer.sliding.is_some_and(|w| w.window == 512)
                 && layer.geometry.query_heads == 64
                 && layer.geometry.kv_heads == 4
                 && layer.geometry.qk_dim == 192
                 && layer.rope.span == 192,
-            "layer-0 SWA geometry mismatch"
+            "SWA geometry mismatch"
         );
         let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
         let suffixes = [
@@ -192,7 +215,7 @@ impl<'a> SwaLayer<'a> {
                 layout
                     .operands
                     .iter()
-                    .find(|w| w.name == format!("model.layers.0.{suffix}"))
+                    .find(|w| w.name == format!("model.layers.{layer_id}.{suffix}"))
                     .context("SWA operand missing")
             })
             .collect::<Result<Vec<_>>>()?;
@@ -211,15 +234,22 @@ impl<'a> SwaLayer<'a> {
                 "SWA weight shape/dtype"
             );
         }
-        let dense = DensePlan::prepare(programs, checkpoint, 0, rows, u64::MAX, &[])?;
+        let dense = layer
+            .dense_activation
+            .map(|_| DensePlan::prepare(programs, checkpoint, layer_id, rows, u64::MAX, &[]))
+            .transpose()?;
         let admission = Admission::new(
             rows,
             &weights
                 .iter()
                 .map(|w| w.allocation_bytes)
                 .collect::<Vec<_>>(),
-            dense.bytes(),
-            contract.rope_tables.allocation_bytes,
+            dense.as_ref().map_or(0, DensePlan::bytes),
+            if rope.is_none() {
+                contract.rope_tables.allocation_bytes
+            } else {
+                0
+            },
             available,
             reservations,
         )?;
@@ -289,8 +319,20 @@ impl<'a> SwaLayer<'a> {
             .iter()
             .map(|(name, pointers, _)| device.run(|| programs.program(name, pointers)))
             .collect::<Result<Vec<_>>>()?;
-        let rope = TargetTables::load(device, programs, &contract, "step5_", u64::MAX, &[])?;
-        let ffn = DenseFfn::load_plan(device, programs, checkpoint, dense)?;
+        let rope = match rope {
+            Some(rope) => rope,
+            None => std::rc::Rc::new(TargetTables::load(
+                device,
+                programs,
+                &contract,
+                "step5_",
+                u64::MAX,
+                &[],
+            )?),
+        };
+        let ffn = dense
+            .map(|plan| DenseFfn::load_plan(device, programs, checkpoint, plan))
+            .transpose()?;
         let weights = weights
             .into_iter()
             .map(|w| load_operand(device, checkpoint, &layout, w))
@@ -305,6 +347,7 @@ impl<'a> SwaLayer<'a> {
             stream,
             ffn,
             rope,
+            layer: layer_id,
             weights,
             planes,
             programs: resolved,
@@ -338,14 +381,44 @@ impl<'a> SwaLayer<'a> {
         pointers: &[*mut std::ffi::c_void],
         scalars: &[Scalar],
     ) -> Result<()> {
-        self.stream.device.run(|| {
-            // SAFETY: the private staged chain supplies admitted same-device planes;
+        self.launch_on(&self.stream, stage, pointers, scalars)
+    }
+
+    fn launch_on(
+        &self,
+        stream: &Stream<'a>,
+        stage: usize,
+        pointers: &[*mut std::ffi::c_void],
+        scalars: &[Scalar],
+    ) -> Result<()> {
+        stream.device.run(|| {
+            // SAFETY: the retained layer supplies admitted same-device planes;
             // its stream is the first field and drains before all referenced owners.
-            unsafe { self.programs[stage].launch(pointers, scalars, self.stream.raw) }
+            unsafe { self.programs[stage].launch(pointers, scalars, stream.raw) }
         })
     }
 
     pub fn enqueue(&self, rows: usize) -> Result<()> {
+        self.project_on(rows, self.planes[POSITIONS].buffer, &self.stream)?;
+        self.launch(
+            6,
+            &[
+                self.planes[POSITIONS].buffer.ptr,
+                self.planes[REQUESTS].buffer.ptr,
+                self.planes[SELECTED].buffer.ptr,
+            ],
+            &[Scalar::I32(rows as i32)],
+        )?;
+        self.attend(rows)?;
+        self.finish_on(rows, &self.stream)
+    }
+
+    fn project_on(
+        &self,
+        rows: usize,
+        positions: CuteafdDeviceBuffer,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
         ensure!(
             rows > 0 && rows <= self.admission.rows,
             "SWA rows exceed capacity"
@@ -354,13 +427,19 @@ impl<'a> SwaLayer<'a> {
         let w = |i: usize| self.weights[i].buffer.ptr;
         let scalars = [Scalar::I32(rows as i32)];
         let norm = [Scalar::I32(rows as i32), Scalar::F32(self.epsilon)];
-        let (cos, sin) = self.rope.layers[0].attention.buffers();
-        self.launch(0, &[p(X), w(0), w(0), w(0), w(0), w(0), p(NORM)], &norm)?;
-        self.launch(1, &[p(NORM), w(1), p(QRAW)], &scalars)?;
-        self.launch(2, &[p(NORM), w(2), p(KRAW)], &scalars)?;
-        self.launch(2, &[p(NORM), w(3), p(VPAGES)], &scalars)?;
-        self.launch(3, &[p(NORM), w(6), p(LOGITS)], &scalars)?;
-        self.launch(
+        let (cos, sin) = self.rope.layers[self.layer].attention.buffers();
+        self.launch_on(
+            stream,
+            0,
+            &[p(X), w(0), w(0), w(0), w(0), w(0), p(NORM)],
+            &norm,
+        )?;
+        self.launch_on(stream, 1, &[p(NORM), w(1), p(QRAW)], &scalars)?;
+        self.launch_on(stream, 2, &[p(NORM), w(2), p(KRAW)], &scalars)?;
+        self.launch_on(stream, 2, &[p(NORM), w(3), p(VPAGES)], &scalars)?;
+        self.launch_on(stream, 3, &[p(NORM), w(6), p(LOGITS)], &scalars)?;
+        self.launch_on(
+            stream,
             4,
             &[
                 p(QRAW),
@@ -368,12 +447,13 @@ impl<'a> SwaLayer<'a> {
                 w(4),
                 cos.ptr,
                 sin.ptr,
-                p(POSITIONS),
+                positions.ptr,
                 p(QUERY),
             ],
             &norm,
         )?;
-        self.launch(
+        self.launch_on(
+            stream,
             5,
             &[
                 p(KRAW),
@@ -381,41 +461,139 @@ impl<'a> SwaLayer<'a> {
                 w(5),
                 cos.ptr,
                 sin.ptr,
-                p(POSITIONS),
+                positions.ptr,
                 p(KPAGES),
             ],
             &norm,
         )?;
-        self.launch(6, &[p(POSITIONS), p(REQUESTS), p(SELECTED)], &scalars)?;
-        self.attend(rows)?;
-        self.launch(8, &[p(ATTN), p(LOGITS), p(GATED)], &scalars)?;
-        self.launch(9, &[p(GATED), w(7), p(DELTA)], &scalars)?;
-        self.launch(10, &[p(X), p(DELTA), self.ffn.input().ptr], &scalars)?;
-        self.ffn.enqueue_on(rows, &self.stream)
+        Ok(())
+    }
+
+    fn finish_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        let p = |i: usize| self.planes[i].buffer.ptr;
+        let w = |i: usize| self.weights[i].buffer.ptr;
+        let scalars = [Scalar::I32(rows as i32)];
+        self.launch_on(stream, 8, &[p(ATTN), p(LOGITS), p(GATED)], &scalars)?;
+        self.launch_on(stream, 9, &[p(GATED), w(7), p(DELTA)], &scalars)?;
+        let post = self
+            .ffn
+            .as_ref()
+            .map_or(self.planes[POST].buffer, DenseFfn::input);
+        self.launch_on(stream, 10, &[p(X), p(DELTA), post.ptr], &scalars)?;
+        if let Some(ffn) = &self.ffn {
+            ffn.enqueue_on(rows, stream)?;
+        }
+        Ok(())
+    }
+
+    pub fn enqueue_step<'e, E: cuteafd_hostcache::copy::CopyEngine>(
+        &'e mut self,
+        step: &mut Step<'e, 'a, E>,
+        rank: usize,
+    ) -> Result<()> {
+        step.project(rank, self.layer, &*self, |layer, input| {
+            layer.check_input(&input)?;
+            layer.project_on(input.rows, input.positions, input.stream)
+        })?;
+        step.stage(
+            rank,
+            self.layer,
+            &self.planes[KPAGES],
+            &self.planes[VPAGES],
+            None,
+        )?;
+        step.attend(rank, self.layer, &*self, |layer, read| layer.read_on(read))
+    }
+
+    fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
+        ensure!(
+            input.heads == 64
+                && input.stream.device.id == self.stream.device.id
+                && std::ptr::eq(input.stream.device.library, self.stream.device.library)
+                && input
+                    .base
+                    .checked_add(input.rows)
+                    .is_some_and(|end| end <= self.rope.tables.plan.extent as usize),
+            "SWA owner device/head/rotary extent mismatch"
+        );
+        Ok(())
+    }
+
+    fn read_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
+        self.check_input(&read.inputs)?;
+        let input = &read.inputs;
+        self.launch_on(
+            input.stream,
+            6,
+            &[
+                input.positions.ptr,
+                input.requests.ptr,
+                self.planes[SELECTED].buffer.ptr,
+            ],
+            &[Scalar::I32(input.rows as i32)],
+        )?;
+        self.attend_on(
+            input.rows,
+            input.positions,
+            input.requests,
+            read.key,
+            read.value,
+            read.table,
+            read.table_width,
+            read.pages,
+            input.stream,
+        )?;
+        self.finish_on(input.rows, input.stream)
     }
 
     fn attend(&self, rows: usize) -> Result<()> {
+        self.attend_on(
+            rows,
+            self.planes[POSITIONS].buffer,
+            self.planes[REQUESTS].buffer,
+            self.planes[KPAGES].buffer,
+            self.planes[VPAGES].buffer,
+            self.planes[TABLE].buffer,
+            self.admission.pages,
+            self.admission.pages,
+            &self.stream,
+        )
+    }
+
+    fn attend_on(
+        &self,
+        rows: usize,
+        positions: CuteafdDeviceBuffer,
+        requests: CuteafdDeviceBuffer,
+        key: CuteafdDeviceBuffer,
+        value: CuteafdDeviceBuffer,
+        table: CuteafdDeviceBuffer,
+        table_width: usize,
+        pages: usize,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
         let p = |i: usize| self.planes[i].buffer.ptr;
-        self.launch(
+        self.launch_on(
+            stream,
             7,
             &[
                 p(QUERY),
-                p(KPAGES),
-                p(VPAGES),
+                key.ptr,
+                value.ptr,
                 p(QUERY),
                 p(QUERY),
-                p(TABLE),
-                p(REQUESTS),
+                table.ptr,
+                requests.ptr,
                 p(SELECTED),
-                p(POSITIONS),
+                positions.ptr,
                 p(QUERY),
                 p(QUERY),
                 p(ATTN),
             ],
             &[
-                Scalar::I64(self.admission.pages as i64),
+                Scalar::I64(pages as i64),
                 Scalar::I64(1),
-                Scalar::I64(self.admission.pages as i64),
+                Scalar::I64(table_width as i64),
                 Scalar::F32(192f32.sqrt().recip()),
                 Scalar::I32(rows as i32),
                 Scalar::I32(1),
@@ -423,11 +601,13 @@ impl<'a> SwaLayer<'a> {
         )
     }
 
-    fn input(&self) -> CuteafdDeviceBuffer {
+    pub fn input(&self) -> CuteafdDeviceBuffer {
         self.planes[X].buffer
     }
-    fn output(&self) -> CuteafdDeviceBuffer {
-        self.ffn.output()
+    pub fn output(&self) -> CuteafdDeviceBuffer {
+        self.ffn
+            .as_ref()
+            .map_or(self.planes[POST].buffer, DenseFfn::output)
     }
 }
 
@@ -539,7 +719,8 @@ mod tests {
                 == manifest["revision"].as_str(),
             "SWA snapshot revision mismatch"
         );
-        let mut chain = SwaLayer::load(device, &programs, &checkpoint, 513, u64::MAX, &[])?;
+        let mut chain =
+            SwaLayer::load(device, &programs, &checkpoint, 0, 513, None, u64::MAX, &[])?;
         ensure!(
             manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.epsilon),
             "SWA epsilon mismatch"
@@ -548,7 +729,9 @@ mod tests {
             device,
             &programs,
             &checkpoint,
+            0,
             513,
+            None,
             chain.admission.bytes - 1,
             &[]
         )
@@ -586,7 +769,10 @@ mod tests {
                 }
                 eager.push((chain.planes[plane].buffer, actual));
             }
-            for (name, buffer) in [("post", chain.ffn.input()), ("output", chain.output())] {
+            for (name, buffer) in [
+                ("post", chain.ffn.as_ref().unwrap().input()),
+                ("output", chain.output()),
+            ] {
                 let actual = read(&chain, buffer, rows * H * 4)?;
                 eprintln!("SWA chained rows={rows} boundary={name}");
                 metrics(&actual, &load(name)?, 4, 4, H)?;
@@ -761,16 +947,206 @@ mod tests {
                 &[
                     chain.input().ptr,
                     chain.planes[DELTA].buffer.ptr,
-                    chain.ffn.input().ptr,
+                    chain.ffn.as_ref().unwrap().input().ptr,
                 ],
                 &[Scalar::I32(rows as i32)],
             )?;
             chain.stream.drain()?;
             ensure!(
-                read(&chain, chain.ffn.input(), load("post")?.len())? == load("post")?,
+                read(
+                    &chain,
+                    chain.ffn.as_ref().unwrap().input(),
+                    load("post")?.len()
+                )? == load("post")?,
                 "SWA isolated residual is not byte-exact"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires pinned SWA fixtures, sealed native library and CUDA"]
+    fn native_swa_transaction_reads_match_contiguous_producers() -> Result<()> {
+        use super::super::{
+            cache::CacheRank,
+            prefix::{Frontier, Placement, Step5Prefix},
+            transaction::{tests::stage_other_layers, Staging},
+        };
+        use cuteafd_engine::prefix::{PrefixCache, PrefixConfig, PrefixFamily};
+        use cuteafd_hostcache::copy::StubCopyEngine;
+        use std::cell::RefCell;
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_SWA_FIXTURE_DIR")?);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        ensure!(
+            manifest["seed"] == 274
+                && manifest["layer"] == 0
+                && manifest["revision"] == "7734b7ffac118d70d8398bfa3eb0fab007eb45b1",
+            "SWA fixture identity"
+        );
+        // SAFETY: the explicit GPU gate supplies a sealed native library.
+        let library =
+            unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library
+            .programs()?
+            .with_manifest(std::path::Path::new(&std::env::var(
+                "CUTEAFD_PROGRAM_MANIFEST",
+            )?))?;
+        let checkpoint =
+            Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        ensure!(
+            checkpoint.snapshot.file_name().and_then(|s| s.to_str())
+                == manifest["revision"].as_str(),
+            "SWA snapshot"
+        );
+        let total = 777;
+        let mut chain = SwaLayer::load(
+            device,
+            &programs,
+            &checkpoint,
+            0,
+            total,
+            None,
+            u64::MAX,
+            &[],
+        )?;
+        let source = fixture(&root, &manifest, "r513_residual")?;
+        let residual: Vec<u8> = source.iter().copied().cycle().take(total * H * 4).collect();
+        device.run(|| library.copy_h2d(chain.input(), &residual))?;
+        chain.enqueue(total)?;
+        chain.stream.drain()?;
+        let expected = read(&chain, chain.planes[ATTN].buffer, total * Q * 2)?;
+        let producers = [
+            (X, H * 4),
+            (QUERY, Q * 2),
+            (KPAGES, KV * 2),
+            (VPAGES, KV * 2),
+            (LOGITS, 64 * 2),
+        ]
+        .into_iter()
+        .map(|(plane, row)| {
+            Ok((
+                plane,
+                row,
+                read(&chain, chain.planes[plane].buffer, total * row)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+        let layout = super::super::cache::tests::layout_for(1024, 1, 0, 64);
+        let owner = RefCell::new(CacheRank::new(device, layout, 0, 1, 2, 40, usize::MAX)?);
+        let staging = Staging::new(device, &programs, &owner.borrow(), usize::MAX)?;
+        let family = Step5Prefix::new(vec![&owner])?;
+        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(
+            family.layout(),
+            PrefixConfig {
+                entries: 0,
+                mark_slots: 2,
+                keep_logits: false,
+                min_tokens: 1,
+            },
+            None,
+        )?;
+        let mut placement = pool
+            .admit_cold(&family, 1, 1, |pages| Placement {
+                pages,
+                sequence: 0,
+                committed: 0,
+            })?
+            .placement;
+        let key = Allocation::new(device, 64 * KV * 2)?;
+        let value = Allocation::new(device, 64 * KV * 2)?;
+        let ik = Allocation::new(device, 64 * 512)?;
+        let iz = Allocation::new(device, 64 * 512)?;
+        // Deliberately cross partial pages, the 512-token window, and the 576-row ring.
+        for end in [
+            7, 8, 63, 64, 128, 192, 256, 320, 384, 448, 511, 512, 575, 576, 640, 704, 768, total,
+        ] {
+            let base = placement.committed;
+            let rows = end - base;
+            let before = placement.pages.clone();
+            for abort in [true, false] {
+                let mut step = Step::begin(
+                    vec![&owner],
+                    vec![&staging],
+                    &mut pool,
+                    &mut placement,
+                    rows,
+                )?;
+                assert!(step.attend(0, 0, &chain, |_, _| Ok(())).is_err());
+                step.project(0, 0, &chain, |layer, input| {
+                    layer.check_input(&input)?;
+                    for (plane, row, data) in &producers {
+                        device.run(|| {
+                            // SAFETY: ordered copies retain source slices; transaction retains the owner.
+                            unsafe {
+                                library.copy_h2d_ordered(
+                                    layer.planes[*plane].buffer,
+                                    &data[base * row..end * row],
+                                    input.stream.raw,
+                                )
+                            }
+                        })?;
+                    }
+                    Ok(())
+                })?;
+                step.stage(0, 0, &chain.planes[KPAGES], &chain.planes[VPAGES], None)?;
+                step.attend(0, 0, &chain, |layer, read| layer.read_on(read))?;
+                owner.borrow().stream.drain()?;
+                ensure!(
+                    read(&chain, chain.planes[ATTN].buffer, rows * Q * 2)?
+                        == expected[base * Q * 2..end * Q * 2],
+                    "SWA transaction attention differs at {base}..{end}"
+                );
+                if abort {
+                    drop(step);
+                    ensure!(
+                        placement.committed == base && placement.pages == before,
+                        "SWA abort visibility"
+                    );
+                } else {
+                    stage_other_layers(&mut step, 0, &key, &value, &ik, &iz)?;
+                    step.publish(rows)?;
+                }
+            }
+        }
+        pool.release(&family, &placement.pages)?;
+        // Exercise the production projection/staging/read entry, not just borrowed producers.
+        device.run(|| library.copy_h2d(chain.input(), &residual[..64 * H * 4]))?;
+        chain.enqueue(64)?;
+        chain.stream.drain()?;
+        let eager = read(&chain, chain.output(), 64 * H * 4)?;
+        let mut placement = pool
+            .admit_cold(&family, 1, 1, |pages| Placement {
+                pages,
+                sequence: 0,
+                committed: 0,
+            })?
+            .placement;
+        let mut step = Step::begin(vec![&owner], vec![&staging], &mut pool, &mut placement, 64)?;
+        chain.enqueue_step(&mut step, 0)?;
+        stage_other_layers(&mut step, 0, &key, &value, &ik, &iz)?;
+        step.publish(64)?;
+        ensure!(
+            read(&chain, chain.output(), eager.len())? == eager,
+            "SWA production enqueue differs"
+        );
+        pool.release(&family, &placement.pages)?;
+        // A routed SWA layer has no dense FFN and shares the already admitted rotary owner.
+        let routed = SwaLayer::load(
+            device,
+            &programs,
+            &checkpoint,
+            4,
+            1,
+            Some(std::rc::Rc::clone(&chain.rope)),
+            u64::MAX,
+            &[],
+        )?;
+        ensure!(
+            std::rc::Rc::ptr_eq(&routed.rope, &chain.rope) && routed.ffn.is_none(),
+            "SWA shared layer binding"
+        );
         Ok(())
     }
 

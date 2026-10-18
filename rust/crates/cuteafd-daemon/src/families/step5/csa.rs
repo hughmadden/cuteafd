@@ -1,5 +1,9 @@
-//! Real-weight layer-3 attention branch over private staged pages, not a serving cache.
-use super::{rope::TargetTables, weights::load_operand};
+//! Layer-selected CSA branch over transaction-owned pages and summaries.
+use super::{
+    rope::TargetTables,
+    transaction::{AttentionRead, Step, StepInputs},
+    weights::load_operand,
+};
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -205,7 +209,8 @@ const DEFS: [(&str, &[&str], &[u8]); 17] = [
 pub(super) struct CsaLayer<'a> {
     // Drain the complete staged branch before any pointer owner retires.
     stream: Stream<'a>,
-    rope: TargetTables<'a>,
+    rope: std::rc::Rc<TargetTables<'a>>,
+    layer: usize,
     weights: Vec<Allocation<'a>>,
     planes: Vec<Allocation<'a>>,
     programs: Vec<Program<'a>>,
@@ -218,12 +223,31 @@ impl<'a> CsaLayer<'a> {
         device: Device<'a>,
         programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint,
+        layer_id: usize,
         rows: usize,
+        rope: Option<std::rc::Rc<TargetTables<'a>>>,
         available: u64,
         reservations: &[u64],
     ) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let layer = &contract.layers[3];
+        let layer = contract
+            .layers
+            .get(layer_id)
+            .context("CSA layer outside target")?;
+        if let Some(rope) = &rope {
+            ensure!(
+                rope.tables.plan == contract.rope_tables,
+                "CSA rotary plan mismatch"
+            );
+            ensure!(
+                rope.layers[layer_id].attention.cos.device.id == device.id
+                    && std::ptr::eq(
+                        rope.layers[layer_id].attention.cos.device.library,
+                        device.library
+                    ),
+                "CSA rotary device mismatch"
+            );
+        }
         ensure!(
             layer.sliding.is_none()
                 && layer.geometry.query_heads == 64
@@ -231,7 +255,7 @@ impl<'a> CsaLayer<'a> {
                 && layer.geometry.qk_dim == 192
                 && layer.rope.span == 64
                 && layer.indexer_rope.is_some_and(|r| r.span == 32),
-            "layer-3 CSA geometry"
+            "CSA layer geometry"
         );
         let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
         let suffixes = [
@@ -257,7 +281,7 @@ impl<'a> CsaLayer<'a> {
                 layout
                     .operands
                     .iter()
-                    .find(|w| w.name == format!("model.layers.3.{s}"))
+                    .find(|w| w.name == format!("model.layers.{layer_id}.{s}"))
                     .with_context(|| format!("CSA operand {s}"))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -290,7 +314,11 @@ impl<'a> CsaLayer<'a> {
                 .iter()
                 .map(|w| w.allocation_bytes)
                 .collect::<Vec<_>>(),
-            contract.rope_tables.allocation_bytes,
+            if rope.is_none() {
+                contract.rope_tables.allocation_bytes
+            } else {
+                0
+            },
             available,
             reservations,
         )?;
@@ -421,7 +449,17 @@ impl<'a> CsaLayer<'a> {
             .collect::<Result<Vec<_>>>()?;
         let residual = device
             .run(|| programs.program("step5_residual_bf16", &["residual", "delta", "out"]))?;
-        let rope = TargetTables::load(device, programs, &contract, "step5_", u64::MAX, &[])?;
+        let rope = match rope {
+            Some(rope) => rope,
+            None => std::rc::Rc::new(TargetTables::load(
+                device,
+                programs,
+                &contract,
+                "step5_",
+                u64::MAX,
+                &[],
+            )?),
+        };
         let weights = weights
             .into_iter()
             .map(|w| load_operand(device, checkpoint, &layout, w))
@@ -434,6 +472,7 @@ impl<'a> CsaLayer<'a> {
         let owner = Self {
             stream: Stream::new(device)?,
             rope,
+            layer: layer_id,
             weights,
             planes,
             programs: resolved,
@@ -476,9 +515,18 @@ impl<'a> CsaLayer<'a> {
         self.planes[plane].buffer.ptr.wrapping_byte_add(offset)
     }
     fn launch(&self, stage: usize, pointers: &[*mut c_void], scalars: &[Scalar]) -> Result<()> {
-        self.stream.device.run(|| {
-            // SAFETY: callers use admitted planes with bounded row offsets on this stream.
-            unsafe { self.programs[stage].launch(pointers, scalars, self.stream.raw) }
+        self.launch_on(&self.stream, stage, pointers, scalars)
+    }
+    fn launch_on(
+        &self,
+        stream: &Stream<'a>,
+        stage: usize,
+        pointers: &[*mut c_void],
+        scalars: &[Scalar],
+    ) -> Result<()> {
+        stream.device.run(|| {
+            // SAFETY: admitted row views and retained layer owners outlive the stream drain.
+            unsafe { self.programs[stage].launch(pointers, scalars, stream.raw) }
         })
     }
     fn norm(
@@ -493,16 +541,45 @@ impl<'a> CsaLayer<'a> {
         width: usize,
         indexer: bool,
     ) -> Result<()> {
+        self.norm_on(
+            stage,
+            input,
+            output,
+            weight,
+            bias,
+            start,
+            rows,
+            width,
+            indexer,
+            self.planes[POSITIONS].buffer,
+            &self.stream,
+        )
+    }
+    fn norm_on(
+        &self,
+        stage: usize,
+        input: usize,
+        output: usize,
+        weight: usize,
+        bias: usize,
+        start: usize,
+        rows: usize,
+        width: usize,
+        indexer: bool,
+        positions: CuteafdDeviceBuffer,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
         let table = if indexer {
-            self.rope.layers[3]
+            self.rope.layers[self.layer]
                 .indexer
                 .as_ref()
                 .context("CSA indexer tables")?
         } else {
-            &self.rope.layers[3].attention
+            &self.rope.layers[self.layer].attention
         };
         let (cos, sin) = table.buffers();
-        self.launch(
+        self.launch_on(
+            stream,
             stage,
             &[
                 self.ptr(input, start * width * 2),
@@ -510,7 +587,7 @@ impl<'a> CsaLayer<'a> {
                 self.weights[bias].buffer.ptr,
                 cos.ptr,
                 sin.ptr,
-                self.ptr(POSITIONS, start * 8),
+                positions.ptr.wrapping_byte_add(start * 8),
                 self.ptr(output, start * width * 2),
             ],
             &[Scalar::I32(rows as i32), Scalar::F32(self.epsilon)],
@@ -521,12 +598,33 @@ impl<'a> CsaLayer<'a> {
             rows > 0 && rows <= self.admission.rows && query_start < rows,
             "CSA live row range"
         );
+        self.project_on(rows, self.planes[POSITIONS].buffer, &self.stream)?;
+        self.compress(rows)?;
+        for start in (query_start..rows).step_by(TILE) {
+            let count = (rows - start).min(TILE);
+            self.score_select(start, count)?;
+            self.attend(start, count)?;
+            self.finish(start, count)?;
+        }
+        Ok(())
+    }
+    fn project_on(
+        &self,
+        rows: usize,
+        positions: CuteafdDeviceBuffer,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0 && rows <= self.admission.rows,
+            "CSA projection rows"
+        );
         for start in (0..rows).step_by(4096) {
             let count = (rows - start).min(4096);
             let scalar = [Scalar::I32(count as i32)];
             let p = |i| self.ptr(i, start * H * 2);
             let w = |i: usize| self.weights[i].buffer.ptr;
-            self.launch(
+            self.launch_on(
+                stream,
                 0,
                 &[
                     self.ptr(X, start * H * 4),
@@ -548,17 +646,27 @@ impl<'a> CsaLayer<'a> {
                 (7, 9, IKRAW, 256),
                 (7, 10, IZ, 256),
             ] {
-                self.launch(
+                self.launch_on(
+                    stream,
                     stage,
                     &[p(NORM), w(weight), self.ptr(out, start * width * 2)],
                     &scalar,
                 )?;
             }
-            self.norm(4, QRAW, QUERY, 4, 4, start, count, Q, false)?;
-            self.norm(5, KRAW, KEY, 5, 5, start, count, KV, false)?;
-            self.norm(8, IQRAW, IQ, 11, 11, start, count, H, true)?;
-            self.norm(9, IKRAW, IK, 12, 13, start, count, 256, true)?;
-            self.launch(
+            self.norm_on(
+                4, QRAW, QUERY, 4, 4, start, count, Q, false, positions, stream,
+            )?;
+            self.norm_on(
+                5, KRAW, KEY, 5, 5, start, count, KV, false, positions, stream,
+            )?;
+            self.norm_on(
+                8, IQRAW, IQ, 11, 11, start, count, H, true, positions, stream,
+            )?;
+            self.norm_on(
+                9, IKRAW, IK, 12, 13, start, count, 256, true, positions, stream,
+            )?;
+            self.launch_on(
+                stream,
                 10,
                 &[
                     p(NORM),
@@ -569,15 +677,81 @@ impl<'a> CsaLayer<'a> {
                 &scalar,
             )?;
         }
-        self.compress(rows)?;
-        for start in (query_start..rows).step_by(TILE) {
-            let count = (rows - start).min(TILE);
-            self.score_select(start, count)?;
-            self.attend(start, count)?;
-            self.finish(start, count)?;
+        Ok(())
+    }
+
+    pub fn enqueue_step<'e, E: cuteafd_hostcache::copy::CopyEngine>(
+        &'e mut self,
+        step: &mut Step<'e, 'a, E>,
+        rank: usize,
+    ) -> Result<()> {
+        step.project(rank, self.layer, &*self, |layer, input| {
+            layer.check_input(&input)?;
+            layer.project_on(input.rows, input.positions, input.stream)
+        })?;
+        step.stage(
+            rank,
+            self.layer,
+            &self.planes[KEY],
+            &self.planes[VALUE],
+            Some((&self.planes[IK], &self.planes[IZ])),
+        )?;
+        step.attend(rank, self.layer, &*self, |layer, read| layer.read_on(read))
+    }
+
+    fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
+        ensure!(
+            input.heads == 64
+                && input.stream.device.id == self.stream.device.id
+                && std::ptr::eq(input.stream.device.library, self.stream.device.library)
+                && input
+                    .base
+                    .checked_add(input.rows)
+                    .is_some_and(|end| end <= self.rope.tables.plan.extent as usize),
+            "CSA owner device/head/rotary extent mismatch"
+        );
+        Ok(())
+    }
+
+    fn read_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
+        self.check_input(&read.inputs)?;
+        let summary = read
+            .summaries
+            .context("CSA full-head read requires owned summaries")?;
+        for start in (0..read.inputs.rows).step_by(TILE) {
+            let count = (read.inputs.rows - start).min(TILE);
+            self.score_select_on(
+                start,
+                count,
+                read.inputs.positions,
+                read.inputs.requests,
+                summary,
+                read.inputs.stream,
+            )?;
+            self.attend_on(
+                start,
+                count,
+                read.inputs.positions,
+                read.inputs.requests,
+                read.key,
+                read.value,
+                read.table,
+                read.table_width,
+                read.pages,
+                read.inputs.stream,
+            )?;
+            self.finish_on(start, count, read.inputs.stream)?;
         }
         Ok(())
     }
+
+    pub fn input(&self) -> CuteafdDeviceBuffer {
+        self.planes[X].buffer
+    }
+    pub fn output(&self) -> CuteafdDeviceBuffer {
+        self.planes[POST].buffer
+    }
+
     fn compress(&self, rows: usize) -> Result<()> {
         let regions = rows / 8;
         if regions == 0 {
@@ -601,27 +775,71 @@ impl<'a> CsaLayer<'a> {
             rows > 0 && rows <= TILE && start + rows <= self.admission.rows,
             "CSA query tile"
         );
-        self.launch(
+        self.score_select_on(
+            start,
+            rows,
+            self.planes[POSITIONS].buffer,
+            self.planes[REQUESTS].buffer,
+            self.planes[SUMMARY].buffer,
+            &self.stream,
+        )
+    }
+    fn score_select_on(
+        &self,
+        start: usize,
+        rows: usize,
+        positions: CuteafdDeviceBuffer,
+        requests: CuteafdDeviceBuffer,
+        summary: CuteafdDeviceBuffer,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0
+                && rows <= TILE
+                && start
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= self.admission.rows),
+            "CSA query tile"
+        );
+        self.launch_on(
+            stream,
             12,
             &[
                 self.ptr(IQ, start * H * 2),
                 self.ptr(IW, start * 16 * 4),
-                self.ptr(SUMMARY, 0),
-                self.ptr(REQUESTS, start * 4),
-                self.ptr(POSITIONS, start * 8),
+                summary.ptr,
+                requests.ptr.wrapping_byte_add(start * 4),
+                positions.ptr.wrapping_byte_add(start * 8),
                 self.ptr(SCORES, 0),
             ],
             &[Scalar::I32(rows as i32), Scalar::I64(1)],
         )?;
-        self.select(start, rows)
+        self.select_on(start, rows, positions, requests, stream)
     }
     fn select(&self, start: usize, rows: usize) -> Result<()> {
-        self.launch(
+        self.select_on(
+            start,
+            rows,
+            self.planes[POSITIONS].buffer,
+            self.planes[REQUESTS].buffer,
+            &self.stream,
+        )
+    }
+    fn select_on(
+        &self,
+        start: usize,
+        rows: usize,
+        positions: CuteafdDeviceBuffer,
+        requests: CuteafdDeviceBuffer,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
+        self.launch_on(
+            stream,
             13,
             &[
                 self.ptr(SCORES, 0),
-                self.ptr(POSITIONS, start * 8),
-                self.ptr(REQUESTS, start * 4),
+                positions.ptr.wrapping_byte_add(start * 8),
+                requests.ptr.wrapping_byte_add(start * 4),
                 self.ptr(SELECTED, 0),
                 self.ptr(NORMALIZED, 0),
                 self.ptr(LENGTHS, 0),
@@ -632,27 +850,54 @@ impl<'a> CsaLayer<'a> {
         )
     }
     fn attend(&self, start: usize, rows: usize) -> Result<()> {
+        self.attend_on(
+            start,
+            rows,
+            self.planes[POSITIONS].buffer,
+            self.planes[REQUESTS].buffer,
+            self.planes[KEY].buffer,
+            self.planes[VALUE].buffer,
+            self.planes[TABLE].buffer,
+            self.admission.pages,
+            self.admission.pages,
+            &self.stream,
+        )
+    }
+    fn attend_on(
+        &self,
+        start: usize,
+        rows: usize,
+        positions: CuteafdDeviceBuffer,
+        requests: CuteafdDeviceBuffer,
+        key: CuteafdDeviceBuffer,
+        value: CuteafdDeviceBuffer,
+        table: CuteafdDeviceBuffer,
+        table_width: usize,
+        pages: usize,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
         let q = self.ptr(QUERY, start * Q * 2);
-        self.launch(
+        self.launch_on(
+            stream,
             14,
             &[
                 q,
-                self.ptr(KEY, 0),
-                self.ptr(VALUE, 0),
+                key.ptr,
+                value.ptr,
                 q,
                 q,
-                self.ptr(TABLE, 0),
-                self.ptr(REQUESTS, start * 4),
+                table.ptr,
+                requests.ptr.wrapping_byte_add(start * 4),
                 self.ptr(SELECTED, 0),
-                self.ptr(POSITIONS, start * 8),
+                positions.ptr.wrapping_byte_add(start * 8),
                 q,
                 q,
                 self.ptr(ATTN, start * Q * 2),
             ],
             &[
-                Scalar::I64(self.admission.pages as i64),
+                Scalar::I64(pages as i64),
                 Scalar::I64(1),
-                Scalar::I64(self.admission.pages as i64),
+                Scalar::I64(table_width as i64),
                 Scalar::F32(192f32.sqrt().recip()),
                 Scalar::I32(rows as i32),
                 Scalar::I32(1),
@@ -660,8 +905,12 @@ impl<'a> CsaLayer<'a> {
         )
     }
     fn finish(&self, start: usize, rows: usize) -> Result<()> {
+        self.finish_on(start, rows, &self.stream)
+    }
+    fn finish_on(&self, start: usize, rows: usize, stream: &Stream<'a>) -> Result<()> {
         let scalar = [Scalar::I32(rows as i32)];
-        self.launch(
+        self.launch_on(
+            stream,
             15,
             &[
                 self.ptr(ATTN, start * Q * 2),
@@ -670,7 +919,8 @@ impl<'a> CsaLayer<'a> {
             ],
             &scalar,
         )?;
-        self.launch(
+        self.launch_on(
+            stream,
             16,
             &[
                 self.ptr(GATED, start * Q * 2),
@@ -679,7 +929,7 @@ impl<'a> CsaLayer<'a> {
             ],
             &scalar,
         )?;
-        self.stream.device.run(|| {
+        stream.device.run(|| {
             // SAFETY: this tile's residual and delta are retained by the stream-first owner.
             unsafe {
                 self.residual.launch(
@@ -689,7 +939,7 @@ impl<'a> CsaLayer<'a> {
                         self.ptr(POST, start * H * 4),
                     ],
                     &scalar,
-                    self.stream.raw,
+                    stream.raw,
                 )
             }
         })
@@ -850,6 +1100,192 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires pinned CSA fixtures, sealed native library and CUDA"]
+    fn native_csa_transaction_reads_match_contiguous_producers() -> Result<()> {
+        use super::super::{
+            cache::CacheRank,
+            prefix::{Frontier, Placement, Step5Prefix},
+            transaction::{tests::stage_other_layers, Staging},
+        };
+        use cuteafd_engine::prefix::{PrefixCache, PrefixConfig, PrefixFamily};
+        use cuteafd_hostcache::copy::StubCopyEngine;
+        use std::cell::RefCell;
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_CSA_FIXTURE_DIR")?);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        ensure!(
+            manifest["seed"] == 274
+                && manifest["layer"] == 3
+                && manifest["revision"] == "7734b7ffac118d70d8398bfa3eb0fab007eb45b1",
+            "CSA fixture identity"
+        );
+        // SAFETY: the explicit GPU gate supplies a sealed native library.
+        let library =
+            unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library
+            .programs()?
+            .with_manifest(std::path::Path::new(&std::env::var(
+                "CUTEAFD_PROGRAM_MANIFEST",
+            )?))?;
+        let checkpoint =
+            Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        ensure!(
+            checkpoint.snapshot.file_name().and_then(|s| s.to_str())
+                == manifest["revision"].as_str(),
+            "CSA snapshot"
+        );
+        let total = 513;
+        let mut chain = CsaLayer::load(
+            device,
+            &programs,
+            &checkpoint,
+            3,
+            total,
+            None,
+            u64::MAX,
+            &[],
+        )?;
+        let residual = fixture(&root, &manifest, "r513_residual")?;
+        device.run(|| library.copy_h2d(chain.input(), &residual))?;
+        chain.enqueue(total, 0)?;
+        chain.stream.drain()?;
+        let expected = read(&chain, ATTN, 0, total * Q * 2)?;
+        let producers = [
+            (X, H * 4),
+            (QUERY, Q * 2),
+            (KEY, KV * 2),
+            (VALUE, KV * 2),
+            (LOGITS, 64 * 2),
+            (IQ, H * 2),
+            (IW, 16 * 4),
+            (IK, 512),
+            (IZ, 512),
+        ]
+        .into_iter()
+        .map(|(plane, row)| Ok((plane, row, read(&chain, plane, 0, total * row)?)))
+        .collect::<Result<Vec<_>>>()?;
+        let layout = super::super::cache::tests::layout_for(1024, 1, 0, 64);
+        let owner = RefCell::new(CacheRank::new(device, layout, 0, 1, 2, 40, usize::MAX)?);
+        let staging = Staging::new(device, &programs, &owner.borrow(), usize::MAX)?;
+        let family = Step5Prefix::new(vec![&owner])?;
+        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(
+            family.layout(),
+            PrefixConfig {
+                entries: 0,
+                mark_slots: 2,
+                keep_logits: false,
+                min_tokens: 1,
+            },
+            None,
+        )?;
+        let mut placement = pool
+            .admit_cold(&family, 1, 1, |pages| Placement {
+                pages,
+                sequence: 0,
+                committed: 0,
+            })?
+            .placement;
+        let key = Allocation::new(device, 64 * KV * 2)?;
+        let value = Allocation::new(device, 64 * KV * 2)?;
+        let ik = Allocation::new(device, 64 * 512)?;
+        let iz = Allocation::new(device, 64 * 512)?;
+        for end in [
+            7, 8, 9, 63, 64, 128, 192, 256, 320, 384, 448, 511, 512, total,
+        ] {
+            let base = placement.committed;
+            let proposed = (base + 64).min(total);
+            let rows = proposed - base;
+            let before = placement.pages.clone();
+            for abort in [true, false] {
+                let mut step = Step::begin(
+                    vec![&owner],
+                    vec![&staging],
+                    &mut pool,
+                    &mut placement,
+                    rows,
+                )?;
+                step.project(0, 3, &chain, |layer, input| {
+                    layer.check_input(&input)?;
+                    for (plane, row, data) in &producers {
+                        device.run(|| {
+                            // SAFETY: ordered copies retain source slices; transaction retains the owner.
+                            unsafe {
+                                library.copy_h2d_ordered(
+                                    layer.planes[*plane].buffer,
+                                    &data[base * row..proposed * row],
+                                    input.stream.raw,
+                                )
+                            }
+                        })?;
+                    }
+                    Ok(())
+                })?;
+                step.stage(
+                    0,
+                    3,
+                    &chain.planes[KEY],
+                    &chain.planes[VALUE],
+                    Some((&chain.planes[IK], &chain.planes[IZ])),
+                )?;
+                step.attend(0, 3, &chain, |layer, read| layer.read_on(read))?;
+                owner.borrow().stream.drain()?;
+                ensure!(
+                    read(&chain, ATTN, 0, rows * Q * 2)?
+                        == expected[base * Q * 2..proposed * Q * 2],
+                    "CSA transaction attention differs at {base}..{proposed}"
+                );
+                if abort {
+                    drop(step);
+                    ensure!(
+                        placement.committed == base && placement.pages == before,
+                        "CSA abort visibility"
+                    );
+                } else {
+                    stage_other_layers(&mut step, 3, &key, &value, &ik, &iz)?;
+                    step.publish(end - base)?;
+                }
+            }
+        }
+        pool.release(&family, &placement.pages)?;
+        device.run(|| library.copy_h2d(chain.input(), &residual[..64 * H * 4]))?;
+        chain.enqueue(64, 0)?;
+        chain.stream.drain()?;
+        let eager = read(&chain, POST, 0, 64 * H * 4)?;
+        let mut placement = pool
+            .admit_cold(&family, 1, 1, |pages| Placement {
+                pages,
+                sequence: 0,
+                committed: 0,
+            })?
+            .placement;
+        let mut step = Step::begin(vec![&owner], vec![&staging], &mut pool, &mut placement, 64)?;
+        chain.enqueue_step(&mut step, 0)?;
+        stage_other_layers(&mut step, 3, &key, &value, &ik, &iz)?;
+        step.publish(64)?;
+        ensure!(
+            read(&chain, POST, 0, eager.len())? == eager,
+            "CSA production enqueue differs"
+        );
+        pool.release(&family, &placement.pages)?;
+        let other = CsaLayer::load(
+            device,
+            &programs,
+            &checkpoint,
+            7,
+            1,
+            Some(std::rc::Rc::clone(&chain.rope)),
+            u64::MAX,
+            &[],
+        )?;
+        ensure!(
+            std::rc::Rc::ptr_eq(&other.rope, &chain.rope) && other.layer == 7,
+            "CSA shared layer binding"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires pinned layer-3 CSA fixtures, sealed native library and CUDA"]
     fn native_csa_layer3_boundaries_and_graph_replay() -> Result<()> {
         let root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_CSA_FIXTURE_DIR")?);
@@ -881,7 +1317,8 @@ mod tests {
                 == manifest["revision"].as_str(),
             "CSA snapshot revision"
         );
-        let mut chain = CsaLayer::load(device, &programs, &checkpoint, 4105, u64::MAX, &[])?;
+        let mut chain =
+            CsaLayer::load(device, &programs, &checkpoint, 3, 4105, None, u64::MAX, &[])?;
         ensure!(
             manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.epsilon),
             "CSA epsilon"
@@ -890,7 +1327,9 @@ mod tests {
             device,
             &programs,
             &checkpoint,
+            3,
             4105,
+            None,
             chain.admission.bytes - 1,
             &[]
         )
