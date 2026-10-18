@@ -200,6 +200,7 @@ PROFILE_NCU_COUNT
 PROFILE_NCU_SET
 PROFILE_NSYS_GPU_METRICS
 PROFILE_EXPERT_INPUT_SAMPLE
+PROFILE_EXPERT_ROUTE_WEIGHTS
 EOF
   _spark_slot_keys HOST LANE_A
   case "$1" in
@@ -365,6 +366,7 @@ PROBE_DUMP_ROOT
 PROFILE
 PROFILE_DIR
 PROFILE_EXPERT_INPUT_SAMPLE
+PROFILE_EXPERT_ROUTE_WEIGHTS
 PROFILE_NCU_COUNT
 PROFILE_NCU_KERNEL
 PROFILE_NCU_SET
@@ -554,6 +556,7 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 #                     input rows (BF16, up to 64 per layer-step) of the first
 #                     PROFILE_EXPERT_INPUT_SAMPLE (default 64, 0 = none) serving
 #                     layer-steps as PROFILE_DIR/expert-input-HOST-NNNNN.safetensors.
+#                     PROFILE_EXPERT_ROUTE_WEIGHTS=on adds each narrow wave's gate weights.
 #   draft-timing      CUTEAFD_DRAFT_TIMING=1 (drafter device and host launch spans)
 #   nsys              the coordinator runs under `nsys profile` (cuda, nvtx, osrt, CUDA
 #                     graph nodes; no CPU sampling), collection paused until
@@ -586,7 +589,7 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 shared_profile_args() {
 release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)"
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
-release_profile_sample_args "$(get PROFILE)" "$(get PROFILE_EXPERT_INPUT_SAMPLE)"
+release_profile_sample_args "$(get PROFILE)" "$(get PROFILE_EXPERT_INPUT_SAMPLE)" "$(get PROFILE_EXPERT_ROUTE_WEIGHTS)"
 profile_args+=(${RELEASE_PROFILE_SAMPLE_ARGS[@]+"${RELEASE_PROFILE_SAMPLE_ARGS[@]}"})
 release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator \
   "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)" "$(get PROFILE_NSYS_GPU_METRICS)"

@@ -593,17 +593,25 @@ release_profile_docker_args() {
   fi
 }
 
-# PROFILE_EXPERT_INPUT_SAMPLE=N (with PROFILE=expert-routes): the coordinator
+# With PROFILE=expert-routes, coordinator only: PROFILE_EXPERT_INPUT_SAMPLE=N
 # saves the MoE input rows of the first N serving layer-steps (default 64, 0 =
-# none). Sets RELEASE_PROFILE_SAMPLE_ARGS (coordinator docker environment).
-# Arguments: PROFILE SAMPLE.
+# none); PROFILE_EXPERT_ROUTE_WEIGHTS=on also logs the gate weights of each
+# narrow wave (off by default). Sets RELEASE_PROFILE_SAMPLE_ARGS (coordinator
+# docker environment). Arguments: PROFILE SAMPLE WEIGHTS.
 release_profile_sample_args() {
-  local profile="$1" sample="$2"
+  local profile="$1" sample="$2" weights="${3-}"
   RELEASE_PROFILE_SAMPLE_ARGS=()
-  [[ -n "$sample" ]] || return 0
-  [[ ",$profile," == *,expert-routes,* ]] || release_die "PROFILE_EXPERT_INPUT_SAMPLE needs PROFILE=expert-routes"
-  [[ "$sample" =~ ^(0|[1-9][0-9]{0,5})$ ]] || release_die "PROFILE_EXPERT_INPUT_SAMPLE must be 0..999999 layer-steps"
-  RELEASE_PROFILE_SAMPLE_ARGS=(-e "CUTEAFD_EXPERT_INPUT_SAMPLE=$sample")
+  if [[ -n "$sample" ]]; then
+    [[ ",$profile," == *,expert-routes,* ]] || release_die "PROFILE_EXPERT_INPUT_SAMPLE needs PROFILE=expert-routes"
+    [[ "$sample" =~ ^(0|[1-9][0-9]{0,5})$ ]] || release_die "PROFILE_EXPERT_INPUT_SAMPLE must be 0..999999 layer-steps"
+    RELEASE_PROFILE_SAMPLE_ARGS+=(-e "CUTEAFD_EXPERT_INPUT_SAMPLE=$sample")
+  fi
+  case "$weights" in
+    ""|off) ;;
+    on) [[ ",$profile," == *,expert-routes,* ]] || release_die "PROFILE_EXPERT_ROUTE_WEIGHTS needs PROFILE=expert-routes"
+      RELEASE_PROFILE_SAMPLE_ARGS+=(-e CUTEAFD_EXPERT_ROUTES_WEIGHTS=1) ;;
+    *) release_die "PROFILE_EXPERT_ROUTE_WEIGHTS must be on or off" ;;
+  esac
 }
 
 # Print the profiler to exec. The container calls this with the tool name only,
@@ -764,7 +772,7 @@ release_known_key() {
     GLM5_FLASH_PREFILL_BATCH) return 0 ;;
     GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
-    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NSYS_GPU_METRICS|PROFILE_EXPERT_INPUT_SAMPLE) return 0 ;;
+    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NSYS_GPU_METRICS|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
@@ -1009,6 +1017,7 @@ release_load_config() {
   PROFILE_NCU_SET=
   PROFILE_NSYS_GPU_METRICS=
   PROFILE_EXPERT_INPUT_SAMPLE=
+  PROFILE_EXPERT_ROUTE_WEIGHTS=
   ADDR=0.0.0.0:8000
   EXPERT_PORT=19441
   CUTEAFD_EXPORT_HOST=oliver

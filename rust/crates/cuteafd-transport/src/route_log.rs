@@ -27,9 +27,13 @@
 //! - `kind` (`decode`, `prefill`, `mtp_verify`, `benchmark`), `layer` (the
 //!   wire's layer id; the model layer index for GLM), `rows`, `ranks`.
 //! - Waves of at most [`ROW_DETAIL_LIMIT`] rows: `topk` (`[[expert, ...] per
-//!   row]`) and `weights` (the gate weights, same shape). Wider (prefill)
-//!   waves: `expert_rows` (`[[expert, rows], ...]`, ascending expert id),
-//!   which bounds a 4096-row record to the expert count.
+//!   row]`), plus `weights` (the gate weights, same shape) only with
+//!   `CUTEAFD_EXPERT_ROUTES_WEIGHTS=1`. Wider (prefill) waves: `expert_rows`
+//!   (`[[expert, rows], ...]`, ascending expert id), which bounds a 4096-row
+//!   record to the expert count.
+//!
+//! The tap copies the raw route words; the writer counts, encodes and batches
+//! (one buffered write per drained batch).
 //!
 //! `CUTEAFD_EXPERT_INPUT_SAMPLE=N` (default 64 with the log on, 0 disables)
 //! also lets a family save the MoE input rows of the first N serving
@@ -56,6 +60,8 @@ pub struct Config {
     pub host: String,
     /// Layer-steps whose MoE inputs are sampled (0: none).
     pub sample_steps: u64,
+    /// Also log narrow waves' gate weights (`CUTEAFD_EXPERT_ROUTES_WEIGHTS=1`).
+    pub weights: bool,
 }
 
 impl Config {
@@ -73,7 +79,8 @@ impl Config {
             Some(value) => value.parse().ok().filter(|&n: &u64| n <= 1_000_000)
                 .with_context(|| format!("CUTEAFD_EXPERT_INPUT_SAMPLE must be 0..1000000 layer-steps, not {value:?}"))?,
         };
-        Ok(Some(Self { directory: directory.into(), host: safe_name(&host), sample_steps }))
+        let weights = get("CUTEAFD_EXPERT_ROUTES_WEIGHTS").as_deref() == Some("1");
+        Ok(Some(Self { directory: directory.into(), host: safe_name(&host), sample_steps, weights }))
     }
 }
 
@@ -100,10 +107,11 @@ pub struct Wave {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Routes {
-    /// Every row's expert ids and gate weights (`[rows][topk]`, row-major).
-    Rows { topk: Vec<Vec<u32>>, weights: Vec<Vec<f32>> },
-    /// `(expert, rows)` in ascending expert order.
-    PerExpert(Vec<(u32, u32)>),
+    /// Every row's expert ids, `[rows][topk]` row-major, and the gate weights
+    /// in the same layout when logged (empty otherwise).
+    Rows { topk: usize, ids: Vec<u32>, weights: Vec<f32> },
+    /// Every route's expert id (a wide wave); encoded as `(expert, rows)`.
+    PerExpert(Vec<u32>),
 }
 
 /// The serving step a family declared, with its rows' requests.
@@ -115,24 +123,23 @@ pub struct StepContext {
 
 impl Wave {
     /// The wave's routes, read from `request` (owner bits of native group
-    /// requests are masked off).
+    /// requests are masked off); `weights` keeps narrow waves' gate weights.
     pub fn from_request(request: &ExpertProtocolV2Request, transport: u64, pass: u64, ranks: usize,
-        step: Option<StepContext>) -> Self {
-        let ids = |slot: &crate::ExpertProtocolV2RowDescriptor| {
-            let span = slot.route_offset as usize..(slot.route_offset + slot.route_count) as usize;
-            request.routes.get(span).unwrap_or(&[])
-        };
+        step: Option<StepContext>, weights: bool) -> Self {
+        let ids = request.routes.iter().map(|r| r.expert_id & ID_MASK).collect();
         let routes = if request.rows.len() <= ROW_DETAIL_LIMIT {
-            Routes::Rows {
-                topk: request.rows.iter().map(|row| ids(row).iter().map(|r| r.expert_id & ID_MASK).collect()).collect(),
-                weights: request.rows.iter().map(|row| ids(row).iter().map(|r| r.gate_weight).collect()).collect(),
+            let topk = request.rows.first().map_or(0, |r| r.route_count as usize);
+            let uniform = request.rows.iter().enumerate()
+                .all(|(i, r)| r.route_count as usize == topk && r.route_offset as usize == i * topk)
+                && request.routes.len() == topk * request.rows.len();
+            if uniform {
+                Routes::Rows { topk, ids,
+                    weights: if weights { request.routes.iter().map(|r| r.gate_weight).collect() } else { Vec::new() } }
+            } else {
+                Routes::PerExpert(ids)
             }
         } else {
-            let mut counts = std::collections::BTreeMap::<u32, u32>::new();
-            for route in &request.routes {
-                *counts.entry(route.expert_id & ID_MASK).or_default() += 1;
-            }
-            Routes::PerExpert(counts.into_iter().collect())
+            Routes::PerExpert(ids)
         };
         let unix_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos().min(u64::MAX as u128) as u64);
@@ -140,27 +147,58 @@ impl Wave {
             layer: request.header.layer_id, rows: request.header.row_count, ranks: ranks as u32, routes }
     }
 
-    pub fn to_json(&self) -> serde_json::Value {
-        let mut record = serde_json::json!({
-            "event": "expert_routes", "unix_ns": self.unix_ns, "transport": self.transport, "pass": self.pass,
-            "kind": kind_name(self.kind), "layer": self.layer, "rows": self.rows, "ranks": self.ranks,
-        });
-        let object = record.as_object_mut().expect("record is an object");
+    /// Appends the record and its newline to `out` (hand-encoded: integers,
+    /// finite floats and fixed keys only).
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(256);
+        let _ = write!(text, r#"{{"event":"expert_routes","unix_ns":{},"transport":{},"pass":{},"kind":"{}","layer":{},"rows":{},"ranks":{}"#,
+            self.unix_ns, self.transport, self.pass, kind_name(self.kind), self.layer, self.rows, self.ranks);
         if let Some(step) = &self.step {
-            object.insert("step".into(), step.step.into());
-            object.insert("requests".into(), step.requests.iter().map(|&(id, rows)| serde_json::json!([id, rows]))
-                .collect());
+            let _ = write!(text, r#","step":{},"requests":["#, step.step);
+            for (i, (id, rows)) in step.requests.iter().enumerate() {
+                let _ = write!(text, "{}[{id},{rows}]", if i > 0 { "," } else { "" });
+            }
+            text.push(']');
         }
         match &self.routes {
-            Routes::Rows { topk, weights } => {
-                object.insert("topk".into(), serde_json::json!(topk));
-                object.insert("weights".into(), serde_json::json!(weights));
+            Routes::Rows { topk, ids, weights } => {
+                text.push_str(r#","topk":["#);
+                for (row, chunk) in ids.chunks((*topk).max(1)).enumerate() {
+                    text.push_str(if row > 0 { ",[" } else { "[" });
+                    for (i, id) in chunk.iter().enumerate() {
+                        let _ = write!(text, "{}{id}", if i > 0 { "," } else { "" });
+                    }
+                    text.push(']');
+                }
+                text.push(']');
+                if !weights.is_empty() {
+                    text.push_str(r#","weights":["#);
+                    for (row, chunk) in weights.chunks((*topk).max(1)).enumerate() {
+                        text.push_str(if row > 0 { ",[" } else { "[" });
+                        for (i, w) in chunk.iter().enumerate() {
+                            let w = if w.is_finite() { *w } else { 0.0 };
+                            let _ = write!(text, "{}{w}", if i > 0 { "," } else { "" });
+                        }
+                        text.push(']');
+                    }
+                    text.push(']');
+                }
             }
-            Routes::PerExpert(counts) => {
-                object.insert("expert_rows".into(), counts.iter().map(|&(e, n)| serde_json::json!([e, n])).collect());
+            Routes::PerExpert(ids) => {
+                let mut counts = [0u32; ID_MASK as usize + 1];
+                for &id in ids { counts[id as usize] += 1; }
+                text.push_str(r#","expert_rows":["#);
+                let mut first = true;
+                for (expert, &n) in counts.iter().enumerate().filter(|(_, n)| **n > 0) {
+                    let _ = write!(text, "{}[{expert},{n}]", if first { "" } else { "," });
+                    first = false;
+                }
+                text.push(']');
             }
         }
-        record
+        text.push_str("}\n");
+        out.extend_from_slice(text.as_bytes());
     }
 }
 
@@ -356,40 +394,41 @@ impl Tap {
         let layer = request.header.layer_id;
         if self.last_layer.is_some_and(|last| layer <= last) { self.pass += 1; }
         self.last_layer = Some(layer);
-        let wave = Wave::from_request(request, self.transport, self.pass, ranks, self.log.current_step());
+        let wave = Wave::from_request(request, self.transport, self.pass, ranks, self.log.current_step(),
+            self.log.config.weights);
         self.log.send(Message::Wave(Box::new(wave)));
     }
 }
 
+/// Drains every queued message into one batch buffer, writes it once and
+/// flushes, so a stopped container keeps what was logged.
 fn write_loop(receiver: mpsc::Receiver<Message>, mut out: std::io::BufWriter<std::fs::File>, directory: &Path,
     host: &str) {
     let mut failed = false;
-    let handle = |message: Message, out: &mut std::io::BufWriter<std::fs::File>| -> Result<()> {
-        match message {
-            Message::Wave(wave) => {
-                serde_json::to_writer(&mut *out, &wave.to_json())?;
-                out.write_all(b"\n")?;
-            }
-            Message::Sample(sample) => {
-                let path = directory.join(format!("expert-input-{host}-{:05}.safetensors", sample.ordinal));
-                std::fs::write(&path, sample.to_safetensors()?).with_context(|| format!("writing {}", path.display()))?;
-            }
-        }
-        Ok(())
+    let mut batch = Vec::with_capacity(1 << 20);
+    let report = |error: anyhow::Error, failed: &mut bool| {
+        if !*failed { tracing::error!("expert route log: {error:#}"); }
+        *failed = true;
     };
     while let Ok(message) = receiver.recv() {
         let mut next = Some(message);
         while let Some(message) = next.take() {
-            if let Err(error) = handle(message, &mut out) {
-                if !failed { tracing::error!("expert route log: {error:#}"); }
-                failed = true;
+            match message {
+                Message::Wave(wave) => wave.encode(&mut batch),
+                Message::Sample(sample) => {
+                    let path = directory.join(format!("expert-input-{host}-{:05}.safetensors", sample.ordinal));
+                    if let Err(error) = sample.to_safetensors()
+                        .and_then(|bytes| std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))) {
+                        report(error, &mut failed);
+                    }
+                }
             }
             next = receiver.try_recv().ok();
         }
-        if let Err(error) = out.flush() {
-            if !failed { tracing::error!("expert route log flush: {error:#}"); }
-            failed = true;
+        if let Err(error) = out.write_all(&batch).and_then(|()| out.flush()) {
+            report(error.into(), &mut failed);
         }
+        batch.clear();
     }
 }
 
@@ -407,6 +446,14 @@ mod tests {
                 source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
                 route_count: topk as u32 }).collect(),
             routes, vec![0; rows * 64]).unwrap()
+    }
+
+    fn encoded(wave: &Wave) -> serde_json::Value {
+        let mut out = Vec::new();
+        wave.encode(&mut out);
+        assert_eq!(out.last(), Some(&b'\n'));
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+        serde_json::from_slice(&out).unwrap()
     }
 
     fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -427,7 +474,10 @@ mod tests {
         assert!(Config::from_vars(vars(&[("CUTEAFD_EXPERT_ROUTES", "1")])).is_err());
         let config = Config::from_vars(vars(&[("CUTEAFD_EXPERT_ROUTES", "1"), ("CUTEAFD_PROFILE_DIR", "/p"),
             ("CUTEAFD_PROFILE_HOST", "../raptor")])).unwrap().unwrap();
-        assert_eq!(config, Config { directory: "/p".into(), host: "___raptor".into(), sample_steps: 64 });
+        assert_eq!(config, Config { directory: "/p".into(), host: "___raptor".into(), sample_steps: 64, weights: false });
+        let weighted = Config::from_vars(vars(&[("CUTEAFD_EXPERT_ROUTES", "1"), ("CUTEAFD_PROFILE_DIR", "/p"),
+            ("CUTEAFD_EXPERT_ROUTES_WEIGHTS", "1")])).unwrap().unwrap();
+        assert!(weighted.weights);
         let zero = Config::from_vars(vars(&[("CUTEAFD_EXPERT_ROUTES", "1"), ("CUTEAFD_PROFILE_DIR", "/p"),
             ("CUTEAFD_EXPERT_INPUT_SAMPLE", "0")])).unwrap().unwrap();
         assert_eq!(zero.sample_steps, 0);
@@ -440,8 +490,8 @@ mod tests {
     #[test]
     fn narrow_waves_keep_every_rows_topk_and_weights() {
         let wave = Wave::from_request(&request(3, 8, 40, ExpertV2SourceKind::Decode), 2, 5, 6,
-            Some(StepContext { step: 11, requests: vec![(4, 2), (7, 1)] }));
-        let json = wave.to_json();
+            Some(StepContext { step: 11, requests: vec![(4, 2), (7, 1)] }), true);
+        let json = encoded(&wave);
         assert_eq!(json["event"], "expert_routes");
         assert_eq!((json["layer"].as_u64(), json["rows"].as_u64(), json["ranks"].as_u64()), (Some(40), Some(3), Some(6)));
         assert_eq!((json["transport"].as_u64(), json["pass"].as_u64(), json["step"].as_u64()), (Some(2), Some(5), Some(11)));
@@ -456,9 +506,24 @@ mod tests {
     }
 
     #[test]
+    fn weights_are_logged_only_when_asked() {
+        let wave = Wave::from_request(&request(2, 8, 9, ExpertV2SourceKind::MtpVerify), 0, 0, 4, None, false);
+        let json = encoded(&wave);
+        assert_eq!(json["kind"], "mtp_verify");
+        assert!(json.get("weights").is_none() && json.get("step").is_none());
+        assert_eq!(json["topk"].as_array().unwrap().len(), 2);
+        // A non-uniform row layout falls back to rows per expert rather than misreporting rows.
+        let mut ragged = request(2, 8, 9, ExpertV2SourceKind::Decode);
+        ragged.rows[1].route_count = 4;
+        ragged.routes.truncate(12);
+        assert!(encoded(&Wave::from_request(&ragged, 0, 0, 4, None, false)).get("expert_rows").is_some());
+    }
+
+    #[test]
     fn wide_waves_keep_rows_per_expert() {
-        let wave = Wave::from_request(&request(ROW_DETAIL_LIMIT + 1, 8, 3, ExpertV2SourceKind::Prefill), 0, 0, 4, None);
-        let json = wave.to_json();
+        let wave = Wave::from_request(&request(ROW_DETAIL_LIMIT + 1, 8, 3, ExpertV2SourceKind::Prefill), 0, 0, 4, None,
+            true);
+        let json = encoded(&wave);
         assert_eq!(json["kind"], "prefill");
         assert!(json.get("topk").is_none() && json.get("step").is_none() && json.get("requests").is_none());
         let counts: Vec<(u32, u32)> = serde_json::from_value(json["expert_rows"].clone()).unwrap();
@@ -470,8 +535,8 @@ mod tests {
     fn owner_bits_are_masked_off() {
         let mut request = request(1, 2, 4, ExpertV2SourceKind::Decode);
         request.routes[0].expert_id = 383 | (1 << 10);
-        let Routes::Rows { topk, .. } = Wave::from_request(&request, 0, 0, 4, None).routes else { panic!() };
-        assert_eq!(topk[0][0], 383);
+        let wave = Wave::from_request(&request, 0, 0, 4, None, false);
+        assert_eq!(encoded(&wave)["topk"][0][0], 383);
     }
 
     #[test]
@@ -507,7 +572,7 @@ mod tests {
         let writer = std::thread::spawn(move || write_loop(receiver, std::io::BufWriter::new(file), &directory, "h"));
         for layer in [3, 4, 3] {
             sender.send(Message::Wave(Box::new(Wave::from_request(&request(2, 8, layer, ExpertV2SourceKind::Decode),
-                0, 0, 4, None)))).unwrap();
+                0, 0, 4, None, false)))).unwrap();
         }
         sender.send(Message::Sample(Box::new(InputSample { ordinal: 0, layer: 3, kind: ExpertV2SourceKind::Decode,
             wave_rows: 1, hidden: 2, topk: 1, x_bf16: vec![0; 4], ids: vec![5], weights: vec![1.0], step: None })))
@@ -524,7 +589,7 @@ mod tests {
     fn tap_numbers_layer_passes_and_records_only_while_serving() {
         let dir = tempfile::tempdir().unwrap();
         let log: &'static Log = Box::leak(Box::new(Log::start(Config { directory: dir.path().into(), host: "t".into(),
-            sample_steps: 0 }).unwrap()));
+            sample_steps: 0, weights: false }).unwrap()));
         let mut tap = log.tap();
         assert_eq!(tap.transport, 0);
         assert_eq!(log.tap().transport, 1);

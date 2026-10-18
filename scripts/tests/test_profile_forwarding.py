@@ -411,10 +411,10 @@ def test_v41_worker_takes_profile_args_after_every_positional():
     assert 'shared_profile_args' in v41[:v41.index('start_coordinator() {')]
 
 
-def _sample(profile, sample):
+def _sample(profile, sample, weights=''):
     script = ('source scripts/lib/release-common.sh; release_profile_sample_args "$@"; '
               'printf "%s\\n" ${RELEASE_PROFILE_SAMPLE_ARGS[@]+"${RELEASE_PROFILE_SAMPLE_ARGS[@]}"}')
-    return subprocess.run(['bash', '-c', script, 'test', profile, sample], cwd=ROOT, capture_output=True, text=True)
+    return subprocess.run(['bash', '-c', script, 'test', profile, sample, weights], cwd=ROOT, capture_output=True, text=True)
 
 
 def test_expert_routes_switch_and_its_sample_cap():
@@ -425,6 +425,14 @@ def test_expert_routes_switch_and_its_sample_cap():
     assert _sample('', '').stdout == '\n' and _sample('expert-routes', '').stdout == '\n'
     assert _sample('census,expert-routes', '0').stdout.split('\n')[:-1] == ['-e', 'CUTEAFD_EXPERT_INPUT_SAMPLE=0']
     assert _sample('expert-routes', '512').stdout.split('\n')[:-1] == ['-e', 'CUTEAFD_EXPERT_INPUT_SAMPLE=512']
+    assert _sample('expert-routes', '', 'off').stdout == '\n'
+    assert _sample('expert-routes', '4', 'on').stdout.split('\n')[:-1] == [
+        '-e', 'CUTEAFD_EXPERT_INPUT_SAMPLE=4', '-e', 'CUTEAFD_EXPERT_ROUTES_WEIGHTS=1']
+    for weights, message in [('yes', 'must be on or off')]:
+        out = _sample('expert-routes', '', weights)
+        assert out.returncode != 0 and message in out.stderr
+    out = _sample('census', '', 'on')
+    assert out.returncode != 0 and 'PROFILE_EXPERT_ROUTE_WEIGHTS needs PROFILE=expert-routes' in out.stderr
     for profile, sample, message in [('census', '8', 'needs PROFILE=expert-routes'),
                                      ('expert-routes', '-1', 'must be 0..999999'),
                                      ('expert-routes', '01', 'must be 0..999999'),
