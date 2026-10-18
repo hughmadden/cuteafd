@@ -258,7 +258,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         self.segment(0, index, GlmOwnedPhase::FfnFront, || e.moe_front(w, layer, self.rows()))?;
         let real = self.tables[0].exchange_rows;
         if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip(w, index, layer, real, self.cap())?)); }
-        e.moe_stage(w, layer, real, self.cap())?;
+        e.moe_stage(w, index, layer, real, self.cap())?;
         let decode = self.tables[0].decode;
         if decode { e.prefetch(index)?; }
         match &mut self.transport {

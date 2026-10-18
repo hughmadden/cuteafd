@@ -29,6 +29,8 @@ pub struct SparkExperts {
     world: SparkWorld,
     /// A [`SparkExpertWave`] was dispatched and not yet received.
     wave_open: bool,
+    /// The opt-in route log (`PROFILE=expert-routes`); `None` when off.
+    route_tap: Option<crate::route_log::Tap>,
 }
 
 /// A dispatched wave that does not borrow its transport, so several
@@ -111,6 +113,7 @@ impl SparkExperts {
             max_frame_bytes: config.max_frame_bytes,
             world,
             wave_open: false,
+            route_tap: crate::route_log::Tap::from_global(),
         })
     }
     pub fn capacity(&self) -> u32 {
@@ -220,6 +223,8 @@ impl SparkExperts {
         if let Err(error) = &result { crate::health::record_failure(format!("expert write failed: {error:#}")); }
         if result.is_err() {
             self.reset_connections();
+        } else if let Some(tap) = &mut self.route_tap {
+            tap.record(request, self.executors.len());
         }
         result
     }
@@ -400,6 +405,9 @@ impl SparkExperts {
             }
         };
         self.clients.dispatch(request)?;
+        if let Some(tap) = &mut self.route_tap {
+            tap.record(request, self.executors.len());
+        }
         Ok(receiver)
     }
 }

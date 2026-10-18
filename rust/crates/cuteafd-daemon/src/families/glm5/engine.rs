@@ -1506,7 +1506,7 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<usize> {
-        self.moe_stage(w, layer, t, cap)?;
+        self.moe_stage(w, index, layer, t, cap)?;
         if decode {
             self.prefetch(index)?;
         }
@@ -1521,7 +1521,7 @@ impl<'a> GlmEngine<'a> {
     /// the shared expert (and the L2 prefetch) as a Spark exchange would.
     fn moe_skip(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<usize> {
         let skip = self.skip.as_ref().context("routed experts are not skipped")?;
-        self.moe_stage(w, layer, t, cap)?;
+        self.moe_stage(w, index, layer, t, cap)?;
         if cap == "m64" {
             let mark = crate::shared::l2_prefetch::exchange_mark(self.library, self.stream)?;
             self.prefetch(index)?;
@@ -1534,7 +1534,7 @@ impl<'a> GlmEngine<'a> {
     /// Routes and wire rows down to this workspace's pinned staging (the host
     /// waits for them), then the shared expert queued on the GPU; send the
     /// request with [`Self::moe_send`].
-    fn moe_stage(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<()> {
+    fn moe_stage(&self, w: &Workspace<'_>, layer_index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 { h * 2 } else { h + h / 32 }));
         let staging = w.router_host.borrow_mut();
@@ -1548,6 +1548,18 @@ impl<'a> GlmEngine<'a> {
         let timer = std::time::Instant::now();
         // SAFETY: the pinned regions are large enough; the sync completes them
         // (and this workspace's previous plane uploads, freeing its staging).
+        // PROFILE=expert-routes only: this layer-step's MoE input rows (BF16 `x`), downloaded
+        // into their own pinned buffer before the existing sync. Off, `input_sample` is `None`.
+        let sample = match cuteafd_transport::route_log::input_sample() {
+            Some(ordinal) => {
+                let rows = t.min(cuteafd_transport::route_log::SAMPLE_ROWS);
+                let pinned = HostAllocation::new(self.library, rows * h * 2)?;
+                // SAFETY: `x` holds this layer-step's `t` >= `rows` BF16 rows in stream order; the sync below completes it.
+                unsafe { self.library.copy_d2h_host_buffer_async(pinned.buffer, w.x.buffer, rows * h * 2, self.stream)?; }
+                Some((ordinal, rows, pinned))
+            }
+            None => None,
+        };
         unsafe {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
@@ -1555,6 +1567,18 @@ impl<'a> GlmEngine<'a> {
             self.library.cuda_stream_synchronize(self.stream)?;
         }
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
+        if let Some((ordinal, rows, pinned)) = sample {
+            let staged = staging.bytes();
+            let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
+            cuteafd_transport::route_log::save_sample(cuteafd_transport::route_log::InputSample {
+                ordinal, layer: layer_index as u32, wave_rows: t as u32, hidden: h as u32, topk: topk as u32,
+                kind: if cap == "m64" { cuteafd_transport::ExpertV2SourceKind::Decode } else { cuteafd_transport::ExpertV2SourceKind::Prefill },
+                x_bf16: pinned.bytes()[..rows * h * 2].to_vec(),
+                ids: (0..rows * topk).map(|i| word(0, i) as i32).collect(),
+                weights: (0..rows * topk).map(|i| f32::from_bits(word(route_bytes, i))).collect(),
+                step: None,
+            });
+        }
         // The shared expert runs on the GPU while the host sends and the Sparks compute.
         self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, Scalar::I32(t as i32))
     }
@@ -1810,7 +1834,7 @@ impl<'a> GlmEngine<'a> {
                 peer_next(unit)?;
                 post(unit, None)?;
             } else {
-                self.moe_stage(workspaces[lane], &layers[index], counts[lane], cap)?;
+                self.moe_stage(workspaces[lane], index, &layers[index], counts[lane], cap)?;
                 self.lane_send(workspaces[lane], index, counts[lane], &mut transports[lane])?;
                 if self.tp2.is_none() { peer_next(unit)?; }
                 inflight.push_back(unit);

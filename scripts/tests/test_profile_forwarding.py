@@ -321,6 +321,7 @@ release_profile_exec "$@"
     ('nsys', '', 'PROFILE=nsys needs PROFILE_DIR'),
     ('ncu', '', 'PROFILE=ncu needs PROFILE_DIR'),
     ('nsys,ncu', '/data/prof', 'nsys or ncu, not both'),
+    ('expert-routes', '', 'PROFILE=expert-routes needs PROFILE_DIR'),
 ])
 def test_helper_refuses_bad_values(profile, directory, message):
     out = _helper(profile, directory, 'kiwi')
@@ -408,3 +409,43 @@ def test_v41_worker_takes_profile_args_after_every_positional():
     assert source.count('release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator') == 1
     v41 = source[source.index('launch_deepseek_v41() {'):]
     assert 'shared_profile_args' in v41[:v41.index('start_coordinator() {')]
+
+
+def _sample(profile, sample):
+    script = ('source scripts/lib/release-common.sh; release_profile_sample_args "$@"; '
+              'printf "%s\\n" ${RELEASE_PROFILE_SAMPLE_ARGS[@]+"${RELEASE_PROFILE_SAMPLE_ARGS[@]}"}')
+    return subprocess.run(['bash', '-c', script, 'test', profile, sample], cwd=ROOT, capture_output=True, text=True)
+
+
+def test_expert_routes_switch_and_its_sample_cap():
+    out = _helper('expert-routes,expert-timing', '/data/prof', 'raptor')
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split('\n')[:-1] == ['-e', 'CUTEAFD_EXPERT_ROUTES=1', '-e', 'CUTEAFD_EXPERT_TIMING=1',
+        '-e', 'CUTEAFD_PROFILE_HOST=raptor', '-v', '/data/prof:/data/prof', '-e', 'CUTEAFD_PROFILE_DIR=/data/prof']
+    assert _sample('', '').stdout == '\n' and _sample('expert-routes', '').stdout == '\n'
+    assert _sample('census,expert-routes', '0').stdout.split('\n')[:-1] == ['-e', 'CUTEAFD_EXPERT_INPUT_SAMPLE=0']
+    assert _sample('expert-routes', '512').stdout.split('\n')[:-1] == ['-e', 'CUTEAFD_EXPERT_INPUT_SAMPLE=512']
+    for profile, sample, message in [('census', '8', 'needs PROFILE=expert-routes'),
+                                     ('expert-routes', '-1', 'must be 0..999999'),
+                                     ('expert-routes', '01', 'must be 0..999999'),
+                                     ('expert-routes', '1000000', 'must be 0..999999')]:
+        out = _sample(profile, sample)
+        assert out.returncode != 0 and message in out.stderr, (profile, sample, out.stderr)
+
+
+def test_family_launch_expert_routes_sample_reaches_only_the_coordinator(tmp_path):
+    prof = tmp_path / 'prof'
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
+                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=expert-routes\nPROFILE_DIR={prof}\n'
+                                   'PROFILE_EXPERT_INPUT_SAMPLE=16\n')
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    coordinator = next(line for line in lines if 'cuteafd serve-glmf' in line)
+    workers = [line for line in lines if 'cuteafd expertd-native' in line]
+    assert workers
+    assert 'CUTEAFD_EXPERT_ROUTES=1' in coordinator and 'CUTEAFD_EXPERT_INPUT_SAMPLE=16' in coordinator
+    assert all('CUTEAFD_EXPERT_INPUT_SAMPLE' not in w for w in workers)
+    (tmp_path / 'refused').mkdir()
+    refused = _family_launch_result(tmp_path / 'refused', GLMF_TWO_LAYER, 'test/glmf',
+                                    'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE_EXPERT_INPUT_SAMPLE=16\n')
+    assert refused.returncode != 0 and 'PROFILE_EXPERT_INPUT_SAMPLE needs PROFILE=expert-routes' in refused.stderr
