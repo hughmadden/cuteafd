@@ -749,6 +749,43 @@ fn dense_source_members<'a>(
         .collect())
 }
 
+/// Validate official dense replacement headers without running layout estimates or
+/// reading any expert payload. Serving and inspection share this exact contract.
+pub fn validate_dense_source(snapshot: &Path, source: &Path) -> Result<()> {
+    let config = read_json(&snapshot.join("config.json"))?;
+    let dense = dense_operands(snapshot, number(&config, "num_hidden_layers")?)?;
+    replacement_dense(&config, &dense, &super::Checkpoint::coordinator(source, false, false)?)?;
+    Ok(())
+}
+
+fn replacement_dense(config: &Value, dense: &[DenseOperand], original: &super::Checkpoint)
+    -> Result<Vec<DenseOperand>> {
+    // Identity/serialization metadata may differ; architecture equality alone is insufficient.
+    for (key, value) in config.as_object().context("config must be an object")? {
+        if key.starts_with('_') || ["quantization_config", "torch_dtype", "dtype",
+            "transformers_version", "base_model", "base_model_name_or_path"].contains(&key.as_str()) {
+            continue;
+        }
+        ensure!(original.config.get(key) == Some(value), "dense source architecture mismatch at {key}");
+    }
+    let groups = super::format::group_by_stem(&original.tensors);
+    dense.iter().map(|item| {
+        let (stem, suffix) = super::format::split_stem(&item.tensor);
+        let group = groups.get(stem).with_context(|| format!("dense source missing {stem}"))?;
+        let members = dense_source_members(group, suffix)
+            .with_context(|| format!("dense source missing {}", item.tensor))?;
+        let operand = super::format::detect(&members)?;
+        ensure!(operand.logical == item.shape, "dense source shape mismatch for {stem}");
+        Ok(DenseOperand {
+            tensor: item.tensor.clone(), shard: members.values().next().unwrap().shard.clone(),
+            encoding: operand.encoding, scale: operand.scale, shape: operand.logical,
+            bytes: members.values().map(|m| m.meta.byte_length).sum(),
+            sharded_side: item.sharded_side, channels_per_shard: item.channels_per_shard,
+            rotation: None, kernel: None,
+        })
+    }).collect()
+}
+
 pub fn inspect(
     snapshot: &Path,
     selected: &str,
@@ -794,55 +831,7 @@ pub fn inspect(
     let mut dense = dense_operands(snapshot, count)?;
     let dense_source = if let Some(source) = dense_from {
         let original = super::Checkpoint::open(source)?;
-        // Compare every architectural config field; only identity/quantization and
-        // serialization metadata may differ. Equal architectures alone is insufficient.
-        for (key, value) in config.as_object().context("config must be an object")? {
-            if key.starts_with('_')
-                || [
-                    "quantization_config",
-                    "torch_dtype",
-                    "dtype",
-                    "transformers_version",
-                    "base_model",
-                    "base_model_name_or_path",
-                ]
-                .contains(&key.as_str())
-            {
-                continue;
-            }
-            ensure!(
-                original.config.get(key) == Some(value),
-                "dense source architecture mismatch at {key}"
-            );
-        }
-        let mut replacements = Vec::new();
-        let groups = super::format::group_by_stem(&original.tensors);
-        for item in &dense {
-            let (stem, suffix) = super::format::split_stem(&item.tensor);
-            let group = groups
-                .get(stem)
-                .with_context(|| format!("dense source missing {stem}"))?;
-            let members = dense_source_members(group, suffix)
-                .with_context(|| format!("dense source missing {}", item.tensor))?;
-            let operand = super::format::detect(&members)?;
-            ensure!(
-                operand.logical == item.shape,
-                "dense source shape mismatch for {stem}"
-            );
-            replacements.push(DenseOperand {
-                tensor: item.tensor.clone(),
-                shard: members.values().next().unwrap().shard.clone(),
-                encoding: operand.encoding,
-                scale: operand.scale,
-                shape: operand.logical,
-                bytes: members.values().map(|m| m.meta.byte_length).sum(),
-                sharded_side: item.sharded_side,
-                channels_per_shard: item.channels_per_shard,
-                rotation: None,
-                kernel: None,
-            });
-        }
-        dense = replacements;
+        dense = replacement_dense(&config, &dense, &original)?;
         "official checkpoint config/headers (architecture matched)".to_owned()
     } else {
         "checkpoint native EXLR8 records (no BF16 conversion)".to_owned()
@@ -1117,6 +1106,25 @@ mod tests {
     }
 
     #[test]
+    fn replacement_dense_checks_architecture_and_logical_shape() {
+        use super::super::testing::{t, write_snapshot};
+        let temp = tempfile::tempdir().unwrap();
+        write_snapshot(temp.path(), &json!({"hidden_size":128}),
+            &[t("norm.weight", "BF16", &[128])], None);
+        let checkpoint = super::super::Checkpoint::open(temp.path()).unwrap();
+        let mut dense = vec![DenseOperand { tensor: "norm.weight".into(), shard: "native".into(),
+            encoding: Encoding::Bf16, scale: None, shape: vec![128], bytes: 256,
+            sharded_side: 0, channels_per_shard: 0, rotation: None, kernel: None }];
+        assert!(replacement_dense(&json!({"hidden_size":128,"torch_dtype":"float16"}),
+            &dense, &checkpoint).is_ok());
+        assert!(replacement_dense(&json!({"hidden_size":256}), &dense, &checkpoint)
+            .unwrap_err().to_string().contains("architecture mismatch"));
+        dense[0].shape = vec![64];
+        assert!(replacement_dense(&json!({"hidden_size":128}), &dense, &checkpoint)
+            .unwrap_err().to_string().contains("shape mismatch"));
+    }
+
+    #[test]
     fn ownership_rotates_every_layer_and_balances_all_units() {
         for n in 3..=7 {
             for layer in [3, 40, 77] {
@@ -1175,6 +1183,7 @@ mod mounted_tests {
             .unwrap();
         }
         if let Some(dense) = std::env::var_os("CUTEAFD_EXLR8_TEST_DENSE") {
+            super::validate_dense_source(root, std::path::Path::new(&dense)).unwrap();
             let official = super::inspect(
                 root,
                 "up1",

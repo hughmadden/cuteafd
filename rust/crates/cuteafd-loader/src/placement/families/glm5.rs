@@ -188,6 +188,9 @@ pub struct GlmInputs<'a> {
     pub gpus: Vec<(u64, Baseline)>,
     pub headroom_bytes: u64,
     pub spark_ranks: usize,
+    /// Native rotated F16 ingress, F32 rank/shared partials and bounded shared execution.
+    pub native_experts: bool,
+    pub native_workspace: u64,
     /// Coordinator-only diagnostics replace routed FFNs with zero intake planes.
     pub skip_routed_experts: bool,
     pub prefill_rows: u64,
@@ -249,6 +252,12 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         || inputs.prefill_rows == 0 || inputs.prefill_rows > 4096 || inputs.max_context == 0 {
         return Err(PlacementError::Inventory("GLM rank/lane/step/context geometry"));
     }
+    if inputs.native_experts && (gpus != 1 || inputs.prefill_lanes != 1
+        || inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
+        || !inputs.experts.is_empty() || inputs.drafter_bytes != 0 || inputs.scratch.is_none()
+        || inputs.context.is_some() || inputs.native_workspace == 0) {
+        return Err(PlacementError::Inventory("EXLR8 requires one coordinator, serial measured workspaces and real Spark experts"));
+    }
     let geometry = glm_cache_geometry(cfg, inputs.layers, gpus)
         .map_err(|_| PlacementError::Inventory("GLM cache geometry"))?;
     if inputs.skip_routed_experts && (!inputs.experts.is_empty() || inputs.spark_ranks != 0
@@ -290,6 +299,19 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 (bytes, Basis::Estimated)
             }
         };
+        let steps = if rank == 0 && inputs.native_experts {
+            // Replace FP8 wire/BF16 shared allocations with native widths, plus
+            // one rank-pointer table per workspace. Each allocation keeps its floor.
+            let extra = |rows: u64| {
+                let h = cfg.hidden as u64;
+                (rows * h * 2).max(FLOOR) - (rows * (h + h / 32)).max(FLOOR)
+                    + (rows * h * 4).max(FLOOR) - (rows * h * 2).max(FLOOR) + FLOOR
+            };
+            steps.checked_add(extra(DECODE_ROWS)).and_then(|bytes|
+                extra(inputs.prefill_rows).checked_mul(inputs.prefill_lanes).and_then(|v| bytes.checked_add(v)))
+                .and_then(|bytes| bytes.checked_add(inputs.native_workspace))
+                .ok_or(PlacementError::Overflow("GLM native workspaces"))?
+        } else { steps };
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Workspace, "steps", steps, basis)));
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "decode graph allowance", graphs, Basis::Estimated)));
         if let Some(&bytes) = inputs.pending_code.get(rank).filter(|&&bytes| bytes > 0) {
@@ -310,7 +332,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             if inputs.spark_ranks > 0 {
                 let endpoints = 1 + if inputs.prefill_lanes > 1 { inputs.prefill_lanes } else { 0 };
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
-                    endpoints * inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * 2, Basis::Formula)));
+                    endpoints * inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * if inputs.native_experts { 4 } else { 2 }, Basis::Formula)));
             }
         }
         pool_overhead.push(table_bytes);
@@ -874,7 +896,7 @@ mod tests {
     fn inputs<'a>(cfg: &'a GlmDsaConfig, cards: &[u64]) -> GlmInputs<'a> {
         GlmInputs { cfg, layers: cfg.layers, gpus: cards.iter().enumerate().map(|(rank, &total)| (total,
             Baseline::Planned { context_bytes: GIB, loaded_bytes: if rank == 0 { 14 * GIB } else { 12 * GIB } })).collect(),
-            headroom_bytes: 2 * GIB, spark_ranks: 4, skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
+            headroom_bytes: 2 * GIB, spark_ranks: 4, native_experts: false, native_workspace: 0, skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
             max_context: 1 << 20, automatic_context: true, scratch: Some([GlmScratch { programs: 16 << 20, topk: 1 << 20 }; 2]),
             drafter_bytes: 3 * GIB, drafter_staging: 0, pending_code: vec![],
             experts: (cfg.first_moe_layer..cfg.layers).map(|_| ExpertCost {
@@ -888,6 +910,36 @@ mod tests {
     /// solve must request `heads` explicitly: auto resolves to `context`,
     /// which fails closed without its programs (issue #202).
     const HEADS: Option<AttentionPlacement> = Some(AttentionPlacement::Heads);
+
+    #[test]
+    fn native_rotated_workspaces_are_exact_and_unsupported_modes_refused() {
+        let cfg = config();
+        let mut base = inputs(&cfg, &[96 * GIB]);
+        base.prefill_lanes = 1;
+        base.prefill_rows = 65;
+        base.experts.clear();
+        base.drafter_bytes = 0;
+        base.drafter_staging = 0;
+        let mut native = base.clone();
+        native.native_experts = true;
+        native.native_workspace = 123456;
+        let ordinary = request(&base).unwrap();
+        let rotated = request(&native).unwrap();
+        let term = |request: &PlacementRequest, name: &str| request.fixed.iter()
+            .find(|demand| demand.group == name).unwrap().bytes;
+        let h = cfg.hidden as u64;
+        assert_eq!(term(&rotated, "steps") - term(&ordinary, "steps"),
+            (DECODE_ROWS + 65) * (h * 3 - h / 32) + 2 * FLOOR + 123456);
+        assert_eq!(term(&rotated, "Spark intake planes"), 4 * 4096 * h * 4);
+        let mut invalid = native.clone(); invalid.prefill_lanes = 2;
+        assert!(request(&invalid).is_err());
+        let mut invalid = native.clone(); invalid.scratch = None;
+        assert!(request(&invalid).is_err());
+        let mut invalid = native.clone(); invalid.spark_ranks = 0;
+        assert!(request(&invalid).is_err());
+        let mut invalid = native; invalid.gpus.push(invalid.gpus[0]);
+        assert!(request(&invalid).is_err());
+    }
 
     #[test]
     fn planner_equals_runtime_glm5() {

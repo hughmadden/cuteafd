@@ -20,6 +20,12 @@ pub(crate) struct EngineArgs {
     /// Checkpoint snapshot (the EXL3 publication carries the dense weights).
     #[arg(long)]
     pub snapshot: PathBuf,
+    /// Published native EXLR8 expert manifest (for example, up1).
+    #[arg(long)]
+    pub exlr8_manifest: Option<String>,
+    /// Official architecture-matched dense checkpoint snapshot; expert weights stay native.
+    #[arg(long, requires = "exlr8_manifest")]
+    pub exlr8_dense_from: Option<PathBuf>,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -100,14 +106,16 @@ pub(crate) struct EngineArgs {
     pub attention_plan_rows: Option<usize>,
 }
 
-fn spark_model(lanes: usize, bf16: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+fn spark_model(lanes: usize, bf16: bool, native: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     ensure!(lanes > 0, "GLM Spark admission requires at least one prefill lane");
-    let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
+    ensure!(!native || lanes == 1, "EXLR8 currently requires serial prefill");
+    let ingress = if native { cuteafd_core::SparkIngress::Exlr8Rotated }
+        else if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
     let endpoints = 1 + if lanes > 1 { lanes } else { 0 };
     Ok(cuteafd_transport::worker_selection::ModelAdmission {
         capacity: 4096, compiled_capacity: 4096,
         endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 4096, ingress }; endpoints],
-        rings: crate::shared::placement::spark_rings(64 << 20)?,
+        rings: crate::shared::placement::spark_rings(if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)? } else { 64 << 20 })?,
     })
 }
 
@@ -126,7 +134,7 @@ mod draft_cli_tests {
     fn spark_contract_matches_decode_link_and_parallel_prefill_lanes() -> Result<()> {
         for lanes in [1, 2, 3, 4] {
             for bf16 in [false, true] {
-                let model = spark_model(lanes, bf16)?;
+                let model = spark_model(lanes, bf16, false)?;
                 model.validate(cuteafd_core::ExpertGeometry::GLM5)?;
                 assert_eq!(model.endpoints.len(), if lanes == 1 { 1 } else { lanes + 1 });
                 assert!(model.endpoints.iter().all(|endpoint| endpoint.capacity == 4096
@@ -134,8 +142,28 @@ mod draft_cli_tests {
                         else { cuteafd_core::SparkIngress::Fp8K32 }));
             }
         }
-        assert!(spark_model(0, false).is_err());
+        let native = spark_model(1, false, true)?;
+        native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
+        assert_eq!(native.endpoints.len(), 1);
+        assert_eq!(native.endpoints[0].ingress, cuteafd_core::SparkIngress::Exlr8Rotated);
+        assert_eq!(native.rings.max_frame_bytes,
+            cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity)?);
+        assert!(spark_model(2, false, true).is_err());
+        assert!(spark_model(0, false, false).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn native_expert_and_dense_source_options_reach_golden() {
+        #[derive(Parser)]
+        struct Golden { #[command(flatten)] args: GoldenArgs }
+        let args = Golden::try_parse_from(["test", "--snapshot", "/native", "--native-lib", "/library",
+            "--golden", "/golden", "--exlr8-manifest", "up1", "--exlr8-dense-from", "/official"])
+            .unwrap().args.engine;
+        assert_eq!(args.exlr8_manifest.as_deref(), Some("up1"));
+        assert_eq!(args.exlr8_dense_from, Some(PathBuf::from("/official")));
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/native", "--native-lib", "/library",
+            "--exlr8-dense-from", "/official"]).is_err());
     }
 
     #[test]
@@ -275,6 +303,7 @@ pub(crate) struct GoldenArgs {
 pub(crate) struct Opened {
     pub snapshot: PathBuf,
     pub catalog: cuteafd_loader::OfficialV41Catalog,
+    dense_catalog: Option<cuteafd_loader::OfficialV41Catalog>,
     pub cfg: GlmDsaConfig,
     pub library: NativeLibrary,
 }
@@ -285,6 +314,23 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
+    let native = catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
+    let dense_catalog = if native {
+        ensure!(args.exlr8_manifest.is_some(), "native EXLR8 requires --exlr8-manifest");
+        let dense = args.exlr8_dense_from.as_deref()
+            .context("native EXLR8 dense execution is not qualified; pass --exlr8-dense-from with the official snapshot")?;
+        cuteafd_loader::plan::exlr8::validate_dense_source(&args.snapshot, dense)?;
+        ensure!(args.split_device.is_none() && args.draft.is_none() && !args.skip_routed_experts,
+            "EXLR8 activation currently requires one coordinator, no drafter and real Spark experts");
+        ensure!(args.layers.is_some_and(|layers| layers > cfg.first_moe_layer && layers < cfg.layers),
+            "EXLR8 activation currently requires a partial routed-layer golden (--layers)");
+        ensure!(args.peers.as_deref().is_some_and(|peers| !peers.is_empty()), "EXLR8 requires Spark peers");
+        Some(cuteafd_loader::read_expert_catalog(dense)?)
+    } else {
+        ensure!(args.exlr8_manifest.is_none() && args.exlr8_dense_from.is_none(),
+            "EXLR8 options require a native EXLR8 checkpoint");
+        None
+    };
     if let Some(snapshot) = &args.draft {
         dflash::check_snapshot_target_bf16_head(&args.snapshot,
             cfg.hidden, cfg.vocab_size, false)?;
@@ -292,7 +338,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     }
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
-    Ok(Opened { snapshot: args.snapshot.clone(), catalog, cfg, library })
+    Ok(Opened { snapshot: args.snapshot.clone(), catalog, dense_catalog, cfg, library })
 }
 
 impl Opened {
@@ -306,6 +352,8 @@ impl Opened {
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5", args.max_context)?;
         let args = &context_args;
+        let native = self.dense_catalog.is_some();
+        let dense_catalog = self.dense_catalog.as_ref().unwrap_or(&self.catalog);
         ensure!(!args.skip_routed_experts || args.peers.is_none(),
             "--skip-routed-experts is a coordinator-only diagnostic; do not pass --peers");
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
@@ -353,7 +401,8 @@ impl Opened {
         };
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
-            let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
+            let (loaded, skipped) = programs.load_matching(|name| selected.contains(name)
+                || (native && matches!(name, "exlr8_shared_a16_serving" | "exlr8_shared_group" | "exlr8_rotate" | "exlr8_reduce")))?;
             tracing::info!(loaded, skipped, "GLM programs loaded");
             Ok(())
         })?;
@@ -366,12 +415,27 @@ impl Opened {
         let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
             .then(|| cuteafd_loader::placement::families::glm5::attention_owners(&self.cfg, layers)).transpose()?;
         use cuteafd_loader::placement::{families::glm5 as glm, Baseline};
-        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&self.snapshot, false, false)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(dense_catalog.snapshot(), false, false)?;
+        let native_plan = if native {
+            Some(engine::exlr8::NativePlan::new(&self.snapshot,
+                args.exlr8_manifest.as_deref().context("EXLR8 manifest")?,
+                self.cfg.first_moe_layer, layers, &programs)?)
+        } else { None };
+        if let Some(plan) = &native_plan { plan.admit_host()?; }
+        let native_resident = native_plan.as_ref().map_or(0, |plan| plan.resident);
+        let native_workspace = native_plan.as_ref().map_or(0, |plan| plan.workspace as u64);
         let host_embedding = args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host;
         if host_embedding { checkpoint.require_untied_embedding("model.embed_tokens.weight")?; }
-        let reserved_weights = cuteafd_loader::plan::layout::glm5::device_bytes(
-            &checkpoint, devices.len(), layers, host_embedding, owners.as_deref())?;
-        let spark_bf16 = checkpoint.spark_input_is_bf16();
+        let mut reserved_weights = cuteafd_loader::plan::layout::glm5::resident_owned(
+            &checkpoint, devices.len(), layers, owners.as_deref())?.into_iter().map(|groups|
+                groups.into_iter().filter(|(group, _, _)| (!host_embedding || group != "embedding")
+                    && (!native || group != "shared_expert"))
+                    .try_fold(0u64, |sum, (_, _, bytes)| sum.checked_add(bytes)
+                        .context("GLM coordinator weight reservation overflow")))
+                .collect::<Result<Vec<_>>>()?;
+        reserved_weights[0] = reserved_weights[0].checked_add(native_resident)
+            .context("EXLR8 coordinator reservation overflow")?;
+        let spark_bf16 = !native && checkpoint.spark_input_is_bf16();
         let gpus = inventory.gpus.iter().zip(&reserved_weights).map(|(gpu, &bytes)| -> Result<_> {
             let free_bytes = gpu.free_bytes.checked_sub(bytes)
                 .context("GLM coordinator header-derived weights exceed pre-weight free memory")?;
@@ -413,7 +477,9 @@ impl Opened {
             self.library.cuda_set_device(args.device)?;
             context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
         }
-        let prefill_lanes = glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize;
+        let prefill_lanes = if native { 1 } else {
+            glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize
+        };
         let prefill_lanes = if owners.is_some() { prefill_lanes.min(2) } else { prefill_lanes };
         let exchange_f32 = glm::local_exchange_f32()?;
         let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),
@@ -439,7 +505,7 @@ impl Opened {
         let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&self.cfg,
             args.prefill_rows as u64, 1, exchange_f32));
         let inputs = glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
-            spark_ranks, skip_routed_experts: args.skip_routed_experts,
+            spark_ranks, native_experts: native, native_workspace, skip_routed_experts: args.skip_routed_experts,
             prefill_rows: args.prefill_rows as u64,
             prefill_lanes: prefill_lanes as u64,
             max_context: args.max_context as u64, automatic_context, scratch: Some([scratch(true)?, scratch(false)?]),
@@ -456,20 +522,24 @@ impl Opened {
         if let Some(peers) = args.peers.as_deref() {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-            crate::shared::placement::SparkAdmission::plan(&self.snapshot,
+            crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
-                peers.len(), None, spark_model(prefill_lanes, spark_bf16)?)?.select(&peers)?;
+                peers.len(), None, spark_model(prefill_lanes, spark_bf16, native)?,
+                args.exlr8_manifest.as_deref())?.select(&peers)?;
         }
         let started = Instant::now();
-        let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream, device: args.device,
+        let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, owners.as_deref()) })?;
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, owners.as_deref(), native) })?;
+        let native_owner = native_plan.map(|plan|
+            engine::exlr8::NativeExperts::load(&self.library, &programs, plan)).transpose()?;
+        let loaded_native = native_owner.as_ref().map_or(0, |owner| owner.resident_bytes() as u64);
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
             + model.norm.buffer.bytes + model.head.buffer.bytes;
         let embedding_bytes = if host_embedding { 0 } else { embedding.vocab() * embedding.hidden() * 2 };
-        let actual_weights = std::iter::once((bytes + embedding_bytes) as u64)
+        let actual_weights = std::iter::once((bytes + embedding_bytes) as u64 + loaded_native)
             .chain(shares.iter().map(|rank| rank.iter().map(|layer| layer.bytes() as u64).sum()))
             .collect::<Vec<_>>();
         ensure!(actual_weights == reserved_weights,
@@ -507,6 +577,7 @@ impl Opened {
         } else { None };
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, prefill_lanes, context.filter(|_| context_kv))?;
+        engine.native_experts = native_owner;
         engine.spark_bf16 = spark_bf16;
         engine.full_prefill_logits = args.full_prefill_logits;
         engine.attention_plan = attention_plan;
@@ -557,8 +628,8 @@ impl Opened {
             Ok((peers, world))
         };
         let config = cuteafd_transport::TcpTransportConfig { timing: false,
-            timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
-        let row_bytes = self.cfg.hidden * 2;
+            timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)? } else { 64 << 20 } };
+        let row_bytes = self.cfg.hidden * if native { 4 } else { 2 };
         crate::shared::memory_report::release_load_staging(&self.library);
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
@@ -570,15 +641,17 @@ impl Opened {
                 row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
             }).collect();
             let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, layer,
-                h as u32, if engine.spark_bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
+                h as u32, if native { cuteafd_transport::ExpertV2Dtype::F16 }
+                    else if engine.spark_bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
                     else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
                 (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
                     row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
                     source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
                     route_count: topk as u32,
                 }).collect(),
-                routes, vec![0; rows * (if engine.spark_bf16 { h * 2 } else { h + h / 32 })])?;
-            request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                routes, vec![0; rows * (if native || engine.spark_bf16 { h * 2 } else { h + h / 32 })])?;
+            request.header.flags |= if native { cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED }
+                else { cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 };
             Ok(request)
         };
         let mut transport = selected_peers.map(|peers| -> Result<SparkLink<'_>> {
@@ -774,8 +847,9 @@ mod draft_head_tests {
 impl Opened {
     /// The checkpoint's `model.embed_tokens.weight` (BF16 [vocab, hidden]).
     fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
-        let tensor = self.catalog.tensor("model.embed_tokens.weight")?;
-        crate::shared::token_io::EmbedSource::new(self.catalog.snapshot(), &tensor.shard, &tensor.metadata,
+        let catalog = self.dense_catalog.as_ref().unwrap_or(&self.catalog);
+        let tensor = catalog.tensor("model.embed_tokens.weight")?;
+        crate::shared::token_io::EmbedSource::new(catalog.snapshot(), &tensor.shard, &tensor.metadata,
             self.cfg.hidden)
     }
 }
