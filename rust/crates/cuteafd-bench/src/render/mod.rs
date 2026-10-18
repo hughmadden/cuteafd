@@ -86,8 +86,8 @@ mod tests {
         let mut report = crate::sample::full_report();
         let h = cuteafd_transport::fabric_health::Health {
             verdict: cuteafd_transport::fabric_health::Verdict::Ok,
-            loss_events_per_gb: Some(60.0), adapter_retransmits_per_gb: Some(1.0),
-            sequence_events_per_gb: Some(59.0), reasons: vec!["ECN and CNP observed".into()],
+            retransmit_events: Some(600), retransmit_pct: Some(0.025), retransmit_judged: true,
+            retransmit_warn_pct: 0.5, reasons: vec!["ECN and CNP observed".into()],
             ..Default::default()
         };
         report.fabric = vec![crate::fabric::Phase { name: "decode".into(), timed: true,
@@ -96,11 +96,11 @@ mod tests {
                 engine_sent_bytes: Some(900_000_000), engine_received_bytes: Some(0),
                 health: Some(h.clone()), health_since_start: Some(h), mtu: Some(9000), ..Default::default() }], ..Default::default() }];
         let card = super::card::card_svg(&report);
-        assert!(card.contains("Fabric OK: peak loss 60.0 / retransmit 1.0"));
+        assert!(card.contains("Fabric OK: peak retransmits 0.025% of packets"));
         assert!(card.contains("pause not collected"));
         let report = super::report::report_svg(&report);
         // The report draws the port as a small multiple with its loss verdict.
-        assert!(report.contains("Fabric during this run") && report.contains("loss 60.0/GB"));
+        assert!(report.contains("Fabric during this run") && report.contains("retransmits 0.025%"));
     }
 
 }

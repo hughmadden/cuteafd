@@ -302,10 +302,10 @@ pub fn health_header(phases: &[Phase]) -> Option<String> {
     let host_states: Vec<_> = phases.iter().filter(|p| p.timed).flat_map(|p| p.health.values())
         .map(|v| cuteafd_transport::fabric_health::Health { verdict: *v, ..Default::default() }).collect();
     let verdict = cuteafd_transport::fabric_health::verdict(states.iter().copied().chain(host_states.iter()));
-    let peak = |f: fn(&cuteafd_transport::fabric_health::Health) -> Option<f64>| states.iter().filter_map(|h| f(h)).reduce(f64::max)
-        .map(|n| format!("{n:.1}")).unwrap_or_else(|| "unknown".into());
-    Some(format!("Fabric {}: peak loss {} / retransmit {} events/GB; pause not collected; reasons in report", verdict.label(),
-        peak(|h| h.loss_events_per_gb), peak(|h| h.adapter_retransmits_per_gb)))
+    // The peak over ports that moved enough traffic to judge.
+    let peak = states.iter().filter(|h| h.retransmit_judged).filter_map(|h| h.retransmit_pct).reduce(f64::max);
+    Some(format!("Fabric {}: peak retransmits {} of packets; pause not collected; reasons in report", verdict.label(),
+        cuteafd_transport::fabric_health::pct(peak)))
 }
 
 pub fn header(phases: &[Phase]) -> Option<String> {
@@ -449,19 +449,19 @@ mod tests {
     fn health_evidence_survives_reports_and_only_timed_warnings_gate() {
         let mut before = snapshot(1.0, 0, 0);
         let mut after = snapshot(2.0, 5_000_000_000, 0);
-        for (snapshot, marks, loss) in [(&mut before, 0, 0), (&mut after, 300_000, 600)] {
+        for (snapshot, marks, gaps) in [(&mut before, 0, 0), (&mut after, 300_000, 600)] {
             let p = &mut snapshot.hosts.get_mut("spark").unwrap().ports[0];
             for key in ["out_of_sequence", "packet_seq_err", "roce_adp_retrans", "local_ack_timeout_err", "rnr_nak_retry_err"] {
-                p.counters.insert(format!("hw_counters/{key}"), if key == "out_of_sequence" { loss } else { 0 });
+                p.counters.insert(format!("hw_counters/{key}"), if key == "out_of_sequence" { gaps } else { 0 });
             }
             p.counters.insert("hw_counters/np_ecn_marked_roce_packets".into(), marks);
         }
         let phase = interval("decode", true, &before, &after);
         assert_eq!(phase.health["spark"], cuteafd_transport::fabric_health::Verdict::Ok);
         let json = serde_json::to_value(&phase).unwrap();
-        assert_eq!(json["ports"][0]["health"]["sequence_events_per_gb"], 60.0);
-        assert_eq!(json["ports"][0]["health"]["adapter_retransmits_per_gb"], 0.0);
-        assert!(health_header(&[phase]).unwrap().contains("60.0"));
+        // 600 gaps over 10 GB at a 4 KB RoCE MTU: 0.025% of packets.
+        assert_eq!(json["ports"][0]["health"]["retransmit_events"], 600);
+        assert!(health_header(&[phase]).unwrap().contains("peak retransmits 0.025% of packets"));
         after.hosts.get_mut("spark").unwrap().ports[0].counters.insert("hw_counters/np_ecn_marked_roce_packets".into(), 0);
         let phase = interval("decode", true, &before, &after);
         assert_eq!(phase.health["spark"], cuteafd_transport::fabric_health::Verdict::Warn);

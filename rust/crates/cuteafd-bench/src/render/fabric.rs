@@ -19,7 +19,7 @@ struct Bar { phase: String, values: [f64; 4], nic: Option<f64> }
 
 #[derive(Debug, Clone)]
 struct PortView { name: String, port: String, link: Option<f64>, bars: Vec<Bar>, peak: f64, worst: Option<f64>,
-    limit: f64, issue: Option<String>, used: bool }
+    limit: f64, issue: Option<String>, warn: bool, used: bool }
 
 fn rate(bytes: Option<u64>, seconds: f64) -> Option<f64> {
     (seconds > 0.0).then_some(())?;
@@ -72,13 +72,17 @@ fn views(report: &Report, phases: &[Phase]) -> Vec<PortView> {
         for p in &phase.ports {
             let key = (rank(p), p.host.clone(), format!("{}/{}", p.device, p.port));
             let view = ports.entry(key.clone()).or_insert_with(|| PortView { name: host_name(report, p), port: key.2.clone(),
-                link: p.link_gbps, bars: Vec::new(), peak: 0.0, worst: None, limit: 100.0, issue: None, used: false });
+                link: p.link_gbps, bars: Vec::new(), peak: 0.0, worst: None, limit: cuteafd_transport::fabric_health::RETRANSMIT_WARN_PCT, issue: None, warn: false, used: false });
             let b = bar(&phase.name, p);
             view.peak = view.peak.max(b.nic.unwrap_or(0.0));
             view.used |= b.values[0] > 0.0 || b.nic.is_some_and(|n| n > 0.0);
+            // Retransmits as a share of packets, judged only where the phase moved enough.
             if let Some(h) = &p.health {
-                if h.loss_warning_threshold_per_gb > 0.0 { view.limit = h.loss_warning_threshold_per_gb; }
-                if let Some(loss) = h.loss_events_per_gb { view.worst = Some(view.worst.map_or(loss, |w: f64| w.max(loss))); }
+                if h.retransmit_warn_pct > 0.0 { view.limit = h.retransmit_warn_pct; }
+                if let Some(share) = h.retransmit_pct {
+                    view.worst = Some(view.worst.map_or(share, |w: f64| w.max(share)));
+                    if h.retransmit_judged && share > view.limit { view.warn = true; }
+                }
             }
             let active = p.state.as_deref().is_some_and(|s| s.contains("ACTIVE"));
             if b.values[0] > 0.0 && !active { view.issue = Some("down".into()); }
@@ -88,10 +92,12 @@ fn views(report: &Report, phases: &[Phase]) -> Vec<PortView> {
     }
     let mut out: Vec<PortView> = ports.into_values().collect();
     for v in &mut out {
-        if v.issue.is_none() { if let Some(w) = v.worst.filter(|w| *w > v.limit) { v.issue = Some(format!("loss {w:.0}/GB")); } }
+        if v.issue.is_none() { if v.warn { v.issue = v.worst.map(|w| format!("retransmits {}", pct(w))); } }
     }
     out
 }
+
+fn pct(v: f64) -> String { cuteafd_transport::fabric_health::pct(Some(v)) }
 
 fn gb(v: f64) -> String {
     if !v.is_finite() { "–".into() } else if v >= 100.0 { format!("{v:.0}") } else if v >= 10.0 { format!("{v:.1}") }
@@ -145,15 +151,17 @@ fn height_or_draw(mut doc: Option<&mut Doc>, t: &Theme, report: &Report, x: f64,
 }
 
 fn cell(doc: &mut Doc, t: &Theme, v: &PortView, x: f64, y: f64, w: f64) {
-    let border = if v.issue.is_some() { t.bad } else { t.line };
+    // Red only for an engine port that is down; a high retransmit rate is a warning.
+    let severity = match v.issue.as_deref() { Some("down") => Some(t.bad), Some(_) => Some(t.warn), None => None };
+    let border = severity.unwrap_or(t.line);
     doc.frame(x, y, w, CELL_H, 8.0, t.well, border);
     let pad = 9.0;
     doc.text(x + pad, y + 16.0, Font::new(11.0, t.ink).weight(600), &fit(&v.name, 11.0, w - 2.0 * pad - 80.0));
     doc.text(x + w - pad, y + 16.0, Font::new(11.0, t.ink).anchor(Anchor::End), &format!("peak {} Gb/s", gb(v.peak)));
-    let verdict = v.issue.clone().unwrap_or_else(|| v.worst.map_or("OK".into(), |l| format!("loss {}/GB", gb(l))));
+    let verdict = v.issue.clone().unwrap_or_else(|| v.worst.map_or("OK".into(), |l| format!("retransmits {}", pct(l))));
     let short = v.port.trim_start_matches("roce").to_string();
     doc.spans(x + pad, y + 30.0, 10.0, Anchor::Start, &[(&fit(&format!("{short} · "), 10.0, w * 0.6), t.muted, 400),
-        (&verdict, if v.issue.is_some() { t.bad } else { t.muted }, if v.issue.is_some() { 600 } else { 400 })]);
+        (&verdict, severity.unwrap_or(t.muted), if v.issue.is_some() { 600 } else { 400 })]);
     let (top, base) = (y + 40.0, y + CELL_H - 20.0);
     let (px, pw) = (x + pad, w - 2.0 * pad);
     let ceiling = v.peak.max(1e-6) * 1.15;

@@ -17,6 +17,10 @@ const histories = new Map();           // port key -> [point]
 let run = null, sequence = 0, names = new Map(), coordinatorName = 'coordinator', live = false;
 const esc = (text) => String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const gb = (v) => !Number.isFinite(v) ? '–' : v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v >= 0.1 ? v.toFixed(2) : v > 0 ? v.toFixed(3) : '0';
+// Retransmits are go-back-N resends as a share of packets (the server's
+// fabric health): a yellow warning above its rate, judged only on windows that
+// moved enough traffic; red is only an engine port that is down.
+const pct2 = (v) => window.CuteUI.pct2(v);
 const address = (host) => host.replace(/^\[([^\]]+)\](?::\d+)?$/, '$1').replace(/:\d+$/, '');
 function hostName(port) {
   if (port.hostname) return port.hostname;
@@ -45,10 +49,10 @@ function point(port, label) {
   const other = Number.isFinite(nic) ? Math.max(0, nic - known) : null;
   const h = port.health || {};
   return { label, port, nic: Number.isFinite(nic) ? nic : null, direction: sent ? 'transmit' : 'receive',
-    engine, sparknest, foreign, other, loss: h.loss_events_per_gb, limit: limitOf(h),
+    engine, sparknest, foreign, other, retransmit: Number.isFinite(h.retransmit_pct) ? h.retransmit_pct : null,
+    judged: !!h.retransmit_judged, limit: h.retransmit_warn_pct > 0 ? h.retransmit_warn_pct : 0.5,
     verdict: h.verdict || 'unknown', seconds: port.seconds };
 }
-const limitOf = (h) => h.loss_warning_threshold_per_gb > 0 ? h.loss_warning_threshold_per_gb : 100;
 
 // What one port's history says, in a few words; problems only.
 function judge(history) {
@@ -56,23 +60,24 @@ function judge(history) {
   const active = /ACTIVE/.test(last.state || '');
   const peak = Math.max(0, ...history.map((p) => p.nic || 0));
   const engine = history.some((p) => (p.engine || 0) > 0);
-  const losses = history.map((p) => p.loss).filter(Number.isFinite);
-  const worst = losses.length ? Math.max(...losses) : null;
+  const shares = history.map((p) => p.retransmit).filter(Number.isFinite);
+  const worst = shares.length ? Math.max(...shares) : null;
   const limit = history.at(-1).limit;
-  let issue = null;
-  if (engine && !active) issue = 'down';
-  else if (worst != null && worst > limit) issue = `loss ${worst.toFixed(0)}/GB`;
-  else if (history.some((p) => p.verdict === 'warn')) issue = 'warning';
+  const high = history.some((p) => p.judged && p.retransmit > limit);
+  let issue = null, severity = null;
+  if (engine && !active) { issue = 'down'; severity = 'bad'; }
+  else if (high) { issue = `retransmits ${pct2(worst)}`; severity = 'warn'; }
+  else if (history.some((p) => p.verdict === 'warn')) { issue = 'warning'; severity = 'warn'; }
   const used = peak > 0 || engine;
-  return { active, peak, engine, worst, limit, issue, used };
+  return { active, peak, engine, worst, limit, issue, severity, used };
 }
 
 function chart(key, history, j) {
-  const card = document.createElement('figure'); card.className = 'fx' + (j.issue ? ' issue' : '');
+  const card = document.createElement('figure'); card.className = 'fx' + (j.severity ? ` ${j.severity}` : '');
   const last = history.at(-1).port;
   const link = last.link_gbps;
   const port = `${last.device}/${last.port}`;
-  const verdict = j.issue ? `<b class="bad">${esc(j.issue)}</b>` : j.worst != null ? `loss ${gb(j.worst)}/GB` : 'OK';
+  const verdict = j.issue ? `<b class="${j.severity}">${esc(j.issue)}</b>` : j.worst != null ? `retransmits ${pct2(j.worst)}` : 'OK';
   card.innerHTML = `<figcaption><span class="host">${esc(hostName(last))}</span><span class="peak">peak ${gb(j.peak)} Gb/s</span>`
     + `<span class="sub" title="${esc(port)}">${esc(port.replace(/^roce/, ''))} · ${verdict}</span></figcaption>`;
   const W = 200, H = 96, top = 4, base = H - 2;
@@ -119,7 +124,7 @@ function chart(key, history, j) {
     tip.innerHTML = `<b>${esc(p.label)}</b> · ${esc(p.direction)}${Number.isFinite(p.seconds) ? ` · ${p.seconds.toFixed(1)} s` : ''}`
       + SERIES.map((s) => `<div><i style="background:${s.color}"></i>${s.name}<span>${gb(p[s.key])} Gb/s</span></div>`).join('')
       + `<div class="total">NIC<span>${gb(p.nic)} Gb/s</span></div>`
-      + (Number.isFinite(p.loss) ? `<div>loss<span>${gb(p.loss)}/GB</span></div>` : '');
+      + (Number.isFinite(p.retransmit) ? `<div>retransmits${p.judged ? '' : ' (little traffic)'}<span>${pct2(p.retransmit)}</span></div>` : '');
     tip.hidden = false;
     const left = Math.min(Math.max(0, event.clientX - bounds.left + 10), card.clientWidth - tip.offsetWidth);
     tip.style.left = `${Math.max(0, left)}px`;
@@ -129,16 +134,16 @@ function chart(key, history, j) {
 }
 
 function table(rows) {
-  const head = ['host', 'port', 'state', 'link', 'peak', 'engine', 'SparkNest', 'foreign', 'other', 'loss / GB', ''];
+  const head = ['host', 'port', 'state', 'link', 'peak', 'engine', 'SparkNest', 'foreign', 'other', 'retransmits', ''];
   const mean = (h, k) => { const v = h.map((p) => p[k]).filter(Number.isFinite); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
   return `<div class="fx-table"><table><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>`
     + rows.map(([, h, j]) => {
       const p = h.at(-1).port;
-      return `<tr class="${j.issue ? 'issue' : j.used ? '' : 'spare'}"><td>${esc(hostName(p))}</td><td>${esc(`${p.device}/${p.port}`)}</td>`
+      return `<tr class="${j.severity || (j.used ? '' : 'spare')}"><td>${esc(hostName(p))}</td><td>${esc(`${p.device}/${p.port}`)}</td>`
         + `<td>${j.active ? 'up' : esc((p.state || 'unknown').replace(/^\d+:\s*/, '').toLowerCase())}</td><td>${gb(p.link_gbps)}</td><td>${gb(j.peak)}</td>`
         + ['engine', 'sparknest', 'foreign', 'other'].map((k) => `<td>${gb(mean(h, k))}</td>`).join('')
-        + `<td>${j.worst == null ? '–' : gb(j.worst)}</td><td>${j.issue ? `<b>${esc(j.issue)}</b>` : j.used ? 'ok' : 'idle'}</td></tr>`;
-    }).join('') + `</tbody></table><p class="note">Gb/s in the busier direction, mean over ${live ? 'live observations' : 'the run\'s phases'}; peak is the largest NIC rate. Loss signals per GB moved are overlapping counters, not lost bytes; warning above ${rows[0]?.[2].limit ?? 100}/GB. Other is NIC traffic not attributed to the engine, SparkNest or a foreign source (headers, ACKs, retries, timing skew).</p></div>`;
+        + `<td>${j.worst == null ? '–' : pct2(j.worst)}</td><td>${j.issue ? `<b>${esc(j.issue)}</b>` : j.used ? 'ok' : 'idle'}</td></tr>`;
+    }).join('') + `</tbody></table><p class="note">Gb/s in the busier direction, mean over ${live ? 'live observations' : 'the run\'s phases'}; peak is the largest NIC rate. Retransmits are go-back-N resends as a share of packets moved (no data is lost); a warning above ${pct2(rows[0]?.[2].limit)}, judged only where a window moved at least 2 GB. Other is NIC traffic not attributed to the engine, SparkNest or a foreign source (headers, ACKs, retries, timing skew).</p></div>`;
 }
 
 function render() {
@@ -202,11 +207,12 @@ window.CuteFabric = {
   },
   name: hostName,
   observed: () => histories.size,
-  // The problems in the shown history, one short phrase per port (empty when clean).
+  // The problems in the shown history, one short phrase per port with its severity (empty when clean).
   problems() {
     return [...histories.values()].map((h) => [h, judge(h)]).filter(([, j]) => j.issue).map(([h, j]) => {
       const name = hostName(h.at(-1).port);
-      return j.issue === 'down' ? `${name}: port down while used` : j.issue.startsWith('loss') ? `high loss on ${name} (${gb(j.worst)}/GB)` : `${name}: ${j.issue}`;
+      const text = j.issue === 'down' ? `${name}: port down while used` : j.issue.startsWith('retransmits') ? `retransmits on ${name} (${pct2(j.worst)} of packets)` : `${name}: ${j.issue}`;
+      return { text, severity: j.severity };
     });
   },
 };

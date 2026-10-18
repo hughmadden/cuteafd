@@ -1672,11 +1672,11 @@ def test_summary_retains_fabric_and_requires_rerun(tmp_path):
     text = (tmp_path/'summary.md').read_text()
     assert 'A/B Verdict: Rerun' in text and 'Fabric By Arm And Phase' in text
     assert 'SparkNest' in text and 'unknown' in text
-    assert 'Fabric Health By Arm And Phase' in text and 'Adapter retransmits/GB' in text
+    assert 'Fabric Health By Arm And Phase' in text and 'Retransmits (% of packets)' in text
 
 
 def test_fabric_health_caveat_only_gates_timed_phases():
-    warning = 'fabric health: port: loss 110.0 events/GB'
+    warning = 'fabric health: port: retransmits 0.6% of packets exceed 0.5%'
     phases = [dict(name='warmup', timed=False, assessments=[warning]),
               dict(name='decode', timed=True, assessments=[warning])]
     assert cards.fabric_assessment(phases) == [

@@ -285,8 +285,10 @@ svg [data-i]:hover, svg [data-i]:focus-visible { filter: brightness(1.25); outli
 .fabric-pop th { color: var(--muted); font-weight: 500; text-align: right; padding: 3px 6px; border-bottom: 1px solid var(--line); }
 .fabric-pop td { text-align: right; padding: 3px 6px; color: var(--ink-2); white-space: nowrap; }
 .fabric-pop th:first-child, .fabric-pop td:first-child, .fabric-pop th:nth-child(2), .fabric-pop td:nth-child(2) { text-align: left; }
+.fabric-pop td.muted { color: var(--muted); }
 .fabric-pop tr.spare td { color: var(--muted); }
 .fabric-pop tr.issue td { color: var(--bad); }
+.fabric-pop tr.warn td { color: var(--warn); }
 .fabric-pop small { color: var(--muted); }
 .fabric-pop .note { margin: 8px 0 0; }
 @media (max-width: 600px) {
