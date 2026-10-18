@@ -374,3 +374,56 @@ fn long_prompt_benchmark() {
         a new turn {:.2} ms (best of 3, 1, 5, 1 runs)", prompt.len(), expected.len(), whole_s * 1e3, first_s * 1e3,
         kept_s * 1e3, grown_s * 1e3);
 }
+
+#[test]
+fn literal_prompt_spans_bypass_special_and_non_special_added_tokens() {
+    let dir = bpe_tokenizer(false);
+    let tokenizer = LoadedTokenizer::from_snapshot(dir.path()).unwrap();
+    let matcher = LiteralTokens::from_snapshot(dir.path()).unwrap();
+    let mut plain = tokenizer.tokenizer.clone();
+    plain.with_added_vocabulary(tokenizers::AddedVocabulary::new());
+    let added = tokenizer.tokenizer.get_added_tokens_decoder();
+    for spelling in ADDED {
+        let spans = matcher.spans(spelling, false);
+        assert_eq!(spans, vec![0..spelling.len()]);
+        let ids = tokenizer.encode_prompt(spelling, &spans).unwrap();
+        assert_eq!(ids, plain.encode(spelling, false).unwrap().get_ids());
+        assert!(!ids.iter().any(|id| added.contains_key(id)), "{spelling}: {ids:?}");
+        assert_eq!(tokenizer.decode_ids(&ids, false).unwrap().text, spelling);
+        assert_ne!(ids, tokenizer.encode_ids(spelling).unwrap());
+    }
+    let text = mixed_text(13, pieces::LONG_TEXT * 2, 100);
+    let spans = matcher.spans(&text, false);
+    let ids = tokenizer.encode_prompt(&text, &spans).unwrap();
+    assert!(!ids.iter().any(|id| added.contains_key(id)));
+    assert_eq!(tokenizer.decode_ids(&ids, false).unwrap().text, text);
+    assert_eq!(tokenizer.encode_prompt(&text, &[]).unwrap(), tokenizer.encode_ids(&text).unwrap());
+    assert!(tokenizer.encode_prompt("text", &[2..5]).is_err());
+    assert!(tokenizer.encode_prompt("text", &[2..3, 0..1]).is_err());
+}
+
+#[test]
+fn literal_matcher_is_longest_nonoverlapping_and_deduplicated() {
+    let tokens = LiteralTokens::new(["<a>", "other", "<a>b", "<a>", "<|image|>", "<|image|>"]
+        .into_iter().map(str::to_owned));
+    let text = "x<a>bother<|image|>";
+    assert_eq!(tokens.spans(text, false), vec![1..5, 5..10, 10..19]);
+    assert_eq!(tokens.spans(text, true), vec![10..19]);
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_LITERAL_SNAPSHOT"]
+fn official_literal_prompt_ids_are_plain_bpe_and_not_control_ids() {
+    let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_LITERAL_SNAPSHOT").expect("snapshot"));
+    let tokenizer = LoadedTokenizer::from_snapshot(&snapshot).unwrap();
+    let matcher = LiteralTokens::from_snapshot(&snapshot).unwrap();
+    let added = tokenizer.tokenizer.get_added_tokens_decoder();
+    for token in added.values().filter(|token| ["image", "audio", "vision", "sentence", "User", "Assistant", "im_start", "im_end"]
+        .iter().any(|word| token.content.contains(word))) {
+        let spans = matcher.spans(&token.content, false);
+        let ids = tokenizer.encode_prompt(&token.content, &spans).unwrap();
+        assert!(!ids.iter().any(|id| added.contains_key(id)), "{}: {ids:?}", token.content);
+        assert_eq!(tokenizer.decode_ids(&ids, false).unwrap().text, token.content);
+        println!("literal {} -> {ids:?}", token.content);
+    }
+}

@@ -16,7 +16,7 @@ impl Prepared {
         limits: cuteafd_api::openai::NativeLimits,
     ) -> Result<Self> {
         let prompt = crate::shared::probe::prompt_ids(&job.probe, || {
-            Ok(cuteafd_loader::encode_tokenizer_text(snapshot, &job.prompt, false)?.token_ids)
+            Ok(cuteafd_loader::encode_tokenizer_prompt(snapshot, &job.prompt, &job.literal_spans)?)
         })?;
         let (prompt, images) = if job.images.is_empty() {
             (prompt, Vec::new())
@@ -295,7 +295,7 @@ mod tests {
     }
     fn request() -> (NativeRequest, mpsc::UnboundedReceiver<std::result::Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>) {
         let (events, output) = mpsc::unbounded_channel();
-        (NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(),
+        (NativeRequest { literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(),
             audio: Vec::new(), max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events,
             usage: None, probe: None }, output)
     }
