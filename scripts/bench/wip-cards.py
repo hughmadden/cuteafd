@@ -1526,7 +1526,7 @@ def v41_tp_role(card, values):
 def checkpoint_is_nvfp4(values):
     """Whether the card's checkpoint ships NVFP4 routed experts (its own
     config.json's moe_quant_algo, as the launcher reads it)."""
-    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash')
+    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
     hub = Path(os.environ.get('HF_HOME', Path.home() / '.cache/huggingface')) / 'hub' / ('models--' + model.replace('/', '--'))
     revision = values.get('MODEL_REVISION') or ((hub / 'refs/main').read_text().strip() if (hub / 'refs/main').is_file() else '')
     try:
