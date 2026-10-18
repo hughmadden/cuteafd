@@ -52,6 +52,9 @@ pub(crate) enum Commands {
     Plan(PlanArgs),
     /// Report RDMA ports, link and PCIe rates, subnets and the rail plan.
     Fabric(FabricArgs),
+    /// Validate a built library's program table against its PROGRAMS.json (WIP/release seal).
+    #[command(hide = true)]
+    ProgramsCheck(crate::commands::programs_check::ProgramsCheckArgs),
     /// Serve a checkpoint through the OpenAI API; the family comes from
     /// --snapshot's config.json (or --family). `serve --family ID --help` lists
     /// that family's options.

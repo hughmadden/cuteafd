@@ -80,9 +80,19 @@ def family_scopes(cards, config_reader):
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             if 'exl3' in card['name']:
                 scopes.add(tag + ':exl3-k23')
+        # EXLR8 checkpoints (EXLR8_MANIFEST names the published manifest) keep every
+        # family coordinator program, add the EXLR8 programs on both roles and serve
+        # their routed experts from EXLR8 units: no routed FP8/NVFP4/EXL3 packages.
+        exlr8 = bool(values.get('EXLR8_MANIFEST'))
+        if exlr8:
+            if family != 'glm5':
+                raise ValueError(f'EXLR8_MANIFEST is supported only for glm5 checkpoints, not {family}')
+            env['CUTEAFD_WIP_EXLR8_AOT'] = 'ON'
         for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4'), ('step5', 'step5', 'STEP5')]:
             if family == fam:
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
+                if exlr8:
+                    continue
                 if count and fam != 'step5':
                     counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")
                 # Qwen's FP8 package has no Spark TP layout (intermediate 640): request the NVFP4 family,

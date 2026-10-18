@@ -202,6 +202,7 @@ async fn run() -> Result<()> {
         Commands::Usage(args) => commands::usage::run(args).await,
         Commands::Doctor(args) => run_doctor(args),
         Commands::Plan(args) => run_plan(args),
+        Commands::ProgramsCheck(args) => commands::programs_check::run(args),
         Commands::V41Golden(args) => families::deepseek_v41::v41_golden::run_golden(args).await,
         Commands::Dsv4Golden(args) => families::deepseek_v4::run_golden(args).await,
         Commands::GlmGolden(args) => families::glm5::run_golden(args).await,

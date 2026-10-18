@@ -76,6 +76,13 @@ audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
 case "$audio_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" >&2; exit 2 ;; esac
 case "$exl3_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_EXL3_AOT must be ON or OFF, got: $exl3_aot" >&2; exit 2 ;; esac
 case "$nvfp4_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_NVFP4_AOT must be ON or OFF, got: $nvfp4_aot" >&2; exit 2 ;; esac
+# EXLR8 programs (wip_aot_scopes.py derives ON from EXLR8_MANIFEST): the coordinator
+# adds the fork's coordinator set to its program table, the Spark builds the routed
+# serving set alone. Unset keeps every existing build's CMake arguments and key.
+exlr8_aot="${CUTEAFD_WIP_EXLR8_AOT:-OFF}"
+case "$exlr8_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_EXLR8_AOT must be ON or OFF, got: $exlr8_aot" >&2; exit 2 ;; esac
+exlr8_cmake_args=()
+[[ "$exlr8_aot" != ON ]] || exlr8_cmake_args=(-DCUTEAFD_ENABLE_EXLR8_AOT=ON)
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
@@ -300,6 +307,7 @@ cmake \
   -DCUTEAFD_ENABLE_QWEN4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_QWEN4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_STEP5_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_STEP5_AOT:-OFF}" || echo OFF)" \
+  ${exlr8_cmake_args[@]+"${exlr8_cmake_args[@]}"} \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
@@ -442,7 +450,7 @@ fi
 # A native-cache hit restored the table with the rest of the native outputs.
 if ((${native_hit:-0})); then
   :
-elif [[ "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF}" == *ON* ]]; then
+elif [[ ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF}" == *ON* ) || "$exlr8_aot" == ON ]]; then
   install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else
   printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"

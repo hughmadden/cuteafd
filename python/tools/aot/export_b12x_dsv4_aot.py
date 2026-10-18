@@ -640,7 +640,11 @@ def main() -> None:
                              "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), mimof/mimof2 (V2.6 Flash MOPD), "
                              "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
                              "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
-                             "step5/step52 (Step-5 full/two-GPU head split), exlr8 (EXLR8 A16 ABI v1)")
+                             "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
+                             "for --exlr8-role, after every other family)")
+    parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
+                        help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
+                             "family programs), spark = routed K1 serving and grouping, all = every program")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
                         help="with glmf: also the decode and verify programs at this many rows (serve "
@@ -691,10 +695,7 @@ def main() -> None:
     work = []
     for name in geometries:
         if name == "exlr8":
-            from export_b12x_exlr8_aot import programs as exlr8_programs
-            manifest["families"][name] = {"hidden": 6144, "units": 16, "top_k": 8}
-            work += [(name, *item) for item in exlr8_programs()]
-            continue
+            continue  # appended after every other family, below
         if name in ("step5", "step52"):
             from export_b12x_step5_aot import programs as step5_programs
             heads = 64 if name == "step5" else 32
@@ -776,6 +777,14 @@ def main() -> None:
                                         moe_inter=GLM53_FLASH.moe_inter // 2)
             work.append(("glmf2", "kda_commit_c", "kda_commit", {"index_cache": "compact"},
                          lambda: glmf.compile_glmf_kda_commit_c_aot(glmf2)))
+    if "exlr8" in geometries:
+        # Last, so every other family's objects and table indices are unchanged.
+        # The fork owns the program list and its role split.
+        from export_b12x_exlr8_aot import programs as exlr8_programs
+        exlr8_work = exlr8_programs(role=args.exlr8_role)
+        manifest["families"]["exlr8"] = {"hidden": 6144, "units": 16, "top_k": 8, "role": args.exlr8_role,
+                                         "programs": [f"exlr8_{item[0]}" for item in exlr8_work]}
+        work += [("exlr8", *item) for item in exlr8_work]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

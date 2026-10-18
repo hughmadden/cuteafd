@@ -136,6 +136,11 @@ while IFS='=' read -r key value; do
 done <<<"$wip_scopes"
 audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
 case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
+# EXLR8 programs (derived from EXLR8_MANIFEST, or an explicit ON/OFF): passed to both
+# legs only when on, so an OFF build's environment and native key are unchanged.
+case "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_EXLR8_AOT must be ON or OFF, got: $CUTEAFD_WIP_EXLR8_AOT" ;; esac
+wip_exlr8_env=()
+[[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == OFF ]] || wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON)
 echo "WIP AOT scopes ($wip_program_family): ${wip_scope_summary[*]}"
 case "${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
 release_validate_wip_instance
@@ -196,6 +201,7 @@ if ((dry_run)); then
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
   echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
   echo "  Audio AOT: $audio_aot"
+  echo "  EXLR8 AOT: ${CUTEAFD_WIP_EXLR8_AOT:-OFF}"
   cuteafd_build_cache_docker_args "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry >/dev/null
   echo "  Spark cache plan (host HOME template; states/admission and uid rechecked on each Spark, no SSH):"
   cuteafd_build_cache_docker_args "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry aarch64 >/dev/null
@@ -794,6 +800,8 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
         local_name="CUTEAFD_WIP_$key"
         printf '%s=%s\n' "$local_name" "${!local_name:-<default>}"
       done
+      # Keyed only when on, so every existing slot keeps its build key.
+      [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == OFF ]] || printf 'CUTEAFD_WIP_EXLR8_AOT=%s\n' "$CUTEAFD_WIP_EXLR8_AOT"
     } | sha256sum | awk '{print $1}'
   )"
   # Each role's key adds the dev image that builds it.
@@ -1262,6 +1270,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_QWEN4_AOT=${CUTEAFD_WIP_QWEN4_AOT:-OFF}" \
     -e "CUTEAFD_WIP_QWEN_DENSE_AOT=${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF}" \
     -e "CUTEAFD_WIP_STEP5_AOT=${CUTEAFD_WIP_STEP5_AOT:-OFF}" \
+    ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
     -e "CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES:-${CUTEAFD_WIP_EXPERT_FAMILIES:-}}" \
     -e "CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \
     -e "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families" \
@@ -1320,7 +1329,7 @@ build_coordinator() {
     ((exported)) || release_die "no coordinator export mode succeeded"
   fi
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator publish
-  docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" \
+  docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
     -e "CUTEAFD_WIP_PROGRAM_FAMILY=${wip_program_family:-}" "$coordinator_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source coordinator "$slot" /wip/output/coordinator \
@@ -1350,7 +1359,7 @@ build_expert() (
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   local build_command
-  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_EXL3_BITS=${CUTEAFD_WIP_EXL3_BITS:-}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_EXL3_BITS=${CUTEAFD_WIP_EXL3_BITS:-}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust" ||
     release_die "Spark WIP Rust phase on $seed_host failed (exit $?)"
   local seed_root
@@ -1371,7 +1380,7 @@ build_expert() (
   fi
   native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
   native_store_nest "$seed_host" aarch64 "$seed_root" expert publish
-  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" "$spark_container" \
+  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$SPARK_EXPERT_DOCKER_DEV" "$image_id"

@@ -53,6 +53,11 @@ if ! test -w "$build_root_parent"; then
   exit 2
 fi
 
+# EXLR8 programs (release-scope.py derives ON from an EXLR8 matrix entry): both
+# roles, each with its own program set; OFF leaves the CMake arguments unchanged.
+case "${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" in ON|OFF) ;; *) echo "CUTEAFD_RELEASE_EXLR8_AOT must be ON or OFF" >&2; exit 2 ;; esac
+exlr8_cmake_args=()
+[[ "${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" != ON ]] || exlr8_cmake_args=(-DCUTEAFD_ENABLE_EXLR8_AOT=ON)
 case "$role" in
   coordinator)
     coordinator_aot=ON
@@ -249,6 +254,7 @@ cmake \
   -DCUTEAFD_ENABLE_QWEN4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_QWEN_DENSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_STEP5_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_STEP5_AOT:-OFF}" || echo OFF)" \
+  ${exlr8_cmake_args[@]+"${exlr8_cmake_args[@]}"} \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
@@ -421,6 +427,12 @@ python3 "$build_root/source/scripts/build/sparkinfer-release-provenance.py" \
 )
 test -x "$output_dir/cuteafd"
 test -s "$output_dir/libcuteafd_native.so"
+# EXLR8 images: the engine's fail-closed loader validates the built table and
+# its manifest, and the role's EXLR8 programs must all be present.
+if [[ "${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" == ON ]]; then
+  "$output_dir/cuteafd" programs-check --native-lib "$output_dir/libcuteafd_native.so" \
+    --manifest "$output_dir/PROGRAMS.json" --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)"
+fi
 test -s "$output_dir/V41_EXPERT_TP_AOT.json"
 test -s "$output_dir/THIRD_PARTY_NOTICES.md"
 test -s "$output_dir/SPARKINFER_PROVENANCE.json"
