@@ -1,5 +1,5 @@
-//! A server shutdown during a benchmark run (its own binary: the loopback
-//! address is process-wide).
+//! Serving lifecycle around a benchmark: discovery after ready, and a shutdown
+//! during a run (its own binary: the loopback address is process-wide).
 mod common;
 use common::fake_engine;
 use cuteafd_api::openai::{auth::ApiKey, router_with_console, ConsoleHub, NativeLimits, NativeRequest};
@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// A server shutdown mid-run saves the run as interrupted with the reason,
+/// Discovery names the fingerprint before any run; a shutdown mid-run saves the run as interrupted with the reason,
 /// never as a panel failure from the connection errors that follow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shutdown_mid_run_is_recorded_as_interrupted() {
+async fn discovery_then_shutdown_mid_run_is_recorded_as_interrupted() {
     let (queue, receive) = mpsc::channel::<NativeRequest>(16);
     fake_engine(receive);
     let router = router_with_console(queue, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
@@ -28,6 +28,10 @@ async fn shutdown_mid_run_is_recorded_as_interrupted() {
     tokio::spawn(async move {
         axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
     });
+    // Discovery after ready: the status names this server's fingerprint before any run.
+    let discovering = bench.clone();
+    tokio::task::spawn_blocking(move || discovering.discover()).await.unwrap();
+    assert!(bench.status()["fingerprint"].is_string(), "fingerprint known before the first run");
     let stopper = bench.clone();
     let report = tokio::task::spawn_blocking(move || {
         let agent = ureq::agent();

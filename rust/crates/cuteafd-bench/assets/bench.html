@@ -45,6 +45,8 @@ body.scary .brand .logo { filter: hue-rotate(150deg) saturate(1.4); animation: g
 /* toolbar */
 .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .toolbar select, .toolbar .btn, dialog input, dialog select { font: 600 11px var(--mono); }
+/* A long run label never widens the page: the select shrinks and truncates. */
+.toolbar select { min-width: 0; max-width: 100%; text-overflow: ellipsis; }
 select { color: var(--ink); background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 7px; padding: 5px 8px; }
 .btn.go { color: var(--bg); background: linear-gradient(90deg, var(--target), var(--accepted)); border-color: transparent; }
 .btn.danger { color: var(--bad); border-color: var(--bad); }
@@ -595,7 +597,10 @@ function tableFor(id, comparedResult = null) {
 function renderRuns() {
   const select = $('runs');
   const fp = currentFingerprint();
-  const merged = fp ? [`<option value="merged:${fmt.esc(fp)}">All panels · newest result each (this server)</option>`] : [];
+  // "this configuration" only for the fingerprint this server reports; an
+  // older configuration's accumulated view says so.
+  const here = status.fingerprint && fp === status.fingerprint;
+  const merged = fp ? [`<option value="merged:${fmt.esc(fp)}">All panels · newest result each (${here ? 'this configuration' : 'an earlier configuration'})</option>`] : [];
   const options = runs.map((r) => `<option value="${r.id}">${fmt.esc(r.created.replace('T', ' ').slice(0, 16))} · ${fmt.esc(r.profile)} · ${fmt.esc(r.status)}${r.quality_failed ? ' · ⚠' : ''}</option>`);
   select.innerHTML = merged.concat(options).join('') || '<option value="">no runs yet</option>';
   if (report) select.value = report.merged ? `merged:${report.fingerprint}` : report.id;

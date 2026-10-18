@@ -209,6 +209,27 @@ impl Bench {
         let _ = self.console.set(console);
     }
 
+    /// Learns the served model and this server's configuration once, off the
+    /// request path, so the page's fingerprint, its accumulated view and panel
+    /// availability are right before any run. Serving calls it when the bench
+    /// is mounted; it waits for the API to answer (bounded) and is a no-op
+    /// once a run has learned the same.
+    pub fn discover(&self) {
+        let mut last = None;
+        for attempt in 0..60 {
+            if self.info.lock().is_ok_and(|i| i.is_some()) { return; }
+            if let Some(base) = crate::context::loopback() {
+                let mut client = Client::new(&base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned());
+                match client.discover() {
+                    Ok(_) => { self.server_info(&client.model); return; }
+                    Err(error) => last = Some(error),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(if attempt < 10 { 200 } else { 1000 }));
+        }
+        if let Some(error) = last { tracing::debug!(%error, "bench: server discovery deferred to the first run"); }
+    }
+
     /// The process-wide instance (SQLite under `store::default_dir()`, in memory if unwritable).
     pub fn global() -> Arc<Self> {
         static BENCH: OnceLock<Arc<Bench>> = OnceLock::new();

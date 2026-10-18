@@ -23,7 +23,14 @@ pub fn wrap(text: &str, size: f64, width: f64) -> Vec<String> {
         if !line.is_empty() {
             line.push(' ');
         }
-        line.push_str(word);
+        // A word longer than a line (a URL, a hash) breaks at the edge instead of running past it.
+        let mut rest: Vec<char> = word.chars().collect();
+        while line.chars().count() + rest.len() > max {
+            let take = max.saturating_sub(line.chars().count()).max(1);
+            line.extend(rest.drain(..take.min(rest.len())));
+            lines.push(std::mem::take(&mut line));
+        }
+        line.extend(rest);
     }
     if !line.is_empty() {
         lines.push(line);

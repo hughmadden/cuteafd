@@ -625,8 +625,11 @@ fn reasoning(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     y += if narrow { hy + 26.0 + heat_h + 18.0 } else { 44.0 + h + 40.0 };
     // 3. Time to solve: solo-equivalent seconds, solved and failed, per level.
     doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2), "TIME TO SOLVE · solved vs failed");
-    doc.text(w, y + 12.0, Font::new(10.0, t.muted).anchor(Anchor::End),
-        if narrow { "solo-equivalent" } else { "solo-equivalent: reasoning tokens ÷ C1 decode" });
+    // How the time is derived, right-aligned where it fits beside the title.
+    let note = if narrow { "solo-equivalent" } else { "solo-equivalent: reasoning tokens ÷ C1 decode" };
+    if w >= 300.0 + super::svg::text_width(note, 10.0) {
+        doc.text(w, y + 12.0, Font::new(10.0, t.muted).anchor(Anchor::End), note);
+    }
     let times: Vec<f64> = rows.iter().filter_map(|r| num(r, "solo_s")).filter(|v| *v > 0.0).collect();
     let (lo, hi) = (times.iter().cloned().fold(f64::INFINITY, f64::min).max(0.05), times.iter().cloned().fold(1.0, f64::max));
     let vh = 160.0;
@@ -661,7 +664,8 @@ fn reasoning(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     }
     y += 28.0 + vh + 42.0;
     // 4. Overthinking: reasoning tokens on the easy (medium) tier.
-    doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2), "OVERTHINKING · reasoning tokens on easy items");
+    doc.text(0.0, y + 12.0, Font::new(10.5, t.ink2).weight(600).spacing(1.2),
+        if w < 420.0 { "OVERTHINKING · easy items" } else { "OVERTHINKING · reasoning tokens on easy items" });
     let bars: Vec<(String, f64, &str, String)> = levels.iter().enumerate().map(|(i, level)| {
         let easy: Vec<f64> = of(&rows, level).filter(|r| r["tier"].as_str() == Some("medium")).filter_map(|r| num(r, "reasoning_tokens")).collect();
         let mean = if easy.is_empty() { 0.0 } else { easy.iter().sum::<f64>() / easy.len() as f64 };

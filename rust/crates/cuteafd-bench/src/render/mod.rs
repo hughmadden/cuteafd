@@ -65,6 +65,13 @@ pub fn date(rfc3339: &str) -> &str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn wrap_breaks_a_word_longer_than_the_line() {
+        let lines = super::bodies::wrap("dev · https://github.com/tpurtell/cuteafd @ 9db3e0b7", 12.0, 120.0);
+        assert!(lines.iter().all(|l| l.chars().count() <= 16), "{lines:?}");
+        assert_eq!(lines.concat().replace(' ', ""), "dev·https://github.com/tpurtell/cuteafd@9db3e0b7");
+    }
+
+    #[test]
     fn number_formats() {
         assert_eq!(super::grouped(2415.3), "2,415");
         assert_eq!(super::grouped(1234567.0), "1,234,567");

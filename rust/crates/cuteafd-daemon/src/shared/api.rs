@@ -143,6 +143,9 @@ impl ApiPolicy {
                     && cuteafd_api::openai::auth::bearer(headers).is_some_and(|token| witness.accepts_internal(token))
             });
             let verify = bench.clone();
+            // Learn the served configuration in the background once the API answers.
+            let discovering = bench.clone();
+            let _ = std::thread::Builder::new().name("bench-discover".into()).spawn(move || discovering.discover());
             (cuteafd_bench::http::mount(router, bench), Some((internal, verify)))
         } else {
             (router.route("/bench", axum::routing::get(cuteafd_api::openai::console::bench_off)), None)

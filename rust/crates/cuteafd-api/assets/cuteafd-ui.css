@@ -38,7 +38,8 @@ body {
     var(--bg);
   min-height: 100vh;
 }
-.app { display: grid; gap: 12px; padding: 14px 18px 28px; max-width: 2000px; margin: 0 auto; }
+/* One column that never grows past the viewport: wide content scrolls inside its own panel. */
+.app { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 18px 28px; max-width: 2000px; margin: 0 auto; }
 
 /* header */
 header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; padding: 2px 2px 4px; }
@@ -162,6 +163,13 @@ header .meta { flex: 1 1 0; min-width: 0; }
 .nav a.primary[aria-current="page"] { box-shadow: none; }
 .nav a:focus-visible { outline: 2px solid var(--target); outline-offset: 2px; }
 .meta span[title] { cursor: help; }
+/* Phone: the facts take their own full-width row, the navigation the next. */
+@media (max-width: 600px) {
+  .app { padding-inline: 16px; }
+  header .meta { flex: 1 1 100%; order: 5; }
+  header .nav { order: 6; flex-wrap: wrap; flex-shrink: 1; margin-left: 0; }
+  .brand { flex-wrap: wrap; }
+}
 .dirty { color: var(--warn); }
 svg.spark, svg.columns { display: block; width: 100%; overflow: visible; }
 .tile svg.spark { height: 30px; margin-top: 3px; }
