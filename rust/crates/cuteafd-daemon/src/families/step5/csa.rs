@@ -219,6 +219,10 @@ pub(super) struct CsaLayer<'a> {
     epsilon: f32,
 }
 impl<'a> CsaLayer<'a> {
+    pub fn workspace_bytes(rows: usize) -> Result<u64> {
+        Ok(Admission::new(rows, &[], 0, u64::MAX, &[])?.bytes)
+    }
+
     pub fn load(
         device: Device<'a>,
         programs: &'a Programs<'a>,

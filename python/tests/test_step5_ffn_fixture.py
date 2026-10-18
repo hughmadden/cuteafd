@@ -17,13 +17,16 @@ SEED = 274
 ROWS = (1, 7, 128)
 
 
-def test_official_layer0_dense_fixtures():
+@pytest.mark.parametrize("layer_id", (0, 1, 2))
+def test_official_first_three_dense_fixtures(layer_id):
     destination = os.environ.get("CUTEAFD_STEP5_FFN_FIXTURE_DIR")
     if not destination:
         pytest.skip("set CUTEAFD_STEP5_FFN_FIXTURE_DIR for real-weight CUDA fixtures")
     torch = pytest.importorskip("torch")
     snapshot = Path(os.environ["STEP5_REFERENCE_SNAPSHOT"])
     root = Path(destination).resolve()
+    if layer_id:
+        root = root / f"layer{layer_id}"
     build_root = Path(os.environ.get("CARGO_TARGET_DIR", Path.home() / ".cache/cuteafd/builds")).resolve()
     assert root.is_relative_to(build_root), "fixtures require the guarded NVMe build bind mount"
     root.mkdir(parents=True, exist_ok=True)
@@ -33,7 +36,7 @@ def test_official_layer0_dense_fixtures():
     config_values["tp_size"] = 1
     config = ref.Step5Config(**config_values)
     with torch.device("meta"):
-        layer = ref.Step5DecoderLayer(config, 0, dtype=torch.bfloat16)
+        layer = ref.Step5DecoderLayer(config, layer_id, dtype=torch.bfloat16)
     # Only this subchain is materialized. Attention remains meta, not a fake oracle.
     layer.post_attention_layernorm.to_empty(device="cuda")
     layer.mlp.to_empty(device="cuda")
@@ -43,7 +46,7 @@ def test_official_layer0_dense_fixtures():
         for name, parameter in list(layer.named_parameters()):
             if not (name.startswith("mlp.") or name.startswith("post_attention_layernorm.")):
                 continue
-            value = reader.get("model.layers.0." + name)
+            value = reader.get(f"model.layers.{layer_id}." + name)
             assert value.dtype == parameter.dtype and value.shape == parameter.shape
             sources[name] = hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
             parameter.copy_(value)
@@ -52,7 +55,7 @@ def test_official_layer0_dense_fixtures():
     residual = torch.randn((max(ROWS), config.hidden_size), generator=generator, dtype=torch.float32).cuda()
     manifest = {
         "schema": 1, "checkpoint": golden.CHECKPOINT, "revision": golden.REVISION,
-        "source_pins": golden.SOURCE_PINS, "seed": SEED, "layer": 0, "rows": list(ROWS),
+        "source_pins": golden.SOURCE_PINS, "seed": SEED, "layer": layer_id, "rows": list(ROWS),
         "epsilon": config.rms_norm_eps, "limit": layer.mlp.limit, "weights_sha256": sources,
         "torch": torch.__version__, "cuda": torch.version.cuda, "files": {},
         "primary": "official_native", "secondary": "official_f32",

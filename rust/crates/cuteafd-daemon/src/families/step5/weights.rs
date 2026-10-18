@@ -263,6 +263,30 @@ mod tests {
     }
 
     #[test]
+    fn replicated_router_keeps_native_bf16_bytes_on_both_ranks() -> Result<()> {
+        let name = "model.layers.3.moe.gate.weight";
+        let shape = vec![352, 4096];
+        let bytes: Vec<u8> = (0..352 * 4096)
+            .flat_map(|i| (0x3f00u16 + (i % 128) as u16).to_le_bytes())
+            .collect();
+        let operand = WeightOperand {
+            name: name.into(),
+            sources: vec![source(name, DType::Bf16, shape.clone())],
+            dtype: DType::Bf16,
+            shape: shape.clone(),
+            slice: WeightSlice::Replicated,
+            allocation_bytes: bytes.len() as u64,
+        };
+        for rank in 0..2 {
+            let actual = pack(&operand, &layout(rank), |_| {
+                Ok((bytes.clone(), DType::Bf16, shape.clone()))
+            })?;
+            assert_eq!(actual, bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn packed_ffn_keeps_gate_then_up_without_a_second_device_copy() -> Result<()> {
         let operand = WeightOperand {
             name: "gate_up".into(),
