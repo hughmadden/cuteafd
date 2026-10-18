@@ -19,8 +19,21 @@ TRELLIS_SHAPES = (
 )
 
 
+SCALED_SHAPES = (
+    ("mxfp8_q_a", 6144, 2048, "mxfp8", 1),
+    ("mxfp8_kv_a", 6144, 576, "mxfp8", 1),
+    ("mxfp8_index_q", 2048, 4096, "mxfp8", 1),
+    ("mxfp8_index_k", 6144, 128, "mxfp8", 1),
+    ("int4_q_b", 2048, 16384, "int4_g32", 1),
+    ("int4_o", 16384, 6144, "int4_g32", 2),
+    ("fp8_row_lm_head", 6144, 154880, "fp8_row", 1),
+)
+
+
 def programs():
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.scaled_linear import compile_scaled_linear_aot
+    from b12x.integration.cuteafd.fp8_row_embedding import compile_fp8_row_embedding_aot
     result = []
     for name, k, n, side in TRELLIS_SHAPES:
         params = dict(input_features=k, output_features=n, bits=4,
@@ -28,6 +41,14 @@ def programs():
                       max_rows=4096)
         result.append((f"trellis_{name}", "trellis_linear", params,
                        partial(compile_trellis_linear_aot, **params)))
+    for name, k, n, encoding, side in SCALED_SHAPES:
+        params = dict(input_features=k, output_features=n, encoding=encoding,
+                      sharded_side=side, max_rows=4096)
+        result.append((name, "scaled_linear", params,
+                       partial(compile_scaled_linear_aot, **params)))
+    params = dict(hidden=6144, vocabulary=154880, max_rows=4096)
+    result.append(("fp8_row_embedding", "fp8_row_embedding", params,
+                   partial(compile_fp8_row_embedding_aot, **params)))
     return result
 
 

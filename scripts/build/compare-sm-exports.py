@@ -126,6 +126,13 @@ def jobs(scope):
         ("exlr8-dense-trellis", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "trellis_q_b,trellis_o,trellis_gate_up,trellis_down"]),
+        ("exlr8-dense-mxfp8", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only",
+          "mxfp8_q_a,mxfp8_kv_a,mxfp8_index_q,mxfp8_index_k"]),
+        ("exlr8-dense-int4", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", "int4_q_b,int4_o"]),
+        ("exlr8-dense-fp8-row", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", "fp8_row_lm_head,fp8_row_embedding"]),
         ("audio", "export_b12x_audio_aot.py", ["--capability", "120"]),
         ("vision-attention", "export_b12x_vision_attention_aot.py", ["--capability", "120"]),
     ])
