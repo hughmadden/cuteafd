@@ -82,7 +82,8 @@ pub use tensors::{
     LoadedTensorSummary, TensorLoadOptions,
 };
 pub use tokenizer::{
-    decode_tokenizer_ids, encode_tokenizer_text, streaming_token_decoder, LoadedTokenizer,
+    decode_tokenizer_ids, encode_tokenizer_text, encode_tokenizer_prompt, streaming_token_decoder, LoadedTokenizer,
+    LiteralSpans, LiteralTokens,
     StreamingTokenDecoder, TokenizerDecodeSummary, TokenizerEncodingSummary,
 };
 

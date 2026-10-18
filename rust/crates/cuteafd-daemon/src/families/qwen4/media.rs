@@ -347,7 +347,7 @@ mod tests {
         assert!(RemoteVision::from_args(&args).is_err());
     }
     fn request(images: Vec<Arc<PreparedImage>>) -> NativeRequest {
-        NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
+        NativeRequest { literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
             max_tokens: 8, sampling: TargetSamplingParams::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: None }
     }

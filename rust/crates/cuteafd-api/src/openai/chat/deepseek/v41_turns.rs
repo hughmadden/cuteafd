@@ -198,7 +198,7 @@ mod tests {
         // The served path expands the adapter's image marker to the checkpoint's
         // placeholder before tokenizing, as encoding.py's IMAGE_PLACEHOLDER.
         build(profile, NativeLimits::default(), &Default::default(), body)
-            .unwrap_or_else(|r| panic!("{}", r.message)).prompt().replace("<｜image｜>", "<｜deepseek_image｜>")
+            .unwrap_or_else(|r| panic!("{}", r.message)).prompt().to_owned()
     }
 
     /// DeepSeek-V4.1-Flash-1017's own encoding.py, case for case

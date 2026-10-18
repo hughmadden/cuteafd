@@ -679,7 +679,7 @@ fn schedule(
                     continue;
                 }
             };
-            let tokens = probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids))?;
+            let tokens = probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))?;
             let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
