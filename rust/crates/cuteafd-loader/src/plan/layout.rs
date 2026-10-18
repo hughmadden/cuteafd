@@ -576,7 +576,13 @@ pub(crate) fn push_resident(devices: &mut [DeviceLayout], ranks: &[Vec<(String, 
 /// The host-mapped table note (engram/PLE tables live on the host; the
 /// device budget holds only their staging).
 pub(crate) fn mapped_table_note(report: &PlanReport, notes: &mut Vec<String>) {
-    let mapped: u64 = report.components.iter().filter(|c| c.component == Component::MappedTable).map(|c| c.bytes).sum();
+    let p = &report.mapped_placement;
+    if p.mapped + p.preloaded > 0 {
+        notes.push(format!("{}; {} host-resident scale bytes charged against {} available bytes (cap {} bytes)",
+            p.label(), p.preloaded_bytes, p.host_budget_bytes, p.cap_bytes));
+    }
+    let mapped: u64 = report.components.iter().filter(|c| c.component == Component::MappedTable).map(|c| c.bytes).sum::<u64>()
+        .saturating_sub(p.preloaded_bytes);
     if mapped > 0 { notes.push(format!("host-mapped table backing: {:.2} GiB (device budget includes staging only)", mapped as f64 / GIB as f64)); }
 }
 

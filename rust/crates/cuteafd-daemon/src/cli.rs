@@ -141,6 +141,9 @@ pub(crate) struct FabricArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
+    #[arg(long, default_value_t = 8.0, value_parser = parse_scale_preload_gib)]
+    pub mapped_scale_preload_gib: f64,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
     pub(crate) vision_replicas: u32,
     /// Vision policy (auto does not imply an implemented encoder).
@@ -567,6 +570,27 @@ pub(crate) struct TransportCapabilitiesArgs {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn mapped_scale_cap_defaults_to_eight_and_accepts_zero() {
+        use clap::Parser;
+        for (flags, cap) in [(vec![], 8.0), (vec!["--mapped-scale-preload-gib", "0"], 0.0),
+            (vec!["--mapped-scale-preload-gib", "0.5"], 0.5)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected plan"); };
+            assert_eq!(args.mapped_scale_preload_gib, cap);
+        }
+        for value in ["-1", "NaN", "inf", "1e100", "invalid"] {
+            assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model",
+                "--mapped-scale-preload-gib", value]).is_err(), "{value}");
+        }
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from([
+            "cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--mapped-scale-preload-gib", "0"]).unwrap().command
+            else { panic!("expected native serve"); };
+        assert_eq!(args.mapped_scale_preload_gib, 0.0);
+    }
+
+    #[test]
     fn plan_mimo_prefix_marks_stay_experimental_and_off() {
         use clap::{CommandFactory, Parser};
         let super::Commands::Plan(args) = super::Cli::try_parse_from(
@@ -856,6 +880,9 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
+    /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
+    #[arg(long, default_value_t = 8.0, value_parser = parse_scale_preload_gib)]
+    pub mapped_scale_preload_gib: f64,
     /// Checked Spark vision replicas; omitted for local RTX fallback.
     #[arg(long)]
     pub vision_peers: Option<String>,
@@ -1076,4 +1103,10 @@ impl NativeServeArgs {
 pub(crate) fn reject_peer_expert_ranges(text: &str) -> Result<bool, String> {
     if text == "false" { return Ok(false); }
     Err("GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); drop --peer-expert-ranges".into())
+}
+
+fn parse_scale_preload_gib(value: &str) -> Result<f64, String> {
+    let gib: f64 = value.parse::<f64>().map_err(|error| error.to_string())?;
+    cuteafd_loader::plan::mapped_scale_preload_bytes(gib).map_err(|error| error.to_string())?;
+    Ok(gib)
 }

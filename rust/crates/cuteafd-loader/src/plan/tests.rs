@@ -159,7 +159,9 @@ fn v41_unused_native_draft_bytes_are_absent_and_selected_dspark_stays() {
 }
 
 fn sparks(ranks: usize) -> PlanOptions {
-    PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), ..PlanOptions::default() }
+    PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
+        // Fixtures compare repeated plans, independent of concurrent host allocations.
+        mapped_scale_host_budget_bytes: Some(64 << 30), ..PlanOptions::default() }
 }
 
 fn component(report: &PlanReport, component: Component) -> &ComponentPlan {
@@ -3310,4 +3312,40 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }
         }
     }
+}
+
+#[test]
+fn mapped_scale_plan_is_all_or_nothing_and_charges_host_bytes() {
+    let dir = snapshot(v41_config(), &[
+        t("layers.1.engram.embed.weight", "F8_E4M3", &[16, 64]),
+        t("layers.1.engram.embed.scale", "F8_E8M0", &[16, 2]),
+        t("layers.14.engram.embed.weight", "F8_E4M3", &[16, 64]),
+        t("layers.14.engram.embed.scale", "F8_E8M0", &[16, 2]),
+    ]);
+    for (cap, host, preloaded) in [(64, 64, 2), (63, 64, 0), (64, 63, 0), (0, 64, 0)] {
+        let report = plan(dir.path(), &PlanOptions { mapped_scale_preload_bytes: cap,
+            mapped_scale_host_budget_bytes: Some(host), ..Default::default() }).unwrap();
+        let p = &report.mapped_placement;
+        assert_eq!((p.mapped, p.preloaded, p.scale_bytes), (4 - preloaded, preloaded, 64));
+        assert_eq!(p.preloaded_bytes, if preloaded > 0 { 64 } else { 0 });
+        assert_eq!(report.bytes_by_owner.get("host-preloaded").copied().unwrap_or(0), p.preloaded_bytes);
+        assert!(render(&report).contains(&p.label()));
+    }
+}
+
+#[test]
+fn ple_plan_counts_row_spaces_not_shards_or_global_scale() {
+    let mut config = qwen4_config(2);
+    config["text_config"]["ple_layer_ids"] = json!([1, 2]);
+    let mut tensors = qwen4_coordinator(&config, false);
+    for layer in 0..2 {
+        let prefix = format!("model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding");
+        tensors.push((format!("{prefix}.shard_0.weight"), "F8_E4M3", vec![16, 160]));
+        tensors.push((format!("{prefix}.shard_1.weight"), "F8_E4M3", vec![16, 160]));
+        tensors.push((format!("{prefix}.weight_scale"), "BF16", vec![1]));
+    }
+    let dir = snapshot(config, &tensors);
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    assert_eq!(report.mapped_placement.label(), "PLE 2 mapped");
+    assert_eq!(report.mapped_placement.scale_bytes, 0);
 }

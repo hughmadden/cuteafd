@@ -32,6 +32,7 @@ impl EngramTable {
     pub fn weights(&self) -> &MappedTable {
         &self.weights
     }
+    pub(crate) fn scales_mut(&mut self) -> &mut MappedTable { &mut self.scales }
     pub fn scales(&self) -> &MappedTable {
         &self.scales
     }

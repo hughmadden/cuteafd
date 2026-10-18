@@ -457,6 +457,8 @@ pub struct Configuration {
     /// One line, e.g. `TP4 × 1 Spark group, experts layers 0-18 on RTX`.
     #[serde(default)]
     pub layout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_placement: Option<cuteafd_loader::formats::mapped_preload::MappedPlacement>,
     /// Every resolved option with its default.
     #[serde(default)]
     pub settings: Vec<Setting>,
@@ -977,6 +979,23 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn configuration_preserves_resolved_mapped_placement() {
+        use cuteafd_loader::formats::mapped_preload::MappedPlacement;
+        let mut configuration = Configuration::default();
+        let old = serde_json::to_value(&configuration).unwrap();
+        assert!(old.get("mapped_placement").is_none());
+        assert_eq!(serde_json::from_value::<Configuration>(old).unwrap(), configuration);
+        for cap in [0, 64] {
+            let placement = MappedPlacement::resolve(4, 2, 64, cap, 128);
+            configuration.layout = Some(placement.label());
+            configuration.mapped_placement = Some(placement.clone());
+            let encoded = serde_json::to_value(&configuration).unwrap();
+            assert_eq!(encoded["mapped_placement"]["preloaded_bytes"], placement.preloaded_bytes);
+            assert_eq!(serde_json::from_value::<Configuration>(encoded).unwrap(), configuration);
+        }
+    }
 
     #[test]
     fn rfc3339_formats_known_instants() {

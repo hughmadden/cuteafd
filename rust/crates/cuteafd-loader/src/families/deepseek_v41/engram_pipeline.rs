@@ -76,6 +76,7 @@ pub struct EngramPipeline {
     prefetch: EngramPrefetcher,
     gatherer: EngramGatherer,
     capacity: usize,
+    placement: crate::formats::mapped_preload::MappedPlacement,
 }
 impl EngramPipeline {
     /// # Safety
@@ -86,15 +87,34 @@ impl EngramPipeline {
         capacity: usize,
         gather_slots: usize,
         staging_budget: usize,
+        scale_preload_cap: u64,
     ) -> Result<Self> {
         ensure!(
             capacity > 0 && capacity <= 4096,
             "invalid engram pipeline capacity"
         );
-        let tables = [
-            Arc::new(unsafe { catalog.map_engram(ENGRAM_LAYERS[0] as usize)? }),
-            Arc::new(unsafe { catalog.map_engram(ENGRAM_LAYERS[1] as usize)? }),
-        ];
+        // SAFETY: forwarded from this constructor's immutable checkpoint contract.
+        let mut tables = unsafe { [catalog.map_engram(ENGRAM_LAYERS[0] as usize)?,
+            catalog.map_engram(ENGRAM_LAYERS[1] as usize)?] };
+        use crate::formats::mapped_preload::{host_budget_bytes, MappedPlacement};
+        let host_budget = host_budget_bytes().unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot admit mapped scale preload; keeping all scales mapped");
+            0
+        });
+        let bytes = tables.iter().map(|table| table.scales().bytes()).sum();
+        let mut placement = MappedPlacement::resolve(4, 2, bytes, scale_preload_cap, host_budget);
+        let started = std::time::Instant::now();
+        if placement.preloaded > 0 {
+            let [first, second] = &mut tables;
+            if let Err(error) = crate::MappedTable::preload_all(&mut [first.scales_mut(), second.scales_mut()]) {
+                placement.fallback(&error);
+            }
+        }
+        tracing::info!(placement = %placement.label(), scale_bytes = bytes,
+            preloaded_bytes = placement.preloaded_bytes, cap_bytes = scale_preload_cap,
+            host_budget_bytes = host_budget, reason = %placement.reason,
+            elapsed_ms = started.elapsed().as_millis(), "mapped scale preload admission");
+        let tables = tables.map(Arc::new);
         Ok(Self {
             identity: Arc::new(()),
             tables,
@@ -102,8 +122,10 @@ impl EngramPipeline {
             prefetch: EngramPrefetcher::new(32, capacity * 24, capacity * 48)?,
             gatherer: EngramGatherer::new(gather_slots, capacity, staging_budget)?,
             capacity,
+            placement,
         })
     }
+    pub fn placement(&self) -> &crate::formats::mapped_preload::MappedPlacement { &self.placement }
     pub fn new_history(&self) -> Result<EngramHistory> {
         Ok(EngramHistory::new(self.token_map.pad_id())?)
     }

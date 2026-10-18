@@ -203,6 +203,7 @@ fn layout(hardware: &Hardware, settings: &[Setting]) -> String {
             });
         }
     }
+    if let Some(placement) = context::mapped_placement() { parts.push(placement.label()); }
     parts.join(" · ")
 }
 
@@ -214,6 +215,7 @@ pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configurat
         quant,
         speculator: speculator(context.family.as_deref(), &settings),
         layout: Some(layout(hardware, &settings)),
+        mapped_placement: context::mapped_placement(),
         settings,
     }
 }

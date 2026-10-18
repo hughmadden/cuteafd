@@ -1,6 +1,6 @@
 //! Digest of engram rows gathered through the serving pipeline (prefetch,
 //! gather worker, staging) for a fixed pseudo-random token stream: compare
-//! two builds for byte-identical gathers. Usage: SNAPSHOT [WAVES].
+//! two builds for byte-identical gathers. Usage: SNAPSHOT [WAVES] [SCALE_PRELOAD_GIB].
 use anyhow::{Context, Result};
 use cuteafd_loader::{read_official_v41_catalog, EngramGatherPoll, EngramPipeline, EngramRequestTokens, EngramTokenMap};
 use sha2::{Digest, Sha256};
@@ -10,10 +10,12 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     let snapshot = Path::new(args.get(1).context("missing snapshot")?);
     let waves: usize = args.get(2).map_or(Ok(24), |w| w.parse())?;
+    let cap = args.get(3).map_or(Ok(8.0), |value| value.parse::<f64>())?;
+    let cap = cuteafd_loader::plan::mapped_scale_preload_bytes(cap)?;
     let catalog = read_official_v41_catalog(snapshot)?;
     let map = EngramTokenMap::from_file(&snapshot.join("tokenizer.json"))?;
     // SAFETY: the checkpoint snapshot is immutable while this process runs.
-    let pipeline = unsafe { EngramPipeline::new(&catalog, map, 256, 4, 256 * 64 * 1024)? };
+    let pipeline = unsafe { EngramPipeline::new(&catalog, map, 256, 4, 256 * 64 * 1024, cap)? };
     let mut histories = [pipeline.new_history()?, pipeline.new_history()?];
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut next = || {

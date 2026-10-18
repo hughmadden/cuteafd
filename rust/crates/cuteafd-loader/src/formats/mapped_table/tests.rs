@@ -712,3 +712,42 @@ fn residency_overhead_measurement() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn preloaded_rows_are_exact_without_random_io_or_page_accounting() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: immutable test-owned files outlive both tables.
+    let mut table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    let mut expected = [0; 12];
+    table.gather_into(&[7, 2, 7], &mut expected)?;
+    let before = table.stats.snapshot();
+    MappedTable::preload_all(&mut [&mut table])?;
+    assert_eq!(table.backend(), TableBackend::Resident);
+    let mut actual = [0; 12];
+    table.gather_into(&[7, 2, 7], &mut actual)?;
+    assert_eq!(actual, expected);
+    table.gather_slots(&[7, 2, 7], &[2, 0, 1], &mut actual)?;
+    assert_eq!(actual, [2, 2, 2, 2, 7, 7, 7, 7, 7, 7, 7, 7]);
+    assert_eq!(table.row(7)?, &[7; 4]);
+    assert_eq!(table.prefetch(&[7, 2, 7], 0)?, 0);
+    assert!(table.prefetch(&[8], 0).is_err());
+    assert!(table.gather_slots(&[0, 1], &[0, 0], &mut actual).is_err());
+    assert_eq!(table.stats.snapshot(), before);
+    Ok(())
+}
+
+#[test]
+fn preload_read_failure_keeps_every_table_mapped() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: files remain immutable during all mapping access; the injected
+    // read failure below never dereferences the truncated mapping.
+    let mut first = unsafe { MappedTable::open(&parts[..1], u8_rows(4))? };
+    let mut second = unsafe { MappedTable::open(&parts[1..], u8_rows(4))? };
+    std::fs::OpenOptions::new().write(true).open(&parts[1].path)?.set_len(0)?;
+    assert!(MappedTable::preload_all(&mut [&mut first, &mut second]).is_err());
+    assert!(first.resident.is_none());
+    assert!(second.resident.is_none());
+    assert_ne!(first.backend(), TableBackend::Resident);
+    assert_ne!(second.backend(), TableBackend::Resident);
+    Ok(())
+}

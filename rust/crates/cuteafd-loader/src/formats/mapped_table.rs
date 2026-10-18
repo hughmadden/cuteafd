@@ -268,10 +268,10 @@ impl RowFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TableBackend { Mmap, MincoreRouted }
+enum TableBackend { Mmap, MincoreRouted, Resident }
 impl std::fmt::Display for TableBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self { Self::Mmap => "mmap-fallback", Self::MincoreRouted => "mincore-routed" })
+        f.write_str(match self { Self::Mmap => "mmap-fallback", Self::MincoreRouted => "mincore-routed", Self::Resident => "resident" })
     }
 }
 static TABLES: Mutex<Vec<(String, Weak<TableStats>)>> = Mutex::new(Vec::new());
@@ -352,6 +352,7 @@ thread_local! {
 /// A row space over one or more mapped parts, with its stats.
 pub struct MappedTable {
     parts: Vec<MappedRows>,
+    resident: Option<Vec<u8>>,
     /// First global row of each part, then the total.
     starts: Vec<u64>,
     /// Rows of every part but possibly the last (division lookup), else 0.
@@ -385,7 +386,7 @@ impl MappedTable {
         } else {
             0
         };
-        let table = Self { parts: mapped, starts, uniform, format, stats: Arc::new(TableStats::default()) };
+        let table = Self { parts: mapped, resident: None, starts, uniform, format, stats: Arc::new(TableStats::default()) };
         {
             use std::os::unix::fs::MetadataExt;
             let mut devices = table.stats.devices.lock().unwrap_or_else(|p| p.into_inner());
@@ -463,6 +464,33 @@ impl MappedTable {
         &self.stats
     }
 
+    /// Publish only after every read succeeds; a failure leaves all tables mapped.
+    pub fn preload_all(tables: &mut [&mut Self]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let buffers = tables.iter().map(|table| {
+            let size = usize::try_from(table.bytes()).map_err(|_| invalid("preload size overflow"))?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(size).map_err(|error| invalid(format!("allocating scale preload: {error}")))?;
+            bytes.resize(size, 0);
+            let mut start = 0;
+            for part in &table.parts {
+                let size = usize::try_from(part.rows * part.row_bytes as u64).map_err(|_| invalid("preload part overflow"))?;
+                for (i, chunk) in bytes[start..start + size].chunks_mut(16 << 20).enumerate() {
+                    part.file.read_exact_at(chunk, part.file_offset + (i as u64 * (16 << 20)))
+                        .map_err(|source| MappedTableError::Io { context: "reading scale preload".into(), source })?;
+                }
+                start += size;
+            }
+            Ok(bytes)
+        }).collect::<Result<Vec<_>>>()?;
+        for (table, bytes) in tables.iter_mut().zip(buffers) {
+            table.resident = Some(bytes);
+            table.stats.resident.store(true, Ordering::Relaxed);
+            table.stats.devices.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        }
+        Ok(())
+    }
+
     fn locate(&self, row: u64) -> Result<(usize, u64)> {
         if row >= self.rows() {
             return Err(MappedTableError::RowRange { row, rows: self.rows() });
@@ -481,6 +509,10 @@ impl MappedTable {
     /// One row's mapped bytes (faults it in when it is not resident).
     pub fn row(&self, row: u64) -> Result<&[u8]> {
         let (part, local) = self.locate(row)?;
+        if let Some(bytes) = &self.resident {
+            let offset = row as usize * self.row_bytes();
+            return Ok(&bytes[offset..offset + self.row_bytes()]);
+        }
         self.parts[part].row(local)
     }
 
@@ -512,6 +544,12 @@ impl MappedTable {
                 || !unique.insert(slot) { return Err(invalid("invalid or overlapping gather slots")); }
             Ok(uring::Read { part: &self.parts[part], row: local, slot })
         }).collect::<Result<_>>()?;
+        if self.resident.is_some() {
+            for (&row, &slot) in rows.iter().zip(slots) {
+                output[slot * width..(slot + 1) * width].copy_from_slice(self.row(row)?);
+            }
+            return Ok(());
+        }
         if self.backend() != TableBackend::Mmap {
             match self.uring_reads(rows, &reads, output, false) {
                 Ok(stats) => { self.stats.record_reads(stats, false); return Ok(()); }
@@ -665,6 +703,10 @@ impl MappedTable {
     /// Advise the deduplicated pages a batch touches, with a hard page budget
     /// over all parts; returns the pages advised. Call from an I/O worker.
     pub fn prefetch(&self, rows: &[u64], max_pages: usize) -> Result<usize> {
+        if self.resident.is_some() {
+            for &row in rows { self.locate(row)?; }
+            return Ok(0);
+        }
         let mut pages = BTreeSet::new();
         for &row in rows {
             let (part, local) = self.locate(row)?;
@@ -725,6 +767,7 @@ pub fn thread_faults() -> Option<[i64; 3]> {
 /// Cumulative counters of one table; updated per batch, never per row.
 #[derive(Default)]
 pub struct TableStats {
+    resident: AtomicBool,
     gathers: AtomicU64,
     rows: AtomicU64,
     bytes: AtomicU64,
@@ -872,11 +915,13 @@ pub struct TableStatsSnapshot {
 
 impl TableStats {
     fn backend(&self) -> TableBackend {
-        if !self.uring.load(Ordering::Relaxed) { TableBackend::Mmap }
+        if self.resident.load(Ordering::Relaxed) { TableBackend::Resident }
+        else if !self.uring.load(Ordering::Relaxed) { TableBackend::Mmap }
         else { TableBackend::MincoreRouted }
     }
     fn accounting(&self) -> &'static str {
-        if self.uring.load(Ordering::Relaxed) && self.nowait.load(Ordering::Relaxed) { "nowait-exact" }
+        if self.resident.load(Ordering::Relaxed) { "resident; no page-in" }
+        else if self.uring.load(Ordering::Relaxed) && self.nowait.load(Ordering::Relaxed) { "nowait-exact" }
         else if self.backend() == TableBackend::MincoreRouted {
             if self.approximate.load(Ordering::Relaxed) { "fuse: mincore-routed (approx)" } else { "mincore-routed" }
         }

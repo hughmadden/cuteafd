@@ -1144,7 +1144,7 @@ mod tests {
             &std::path::Path::new(&snapshot).join("tokenizer.json"),
         )?;
         let pipeline =
-            unsafe { cuteafd_loader::EngramPipeline::new(&catalog, token_map, 16, 2, 8 << 20)? };
+            unsafe { cuteafd_loader::EngramPipeline::new(&catalog, token_map, 16, 2, 8 << 20, 0)? };
         let pages = [4, 4, 4, 8];
         let mut requests = Requests::new_distributed(
             &lib,

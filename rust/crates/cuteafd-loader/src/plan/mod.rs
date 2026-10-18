@@ -159,6 +159,7 @@ pub struct RoleReadiness {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
+    pub mapped_placement: crate::formats::mapped_preload::MappedPlacement,
     pub attention_placement: crate::placement::AttentionPlacement,
     /// What the caller asked for (None: auto); families whose solver resolves
     /// auto itself (GLM 5.3) take this rather than the resolved default.
@@ -261,6 +262,9 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    pub mapped_scale_preload_bytes: u64,
+    /// Available host budget override for offline planning; live cgroup-aware sample otherwise.
+    pub mapped_scale_host_budget_bytes: Option<u64>,
     /// Resolved target-checkpoint draft ownership; absent keeps family defaults.
     pub draft_ownership: Option<spec::DraftOwnership>,
     pub attention_placement: Option<crate::placement::AttentionPlacement>,
@@ -279,6 +283,8 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
+            mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
             attention_placement: None,
             vision: MediaMode::Auto,
@@ -312,6 +318,11 @@ impl PlanOptions {
         }
         Ok(())
     }
+}
+
+/// A scale preload cap accepts zero to disable it, unlike device budgets.
+pub fn mapped_scale_preload_bytes(gib: f64) -> Result<u64, PlanError> {
+    if gib == 0.0 { Ok(0) } else { budget_bytes("--mapped-scale-preload-gib", gib) }
 }
 
 /// `gib` as bytes: a finite, positive number of GiB that fits in u64.
@@ -453,6 +464,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     options.validate()?;
     let checkpoint = input.checkpoint();
     let mut report = PlanReport {
+        mapped_placement: Default::default(),
         attention_placement: options.attention_placement.unwrap_or_default(),
         requested_attention: options.attention_placement,
         vision: options.vision,
@@ -622,6 +634,32 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             }
             None => report.unclassified.push(tensor.meta.name.clone()),
         }
+    }
+    // Count logical random-read tensors, not storage shards or global scalars.
+    let mapped = by_component.get(&Component::MappedTable).map(Vec::as_slice).unwrap_or(&[]);
+    let mut names = BTreeSet::new();
+    let mut scales = 0;
+    let mut scale_bytes = 0;
+    for tensor in mapped {
+        let meta = &tensor.meta;
+        if meta.shape.len() != 2 || meta.shape[0] <= 1 { continue }
+        let (stem, suffix) = format::split_stem(&meta.name);
+        if !matches!(suffix, "weight" | "scale" | "weight_scale" | "weight_scale_inv") { continue }
+        // Qwen splits one row space into shard_N tensors.
+        let logical = stem.rsplit_once(".shard_").map_or(stem, |(prefix, _)| prefix);
+        if names.insert((logical.to_owned(), suffix.to_owned())) && matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") {
+            scales += 1;
+        }
+        if matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") { scale_bytes += meta.byte_length; }
+    }
+    let host_budget = if scales == 0 { 0 } else {
+        options.mapped_scale_host_budget_bytes.unwrap_or_else(||
+            crate::formats::mapped_preload::host_budget_bytes().unwrap_or(0))
+    };
+    report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
+        names.len(), scales, scale_bytes, options.mapped_scale_preload_bytes, host_budget);
+    if report.mapped_placement.preloaded_bytes > 0 {
+        report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);
     }
     // The expert staging's own verdict on the routed experts.
     let catalog = (family.expert_catalog() && by_component.contains_key(&Component::RoutedExpert))
@@ -829,7 +867,8 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     let bytes_of = |owner: Owner| -> u64 {
         report.components.iter().filter(|c| c.owner == owner && !matches!(c.component, Component::Vision | Component::Audio)).map(|c| c.bytes).sum()
     };
-    let (routed, rtx, mapped) = (bytes_of(Owner::SparkSliced), bytes_of(Owner::Rtx), bytes_of(Owner::HostMapped));
+    let (routed, rtx, mapped) = (bytes_of(Owner::SparkSliced), bytes_of(Owner::Rtx),
+        bytes_of(Owner::HostMapped).saturating_sub(report.mapped_placement.preloaded_bytes));
     for (owner, bytes) in [(Owner::Rtx, rtx), (Owner::SparkSliced, routed), (Owner::HostMapped, mapped)] {
         if bytes > 0 {
             *report.bytes_by_owner.entry(owner.label(options.placement)).or_default() += bytes;
@@ -1047,6 +1086,11 @@ pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanRepo
 pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    if report.mapped_placement.mapped + report.mapped_placement.preloaded > 0 {
+        let p = &report.mapped_placement;
+        let _ = writeln!(out, "{}; scales {} bytes / cap {} bytes; host preload {} bytes / budget {} bytes ({})",
+            p.label(), p.scale_bytes, p.cap_bytes, p.preloaded_bytes, p.host_budget_bytes, p.reason);
+    }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if let Some(selection) = &report.prefill_selection { let _ = writeln!(out, "{selection}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }

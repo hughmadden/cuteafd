@@ -90,7 +90,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         &std::path::Path::new(&model).join("tokenizer.json"),
     )?;
     let pipeline =
-        unsafe { cuteafd_loader::EngramPipeline::new(&catalog, map, 80, 4, 8 * 1024 * 1024)? };
+        unsafe { cuteafd_loader::EngramPipeline::new(&catalog, map, 80, 4, 8 * 1024 * 1024, 0)? };
     let mut requests = Requests::new(
         &lib,
         pipeline,
