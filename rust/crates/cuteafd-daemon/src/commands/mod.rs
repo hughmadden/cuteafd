@@ -6,5 +6,6 @@ pub(crate) mod doctor;
 pub(crate) mod family;
 pub(crate) mod gateway;
 pub(crate) mod plan;
+pub(crate) mod programs_check;
 pub(crate) mod transport_capabilities;
 pub(crate) mod usage;

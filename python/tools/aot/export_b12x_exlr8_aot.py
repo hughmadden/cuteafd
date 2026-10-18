@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export EXLR8 standalone/serving K1 and rotated-domain glue programs."""
+"""Export the fork's EXLR8 programs for one role (all, coordinator or spark)."""
 from __future__ import annotations
 
 import argparse
@@ -19,9 +19,10 @@ def programs(hidden=6144, units=16, top_k=8, max_groups=512, role="all"):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--role", choices=("all", "coordinator", "spark"), default="all")
     args = parser.parse_args()
     from export_b12x_dsv4_aot import main as export
-    sys.argv = [sys.argv[0], "--geometry", "exlr8",
+    sys.argv = [sys.argv[0], "--geometry", "exlr8", "--exlr8-role", args.role,
                 "--output-dir", str(args.output_dir)]
     export()
 

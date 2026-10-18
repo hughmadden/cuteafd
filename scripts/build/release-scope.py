@@ -17,7 +17,7 @@ import re
 import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
-SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'AUDIO', 'CONTEXT_SPLIT')
+SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
          'FP8_MOE_BF16_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
@@ -199,6 +199,7 @@ def requirements(repo, matrix, scope):
                            roles=sorted(tokens(scopes['CUTEAFD_WIP_SPARK_TP_ROLES'])),
                            nvfp4='nvfp4' in values.get('MODEL_ID', '').lower(),
                            audio=scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON',
+                           exlr8=scopes.get('CUTEAFD_WIP_EXLR8_AOT') == 'ON',
                            context_split=family in ('deepseek_v4', 'glm5', 'glm5_flash') and dual))
     if scope == 'all':
         result.append(dict(name='v2.0.0-export-floor', family='release_floor', programs=sorted(PREVIOUS_RELEASE_FLOOR['MIMO_GEOMETRIES']),
@@ -295,6 +296,16 @@ def check_inventory(root, role, wanted, symbols=None):
                     require(any(p.get('op') == 'scored_index_topk'
                                 for p in programs if p.get('family') == entry['programs'][0]),
                             'PROGRAMS.json missing context-split programs')
+            if entry.get('exlr8'):
+                # Each role's table carries the fork's EXLR8 set for that role (the
+                # exporter records it); the coordinator's sits beside the family programs.
+                exlr8_role = 'coordinator' if role == 'coordinator' else 'spark'
+                manifest = read_json(share / 'PROGRAMS.json')
+                recorded = manifest.get('families', {}).get('exlr8', {})
+                names = {p.get('name') for p in manifest.get('programs', []) if p.get('family') == 'exlr8'}
+                require(recorded.get('role') == exlr8_role, f'PROGRAMS.json has no EXLR8 {exlr8_role} programs')
+                require(names and names == set(recorded.get('programs', [])),
+                        f'PROGRAMS.json EXLR8 programs {sorted(names)} differ from the recorded set')
             if entry['family'] == 'deepseek_v41':
                 require(bool(read_json(share / 'V41_EXPERT_AOT.json').get('variants')), 'V41_EXPERT_AOT.json has no variants')
                 if role == 'expert':
