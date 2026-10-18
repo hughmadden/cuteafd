@@ -42,6 +42,16 @@ def test_exlr8_has_separate_comparison_group():
     assert jobs == [("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"])]
 
 
+def test_serving_and_glue_export_inventory():
+    tree = ast.parse((ROOT / "python/tools/aot/export_b12x_exlr8_aot.py").read_text())
+    builders = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "programs")
+    result = next(n for n in builders.body if isinstance(n, ast.Return))
+    assert [item.elts[0].value for item in result.value.elts] == [
+        "a16_decode", "a16_serving", "group", "rotate", "reduce"]
+    serving = result.value.elts[1].elts[-1].body
+    assert any(k.arg == "device_count" and k.value.value is True for k in serving.keywords)
+
+
 def test_no_changes_to_existing_export_builders():
     # The new family remains opt-in; existing geometry lists are unchanged.
     spec = importlib.util.spec_from_file_location("sm_exports", ROOT / "scripts/build/compare-sm-exports.py")
