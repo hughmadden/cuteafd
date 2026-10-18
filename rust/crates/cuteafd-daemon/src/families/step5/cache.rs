@@ -236,6 +236,7 @@ pub(super) mod tests {
             heads: 64, groups: 4, dim: 192, window: 512, max_context: 1 << 20,
             full: (0..95).map(|l| l < 92 && l % 4 == 3).collect(),
             moe: Vec::new(), theta: Vec::new(), rotary: Vec::new(),
+            rope_scaling: None, scale_full: false, scale_sliding: false,
             activation: Vec::new(), shared_activation: Vec::new(),
         };
         Step5CacheLayout::new(&config, 1, context, 3).unwrap()
