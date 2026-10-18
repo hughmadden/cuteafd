@@ -53,6 +53,8 @@ class DecodedExperts:
             operands = {}
             for projection in ("gate", "up", "down"):
                 widths = selected[projection] if shared else selected[projection][int(expert)]
+                if projection == "down":
+                    widths = [widths] * len(selected["gate"] if shared else selected["gate"][int(expert)])
                 units = [self.oracle.expert_unit(self.snapshot, 3, int(k), int(expert), unit,
                                                 projection, shared=shared)[0]
                          for unit, k in enumerate(widths)]
@@ -62,6 +64,15 @@ class DecodedExperts:
                 operands[projection] = self.torch.from_numpy(np.concatenate(units, axis=axis).T.copy())
             self.current, self.operands = identity, operands
         return self.operands
+
+
+def layer_widths(selected):
+    widths = set(selected["down"])
+    widths.add(selected["shared"]["down"])
+    for projection in ("gate", "up"):
+        widths.update(k for expert in selected[projection] for k in expert)
+        widths.update(selected["shared"][projection])
+    return widths
 
 
 def test_decoded_experts_preserve_unit_axes_widths_and_shared_identity():
@@ -75,14 +86,15 @@ def test_decoded_experts_preserve_unit_axes_widths_and_shared_identity():
         return np.full(shape, k + unit / 8, dtype=np.float32), None, "checksum"
 
     selected = {"layers": {"3": {
-        **{p: [[2, 3]] for p in ("gate", "up", "down")},
-        "shared": {p: [4, 4] for p in ("gate", "up", "down")}}}}
+        **{p: [[2, 3]] for p in ("gate", "up")}, "down": [3],
+        "shared": {"gate": [4, 4], "up": [4, 4], "down": 4}}}}
+    assert layer_widths(selected["layers"]["3"]) == {2, 3, 4}
     bank = DecodedExperts(None, selected, SimpleNamespace(expert_unit=unit), torch)
     routed = bank.get(0)
     assert all(w.shape == (256, 256) and w.dtype == torch.float32 for w in routed.values())
     assert torch.all(routed["gate"][:128] == 2)
     assert torch.all(routed["gate"][128:] == 3.125)
-    assert torch.all(routed["down"][:, :128] == 2)
+    assert torch.all(routed["down"][:, :128] == 3)
     assert torch.all(routed["down"][:, 128:] == 3.125)
     assert bank.get(0) is routed and len(calls) == 6
     shared = bank.get(0, shared=True)
@@ -162,10 +174,7 @@ def test_layer3_same_quant_fixtures(monkeypatch):
         "fp64_arithmetic": "same oracle-decoded F32 physical operands, BF16 inputs; FP64 projections, silu, routing and residual sum",
         "torch": torch.__version__, "cuda": torch.version.cuda, "allow_tf32": False,
     }
-    widths = set()
-    for projection in ("gate", "up", "down"):
-        widths.update(k for expert in selected["layers"]["3"][projection] for k in expert)
-        widths.update(selected["layers"]["3"]["shared"][projection])
+    widths = layer_widths(selected["layers"]["3"])
     paths = ["config.json", "manifests/exlr8-manifest-up1.json", "experts/exlr8-layer-003.index.safetensors"]
     paths += [f"experts/exlr8-layer-003.k{k}.safetensors" for k in sorted(widths)]
     manifest["checkpoint_files_sha256"] = {p: sha256(snapshot / p) for p in paths}
