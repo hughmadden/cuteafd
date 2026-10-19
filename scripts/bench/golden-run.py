@@ -7,7 +7,7 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
       [--arm-env A:KEY=VALUE] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
       [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] \\
-      [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--worker-arg ARG]] \\
+      [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
       -- ARGS...
 
 Each arm runs its slot's `cuteafd`, `libcuteafd_native.so`, `PROGRAMS.json` and expert
@@ -458,7 +458,8 @@ def worker_command(state, arm, rank, record):
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
            # As the coordinator gets it: workers resolve installed programs and packages from it.
            'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json',
-           'RUST_LOG': 'info', **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env']}
+           'RUST_LOG': 'info', **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env'],
+           **sparks.get('arm_env', {}).get(arm, {})}
     for key, value in env.items():
         cmd += ['-e', f'{key}={value}']
     # Bounded by itself: a killed driver still frees the Spark after the run's budget.
@@ -1131,14 +1132,21 @@ def build_state(args, arms):
         for value in args.worker_env:
             key, val = parse_env(value)
             worker_env[key] = val
+        arm_worker_env = {name: {} for name in arms}
+        for value in args.arm_worker_env:
+            name, sep, setting = value.partition(':')
+            if not sep or name not in arms:
+                raise ValueError(f'--arm-worker-env {value!r} names no arm (ARM:KEY=VALUE)')
+            key, val = parse_env(setting)
+            arm_worker_env[name][key] = val
         sparks = dict(hosts=hosts, lanes=lanes, port=args.expert_port,
                       peers_csv=','.join(f'{lane}:{args.expert_port}' for lane in lanes),
                       layers=parse_layers(args.expert_layers) if args.expert_layers else [],
-                      env=worker_env, args=list(args.worker_arg), budget=args.worker_budget_bytes,
+                      env=worker_env, arm_env=arm_worker_env, args=list(args.worker_arg), budget=args.worker_budget_bytes,
                       memory=args.worker_memory_bytes,
                       ready_timeout=args.worker_ready_timeout, poll_s=args.worker_poll)
-    elif args.expert_layers or args.worker_env or args.worker_arg or args.worker_memory_bytes is not None:
-        raise ValueError('--expert-layers, --worker-env, --worker-arg and --worker-memory-bytes need --spark-hosts')
+    elif args.expert_layers or args.worker_env or args.arm_worker_env or args.worker_arg or args.worker_memory_bytes is not None:
+        raise ValueError('--expert-layers, --worker-env, --arm-worker-env, --worker-arg and --worker-memory-bytes need --spark-hosts')
     mode = 'native-test' if args.native_test else 'command' if args.command else 'golden'
     if mode == 'golden':
         golden = golden_args(args.family, args.golden, sparks=sparks is not None)
@@ -1198,6 +1206,8 @@ def main(argv=None):
                         'CUTEAFD_GOLDEN_EXPERT_LAYERS and {expert_layers}')
     parser.add_argument('--expert-port', type=int, default=DEFAULT_EXPERT_PORT)
     parser.add_argument('--worker-env', action='append', default=[], metavar='KEY=VALUE', help='worker environment')
+    parser.add_argument('--arm-worker-env', action='append', default=[], metavar='ARM:KEY=VALUE',
+                        help='worker environment for one arm (repeatable; over --worker-env)')
     parser.add_argument('--worker-arg', action='append', default=[], metavar='ARG',
                         help='extra expertd-native argument (repeatable; e.g. --worker-arg=--exl3-schedule)')
     parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET)
