@@ -350,7 +350,7 @@ fn request(
     Ok(request)
 }
 
-fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<(SparkWorld, TcpTransportConfig)> {
+fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: usize) -> Result<(SparkWorld, TcpTransportConfig)> {
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
     let metadata: Value = serde_json::from_slice(&std::fs::read(
@@ -393,22 +393,18 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         },
         args.peers.len(),
         None,
-        ModelAdmission {
-            capacity: rows as u32,
-            compiled_capacity: compiled as u32,
-            endpoints: vec![SparkEndpoint {
-                capacity: rows as u32,
-                ingress: SparkIngress::Bf16,
-            }],
-            rings: spark_rings(config.max_frame_bytes)?,
-        },
+        ModelAdmission::for_clients(ExpertGeometry::STEP5,
+            SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16 },
+            compiled as u32, spark_rings(config.max_frame_bytes)?, clients)?,
     )?
     .select(&args.peers)?;
+    cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
+        SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16 }, clients)?;
     Ok((world, config))
 }
 
 fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<SparkDeviceLink<'a>> {
-    let (world, config) = expert_admission(args, rows, layers)?;
+    let (world, config) = expert_admission(args, rows, layers, 1)?;
     ensure!(world.supports_device_exchange(), "Step-5 diagnostic requires native device exchange");
     let warm = request(
         3,
@@ -639,10 +635,10 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let stages = [Staging::new(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize)?,
         Staging::new(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize)?];
     let mut lanes = [None, None];
-    for rank in 0..2 {
-        if !(0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|local| local.routed_wave)) { continue; }
-        let (world, config) = expert_admission(args, rows, layers)?;
-        lanes[rank] = Some(devices[rank].own(|| SparkLane::new(&library, world, args.peers.clone(), rows as u32, config, H * 2))?);
+    let wave_ranks = ownership.routed_wave_ranks()?;
+    let (world, config) = expert_admission(args, rows, layers, wave_ranks.len())?;
+    for rank in wave_ranks {
+        lanes[rank] = Some(devices[rank].own(|| SparkLane::new(&library, world, args.peers.clone(), rows as u32, config.clone(), H * 2))?);
     }
     let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
     let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), PrefixConfig {

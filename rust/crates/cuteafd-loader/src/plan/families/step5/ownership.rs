@@ -81,6 +81,19 @@ impl ExecutionOwnership {
         Ok(())
     }
 
+    /// Persistent transports are per owning rank, not per simultaneous wave.
+    pub fn routed_wave_ranks(&self) -> Result<Vec<usize>> {
+        let mut ranks = Vec::new();
+        for rank in 0..self.ranks {
+            let mut owns = false;
+            for layer in 0..self.execution.modes().len() {
+                owns |= self.layer(layer, rank)?.routed_wave;
+            }
+            if owns { ranks.push(rank); }
+        }
+        Ok(ranks)
+    }
+
     pub fn layer(&self, layer: usize, rank: usize) -> Result<LayerRank> {
         ensure!(rank < self.ranks, "Step-5 execution rank");
         Ok(match self.execution.mode(layer)? {
