@@ -91,6 +91,11 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
                     }
                     let ffn = operands.iter().any(|o| o.name.ends_with("post_attention_layernorm.weight"));
                     assert_eq!(ffn, local.ffn);
+                    assert_eq!(local.routed_wave, cfg.moe[layer] && match mode {
+                        LayerMode::Whole { gpu, .. } => rank == gpu as usize,
+                        LayerMode::HeadSplit => rank == 0,
+                        LayerMode::ContextSplit => unreachable!(),
+                    });
                     if ffn { ffns.push(rank); }
                     let branch = if cfg.moe[layer] { "share_expert" } else { "mlp" };
                     assert_eq!(operands.iter().any(|o| o.name.ends_with(&format!("{branch}.gate_up_proj.weight"))), local.ffn);
@@ -173,6 +178,80 @@ fn execution_ownership_refuses_unbound_modes_and_checkpoint_changes() {
     changed.full[3] = false;
     assert!(owners.validate_config(&changed).is_err());
     assert!(crate::serving_capacity::step5::Step5CacheLayout::for_execution(&changed, &owners, 1024, 0, 64).is_err());
+}
+
+#[test]
+fn routed_replication_admission_requires_a_consumer_ordered_head_exchange() {
+    use crate::placement::{FfnMode, LayerMode, LayerPlanError, RoutedReplication};
+    use super::ownership;
+    let whole = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
+    let copy = |slot, storage| Some(RoutedReplication { source: 0, slot, storage });
+    let check = |modes: &[LayerMode], copies: &[Option<RoutedReplication>]| {
+        ownership::plan(modes, 0, 0).validate_routed_replications(copies)
+    };
+    // Different slots do not protect an aliased allocation; different buffers
+    // do not protect a publication flag whose next value can pass its reader.
+    for copies in [[copy(4, 1), copy(4, 2)], [copy(4, 1), copy(5, 1)]] {
+        assert!(matches!(check(&[whole, whole], &copies), Err(LayerPlanError::ReplicationReuse { layer: 1, previous: 0 })));
+    }
+    // Two unique destinations/flags still race on the next request, even when
+    // the planner supplies an exit hop. Context and one-way hops are no proof.
+    for modes in [vec![whole, whole], vec![whole, LayerMode::ContextSplit]] {
+        assert!(matches!(check(&modes, &[copy(4, 1), copy(5, 2)]), Err(LayerPlanError::ReplicationReuse { .. })));
+    }
+    assert!(check(&[whole], &[copy(4, 1)]).is_err());
+    assert!(check(&[whole, LayerMode::HeadSplit, whole], &[copy(4, 1), None, copy(4, 1)]).is_err(),
+        "in-pass exchange cannot excuse unsafe wraparound reuse");
+    check(&[LayerMode::HeadSplit, whole, LayerMode::HeadSplit, whole],
+        &[None, copy(4, 1), None, copy(4, 1)]).unwrap();
+    check(&[LayerMode::HeadSplit, whole, whole], &[None, copy(4, 1), copy(5, 2)]).unwrap();
+    let plan = ownership::plan(&[whole], 0, 0);
+    for invalid in [vec![], vec![copy(usize::MAX, 1)], vec![copy(4, 0)],
+        vec![Some(RoutedReplication { source: 2, slot: 4, storage: 1 })]] {
+        assert_eq!(plan.validate_routed_replications(&invalid), Err(LayerPlanError::ReplicationBindings));
+    }
+}
+
+#[test]
+fn step5_routed_replication_bindings_are_single_wave_and_disjoint_from_heads() {
+    use crate::placement::{FfnMode, LayerMode};
+    use super::ownership::{self, ExecutionOwnership};
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    let modes: Vec<_> = (0..cfg.layers).map(|layer| if cfg.full[layer] {
+        LayerMode::Whole { gpu: ((layer / 4) % 2) as u8, ffn: FfnMode::Owner }
+    } else { LayerMode::HeadSplit }).collect();
+    let ownership = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0)).unwrap();
+    let copies = ownership.routed_replications(0).unwrap();
+    assert_eq!(copies.iter().flatten().count(), 66);
+    for (ordinal, (layer, copy)) in copies.iter().enumerate().filter_map(|(l, c)| c.map(|c| (l, c))).enumerate() {
+        assert_eq!(copy.source, 0);
+        assert_eq!(copy.slot, 4 + ordinal % 2);
+        assert_eq!(copy.storage, layer + 1);
+        assert!(cfg.moe[layer] && !cfg.full[layer]);
+    }
+    ownership.execution().validate_routed_replications(&copies).unwrap();
+    assert!(ownership.routed_replications(1).is_err());
+    let mut spec = ownership.execution().spec();
+    spec.lanes = 2;
+    let mut placement = crate::placement::Placement {
+        pool_tokens: 0, pool_limits: crate::placement::PoolLimits(vec![]),
+        attention_placement: crate::placement::AttentionPlacement::Layers, attention_by_kind: vec![],
+        peer_row_bytes: 0, onboard_layers: 0,
+        layers: modes.iter().map(|&mode| crate::placement::LayerAssignment {
+            mode, experts: crate::placement::ExpertHome::Spark }).collect(),
+        movables: vec![], expert_ranges: vec![], residual: ownership.execution().homes().to_vec(),
+        hops: vec![], tp2: None, items: vec![],
+    };
+    placement.hops = crate::placement::plan_hops(&modes, &spec).unwrap();
+    let two = ExecutionOwnership::new(&cfg, 2,
+        crate::placement::LayerExecutionPlan::new(&placement, spec).unwrap()).unwrap();
+    let lanes = [two.routed_replications(0).unwrap(), two.routed_replications(1).unwrap()];
+    for copy in lanes[0].iter().flatten() {
+        assert!(lanes[1].iter().flatten().all(|peer| peer.slot != copy.slot && peer.storage != copy.storage));
+    }
+    assert!(two.routed_replications(2).is_err());
 }
 
 #[test]
