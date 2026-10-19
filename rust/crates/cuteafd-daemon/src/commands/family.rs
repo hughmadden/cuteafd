@@ -16,12 +16,13 @@ pub(crate) const FAMILIES: &[(&str, &str, Option<&str>)] = &[
     ("mimo_v2", "serve-mimo", Some("mimo-golden")),
     ("qwen4", "serve-qwen4", Some("qwen4-golden")),
     ("step5", "serve-step5", Some("step5-golden")),
+    ("kimi_k3", "serve-kimi", Some("kimi-golden")),
 ];
 
 #[derive(Debug, clap::Args)]
 #[command(disable_help_flag = true)]
 pub(crate) struct FamilyArgs {
-    /// Family id: deepseek_v41, deepseek_v4, glm5, glm5_flash, mimo_v2, qwen4 or step5.
+    /// Family id: deepseek_v41, deepseek_v4, glm5, glm5_flash, mimo_v2, qwen4, step5 or kimi_k3.
     /// Detected from --snapshot's config.json when omitted.
     #[arg(long)]
     pub(crate) family: Option<String>,
