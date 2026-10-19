@@ -276,8 +276,23 @@ impl<'a> CacheRank<'a> {
         self.restore_copies(copies)
     }
 
-    /// Shared prefix metadata identifies host-restored marks; local capture
-    /// bookkeeping cannot identify a slot that the host tier just overwrote.
+    /// Validate canonical bytes, not arena-local capture bookkeeping, before
+    /// any rank installs a host-promoted snapshot into active state.
+    pub fn validate_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
+        self.check_idle(sequence)?;
+        self.snapshot_copies(sequence, slot, frontier)?;
+        self.drain()?;
+        let mark = self.mark_view(u32::try_from(slot)?)?;
+        let length = self.layout.ranks[self.rank].length;
+        ensure!(length.bytes == 8, "Step-5 canonical mark length width");
+        let source = view(mark, length)?;
+        let mut encoded = [0; 8];
+        self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut encoded, source))?;
+        validate_mark_length(encoded, frontier)
+    }
+
+    /// Caller validates every rank with validate_retained before installing any
+    /// rank. The shared family retains the arena slot across both phases.
     pub fn restore_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
         self.check_idle(sequence)?;
         self.drain()?;
@@ -313,6 +328,12 @@ impl<'a> CacheRank<'a> {
     }
 }
 
+fn validate_mark_length(encoded: [u8; 8], frontier: u64) -> Result<()> {
+    ensure!(u64::from_le_bytes(encoded) == frontier,
+        "Step-5 canonical mark length differs from retained frontier");
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -334,6 +355,15 @@ pub(super) mod tests {
             activation: Vec::new(), shared_activation: Vec::new(),
         };
         Step5CacheLayout::new(&config, ranks, context, mtp, step).unwrap()
+    }
+
+    #[test]
+    fn canonical_mark_length_requires_exact_encoded_frontier() {
+        for frontier in [0u64, 1, 63, 64, 65, 1 << 20, u64::MAX] {
+            validate_mark_length(frontier.to_le_bytes(), frontier).unwrap();
+            assert!(validate_mark_length(frontier.wrapping_add(1).to_le_bytes(), frontier).is_err());
+            assert!(validate_mark_length(frontier.wrapping_sub(1).to_le_bytes(), frontier).is_err());
+        }
     }
 
     #[test]
