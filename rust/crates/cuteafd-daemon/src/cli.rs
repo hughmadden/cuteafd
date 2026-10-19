@@ -1007,6 +1007,9 @@ pub(crate) struct NativeServeArgs {
     /// capped at min(32GiB, 25% host RAM); explicit bytes override both; 0 disables it.
     #[arg(long, default_value = "0", env = "CUTEAFD_HOST_CACHE_BYTES")]
     pub host_cache_bytes: crate::shared::prefix::HostBudget,
+    /// KV tokens kept free after host pressure eviction (0 disables batching).
+    #[arg(long, default_value_t = cuteafd_core::prefix::DEFAULT_HOST_CACHE_EVICT_TOKENS)]
+    pub host_cache_evict_tokens: u64,
     /// Pinned allocation and registration granularity for the snapshot cache.
     #[arg(long, default_value_t = 256 << 20, env = "CUTEAFD_HOST_CACHE_CHUNK_BYTES")]
     pub host_cache_chunk_bytes: u64,
@@ -1130,6 +1133,7 @@ impl NativeServeArgs {
         let config = Config {
             bytes: self.host_cache_bytes.explicit_bytes(),
             chunk_bytes: self.host_cache_chunk_bytes,
+            eviction_headroom: [0; 4],
             store: match self.host_cache_store {
                 HostCacheStore::OnRetain => StoreMode::OnRetain,
                 HostCacheStore::OnEvict => StoreMode::OnEvict,

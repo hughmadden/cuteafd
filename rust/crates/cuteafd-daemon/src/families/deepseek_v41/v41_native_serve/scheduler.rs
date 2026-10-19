@@ -169,12 +169,14 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
     let units = requests.cache().unit_capacity();
     let layout = super::prefix::layout(units, draft, true);
     let mut config = args.host_cache_config()?;
+    config.eviction_headroom = crate::shared::prefix::budget::eviction_headroom(layout, args.host_cache_evict_tokens)?;
+    if args.host_cache_evict_tokens > 0 { config.eviction_headroom[3] = super::scores::VOCAB as u64 * 4; }
     if matches!(args.host_cache_bytes, crate::shared::prefix::HostBudget::Auto) {
         let required = crate::shared::prefix::budget::retained_bytes(layout,
             args.concurrency as usize, args.max_context_tokens as usize, config.chunk_bytes)?;
         let memory = crate::shared::prefix::budget::host_memory()?;
-        config.bytes = crate::shared::prefix::budget::automatic_bytes(
-            required, config.chunk_bytes, memory, 0);
+        config.bytes = crate::shared::prefix::budget::resolve_bytes(layout, None,
+            args.concurrency as usize, args.max_context_tokens as usize, config.chunk_bytes, memory)?;
         config.validate()?;
         tracing::info!(target: "cuteafd::host_cache", required_bytes=required, resolved_bytes=config.bytes,
             "automatic host cache budget (staging and snapshot overhead excluded from token capacity)");

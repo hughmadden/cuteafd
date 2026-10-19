@@ -1155,7 +1155,9 @@ mod tests {
             let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
             args.coordinator_gpu_budget_gib = cli.coordinator_gpu_budget_gib;
-            options(&args).unwrap()
+            let mut selected = options(&args).unwrap();
+            selected.layout.as_mut().unwrap().host_memory = Some((128 << 30, 128 << 30));
+            selected
         };
         let expected = parse("--coordinator-gpu-budget-gib", false);
         let snapshot = tempfile::tempdir().unwrap();

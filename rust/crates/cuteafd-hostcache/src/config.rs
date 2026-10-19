@@ -27,6 +27,8 @@ pub struct Config {
     pub bytes: u64,
     /// Pinned allocation and registration granularity.
     pub chunk_bytes: u64,
+    /// Resolved extra free bytes by page/tail/draft/scores class after pressure.
+    pub eviction_headroom: [u64; 4],
     pub store: StoreMode,
     /// Longest the device-evict path waits for an in-flight store before dropping uncached.
     pub copy_budget_ns: u64,
@@ -51,6 +53,7 @@ impl Default for Config {
         Self {
             bytes: 0,
             chunk_bytes: 256 << 20,
+            eviction_headroom: [0; 4],
             store: StoreMode::OnRetain,
             copy_budget_ns: 1_000_000_000,
             restore_budget_ns: 500_000_000,

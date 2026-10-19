@@ -839,8 +839,8 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         completed || self.engine.release_barrier(stream).is_ok()
     }
 
-    /// Make a completed store resident, drop the payload it replaced, and bring the pool under
-    /// quota. Invariant: the payload is resident exactly while its snapshot is. Records the
+    /// Make a completed store resident and drop the payload it replaced; admission already
+    /// reserved its slabs. Invariant: the payload is resident exactly while its snapshot is. Records the
     /// store-latency histogram entry exactly once, here, wherever the completion was observed
     /// (`tick` or the evict path's bounded wait).
     fn commit_pending(&mut self, pending: PendingStore<P>, now: u64) {
@@ -910,7 +910,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         device_pages: &[Vec<DevicePageId>; COMPRESSORS]) -> Option<StorePlan> {
         let snapshots = self.snapshots.as_mut()?;
         let started = std::time::Instant::now();
-        let (victims, freed) = snapshots.make_room(meta, device_pages);
+        let (victims, freed) = snapshots.make_room(meta, device_pages, self.config.eviction_headroom);
         if !victims.is_empty() {
             for key in &victims { self.payloads.remove(key); }
             let metrics = self.metrics.get_mut();

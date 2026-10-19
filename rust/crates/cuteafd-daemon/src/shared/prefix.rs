@@ -34,6 +34,9 @@ pub(crate) struct PrefixArgs {
     /// a byte count fixes the quota (e.g. 64GiB), and 0 disables the host tier.
     #[arg(long, env = "CUTEAFD_HOST_CACHE_BYTES", default_value = "0")]
     pub host_cache_bytes: HostBudget,
+    /// KV tokens to keep free after host pressure eviction (0 disables batching).
+    #[arg(long, default_value_t = cuteafd_core::prefix::DEFAULT_HOST_CACHE_EVICT_TOKENS)]
+    pub host_cache_evict_tokens: u64,
     /// RAM kept outside an automatic pinned prefix pool, at least 10% of total RAM.
     #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
     pub host_cache_headroom_bytes: u64,
@@ -135,7 +138,7 @@ impl PrefixArgs {
             HostBudget::Auto => {
                 let memory = budget::host_memory()?;
                 let required = budget::retained_bytes(layout, concurrency, max_context, chunk)?;
-                let bytes = budget::automatic_bytes(required, chunk, memory, self.host_cache_headroom_bytes);
+                let bytes = budget::resolve_bytes(layout, None, concurrency, max_context, chunk, memory)?;
                 tracing::info!(required_bytes = required, resolved_bytes = bytes, available_bytes = memory.available,
                     total_bytes = memory.total, headroom_bytes = self.host_cache_headroom_bytes,
                     "automatic retained-prefix host budget (does not add active KV capacity)");
@@ -148,6 +151,7 @@ impl PrefixArgs {
         budget::admit(bytes, self.scoring_host_bytes, self.host_cache_headroom_bytes)?;
         let config = cuteafd_hostcache::config::Config {
             bytes,
+            eviction_headroom: budget::eviction_headroom(layout, self.host_cache_evict_tokens)?,
             chunk_bytes: chunk.min(bytes),
             min_tokens: self.host_cache_min_tokens,
             max_tokens: u32::try_from(max_context)?,
@@ -250,6 +254,8 @@ mod tests {
     fn prefix_knobs_default_on_with_the_host_tier_off() {
         let cli = Cli::parse_from(["serve"]);
         assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (20, HostBudget::Bytes(0)));
+        assert_eq!(cli.prefix.host_cache_evict_tokens, 16 * 1024);
+        assert_eq!(Cli::parse_from(["serve", "--host-cache-evict-tokens", "0"]).prefix.host_cache_evict_tokens, 0);
         assert_eq!(cli.prefix.prefix_partial, Toggle::Off);
         assert_eq!(cli.prefix.points(), PointPolicy { gap: 0, boundaries: 0, per_request: 4 });
         let cli = Cli::parse_from(["serve", "--prefix-partial", "on", "--prefix-point-gap", "8192",

@@ -98,8 +98,21 @@ pub(crate) fn retained_bytes(layout: FamilyLayout, concurrency: usize, max_conte
         .context("invalid geometry or overflow for automatic host prefix budget")
 }
 
-pub(crate) fn automatic_bytes(required: u64, chunk: u64, memory: HostMemory, _headroom: u64) -> u64 {
-    required.min(cuteafd_core::prefix::default_host_cache_bytes(memory.total)) / chunk * chunk
+pub(crate) fn resolve_bytes(layout: FamilyLayout, explicit: Option<u64>, concurrency: usize,
+    max_context: usize, chunk: u64, memory: HostMemory) -> Result<u64> {
+    cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
+        page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
+        draft_bytes: layout.draft_bytes as u64 }
+        .resolve(explicit, max_context as u64, concurrency as u64, memory.total, chunk)
+        .context("invalid geometry or overflow for automatic host prefix budget")
+}
+
+pub(crate) fn eviction_headroom(layout: FamilyLayout, tokens: u64) -> Result<[u64; 4]> {
+    let [pages, marks, draft] = cuteafd_core::prefix::HostCacheGeometry {
+        unit_rows: layout.page_rows as u64, page_bytes: layout.page_bytes as u64,
+        mark_bytes: layout.mark_bytes as u64, draft_bytes: layout.draft_bytes as u64,
+    }.eviction_headroom_bytes(tokens).context("host eviction headroom overflow")?;
+    Ok([pages, marks, draft, 0])
 }
 
 /// The live ledger is attribution only: those pinned bytes are already absent
@@ -130,15 +143,82 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     #[test]
+    fn shared_resolver_matches_c84a1a1e_default_family_quotas() -> Result<()> {
+        // c84a1a1e retained_bytes + automatic_bytes, one coordinator, C16,
+        // 128 GiB effective RAM, 256 MiB chunks. Default KV representations:
+        // V4.1 native+dSpark, MiMo Pro INT8/full + BF16/SWA + warm DFlash,
+        // Qwen FP8+MTP+PLE, GLM FP8, V4 Flash native+three dSpark stages.
+        // The 4K extent also checks uncapped arithmetic for the large families.
+        let fixtures = [
+            ("v41-dspark", 512, 455_680, 2_922_816, 1_048_576, 19_058_917_376, 536_870_912),
+            ("mimo-dflash", 64, 1_843_200, 60_293_128, 1_048_576, 34_359_738_368, 3_758_096_384),
+            ("qwen-mtp", 256, 4_526_080, 115_642_368, 262_144, 34_359_738_368, 4_294_967_296),
+            ("glm", 64, 3_452_160, 0, 1_048_576, 34_359_738_368, 4_831_838_208),
+            ("v4-dspark", 256, 998_208, 27_850_752, 1_048_576, 34_359_738_368, 1_342_177_280),
+        ];
+        let memory = HostMemory { total: 128 * GIB, available: 128 * GIB };
+        for (family, page_rows, page_bytes, mark_bytes, context, old_default, old_4k) in fixtures {
+            let layout = FamilyLayout { page_rows, pages: 8192, page_bytes, mark_bytes,
+                draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
+                mark_store: Default::default(), page_owners: Default::default() };
+            for (context, expected) in [(context, old_default), (4096, old_4k)] {
+                assert_eq!(resolve_bytes(layout, None, 16, context, 256 << 20, memory)?, expected, "{family}, {context}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn planner_matches_runtime_for_bf16_qwen_with_native_mtp() -> Result<()> {
+        use cuteafd_loader::{families::qwen4::{Qwen4Attention, Qwen4Config, Qwen4KvCache},
+            plan::{testing, layout::LayoutOptions, PlanInput, PlanOptions, MediaMode}};
+        let dir = tempfile::tempdir()?;
+        let mut config = testing::qwen4_config(4);
+        config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
+        testing::write_snapshot(dir.path(), &config, &testing::qwen4_coordinator(&config, true), None);
+        let cfg = Qwen4Config::from_hf(&config)?;
+        let input = PlanInput::open(dir.path())?;
+        let memory = HostMemory { total: 128 * GIB, available: 128 * GIB };
+        let context = 1 << 18;
+        let concurrency = 1;
+        let mut quotas = Vec::new();
+        for (mtp, kv) in [(false, Qwen4KvCache::Fp8), (true, Qwen4KvCache::Fp8), (true, Qwen4KvCache::Bf16)] {
+            let options = LayoutOptions { host_memory: Some((memory.total, memory.available)),
+                host_cache_bytes: None, context_tokens: context, concurrency,
+                native_mtp_layers: usize::from(mtp), qwen_kv: kv, ..Default::default() };
+            let report = input.plan(&PlanOptions { layout: Some(options), vision: MediaMode::Off,
+                ..Default::default() })?;
+            let full = cfg.attention.iter().filter(|&&a| a == Qwen4Attention::Full).count();
+            // The runtime allocates these owner-local GDN regions and paged
+            // buffers; MTP adds its full-attention pool, not its pending stash.
+            let gdn = crate::shared::qwen::GdnLayout::new(cfg.gdn_geometry())?;
+            let marks = (cfg.layers - full) * (gdn.conv_slot_bytes + gdn.state_slot_bytes)
+                + if cfg.ple_layers.is_empty() { 0 } else { 9 * cfg.hc_count * cfg.hidden * 2 };
+            let layout = FamilyLayout { page_rows: 256, pages: 4096,
+                page_bytes: (full + usize::from(mtp)) * (256 * (kv.record_bytes(cfg.kv_heads, cfg.head_dim) + 256) + 64 * 256),
+                mark_bytes: marks, draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
+                mark_store: Default::default(), page_owners: Default::default() };
+            let runtime = resolve_bytes(layout, None, concurrency as usize, context as usize, 256 << 20, memory)?;
+            assert_eq!(report.host_budget_bytes, runtime, "MTP={mtp}, KV={kv:?}, report={report:?}");
+            quotas.push(runtime);
+        }
+        assert!(quotas[0] < quotas[1] && quotas[1] < quotas[2], "geometry must not be hidden by the cap: {quotas:?}");
+        Ok(())
+    }
+
+    #[test]
     fn auto_is_a_fixed_fraction_capped_at_32_gib_and_respects_cgroup_total() -> Result<()> {
         assert_eq!(cuteafd_core::prefix::default_host_cache_bytes(183 * GIB), 32 * GIB);
         assert_eq!(cuteafd_core::prefix::default_host_cache_bytes(64 * GIB), 16 * GIB);
+        let layout = FamilyLayout { page_rows: 1, pages: 1, page_bytes: GIB as usize, mark_bytes: 0,
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
+        let resolve = |memory| resolve_bytes(layout, None, 16, 200, GIB, memory).unwrap();
         let mut memory = meminfo("MemTotal: 134217728 kB\nMemAvailable: 100663296 kB\n")?;
-        assert_eq!(automatic_bytes(200 * GIB, GIB, memory, 8 * GIB), 32 * GIB);
+        assert_eq!(resolve(memory), 32 * GIB);
         apply_cgroup(&mut memory, &(64 * GIB).to_string(), &(40 * GIB).to_string())?;
-        assert_eq!(automatic_bytes(200 * GIB, GIB, memory, 8 * GIB), 16 * GIB);
+        assert_eq!(resolve(memory), 16 * GIB);
         apply_cgroup(&mut memory, &(48 * GIB).to_string(), &(44 * GIB).to_string())?;
-        assert_eq!(automatic_bytes(200 * GIB, GIB, memory, 8 * GIB), 12 * GIB);
+        assert_eq!(resolve(memory), 12 * GIB);
         apply_cgroup(&mut memory, "max", "0")?;
         assert_eq!(memory.available, 4 * GIB);
         assert!(meminfo("MemTotal: 100 kB\n").is_err());
@@ -153,8 +233,8 @@ mod tests {
         // Six full-context snapshots: twelve pages in six chunks, six marks in one.
         assert_eq!(retained_bytes(layout, 2, 65, 1024)?, 7 * 1024);
         let memory = HostMemory { total: 32768, available: 32000 };
-        assert_eq!(automatic_bytes(6 * 1024, 1024, memory, 0), 6 * 1024);
-        assert_eq!(automatic_bytes(100 * 1024, 1024, memory, 0), 8 * 1024);
+        assert_eq!(resolve_bytes(layout, None, 1, 65, 1024, memory)?, 6 * 1024);
+        assert_eq!(resolve_bytes(layout, None, 16, 4096, 1024, memory)?, 8 * 1024);
         assert!(retained_bytes(layout, usize::MAX, usize::MAX, 1024).is_err());
         Ok(())
     }

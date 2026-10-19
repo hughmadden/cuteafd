@@ -36,9 +36,65 @@ pub fn host_cache_required_bytes(context: u64, concurrency: u64,
     chunks.checked_mul(chunk)
 }
 
+/// Snapshot size classes shared by offline admission and the live host tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCacheGeometry {
+    pub unit_rows: u64,
+    pub page_bytes: u64,
+    pub mark_bytes: u64,
+    pub draft_bytes: u64,
+}
+
+/// Extra KV kept free after a pressure eviction, independently of the quota.
+pub const DEFAULT_HOST_CACHE_EVICT_TOKENS: u64 = 16 * 1024;
+
+impl HostCacheGeometry {
+    /// Page, positional-mark and draft size-class bytes for one headroom extent.
+    pub fn eviction_headroom_bytes(self, tokens: u64) -> Option<[u64; 3]> {
+        if tokens == 0 { return Some([0; 3]); }
+        if self.unit_rows == 0 { return None; }
+        Some([tokens.div_ceil(self.unit_rows).checked_mul(self.page_bytes)?,
+            self.mark_bytes.max(1), self.draft_bytes])
+    }
+
+    pub fn chunk_bytes(self) -> u64 {
+        (256u64 << 20).max(self.page_bytes).max(self.mark_bytes).max(self.draft_bytes)
+    }
+
+    /// Explicit quotas bypass geometry and caps; automatic quotas hold whole chunks.
+    pub fn resolve(self, explicit: Option<u64>, context: u64, concurrency: u64,
+        host_total: u64, chunk: u64) -> Option<u64> {
+        if let Some(bytes) = explicit { return Some(bytes); }
+        let required = host_cache_required_bytes(context, concurrency, self.unit_rows,
+            self.page_bytes, self.mark_bytes.max(1), self.draft_bytes, chunk)?;
+        Some(required.min(default_host_cache_bytes(host_total)) / chunk * chunk)
+    }
+}
+
 #[cfg(test)]
 mod host_budget_tests {
     use super::*;
+    #[test]
+    fn eviction_headroom_uses_the_resolved_family_classes() {
+        let geometry = HostCacheGeometry { unit_rows: 512, page_bytes: 455_680,
+            mark_bytes: 2_922_816, draft_bytes: 12_288 };
+        assert_eq!(geometry.eviction_headroom_bytes(DEFAULT_HOST_CACHE_EVICT_TOKENS),
+            Some([32 * 455_680, 2_922_816, 12_288]));
+        assert_eq!(geometry.eviction_headroom_bytes(0), Some([0; 3]));
+        assert_eq!(geometry.eviction_headroom_bytes(513), Some([2 * 455_680, 2_922_816, 12_288]));
+    }
+
+    #[test]
+    fn shared_resolver_preserves_explicit_overrides_and_whole_chunk_caps() {
+        let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 512,
+            mark_bytes: 140, draft_bytes: 0 };
+        assert_eq!(geometry.resolve(None, 65, 2, 32768, 1024), Some(7 * 1024));
+        assert_eq!(geometry.resolve(None, 4096, 16, 32768, 1024), Some(8 * 1024));
+        assert_eq!(geometry.resolve(Some(40001), 0, u64::MAX, 1, 0), Some(40001));
+        assert_eq!(geometry.resolve(Some(0), 0, 0, 0, 0), Some(0));
+        assert_eq!(geometry.resolve(None, 0, 1, 32768, 1024), None);
+    }
+
     #[test]
     fn concurrency_default_and_small_host_cap() {
         let required = |concurrency| host_cache_required_bytes(1 << 20, concurrency, 512, 4096, 1024, 0, 1 << 20).unwrap();

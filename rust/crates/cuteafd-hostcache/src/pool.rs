@@ -355,6 +355,33 @@ impl SlabPool {
         chunks <= self.free_chunks.len() as u64
     }
 
+    /// Cap extra class demand to what an empty pool can hold beside the incoming store.
+    /// Scale every class together; chunk rounding can make a small quota allow no overage.
+    pub(crate) fn pressure_target(&self, incoming: [u64; 4], bytes: [u64; 4]) -> [u64; 4] {
+        let extra = std::array::from_fn::<_, 4, _>(|i| {
+            let size = self.layout.size(Class::ALL[i]) as u64;
+            if size == 0 { 0 } else { bytes[i].div_ceil(size) }
+        });
+        let target = |scale: u64| std::array::from_fn(|i|
+            incoming[i].saturating_add(((extra[i] as u128 * scale as u128) / 65536) as u64));
+        let fits = |counts: [u64; 4]| {
+            let chunks = Class::ALL.into_iter().zip(counts).try_fold(0u64, |n, (class, count)| {
+                let size = self.layout.size(class);
+                if count == 0 { return Some(n); }
+                if size == 0 { return None; }
+                n.checked_add(count.div_ceil((self.chunk_bytes / size) as u64))
+            });
+            chunks.is_some_and(|n| n <= self.chunks.len() as u64)
+        };
+        if fits(target(65536)) { return target(65536); }
+        let (mut low, mut high) = (0u64, 65536u64);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if fits(target(middle)) { low = middle; } else { high = middle - 1; }
+        }
+        target(low)
+    }
+
     /// Per-class held, free and carved-chunk counts, in [`Class::ALL`] order.
     pub fn occupancy(&self) -> [(Class, ClassOccupancy); Class::ALL.len()] {
         Class::ALL.map(|class| {
@@ -595,6 +622,18 @@ pub mod testing {
 mod tests {
     use super::testing::{layout, pool, FakePinned, CHUNK};
     use super::*;
+
+    #[test]
+    fn pressure_headroom_is_capped_by_simultaneous_class_capacity() {
+        let layout = Layout { page: 64, tail: 128, draft: 0, scores: 0 };
+        let mut memory = testing::FakePinned::new(usize::MAX);
+        let pool = SlabPool::new(512, 256, layout, &mut memory).unwrap();
+        assert_eq!(pool.pressure_target([4, 2, 0, 0], [1 << 30; 4]), [4, 2, 0, 0]);
+        let target = pool.pressure_target([1, 1, 0, 0], [256, 256, 0, 0]);
+        assert!(target[0] >= 1 && target[1] >= 1);
+        assert!(pool.can_take(target));
+        assert_eq!(pool.pressure_target([1, 1, 0, 0], [0; 4]), [1, 1, 0, 0]);
+    }
 
     #[test]
     fn is_held_tracks_take_and_give_back() {
