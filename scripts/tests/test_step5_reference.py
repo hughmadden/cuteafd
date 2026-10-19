@@ -316,3 +316,14 @@ def test_fixed_native_fp8_rows_preserves_official_dispatch():
     calls.clear()
     assert torch.equal(wrapped(x, weight, None), x @ weight.T)
     assert calls == [(141, True, False)]
+
+
+def test_native_fp8_diagnostic_consumes_top_level_quantization_metadata():
+    quant = dict(quant_method="fp8", weight_block_size=[128, 128])
+    payload = dict(text_config=dict(num_hidden_layers=92), quantization_config=quant)
+    assert golden.decoder_config(payload) == dict(num_hidden_layers=92, quantization_config=quant)
+    assert payload["text_config"] == dict(num_hidden_layers=92)
+    assert golden.decoder_config(dict(text_config=dict(tp=1))) == dict(tp=1)
+    payload["text_config"]["quantization_config"] = dict(quant_method="wrong")
+    with pytest.raises(ValueError, match="conflicting"):
+        golden.decoder_config(payload)
