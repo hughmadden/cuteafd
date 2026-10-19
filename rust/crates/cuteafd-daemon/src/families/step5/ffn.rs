@@ -318,6 +318,10 @@ impl<'a> DenseFfn<'a> {
         Ok(())
     }
 
+    pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
+        super::weights::validate_live_weights(device.id, &self.weights)
+    }
+
     pub fn input(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
         self.planes[0].buffer
     }

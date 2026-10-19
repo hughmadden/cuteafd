@@ -179,7 +179,11 @@ pub(super) struct SwaLayer<'a> {
 
 impl<'a> SwaLayer<'a> {
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
-        Ok(Admission::new(rows, &[], 0, 0, u64::MAX, &[])?.bytes)
+        Self::workspace_for_heads(rows, 64)
+    }
+
+    pub fn workspace_for_heads(rows: usize, heads: usize) -> Result<u64> {
+        Ok(Admission::for_heads(rows, heads, &[], 0, 0, u64::MAX, &[])?.bytes)
     }
 
     pub fn load(
@@ -726,6 +730,10 @@ impl<'a> SwaLayer<'a> {
         )
     }
 
+    pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
+        super::weights::validate_live_weights(device.id, &self.weights)
+    }
+
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.planes[X].buffer
     }
@@ -742,6 +750,21 @@ impl<'a> SwaLayer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_head_workspace_charges_the_f32_partial_at_every_row_capacity() -> Result<()> {
+        for rows in 1..=4096 {
+            let split = Admission::for_heads(rows, 32, &[], 0, 0, u64::MAX, &[])?;
+            let whole = Admission::for_heads(rows, 64, &[], 0, 0, u64::MAX, &[])?;
+            assert_eq!(split.planes[DELTA], (rows * H * 4).max(256));
+            assert_eq!(SwaLayer::workspace_for_heads(rows, 32)?, split.bytes);
+            assert!(split.bytes <= whole.bytes);
+        }
+        assert!(SwaLayer::workspace_for_heads(0, 32).is_err());
+        assert!(SwaLayer::workspace_for_heads(4097, 32).is_err());
+        assert!(SwaLayer::workspace_for_heads(64, 16).is_err());
+        Ok(())
+    }
+
     fn fixture(root: &std::path::Path, manifest: &serde_json::Value, key: &str) -> Result<Vec<u8>> {
         use sha2::{Digest, Sha256};
         let bytes = std::fs::read(root.join(format!("{key}.bin")))?;
