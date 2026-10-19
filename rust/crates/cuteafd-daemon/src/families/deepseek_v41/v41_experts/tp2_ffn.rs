@@ -10,7 +10,7 @@ use crate::shared::experts::rtx::{
 };
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Result};
-use cuteafd_ffi::{CuteafdDeviceBuffer, V41Bf16Add};
+use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add};
 use std::rc::Rc;
 
 /// Weight-only budgets have already been admitted separately from every lane's
@@ -128,7 +128,7 @@ pub(crate) struct Wave<'a> {
     shared: SharedWave<'a>,
     routed: OwnerPair<'a>,
     output: [Allocation<'a>; 2],
-    add: V41Bf16Add<'a>,
+    add: Bf16Add<'a>,
     /// SM peer copies per destination GPU for device-ordered passes.
     sm: [Option<cuteafd_ffi::V41PeerCopy<'a>>; 2],
     layers: usize,
@@ -245,7 +245,7 @@ impl<'a> Wave<'a> {
                 Allocation::new(devices[0], capacity as usize * 10240)?,
                 Allocation::new(devices[1], capacity as usize * 10240)?,
             ],
-            add: devices[0].library.v41_bf16_add()?,
+            add: devices[0].library.bf16_add()?,
             sm: [0, 1]
                 .map(|rank| {
                     crate::shared::memory::chain::device_enabled()

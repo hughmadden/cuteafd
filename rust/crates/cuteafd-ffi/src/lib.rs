@@ -6,7 +6,7 @@ pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, Ki
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit,
     KimiRouter, KimiRoutes, KimiExpertInput, MLA_PAGE_ROWS, MLA_RECORD_BYTES};
 pub use shared::vocab_head::{VOCAB_HEAD_ROWS_MAX, VOCAB_HEAD_ROWS_PASS};
-pub use shared::v41_device_ops::{V41Bf16Add, V41PeerCopy};
+pub use shared::v41_device_ops::{Bf16Add, V41PeerCopy};
 pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;
 pub use families::deepseek_v41::v41_index_topk::V41IndexTopK;
 pub use families::deepseek_v41::v41_sparse_attention::{V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow};
