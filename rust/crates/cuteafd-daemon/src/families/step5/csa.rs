@@ -226,20 +226,6 @@ pub(super) struct CsaLayer<'a> {
     immutable: std::rc::Rc<CsaWeights<'a>>,
 }
 impl<'a> CsaLayer<'a> {
-    pub(super) fn initialize_graph_planes(&self, stream: &Stream<'a>) -> Result<()> {
-        ensure!(stream.device.id == self.stream.device.id, "Step-5 graph initialization device");
-        let mut guard = stream.cancellation_guard("Step-5 graph workspace initialization");
-        stream.device.run(|| {
-            for plane in &self.planes {
-                // SAFETY: exclusive startup owns every mutable plane until this stream drains.
-                unsafe { stream.device.library.cuda_zero_bytes_async(plane.buffer, plane.buffer.bytes, stream.raw)?; }
-            }
-            Ok(())
-        })?;
-        stream.drain()?;
-        guard.complete = true;
-        Ok(())
-    }
 
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
         Ok(Admission::new(rows, &[], 0, u64::MAX, &[])?.bytes)
@@ -771,17 +757,9 @@ impl<'a> CsaLayer<'a> {
     pub fn enqueue_attention_step<'e, E: cuteafd_hostcache::copy::CopyEngine>(
         &'e self, step: &mut Step<'e, 'a, E>, rank: usize,
     ) -> Result<()> {
-        self.enqueue_attention_segments(step, rank, |_, _| Ok(false))
-    }
-
-    pub(super) fn enqueue_attention_segments<'e, E: cuteafd_hostcache::copy::CopyEngine>(
-        &'e self, step: &mut Step<'e, 'a, E>, rank: usize,
-        mut replay: impl FnMut(super::graphs::Op, &StepInputs<'_, 'a>) -> Result<bool>,
-    ) -> Result<()> {
         ensure!(self.ffn.is_none(), "shared CSA pipeline must own its FFN separately");
         step.project(rank, self.immutable.layer, self, |layer, input| {
             layer.check_input(&input)?;
-            if replay(super::graphs::Op::Projection(self.immutable.layer), &input)? { return Ok(()); }
             layer.project_on(input.rows, input.positions, input.stream)
         })?;
         step.stage(rank, self.immutable.layer, &self.planes[KEY], &self.planes[VALUE],

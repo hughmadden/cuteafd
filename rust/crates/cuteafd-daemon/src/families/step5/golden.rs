@@ -743,7 +743,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
         let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let execution = Execution::load_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
-            vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), vec![None, None], 1)?;
+            vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), vec![None, None], 1, 17)?;
         let input = Allocation::new(devices[0], rows * H * 4)?;
         devices[0].run(|| library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?))?;
         let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
@@ -879,7 +879,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         .collect::<Result<Vec<_>>>()?;
     let execution = Execution::load_lanes_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
         stages.iter().map(|stage| vec![&stage[0], &stage[1]]).collect(), rows,
-        available.to_vec(), reservations.to_vec(), transports.into_iter().map(Vec::from).collect(), 92)?;
+        available.to_vec(), reservations.to_vec(), transports.into_iter().map(Vec::from).collect(), 92, 17)?;
     let embeddings = embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?;
     let inputs = (0..lane_count).map(|_| {
         let input = Allocation::new(devices[0], rows * H * 4)?;
@@ -891,7 +891,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         vec![&caches[0], &caches[1]], vec![&stage[0], &stage[1]], &pool, placement, rows))
         .collect::<Result<Vec<_>>>()?;
     execution.enqueue_lanes(&mut steps.iter_mut().collect::<Vec<_>>(),
-        &inputs.iter().collect::<Vec<_>>(), request)?;
+        &inputs.iter().collect::<Vec<_>>(), ExpertV2SourceKind::Prefill)?;
     drop(steps);
     ensure!(placements.iter().all(|placement| placement.committed == 0),
         "Step-5 shared cold golden must not publish state");

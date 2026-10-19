@@ -315,6 +315,24 @@ fn retain_wave(sequences: &[SequenceRows<'_>]) -> Result<Vec<Sequence>> {
     }).collect()
 }
 
+fn expert_rows(sequences: &[Sequence], kind: cuteafd_transport::ExpertV2SourceKind)
+    -> Result<Vec<cuteafd_transport::ExpertProtocolV2RowDescriptor>> {
+    let mut rows = Vec::new();
+    for sequence in sequences {
+        ensure!(sequence.start == rows.len(), "Step-5 expert row slice differs from native Step");
+        let end = sequence.base.checked_add(sequence.rows).context("Step-5 expert position overflow")?;
+        for position in sequence.base..end {
+            let row = u32::try_from(rows.len())?;
+            rows.push(cuteafd_transport::ExpertProtocolV2RowDescriptor {
+                row_id: u64::from(row), source_kind: kind,
+                source_request_id: sequence.sequence, token_position: u64::try_from(position)?,
+                route_offset: row.checked_mul(8).context("Step-5 expert route offset overflow")?, route_count: 8,
+            });
+        }
+    }
+    Ok(rows)
+}
+
 // Only these scoped operations borrow the shared allocator. A live Step owns
 // page references, never a RefMut that could cross a callback or a device wait.
 fn fork_at_begin<E: CopyEngine>(pool: &RefCell<PrefixCache<E, Frontier>>,
@@ -387,6 +405,11 @@ pub(super) struct Step<'e, 'a, E: CopyEngine> {
 
 impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
     pub(super) fn rows(&self) -> usize { self.rows }
+
+    pub(super) fn expert_rows(&self, kind: cuteafd_transport::ExpertV2SourceKind)
+        -> Result<Vec<cuteafd_transport::ExpertProtocolV2RowDescriptor>> {
+        expert_rows(&self.sequences, kind)
+    }
 
     pub fn validate_binding(&self, ranks: &[&RefCell<CacheRank<'a>>],
         stages: &[&Staging<'a>], rows: usize) -> Result<()> {
@@ -1066,6 +1089,32 @@ pub(super) mod tests {
         assert_eq!(device.borrow().writes, [first[0], reused[0]]);
         pool.release(&reused);
         assert_eq!(pool.free(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn expert_descriptors_follow_owned_sequence_positions_and_explicit_kind() -> Result<()> {
+        use cuteafd_transport::ExpertV2SourceKind;
+        let kept = retain_wave(&[
+            SequenceRows { sequence: 7, start: 0, rows: 2, base: 65, pages: &[4, 5] },
+            SequenceRows { sequence: 2, start: 2, rows: 1, base: 91, pages: &[4, 6] },
+        ])?;
+        for kind in [ExpertV2SourceKind::Prefill, ExpertV2SourceKind::Decode, ExpertV2SourceKind::MtpVerify] {
+            let rows = expert_rows(&kept, kind)?;
+            assert_eq!(rows.iter().map(|row| (row.source_request_id, row.token_position)).collect::<Vec<_>>(),
+                [(7, 65), (7, 66), (2, 91)]);
+            for (index, row) in rows.iter().enumerate() {
+                assert_eq!(row.row_id, index as u64);
+                assert_eq!(row.source_kind, kind);
+                assert_eq!((row.route_offset, row.route_count), (index as u32 * 8, 8));
+            }
+        }
+        let mut invalid = kept.clone();
+        invalid[1].start = 1;
+        assert!(expert_rows(&invalid, ExpertV2SourceKind::Decode).is_err());
+        invalid[1].start = 2;
+        invalid[1].base = usize::MAX;
+        assert!(expert_rows(&invalid, ExpertV2SourceKind::Decode).is_err());
         Ok(())
     }
 

@@ -12,7 +12,9 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_hostcache::copy::CopyEngine;
 use cuteafd_loader::{placement::{Hop, HopPoint, LayerMode}, plan::{checkpoint::Checkpoint,
     families::step5::{coordinator::{CoordinatorContract, RankWeightLayout}, ownership::ExecutionOwnership}}};
-use cuteafd_transport::ExpertProtocolV2Request;
+use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry,
+    ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
+    expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use std::{cell::{Cell, RefCell}, ffi::c_void, rc::Rc, time::Duration};
 
 const H: usize = 4096;
@@ -171,13 +173,12 @@ fn admit_native_lanes<T>(admission: &[RankAdmission], lanes: usize,
 
 pub(super) struct Execution<'e, 'a> {
     lanes: Vec<LaneExecution<'e, 'a>>,
+    startup_captures: u64,
 }
 
 struct LaneExecution<'e, 'a> {
     id: usize,
     ownership: ExecutionOwnership,
-    // Destroy executables before their externally pinned native operands.
-    graphs: Vec<RefCell<Option<super::graphs::Graphs<'a>>>>,
     native: NativeLane<'a>,
     caches: Vec<&'e RefCell<CacheRank<'a>>>,
     stages: Vec<&'e Staging<'a>>,
@@ -188,8 +189,7 @@ struct LaneExecution<'e, 'a> {
     rows: usize,
     inventory: Vec<Inventory>,
     requests: Cell<u64>,
-    startup_captures: Cell<Option<u64>>,
-    replay: Cell<bool>,
+    placement_version: u64,
     terminal_output: Cell<Option<CuteafdDeviceBuffer>>,
 }
 
@@ -297,9 +297,10 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: ExecutionOwnership, caches: Vec<&'e RefCell<CacheRank<'a>>>,
         stages: Vec<&'e Staging<'a>>, rows: usize, available: Vec<u64>,
-        reservations: Vec<u64>, lanes: Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>) -> Result<Self> {
+        reservations: Vec<u64>, lanes: Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>,
+        placement_version: u64) -> Result<Self> {
         Self::load_count(programs, checkpoint, ownership, caches, stages, rows, available,
-            reservations, lanes, 92)
+            reservations, lanes, 92, placement_version)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -307,9 +308,9 @@ impl<'e, 'a> Execution<'e, 'a> {
         ownership: ExecutionOwnership, caches: Vec<&'e RefCell<CacheRank<'a>>>,
         stages: Vec<&'e Staging<'a>>, rows: usize, available: Vec<u64>,
         reservations: Vec<u64>, lanes: Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>,
-        count: usize) -> Result<Self> {
+        count: usize, placement_version: u64) -> Result<Self> {
         Self::load_lanes_count(programs, checkpoint, ownership, caches, vec![stages], rows,
-            available, reservations, vec![lanes], count)
+            available, reservations, vec![lanes], count, placement_version)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -317,7 +318,8 @@ impl<'e, 'a> Execution<'e, 'a> {
         ownership: ExecutionOwnership, caches: Vec<&'e RefCell<CacheRank<'a>>>,
         stages: Vec<Vec<&'e Staging<'a>>>, rows: usize, available: Vec<u64>,
         reservations: Vec<u64>, transports: Vec<Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>>,
-        count: usize) -> Result<Self> {
+        count: usize, placement_version: u64) -> Result<Self> {
+        ensure!(placement_version != 0, "Step-5 execution needs an admitted placement version");
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
         let lane_count = usize::try_from(ownership.execution().spec().lanes)?;
         validate_rank_inventory(ownership.ranks(), &[caches.len(), available.len(), reservations.len()])?;
@@ -353,9 +355,9 @@ impl<'e, 'a> Execution<'e, 'a> {
             rows, count, &available, &reservations)?;
         let lanes = owners.lanes.into_iter().zip(stages).zip(transports).enumerate()
             .map(|(id, ((native, stages), transports))| LaneExecution::bind(checkpoint,
-                ownership.clone(), native, caches.clone(), stages, rows, transports, count, id))
+                ownership.clone(), native, caches.clone(), stages, rows, transports, count, id, placement_version))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { lanes })
+        Ok(Self { lanes, startup_captures: cuteafd_ffi::graph_captures() })
     }
 }
 
@@ -363,7 +365,8 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
     #[allow(clippy::too_many_arguments)]
     fn bind(checkpoint: &'a Checkpoint, ownership: ExecutionOwnership, native: NativeLane<'a>,
         caches: Vec<&'e RefCell<CacheRank<'a>>>, stages: Vec<&'e Staging<'a>>, rows: usize,
-        lanes: Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>, count: usize, id: usize) -> Result<Self> {
+        lanes: Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>, count: usize, id: usize,
+        placement_version: u64) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let devices: Vec<_> = caches.iter().map(|cache| cache.borrow().stream.device).collect();
         let exchange = if ownership.ranks() == 2 {
@@ -430,9 +433,8 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
         }
         let execution = Self { id, ownership, native, caches, stages, exchange,
             sequence: RefCell::new(HeadSequence::new(id)?), lanes: lanes.into_iter().map(RefCell::new).collect(),
-            pinned, rows, inventory, requests: Cell::new(0),
-            graphs: (0..devices.len()).map(|_| RefCell::new(None)).collect(),
-            startup_captures: Cell::new(None), replay: Cell::new(false), terminal_output: Cell::new(None) };
+            pinned, rows, inventory, requests: Cell::new(0), placement_version,
+            terminal_output: Cell::new(None) };
         if count == 92 { execution.validate_replications()?; }
         Ok(execution)
     }
@@ -480,7 +482,7 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
                 attention::replicate_terminal(self.exchange.peer()?, input.buffer, self.layer(1, 0)?.input(), step.rows() * H * 4)?;
                 let mut binding = Bindings { execution: self, step, scope,
                     current: vec![None, Some(self.layer(1, 0)?.input())], input: input.buffer,
-                    request: super::golden::request, layer: 0, diagnostic: Some(directory) };
+                    kind: ExpertV2SourceKind::Benchmark, layer: 0, diagnostic: Some(directory) };
                 binding.heads(0)?;
                 binding.ffn(0, None)?;
                 for stage in &self.stages { stage.stream.drain()?; }
@@ -506,51 +508,6 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
         self.ownership.execution().validate_routed_replications(&copies)?;
         Ok(())
     }
-    fn graph_arithmetic(&self, key: super::graphs::Key) -> Result<()> {
-        use super::graphs::Op;
-        ensure!(key.lane == self.id && key.rank < self.stages.len() && key.rows <= self.rows,
-            "Step-5 graph key differs from retained lane");
-        let stage = self.stages[key.rank];
-        match key.op {
-            Op::Projection(layer) => match &self.layer(key.rank, layer)?.attention {
-                Attention::Sliding(owner) => owner.project_on(key.rows, stage.positions(), &stage.stream),
-                Attention::Sparse(owner) => owner.project_on(key.rows, stage.positions(), &stage.stream),
-            },
-            Op::SlidingFinish(layer) => {
-                let Attention::Sliding(owner) = &self.layer(key.rank, layer)?.attention else {
-                    anyhow::bail!("Step-5 sliding graph bound to CSA");
-                };
-                owner.finish_on(key.rows, &stage.stream)
-            }
-            Op::Dense(layer) => {
-                let Ffn::Dense(owner) = &self.layer(key.rank, layer)?.ffn else {
-                    anyhow::bail!("Step-5 dense graph bound to routed FFN");
-                };
-                owner.enqueue_on(key.rows, &stage.stream)
-            }
-            Op::Frontend(layer) | Op::Shared(layer) | Op::Join(layer) => {
-                let Ffn::Routed(owner) = &self.layer(key.rank, layer)?.ffn else {
-                    anyhow::bail!("Step-5 routed graph bound to dense FFN");
-                };
-                match key.op {
-                    Op::Frontend(_) if self.ownership.layer(layer, key.rank)?.routed_wave => owner.frontend_on(key.rows, &stage.stream),
-                    Op::Frontend(_) => owner.normalize_on(key.rows, &stage.stream),
-                    Op::Shared(_) => owner.shared_on(key.rows, &stage.stream),
-                    Op::Join(_) => owner.finish_on(key.rows, &stage.stream),
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-
-    fn replay(&self, rank: usize, rows: usize, op: super::graphs::Op,
-        stream: &crate::shared::memory::device::Stream<'a>) -> Result<bool> {
-        if !self.replay.get() { return Ok(false); }
-        self.graphs.get(rank).context("Step-5 graph rank")?.borrow_mut().as_mut()
-            .context("Step-5 startup graph bank absent")?
-            .launch(super::graphs::Key { lane: self.id, rank, rows, op }, stream)
-    }
-
     fn shutdown(&self) -> Result<()> { shutdown_lanes(&[self]) }
 
     fn quiesce(&self) -> Result<()> {
@@ -596,12 +553,7 @@ fn shutdown_lanes(lanes: &[&LaneExecution<'_, '_>]) -> Result<()> {
         ranks: || collect_lane_results(lanes.iter().map(|lane| lane.drain_compute())),
         links: || collect_lane_results(lanes.iter().map(|lane| lane.quiesce())),
         copies: || collect_lane_results(lanes.iter().map(|lane| lane.drain_copies())),
-        graphs: || {
-            for lane in &lanes {
-                for graphs in &lane.graphs { graphs.borrow_mut().take(); }
-            }
-            Ok(())
-        },
+        graphs: || Ok(()),
         finish: |drained| {
             for lane in &lanes {
                 lane.exchange.finish_terminal(drained);
@@ -613,28 +565,7 @@ fn shutdown_lanes(lanes: &[&LaneExecution<'_, '_>]) -> Result<()> {
     Ok(())
 }
 
-pub(super) struct ReplayScope<'s, 'e, 'a> {
-    execution: &'s Execution<'e, 'a>,
-    previous: Vec<bool>,
-}
-impl Drop for ReplayScope<'_, '_, '_> {
-    fn drop(&mut self) {
-        for (lane, &previous) in self.execution.lanes.iter().zip(&self.previous) { lane.replay.set(previous); }
-    }
-}
-
 impl<'e, 'a> Execution<'e, 'a> {
-    pub(super) fn require_startup_graphs(&self) -> Result<()> {
-        ensure!(self.lanes.iter().all(|lane| lane.startup_captures.get().is_some()),
-            "Step-5 serving requires startup graph capture");
-        self.require_live()
-    }
-
-    pub(super) fn replay_scope(&self, enabled: bool) -> ReplayScope<'_, 'e, 'a> {
-        let previous = self.lanes.iter().map(|lane| lane.replay.replace(enabled)).collect();
-        ReplayScope { execution: self, previous }
-    }
-
     pub(super) fn validate_lane_caches(&self, lane: usize, caches: &[&RefCell<CacheRank<'a>>], rows: usize) -> Result<()> {
         let owner = self.lanes.get(lane).context("Step-5 backend lane")?;
         ensure!(owner.rows == rows && caches.len() == owner.caches.len()
@@ -649,56 +580,15 @@ impl<'e, 'a> Execution<'e, 'a> {
         Ok((owner.device(rank)?, owner.terminal_output.get().context("Step-5 terminal wave absent")?))
     }
 
-    pub(super) fn warm_graphs(&self, reserved: &cuteafd_loader::placement::inventory::StartupGraphs<super::graphs::Key>) -> Result<()> {
-        let first = self.lanes.first().context("Step-5 missing execution lane")?;
-        let expected = super::graphs::inventory(&first.ownership, first.rows)?;
-        ensure!(reserved == &expected, "Step-5 graph warm list differs from admission");
-        ensure!(self.lanes.iter().all(|lane| lane.startup_captures.get().is_none()),
-            "Step-5 startup graphs already captured");
-        for lane in &self.lanes {
-            for rank in 0..lane.stages.len() {
-                let keys: Vec<_> = reserved.keys.iter().copied().filter(|key|
-                    key.lane == lane.id && key.rank == rank).collect();
-                let stage = lane.stages[rank];
-                stage.stream.device.run(|| {
-                    // SAFETY: startup owns the metadata plane; every projection reads initialized positions.
-                    unsafe { stage.stream.device.library.cuda_zero_bytes_async(
-                        stage.positions(), stage.positions().bytes, stage.stream.raw) }
-                })?;
-                for layer in lane.native.ranks[rank].iter().flatten() {
-                    match &layer.attention {
-                        Attention::Sliding(owner) => owner.initialize_graph_planes(&stage.stream)?,
-                        Attention::Sparse(owner) => owner.initialize_graph_planes(&stage.stream)?,
-                    }
-                    match &layer.ffn {
-                        Ffn::Dense(owner) => owner.initialize_graph_planes(&stage.stream)?,
-                        Ffn::Routed(owner) => owner.initialize_graph_planes(&stage.stream)?,
-                    }
-                }
-                stage.stream.drain()?;
-                let graphs = super::graphs::Graphs::capture(&stage.stream, &keys, |key| lane.graph_arithmetic(key))?;
-                *lane.graphs[rank].borrow_mut() = Some(graphs);
-            }
-        }
-        let baseline = cuteafd_ffi::graph_captures();
-        for lane in &self.lanes { lane.startup_captures.set(Some(baseline)); lane.replay.set(true); }
-        Ok(())
-    }
-
     pub(super) fn require_live(&self) -> Result<()> {
+        check_captures(self.startup_captures, cuteafd_ffi::graph_captures())?;
         for lane in &self.lanes {
             lane.exchange.require_live()?;
             ensure!(lane.caches.iter().all(|cache| !cache.borrow().poisoned.get()), "Step-5 poisoned cache");
-            if let Some(startup) = lane.startup_captures.get() {
-                super::graphs::check_captures(startup, cuteafd_ffi::graph_captures())?;
-            }
         }
         Ok(())
     }
 
-    pub(super) fn set_replay(&self, enabled: bool) {
-        for lane in &self.lanes { lane.replay.set(enabled); }
-    }
     pub(super) fn lane_count(&self) -> usize { self.lanes.len() }
     pub(super) fn lane_stages(&self, lane: usize) -> Result<Vec<&'e Staging<'a>>> {
         Ok(self.lanes.get(lane).context("Step-5 staging lane")?.stages.clone())
@@ -727,19 +617,19 @@ impl<'e, 'a> Execution<'e, 'a> {
         self.only_lane()?.enqueue_layer0(step, input, directory)
     }
     pub fn enqueue<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
-        input: &'s Allocation<'a>, request: Request) -> Result<()> {
-        self.enqueue_lanes(&mut [step], &[input], request)
+        input: &'s Allocation<'a>, kind: ExpertV2SourceKind) -> Result<()> {
+        self.enqueue_lanes(&mut [step], &[input], kind)
     }
     pub(super) fn enqueue_lanes<'s, E: CopyEngine>(&'s self, steps: &mut [&mut Step<'s, 'a, E>],
-        inputs: &[&'s Allocation<'a>], request: Request) -> Result<()> {
+        inputs: &[&'s Allocation<'a>], kind: ExpertV2SourceKind) -> Result<()> {
         ensure!(steps.len() == self.lanes.len(), "Step-5 submission lane inventory");
         let selected: Vec<_> = (0..self.lanes.len()).collect();
-        self.enqueue_selected(&selected, steps, inputs, request)
+        self.enqueue_selected(&selected, steps, inputs, kind)
     }
 
     /// Idle lanes retain their private owners; active lanes keep their admitted IDs.
     pub(super) fn enqueue_selected<'s, E: CopyEngine>(&'s self, selected: &[usize],
-        steps: &mut [&mut Step<'s, 'a, E>], inputs: &[&'s Allocation<'a>], request: Request) -> Result<()> {
+        steps: &mut [&mut Step<'s, 'a, E>], inputs: &[&'s Allocation<'a>], kind: ExpertV2SourceKind) -> Result<()> {
         validate_lane_selection(self.lanes.len(), selected, steps.len(), inputs.len())?;
         let lanes: Vec<_> = selected.iter().map(|&lane| &self.lanes[lane]).collect();
         for ((lane, step), input) in lanes.iter().zip(steps.iter()).zip(inputs) {
@@ -759,7 +649,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                     .map(|((lane, step), input)| {
                         step.compose(lane.ownership.execution().spec().entry_gpu as usize, *input, |_, _| Ok(()))?;
                         Ok(Bindings { execution: lane, step, scope, current: vec![None; lane.ownership.ranks()],
-                            input: input.buffer, request, layer: 0, diagnostic: None })
+                            input: input.buffer, kind, layer: 0, diagnostic: None })
                     }).collect::<Result<Vec<_>>>()?;
                 let exchanges: Vec<_> = lanes.iter().map(|lane| &lane.exchange).collect();
                 let rows: Vec<_> = bindings.iter().map(|binding| binding.step.rows()).collect();
@@ -794,17 +684,32 @@ fn validate_lane_selection(admitted: usize, selected: &[usize], steps: usize, in
     Ok(())
 }
 
+fn expert_request(identity: u64, placement_version: u64, layer: usize,
+    rows: Vec<ExpertProtocolV2RowDescriptor>, routes: Vec<ExpertProtocolV2RouteEntry>, wire: bytes::Bytes,
+) -> Result<ExpertProtocolV2Request> {
+    ensure!(identity != 0 && placement_version != 0 && (3..91).contains(&layer),
+        "Step-5 routed request identity, placement or target layer");
+    let mut request = ExpertProtocolV2Request::new_bytes(identity, placement_version,
+        u32::try_from(layer)?, H as u32, ExpertV2Dtype::Bf16, rows, routes, wire)?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
+}
+
+fn check_captures(startup: u64, current: u64) -> Result<()> {
+    ensure!(startup == current, "Step-5 zero-steady-capture contract: startup={startup}, current={current}");
+    Ok(())
+}
+
 fn request_identity(lane: usize, ordinal: u64) -> Result<u64> {
     ensure!(lane < 2, "Step-5 request lane outside admission");
     ordinal.checked_mul(2).and_then(|id| id.checked_add(lane as u64 + 1))
         .context("Step-5 request namespace exhausted")
 }
 
-type Request = fn(usize, usize, Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, bytes::Bytes) -> Result<ExpertProtocolV2Request>;
 struct Bindings<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
     execution: &'s LaneExecution<'e, 'a>, step: &'b mut Step<'s, 'a, E>,
     scope: &'g SubmissionScope<'g>, current: Vec<Option<CuteafdDeviceBuffer>>,
-    input: CuteafdDeviceBuffer, request: Request, layer: usize,
+    input: CuteafdDeviceBuffer, kind: ExpertV2SourceKind, layer: usize,
     diagnostic: Option<&'s std::path::Path>,
 }
 impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
@@ -823,12 +728,9 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         let owner = self.execution.layer(rank, layer)?;
         let source = self.current[rank].unwrap_or(self.input);
         self.copy(rank, owner.input(), source)?;
-        let execution = self.execution;
         match &owner.attention {
-            Attention::Sliding(owner) => owner.enqueue_attention_segments(self.step, rank,
-                |op, meta| execution.replay(rank, meta.rows, op, meta.stream)),
-            Attention::Sparse(owner) => owner.enqueue_attention_segments(self.step, rank,
-                |op, meta| execution.replay(rank, meta.rows, op, meta.stream)),
+            Attention::Sliding(owner) => owner.enqueue_attention_step(self.step, rank),
+            Attention::Sparse(owner) => owner.enqueue_attention_step(self.step, rank),
         }
     }
 }
@@ -896,13 +798,11 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
             self.copy(rank, local.ffn_input(), local.post())?;
             match &local.ffn {
                 Ffn::Dense(ffn) => self.step.compose(rank, ffn, |ffn, meta| {
-                    if execution.replay(rank, meta.rows, super::graphs::Op::Dense(layer), meta.stream)? { return Ok(()); }
                     ffn.enqueue_on(meta.rows, meta.stream)
                 })?,
                 Ffn::Routed(ffn) => {
                     let dispatch = execution.ownership.layer(layer, rank)?.routed_wave;
                     self.step.compose(rank, ffn, |ffn, meta| {
-                        if execution.replay(rank, meta.rows, super::graphs::Op::Frontend(layer), meta.stream)? { return Ok(()); }
                         if dispatch { ffn.frontend_on(meta.rows, meta.stream) }
                         else { ffn.normalize_on(meta.rows, meta.stream) }
                     })?;
@@ -921,8 +821,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         })?;
                         let routes = layout.routes(host.bytes())?;
                         let wire = bytes::Bytes::copy_from_slice(layout.wire(host.bytes())?);
-                        let request = self.request;
-                        let rows = self.step.rows();
+                        let descriptors = self.step.expert_rows(self.kind)?;
                         let mut lane = execution.lanes[rank].borrow_mut();
                         let lane = lane.as_mut().context("Step-5 routed wave lane missing")?;
                         let device = lane.device;
@@ -930,15 +829,11 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         let next = ordinal.checked_add(1).context("Step-5 request sequence exhausted")?;
                         let identity = request_identity(execution.id, ordinal)?;
                         execution.requests.set(next);
-                        device.run(|| lane.get_mut().submit(self.step.rows(), Box::new(move || {
-                            let mut wave = request(layer, rows, routes, wire)?;
-                            wave.header.request_id = identity;
-                            Ok(wave)
-                        })))?;
+                        let request = expert_request(identity, execution.placement_version, layer, descriptors, routes, wire)?;
+                        device.run(|| lane.get_mut().submit(self.step.rows(), Box::new(move || Ok(request))))?;
                         wave = Some(rank);
                     }
                     self.step.compose(rank, ffn, |ffn, meta| {
-                        if execution.replay(rank, meta.rows, super::graphs::Op::Shared(layer), meta.stream)? { return Ok(()); }
                         ffn.shared_on(meta.rows, meta.stream)
                     })?;
                 }
@@ -973,13 +868,11 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
             for at in 0..2 {
                 let Ffn::Routed(ffn) = &execution.layer(at, layer)?.ffn else { anyhow::bail!("Step-5 native routed join missing"); };
                 self.step.compose(at, ffn, |ffn, meta| {
-                    if execution.replay(at, meta.rows, super::graphs::Op::Join(layer), meta.stream)? { return Ok(()); }
                     ffn.finish_on(meta.rows, meta.stream)
                 })?;
             }
         } else {
             self.step.compose(rank, ffn, |ffn, meta| {
-                if execution.replay(rank, meta.rows, super::graphs::Op::Join(layer), meta.stream)? { return Ok(()); }
                 ffn.finish_on(meta.rows, meta.stream)
             })?;
         }
@@ -1104,6 +997,30 @@ mod tests {
             theta: vec![], rotary: vec![], rope_scaling: None, scale_full: false,
             scale_sliding: false, activation: vec![], shared_activation: vec![] }
     }
+    #[test]
+    fn routed_request_preserves_admitted_version_and_owned_row_metadata() -> Result<()> {
+        let rows = vec![ExpertProtocolV2RowDescriptor { row_id: 0,
+            source_kind: ExpertV2SourceKind::Decode, source_request_id: 7,
+            token_position: 1234, route_offset: 0, route_count: 8 }];
+        let routes = (0..8).map(|expert| ExpertProtocolV2RouteEntry {
+            row_index: 0, expert_id: expert, gate_weight: 0.125 }).collect::<Vec<_>>();
+        let wire = bytes::Bytes::from(vec![0; H * 2]);
+        let request = expert_request(39, 812, 88, rows.clone(), routes.clone(), wire.clone())?;
+        assert_eq!((request.header.request_id, request.header.placement_version, request.header.layer_id), (39, 812, 88));
+        assert_eq!(request.rows, rows);
+        assert_ne!(request.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
+        for (id, version, layer) in [(0, 812, 88), (39, 0, 88), (39, 812, 2), (39, 812, 91)] {
+            assert!(expert_request(id, version, layer, rows.clone(), routes.clone(), wire.clone()).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn eager_execution_never_grows_the_capture_count() {
+        check_captures(19, 19).unwrap();
+        assert!(check_captures(19, 20).is_err());
+    }
+
     #[test]
     fn request_identities_are_disjoint_checked_and_never_zero() -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();

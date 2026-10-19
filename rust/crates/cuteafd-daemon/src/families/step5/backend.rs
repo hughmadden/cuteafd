@@ -11,6 +11,11 @@ use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia}
 use cuteafd_ffi::NativeLibrary;
 use std::{cell::{Cell, RefCell}, path::Path};
 
+fn verify_kind(speculative: bool) -> cuteafd_transport::ExpertV2SourceKind {
+    if speculative { cuteafd_transport::ExpertV2SourceKind::MtpVerify }
+    else { cuteafd_transport::ExpertV2SourceKind::Decode }
+}
+
 const H: usize = 4096;
 const V: usize = 128896;
 type Evidence<'e, 'a> = Step<'e, 'a, CudaCopyEngine<'a>>;
@@ -104,7 +109,7 @@ pub(super) struct Step5Backend<'e, 'a> {
 impl<'e, 'a> Step5Backend<'e, 'a> {
     pub(super) fn new(execution: &'e Execution<'e, 'a>, ranks: Vec<&'e RefCell<CacheRank<'a>>>,
         embedding: &'e TokenEmbedding<'a>, inputs: Vec<&'e Inputs<'a>>) -> Result<Self> {
-        execution.require_startup_graphs()?;
+        execution.require_live()?;
         ensure!(ranks.len() == execution.ownership().ranks()
             && inputs.len() == execution.lane_count(), "Step-5 backend owner inventory");
         let first = ranks.first().context("Step-5 backend missing cache")?.borrow();
@@ -128,7 +133,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
     }
 
     fn execute(&self, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
-        replay: bool) -> Result<(Evidence<'e, 'a>, DeviceLogits)> {
+        kind: cuteafd_transport::ExpertV2SourceKind) -> Result<(Evidence<'e, 'a>, DeviceLogits)> {
         self.execution.require_live()?;
         let lane = self.next_lane.get();
         self.next_lane.set((lane + 1) % self.inputs.len());
@@ -156,8 +161,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
                     input.residual.buffer, meta.rows * H, meta.stream.raw)
             }
         }))?;
-        let _replay = self.execution.replay_scope(replay);
-        self.execution.enqueue_selected(&[lane], &mut [&mut step], &[&input.residual], super::golden::request)?;
+        self.execution.enqueue_selected(&[lane], &mut [&mut step], &[&input.residual], kind)?;
         let (device, output) = self.execution.lane_terminal_output(lane)?;
         let head_rank = self.execution.ownership().execution().spec().head_gpu as usize;
         let head = self.execution.lane_head(lane)?;
@@ -169,11 +173,11 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
     }
 
     fn immediate(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
-        replay: bool) -> Result<DeviceLogits> {
+        kind: cuteafd_transport::ExpertV2SourceKind) -> Result<DeviceLogits> {
         self.pending.retire();
         self.immediate.retire();
         let submitted = ImmediateWave::record(sequences);
-        let (step, logits) = self.execute(sequences, pool, replay)?;
+        let (step, logits) = self.execute(sequences, pool, kind)?;
         let mut accepted = sequences.iter_mut().map(|(placement, tokens)| (&mut **placement, tokens.len()))
             .collect::<Vec<_>>();
         step.publish_wave(&mut accepted)?;
@@ -245,29 +249,29 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.pending.retire();
         ensure!(logit_rows <= tokens.len(), "Step-5 prefill logits extent");
-        let mut logits = self.immediate(&mut [(placement, tokens)], pool, true)?;
+        let mut logits = self.immediate(&mut [(placement, tokens)], pool, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
         if logit_rows == 0 { return Ok(None); }
         logits.ptr = logits.ptr.wrapping_byte_add((logits.rows - logit_rows) * logits.stride * 4);
         logits.rows = logit_rows;
         Ok(Some(logits))
     }
-    fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], _speculative: bool,
+    fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.pending.retire();
         self.immediate.retire();
-        self.pending.verify(|| self.execute(sequences, pool, true)).map(Some)
+        self.pending.verify(|| self.execute(sequences, pool, verify_kind(speculative))).map(Some)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.pending.retire();
         self.immediate.retire();
-        if speculative { self.pending.verify(|| self.execute(sequences, pool, false)).map(Some) }
-        else { self.immediate(sequences, pool, false).map(Some) }
+        if speculative { self.pending.verify(|| self.execute(sequences, pool, verify_kind(speculative))).map(Some) }
+        else { self.immediate(sequences, pool, cuteafd_transport::ExpertV2SourceKind::Prefill).map(Some) }
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
         serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
-            "attention":"eager_per_sequence", "arithmetic":"startup_exact_keys"})
+            "attention":"eager_per_sequence", "arithmetic":"eager"})
     }
     fn draft_geometry(&self, _snapshot: &Path, _width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         anyhow::bail!("Step-5 native MTP layers 92..94 are not yet qualified")

@@ -245,20 +245,6 @@ impl DensePlan {
 }
 
 impl<'a> DenseFfn<'a> {
-    pub(super) fn initialize_graph_planes(&self, stream: &Stream<'a>) -> Result<()> {
-        ensure!(stream.device.id == self.stream.device.id, "Step-5 graph initialization device");
-        let mut guard = stream.cancellation_guard("Step-5 graph workspace initialization");
-        stream.device.run(|| {
-            for plane in &self.planes {
-                // SAFETY: exclusive startup owns every mutable plane until this stream drains.
-                unsafe { stream.device.library.cuda_zero_bytes_async(plane.buffer, plane.buffer.bytes, stream.raw)?; }
-            }
-            Ok(())
-        })?;
-        stream.drain()?;
-        guard.complete = true;
-        Ok(())
-    }
 
     pub fn load(
         device: Device<'a>,
