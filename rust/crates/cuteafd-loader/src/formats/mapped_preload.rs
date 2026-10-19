@@ -47,6 +47,12 @@ impl MappedPlacement {
 /// Once allocated, the anonymous buffers are charged by the OS to subsequent
 /// prefix-cache admission, not subtracted a second time.
 pub fn host_budget_bytes() -> Result<u64> {
+    let (total, available) = host_memory()?;
+    Ok(available.saturating_sub(total / 10))
+}
+
+/// Live host/cgroup capacity before coordinator allocations.
+pub fn host_memory() -> Result<(u64, u64)> {
     let text = std::fs::read_to_string("/proc/meminfo")?;
     let field = |key| -> Result<u64> {
         let value = text.lines().find_map(|line| line.strip_prefix(key))
@@ -74,7 +80,7 @@ pub fn host_budget_bytes() -> Result<u64> {
             }
         }
     }
-    Ok(available.saturating_sub(total / 10))
+    Ok((total, available))
 }
 
 #[cfg(test)]

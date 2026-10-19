@@ -99,3 +99,54 @@ def test_deployment_goldens_cover_the_complete_release_matrix() -> None:
     assert {p.stem for p in FIXTURES.glob("*.json")} == {e["name"] for e in ENTRIES}
     assert {e["family"] for e in ENTRIES} == {
         "deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"}
+
+
+@pytest.mark.parametrize("quota", ["0", "auto", "16GiB"])
+@pytest.mark.parametrize("full", ["off", "on"])
+def test_host_cache_and_full_logits_reach_plan_and_serve(quota: str, full: str) -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "glm53-exl3-max"))
+    entry["set"].update(HOST_CACHE_BYTES=quota, FULL_PREFILL_LOGITS=full)
+    result = capture(ROOT, f"host-budget-{quota}-{full}", release_entry=entry)
+    plan = result["plans"][0]
+    serve = parse_run(result["containers"][0]["argv"])["command"]
+    assert plan[plan.index("--host-cache-bytes") + 1] == quota
+    actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
+    assert actual == quota
+    assert ("--full-prefill-logits" in plan) == (full == "on")
+    assert ("--full-prefill-logits" in serve) == (full == "on")
+
+
+@pytest.mark.parametrize("quota", [None, "0", "2GiB"])
+@pytest.mark.parametrize("vision", ["off", "rtx"])
+def test_effective_media_cache_quota_reaches_plan(quota: str | None, vision: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import v41_launch_capture
+
+    original_checkpoint = v41_launch_capture.release_checkpoint
+    monkeypatch.setattr(v41_launch_capture, "release_checkpoint",
+        lambda family, model: {**original_checkpoint(family, model), "vision_config": {"hidden_size": 1024}})
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo26-flash-min"))
+    entry["set"].update(VISION=vision)
+    entry["set"].pop("MEDIA_CACHE_BYTES", None)
+    if quota is not None:
+        entry["set"]["MEDIA_CACHE_BYTES"] = quota
+    result = capture(ROOT, f"media-budget-{quota}-{vision}", release_entry=entry)
+    plan = result["plans"][0]
+    serve = parse_run(result["containers"][0]["argv"])["command"]
+    expected = vision != "off" and quota is not None
+    for command in (plan, serve):
+        assert ("--media-cache-bytes" in command) == expected
+        if expected:
+            assert command[command.index("--media-cache-bytes") + 1] == quota
+
+
+@pytest.mark.parametrize("enabled", ["off", "on"])
+def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo26-flash-min"))
+    entry["set"].pop("HOST_CACHE_BYTES", None)
+    entry["set"]["MIMO_HOST_CACHE"] = enabled
+    result = capture(ROOT, f"implicit-host-cache-{enabled}", release_entry=entry)
+    plan = result["plans"][0]
+    serve = parse_run(result["containers"][0]["argv"])["command"]
+    actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
+    assert actual == ("auto" if enabled == "on" else "0")
+    assert plan[plan.index("--host-cache-bytes") + 1] == actual

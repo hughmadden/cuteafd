@@ -379,6 +379,12 @@ pub(crate) struct PlanArgs {
     /// Prefix mark arena slots (0 disables marks).
     #[arg(long)]
     pub(crate) prefix_slots: Option<u64>,
+    /// Pinned prompt-cache quota for --layout (auto: min(32GiB, 25% host RAM)).
+    #[arg(long, default_value = "auto")]
+    pub(crate) host_cache_bytes: crate::shared::prefix::HostBudget,
+    /// Host media embedding-cache quota for --layout (default min(8GiB, 5% RAM)).
+    #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
+    pub(crate) media_cache_bytes: Option<u64>,
     /// MiMo and GLM 5.3 Flash retained snapshots per bank for --layout (matches serving).
     #[arg(long, default_value_t = 20)]
     pub(crate) prefix_cache_entries: u64,

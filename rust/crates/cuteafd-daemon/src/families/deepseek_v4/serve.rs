@@ -550,6 +550,8 @@ fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs
     -> Result<(Dsv4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     anyhow::ensure!(args.prefix_partial == Toggle::Off,
         "DeepSeek V4 restores exact snapshots only (window and compressor state)");
+    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
+        engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     let family = Dsv4Prefix::new(engine, |mark| mark_slots(engine, args, mark))?;
     // The pinned host tier copies through one GPU's copy engine; a heads split keeps its

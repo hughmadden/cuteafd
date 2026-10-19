@@ -258,7 +258,8 @@ pub(super) fn preflight(
                 mark_store: cuteafd_engine::prefix::MarkStore::Arena,
                 page_owners: Default::default(),
             };
-            prefix.host_config(layout, args.max_context)?
+            prefix.with_scoring(if args.full_prefill_logits { args.prefill_rows } else { 64 },
+                args.prefill_rows, cfg.vocab_size)?.host_config(layout, args.max_context)?
         }
         None => None,
     };

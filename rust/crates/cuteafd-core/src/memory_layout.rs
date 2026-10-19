@@ -217,6 +217,43 @@ pub struct Waste {
     pub bytes: u64,
 }
 
+/// Coordinator host admission. Resident items are already reflected in the
+/// OS/cgroup's available bytes; only deferred items are charged against it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostLayout {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub reserve_bytes: u64,
+    pub host_budget_bytes: u64,
+    pub resident_bytes: u64,
+    pub deferred_bytes: u64,
+    pub headroom_bytes: u64,
+    pub shortfall_bytes: u64,
+    pub items: Vec<Item>,
+}
+
+impl HostLayout {
+    pub fn new(total: u64, available: u64, reserve: u64, cache: u64, items: Vec<Item>) -> Option<Self> {
+        let sum = |lifetime| items.iter().filter(|i| i.lifetime == lifetime)
+            .try_fold(0u64, |n, i| n.checked_add(i.bytes));
+        let resident = sum(ItemLifetime::ReadyResident)?;
+        let deferred = sum(ItemLifetime::PostReadyReserve)?;
+        let required = cache.checked_add(deferred)?.checked_add(reserve)?;
+        let all = required.checked_add(resident)?;
+        Some(Self { total_bytes: total, available_bytes: available, reserve_bytes: reserve,
+            host_budget_bytes: cache, resident_bytes: resident, deferred_bytes: deferred,
+            headroom_bytes: available.saturating_sub(required).min(total.saturating_sub(all)),
+            shortfall_bytes: required.saturating_sub(available).max(all.saturating_sub(total)), items })
+    }
+}
+
+/// Host gather plus one lane download can coexist. Single-lane scoring returns
+/// the download directly. Every size is FP32, regardless of checkpoint format.
+pub fn host_logits_bytes(rows: u64, lane_rows: u64, vocab: u64) -> Option<u64> {
+    let live_rows = if rows > lane_rows { rows.checked_add(lane_rows)? } else { rows };
+    live_rows.checked_mul(vocab)?.checked_mul(4)
+}
+
 impl MemoryLayout {
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -311,6 +348,34 @@ pub fn size_pool(free: &[i64], per_token: &[u64], unit_tokens: u64, target: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_admission_charges_future_owners_but_not_resident_bytes_twice() {
+        let resident = Item::new(Category::Transport, "transport/rdma-rings", "", 20, Basis::Exact);
+        let future = Item::new(Category::Workspace, "scoring/full-logits", "", 10, Basis::Formula)
+            .with_lifetime(ItemLifetime::PostReadyReserve);
+        let host = HostLayout::new(100, 60, 10, 30, vec![resident.clone(), future.clone()]).unwrap();
+        assert_eq!((host.resident_bytes, host.deferred_bytes, host.headroom_bytes, host.shortfall_bytes),
+            (20, 10, 10, 0));
+        let tight = HostLayout::new(100, 40, 10, 30, vec![resident.clone(), future.clone()]).unwrap();
+        assert_eq!(tight.shortfall_bytes, 10);
+        let total = HostLayout::new(60, 60, 10, 30, vec![resident, future]).unwrap();
+        assert_eq!(total.shortfall_bytes, 10);
+        let encoded = serde_json::to_value(&host).unwrap();
+        assert_eq!(serde_json::from_value::<HostLayout>(encoded).unwrap(), host);
+    }
+
+    #[test]
+    fn host_sizes_are_checked_and_logits_include_only_the_live_lane_peak() {
+        assert_eq!(host_logits_bytes(4096, 4096, 154880), Some(2_537_553_920));
+        assert_eq!(host_logits_bytes(8192, 4096, 154880), Some(7_612_661_760));
+        assert_eq!(host_logits_bytes(64, 4096, 154880), Some(39_649_280));
+        assert!(host_logits_bytes(u64::MAX, 1, 1).is_none());
+        assert!(host_logits_bytes(1, 1, u64::MAX).is_none());
+        assert!(HostLayout::new(u64::MAX, u64::MAX, 1, u64::MAX, vec![]).is_none());
+        let item = Item::new(Category::Workspace, "resident", "", u64::MAX, Basis::Exact);
+        assert!(HostLayout::new(u64::MAX, u64::MAX, 0, 0, vec![item.clone(), item]).is_none());
+    }
 
     #[test]
     fn spark_residual_is_estimated_ready_resident_with_census_provenance() {

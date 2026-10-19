@@ -166,8 +166,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let draft = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s,
         snapshot_wait: args.mimo_snapshot_wait };
-    let mut prefix = args.prefix.clone();
-    prefix.mimo_host_cap = args.mimo_host_cache;
+    let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let vision = args.vision;
     let audio = args.audio;
@@ -433,7 +432,9 @@ impl Active<'_> {
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
 pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
-    prefix_cache_with(engine, args, concurrency, |layout| args.host_config(layout, engine.max_context))
+    let args = args.with_scoring(if engine.full_prefill_logits() { engine.prefill_rows } else { 64 },
+        engine.prefill_rows, engine.cfg.vocab_size)?;
+    prefix_cache_with(engine, &args, concurrency, |layout| args.host_config(layout, engine.max_context))
 }
 
 fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize,
@@ -447,7 +448,13 @@ fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, conc
     let layout = family.layout();
     // Serving consumes the quota resolved before loading; diagnostics may
     // resolve it here. Register all pools/mark arenas on their actual GPUs.
+    let scoring = args.with_scoring(if engine.full_prefill_logits() { engine.prefill_rows } else { 64 },
+        engine.prefill_rows, engine.cfg.vocab_size)?;
     let host = host_config(layout)?.map(|config| {
+        // Preflight resolved the quota before loading. Re-admit with all pinned
+        // engine and transport owners now resident, without charging them twice.
+        crate::shared::prefix::budget::admit(config.bytes, scoring.scoring_host_bytes,
+            args.host_cache_headroom_bytes)?;
         CudaCopyEngine::registered_owned(engine.library, family.host_owners()).map(|copy| (config, copy))
     }).transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);

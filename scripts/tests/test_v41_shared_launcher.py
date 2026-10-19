@@ -122,6 +122,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--memory-reservation"):
             if flag in command:
                 additions += [flag, command[command.index(flag) + 1]]
+        cache = command[command.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in command else "0"
+        expected[expected.index("--prefix-cache-entries") + 2:expected.index("--prefix-cache-entries") + 2] = ["--host-cache-bytes", cache]
         additions += ["--speculator", "dspark" if "--dspark" in command else "off",
                       "--deployment-peers", command[command.index("--peers") + 1]]
         expected[expected.index("--rtx"):expected.index("--rtx")] = additions

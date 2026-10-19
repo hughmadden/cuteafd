@@ -14,6 +14,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Bounded retained-prefix host quota, independent of currently free RAM.
+pub const fn default_host_cache_bytes(total: u64) -> u64 {
+    let quarter = total / 4;
+    if quarter < 32 << 30 { quarter } else { 32 << 30 }
+}
+
 /// Position-addressed window with enough append-only space for one uncommitted step.
 /// Snapshots retain only `window` visible rows, never speculative slack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
