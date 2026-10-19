@@ -235,6 +235,41 @@ impl<'a> CsaLayer<'a> {
         available: u64,
         reservations: &[u64],
     ) -> Result<Self> {
+        Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true)
+    }
+
+    pub fn for_execution(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        layer: usize,
+        rows: usize,
+        rope: Option<std::rc::Rc<TargetTables<'a>>>,
+        available: u64,
+        reservations: &[u64],
+        rank: usize,
+        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+    ) -> Result<Self> {
+        let local = ownership.layer(layer, rank)?;
+        ensure!(local.query_heads == 64 && local.kv_heads == 4,
+            "Step-5 CSA needs a whole native attention owner");
+        Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
+            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, false)
+    }
+
+    fn load_layout(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        layer_id: usize,
+        rows: usize,
+        rope: Option<std::rc::Rc<TargetTables<'a>>>,
+        available: u64,
+        reservations: &[u64],
+        layout: RankWeightLayout,
+        include_dense: bool,
+    ) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layer = contract
             .layers
@@ -263,7 +298,6 @@ impl<'a> CsaLayer<'a> {
                 && layer.indexer_rope.is_some_and(|r| r.span == 32),
             "CSA layer geometry"
         );
-        let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
         let suffixes = [
             "input_layernorm.weight",
             "self_attn.q_proj.weight",
@@ -314,8 +348,7 @@ impl<'a> CsaLayer<'a> {
                 w.name
             );
         }
-        let dense = layer
-            .dense_activation
+        let dense = layer.dense_activation.filter(|_| include_dense)
             .map(|_| DensePlan::prepare(programs, checkpoint, layer_id, rows, u64::MAX, &[]))
             .transpose()?;
         let admission = Admission::new(
@@ -711,7 +744,27 @@ impl<'a> CsaLayer<'a> {
             &self.planes[VALUE],
             Some((&self.planes[IK], &self.planes[IZ])),
         )?;
-        step.attend(rank, self.layer, &*self, |layer, read| layer.read_on(read))
+        step.attend(rank, self.layer, &*self, |layer, read| {
+            let rows = read.inputs.rows;
+            let stream = read.inputs.stream;
+            layer.read_attention_on(read)?;
+            layer.finish_dense_on(0, rows, stream)
+        })
+    }
+
+    pub fn enqueue_attention_step<'e, E: cuteafd_hostcache::copy::CopyEngine>(
+        &'e self,
+        step: &mut Step<'e, 'a, E>,
+        rank: usize,
+    ) -> Result<()> {
+        ensure!(self.ffn.is_none(), "shared CSA pipeline must own its FFN separately");
+        step.project(rank, self.layer, self, |layer, input| {
+            layer.check_input(&input)?;
+            layer.project_on(input.rows, input.positions, input.stream)
+        })?;
+        step.stage(rank, self.layer, &self.planes[KEY], &self.planes[VALUE],
+            Some((&self.planes[IK], &self.planes[IZ])))?;
+        step.attend(rank, self.layer, self, |layer, read| layer.read_attention_on(read))
     }
 
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
@@ -729,6 +782,13 @@ impl<'a> CsaLayer<'a> {
     }
 
     fn read_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
+        let rows = read.inputs.rows;
+        let stream = read.inputs.stream;
+        self.read_attention_on(read)?;
+        self.finish_dense_on(0, rows, stream)
+    }
+
+    fn read_attention_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
         self.check_input(&read.inputs)?;
         let summary = read
             .summaries
@@ -757,7 +817,11 @@ impl<'a> CsaLayer<'a> {
             )?;
             self.finish_on(start, count, read.inputs.stream)?;
         }
-        self.finish_dense_on(0, read.inputs.rows, read.inputs.stream)
+        Ok(())
+    }
+
+    pub fn attention_output(&self) -> CuteafdDeviceBuffer {
+        self.planes[POST].buffer
     }
 
     fn finish_dense_on(&self, start: usize, rows: usize, stream: &Stream<'a>) -> Result<()> {
