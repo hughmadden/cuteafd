@@ -150,7 +150,8 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
         how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() }];
     report.min_spark_ranks = Some(world);
     report.spark_ranks = world;
-    report.spark_rank_share = 1.0 / world as f64;
+    report.spark_rank_share = residents.iter().copied().max().unwrap_or(0) as f64
+        / residents.iter().sum::<u64>().max(1) as f64;
     report.bytes_by_owner = BTreeMap::from([(format!("spark x{world}"), residents.iter().sum()),
         ("rtx".into(), memory.devices.iter().flat_map(|d| &d.items)
             .filter(|i| matches!(i.category, cuteafd_core::memory_layout::Category::Weights

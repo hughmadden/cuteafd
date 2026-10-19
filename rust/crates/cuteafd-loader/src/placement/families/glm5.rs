@@ -930,7 +930,11 @@ mod tests {
         assert!(request(&invalid).is_err());
         let mut pair = native.clone(); pair.gpus.push(pair.gpus[0]);
         assert!(request(&pair).is_ok());
-        let mut invalid = pair; invalid.spark_ranks = 6;
+        for ranks in 1..=6 {
+            let mut supported = pair.clone(); supported.spark_ranks = ranks;
+            assert!(request(&supported).is_ok());
+        }
+        let mut invalid = pair; invalid.spark_ranks = 7;
         assert!(request(&invalid).is_err());
     }
 
