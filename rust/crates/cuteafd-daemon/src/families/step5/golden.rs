@@ -742,8 +742,8 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
         let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
-        let execution = Execution::load_count(&programs, checkpoint, ownership, [&caches[0], &caches[1]],
-            [&stages[0], &stages[1]], rows, available, reservations, [None, None], 1)?;
+        let execution = Execution::load_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
+            vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), vec![None, None], 1)?;
         let input = Allocation::new(devices[0], rows * H * 4)?;
         devices[0].run(|| library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?))?;
         let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
@@ -877,9 +877,9 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let mut placements = (0..lane_count).map(|lane| Ok(pool.borrow_mut().admit_cold(&family, 1, 1,
         |pages| Placement { pages, sequence: lane as u64, committed: 0 })?.placement))
         .collect::<Result<Vec<_>>>()?;
-    let execution = Execution::load_lanes_count(&programs, checkpoint, ownership, [&caches[0], &caches[1]],
-        stages.iter().map(|stage| [&stage[0], &stage[1]]).collect(), rows,
-        available, reservations, transports, 92)?;
+    let execution = Execution::load_lanes_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
+        stages.iter().map(|stage| vec![&stage[0], &stage[1]]).collect(), rows,
+        available.to_vec(), reservations.to_vec(), transports.into_iter().map(Vec::from).collect(), 92)?;
     let embeddings = embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?;
     let inputs = (0..lane_count).map(|_| {
         let input = Allocation::new(devices[0], rows * H * 4)?;

@@ -6,7 +6,7 @@ use crate::shared::{experts::{rtx::pair::{self, SubmissionScope}, staging::Route
     memory::{HostAllocation, device::{Allocation, Device, DeviceOwner}},
     peer_split::{PeerExchange, RankDevice, attention::{self, AttentionStateOwners,
         HeadKernels, HeadMerge, HeadPrecision, HeadProjection, HeadSequence,
-        LaneOrder, LayerKernels, PipelineKernels}, hop::HopLink}, spark_intake::SparkLane};
+        LaneOrder, LayerKernels, LayerProtocol, PipelineKernels}, hop::{HopLink, HopTicket}, TerminalState}, spark_intake::SparkLane};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_hostcache::copy::CopyEngine;
@@ -82,12 +82,12 @@ impl<'a> Layer<'a> {
 
 /// A private lane retains component Rc owners; it never reloads their operands.
 struct NativeLane<'a> {
-    ranks: [Vec<Option<Layer<'a>>>; 2],
+    ranks: Vec<Vec<Option<Layer<'a>>>>,
     head: Option<super::head::TargetHeadOwner<'a>>,
 }
 impl<'a> NativeLane<'a> {
     fn new_lane(&self) -> Result<Self> {
-        let mut ranks = [Vec::new(), Vec::new()];
+        let mut ranks = (0..self.ranks.len()).map(|_| Vec::new()).collect::<Vec<_>>();
         for (destination, source) in ranks.iter_mut().zip(&self.ranks) {
             *destination = source.iter().map(|layer| layer.as_ref().map(Layer::new_lane).transpose())
                 .collect::<Result<_>>()?;
@@ -104,25 +104,26 @@ struct NativeLanes<'a> {
 }
 impl<'a> NativeLanes<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: &ExecutionOwnership, devices: [Device<'a>; 2], rows: usize,
-        count: usize, available: [u64; 2], reservations: [u64; 2]) -> Result<Self> {
-        ensure!(ownership.ranks() == 2 && matches!(count, 1 | 92), "Step-5 native rank/layer inventory");
+        ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize,
+        count: usize, available: &[u64], reservations: &[u64]) -> Result<Self> {
+        validate_rank_inventory(ownership.ranks(), &[devices.len(), available.len(), reservations.len()])?;
+        ensure!(matches!(count, 1 | 92), "Step-5 native layer inventory");
         let lanes = usize::try_from(ownership.execution().spec().lanes)?;
         let head_rank = ownership.execution().spec().head_gpu as usize;
-        ensure!(head_rank < 2, "Step-5 final head rank");
+        ensure!(head_rank < ownership.ranks(), "Step-5 final head rank");
         let head_plan = (count == 92).then(||
             super::head::HeadPlan::for_execution(programs, checkpoint, rows, ownership)).transpose()?;
-        let mut admission = [RankAdmission { immutable: 0, workspace: 0 }; 2];
+        let mut admission = vec![RankAdmission { immutable: 0, workspace: 0 }; ownership.ranks()];
         for (rank, plan) in admission.iter_mut().enumerate() {
             *plan = Execution::rank_admission(programs, checkpoint, ownership, rank, rows, count)?;
             if rank == head_rank {
                 if let Some(head) = &head_plan { *plan = plan.with_head(head)?; }
             }
         }
-        admit_native_lanes(admission, lanes, available, reservations, || {
+        admit_native_lanes(&admission, lanes, available, reservations, || {
             let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-            let mut ranks: [Vec<Option<Layer<'a>>>; 2] = [Vec::new(), Vec::new()];
-            for rank in 0..2 {
+            let mut ranks: Vec<Vec<Option<Layer<'a>>>> = (0..ownership.ranks()).map(|_| Vec::new()).collect();
+            for rank in 0..ownership.ranks() {
                 let device = devices[rank];
                 let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
                 for layer in 0..count {
@@ -155,9 +156,16 @@ impl<'a> NativeLanes<'a> {
     }
 }
 
-fn admit_native_lanes<T>(admission: [RankAdmission; 2], lanes: usize,
-    available: [u64; 2], reservations: [u64; 2], allocate: impl FnOnce() -> Result<T>) -> Result<T> {
-    for rank in 0..2 { admission[rank].check(lanes, available[rank], &[reservations[rank]])?; }
+fn validate_rank_inventory(ranks: usize, lengths: &[usize]) -> Result<()> {
+    ensure!(matches!(ranks, 1 | 2) && lengths.iter().all(|&length| length == ranks),
+        "Step-5 rank inventory must match one or two admitted ranks");
+    Ok(())
+}
+
+fn admit_native_lanes<T>(admission: &[RankAdmission], lanes: usize,
+    available: &[u64], reservations: &[u64], allocate: impl FnOnce() -> Result<T>) -> Result<T> {
+    validate_rank_inventory(admission.len(), &[available.len(), reservations.len()])?;
+    for rank in 0..admission.len() { admission[rank].check(lanes, available[rank], &[reservations[rank]])?; }
     allocate()
 }
 
@@ -169,16 +177,64 @@ struct LaneExecution<'e, 'a> {
     id: usize,
     ownership: ExecutionOwnership,
     native: NativeLane<'a>,
-    caches: [&'e RefCell<CacheRank<'a>>; 2],
-    stages: [&'e Staging<'a>; 2],
-    peer: PeerExchange<'a>,
-    hops: HopLink<'a>,
+    caches: Vec<&'e RefCell<CacheRank<'a>>>,
+    stages: Vec<&'e Staging<'a>>,
+    exchange: Exchange<'a>,
     sequence: RefCell<HeadSequence>,
-    lanes: [RefCell<Option<DeviceOwner<'a, SparkLane<'a>>>>; 2],
-    pinned: [RefCell<HostAllocation<'a>>; 2],
+    lanes: Vec<RefCell<Option<DeviceOwner<'a, SparkLane<'a>>>>>,
+    pinned: Vec<RefCell<HostAllocation<'a>>>,
     rows: usize,
     inventory: Vec<Inventory>,
     requests: Cell<u64>,
+}
+
+enum Exchange<'a> {
+    Local(Cell<TerminalState>),
+    Pair { peer: PeerExchange<'a>, hops: HopLink<'a> },
+}
+impl<'a> Exchange<'a> {
+    fn peer(&self) -> Result<&PeerExchange<'a>> {
+        match self { Self::Pair { peer, .. } => Ok(peer), Self::Local(_) => anyhow::bail!("Step-5 local execution has no peer") }
+    }
+    fn terminal_state(&self) -> TerminalState {
+        match self { Self::Pair { peer, .. } => peer.terminal_state(), Self::Local(state) => state.get() }
+    }
+    fn publish_abort(&self) -> Result<()> {
+        match self {
+            Self::Pair { peer, .. } => peer.publish_abort(),
+            Self::Local(state) => {
+                ensure!(matches!(state.get(), TerminalState::Active | TerminalState::Drained),
+                    "Step-5 local execution is already terminal");
+                if state.get() == TerminalState::Active { state.set(TerminalState::Aborting); }
+                Ok(())
+            }
+        }
+    }
+    fn finish_terminal(&self, drained: bool) {
+        match self {
+            Self::Pair { peer, .. } => peer.finish_terminal(drained),
+            Self::Local(state) => state.set(if drained { TerminalState::Drained } else { TerminalState::Retained }),
+        }
+    }
+}
+impl LayerProtocol for Exchange<'_> {
+    type Ticket = HopTicket;
+    fn require_live(&self) -> Result<()> {
+        ensure!(self.terminal_state() == TerminalState::Active, "Step-5 terminal execution cannot be reused");
+        Ok(())
+    }
+    fn push_entry(&self, from: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+        self.peer()?.push_to(from, crate::shared::peer_split::DIRECT, source, destination, bytes)
+    }
+    fn wait_entry(&self, to: usize) -> Result<()> { self.peer()?.wait(to, crate::shared::peer_split::DIRECT) }
+    fn send(&self, index: usize, lane: usize, source: *const c_void, rows: usize) -> Result<Self::Ticket> {
+        match self { Self::Pair { hops, .. } => hops.send(index, lane, source, rows),
+            Self::Local(_) => anyhow::bail!("Step-5 local execution cannot send a peer hop") }
+    }
+    fn land(&self, ticket: Self::Ticket) -> Result<*mut c_void> {
+        match self { Self::Pair { hops, .. } => hops.land(ticket),
+            Self::Local(_) => anyhow::bail!("Step-5 local execution cannot receive a peer hop") }
+    }
 }
 
 struct Inventory { weights: Vec<u8>, kv: Vec<u8>, indexer: Option<Vec<u8>>, compressor: Option<Vec<u8>> }
@@ -192,7 +248,7 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn required_bytes_count(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, rank: usize, rows: usize, count: usize) -> Result<u64> {
         ensure!(matches!(count, 1 | 92), "Step-5 diagnostic layer count");
-        ensure!(ownership.ranks() == 2, "Step-5 shared execution requires two ranks");
+        ensure!(matches!(ownership.ranks(), 1 | 2), "Step-5 shared execution rank count");
         Self::rank_admission(programs, checkpoint, ownership, rank, rows, count)?
             .bytes(usize::try_from(ownership.execution().spec().lanes)?)
     }
@@ -234,18 +290,18 @@ impl<'e, 'a> Execution<'e, 'a> {
     }
 
     pub fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: ExecutionOwnership, caches: [&'e RefCell<CacheRank<'a>>; 2],
-        stages: [&'e Staging<'a>; 2], rows: usize, available: [u64; 2],
-        reservations: [u64; 2], lanes: [Option<DeviceOwner<'a, SparkLane<'a>>>; 2]) -> Result<Self> {
+        ownership: ExecutionOwnership, caches: Vec<&'e RefCell<CacheRank<'a>>>,
+        stages: Vec<&'e Staging<'a>>, rows: usize, available: Vec<u64>,
+        reservations: Vec<u64>, lanes: Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>) -> Result<Self> {
         Self::load_count(programs, checkpoint, ownership, caches, stages, rows, available,
             reservations, lanes, 92)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_count(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: ExecutionOwnership, caches: [&'e RefCell<CacheRank<'a>>; 2],
-        stages: [&'e Staging<'a>; 2], rows: usize, available: [u64; 2],
-        reservations: [u64; 2], lanes: [Option<DeviceOwner<'a, SparkLane<'a>>>; 2],
+        ownership: ExecutionOwnership, caches: Vec<&'e RefCell<CacheRank<'a>>>,
+        stages: Vec<&'e Staging<'a>>, rows: usize, available: Vec<u64>,
+        reservations: Vec<u64>, lanes: Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>,
         count: usize) -> Result<Self> {
         Self::load_lanes_count(programs, checkpoint, ownership, caches, vec![stages], rows,
             available, reservations, vec![lanes], count)
@@ -253,20 +309,24 @@ impl<'e, 'a> Execution<'e, 'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_lanes_count(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: ExecutionOwnership, caches: [&'e RefCell<CacheRank<'a>>; 2],
-        stages: Vec<[&'e Staging<'a>; 2]>, rows: usize, available: [u64; 2],
-        reservations: [u64; 2], transports: Vec<[Option<DeviceOwner<'a, SparkLane<'a>>>; 2]>,
+        ownership: ExecutionOwnership, caches: Vec<&'e RefCell<CacheRank<'a>>>,
+        stages: Vec<Vec<&'e Staging<'a>>>, rows: usize, available: Vec<u64>,
+        reservations: Vec<u64>, transports: Vec<Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>>,
         count: usize) -> Result<Self> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
         let lane_count = usize::try_from(ownership.execution().spec().lanes)?;
-        ensure!(ownership.ranks() == 2 && matches!(lane_count, 1 | 2)
+        validate_rank_inventory(ownership.ranks(), &[caches.len(), available.len(), reservations.len()])?;
+        for (stages, transports) in stages.iter().zip(&transports) {
+            validate_rank_inventory(ownership.ranks(), &[stages.len(), transports.len()])?;
+        }
+        ensure!(matches!(lane_count, 1 | 2)
             && stages.len() == lane_count && transports.len() == lane_count,
             "Step-5 transport/cache lane inventory");
-        for rank in 0..2 {
+        for rank in 0..ownership.ranks() {
             ensure!(rows as u64 <= ownership.execution().spec().rows,
                 "Step-5 live rows exceed execution plan");
             let cache = caches[rank].borrow();
-            ensure!(cache.rank() == rank && cache.layout().ranks.len() == 2,
+            ensure!(cache.rank() == rank && cache.layout().ranks.len() == ownership.ranks(),
                 "Step-5 cache rank inventory");
             for (lane, stages) in stages.iter().enumerate() {
                 stages[rank].validate_cache(&cache)?;
@@ -279,14 +339,16 @@ impl<'e, 'a> Execution<'e, 'a> {
                     "Step-5 execution lanes share a staging stream");
             }
         }
-        let devices = [caches[0].borrow().stream.device, caches[1].borrow().stream.device];
-        ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
+        let devices: Vec<_> = caches.iter().map(|cache| cache.borrow().stream.device).collect();
+        ensure!(devices.iter().enumerate().all(|(rank, device)|
+            std::ptr::eq(device.library, devices[0].library)
+                && devices[..rank].iter().all(|other| other.id != device.id)),
             "Step-5 rank devices/library differ");
-        let owners = NativeLanes::load(programs, checkpoint, &ownership, devices,
-            rows, count, available, reservations)?;
+        let owners = NativeLanes::load(programs, checkpoint, &ownership, &devices,
+            rows, count, &available, &reservations)?;
         let lanes = owners.lanes.into_iter().zip(stages).zip(transports).enumerate()
             .map(|(id, ((native, stages), transports))| LaneExecution::bind(checkpoint,
-                ownership.clone(), native, caches, stages, rows, transports, count, id))
+                ownership.clone(), native, caches.clone(), stages, rows, transports, count, id))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { lanes })
     }
@@ -295,28 +357,34 @@ impl<'e, 'a> Execution<'e, 'a> {
 impl<'e, 'a> LaneExecution<'e, 'a> {
     #[allow(clippy::too_many_arguments)]
     fn bind(checkpoint: &'a Checkpoint, ownership: ExecutionOwnership, native: NativeLane<'a>,
-        caches: [&'e RefCell<CacheRank<'a>>; 2], stages: [&'e Staging<'a>; 2], rows: usize,
-        lanes: [Option<DeviceOwner<'a, SparkLane<'a>>>; 2], count: usize, id: usize) -> Result<Self> {
+        caches: Vec<&'e RefCell<CacheRank<'a>>>, stages: Vec<&'e Staging<'a>>, rows: usize,
+        lanes: Vec<Option<DeviceOwner<'a, SparkLane<'a>>>>, count: usize, id: usize) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let devices = [caches[0].borrow().stream.device, caches[1].borrow().stream.device];
-        let native_ranks = std::array::from_fn(|rank| RankDevice { device: devices[rank].id,
-            stream: stages[rank].stream.raw });
-        let peer = devices[0].run(|| PeerExchange::new_abortable(devices[0].library, native_ranks, 8, rows * H * 4))?;
-        let mut hops = devices[0].run(|| HopLink::new_private_lane(devices[0].library, native_ranks,
-            ownership.execution().hops(), ownership.execution().spec(), id))?;
-        hops.attach_abort([peer.abort_word(0)?.context("Step-5 lead abort")?,
-            peer.abort_word(1)?.context("Step-5 peer abort")?])?;
-        hops.validate_binding(ownership.execution(), &peer)?;
+        let devices: Vec<_> = caches.iter().map(|cache| cache.borrow().stream.device).collect();
+        let exchange = if ownership.ranks() == 2 {
+            let native_ranks = std::array::from_fn(|rank| RankDevice { device: devices[rank].id,
+                stream: stages[rank].stream.raw });
+            let peer = devices[0].run(|| PeerExchange::new_abortable(devices[0].library, native_ranks, 8, rows * H * 4))?;
+            let mut hops = devices[0].run(|| HopLink::new_private_lane(devices[0].library, native_ranks,
+                ownership.execution().hops(), ownership.execution().spec(), id))?;
+            hops.attach_abort([peer.abort_word(0)?.context("Step-5 lead abort")?,
+                peer.abort_word(1)?.context("Step-5 peer abort")?])?;
+            hops.validate_binding(ownership.execution(), &peer)?;
+            Exchange::Pair { peer, hops }
+        } else {
+            ensure!(ownership.execution().hops().is_empty(), "Step-5 local execution cannot own peer hops");
+            Exchange::Local(Cell::new(TerminalState::Active))
+        };
         let ranks = &native.ranks;
         let bytes = RouteStaging::new(rows, 8, H * 2)?.bytes;
-        let pinned = [RefCell::new(HostAllocation::new(devices[0].library, bytes)?),
-            RefCell::new(HostAllocation::new(devices[1].library, bytes)?)];
+        let pinned = devices.iter().map(|device| HostAllocation::new(device.library, bytes).map(RefCell::new))
+            .collect::<Result<Vec<_>>>()?;
         let mut inventory = Vec::new();
         for layer in 0..count {
             let mut state = Inventory { weights: Vec::new(), kv: Vec::new(),
                 indexer: contract.layers[layer].sliding.is_none().then(Vec::new),
                 compressor: contract.layers[layer].sliding.is_none().then(Vec::new) };
-            for rank in 0..2 {
+            for rank in 0..ownership.ranks() {
                 if let Some(local) = &ranks[rank][layer] {
                     match &local.attention {
                         Attention::Sliding(owner) => owner.validate_live_weights(devices[rank])?,
@@ -355,15 +423,28 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
             }
             inventory.push(state);
         }
-        let execution = Self { id, ownership, native, caches, stages, peer, hops,
-            sequence: RefCell::new(HeadSequence::new(id)?), lanes: lanes.map(RefCell::new),
+        let execution = Self { id, ownership, native, caches, stages, exchange,
+            sequence: RefCell::new(HeadSequence::new(id)?), lanes: lanes.into_iter().map(RefCell::new).collect(),
             pinned, rows, inventory, requests: Cell::new(0) };
         if count == 92 { execution.validate_replications()?; }
         Ok(execution)
     }
 
+    fn device(&self, rank: usize) -> Result<Device<'a>> {
+        Ok(self.caches.get(rank).context("Step-5 device outside admitted ranks")?.borrow().stream.device)
+    }
     fn layer(&self, rank: usize, layer: usize) -> Result<&Layer<'a>> {
-        self.native.ranks[rank].get(layer).and_then(Option::as_ref).context("Step-5 missing live layer owner")
+        self.native.ranks.get(rank).and_then(|layers| layers.get(layer)).and_then(Option::as_ref)
+            .context("Step-5 missing live layer owner")
+    }
+    fn drain_compute(&self) -> Result<()> {
+        match &self.exchange {
+            Exchange::Pair { peer, .. } => peer.drain_compute(),
+            Exchange::Local(state) => {
+                ensure!(state.get() == TerminalState::Aborting, "Step-5 local drain requires terminal state");
+                collect_lane_results(self.stages.iter().map(|stage| stage.stream.drain()))
+            }
+        }
     }
     pub fn output(&self, layer: usize) -> Result<(Device<'a>, CuteafdDeviceBuffer)> {
         let rank = match self.ownership.execution().mode(layer)? {
@@ -384,14 +465,14 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
 
     pub(super) fn enqueue_layer0<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
         input: &'s Allocation<'a>, directory: &'s std::path::Path) -> Result<()> {
-        ensure!(self.native.ranks.iter().all(|layers| layers.len() == 1), "layer-zero diagnostic must load only layer zero");
+        ensure!(self.ownership.ranks() == 2 && self.native.ranks.iter().all(|layers| layers.len() == 1), "layer-zero diagnostic must load only layer zero");
         step.validate_binding(&self.caches, &self.stages, self.rows)?;
-        pair::submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
+        pair::submit_scoped(|| self.exchange.require_live(), || self.shutdown(), |scope| {
             step.in_submission(scope, |step| {
                 step.compose(0, input, |_, _| Ok(()))?;
-                attention::replicate_terminal(&self.peer, input.buffer, self.layer(1, 0)?.input(), step.rows() * H * 4)?;
+                attention::replicate_terminal(self.exchange.peer()?, input.buffer, self.layer(1, 0)?.input(), step.rows() * H * 4)?;
                 let mut binding = Bindings { execution: self, step, scope,
-                    current: [None, Some(self.layer(1, 0)?.input())], input: input.buffer,
+                    current: vec![None, Some(self.layer(1, 0)?.input())], input: input.buffer,
                     request: super::golden::request, layer: 0, diagnostic: Some(directory) };
                 binding.heads(0)?;
                 binding.ffn(0, None)?;
@@ -410,7 +491,7 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
                 let (source, destination) = (source.routed_output(), destination.routed_output());
                 ensure!(!source.ptr.is_null() && !destination.ptr.is_null()
                     && source.bytes >= self.rows * H * 2 && destination.bytes >= self.rows * H * 2
-                    && source.device_id == self.peer.device(0) && destination.device_id == self.peer.device(1),
+                    && source.device_id == self.device(0)?.id && destination.device_id == self.device(1)?.id,
                     "Step-5 routed replication live storage/device");
                 copy.storage = destination.ptr as usize;
             }
@@ -454,16 +535,19 @@ pub(super) fn collect_lane_results(results: impl IntoIterator<Item = Result<()>>
 
 fn shutdown_lanes(lanes: &[&LaneExecution<'_, '_>]) -> Result<()> {
     use crate::shared::peer_split::TerminalState;
-    if lanes.iter().all(|lane| lane.peer.terminal_state() == TerminalState::Drained) { return Ok(()); }
+    // A failed active subset may already be drained when the aggregate retires.
+    let lanes: Vec<_> = lanes.iter().copied()
+        .filter(|lane| lane.exchange.terminal_state() != TerminalState::Drained).collect();
+    if lanes.is_empty() { return Ok(()); }
     let result = pair::teardown(&mut pair::Teardown {
-        abort: || collect_lane_results(lanes.iter().map(|lane| lane.peer.publish_abort())),
-        ranks: || collect_lane_results(lanes.iter().map(|lane| lane.peer.drain_compute())),
+        abort: || collect_lane_results(lanes.iter().map(|lane| lane.exchange.publish_abort())),
+        ranks: || collect_lane_results(lanes.iter().map(|lane| lane.drain_compute())),
         links: || collect_lane_results(lanes.iter().map(|lane| lane.quiesce())),
         copies: || collect_lane_results(lanes.iter().map(|lane| lane.drain_copies())),
         graphs: || Ok(()),
         finish: |drained| {
-            for lane in lanes {
-                lane.peer.finish_terminal(drained);
+            for lane in &lanes {
+                lane.exchange.finish_terminal(drained);
                 if !drained { lane.caches[0].borrow().stream.device.library.quarantine_module_after_failed_drain(); }
             }
         },
@@ -512,22 +596,26 @@ impl<'e, 'a> Execution<'e, 'a> {
         let lanes: Vec<_> = selected.iter().map(|&lane| &self.lanes[lane]).collect();
         for ((lane, step), input) in lanes.iter().zip(steps.iter()).zip(inputs) {
             step.validate_binding(&lane.caches, &lane.stages, lane.rows)?;
+            if let Exchange::Pair { peer, hops } = &lane.exchange {
+                hops.validate_binding(lane.ownership.execution(), peer)?;
+                hops.validate_dispatch(lane.id, false)?;
+            }
             lane.validate_replications()?;
             ensure!(!input.buffer.ptr.is_null()
-                && input.buffer.device_id == lane.peer.device(lane.ownership.execution().spec().entry_gpu as usize)
+                && input.buffer.device_id == lane.device(lane.ownership.execution().spec().entry_gpu as usize)?.id
                 && input.buffer.bytes >= step.rows() * H * 4, "Step-5 live input allocation");
         }
-        pair::submit_scoped(|| collect_lane_results(lanes.iter().map(|lane| lane.peer.require_live())),
+        pair::submit_scoped(|| collect_lane_results(lanes.iter().map(|lane| lane.exchange.require_live())),
             || shutdown_lanes(&lanes), |scope| Step::in_submissions(scope, steps, |steps| {
                 let mut bindings = lanes.iter().copied().zip(steps.iter_mut()).zip(inputs)
                     .map(|((lane, step), input)| {
                         step.compose(lane.ownership.execution().spec().entry_gpu as usize, *input, |_, _| Ok(()))?;
-                        Ok(Bindings { execution: lane, step, scope, current: [None, None],
+                        Ok(Bindings { execution: lane, step, scope, current: vec![None; lane.ownership.ranks()],
                             input: input.buffer, request, layer: 0, diagnostic: None })
                     }).collect::<Result<Vec<_>>>()?;
-                let exchanges: Vec<_> = lanes.iter().map(|lane| (&lane.peer, &lane.hops)).collect();
+                let exchanges: Vec<_> = lanes.iter().map(|lane| &lane.exchange).collect();
                 let rows: Vec<_> = bindings.iter().map(|binding| binding.step.rows()).collect();
-                attention::layer_pipeline_selected(scope, lanes[0].ownership.execution(), &exchanges,
+                attention::layer_pipeline_selected_instances(scope, lanes[0].ownership.execution(), &exchanges,
                     selected, LaneOrder::Independent, &rows, &mut bindings)?;
                 collect_lane_results(lanes.iter().flat_map(|lane| lane.stages.iter())
                     .map(|stage| stage.stream.drain()))
@@ -560,13 +648,13 @@ fn request_identity(lane: usize, ordinal: u64) -> Result<u64> {
 type Request = fn(usize, usize, Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, bytes::Bytes) -> Result<ExpertProtocolV2Request>;
 struct Bindings<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
     execution: &'s LaneExecution<'e, 'a>, step: &'b mut Step<'s, 'a, E>,
-    scope: &'g SubmissionScope<'g>, current: [Option<CuteafdDeviceBuffer>; 2],
+    scope: &'g SubmissionScope<'g>, current: Vec<Option<CuteafdDeviceBuffer>>,
     input: CuteafdDeviceBuffer, request: Request, layer: usize,
     diagnostic: Option<&'s std::path::Path>,
 }
 impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
     fn copy(&mut self, rank: usize, destination: CuteafdDeviceBuffer, source: CuteafdDeviceBuffer) -> Result<()> {
-        ensure!(destination.device_id == self.execution.peer.device(rank)
+        ensure!(destination.device_id == self.execution.device(rank)?.id
             && source.device_id == destination.device_id && !source.ptr.is_null() && !destination.ptr.is_null()
             && source.bytes >= self.step.rows() * H * 4 && destination.bytes >= self.step.rows() * H * 4,
             "Step-5 residual copy live rank extent");
@@ -598,7 +686,7 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
         ensure!(matches!(hop.at, HopPoint::Entry | HopPoint::BeforeLayer(_) | HopPoint::Exit),
             "Step-5 whole native FFN never broadcasts after attention");
         self.current[hop.to as usize] = Some(CuteafdDeviceBuffer { ptr: residual,
-            bytes: self.step.rows() * H * 4, device_id: self.execution.peer.device(hop.to as usize), flags: 0 });
+            bytes: self.step.rows() * H * 4, device_id: self.execution.device(hop.to as usize)?.id, flags: 0 });
         Ok(())
     }
     fn heads(&mut self, layer: usize) -> Result<()> {
@@ -618,7 +706,7 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
             }
         }
         let execution = self.execution;
-        attention::head_partials(self.scope, &execution.peer, &mut execution.sequence.borrow_mut(),
+        attention::head_partials(self.scope, execution.exchange.peer()?, &mut execution.sequence.borrow_mut(),
             self.step.rows() * H, HeadPrecision::F32, self)
     }
     fn context(&mut self, _layer: usize, _ordinal: usize) -> Result<()> {
@@ -644,7 +732,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
     fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<Self::FfnTicket> {
         let execution = self.execution;
         let mut wave = None;
-        for rank in 0..2 {
+        for rank in 0..execution.ownership.ranks() {
             if owner.is_some_and(|owner| owner != rank) { continue; }
             let local = execution.layer(rank, layer)?;
             self.copy(rank, local.ffn_input(), local.post())?;
@@ -715,7 +803,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
         if execution.ownership.execution().mode(layer)? == LayerMode::HeadSplit {
             let Ffn::Routed(destination) = &execution.layer(1 - rank, layer)?.ffn else { anyhow::bail!("Step-5 routed replica missing"); };
             let binding = execution.ownership.routed_replications(execution.id)?[layer].context("Step-5 routed publication binding")?;
-            attention::replicate_result(self.scope, &execution.peer, rank, binding.slot,
+            attention::replicate_result(self.scope, execution.exchange.peer()?, rank, binding.slot,
                 ffn.routed_output(), destination.routed_output(), self.step.rows() * H * 2)?;
             for at in 0..2 {
                 let Ffn::Routed(ffn) = &execution.layer(at, layer)?.ffn else { anyhow::bail!("Step-5 native routed join missing"); };
@@ -816,7 +904,7 @@ mod tests {
         }
         fn begin_ffn(&mut self, layer: usize, _: Option<usize>) -> Result<Self::FfnTicket> {
             let mut wave = None;
-            for rank in 0..2 {
+            for rank in 0..self.0.ownership.ranks() {
                 if self.0.ownership.layer(layer, rank)?.routed_wave {
                     assert!(wave.is_none(), "duplicate routed dispatch");
                     self.0.host.borrow_mut().sync(rank, "route D2H before Spark dispatch");
@@ -904,6 +992,34 @@ mod tests {
     }
 
     #[test]
+    fn single_rank_target_uses_common_pipeline_with_admitted_lane_one() -> Result<()> {
+        use cuteafd_loader::placement::*;
+        let cfg = config();
+        let modes = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.layers];
+        let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
+            rows: 64, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+        let placement = Placement { pool_tokens: 0, pool_limits: PoolLimits(vec![]),
+            attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![], peer_row_bytes: 0,
+            onboard_layers: 0, layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
+            movables: vec![], expert_ranges: vec![], residual: residual_homes(&modes, &spec)?,
+            hops: plan_hops(&modes, &spec)?, tp2: None, items: vec![] };
+        let ownership = ExecutionOwnership::new(&cfg, 1, LayerExecutionPlan::new(&placement, spec)?)?;
+        let trace = Trace { ownership, host: RefCell::new(HostSchedule::default()),
+            heads: Cell::new(0), waves: Cell::new(0) };
+        let local = Exchange::Local(Cell::new(TerminalState::Active));
+        for order in [LaneOrder::Independent, LaneOrder::OrderedChunks] {
+            pair::submit_scoped(|| local.require_live(), || Ok(()), |scope|
+                crate::shared::peer_split::attention::layer_pipeline_selected_instances(scope, trace.ownership.execution(), &[&local],
+                    &[1], order, &[64], &mut [Recorder(&trace)]))?;
+        }
+        assert_eq!(trace.heads.get(), 0);
+        assert_eq!(trace.waves.get(), 176);
+        assert!(trace.ownership.execution().hops().is_empty());
+        check_host(&trace.host.borrow()).map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[test]
     fn one_lane_native_plan_orders_host_syncs_hops_and_routed_replies_across_odd_head_passes() -> Result<()> {
         let trace = Trace { ownership: super::super::golden::split_ownership(&config(), 64)?,
             host: RefCell::new(HostSchedule::default()), heads: Cell::new(0), waves: Cell::new(0) };
@@ -971,14 +1087,59 @@ mod admission_tests {
         let calls = std::cell::Cell::new(0);
         let allocate = || { calls.set(calls.get() + 1); Ok(()) };
         // Rank zero fits, but rank one must fail without loading either rank.
-        assert!(admit_native_lanes(admission, 2, [140, 259], [0, 0], allocate).is_err());
+        assert!(admit_native_lanes(&admission, 2, &[140, 259], &[0, 0], allocate).is_err());
         assert_eq!(calls.get(), 0);
-        assert!(admit_native_lanes(admission, 2, [140, 260], [0, 1], allocate).is_err());
+        assert!(admit_native_lanes(&admission, 2, &[140, 260], &[0, 1], allocate).is_err());
         assert_eq!(calls.get(), 0);
-        assert!(admit_native_lanes(admission, 3, [u64::MAX; 2], [0; 2], allocate).is_err());
+        assert!(admit_native_lanes(&admission, 3, &[u64::MAX; 2], &[0; 2], allocate).is_err());
         assert_eq!(calls.get(), 0);
-        admit_native_lanes(admission, 2, [147, 269], [7, 9], allocate)?;
+        admit_native_lanes(&admission, 2, &[147, 269], &[7, 9], allocate)?;
         assert_eq!(calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rank_inventory_rejects_missing_and_fake_ranks_before_allocation() -> Result<()> {
+        for ranks in 1..=2 {
+            validate_rank_inventory(ranks, &[ranks, ranks, ranks])?;
+            for length in 0..=3 {
+                if length != ranks { assert!(validate_rank_inventory(ranks, &[ranks, length]).is_err()); }
+            }
+        }
+        assert!(validate_rank_inventory(0, &[]).is_err());
+        assert!(validate_rank_inventory(3, &[3]).is_err());
+        let admission = [RankAdmission { immutable: 100, workspace: 20 }];
+        let calls = Cell::new(0);
+        let allocate = || { calls.set(calls.get() + 1); Ok(()) };
+        assert!(admit_native_lanes(&admission, 2, &[139], &[0], allocate).is_err());
+        assert!(admit_native_lanes(&admission, 2, &[140, 140], &[0], allocate).is_err());
+        assert_eq!(calls.get(), 0);
+        admit_native_lanes(&admission, 2, &[140], &[0], allocate)?;
+        assert_eq!(calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn local_protocol_rejects_peer_operations_and_terminal_reuse() -> Result<()> {
+        let local = Exchange::Local(Cell::new(TerminalState::Active));
+        local.require_live()?;
+        assert!(local.peer().is_err());
+        assert!(local.push_entry(0, std::ptr::null(), std::ptr::null_mut(), 1).is_err());
+        assert!(local.wait_entry(0).is_err());
+        assert!(local.send(0, 1, std::ptr::null(), 1).is_err());
+        local.publish_abort()?;
+        assert_eq!(local.terminal_state(), TerminalState::Aborting);
+        assert!(local.require_live().is_err());
+        local.finish_terminal(true);
+        assert_eq!(local.terminal_state(), TerminalState::Drained);
+        local.publish_abort()?;
+        assert!(local.require_live().is_err());
+        let failed = Exchange::Local(Cell::new(TerminalState::Active));
+        failed.publish_abort()?;
+        failed.finish_terminal(false);
+        assert_eq!(failed.terminal_state(), TerminalState::Retained);
+        assert!(failed.require_live().is_err());
+        assert!(failed.publish_abort().is_err());
         Ok(())
     }
 
