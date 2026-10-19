@@ -8,15 +8,15 @@ use std::{cell::{Cell, RefCell}, rc::{Rc, Weak}};
 /// Checked cache-only reservations. Weights, code, workspace and transport must
 /// be subtracted before supplying the available bytes to `CacheRank::new`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Reservation {
-    active: usize,
-    marks: usize,
-    pages: usize,
-    total: usize,
+pub(super) struct Reservation {
+    pub(super) active: usize,
+    pub(super) marks: usize,
+    pub(super) pages: usize,
+    pub(super) total: usize,
 }
 
 impl Reservation {
-    fn new(layout: &Step5CacheLayout, rank: usize, sequences: u64, slots: u64,
+    pub(super) fn new(layout: &Step5CacheLayout, rank: usize, sequences: u64, slots: u64,
         pages: u64, available: usize) -> Result<Self> {
         ensure!(sequences > 0 && pages > 0, "empty Step-5 cache capacity");
         let state = layout.ranks.get(rank).context("Step-5 cache rank")?;

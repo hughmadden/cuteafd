@@ -23,8 +23,8 @@ const H: usize = 4096;
 /// The final head contributes weights once and a private handle workspace per lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RankAdmission {
-    immutable: u64,
-    workspace: u64,
+    pub(super) immutable: u64,
+    pub(super) workspace: u64,
 }
 impl RankAdmission {
     fn bytes(self, lanes: usize) -> Result<u64> {

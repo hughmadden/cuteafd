@@ -189,6 +189,11 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             "Step-5 scheduler slots or embedding geometry differ from admission");
         let rows = inputs[0].rows;
         let entry = execution.ownership().execution().spec().entry_gpu as usize;
+        let entry_device = ranks[entry].borrow().stream.device;
+        ensure!(embedding.placement() == crate::shared::token_io::EmbedPlacement::Gpu
+            && embedding.owner().id == entry_device.id
+            && std::ptr::eq(embedding.owner().library, entry_device.library),
+            "Step-5 embedding must be GPU-resident on the admitted entry device/library");
         for (lane, input) in inputs.iter().enumerate() {
             let stages = execution.lane_stages(lane)?;
             ensure!(input.rows == rows && input.residual.device.id == stages[entry].stream.device.id
