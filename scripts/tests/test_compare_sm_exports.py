@@ -81,6 +81,34 @@ def test_mimop_k32_tp6_uses_production_exact_slice_export():
                     "--layouts", "tp6", "--exact-slices"])
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_compact_glm_gate_lists_and_exports_only_qualified_shapes(tmp_path, monkeypatch, compact):
+    mode = "compact" if compact else "legacy"
+    name = f"exl3-glm-{mode}"
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"), "--list"],
+                            check=True, capture_output=True, text=True)
+    assert result.stdout.splitlines().count(name) == 1
+    _, exporter, args = next(job for job in compare_sm.jobs("all") if job[0] == name)
+    assert exporter == "package_exl3_aot.py"
+    assert ("--compact-weights" in args) == compact
+    recorded = []
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
+        export=lambda *values, **options: recorded.append((values, options))))
+    compare_sm._export_exl3(args, tmp_path)
+    assert len(recorded) == 4
+    assert {(values[1], values[3]) for values, _ in recorded} == {(w, r) for w in (256, 384) for r in (1, 16)}
+    for values, options in recorded:
+        width, _, rows, bits, routing, topk, dtype = values[1:]
+        assert values[2] == 256 and bits == (4, 5) and topk == 8 and dtype == "bf16"
+        assert routing == "auto" and values[0] == tmp_path / f"width{width}" / f"m{rows}"
+        assert options == dict(hidden=6144, compile_only=True, swiglu_limit=None,
+                               tile=(64, 256 if width == 256 else 128, 64, 256 if width == 256 else 128),
+                               **({"compact_weights": True} if compact else {}))
+    with pytest.raises(ValueError, match="GLM K4/K5 rows 1/16"):
+        compare_sm._export_exl3(["--geometry", "glm", "--capacities", "1", "--bits", "4,5", "--compact-glm"], tmp_path)
+
+
 def test_identical_object_ignores_context_metadata(tmp_path):
     report = compare_sm.compare(*exports(tmp_path))
     assert report["programs"][0]["classification"] == "identical"
