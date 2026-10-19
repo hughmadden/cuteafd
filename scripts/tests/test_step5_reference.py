@@ -167,6 +167,44 @@ def test_official_router_bias_selection_only_and_fp32_slot_sum(release):
     assert torch.equal(result.view(torch.int16), torch.ones_like(x).view(torch.int16))
 
 
+@pytest.mark.parametrize('bf16_boundaries', [False, True])
+def test_swa_head_partition_fp64_matches_unsplit_and_detects_rank1_wiring(bf16_boundaries):
+    import numpy as np
+    rng = np.random.default_rng(274)
+    width, dim, qh, kvh = 8, 192, 64, 4
+    weights = {name: rng.normal(0, .1, shape) for name, shape in dict(
+        input_norm=(width,), q=(qh * dim, width), k=(kvh * dim, width),
+        v=(kvh * dim, width), q_norm=(dim,), k_norm=(dim,),
+        g=(qh, width), o=(width, qh * dim)).items()}
+    hidden = rng.normal(size=(7, width))
+    positions = np.array([0, 1, 63, 64, 511, 512, 639])
+    args = dict(bf16_boundaries=bf16_boundaries)
+    full = golden.swa_head_partition_fp64(hidden, weights, positions, **args)
+    ranks = [golden.swa_head_partition_fp64(hidden, weights, positions,
+             rank=rank, ranks=2, **args) for rank in range(2)]
+    for rank, result in enumerate(ranks):
+        assert result['query_heads'].tolist() == list(range(rank * 32, (rank + 1) * 32))
+        assert result['kv_heads'].tolist() == list(range(rank * 2, (rank + 1) * 2))
+        for key in ('q', 'attention', 'gated'):
+            np.testing.assert_allclose(result[key], full[key][:, rank * 32:(rank + 1) * 32],
+                                       atol=1e-13, rtol=1e-12)
+        np.testing.assert_allclose(result['k'], full['k'][:, rank * 2:(rank + 1) * 2],
+                                   atol=1e-13, rtol=1e-12)
+    np.testing.assert_allclose(ranks[0]['partial'] + ranks[1]['partial'], full['partial'],
+                               atol=1e-12, rtol=1e-11)
+    wrong_rope = golden.swa_head_partition_fp64(hidden, weights, positions + 1,
+                 rank=1, ranks=2, **args)
+    # A common absolute rotary shift cancels in exact math; use a wrong Q
+    # head slice as an independently detectable rank-1 wiring error.
+    wrong_weights = dict(weights, q=np.roll(weights['q'].reshape(qh, dim, width), 16, axis=0)
+                         .reshape(qh * dim, width))
+    wrong_heads = golden.swa_head_partition_fp64(hidden, wrong_weights, positions,
+                  rank=1, ranks=2, **args)
+    assert np.max(np.abs(wrong_heads['partial'] - ranks[1]['partial'])) > .01
+    if not bf16_boundaries:
+        np.testing.assert_allclose(wrong_rope['partial'], ranks[1]['partial'], atol=1e-12, rtol=1e-11)
+
+
 def test_bounded_sliding_cpu_prefix_exact_and_matches_dense():
     torch = pytest.importorskip("torch")
     torch.manual_seed(17)

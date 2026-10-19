@@ -56,14 +56,20 @@ struct Inventory { weights: Vec<u8>, kv: Vec<u8>, indexer: Option<Vec<u8>>, comp
 impl<'e, 'a> Execution<'e, 'a> {
     pub fn required_bytes(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, rank: usize, rows: usize) -> Result<u64> {
+        Self::required_bytes_count(programs, checkpoint, ownership, rank, rows, 92)
+    }
+
+    pub(super) fn required_bytes_count(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: &ExecutionOwnership, rank: usize, rows: usize, count: usize) -> Result<u64> {
+        ensure!(matches!(count, 1 | 92), "Step-5 diagnostic layer count");
         ensure!(ownership.ranks() == 2 && ownership.execution().spec().lanes == 1,
             "Step-5 shared golden explicitly admits exactly one lane and two ranks");
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layout = RankWeightLayout::for_execution(checkpoint, rank, ownership)?;
-        let mut bytes = layout.operands.iter().filter(|w| w.name.starts_with("model.layers."))
+        let mut bytes = layout.operands.iter().filter(|w| (0..count).any(|layer| w.name.starts_with(&format!("model.layers.{layer}."))))
             .try_fold(contract.rope_tables.allocation_bytes, |n, w| n.checked_add(w.allocation_bytes))
             .context("Step-5 native rank weight overflow")?;
-        for layer in 0..contract.layers.len() {
+        for layer in 0..count {
             if ownership.layer(layer, rank)?.query_heads == 0 { continue; }
             let attention = if contract.layers[layer].sliding.is_some() {
                 SwaLayer::workspace_for_heads(rows, ownership.layer(layer, rank)?.query_heads)? }
@@ -83,9 +89,20 @@ impl<'e, 'a> Execution<'e, 'a> {
         ownership: ExecutionOwnership, caches: [&'e RefCell<CacheRank<'a>>; 2],
         stages: [&'e Staging<'a>; 2], rows: usize, available: [u64; 2],
         reservations: [u64; 2], lanes: [Option<DeviceOwner<'a, SparkLane<'a>>>; 2]) -> Result<Self> {
+        Self::load_count(programs, checkpoint, ownership, caches, stages, rows, available,
+            reservations, lanes, 92)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_count(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: ExecutionOwnership, caches: [&'e RefCell<CacheRank<'a>>; 2],
+        stages: [&'e Staging<'a>; 2], rows: usize, available: [u64; 2],
+        reservations: [u64; 2], lanes: [Option<DeviceOwner<'a, SparkLane<'a>>>; 2],
+        count: usize) -> Result<Self> {
+        ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         for rank in 0..2 {
-            let required = Self::required_bytes(programs, checkpoint, &ownership, rank, rows)?;
+            let required = Self::required_bytes_count(programs, checkpoint, &ownership, rank, rows, count)?;
             ensure!(required.checked_add(reservations[rank]).is_some_and(|n| n <= available[rank]),
                 "Step-5 native rank {rank} exceeds preallocation admission");
             ensure!(rows as u64 <= ownership.execution().spec().rows,
@@ -93,7 +110,7 @@ impl<'e, 'a> Execution<'e, 'a> {
             let cache = caches[rank].borrow();
             ensure!(cache.rank() == rank && cache.layout().ranks.len() == 2,
                 "Step-5 cache rank inventory");
-            ensure!(lanes[rank].is_some() == (0..contract.layers.len()).any(|l|
+            ensure!(lanes[rank].is_some() == (0..count).any(|l|
                 ownership.layer(l, rank).is_ok_and(|local| local.routed_wave)),
                 "Step-5 routed-wave transport inventory");
         }
@@ -112,7 +129,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         for rank in 0..2 {
             let device = devices[rank];
             let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
-            for layer in 0..contract.layers.len() {
+            for layer in 0..count {
                 if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
                 let attention = if contract.layers[layer].sliding.is_some() {
                     Attention::Sliding(SwaLayer::for_execution(device, programs, checkpoint, layer,
@@ -135,7 +152,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         let pinned = [RefCell::new(HostAllocation::new(devices[0].library, bytes)?),
             RefCell::new(HostAllocation::new(devices[1].library, bytes)?)];
         let mut inventory = Vec::new();
-        for layer in 0..contract.layers.len() {
+        for layer in 0..count {
             let mut state = Inventory { weights: Vec::new(), kv: Vec::new(),
                 indexer: contract.layers[layer].sliding.is_none().then(Vec::new),
                 compressor: contract.layers[layer].sliding.is_none().then(Vec::new) };
@@ -180,7 +197,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         }
         let execution = Self { ownership, ranks, caches, stages, peer, hops,
             sequence: RefCell::new(HeadSequence::new(0)?), lanes: lanes.map(RefCell::new), pinned, rows, inventory };
-        execution.validate_replications()?;
+        if count == 92 { execution.validate_replications()?; }
         Ok(execution)
     }
 
@@ -194,6 +211,32 @@ impl<'e, 'a> Execution<'e, 'a> {
         };
         Ok((self.caches[rank].borrow().stream.device, self.layer(rank, layer)?.output()))
     }
+    pub(super) fn diagnostic_layer0(&self, rank: usize) -> Result<(&SwaLayer<'a>, &DenseFfn<'a>)> {
+        let layer = self.layer(rank, 0)?;
+        let (Attention::Sliding(attention), Ffn::Dense(ffn)) = (&layer.attention, &layer.ffn)
+            else { anyhow::bail!("Step-5 layer zero diagnostic ownership"); };
+        Ok((attention, ffn))
+    }
+
+    pub(super) fn enqueue_layer0<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
+        input: &'s Allocation<'a>, directory: &'s std::path::Path) -> Result<()> {
+        ensure!(self.ranks.iter().all(|layers| layers.len() == 1), "layer-zero diagnostic must load only layer zero");
+        step.validate_binding(&self.caches, &self.stages, self.rows)?;
+        pair::submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
+            step.in_submission(scope, |step| {
+                step.compose(0, input, |_, _| Ok(()))?;
+                attention::replicate_terminal(&self.peer, input.buffer, self.layer(1, 0)?.input(), self.rows * H * 4)?;
+                let mut binding = Bindings { execution: self, step, scope,
+                    current: [None, Some(self.layer(1, 0)?.input())], input: input.buffer,
+                    request: super::golden::request, layer: 0, diagnostic: Some(directory) };
+                binding.heads(0)?;
+                binding.ffn(0, None)?;
+                for cache in &self.caches { cache.borrow().stream.drain()?; }
+                Ok(())
+            })
+        })
+    }
+
     fn validate_replications(&self) -> Result<()> {
         let mut copies = self.ownership.routed_replications(0)?;
         for (layer, copy) in copies.iter_mut().enumerate() {
@@ -248,7 +291,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         pair::submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
             step.in_submission(scope, |step| {
                 step.compose(self.ownership.execution().spec().entry_gpu as usize, input, |_, _| Ok(()))?;
-                let mut bindings = [Bindings { execution: self, step, scope, current: [None, None], input: input.buffer, request, layer: 0 }];
+                let mut bindings = [Bindings { execution: self, step, scope, current: [None, None], input: input.buffer, request, layer: 0, diagnostic: None }];
                 attention::layer_pipeline(scope, self.ownership.execution(), &self.peer, &self.hops,
                     LaneOrder::Independent, &[self.rows], &mut bindings)?;
                 for cache in &self.caches { cache.borrow().stream.drain()?; }
@@ -268,6 +311,7 @@ struct Bindings<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
     execution: &'s Execution<'e, 'a>, step: &'b mut Step<'s, 'a, E>,
     scope: &'g SubmissionScope<'g>, current: [Option<CuteafdDeviceBuffer>; 2],
     input: CuteafdDeviceBuffer, request: Request, layer: usize,
+    diagnostic: Option<&'s std::path::Path>,
 }
 impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
     fn copy(&mut self, rank: usize, destination: CuteafdDeviceBuffer, source: CuteafdDeviceBuffer) -> Result<()> {
@@ -310,6 +354,18 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
         self.layer = layer;
         self.attention(0, layer)?;
         self.attention(1, layer)?;
+        if let Some(directory) = self.diagnostic {
+            // Capture before merge reuses the normalized input plane.
+            for rank in 0..2 {
+                self.execution.caches[rank].borrow().stream.drain()?;
+                let (owner, _) = self.execution.diagnostic_layer0(rank)?;
+                let device = self.execution.caches[rank].borrow().stream.device;
+                super::golden::dump_plane(directory, &format!("rank{rank}-attention_input"), device,
+                    owner.diagnostic_norm(), self.execution.rows, true)?;
+                super::golden::dump_plane(directory, &format!("rank{rank}-o_partial"), device,
+                    owner.projection_partial()?, self.execution.rows, false)?;
+            }
+        }
         let execution = self.execution;
         attention::head_partials(self.scope, &execution.peer, &mut execution.sequence.borrow_mut(),
             execution.rows * H, HeadPrecision::F32, self)
@@ -425,7 +481,8 @@ impl<E: CopyEngine> HeadKernels for Bindings<'_, '_, '_, '_, '_, E> {
         let layer = self.layer;
         let Attention::Sliding(owner) = &self.execution.layer(rank, layer)?.attention else { anyhow::bail!("Step-5 head split requires SWA"); };
         let HeadMerge::F32(values) = values else { anyhow::bail!("Step-5 head merge requires F32"); };
-        self.step.compose(rank, owner, |owner, meta| owner.merge_partial_on(meta.rows, values, meta.stream))
+        let capture = self.diagnostic.map(|directory| (directory, rank));
+        self.step.compose(rank, owner, |owner, meta| owner.merge_partial_capture_on(meta.rows, values, meta.stream, capture))
     }
 }
 

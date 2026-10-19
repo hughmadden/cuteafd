@@ -329,6 +329,10 @@ impl<'a> DenseFfn<'a> {
         self.planes[5].buffer
     }
 
+    pub(super) fn diagnostic_planes(&self) -> [(cuteafd_ffi::CuteafdDeviceBuffer, bool); 4] {
+        [0, 1, 4, 5].map(|i| (self.planes[i].buffer, matches!(i, 1 | 4)))
+    }
+
     // The containing layer owns this stream ahead of the FFN fields and drains
     // it before releasing us. Standalone callers keep using the owned stream.
     pub fn enqueue_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {

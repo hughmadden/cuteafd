@@ -58,7 +58,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long, default_value_t = 0)]
     device: i32,
     /// Shared native pipeline qualification with exactly one explicitly admitted lane.
-    #[arg(long, requires = "nll", conflicts_with = "prefix_state")]
+    #[arg(long, conflicts_with = "prefix_state")]
     split_device: Option<i32>,
     /// Validate source, reference and routed-layer selection without CUDA.
     #[arg(long)]
@@ -87,9 +87,19 @@ pub(crate) struct GoldenArgs {
     /// Compare real cold/shared-prefix canonical state and an identical continuation.
     #[arg(long, requires = "nll")]
     prefix_state: bool,
+    /// Worker-free layer-zero boundary diagnostic, without scoring or state publication.
+    #[arg(long, conflicts_with_all = ["nll", "prefix_state", "save_logits", "dump_residuals", "compare_final_norm"])]
+    dump_layer0: Option<PathBuf>,
 }
 
 fn diagnostic_selection(args: &GoldenArgs) -> Result<()> {
+    ensure!(args.dump_layer0.is_none() || (args.last_layer == 0 && !args.nll
+        && !args.prefix_state && args.peers.is_empty() && args.compare_layers.is_empty()
+        && args.save_logits.is_none() && args.dump_residuals.is_none() && !args.compare_final_norm),
+        "layer-zero dump requires --last-layer 0, no peers, scoring, or full-target diagnostics");
+    ensure!(args.last_layer != 0 || args.dump_layer0.is_some(), "layer zero requires --dump-layer0");
+    ensure!(args.split_device.is_none() || args.dump_layer0.is_some() || (args.nll && args.last_layer == 91),
+        "shared execution requires full NLL or layer-zero diagnostic");
     let writes = args.save_logits.is_some() || args.dump_residuals.is_some();
     ensure!(!writes || (args.nll && args.last_layer == 91 && !args.prefix_state),
         "Step-5 diagnostic outputs require complete cold NLL mode");
@@ -341,7 +351,9 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
                 "tail diagnostic payload digest differs: {file}");
         }
     }
-    let (expected, positions) = if args.nll {
+    let (expected, positions) = if args.dump_layer0.is_some() {
+        (vec![], vec![])
+    } else if args.nll {
         ensure!(entry["vocab"].as_u64() == Some(vocab as u64), "reference vocabulary mismatch");
         let positions = entry["positions"].as_array().context("missing scored positions")?.iter()
             .map(|p| usize::try_from(p.as_u64().context("invalid scored position")?).map_err(Into::into))
@@ -391,7 +403,7 @@ fn embedding_rows(checkpoint: &Checkpoint, tokens: &[u32], vocab: usize) -> Resu
     Ok(result)
 }
 
-fn request(
+pub(super) fn request(
     layer: usize,
     rows: usize,
     routes: Vec<ExpertProtocolV2RouteEntry>,
@@ -648,6 +660,124 @@ fn shared_diagnostic_verdict(nll: f64, reference_nll: f64, kl: f64, max_kl: f64)
     Ok(())
 }
 
+pub(super) fn dump_plane(directory: &std::path::Path, name: &str, device: Device<'_>,
+    buffer: cuteafd_ffi::CuteafdDeviceBuffer, rows: usize, bf16: bool) -> Result<()> {
+    let bytes = rows.checked_mul(H).and_then(|n| n.checked_mul(if bf16 { 2 } else { 4 }))
+        .context("layer-zero dump extent overflow")?;
+    ensure!(buffer.bytes >= bytes, "layer-zero dump buffer extent");
+    let raw = read_buffer(device, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
+    let values = if bf16 {
+        raw.chunks_exact(2).map(|v| f32::from_bits((u16::from_le_bytes(v.try_into().unwrap()) as u32) << 16)).collect::<Vec<_>>()
+    } else {
+        raw.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>()
+    };
+    write_f32(directory.join(format!("{name}.bin")), &values, rows, H)
+}
+
+fn dump_layer0_tail(directory: &std::path::Path, prefix: &str, device: Device<'_>,
+    attention: &super::swa::SwaLayer<'_>, ffn: &super::ffn::DenseFfn<'_>, rows: usize) -> Result<()> {
+    for (name, (buffer, bf16)) in ["attention_output", "post_attention_residual"].into_iter()
+        .zip(attention.diagnostic_attention()).chain(
+            ["ffn_input", "ffn_normalized_input", "ffn_delta", "post_layer_residual"].into_iter().zip(ffn.diagnostic_planes())) {
+        dump_plane(directory, &format!("{prefix}{name}"), device, buffer, rows, bf16)?;
+    }
+    Ok(())
+}
+
+fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, reference: Reference) -> Result<()> {
+    use super::execution::Execution;
+    let directory = args.dump_layer0.as_ref().context("layer-zero dump directory")?;
+    let rows = reference.tokens.len();
+    if args.check_headers { println!("Step-5 layer-zero diagnostic headers validated: rows={rows}; no scoring or experts"); return Ok(()); }
+    ensure!(args.device >= 0 && args.split_device.is_none_or(|peer| peer >= 0 && peer != args.device),
+        "layer-zero device selection");
+    std::fs::create_dir_all(directory)?;
+    let metadata = directory.join("meta.json");
+    if metadata.exists() { std::fs::remove_file(&metadata)?; }
+    // SAFETY: sealed runner library outlives every program, stream and allocation.
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? };
+    library.cuda_set_device(args.device)?;
+    let programs = library.programs()?.with_manifest(&args.manifest)?;
+    let pages = (rows as u64).div_ceil(64) + 1;
+    let config = PrefixConfig { entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 };
+    let shared = args.split_device.is_some();
+    if let Some(peer) = args.split_device {
+        let devices = [args.device, peer].map(|id| Device { library: &library, id });
+        let ownership = split_ownership(cfg, rows)?;
+        let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64)?;
+        let mut available = [0; 2];
+        let mut reservations = [0; 2];
+        let mut cache_bytes = [0; 2];
+        let mut stage_bytes = [0; 2];
+        for rank in 0..2 {
+            available[rank] = devices[rank].run(|| library.cuda_memory_info())?.0 as u64;
+            cache_bytes[rank] = layout.ranks[rank].bytes + layout.geometry.ranks[rank].persistent_unit_bytes * pages;
+            stage_bytes[rank] = Staging::bytes(&layout, rank)? as u64;
+            let hops = cuteafd_loader::placement::hop_buffer_bytes(ownership.execution().hops(), &ownership.execution().spec(), 2)
+                .context("layer-zero hop admission")?;
+            reservations[rank] = cache_bytes[rank] + stage_bytes[rank] + hops[rank]
+                + (9 * rows * H * 4) as u64 + (4u64 << 30);
+            ensure!(Execution::required_bytes_count(&programs, checkpoint, &ownership, rank, rows, 1)?
+                + reservations[rank] <= available[rank], "layer-zero rank allocation admission");
+        }
+        let caches = [RefCell::new(CacheRank::new(devices[0], layout.clone(), 0, 1, 0, pages, cache_bytes[0] as usize)?),
+            RefCell::new(CacheRank::new(devices[1], layout, 1, 1, 0, pages, cache_bytes[1] as usize)?)];
+        let stages = [Staging::new(devices[0], &programs, &caches[0].borrow(), stage_bytes[0] as usize)?,
+            Staging::new(devices[1], &programs, &caches[1].borrow(), stage_bytes[1] as usize)?];
+        let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
+        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?;
+        let mut placement = pool.admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+        let execution = Execution::load_count(&programs, checkpoint, ownership, [&caches[0], &caches[1]],
+            [&stages[0], &stages[1]], rows, available, reservations, [None, None], 1)?;
+        let input = Allocation::new(devices[0], rows * H * 4)?;
+        devices[0].run(|| library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?))?;
+        let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &mut pool, &mut placement, rows)?;
+        execution.enqueue_layer0(&mut step, &input, directory)?;
+        drop(step);
+        ensure!(placement.committed == 0, "layer-zero diagnostic must not publish state");
+        for rank in 0..2 {
+            let (attention, ffn) = execution.diagnostic_layer0(rank)?;
+            dump_layer0_tail(directory, &format!("rank{rank}-"), devices[rank], attention, ffn, rows)?;
+        }
+    } else {
+        let device = Device { library: &library, id: args.device };
+        let available = library.cuda_memory_info()?.0 as u64;
+        let layout = Step5CacheLayout::new(cfg, 1, rows as u64, 0, rows as u64)?;
+        let cache_bytes = layout.ranks[0].bytes + layout.geometry.ranks[0].persistent_unit_bytes * pages;
+        let staging_bytes = Staging::bytes(&layout, 0)? as u64;
+        let reserved = cache_bytes + staging_bytes + (rows * H * 4) as u64 + (4u64 << 30);
+        ensure!(TargetChain::required_bytes(&programs, checkpoint, 1, rows)? + reserved <= available,
+            "layer-zero old-path allocation admission");
+        let cache = RefCell::new(CacheRank::new(device, layout, 0, 1, 0, pages, cache_bytes as usize)?);
+        let staging = Staging::new(device, &programs, &cache.borrow(), staging_bytes as usize)?;
+        let family = Step5Prefix::new(vec![&cache])?;
+        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?;
+        let mut placement = pool.admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+        let mut chain = TargetChain::load(device, &programs, checkpoint, 1, rows, available, &[reserved])?;
+        let input = Allocation::new(device, rows * H * 4)?;
+        library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?)?;
+        let mut step = Step::begin(vec![&cache], vec![&staging], &mut pool, &mut placement, rows)?;
+        chain.enqueue_step(&mut step, 0, &input, None, 0)?;
+        cache.borrow().stream.drain()?;
+        drop(step);
+        ensure!(placement.committed == 0, "layer-zero diagnostic must not publish state");
+        let attention = chain.diagnostic_layer0()?;
+        dump_plane(directory, "attention_input", device, attention.diagnostic_norm(), rows, true)?;
+        dump_layer0_tail(directory, "", device, attention, attention.diagnostic_dense()?, rows)?;
+    }
+    std::fs::write(directory.join("positions.bin"), (0..rows as u32).flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
+    std::fs::write(directory.join("tokens.bin"), reference.tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+    std::fs::write(metadata, serde_json::to_vec_pretty(&serde_json::json!({
+        "schema": "cuteafd.step5.layer0/1", "rows": rows, "width": H, "dtype": "F32",
+        "byte_order": "little", "positions": "positions.bin", "position_dtype": "U32",
+        "tokens": "tokens.bin", "shared": shared, "window": args.window, "complete": true,
+        "bf16_planes_expanded_losslessly": true, "attention_output": "rounded O projection delta",
+        "ffn_delta": "rounded dense down projection before residual addition", "diagnostic_only": true
+    }))?)?;
+    println!("Step-5 layer-zero boundary diagnostic rows={rows} shared={shared}; no scoring or serving qualification");
+    Ok(())
+}
+
 fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     reference: Reference, layers: &[usize]) -> Result<()> {
     use super::execution::Execution;
@@ -762,8 +892,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
 
 pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     diagnostic_selection(&args)?;
-    let layers = selected_layers()?;
-    selection(args.last_layer, args.peers.len(), &layers, args.nll)?;
+    let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
+    if args.dump_layer0.is_none() { selection(args.last_layer, args.peers.len(), &layers, args.nll)?; }
     ensure!(
         args.snapshot.file_name().and_then(|s| s.to_str()) == Some(FP8_REVISION),
         "Step-5 golden requires pinned native FP8 revision"
@@ -771,6 +901,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
     let reference = reference(&args, cfg.vocab)?;
+    if args.dump_layer0.is_some() { return layer0_run(&args, &checkpoint, &cfg, reference); }
     if args.split_device.is_some() { return split_run(&args, &checkpoint, &cfg, reference, &layers); }
     let Reference { tokens, expected, positions, hidden, final_norm } = reference;
     let reference_kind = if args.fp8_diagnostic_reference { "native-FP8 diagnostic" } else { "BF16-root diagnostic" };
@@ -1013,6 +1144,32 @@ mod tests {
     }
 
     #[test]
+    fn layer_zero_diagnostic_flags_refuse_scoring_peers_and_other_prefixes() -> Result<()> {
+        for split in [None, Some(1)] {
+            let mut args = diagnostic_args(&["--dump-layer0", "/boundary"])?;
+            args.last_layer = 0;
+            args.split_device = split;
+            diagnostic_selection(&args)?;
+            args.last_layer = 1;
+            assert!(diagnostic_selection(&args).is_err());
+            args.last_layer = 0;
+            args.peers.push("127.0.0.1:1".parse()?);
+            assert!(diagnostic_selection(&args).is_err());
+            args.peers.clear();
+            args.nll = true;
+            assert!(diagnostic_selection(&args).is_err());
+        }
+        assert!(diagnostic_args(&["--dump-layer0", "/boundary", "--nll"]).is_err());
+        let mut args = diagnostic_args(&[])?;
+        args.last_layer = 0;
+        assert!(diagnostic_selection(&args).is_err());
+        args.last_layer = 91;
+        args.split_device = Some(1);
+        assert!(diagnostic_selection(&args).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn diagnostic_files_preserve_full_rows_bits_positions_and_head_input() -> Result<()> {
         let root = tempfile::tempdir()?;
         let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0,91"])?;
@@ -1240,6 +1397,7 @@ mod tests {
             save_logits: None,
             dump_residuals: None,
             dump_layers: vec![],
+            dump_layer0: None,
         };
         let Reference { tokens, expected: hidden, .. } = reference(&args, 3)?;
         assert_eq!(tokens, [1]);
@@ -1284,7 +1442,7 @@ mod tests {
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
             peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None, check_headers: true, nll: true, prefix_state: false,
             fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false,
-            save_logits: None, dump_residuals: None, dump_layers: vec![] };
+            save_logits: None, dump_residuals: None, dump_layers: vec![], dump_layer0: None };
         let full = reference(&args, 3)?;
         assert_eq!(full.positions, [1, 3]);
         let targets = full.positions.iter().map(|&p| full.tokens[p]).collect::<Vec<_>>();

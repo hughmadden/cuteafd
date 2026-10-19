@@ -574,10 +574,29 @@ impl<'a> SwaLayer<'a> {
         Ok(self.planes[DELTA].buffer)
     }
 
+    pub(super) fn diagnostic_norm(&self) -> CuteafdDeviceBuffer {
+        self.planes[NORM].buffer
+    }
+
+    pub(super) fn diagnostic_attention(&self) -> [(CuteafdDeviceBuffer, bool); 2] {
+        // In head-split mode NORM holds the once-rounded merged O delta.
+        [(self.planes[if self.heads == 32 { NORM } else { DELTA }].buffer, true),
+            (self.planes[POST].buffer, false)]
+    }
+
+    pub(super) fn diagnostic_dense(&self) -> Result<&DenseFfn<'a>> {
+        self.ffn.as_ref().context("SWA diagnostic requires embedded dense FFN")
+    }
+
     /// Ordered rank0 + rank1 projection, one BF16 narrowing, then F32 residual.
     /// The caller retains the exchange and invokes this on its cache stream.
     pub fn merge_partial_on(&self, rows: usize, values: [*const std::ffi::c_void; 2],
         stream: &Stream<'a>) -> Result<()> {
+        self.merge_partial_capture_on(rows, values, stream, None)
+    }
+
+    pub(super) fn merge_partial_capture_on(&self, rows: usize, values: [*const std::ffi::c_void; 2],
+        stream: &Stream<'a>, capture: Option<(&std::path::Path, usize)>) -> Result<()> {
         ensure!(self.heads == 32 && (1..=self.admission.rows).contains(&rows)
             && values.iter().all(|value| !value.is_null())
             && stream.device.id == self.stream.device.id
@@ -588,6 +607,11 @@ impl<'a> SwaLayer<'a> {
         // attention and is large enough for the rounded hidden-width delta.
         self.launch_on(stream, 11, &[values[0].cast_mut(), values[1].cast_mut(), p(POST)],
             &[Scalar::I32(rows as i32)])?;
+        if let Some((directory, rank)) = capture {
+            stream.drain()?;
+            super::golden::dump_plane(directory, &format!("rank{rank}-merged_o_f32"),
+                stream.device, self.planes[POST].buffer, rows, false)?;
+        }
         stream.device.run(|| {
             // SAFETY: disjoint admitted same-device planes survive cache-stream drainage.
             unsafe { stream.device.library.cuda_f32_to_bf16_async(self.planes[POST].buffer,
