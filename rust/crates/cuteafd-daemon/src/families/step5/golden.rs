@@ -1,4 +1,4 @@
-//! Cold target qualification. Partial prefixes never score logits; no run publishes cache state.
+//! Target diagnostics. Cache publication is confined to the explicit prefix-state check.
 use super::{
     cache::CacheRank,
     chain::TargetChain,
@@ -14,7 +14,7 @@ use crate::shared::{
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
-use cuteafd_engine::prefix::{PrefixCache, PrefixConfig, PrefixFamily};
+use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_loader::{
     plan::{checkpoint::Checkpoint, families::step5::Config},
@@ -63,6 +63,9 @@ pub(crate) struct GoldenArgs {
     /// Score complete embedding-to-logits execution against the pinned BF16 reference.
     #[arg(long)]
     nll: bool,
+    /// Compare real cold/shared-prefix canonical state and an identical continuation.
+    #[arg(long, requires = "nll")]
+    prefix_state: bool,
 }
 
 fn selection(last: usize, peers: usize, hosted: &[usize], nll: bool) -> Result<()> {
@@ -360,6 +363,124 @@ fn link<'a>(
     )
 }
 
+const PREFIX_FRONTIERS: [usize; 5] = [63, 64, 65, 575, 576];
+
+fn prefix_state_bytes(layout: &Step5CacheLayout, rows: usize) -> Result<u64> {
+    ensure!(rows > 576, "Step-5 prefix state check needs at least 577 tokens");
+    let pages = (rows as u64).div_ceil(64).checked_mul(4)
+        .and_then(|n| n.checked_add(4)).context("prefix page capacity overflow")?;
+    layout.ranks[0].bytes.checked_mul(6)
+        .and_then(|n| n.checked_add(layout.geometry.ranks[0].persistent_unit_bytes.checked_mul(pages)?))
+        .and_then(|n| n.checked_add(Staging::bytes(layout, 0).ok()? as u64))
+        .context("prefix state admission overflow")
+}
+
+fn read_buffer(device: Device<'_>, buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<Vec<u8>> {
+    let mut bytes = vec![0; buffer.bytes];
+    device.run(|| device.library.copy_d2h(&mut bytes, buffer))?;
+    Ok(bytes)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CanonicalState {
+    mark: Vec<u8>,
+    pages: Vec<Vec<u8>>,
+}
+
+fn canonical_state(cache: &RefCell<CacheRank<'_>>, placement: &Placement) -> Result<CanonicalState> {
+    let mut owner = cache.borrow_mut();
+    // Slot 2 is reserved for inspection, outside the shared pool's two slots.
+    owner.capture(placement.sequence, 2, placement.committed as u64)?;
+    let device = owner.stream.device;
+    let mark = read_buffer(device, owner.mark_view(2)?)?;
+    let mut pages = Vec::new();
+    for (logical, &physical) in placement.pages.iter().take(placement.committed.div_ceil(64)).enumerate() {
+        let live = (placement.committed - logical * 64).min(64);
+        for plane in owner.page_views(physical)? {
+            let mut bytes = read_buffer(device, plane)?;
+            bytes.truncate(bytes.len() / 64 * live);
+            pages.push(bytes);
+        }
+    }
+    Ok(CanonicalState { mark, pages })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn committed_step<'a>(
+    checkpoint: &Checkpoint, vocab: usize, tokens: &[u32], chain: &mut TargetChain<'a>,
+    cache: &RefCell<CacheRank<'a>>, staging: &Staging<'a>,
+    pool: &mut PrefixCache<StubCopyEngine, Frontier>, placement: &mut Placement,
+    input: &Allocation<'a>, link: &SparkDeviceLink<'a>, waves: usize,
+) -> Result<Vec<u8>> {
+    let device = cache.borrow().stream.device;
+    device.run(|| device.library.copy_h2d(input.buffer, &embedding_rows(checkpoint, tokens, vocab)?))?;
+    link.arm()?;
+    link.expect(waves as u64);
+    let mut step = Step::begin(vec![cache], vec![staging], pool, placement, tokens.len())?;
+    chain.enqueue_step(&mut step, 0, input, Some(link), 0)?;
+    cache.borrow().stream.drain()?;
+    link.check()?;
+    step.publish(tokens.len())?;
+    let mut output = chain.output(91)?;
+    output.bytes = tokens.len() * H * 4;
+    let hidden = read_buffer(device, output)?;
+    ensure!(hidden.chunks_exact(4).all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite()),
+        "nonfinite Step-5 prefix continuation");
+    Ok(hidden)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_prefix_state<'a>(
+    device: Device<'a>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    checkpoint: &Checkpoint, cfg: &Config, tokens: &[u32], chain: &mut TargetChain<'a>,
+    input: &Allocation<'a>, link: &SparkDeviceLink<'a>, waves: usize, available: usize,
+) -> Result<()> {
+    let shape = Step5CacheLayout::new(cfg, 1, tokens.len() as u64, 0, tokens.len() as u64)?;
+    prefix_state_bytes(&shape, tokens.len())?;
+    let pages = tokens.len().div_ceil(64) * 4 + 4;
+    for frontier in PREFIX_FRONTIERS {
+        let cache = RefCell::new(CacheRank::new(device, shape.clone(), 0, 3, 3, pages as u64, available)?);
+        let staging = Staging::new(device, programs, &cache.borrow(), available)?;
+        let family = Step5Prefix::new(vec![&cache])?;
+        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(),
+            PrefixConfig { entries: 1, mark_slots: 2, keep_logits: false, min_tokens: 1 }, None)?;
+        let mut source = pool.admit_cold(&family, frontier, frontier + 1,
+            |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+        committed_step(checkpoint, cfg.vocab, &tokens[..frontier], chain, &cache, &staging,
+            &mut pool, &mut source, input, link, waves)?;
+        let expected = canonical_state(&cache, &source)?;
+        ensure!(pool.capture(&family, SnapshotKind::Prompt, &tokens[..frontier], &source, After::default())?,
+            "Step-5 diagnostic snapshot was not retained");
+        let mut cold = pool.admit_cold(&family, frontier, frontier + 1,
+            |pages| Placement { pages, sequence: 1, committed: 0 })?.placement;
+        committed_step(checkpoint, cfg.vocab, &tokens[..frontier], chain, &cache, &staging,
+            &mut pool, &mut cold, input, link, waves)?;
+        ensure!(expected == canonical_state(&cache, &cold)?,
+            "Step-5 independently cold state differs at {frontier}");
+        let admitted = pool.admit(&family, &tokens[..frontier + 1], frontier + 1, false,
+            |pages| Placement { pages, sequence: 2, committed: 0 })?;
+        ensure!(admitted.resume == frontier && admitted.source.as_ref().is_some_and(|s|
+            !s.partial && s.frontier == frontier && s.plan.exact()),
+            "Step-5 expected deepest exact prefix hit at {frontier}");
+        let mut restored = admitted.placement;
+        ensure!(expected == canonical_state(&cache, &restored)?,
+            "Step-5 restored canonical mark or live CSA rows differ at {frontier}");
+        let cold_hidden = committed_step(checkpoint, cfg.vocab, &tokens[frontier..frontier + 1],
+            chain, &cache, &staging, &mut pool, &mut cold, input, link, waves)?;
+        let restored_hidden = committed_step(checkpoint, cfg.vocab, &tokens[frontier..frontier + 1],
+            chain, &cache, &staging, &mut pool, &mut restored, input, link, waves)?;
+        ensure!(cold_hidden == restored_hidden, "Step-5 continuation hidden bytes differ at {frontier}");
+        ensure!(canonical_state(&cache, &cold)? == canonical_state(&cache, &restored)?,
+            "Step-5 continuation canonical state differs at {frontier}");
+        ensure!(expected == canonical_state(&cache, &source)?,
+            "Step-5 continuation mutated retained source at {frontier}");
+        println!("Step-5 exact-prefix diagnostic frontier={frontier} canonical_mark_bytes={} live_csa_planes={} continuation_rows=1 byte_exact=true (no serving/lossless qualification)", expected.mark.len(), expected.pages.len());
+        for placement in [&source, &cold, &restored] { pool.release(&family, &placement.pages)?; }
+        pool.clear(&family)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     let layers = selected_layers()?;
     selection(args.last_layer, args.peers.len(), &layers, args.nll)?;
@@ -371,6 +492,8 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     let cfg = Config::parse(&checkpoint)?;
     let Reference { tokens, expected, positions } = reference(&args, cfg.vocab)?;
     let rows = tokens.len();
+    ensure!(!args.prefix_state || (args.nll && args.last_layer == 91),
+        "Step-5 prefix state check requires the complete target");
     let layout = Step5CacheLayout::new(&cfg, 1, rows as u64, 0, rows as u64)?;
     if args.check_headers {
         println!("Step-5 headers/reference validated: rows={rows} layers=0..{} TP{}; no CUDA or numerical qualification", args.last_layer, args.peers.len());
@@ -403,9 +526,13 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     let (free, _) = library.cuda_memory_info()?;
     let available = free as u64;
     let pages = (rows as u64).div_ceil(64) + 1;
+    let prefix_bytes = if args.prefix_state {
+        prefix_state_bytes(&layout, rows)?
+    } else { 0 };
     let cache_bytes = layout.ranks[0]
         .bytes
         .checked_add(layout.geometry.ranks[0].persistent_unit_bytes * pages)
+        .and_then(|n| n.checked_add(prefix_bytes))
         .context("golden cache bytes")?;
     let staging_bytes = Staging::bytes(&layout, 0)? as u64;
     let input_bytes = (rows * H * 4) as u64;
@@ -491,6 +618,10 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
         seconds = started.elapsed().as_secs_f64(),
         "Step-5 cold prefix readiness"
     );
+    if args.prefix_state {
+        return check_prefix_state(device, &programs, &checkpoint, &cfg, &tokens,
+            &mut chain, &input, &link, layers.len(), remaining);
+    }
     link.arm()?;
     link.expect(layers.len() as u64);
     let mut step = Step::begin(
@@ -548,6 +679,16 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prefix_state_admits_three_sequences_three_marks_and_cow_pages() -> Result<()> {
+        let layout = super::super::cache::tests::layout_at(640);
+        assert_eq!(PREFIX_FRONTIERS, [63, 64, 65, 575, 576]);
+        assert!(prefix_state_bytes(&layout, 576).is_err());
+        assert_eq!(prefix_state_bytes(&layout, 640)?,
+            layout.ranks[0].bytes * 6 + layout.geometry.ranks[0].persistent_unit_bytes * 44
+                + Staging::bytes(&layout, 0)? as u64);
+        Ok(())
+    }
     #[test]
     fn prefix_scope_requires_exact_real_experts_and_refuses_logits_claims() {
         for world in [4, 6] {
@@ -634,6 +775,7 @@ mod tests {
             device: 0,
             check_headers: true,
             nll: false,
+            prefix_state: false,
         };
         let Reference { tokens, expected: hidden, .. } = reference(&args, 3)?;
         assert_eq!(tokens, [1]);
@@ -676,7 +818,7 @@ mod tests {
         std::fs::write(folder.join("logits.bin"), &logits)?;
         let mut args = GoldenArgs { snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
-            peers: vec![], last_layer: 91, prefill: None, device: 0, check_headers: true, nll: true };
+            peers: vec![], last_layer: 91, prefill: None, device: 0, check_headers: true, nll: true, prefix_state: false };
         let full = reference(&args, 3)?;
         assert_eq!(full.positions, [1, 3]);
         let targets = full.positions.iter().map(|&p| full.tokens[p]).collect::<Vec<_>>();
