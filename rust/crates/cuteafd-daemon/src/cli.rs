@@ -131,6 +131,12 @@ pub(crate) struct FabricArgs {
     /// CUDA device the probe lands in.
     #[arg(long, default_value_t = 0)]
     pub(crate) device: i32,
+    /// Run untimed host-to-device traffic before the landing probe.
+    #[arg(long)]
+    pub(crate) landing_warmup: bool,
+    /// Run the landing probe this many times back to back (at most five).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=5))]
+    pub(crate) landing_repeats: u32,
     /// Also measure GPU<->GPU peer transfers (copy engine, SM pull/push,
     /// pinned-host bounce; one-way, hops and two-way exchanges, eager and
     /// graph-captured) between the two `--p2p-devices`, idle and under
@@ -584,6 +590,23 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fabric_landing_diagnostics_are_bounded_and_opt_in() {
+        use clap::Parser;
+        let super::Commands::Fabric(args) = super::Cli::try_parse_from(["cuteafd", "fabric"]).unwrap().command
+            else { panic!("expected fabric"); };
+        assert!(!args.landing_warmup);
+        assert_eq!(args.landing_repeats, 1);
+        let super::Commands::Fabric(args) = super::Cli::try_parse_from(
+            ["cuteafd", "fabric", "--landing-warmup", "--landing-repeats", "3"]).unwrap().command
+            else { panic!("expected fabric"); };
+        assert!(args.landing_warmup);
+        assert_eq!(args.landing_repeats, 3);
+        for repeats in ["0", "6", "-1"] {
+            assert!(super::Cli::try_parse_from(["cuteafd", "fabric", "--landing-repeats", repeats]).is_err());
+        }
+    }
+
     #[test]
     fn mapped_scale_cap_defaults_to_zero_and_accepts_a_cap() {
         use clap::Parser;

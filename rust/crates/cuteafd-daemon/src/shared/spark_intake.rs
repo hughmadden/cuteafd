@@ -196,6 +196,11 @@ pub(crate) fn probe_h2d(library: &NativeLibrary) -> Result<f64> {
     timed
 }
 
+/// Exercise the copy engine and PCIe link before timing peer writes.
+fn warm_landing_link(library: &NativeLibrary) -> Result<()> {
+    probe_h2d(library).map(|_| ())
+}
+
 fn resolve_landing_probe(setting: &str, probe: &Result<GpuLandingProbe>, h2d: Option<f64>) -> (IntakeMode, String) {
     match probe {
         Err(error) => (IntakeMode::Pinned, format!("GPU landing probe failed: {error:#}")),
@@ -248,10 +253,27 @@ pub(crate) fn transport_mode(library: &NativeLibrary, ranks: usize, capacity: us
     Ok(mode)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LandingPcieLink {
+    generation: Option<u32>,
+    width: Option<u32>,
+}
+
+fn landing_pcie_link(library: &NativeLibrary) -> Option<LandingPcieLink> {
+    let bus = library.cuda_device_pci_bus_id(library.cuda_get_device().ok()?)?;
+    let nvml = cuteafd_ffi::nvml::Nvml::open().ok()?;
+    let devices = nvml.devices().ok()?;
+    let device = devices.iter().find(|device| device.identity.pci_bus_id.trim_start_matches('0')
+        .eq_ignore_ascii_case(bus.trim_start_matches('0')))?;
+    let (generation, width) = device.pcie_link();
+    Some(LandingPcieLink { generation, width })
+}
+
 /// `cuteafd fabric`'s view of GPU landing on one CUDA device.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct FabricLanding {
     pub(crate) cuda_device: i32,
+    pub(crate) pcie_link: Option<LandingPcieLink>,
     pub(crate) probe: Option<GpuLandingProbe>,
     pub(crate) h2d_gbps: Option<f64>,
     pub(crate) error: Option<String>,
@@ -262,7 +284,9 @@ impl FabricLanding {
         match (&self.probe, &self.error) {
             (Some(p), _) if p.usable() => {
                 let (gpu, rates) = gpu_wins(p, self.h2d_gbps);
-                format!("GPU landing (cuda {}, {}): dma-buf ok, loopback {rates}; intake auto: {}",
+                let link = self.pcie_link.as_ref().map(|link| format!("PCIe gen {:?} x{:?}", link.generation, link.width))
+                    .unwrap_or_else(|| "PCIe unknown".into());
+                format!("GPU landing (cuda {}, {}, {link}): dma-buf ok, loopback {rates}; intake auto: {}",
                     self.cuda_device, p.rdma_device, if gpu { "gpu" } else { "pinned" })
             }
             (Some(p), _) => format!("GPU landing (cuda {}): unusable ({}); intake auto: pinned", self.cuda_device,
@@ -276,21 +300,23 @@ impl FabricLanding {
 
 /// Runs the GPU landing probe for `cuteafd fabric` when a native library is
 /// given (or `CUTEAFD_NATIVE_LIB` names one).
-pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32) -> FabricLanding {
+pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, warmup: bool) -> FabricLanding {
     let path = native_lib.map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("CUTEAFD_NATIVE_LIB").map(std::path::PathBuf::from));
-    let result = (|| -> Result<(GpuLandingProbe, Option<f64>)> {
+    let result = (|| -> Result<(GpuLandingProbe, Option<f64>, Option<LandingPcieLink>)> {
         let path = path.context("no native library (pass --native-lib or set CUTEAFD_NATIVE_LIB)")?;
         // SAFETY: a trusted image library, loaded once for this command.
         let library = unsafe { NativeLibrary::load(&path) }?;
         library.cuda_set_device(device)?;
+        if warmup { warm_landing_link(&library)?; }
         let probe = probe_gpu_landing(&library)?;
+        let pcie_link = landing_pcie_link(&library);
         let h2d = probe_h2d(&library).ok();
-        Ok((probe, h2d))
+        Ok((probe, h2d, pcie_link))
     })();
     match result {
-        Ok((probe, h2d_gbps)) => FabricLanding { cuda_device: device, probe: Some(probe), h2d_gbps, error: None },
-        Err(error) => FabricLanding { cuda_device: device, probe: None, h2d_gbps: None, error: Some(format!("{error:#}")) },
+        Ok((probe, h2d_gbps, pcie_link)) => FabricLanding { cuda_device: device, pcie_link, probe: Some(probe), h2d_gbps, error: None },
+        Err(error) => FabricLanding { cuda_device: device, pcie_link: None, probe: None, h2d_gbps: None, error: Some(format!("{error:#}")) },
     }
 }
 

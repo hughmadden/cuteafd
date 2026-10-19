@@ -107,6 +107,8 @@ pub struct Nvml {
     utilization: Option<UtilizationFn>,
     power: Option<PowerFn>,
     power_limit: Option<PowerFn>,
+    pcie_generation: Option<PowerFn>,
+    pcie_width: Option<PowerFn>,
     // Keeps every function pointer above valid; dropped last.
     _library: Library,
 }
@@ -157,6 +159,8 @@ impl Nvml {
             utilization: symbol(&library, b"nvmlDeviceGetUtilizationRates"),
             power: symbol(&library, b"nvmlDeviceGetPowerUsage"),
             power_limit: symbol(&library, b"nvmlDeviceGetEnforcedPowerLimit"),
+            pcie_generation: symbol(&library, b"nvmlDeviceGetCurrPcieLinkGeneration"),
+            pcie_width: symbol(&library, b"nvmlDeviceGetCurrPcieLinkWidth"),
             _library: library,
         };
         // SAFETY: nvmlInit_v2 takes no arguments; a matching nvmlShutdown runs on drop.
@@ -244,6 +248,11 @@ impl NvmlDevice<'_> {
         let mut value: c_uint = 0;
         // SAFETY: `value` is a valid out-pointer.
         (unsafe { call(self.handle, &mut value) } == SUCCESS).then_some(value)
+    }
+
+    /// Current negotiated PCIe generation and lane width, when NVML exposes them.
+    pub fn pcie_link(&self) -> (Option<u32>, Option<u32>) {
+        (self.uint(self.nvml.pcie_generation), self.uint(self.nvml.pcie_width))
     }
 
     /// One reading: temperature, SM clock, power, enforced limit, clock-event reasons and

@@ -219,12 +219,16 @@ async fn run() -> Result<()> {
         Commands::ServeDsv4(args) => families::deepseek_v4::serve::run_serve(args).await,
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;
-            let landing = shared::spark_intake::fabric_probe(args.native_lib.as_deref(), args.device);
+            let landings: Vec<_> = (0..args.landing_repeats).map(|_| {
+                shared::spark_intake::fabric_probe(args.native_lib.as_deref(), args.device, args.landing_warmup)
+            }).collect();
+            let landing = &landings[0];
             let p2p = args.p2p.then(|| shared::peer_probe::run(args.native_lib.as_deref(), &args.p2p_devices,
                 &args.p2p_bytes));
             if args.json {
                 let mut value = serde_json::to_value(&report)?;
-                value["gpu_landing"] = serde_json::to_value(&landing)?;
+                value["gpu_landing"] = serde_json::to_value(landing)?;
+                value["gpu_landing_repeats"] = serde_json::to_value(&landings)?;
                 if let Some(p2p) = &p2p {
                     value["p2p"] = serde_json::to_value(p2p)?;
                 }
@@ -245,7 +249,9 @@ async fn run() -> Result<()> {
                     );
                 }
                 println!("{}", report.summary());
-                println!("{}", landing.summary());
+                for landing in &landings {
+                    println!("{}", landing.summary());
+                }
                 if let Some(p2p) = &p2p {
                     print!("{}", p2p.table());
                 }

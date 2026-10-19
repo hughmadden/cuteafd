@@ -2042,6 +2042,11 @@ impl NativeLibrary {
         Ok(device)
     }
 
+    /// PCI identity of this process's CUDA ordinal (not the NVML index).
+    pub fn cuda_device_pci_bus_id(&self, device: i32) -> Option<String> {
+        cuda_runtime::device_pci_bus_id(device)
+    }
+
     /// Host-thread-local selection. Restore the previous device before yielding.
     pub fn cuda_set_device(&self, device: i32) -> Result<()> {
         let call: Symbol<unsafe extern "C" fn(i32) -> CuteafdStatus> =
