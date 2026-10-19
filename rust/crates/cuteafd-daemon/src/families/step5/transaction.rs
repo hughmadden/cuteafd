@@ -52,6 +52,7 @@ pub(super) struct Staging<'a> {
     ring_table: Allocation<'a>,
     page_table: Allocation<'a>,
     table_width: usize,
+    sequences: usize,
 }
 
 pub(super) struct StepInputs<'s, 'a> {
@@ -75,10 +76,27 @@ pub(super) struct AttentionRead<'s, 'a> {
     pub pages: usize,
 }
 
+// Every sequence can prepend seven committed CSA rows. Keep each prefix
+// disjoint until acceptance, while compressor scratch is reused in stream order.
+fn retained_wave_rows(rows: usize, sequences: usize) -> Result<usize> {
+    ensure!(rows > 0 && sequences > 0, "Step-5 staging requires rows and sequences");
+    rows.checked_add(sequences.min(rows).checked_mul(7)
+        .context("Step-5 retained pending rows overflow")?)
+        .context("Step-5 retained wave rows overflow")
+}
+
 impl<'a> Staging<'a> {
     pub fn bytes(
         layout: &cuteafd_loader::serving_capacity::step5::Step5CacheLayout,
         rank: usize,
+    ) -> Result<usize> {
+        Self::bytes_for_sequences(layout, rank, 1)
+    }
+
+    pub(super) fn bytes_for_sequences(
+        layout: &cuteafd_loader::serving_capacity::step5::Step5CacheLayout,
+        rank: usize,
+        sequences: usize,
     ) -> Result<usize> {
         let layers = layout
             .ranks
@@ -86,10 +104,9 @@ impl<'a> Staging<'a> {
             .context("Step-5 staging rank")?
             .regions
             .len();
-        let rows = usize::try_from(layout.ring.step)?
-            .checked_add(7)
-            .context("Step-5 staging rows")?;
-        let regions = rows / 8;
+        let step = usize::try_from(layout.ring.step)?;
+        let rows = retained_wave_rows(step, sequences)?;
+        let regions = (step + 7) / 8;
         let metadata = regions
             .checked_mul(4)
             .context("Step-5 region metadata overflow")?
@@ -98,7 +115,6 @@ impl<'a> Staging<'a> {
             .checked_mul(256 * 4)
             .context("Step-5 region scratch overflow")?
             .max(256);
-        let step = usize::try_from(layout.ring.step)?;
         let table = usize::try_from(layout.context.div_ceil(64))?
             .checked_mul(4)
             .context("Step-5 attention table overflow")?
@@ -109,7 +125,7 @@ impl<'a> Staging<'a> {
             .and_then(|n| n.checked_add(if layers == 0 { 0 } else { scratch }))
             .and_then(|n| n.checked_add(step.checked_mul(8)?.max(256)))
             .and_then(|n| n.checked_add(step.checked_mul(4)?.max(256)))
-            .and_then(|n| n.checked_add(table.checked_mul(2)?))
+            .and_then(|n| n.checked_add(table.checked_mul(sequences.checked_add(1)?)?))
             .context("Step-5 staging bytes overflow")
     }
 
@@ -119,7 +135,19 @@ impl<'a> Staging<'a> {
         cache: &CacheRank<'a>,
         available: usize,
     ) -> Result<Self> {
-        let bytes = Self::bytes(cache.layout(), cache.rank())?;
+        Self::new_for_sequences(device, programs, cache, available, 1)
+    }
+
+    pub(super) fn new_for_sequences(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        cache: &CacheRank<'a>,
+        available: usize,
+        sequences: usize,
+    ) -> Result<Self> {
+        ensure!(sequences <= usize::try_from(cache.sequences())?,
+            "Step-5 staging sequence capacity exceeds cache admission");
+        let bytes = Self::bytes_for_sequences(cache.layout(), cache.rank(), sequences)?;
         ensure!(
             device.id == cache.stream.device.id
                 && std::ptr::eq(device.library, cache.stream.device.library),
@@ -130,6 +158,7 @@ impl<'a> Staging<'a> {
             "Step-5 staging needs {bytes} bytes, admitted only {available}"
         );
         let rows = usize::try_from(cache.layout().ring.step)?;
+        let retained = retained_wave_rows(rows, sequences)?;
         let regions = (rows + 7) / 8;
         let sparse = if cache.layout().ranks[cache.rank()].regions.is_empty() { None } else {
             let spec = programs.spec("step5_region_compress")?;
@@ -150,8 +179,8 @@ impl<'a> Staging<'a> {
             .iter()
             .map(|_| {
                 Ok((
-                    Allocation::new(device, (rows + 7) * 256 * 2)?,
-                    Allocation::new(device, (rows + 7) * 256 * 2)?,
+                    Allocation::new(device, retained * 256 * 2)?,
+                    Allocation::new(device, retained * 256 * 2)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -165,8 +194,9 @@ impl<'a> Staging<'a> {
             positions: Allocation::new(device, (rows * 8).max(256))?,
             requests: Allocation::new(device, (rows * 4).max(256))?,
             ring_table: Allocation::new(device, (table_width * 4).max(256))?,
-            page_table: Allocation::new(device, (table_width * 4).max(256))?,
+            page_table: Allocation::new(device, (table_width * 4).max(256) * sequences)?,
             table_width,
+            sequences,
             rows,
             regions,
             bytes,
@@ -964,6 +994,25 @@ pub(super) mod tests {
         assert!(validate_wave(&[valid], &wrong_rows, 2, 16, 192, 8).is_err());
         let parity = RefPagePool::parity(8, 64, 0);
         assert!(validate_wave(&[valid], &parity, 2, 16, 192, 8).is_err());
+    }
+
+    #[test]
+    fn staging_wave_admission_retains_each_pending_prefix_and_page_table() {
+        for rows in [1usize, 16, 64, 513, 4096] {
+            let layout = super::super::cache::tests::layout_for(8192, 2, 0, rows as u64);
+            let single = Staging::bytes(&layout, 0).unwrap();
+            let table = (8192usize.div_ceil(64) * 4).max(256);
+            for sequences in [1usize, 2, 4, 16, 64] {
+                let retained = rows + 7 * sequences.min(rows);
+                assert_eq!(retained_wave_rows(rows, sequences).unwrap(), retained);
+                let extra_raw = (retained - (rows + 7)) * 512 * 2 * 23;
+                assert_eq!(Staging::bytes_for_sequences(&layout, 0, sequences).unwrap(),
+                    single + extra_raw + table * (sequences - 1));
+            }
+        }
+        for (rows, sequences) in [(0, 1), (1, 0), (usize::MAX, 1), (usize::MAX, usize::MAX)] {
+            assert!(retained_wave_rows(rows, sequences).is_err());
+        }
     }
 
     #[test]
