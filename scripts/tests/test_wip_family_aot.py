@@ -281,6 +281,9 @@ def test_step5_bf16_input_sibling_is_allowed_in_wip(tmp_path):
     config = config_file(tmp_path, 'step5', 'Step-5-Preview', 6)
     output = dry_run(tmp_path, config, {'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES': 'step5'})
     assert 'WIP AOT scopes (step5)' in output
+    # Derived without the environment, and the derived value reaches the build (#516).
+    derived = dry_run(tmp_path, config)
+    assert 'FP8 BF16-input siblings: step5' in derived
     wip = (ROOT / 'wip.sh').read_text()
     pattern = wip.split("bf16_family_pattern='^(", 1)[1].split(')', 1)[0]
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
