@@ -264,7 +264,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         let native = owners.lanes.pop().context("Step-5 admitted native lane missing")?;
         ensure!(owners.lanes.is_empty(), "Step-5 one-lane binding received extra workspaces");
         let native_ranks = std::array::from_fn(|rank| RankDevice { device: devices[rank].id,
-            stream: caches[rank].borrow().stream.raw });
+            stream: stages[rank].stream.raw });
         let peer = devices[0].run(|| PeerExchange::new_abortable(devices[0].library, native_ranks, 8, rows * H * 4))?;
         let mut hops = devices[0].run(|| HopLink::new(devices[0].library, native_ranks,
             ownership.execution().hops(), ownership.execution().spec()))?;
@@ -358,7 +358,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                     request: super::golden::request, layer: 0, diagnostic: Some(directory) };
                 binding.heads(0)?;
                 binding.ffn(0, None)?;
-                for cache in &self.caches { cache.borrow().stream.drain()?; }
+                for stage in &self.stages { stage.stream.drain()?; }
                 Ok(())
             })
         })
@@ -421,7 +421,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                 let mut bindings = [Bindings { execution: self, step, scope, current: [None, None], input: input.buffer, request, layer: 0, diagnostic: None }];
                 attention::layer_pipeline(scope, self.ownership.execution(), &self.peer, &self.hops,
                     LaneOrder::Independent, &[self.rows], &mut bindings)?;
-                for cache in &self.caches { cache.borrow().stream.drain()?; }
+                for stage in &self.stages { stage.stream.drain()?; }
                 Ok(())
             })
         })
@@ -484,7 +484,7 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
         if let Some(directory) = self.diagnostic {
             // Capture before merge reuses the normalized input plane.
             for rank in 0..2 {
-                self.execution.caches[rank].borrow().stream.drain()?;
+                self.execution.stages[rank].stream.drain()?;
                 let (owner, _) = self.execution.diagnostic_layer0(rank)?;
                 let device = self.execution.caches[rank].borrow().stream.device;
                 super::golden::dump_plane(directory, &format!("rank{rank}-attention_input"), device,

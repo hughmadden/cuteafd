@@ -564,7 +564,7 @@ fn canonical_state(cache: &RefCell<CacheRank<'_>>, placement: &Placement) -> Res
 fn committed_step<'a>(
     checkpoint: &Checkpoint, vocab: usize, tokens: &[u32], chain: &mut TargetChain<'a>,
     cache: &RefCell<CacheRank<'a>>, staging: &Staging<'a>,
-    pool: &mut PrefixCache<StubCopyEngine, Frontier>, placement: &mut Placement,
+    pool: &RefCell<PrefixCache<StubCopyEngine, Frontier>>, placement: &mut Placement,
     input: &Allocation<'a>, link: &SparkDeviceLink<'a>, waves: usize,
 ) -> Result<Vec<u8>> {
     let device = cache.borrow().stream.device;
@@ -573,7 +573,7 @@ fn committed_step<'a>(
     link.expect(waves as u64);
     let mut step = Step::begin(vec![cache], vec![staging], pool, placement, tokens.len())?;
     chain.enqueue_step(&mut step, 0, input, Some(link), 0)?;
-    cache.borrow().stream.drain()?;
+    cache.borrow().drain()?;
     link.check()?;
     step.publish(tokens.len())?;
     let mut output = chain.output(91)?;
@@ -597,22 +597,22 @@ fn check_prefix_state<'a>(
         let cache = RefCell::new(CacheRank::new(device, shape.clone(), 0, 3, 3, pages as u64, available)?);
         let staging = Staging::new(device, programs, &cache.borrow(), available)?;
         let family = Step5Prefix::new(vec![&cache])?;
-        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(),
-            PrefixConfig { entries: 1, mark_slots: 2, keep_logits: false, min_tokens: 1 }, None)?;
-        let mut source = pool.admit_cold(&family, frontier, frontier + 1,
+        let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(),
+            PrefixConfig { entries: 1, mark_slots: 2, keep_logits: false, min_tokens: 1 }, None)?);
+        let mut source = pool.borrow_mut().admit_cold(&family, frontier, frontier + 1,
             |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         committed_step(checkpoint, cfg.vocab, &tokens[..frontier], chain, &cache, &staging,
-            &mut pool, &mut source, input, link, waves)?;
+            &pool, &mut source, input, link, waves)?;
         let expected = canonical_state(&cache, &source)?;
-        ensure!(pool.capture(&family, SnapshotKind::Prompt, &tokens[..frontier], &source, After::default())?,
+        ensure!(pool.borrow_mut().capture(&family, SnapshotKind::Prompt, &tokens[..frontier], &source, After::default())?,
             "Step-5 diagnostic snapshot was not retained");
-        let mut cold = pool.admit_cold(&family, frontier, frontier + 1,
+        let mut cold = pool.borrow_mut().admit_cold(&family, frontier, frontier + 1,
             |pages| Placement { pages, sequence: 1, committed: 0 })?.placement;
         committed_step(checkpoint, cfg.vocab, &tokens[..frontier], chain, &cache, &staging,
-            &mut pool, &mut cold, input, link, waves)?;
+            &pool, &mut cold, input, link, waves)?;
         ensure!(expected == canonical_state(&cache, &cold)?,
             "Step-5 independently cold state differs at {frontier}");
-        let admitted = pool.admit(&family, &tokens[..frontier + 1], frontier + 1, false,
+        let admitted = pool.borrow_mut().admit(&family, &tokens[..frontier + 1], frontier + 1, false,
             |pages| Placement { pages, sequence: 2, committed: 0 })?;
         ensure!(admitted.resume == frontier && admitted.source.as_ref().is_some_and(|s|
             !s.partial && s.frontier == frontier && s.plan.exact()),
@@ -621,17 +621,17 @@ fn check_prefix_state<'a>(
         ensure!(expected == canonical_state(&cache, &restored)?,
             "Step-5 restored canonical mark or live CSA rows differ at {frontier}");
         let cold_hidden = committed_step(checkpoint, cfg.vocab, &tokens[frontier..frontier + 1],
-            chain, &cache, &staging, &mut pool, &mut cold, input, link, waves)?;
+            chain, &cache, &staging, &pool, &mut cold, input, link, waves)?;
         let restored_hidden = committed_step(checkpoint, cfg.vocab, &tokens[frontier..frontier + 1],
-            chain, &cache, &staging, &mut pool, &mut restored, input, link, waves)?;
+            chain, &cache, &staging, &pool, &mut restored, input, link, waves)?;
         ensure!(cold_hidden == restored_hidden, "Step-5 continuation hidden bytes differ at {frontier}");
         ensure!(canonical_state(&cache, &cold)? == canonical_state(&cache, &restored)?,
             "Step-5 continuation canonical state differs at {frontier}");
         ensure!(expected == canonical_state(&cache, &source)?,
             "Step-5 continuation mutated retained source at {frontier}");
         println!("Step-5 exact-prefix diagnostic frontier={frontier} canonical_mark_bytes={} live_csa_planes={} continuation_rows=1 byte_exact=true (no serving/lossless qualification)", expected.mark.len(), expected.pages.len());
-        for placement in [&source, &cold, &restored] { pool.release(&family, &placement.pages)?; }
-        pool.clear(&family)?;
+        for placement in [&source, &cold, &restored] { pool.borrow_mut().release(&family, &placement.pages)?; }
+        pool.borrow_mut().clear(&family)?;
     }
     Ok(())
 }
@@ -725,13 +725,13 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let stages = [Staging::new(devices[0], &programs, &caches[0].borrow(), stage_bytes[0] as usize)?,
             Staging::new(devices[1], &programs, &caches[1].borrow(), stage_bytes[1] as usize)?];
         let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
-        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?;
-        let mut placement = pool.admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+        let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
+        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let execution = Execution::load_count(&programs, checkpoint, ownership, [&caches[0], &caches[1]],
             [&stages[0], &stages[1]], rows, available, reservations, [None, None], 1)?;
         let input = Allocation::new(devices[0], rows * H * 4)?;
         devices[0].run(|| library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?))?;
-        let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &mut pool, &mut placement, rows)?;
+        let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
         execution.enqueue_layer0(&mut step, &input, directory)?;
         drop(step);
         ensure!(placement.committed == 0, "layer-zero diagnostic must not publish state");
@@ -751,14 +751,14 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let cache = RefCell::new(CacheRank::new(device, layout, 0, 1, 0, pages, cache_bytes as usize)?);
         let staging = Staging::new(device, &programs, &cache.borrow(), staging_bytes as usize)?;
         let family = Step5Prefix::new(vec![&cache])?;
-        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?;
-        let mut placement = pool.admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+        let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
+        let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let mut chain = TargetChain::load(device, &programs, checkpoint, 1, rows, available, &[reserved])?;
         let input = Allocation::new(device, rows * H * 4)?;
         library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?)?;
-        let mut step = Step::begin(vec![&cache], vec![&staging], &mut pool, &mut placement, rows)?;
+        let mut step = Step::begin(vec![&cache], vec![&staging], &pool, &mut placement, rows)?;
         chain.enqueue_step(&mut step, 0, &input, None, 0)?;
-        cache.borrow().stream.drain()?;
+        cache.borrow().drain()?;
         drop(step);
         ensure!(placement.committed == 0, "layer-zero diagnostic must not publish state");
         let attention = chain.diagnostic_layer0()?;
@@ -840,16 +840,16 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         lanes[rank] = Some(devices[rank].own(|| SparkLane::new(&library, world, args.peers.clone(), rows as u32, config.clone(), H * 2))?);
     }
     let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
-    let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), PrefixConfig {
-        entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?;
-    let mut placement = pool.admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+    let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), PrefixConfig {
+        entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?);
+    let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
     let execution = Execution::load(&programs, checkpoint, ownership, [&caches[0], &caches[1]],
         [&stages[0], &stages[1]], rows, available, reservations, lanes)?;
     let head = execution.head()?;
     let input = Allocation::new(devices[0], rows * H * 4)?;
     devices[0].run(|| library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?))?;
     tracing::info!(seconds=started.elapsed().as_secs_f64(), "Step-5 shared one-lane readiness");
-    let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &mut pool, &mut placement, rows)?;
+    let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
     execution.enqueue(&mut step, &input, request)?;
     drop(step);
     ensure!(placement.committed == 0, "Step-5 shared cold golden must not publish state");
@@ -993,7 +993,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     let cache = RefCell::new(CacheRank::new(device, layout, 0, 1, 0, pages, remaining)?);
     let staging = Staging::new(device, &programs, &cache.borrow(), remaining)?;
     let family = Step5Prefix::new(vec![&cache])?;
-    let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(
+    let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(
         family.layout(),
         PrefixConfig {
             entries: 0,
@@ -1002,8 +1002,8 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
             min_tokens: 1,
         },
         None,
-    )?;
-    let mut placement = pool
+    )?);
+    let mut placement = pool.borrow_mut()
         .admit_cold(&family, 1, 1, |pages| Placement {
             pages,
             sequence: 0,
@@ -1039,12 +1039,12 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     let mut step = Step::begin(
         vec![&cache],
         vec![&staging],
-        &mut pool,
+        &pool,
         &mut placement,
         rows,
     )?;
     chain.enqueue_step(&mut step, 0, &input, Some(&link), 0)?;
-    cache.borrow().stream.drain()?;
+    cache.borrow().drain()?;
     link.check()?;
     drop(step);
     ensure!(

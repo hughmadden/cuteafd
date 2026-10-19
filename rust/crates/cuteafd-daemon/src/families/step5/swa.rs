@@ -1239,7 +1239,7 @@ mod tests {
         let owner = RefCell::new(CacheRank::new(device, layout, 0, 1, 2, 40, usize::MAX)?);
         let staging = Staging::new(device, &programs, &owner.borrow(), usize::MAX)?;
         let family = Step5Prefix::new(vec![&owner])?;
-        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(
+        let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(
             family.layout(),
             PrefixConfig {
                 entries: 0,
@@ -1248,8 +1248,8 @@ mod tests {
                 min_tokens: 1,
             },
             None,
-        )?;
-        let mut placement = pool
+        )?);
+        let mut placement = pool.borrow_mut()
             .admit_cold(&family, 1, 1, |pages| Placement {
                 pages,
                 sequence: 0,
@@ -1271,7 +1271,7 @@ mod tests {
                 let mut step = Step::begin(
                     vec![&owner],
                     vec![&staging],
-                    &mut pool,
+                    &pool,
                     &mut placement,
                     rows,
                 )?;
@@ -1294,7 +1294,7 @@ mod tests {
                 })?;
                 step.stage(0, 0, &chain.planes[KPAGES], &chain.planes[VPAGES], None)?;
                 step.attend(0, 0, &chain, |layer, read| layer.read_on(read))?;
-                owner.borrow().stream.drain()?;
+                owner.borrow().drain()?;
                 ensure!(
                     read(&chain, chain.planes[ATTN].buffer, rows * Q * 2)?
                         == expected[base * Q * 2..end * Q * 2],
@@ -1312,20 +1312,20 @@ mod tests {
                 }
             }
         }
-        pool.release(&family, &placement.pages)?;
+        pool.borrow_mut().release(&family, &placement.pages)?;
         // Exercise the production projection/staging/read entry, not just borrowed producers.
         device.run(|| library.copy_h2d(chain.input(), &residual[..64 * H * 4]))?;
         chain.enqueue(64)?;
         chain.stream.drain()?;
         let eager = read(&chain, chain.output(), 64 * H * 4)?;
-        let mut placement = pool
+        let mut placement = pool.borrow_mut()
             .admit_cold(&family, 1, 1, |pages| Placement {
                 pages,
                 sequence: 0,
                 committed: 0,
             })?
             .placement;
-        let mut step = Step::begin(vec![&owner], vec![&staging], &mut pool, &mut placement, 64)?;
+        let mut step = Step::begin(vec![&owner], vec![&staging], &pool, &mut placement, 64)?;
         chain.enqueue_step(&mut step, 0)?;
         stage_other_layers(&mut step, 0, &key, &value, &ik, &iz)?;
         step.publish(64)?;
@@ -1333,7 +1333,7 @@ mod tests {
             read(&chain, chain.output(), eager.len())? == eager,
             "SWA production enqueue differs"
         );
-        pool.release(&family, &placement.pages)?;
+        pool.borrow_mut().release(&family, &placement.pages)?;
         let lane = chain.new_lane()?;
         ensure!(std::rc::Rc::ptr_eq(&chain.immutable, &lane.immutable)
             && chain.stream.raw != lane.stream.raw
