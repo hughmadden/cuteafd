@@ -45,9 +45,36 @@ def count_objects(geometry, worlds, intermediate, unit=128):
     schedules = {(p[1], capacity, name) for p in profiles for capacity in capacities
                  for name, _ in pack.decode_schedule_variants(geometry, 'spark', p[0], capacity)}
     after = 2 * (len(classes) * len(capacities) + len(schedules))
+    per_world = {world: {intermediate // unit // world * unit,
+                        ((intermediate // unit + world - 1) // world) * unit}
+                 for world in worlds}
+    full_schedules = {(world, width, capacity, name)
+                      for world, widths in per_world.items() for width in widths for capacity in capacities
+                      for name, _ in pack.decode_schedule_variants(
+                          geometry, 'spark', f'tp{world}-width{width}', capacity)}
+    shared_schedules = {(width, capacity, name) for _, width, capacity, name in full_schedules}
+    full_before = 2 * (sum(map(len, per_world.values())) * len(capacities) + len(full_schedules))
+    full_after = 2 * (len(classes) * len(capacities) + len(shared_schedules))
     return dict(before_objects=before, after_objects=after, width_columns=classes,
+                full_range_count_keyed_objects=full_before,
+                full_range_width_keyed_objects=full_after,
                 current_covered_worlds=sorted({int(p[0].split('-')[0][2:]) for p in profiles}),
                 proposed_worlds=sorted(worlds), capacities=capacities)
+
+
+def count_layout_keys(counts):
+    """Exact ABI/unit/width key counts; not mixed-format CUDA object counts."""
+    per_world = {row['sparks']: {('padded' if row['padded'] else 'compact',
+                                row['unit_columns'], width * row['unit_columns'])
+                               for width in row['units_per_expert']}
+                 for row in counts if row['sparks']}
+    union = set().union(*per_world.values()) if per_world else set()
+    baseline = set().union(*(keys for n, keys in per_world.items() if n not in (5, 7, 8)))
+    return dict(worlds=sorted(per_world), count_keyed_jobs=sum(map(len, per_world.values())),
+                width_keyed_jobs=len(union), keys=sorted(union),
+                added_keys_5_7_8=len(union - baseline),
+                keys_for_5_7_8={str(n): sorted(keys - baseline) for n, keys in per_world.items()
+                                 if n in (5, 7, 8)})
 
 
 def test_width_class_count_is_not_rank_count():
@@ -60,6 +87,21 @@ def test_width_class_count_is_not_rank_count():
     assert full['width_columns'] == [256, 384, 512, 640, 768, 1024, 2048]
     assert full['after_objects'] == 84
     assert full['before_objects'] == 108  # current exporter stops at TP6
+    assert full['full_range_count_keyed_objects'] == 144
+    assert full['full_range_width_keyed_objects'] == 84
+    for world in (5, 7, 8):
+        smaller = count_objects('glm', set(range(1, 9)) - {world}, 2048)
+        assert smaller['full_range_width_keyed_objects'] == 84
+
+
+def test_layout_key_counts_keep_padded_abi_and_units_distinct():
+    counts = [dict(sparks=n, padded=False, unit_columns=128, units_per_expert=widths)
+              for n, widths in [(1, [16]), (2, [8]), (3, [5, 6]), (4, [4]),
+                                (5, [3, 4]), (6, [2, 3]), (7, [2, 3]), (8, [2])]]
+    result = count_layout_keys(counts)
+    assert (result['count_keyed_jobs'], result['width_keyed_jobs'], result['added_keys_5_7_8']) == (12, 7, 0)
+    counts.append(dict(sparks=9, padded=True, unit_columns=128, units_per_expert=[2]))
+    assert count_layout_keys(counts)['width_keyed_jobs'] == 8
 
 
 def test_previous_release_exl3_count_enumeration(record_property):
@@ -80,9 +122,13 @@ def test_previous_release_exl3_count_enumeration(record_property):
 def test_whole_matrix_exl3_count_enumeration(record_property):
     entries = json.loads(Path(os.environ['CUTEAFD_SPARK_RANGE_MATRIX']).read_text())
     results = {}
+    keys = []
     for entry in entries:
         for column in entry.get('columns', []):
             package = column['package'].split()[0]
+            keys.append(dict(model=entry['model'], package=package, rtx_gpus=column['rtx_gpus'],
+                             geometric_minimum=(column.get('range') or {}).get('minimum'),
+                             policy_only=column.get('range') is None, **count_layout_keys(column['counts'])))
             if ':exl3' not in package:
                 continue
             geometry = package.split(':')[0]
@@ -91,6 +137,7 @@ def test_whole_matrix_exl3_count_enumeration(record_property):
             results[str(key)] = count_objects(geometry, worlds, column['intermediate'], column['unit_columns'])
     assert results
     record_property('matrix_exl3_export_objects', json.dumps(results))
+    record_property('matrix_export_keys', json.dumps(keys))
     output = os.environ.get('CUTEAFD_SPARK_RANGE_EXPORT_RESULTS')
     if output:
-        Path(output).write_text(json.dumps(results, indent=2) + '\n')
+        Path(output).write_text(json.dumps(dict(exl3_objects=results, layout_keys=keys), indent=2) + '\n')
