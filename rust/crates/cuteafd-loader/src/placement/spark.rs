@@ -383,6 +383,9 @@ mod tests {
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
         let dir = tempfile::tempdir().unwrap();
         let mut config = mimo_flash_config();
+        config["num_hidden_layers"] = 3.into();
+        config["hybrid_layer_pattern"] = serde_json::json!([0, 1, 1]);
+        config["moe_layer_freq"] = serde_json::json!([0, 1, 1]);
         config["n_routed_experts"] = 2.into();
         config["num_experts_per_tok"] = 1.into();
         let mut tensors = Vec::new();
