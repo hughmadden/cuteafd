@@ -1228,6 +1228,8 @@ def main(argv=None):
     parser.add_argument('--wait', type=float, default=float(os.environ.get('CUTEAFD_HW_LOCK_WAIT_S', 21600)))
     parser.add_argument('--preflight', default='', help='shell check before enqueue and at grant (as hwlock)')
     parser.add_argument('--preflight-timeout', type=float, default=300)
+    parser.add_argument('--preflight-at-grant', action='store_true',
+                        help='run --preflight only once the locks are granted (free-memory floors and the like)')
     parser.add_argument('--compare-logits', action='append', default=[], metavar='A:B')
     parser.add_argument('--vocab', type=int, help='logits row width (default: the checkpoint config.json vocab_size)')
     parser.add_argument('--overwrite', action='store_true', help='replace an earlier golden/ of this task')
@@ -1260,7 +1262,8 @@ def main(argv=None):
                 raise ValueError('task and arm names make a container name over 128 characters')
         state['slots'] = preflight(state, arms, at_grant=False)
         state['serving_args'] = serving_args()
-        hwlock.check_preflight(args.preflight, args.preflight_timeout)
+        if not args.preflight_at_grant:
+            hwlock.check_preflight(args.preflight, args.preflight_timeout)
     except (ValueError, OSError, subprocess.SubprocessError, hwlock.PreflightFailed) as error:
         print(f'golden-run: {error}', file=sys.stderr)
         return 78 if isinstance(error, hwlock.PreflightFailed) else 2
@@ -1307,7 +1310,8 @@ def main(argv=None):
             body()  # an enclosing hwlock already holds our locks
         else:
             with hwlock.hold(state['locks'], args.wait, f'golden-run {args.task}', preflight=args.preflight,
-                             preflight_timeout=args.preflight_timeout):
+                             preflight_timeout=args.preflight_timeout,
+                             preflight_at_grant_only=args.preflight_at_grant):
                 body()
     except hwlock.PreflightFailed as error:
         print(f'golden-run: {error}', file=sys.stderr)
