@@ -19,6 +19,22 @@ fn tile_width(max_length: usize, bucket: usize) -> usize {
     max_length.max(1).div_ceil(bucket).saturating_mul(bucket).min(WIDTH)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ScoreGroup {
+    request: usize,
+    offset: usize,
+    rows: usize,
+    binding: [usize; 10],
+}
+
+fn extend_score_groups(groups: &mut Vec<ScoreGroup>, request: usize, rows: usize, binding: [usize; 10]) {
+    if let Some(last) = groups.last_mut() {
+        if last.binding == binding { last.rows += rows; return; }
+    }
+    let offset = groups.last().map_or(0, |last| last.offset + last.rows);
+    groups.push(ScoreGroup { request, offset, rows, binding });
+}
+
 pub(crate) struct SelectionRequest<'a> {
     pub proposal: &'a IndexProposal<'a>,
     /// Increasing query token positions, in the query producer's row order.
@@ -291,6 +307,7 @@ impl<'a> IndexSelectionWave<'a> {
         &self,
         query: &IndexQueryOutput<'_>,
         requests: &[SelectionRequest<'_>],
+        groups: &[ScoreGroup],
         shared: Option<&IndexSelectionOutput<'_>>,
         rows: usize,
         tiles: usize,
@@ -324,18 +341,19 @@ impl<'a> IndexSelectionWave<'a> {
                         stream,
                     )?;
                 }
-                let mut offset = 0;
-                for request in requests {
-                    let n = request.positions.len();
-                    let p = request.proposal;
+                for group in groups {
+                    let (offset, n) = (group.offset, group.rows);
+                    let p = requests[group.request].proposal;
+                    let slots = p.cache.pool_rows.bytes / 8;
+                    let stride = p.cache.pool_pages.bytes / (slots * 4);
                     self.score.execute_overlay(
                         slice(query.packed, offset * 2048, n * 2048),
                         slice(query.scales, offset * 128, n * 128),
                         slice(query.head_weights, offset * 64, n * 64),
                         p.cache.packed,
                         p.cache.scales,
-                        p.cache.device_pages,
-                        p.cache.device_rows,
+                        p.cache.pool_pages,
+                        p.cache.pool_rows,
                         slice(self.b(0), offset * 48, n * 48),
                         slice(self.b(3), offset * width * 8, n * width * 8),
                         slice(self.b(4), offset * width * 4, n * width * 4),
@@ -344,12 +362,11 @@ impl<'a> IndexSelectionWave<'a> {
                         p.capacity,
                         n,
                         width,
-                        1,
-                        p.cache.device_pages.bytes / 4,
+                        slots,
+                        stride,
                         p.cache.packed.bytes / 64,
                         stream,
                     )?;
-                    offset += n;
                 }
                 self.top.update(
                     self.b(4),
@@ -472,6 +489,7 @@ impl<'a> IndexSelectionWave<'a> {
             query.head_weights.ptr as usize,
         ];
         let mut metadata = Vec::with_capacity(rows);
+        let mut groups = Vec::new();
         for (i, r) in requests.iter().enumerate() {
             ensure!(
                 !r.positions.is_empty() && r.positions.windows(2).all(|x| x[0] < x[1]),
@@ -495,24 +513,34 @@ impl<'a> IndexSelectionWave<'a> {
                 "selection state owner differs"
             );
             let p = r.proposal;
-            fingerprint.extend([
-                r.positions.len(),
+            ensure!(p.cache.pool_rows.bytes > 0 && p.cache.slot < p.cache.pool_rows.bytes / 8
+                && p.cache.pool_pages.bytes == (p.cache.pool_rows.bytes / 8) * p.cache.device_pages.bytes,
+                "index pool table geometry differs");
+            extend_score_groups(&mut groups, i, r.positions.len(), [
                 p.cache.packed.ptr as usize,
                 p.cache.scales.ptr as usize,
-                p.cache.device_pages.ptr as usize,
-                p.cache.device_rows.ptr as usize,
-                p.cache.device_pages.bytes,
+                p.cache.pool_pages.ptr as usize,
+                p.cache.pool_rows.ptr as usize,
+                p.cache.pool_pages.bytes,
+                p.cache.pool_rows.bytes,
                 p.cache.packed.bytes,
                 p.packed.ptr as usize,
                 p.scales.ptr as usize,
                 p.capacity,
             ]);
             for &position in r.positions {
-                let m = p.metadata(position)?;
+                let mut m = p.metadata(position)?;
+                m[0] = p.cache.slot as u64;
                 max_length = max_length.max(m[1]);
                 metadata.push(m);
                 bindings.push((p.binding(), position));
             }
+        }
+        // Request partitions and slots live in per-row metadata, not executable
+        // geometry. Only distinct proposal/table owners require another launch.
+        for group in &groups {
+            fingerprint.push(group.rows);
+            fingerprint.extend(group.binding);
         }
         if query.origin().is_some() {
             ensure!(
@@ -577,7 +605,7 @@ impl<'a> IndexSelectionWave<'a> {
                     .cuda_graph_begin_capture(self.stream.raw)?;
             }
             let launched = unsafe {
-                self.enqueue(query, requests, shared, rows, tiles, width, use_candidates)
+                self.enqueue(query, requests, &groups, shared, rows, tiles, width, use_candidates)
             };
             let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
             match (launched, captured) {
@@ -600,7 +628,7 @@ impl<'a> IndexSelectionWave<'a> {
             if capture {
                 let g = self.graph.as_ref().context("selection graph missing")?.0;
                 self.stream.library.cuda_graph_launch(g, self.stream.raw)
-            } else { self.enqueue(query, requests, shared, rows, tiles, width, use_candidates) }
+            } else { self.enqueue(query, requests, &groups, shared, rows, tiles, width, use_candidates) }
         };
         let launched = if crate::shared::decode_graph::census::enabled() {
             unsafe { self.stream.library.cuda_graph_census_call(self.stream.raw, c"index", rows, capture,
@@ -647,6 +675,28 @@ impl Drop for IndexSelectionWave<'_> {
 #[cfg(test)]
 mod graph_tests {
     use super::*;
+
+    #[test]
+    fn score_groups_ignore_request_partition_but_preserve_launch_bindings() {
+        let binding = [17; 10];
+        for partition in [vec![1; 16], vec![8, 8], vec![1, 15], vec![15, 1], vec![16]] {
+            let mut groups = Vec::new();
+            for (request, rows) in partition.into_iter().enumerate() {
+                extend_score_groups(&mut groups, request, rows, binding);
+            }
+            assert_eq!(groups, vec![ScoreGroup { request: 0, offset: 0, rows: 16, binding }]);
+        }
+        for field in 0..binding.len() {
+            let mut other = binding;
+            other[field] += 1;
+            let mut groups = Vec::new();
+            extend_score_groups(&mut groups, 0, 8, binding);
+            extend_score_groups(&mut groups, 1, 3, other);
+            extend_score_groups(&mut groups, 2, 5, binding);
+            assert_eq!(groups.iter().map(|g| (g.request, g.offset, g.rows)).collect::<Vec<_>>(),
+                vec![(0, 0, 8), (1, 8, 3), (2, 11, 5)]);
+        }
+    }
 
     #[test]
     fn fixed_selection_bank_keeps_hits_and_never_captures_overflow() {
