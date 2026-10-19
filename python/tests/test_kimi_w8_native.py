@@ -92,8 +92,9 @@ def inputs(rows, candidates, case):
 
 
 @pytest.mark.parametrize("intermediate", [3072, 6144, 16896, 33792])
+@pytest.mark.parametrize("compensated", [False, True], ids=["direct", "compensated"])
 @torch.no_grad()
-def test_ffn_chain_official_fp64(intermediate):
+def test_ffn_chain_official_fp64(intermediate, compensated):
     from b12x.integration.cuteafd import kimi_residual, pointwise
     # The full-width projections use the production hidden size; M16 bounds
     # FP64 work while exercising a genuine batched dense/shared FFN chain.
@@ -110,9 +111,10 @@ def test_ffn_chain_official_fp64(intermediate):
     projected = torch.empty(rows, 2 * intermediate, dtype=torch.bfloat16, device="cuda")
     activated = torch.empty(rows, intermediate, dtype=torch.bfloat16, device="cuda")
     out = torch.empty_like(x)
-    gate_up = pointwise.compile_bf16_projection_aot(width=hidden, outputs=2 * intermediate)
+    projection_options = {"compensated": True} if compensated else {}
+    gate_up = pointwise.compile_bf16_projection_aot(width=hidden, outputs=2 * intermediate, **projection_options)
     activation = kimi_residual.compile_kimi_situ_aot(intermediate)
-    down = pointwise.compile_bf16_projection_aot(width=intermediate, outputs=hidden)
+    down = pointwise.compile_bf16_projection_aot(width=intermediate, outputs=hidden, **projection_options)
     gate_up.launch(x, packed, projected, scalars=(rows,))
     activation.launch(projected, activated, scalars=(rows,))
     down.launch(activated, mlp.down_proj.weight, out, scalars=(rows,))
