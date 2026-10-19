@@ -45,6 +45,7 @@ pub(super) struct Worker<'w, 'a> {
     selected: usize,
     capacity: usize,
     executor_id: u64,
+    timing: Option<super::super::execution::timing::WorkerTiming<'a>>,
 }
 
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
@@ -107,9 +108,10 @@ impl<'w, 'a> Worker<'w, 'a> {
                 workspace - decode_bytes, ExpertSet::Routed)?)
         } else { None };
         let stream = LoadStream { library, raw: library.cuda_stream_create()? };
+        let timing = super::super::execution::timing::WorkerTiming::from_env(library, config.rank)?;
         Ok(Self { stream, execution, prefill, weights, library, selected: 0,
             capacity: config.capacity as usize,
-            executor_id: config.spark_world()?.topology().executor_id(config.rank)? })
+            executor_id: config.spark_world()?.topology().executor_id(config.rank)?, timing })
     }
     pub(super) fn bind_layer(&mut self, index: usize) -> Result<()> {
         ensure!(index < self.weights.len(), "EXLR8 requested layer is not resident");
@@ -155,6 +157,7 @@ impl<'w, 'a> Worker<'w, 'a> {
                     // through the unconditional stream drain after this closure.
                     unsafe {
                         library_copy(self.library, execution.input()?, hidden, hidden.bytes, self.stream.raw)?;
+                        if let Some(timing) = &self.timing { timing.record(0, self.stream.raw)?; }
                         super::routes::copy_route_records(self.library, records,
                             execution.ids()?, execution.route_weights()?, routes, self.stream.raw)?;
                     }
@@ -169,10 +172,14 @@ impl<'w, 'a> Worker<'w, 'a> {
                         let gates = std::slice::from_raw_parts(exchange.routing[range].as_ptr().cast(), routes * 4);
                         self.library.copy_h2d(execution.ids()?, ids)?;
                         self.library.copy_h2d(execution.route_weights()?, gates)?;
+                        if let Some(timing) = &self.timing { timing.record(0, self.stream.raw)?; }
                     }
                 }
-                // SAFETY: weights, arena and inputs remain owned through the drain.
-                unsafe { execution.run(&self.weights[self.selected], rows, self.stream.raw)?; }
+                // SAFETY: weights, arena, timing events and inputs remain owned through the drain.
+                unsafe {
+                    execution.run(&self.weights[self.selected], rows, self.stream.raw)?;
+                    if let Some(timing) = &self.timing { timing.record(1, self.stream.raw)?; }
+                }
                 let output = super::super::exlr8::view(execution.output()?, 0, rows * output_stride)?;
                 if let Some(destination) = destination {
                     let target = super::super::exlr8::view(destination, first * output_stride, output.bytes)?;
@@ -183,6 +190,10 @@ impl<'w, 'a> Worker<'w, 'a> {
                 // any default-stream upload, download or mapped frame release.
                 // SAFETY: this worker exclusively owns the stream and all queued views.
                 unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
+                if let Some(timing) = &mut self.timing {
+                    // SAFETY: the existing completion barrier finished both event records.
+                    unsafe { timing.publish(request.request_id(), request.layer(), rows as u32, executor_id, "exlr8")?; }
+                }
                 if destination.is_none() {
                     self.library.copy_d2h(&mut exchange.partials[first * output_stride..(first + rows) * output_stride], output)?;
                 }
