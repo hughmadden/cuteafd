@@ -18,11 +18,25 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
             .ok_or_else(|| invalid(format!("missing or invalid geometry.{name}")))
     };
     let shared = spec.name == "exlr8_shared_a16_serving";
-    let serving = shared || spec.name == "exlr8_a16_serving";
+    let grouped = spec.name == "exlr8_a16_grouped";
+    let serving = shared || grouped || spec.name == "exlr8_a16_serving";
+    let max_rows = if grouped { 4096 } else { 64 };
+    let group_rows = if grouped {
+        let rows = field("group_rows")?;
+        if !matches!(rows, 16 | 32 | 64) {
+            return Err(invalid("grouped row tile must be 16, 32 or 64"));
+        }
+        rows
+    } else {
+        if spec.geometry.get("group_rows").is_some_and(|r| r.as_u64() != Some(16)) {
+            return Err(invalid("decode requires 16-row groups"));
+        }
+        16
+    };
     if (!serving && spec.name != "exlr8_a16_decode")
         || field("abi_version")? != 3
-        || field("max_rows")? != 64
-        || spec.capacity_rows != 64
+        || field("max_rows")? != max_rows
+        || u64::from(spec.capacity_rows) != max_rows
         || field("split_k_blocks")? != 8
     {
         return Err(invalid(
@@ -74,24 +88,24 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     };
     // Leave headroom for the final grid-stride increment before loop exit.
     let tasks = [
-        product(&[g, u, 2, h.div_ceil(1024)])?,
+        product(&[g, u, 2, h.div_ceil(1024), if grouped { 4 } else { 1 }])?,
         product(&[g, u])?,
-        product(&[g, h / 128])?,
-        product(&[64, h / 128])?,
+        product(&[g, h / 128, if grouped { 4 } else { 1 }])?,
+        product(&[max_rows, h / 128])?,
     ];
     if tasks.iter().any(|&n| n > i32::MAX as u64 / 2)
-        || product(&[64, t])? > i32::MAX as u64
-        || product(&[g, 16])? > i32::MAX as u64
+        || product(&[max_rows, t])? > i32::MAX as u64
+        || product(&[g, group_rows])? > i32::MAX as u64
     {
         return Err(invalid("task or route indexing exceeds signed int32"));
     }
     let sizes = HashMap::from([
         (
             "fc1".to_string(),
-            product(&[g, u, 2, h.div_ceil(1024), 16, 128, 4])?,
+            product(&[g, u, 2, h.div_ceil(1024), group_rows, 128, 4])?,
         ),
-        ("intermediate".to_string(), product(&[g, u, 16, 128, 2])?),
-        ("fc2".to_string(), product(&[g, 16, h, 4])?),
+        ("intermediate".to_string(), product(&[g, u, group_rows, 128, 2])?),
+        ("fc2".to_string(), product(&[g, group_rows, h, 4])?),
     ]);
     if spec.scratch != sizes {
         return Err(invalid("scratch capacities differ from EXLR8 ABI"));
@@ -102,12 +116,12 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
 pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), ManifestError> {
     if matches!(
         spec.name.as_str(),
-        "exlr8_group" | "exlr8_shared_group"
+        "exlr8_group" | "exlr8_shared_group" | "exlr8_grouped_group"
     ) {
         return validate_glue(spec, entry);
     }
     validate(spec)?;
-    if entry["capacity_rows"].as_u64() != Some(64) || entry.get("card_plans").is_some() {
+    if entry["capacity_rows"].as_u64() != Some(u64::from(spec.capacity_rows)) || entry.get("card_plans").is_some() {
         return Err(invalid(
             "EXLR8 requires one SM-count-independent plan and exact capacity",
         ));
@@ -117,17 +131,18 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
     let t = spec.geometry["top_k"].as_u64().unwrap();
     let g = spec.geometry["max_groups"].as_u64().unwrap();
     let s = h.div_ceil(1024);
+    let r = spec.geometry["group_rows"].as_u64().unwrap_or(16);
     let mut shapes = vec![
         format!("[rows,{h}]"),
         format!("[E,{u},3,3]"),
         format!("[E,{u},3]"),
         format!("[{g}]"),
-        format!("[{g},16]"),
+        format!("[{g},{r}]"),
         format!("[rows,{t}]"),
         format!("[rows,{t}]"),
-        format!("[{g},{u},2,{s},16,128]"),
-        format!("[{g},{u},16,128]"),
-        format!("[{g},16,{h}]"),
+        format!("[{g},{u},2,{s},{r},128]"),
+        format!("[{g},{u},{r},128]"),
+        format!("[{g},{r},{h}]"),
         format!("[{h}]"),
         format!("[rows,{h}]"),
     ];
@@ -137,7 +152,7 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
     ];
     if matches!(
         spec.name.as_str(),
-        "exlr8_a16_serving" | "exlr8_shared_a16_serving"
+        "exlr8_a16_serving" | "exlr8_shared_a16_serving" | "exlr8_a16_grouped"
     ) {
         shapes.push("[1]".into());
         dtypes.push("int32");
@@ -200,6 +215,12 @@ fn validate_glue(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), Ma
             let g = field("max_groups")?;
             let h = field("hidden")?;
             let shared = spec.name == "exlr8_shared_group";
+            let grouped = spec.name == "exlr8_grouped_group";
+            let r = if grouped { field("group_rows")? } else { 16 };
+            if (grouped && !matches!(r, 16 | 32 | 64))
+                || (!grouped && spec.geometry.get("group_rows").is_some_and(|r| r.as_u64() != Some(16))) {
+                return Err(invalid("grouping row tile"));
+            }
             let (format, dtype, row, row_bytes) = if shared {
                 ("bf16", "bfloat16", h, h * 2)
             } else {
@@ -210,10 +231,10 @@ fn validate_glue(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), Ma
                     "shared grouping requires experts=1, top_k=1, max_groups=4",
                 ));
             }
-            if rows != 64
+            if rows != if grouped { 4096 } else { 64 }
                 || e > 256
                 || t > 32
-                || g > i32::MAX as u64 / 16
+                || g > i32::MAX as u64 / r
                 || spec.scalar_kinds != b"ii"
                 || h % 128 != 0
                 || rows * h * 2 > i32::MAX as u64
@@ -229,7 +250,7 @@ fn validate_glue(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), Ma
                 ("x", dtype, format!("[rows,{row}]"), "in"),
                 ("signs_in", "int8", format!("[{h}]"), "in"),
                 ("group_expert", "int32", format!("[{g}]"), "out"),
-                ("route_slots", "int32", format!("[{g},16]"), "out"),
+                ("route_slots", "int32", format!("[{g},{r}]"), "out"),
                 ("route_group_lane", "int32", format!("[rows,{t}]"), "out"),
                 ("group_count", "int32", "[1]".into(), "out"),
                 ("activation", "float16", format!("[rows,{h}]"), "out"),
@@ -318,6 +339,7 @@ mod tests {
     }
     #[test]
     fn glue_contracts_reject_pointer_and_geometry_drift() {
+        for grouped in [false, true] {
         for (name, kinds, pointers) in [
             (
                 "exlr8_group",
@@ -334,7 +356,11 @@ mod tests {
                 ],
             ),
         ] {
-            let rows = 64;
+            let rows = if grouped { 4096 } else { 64 };
+            let tile = if grouped { 64 } else { 16 };
+            let pointers: Vec<_> = pointers.into_iter().map(|(n, d, shape, r)|
+                (n, d, if n == "route_slots" { format!("[512,{tile}]") } else { shape.into() }, r)).collect();
+            let name = if grouped { "exlr8_grouped_group" } else { name };
             let s = ProgramSpec {
                 name: name.into(),
                 pointers: pointers.iter().map(|p| p.0.into()).collect(),
@@ -349,7 +375,8 @@ mod tests {
                 "pointers": pointers.iter().map(|(n,d,s,r)| serde_json::json!({
                     "name":n,"dtype":d,"shape":s,"role":r})).collect::<Vec<_>>()});
             let mut s = s;
-            if name == "exlr8_group" { s.geometry["abi_version"] = serde_json::json!(2); }
+            s.geometry["abi_version"] = serde_json::json!(2);
+            if grouped { s.geometry["group_rows"] = serde_json::json!(tile); }
             validate_entry(&s, &e).unwrap();
             for key in ["name", "dtype", "shape", "role"] {
                 let mut bad = e.clone();
@@ -363,6 +390,7 @@ mod tests {
             bad["card_plans"] = serde_json::json!([]);
             assert!(validate_entry(&s, &bad).is_err());
         }
+    }
     }
     #[test]
     fn accepts_decode_v3() {
@@ -398,6 +426,45 @@ mod tests {
         e["pointers"][12]["dtype"] = serde_json::json!("int64");
         assert!(validate_entry(&s, &e).is_err());
     }
+    #[test]
+    fn grouped_prefill_requires_exact_capacity_tiles_scratch_and_index_bounds() {
+        for tile in [16u64, 32, 64] {
+            let mut s = spec();
+            s.name = "exlr8_a16_grouped".into();
+            s.capacity_rows = 4096;
+            s.geometry["max_rows"] = serde_json::json!(4096);
+            s.geometry["group_rows"] = serde_json::json!(tile);
+            s.geometry["ctas_per_sm"] = serde_json::json!(2);
+            s.pointers.push("group_count".into());
+            s.scalar_kinds = b"ii".to_vec();
+            for bytes in s.scratch.values_mut() { *bytes *= tile / 16; }
+            let mut e = entry();
+            e["capacity_rows"] = serde_json::json!(4096);
+            e["pointers"][4]["shape"] = serde_json::json!(format!("[512,{tile}]"));
+            e["pointers"][7]["shape"] = serde_json::json!(format!("[512,16,2,6,{tile},128]"));
+            e["pointers"][8]["shape"] = serde_json::json!(format!("[512,16,{tile},128]"));
+            e["pointers"][9]["shape"] = serde_json::json!(format!("[512,{tile},6144]"));
+            e["pointers"].as_array_mut().unwrap().push(serde_json::json!({
+                "name":"group_count", "shape":"[1]", "dtype":"int32", "role":"in"}));
+            e["scratch_bytes_at_capacity"] = serde_json::to_value(&s.scratch).unwrap();
+            validate_entry(&s, &e).unwrap();
+            for (key, value) in [("max_rows",64), ("group_rows",8), ("units",i32::MAX as u64),
+                ("top_k",i32::MAX as u64), ("max_groups",i32::MAX as u64)] {
+                let mut bad = s.clone();
+                bad.geometry[key] = serde_json::json!(value);
+                assert!(validate(&bad).is_err(), "{key}");
+            }
+            let mut bad = s.clone();
+            bad.capacity_rows = 64;
+            assert!(validate(&bad).is_err());
+            bad = s.clone();
+            *bad.scratch.get_mut("fc2").unwrap() -= 1;
+            assert!(validate(&bad).is_err());
+            e["pointers"][4]["shape"] = serde_json::json!("[512,8]");
+            assert!(validate_entry(&s, &e).is_err());
+        }
+    }
+
     #[test]
     fn shared_serving_requires_single_route_and_four_groups() {
         let mut s = spec();

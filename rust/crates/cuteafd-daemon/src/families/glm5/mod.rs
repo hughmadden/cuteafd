@@ -120,8 +120,8 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
     ensure!(matches!(args.exlr8_manifest.as_deref(), Some("up1" | "bit325")),
         "EXLR8 full execution currently admits up1 or bit325 only");
     ensure!(args.split_device.is_some_and(|device| device != args.device)
-        && peers.split(',').count() == 4 && args.layers.is_none_or(|count| count == layers),
-        "EXLR8 full execution requires two coordinators, TP4 and all backbone layers");
+        && (1..=6).contains(&peers.split(',').count()) && args.layers.is_none_or(|count| count == layers),
+        "EXLR8 full execution requires two coordinators, 1..=6 Spark ranks and all backbone layers");
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
         .map_err(anyhow::Error::msg)?;
     ensure!(attention.is_none_or(|placement| placement == AttentionPlacement::Context),
@@ -209,13 +209,16 @@ mod draft_cli_tests {
             candidate.attention_placement = "auto".into();
             assert!(native_activation(&candidate, 3, 78, false).is_ok());
         }
+        let mut six = args.clone();
+        six.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1".into());
+        assert!(native_activation(&six, 3, 78, true).is_ok());
         for bad in 0..9 {
             let mut candidate = args.clone();
             match bad {
                 0 => candidate.exlr8_manifest = Some("home".into()),
                 1 => candidate.split_device = None,
                 2 => candidate.split_device = Some(0),
-                3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1".into()),
+                3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1,g:1".into()),
                 4 => candidate.layers = Some(4),
                 5 => candidate.attention_placement = "heads".into(),
                 6 => candidate.draft = Some("/draft".into()),

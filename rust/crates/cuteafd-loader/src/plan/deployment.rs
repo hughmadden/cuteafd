@@ -102,7 +102,7 @@ impl<'a> DeploymentSpec<'a> {
 
     pub fn from_exlr8(native: &'a super::exlr8::NativePlan, options: &'a DeploymentOptions) -> Result<Self> {
         ensure!(options.rtx_gpus == 2 && options.spark_tp.is_none() && options.spark_ep.is_none()
-            && options.speculator == "off", "EXLR8 deployment requires two RTX, canonical TP4 and no speculator");
+            && options.speculator == "off", "EXLR8 deployment requires two RTX, canonical Spark wire and no speculator");
         Self::build(&native.report, options, Some(native))
     }
 
@@ -143,8 +143,8 @@ impl<'a> DeploymentSpec<'a> {
             let intermediate = report.spec.as_ref().and_then(|spec| spec.moe.as_ref())
                 .context("Spark deployment requires routed expert geometry")?.intermediate;
             if native.is_none() { super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?; }
-            else { ensure!(family == "glm5" && ranks == 4 && experts.package == "glm:exlr8",
-                "EXLR8 deployment requires GLM native TP4"); }
+            else { ensure!(family == "glm5" && (1..=6).contains(&ranks) && experts.package == "glm:exlr8",
+                "EXLR8 deployment requires GLM native canonical Sparks"); }
         }
         ensure!(options.peers.is_empty() || options.peers.len() >= ranks,
             "deployment peer inventory does not cover selected Spark ranks");

@@ -317,7 +317,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
 
 /// Native EXLR8 uses the ordinary GLM solver, with ordinary per-GPU TP2 shared ownership.
 pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
-    workspace: u64, manifest: &serde_json::Value) -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
+    workspace: u64, spark_ranks: usize, manifest: &serde_json::Value) -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
     anyhow::ensure!(options.rtx_bytes.len() == 2 && shared_bytes.len() == 2, "EXLR8 requires two RTX shared owners");
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
@@ -355,7 +355,7 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
     let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers,
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
-        headroom_bytes: options.headroom_bytes, spark_ranks: 4, native_experts: true,
+        headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,
         native_workspace: workspace, skip_routed_experts: false, prefill_rows: rows, prefill_lanes: 1,
         max_context: context, automatic_context: false, scratch: Some(scratch), drafter_bytes: 0,
         drafter_staging: 0, pending_code: Vec::new(), experts: Vec::new(), expert_workspace: 0,

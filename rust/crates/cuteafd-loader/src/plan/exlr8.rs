@@ -61,7 +61,7 @@ pub fn shared_workspace(manifest: &Value) -> Result<u64> {
         n("scratch_bytes_at_capacity", "intermediate")?, n("scratch_bytes_at_capacity", "fc2")?];
     ensure!(scratch == [6_291_456, 262_144, 1_572_864],
         "EXLR8 shared scratch capacities differ from the native ABI");
-    Ok(residency::execution_workspace_layout(64, n("geometry", "hidden")?, n("geometry", "top_k")?,
+    Ok(residency::execution_workspace_layout(64, 64, 16, n("geometry", "hidden")?, n("geometry", "top_k")?,
         n("geometry", "max_groups")?, scratch[0], scratch[1], scratch[2], residency::ExpertSet::Shared)?.1 as u64)
 }
 
@@ -76,7 +76,10 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
     use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
     ensure!(matches!(selected, "up1" | "bit325"), "EXLR8 native manifest must be up1 or bit325");
-    ensure!(options.placement == ExpertPlacement::Sparks { ranks: 4 }, "EXLR8 native deployment requires canonical TP4 Sparks");
+    let world = match options.placement {
+        ExpertPlacement::Sparks { ranks } if (1..=6).contains(&ranks) => ranks,
+        _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=6 ranks"),
+    };
     ensure!(speculator == "off", "EXLR8 native deployment requires --speculator off");
     ensure!(matches!(options.attention_placement, None | Some(crate::placement::AttentionPlacement::Context)),
         "EXLR8 native deployment requires context attention");
@@ -97,14 +100,14 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
         "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
     let (_, set_id) = manifest_identity(snapshot, selected)?;
     let mut shared = vec![0u64; 2];
-    let mut residents = vec![0u64; 4];
+    let mut residents = vec![0u64; world];
     for layer in cfg.first_moe_layer..cfg.layers {
         for (rank, resident) in shared.iter_mut().enumerate() {
             let plan = residency::Residency::plan(snapshot, selected, layer, 2, rank, residency::ExpertSet::Shared)?;
             *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
         }
         for (rank, resident) in residents.iter_mut().enumerate() {
-            let plan = residency::Residency::plan(snapshot, selected, layer, 4, rank, residency::ExpertSet::Routed)?;
+            let plan = residency::Residency::plan(snapshot, selected, layer, world, rank, residency::ExpertSet::Routed)?;
             *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 routed residency overflow")?;
         }
     }
@@ -113,7 +116,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     let programs = read_json(layout.workspace_manifest.as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
     let workspace = shared_workspace(&programs)?;
-    let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, &shared, workspace, &programs)?;
+    let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, &shared, workspace, world, &programs)?;
     let mut dense_options = options.clone();
     dense_options.layout = None;
     // This pass classifies dense operands only; native_layout already admitted context TP2.
@@ -142,12 +145,13 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     report.attention_placement = crate::placement::AttentionPlacement::Context;
     report.prefill_rows = Some(if layout.prefill_rows == 0 { 4096 } else { layout.prefill_rows });
     report.experts = Some(super::family::ExpertContract { package: "glm:exlr8".into(), block: 128,
-        spark_worlds: vec![4], local: Err("EXLR8 coordinator-local routed experts are unsupported".into()) });
+        spark_worlds: vec![world], local: Err("EXLR8 coordinator-local routed experts are unsupported".into()) });
     report.hints = vec![super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
         how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() }];
-    report.min_spark_ranks = Some(4);
-    report.spark_rank_share = 0.25;
-    report.bytes_by_owner = BTreeMap::from([("spark x4".into(), residents.iter().sum()),
+    report.min_spark_ranks = Some(world);
+    report.spark_ranks = world;
+    report.spark_rank_share = 1.0 / world as f64;
+    report.bytes_by_owner = BTreeMap::from([(format!("spark x{world}"), residents.iter().sum()),
         ("rtx".into(), memory.devices.iter().flat_map(|d| &d.items)
             .filter(|i| matches!(i.category, cuteafd_core::memory_layout::Category::Weights
                 | cuteafd_core::memory_layout::Category::Embedding)).map(|i| i.bytes).sum())]);
@@ -1095,7 +1099,7 @@ mod tests {
             invalid["programs"].as_array_mut().unwrap().remove(missing);
             assert!(shared_workspace(&invalid).is_err());
         }
-        assert_eq!(bytes, residency::execution_workspace_layout(64,6144,1,4,
+        assert_eq!(bytes, residency::execution_workspace_layout(64,64,16,6144,1,4,
             6291456,262144,1572864,residency::ExpertSet::Shared).unwrap().1 as u64);
         for (field, value) in [("abi_version", 1), ("hidden", 128), ("top_k", 8), ("units", 0), ("max_groups", 512)] {
             let mut invalid = manifest.clone();
@@ -1121,7 +1125,9 @@ mod tests {
         assert!(error(&options,"other","off").contains("manifest"));
         assert!(error(&options,"up1","dflash2").contains("speculator off"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:6 };
-        assert!(error(&options,"up1","off").contains("TP4"));
+        assert!(!error(&options,"up1","off").contains("canonical Sparks"));
+        options.placement = super::super::ExpertPlacement::Sparks { ranks:7 };
+        assert!(error(&options,"up1","off").contains("1..=6"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:4 };
         options.layout.as_mut().unwrap().rtx_bytes.truncate(1);
         assert!(error(&options,"up1","off").contains("two RTX"));

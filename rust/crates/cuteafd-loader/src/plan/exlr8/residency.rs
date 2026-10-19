@@ -121,13 +121,15 @@ fn reserve(cursor: &mut usize, bytes: usize) -> anyhow::Result<usize> {
 }
 /// Exact arena shared by runtime native execution and offline admission.
 pub fn execution_workspace_layout(
-    rows: usize, hidden: usize, top_k: usize, max_groups: usize,
+    rows: usize, max_rows: usize, group_rows: usize, hidden: usize, top_k: usize, max_groups: usize,
     fc1_scratch: usize, intermediate_scratch: usize, fc2_scratch: usize,
     set: ExpertSet,
 ) -> anyhow::Result<([(usize, usize); 11], usize)> {
-    ensure!(rows > 0 && rows <= 64 && hidden > 0 && hidden % 128 == 0
+    ensure!(matches!((max_rows, group_rows), (64, 16) | (4096, 16 | 32 | 64))
+        && (max_rows == 64 || set == ExpertSet::Routed)
+        && rows > 0 && rows <= max_rows && hidden > 0 && hidden % 128 == 0
         && top_k > 0 && max_groups > 0,
-        "EXLR8 workspace requires 1..64 rows, aligned hidden and nonzero routes");
+        "EXLR8 workspace requires admitted row/tile geometry, aligned hidden and nonzero routes");
     let mul = |a: usize, b: usize| a.checked_mul(b).context("EXLR8 workspace size overflow");
     let values = mul(rows, hidden)?;
     let routes = mul(rows, top_k)?;
@@ -138,7 +140,7 @@ pub fn execution_workspace_layout(
     };
     // Input and rotated activation are separate: ingress runs once per row.
     let sizes = [mul(rows, input_row_bytes)?, mul(routes, 4)?, mul(routes, 4)?, mul(values, 2)?,
-        mul(max_groups, 4)?, mul(mul(max_groups, 16)?, 4)?, mul(routes, 4)?, 4,
+        mul(max_groups, 4)?, mul(mul(max_groups, group_rows)?, 4)?, mul(routes, 4)?, 4,
         fc1_scratch, intermediate_scratch.checked_add(fc2_scratch)
             .context("EXLR8 workspace scratch overflow")?, mul(values, 2)?];
     let mut cursor = 0;
@@ -650,7 +652,7 @@ mod tests {
 
     #[test]
     fn execution_workspace_is_exact_aligned_and_checked() {
-        let (ranges, total) = execution_workspace_layout(64, 6144, 8, 24, 17, 19, 23, ExpertSet::Routed).unwrap();
+        let (ranges, total) = execution_workspace_layout(64, 64, 16, 6144, 8, 24, 17, 19, 23, ExpertSet::Routed).unwrap();
         let sizes = [64 * 6336, 64 * 8 * 4, 64 * 8 * 4, 64 * 6144 * 2,
             24 * 4, 24 * 16 * 4, 64 * 8 * 4, 4, 17, 42, 64 * 6144 * 2];
         let mut end: usize = 0;
@@ -669,7 +671,7 @@ mod tests {
             (64, 6144, 8, 24, 0, usize::MAX, 1),
             (64, 6144, 8, 24, usize::MAX, 0, 0),
         ] {
-            assert!(execution_workspace_layout(rows, hidden, top_k, groups, fc1, intermediate, fc2, ExpertSet::Routed).is_err());
+            assert!(execution_workspace_layout(rows, 64, 16, hidden, top_k, groups, fc1, intermediate, fc2, ExpertSet::Routed).is_err());
         }
     }
 

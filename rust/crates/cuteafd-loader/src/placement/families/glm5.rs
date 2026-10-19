@@ -254,10 +254,9 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
     }
     if inputs.native_experts && (inputs.prefill_lanes != 1
         || inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
-        || (gpus == 2 && inputs.spark_ranks != 4)
         || !inputs.experts.is_empty() || inputs.drafter_bytes != 0 || inputs.scratch.is_none()
         || inputs.native_workspace == 0) {
-        return Err(PlacementError::Inventory("EXLR8 requires serial measured workspaces, real Spark experts and TP4 on two coordinators"));
+        return Err(PlacementError::Inventory("EXLR8 requires serial measured workspaces, real Spark experts and 1..=6 ranks"));
     }
     let geometry = glm_cache_geometry(cfg, inputs.layers, gpus)
         .map_err(|_| PlacementError::Inventory("GLM cache geometry"))?;

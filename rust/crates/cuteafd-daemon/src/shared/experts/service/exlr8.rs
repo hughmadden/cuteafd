@@ -1,4 +1,4 @@
-//! Native FP8 K32 Spark adapter; wider waves reuse one bounded K1 arena.
+//! Native FP8 K32 Spark adapter with distinct decode and grouped prefill arenas.
 use super::*;
 use crate::shared::experts::exlr8::{Exlr8Execution, Exlr8Weights};
 use crate::shared::memory::LoadStream;
@@ -9,8 +9,20 @@ use cuteafd_transport::{ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2Respo
 
 const K1_ROWS: usize = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
 
+const PREFILL_ROWS: usize = 4096;
+
 fn chunks(rows: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..rows).step_by(K1_ROWS).map(move |first| (first, (rows - first).min(K1_ROWS)))
+    let capacity = if rows <= K1_ROWS { K1_ROWS } else { PREFILL_ROWS };
+    (0..rows).step_by(capacity).map(move |first| (first, (rows - first).min(capacity)))
+}
+
+fn execution_bytes(programs: &Programs<'_>, capacity: usize) -> Result<usize> {
+    ensure!((1..=PREFILL_ROWS).contains(&capacity), "EXLR8 capacity must be 1..4096");
+    let decode = Exlr8Execution::workspace_bytes(programs, capacity.min(K1_ROWS), ExpertSet::Routed)?;
+    let prefill = if capacity > K1_ROWS {
+        Exlr8Execution::workspace_bytes(programs, capacity, ExpertSet::Routed)?
+    } else { 0 };
+    decode.checked_add(prefill).context("EXLR8 retained execution workspace overflow")
 }
 
 // This is a traffic cost per routed occurrence, not a staging reservation.
@@ -27,6 +39,7 @@ pub(super) struct Worker<'w, 'a> {
     // Drain before execution storage or the borrowed weights can be released.
     stream: LoadStream<'a>,
     execution: Exlr8Execution<'a>,
+    prefill: Option<Exlr8Execution<'a>>,
     weights: &'w [Exlr8Weights<'a>],
     library: &'a NativeLibrary,
     selected: usize,
@@ -42,9 +55,9 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     ensure!(model.endpoints.iter().all(|endpoint|
         endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32),
         "EXLR8 worker requires standard FP8 K32 ingress and BF16 partials");
-    let rows = (config.capacity as usize).min(K1_ROWS);
+    let rows = config.capacity as usize;
     let fallback_staging = rows.checked_mul({ let h = catalog.routed_experts().geometry()?.hidden as usize; h + h / 32 }).context("EXLR8 fallback staging overflow")?;
-    let k1_workspace_bytes = Exlr8Execution::workspace_bytes(programs, rows, ExpertSet::Routed)?;
+    let k1_workspace_bytes = execution_bytes(programs, rows)?;
     let workspace = k1_workspace_bytes.checked_add(fallback_staging)
         .context("EXLR8 workspace admission overflow")?;
     let plans = config.resident_layers(catalog.routed_experts().layers)?.into_iter()
@@ -83,10 +96,18 @@ impl<'w, 'a> Worker<'w, 'a> {
         weights: &'w [Exlr8Weights<'a>], config: &NativeExpertServiceConfig,
         remaining: usize) -> Result<Self> {
         ensure!(!weights.is_empty(), "EXLR8 worker has no resident layers");
+        let capacity = config.capacity as usize;
+        let workspace = execution_bytes(programs, capacity)?;
+        ensure!(workspace <= remaining, "EXLR8 retained arenas exceed admitted bytes");
+        let decode_bytes = Exlr8Execution::workspace_bytes(programs, capacity.min(K1_ROWS), ExpertSet::Routed)?;
         let execution = Exlr8Execution::new(library, programs,
-            (config.capacity as usize).min(K1_ROWS), remaining, ExpertSet::Routed)?;
+            capacity.min(K1_ROWS), decode_bytes, ExpertSet::Routed)?;
+        let prefill = if capacity > K1_ROWS {
+            Some(Exlr8Execution::new(library, programs, capacity,
+                workspace - decode_bytes, ExpertSet::Routed)?)
+        } else { None };
         let stream = LoadStream { library, raw: library.cuda_stream_create()? };
-        Ok(Self { stream, execution, weights, library, selected: 0,
+        Ok(Self { stream, execution, prefill, weights, library, selected: 0,
             capacity: config.capacity as usize,
             executor_id: config.spark_world()?.topology().executor_id(config.rank)? })
     }
@@ -121,6 +142,9 @@ impl<'w, 'a> Worker<'w, 'a> {
         if mapped.is_none() {
             request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?;
         }
+        let execution = if request.rows() as usize > K1_ROWS {
+            self.prefill.as_ref().context("EXLR8 grouped prefill was not admitted")?
+        } else { &self.execution };
         let work = (|| -> Result<()> {
             for (first, rows) in chunks(request.rows() as usize) {
                 let routes = rows * topk;
@@ -130,12 +154,12 @@ impl<'w, 'a> Worker<'w, 'a> {
                     // SAFETY: validated mapped request and exclusive arena remain live
                     // through the unconditional stream drain after this closure.
                     unsafe {
-                        library_copy(self.library, self.execution.input()?, hidden, hidden.bytes, self.stream.raw)?;
+                        library_copy(self.library, execution.input()?, hidden, hidden.bytes, self.stream.raw)?;
                         super::routes::copy_route_records(self.library, records,
-                            self.execution.ids()?, self.execution.route_weights()?, routes, self.stream.raw)?;
+                            execution.ids()?, execution.route_weights()?, routes, self.stream.raw)?;
                     }
                 } else {
-                    self.library.copy_h2d(self.execution.input()?,
+                    self.library.copy_h2d(execution.input()?,
                         &request.hidden()[first * input_stride..(first + rows) * input_stride])?;
                     let range = first * topk..(first + rows) * topk;
                     // SAFETY: contiguous initialized i32/f32 arrays, read as their
@@ -143,19 +167,19 @@ impl<'w, 'a> Worker<'w, 'a> {
                     unsafe {
                         let ids = std::slice::from_raw_parts(exchange.ids[range.clone()].as_ptr().cast(), routes * 4);
                         let gates = std::slice::from_raw_parts(exchange.routing[range].as_ptr().cast(), routes * 4);
-                        self.library.copy_h2d(self.execution.ids()?, ids)?;
-                        self.library.copy_h2d(self.execution.route_weights()?, gates)?;
+                        self.library.copy_h2d(execution.ids()?, ids)?;
+                        self.library.copy_h2d(execution.route_weights()?, gates)?;
                     }
                 }
                 // SAFETY: weights, arena and inputs remain owned through the drain.
-                unsafe { self.execution.run(&self.weights[self.selected], rows, self.stream.raw)?; }
-                let output = super::super::exlr8::view(self.execution.output()?, 0, rows * output_stride)?;
+                unsafe { execution.run(&self.weights[self.selected], rows, self.stream.raw)?; }
+                let output = super::super::exlr8::view(execution.output()?, 0, rows * output_stride)?;
                 if let Some(destination) = destination {
                     let target = super::super::exlr8::view(destination, first * output_stride, output.bytes)?;
                     // SAFETY: transport owns the destination until response send completes.
                     unsafe { library_copy(self.library, target, output, output.bytes, self.stream.raw)?; }
                 }
-                // One arena is reused across serial64 chunks; finish readers before
+                // Finish arena readers before
                 // any default-stream upload, download or mapped frame release.
                 // SAFETY: this worker exclusively owns the stream and all queued views.
                 unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
@@ -249,7 +273,8 @@ mod tests {
             let mut next = 0;
             for (first, count) in chunks(rows) {
                 assert_eq!(first, next);
-                assert!((1..=K1_ROWS).contains(&count));
+                assert!((1..=if rows <= K1_ROWS { K1_ROWS } else { PREFILL_ROWS }).contains(&count));
+                assert_eq!(count, rows);
                 let wire_stride = 6144 + 6144 / 32;
                 let input = first * wire_stride..(first + count) * wire_stride;
                 let output = first * 6144 * 2..(first + count) * 6144 * 2;

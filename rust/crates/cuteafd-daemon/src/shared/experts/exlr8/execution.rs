@@ -7,8 +7,9 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::ExpertSet;
 use std::ffi::c_void;
 
-fn program_names(set: ExpertSet) -> (&'static str, &'static str) {
+fn program_names(set: ExpertSet, rows: usize) -> (&'static str, &'static str) {
     match set {
+        ExpertSet::Routed if rows > 64 => ("exlr8_a16_grouped", "exlr8_grouped_group"),
         ExpertSet::Routed => ("exlr8_a16_serving", "exlr8_group"),
         ExpertSet::Shared => ("exlr8_shared_a16_serving", "exlr8_shared_group"),
     }
@@ -71,11 +72,11 @@ impl Workspace {
     fn plan(spec: &ProgramSpec, rows: usize, set: ExpertSet) -> Result<Self> {
         cuteafd_ffi::exlr8::validate(spec)?;
         ensure!(
-            spec.name == program_names(set).0 && spec.geometry["abi_version"] == 3,
+            spec.name == program_names(set, rows).0 && spec.geometry["abi_version"] == 3,
             "EXLR8 execution requires fused rotation ABI v3"
         );
         ensure!(
-            rows > 0 && rows <= 64 && rows <= spec.capacity_rows as usize,
+            rows > 0 && rows <= spec.capacity_rows as usize,
             "EXLR8 rows outside admitted K1 capacity"
         );
         let dimension = |name| -> Result<usize> {
@@ -95,7 +96,9 @@ impl Workspace {
                 .context("K1 scratch exceeds address space")
         };
         let (ranges, bytes) = cuteafd_loader::plan::exlr8::residency::execution_workspace_layout(
-            rows, hidden, top_k, max_groups, scratch("fc1")?,
+            rows, spec.capacity_rows as usize,
+            spec.geometry["group_rows"].as_u64().unwrap_or(16) as usize,
+            hidden, top_k, max_groups, scratch("fc1")?,
             scratch("intermediate")?, scratch("fc2")?, set)?;
         Ok(Self {
             ranges,
@@ -118,6 +121,7 @@ pub(crate) struct Exlr8Execution<'a> {
     routing: RoutingLifetime,
     intermediate_bytes: usize,
     cta_limit: i32,
+    group_cta_limit: i32,
     set: ExpertSet,
 }
 impl<'a> Exlr8Execution<'a> {
@@ -126,7 +130,7 @@ impl<'a> Exlr8Execution<'a> {
         rows: usize,
         set: ExpertSet,
     ) -> Result<usize> {
-        let k1 = programs.program(program_names(set).0, K1_POINTERS)?;
+        let k1 = programs.program(program_names(set, rows).0, K1_POINTERS)?;
         Ok(Workspace::plan(k1.spec(), rows, set)?.bytes)
     }
 
@@ -137,7 +141,7 @@ impl<'a> Exlr8Execution<'a> {
         available: usize,
         set: ExpertSet,
     ) -> Result<Self> {
-        let (k1_name, group_name) = program_names(set);
+        let (k1_name, group_name) = program_names(set, rows);
         let k1 = programs.program(k1_name, K1_POINTERS)?;
         let group = programs.program(
             group_name,
@@ -158,7 +162,9 @@ impl<'a> Exlr8Execution<'a> {
                 && group.spec().geometry["top_k"] == k1.spec().geometry["top_k"]
                 && group.spec().geometry["max_groups"] == k1.spec().geometry["max_groups"]
                 && group.spec().geometry["hidden"] == k1.spec().geometry["hidden"]
-                && group.spec().geometry["ctas_per_sm"] == k1.spec().geometry["ctas_per_sm"]
+                && group.spec().capacity_rows == k1.spec().capacity_rows
+                && group.spec().geometry["group_rows"].as_u64().unwrap_or(16)
+                    == k1.spec().geometry["group_rows"].as_u64().unwrap_or(16)
                 && group.spec().geometry["input_format"] == match set {
                     ExpertSet::Routed => "fp8_k32",
                     ExpertSet::Shared => "bf16",
@@ -172,15 +178,14 @@ impl<'a> Exlr8Execution<'a> {
             "EXLR8 workspace exceeds admitted device bytes"
         );
         let intermediate_bytes = usize::try_from(k1.spec().scratch["intermediate"])?;
-        let ctas = i32::try_from(
-            k1.spec().geometry["ctas_per_sm"]
-                .as_u64()
-                .context("CTA hint")?,
-        )?;
-        let cta_limit = i32::try_from(library.sm_count()?)?
-            .checked_mul(ctas)
-            .context("CTA limit overflow")?;
-        ensure!(cta_limit > 0, "runtime SM count must be positive");
+        let sms = i32::try_from(library.sm_count()?)?;
+        let limit = |spec: &ProgramSpec| -> Result<i32> {
+            let ctas = i32::try_from(spec.geometry["ctas_per_sm"].as_u64().context("CTA hint")?)?;
+            ensure!((1..=32).contains(&ctas) && sms > 0, "invalid runtime CTA geometry");
+            sms.checked_mul(ctas).context("CTA limit overflow")
+        };
+        let cta_limit = limit(k1.spec())?;
+        let group_cta_limit = limit(group.spec())?;
         let arena = DeviceAllocation::named(library, layout.bytes, "experts/workspace/exlr8")?;
         Ok(Self {
             group,
@@ -190,6 +195,7 @@ impl<'a> Exlr8Execution<'a> {
             routing: RoutingLifetime::default(),
             intermediate_bytes,
             cta_limit,
+            group_cta_limit,
             set,
         })
     }
@@ -278,7 +284,7 @@ impl<'a> Exlr8Execution<'a> {
         unsafe {
             self.group.launch(
                 &[p(1), p(0), weights.signs(false)?.ptr, p(4), p(5), p(6), p(7), p(10)],
-                &[Scalar::I32(rows as i32), Scalar::I32(self.cta_limit)],
+                &[Scalar::I32(rows as i32), Scalar::I32(self.group_cta_limit)],
                 stream,
             )?;
             self.k1.launch(
@@ -315,7 +321,7 @@ mod tests {
             ExpertSet::Shared => (1, 4),
         };
         ProgramSpec {
-            name: program_names(set).0.into(),
+            name: program_names(set, 64).0.into(),
             pointers: K1_POINTERS.iter().map(|name| (*name).into()).collect(),
             scalar_kinds: b"ii".to_vec(),
             scratch: [
@@ -377,6 +383,28 @@ mod tests {
                     .unwrap()
                     .bytes
         );
+    }
+
+    #[test]
+    fn grouped_workspace_uses_wide_route_slots_without_changing_decode() {
+        let mut grouped = spec(ExpertSet::Routed);
+        grouped.name = program_names(ExpertSet::Routed, 65).0.into();
+        grouped.capacity_rows = 4096;
+        grouped.geometry["max_rows"] = serde_json::json!(4096);
+        grouped.geometry["group_rows"] = serde_json::json!(64);
+        grouped.geometry["ctas_per_sm"] = serde_json::json!(2);
+        for bytes in grouped.scratch.values_mut() { *bytes *= 4; }
+        for rows in [65, 128, 4095, 4096] {
+            let workspace = Workspace::plan(&grouped, rows, ExpertSet::Routed).unwrap();
+            assert_eq!(workspace.ranges[5].1, 512 * 64 * 4);
+            assert_eq!(workspace.ranges[0].1, rows * 6336);
+            assert_eq!(workspace.ranges[10].1, rows * 6144 * 2);
+        }
+        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed).is_err());
+        assert!(Workspace::plan(&grouped, 4097, ExpertSet::Routed).is_err());
+        assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared).is_err());
+        assert_eq!(program_names(ExpertSet::Routed, 64).0, "exlr8_a16_serving");
+        assert_eq!(program_names(ExpertSet::Shared, 64).0, "exlr8_shared_a16_serving");
     }
 
     #[test]

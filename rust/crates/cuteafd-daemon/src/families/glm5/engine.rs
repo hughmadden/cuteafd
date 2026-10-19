@@ -2325,13 +2325,8 @@ mod long_graph_tests {
 
 impl Drop for GlmEngine<'_> {
     fn drop(&mut self) {
-<<<<<<< HEAD
         if self.tp2.is_some() || self.layer_execution.is_some() || !self.lanes.borrow().is_empty()
-            || (self.native_experts.is_some() && self.peer.is_some()) {
-=======
-        if self.tp2.is_some() || self.layer_execution.is_some()
             || (!self.native_experts.is_empty() && self.peer.is_some()) {
->>>>>>> 074c796a (Restore standard EXLR8 transport and guard pending rotation ABI)
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }
         if !self.native_experts.is_empty() {
