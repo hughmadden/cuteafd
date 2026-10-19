@@ -211,6 +211,7 @@ wip_native_key() {
     printf 'image %s\n' "${CUTEAFD_WIP_DEV_IMAGE_ID:?the native cache needs the dev image ID}"
     # Every scope switch that reaches CMake or an exporter.
     env | grep -E '^CUTEAFD_WIP_[A-Z0-9_]+=' |
+      grep -vE '^CUTEAFD_WIP_KIMIK3_AOT=OFF$' |
       grep -vE '^CUTEAFD_WIP_(CARGO_FEATURES|EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" "$coordinator_aot" "$xgrammar"

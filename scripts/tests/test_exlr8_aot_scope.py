@@ -252,3 +252,15 @@ def test_kimi_switch_is_forwarded_to_coordinator_and_native_dispatch():
     block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)', 1)[1].split('if(CUTEAFD_ENABLE_EXLR8_AOT)', 1)[0]
     assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3")' in block
     assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3")' in block
+
+
+def test_kimi_native_key_preserves_off_and_keys_on():
+    build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    block = build[build.index('    env | grep -E'):build.index('    printf', build.index('    env | grep -E'))]
+    # Run the actual native-key environment filter, not a copy of its rules.
+    base = {'PATH': '/usr/bin:/bin', 'CUTEAFD_WIP_GLM_AOT': 'ON'}
+    def keyed(extra):
+        return subprocess.check_output(['bash', '-c', block], env={**base, **extra}, text=True)
+    unset = keyed({})
+    assert keyed({'CUTEAFD_WIP_KIMIK3_AOT': 'OFF'}) == unset
+    assert keyed({'CUTEAFD_WIP_KIMIK3_AOT': 'ON'}) != unset
