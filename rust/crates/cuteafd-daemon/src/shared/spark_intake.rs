@@ -1303,6 +1303,7 @@ impl<'a> SparkDeviceLink<'a> {
         let choice = choose_mode(library)?;
         ensure!(device_choice_available(&choice),
             "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
+        library.v41_compact_reducer()?.require_plane_reduction(peers.len() as u32)?;
         let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), if written_responses() { 1 } else { capacity },
             row_bytes)?;
         let mailbox = HostAllocation::new(library, device_mailbox::bytes(capacity, topk, wire_row_bytes))?;

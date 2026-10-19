@@ -117,9 +117,10 @@ impl SparkWorld {
         }
     }
 
-    /// The device producer emits canonical routes; TP4 is its qualified layout.
+    /// The canonical device producer supports TP4 and TP6 rank planes.
     pub fn supports_device_exchange(self) -> bool {
-        self.wire == SparkWire::Canonical && self.topology == SparkTopology::NATIVE_TP4_EP1
+        self.wire == SparkWire::Canonical
+            && matches!(self.topology, SparkTopology::NATIVE_TP4_EP1 | SparkTopology::NATIVE_TP6_EP1)
     }
 }
 
@@ -765,8 +766,21 @@ mod tests {
         assert_eq!(world.topology().executor_ids(), [1, 2, 3, 4]);
         assert_eq!(world.ownership_topology(), None);
         assert!(!SparkWorld::owned(SparkTopology::NATIVE_TP4_EP1)?.supports_device_exchange());
-        for ranks in [1, 2, 3, 5, 6] {
-            assert!(!SparkWorld::canonical(ranks)?.supports_device_exchange());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_tp6_device_exchange_is_pure_tp_only() -> Result<()> {
+        let world = SparkWorld::canonical(6)?;
+        assert!(world.supports_device_exchange());
+        assert_eq!(world.topology(), SparkTopology::NATIVE_TP6_EP1);
+        assert_eq!(world.topology().executor_ids(), [27, 28, 29, 30, 31, 32]);
+        assert_eq!(world.ownership_topology(), None);
+        for ranks in 1..=6 {
+            assert_eq!(SparkWorld::canonical(ranks)?.supports_device_exchange(), matches!(ranks, 4 | 6));
+        }
+        for (tp, ep) in [(2, 1), (3, 1), (4, 1), (6, 1), (2, 2), (3, 2), (2, 3)] {
+            assert!(!SparkWorld::owned(SparkTopology::new(tp, ep)?)?.supports_device_exchange());
         }
         Ok(())
     }

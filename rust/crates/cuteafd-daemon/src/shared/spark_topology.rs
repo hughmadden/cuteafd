@@ -146,8 +146,10 @@ mod tests {
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         require_world(SparkWorld::canonical(4)?, &catalog)?;
         require_world(SparkWorld::owned(SparkTopology::NATIVE_TP3_EP1)?, &catalog)?;
-        let error = require_world(SparkWorld::canonical(3)?, &catalog).unwrap_err();
-        assert!(error.to_string().contains("native Spark experts outside TP4 require ownership wire"));
+        for ranks in [3, 6] {
+            let error = require_world(SparkWorld::canonical(ranks)?, &catalog).unwrap_err();
+            assert!(error.to_string().contains("native Spark experts outside TP4 require ownership wire"));
+        }
         Ok(())
     }
 
