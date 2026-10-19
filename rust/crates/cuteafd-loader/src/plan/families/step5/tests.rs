@@ -50,6 +50,132 @@ fn report(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Opti
 }
 
 #[test]
+fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
+    use crate::placement::{FfnMode, LayerMode};
+    use crate::serving_capacity::{step5::Step5CacheLayout, KvPlacement};
+    use super::{coordinator::RankWeightLayout, ownership::{self, ExecutionOwnership}};
+    for quant in ["fp8", "nvfp4"] {
+        let dir = snapshot(quant);
+        let cp = Checkpoint::open(dir.path()).unwrap();
+        let cfg = Config::parse(&cp).unwrap();
+        let diagnostic = Step5CacheLayout::new(&cfg, 1, 1024, 0, 64).unwrap();
+        // Exercise unequal owner counts, a rank with no CSA, and owned SWA.
+        for (ranks, policy) in [(1, 0), (2, 0), (2, 1), (2, 2)] {
+            let modes: Vec<_> = (0..cfg.layers).map(|l| {
+                if ranks == 2 && !cfg.full[l] && policy != 2 { LayerMode::HeadSplit }
+                else { LayerMode::Whole { gpu: if ranks == 1 || policy == 1 { 0 }
+                    else { ((l / 4) % 2) as u8 }, ffn: FfnMode::Owner } }
+            }).collect();
+            let head = if ranks == 1 { 0 } else { 1 };
+            let owners = ExecutionOwnership::new(&cfg, ranks, ownership::plan(&modes, 0, head)).unwrap();
+            let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64).unwrap();
+            assert_eq!(layout.geometry.placement, if ranks == 1 { KvPlacement::SingleDevice }
+                else { KvPlacement::PartitionedLayers });
+            assert_eq!(layout.geometry.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>(),
+                diagnostic.geometry.ranks[0].persistent_unit_bytes);
+            let weights: Vec<_> = (0..ranks).map(|rank| RankWeightLayout::for_execution(&cp, rank, &owners).unwrap()).collect();
+            for (layer, &mode) in modes.iter().enumerate() {
+                let mut attention = Vec::new();
+                let mut ffns = Vec::new();
+                for rank in 0..ranks {
+                    let local = owners.layer(layer, rank).unwrap();
+                    let state = &layout.ranks[rank];
+                    let prefix = format!("model.layers.{layer}.");
+                    let operands: Vec<_> = weights[rank].operands.iter()
+                        .filter(|o| o.name.starts_with(&prefix)).collect();
+                    let q = operands.iter().find(|o| o.name.ends_with("self_attn.q_proj.weight"));
+                    assert_eq!(q.is_some(), local.query_heads > 0);
+                    if let Some(q) = q {
+                        attention.push(rank as u8);
+                        assert_eq!(q.shape, [local.query_heads * 192, 4096]);
+                    }
+                    let ffn = operands.iter().any(|o| o.name.ends_with("post_attention_layernorm.weight"));
+                    assert_eq!(ffn, local.ffn);
+                    if ffn { ffns.push(rank); }
+                    let branch = if cfg.moe[layer] { "share_expert" } else { "mlp" };
+                    assert_eq!(operands.iter().any(|o| o.name.ends_with(&format!("{branch}.gate_up_proj.weight"))), local.ffn);
+                    assert_eq!(operands.iter().any(|o| o.name.ends_with("moe.gate.weight")), local.ffn && cfg.moe[layer]);
+                    if cfg.full[layer] {
+                        let region = state.regions.iter().find(|r| r.layer == layer);
+                        assert_eq!(region.is_some(), local.query_heads > 0);
+                        if let Some(region) = region {
+                            assert_eq!(region.query_heads, 64);
+                            assert_eq!(region.page_bytes, 64 * 4 * 192 * 2);
+                            assert_eq!(region.summaries.unwrap().bytes, 128 * 256);
+                            assert!(operands.iter().any(|o| o.name.ends_with("sparse_indexer_q.weight")));
+                            assert!(operands.iter().all(|o| o.slice == coordinator::WeightSlice::Replicated));
+                        } else { assert!(operands.is_empty()); }
+                    } else {
+                        let ring = state.sliding.iter().find(|s| s.layer == layer);
+                        assert_eq!(ring.is_some(), local.query_heads > 0);
+                        if let Some(ring) = ring {
+                            assert_eq!(ring.query_heads, local.query_heads);
+                            assert_eq!(ring.key.bytes, layout.ring.rows * local.kv_heads as u64 * 192 * 2);
+                        }
+                    }
+                }
+                owners.execution().validate_state_owners(layer, &attention).unwrap();
+                assert_eq!(ffns, match mode { LayerMode::Whole { gpu, .. } => vec![gpu as usize], _ => vec![0, 1] });
+            }
+            for rank in 0..ranks {
+                let state = &layout.ranks[rank];
+                let cost = layout.geometry.ranks[rank];
+                assert_eq!(cost.persistent_unit_bytes, state.regions.iter().map(|r| r.page_bytes * 2).sum::<u64>());
+                assert_eq!(cost.active_state_per_sequence_bytes, state.bytes);
+                assert_eq!(cost.retained_mark_bytes, state.bytes);
+                assert_eq!(weights[rank].resident_bytes, weights[rank].operands.iter().map(|o| o.allocation_bytes).sum::<u64>());
+                assert_eq!(weights[rank].operands.iter().any(|o| o.name == "model.embed_tokens.weight"), rank == 0);
+                assert_eq!(weights[rank].operands.iter().any(|o| o.name == "lm_head.weight"), rank == head as usize);
+                for frontier in [0, 63, 64, 65, 575, 576, 1024] {
+                    let spans = layout.snapshot_spans(rank, frontier).unwrap();
+                    let expected = 8 + state.sliding.iter().map(|s| 2 * frontier.min(512) * s.key.bytes / layout.ring.rows).sum::<u64>()
+                        + state.regions.len() as u64 * (2 * 8 * 256 * 2 + frontier / 8 * 256);
+                    assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
+                    let copies = layout.snapshot_copies(rank, frontier, 3, 2, 4, 3).unwrap();
+                    assert_eq!(copies.iter().map(|s| s.active.bytes).sum::<u64>(), expected);
+                    assert!(copies.iter().all(|c| c.active.offset + c.active.bytes <= state.bytes * 3
+                        && c.mark.offset >= state.bytes * 3 && c.mark.offset + c.mark.bytes <= state.bytes * 4));
+                    assert_eq!(layout.csa_tail_bytes(rank, frontier % 64).unwrap(), cost.persistent_unit_bytes / 64 * (frontier % 64));
+                }
+            }
+            let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64).unwrap();
+            for (rank, state) in mtp.ranks.iter().enumerate() {
+                assert_eq!(state.mtp_hidden.is_some(), rank == head as usize);
+                assert_eq!(state.sliding.iter().filter(|s| s.mtp).count(), if rank == head as usize { 3 } else { 0 });
+            }
+        }
+    }
+}
+
+#[test]
+fn execution_ownership_refuses_unbound_modes_and_checkpoint_changes() {
+    use crate::placement::{FfnMode, LayerMode};
+    use super::ownership::{self, ExecutionOwnership};
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    let whole = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
+    let modes = vec![whole; 92];
+    let owners = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0)).unwrap();
+    assert!(owners.layer(92, 0).is_err());
+    assert!(owners.layer(0, 2).is_err());
+    for ranks in [0, 3] { assert!(ExecutionOwnership::new(&cfg, ranks, ownership::plan(&modes, 0, 0)).is_err()); }
+    assert!(ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes[..91], 0, 0)).is_err());
+    for (layer, mode, ranks) in [(3, LayerMode::HeadSplit, 2), (0, LayerMode::HeadSplit, 1),
+        (0, LayerMode::ContextSplit, 2), (3, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, 2),
+        (0, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }, 1)] {
+        let mut changed = modes.clone();
+        changed[layer] = mode;
+        assert!(ExecutionOwnership::new(&cfg, ranks, ownership::plan(&changed, 0, 0)).is_err());
+    }
+    assert!(ExecutionOwnership::new(&cfg, 1, ownership::plan(&modes, 0, 1)).is_err());
+    let mut changed = cfg.clone();
+    changed.full[3] = false;
+    assert!(owners.validate_config(&changed).is_err());
+    assert!(crate::serving_capacity::step5::Step5CacheLayout::for_execution(&changed, &owners, 1024, 0, 64).is_err());
+}
+
+#[test]
 fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
     use crate::serving_capacity::step5::{Step5CacheLayout, PAGE_ROWS, REGION_ROWS};
     let dir = snapshot("fp8");
