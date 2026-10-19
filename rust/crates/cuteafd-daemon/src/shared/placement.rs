@@ -409,7 +409,7 @@ mod tests {
                 2 => reports[1].host_exchange_bytes = 1,
                 3 => reports[1].row_indices_bytes = 1,
                 4 => reports[1].runtime.sample.arch.clear(),
-                _ => reports[1].slices.push(cuteafd_core::SparkSlice { layer: 13,
+                _ => reports[1].slices.push(cuteafd_core::SparkSlice { unit_map: None, layer: 13,
                     first: 0, width: 128, stored_width: 128, tiers: vec![], projection_counts: vec![] }),
             }
             let error = format!("{:#}", plan.reconcile(&reports).unwrap_err());

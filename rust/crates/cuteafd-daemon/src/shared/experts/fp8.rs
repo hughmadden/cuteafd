@@ -30,7 +30,8 @@ pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
     };
     ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
         && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
-        && info.slice == tensors.rank_width(tp, rank, slicing)?,
+        && layers.iter().all(|&layer| tensors.for_layer(layer)
+            .and_then(|view| view.rank_width(tp, rank, slicing)).is_ok_and(|width| width == info.slice)),
         "expert package does not serve checkpoint geometry/storage at TP{tp}: {info:?}");
     ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input,
         "native BF16/NVFP4 weights require BF16 input");
@@ -205,7 +206,7 @@ impl<'a> Fp8Layer<'a> {
     fn loaded_slice(tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize,
         slicing: Slicing) -> Result<cuteafd_core::SparkSlice> {
         let (first, width) = tensors.rank_range_with(tp, rank, slicing)?;
-        Ok(cuteafd_core::SparkSlice { layer: u32::try_from(layer)?, first: u32::try_from(first)?,
+        Ok(cuteafd_core::SparkSlice { unit_map: Some(tensors.unit_map(tp, rank, slicing)?.fingerprint()), layer: u32::try_from(layer)?, first: u32::try_from(first)?,
             width: u32::try_from(width)?, stored_width: u32::try_from(tensors.rank_width(tp, rank, slicing)?)?,
             tiers: vec![], projection_counts: vec![] })
     }
@@ -359,12 +360,10 @@ impl<'a> Fp8Experts<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         let mut experts = Self::prepare_with_modules(library, tensors, directory, bf16_directory,
             layers, tp, rank, capacity, budget, modules)?;
-        let slicing = if directory.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("-w")) {
-            Slicing::Blocks(128)
-        } else { Slicing::Padded };
+        let slicing = tensors.slicing_for_directory(directory, tp);
         experts.layers = layers.iter().copied().map(|layer| {
             let started = std::time::Instant::now();
-            let loaded = Fp8Layer::load_with(library, tensors, layer, tp, rank, slicing)?;
+            let loaded = Fp8Layer::load_with(library, &tensors.for_layer(layer)?, layer, tp, rank, slicing)?;
             tracing::info!(layer, tp, rank, elapsed_ms = started.elapsed().as_millis() as u64,
                 "FP8 expert layer resident");
             Ok(loaded)
@@ -385,10 +384,7 @@ impl<'a> Fp8Experts<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         validate_layer_ids(layers)?;
         // `tp<n>-w<width>` layouts store each rank's own whole 128-row blocks (see `exact_layout`).
-        let slicing = match directory.file_name().and_then(|n| n.to_str()).and_then(|n| n.split_once("-w")) {
-            Some(_) => Slicing::Blocks(128),
-            None => Slicing::Padded,
-        };
+        let slicing = tensors.slicing_for_directory(directory, tp);
         for &layer in layers {
             tensors.validate_layer(layer)?;
         }

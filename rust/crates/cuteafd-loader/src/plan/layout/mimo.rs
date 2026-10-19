@@ -161,8 +161,10 @@ fn spark_experts(input: &super::super::PlanInput, _options: &LayoutOptions,
     let catalog = input.expert_catalog()?;
     let tensors = catalog.fp8().context("MiMo Spark expert headers")?;
     let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
-    let remote = cfg.dense.iter().filter(|&&dense| !dense).count().checked_sub(onboard)
-        .context("MiMo onboard exceeds routed layers")?;
+    let routed = cfg.dense.iter().enumerate().filter_map(|(layer, &dense)| (!dense).then_some(layer))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(onboard <= routed.len(), "MiMo onboard exceeds routed layers");
+    let remote = &routed[onboard..];
     let ranks = sparks.len();
     use crate::formats::fp8_experts::ExpertFormat;
     let family = match (cfg.program_family()?, tensors.format()) {
@@ -176,9 +178,12 @@ fn spark_experts(input: &super::super::PlanInput, _options: &LayoutOptions,
         tensors.shape().intermediate, ranks)?;
     for spark in sparks {
         let slicing = recipe.slicing;
-        let bytes = crate::placement::families::mimo_v2::expert_layer_bytes(tensors,
-            ranks, spark.index as usize, slicing)?
-            .checked_mul(remote as u64).context("MiMo Spark expert bytes overflow")?;
+        let bytes = remote.iter().try_fold(0u64, |total, &layer| {
+            let view = tensors.for_layer_metadata(layer)?;
+            let bytes = crate::placement::families::mimo_v2::expert_layer_bytes(&view,
+                ranks, spark.index as usize, slicing)?;
+            total.checked_add(bytes).context("MiMo Spark expert bytes overflow")
+        })?;
         let format = match slicing { crate::formats::fp8_experts::Slicing::Padded => "native padded blocks",
             crate::formats::fp8_experts::Slicing::Blocks(_) => "native exact blocks" };
         spark.items.push(Item::new(Category::Experts, "routed_expert", format, bytes, Basis::Exact));

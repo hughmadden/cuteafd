@@ -167,7 +167,7 @@ impl SparkAssignment {
         for &layer in &working.spark_layers {
             ensure!(layer >= catalog.routed_experts().first_layer && layer < geometry.layers as usize,
                 "Spark layer {layer} is outside routed checkpoint headers");
-            let mut slice = cuteafd_core::SparkSlice { layer: u32::try_from(layer)?, first: 0,
+            let mut slice = cuteafd_core::SparkSlice { unit_map: None, layer: u32::try_from(layer)?, first: 0,
                 width: 0, stored_width: 0, tiers: vec![], projection_counts: vec![] };
             let resident = match layout {
                 SparkResidentLayout::Exl3 { world, rank } => {
@@ -186,6 +186,7 @@ impl SparkAssignment {
                     let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?
                         .for_layer(layer)?;
                     let (first, width) = tensors.rank_range_with(world, rank, slicing)?;
+                    slice.unit_map = Some(tensors.unit_map(world, rank, slicing)?.fingerprint());
                     slice.first = u32::try_from(first)?;
                     slice.width = u32::try_from(width)?;
                     slice.stored_width = u32::try_from(tensors.rank_width(world, rank, slicing)?)?;
@@ -442,7 +443,7 @@ mod tests {
     fn assignment_reconciles_exact_bytes_and_worker_architecture() {
         use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkRuntimeInventory, SparkSlice};
         let assignment = SparkAssignment { rank: 2, resident_bytes: 1 << 30,
-            slices: vec![SparkSlice { layer: 3, first: 768, width: 384, stored_width: 384,
+            slices: vec![SparkSlice { unit_map: None, layer: 3, first: 768, width: 384, stored_width: 384,
                 tiers: vec![2, 3], projection_counts: vec![[10, 11, 12], [12, 11, 10]] }],
             io: SparkIoBytes { intake: 100, host_exchange: 200, row_indices: 400, mapped_rings: 800, endpoint_staging: 160 } };
         let report = ModelAdmissionResponse { rank: 2, resident_bytes: assignment.resident_bytes,

@@ -1,3 +1,4 @@
+pub mod tp_units;
 pub mod dense_attention;
 pub mod ffn_activation;
 pub use ffn_activation::FfnActivation;

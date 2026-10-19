@@ -31,6 +31,8 @@ pub enum SparkIngress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SparkSlice {
+    /// Canonical source-unit map seal for unit-sliced expert backends.
+    pub unit_map: Option<String>,
     pub layer: u32,
     pub first: u32,
     pub width: u32,

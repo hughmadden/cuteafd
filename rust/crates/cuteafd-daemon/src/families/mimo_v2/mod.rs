@@ -15,6 +15,8 @@ mod split;
 mod teardown;
 #[cfg(test)]
 mod host_gate;
+#[cfg(test)]
+mod tp_gate;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;

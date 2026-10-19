@@ -30,7 +30,10 @@ impl Fp8Group {
         ensure!(config.spark_world()?.wire() == cuteafd_transport::expert::SparkWire::Canonical,
             "native expert packages require canonical Spark wire");
         let layers = config.resident_layers(catalog.routed_experts().layers)?;
-        tensors.homogeneous_layers(&layers)?.into_iter().map(|(tensors, layers)| {
+        let mut groups = Vec::<Self>::new();
+        for layer in layers {
+            let tensors = tensors.for_layer(layer)?;
+            let layers = vec![layer];
             tensors.slice(config.world)?;
             let directory = config.fp8_package.clone().unwrap_or_else(||
                 fp8::package_directory(&config.library, config.world, tensors.format()));
@@ -40,7 +43,9 @@ impl Fp8Group {
                 ExpertFormat::Nvfp4 => "nvfp4", ExpertFormat::Bf16 => "bf16", _ => "fp8",
             };
             super::backend::validate_fp8_recipe(&format!("{family}:{format}"), tensors.shape().intermediate,
-                config.world, &directory, config.rank, slicing,
+                config.world, &directory,
+                cuteafd_loader::plan::experts::spark_recipe(&format!("{family}:{format}"),
+                    tensors.shape().intermediate, config.world)?.rank_for_layer(config.rank, layer), slicing,
                 tensors.rank_width(config.world, config.rank, slicing)?)?;
             if config.world == 5 {
                 ensure!(slicing == Slicing::Blocks(128) || tensors.shape().intermediate % (128 * config.world) == 0,
@@ -56,8 +61,17 @@ impl Fp8Group {
                 fp8::validate_bf16_package(&metadata.info, &sibling.info, capacity)?;
                 scratch = scratch.max(sibling.scratch_for(capacity)?);
             }
-            Ok(Self { tensors, layers, directory, bf16_directory, slicing, scratch, modules: None })
-        }).collect()
+            if let Some(group) = groups.iter_mut().find(|group| group.directory == directory
+                && group.bf16_directory == bf16_directory && group.slicing == slicing
+                && group.tensors.format() == tensors.format()
+                && group.tensors.activation(group.layers[0]) == tensors.activation(layer)) {
+                group.layers.push(layer);
+                group.scratch = group.scratch.max(scratch);
+            } else {
+                groups.push(Self { tensors, layers, directory, bf16_directory, slicing, scratch, modules: None });
+            }
+        }
+        Ok(groups)
     }
 }
 

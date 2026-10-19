@@ -561,7 +561,7 @@ mod tests {
             arch: "sm_121".into(), driver: "test".into() }
     }
     fn assignment() -> SparkAssignment {
-        SparkAssignment { rank: 1, resident_bytes: 1000, slices: vec![cuteafd_core::SparkSlice {
+        SparkAssignment { rank: 1, resident_bytes: 1000, slices: vec![cuteafd_core::SparkSlice { unit_map: None,
             layer: 5, first: 768, width: 768, stored_width: 768, tiers: vec![], projection_counts: vec![] }],
             io: crate::placement::SparkIoBytes { intake: u64::MAX, host_exchange: 111, row_indices: 222, mapped_rings: 333, endpoint_staging: 444 } }
     }
