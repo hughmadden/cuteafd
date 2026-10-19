@@ -18,6 +18,11 @@ fn checkpoint_ingress(snapshot: &std::path::Path) -> Result<(SparkIngress, Exper
     } else { (SparkIngress::Fp8K32, ExpertV2Dtype::Fp8E4m3Ue8m0K32) })
 }
 
+fn partial_row_bytes(geometry: ExpertGeometry) -> Result<usize> {
+    // Rank-local expert reduction returns one hidden-wide BF16 row, regardless of ingress.
+    ExpertV2Dtype::Bf16.row_bytes(geometry.hidden as usize)
+}
+
 fn request(geometry: ExpertGeometry, layer: usize, rows: usize, dtype: ExpertV2Dtype)
     -> Result<ExpertProtocolV2Request> {
     let k = geometry.topk as usize;
@@ -121,6 +126,31 @@ fn requests_use_checkpoint_geometry_and_two_repeated_oracle_rows() -> Result<()>
 }
 
 #[test]
+fn compact_partial_planes_use_bf16_rows_independently_of_ingress_and_topk() -> Result<()> {
+    for geometry in [ExpertGeometry::DEEPSEEK_V41, ExpertGeometry::GLM5,
+        ExpertGeometry::MIMO_V2_FLASH, ExpertGeometry::MIMO_V26_PRO] {
+        let output_pitch = partial_row_bytes(geometry)?;
+        assert_eq!(output_pitch, geometry.hidden as usize * 2);
+        for dtype in [ExpertV2Dtype::Bf16, ExpertV2Dtype::Fp8E4m3Ue8m0K32] {
+            for rows in [1, 16] {
+                let request = request(geometry, 3, rows, dtype)?;
+                assert_eq!(request.header.row_count as usize, rows);
+                assert_eq!(request.routes.len(), rows * geometry.topk as usize);
+                assert_ne!(request.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
+                let plane_bytes = rows * output_pitch;
+                assert_eq!(plane_bytes, rows * geometry.hidden as usize * 2);
+                if dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32 {
+                    assert!(request.hidden_payload.len() < plane_bytes);
+                } else {
+                    assert_eq!(request.hidden_payload.len(), plane_bytes);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn gate_ingress_matches_production_checkpoint_contract() -> Result<()> {
     use cuteafd_loader::plan::testing as fixture;
     for (write, ingress, dtype) in [
@@ -156,7 +186,7 @@ fn native_tp_rank_sum() -> Result<()> {
     let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
     let geometry = validate_source(&catalog, &family, &format)?;
     let (ingress, dtype) = checkpoint_ingress(&snapshot)?;
-    let row_bytes = dtype.row_bytes(geometry.hidden as usize)?;
+    let output_row_bytes = partial_row_bytes(geometry)?;
     let spark_world = checkpoint_world(&catalog, world)?;
     cuteafd_core::set_expert_geometry(geometry)
         .map_err(|_| anyhow::anyhow!("rank-sum process already selected another expert geometry"))?;
@@ -176,11 +206,11 @@ fn native_tp_rank_sum() -> Result<()> {
             endpoints: vec![SparkEndpoint { capacity: 16, ingress }],
             rings: spark_rings(config.max_frame_bytes)? })?.select(&peers)?;
     let h = geometry.hidden as usize;
-    let zero = DeviceAllocation::new(&library, 16 * h * 2)?;
-    let output = DeviceAllocation::new(&library, 16 * h * 2)?;
+    let zero = DeviceAllocation::new(&library, 16 * output_row_bytes)?;
+    let output = DeviceAllocation::new(&library, 16 * output_row_bytes)?;
     library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
     let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-    let mut link = SparkLink::new(&library, spark_world, &peers, 16, config, row_bytes)?;
+    let mut link = SparkLink::new(&library, spark_world, &peers, 16, config, output_row_bytes)?;
     link.enable_terminal_ownership(library.clone())?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let result = runtime.block_on(async {
