@@ -57,6 +57,68 @@ pub fn residual_score_weight(norm: &LoadedTensor, projection: &LoadedTensor, hid
         }).collect())
 }
 
+/// Replicated native latent weights; neither projection is TP-sharded.
+#[derive(Debug)]
+pub struct LatentWeights {
+    pub down: LoadedTensor,
+    pub norm: LoadedTensor,
+    pub up: LoadedTensor,
+}
+
+pub fn load_latent(cfg: &KimiK3Config, layer: usize,
+    mut read: impl FnMut(&str) -> anyhow::Result<LoadedTensor>) -> Result<LatentWeights> {
+    if cfg.dense.get(layer) != Some(&false) {
+        return Err(W8WeightError::Invalid("latent MoE layer"));
+    }
+    let prefix = format!("language_model.model.layers.{layer}.block_sparse_moe");
+    let mut load = |leaf: &str, shape: &[usize]| -> Result<LoadedTensor> {
+        let name = format!("{prefix}.{leaf}.weight");
+        let tensor = read(&name).map_err(|source| W8WeightError::Read { name, source })?;
+        check_bf16(&tensor, shape)?;
+        Ok(tensor)
+    };
+    Ok(LatentWeights {
+        down: load("routed_expert_down_proj", &[cfg.latent, cfg.hidden])?,
+        norm: load("routed_expert_norm", &[cfg.latent])?,
+        up: load("routed_expert_up_proj", &[cfg.hidden, cfg.latent])?,
+    })
+}
+
+/// Each fused site consumes the score product and the following norm, not the
+/// residual norm itself. These inputs remain replicated on both TP2 ranks.
+#[derive(Debug)]
+pub struct ResidualWeights {
+    pub score: Vec<u8>,
+    pub norm: LoadedTensor,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ResidualWeightSite { Attention(usize), Ffn(usize), Output }
+
+pub fn load_residual(cfg: &KimiK3Config, site: ResidualWeightSite,
+    mut read: impl FnMut(&str) -> anyhow::Result<LoadedTensor>) -> Result<ResidualWeights> {
+    let (base, residual, following) = match site {
+        ResidualWeightSite::Attention(layer) | ResidualWeightSite::Ffn(layer) => {
+            if layer >= cfg.layers { return Err(W8WeightError::Invalid("residual layer")); }
+            let attention = matches!(site, ResidualWeightSite::Attention(_));
+            (format!("language_model.model.layers.{layer}"),
+                if attention { "self_attention_res" } else { "mlp_res" },
+                if attention { "input_layernorm" } else { "post_attention_layernorm" })
+        }
+        ResidualWeightSite::Output => ("language_model.model".into(), "output_attn_res", "norm"),
+    };
+    let mut load = |leaf: &str, shape: &[usize]| -> Result<LoadedTensor> {
+        let name = format!("{base}.{leaf}.weight");
+        let tensor = read(&name).map_err(|source| W8WeightError::Read { name, source })?;
+        check_bf16(&tensor, shape)?;
+        Ok(tensor)
+    };
+    let residual_norm = load(&format!("{residual}_norm"), &[cfg.hidden])?;
+    let projection = load(&format!("{residual}_proj"), &[1, cfg.hidden])?;
+    let score = residual_score_weight(&residual_norm, &projection, cfg.hidden)?;
+    Ok(ResidualWeights { score, norm: load(following, &[cfg.hidden])? })
+}
+
 fn check_bf16(tensor: &LoadedTensor, shape: &[usize]) -> Result<()> {
     let bytes = shape.iter().try_fold(2usize, |n, &v| n.checked_mul(v));
     if tensor.info.dtype != DType::Bf16 || tensor.info.shape != shape || bytes != Some(tensor.bytes.len()) {
@@ -136,6 +198,41 @@ mod tests {
         }
         assert!(pack_ffn(&cfg, 0, 3, |_| unreachable!()).is_err());
         assert!(pack_ffn(&cfg, cfg.layers, 2, |_| unreachable!()).is_err());
+    }
+
+    #[test]
+    fn latent_and_residual_checkpoint_inputs_keep_native_shapes_and_names() {
+        let mut cfg = KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap();
+        cfg.hidden = 4; cfg.latent = 2;
+        let latent = load_latent(&cfg, 1, |name| {
+            let shape = if name.ends_with("routed_expert_down_proj.weight") { vec![2, 4] }
+                else if name.ends_with("routed_expert_up_proj.weight") { vec![4, 2] }
+                else { assert!(name.ends_with("routed_expert_norm.weight")); vec![2] };
+            assert!(name.starts_with("language_model.model.layers.1.block_sparse_moe."));
+            let count = shape.iter().product::<usize>();
+            Ok(tensor(name, shape, values(std::iter::repeat_n(0x3f80, count))))
+        }).unwrap();
+        assert_eq!(latent.down.info.shape, [2, 4]);
+        assert_eq!(latent.norm.info.shape, [2]);
+        assert_eq!(latent.up.info.shape, [4, 2]);
+        assert!(load_latent(&cfg, 0, |_| unreachable!()).is_err());
+        assert!(load_latent(&cfg, cfg.layers, |_| unreachable!()).is_err());
+        for (site, expected) in [
+            (ResidualWeightSite::Attention(1), ["layers.1.self_attention_res_norm", "layers.1.self_attention_res_proj", "layers.1.input_layernorm"]),
+            (ResidualWeightSite::Ffn(1), ["layers.1.mlp_res_norm", "layers.1.mlp_res_proj", "layers.1.post_attention_layernorm"]),
+            (ResidualWeightSite::Output, ["output_attn_res_norm", "output_attn_res_proj", "norm"]),
+        ] {
+            let mut names = Vec::new();
+            let packed = load_residual(&cfg, site, |name| {
+                names.push(name.to_string());
+                let shape = if name.ends_with("_proj.weight") { vec![1, 4] } else { vec![4] };
+                Ok(tensor(name, shape, values([0x3f81; 4])))
+            }).unwrap();
+            assert_eq!(names, expected.map(|s| format!("language_model.model.{s}.weight")));
+            assert_eq!(packed.score.len(), 16);
+            assert_eq!(packed.norm.info.shape, [4]);
+        }
+        assert!(load_residual(&cfg, ResidualWeightSite::Attention(cfg.layers), |_| unreachable!()).is_err());
     }
 
     #[test]
