@@ -72,6 +72,22 @@ pub struct SparkAllocationTerm {
 mod spark_census;
 pub use spark_census::{spark_census_deltas, CensusDeviceKind, CensusDeviceWitness, SparkCensusDeltas, SparkCensusError};
 
+/// Raw counters for one visible memory-cgroup ancestor; not process attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CgroupMemorySample {
+    pub path: String,
+    pub version: u8,
+    pub current_bytes: Option<u64>,
+    pub peak_bytes: Option<u64>,
+    /// Missing file and an explicitly unlimited ceiling are distinct.
+    pub max: Option<CgroupMemoryLimit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CgroupMemoryLimit { Bytes(u64), Unlimited }
+
 /// Same-process evidence: integrated CUDA uses system/cgroup phase deltas;
 /// process maps attribute host-only memory, never driver-owned CUDA UMA.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +97,10 @@ pub struct SparkProcessSample {
     pub pid: u32,
     pub monotonic_ns: u64,
     pub rss_bytes: u64,
+    /// Process lifetime peak RSS from /proc/self/status, absent without an mm.
+    pub peak_rss_bytes: Option<u64>,
+    /// Current and lifetime peak counters, including visible ancestor limits.
+    pub cgroup_memory: Vec<CgroupMemorySample>,
     pub pss_bytes: u64,
     pub private_bytes: u64,
     pub tracked_device_bytes: u64,

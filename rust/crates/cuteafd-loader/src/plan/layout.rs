@@ -15,6 +15,9 @@ pub(crate) mod qwen;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
+/// Historical offline GB10 device capacity estimate, not a measured admission.
+/// Kept distinct from the family's weights-only default until load/steady census.
+pub const DEFAULT_SPARK_DEVICE_BYTES: u64 = 108 * GIB;
 // 2026-10-07 SM120/SM121 resident ledger at the fixed 4096-image-token capacity:
 // native scratch_glm's aligned arenas, including its dedicated 4 MiB BLAS workspace.
 const GLM_FLASH_ENCODER_SCRATCH_BYTES: u64 = 791_907_584;
@@ -155,8 +158,7 @@ impl Default for LayoutOptions {
             vision_replicas: 1,
             host_embedding: false,
             force_gpu_embedding: false,
-            // 121.7 GiB GB10 minus the host OS and sparknestd measured idle (~13 GiB).
-            spark_bytes: 108 * GIB,
+            spark_bytes: DEFAULT_SPARK_DEVICE_BYTES,
             spark_allocation_budget_bytes: None,
             head_split: true,
             prefill_rows: 0,

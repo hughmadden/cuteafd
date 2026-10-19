@@ -1511,6 +1511,24 @@ fn invalid_budgets_are_typed_option_errors() {
 }
 
 #[test]
+fn explicit_spark_ceiling_updates_all_layout_budgets_without_changing_defaults() {
+    assert_eq!(DEFAULT_SPARK_BUDGET_BYTES, 100 << 30);
+    assert_eq!(super::families::kimi::SPARK_BUDGET_BYTES, 108 << 30);
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions::default()), ..Default::default() };
+    options.apply_spark_budget();
+    assert_eq!(options.spark_budget_bytes, None);
+    assert_eq!(options.layout.as_ref().unwrap().spark_bytes, 108 << 30);
+    assert_eq!(options.layout.as_ref().unwrap().spark_allocation_budget_bytes, None);
+    for budget in [82 << 30, 112 << 30] {
+        options.spark_budget_bytes = Some(budget);
+        options.apply_spark_budget();
+        assert_eq!(options.spark_budget(), budget);
+        assert_eq!(options.layout.as_ref().unwrap().spark_bytes, budget);
+        assert_eq!(options.layout.as_ref().unwrap().spark_allocation_budget_bytes, Some(budget));
+    }
+}
+
+#[test]
 fn capacity_suggests_a_packaged_rank_count() {
     // One layer of Qwen EXL3 K4 experts.
     let dir = qwen_snapshot(4);

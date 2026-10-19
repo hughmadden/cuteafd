@@ -304,6 +304,15 @@ impl Default for PlanOptions {
 }
 
 impl PlanOptions {
+    /// An explicit Spark ceiling applies to the complete layout as well as
+    /// weights. Unset keeps the separate historical device/family defaults.
+    pub fn apply_spark_budget(&mut self) {
+        if let (Some(bytes), Some(layout)) = (self.spark_budget_bytes, &mut self.layout) {
+            layout.spark_bytes = bytes;
+            layout.spark_allocation_budget_bytes = Some(bytes);
+        }
+    }
+
     /// Rejects options that describe no deployment: Spark worlds the
     /// transport does not run (it runs 1 through 6; 0 is the local-only
     /// placement) and empty budgets.
@@ -598,8 +607,9 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     report.vision = model.vision_mode(options.vision);
     // An unset Spark budget is the family's own (Kimi K3 admits more than the
     // shared default); an explicit --spark-budget-gib always wins.
-    let resolved = PlanOptions { spark_budget_bytes: Some(options.spark_budget_bytes
-        .unwrap_or_else(|| model.spark_budget_bytes())), ..options.clone() };
+    let mut resolved = options.clone();
+    resolved.apply_spark_budget();
+    resolved.spark_budget_bytes = Some(options.spark_budget_bytes.unwrap_or_else(|| model.spark_budget_bytes()));
     let options = &resolved;
     report.spark_budget_bytes = options.spark_budget();
     let spec = model.spec();

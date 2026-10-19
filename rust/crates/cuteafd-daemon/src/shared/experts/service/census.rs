@@ -31,6 +31,9 @@ impl Census {
         let text = std::fs::read_to_string("/proc/self/smaps")
             .context("reading process-attributable Spark census")?;
         let maps = parse_smaps(&text)?;
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        let peak_rss = optional_kib_field(&status, "VmHWM:")?;
+        let cgroup_memory = cuteafd_ffi::cgroup_memory_census()?;
         let meminfo = std::fs::read_to_string("/proc/meminfo")?;
         let available = kib_field(&meminfo, "MemAvailable:")?;
         let system_headroom = cuteafd_ffi::cgroup_memory_headroom(usize::try_from(available)?)? as u64;
@@ -42,7 +45,8 @@ impl Census {
         let device = library.map(|l| l.cuda_get_device()).transpose()?.unwrap_or(0);
         self.samples.push(SparkProcessSample { phase: phase.into(), pid: std::process::id(),
             monotonic_ns: self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            rss_bytes: maps.rss, pss_bytes: maps.pss, private_bytes: maps.private,
+            rss_bytes: maps.rss, peak_rss_bytes: peak_rss, cgroup_memory,
+            pss_bytes: maps.pss, private_bytes: maps.private,
             device_kind: self.device_kind, device_witness: witness,
             cuda_mapping_pss_bytes: maps.cuda_pss, anonymous_pss_bytes: maps.anon_pss,
             file_pss_bytes: maps.file_pss,
@@ -53,7 +57,7 @@ impl Census {
             tracked_device_bytes: ledger.total(Space::Device, device) as u64,
             tracked_pinned_bytes: ledger.total(Space::Pinned, -1) as u64,
             raw_cuda_free_bytes: library.and_then(|l| l.cuda_physical_memory_info().ok()).map(|(free, _)| free as u64),
-            method: "same_pid_smaps (CUDA device mapping PSS, anonymous PSS, file PSS); independent MemAvailable/system and cgroup-bounded admission headroom; raw CUDA diagnostic only; device witness explicitly selected by integrated/discrete property; host-only maps/system agreement; quiet-host qualification external".into() });
+            method: "same_pid_status VmHWM and raw memory-cgroup current/peak/max (lifetime peaks, not isolated attribution); same_pid_smaps (CUDA device mapping PSS, anonymous PSS, file PSS); independent MemAvailable/system and cgroup-bounded admission headroom; raw CUDA diagnostic only; device witness explicitly selected by integrated/discrete property; host-only maps/system agreement; quiet-host qualification external".into() });
         tracing::info!(target: "cuteafd::spark_memory", record = %serde_json::to_string(self.samples.last().unwrap())?,
             "Spark process census");
         Ok(())
@@ -83,6 +87,11 @@ impl Census {
             // qualified proof constructor also requires that external evidence.
             context_modules_qualified: false })
     }
+}
+
+fn optional_kib_field(text: &str, key: &str) -> Result<Option<u64>> {
+    if text.lines().any(|line| line.starts_with(key)) { kib_field(text, key).map(Some) }
+    else { Ok(None) }
 }
 
 fn kib_field(text: &str, key: &str) -> Result<u64> {
@@ -144,6 +153,16 @@ fn witness_verdict(samples: &[SparkProcessSample]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lifetime_peak_rss_is_optional_but_malformed_samples_fail() {
+        assert_eq!(optional_kib_field("Name: worker\nVmHWM: 123 kB\n", "VmHWM:").unwrap(), Some(123 * 1024));
+        assert_eq!(optional_kib_field("Name: kernel\n", "VmHWM:").unwrap(), None);
+        for text in ["VmHWM: 1 kB\nVmHWM: 2 kB", "VmHWM: nope kB", "VmHWM: 4 MB",
+            "VmHWM: -1 kB", "VmHWM: 18446744073709551615 kB"] {
+            assert!(optional_kib_field(text, "VmHWM:").is_err(), "{text}");
+        }
+    }
+
     fn samples() -> Vec<SparkProcessSample> {
         let phases = ["before_context", "after_context_before_media", "before_expert_modules",
             "after_expert_modules_before_weights", "after_retained_arenas", "serve_owners_before_endpoint_rings"];
@@ -151,7 +170,7 @@ mod tests {
             let mib = 1 << 20;
             let cuda = [0, 32, 32, 96, 1120, 1120][i] * mib;
             SparkProcessSample { phase: phase.into(), pid: 42, monotonic_ns: i as u64 + 1,
-                rss_bytes: cuda, pss_bytes: cuda, private_bytes: 0,
+                rss_bytes: cuda, peak_rss_bytes: Some(cuda), cgroup_memory: vec![], pss_bytes: cuda, private_bytes: 0,
                 tracked_device_bytes: if i >= 4 { 1024 * mib } else { 0 }, tracked_pinned_bytes: 0,
                 device_kind: Some(CensusDeviceKind::Discrete), device_witness: Some(CensusDeviceWitness::CudaMappingPss),
                 cuda_mapping_pss_bytes: cuda, anonymous_pss_bytes: 0, file_pss_bytes: 0,

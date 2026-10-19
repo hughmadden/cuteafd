@@ -19,7 +19,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     if !args.layout && args.vision_replicas != 1 {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
-    let options = PlanOptions {
+    let mut options = PlanOptions {
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
@@ -95,6 +95,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             })
         }).transpose()?,
     };
+    options.apply_spark_budget();
     options.validate()?;
     Ok(options)
 }
@@ -1188,7 +1189,21 @@ mod tests {
         request.spark_budget_gib = Some(82.0);
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, Some(82 << 30));
-        assert_eq!(options.layout.unwrap().spark_allocation_budget_bytes, Some(82 << 30));
+        let layout = options.layout.unwrap();
+        assert_eq!(layout.spark_allocation_budget_bytes, Some(82 << 30));
+        assert_eq!(layout.spark_bytes, 82 << 30);
+    }
+
+    #[test]
+    fn unset_spark_budget_preserves_separate_defaults() {
+        let mut request = args(std::path::Path::new("/not-read"), 4, false);
+        request.spark_budget_gib = None;
+        let options = options(&request).unwrap();
+        assert_eq!(options.spark_budget_bytes, None);
+        assert_eq!(options.spark_budget(), 100 << 30);
+        let layout = options.layout.unwrap();
+        assert_eq!(layout.spark_allocation_budget_bytes, None);
+        assert_eq!(layout.spark_bytes, 108 << 30);
     }
 
     #[test]

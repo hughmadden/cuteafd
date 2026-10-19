@@ -244,6 +244,15 @@ fn max_card_charges_spark_runtime_and_onboards_layers_as_the_fallback() {
     let report = plan::plan(dir.path(), &with_layout(6, Some(100 << 30))).unwrap();
     assert!(!report.fits);
     assert!(report.hints.iter().any(|h| h.what.contains("107.54 GiB/rank, 7.54 GiB over the 100.00 GiB")), "{:#?}", report.hints);
+    // Explicit ceiling replaces the old 108 GiB device estimate too; runtime
+    // remains unqualified even when this offline ledger fits.
+    let report = plan::plan(dir.path(), &with_layout(6, Some(112 << 30))).unwrap();
+    assert_eq!(report.spark_budget_bytes, 112 << 30);
+    let memory = report.memory_layout.as_ref().unwrap();
+    assert!(device(memory, DeviceKind::Spark).iter().all(|d| d.capacity_bytes == 112 << 30 && d.free_bytes() > 0));
+    assert!(!report.hints.iter().any(|h| h.what.contains("full memory layout needs")));
+    assert!(!report.fits && !report.placement_supported, "header fit is not W9 qualification");
+    assert!(memory.notes.iter().any(|n| n.contains("offline estimates")));
     // Other card columns are refused by name.
     let report = plan::plan(dir.path(), &with_layout(4, None)).unwrap();
     assert!(report.hints.iter().any(|h| h.what.contains("6 Spark ranks")));

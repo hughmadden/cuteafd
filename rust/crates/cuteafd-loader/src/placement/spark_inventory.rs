@@ -597,7 +597,7 @@ mod tests {
             let cuda = [0, 32, 32, 96, 1120, 1120][i] * mib;
             cuteafd_core::expert_geometry::SparkProcessSample {
                 phase: phase.into(), pid: 42, monotonic_ns: i as u64 + 1,
-                rss_bytes: cuda, pss_bytes: cuda, private_bytes: 0,
+                rss_bytes: cuda, peak_rss_bytes: Some(cuda), cgroup_memory: vec![], pss_bytes: cuda, private_bytes: 0,
                 tracked_device_bytes: if i >= 4 { 1024 * mib } else { 0 }, tracked_pinned_bytes: 0,
                 device_kind: Some(cuteafd_core::expert_geometry::CensusDeviceKind::Discrete),
                 device_witness: Some(cuteafd_core::expert_geometry::CensusDeviceWitness::CudaMappingPss),

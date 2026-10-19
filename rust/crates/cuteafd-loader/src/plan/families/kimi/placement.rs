@@ -25,6 +25,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let gpus = opts.rtx_bytes.len();
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![
         "Kimi K3 header lower bound: coordinator workspaces/graphs/prefix marks not charged; NOT serving admission".into(),
+        "Spark budgets are offline estimates (including an explicit override), not load/steady census-qualified admission".into(),
     ] };
     let refusal = |report: &mut PlanReport, what: String, how: &str| {
         report.fits = false;
