@@ -568,8 +568,9 @@ pub(crate) fn layer_pipeline<K: PipelineKernels>(scope: &crate::shared::experts:
 pub(crate) fn layer_pipeline_lanes<K: PipelineKernels>(scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
     plan: &LayerExecutionPlan, instances: &[(&PeerExchange<'_>, &HopLink<'_>)],
     order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
-    let exchanges = instances.iter().map(|&(peer, hops)| {
+    let exchanges = instances.iter().enumerate().map(|(lane, &(peer, hops))| {
         hops.validate_binding(plan, peer)?;
+        hops.validate_dispatch(lane, instances.len() == 1)?;
         Ok(LayerExchange { peer, hops })
     }).collect::<Result<Vec<_>>>()?;
     let exchanges: Vec<_> = exchanges.iter().collect();

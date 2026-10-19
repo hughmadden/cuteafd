@@ -432,7 +432,10 @@ pub(super) fn request(
     Ok(request)
 }
 
-fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: usize) -> Result<(SparkWorld, TcpTransportConfig)> {
+fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: usize,
+    prefill_lanes: usize) -> Result<(SparkWorld, TcpTransportConfig)> {
+    ensure!(matches!(prefill_lanes, 1 | 2) && clients >= prefill_lanes
+        && clients % prefill_lanes == 0, "Step-5 persistent lane endpoint inventory");
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
     let metadata: Value = serde_json::from_slice(&std::fs::read(
@@ -471,7 +474,7 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: u
             rtx_layers: vec![],
             spark_layers: layers.to_vec(),
             spark_ranks: args.peers.len(),
-            prefill_lanes: 1,
+            prefill_lanes: u64::try_from(prefill_lanes)?,
         },
         args.peers.len(),
         None,
@@ -486,7 +489,7 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: u
 }
 
 fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<SparkDeviceLink<'a>> {
-    let (world, config) = expert_admission(args, rows, layers, 1)?;
+    let (world, config) = expert_admission(args, rows, layers, 1, 1)?;
     ensure!(world.supports_device_exchange(), "Step-5 diagnostic requires native device exchange");
     let warm = request(
         3,
@@ -835,7 +838,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         Staging::new(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize)?];
     let mut lanes = [None, None];
     let wave_ranks = ownership.routed_wave_ranks()?;
-    let (world, config) = expert_admission(args, rows, layers, wave_ranks.len())?;
+    let (world, config) = expert_admission(args, rows, layers, ownership.routed_endpoints()?,
+        usize::try_from(ownership.execution().spec().lanes)?)?;
     for rank in wave_ranks {
         lanes[rank] = Some(devices[rank].own(|| SparkLane::new(&library, world, args.peers.clone(), rows as u32, config.clone(), H * 2))?);
     }

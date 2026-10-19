@@ -1,4 +1,4 @@
-//! Explicit one-lane native binding for shared-pipeline qualification.
+//! Shared immutable weights with private native execution lanes.
 use super::{cache::CacheRank, csa::CsaLayer, ffn::{DenseFfn, DensePlan},
     rope::TargetTables, routed::{RoutedFfn, RoutedPlan}, swa::SwaLayer,
     transaction::{Staging, Step}};
@@ -13,7 +13,7 @@ use cuteafd_hostcache::copy::CopyEngine;
 use cuteafd_loader::{placement::{Hop, HopPoint, LayerMode}, plan::{checkpoint::Checkpoint,
     families::step5::{coordinator::{CoordinatorContract, RankWeightLayout}, ownership::ExecutionOwnership}}};
 use cuteafd_transport::ExpertProtocolV2Request;
-use std::{cell::RefCell, ffi::c_void, rc::Rc, time::Duration};
+use std::{cell::{Cell, RefCell}, ffi::c_void, rc::Rc, time::Duration};
 
 const H: usize = 4096;
 
@@ -161,8 +161,12 @@ fn admit_native_lanes<T>(admission: [RankAdmission; 2], lanes: usize,
     allocate()
 }
 
-/// Transport/cache bindings remain one lane until their namespaces are qualified.
 pub(super) struct Execution<'e, 'a> {
+    lanes: Vec<LaneExecution<'e, 'a>>,
+}
+
+struct LaneExecution<'e, 'a> {
+    id: usize,
     ownership: ExecutionOwnership,
     native: NativeLane<'a>,
     caches: [&'e RefCell<CacheRank<'a>>; 2],
@@ -174,6 +178,7 @@ pub(super) struct Execution<'e, 'a> {
     pinned: [RefCell<HostAllocation<'a>>; 2],
     rows: usize,
     inventory: Vec<Inventory>,
+    requests: Cell<u64>,
 }
 
 struct Inventory { weights: Vec<u8>, kv: Vec<u8>, indexer: Option<Vec<u8>>, compressor: Option<Vec<u8>> }
@@ -187,9 +192,9 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn required_bytes_count(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, rank: usize, rows: usize, count: usize) -> Result<u64> {
         ensure!(matches!(count, 1 | 92), "Step-5 diagnostic layer count");
-        ensure!(ownership.ranks() == 2 && ownership.execution().spec().lanes == 1,
-            "Step-5 shared golden explicitly admits exactly one lane and two ranks");
-        Self::rank_admission(programs, checkpoint, ownership, rank, rows, count)?.bytes(1)
+        ensure!(ownership.ranks() == 2, "Step-5 shared execution requires two ranks");
+        Self::rank_admission(programs, checkpoint, ownership, rank, rows, count)?
+            .bytes(usize::try_from(ownership.execution().spec().lanes)?)
     }
 
     /// Includes the vocabulary head on its owning rank. Call for every rank before
@@ -242,32 +247,63 @@ impl<'e, 'a> Execution<'e, 'a> {
         stages: [&'e Staging<'a>; 2], rows: usize, available: [u64; 2],
         reservations: [u64; 2], lanes: [Option<DeviceOwner<'a, SparkLane<'a>>>; 2],
         count: usize) -> Result<Self> {
+        Self::load_lanes_count(programs, checkpoint, ownership, caches, vec![stages], rows,
+            available, reservations, vec![lanes], count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_lanes_count(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: ExecutionOwnership, caches: [&'e RefCell<CacheRank<'a>>; 2],
+        stages: Vec<[&'e Staging<'a>; 2]>, rows: usize, available: [u64; 2],
+        reservations: [u64; 2], transports: Vec<[Option<DeviceOwner<'a, SparkLane<'a>>>; 2]>,
+        count: usize) -> Result<Self> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        ensure!(ownership.ranks() == 2 && ownership.execution().spec().lanes == 1,
-            "Step-5 transport/cache binding explicitly admits exactly one lane and two ranks");
+        let lane_count = usize::try_from(ownership.execution().spec().lanes)?;
+        ensure!(ownership.ranks() == 2 && matches!(lane_count, 1 | 2)
+            && stages.len() == lane_count && transports.len() == lane_count,
+            "Step-5 transport/cache lane inventory");
         for rank in 0..2 {
             ensure!(rows as u64 <= ownership.execution().spec().rows,
                 "Step-5 live rows exceed execution plan");
             let cache = caches[rank].borrow();
             ensure!(cache.rank() == rank && cache.layout().ranks.len() == 2,
                 "Step-5 cache rank inventory");
-            ensure!(lanes[rank].is_some() == (0..count).any(|l|
-                ownership.layer(l, rank).is_ok_and(|local| local.routed_wave)),
-                "Step-5 routed-wave transport inventory");
+            for (lane, stages) in stages.iter().enumerate() {
+                stages[rank].validate_cache(&cache)?;
+                ensure!(transports[lane][rank].is_some() == (0..count).any(|l|
+                    ownership.layer(l, rank).is_ok_and(|local| local.routed_wave)),
+                    "Step-5 routed-wave transport inventory");
+            }
+            if lane_count == 2 {
+                ensure!(!Rc::ptr_eq(&stages[0][rank].stream, &stages[1][rank].stream),
+                    "Step-5 execution lanes share a staging stream");
+            }
         }
         let devices = [caches[0].borrow().stream.device, caches[1].borrow().stream.device];
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "Step-5 rank devices/library differ");
-        let mut owners = NativeLanes::load(programs, checkpoint, &ownership, devices,
+        let owners = NativeLanes::load(programs, checkpoint, &ownership, devices,
             rows, count, available, reservations)?;
-        let native = owners.lanes.pop().context("Step-5 admitted native lane missing")?;
-        ensure!(owners.lanes.is_empty(), "Step-5 one-lane binding received extra workspaces");
+        let lanes = owners.lanes.into_iter().zip(stages).zip(transports).enumerate()
+            .map(|(id, ((native, stages), transports))| LaneExecution::bind(checkpoint,
+                ownership.clone(), native, caches, stages, rows, transports, count, id))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { lanes })
+    }
+}
+
+impl<'e, 'a> LaneExecution<'e, 'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn bind(checkpoint: &'a Checkpoint, ownership: ExecutionOwnership, native: NativeLane<'a>,
+        caches: [&'e RefCell<CacheRank<'a>>; 2], stages: [&'e Staging<'a>; 2], rows: usize,
+        lanes: [Option<DeviceOwner<'a, SparkLane<'a>>>; 2], count: usize, id: usize) -> Result<Self> {
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        let devices = [caches[0].borrow().stream.device, caches[1].borrow().stream.device];
         let native_ranks = std::array::from_fn(|rank| RankDevice { device: devices[rank].id,
             stream: stages[rank].stream.raw });
         let peer = devices[0].run(|| PeerExchange::new_abortable(devices[0].library, native_ranks, 8, rows * H * 4))?;
-        let mut hops = devices[0].run(|| HopLink::new(devices[0].library, native_ranks,
-            ownership.execution().hops(), ownership.execution().spec()))?;
+        let mut hops = devices[0].run(|| HopLink::new_private_lane(devices[0].library, native_ranks,
+            ownership.execution().hops(), ownership.execution().spec(), id))?;
         hops.attach_abort([peer.abort_word(0)?.context("Step-5 lead abort")?,
             peer.abort_word(1)?.context("Step-5 peer abort")?])?;
         hops.validate_binding(ownership.execution(), &peer)?;
@@ -319,8 +355,9 @@ impl<'e, 'a> Execution<'e, 'a> {
             }
             inventory.push(state);
         }
-        let execution = Self { ownership, native, caches, stages, peer, hops,
-            sequence: RefCell::new(HeadSequence::new(0)?), lanes: lanes.map(RefCell::new), pinned, rows, inventory };
+        let execution = Self { id, ownership, native, caches, stages, peer, hops,
+            sequence: RefCell::new(HeadSequence::new(id)?), lanes: lanes.map(RefCell::new),
+            pinned, rows, inventory, requests: Cell::new(0) };
         if count == 92 { execution.validate_replications()?; }
         Ok(execution)
     }
@@ -365,7 +402,7 @@ impl<'e, 'a> Execution<'e, 'a> {
     }
 
     fn validate_replications(&self) -> Result<()> {
-        let mut copies = self.ownership.routed_replications(0)?;
+        let mut copies = self.ownership.routed_replications(self.id)?;
         for (layer, copy) in copies.iter_mut().enumerate() {
             if let Some(copy) = copy {
                 let Ffn::Routed(source) = &self.layer(copy.source as usize, layer)?.ffn else { anyhow::bail!("Step-5 routed source executor"); };
@@ -381,61 +418,127 @@ impl<'e, 'a> Execution<'e, 'a> {
         self.ownership.execution().validate_routed_replications(&copies)?;
         Ok(())
     }
-    fn shutdown(&self) -> Result<()> {
-        if self.peer.terminal_state() == crate::shared::peer_split::TerminalState::Drained { return Ok(()); }
-        let library = self.caches[0].borrow().stream.device.library;
-        let result = pair::teardown(&mut pair::Teardown {
-            abort: || self.peer.publish_abort(), ranks: || self.peer.drain_compute(),
-            links: || { for lane in &self.lanes { if let Some(lane) = lane.borrow_mut().as_mut() {
-                let device = lane.device;
-                device.run(|| lane.get_mut().terminal_quiesce())?;
-            }} Ok(()) },
-            copies: || { for lane in &self.lanes { if let Some(lane) = lane.borrow().as_ref() {
-                lane.device.run(|| lane.intake.terminal_drain_copies())?;
-            }}
-                for lane in &self.lanes { if let Some(lane) = lane.borrow_mut().as_mut() {
-                    let device = lane.device;
-                    device.run(|| lane.get_mut().terminal_release())?;
-                }}
-                Ok(()) },
-            graphs: || Ok(()),
-            finish: |drained| {
-                self.peer.finish_terminal(drained);
-                if !drained { library.quarantine_module_after_failed_drain(); }
-            },
-        });
-        // This qualification owner has no quarantine for borrowed cache/staging
-        // streams. A failed teardown must not return and release their storage.
-        crate::shared::decode_graph::fatal_drain(result, "Step-5 pipeline terminal owners");
-        Ok(())
+    fn shutdown(&self) -> Result<()> { shutdown_lanes(&[self]) }
+
+    fn quiesce(&self) -> Result<()> {
+        collect_lane_results(self.lanes.iter().filter_map(|lane| lane.borrow_mut().as_mut().map(|lane| {
+            let device = lane.device;
+            device.run(|| lane.get_mut().terminal_quiesce())
+        })))
     }
-    pub fn enqueue<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
-        input: &'s Allocation<'a>, request: Request) -> Result<()> {
-        step.validate_binding(&self.caches, &self.stages, self.rows)?;
-        self.validate_replications()?;
-        ensure!(!input.buffer.ptr.is_null() && input.buffer.device_id == self.peer.device(self.ownership.execution().spec().entry_gpu as usize)
-            && input.buffer.bytes >= self.rows * H * 4, "Step-5 live input allocation");
-        pair::submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
-            step.in_submission(scope, |step| {
-                step.compose(self.ownership.execution().spec().entry_gpu as usize, input, |_, _| Ok(()))?;
-                let mut bindings = [Bindings { execution: self, step, scope, current: [None, None], input: input.buffer, request, layer: 0, diagnostic: None }];
-                attention::layer_pipeline(scope, self.ownership.execution(), &self.peer, &self.hops,
-                    LaneOrder::Independent, &[self.rows], &mut bindings)?;
-                for stage in &self.stages { stage.stream.drain()?; }
-                Ok(())
-            })
-        })
+
+    fn drain_copies(&self) -> Result<()> {
+        collect_lane_results(self.lanes.iter().filter_map(|lane| lane.borrow().as_ref().map(|lane|
+            lane.device.run(|| lane.intake.terminal_drain_copies()))))?;
+        collect_lane_results(self.lanes.iter().filter_map(|lane| lane.borrow_mut().as_mut().map(|lane| {
+            let device = lane.device;
+            device.run(|| lane.get_mut().terminal_release())
+        })))
     }
+
 }
-impl Drop for Execution<'_, '_> {
+impl Drop for LaneExecution<'_, '_> {
     fn drop(&mut self) { if let Err(error) = self.shutdown() {
         tracing::error!(%error, "Step-5 native pipeline teardown retained queued owners");
     }}
 }
 
+// Attempt every owner in a phase, even if an earlier owner fails. In particular,
+// every abort publication precedes the first compute drain across all lanes.
+fn collect_lane_results(results: impl IntoIterator<Item = Result<()>>) -> Result<()> {
+    let failures: Vec<_> = results.into_iter().filter_map(Result::err)
+        .map(|error| format!("{error:#}")).collect();
+    ensure!(failures.is_empty(), "Step-5 lane owners: {}", failures.join("; "));
+    Ok(())
+}
+
+fn shutdown_lanes(lanes: &[&LaneExecution<'_, '_>]) -> Result<()> {
+    use crate::shared::peer_split::TerminalState;
+    if lanes.iter().all(|lane| lane.peer.terminal_state() == TerminalState::Drained) { return Ok(()); }
+    let result = pair::teardown(&mut pair::Teardown {
+        abort: || collect_lane_results(lanes.iter().map(|lane| lane.peer.publish_abort())),
+        ranks: || collect_lane_results(lanes.iter().map(|lane| lane.peer.drain_compute())),
+        links: || collect_lane_results(lanes.iter().map(|lane| lane.quiesce())),
+        copies: || collect_lane_results(lanes.iter().map(|lane| lane.drain_copies())),
+        graphs: || Ok(()),
+        finish: |drained| {
+            for lane in lanes {
+                lane.peer.finish_terminal(drained);
+                if !drained { lane.caches[0].borrow().stream.device.library.quarantine_module_after_failed_drain(); }
+            }
+        },
+    });
+    crate::shared::decode_graph::fatal_drain(result, "Step-5 pipeline terminal owners");
+    Ok(())
+}
+
+impl<'e, 'a> Execution<'e, 'a> {
+    fn only_lane(&self) -> Result<&LaneExecution<'e, 'a>> {
+        ensure!(self.lanes.len() == 1, "Step-5 singleton diagnostic requires one lane");
+        Ok(&self.lanes[0])
+    }
+    pub fn output(&self, layer: usize) -> Result<(Device<'a>, CuteafdDeviceBuffer)> {
+        self.only_lane()?.output(layer)
+    }
+    pub(super) fn head(&self) -> Result<&super::head::TargetHeadOwner<'a>> { self.only_lane()?.head() }
+    pub(super) fn diagnostic_layer0(&self, rank: usize) -> Result<(&SwaLayer<'a>, &DenseFfn<'a>)> {
+        self.only_lane()?.diagnostic_layer0(rank)
+    }
+    pub(super) fn enqueue_layer0<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
+        input: &'s Allocation<'a>, directory: &'s std::path::Path) -> Result<()> {
+        self.only_lane()?.enqueue_layer0(step, input, directory)
+    }
+    pub fn enqueue<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
+        input: &'s Allocation<'a>, request: Request) -> Result<()> {
+        self.enqueue_lanes(&mut [step], &[input], request)
+    }
+    pub(super) fn enqueue_lanes<'s, E: CopyEngine>(&'s self, steps: &mut [&mut Step<'s, 'a, E>],
+        inputs: &[&'s Allocation<'a>], request: Request) -> Result<()> {
+        ensure!(steps.len() == self.lanes.len() && inputs.len() == steps.len(),
+            "Step-5 submission lane inventory");
+        for ((lane, step), input) in self.lanes.iter().zip(steps.iter()).zip(inputs) {
+            step.validate_binding(&lane.caches, &lane.stages, lane.rows)?;
+            lane.validate_replications()?;
+            ensure!(!input.buffer.ptr.is_null()
+                && input.buffer.device_id == lane.peer.device(lane.ownership.execution().spec().entry_gpu as usize)
+                && input.buffer.bytes >= lane.rows * H * 4, "Step-5 live input allocation");
+        }
+        let lanes: Vec<_> = self.lanes.iter().collect();
+        pair::submit_scoped(|| collect_lane_results(lanes.iter().map(|lane| lane.peer.require_live())),
+            || shutdown_lanes(&lanes), |scope| Step::in_submissions(scope, steps, |steps| {
+                let mut bindings = self.lanes.iter().zip(steps.iter_mut()).zip(inputs)
+                    .map(|((lane, step), input)| {
+                        step.compose(lane.ownership.execution().spec().entry_gpu as usize, *input, |_, _| Ok(()))?;
+                        Ok(Bindings { execution: lane, step, scope, current: [None, None],
+                            input: input.buffer, request, layer: 0, diagnostic: None })
+                    }).collect::<Result<Vec<_>>>()?;
+                let exchanges: Vec<_> = self.lanes.iter().map(|lane| (&lane.peer, &lane.hops)).collect();
+                let rows: Vec<_> = self.lanes.iter().map(|lane| lane.rows).collect();
+                attention::layer_pipeline_lanes(scope, self.lanes[0].ownership.execution(), &exchanges,
+                    LaneOrder::Independent, &rows, &mut bindings)?;
+                collect_lane_results(self.lanes.iter().flat_map(|lane| lane.stages.iter())
+                    .map(|stage| stage.stream.drain()))
+            }))
+    }
+}
+impl Drop for Execution<'_, '_> {
+    fn drop(&mut self) {
+        let lanes: Vec<_> = self.lanes.iter().collect();
+        if let Err(error) = shutdown_lanes(&lanes) {
+            tracing::error!(%error, "Step-5 aggregate teardown retained queued owners");
+        }
+    }
+}
+
+fn request_identity(lane: usize, ordinal: u64) -> Result<u64> {
+    ensure!(lane < 2, "Step-5 request lane outside admission");
+    ordinal.checked_mul(2).and_then(|id| id.checked_add(lane as u64 + 1))
+        .context("Step-5 request namespace exhausted")
+}
+
 type Request = fn(usize, usize, Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, bytes::Bytes) -> Result<ExpertProtocolV2Request>;
 struct Bindings<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
-    execution: &'s Execution<'e, 'a>, step: &'b mut Step<'s, 'a, E>,
+    execution: &'s LaneExecution<'e, 'a>, step: &'b mut Step<'s, 'a, E>,
     scope: &'g SubmissionScope<'g>, current: [Option<CuteafdDeviceBuffer>; 2],
     input: CuteafdDeviceBuffer, request: Request, layer: usize,
     diagnostic: Option<&'s std::path::Path>,
@@ -552,8 +655,15 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         let mut lane = execution.lanes[rank].borrow_mut();
                         let lane = lane.as_mut().context("Step-5 routed wave lane missing")?;
                         let device = lane.device;
-                        device.run(|| lane.get_mut().submit(execution.rows,
-                            Box::new(move || request(layer, rows, routes, wire))))?;
+                        let ordinal = execution.requests.get();
+                        let next = ordinal.checked_add(1).context("Step-5 request sequence exhausted")?;
+                        let identity = request_identity(execution.id, ordinal)?;
+                        execution.requests.set(next);
+                        device.run(|| lane.get_mut().submit(execution.rows, Box::new(move || {
+                            let mut wave = request(layer, rows, routes, wire)?;
+                            wave.header.request_id = identity;
+                            Ok(wave)
+                        })))?;
                         wave = Some(rank);
                     }
                     self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
@@ -583,7 +693,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
         })?;
         if execution.ownership.execution().mode(layer)? == LayerMode::HeadSplit {
             let Ffn::Routed(destination) = &execution.layer(1 - rank, layer)?.ffn else { anyhow::bail!("Step-5 routed replica missing"); };
-            let binding = execution.ownership.routed_replications(0)?[layer].context("Step-5 routed publication binding")?;
+            let binding = execution.ownership.routed_replications(execution.id)?[layer].context("Step-5 routed publication binding")?;
             attention::replicate_result(self.scope, &execution.peer, rank, binding.slot,
                 ffn.routed_output(), destination.routed_output(), execution.rows * H * 2)?;
             for at in 0..2 {
@@ -714,6 +824,64 @@ mod tests {
             theta: vec![], rotary: vec![], rope_scaling: None, scale_full: false,
             scale_sliding: false, activation: vec![], shared_activation: vec![] }
     }
+    #[test]
+    fn request_identities_are_disjoint_checked_and_never_zero() -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for ordinal in 0..1024 {
+            for lane in 0..2 {
+                let id = request_identity(lane, ordinal)?;
+                assert_ne!(id, 0);
+                assert!(seen.insert(id));
+                assert_eq!((id - 1) % 2, lane as u64);
+            }
+        }
+        assert_eq!(request_identity(0, u64::MAX / 2)?, u64::MAX);
+        assert!(request_identity(1, u64::MAX / 2).is_err());
+        assert!(request_identity(0, u64::MAX / 2 + 1).is_err());
+        assert!(request_identity(2, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_terminal_phases_attempt_both_owners_and_abort_before_draining() {
+        for fault in [None, Some("abort"), Some("ranks"), Some("links"), Some("copies")] {
+            for cancelled in [false, true] {
+                let events = RefCell::new(Vec::new());
+                let phase = |name| collect_lane_results((0..2).map(|lane| {
+                    events.borrow_mut().push((name, lane));
+                    ensure!(fault != Some(name) || lane != 0, "injected {name} failure");
+                    Ok(())
+                }));
+                let shutdown = || pair::teardown(&mut pair::Teardown {
+                    abort: || phase("abort"), ranks: || phase("ranks"),
+                    links: || phase("links"), copies: || phase("copies"),
+                    graphs: || Ok(()),
+                    finish: |drained| events.borrow_mut().push((if drained { "drained" } else { "retained" }, 2)),
+                });
+                if cancelled {
+                    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _: Result<()> = pair::submit_scoped(|| Ok(()), shutdown, |_| {
+                            panic!("injected submission cancellation")
+                        });
+                    })).is_err());
+                } else {
+                    let result: Result<()> = pair::submit_scoped(|| Ok(()), shutdown, |_| {
+                        anyhow::bail!("injected submission failure")
+                    });
+                    assert!(result.is_err());
+                }
+                let mut expected = vec![("abort", 0), ("abort", 1)];
+                if fault != Some("abort") { expected.extend([("ranks", 0), ("ranks", 1)]); }
+                expected.extend([("links", 0), ("links", 1)]);
+                if !matches!(fault, Some("abort" | "ranks" | "links")) {
+                    expected.extend([("copies", 0), ("copies", 1)]);
+                }
+                expected.push((if fault.is_none() { "drained" } else { "retained" }, 2));
+                assert_eq!(*events.borrow(), expected, "fault={fault:?} cancelled={cancelled}");
+            }
+        }
+    }
+
     #[test]
     fn one_lane_native_plan_orders_host_syncs_hops_and_routed_replies_across_odd_head_passes() -> Result<()> {
         let trace = Trace { ownership: super::super::golden::split_ownership(&config(), 64)?,

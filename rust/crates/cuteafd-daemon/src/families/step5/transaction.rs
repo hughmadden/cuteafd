@@ -197,6 +197,14 @@ impl<'a> Staging<'a> {
         self.bytes
     }
 
+    pub(super) fn validate_cache(&self, cache: &CacheRank<'_>) -> Result<()> {
+        ensure!(self.cache_owner == cache.identity()
+            && self.stream.device.id == cache.stream.device.id
+            && std::ptr::eq(self.stream.device.library, cache.stream.device.library),
+            "Step-5 staging cache binding differs");
+        Ok(())
+    }
+
     pub fn owns_compressor(&self, cache: &CacheRank<'_>, layer: usize) -> bool {
         self.cache_owner == cache.identity() && self.sparse.is_some()
             && cache.layout().ranks[cache.rank()].regions.iter().position(|r| r.layer == layer)
@@ -264,6 +272,20 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let _mode = SubmissionMode::enter(self.submission.clone())?;
         let result = work(self);
         if result.is_err() { self.failed = true; }
+        result
+    }
+
+    pub(super) fn in_submissions<T>(
+        _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+        steps: &mut [&mut Self],
+        work: impl FnOnce(&mut [&mut Self]) -> Result<T>,
+    ) -> Result<T> {
+        let _modes = steps.iter().map(|step| SubmissionMode::enter(step.submission.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let result = work(steps);
+        if result.is_err() {
+            for step in steps { step.failed = true; }
+        }
         result
     }
 
