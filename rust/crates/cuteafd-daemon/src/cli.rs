@@ -1065,7 +1065,7 @@ pub(crate) struct NativeServeArgs {
     #[arg(long)] pub snapshot: PathBuf,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)] pub model_id: Option<String>,
-    #[arg(long)] pub native_lib: PathBuf,
+    #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long,value_delimiter=',',num_args=1..)] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long,default_value="127.0.0.1:8000")] pub listen: String,
     /// Replicated-group tensor-parallel degree inside one Spark group (opt-in; all-or-none with --spark-ep).
