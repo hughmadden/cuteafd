@@ -75,9 +75,79 @@ pub(crate) struct GoldenArgs {
     /// Compare the post-layer-91 BF16 final-norm plane to an explicit reference export.
     #[arg(long, requires = "nll", conflicts_with = "prefix_state")]
     compare_final_norm: bool,
+    /// Save every input row's F32 logits and U32 tokens in the shared golden format.
+    #[arg(long, requires = "nll", conflicts_with = "prefix_state")]
+    save_logits: Option<PathBuf>,
+    /// Save selected post-layer F32 rows and the final BF16 norm expanded to F32.
+    #[arg(long, requires_all = ["nll", "dump_layers"], conflicts_with = "prefix_state")]
+    dump_residuals: Option<PathBuf>,
+    /// Increasing target layer IDs to dump; independent of reference hidden fixtures.
+    #[arg(long, value_delimiter = ',', requires = "dump_residuals")]
+    dump_layers: Vec<usize>,
     /// Compare real cold/shared-prefix canonical state and an identical continuation.
     #[arg(long, requires = "nll")]
     prefix_state: bool,
+}
+
+fn diagnostic_selection(args: &GoldenArgs) -> Result<()> {
+    let writes = args.save_logits.is_some() || args.dump_residuals.is_some();
+    ensure!(!writes || (args.nll && args.last_layer == 91 && !args.prefix_state),
+        "Step-5 diagnostic outputs require complete cold NLL mode");
+    ensure!(args.dump_residuals.is_some() != args.dump_layers.is_empty()
+        && args.dump_layers.iter().all(|&layer| layer <= args.last_layer)
+        && args.dump_layers.windows(2).all(|layers| layers[0] < layers[1]),
+        "residual dump layers must be nonempty, increasing, executed, and paired with --dump-residuals");
+    Ok(())
+}
+
+fn write_f32(path: PathBuf, values: &[f32], rows: usize, width: usize) -> Result<()> {
+    ensure!(rows > 0 && width > 0 && rows.checked_mul(width) == Some(values.len())
+        && values.iter().all(|v| v.is_finite()), "diagnostic F32 shape/finite mismatch");
+    std::fs::write(path, values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_diagnostics(
+    args: &GoldenArgs, tokens: &[u32], positions: &[usize], vocab: usize,
+    logits: &[f32], normalized: Option<&[f32]>,
+    mut residual: impl FnMut(usize) -> Result<Vec<f32>>,
+) -> Result<()> {
+    diagnostic_selection(args)?;
+    if args.save_logits.is_none() && args.dump_residuals.is_none() { return Ok(()); }
+    ensure!(!tokens.is_empty() && tokens.iter().all(|&t| (t as usize) < vocab)
+        && !positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
+        && positions.windows(2).all(|p| p[0] < p[1]), "diagnostic token/scored positions mismatch");
+    let token_bytes = tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    if let Some(dir) = &args.save_logits {
+        std::fs::create_dir_all(dir)?;
+        write_f32(dir.join("logits.bin"), logits, tokens.len(), vocab)?;
+        std::fs::write(dir.join("tokens.bin"), &token_bytes)?;
+    }
+    if let Some(dir) = &args.dump_residuals {
+        let normalized = normalized.context("residual dump requires final normalized head input")?;
+        std::fs::create_dir_all(dir)?;
+        // Metadata is published last, so a failed dump is never marked complete.
+        let meta = dir.join("meta.json");
+        if meta.exists() { std::fs::remove_file(&meta)?; }
+        for &layer in &args.dump_layers {
+            write_f32(dir.join(format!("layer{layer:02}.bin")), &residual(layer)?, tokens.len(), H)?;
+        }
+        write_f32(dir.join("final_norm.bin"), normalized, tokens.len(), H)?;
+        std::fs::write(dir.join("tokens.bin"), token_bytes)?;
+        std::fs::write(dir.join("positions.bin"), (0..tokens.len() as u32)
+            .flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
+        std::fs::write(meta, serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "cuteafd.step5.residuals/1", "window": args.window,
+            "rows": tokens.len(), "width": H, "dtype": "F32", "byte_order": "little",
+            "positions": "positions.bin", "position_dtype": "U32", "tokens": "tokens.bin",
+            "layers": args.dump_layers, "layer_pattern": "layerNN.bin",
+            "final_norm": "final_norm.bin", "final_norm_source_dtype": "BF16",
+            "scored_target_positions": positions, "logits_row_target_offset": 1,
+            "complete": true
+        }))?)?;
+    }
+    Ok(())
 }
 
 fn selection(last: usize, peers: usize, hosted: &[usize], nll: bool) -> Result<()> {
@@ -665,8 +735,16 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let (_, output) = execution.output(91)?;
     ensure!(output.device_id == devices[head_rank].id, "Step-5 shared final head owner");
     let actual = head.logits(output)?;
+    let normalized = (args.dump_residuals.is_some() || reference.final_norm.is_some())
+        .then(|| head.normalized()).transpose()?;
+    save_diagnostics(args, &reference.tokens, &reference.positions, cfg.vocab,
+        &actual, normalized.as_deref(), |layer| {
+            let (device, output) = execution.output(layer)?;
+            Ok(read_buffer(device, output)?.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+        })?;
     if let Some(expected) = reference.final_norm {
-        let (cosine, relative_l2) = hidden_metrics(&head.normalized()?, &expected)?;
+        let (cosine, relative_l2) = hidden_metrics(normalized.as_deref().context("final norm inspection")?, &expected)?;
         println!("Step-5 shared hidden rows={rows} layer=final_norm cosine={cosine:.9} relative_l2={relative_l2:.9}");
     }
     let ours = select_scored_rows(&actual, &reference.positions, cfg.vocab)?;
@@ -683,6 +761,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
 }
 
 pub(crate) fn run(args: GoldenArgs) -> Result<()> {
+    diagnostic_selection(&args)?;
     let layers = selected_layers()?;
     selection(args.last_layer, args.peers.len(), &layers, args.nll)?;
     ensure!(
@@ -852,8 +931,15 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     }
     if let Some(head) = head {
         let actual = head.logits(chain.output(91)?)?;
+        let normalized = (args.dump_residuals.is_some() || final_norm.is_some())
+            .then(|| head.normalized()).transpose()?;
+        save_diagnostics(&args, &tokens, &positions, cfg.vocab, &actual,
+            normalized.as_deref(), |layer| {
+                Ok(read_buffer(device, chain.output(layer)?)?.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+            })?;
         if let Some(expected) = final_norm {
-            let (cosine, relative_l2) = hidden_metrics(&head.normalized()?, &expected)?;
+            let (cosine, relative_l2) = hidden_metrics(normalized.as_deref().context("final norm inspection")?, &expected)?;
             println!("Step-5 hidden ladder rows={rows} layer=final_norm cosine={cosine:.9} relative_l2={relative_l2:.9} reference={reference_kind}");
         }
         let ours = select_scored_rows(&actual, &positions, cfg.vocab)?;
@@ -882,6 +968,123 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn diagnostic_args(flags: &[&str]) -> Result<GoldenArgs> {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from([
+            "cuteafd", "step5-golden", "--snapshot", "/snapshot", "--golden", "/reference",
+            "--window", "code-1", "--last-layer", "91",
+        ].into_iter().chain(flags.iter().copied()))?;
+        let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
+        Ok(args)
+    }
+
+    #[test]
+    fn diagnostic_flags_require_complete_cold_execution_and_ordered_layers() -> Result<()> {
+        for split in [vec![], vec!["--split-device", "1"]] {
+            let mut flags = vec!["--nll", "--save-logits", "/logits", "--dump-residuals", "/residuals",
+                "--dump-layers", "0,3,10,30,60,87,91"];
+            flags.extend(split);
+            let args = diagnostic_args(&flags)?;
+            diagnostic_selection(&args)?;
+            assert_eq!(args.save_logits.as_deref(), Some(std::path::Path::new("/logits")));
+            assert_eq!(args.dump_layers, [0, 3, 10, 30, 60, 87, 91]);
+            assert!(args.compare_layers.is_empty());
+        }
+        diagnostic_selection(&diagnostic_args(&[])?)?;
+        diagnostic_selection(&diagnostic_args(&["--nll", "--save-logits", "/logits"])?)?;
+        for flags in [
+            vec!["--save-logits", "/logits"],
+            vec!["--nll", "--prefix-state", "--save-logits", "/logits"],
+            vec!["--nll", "--dump-residuals", "/residuals"],
+            vec!["--nll", "--dump-layers", "0"],
+            vec!["--nll", "--prefix-state", "--dump-residuals", "/residuals", "--dump-layers", "0"],
+        ] { assert!(diagnostic_args(&flags).is_err(), "{flags:?}"); }
+        for layers in ["0,0", "3,0", "92", "18446744073709551615"] {
+            let args = diagnostic_args(&["--nll", "--dump-residuals", "/residuals", "--dump-layers", layers])?;
+            assert!(diagnostic_selection(&args).is_err(), "{layers}");
+        }
+        let mut args = diagnostic_args(&["--nll", "--save-logits", "/logits"])?;
+        args.last_layer = 87;
+        assert!(diagnostic_selection(&args).is_err());
+        args.last_layer = 91;
+        args.prefix_state = true;
+        assert!(diagnostic_selection(&args).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_files_preserve_full_rows_bits_positions_and_head_input() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0,91"])?;
+        let logits_dir = root.path().join("logits");
+        let residual_dir = root.path().join("residuals");
+        args.save_logits = Some(logits_dir.clone());
+        args.dump_residuals = Some(residual_dir.clone());
+        let tokens = [2u32, 0, 1];
+        let positions = [1, 2];
+        let logits = [-0.0f32, 1., -2., 3., 4., 5., 6., 7., 8.];
+        let norm = vec![0.5f32; tokens.len() * H];
+        let mut requested = vec![];
+        save_diagnostics(&args, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
+            requested.push(layer);
+            Ok(vec![layer as f32; tokens.len() * H])
+        })?;
+        assert_eq!(requested, [0, 91]);
+        assert_eq!(std::fs::read(logits_dir.join("tokens.bin"))?,
+            tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>());
+        assert_eq!(std::fs::read(logits_dir.join("logits.bin"))?,
+            logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        assert_eq!(std::fs::read(residual_dir.join("positions.bin"))?,
+            [0u32, 1, 2].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>());
+        for (file, value) in [("layer00.bin", 0f32), ("layer91.bin", 91.), ("final_norm.bin", 0.5)] {
+            assert_eq!(std::fs::read(residual_dir.join(file))?,
+                vec![value; tokens.len() * H].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        }
+        let meta: Value = serde_json::from_slice(&std::fs::read(residual_dir.join("meta.json"))?)?;
+        assert_eq!(meta, serde_json::json!({
+            "schema":"cuteafd.step5.residuals/1", "window":"code-1", "rows":3, "width":H,
+            "dtype":"F32", "byte_order":"little", "positions":"positions.bin", "position_dtype":"U32",
+            "tokens":"tokens.bin", "layers":[0,91], "layer_pattern":"layerNN.bin",
+            "final_norm":"final_norm.bin", "final_norm_source_dtype":"BF16",
+            "scored_target_positions":[1,2], "logits_row_target_offset":1, "complete":true
+        }));
+        let scored = select_scored_rows(&logits, &positions, 3)?;
+        assert_eq!(scored, logits[..6]);
+        // Outputs survive the numerical rejection that follows writing in the shared path.
+        assert!(shared_diagnostic_verdict(0.02, 0., 0.01, 0.1).is_err());
+        assert!(logits_dir.join("logits.bin").is_file());
+        assert!(residual_dir.join("meta.json").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_writer_rejects_bad_payloads_without_complete_residual_metadata() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0"])?;
+        args.dump_residuals = Some(root.path().into());
+        let norm = vec![1f32; 2 * H];
+        for bad in [vec![1.; H], vec![f32::NAN; 2 * H], vec![f32::INFINITY; 2 * H]] {
+            std::fs::write(root.path().join("meta.json"), b"stale")?;
+            assert!(save_diagnostics(&args, &[0, 1], &[1], 2, &[0.; 4], Some(&norm),
+                |_| Ok(bad.clone())).is_err());
+            assert!(!root.path().join("meta.json").exists());
+        }
+        assert!(save_diagnostics(&args, &[0, 1], &[1], 2, &[0.; 4], None,
+            |_| Ok(norm.clone())).is_err());
+        for positions in [vec![], vec![0], vec![2], vec![1, 1]] {
+            assert!(save_diagnostics(&args, &[0, 1], &positions, 2, &[0.; 4], Some(&norm),
+                |_| Ok(norm.clone())).is_err());
+        }
+        args.dump_residuals = None;
+        args.dump_layers.clear();
+        args.save_logits = Some(root.path().join("logits"));
+        for bad in [vec![0.; 3], vec![f32::NAN; 4]] {
+            assert!(save_diagnostics(&args, &[0, 1], &[1], 2, &bad, None,
+                |_| unreachable!()).is_err());
+        }
+        Ok(())
+    }
+
     #[test]
     fn shared_diagnostic_enforces_finite_scores_and_inclusive_stop_bars() {
         assert!(shared_diagnostic_verdict(0.01, 0.0, 0.03, 0.7).is_ok());
@@ -1034,6 +1237,9 @@ mod tests {
             fp8_diagnostic_reference: false,
             compare_layers: vec![],
             compare_final_norm: false,
+            save_logits: None,
+            dump_residuals: None,
+            dump_layers: vec![],
         };
         let Reference { tokens, expected: hidden, .. } = reference(&args, 3)?;
         assert_eq!(tokens, [1]);
@@ -1077,7 +1283,8 @@ mod tests {
         let mut args = GoldenArgs { snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
             peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None, check_headers: true, nll: true, prefix_state: false,
-            fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false };
+            fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false,
+            save_logits: None, dump_residuals: None, dump_layers: vec![] };
         let full = reference(&args, 3)?;
         assert_eq!(full.positions, [1, 3]);
         let targets = full.positions.iter().map(|&p| full.tokens[p]).collect::<Vec<_>>();
