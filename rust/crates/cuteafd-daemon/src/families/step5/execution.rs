@@ -577,7 +577,7 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn lane_terminal_output(&self, lane: usize) -> Result<(Device<'a>, CuteafdDeviceBuffer)> {
         let owner = self.lanes.get(lane).context("Step-5 terminal lane")?;
         let rank = owner.ownership.execution().spec().head_gpu as usize;
-        Ok((owner.device(rank)?, owner.terminal_output.get().context("Step-5 terminal wave absent")?))
+        Ok((owner.device(rank)?, owner.terminal_output.take().context("Step-5 terminal wave absent")?))
     }
 
     pub(super) fn require_live(&self) -> Result<()> {
@@ -633,6 +633,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         validate_lane_selection(self.lanes.len(), selected, steps.len(), inputs.len())?;
         let lanes: Vec<_> = selected.iter().map(|&lane| &self.lanes[lane]).collect();
         for ((lane, step), input) in lanes.iter().zip(steps.iter()).zip(inputs) {
+            lane.terminal_output.set(None);
             step.validate_binding(&lane.caches, &lane.stages, lane.rows)?;
             if let Exchange::Pair { peer, hops } = &lane.exchange {
                 hops.validate_binding(lane.ownership.execution(), peer)?;

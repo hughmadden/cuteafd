@@ -62,6 +62,68 @@ impl ImmediateWave {
     }
 }
 
+/// Request-local state shared by every backend entry, without native-owner mocks.
+struct BackendState<T> {
+    pending: Pending<T>,
+    immediate: ImmediateWave,
+    next_lane: Cell<usize>,
+    active_lane: Cell<Option<usize>>,
+    lanes: usize,
+    fail_verify_once: Cell<bool>,
+}
+impl<T> BackendState<T> {
+    fn new(lanes: usize, fail_verify_once: bool) -> Result<Self> {
+        ensure!(matches!(lanes, 1 | 2), "Step-5 backend requires one or two native lanes");
+        Ok(Self { pending: Pending::default(), immediate: ImmediateWave::default(),
+            next_lane: Cell::new(0), active_lane: Cell::new(None), lanes,
+            fail_verify_once: Cell::new(fail_verify_once) })
+    }
+
+    fn retire(&self) {
+        self.pending.retire();
+        self.immediate.retire();
+        self.active_lane.set(None);
+    }
+
+    fn take_pending(&self) -> Option<T> {
+        let pending = self.pending.take();
+        self.active_lane.set(None);
+        pending
+    }
+
+    fn submit<O>(&self, work: impl FnOnce(usize) -> Result<O>) -> Result<O> {
+        self.retire();
+        let lane = self.next_lane.get();
+        self.active_lane.set(Some(lane));
+        match work(lane) {
+            Ok(output) => {
+                self.next_lane.set((lane + 1) % self.lanes);
+                Ok(output)
+            }
+            Err(error) => {
+                self.retire();
+                Err(error)
+            }
+        }
+    }
+
+    fn verify<O>(&self, work: impl FnOnce(usize) -> Result<(T, O)>) -> Result<O> {
+        self.submit(|lane| self.pending.verify(|| {
+            let completed = work(lane)?;
+            // Real target work succeeded. Dropping its Step drains without
+            // resurrecting an owner terminal-aborted by a native/transport error.
+            if self.fail_verify_once.replace(false) {
+                tracing::warn!(lane, "Step-5 injected post-execution verify failure");
+                anyhow::bail!("Step-5 injected post-execution verify failure on lane {lane}");
+            }
+            Ok(completed)
+        }))
+    }
+}
+impl<T> Drop for BackendState<T> {
+    fn drop(&mut self) { self.retire(); }
+}
+
 /// Input storage is admitted and retained outside the backend, like native lanes.
 pub(super) struct Inputs<'a> {
     ids: Allocation<'a>,
@@ -92,14 +154,12 @@ impl scheduler::DraftState for NoDraft {
 
 pub(super) struct Step5Backend<'e, 'a> {
     // Retire the Step before any borrowed native or input owner can disappear.
-    pending: Pending<Evidence<'e, 'a>>,
-    immediate: ImmediateWave,
+    state: BackendState<Evidence<'e, 'a>>,
     execution: &'e Execution<'e, 'a>,
     ranks: Vec<&'e RefCell<CacheRank<'a>>>,
     embedding: &'e TokenEmbedding<'a>,
     inputs: Vec<&'e Inputs<'a>>,
     profile: RefCell<[f64; 2]>,
-    next_lane: Cell<usize>,
     rows: usize,
     context: usize,
     sequences: usize,
@@ -128,15 +188,18 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
                 "Step-5 input owner differs from admitted execution lane");
             execution.validate_lane_caches(lane, &ranks, rows)?;
         }
-        Ok(Self { pending: Pending::default(), immediate: ImmediateWave::default(), execution, ranks, embedding, inputs,
-            profile: RefCell::new([0.0; 2]), next_lane: Cell::new(0), rows, context, sequences, library })
+        let fail_verify_once = match std::env::var("CUTEAFD_DIAG_STEP5_FAIL_VERIFY_ONCE") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(value) if value == "1" => true,
+            _ => anyhow::bail!("CUTEAFD_DIAG_STEP5_FAIL_VERIFY_ONCE must be unset or 1"),
+        };
+        Ok(Self { state: BackendState::new(inputs.len(), fail_verify_once)?, execution, ranks, embedding, inputs,
+            profile: RefCell::new([0.0; 2]), rows, context, sequences, library })
     }
 
-    fn execute(&self, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
+    fn execute(&self, lane: usize, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
         kind: cuteafd_transport::ExpertV2SourceKind) -> Result<(Evidence<'e, 'a>, DeviceLogits)> {
         self.execution.require_live()?;
-        let lane = self.next_lane.get();
-        self.next_lane.set((lane + 1) % self.inputs.len());
         let input = self.inputs[lane];
         let mut first_row = 0usize;
         let descriptors = sequences.iter().map(|(placement, tokens)| {
@@ -174,20 +237,21 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
 
     fn immediate(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
         kind: cuteafd_transport::ExpertV2SourceKind) -> Result<DeviceLogits> {
-        self.pending.retire();
-        self.immediate.retire();
-        let submitted = ImmediateWave::record(sequences);
-        let (step, logits) = self.execute(sequences, pool, kind)?;
-        let mut accepted = sequences.iter_mut().map(|(placement, tokens)| (&mut **placement, tokens.len()))
-            .collect::<Vec<_>>();
-        step.publish_wave(&mut accepted)?;
-        *self.immediate.0.borrow_mut() = Some(submitted);
-        Ok(logits)
+        self.state.submit(|lane| {
+            let submitted = ImmediateWave::record(sequences);
+            let (step, logits) = self.execute(lane, sequences, pool, kind)?;
+            let mut accepted = sequences.iter_mut().map(|(placement, tokens)| (&mut **placement, tokens.len()))
+                .collect::<Vec<_>>();
+            step.publish_wave(&mut accepted)?;
+            *self.state.immediate.0.borrow_mut() = Some(submitted);
+            self.state.active_lane.set(None);
+            Ok(logits)
+        })
     }
 }
 
 impl Drop for Step5Backend<'_, '_> {
-    fn drop(&mut self) { self.pending.retire(); }
+    fn drop(&mut self) { self.state.retire(); }
 }
 
 impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
@@ -209,7 +273,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
         -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Frontier>)> {
         ensure!(args.prefix_partial == Toggle::Off, "Step-5 supports exact prefix frontiers only");
-        let family = Step5Prefix::with_pending(self.ranks.clone(), self.pending.clone())?;
+        let family = Step5Prefix::with_pending(self.ranks.clone(), self.state.pending.clone())?;
         let shape = self.geometry();
         let args = args.with_scoring(shape.decode_rows, shape.decode_rows, V)?;
         let layout = family.layout();
@@ -238,16 +302,16 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         Placement { pages, sequence: slot as u64, committed: 0 }
     }
     fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia,
-        _tokens: &[u32], _resume: usize) { self.pending.retire(); self.immediate.retire(); }
+        _tokens: &[u32], _resume: usize) { self.state.retire(); }
     fn history(&self, _placement: &Placement) {}
     fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {
-        self.pending.retire(); self.immediate.retire(); self.execution.require_live()
+        self.state.retire(); self.execution.require_live()
     }
     fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        self.pending.retire();
+        self.state.retire();
         ensure!(logit_rows <= tokens.len(), "Step-5 prefill logits extent");
         let mut logits = self.immediate(&mut [(placement, tokens)], pool, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
         if logit_rows == 0 { return Ok(None); }
@@ -257,15 +321,12 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        self.pending.retire();
-        self.immediate.retire();
-        self.pending.verify(|| self.execute(sequences, pool, verify_kind(speculative))).map(Some)
+        self.state.verify(|lane| self.execute(lane, sequences, pool, verify_kind(speculative))).map(Some)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        self.pending.retire();
-        self.immediate.retire();
-        if speculative { self.pending.verify(|| self.execute(sequences, pool, verify_kind(speculative))).map(Some) }
+        self.state.retire();
+        if speculative { self.state.verify(|lane| self.execute(lane, sequences, pool, verify_kind(speculative))).map(Some) }
         else { self.immediate(sequences, pool, cuteafd_transport::ExpertV2SourceKind::Prefill).map(Some) }
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
@@ -283,7 +344,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         _timing: &mut scheduler::DraftTiming) -> Result<Vec<Vec<u32>>> { anyhow::bail!("Step-5 MTP is not yet qualified") }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, NoDraft, ()>],
         speculative: bool, draft: bool) -> Result<()> {
-        let pending = self.pending.take();
+        let pending = self.state.take_pending();
         ensure!(!draft, "Step-5 MTP is not yet qualified");
         if let Some(step) = pending {
             let mut accepted = Vec::with_capacity(verified.len());
@@ -298,7 +359,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
             step.publish_wave(&mut accepted)
         } else {
             ensure!(!speculative, "Step-5 speculative accept requires pending Step evidence");
-            self.immediate.accept(verified)
+            self.state.immediate.accept(verified)
         }
     }
     fn probe_begin(&self, _rows: usize) {}
@@ -350,6 +411,77 @@ mod tests {
             *wave.0.borrow_mut() = Some(ImmediateWave::record(&[(&mut placement, &[17])]));
             wave.retire();
             assert!(wave.accept(&[]).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn backend_verify_failure_drains_and_readmits_same_slot_on_same_lane() -> Result<()> {
+        use std::rc::Rc;
+        struct Evidence {
+            slot: u64,
+            drained: Rc<RefCell<Vec<u64>>>,
+            pending: Pending<Evidence>,
+        }
+        impl Drop for Evidence {
+            fn drop(&mut self) {
+                // Drain callbacks may inspect the shared evidence slot: no
+                // RefCell borrow can survive taking the abandoned Step.
+                assert!(self.pending.take().is_none());
+                self.drained.borrow_mut().push(self.slot);
+            }
+        }
+        for lanes in [1, 2] {
+            for lane in 0..lanes {
+                let state = BackendState::new(lanes, true)?;
+                state.next_lane.set(lane);
+                let drained = Rc::new(RefCell::new(Vec::new()));
+                let mut placement = Placement { sequence: 7, pages: vec![3], committed: 65 };
+                let make = || Evidence { slot: 7, drained: drained.clone(), pending: state.pending.clone() };
+                state.pending.verify(|| Ok((make(), ())))?;
+                *state.immediate.0.borrow_mut() = Some(ImmediateWave::record(&[(&mut placement, &[11])]));
+                state.active_lane.set(Some(lane));
+                let failed = state.verify(|selected| {
+                    assert_eq!(selected, lane);
+                    assert_eq!(&*drained.borrow(), &[7], "old evidence drains before reused-slot work");
+                    assert!(state.immediate.0.borrow().is_none());
+                    Ok((make(), 99u32))
+                });
+                assert!(failed.unwrap_err().to_string().contains("injected post-execution"));
+                assert_eq!(&*drained.borrow(), &[7, 7], "failed native Step is dropped before error returns");
+                assert!(state.pending.take().is_none());
+                assert!(state.immediate.0.borrow().is_none());
+                assert_eq!(state.active_lane.get(), None);
+                assert_eq!(state.next_lane.get(), lane);
+                assert_eq!(placement.committed, 65, "failure publishes no frontier");
+
+                // Scheduler owns releasing/rebinding pages. Model that boundary
+                // here without claiming a CPU probe executes native reset kernels.
+                placement.pages = vec![9];
+                placement.committed = 0;
+                let output = state.verify(|selected| {
+                    assert_eq!(selected, lane, "recovery uses the failed native lane");
+                    assert!(state.pending.take().is_none());
+                    assert!(state.immediate.0.borrow().is_none());
+                    assert_eq!((placement.sequence, placement.committed), (7, 0));
+                    Ok((make(), 101u32))
+                })?;
+                assert_eq!(output, 101);
+                assert_eq!(state.active_lane.get(), Some(lane));
+                assert_eq!(state.next_lane.get(), (lane + 1) % lanes);
+                drop(state.take_pending());
+                assert_eq!(state.active_lane.get(), None);
+                assert_eq!(&*drained.borrow(), &[7, 7, 7]);
+
+                let failed: Result<()> = state.verify(|selected| {
+                    assert_eq!(selected, (lane + 1) % lanes);
+                    anyhow::bail!("verify work failed before publication")
+                });
+                assert!(failed.is_err());
+                assert!(state.pending.take().is_none());
+                assert_eq!(state.active_lane.get(), None);
+                assert_eq!(state.next_lane.get(), (lane + 1) % lanes);
+            }
         }
         Ok(())
     }
