@@ -61,6 +61,19 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+@pytest.mark.parametrize("group,names", [
+    ("residual", ["attn_res_c1_keep_append", "attn_res_c2_add_append",
+                  "attn_res_c4_add", "attn_res_c5_add",
+                  "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"]),
+    ("latent", ["rmsnorm_h3584", "rmsnorm_h7168", "latent_down", "latent_up"]),
+    ("situ", [f"situ_i{width}" for width in (3072, 6144, 16896, 33792)]),
+])
+def test_kimi_w8_cross_sm_groups(group, names):
+    job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kimi-{group}")
+    assert job == (f"kimi-{group}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(names)])
+
+
 def test_identical_object_ignores_context_metadata(tmp_path):
     report = compare_sm.compare(*exports(tmp_path))
     assert report["programs"][0]["classification"] == "identical"
@@ -246,6 +259,14 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
             assert args[args.index("--geometry") + 1] == family
             assert args[args.index("--role") + 1] == role
             assert args[args.index("--atomic-min-capacity") + 1] == "256"
+
+
+@pytest.mark.parametrize("geometry", ["glmf", "glmf2", "kimik3"])
+@pytest.mark.parametrize("label,stem", [("decode", "kda_m64"), ("prefill", "kda_m4096"), ("commit", "kda_commit")])
+def test_kda_groups_export_only_the_shared_kda_programs(geometry, label, stem):
+    job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kda-{geometry}-{label}")
+    assert job == (f"kda-{geometry}-{label}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", geometry, "--only", stem])
 
 
 def test_hybrid_group_covers_compact_and_grouped_live_rows():
@@ -460,3 +481,17 @@ def test_step5_rope_builders_cover_all_policy_modes_without_recipe_specializatio
     assert calls == {f"rope_s{span}_{'llama3' if scaling else 'plain'}":
                      dict(rotary_span=span, llama3=scaling)
                      for span in (32, 64, 192) for scaling in (False, True)}
+def test_source_comparison_requires_same_sm_and_allows_only_source_changes(tmp_path):
+    left, right = exports(tmp_path)
+    with pytest.raises(ValueError, match="same SM count"):
+        compare_sm.compare(left, right, source_comparison=True)
+    context_file = right / "comparison-context.json"
+    context = json.loads(context_file.read_text())
+    context.update(sms=188, sparkinfer_revision="candidate", source_tree_sha256="new-tree",
+                   exporter_sha256="new-exporter", export_sources_sha256={"export.py": "new"})
+    context_file.write_text(json.dumps(context))
+    assert compare_sm.compare(left, right, source_comparison=True)["programs"][0]["object_identical"]
+    context["toolchain"] = {"torch": "other"}
+    context_file.write_text(json.dumps(context))
+    with pytest.raises(ValueError, match="toolchain"):
+        compare_sm.compare(left, right, source_comparison=True)

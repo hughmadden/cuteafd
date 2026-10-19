@@ -72,6 +72,22 @@ pub struct SparkAllocationTerm {
 mod spark_census;
 pub use spark_census::{spark_census_deltas, CensusDeviceKind, CensusDeviceWitness, SparkCensusDeltas, SparkCensusError};
 
+/// Raw counters for one visible memory-cgroup ancestor; not process attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CgroupMemorySample {
+    pub path: String,
+    pub version: u8,
+    pub current_bytes: Option<u64>,
+    pub peak_bytes: Option<u64>,
+    /// Missing file and an explicitly unlimited ceiling are distinct.
+    pub max: Option<CgroupMemoryLimit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CgroupMemoryLimit { Bytes(u64), Unlimited }
+
 /// Same-process evidence: integrated CUDA uses system/cgroup phase deltas;
 /// process maps attribute host-only memory, never driver-owned CUDA UMA.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +97,10 @@ pub struct SparkProcessSample {
     pub pid: u32,
     pub monotonic_ns: u64,
     pub rss_bytes: u64,
+    /// Process lifetime peak RSS from /proc/self/status, absent without an mm.
+    pub peak_rss_bytes: Option<u64>,
+    /// Current and lifetime peak counters, including visible ancestor limits.
+    pub cgroup_memory: Vec<CgroupMemorySample>,
     pub pss_bytes: u64,
     pub private_bytes: u64,
     pub tracked_device_bytes: u64,
@@ -202,6 +222,9 @@ impl ExpertGeometry {
     pub const GLM5_FLASH: Self = Self { hidden: 4096, experts: 288, topk: 8, intermediate: 2048, layers: 45 };
     /// Qwen 3.8 Flash Next (qwen4_exp): 48 routed layers, softmax top-10, SiLU unclamped.
     pub const QWEN4: Self = Self { hidden: 2560, experts: 512, topk: 10, intermediate: 640, layers: 48 };
+    /// Kimi K3 latent MoE: experts see the 3584-wide `routed_expert_down_proj`
+    /// output (not the 7168 residual); routed layers 1..93, sigmoid top-16, Situ.
+    pub const KIMI_K3: Self = Self { hidden: 3584, experts: 896, topk: 16, intermediate: 3072, layers: 93 };
 
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
     pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
@@ -258,6 +281,7 @@ impl ExpertGeometry {
             (Self::GLM5_FLASH, "glmf"),
             (Self::QWEN4, "qwen4"),
             (Self::STEP5, "step5"),
+            (Self::KIMI_K3, "kimik3"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
@@ -269,12 +293,15 @@ impl ExpertGeometry {
     pub fn swiglu_limit(&self) -> Option<f32> {
         if self.same_shape(&Self::STEP5) { return Some(7.0); }
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
-            && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)).then_some(10.0)
+            && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
+            && !self.same_shape(&Self::KIMI_K3)).then_some(10.0)
     }
 
     /// Expert arithmetic; existing families retain their legacy rounding exactly.
     pub fn activation(&self) -> crate::FfnActivation {
-        if self.same_shape(&Self::STEP5) {
+        if self.same_shape(&Self::KIMI_K3) {
+            crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }
+        } else if self.same_shape(&Self::STEP5) {
             crate::FfnActivation::SiluPostClampFp32Product { limit: 7.0 }
         } else {
             crate::FfnActivation::SiluBf16Product { limit: self.swiglu_limit() }
@@ -293,7 +320,7 @@ impl ExpertGeometry {
 }
 
 /// Capacity selects the compiled reduction geometry, never the live row count.
-/// GLM Flash's m1/m80 use K64; m16 uses K128 and adds serial/verify drift.
+/// GLM Flash and Kimi use K64 at m1/m80; m16 uses K128 and causes drift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exl3RowPolicy {
     Nearest,
@@ -302,7 +329,9 @@ pub enum Exl3RowPolicy {
 
 impl Exl3RowPolicy {
     pub fn for_geometry(geometry: ExpertGeometry) -> Self {
-        if geometry.same_shape(&ExpertGeometry::GLM5_FLASH) { Self::GlmFlashK64 } else { Self::Nearest }
+        if geometry.same_shape(&ExpertGeometry::GLM5_FLASH)
+            || geometry.same_shape(&ExpertGeometry::KIMI_K3)
+        { Self::GlmFlashK64 } else { Self::Nearest }
     }
 
     pub fn active() -> Self { Self::for_geometry(expert_geometry()) }
@@ -320,7 +349,8 @@ impl Exl3RowPolicy {
         // Keep a canonical-reduction decode export available even at narrow admission.
         let required = max_live_rows.max(if max_live_rows > 1 { 80 } else { 1 });
         let maximum = CAPACITIES.into_iter().find(|&c| c as usize >= required).unwrap();
-        Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum).collect())
+        Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum
+            && (self != Self::GlmFlashK64 || c != 16)).collect())
     }
 }
 
@@ -354,10 +384,20 @@ mod tests {
         assert_eq!(policy.capacities(1).unwrap(), [1]);
         for rows in 2..=16 {
             assert_eq!(policy.required_capacity(rows), 80);
-            assert_eq!(policy.capacities(rows).unwrap(), [1, 16, 80]);
+            assert_eq!(policy.capacities(rows).unwrap(), [1, 80]);
             assert_eq!(Exl3RowPolicy::Nearest.capacities(rows).unwrap(), [1, 16, 80]);
         }
-        assert_eq!(policy.capacities(4096).unwrap(), [1, 16, 80, 256, 1024, 4096]);
+        assert_eq!(policy.capacities(4096).unwrap(), [1, 80, 256, 1024, 4096]);
+        assert_eq!(Exl3RowPolicy::for_geometry(ExpertGeometry::KIMI_K3), policy);
+        let old = [1, 16, 80, 256, 1024, 4096];
+        let new = policy.capacities(4096).unwrap();
+        for rows in 1..=4096 {
+            let required = policy.required_capacity(rows);
+            let before = old.iter().find(|&&c| c >= required).unwrap();
+            let after = new.iter().find(|&&c| c as usize >= required).unwrap();
+            assert_eq!(*before, *after as usize, "GLM Flash selection changed at {rows}");
+            assert_ne!(*after, 16);
+        }
     }
 
     #[test]
@@ -401,6 +441,14 @@ mod tests {
         assert_eq!(glm_with_mtp.swiglu_limit(), None);
         assert_eq!(ExpertGeometry::QWEN4.family(), Some("qwen4"));
         assert_eq!(ExpertGeometry::QWEN4.swiglu_limit(), None);
+        let kimi = ExpertGeometry::KIMI_K3;
+        assert_eq!(kimi.family(), Some("kimik3"));
+        assert_eq!(kimi.swiglu_limit(), None);
+        assert_eq!(kimi.activation(), crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) });
+        assert_eq!(kimi.slice(6), Some(512));
+        // Latent rows: BF16 ingress is sized from 3584, not the 7168 residual.
+        assert_eq!(kimi.row_bytes(), 7168);
+        assert_eq!(kimi.compact_wire_bytes(1, true), Some((40 + 16 * 12 + 3584 * 2 + 96, 4 + 3584 * 2 + 96)));
         assert_eq!(ExpertGeometry::QWEN4.slice(4), Some(160));
     }
 }

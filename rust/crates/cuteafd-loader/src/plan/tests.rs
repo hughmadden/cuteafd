@@ -779,11 +779,11 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
         }
         let scratch = crate::placement::families::glm5_flash::expert_workspace(&catalog,
             Some(&share.join("PROGRAMS.json")), 4096, tp).unwrap();
-        assert_eq!(scratch, 4096*16 + 6*(32+256) + 4096*4096*if tp == 2 {4} else {2});
+        assert_eq!(scratch, 4096*16 + 5*(32+256) + 4096*4096*if tp == 2 {4} else {2});
         for rows in [2, 4, 9, 16] {
             let scratch = crate::placement::families::glm5_flash::expert_workspace(&catalog,
                 Some(&share.join("PROGRAMS.json")), rows, tp).unwrap();
-            assert_eq!(scratch, 80*16 + 3*(32+256) + rows*4096*if tp == 2 {4} else {2});
+            assert_eq!(scratch, 80*16 + 2*(32+256) + rows*4096*if tp == 2 {4} else {2});
         }
         // Narrow admission must require m80 even though m16 fits the live rows.
         std::fs::remove_file(root.join(format!("rtx-tp{tp}/m80/v41_exl3.json"))).unwrap();
@@ -1505,8 +1505,26 @@ fn invalid_budgets_are_typed_option_errors() {
     }
     assert_eq!(budget_bytes("--spark-budget-gib", 100.0).unwrap(), 100 << 30);
     let dir = qwen_snapshot(4);
-    for options in [PlanOptions { spark_budget_bytes: 0, ..sparks(4) }, PlanOptions { coordinator_budget_bytes: 0, ..sparks(0) }] {
+    for options in [PlanOptions { spark_budget_bytes: Some(0), ..sparks(4) }, PlanOptions { coordinator_budget_bytes: 0, ..sparks(0) }] {
         assert!(matches!(plan(dir.path(), &options), Err(PlanError::InvalidOption { .. })));
+    }
+}
+
+#[test]
+fn explicit_spark_ceiling_updates_all_layout_budgets_without_changing_defaults() {
+    assert_eq!(DEFAULT_SPARK_BUDGET_BYTES, 100 << 30);
+    assert_eq!(super::families::kimi::SPARK_BUDGET_BYTES, 108 << 30);
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions::default()), ..Default::default() };
+    options.apply_spark_budget();
+    assert_eq!(options.spark_budget_bytes, None);
+    assert_eq!(options.layout.as_ref().unwrap().spark_bytes, 108 << 30);
+    assert_eq!(options.layout.as_ref().unwrap().spark_allocation_budget_bytes, None);
+    for budget in [82 << 30, 112 << 30] {
+        options.spark_budget_bytes = Some(budget);
+        options.apply_spark_budget();
+        assert_eq!(options.spark_budget(), budget);
+        assert_eq!(options.layout.as_ref().unwrap().spark_bytes, budget);
+        assert_eq!(options.layout.as_ref().unwrap().spark_allocation_budget_bytes, Some(budget));
     }
 }
 
@@ -1517,9 +1535,9 @@ fn capacity_suggests_a_packaged_rank_count() {
     let routed = component(&plan(dir.path(), &sparks(2)).unwrap(), Component::RoutedExpert).bytes;
     // Qwen's 5 blocks over 2, 3, 4 ranks: the widest holds 3/5, 2/5, 2/5 (padded to 128 rows).
     let budget = (routed as f64 * 0.45) as u64;
-    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: budget, ..sparks(2) }).unwrap();
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: Some(budget), ..sparks(2) }).unwrap();
     assert!(!report.fits && report.min_spark_ranks == Some(3), "{}", render(&report));
-    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: budget, ..sparks(3) }).unwrap();
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: Some(budget), ..sparks(3) }).unwrap();
     assert!(report.fits && report.executable(), "{}", render(&report));
 }
 
@@ -1535,10 +1553,10 @@ fn capacity_counts_the_widest_rank_of_an_uneven_split() {
     tensors.extend(fp8("model.language_model.layers.1.mlp.experts.0.down_proj", 4096, 2048, None));
     let dir = snapshot(glm5_flash_config(2), &tensors);
     let routed = component(&plan(dir.path(), &sparks(6)).unwrap(), Component::RoutedExpert).bytes as f64;
-    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: (routed * 0.18) as u64, ..sparks(6) }).unwrap();
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: Some((routed * 0.18) as u64), ..sparks(6) }).unwrap();
     assert!((report.spark_rank_share - 3.0 / 16.0).abs() < 1e-12, "{}", report.spark_rank_share);
     assert!(!report.fits, "3/16 of the routed bytes exceeds 0.18");
-    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: (routed * 0.19) as u64, ..sparks(6) }).unwrap();
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: Some((routed * 0.19) as u64), ..sparks(6) }).unwrap();
     assert!(report.fits && report.min_spark_ranks == Some(6), "{}", render(&report));
 }
 
@@ -3003,7 +3021,7 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
     let mut tensors = mimo_flash_mopd_tensors();
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(config, &tensors, Some(4));
-    let options = |budget: u64| PlanOptions { vision: super::MediaMode::Spark(None), spark_budget_bytes: budget,
+    let options = |budget: u64| PlanOptions { vision: super::MediaMode::Spark(None), spark_budget_bytes: Some(budget),
         layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), concurrency: 4,
             spark_allocation_budget_bytes: Some(budget),
             onboard: Some(crate::placement::Onboard::Layers(0)), ..Default::default() }), ..sparks(4) };

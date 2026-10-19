@@ -57,6 +57,28 @@ def jobs(scope):
                for kind in (("_win", "_c4", "_c128") if geometry in ("flash", "pro") else ("",))]
         result.append((f"suspect-{geometry}-mla", "export_b12x_dsv4_aot.py",
                        ["--geometry", geometry, "--only", ",".join(mla)]))
+    for geometry in ("glmf", "glmf2", "kimik3"):
+        for label, names in (("decode", "kda_m64"), ("prefill", "kda_m4096"), ("commit", "kda_commit")):
+            result.append((f"kda-{geometry}-{label}", "export_b12x_dsv4_aot.py",
+                           ["--geometry", geometry, "--only", names]))
+    for heads in (48, 96):
+        suffix = "" if heads == 48 else "_h96"
+        names = [f"{op}{suffix}_m{rows}" for rows in (64, 4096)
+                 for op in ("mla_producer", "mla_output")]
+        names += [f"dense_mla_{mode}{suffix}_m{rows}"
+                  for mode, rows in (("decode", 64), ("verify", 64), ("extend", 4096))]
+        result.append((f"kimi-mla-h{heads}", "export_b12x_dsv4_aot.py",
+                       ["--geometry", "kimik3", "--only", ",".join(names)]))
+    result.append(("kimi-residual", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join([
+                       "attn_res_c1_keep_append", "attn_res_c2_add_append",
+                       "attn_res_c4_add", "attn_res_c5_add",
+                       "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"])]))
+    result.append(("kimi-latent", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", "rmsnorm_h3584,rmsnorm_h7168,latent_down,latent_up"]))
+    result.append(("kimi-situ", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(
+                       f"situ_i{width}" for width in (3072, 6144, 16896, 33792))]))
     if scope == "suspects":
         return result
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
@@ -111,6 +133,8 @@ def jobs(scope):
     result.extend((f"exl3-{geometry}-k23", "package_exl3_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
+    result.append(("exl3-kimik3-k23", "package_exl3_aot.py",
+                   ["--geometry", "kimik3", "--capacities", CAPACITIES, "--bits", "2,3"]))
     for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"),
                            ("qwen4", "3,4,5"), ("qwen4", "2,3,4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
@@ -201,11 +225,15 @@ def _export_exl3(extra, output):
     import package_exl3_aot as package
     from export_b12x_exl3_aot import export
     geometry = extra[extra.index("--geometry") + 1]
-    capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
+    requested = extra[extra.index("--capacities") + 1]
+    capacities = (package.package_capacities(geometry, requested) if hasattr(package, "package_capacities")
+                  else sorted({int(item) for item in requested.split(",")}))
     bits = tuple(int(item) for item in extra[extra.index("--bits") + 1].split(",")) if "--bits" in extra else (3, 4)
     for profile, width, experts, topk, dtype, _ in package.profiles_for_role("coordinator", geometry):
         for rows in capacities:
             options = {"hidden": package.GEOMETRIES[geometry][0], "compile_only": True}
+            if getattr(package, "activation", lambda _: "silu")(geometry) != "silu":
+                options["activation"] = package.activation(geometry)
             block = package.route_block(geometry, rows)
             if len(bits) == 2 and package.warp_specialized(geometry, "coordinator", width, rows):
                 block = 64
@@ -376,7 +404,7 @@ def differing_fields(left, right, prefix=""):
     return [] if left == right else [prefix.lstrip(".")]
 
 
-def compare(left, right):
+def compare(left, right, *, source_comparison=False):
     inspector = load_file("cuteafd_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
     left_names = {path.relative_to(left).as_posix() for path in left.rglob("*") if path.suffix in (".o", ".cubin")}
     right_names = {path.relative_to(right).as_posix() for path in right.rglob("*") if path.suffix in (".o", ".cubin")}
@@ -389,15 +417,20 @@ def compare(left, right):
         sms = context.get("sms")
         if type(sms) is not int or sms <= 0 or context.get("capability") != [12, 0]:
             raise ValueError("comparison context must identify positive SM count and compute 12.0")
-    if contexts[0]["sms"] == contexts[1]["sms"]:
+    if source_comparison:
+        if contexts[0]["sms"] != contexts[1]["sms"]:
+            raise ValueError("source comparison contexts must have the same SM count")
+    elif contexts[0]["sms"] == contexts[1]["sms"]:
         raise ValueError("comparison contexts must have two distinct SM counts")
+    source_fields = {"sparkinfer_revision", "source_tree_sha256", "exporter_sha256",
+                     "comparison_script_sha256", "export_sources_sha256"}
     for key in ("capability", "sparkinfer_revision", "source_tree_sha256", "exporter", "args",
                 "toolchain", "environment", "exporter_sha256", "comparison_script_sha256", "export_sources_sha256",
                 "max_shared_memory_per_block", "max_shared_memory_per_multiprocessor"):
         if any(key not in context for context in contexts):
             raise ValueError(f"comparison context missing provenance: {key}")
-        if contexts[0][key] != contexts[1][key]:
-            raise ValueError(f"comparison target differs beyond SM count: {key}")
+        if contexts[0][key] != contexts[1][key] and not (source_comparison and key in source_fields):
+            raise ValueError(f"comparison target differs beyond {'source' if source_comparison else 'SM count'}: {key}")
     metas = [metadata(directory) for directory in (left, right)]
     if contexts[0]["exporter"] == "export_b12x_dsv4_aot.py" and "--only" not in contexts[0]["args"]:
         for target in metas:
@@ -461,6 +494,8 @@ def main():
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=Path.home() / ".cache/cuteafd/builds/plat1-sm120/sm-exports")
     parser.add_argument("--compare-only", action="store_true")
+    parser.add_argument("--baseline-source", type=Path,
+                        help="baseline engine checkout with pinned fork; compare sources at the first --sms count")
     parser.add_argument("--require-identical", action="store_true")
     parser.add_argument("--timeout", type=int, default=7200, help="seconds per export context")
     parser.add_argument("--workers", type=int, default=1, help="independent CPU export groups in parallel")
@@ -485,11 +520,19 @@ def main():
     if args.workers < 1 or args.timeout < 1:
         parser.error("--workers and --timeout must be positive")
     reports = []
+    baseline_source = args.baseline_source.expanduser().resolve() if args.baseline_source else None
+    if baseline_source and not (baseline_source / "third_party/sparkinfer.lock.json").is_file():
+        parser.error("--baseline-source must be an engine checkout with a pinned SparkInfer tree")
 
     def export_group(job):
         name, exporter, extra = job
-        directories = [output / name / str(sms) for sms in args.sms]
-        for sms, directory in zip(args.sms, directories):
+        if baseline_source:
+            directories = [output / name / "baseline", output / name / "candidate"]
+            targets = [(args.sms[0], baseline_source), (args.sms[0], ROOT)]
+        else:
+            directories = [output / name / str(sms) for sms in args.sms]
+            targets = [(sms, ROOT) for sms in args.sms]
+        for (sms, source), directory in zip(targets, directories):
             if args.compare_only:
                 continue
             # Never silently reuse stale objects after a partial or older run.
@@ -498,7 +541,9 @@ def main():
             directory.mkdir(parents=True, exist_ok=True)
             payload = dict(sms=sms, exporter=exporter, args=extra, output=str(directory))
             print(f"export {name} SMs={sms}", flush=True)
-            env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+            env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(source),
+                       CUTEAFD_SPARKINFER_SOURCE_DIR=str(source / "third_party/sparkinfer"),
+                       CUTEAFD_SPARKINFER_LOCK_FILE=str(source / "third_party/sparkinfer.lock.json"))
             with (directory / "export.log").open("w") as log:
                 try:
                     subprocess.run([sys.executable, str(Path(__file__).resolve()), "--_worker", json.dumps(payload)],
@@ -508,7 +553,8 @@ def main():
                     print(f"{name} SMs={sms} failed; {(directory / 'export.log').read_text()[-12000:]}",
                           file=sys.stderr, flush=True)
                     raise
-        report = compare(*directories)
+        report = compare(*directories, source_comparison=True) if baseline_source else compare(*directories)
+        report["comparison_axis"] = "source" if baseline_source else "sm_count"
         report["group"] = name
         (output / name / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
         for record in report["programs"]:

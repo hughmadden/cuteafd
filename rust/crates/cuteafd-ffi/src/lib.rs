@@ -1,6 +1,10 @@
 mod families;
 mod shared;
 pub use shared::{audio, exlr8, fp8_moe, peer_exchange, programs, vision};
+pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
+    KimiFfn, KimiFfnBatch, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
+    KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit,
+    MLA_PAGE_ROWS, MLA_RECORD_BYTES};
 pub use shared::vocab_head::{VOCAB_HEAD_ROWS_MAX, VOCAB_HEAD_ROWS_PASS};
 pub use shared::v41_device_ops::{V41Bf16Add, V41PeerCopy};
 pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;
@@ -94,42 +98,90 @@ fn device_allocatable_memory(info: &CuteafdCudaDeviceInfo,
     Ok((integrated_headroom()?.min(total), total))
 }
 
-fn cgroup_allocatable_bytes(mut available: usize, membership: &str,
-    read: impl Fn(&Path) -> Result<Option<String>>) -> Result<usize> {
+// Admission and diagnostics must resolve membership/namespace paths identically.
+fn memory_cgroup_paths(membership: &str) -> Vec<(std::path::PathBuf, bool)> {
+    let mut paths = Vec::new();
     for line in membership.lines() {
         let mut fields = line.splitn(3, ':');
         let (_, Some(controllers), Some(relative)) = (fields.next(), fields.next(), fields.next()) else { continue };
-        let (root, limit_file, current_file) = if controllers.is_empty() {
-            (Path::new("/sys/fs/cgroup"), "memory.max", "memory.current")
+        let (root, v2) = if controllers.is_empty() {
+            (Path::new("/sys/fs/cgroup"), true)
         } else if controllers.split(',').any(|c| c == "memory") {
-            (Path::new("/sys/fs/cgroup/memory"), "memory.limit_in_bytes", "memory.usage_in_bytes")
+            (Path::new("/sys/fs/cgroup/memory"), false)
         } else { continue };
         let relative = Path::new(relative.trim_start_matches('/'));
         let member = if relative.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
             root.to_path_buf()
-        } else { root.join(relative) };
+        } else { root.join(relative).components().collect() };
         // Namespaces may expose only the mount root. Every visible ancestor's
         // hard limit constrains allocations too, not just the worker's limit.
         for path in member.ancestors().take_while(|p| p.starts_with(root)).chain(std::iter::once(root)) {
-            let Some(limit) = read(&path.join(limit_file))? else { continue };
-            if limit.trim() == "max" { continue }
-            let limit: u64 = limit.trim().parse().context("invalid cgroup memory limit")?;
-            let current = read(&path.join(current_file))?.context("missing cgroup memory usage")?;
-            let current: u64 = current.trim().parse().context("invalid cgroup memory usage")?;
-            available = available.min(usize::try_from(limit.saturating_sub(current)).unwrap_or(usize::MAX));
+            let entry = (path.to_path_buf(), v2);
+            if !paths.contains(&entry) { paths.push(entry); }
         }
     }
+    paths
+}
+
+fn cgroup_allocatable_bytes(mut available: usize, membership: &str,
+    read: impl Fn(&Path) -> Result<Option<String>>) -> Result<usize> {
+    for (path, v2) in memory_cgroup_paths(membership) {
+        let (limit_file, current_file) = if v2 { ("memory.max", "memory.current") }
+            else { ("memory.limit_in_bytes", "memory.usage_in_bytes") };
+        let Some(limit) = read(&path.join(limit_file))? else { continue };
+        if limit.trim() == "max" { continue }
+        let limit: u64 = limit.trim().parse().context("invalid cgroup memory limit")?;
+        let current = read(&path.join(current_file))?.context("missing cgroup memory usage")?;
+        let current: u64 = current.trim().parse().context("invalid cgroup memory usage")?;
+        available = available.min(usize::try_from(limit.saturating_sub(current)).unwrap_or(usize::MAX));
+    }
     Ok(available)
+}
+
+fn read_cgroup_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn cgroup_memory_samples(membership: &str, read: impl Fn(&Path) -> Result<Option<String>>)
+    -> Result<Vec<cuteafd_core::expert_geometry::CgroupMemorySample>> {
+    use cuteafd_core::expert_geometry::{CgroupMemoryLimit, CgroupMemorySample};
+    let mut samples = Vec::new();
+    for (path, v2) in memory_cgroup_paths(membership) {
+        let files = if v2 { ["memory.current", "memory.peak", "memory.max"] }
+            else { ["memory.usage_in_bytes", "memory.max_usage_in_bytes", "memory.limit_in_bytes"] };
+        let counter = |file: &str| -> Result<Option<u64>> {
+            read(&path.join(file))?.map(|text| text.trim().parse()
+                .with_context(|| format!("invalid cgroup {file}"))).transpose()
+        };
+        let current_bytes = counter(files[0])?;
+        let peak_bytes = counter(files[1])?;
+        let max = read(&path.join(files[2]))?.map(|text| {
+            if v2 && text.trim() == "max" { Ok(CgroupMemoryLimit::Unlimited) }
+            else { text.trim().parse().map(CgroupMemoryLimit::Bytes).context("invalid cgroup memory max") }
+        }).transpose()?;
+        if current_bytes.is_some() || peak_bytes.is_some() || max.is_some() {
+            samples.push(CgroupMemorySample { path: path.to_string_lossy().into_owned(),
+                version: if v2 { 2 } else { 1 }, current_bytes, peak_bytes, max });
+        }
+    }
+    Ok(samples)
+}
+
+/// Raw cgroup counters for diagnostics, not CUDA attribution or new admission.
+/// Older kernels without memory.peak retain an explicit missing peak.
+pub fn cgroup_memory_census() -> Result<Vec<cuteafd_core::expert_geometry::CgroupMemorySample>> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").context("reading device cgroup membership")?;
+    cgroup_memory_samples(&membership, read_cgroup_file)
 }
 
 /// Bound a MemAvailable sample by every visible cgroup ancestor, without CUDA queries.
 pub fn cgroup_memory_headroom(available: usize) -> Result<usize> {
     let membership = std::fs::read_to_string("/proc/self/cgroup").context("reading device cgroup membership")?;
-    cgroup_allocatable_bytes(available, &membership, |path| match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
-    })
+    cgroup_allocatable_bytes(available, &membership, read_cgroup_file)
 }
 
 #[cfg(test)]
@@ -204,6 +256,59 @@ mod allocatable_memory_tests {
         assert!(cgroup_allocatable_bytes(90, "0::/", |p| Ok(
             p.ends_with("memory.max").then(|| "30".into()))).is_err());
         assert!(cgroup_allocatable_bytes(90, "0::/", |_| anyhow::bail!("denied")).is_err());
+    }
+
+    #[test]
+    fn raw_cgroup_census_retains_nested_limits_missing_peaks_and_unlimited() {
+        use cuteafd_core::expert_geometry::CgroupMemoryLimit::{Bytes, Unlimited};
+        let files = std::collections::HashMap::from([
+            ("/sys/fs/cgroup/team/worker/memory.current", "20"),
+            ("/sys/fs/cgroup/team/worker/memory.peak", "35"),
+            ("/sys/fs/cgroup/team/worker/memory.max", "100"),
+            ("/sys/fs/cgroup/team/memory.current", "50"),
+            ("/sys/fs/cgroup/team/memory.max", "60"),
+            ("/sys/fs/cgroup/memory.current", "70"),
+            ("/sys/fs/cgroup/memory.peak", "90"),
+            ("/sys/fs/cgroup/memory.max", "max"),
+        ]);
+        let read = |p: &std::path::Path| Ok(files.get(p.to_str().unwrap()).map(|s| s.to_string()));
+        let rows = super::cgroup_memory_samples("0::/team/worker", read).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!((rows[0].version, rows[0].current_bytes, rows[0].peak_bytes, rows[0].max),
+            (2, Some(20), Some(35), Some(Bytes(100))));
+        assert_eq!((rows[1].current_bytes, rows[1].peak_bytes, rows[1].max), (Some(50), None, Some(Bytes(60))));
+        assert_eq!(rows[2].max, Some(Unlimited));
+        for membership in ["0::/hidden/path", "0::/../../outside", "0::/", "0::/\n0::/"] {
+            let visible = super::cgroup_memory_samples(membership, read).unwrap();
+            assert_eq!(visible.len(), 1, "{membership}");
+            assert_eq!(visible[0].path, "/sys/fs/cgroup");
+            assert_eq!(visible[0].max, Some(Unlimited));
+        }
+        let json = serde_json::to_string(&rows).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<cuteafd_core::expert_geometry::CgroupMemorySample>>(&json).unwrap(), rows);
+    }
+
+    #[test]
+    fn raw_cgroup_census_supports_v1_and_rejects_unreadable_or_invalid_counters() {
+        use cuteafd_core::expert_geometry::CgroupMemoryLimit::Bytes;
+        let read = |p: &std::path::Path| Ok(match p.to_str().unwrap() {
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes" => Some("15".into()),
+            "/sys/fs/cgroup/memory/memory.max_usage_in_bytes" => Some("45".into()),
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes" => Some("50".into()),
+            _ => None,
+        });
+        let rows = super::cgroup_memory_samples("7:cpu,memory:/", read).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].version, rows[0].current_bytes, rows[0].peak_bytes, rows[0].max),
+            (1, Some(15), Some(45), Some(Bytes(50))));
+        assert!(super::cgroup_memory_samples("7:cpu:/", |_| panic!("not memory")).unwrap().is_empty());
+        assert!(super::cgroup_memory_samples("0::/", |_| Ok(None)).unwrap().is_empty());
+        for file in ["memory.current", "memory.peak", "memory.max"] {
+            for invalid in ["nope", "-1", "18446744073709551616"] {
+                assert!(super::cgroup_memory_samples("0::/", |p| Ok(p.ends_with(file).then(|| invalid.into()))).is_err());
+            }
+        }
+        assert!(super::cgroup_memory_samples("0::/", |_| anyhow::bail!("denied")).is_err());
     }
 
     #[test]

@@ -232,10 +232,15 @@ GEOMETRIES = {
     'glmf': (4096, 2048, 288, 8),
     # Qwen 3.8 Flash Next (qwen4_exp): 512 experts, softmax top-10, unclamped SiLU.
     'qwen4': (2560, 640, 512, 10),
+    'kimik3': (3584, 3072, 896, 16),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None}
+
+
+def activation(geometry: str) -> str:
+    return 'situ' if geometry == 'kimik3' else 'silu'
 
 
 def swiglu_limit(geometry: str) -> float | None:
@@ -500,6 +505,9 @@ def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
     split exactly, each compiling one export per capacity shared by its ranks.
     Other geometries derive the same H128 split from their own intermediate.
     """
+    if geometry == 'kimik3':
+        return [profile for profile in shard_profiles(geometry, role)
+                if profile[0] == ('tp6-width512' if role == 'spark' else 'rtx-tp1')]
     if geometry != 'v41':
         return shard_profiles(geometry, role)
     if role == 'spark':
@@ -691,13 +699,22 @@ def compile_variants(payloads, jobs):
         pool.shutdown(wait=True, cancel_futures=True)
 
 
+def package_capacities(geometry: str, requested: str) -> list[int]:
+    capacities = sorted(set(int(v) for v in requested.split(',')))
+    if not capacities or any(v < 1 or v > 4096 for v in capacities):
+        raise ValueError('EXL3 capacities must be in 1..4096')
+    if geometry == 'kimik3':
+        capacities = [v for v in capacities if v != 16]
+        if any(v not in (1, 80, 256, 1024, 4096) for v in capacities) or not capacities:
+            raise ValueError('Kimi EXL3 requires K64 capacities 1,80,256,1024,4096')
+    return capacities
+
+
 def build(args: argparse.Namespace) -> None:
     validate_destination(args.output)
     geometry = getattr(args, 'geometry', 'v41')
     hidden = GEOMETRIES[geometry][0]
-    capacities = sorted(set(int(v) for v in args.capacities.split(',')))
-    if not capacities or any(v < 1 or v > 4096 for v in capacities):
-        raise ValueError('EXL3 capacities must be in 1..4096')
+    capacities = package_capacities(geometry, args.capacities)
     all_counts = getattr(args, 'all_spark_counts', False)
     if all_counts and args.role != 'spark':
         raise ValueError('--all-spark-counts requires a Spark role')
@@ -745,6 +762,8 @@ def build(args: argparse.Namespace) -> None:
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
                 raw = profile_dir / f'm{capacity}'  # one capacity, one directory
                 options = {}
+                if activation(geometry) != 'silu':
+                    options['activation'] = activation(geometry)
                 if tile is not None:
                     options['tile'] = tile
                 if geometry != 'v41':
