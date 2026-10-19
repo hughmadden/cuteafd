@@ -4,6 +4,7 @@ mod chain;
 mod routed;
 mod csa;
 mod ffn;
+pub(crate) mod golden;
 #[cfg(test)]
 mod norm_accuracy;
 mod prefix;

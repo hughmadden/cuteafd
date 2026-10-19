@@ -52,15 +52,12 @@ pub(super) struct TargetChain<'a> {
     bytes: u64,
 }
 impl<'a> TargetChain<'a> {
-    pub fn load(
-        device: Device<'a>,
+    fn plan(
         programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint,
         count: usize,
         rows: usize,
-        available: u64,
-        reservations: &[u64],
-    ) -> Result<Self> {
+    ) -> Result<(u64, Vec<Option<RoutedPlan>>)> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         ensure!(
             (1..=contract.layers.len()).contains(&count) && (1..=4096).contains(&rows),
@@ -101,6 +98,27 @@ impl<'a> TargetChain<'a> {
                 .and_then(|n| n.checked_add(ffn))
                 .context("chain workspace overflow")?;
         }
+        Ok((bytes, routed))
+    }
+    pub fn required_bytes(
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        count: usize,
+        rows: usize,
+    ) -> Result<u64> {
+        Ok(Self::plan(programs, checkpoint, count, rows)?.0)
+    }
+    pub fn load(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        count: usize,
+        rows: usize,
+        available: u64,
+        reservations: &[u64],
+    ) -> Result<Self> {
+        let (bytes, routed) = Self::plan(programs, checkpoint, count, rows)?;
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let total = reservations
             .iter()
             .try_fold(bytes, |n, r| n.checked_add(*r))
@@ -472,8 +490,8 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let world = SparkWorld::canonical(peers.len())?;
         ensure!(
-            peers.len() == 4 && world.supports_device_exchange(),
-            "chain gate requires canonical TP4"
+            [4, 6].contains(&peers.len()) && world.supports_device_exchange(),
+            "chain gate requires canonical TP4 or TP6"
         );
         ensure!(
             std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")? == "3",
@@ -487,19 +505,19 @@ mod tests {
         let metadata: Value = serde_json::from_slice(&std::fs::read(
             packages.join("fp8/fp8-step5/manifest.json"),
         )?)?;
-        let tp4 = &metadata["layouts"]["tp4"];
+        let tp4 = &metadata["layouts"][format!("tp{}", peers.len())];
         ensure!(
             tp4["hidden"] == H
                 && tp4["experts"] == 352
                 && tp4["top_k"] == 8
                 && tp4["intermediate"] == 1536
-                && tp4["slice"] == 384
-                && tp4["tp"] == 4,
+                && tp4["slice"] == 1536 / peers.len()
+                && tp4["tp"] == peers.len(),
             "sealed Step-5 expert geometry"
         );
-        let capacities = metadata["layouts"]["tp4"]["capacities"]
+        let capacities = tp4["capacities"]
             .as_array()
-            .context("sealed FP8 TP4 capacities")?;
+            .context("sealed FP8 TP capacities")?;
         let compiled = capacities
             .iter()
             .map(|c| c["capacity"].as_u64().context("FP8 capacity integer"))
@@ -518,10 +536,10 @@ mod tests {
             &cuteafd_loader::placement::SparkWorkingSet {
                 rtx_layers: vec![],
                 spark_layers: vec![3],
-                spark_ranks: 4,
+                spark_ranks: peers.len(),
                 prefill_lanes: 1,
             },
-            4,
+            peers.len(),
             None,
             ModelAdmission {
                 capacity: 64,
@@ -625,8 +643,8 @@ mod tests {
                     && identity["revision"].as_str()
                         == snapshot.file_name().and_then(|s| s.to_str())
                     && identity["layer"] == 3
-                    && identity["tp"] == 4
-                    && identity["slice"] == 384
+                    && [4, 6].iter().any(|tp| identity["tp"] == *tp)
+                    && identity["slice"].as_u64() == identity["tp"].as_u64().map(|tp| 1536 / tp)
                     && identity["ingress"] == "bf16"
                     && identity["maximum_rows"] == 64
                     && identity["error_ratio_bound"] == 1.01
@@ -766,7 +784,7 @@ mod tests {
             }
             if let Some(link) = &link {
                 ensure!(
-                    manifest["same_quant"]["tp"] == 4
+                    manifest["same_quant"]["tp"] == link.world_size()
                         && manifest["same_quant"]["error_ratio_bound"] == 1.01
                         && manifest["same_quant"]["revision"].as_str()
                             == snapshot.file_name().and_then(|s| s.to_str()),
@@ -833,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires golden-run real TP4 experts and same-quant fixtures"]
+    #[ignore = "requires golden-run real TP4/TP6 experts and same-quant fixtures"]
     fn native_step5_layer_chain() -> Result<()> {
         native(4)
     }
