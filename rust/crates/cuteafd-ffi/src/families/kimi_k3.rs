@@ -362,6 +362,119 @@ impl<'a> KimiFfn<'a> {
     }
 }
 
+/// Native RMSNorm: F32 normalization -> BF16 -> BF16 weight product -> BF16.
+/// Unlike a one-round affine norm, this preserves the checkpoint's intermediate.
+pub struct KimiRmsNorm<'a> {
+    program: Program<'a>,
+    hidden: usize,
+    rows: usize,
+}
+impl<'a> KimiRmsNorm<'a> {
+    pub fn load(programs: &'a Programs<'a>, hidden: usize) -> W8Result<Self> {
+        let program = programs.program(&format!("kimik3_rmsnorm_h{hidden}"), &["x", "weight", "out"])?;
+        validate_norm_manifest(program.spec(), hidden)?;
+        let rows = program.spec().capacity_rows as usize;
+        Ok(Self { program, hidden, rows })
+    }
+
+    /// Storage must remain live and unchanged until all enqueued work/replays finish.
+    pub fn launch(&self, rows: usize, input: Buffer, weight: Buffer, output: Buffer,
+        stream: *mut c_void) -> W8Result<()> {
+        validate_norm_buffers(rows, self.rows, self.hidden, input, weight, output)?;
+        // SAFETY: resolved program, checked dense extents/device/disjoint output,
+        // and the caller owns storage and stream through completion and replay.
+        unsafe { self.program.launch(&[input.ptr, weight.ptr, output.ptr],
+            &[Scalar::I32(rows as i32), Scalar::F32(1e-5)], stream)?; }
+        Ok(())
+    }
+}
+
+/// Replicated latent down projection followed, after the complete expert meet,
+/// by native RMSNorm and the latent up projection. No TP meet belongs inside.
+pub struct KimiLatent<'a> {
+    down: Program<'a>,
+    norm: KimiRmsNorm<'a>,
+    up: Program<'a>,
+    rows: usize,
+}
+impl<'a> KimiLatent<'a> {
+    pub fn load(programs: &'a Programs<'a>) -> W8Result<Self> {
+        let down = programs.program("kimik3_latent_down", &["x", "w", "out"])?;
+        let up = programs.program("kimik3_latent_up", &["x", "w", "out"])?;
+        validate_projection_manifest(down.spec(), 7168, 3584)?;
+        validate_projection_manifest(up.spec(), 3584, 7168)?;
+        let norm = KimiRmsNorm::load(programs, 3584)?;
+        let rows = norm.rows.min(down.spec().capacity_rows as usize).min(up.spec().capacity_rows as usize);
+        Ok(Self { down, norm, up, rows })
+    }
+
+    pub fn down(&self, rows: usize, input: Buffer, weight: Buffer, output: Buffer,
+        stream: *mut c_void) -> W8Result<()> {
+        validate_projection_buffers(rows, self.rows, 7168, 3584, input, weight, output)?;
+        // SAFETY: validated projection storage; the caller owns operands/stream
+        // through completion, including every captured graph replay.
+        unsafe { self.down.launch(&[input.ptr, weight.ptr, output.ptr],
+            &[Scalar::I32(rows as i32)], stream)?; }
+        Ok(())
+    }
+
+    /// `combined` is the complete BF16 weighted sum, never a Spark partial.
+    /// All operands are validated before either stage is enqueued.
+    pub fn up(&self, rows: usize, combined: Buffer, norm_weight: Buffer,
+        normalized: Buffer, up_weight: Buffer, output: Buffer,
+        stream: *mut c_void) -> W8Result<()> {
+        validate_norm_buffers(rows, self.rows, 3584, combined, norm_weight, normalized)?;
+        validate_projection_buffers(rows, self.rows, 3584, 7168, normalized, up_weight, output)?;
+        let buffers = [(combined, rows * 3584 * 2), (norm_weight, 3584 * 2),
+            (normalized, rows * 3584 * 2), (up_weight, 7168 * 3584 * 2), (output, rows * 7168 * 2)];
+        for writer in [2, 4] {
+            for other in 0..buffers.len() {
+                if writer != other { reject_overlap(buffers[writer], buffers[other])?; }
+            }
+        }
+        self.norm.launch(rows, combined, norm_weight, normalized, stream)?;
+        // SAFETY: validated dense projection storage and ordered dependency on
+        // the native normalization launch on the same caller-owned stream.
+        unsafe { self.up.launch(&[normalized.ptr, up_weight.ptr, output.ptr],
+            &[Scalar::I32(rows as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_norm_manifest(spec: &ProgramSpec, hidden: usize) -> W8Result<()> {
+    validate_w8_manifest(spec, b"if")?;
+    if !matches!(hidden, 3584 | 7168) || spec.geometry["hidden"].as_u64() != Some(hidden as u64) {
+        return Err(KimiW8Error::Invalid("native RMSNorm manifest geometry"));
+    }
+    Ok(())
+}
+
+fn validate_norm_buffers(rows: usize, capacity: usize, hidden: usize,
+    input: Buffer, weight: Buffer, output: Buffer) -> W8Result<()> {
+    if rows == 0 || rows > capacity || rows > i32::MAX as usize {
+        return Err(KimiW8Error::Invalid("RMSNorm rows/capacity"));
+    }
+    let bytes = rows.checked_mul(hidden).and_then(|n| n.checked_mul(2))
+        .ok_or(KimiW8Error::Invalid("RMSNorm extent overflow"))?;
+    let weight_bytes = hidden.checked_mul(2).ok_or(KimiW8Error::Invalid("RMSNorm extent overflow"))?;
+    validate_w8_buffers(&[(input, bytes), (weight, weight_bytes), (output, bytes)], input.device_id)?;
+    reject_overlap((output, bytes), (input, bytes))?;
+    reject_overlap((output, bytes), (weight, weight_bytes))
+}
+
+fn validate_projection_buffers(rows: usize, capacity: usize, width: usize, outputs: usize,
+    input: Buffer, weight: Buffer, output: Buffer) -> W8Result<()> {
+    if rows == 0 || rows > capacity || rows > i32::MAX as usize {
+        return Err(KimiW8Error::Invalid("projection rows/capacity"));
+    }
+    let bytes = |a: usize, b: usize| a.checked_mul(b).and_then(|n| n.checked_mul(2))
+        .ok_or(KimiW8Error::Invalid("projection extent overflow"));
+    let (x, w, y) = (bytes(rows, width)?, bytes(width, outputs)?, bytes(rows, outputs)?);
+    validate_w8_buffers(&[(input, x), (weight, w), (output, y)], input.device_id)?;
+    reject_overlap((output, y), (input, x))?;
+    reject_overlap((output, y), (weight, w))
+}
+
 fn validate_projection_manifest(spec: &ProgramSpec, width: usize, outputs: usize) -> W8Result<()> {
     validate_w8_manifest(spec, b"i")?;
     let g = &spec.geometry;
@@ -513,6 +626,46 @@ mod tests {
                     assert!(validate_projection_manifest(&wrong, width, outputs).is_err());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn latent_native_norm_contract_and_projection_buffer_admission() {
+        for hidden in [3584, 7168] {
+            let site = KimiResidualSite { candidates: 1, prefix: KimiPrefixMode::Keep, append: true };
+            let mut spec = residual_spec(site);
+            spec.scalar_kinds = b"if".to_vec();
+            spec.geometry = serde_json::json!({"hidden": hidden});
+            validate_norm_manifest(&spec, hidden).unwrap();
+            let mut bad = spec.clone(); bad.scalar_kinds = b"i".to_vec();
+            assert!(validate_norm_manifest(&bad, hidden).is_err());
+            let mut bad = spec.clone(); bad.geometry["hidden"] = serde_json::json!(1);
+            assert!(validate_norm_manifest(&bad, hidden).is_err());
+            assert!(validate_norm_manifest(&spec, 512).is_err());
+            let buffer = |ptr, bytes| Buffer { ptr: ptr as *mut c_void, bytes, device_id: 0, flags: 0 };
+            let x = buffer(0x1000usize, hidden * 2);
+            let w = buffer(0x100000usize, hidden * 2);
+            let y = buffer(0x200000usize, hidden * 2);
+            validate_norm_buffers(1, 4096, hidden, x, w, y).unwrap();
+            assert!(validate_norm_buffers(0, 4096, hidden, x, w, y).is_err());
+            assert!(validate_norm_buffers(2, 1, hidden, x, w, y).is_err());
+            assert!(validate_norm_buffers(2, 4096, hidden, x, w, y).is_err());
+            assert!(validate_norm_buffers(1, 4096, hidden, x, w, x).is_err());
+            assert!(validate_norm_buffers(1, 4096, hidden, x, w, w).is_err());
+            assert!(validate_norm_buffers(1, 4096, hidden, x, w,
+                Buffer { device_id: 1, ..y }).is_err());
+        }
+        for (width, outputs) in [(7168, 3584), (3584, 7168)] {
+            let buffer = |ptr, bytes| Buffer { ptr: ptr as *mut c_void, bytes, device_id: 0, flags: 0 };
+            let x = buffer(0x1000usize, width * 2);
+            let w = buffer(0x100000usize, width * outputs * 2);
+            let y = buffer(0x10000000usize, outputs * 2);
+            validate_projection_buffers(1, 4096, width, outputs, x, w, y).unwrap();
+            assert!(validate_projection_buffers(0, 4096, width, outputs, x, w, y).is_err());
+            assert!(validate_projection_buffers(1, 4096, width, outputs, x, w,
+                Buffer { ptr: w.ptr, ..y }).is_err());
+            assert!(validate_projection_buffers(1, 4096, width, outputs, x,
+                Buffer { bytes: w.bytes - 1, ..w }, y).is_err());
         }
     }
 

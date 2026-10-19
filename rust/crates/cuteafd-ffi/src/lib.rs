@@ -2,7 +2,8 @@ mod families;
 mod shared;
 pub use shared::{audio, exlr8, fp8_moe, peer_exchange, programs, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
-    KimiFfn, KimiFfnBatch, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite, KimiSitu, KimiW8Error,
+    KimiFfn, KimiFfnBatch, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
+    KimiRmsNorm, KimiSitu, KimiW8Error,
     MLA_PAGE_ROWS, MLA_RECORD_BYTES};
 pub use shared::vocab_head::{VOCAB_HEAD_ROWS_MAX, VOCAB_HEAD_ROWS_PASS};
 pub use shared::v41_device_ops::{V41Bf16Add, V41PeerCopy};
