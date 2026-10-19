@@ -366,6 +366,7 @@ candidate_env_args() {
   # the bootstrap/admission tracing::info lines are invisible without this.
   # A user filter that hides them makes the readiness waits time out (nonzero).
   printf '%s\0' -e "RUST_LOG=${RUST_LOG:-info}"
+  printf '%s\0' -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_TPEP_WORKER_READY_TIMEOUT_SECONDS:-900}"
   for forward in \
     CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP \
     CUTEAFD_VERBS_APP_IB_PORT_NUM \

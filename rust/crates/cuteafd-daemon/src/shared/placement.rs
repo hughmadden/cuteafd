@@ -7,6 +7,16 @@ use cuteafd_loader::placement::{SparkAssignment, SparkResidentLayout, SparkWorki
 use cuteafd_transport::{expert::SparkTopology, worker_selection::{ModelAdmission, WorkerIdentity, WorkerSelection}};
 use std::{net::SocketAddr, path::Path, time::Duration};
 
+const ADMISSION_TIMEOUT_ENV: &str = "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS";
+
+fn admission_timeout(value: Option<&str>) -> Result<Duration> {
+    let seconds = value.unwrap_or("1200").parse::<u64>()
+        .with_context(|| format!("{ADMISSION_TIMEOUT_ENV} must be positive integer seconds"))?;
+    ensure!(seconds > 0 && std::time::Instant::now().checked_add(Duration::from_secs(seconds)).is_some(),
+        "{ADMISSION_TIMEOUT_ENV} must be positive, representable seconds");
+    Ok(Duration::from_secs(seconds))
+}
+
 /// Header-derived expectations exist before workers load or coordinator owners allocate.
 pub(crate) struct SparkAdmission {
     selection: WorkerSelection,
@@ -94,9 +104,12 @@ impl SparkAdmission {
     }
 
     pub(crate) fn start(self, peers: &[SocketAddr]) -> Result<PendingSparkAdmission> {
+        let value = std::env::var(ADMISSION_TIMEOUT_ENV).ok();
+        let timeout = admission_timeout(value.as_deref())?;
         let pending = cuteafd_transport::worker_selection::start_model_admission(
-            peers, &self.selection, Duration::from_secs(1200))?;
-        Ok(PendingSparkAdmission { plan: self, pending })
+            peers, &self.selection, timeout)
+            .with_context(|| format!("Spark worker admission start failed (timeout {} s)", timeout.as_secs()))?;
+        Ok(PendingSparkAdmission { plan: self, pending, timeout })
     }
 
     pub(crate) fn select(self, peers: &[SocketAddr]) -> Result<()> {
@@ -107,11 +120,13 @@ impl SparkAdmission {
 pub(crate) struct PendingSparkAdmission {
     plan: SparkAdmission,
     pending: cuteafd_transport::worker_selection::PendingModelAdmission,
+    timeout: Duration,
 }
 
 impl PendingSparkAdmission {
     pub(crate) fn wait(self) -> Result<()> {
-        let reports = self.pending.wait()?;
+        let reports = self.pending.wait()
+            .with_context(|| format!("Spark worker admission failed (timeout {} s)", self.timeout.as_secs()))?;
         self.plan.reconcile(&reports)?;
         for report in reports {
             tracing::info!(rank = report.rank, resident_bytes = report.resident_bytes,
@@ -126,6 +141,41 @@ impl PendingSparkAdmission {
 mod tests {
     use super::*;
     use cuteafd_core::{RuntimeSample, SparkEndpoint, SparkIngress, SparkRuntimeInventory};
+
+    #[test]
+    fn admission_timeout_uses_launch_bound_and_rejects_invalid_values() -> Result<()> {
+        assert_eq!(admission_timeout(Some("2400"))?, Duration::from_secs(2400));
+        assert_eq!(admission_timeout(None)?, Duration::from_secs(1200));
+        for value in ["", "0", "-1", "1.5", "invalid", "18446744073709551615"] {
+            let error = format!("{:#}", admission_timeout(Some(value)).unwrap_err());
+            assert!(error.contains(ADMISSION_TIMEOUT_ENV), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn admission_timeout_failure_names_the_configured_bound() -> Result<()> {
+        let plan = idle_plan()?;
+        let listeners = (0..2).map(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let peers = listeners.iter().map(|listener| listener.local_addr())
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _streams = listeners.into_iter().map(|listener| listener.accept().unwrap())
+                .collect::<Vec<_>>();
+            let _ = hold.recv_timeout(Duration::from_secs(5));
+        });
+        let timeout = Duration::from_secs(1);
+        let pending = cuteafd_transport::worker_selection::start_model_admission(
+            &peers, &plan.selection, timeout)?;
+        let result = PendingSparkAdmission { plan, pending, timeout }.wait();
+        let _ = release.send(());
+        worker.join().unwrap();
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("Spark worker admission failed (timeout 1 s)"), "{error}");
+        Ok(())
+    }
 
     fn idle_plan() -> Result<SparkAdmission> {
         let root = tempfile::tempdir()?;

@@ -247,6 +247,7 @@ def test_mock_start_dual_orders_ack_health_request_gid(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     assert len(launches) == 7, launches
     experts, coordinator = launches[:6], launches[6]
+    assert "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=20" in coordinator
     assert "--placement-directory" not in coordinator and "--dspark-draft-limit 7" in coordinator
     assert "--kv-pool-size 5037542400" in coordinator and "--rtx-expert-layers 20" in coordinator
     for index, line in enumerate(experts):

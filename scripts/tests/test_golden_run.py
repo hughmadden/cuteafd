@@ -506,6 +506,12 @@ def test_golden_subcommand_needs_peers_placeholder_with_sparks():
         golden.substitute(['{fixtures}'], '/s')
 
 
+@pytest.mark.parametrize('seconds', ['0', '-1'])
+def test_worker_admission_rejects_nonpositive_launch_bound(spark_env, seconds, capsys):
+    assert golden.main(spark_argv(spark_env, '--worker-ready-timeout', seconds)) == 2
+    assert '--worker-ready-timeout must be positive seconds' in capsys.readouterr().err
+
+
 def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monkeypatch):
     env = spark_env
     monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
@@ -525,7 +531,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
             released.append(json.loads(env['state'].read_text()))
             return self.inner.__exit__(*exc)
     monkeypatch.setattr(golden.hwlock, 'hold', Hold)
-    assert golden.main(spark_argv(env)) == 0
+    assert golden.main(spark_argv(env, '--worker-ready-timeout', '2400')) == 0
     assert order == [['sparks', 'gpu1', 'rhea', 'moa']]
     assert released == [{}]  # every worker and the coordinator removed before the locks went
     calls = docker_calls(env)
@@ -552,6 +558,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
     assert run_env['CUTEAFD_GOLDEN_SNAPSHOT'] == '/hf/hub/models--org--model/snapshots/rev1'
     assert run_env['CUTEAFD_PROGRAM_MANIFEST'] == '/opt/cuteafd/share/PROGRAMS.json'
     assert run_env['CUTEAFD_GOLDEN_SPARK_PACKAGES'] == '/opt/cuteafd/spark'
+    assert run_env['CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS'] == '2400'
     call = calls[coordinator]
     assert '--network' in call and '--device=/dev/infiniband' in call
     assert call[call.index('-w') + 1] == '/workspace/cuteafd'
