@@ -60,6 +60,7 @@
       <div class="row"><span class="label" id="h-title">Host KV offload · pinned RAM</span><span class="num"><b id="h-used">–</b> / <span id="h-total">–</span></span></div>
       <div class="track"><span id="h-bar" style="background:var(--prefill);width:0"></span></div>
       <div class="row"><span class="num">snapshots <b id="h-snaps">–</b> · hits <b id="h-hits">–</b> / <span id="h-look">–</span></span><span class="num"><span id="h-p50-label">restore p50</span> <b id="h-p50">–</b></span></div>
+      <div class="row" id="h-eviction-row" hidden><span class="num">host evictions <b id="h-evictions">0</b></span><span class="num">host time <b id="h-eviction-time">0 ms</b></span></div>
     </div>
     <div class="meter" id="gpu-meter" hidden>
       <div class="row"><span class="label" id="gpu-title">GPUs</span><span class="num gpu-total" id="gpu-total"></span></div>
@@ -557,10 +558,13 @@ function renderMeters() {
   }
   renderGpus(g.thermal);
   const h = g.host;
+  $('#h-eviction-row').hidden = !h;
   if (h) {
     $('#h-used').textContent = bytes(h.bytes_used); $('#h-total').textContent = bytes(h.quota_bytes);
     $('#h-bar').style.width = (100 * h.bytes_used / Math.max(1, h.quota_bytes)) + '%';
     $('#h-snaps').textContent = n0(h.resident_snapshots); $('#h-hits').textContent = n0(h.host_hits); $('#h-look').textContent = n0(h.lookups);
+    $('#h-evictions').textContent = n0(h.host_evictions);
+    $('#h-eviction-time').textContent = F.ms((h.host_eviction_ns || 0) / 1e6);
     const b = h.restore_latency_buckets || [], total = b.reduce((x, y) => x + y, 0);
     const bounds = ['≤1 ms', '≤5 ms', '≤10 ms', '≤50 ms', '≤100 ms', '≤500 ms', '≤1 s', '>1 s'];
     let acc = 0, p50 = '–'; for (let i = 0; i < b.length; i++) { acc += b[i]; if (total && acc >= total / 2) { p50 = bounds[i]; break; } }

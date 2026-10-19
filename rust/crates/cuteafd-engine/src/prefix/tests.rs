@@ -627,6 +627,29 @@ fn host_tier_restores_evicted_snapshots_exactly_and_shares_identical_prefixes() 
 }
 
 #[test]
+fn host_retention_exceeds_device_banks_and_counts_shared_pages_once() {
+    let fake = Fake::new(64, 4, 8);
+    let mut cache = cache(&fake, 1, 1 << 20);
+    let system = seq(100, 16);
+    for n in 0..12 {
+        let mut prompt = system.clone();
+        prompt.extend(seq(1000 + n * 100, 10));
+        let (_, _, p) = serve(&mut cache, &fake, 0, &prompt, &[], 26);
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    let stats = cache.stats();
+    let host = stats.host.unwrap();
+    assert_eq!(stats.entries_prompt, 1);
+    assert_eq!(host.resident_snapshots, 12);
+    assert_eq!(host.host_evictions, 0);
+    assert_eq!(host.pages_copied, 4 + 12 * 3);
+    assert_eq!(host.pages_shared, 11 * 4);
+    assert_eq!(host.bytes_used, (4 + 12 * 3) * (ROWS * ROW) as u64 + 12 * (WINDOW * ROW) as u64);
+}
+
+#[test]
 fn host_snapshot_rejects_a_different_record_format_before_copying() {
     let fake = Fake::new(24, 4, 8);
     fake.record_format.set("qwen4_e4m3_token_head_f32_v1");

@@ -7,14 +7,14 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
-fn host_ledger_uses_fixed_quota_and_reports_other_owners_and_refusal() {
+fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
     use cuteafd_core::memory_layout::ItemLifetime;
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
     for (total, expected) in [(183u64, 32u64), (64, 16)] {
         let mut report = input.plan(&PlanOptions::default()).unwrap();
         let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)),
-            full_prefill_logits: true, ..Default::default() };
+            full_prefill_logits: true, context_tokens: 1 << 40, ..Default::default() };
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         let host = report.host_ledger.as_ref().unwrap();
         assert_eq!(report.host_budget_bytes, expected << 30);
@@ -30,9 +30,52 @@ fn host_ledger_uses_fixed_quota_and_reports_other_owners_and_refusal() {
         assert!(!report.fits);
         assert!(report.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
         assert!(report.hints.iter().any(|h| h.what.contains("coordinator host memory shortfall")));
+        options.host_cache_bytes = Some(40 << 30);
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert_eq!(report.host_budget_bytes, 40 << 30); // Explicit quota bypasses both caps.
         options.host_cache_bytes = Some(0);
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         assert_eq!(report.host_budget_bytes, 0);
+    }
+}
+
+#[test]
+fn real_layout_charges_host_and_names_unsupported_snapshot_geometry() {
+    let mut config = mimo_flash_config();
+    config.as_object_mut().unwrap().remove("max_position_embeddings");
+    let dir = snapshot(config, &mimo_flash_tensors());
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+    }), ..sparks(4) };
+    let report = plan(dir.path(), &options).unwrap();
+    assert!(report.spec.is_some() && report.host_ledger.is_some());
+    assert!(!report.fits && !report.placement_supported);
+    assert!(report.hints.iter().any(|h| h.what.contains("mimo_v2 host prefix cache unsupported")
+        && h.what.contains("auto bytes") && h.what.contains("context 0")), "{}", render(&report));
+    options.layout.as_mut().unwrap().host_cache_bytes = Some(1234567);
+    let explicit = plan(dir.path(), &options).unwrap();
+    assert_eq!(explicit.host_budget_bytes, 1234567);
+    assert_eq!(explicit.host_ledger.as_ref().unwrap().host_budget_bytes, 1234567);
+}
+
+#[test]
+fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&PlanOptions::default()).unwrap();
+    let geometry = &report.cache_requirements.as_ref().unwrap().target_only_layouts[0];
+    let rank = &geometry.ranks[0];
+    let (rows, page, mark) = (geometry.logical_unit_rows, rank.persistent_unit_bytes, rank.retained_mark_bytes);
+    let chunk = (256u64 << 20).max(page).max(mark);
+    for concurrency in [1, 16] {
+        let expected = cuteafd_core::prefix::host_cache_required_bytes(1 << 20, concurrency,
+            rows, page, mark.max(1), 0, chunk).unwrap().min(32 << 30);
+        for entries in [1, 2000] {
+            let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries, ..Default::default() };
+            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            assert_eq!(report.host_budget_bytes, expected);
+        }
     }
 }
 
@@ -2326,8 +2369,12 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
         plans.insert(name.into(), value);
     }
     let actual = Value::Object(plans);
-    let expected: Value = serde_json::from_str(include_str!(
+    let mut expected: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/glmf-startup-plans.json")).unwrap();
+    // The fixture now declares its real context ceiling for host admission.
+    for report in expected.as_object_mut().unwrap().values_mut() {
+        report["cache_requirements"]["checkpoint_max_context_tokens"] = json!(1_048_576);
+    }
     // The shared solver cannot admit this historical A_log-only checkpoint.
     // Preserve the old snapshot/hash as provenance, but require a named refusal
     // instead of manufacturing resident weights and an executable layout.
@@ -2357,6 +2404,7 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     // exact Spark I/O; this fixture remains the unchanged historical reference.
     let mut legacy = expected;
     for report in legacy.as_object_mut().unwrap().values_mut() {
+        report["cache_requirements"]["checkpoint_max_context_tokens"] = Value::Null;
         assert_eq!(report.as_object_mut().unwrap().shift_remove("attention_placement"), Some(json!("heads")));
         let notes = report["memory_layout"]["notes"].as_array_mut().unwrap();
         assert_eq!(notes.remove(1), json!("attention placement heads"));
@@ -2621,7 +2669,8 @@ fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle
     let dir = snapshot(qwen4_config(48), &[]);
     let options = PlanOptions {
         layout: Some(layout::LayoutOptions {
-            rtx_bytes: vec![12 << 30, 96 << 30], head_split: false, pool_tokens: Some(0), ..Default::default()
+            rtx_bytes: vec![12 << 30, 96 << 30], head_split: false, pool_tokens: Some(0),
+            context_tokens: 32768, ..Default::default()
         }), ..sparks(0)
     };
     let report = plan(dir.path(), &options).unwrap();
@@ -2762,7 +2811,8 @@ fn layout_charges_local_routed_experts_to_the_coordinator() {
 fn default_uses_all_sparks_and_explicit_unsupported_count_refuses() {
     let dir = qwen_snapshot(4);
     let options = PlanOptions {
-        layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), ..Default::default() }),
+        // This single linear-layer package has no paged KV host tier.
+        layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), host_cache_bytes: Some(0), ..Default::default() }),
         ..sparks(6)
     };
     let all = plan_spark_count(dir.path(), &options, 4, None).unwrap();

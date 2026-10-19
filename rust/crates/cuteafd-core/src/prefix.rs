@@ -20,6 +20,95 @@ pub const fn default_host_cache_bytes(total: u64) -> u64 {
     if quarter < 32 << 30 { quarter } else { 32 << 30 }
 }
 
+/// Full-context inactive KV quota, with four sequences of overage. Explicit quotas bypass it.
+pub fn host_cache_required_bytes(context: u64, concurrency: u64,
+    unit_rows: u64, page_bytes: u64, mark_bytes: u64, draft_bytes: u64, chunk: u64) -> Option<u64> {
+    if context == 0 || unit_rows == 0 || page_bytes == 0 || chunk == 0 { return None; }
+    let snapshots = concurrency.checked_add(4)?;
+    let pages = context.div_ceil(unit_rows).checked_mul(snapshots)?;
+    let mut chunks = 0u64;
+    for (count, bytes) in [(pages, page_bytes), (snapshots, mark_bytes), (snapshots, draft_bytes)] {
+        if bytes == 0 { continue; }
+        let per = chunk / bytes;
+        if per == 0 { return None; }
+        chunks = chunks.checked_add(count.div_ceil(per))?;
+    }
+    chunks.checked_mul(chunk)
+}
+
+/// Snapshot size classes shared by offline admission and the live host tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCacheGeometry {
+    pub unit_rows: u64,
+    pub page_bytes: u64,
+    pub mark_bytes: u64,
+    pub draft_bytes: u64,
+}
+
+/// Extra KV kept free after a pressure eviction, independently of the quota.
+pub const DEFAULT_HOST_CACHE_EVICT_TOKENS: u64 = 16 * 1024;
+
+impl HostCacheGeometry {
+    /// Page, positional-mark and draft size-class bytes for one headroom extent.
+    pub fn eviction_headroom_bytes(self, tokens: u64) -> Option<[u64; 3]> {
+        if tokens == 0 { return Some([0; 3]); }
+        if self.unit_rows == 0 { return None; }
+        Some([tokens.div_ceil(self.unit_rows).checked_mul(self.page_bytes)?,
+            self.mark_bytes.max(1), self.draft_bytes])
+    }
+
+    pub fn chunk_bytes(self) -> u64 {
+        (256u64 << 20).max(self.page_bytes).max(self.mark_bytes).max(self.draft_bytes)
+    }
+
+    /// Explicit quotas bypass geometry and caps; automatic quotas hold whole chunks.
+    pub fn resolve(self, explicit: Option<u64>, context: u64, concurrency: u64,
+        host_total: u64, chunk: u64) -> Option<u64> {
+        if let Some(bytes) = explicit { return Some(bytes); }
+        let required = host_cache_required_bytes(context, concurrency, self.unit_rows,
+            self.page_bytes, self.mark_bytes.max(1), self.draft_bytes, chunk)?;
+        Some(required.min(default_host_cache_bytes(host_total)) / chunk * chunk)
+    }
+}
+
+#[cfg(test)]
+mod host_budget_tests {
+    use super::*;
+    #[test]
+    fn eviction_headroom_uses_the_resolved_family_classes() {
+        let geometry = HostCacheGeometry { unit_rows: 512, page_bytes: 455_680,
+            mark_bytes: 2_922_816, draft_bytes: 12_288 };
+        assert_eq!(geometry.eviction_headroom_bytes(DEFAULT_HOST_CACHE_EVICT_TOKENS),
+            Some([32 * 455_680, 2_922_816, 12_288]));
+        assert_eq!(geometry.eviction_headroom_bytes(0), Some([0; 3]));
+        assert_eq!(geometry.eviction_headroom_bytes(513), Some([2 * 455_680, 2_922_816, 12_288]));
+    }
+
+    #[test]
+    fn shared_resolver_preserves_explicit_overrides_and_whole_chunk_caps() {
+        let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 512,
+            mark_bytes: 140, draft_bytes: 0 };
+        assert_eq!(geometry.resolve(None, 65, 2, 32768, 1024), Some(7 * 1024));
+        assert_eq!(geometry.resolve(None, 4096, 16, 32768, 1024), Some(8 * 1024));
+        assert_eq!(geometry.resolve(Some(40001), 0, u64::MAX, 1, 0), Some(40001));
+        assert_eq!(geometry.resolve(Some(0), 0, 0, 0, 0), Some(0));
+        assert_eq!(geometry.resolve(None, 0, 1, 32768, 1024), None);
+    }
+
+    #[test]
+    fn concurrency_default_and_small_host_cap() {
+        let required = |concurrency| host_cache_required_bytes(1 << 20, concurrency, 512, 4096, 1024, 0, 1 << 20).unwrap();
+        assert_eq!(required(1), 41 << 20);
+        assert_eq!(required(16), 161 << 20);
+        // Tail and draft are distinct size classes, each requiring its own chunk.
+        assert_eq!(host_cache_required_bytes(1, 1, 1, 1, 1, 1, 1024), Some(3072));
+        let small_host = 128 << 20;
+        assert_eq!(required(16).min(default_host_cache_bytes(small_host)), 32 << 20);
+        assert_eq!(default_host_cache_bytes(256 << 30), 32 << 30);
+        assert!(host_cache_required_bytes(u64::MAX, u64::MAX, 1, 4096, 1024, 0, 1 << 20).is_none());
+    }
+}
+
 /// Position-addressed window with enough append-only space for one uncommitted step.
 /// Snapshots retain only `window` visible rows, never speculative slack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +497,18 @@ impl<T> Radix<T> {
         self.root.collect(&mut values);
         values
     }
+    /// Values in this bank's eviction order, without changing the access clocks.
+    pub fn eviction_order(&self) -> Vec<&T> {
+        fn collect<'a, T>(node: &'a Node<T>, out: &mut Vec<(u64, &'a T)>) {
+            if let Some((clock, value)) = &node.value { out.push((*clock, value)); }
+            for child in node.children.values() { collect(child, out); }
+        }
+        let mut values = Vec::with_capacity(self.entries);
+        collect(&self.root, &mut values);
+        values.sort_unstable_by_key(|(clock, _)| *clock);
+        values.into_iter().map(|(_, value)| value).collect()
+    }
+
     /// The bound this bank was created with; zero disables retention entirely.
     pub fn limit(&self) -> usize {
         self.limit

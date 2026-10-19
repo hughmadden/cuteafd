@@ -145,25 +145,6 @@ pub(crate) fn layout(units: usize, draft: bool, partial: bool) -> FamilyLayout {
     }
 }
 
-/// The automatic host budget: logical capacity above `entries * max_context` tokens (as
-/// before), in this layout's slabs: one unit slab per 512 tokens plus one mark per snapshot.
-pub(crate) fn host_budget(layout: FamilyLayout, device_tokens: u64, entries: u32, max_context: u32, chunk: u64)
-    -> Result<cuteafd_hostcache::budget::Budget> {
-    let mut budget = cuteafd_hostcache::budget::plan(device_tokens, entries, max_context, chunk, false)?;
-    if budget.pinned_bytes == 0 { return Ok(budget); }
-    let unit = UNIT_TOKENS as u64;
-    let snapshots = 2 * u64::from(entries) + 2;
-    let units = budget.host_tokens / unit + budget.staging_tokens / unit + snapshots;
-    let chunks = |slabs: u64, bytes: usize| -> Result<u64> {
-        let per = chunk / bytes as u64;
-        ensure!(per > 0, "host cache chunk is smaller than a V4.1 snapshot slab");
-        Ok(slabs.div_ceil(per))
-    };
-    budget.pinned_bytes = (chunks(units, layout.page_bytes)? + chunks(snapshots, layout.mark_bytes)?)
-        .checked_mul(chunk).context("host cache budget overflow")?;
-    Ok(budget)
-}
-
 /// Where V4.1 resumes a snapshot: the default plan, except that an exact ancestor followed by
 /// at least 128 new tokens continues its encoder (exact), and a partial match shares sources
 /// through the even-aligned, media-safe common prefix and replays 128 tokens before it.

@@ -134,6 +134,8 @@ fn context_names_the_missing_native_abi_instead_of_claiming_fit() {
     options.attention_placement = Some(crate::placement::AttentionPlacement::Context);
     let report = plan::plan(dir.path(), &options).unwrap();
     assert!(!report.placement_supported && !report.fits);
+    assert!(report.hints.iter().any(|h| h.what.contains("kimi_k3 host prefix cache unsupported")
+        && h.what.contains("auto bytes")), "{:?}", report.hints);
     assert!(report.hints.iter().any(|h| h.what.contains("owned-page query exchange/LSE-combine ABI")), "{:?}", report.hints);
     assert!(report.memory_layout.as_ref().unwrap().devices.is_empty());
 }

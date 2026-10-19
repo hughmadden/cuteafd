@@ -65,6 +65,8 @@ pub struct Snapshot {
     /// nothing: the hook is a no-op and never executes.
     pub device_evictions: u64,
     pub host_evictions: u64,
+    /// Host wall time selecting and releasing store-pressure victims.
+    pub host_eviction_ns: u64,
     pub host_evicted_bytes: u64,
     /// Engine submissions issued so far: one per 1D copy and one per coalesced batch, so the
     /// fleet report can show submissions per snapshot before and after coalescing. Gauge,

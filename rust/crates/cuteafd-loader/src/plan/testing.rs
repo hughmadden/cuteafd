@@ -292,6 +292,7 @@ pub fn glm5_flash_config(layers: usize) -> Value {
         "architectures": ["Glm5NextForConditionalGeneration"], "model_type": "glm5_next",
         "quantization_config": FP8_BLOCK.clone(), "text_config": {
             "model_type": "glm5_next_text", "vocab_size": 64, "hidden_size": 4096, "num_hidden_layers": layers,
+            "max_position_embeddings": 1048576,
             "layer_types": (0..layers).map(|l| if l % 2 == 1 { "deepseek_sparse_attention" } else { "linear_attention" })
                 .collect::<Vec<_>>(),
             "mlp_layer_types": (0..layers).map(|l| if l == 0 { "dense" } else { "sparse" }).collect::<Vec<_>>(),
@@ -356,6 +357,7 @@ pub fn qwen4_config(layers: usize) -> Value {
         "architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp",
         "quantization_config": exl3_compact(4), "text_config": {
             "model_type": "qwen4_exp_text", "vocab_size": 64, "hidden_size": 2560, "num_hidden_layers": layers,
+            "max_position_embeddings": 262144,
             "layer_types": (0..layers).map(|l| if l % 4 == 3 { "full_attention" } else { "linear_attention" })
                 .collect::<Vec<_>>(),
             "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
@@ -471,7 +473,7 @@ pub fn write_v4_snapshot(path: &Path) {
 
 pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
     // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
-    let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
+    let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4", "max_position_embeddings": 1048576});
     let mut ratios = vec![0, 0];
     ratios.extend([4, 128, 4]);
     let args = json!({

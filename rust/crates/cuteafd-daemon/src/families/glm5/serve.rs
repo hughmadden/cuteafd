@@ -366,7 +366,7 @@ impl Trace {
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
-fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs)
+fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrency: usize)
     -> Result<(GlmPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
         engine.prefill_rows, engine.cfg.vocab_size)?;
@@ -384,10 +384,10 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs)
     } else if engine.ranks() > 1 {
         // SAFETY of the registration: the engine (and its pools) outlives the cache, which
         // `schedule` drops first.
-        args.host_config(family.layout(), engine.max_context)?.map(|config|
+        args.host_config(family.layout(), engine.max_context, concurrency)?.map(|config|
             CudaCopyEngine::registered(engine.library, &family.buffers()).map(|copy| (config, copy))).transpose()?
     } else {
-        args.host_tier(engine.library, template, family.layout(), engine.max_context)?
+        args.host_tier(engine.library, template, family.layout(), engine.max_context, concurrency)?
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
@@ -430,7 +430,7 @@ fn draft_seed() -> cuteafd_core::PolicySeed {
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
     max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement) -> Result<()> {
-    let (family, mut cache) = prefix_cache(engine, prefix)?;
+    let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
     let markers = crate::shared::prefix::marker_ids(&opened.snapshot,
         &crate::families::glm5_flash::serve::MESSAGE_STARTS)?;
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(

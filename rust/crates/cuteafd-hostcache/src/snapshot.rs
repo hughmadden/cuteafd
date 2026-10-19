@@ -367,6 +367,50 @@ impl Snapshots {
         }
     }
 
+    /// Make room in one eviction-order pass, then let the caller plan exactly once.
+    /// Slab occupancy, not snapshot footprints, accounts for shared pages and class fragmentation.
+    pub(crate) fn make_room(&mut self, meta: &SnapshotMeta,
+        device_pages: &[Vec<DevicePageId>; COMPRESSORS], headroom: [u64; 4]) -> (Vec<Key>, u64) {
+        let layout = self.pool.layout();
+        let mut demand = [0, 1, u64::from(meta.has_draft && layout.draft > 0),
+            u64::from(layout.scores > 0)];
+        let mut shared = HashMap::<PageRef, u64>::new();
+        for id in device_pages.iter().flatten() {
+            if let Some(&page) = self.device_map.get(id) {
+                *shared.entry(page).or_default() += 1;
+            } else { demand[0] += 1; }
+        }
+        if self.pool.can_take(demand) { return (Vec::new(), 0); }
+        let mut candidates: Vec<_> = match self.order {
+            EvictionOrder::LeastRecent => {
+                let mut snapshots: Vec<_> = self.snapshots.values().filter(|s| s.pins == 0).collect();
+                snapshots.sort_unstable_by_key(|s| s.last_use);
+                snapshots.into_iter().map(|s| s.key).collect()
+            }
+            EvictionOrder::Banks => [SnapshotKind::Prompt, SnapshotKind::Turn].into_iter()
+                .flat_map(|kind| self.retention.bank(kind).eviction_order().into_iter().copied())
+                .filter(|key| self.snapshots.get(key).is_some_and(|s| s.pins == 0)).collect(),
+        };
+        let before = self.bytes_used();
+        let mut target = self.pool.pressure_target(demand, headroom);
+        let mut evicted = Vec::new();
+        for key in candidates.drain(..) {
+            let pages: Vec<_> = self.snapshots[&key].pages.iter().flatten()
+                .filter(|page| shared.contains_key(page)).copied().collect();
+            self.remove(key);
+            for page in pages {
+                if self.page_ref_count(page) == 0 {
+                    // An incoming shared page must be copied if its final resident owner left.
+                    demand[0] += shared.remove(&page).unwrap_or(0);
+                    target = self.pool.pressure_target(demand, headroom);
+                }
+            }
+            evicted.push(key);
+            if self.pool.can_take(target) { break; }
+        }
+        (evicted, before - self.bytes_used())
+    }
+
     /// Evict the next unpinned snapshot in this store's `EvictionOrder`; returns its key and the
     /// bytes freed, or `None` when only pinned snapshots remain. Invariant: a pinned snapshot is
     /// never evicted.
@@ -1096,6 +1140,162 @@ mod tests {
         store.unpin(7);
         assert!(store.is_empty());
         assert_eq!(store.bytes_used(), 0);
+    }
+
+    #[test]
+    fn pressure_batches_headroom_but_does_not_evict_on_a_following_store_that_fits() {
+        let layout = Layout { page: 64, tail: 64, draft: 0, scores: 0 };
+        let mut memory = crate::pool::testing::FakePinned::new(usize::MAX);
+        let mut store = Snapshots::new(SlabPool::new(1024, 256, layout, &mut memory).unwrap());
+        for n in 0..8 {
+            let plan = store.plan_store(meta(SnapshotKind::Turn, &[n], false), &pages(&[id(n)])).unwrap();
+            store.commit_store(plan, n as u64);
+        }
+        let incoming = pages(&[id(100)]);
+        let (victims, _) = store.make_room(&meta(SnapshotKind::Turn, &[100], false), &incoming, [128, 128, 0, 0]);
+        assert_eq!(victims.len(), 3);
+        assert!(store.pool.can_take([3, 3, 0, 0]));
+        let plan = store.plan_store(meta(SnapshotKind::Turn, &[100], false), &incoming).unwrap();
+        store.commit_store(plan, 100);
+        let next = pages(&[id(101)]);
+        assert!(store.make_room(&meta(SnapshotKind::Turn, &[101], false), &next, [128, 128, 0, 0]).0.is_empty());
+        let plan = store.plan_store(meta(SnapshotKind::Turn, &[101], false), &next).unwrap();
+        store.commit_store(plan, 101);
+        assert!(store.bytes_used() <= 1024);
+    }
+
+    #[test]
+    fn bulk_victims_match_retry_loop_on_randomized_shared_pinned_traces() {
+        for order in [EvictionOrder::Banks, EvictionOrder::LeastRecent] {
+            let build = || {
+                let layout = Layout { page: 64, tail: 128, draft: 64, scores: 32 };
+                let mut memory = crate::pool::testing::FakePinned::new(usize::MAX);
+                Snapshots::with_rule(SlabPool::new(8192, 256, layout, &mut memory).unwrap(), ReuseRule::EXACT, order)
+            };
+            let (mut old, mut new) = (build(), build());
+            let mut random = 93u64;
+            for step in 0..2000 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let ids: Vec<_> = (0..(random >> 32) % 12).map(|i| id(((random >> 16) + i) as u32 % 31)).collect();
+                let pages = pages(&ids);
+                let meta = meta(if random & 1 == 0 { SnapshotKind::Prompt } else { SnapshotKind::Turn },
+                    &[step, random as u32], random & 2 == 0);
+                // Exercise independent bank clocks and pin exclusion between stores.
+                if step % 5 == 0 {
+                    let key = old.snapshots.keys().copied().min();
+                    if let Some(key) = key {
+                        old.pin(key); new.pin(key);
+                        let tokens = old.snapshots[&key].meta.tokens.clone();
+                        old.lookup(&tokens, step as u64); new.lookup(&tokens, step as u64);
+                    }
+                }
+                let headroom = if step % 3 == 0 { [512, 128, 64, 32] } else { [0; 4] };
+                let (old_plan, expected) = retry_pressure(&mut old, &meta, &pages, headroom);
+                let (actual, _) = new.make_room(&meta, &pages, headroom);
+                let new_plan = new.plan_store(meta, &pages).ok();
+                assert_eq!(actual, expected, "step {step} order {order:?}");
+                assert_eq!(new_plan.is_some(), old_plan.is_some());
+                if let (Some(a), Some(b)) = (old_plan, new_plan) {
+                    // Failed plans used keys only on success, so these must stay in sync.
+                    assert_eq!(old.commit_store(a, step as u64), new.commit_store(b, step as u64));
+                }
+                assert_eq!(old.bytes_used(), new.bytes_used());
+                if step % 7 == 0 {
+                    let mut keys: Vec<_> = old.snapshots.keys().copied().collect(); keys.sort_unstable();
+                    if let Some(key) = keys.into_iter().find(|k| old.snapshots[k].pins > 0) {
+                        old.unpin(key); new.unpin(key);
+                    }
+                }
+            }
+        }
+    }
+
+    // Reference: the former allocate/fail/evict-one loop, extended to the same
+    // free-class target. Trial plans are rolled back without consuming a key.
+    fn retry_pressure(store: &mut Snapshots, meta: &SnapshotMeta,
+        pages: &[Vec<DevicePageId>; COMPRESSORS], headroom: [u64; 4]) -> (Option<StorePlan>, Vec<Key>) {
+        let demand = |store: &Snapshots| {
+            let layout = store.pool.layout();
+            [pages.iter().flatten().filter(|id| !store.device_map.contains_key(id)).count() as u64,
+                1, u64::from(meta.has_draft && layout.draft > 0), u64::from(layout.scores > 0)]
+        };
+        let pressure = !store.pool.can_take(demand(store));
+        let mut victims = Vec::new();
+        loop {
+            let incoming = demand(store);
+            let ready = !pressure || store.pool.can_take(store.pool.pressure_target(incoming, headroom));
+            if let Ok(plan) = store.plan_store(meta.clone(), pages) {
+                if ready { return (Some(plan), victims); }
+                store.abort_store(plan);
+                store.next_key -= 1;
+            }
+            if let Some((key, _)) = store.evict_one() { victims.push(key); }
+            else { return (store.plan_store(meta.clone(), pages).ok(), victims); }
+        }
+    }
+
+    /// Metadata-only CPU measurement: real slab geometry/occupancy, no pinned payload or DMA.
+    #[test]
+    #[ignore = "CPU benchmark: run explicitly in release mode with --nocapture"]
+    fn full_cache_store_cpu_benchmark() {
+        use std::time::Instant;
+        let chunk = 256u64 << 20;
+        let layout = Layout::family(455680, 2720064, 0);
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: 512,
+            page_bytes: layout.page as u64, mark_bytes: layout.tail as u64, draft_bytes: 0 };
+        let [page, tail, draft] = geometry.eviction_headroom_bytes(
+            cuteafd_core::prefix::DEFAULT_HOST_CACHE_EVICT_TOKENS).unwrap();
+        let headroom = [page, tail, draft, 0];
+        let budget = 32 << 30;
+        let build = || {
+            let mut memory = crate::pool::testing::FakePinned::new(usize::MAX);
+            let pool = SlabPool::new(budget, chunk as usize, layout, &mut memory).unwrap();
+            let mut store = Snapshots::with_rule(pool, ReuseRule::EXACT, EvictionOrder::LeastRecent);
+            for n in 0..2000u32 {
+                let unique = 31 + u32::from(n % 5 == 0);
+                let mut ids: Vec<_> = (0..512 - unique).map(id).collect();
+                ids.extend((0..unique).map(|p| id(1000 + n * 64 + p)));
+                let mut tokens = vec![0; 256 * 1024]; tokens[0] = n;
+                let plan = store.plan_store(SnapshotMeta { kind: SnapshotKind::Turn, tokens,
+                    end: 256 * 1024, has_draft: false }, &pages(&ids)).unwrap();
+                store.commit_store(plan, n as u64);
+            }
+            store
+        };
+        for (name, bulk, overage) in [("retry-minimum", false, [0; 4]),
+            ("retry-headroom", false, headroom), ("bulk-headroom", true, headroom)] {
+            let (mut elapsed, mut victims, mut evicting) = (0u128, 0, 0);
+            let stores = 64u32;
+            for sample in 0..5 {
+                let mut store = build();
+                assert_eq!(store.len(), 2000);
+                for n in 0..stores {
+                    // Shared prompt/turn-style pages plus ~31 fresh pages per store.
+                    let unique = 31 + u32::from(n % 5 == 0);
+                    let mut ids: Vec<_> = (0..512 - unique).map(id).collect();
+                    ids.extend((0..unique).map(|p| id(1_000_000 + (sample * stores + n) * 64 + p)));
+                    let incoming = pages(&ids);
+                    let mut tokens = vec![0; 256 * 1024]; tokens[0] = 1_000_000 + sample * stores + n;
+                    let meta = SnapshotMeta { kind: SnapshotKind::Turn, tokens, end: 256 * 1024, has_draft: false };
+                    let start = Instant::now();
+                    let (plan, count) = if bulk {
+                        let (keys, _) = store.make_room(&meta, &incoming, overage);
+                        (store.plan_store(meta, &incoming).unwrap(), keys.len())
+                    } else {
+                        let (plan, keys) = retry_pressure(&mut store, &meta, &incoming, overage);
+                        (plan.unwrap(), keys.len())
+                    };
+                    victims += count;
+                    evicting += usize::from(count > 0);
+                    store.commit_store(plan, (2000 + n) as u64);
+                    elapsed += start.elapsed().as_nanos();
+                }
+            }
+            let total = 5 * stores as usize;
+            println!("full-cache store arm={name} initial_snapshots=2000 prompt_tokens=262144 pool_tokens=2097152 concurrency=16 budget={budget} stores={total} mean_us={:.3} evicting_share={:.4} victims_per_evict={:.3}",
+                elapsed as f64 / (total as f64 * 1000.0), evicting as f64 / total as f64,
+                victims as f64 / evicting.max(1) as f64);
+        }
     }
 
     #[cfg(debug_assertions)]

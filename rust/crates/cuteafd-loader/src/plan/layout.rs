@@ -25,7 +25,8 @@ const GLM_FLASH_ENCODER_SCRATCH_BYTES: u64 = 791_907_584;
 /// The hardware and serving shape to lay out.
 #[derive(Debug, Clone)]
 pub struct LayoutOptions {
-    /// None selects min(32 GiB, 25% host total); Some(0) disables the host tier.
+    /// None sizes full-context KV for concurrency + 4, capped at min(32 GiB, 25% host RAM).
+    /// Explicit bytes bypass both; Some(0) disables the host tier.
     pub host_cache_bytes: Option<u64>,
     /// None selects min(8 GiB, 5% host total) when a supported media tower is loaded.
     pub media_cache_bytes: Option<u64>,
@@ -994,6 +995,66 @@ pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
         .into_iter().map(|b| b.div_ceil(256)*256).sum()
 }
 
+/// Resolve the serving representation, not the inventory's target-only defaults.
+fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint)
+    -> anyhow::Result<(cuteafd_core::prefix::HostCacheGeometry, u64, u64)> {
+    use anyhow::{Context, ensure};
+    use crate::serving_capacity::{CacheOptions, KvPlacement};
+    let family = super::family::detect(checkpoint).context("missing host cache family")?;
+    let model = family.open(checkpoint)?;
+    let id = family.id();
+    let policy = ShapePolicy {
+        context: if matches!(id, "mimo_v2" | "deepseek_v41") { ContextPolicy::Checkpoint }
+            else { ContextPolicy::ManifestBounded },
+        prefill_rows: (id == "deepseek_v41").then_some(2048),
+        all_native_stages: id == "deepseek_v4",
+    };
+    let admitted_rows = report.prefill_rows;
+    let shape = Shape::resolve(report, model.as_ref(), options, policy);
+    report.prefill_rows = admitted_rows;
+    let ranks = if id == "deepseek_v41" || options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
+    let selected = CacheOptions { coordinator_ranks: ranks,
+        native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
+        qwen_kv: options.qwen_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
+        glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
+        glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
+    // Qwen's dual-owner layout partitions whole layers. Its host snapshot
+    // concatenates those owners, so its aggregate is the single-owner geometry.
+    let cache = model.cache_geometry(if id == "qwen4" { CacheOptions { coordinator_ranks: 1, ..selected } }
+        else { selected })?.context("host cache layout unavailable")?;
+    ensure!(!cache.ranks.is_empty(), "host cache has no owners");
+    let pages = if cache.placement == KvPlacement::Replicated { &cache.ranks[..1] } else { &cache.ranks[..] };
+    let page_bytes = pages.iter().try_fold(0u64, |n, r| n.checked_add(r.persistent_unit_bytes))
+        .context("host cache pages overflow")?;
+    // Even replicated pages have distinct per-owner recurrent/window marks.
+    let mut mark_bytes = cache.ranks.iter().try_fold(0u64, |n, r| n.checked_add(r.retained_mark_bytes))
+        .context("host cache marks overflow")?;
+    if id == "deepseek_v41" && shape.native_layers > 0 {
+        ensure!(shape.native_layers == 3, "V4.1 dSpark retains all three stages");
+        mark_bytes = mark_bytes.checked_add(3 * 128 * 528).context("dSpark mark overflow")?;
+    }
+    if id == "mimo_v2" && options.mimo_prefix_draft {
+        let dir = checkpoint.snapshot.join("dflash");
+        let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
+            let cfg = crate::families::mimo_v2::draft_config::DflashConfig::read(&dir)?;
+            crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_width() as u64)?
+        } else if dir.join("config.json").is_file() {
+            let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings.max(shape.concurrency))
+                .map_err(anyhow::Error::msg)?.0
+        } else { 0 };
+        mark_bytes = mark_bytes.checked_add(draft).context("MiMo draft mark overflow")?;
+    }
+    let mut context = shape.context_tokens;
+    if id == "deepseek_v4" && options.context_tokens == 0 {
+        if let Some(memory) = &report.memory_layout {
+            if memory.pool_tokens < context { context = memory.pool_tokens.saturating_sub(256); }
+        }
+    }
+    Ok((cuteafd_core::prefix::HostCacheGeometry { unit_rows: cache.logical_unit_rows,
+        page_bytes, mark_bytes, draft_bytes: 0 }, context, shape.concurrency))
+}
+
 /// Offline host owners are future allocations, unlike the runtime's live pinned
 /// ledger. The OS sample excludes external consumers, not this unstarted server.
 pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint, native: bool) -> anyhow::Result<()> {
@@ -1111,16 +1172,35 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         push(Category::Embedding, "media/embedding-cache", "host quota", media, Basis::Formula);
     }
     let tier_disabled = options.rtx_bytes.len() > 1 && (family == "glm5_flash"
-        || (family == "glm5" && report.attention_placement == crate::placement::AttentionPlacement::Heads));
-    let cache = if options.mimo_prefix_entries == 0 || tier_disabled { 0 } else {
-        options.host_cache_bytes.unwrap_or_else(|| cuteafd_core::prefix::default_host_cache_bytes(total)) };
+        || (matches!(family, "glm5" | "deepseek_v4")
+            && report.attention_placement == crate::placement::AttentionPlacement::Heads));
+    let family = family.to_owned();
+    let cache = if options.mimo_prefix_entries == 0 || tier_disabled || options.host_cache_bytes == Some(0) { 0 } else {
+        let resolved = selected_host_geometry(report, options, checkpoint).and_then(|(geometry, context, concurrency)| {
+            geometry.resolve(options.host_cache_bytes, context, concurrency, total, geometry.chunk_bytes())
+                .with_context(|| format!("invalid host snapshot geometry {geometry:?}, context {context}, concurrency {concurrency}"))
+        });
+        match resolved {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report.fits = false;
+                report.placement_supported = false;
+                report.hints.push(super::Hint {
+                    what: format!("{family} host prefix cache unsupported (requested {}): {error:#}",
+                        options.host_cache_bytes.map_or_else(|| "auto bytes".into(), |n| format!("{n} bytes"))),
+                    how: "Add exact retained page and mark geometry and a host restore implementation for this family/shape, or disable the host tier with --host-cache-bytes 0.".into(),
+                });
+                options.host_cache_bytes.unwrap_or(0)
+            }
+        }
+    };
     let host = HostLayout::new(total, available, (8 << 30).max(total / 10), cache, items)
         .context("coordinator host total overflow")?;
     ensure!(host.total_bytes > 0, "coordinator host memory is zero");
     report.host_budget_bytes = cache;
     if host.shortfall_bytes > 0 {
         report.fits = false;
-        report.hints.push(super::Hint { what: format!("coordinator host memory shortfall {} bytes: prefix cache {}, other consumers {}, reserve {}, available {}",
+        report.hints.push(super::Hint { what: format!("{family} coordinator host memory shortfall {} bytes: prefix cache {}, other consumers {}, reserve {}, available {}",
             host.shortfall_bytes, cache, host.deferred_bytes, host.reserve_bytes, available),
             how: "Reduce --host-cache-bytes or the scoring/transport shape, or free host memory.".into() });
     }

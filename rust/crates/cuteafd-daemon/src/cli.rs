@@ -379,7 +379,8 @@ pub(crate) struct PlanArgs {
     /// Prefix mark arena slots (0 disables marks).
     #[arg(long)]
     pub(crate) prefix_slots: Option<u64>,
-    /// Pinned prompt-cache quota for --layout (auto: min(32GiB, 25% host RAM)).
+    /// Pinned prompt-cache quota for --layout (auto: full-context KV for concurrency + 4,
+    /// capped at min(32GiB, 25% host RAM); explicit bytes override both).
     #[arg(long, default_value = "auto")]
     pub(crate) host_cache_bytes: crate::shared::prefix::HostBudget,
     /// Host media embedding-cache quota for --layout (default min(8GiB, 5% RAM)).
@@ -1002,9 +1003,13 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(0..=128))]
     pub prefix_cache_entries: u32,
 
-    /// Pinned snapshot memory: auto sizes logical GPU+RAM capacity above retained entries * context; 0 disables it.
+    /// Pinned snapshot memory: auto sizes full-context KV for concurrency + 4,
+    /// capped at min(32GiB, 25% host RAM); explicit bytes override both; 0 disables it.
     #[arg(long, default_value = "0", env = "CUTEAFD_HOST_CACHE_BYTES")]
     pub host_cache_bytes: crate::shared::prefix::HostBudget,
+    /// KV tokens kept free after host pressure eviction (0 disables batching).
+    #[arg(long, default_value_t = cuteafd_core::prefix::DEFAULT_HOST_CACHE_EVICT_TOKENS)]
+    pub host_cache_evict_tokens: u64,
     /// Pinned allocation and registration granularity for the snapshot cache.
     #[arg(long, default_value_t = 256 << 20, env = "CUTEAFD_HOST_CACHE_CHUNK_BYTES")]
     pub host_cache_chunk_bytes: u64,
@@ -1128,6 +1133,7 @@ impl NativeServeArgs {
         let config = Config {
             bytes: self.host_cache_bytes.explicit_bytes(),
             chunk_bytes: self.host_cache_chunk_bytes,
+            eviction_headroom: [0; 4],
             store: match self.host_cache_store {
                 HostCacheStore::OnRetain => StoreMode::OnRetain,
                 HostCacheStore::OnEvict => StoreMode::OnEvict,

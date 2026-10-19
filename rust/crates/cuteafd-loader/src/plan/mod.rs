@@ -623,6 +623,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     let options = &resolved;
     report.spark_budget_bytes = options.spark_budget();
     let spec = model.spec();
+    report.spec = Some(spec.clone());
     let ownership = options.draft_ownership.unwrap_or_else(|| {
         let native = options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0);
         spec::DraftOwnership::selected(family.id(), if !native { "off" }
@@ -896,7 +897,6 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             how: "The component bytes are a checkpoint inventory, not a serving-fit result; implement and gate the runtime first.".into(),
         });
     }
-    report.spec = Some(spec.clone());
     Ok(report)
 }
 

@@ -434,7 +434,7 @@ pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let args = args.with_scoring(if engine.full_prefill_logits() { engine.prefill_rows } else { 64 },
         engine.prefill_rows, engine.cfg.vocab_size)?;
-    prefix_cache_with(engine, &args, concurrency, |layout| args.host_config(layout, engine.max_context))
+    prefix_cache_with(engine, &args, concurrency, |layout| args.host_config(layout, engine.max_context, concurrency))
 }
 
 fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize,
