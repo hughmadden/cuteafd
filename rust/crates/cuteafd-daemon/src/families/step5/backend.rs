@@ -115,17 +115,18 @@ impl<T> BackendState<T> {
         }
     }
 
+    fn post_execution<O>(&self, lane: usize, completed: O) -> Result<O> {
+        // Real target work succeeded. Dropping its Step drains before either
+        // eager publication or pending evidence can advance the frontier.
+        if self.fail_verify_once.replace(false) {
+            tracing::warn!(lane, "Step-5 injected post-execution verify failure");
+            anyhow::bail!("Step-5 injected post-execution verify failure on lane {lane}");
+        }
+        Ok(completed)
+    }
+
     fn verify<O>(&self, work: impl FnOnce(usize) -> Result<(T, O)>) -> Result<O> {
-        self.submit(|lane| self.pending.verify(|| {
-            let completed = work(lane)?;
-            // Real target work succeeded. Dropping its Step drains without
-            // resurrecting an owner terminal-aborted by a native/transport error.
-            if self.fail_verify_once.replace(false) {
-                tracing::warn!(lane, "Step-5 injected post-execution verify failure");
-                anyhow::bail!("Step-5 injected post-execution verify failure on lane {lane}");
-            }
-            Ok(completed)
-        }))
+        self.submit(|lane| self.pending.verify(|| self.post_execution(lane, work(lane)?)))
     }
 }
 impl<T> Drop for BackendState<T> {
@@ -252,7 +253,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         kind: cuteafd_transport::ExpertV2SourceKind) -> Result<DeviceLogits> {
         self.state.submit(|lane| {
             let submitted = ImmediateWave::record(sequences);
-            let (step, logits) = self.execute(lane, sequences, pool, kind)?;
+            let (step, logits) = self.state.post_execution(lane, self.execute(lane, sequences, pool, kind)?)?;
             let mut accepted = sequences.iter_mut().map(|(placement, tokens)| (&mut **placement, tokens.len()))
                 .collect::<Vec<_>>();
             step.publish_wave(&mut accepted)?;
@@ -510,6 +511,58 @@ mod tests {
                 assert_eq!(state.next_lane.get(), (lane + 1) % lanes);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn eager_failure_drains_before_publication_and_reuses_failed_lane() -> Result<()> {
+        use std::rc::Rc;
+        struct Evidence(Rc<Cell<usize>>);
+        impl Drop for Evidence {
+            fn drop(&mut self) { self.0.set(self.0.get() + 1); }
+        }
+        for lanes in [1, 2] {
+            for lane in 0..lanes {
+                let state = BackendState::<Evidence>::new(lanes, true)?;
+                state.next_lane.set(lane);
+                let drained = Rc::new(Cell::new(0));
+                let published = Cell::new(false);
+                let failed: Result<()> = state.submit(|selected| {
+                    assert_eq!(selected, lane);
+                    let _step = state.post_execution(selected, Evidence(drained.clone()))?;
+                    published.set(true);
+                    Ok(())
+                });
+                assert!(failed.unwrap_err().to_string().contains("injected post-execution"));
+                assert!(!published.get());
+                assert_eq!(drained.get(), 1);
+                assert!(state.pending.take().is_none());
+                assert!(state.immediate.0.borrow().is_none());
+                assert_eq!(state.active_lane.get(), None);
+                assert_eq!(state.next_lane.get(), lane);
+                state.submit(|selected| {
+                    assert_eq!(selected, lane);
+                    let _step = state.post_execution(selected, Evidence(drained.clone()))?;
+                    published.set(true);
+                    Ok(())
+                })?;
+                assert!(published.get());
+                assert_eq!(drained.get(), 2);
+                assert_eq!(state.next_lane.get(), (lane + 1) % lanes);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_execution_does_not_consume_post_execution_injection() -> Result<()> {
+        let state = BackendState::<()>::new(2, true)?;
+        let failed: Result<()> = state.submit(|_| anyhow::bail!("execution failed"));
+        assert!(failed.is_err());
+        assert!(state.fail_verify_once.get());
+        assert!(state.verify(|_| Ok(((), ()))).is_err());
+        assert!(!state.fail_verify_once.get());
+        state.verify(|_| Ok(((), ())))?;
         Ok(())
     }
 
