@@ -273,6 +273,7 @@ fn landing_pcie_link(library: &NativeLibrary) -> Option<LandingPcieLink> {
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct FabricLanding {
     pub(crate) cuda_device: i32,
+    pub(crate) pcie_before: Option<LandingPcieLink>,
     pub(crate) pcie_link: Option<LandingPcieLink>,
     pub(crate) probe: Option<GpuLandingProbe>,
     pub(crate) h2d_gbps: Option<f64>,
@@ -284,7 +285,9 @@ impl FabricLanding {
         match (&self.probe, &self.error) {
             (Some(p), _) if p.usable() => {
                 let (gpu, rates) = gpu_wins(p, self.h2d_gbps);
-                let link = self.pcie_link.as_ref().map(|link| format!("PCIe gen {:?} x{:?}", link.generation, link.width))
+                let link = self.pcie_link.as_ref().map(|link| format!("PCIe gen {} x{}",
+                    link.generation.map_or("?".into(), |value| value.to_string()),
+                    link.width.map_or("?".into(), |value| value.to_string())))
                     .unwrap_or_else(|| "PCIe unknown".into());
                 format!("GPU landing (cuda {}, {}, {link}): dma-buf ok, loopback {rates}; intake auto: {}",
                     self.cuda_device, p.rdma_device, if gpu { "gpu" } else { "pinned" })
@@ -300,24 +303,32 @@ impl FabricLanding {
 
 /// Runs the GPU landing probe for `cuteafd fabric` when a native library is
 /// given (or `CUTEAFD_NATIVE_LIB` names one).
-pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, warmup: bool) -> FabricLanding {
-    let path = native_lib.map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("CUTEAFD_NATIVE_LIB").map(std::path::PathBuf::from));
-    let result = (|| -> Result<(GpuLandingProbe, Option<f64>, Option<LandingPcieLink>)> {
-        let path = path.context("no native library (pass --native-lib or set CUTEAFD_NATIVE_LIB)")?;
-        // SAFETY: a trusted image library, loaded once for this command.
+pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, warmup: bool, repeats: u32)
+    -> Vec<FabricLanding> {
+    let library = (|| -> Result<NativeLibrary> {
+        let path = native_lib.map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("CUTEAFD_NATIVE_LIB").map(std::path::PathBuf::from))
+            .context("no native library (pass --native-lib or set CUTEAFD_NATIVE_LIB)")?;
+        // SAFETY: a trusted image library, kept loaded across all repeats.
         let library = unsafe { NativeLibrary::load(&path) }?;
         library.cuda_set_device(device)?;
-        if warmup { warm_landing_link(&library)?; }
-        let probe = probe_gpu_landing(&library)?;
-        let pcie_link = landing_pcie_link(&library);
-        let h2d = probe_h2d(&library).ok();
-        Ok((probe, h2d, pcie_link))
+        Ok(library)
     })();
-    match result {
-        Ok((probe, h2d_gbps, pcie_link)) => FabricLanding { cuda_device: device, pcie_link, probe: Some(probe), h2d_gbps, error: None },
-        Err(error) => FabricLanding { cuda_device: device, pcie_link: None, probe: None, h2d_gbps: None, error: Some(format!("{error:#}")) },
-    }
+    (0..repeats.clamp(1, 5)).map(|_| {
+        let pcie_before = library.as_ref().ok().and_then(landing_pcie_link);
+        let result = (|| -> Result<(GpuLandingProbe, Option<f64>, Option<LandingPcieLink>)> {
+            let library = library.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            if warmup { warm_landing_link(library)?; }
+            let probe = probe_gpu_landing(library)?;
+            let pcie_link = landing_pcie_link(library);
+            let h2d = probe_h2d(library).ok();
+            Ok((probe, h2d, pcie_link))
+        })();
+        match result {
+            Ok((probe, h2d_gbps, pcie_link)) => FabricLanding { cuda_device: device, pcie_before, pcie_link, probe: Some(probe), h2d_gbps, error: None },
+            Err(error) => FabricLanding { cuda_device: device, pcie_before, pcie_link: None, probe: None, h2d_gbps: None, error: Some(format!("{error:#}")) },
+        }
+    }).collect()
 }
 
 /// One transport's rank planes and the machinery that fills them.
@@ -1510,6 +1521,17 @@ mod tests {
         GpuLandingProbe {
             rdma_device: "mlx5_0".into(), cuda_device: 0, dma_buf: true, gpudirect_rdma: true,
             writes_ordering: 100, registered: true, gpu_gbps, host_gbps: 52.4, status: String::new(), error: None,
+        }
+    }
+
+    #[test]
+    fn fabric_probe_reports_missing_library_for_each_bounded_repeat() {
+        let reports = fabric_probe(Some(std::path::Path::new("/nonexistent-landing-probe-library.so")), 0, true, 3);
+        assert_eq!(reports.len(), 3);
+        for report in reports {
+            assert!(report.probe.is_none());
+            assert!(report.error.is_some());
+            assert!(report.summary().contains("intake auto: pinned"));
         }
     }
 

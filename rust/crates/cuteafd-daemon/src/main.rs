@@ -219,9 +219,8 @@ async fn run() -> Result<()> {
         Commands::ServeDsv4(args) => families::deepseek_v4::serve::run_serve(args).await,
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;
-            let landings: Vec<_> = (0..args.landing_repeats).map(|_| {
-                shared::spark_intake::fabric_probe(args.native_lib.as_deref(), args.device, args.landing_warmup)
-            }).collect();
+            let landings = shared::spark_intake::fabric_probe(args.native_lib.as_deref(), args.device,
+                args.landing_warmup, args.landing_repeats);
             let landing = &landings[0];
             let p2p = args.p2p.then(|| shared::peer_probe::run(args.native_lib.as_deref(), &args.p2p_devices,
                 &args.p2p_bytes));
