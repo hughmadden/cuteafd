@@ -37,6 +37,7 @@ const TABLE: usize = 13;
 const SELECTED: usize = 14;
 const POST: usize = 15;
 
+#[derive(Clone)]
 struct Admission {
     rows: usize,
     pages: usize,
@@ -163,18 +164,22 @@ const DEFS: [(&str, &[&str], &[u8]); 12] = [
     ("step5_residual_f32", &["residual", "delta", "out"], b"i"),
 ];
 
+struct SwaWeights<'a> {
+    rope: std::rc::Rc<TargetTables<'a>>,
+    layer: usize,
+    weights: Vec<Allocation<'a>>,
+    programs: Vec<Program<'a>>,
+    epsilon: f32,
+    heads: usize,
+}
+
 pub(super) struct SwaLayer<'a> {
     // This stream drains before every composed owner, including the FFN.
     stream: Stream<'a>,
     ffn: Option<DenseFfn<'a>>,
-    rope: std::rc::Rc<TargetTables<'a>>,
-    layer: usize,
-    weights: Vec<Allocation<'a>>,
     planes: Vec<Allocation<'a>>,
-    programs: Vec<Program<'a>>,
     admission: Admission,
-    epsilon: f32,
-    heads: usize,
+    immutable: std::rc::Rc<SwaWeights<'a>>,
 }
 
 impl<'a> SwaLayer<'a> {
@@ -407,25 +412,23 @@ impl<'a> SwaLayer<'a> {
             .into_iter()
             .map(|w| load_operand(device, checkpoint, &layout, w))
             .collect::<Result<Vec<_>>>()?;
-        let planes = admission
-            .planes
-            .iter()
-            .map(|&bytes| Allocation::new(device, bytes))
+        Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { rope, layer: layer_id, weights,
+            programs: resolved, epsilon: contract.norms.input, heads }), ffn)
+    }
+
+    /// Fresh metadata and attention/FFN planes, with no checkpoint or program reload.
+    pub(super) fn new_lane(&self) -> Result<Self> {
+        let ffn = self.ffn.as_ref().map(DenseFfn::new_lane).transpose()?;
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn)
+    }
+
+    fn workspace(device: Device<'a>, admission: Admission,
+        immutable: std::rc::Rc<SwaWeights<'a>>, ffn: Option<DenseFfn<'a>>) -> Result<Self> {
+        let planes = admission.planes.iter().map(|&n| Allocation::new(device, n))
             .collect::<Result<Vec<_>>>()?;
         let stream = Stream::new(device)?;
-        let owner = Self {
-            stream,
-            ffn,
-            rope,
-            layer: layer_id,
-            weights,
-            planes,
-            programs: resolved,
-            admission,
-            epsilon: contract.norms.input,
-            heads,
-        };
-        // Immutable single-request metadata is initialized once, never on replay.
+        let rows = admission.rows;
+        let owner = Self { stream, ffn, planes, admission, immutable };
         for (plane, bytes) in [
             (
                 POSITIONS,
@@ -465,7 +468,7 @@ impl<'a> SwaLayer<'a> {
         stream.device.run(|| {
             // SAFETY: the retained layer supplies admitted same-device planes;
             // its stream is the first field and drains before all referenced owners.
-            unsafe { self.programs[stage].launch(pointers, scalars, stream.raw) }
+            unsafe { self.immutable.programs[stage].launch(pointers, scalars, stream.raw) }
         })
     }
 
@@ -496,10 +499,10 @@ impl<'a> SwaLayer<'a> {
             "SWA rows exceed capacity"
         );
         let p = |i: usize| self.planes[i].buffer.ptr;
-        let w = |i: usize| self.weights[i].buffer.ptr;
+        let w = |i: usize| self.immutable.weights[i].buffer.ptr;
         let scalars = [Scalar::I32(rows as i32)];
-        let norm = [Scalar::I32(rows as i32), Scalar::F32(self.epsilon)];
-        let (cos, sin) = self.rope.layers[self.layer].attention.buffers();
+        let norm = [Scalar::I32(rows as i32), Scalar::F32(self.immutable.epsilon)];
+        let (cos, sin) = self.immutable.rope.layers[self.immutable.layer].attention.buffers();
         self.launch_on(
             stream,
             0,
@@ -543,11 +546,11 @@ impl<'a> SwaLayer<'a> {
 
     fn finish_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         let p = |i: usize| self.planes[i].buffer.ptr;
-        let w = |i: usize| self.weights[i].buffer.ptr;
+        let w = |i: usize| self.immutable.weights[i].buffer.ptr;
         let scalars = [Scalar::I32(rows as i32)];
         self.launch_on(stream, 8, &[p(ATTN), p(LOGITS), p(GATED)], &scalars)?;
         self.launch_on(stream, 9, &[p(GATED), w(7), p(DELTA)], &scalars)?;
-        if self.heads == 64 {
+        if self.immutable.heads == 64 {
             self.launch_on(stream, 10, &[p(X), p(DELTA), p(POST)], &scalars)?;
         }
         Ok(())
@@ -570,7 +573,7 @@ impl<'a> SwaLayer<'a> {
     }
 
     pub fn projection_partial(&self) -> Result<CuteafdDeviceBuffer> {
-        ensure!(self.heads == 32, "SWA F32 partial requires head split");
+        ensure!(self.immutable.heads == 32, "SWA F32 partial requires head split");
         Ok(self.planes[DELTA].buffer)
     }
 
@@ -580,7 +583,7 @@ impl<'a> SwaLayer<'a> {
 
     pub(super) fn diagnostic_attention(&self) -> [(CuteafdDeviceBuffer, bool); 2] {
         // In head-split mode NORM holds the once-rounded merged O delta.
-        [(self.planes[if self.heads == 32 { NORM } else { DELTA }].buffer, true),
+        [(self.planes[if self.immutable.heads == 32 { NORM } else { DELTA }].buffer, true),
             (self.planes[POST].buffer, false)]
     }
 
@@ -597,7 +600,7 @@ impl<'a> SwaLayer<'a> {
 
     pub(super) fn merge_partial_capture_on(&self, rows: usize, values: [*const std::ffi::c_void; 2],
         stream: &Stream<'a>, capture: Option<(&std::path::Path, usize)>) -> Result<()> {
-        ensure!(self.heads == 32 && (1..=self.admission.rows).contains(&rows)
+        ensure!(self.immutable.heads == 32 && (1..=self.admission.rows).contains(&rows)
             && values.iter().all(|value| !value.is_null())
             && stream.device.id == self.stream.device.id
             && std::ptr::eq(stream.device.library, self.stream.device.library),
@@ -625,18 +628,18 @@ impl<'a> SwaLayer<'a> {
         step: &mut Step<'e, 'a, E>,
         rank: usize,
     ) -> Result<()> {
-        step.project(rank, self.layer, &*self, |layer, input| {
+        step.project(rank, self.immutable.layer, &*self, |layer, input| {
             layer.check_input(&input)?;
             layer.project_on(input.rows, input.positions, input.stream)
         })?;
         step.stage(
             rank,
-            self.layer,
+            self.immutable.layer,
             &self.planes[KPAGES],
             &self.planes[VPAGES],
             None,
         )?;
-        step.attend(rank, self.layer, &*self, |layer, read| {
+        step.attend(rank, self.immutable.layer, &*self, |layer, read| {
             let rows = read.inputs.rows;
             let stream = read.inputs.stream;
             layer.read_on(read)?;
@@ -650,23 +653,23 @@ impl<'a> SwaLayer<'a> {
         rank: usize,
     ) -> Result<()> {
         ensure!(self.ffn.is_none(), "shared SWA pipeline must own its FFN separately");
-        step.project(rank, self.layer, self, |layer, input| {
+        step.project(rank, self.immutable.layer, self, |layer, input| {
             layer.check_input(&input)?;
             layer.project_on(input.rows, input.positions, input.stream)
         })?;
-        step.stage(rank, self.layer, &self.planes[KPAGES], &self.planes[VPAGES], None)?;
-        step.attend(rank, self.layer, self, |layer, read| layer.read_on(read))
+        step.stage(rank, self.immutable.layer, &self.planes[KPAGES], &self.planes[VPAGES], None)?;
+        step.attend(rank, self.immutable.layer, self, |layer, read| layer.read_on(read))
     }
 
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
         ensure!(
-            input.heads == self.heads
+            input.heads == self.immutable.heads
                 && input.stream.device.id == self.stream.device.id
                 && std::ptr::eq(input.stream.device.library, self.stream.device.library)
                 && input
                     .base
                     .checked_add(input.rows)
-                    .is_some_and(|end| end <= self.rope.tables.plan.extent as usize),
+                    .is_some_and(|end| end <= self.immutable.rope.tables.plan.extent as usize),
             "SWA owner device/head/rotary extent mismatch"
         );
         Ok(())
@@ -755,7 +758,7 @@ impl<'a> SwaLayer<'a> {
     }
 
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
-        super::weights::validate_live_weights(device.id, &self.weights)
+        super::weights::validate_live_weights(device.id, &self.immutable.weights)
     }
 
     pub fn input(&self) -> CuteafdDeviceBuffer {
@@ -921,7 +924,7 @@ mod tests {
             &[],
         )?;
         ensure!(
-            manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.epsilon),
+            manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.immutable.epsilon),
             "SWA epsilon mismatch"
         );
         assert!(SwaLayer::load(
@@ -1020,7 +1023,7 @@ mod tests {
                     stage,
                     &[
                         chain.planes[input_plane].buffer.ptr,
-                        chain.weights[weight].buffer.ptr,
+                        chain.immutable.weights[weight].buffer.ptr,
                         chain.planes[plane].buffer.ptr,
                     ],
                     &[Scalar::I32(rows as i32)],
@@ -1044,19 +1047,19 @@ mod tests {
             {
                 let source = if stage == 4 { "qraw" } else { "kraw" };
                 device.run(|| library.copy_h2d(chain.planes[input].buffer, &load(source)?))?;
-                let (cos, sin) = chain.rope.layers[layer].attention.buffers();
+                let (cos, sin) = chain.immutable.rope.layers[layer].attention.buffers();
                 chain.launch(
                     stage,
                     &[
                         chain.planes[input].buffer.ptr,
-                        chain.weights[weight].buffer.ptr,
-                        chain.weights[weight].buffer.ptr,
+                        chain.immutable.weights[weight].buffer.ptr,
+                        chain.immutable.weights[weight].buffer.ptr,
                         cos.ptr,
                         sin.ptr,
                         chain.planes[POSITIONS].buffer.ptr,
                         chain.planes[output].buffer.ptr,
                     ],
-                    &[Scalar::I32(rows as i32), Scalar::F32(chain.epsilon)],
+                    &[Scalar::I32(rows as i32), Scalar::F32(chain.immutable.epsilon)],
                 )?;
                 chain.stream.drain()?;
                 let expected = load(name)?;
@@ -1331,6 +1334,13 @@ mod tests {
             "SWA production enqueue differs"
         );
         pool.release(&family, &placement.pages)?;
+        let lane = chain.new_lane()?;
+        ensure!(std::rc::Rc::ptr_eq(&chain.immutable, &lane.immutable)
+            && chain.stream.raw != lane.stream.raw
+            && chain.planes.iter().zip(&lane.planes).all(|(a, b)|
+                a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
+            "Step-5 lane must share immutable storage and isolate every stream/plane");
+        drop(lane);
         // A routed SWA layer has no dense FFN and shares the already admitted rotary owner.
         let routed = SwaLayer::load(
             device,
@@ -1338,12 +1348,12 @@ mod tests {
             &checkpoint,
             4,
             1,
-            Some(std::rc::Rc::clone(&chain.rope)),
+            Some(std::rc::Rc::clone(&chain.immutable.rope)),
             u64::MAX,
             &[],
         )?;
         ensure!(
-            std::rc::Rc::ptr_eq(&routed.rope, &chain.rope) && routed.ffn.is_none(),
+            std::rc::Rc::ptr_eq(&routed.immutable.rope, &chain.immutable.rope) && routed.ffn.is_none(),
             "SWA shared layer binding"
         );
         Ok(())

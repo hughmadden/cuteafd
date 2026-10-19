@@ -57,6 +57,7 @@ const LENGTHS: usize = 29;
 const VALUES: usize = 30;
 const IDS: usize = 31;
 
+#[derive(Clone)]
 struct Admission {
     rows: usize,
     pages: usize,
@@ -207,18 +208,22 @@ const DEFS: [(&str, &[&str], &[u8]); 17] = [
     ("step5_attn_out", &["x", "w", "out"], b"i"),
 ];
 
+struct CsaWeights<'a> {
+    rope: std::rc::Rc<TargetTables<'a>>,
+    layer: usize,
+    weights: Vec<Allocation<'a>>,
+    programs: Vec<Program<'a>>,
+    residual: Program<'a>,
+    epsilon: f32,
+}
+
 pub(super) struct CsaLayer<'a> {
     // Drain the complete staged branch before any pointer owner retires.
     stream: Stream<'a>,
     ffn: Option<DenseFfn<'a>>,
-    rope: std::rc::Rc<TargetTables<'a>>,
-    layer: usize,
-    weights: Vec<Allocation<'a>>,
     planes: Vec<Allocation<'a>>,
-    programs: Vec<Program<'a>>,
-    residual: Program<'a>,
     admission: Admission,
-    epsilon: f32,
+    immutable: std::rc::Rc<CsaWeights<'a>>,
 }
 impl<'a> CsaLayer<'a> {
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
@@ -511,23 +516,23 @@ impl<'a> CsaLayer<'a> {
             .into_iter()
             .map(|w| load_operand(device, checkpoint, &layout, w))
             .collect::<Result<Vec<_>>>()?;
-        let planes = admission
-            .planes
-            .iter()
-            .map(|&n| Allocation::new(device, n))
+        Self::workspace(device, admission, std::rc::Rc::new(CsaWeights { rope, layer: layer_id, weights,
+            programs: resolved, residual, epsilon: contract.norms.input }), ffn)
+    }
+
+    /// Fresh metadata and attention/FFN planes, with no checkpoint or program reload.
+    pub(super) fn new_lane(&self) -> Result<Self> {
+        let ffn = self.ffn.as_ref().map(DenseFfn::new_lane).transpose()?;
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn)
+    }
+
+    fn workspace(device: Device<'a>, admission: Admission,
+        immutable: std::rc::Rc<CsaWeights<'a>>, ffn: Option<DenseFfn<'a>>) -> Result<Self> {
+        let planes = admission.planes.iter().map(|&n| Allocation::new(device, n))
             .collect::<Result<Vec<_>>>()?;
-        let owner = Self {
-            stream: Stream::new(device)?,
-            ffn,
-            rope,
-            layer: layer_id,
-            weights,
-            planes,
-            programs: resolved,
-            residual,
-            admission,
-            epsilon: contract.norms.input,
-        };
+        let stream = Stream::new(device)?;
+        let rows = admission.rows;
+        let owner = Self { stream, ffn, planes, admission, immutable };
         for (plane, data) in [
             (
                 POSITIONS,
@@ -574,7 +579,7 @@ impl<'a> CsaLayer<'a> {
     ) -> Result<()> {
         stream.device.run(|| {
             // SAFETY: admitted row views and retained layer owners outlive the stream drain.
-            unsafe { self.programs[stage].launch(pointers, scalars, stream.raw) }
+            unsafe { self.immutable.programs[stage].launch(pointers, scalars, stream.raw) }
         })
     }
     fn norm(
@@ -618,12 +623,12 @@ impl<'a> CsaLayer<'a> {
         stream: &Stream<'a>,
     ) -> Result<()> {
         let table = if indexer {
-            self.rope.layers[self.layer]
+            self.immutable.rope.layers[self.immutable.layer]
                 .indexer
                 .as_ref()
                 .context("CSA indexer tables")?
         } else {
-            &self.rope.layers[self.layer].attention
+            &self.immutable.rope.layers[self.immutable.layer].attention
         };
         let (cos, sin) = table.buffers();
         self.launch_on(
@@ -631,14 +636,14 @@ impl<'a> CsaLayer<'a> {
             stage,
             &[
                 self.ptr(input, start * width * 2),
-                self.weights[weight].buffer.ptr,
-                self.weights[bias].buffer.ptr,
+                self.immutable.weights[weight].buffer.ptr,
+                self.immutable.weights[bias].buffer.ptr,
                 cos.ptr,
                 sin.ptr,
                 positions.ptr.wrapping_byte_add(start * 8),
                 self.ptr(output, start * width * 2),
             ],
-            &[Scalar::I32(rows as i32), Scalar::F32(self.epsilon)],
+            &[Scalar::I32(rows as i32), Scalar::F32(self.immutable.epsilon)],
         )
     }
     pub fn enqueue(&self, rows: usize, query_start: usize) -> Result<()> {
@@ -670,7 +675,7 @@ impl<'a> CsaLayer<'a> {
             let count = (rows - start).min(4096);
             let scalar = [Scalar::I32(count as i32)];
             let p = |i| self.ptr(i, start * H * 2);
-            let w = |i: usize| self.weights[i].buffer.ptr;
+            let w = |i: usize| self.immutable.weights[i].buffer.ptr;
             self.launch_on(
                 stream,
                 0,
@@ -683,7 +688,7 @@ impl<'a> CsaLayer<'a> {
                     w(0),
                     p(NORM),
                 ],
-                &[scalar[0], Scalar::F32(self.epsilon)],
+                &[scalar[0], Scalar::F32(self.immutable.epsilon)],
             )?;
             for (stage, weight, out, width) in [
                 (1, 1, QRAW, Q),
@@ -733,18 +738,18 @@ impl<'a> CsaLayer<'a> {
         step: &mut Step<'e, 'a, E>,
         rank: usize,
     ) -> Result<()> {
-        step.project(rank, self.layer, &*self, |layer, input| {
+        step.project(rank, self.immutable.layer, &*self, |layer, input| {
             layer.check_input(&input)?;
             layer.project_on(input.rows, input.positions, input.stream)
         })?;
         step.stage(
             rank,
-            self.layer,
+            self.immutable.layer,
             &self.planes[KEY],
             &self.planes[VALUE],
             Some((&self.planes[IK], &self.planes[IZ])),
         )?;
-        step.attend(rank, self.layer, &*self, |layer, read| {
+        step.attend(rank, self.immutable.layer, &*self, |layer, read| {
             let rows = read.inputs.rows;
             let stream = read.inputs.stream;
             layer.read_attention_on(read)?;
@@ -758,13 +763,13 @@ impl<'a> CsaLayer<'a> {
         rank: usize,
     ) -> Result<()> {
         ensure!(self.ffn.is_none(), "shared CSA pipeline must own its FFN separately");
-        step.project(rank, self.layer, self, |layer, input| {
+        step.project(rank, self.immutable.layer, self, |layer, input| {
             layer.check_input(&input)?;
             layer.project_on(input.rows, input.positions, input.stream)
         })?;
-        step.stage(rank, self.layer, &self.planes[KEY], &self.planes[VALUE],
+        step.stage(rank, self.immutable.layer, &self.planes[KEY], &self.planes[VALUE],
             Some((&self.planes[IK], &self.planes[IZ])))?;
-        step.attend(rank, self.layer, self, |layer, read| layer.read_attention_on(read))
+        step.attend(rank, self.immutable.layer, self, |layer, read| layer.read_attention_on(read))
     }
 
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
@@ -775,7 +780,7 @@ impl<'a> CsaLayer<'a> {
                 && input
                     .base
                     .checked_add(input.rows)
-                    .is_some_and(|end| end <= self.rope.tables.plan.extent as usize),
+                    .is_some_and(|end| end <= self.immutable.rope.tables.plan.extent as usize),
             "CSA owner device/head/rotary extent mismatch"
         );
         Ok(())
@@ -848,7 +853,7 @@ impl<'a> CsaLayer<'a> {
     }
 
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
-        super::weights::validate_live_weights(device.id, &self.weights)
+        super::weights::validate_live_weights(device.id, &self.immutable.weights)
     }
 
     pub fn input(&self) -> CuteafdDeviceBuffer {
@@ -1035,7 +1040,7 @@ impl<'a> CsaLayer<'a> {
             16,
             &[
                 self.ptr(GATED, start * Q * 2),
-                self.weights[7].buffer.ptr,
+                self.immutable.weights[7].buffer.ptr,
                 self.ptr(DELTA, start * H * 2),
             ],
             &scalar,
@@ -1043,7 +1048,7 @@ impl<'a> CsaLayer<'a> {
         stream.device.run(|| {
             // SAFETY: this tile's residual and delta are retained by the stream-first owner.
             unsafe {
-                self.residual.launch(
+                self.immutable.residual.launch(
                     &[
                         self.ptr(X, start * H * 4),
                         self.ptr(DELTA, start * H * 2),
@@ -1379,18 +1384,25 @@ mod tests {
             "CSA production enqueue differs"
         );
         pool.release(&family, &placement.pages)?;
+        let lane = chain.new_lane()?;
+        ensure!(std::rc::Rc::ptr_eq(&chain.immutable, &lane.immutable)
+            && chain.stream.raw != lane.stream.raw
+            && chain.planes.iter().zip(&lane.planes).all(|(a, b)|
+                a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
+            "Step-5 lane must share immutable storage and isolate every stream/plane");
+        drop(lane);
         let other = CsaLayer::load(
             device,
             &programs,
             &checkpoint,
             7,
             1,
-            Some(std::rc::Rc::clone(&chain.rope)),
+            Some(std::rc::Rc::clone(&chain.immutable.rope)),
             u64::MAX,
             &[],
         )?;
         ensure!(
-            std::rc::Rc::ptr_eq(&other.rope, &chain.rope) && other.layer == 7,
+            std::rc::Rc::ptr_eq(&other.immutable.rope, &chain.immutable.rope) && other.immutable.layer == 7,
             "CSA shared layer binding"
         );
         Ok(())
@@ -1532,7 +1544,7 @@ mod tests {
         let mut chain =
             CsaLayer::load(device, &programs, &checkpoint, 3, 4105, None, u64::MAX, &[])?;
         ensure!(
-            manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.epsilon),
+            manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.immutable.epsilon),
             "CSA epsilon"
         );
         assert!(CsaLayer::load(
@@ -1660,7 +1672,7 @@ mod tests {
                                 start * H * 2
                             },
                         ),
-                        chain.weights[weight].buffer.ptr,
+                        chain.immutable.weights[weight].buffer.ptr,
                         chain.ptr(plane, start * width * 2),
                     ],
                     &[Scalar::I32(count as i32)],
@@ -1715,7 +1727,7 @@ mod tests {
                 10,
                 &[
                     chain.ptr(NORM, start * H * 2),
-                    chain.weights[14].buffer.ptr,
+                    chain.immutable.weights[14].buffer.ptr,
                     chain.ptr(IW, start * 16 * 4),
                     chain.ptr(IWSCR, start * 16 * 2),
                 ],
@@ -1818,7 +1830,7 @@ mod tests {
             device.run(|| {
                 // SAFETY: all residual operands belong to this admitted same-device owner.
                 unsafe {
-                    chain.residual.launch(
+                    chain.immutable.residual.launch(
                         &[
                             chain.ptr(X, start * H * 4),
                             chain.ptr(DELTA, start * H * 2),

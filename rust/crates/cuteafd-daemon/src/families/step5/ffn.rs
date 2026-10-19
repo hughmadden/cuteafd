@@ -12,7 +12,7 @@ use cuteafd_loader::plan::{
 const HIDDEN: usize = 4096;
 const DENSE: usize = 13824;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Admission {
     rows: usize,
     planes: [usize; 6],
@@ -71,14 +71,18 @@ impl Admission {
     }
 }
 
+struct DenseWeights<'a> {
+    weights: Vec<Allocation<'a>>,
+    programs: Vec<Program<'a>>,
+    epsilon: f32,
+}
+
 pub(super) struct DenseFfn<'a> {
     // Fields drop in declaration order: drain before storage or programs retire.
     stream: Stream<'a>,
-    weights: Vec<Allocation<'a>>,
     planes: Vec<Allocation<'a>>,
-    programs: Vec<Program<'a>>,
     admission: Admission,
-    epsilon: f32,
+    immutable: std::rc::Rc<DenseWeights<'a>>,
 }
 
 pub(super) struct DensePlan {
@@ -290,21 +294,23 @@ impl<'a> DenseFfn<'a> {
             .into_iter()
             .map(|w| load_operand(device, checkpoint, &layout, &w))
             .collect::<Result<Vec<_>>>()?;
+        Self::workspace(device, admission, std::rc::Rc::new(DenseWeights {
+            weights: loaded, programs: resolved, epsilon,
+        }))
+    }
+
+    /// The caller admits all lanes together before creating any workspace.
+    pub(super) fn new_lane(&self) -> Result<Self> {
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone())
+    }
+
+    fn workspace(device: Device<'a>, admission: Admission,
+        immutable: std::rc::Rc<DenseWeights<'a>>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_dense_workspace");
-        let planes = admission
-            .planes
-            .iter()
-            .map(|&bytes| Allocation::new(device, bytes))
+        let planes = admission.planes.iter().map(|&bytes| Allocation::new(device, bytes))
             .collect::<Result<Vec<_>>>()?;
         let stream = Stream::new(device)?;
-        Ok(Self {
-            stream,
-            weights: loaded,
-            planes,
-            programs: resolved,
-            admission,
-            epsilon,
-        })
+        Ok(Self { stream, planes, admission, immutable })
     }
 
     pub fn enqueue(&mut self, rows: usize) -> Result<()> {
@@ -312,14 +318,14 @@ impl<'a> DenseFfn<'a> {
             rows > 0 && rows <= self.admission.rows,
             "dense live rows exceed admitted capacity"
         );
-        for stage in 0..self.programs.len() {
+        for stage in 0..self.immutable.programs.len() {
             self.enqueue_stage(stage, rows)?;
         }
         Ok(())
     }
 
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
-        super::weights::validate_live_weights(device.id, &self.weights)
+        super::weights::validate_live_weights(device.id, &self.immutable.weights)
     }
 
     pub fn input(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
@@ -387,6 +393,7 @@ impl<'a> DenseFfn<'a> {
             .map(|(a, stride)| a.buffer.ptr.wrapping_byte_add(start * stride))
             .collect::<Vec<_>>();
         let w = self
+            .immutable
             .weights
             .iter()
             .map(|a| a.buffer.ptr)
@@ -401,12 +408,12 @@ impl<'a> DenseFfn<'a> {
         self.stream.device.run(|| {
             let mut scalars = vec![Scalar::I32(rows as i32)];
             if stage == 0 {
-                scalars.push(Scalar::F32(self.epsilon));
+                scalars.push(Scalar::F32(self.immutable.epsilon));
             }
             // SAFETY: all buffers are admitted, owned on this device, and retained
             // beyond the stream drain. Ignored nonrotary norm operands are never read.
             unsafe {
-                self.programs[stage].launch(&pointers[stage], &scalars, stream.raw)?;
+                self.immutable.programs[stage].launch(&pointers[stage], &scalars, stream.raw)?;
             }
             Ok(())
         })
@@ -622,9 +629,16 @@ mod tests {
         );
         let mut chain = DenseFfn::load(device, &programs, &checkpoint, layer, 128, u64::MAX, &[])?;
         ensure!(
-            manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.epsilon),
+            manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.immutable.epsilon),
             "fixture epsilon differs"
         );
+        let lane = chain.new_lane()?;
+        ensure!(std::rc::Rc::ptr_eq(&chain.immutable, &lane.immutable)
+            && chain.stream.raw != lane.stream.raw
+            && chain.planes.iter().zip(&lane.planes).all(|(a, b)|
+                a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
+            "Step-5 lane must share immutable storage and isolate every stream/plane");
+        drop(lane);
         let bytes = chain.admission.bytes;
         assert!(
             DenseFfn::load(device, &programs, &checkpoint, layer, 128, bytes - 1, &[]).is_err()

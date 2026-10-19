@@ -35,7 +35,7 @@ const WIDE: usize = 11;
 const COMBINED: usize = 12;
 const OUTPUT: usize = 13;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Admission {
     rows: usize,
     planes: [usize; 14],
@@ -266,14 +266,18 @@ fn definitions(activation: &str) -> [(&str, &[&str], &[u8]); 8] {
     ]
 }
 
-pub(super) struct RoutedFfn<'a> {
-    stream: Stream<'a>,
+struct RoutedWeights<'a> {
     weights: Vec<Allocation<'a>>,
-    planes: Vec<Allocation<'a>>,
     programs: Vec<Program<'a>>,
-    admission: Admission,
     epsilon: f32,
     layer: usize,
+}
+
+pub(super) struct RoutedFfn<'a> {
+    stream: Stream<'a>,
+    planes: Vec<Allocation<'a>>,
+    admission: Admission,
+    immutable: std::rc::Rc<RoutedWeights<'a>>,
 }
 impl<'a> RoutedFfn<'a> {
     pub fn load(
@@ -293,37 +297,32 @@ impl<'a> RoutedFfn<'a> {
             .iter()
             .map(|w| load_operand(device, checkpoint, &plan.layout, w))
             .collect::<Result<Vec<_>>>()?;
+        Self::workspace(device, plan.admission, std::rc::Rc::new(RoutedWeights {
+            weights, programs: resolved, epsilon: plan.epsilon, layer,
+        }))
+    }
+
+    /// Share only native weights/programs; route, reduction and zero planes are private.
+    pub(super) fn new_lane(&self) -> Result<Self> {
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone())
+    }
+
+    fn workspace(device: Device<'a>, admission: Admission,
+        immutable: std::rc::Rc<RoutedWeights<'a>>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_routed_workspace");
-        let planes = plan
-            .admission
-            .planes
-            .iter()
-            .map(|&n| Allocation::new(device, n))
+        let planes = admission.planes.iter().map(|&n| Allocation::new(device, n))
             .collect::<Result<Vec<_>>>()?;
         let stream = Stream::new(device)?;
         device.run(|| {
-            // SAFETY: private zero plane is retained until stream drainage and never overwritten.
-            unsafe {
-                device.library.cuda_zero_bytes_async(
-                    planes[ZERO].buffer,
-                    planes[ZERO].buffer.bytes,
-                    stream.raw,
-                )
-            }
+            // SAFETY: private zero plane survives drainage and is never overwritten.
+            unsafe { device.library.cuda_zero_bytes_async(planes[ZERO].buffer,
+                planes[ZERO].buffer.bytes, stream.raw) }
         })?;
         stream.drain()?;
-        Ok(Self {
-            stream,
-            weights,
-            planes,
-            programs: resolved,
-            admission: plan.admission,
-            epsilon: plan.epsilon,
-            layer,
-        })
+        Ok(Self { stream, planes, admission, immutable })
     }
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
-        super::weights::validate_live_weights(device.id, &self.weights)
+        super::weights::validate_live_weights(device.id, &self.immutable.weights)
     }
 
     pub fn input(&self) -> CuteafdDeviceBuffer {
@@ -349,11 +348,11 @@ impl<'a> RoutedFfn<'a> {
     ) -> Result<()> {
         let mut scalars = vec![Scalar::I32(rows as i32)];
         if index == 0 {
-            scalars.push(Scalar::F32(self.epsilon));
+            scalars.push(Scalar::F32(self.immutable.epsilon));
         }
         stream.device.run(|| {
             // SAFETY: admitted live-row views are retained by the transaction until this stream drains.
-            unsafe { self.programs[index].launch(pointers, &scalars, stream.raw) }
+            unsafe { self.immutable.programs[index].launch(pointers, &scalars, stream.raw) }
         })
     }
 
@@ -377,7 +376,7 @@ impl<'a> RoutedFfn<'a> {
         stream.device.run(|| {
             // SAFETY: the diagnostic owner retains normalized rows and routes through drainage.
             unsafe {
-                link.dispatch(self.layer, rows, kind, self.planes[IDS].buffer,
+                link.dispatch(self.immutable.layer, rows, kind, self.planes[IDS].buffer,
                     self.planes[ROUTES].buffer, self.planes[NORM].buffer, stream.raw)
             }
         })?;
@@ -412,7 +411,7 @@ impl<'a> RoutedFfn<'a> {
     pub fn normalize_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.check_stream(rows, stream)?;
         let p = |i: usize| self.planes[i].buffer.ptr;
-        let weight = self.weights[0].buffer.ptr;
+        let weight = self.immutable.weights[0].buffer.ptr;
         self.launch(0, &[p(INPUT), weight, weight, weight, weight, weight, p(NORM)], rows, stream)
     }
 
@@ -420,7 +419,7 @@ impl<'a> RoutedFfn<'a> {
     pub fn frontend_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.normalize_on(rows, stream)?;
         let p = |i: usize| self.planes[i].buffer.ptr;
-        let w = |i: usize| self.weights[i].buffer.ptr;
+        let w = |i: usize| self.immutable.weights[i].buffer.ptr;
         self.launch(1, &[p(NORM), w(1), p(LOGITS)], rows, stream)?;
         stream.device.run(|| {
             // SAFETY: disjoint admitted logits planes and routes remain live through the stream drain.
@@ -455,7 +454,7 @@ impl<'a> RoutedFfn<'a> {
     pub fn shared_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.check_stream(rows, stream)?;
         let p = |i: usize| self.planes[i].buffer.ptr;
-        let w = |i: usize| self.weights[i].buffer.ptr;
+        let w = |i: usize| self.immutable.weights[i].buffer.ptr;
         self.launch(3, &[p(NORM), w(3), p(GATE_UP)], rows, stream)?;
         self.launch(4, &[p(GATE_UP), p(ACTIVATION)], rows, stream)?;
         self.launch(5, &[p(ACTIVATION), w(4), p(SHARED)], rows, stream)
@@ -475,6 +474,34 @@ impl<'a> RoutedFfn<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires sealed native library, pinned Step-5 snapshot and CUDA"]
+    fn native_lane_shares_weights_and_isolates_workspace() -> Result<()> {
+        // SAFETY: the operator supplies the matching sealed native library.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library.programs()?.with_manifest(std::path::Path::new(
+            &std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let checkpoint = Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let plan = RoutedPlan::prepare(&programs, &checkpoint, 3, 1, u64::MAX, &[])?;
+        let owner = RoutedFfn::load(device, &programs, &checkpoint, 3, plan)?;
+        let lane = owner.new_lane()?;
+        ensure!(std::rc::Rc::ptr_eq(&owner.immutable, &lane.immutable)
+            && owner.stream.raw != lane.stream.raw
+            && owner.planes.iter().zip(&lane.planes).all(|(a, b)|
+                a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
+            "Step-5 lane immutable/private storage identities");
+        let immutable = lane.immutable.clone();
+        drop(owner);
+        ensure!(std::rc::Rc::strong_count(&immutable) == 2,
+            "Step-5 weights must survive the original lane");
+        lane.stream.drain()?;
+        drop(lane);
+        ensure!(std::rc::Rc::strong_count(&immutable) == 1,
+            "Step-5 lane must release its immutable reference after drainage");
+        Ok(())
+    }
+
     #[test]
     fn routed_admission_charges_logits_copy_and_separate_fp32_branches() -> Result<()> {
         let one = Admission::new(1, &[], u64::MAX, &[])?;

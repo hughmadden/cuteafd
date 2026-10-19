@@ -17,6 +17,39 @@ use std::{cell::RefCell, ffi::c_void, rc::Rc, time::Duration};
 
 const H: usize = 4096;
 
+/// Exact native allocation bytes, excluding caller-owned cache/transport/code reserves.
+/// The final head contributes weights once and a private handle workspace per lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RankAdmission {
+    immutable: u64,
+    workspace: u64,
+}
+impl RankAdmission {
+    fn bytes(self, lanes: usize) -> Result<u64> {
+        ensure!(matches!(lanes, 1 | 2), "Step-5 native lane count must be one or two");
+        self.workspace.checked_mul(lanes as u64).and_then(|n| n.checked_add(self.immutable))
+            .context("Step-5 native lane admission overflow")
+    }
+
+    pub(super) fn check(self, lanes: usize, available: u64, reservations: &[u64]) -> Result<u64> {
+        let bytes = self.bytes(lanes)?;
+        let total = reservations.iter().try_fold(bytes, |n, &v| n.checked_add(v))
+            .context("Step-5 native lane reservation overflow")?;
+        ensure!(total <= available,
+            "Step-5 native weights and {lanes} lane workspaces need {total} bytes, available {available}");
+        Ok(bytes)
+    }
+
+    fn with_head(self, head: &super::head::HeadPlan) -> Result<Self> {
+        Ok(Self {
+            immutable: self.immutable.checked_add(head.immutable_bytes())
+                .context("Step-5 native head weight overflow")?,
+            workspace: self.workspace.checked_add(head.workspace_bytes())
+                .context("Step-5 native head workspace overflow")?,
+        })
+    }
+}
+
 enum Attention<'a> { Sliding(SwaLayer<'a>), Sparse(CsaLayer<'a>) }
 enum Ffn<'a> { Dense(DenseFfn<'a>), Routed(RoutedFfn<'a>) }
 struct Layer<'a> { attention: Attention<'a>, ffn: Ffn<'a> }
@@ -64,11 +97,29 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(matches!(count, 1 | 92), "Step-5 diagnostic layer count");
         ensure!(ownership.ranks() == 2 && ownership.execution().spec().lanes == 1,
             "Step-5 shared golden explicitly admits exactly one lane and two ranks");
+        Self::rank_admission(programs, checkpoint, ownership, rank, rows, count)?.bytes(1)
+    }
+
+    /// Includes the vocabulary head on its owning rank. Call for every rank before
+    /// allocating any lane; cache, staging, input, transport and code are reserves.
+    pub(super) fn serving_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: &ExecutionOwnership, rank: usize, rows: usize) -> Result<RankAdmission> {
+        let admission = Self::rank_admission(programs, checkpoint, ownership, rank, rows, 92)?;
+        if rank == ownership.execution().spec().head_gpu as usize {
+            admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, rows, ownership)?)
+        } else { Ok(admission) }
+    }
+
+    fn rank_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: &ExecutionOwnership, rank: usize, rows: usize, count: usize) -> Result<RankAdmission> {
+        ensure!(matches!(count, 1 | 92) && rank < ownership.ranks(), "Step-5 native rank/layer admission");
+        ensure!(rows as u64 <= ownership.execution().spec().rows, "Step-5 native row admission");
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layout = RankWeightLayout::for_execution(checkpoint, rank, ownership)?;
-        let mut bytes = layout.operands.iter().filter(|w| (0..count).any(|layer| w.name.starts_with(&format!("model.layers.{layer}."))))
+        let immutable = layout.operands.iter().filter(|w| (0..count).any(|layer| w.name.starts_with(&format!("model.layers.{layer}."))))
             .try_fold(contract.rope_tables.allocation_bytes, |n, w| n.checked_add(w.allocation_bytes))
             .context("Step-5 native rank weight overflow")?;
+        let mut workspace = 0u64;
         for layer in 0..count {
             if ownership.layer(layer, rank)?.query_heads == 0 { continue; }
             let attention = if contract.layers[layer].sliding.is_some() {
@@ -79,10 +130,10 @@ impl<'e, 'a> Execution<'e, 'a> {
             } else {
                 RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?.workspace_bytes()
             };
-            bytes = bytes.checked_add(attention).and_then(|n| n.checked_add(ffn))
+            workspace = workspace.checked_add(attention).and_then(|n| n.checked_add(ffn))
                 .context("Step-5 native rank workspace overflow")?;
         }
-        Ok(bytes)
+        Ok(RankAdmission { immutable, workspace })
     }
 
     pub fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -602,5 +653,44 @@ mod tests {
         }
         check_submission_faults(&trace.host.borrow().streams()).map_err(anyhow::Error::msg)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn immutable_bytes_are_shared_and_every_lane_workspace_is_charged() -> Result<()> {
+        let plan = RankAdmission { immutable: 1_000_000, workspace: 123_456 };
+        assert_eq!(plan.check(1, 1_123_456, &[])?, 1_123_456);
+        assert_eq!(plan.check(2, 1_380_456, &[133_544])?, 1_246_912);
+        Ok(())
+    }
+
+    #[test]
+    fn final_head_weights_and_private_blas_workspace_are_included() -> Result<()> {
+        let head = super::super::head::tests::admission_plan(64);
+        let base = RankAdmission { immutable: 1000, workspace: 2000 };
+        let plan = base.with_head(&head)?;
+        assert_eq!(plan.bytes(1)?, base.bytes(1)? + head.bytes());
+        assert_eq!(plan.bytes(2)?, base.bytes(2)? + head.bytes() + head.workspace_bytes());
+        assert_eq!(plan.bytes(2)? - plan.bytes(1)?, 2000 + head.workspace_bytes());
+        assert!(plan.check(2, plan.bytes(2)? - 1, &[]).is_err());
+        assert!(RankAdmission { immutable: u64::MAX, workspace: 0 }.with_head(&head).is_err());
+        assert!(RankAdmission { immutable: 0, workspace: u64::MAX }.with_head(&head).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lane_admission_refuses_underbudget_invalid_counts_and_overflow() {
+        let plan = RankAdmission { immutable: 100, workspace: 20 };
+        assert!(plan.check(2, 139, &[]).is_err());
+        assert!(plan.check(2, 140, &[1]).is_err());
+        assert!(plan.check(0, u64::MAX, &[]).is_err());
+        assert!(plan.check(3, u64::MAX, &[]).is_err());
+        assert!(plan.check(2, u64::MAX, &[u64::MAX]).is_err());
+        assert!(RankAdmission { immutable: 0, workspace: u64::MAX }.bytes(2).is_err());
+        assert!(RankAdmission { immutable: u64::MAX, workspace: 1 }.bytes(1).is_err());
     }
 }
