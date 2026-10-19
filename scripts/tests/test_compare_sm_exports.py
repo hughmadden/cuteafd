@@ -61,6 +61,17 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+@pytest.mark.parametrize("group,names", [
+    ("residual", ["attn_res_c1_keep_append", "attn_res_c2_add_append",
+                  "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"]),
+    ("situ", [f"situ_i{width}" for width in (3072, 6144, 16896, 33792)]),
+])
+def test_kimi_w8_cross_sm_groups(group, names):
+    job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kimi-{group}")
+    assert job == (f"kimi-{group}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(names)])
+
+
 def test_identical_object_ignores_context_metadata(tmp_path):
     report = compare_sm.compare(*exports(tmp_path))
     assert report["programs"][0]["classification"] == "identical"

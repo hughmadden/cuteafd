@@ -496,6 +496,42 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                         {"mode": mode, "max_rows": rows, "heads": heads},
                         lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
                             g, max_rows=r, max_context=max_context, mode=m)))
+    out.extend(kimi_w8_programs())
+    return out
+
+
+def kimi_w8_programs():
+    """Static residual sites, but runtime rows/arena stride for exact row invariance."""
+    def build_residual(params):
+        from b12x.integration.cuteafd import kimi_residual
+        return kimi_residual.compile_kimi_attn_res_rmsnorm_aot(**params)
+
+    def build_situ(width):
+        from b12x.integration.cuteafd import kimi_residual
+        return kimi_residual.compile_kimi_situ_aot(intermediate=width)
+
+    def build_projection(params):
+        from b12x.integration.cuteafd import pointwise
+        return pointwise.compile_bf16_projection_aot(**params)
+
+    out = []
+    sites = [(1, "keep", True, False)]
+    sites.extend((c, mode, append, True) for c in range(2, 10)
+                 for mode, append in (("add", False), ("replace", False), ("keep", False)))
+    sites.extend((c, "add", True, True) for c in range(2, 9))
+    for candidates, mode, append, mix in sites:
+        params = dict(hidden=7168, candidates=candidates, prefix_mode=mode,
+                      append=append, has_mix=mix)
+        name = f"attn_res_c{candidates}_{mode}" + ("_append" if append else "")
+        out.append((name, "attn_res_rmsnorm", params,
+                    lambda kw=params: build_residual(kw)))
+    for width in (3072, 6144, 16896, 33792):
+        out.append((f"situ_i{width}", "situ", {"intermediate": width},
+                    lambda w=width: build_situ(w)))
+        for op, params in (("gate_up", {"width": 7168, "outputs": 2 * width}),
+                           ("down", {"width": width, "outputs": 7168})):
+            out.append((f"ffn_{op}_i{width}", "bf16_projection", params,
+                        lambda kw=params: build_projection(kw)))
     return out
 
 

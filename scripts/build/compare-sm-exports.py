@@ -69,6 +69,13 @@ def jobs(scope):
                   for mode, rows in (("decode", 64), ("verify", 64), ("extend", 4096))]
         result.append((f"kimi-mla-h{heads}", "export_b12x_dsv4_aot.py",
                        ["--geometry", "kimik3", "--only", ",".join(names)]))
+    result.append(("kimi-residual", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join([
+                       "attn_res_c1_keep_append", "attn_res_c2_add_append",
+                       "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"])]))
+    result.append(("kimi-situ", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(
+                       f"situ_i{width}" for width in (3072, 6144, 16896, 33792))]))
     if scope == "suspects":
         return result
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])

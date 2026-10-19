@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import ast
 import __future__
+import json
 from functools import lru_cache
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,7 +30,7 @@ def official():
     source = snapshot / "modeling_kimi_linear.py"
     if not source.is_file():
         pytest.fail("official Kimi modeling source is required for this gate")
-    names = {"SituAndMul", "KimiRMSNorm", "_apply_attn_res"}
+    names = {"SituAndMul", "KimiRMSNorm", "_apply_attn_res", "_get_situ_activation_params", "KimiMLP"}
     tree = ast.parse(source.read_text())
     tree.body = [node for node in tree.body
         if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
@@ -89,6 +91,53 @@ def inputs(rows, candidates, case):
     return arena.cuda(), delta.cuda(), norm.cuda(), proj.cuda(), following.cuda()
 
 
+@pytest.mark.parametrize("intermediate", [3072, 6144, 16896, 33792])
+@torch.no_grad()
+def test_ffn_chain_official_fp64(intermediate):
+    from b12x.integration.cuteafd import kimi_residual, pointwise
+    # The full-width projections use the production hidden size; M16 bounds
+    # FP64 work while exercising a genuine batched dense/shared FFN chain.
+    rows, hidden = 16, 7168
+    g = torch.Generator().manual_seed(273)
+    x = torch.randn(rows, hidden, generator=g).bfloat16().cuda()
+    config = SimpleNamespace(hidden_size=hidden, intermediate_size=intermediate,
+        hidden_act="situ", activation_situ_beta=4.0, activation_situ_linear_beta=25.0)
+    mlp = official()["KimiMLP"](config).cuda().bfloat16()
+    for parameter in mlp.parameters():
+        parameter.copy_((torch.randn(parameter.shape, generator=g) * 0.01).bfloat16().cuda())
+    baseline = mlp(x)
+    packed = torch.cat((mlp.gate_proj.weight, mlp.up_proj.weight), 0)
+    projected = torch.empty(rows, 2 * intermediate, dtype=torch.bfloat16, device="cuda")
+    activated = torch.empty(rows, intermediate, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty_like(x)
+    gate_up = pointwise.compile_bf16_projection_aot(width=hidden, outputs=2 * intermediate)
+    activation = kimi_residual.compile_kimi_situ_aot(intermediate)
+    down = pointwise.compile_bf16_projection_aot(width=intermediate, outputs=hidden)
+    gate_up.launch(x, packed, projected, scalars=(rows,))
+    activation.launch(projected, activated, scalars=(rows,))
+    down.launch(activated, mlp.down_proj.weight, out, scalars=(rows,))
+    torch.cuda.synchronize()
+    # Preserve the BF16 projection and activation boundaries; the final FP64
+    # product stays unrounded so output-storage error is measured as well.
+    xx = x.cpu().double()
+    gate = (xx @ mlp.gate_proj.weight.cpu().double().T).bfloat16().double()
+    up = (xx @ mlp.up_proj.weight.cpu().double().T).bfloat16().double()
+    oracle_activation = ((4 * (gate / 4).tanh() / (1 + (-gate).exp())) *
+                         (25 * (up / 25).tanh())).bfloat16().double()
+    oracle = oracle_activation @ mlp.down_proj.weight.cpu().double().T
+    assert_accuracy(out, baseline, oracle)
+    first = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gate_up.launch(x, packed, projected, scalars=(rows,))
+        activation.launch(projected, activated, scalars=(rows,))
+        down.launch(activated, mlp.down_proj.weight, out, scalars=(rows,))
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, first), "FFN graph replay is not byte-exact"
+
+
 # All candidate counts and site transitions; wide prefill is bounded separately.
 SITES = [(1, "keep", True, False)] + [
     (c, mode, append, True) for c in range(2, 10)
@@ -120,7 +169,9 @@ def test_residual_official_fp64(candidates, mode, append, mix, rows, case):
     score_weight = norm.float() * proj.float()
     baseline = out_norm(definitions["_apply_attn_res"](prefix, blocks, projection, res_norm) if mix else prefix)
     values = torch.cat((blocks, prefix[:, None]), 1)
-    oracle = residual_oracle(values, score_weight, following, 1e-5)
+    # Include the official F32 score-weight product's error in the comparison.
+    oracle_weight = norm.cpu().double() * proj.cpu().double()
+    oracle = residual_oracle(values, oracle_weight, following, 1e-5)
     program = compile_kimi_attn_res_rmsnorm_aot(7168, candidates, mode, append, mix)
     out = torch.empty_like(prefix)
     program.launch(arena, delta, score_weight, following, out, scalars=(rows, arena.shape[1], 1e-5))
@@ -154,6 +205,51 @@ def test_residual_prefill_official_fp64(candidates):
     test_residual_official_fp64(candidates, "add", False, True, 4096, "normal")
 
 
+@pytest.mark.parametrize("candidates,mode,append,mix", [
+    (1, "keep", True, False), (2, "add", True, True),
+    (9, "add", False, True), (9, "replace", False, True), (9, "keep", False, True)])
+@torch.no_grad()
+def test_residual_same_row_width_and_position(candidates, mode, append, mix):
+    from b12x.integration.cuteafd.kimi_residual import compile_kimi_attn_res_rmsnorm_aot
+    seed, delta, norm, proj, following = inputs(1, candidates, "normal")
+    score_weight = norm.float() * proj.float()
+    program = compile_kimi_attn_res_rmsnorm_aot(7168, candidates, mode, append, mix)
+    expected = None
+    # The same compiled callable, inputs and weights must not depend on M or row position.
+    for rows in (1, 16, 4096):
+        arena = seed[:, :1].repeat(1, rows + 3, 1)
+        change = delta.repeat(rows, 1)
+        out = torch.empty(rows, 7168, device="cuda", dtype=torch.bfloat16)
+        program.launch(arena, change, score_weight, following, out,
+                       scalars=(rows, rows + 3, 1e-5))
+        torch.cuda.synchronize()
+        if expected is None:
+            expected = out[0].clone()
+        for position in {0, min(1, rows - 1), rows - 1}:
+            assert torch.equal(out[position], expected), "residual depends on width/row position"
+        del arena, change, out
+
+
+@pytest.mark.parametrize("intermediate", [3072, 6144, 16896, 33792])
+@torch.no_grad()
+def test_situ_same_row_width_and_position(intermediate):
+    from b12x.integration.cuteafd.kimi_residual import compile_kimi_situ_aot
+    g = torch.Generator().manual_seed(273)
+    row = (torch.randn(1, 2 * intermediate, generator=g) * 8).bfloat16().cuda()
+    program = compile_kimi_situ_aot(intermediate)
+    expected = None
+    for rows in (1, 16, 4096):
+        x = row.repeat(rows, 1)
+        out = torch.empty(rows, intermediate, device="cuda", dtype=torch.bfloat16)
+        program.launch(x, out, scalars=(rows,))
+        torch.cuda.synchronize()
+        if expected is None:
+            expected = out[0].clone()
+        for position in {0, min(1, rows - 1), rows - 1}:
+            assert torch.equal(out[position], expected), "Situ depends on width/row position"
+        del x, out
+
+
 @pytest.mark.parametrize("intermediate", [3072, 6144, 16896, 33792])
 @pytest.mark.parametrize("rows", [1, 16, 4096])
 @torch.no_grad()
@@ -183,3 +279,49 @@ def test_situ_official_fp64(intermediate, rows):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, first), "graph replay is not byte-exact"
+
+
+@pytest.mark.skipif(not os.environ.get("CUTEAFD_KIMI_W8_REPORT"), reason="optional resource/timing report")
+@pytest.mark.parametrize("kind,width", [("residual", 1), ("residual", 2), ("residual", 9)] +
+                         [("situ", w) for w in (3072, 6144, 16896, 33792)])
+@torch.no_grad()
+def test_w8_resource_and_timing_report(kind, width):
+    from b12x.integration.cuteafd import kimi_residual
+    from b12x.integration.cuteafd._common import exportable_compilation
+    directory = Path(os.environ["CUTEAFD_KIMI_W8_REPORT"]) / f"{kind}-{width}"
+    directory.mkdir(parents=True, exist_ok=True)
+    with exportable_compilation():
+        if kind == "residual":
+            program = kimi_residual.compile_kimi_attn_res_rmsnorm_aot(
+                7168, width, "keep" if width == 1 else "add", width == 1, width != 1)
+        else:
+            program = kimi_residual.compile_kimi_situ_aot(width)
+    program.export_to_c(str(directory), "kernel", "kimi_w8")
+    records = []
+    for rows in (1, 16, 4096):
+        if kind == "residual":
+            arena, delta, norm, proj, following = inputs(rows, width, "normal")
+            out = torch.empty_like(delta)
+            args = (arena, delta, norm.float() * proj.float(), following, out)
+            scalars = (rows, rows + 3, 1e-5)
+        else:
+            x = torch.randn(rows, 2 * width, device="cuda", dtype=torch.bfloat16)
+            out = torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)
+            args, scalars = (x, out), (rows,)
+        # Warm once, then measure device work in a graph, not Python dispatch.
+        program.launch(*args, scalars=scalars)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(100):
+                program.launch(*args, scalars=scalars)
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        records.append(dict(rows=rows, device_us=start.elapsed_time(end) * 1000 / 100))
+        del graph, args, out
+    (directory / "timing.json").write_text(json.dumps(dict(
+        geometry=dict(program.geometry), timing=records, warm_batches=1,
+        repetitions_per_graph=100), indent=2) + "\n")

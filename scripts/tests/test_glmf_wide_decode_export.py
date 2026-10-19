@@ -37,7 +37,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "kimi_mla"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "kimi_mla", "kimi_residual", "pointwise"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -375,3 +375,31 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
             assert vars(args[0]) == {"heads": heads}
             assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
             assert params == {"mode": mode, "max_rows": rows, "heads": heads}
+
+
+def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
+    programs = exporter.kimi_w8_programs()
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
+    assert len(calls) == len(programs) == 44
+    for stem, (op, params, (module, fn, args, kwargs)) in calls.items():
+        assert args == () and kwargs == params
+        if op == "bf16_projection":
+            assert module == "pointwise" and fn == "compile_bf16_projection_aot"
+            width = int(stem.rsplit("_i", 1)[1])
+            assert params == ({"width": 7168, "outputs": 2 * width} if "gate_up" in stem
+                              else {"width": width, "outputs": 7168})
+            continue
+        assert module == "kimi_residual"
+        if op == "situ":
+            assert fn == "compile_kimi_situ_aot"
+            assert params == {"intermediate": int(stem.removeprefix("situ_i"))}
+        else:
+            assert op == "attn_res_rmsnorm" and fn == "compile_kimi_attn_res_rmsnorm_aot"
+            assert params["hidden"] == 7168
+            assert params["has_mix"] == (params["candidates"] != 1)
+            assert params["append"] == stem.endswith("_append")
+    for candidates in range(2, 10):
+        for mode in ("keep", "add", "replace"):
+            assert f"attn_res_c{candidates}_{mode}" in calls
+    assert {params["intermediate"] for _, op, params, _ in programs if op == "situ"} == {
+        3072, 6144, 16896, 33792}
