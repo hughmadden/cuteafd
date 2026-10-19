@@ -68,6 +68,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         world: args.world as usize,
         model_admission: None,
         selected_layers: None,
+        placement: cuteafd_core::tp_units::TpPlacement::active()?,
         capacity: 0,
         device_budget: args.device_budget_bytes,
         max_frame_bytes: 0,
@@ -99,6 +100,7 @@ pub(crate) struct NativeExpertServiceConfig {
     pub world: usize,
     model_admission: Option<cuteafd_transport::worker_selection::ModelAdmission>,
     selected_layers: Option<Vec<usize>>,
+    placement: cuteafd_core::tp_units::TpPlacement,
     pub capacity: u32,
     pub device_budget: usize,
     pub max_frame_bytes: usize,
@@ -545,6 +547,7 @@ mod tests {
                     depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
             }),
             selected_layers: None,
+            placement: cuteafd_core::tp_units::TpPlacement::RoundRobin,
             capacity: 16,
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,
@@ -677,7 +680,11 @@ mod tests {
         assert_eq!(one.selection(7).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world: 1 });
         assert!(one.selection(7).unwrap().role() > 7);
         assert_eq!(one.native_group().unwrap(), None);
-        assert!(one.exl3_directory_for(&[4, 5]).ends_with("tp1-rank0"));
+        assert!(one.exl3_directory_for(&[4, 5], "tp1-rank0").ends_with("tp1-rank0"));
+        assert!(one.exl3_directory_for(&[4, 5], "tp6-compact-rank0").ends_with("tp6-compact-rank0"));
+        let mut explicit = one;
+        explicit.exl3_aot_dir = Some("/custom-export".into());
+        assert_eq!(explicit.exl3_directory_for(&[4, 5], "tp6-compact-rank0"), PathBuf::from("/custom-export"));
     }
 
     #[test]
@@ -723,7 +730,7 @@ mod tests {
             let config = config(3, rank, Some(SparkTopology::NATIVE_TP3_EP1));
             assert_eq!(config.exl3_selection(7).unwrap(),
                 ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 3 });
-            assert!(config.exl3_directory_for(&[2, 3]).ends_with(format!("tp3-rank{rank}")));
+            assert!(config.exl3_directory_for(&[2, 3], &format!("tp3-rank{rank}")).ends_with(format!("tp3-rank{rank}")));
             assert_eq!(config.native_group().unwrap(), Some(0));
         }
         let config = config(6, 0, Some(SparkTopology::NATIVE_TP3_EP2));
@@ -1181,13 +1188,28 @@ impl NativeExpertServiceConfig {
     /// Resolve this rank's EXL3 AOT package for the running checkpoint's
     /// decoder tiers (multi-family images) with the legacy single-family
     /// location as fallback. An explicit --exl3-aot-dir is used verbatim.
-    fn exl3_directory_for(&self, tiers: &[usize]) -> PathBuf {
+    fn exl3_directory_for(&self, tiers: &[usize], layout: &str) -> PathBuf {
         self.exl3_aot_dir.clone().unwrap_or_else(|| {
-            crate::shared::experts::exl3::aot_layout_directory(
-                &self.library,
-                tiers,
-                &format!("tp{}-rank{}", self.world, self.rank),
-            )
+            crate::shared::experts::exl3::aot_layout_directory(&self.library, tiers, layout)
         })
+    }
+
+    fn exl3_directory(&self, catalog: &OfficialV41Catalog) -> Result<PathBuf> {
+        let layer = *self.resident_layers(catalog.routed_experts().layers)?.first()
+            .context("EXL3 package selection requires a resident layer")?;
+        let plan = crate::shared::experts::exl3::planned_residency(catalog,
+            self.exl3_selection(layer)?, self.placement)?;
+        Ok(self.exl3_directory_for(&plan.tiers, &plan.aot_layout()))
+    }
+
+    fn validate_exl3_residency(&self, catalog: &OfficialV41Catalog, directory: &std::path::Path) -> Result<()> {
+        let geometry = catalog.routed_experts().geometry()?;
+        for layer in self.resident_layers(catalog.routed_experts().layers)? {
+            let plan = crate::shared::experts::exl3::planned_residency(catalog,
+                self.exl3_selection(layer)?, self.placement)?;
+            crate::shared::experts::exl3::worker::Exl3Worker::validate_planned_residency(
+                directory, self.capacity, self.exl3_schedule, &plan, geometry)?;
+        }
+        Ok(())
     }
 }

@@ -28,6 +28,8 @@ pub struct WorkerIdentity {
 }
 
 impl WorkerIdentity {
+    pub fn placement(&self) -> cuteafd_core::tp_units::TpPlacement { self.placement }
+
     /// Paths may differ between hosts; the checkpoint's config and tensor index
     /// bytes, not a local pathname or a separately computed plan, identify it.
     pub fn from_snapshot(snapshot: &Path, geometry: cuteafd_core::ExpertGeometry,

@@ -216,6 +216,29 @@ impl Manifest {
         ensure!(legacy || compact, "EXL3 descriptor/version mismatch");
         Ok(())
     }
+    fn validate_residency(&self, layout: &cuteafd_loader::V41Exl3Residency,
+        geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
+        self.validate_native_contract()?;
+        let rows = self.descriptor_rows.unwrap_or(3);
+        ensure!(layout.unit_map.is_some() == (rows == 7),
+            "EXL3 compact storage/native contract mismatch");
+        let descriptor = layout.buffers.iter().find(|buffer| buffer.name == "descriptor_map")
+            .context("EXL3 residency lacks descriptor map")?;
+        let bytes = rows.checked_mul(self.experts).and_then(|n| n.checked_mul(self.bits.len()))
+            .and_then(|n| n.checked_mul(4)).context("EXL3 descriptor extent overflow")?;
+        ensure!(descriptor.bytes == bytes && descriptor.initial_words.len() == bytes / 4,
+            "EXL3 resident descriptor extent mismatch");
+        ensure!(self.hidden == geometry.hidden as usize
+                && self.intermediate == layout.intermediate
+                && self.experts == layout.experts && self.bits == layout.tiers
+                && self.swiglu_limit == geometry.swiglu_limit(),
+            "EXL3 export/residency geometry mismatch");
+        let topk = if matches!(layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_))
+            && geometry.family() == Some("v41") { 3 } else { geometry.topk as usize };
+        ensure!(self.top_k == topk, "EXL3 expert top-k mismatch");
+        Ok(())
+    }
+
     fn workspace_bytes(&self, format: Exl3InputFormat) -> Result<usize> {
         let mut bytes = self.trellis_lut.bytes.max(16);
         for (name, buffer) in &self.buffers {
@@ -471,6 +494,14 @@ impl<'a> Exl3Execution<'a> {
     }
 
 
+    /// Compare the installed code with header-derived storage before any weight allocation.
+    pub(crate) fn validate_planned_residency(directory: &Path,
+        layout: &cuteafd_loader::V41Exl3Residency,
+        geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
+        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        meta.validate_residency(layout, geometry)
+    }
+
     /// Device allocation payload per lane, including aliases and optional wire
     /// reconstruction. Weight storage and CUDA module/driver reserve are separate.
     pub(crate) fn plan(directory: &Path, format: Exl3InputFormat) -> Result<usize> {
@@ -537,35 +568,13 @@ impl<'a> Exl3Execution<'a> {
         meta.validate_native_contract()?;
         let device = library.cuda_get_device()?;
         for weight in weights.iter() {
-            let descriptor_rows = meta.descriptor_rows.unwrap_or(3);
-            ensure!(weight.layout.unit_map.is_some() == (descriptor_rows == 7),
-                "EXL3 compact storage/native contract mismatch");
-            ensure!(weight.buffer("descriptor_map")?.bytes == descriptor_rows * meta.experts * meta.bits.len() * 4,
-                "EXL3 resident descriptor extent mismatch");
+            meta.validate_residency(&weight.layout, cuteafd_core::expert_geometry())?;
             ensure!(
                 weight.layout.world == weights[0].layout.world
                     && weight.layout.rank == weights[0].layout.rank
                     && weight.buffer("global_to_combined")?.device_id == device,
                 "EXL3 resident layers must share one device and TP rank"
             );
-            ensure!(
-                meta.hidden == cuteafd_core::expert_geometry().hidden as usize
-                    && meta.intermediate == weight.layout.intermediate
-                    && meta.experts == weight.layout.experts
-                    && meta.bits == weight.layout.tiers
-                    && meta.swiglu_limit == cuteafd_core::expert_geometry().swiglu_limit(),
-                "EXL3 export/residency geometry mismatch"
-            );
-            // V4.1 dSpark drafts route top-3; DeepSeek V4 stages and every
-            // backbone follow the model.
-            let expected_topk =
-                if matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_))
-                    && cuteafd_core::expert_geometry().family() == Some("v41") {
-                    3
-                } else {
-                    cuteafd_core::expert_geometry().topk as usize
-                };
-            ensure!(meta.top_k == expected_topk, "EXL3 expert top-k mismatch");
         }
         let info = modules.owner.kernel.info();
         let mut storage = Vec::new();
@@ -869,6 +878,54 @@ mod shared_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planned_residency_refuses_mismatched_code_before_allocation() -> Result<()> {
+        use cuteafd_loader::{V41Exl3Layer, V41Exl3Residency, V41Exl3ResidentBuffer};
+        use cuteafd_core::tp_units::{RankUnits, UnitRule};
+        let geometry = cuteafd_core::ExpertGeometry::GLM5;
+        let root = tempfile::tempdir()?;
+        for compact in [false, true] {
+            let rows = if compact { 7 } else { 3 };
+            let mut layout = V41Exl3Residency {
+                layer: V41Exl3Layer::Backbone(3), world: 6, rank: 0,
+                intermediate_start: 0, experts: geometry.experts as usize, intermediate: 384,
+                tiers: vec![4, 5], projection_counts: vec![], loads: vec![],
+                unit_map: compact.then(|| RankUnits::new(UnitRule::Rotated,
+                    geometry.experts as usize, geometry.intermediate as usize, 128, 3, 6, 0)).transpose()?,
+                buffers: vec![V41Exl3ResidentBuffer { name: "descriptor_map".into(),
+                    bytes: rows * geometry.experts as usize * 2 * 4,
+                    initial_words: vec![0; rows * geometry.experts as usize * 2] }],
+            };
+            assert_eq!(layout.aot_layout(), if compact { "tp6-compact-rank0" } else { "tp6-rank0" });
+            let metadata = serde_json::json!({
+                "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16", "sparkinfer_revision":"test",
+                "hidden":geometry.hidden,"intermediate":384,"experts":geometry.experts,"capacity":16,
+                "top_k":geometry.topk,"bits":[4,5],"swiglu_limit":geometry.swiglu_limit(),
+                "direct":false,"sms":48,"blocks_per_sm":1,"buffers":{},"objects":[],
+                "descriptor_rows":rows,"native_info_version":if compact { 3 } else { 2 },
+                "trellis_lut":{"file":"lut","bytes":16,"sha256":"test"}
+            });
+            let path = root.path().join("v41_exl3.json");
+            std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
+            Exl3Execution::validate_planned_residency(root.path(), &layout, geometry)?;
+            for (field, value) in [("intermediate", serde_json::json!(256)),
+                ("hidden", serde_json::json!(128)), ("experts", serde_json::json!(1)),
+                ("bits", serde_json::json!([3,4])), ("top_k", serde_json::json!(1)),
+                ("swiglu_limit", serde_json::json!(10.0)),
+                ("descriptor_rows", serde_json::json!(if compact { 3 } else { 7 })),
+                ("native_info_version", serde_json::json!(9))] {
+                let mut changed = metadata.clone();
+                changed[field] = value;
+                std::fs::write(&path, serde_json::to_vec(&changed)?)?;
+                assert!(Exl3Execution::validate_planned_residency(root.path(), &layout, geometry).is_err(), "{field}");
+            }
+            std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
+            layout.buffers[0].initial_words.pop();
+            assert!(Exl3Execution::validate_planned_residency(root.path(), &layout, geometry).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn fixed_reduction_plan_follows_m1_not_live_width() -> Result<()> {

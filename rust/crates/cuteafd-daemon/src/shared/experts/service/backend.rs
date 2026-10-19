@@ -100,7 +100,7 @@ impl<'a> Weights<'a> {
                 };
                 resident = resident.checked_add(u64::try_from(weight.resident_bytes())?)
                     .context("EXL3 resident sum overflow")?;
-                slices.push(SparkSlice { unit_map: None, layer: u32::try_from(layer)?,
+                slices.push(SparkSlice { unit_map: plan.unit_map.as_ref().map(|map| map.fingerprint()), layer: u32::try_from(layer)?,
                     first: u32::try_from(plan.intermediate_start)?, width: u32::try_from(plan.intermediate)?,
                     stored_width: u32::try_from(plan.intermediate)?,
                     tiers: plan.tiers.iter().copied().map(u32::try_from).collect::<Result<_, _>>()?,
@@ -189,12 +189,10 @@ impl<'a> Weights<'a> {
                 let mut execution = Exl3Worker::with_modules(
                     library,
                     weights.clone(),
-                    &config.exl3_directory_for(
-                        weights
-                            .first()
-                            .map(|weight| weight.layout.tiers.as_slice())
-                            .unwrap_or(&[]),
-                    ),
+                    &{
+                        let plan = &weights.first().context("EXL3 worker has no resident weights")?.layout;
+                        config.exl3_directory_for(&plan.tiers, &plan.aot_layout())
+                    },
                     config.capacity,
                     remaining,
                     config.exl3_schedule,
@@ -521,21 +519,19 @@ pub(super) fn load_exl3<'a>(
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
 ) -> Result<(Weights<'a>, usize)> {
-    let exl3_tiers: &[usize] = catalog
-        .exl3()
-        .map(|manifest| manifest.decoder_tiers())
-        .unwrap_or(&[]);
-    let exl3_directory = config.exl3_directory_for(exl3_tiers);
+    let exl3_directory = config.exl3_directory(catalog)?;
     Exl3Worker::validate_exports(&exl3_directory, config.capacity, config.rank,
         config.exl3_schedule)?;
+    config.validate_exl3_residency(catalog, &exl3_directory)?;
 
     let workspace = Exl3Worker::plan(&exl3_directory, config.capacity, config.exl3_schedule)
         .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let plans = layers.iter().map(|&layer| {
-            Exl3Weights::plan(
+            Exl3Weights::plan_with_placement(
                 catalog,
                 config.exl3_selection(layer)?,
+                config.placement,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -565,11 +561,12 @@ pub(super) fn load_exl3<'a>(
     for (index, plan) in plans.iter().enumerate() {
         let layer = layers[index];
         let started = std::time::Instant::now();
-        let weight = Exl3Weights::load(
+        let weight = Exl3Weights::load_with_placement(
             library,
             catalog,
             config.exl3_selection(layer)?,
             remaining,
+            config.placement,
         )?;
         remaining = remaining
             .checked_sub(plan.resident_bytes)

@@ -92,11 +92,14 @@ fn residency_selection(layer: ExpertLayer) -> Result<(V41Exl3Layer, usize, usize
 }
 
 fn layout(catalog: &OfficialV41Catalog, layer: ExpertLayer) -> Result<V41Exl3Residency> {
+    planned_residency(catalog, layer, cuteafd_core::tp_units::TpPlacement::RoundRobin)
+}
+
+pub(crate) fn planned_residency(catalog: &OfficialV41Catalog, layer: ExpertLayer,
+    placement: cuteafd_core::tp_units::TpPlacement) -> Result<V41Exl3Residency> {
     let (layer, world, rank) = residency_selection(layer)?;
-    catalog
-        .exl3()
-        .context("EXL3 residency requires a routed EXL3 checkpoint")?
-        .residency(layer, world, rank)
+    catalog.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?
+        .residency_with_placement(layer, world, rank, placement)
 }
 
 fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<ExpertLoadBudget> {
@@ -137,6 +140,11 @@ impl<'a> Exl3Weights<'a> {
         layer: ExpertLayer,
     ) -> Result<ExpertLoadBudget> {
         budget(catalog, &layout(catalog, layer)?)
+    }
+
+    pub(crate) fn plan_with_placement(catalog: &OfficialV41Catalog, layer: ExpertLayer,
+        placement: cuteafd_core::tp_units::TpPlacement) -> Result<ExpertLoadBudget> {
+        budget(catalog, &planned_residency(catalog, layer, placement)?)
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
@@ -290,7 +298,14 @@ impl<'a> Exl3Weights<'a> {
         layer: ExpertLayer,
         available_device_bytes: usize,
     ) -> Result<Self> {
-        let layout = layout(catalog, layer)?;
+        Self::load_with_placement(library, catalog, layer, available_device_bytes,
+            cuteafd_core::tp_units::TpPlacement::RoundRobin)
+    }
+
+    pub(crate) fn load_with_placement(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        layer: ExpertLayer, available_device_bytes: usize,
+        placement: cuteafd_core::tp_units::TpPlacement) -> Result<Self> {
+        let layout = planned_residency(catalog, layer, placement)?;
         let budget = budget(catalog, &layout)?;
         ensure!(
             budget.peak_device_bytes()? <= available_device_bytes,

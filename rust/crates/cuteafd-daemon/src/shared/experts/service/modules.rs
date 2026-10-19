@@ -99,9 +99,10 @@ impl<'a> WarmModules<'a> {
             }
             return Ok(Self::Fp8(Some(groups)));
         }
-        if let Some(manifest) = catalog.exl3() {
-            let directory = config.exl3_directory_for(manifest.decoder_tiers());
+        if catalog.exl3().is_some() {
+            let directory = config.exl3_directory(catalog)?;
             Exl3Worker::validate_exports(&directory, config.capacity, config.rank, config.exl3_schedule)?;
+            config.validate_exl3_residency(catalog, &directory)?;
             let modules = cuteafd_core::Exl3RowPolicy::active().capacities(config.capacity as usize)?
                 .into_iter().map(|capacity| {
                     // SAFETY: exports were validated above; no arenas or weights are allocated.
@@ -169,6 +170,9 @@ mod tests {
             "Exl3Workspace::new", "Fp8Experts::load", "weights.execution"] {
             assert!(!source.contains(forbidden), "module phase contains {forbidden}");
         }
+        let exl3 = source.split("if catalog.exl3().is_some() {").nth(1).unwrap();
+        assert!(exl3.find("config.validate_exl3_residency(catalog, &directory)?").unwrap()
+            < exl3.find("Exl3Modules::load").unwrap());
         let worker = include_str!("local.rs");
         let modules = worker.find("let mut modules = match super::modules::WarmModules::load").unwrap();
         let weights = worker.find("load_weights(&library").unwrap();

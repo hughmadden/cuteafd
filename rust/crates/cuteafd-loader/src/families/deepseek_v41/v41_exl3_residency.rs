@@ -48,6 +48,12 @@ pub struct V41Exl3Residency {
 }
 
 impl V41Exl3Residency {
+    /// Installed code follows the storage contract, not a directory-name guess.
+    pub fn aot_layout(&self) -> String {
+        let compact = if self.unit_map.is_some() { "-compact" } else { "" };
+        format!("tp{}{compact}-rank{}", self.world, self.rank)
+    }
+
     /// Pointer offsets and payload for the single CUDA arena used by loading.
     /// Rotation vectors are resident once per decoder tier; these buffers also
     /// include descriptors and unit maps absent from checkpoint tensor totals.
@@ -422,7 +428,9 @@ mod tests {
                     if units % world == 0 {
                         assert_eq!(serde_json::to_value(&plan)?, serde_json::to_value(&old)?);
                         assert!(plan.unit_map.is_none());
+                        assert_eq!(plan.aot_layout(), format!("tp{world}-rank{rank}"));
                     } else {
+                        assert_eq!(plan.aot_layout(), format!("tp{world}-compact-rank{rank}"));
                         let map = plan.unit_map.as_ref().unwrap();
                         let stride = plan.experts * plan.tiers.len();
                         let descriptor = &plan.buffers.iter().find(|b| b.name == "descriptor_map").unwrap().initial_words;

@@ -39,6 +39,7 @@ impl SparkAdmission {
             "Spark admission working-set world differs from launched peers");
         let identity = WorkerIdentity::from_snapshot_manifest(snapshot, geometry,
             crate::shared::spark_topology::world(topology, world)?, manifest)?;
+        let placement = identity.placement();
         let selection = WorkerSelection::new(identity, &working.spark_layers)?.with_model(model.clone())?;
         // Idle workers still acknowledge the identity, but need no storage package.
         let assignments = if working.spark_layers.is_empty() {
@@ -81,7 +82,7 @@ impl SparkAdmission {
                 let shard = topology.map(|topology| topology.tp_rank(rank)).transpose()?
                     .map_or(rank, usize::from);
                 let layout = if catalog.exl3().is_some() {
-                    SparkResidentLayout::Exl3 { world: tp, rank: shard }
+                    SparkResidentLayout::Exl3 { world: tp, rank: shard, placement }
                 } else if catalog.fp8().is_some() {
                     SparkResidentLayout::Fp8 { world: tp, rank: shard, slicing: recipe.slicing }
                 } else {

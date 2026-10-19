@@ -133,7 +133,7 @@ pub struct SparkAssignment {
 /// this same layout before allocating. Native shards may be replicated groups.
 #[derive(Debug, Clone, Copy)]
 pub enum SparkResidentLayout {
-    Exl3 { world: usize, rank: usize },
+    Exl3 { world: usize, rank: usize, placement: cuteafd_core::tp_units::TpPlacement },
     Fp8 { world: usize, rank: usize, slicing: crate::formats::fp8_experts::Slicing },
     Native { world: usize, rank: usize, stored_width: usize },
 }
@@ -155,9 +155,10 @@ impl SparkAssignment {
             let mut slice = cuteafd_core::SparkSlice { unit_map: None, layer: u32::try_from(layer)?, first: 0,
                 width: 0, stored_width: 0, tiers: vec![], projection_counts: vec![] };
             let resident = match layout {
-                SparkResidentLayout::Exl3 { world, rank } => {
+                SparkResidentLayout::Exl3 { world, rank, placement } => {
                     let manifest = catalog.exl3().context("Spark EXL3 layout needs checkpoint trellis headers")?;
-                    let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?;
+                    let plan = manifest.residency_with_placement(crate::V41Exl3Layer::Backbone(layer), world, rank, placement)?;
+                    slice.unit_map = plan.unit_map.as_ref().map(|map| map.fingerprint());
                     slice.first = u32::try_from(plan.intermediate_start)?;
                     slice.width = u32::try_from(plan.intermediate)?;
                     slice.stored_width = slice.width;
@@ -323,7 +324,7 @@ mod tests {
         let endpoints = [SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 }];
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
-            SparkResidentLayout::Exl3 { world: 4, rank: 3 },
+            SparkResidentLayout::Exl3 { world: 4, rank: 3, placement: cuteafd_core::tp_units::TpPlacement::RoundRobin },
             &endpoints, rings).unwrap();
         let plan = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(0), 4, 3).unwrap();
         assert_eq!(assignment.resident_bytes, plan.device_arena_layout().unwrap().1 as u64);

@@ -128,7 +128,7 @@ pub enum SparkRecipeRefusal {
     MissingPackage { package: String, world: usize },
     #[error("unknown Spark package recipe: {0}")]
     UnknownPackage(String),
-    #[error("balanced TP placement is not qualified for {package} at TP{world}; requires MXFP4 TP6")]
+    #[error("balanced TP placement has no executable storage/kernel recipe for {package} at TP{world}")]
     UnsupportedPlacement { package: String, world: usize },
     #[error("{0}")]
     Placement(cuteafd_core::tp_units::UnitMapError),
@@ -215,9 +215,6 @@ pub fn spark_recipe_with_placement(package: &str, intermediate: usize, world: us
     if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
-    if placement == cuteafd_core::tp_units::TpPlacement::Balanced && !(mxfp4 && !native && world == 6) {
-        return Err(SparkRecipeRefusal::UnsupportedPlacement { package: key.into(), world });
-    }
     // V4.1 EXL3 TP6 remains unqualified pending a capped-local fidelity gate.
     // Kimi K3's only Spark layout is TP6 width 512 (#273: TP4 needs 160 GiB/rank).
     if (family == "v41" && exl3 && world == 6) || (family == "kimik3" && world != 6) {
@@ -237,10 +234,20 @@ pub fn spark_recipe_with_placement(package: &str, intermediate: usize, world: us
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
     }
     let exact = exl3 || (!native && intermediate % 128 == 0 && intermediate / 128 >= world);
-    let fine = placement == cuteafd_core::tp_units::TpPlacement::Balanced && mxfp4 && !native && world == 6;
+    let balanced = placement == cuteafd_core::tp_units::TpPlacement::Balanced;
+    let fine = balanced && mxfp4 && !native && world == 6 && intermediate / 128 % world != 0;
+    // Compact GLM K4/K5 is executable for qualification, not a default change.
+    let compact = balanced && family == "glm" && format == "exl3-k45"
+        && world == 6 && intermediate / 128 % world != 0;
+    if balanced && intermediate / 128 % world != 0 && !(fine || compact) {
+        return Err(SparkRecipeRefusal::UnsupportedPlacement { package: key.into(), world });
+    }
     let unit = if fine { 32 } else { 128 };
-    let rule = if fine { placement.rule(unit, intermediate / unit, world) } else { cuteafd_core::tp_units::UnitRule::Contiguous };
-    let widths = if exact {
+    let rule = if fine || compact { placement.rule(unit, intermediate / unit, world) }
+        else { cuteafd_core::tp_units::UnitRule::Contiguous };
+    let widths = if compact {
+        vec![(intermediate / unit).div_ceil(world) * unit; world]
+    } else if exact {
         (0..world).map(|rank| cuteafd_core::tp_units::RankUnits::new(rule, 1, intermediate, unit, 0, world, rank)
             .map(|map| map.resident_units() * unit).map_err(SparkRecipeRefusal::Placement)).collect::<Result<Vec<_>, _>>()?
     } else {
@@ -248,7 +255,8 @@ pub fn spark_recipe_with_placement(package: &str, intermediate: usize, world: us
             .ok_or(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block })?; world]
     };
     let required_layouts = if exl3 {
-        (0..world).map(|rank| format!("tp{world}-rank{rank}")).collect()
+        let tag = if compact { "-compact" } else { "" };
+        (0..world).map(|rank| format!("tp{world}{tag}-rank{rank}")).collect()
     } else if exact && widths.iter().any(|width| *width != widths[0]) {
         let mut unique = widths.clone(); unique.sort_unstable_by(|a, b| b.cmp(a)); unique.dedup();
         unique.into_iter().map(|width| format!("tp{world}-w{width}")).collect()
@@ -286,10 +294,29 @@ mod tests {
             assert_eq!((0..6).map(|layer| recipe.width_for_layer(rank, layer).unwrap()).sum::<usize>(), 2048);
         }
         assert_eq!(recipe.width_for_layer(6, 1), None);
-        for (package, world) in [("mimop:fp8", 2), ("glmf:exl3-k4", 6), ("step5:fp8", 6)] {
+        assert_eq!(spark_recipe_with_placement("mimop:fp8", 2048, 2, TpPlacement::Balanced).unwrap(),
+            spark_recipe_with_placement("mimop:fp8", 2048, 2, TpPlacement::RoundRobin).unwrap());
+        for (package, world) in [("glmf:exl3-k4", 6), ("step5:fp8", 6)] {
             assert!(matches!(spark_recipe_with_placement(package, 2048, world, TpPlacement::Balanced),
                 Err(SparkRecipeRefusal::UnsupportedPlacement { .. })));
         }
+    }
+
+    #[test]
+    fn compact_exl3_recipe_uses_own_maximum_and_preserves_even_exports() {
+        use cuteafd_core::tp_units::{TpPlacement, UnitRule};
+        let recipe = spark_recipe_with_placement("glm:exl3-k45", 2048, 6, TpPlacement::Balanced).unwrap();
+        assert_eq!(recipe.rule, UnitRule::Rotated);
+        assert_eq!(recipe.widths, [384; 6]);
+        assert_eq!(recipe.required_layouts,
+            (0..6).map(|rank| format!("tp6-compact-rank{rank}")).collect::<Vec<_>>());
+        for (package, intermediate, world) in [("glm:exl3-k45", 2048, 4),
+            ("v41:mxfp4", 2304, 6), ("step5:fp8", 1536, 6)] {
+            assert_eq!(spark_recipe_with_placement(package, intermediate, world, TpPlacement::Balanced).unwrap(),
+                spark_recipe_with_placement(package, intermediate, world, TpPlacement::RoundRobin).unwrap());
+        }
+        assert!(matches!(spark_recipe_with_placement("glm:exl3-k34", 2048, 6, TpPlacement::Balanced),
+            Err(SparkRecipeRefusal::UnsupportedPlacement { .. })));
     }
 
     #[test]
