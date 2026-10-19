@@ -32,7 +32,8 @@ def test_deployment_preserves_release_container_commands(entry: dict) -> None:
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
         before, after = parse_run(old["argv"]), parse_run(new["argv"])
-        before["env"]["CUTEAFD_TP_PLACEMENT"] = "round-robin"
+        # MiMo Pro configs select balanced TP placement (#521); every other card stays round-robin.
+        before["env"]["CUTEAFD_TP_PLACEMENT"] = "balanced" if "mimo-v26-pro" in entry["config"] else "round-robin"
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
