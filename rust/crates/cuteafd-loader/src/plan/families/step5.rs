@@ -6,6 +6,7 @@ use crate::plan::{checkpoint::Checkpoint, family::*, format::QuantOperand, names
 
 mod placement;
 pub mod coordinator;
+pub mod ownership;
 #[cfg(test)]
 mod tests;
 
