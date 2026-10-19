@@ -77,14 +77,15 @@ pub(crate) trait Backend<'a> {
     type History;
     type Coordinates;
     type Encoder: Encoder;
-    type Prefix: PrefixFamily<Placement = Self::Placement>;
+    type Meta: Clone + Default;
+    type Prefix: PrefixFamily<Self::Meta, Placement = Self::Placement>;
 
     fn geometry(&self) -> Geometry;
     fn message_starts(&self) -> &[&str] { &MESSAGE_STARTS }
     fn library(&self) -> &'a NativeLibrary;
     fn profile(&self) -> &RefCell<[f64; 2]>;
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
-        -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)>;
+        -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Self::Meta>)>;
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)>;
     fn probe_features(&self, prompt: &Prompt, media: &mut RequestMedia,
         cache: &mut cuteafd_engine::media::EmbeddingCache, snapshot: &Path) -> Result<()>;
@@ -295,7 +296,7 @@ impl Trace {
 }
 
 /// Gives a finished or failed sequence's units and state slot back.
-fn release<P: Placement, F: PrefixFamily<Placement = P>>(family: &F, cache: &mut PrefixCache<CudaCopyEngine<'_>>, slots: &mut Vec<i32>,
+fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>>(family: &F, cache: &mut PrefixCache<CudaCopyEngine<'_>, M>, slots: &mut Vec<i32>,
     placement: &P, family_name: &str) {
     if let Err(error) = cache.release(family, placement.units()) {
         tracing::error!(%error, family = family_name, "releasing sequence units");
@@ -391,8 +392,8 @@ mod verify_tests {
 }
 
 /// Serving statistics for `/v1/stats`.
-fn publish<E: Encoder>(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
-    cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<Prompt, E>,
+fn publish<E: Encoder, M: Clone + Default>(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
+    cache: &PrefixCache<CudaCopyEngine<'_>, M>, media: &MediaAdmission<Prompt, E>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
@@ -836,7 +837,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe)).then(|| p.keys.tokens().to_vec());
                 let spans = p.keys.spans().to_vec();
                 let session = p.ticket.session();
-                let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &B::Placement| {
+                let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>, B::Meta>, placement: &B::Placement| {
                     if let (Some(prompt), Some(logits)) = (&prompt, &logits) {
                         cache.capture_session(session.clone());
                         if let Err(error) = cache.capture_media(&family, SnapshotKind::Prompt, prompt, &spans, placement,

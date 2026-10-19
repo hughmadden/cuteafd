@@ -627,6 +627,94 @@ fn host_tier_restores_evicted_snapshots_exactly_and_shares_identical_prefixes() 
 }
 
 #[test]
+fn family_metadata_survives_host_promotion_and_tail_cow() {
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct Metadata { len: usize, logical_pages: usize, generation: u64 }
+
+    struct Family {
+        fake: Fake,
+        generation: Cell<u64>,
+        restored: RefCell<Vec<Metadata>>,
+    }
+    impl PrefixFamily<Metadata> for Family {
+        type Placement = Placement;
+        fn layout(&self) -> FamilyLayout { self.fake.layout() }
+        fn record_format(&self) -> &'static str { "fake_frontier_metadata_v1" }
+        fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.pages }
+        fn commit_point(&self, placement: &Placement) -> usize { placement.len }
+        fn capture_meta(&self, placement: &Placement, len: usize) -> Result<Metadata, BoxError> {
+            if placement.len != len { return Err("metadata must describe the committed frontier".into()); }
+            Ok(Metadata { len, logical_pages: len.div_ceil(ROWS), generation: self.generation.get() })
+        }
+        fn capture(&self, slot: MarkSlot, placement: &Placement, len: usize) -> Result<(), BoxError> {
+            self.fake.capture(slot, placement, len)
+        }
+        fn restore(&self, mark: Option<MarkSlot>, placement: &mut Placement, len: usize) -> Result<(), BoxError> {
+            self.fake.restore(mark, placement, len)
+        }
+        fn restore_with(&self, mark: Option<&Mark>, saved: Option<&Metadata>, placement: &mut Placement,
+            plan: &RestorePlan, _context: &RestoreContext<'_>) -> Result<(), BoxError> {
+            let saved = saved.ok_or("snapshot lost its family metadata")?;
+            if !plan.exact() || saved.len != plan.snapshot_end || saved.len != plan.resume()
+                || saved.logical_pages != saved.len.div_ceil(ROWS) || placement.len != 0 {
+                return Err("snapshot metadata differs from exact restore plan".into());
+            }
+            let Some(Mark::Slot(slot)) = mark else { return Err("snapshot lost its arena mark".into()); };
+            self.fake.restore(Some(*slot), placement, plan.resume())?;
+            self.restored.borrow_mut().push(saved.clone());
+            Ok(())
+        }
+        fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> { self.fake.copy_rows(copy) }
+        fn drain(&self) -> Result<(), BoxError> { self.fake.drain() }
+        fn page_segments(&self, page: u32) -> Vec<DeviceRange> { self.fake.page_segments(page) }
+        fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> { self.fake.mark_segments(slot) }
+    }
+
+    let family = Family { fake: Fake::new(64, 4, 4), generation: Cell::new(0), restored: RefCell::new(Vec::new()) };
+    let host = HostConfig { bytes: 1 << 20, chunk_bytes: 1 << 16, min_tokens: 1, ..HostConfig::default() };
+    let mut cache = PrefixCache::<Shared, Metadata>::new(family.layout(), config(4, 4),
+        Some((host, Shared(family.fake.mem.clone())))).unwrap();
+    let prompts = [seq(100, 13), seq(1000, 21)];
+    for (index, prompt) in prompts.iter().enumerate() {
+        family.generation.set(100 + index as u64);
+        let mut source = cache.admit(&family, prompt, prompt.len() + 1, false,
+            |pages| Placement { pages, ring: index, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = family.fake.forward(&mut source, prompt).unwrap();
+        assert!(cache.capture(&family, SnapshotKind::Prompt, prompt, &source,
+            After::from_logits(&logits, true)).unwrap());
+        family.fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        cache.release(&family, &source.pages).unwrap();
+    }
+    assert_eq!(cache.stats().host.unwrap().stores_completed, 2);
+    cache.clear(&family).unwrap();
+    assert_eq!(cache.pool().free(), 64);
+    // Neither the current capture generation nor a reused arena slot identifies
+    // the evicted snapshot: its own metadata must travel through the host tier.
+    family.generation.set(u64::MAX);
+    for (index, prompt) in prompts.iter().enumerate() {
+        let mut next = prompt.clone();
+        next.push(9000 + index as u32);
+        let copies = cache.stats().cow_copies;
+        let admitted = cache.admit(&family, &next, next.len(), false,
+            |pages| Placement { pages, ring: index + 2, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(admitted.resume, prompt.len());
+        assert!(admitted.source.unwrap().host);
+        assert_eq!(cache.stats().cow_copies, copies + 1, "partial tail must be COW");
+        let mut restored = admitted.placement;
+        family.fake.forward(&mut restored, &next).unwrap();
+        cache.release(&family, &restored.pages).unwrap();
+    }
+    assert_eq!(*family.restored.borrow(), vec![
+        Metadata { len: 13, logical_pages: 4, generation: 100 },
+        Metadata { len: 21, logical_pages: 6, generation: 101 },
+    ]);
+    assert_eq!(cache.stats().promotions, 2);
+    cache.clear(&family).unwrap();
+    assert_eq!(cache.pool().free(), 64);
+}
+
+#[test]
 fn host_retention_exceeds_device_banks_and_counts_shared_pages_once() {
     let fake = Fake::new(64, 4, 8);
     let mut cache = cache(&fake, 1, 1 << 20);

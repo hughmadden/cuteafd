@@ -320,6 +320,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     type History = cuteafd_loader::families::qwen4::NgramHistory;
     type Coordinates = cuteafd_loader::families::qwen4::RopePositions;
     type Encoder = crate::shared::qwen::Encoder;
+    type Meta = ();
     type Prefix = Qwen4Prefix<'e, 'a>;
 
     fn geometry(&self) -> scheduler::Geometry {

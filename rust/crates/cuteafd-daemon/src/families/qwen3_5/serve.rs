@@ -36,6 +36,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     type History = ();
     type Coordinates = ();
     type Encoder = crate::shared::qwen::Encoder;
+    type Meta = ();
     type Prefix = DensePrefix<'e, 'a>;
 
     fn geometry(&self) -> scheduler::Geometry {
