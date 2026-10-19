@@ -301,6 +301,7 @@ impl Panel for PrefixCache {
         let mut history = vec![json!({"role": "system", "content": format!("[{}] You are a concise assistant. \
             Reference notes follow.\n\n{}", nonce(), filler(4242, 700))})];
         let mut turns = Vec::new();
+        let tiers_before = common::prefix_tier_counters(ctx.client);
         for turn in 1..=6 {
             ctx.progress.step((turn - 1) as f64 / 6.0, format!("turn {turn}"));
             history.push(json!({"role": "user", "content": format!("Question {turn}: {} Answer in three sentences.",
@@ -320,13 +321,17 @@ impl Panel for PrefixCache {
             let supported = cold.probe.as_ref().is_some_and(|r| r.engine.is_some());
             turns.push(json!({"turn": turn, "prompt_tokens": chat.timing.prompt_tokens,
                 "cached_tokens": chat.timing.cached_tokens, "ttft_s": chat.timing.ttft_s,
+                "source": common::prefix_source(&chat),
                 "cold_ttft_s": supported.then_some(cold.timing.ttft_s), "fabric": fabric,
                 "cold_fabric": ctx.client.fabric_since(fabric_mark, &format!("prefix_cache/{turn}/cold"), true)}));
             history.push(json!({"role": "assistant", "content": chat.content}));
             ctx.progress.partial(json!({"turns": turns}));
         }
+        let tiers = common::prefix_tier_interval(tiers_before.as_ref(), common::prefix_tier_counters(ctx.client).as_ref());
         let rows = turns.iter().map(|t| vec![t["turn"].clone(), t["prompt_tokens"].clone(), t["cached_tokens"].clone(),
-            json!(t["ttft_s"].as_f64().unwrap_or(0.0) * 1e3), json!(t["cold_ttft_s"].as_f64().map(|v| v * 1e3))]).collect();
-        Ok(json!({"turns": turns, "table": table(&["turn", "prompt", "cached", "TTFT ms", "cold TTFT ms"], rows)}))
+            t["source"].clone(), json!(t["ttft_s"].as_f64().unwrap_or(0.0) * 1e3),
+            json!(t["cold_ttft_s"].as_f64().map(|v| v * 1e3))]).collect();
+        Ok(json!({"turns": turns, "tiers": tiers,
+            "table": table(&["turn", "prompt", "cached", "source", "TTFT ms", "cold TTFT ms"], rows)}))
     }
 }
