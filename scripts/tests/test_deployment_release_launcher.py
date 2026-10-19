@@ -84,11 +84,23 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
             assert "--exlr8-dense-from" not in command
 
 
+@pytest.mark.parametrize("ranks", range(1, 7))
+def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int) -> None:
+    entry = exlr8_entry()
+    entry["set"]["SPARK_COUNT"] = str(ranks)
+    result = capture(ROOT, f"exlr8-world-{ranks}", release_entry=entry)
+    assert len(result["containers"]) == ranks + 1
+    workers = [parse_run(run["argv"])["command"] for run in result["containers"][1:]]
+    for rank, command in enumerate(workers):
+        assert command[command.index("--rank") + 1] == str(rank)
+        assert command[command.index("--world") + 1] == str(ranks)
+
+
 @pytest.mark.parametrize("overrides,reason", [
     ({"EXLR8_MANIFEST": "other"}, "EXLR8_MANIFEST"),
     ({"EXLR8_DENSE_FROM": ""}, "EXLR8_DENSE_FROM"),
     ({"RTX_GPUS": "1"}, "two RTX"),
-    ({"SPARK_COUNT": "6"}, "canonical TP4"),
+    ({"SPARK_COUNT": "7"}, "canonical Spark ranks"),
     ({"SPECULATOR": "dflash2"}, "SPECULATOR=off"),
     ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),
     ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),

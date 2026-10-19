@@ -9,6 +9,7 @@ use std::{
 
 const REVISION: &str = "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80";
 const DENSE_REVISION: &str = "aca966e4e02791568aa6a4ced368624b3d897f42";
+const ROWS: [usize; 5] = [1, 8, 64, 65, 128];
 const SOURCES: [&str; 4] = [
     "python/reference/exlr8.py",
     "python/reference/shape_invariant.py",
@@ -53,6 +54,7 @@ fn fixture(
     shape: &[usize],
 ) -> Result<Vec<u8>> {
     let size = match dtype {
+        "torch.uint8" => 1usize,
         "torch.bfloat16" => 2usize,
         "torch.float32" | "torch.int32" => 4,
         "torch.float64" => 8,
@@ -173,10 +175,11 @@ fn native_layer3_same_quant() -> Result<()> {
     let dense = PathBuf::from(std::env::var("CUTEAFD_EXLR8_DENSE_SNAPSHOT")?);
     let manifest: Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
     ensure!(
-        manifest["schema"] == 1
+        manifest["schema"] == 2
+            && manifest["activation_wire"] == "fp8_e4m3_ue8m0_k32_amax_floor_1e-4_routed_only"
             && manifest["seed"] == 408
             && manifest["layer"] == 3
-            && manifest["rows"] == serde_json::json!([1, 8, 64, 65])
+            && manifest["rows"] == serde_json::json!(ROWS)
             && manifest["manifest"] == "up1"
             && manifest["revision"] == REVISION
             && manifest["dense_revision"] == DENSE_REVISION
@@ -275,7 +278,7 @@ fn native_layer3_same_quant() -> Result<()> {
         "--pool-tokens".into(),
         "256".into(),
         "--prefill-rows".into(),
-        "65".into(),
+        ROWS.last().unwrap().to_string().into(),
         "--rtx-expert-layers".into(),
         "0".into(),
         "--l2-prefetch".into(),
@@ -291,11 +294,11 @@ fn native_layer3_same_quant() -> Result<()> {
         // before with_engine drops transport or native owners.
         let mut workspaces = engine.lane_workspaces.borrow_mut();
         if workspaces.is_empty() {
-            workspaces.push(engine.workspace(65, false)?);
+            workspaces.push(engine.workspace(*ROWS.last().unwrap(), false)?);
         }
         let w = &workspaces[0];
         let result = (|| {
-            for rows in [1usize, 8, 64, 65] {
+            for rows in ROWS {
                 let h = engine.cfg.hidden;
                 let load = |suffix: &str, dtype: &str, shape: &[usize]| {
                     fixture(&root, &manifest, &format!("r{rows}_{suffix}"), dtype, shape)
@@ -321,6 +324,42 @@ fn native_layer3_same_quant() -> Result<()> {
                     false,
                     transport,
                     runtime,
+                )?;
+                let staged = w.router_host.borrow();
+                let request = expert_request(
+                    staged.bytes(),
+                    3,
+                    rows,
+                    h,
+                    engine.cfg.topk,
+                    false,
+                    engine.spark_bf16,
+                )?;
+                ensure!(
+                    request.header.hidden_dtype
+                        == cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                    "same-quant gate requires standard Fp8K32 requests"
+                );
+                let wire = request.hidden_payload.as_ref();
+                let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
+                std::fs::write(out.join(format!("r{rows}_actual_wire.bin")), wire)?;
+                let expected_wire = load("wire", "torch.uint8", &[rows, h + h / 32])?;
+                ensure!(
+                    wire == expected_wire,
+                    "native request differs from NumPy FP8 K32 oracle at {rows} rows"
+                );
+                drop(staged);
+                // The ordinary reducer writes delta; norm applies the residual in place.
+                engine.run(
+                    "glm_norm",
+                    &[
+                        ("residual", w.h.buffer.ptr),
+                        ("delta0", w.delta.buffer.ptr),
+                        ("delta1", w.delta.buffer.ptr),
+                        ("weight", engine.weights.layers[3].ptr("post_norm")?),
+                        ("out", w.x.buffer.ptr),
+                    ],
+                    &[Scalar::I32(rows as i32), Scalar::I32(1)],
                 )?;
                 let actual = engine.download(&w.h, rows * h * 2)?;
                 let ids = engine.download(&w.route_ids, rows * engine.cfg.topk * 4)?;

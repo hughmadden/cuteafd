@@ -188,7 +188,7 @@ pub struct GlmInputs<'a> {
     pub gpus: Vec<(u64, Baseline)>,
     pub headroom_bytes: u64,
     pub spark_ranks: usize,
-    /// Native rotated F16 ingress, F32 rank/shared partials and bounded shared execution.
+    /// Native FP8 K32 ingress, BF16 partials and bounded per-GPU shared execution.
     pub native_experts: bool,
     pub native_workspace: u64,
     /// Coordinator-only diagnostics replace routed FFNs with zero intake planes.
@@ -254,10 +254,9 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
     }
     if inputs.native_experts && (inputs.prefill_lanes != 1
         || inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
-        || (gpus == 2 && inputs.spark_ranks != 4)
         || !inputs.experts.is_empty() || inputs.drafter_bytes != 0 || inputs.scratch.is_none()
         || inputs.native_workspace == 0) {
-        return Err(PlacementError::Inventory("EXLR8 requires serial measured workspaces, real Spark experts and TP4 on two coordinators"));
+        return Err(PlacementError::Inventory("EXLR8 requires serial measured workspaces, real Spark experts and 1..=6 ranks"));
     }
     let geometry = glm_cache_geometry(cfg, inputs.layers, gpus)
         .map_err(|_| PlacementError::Inventory("GLM cache geometry"))?;
@@ -300,17 +299,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 (bytes, Basis::Estimated)
             }
         };
-        let steps = if rank == 0 && inputs.native_experts {
-            // Replace FP8 wire/BF16 shared allocations with native widths, plus
-            // one rank-pointer table per workspace. Each allocation keeps its floor.
-            let extra = |rows: u64| {
-                let h = cfg.hidden as u64;
-                (rows * h * 2).max(FLOOR) - (rows * (h + h / 32)).max(FLOOR)
-                    + (rows * h * 4).max(FLOOR) - (rows * h * 2).max(FLOOR) + FLOOR
-            };
-            steps.checked_add(extra(DECODE_ROWS)).and_then(|bytes|
-                extra(inputs.prefill_rows).checked_mul(inputs.prefill_lanes).and_then(|v| bytes.checked_add(v)))
-                .and_then(|bytes| bytes.checked_add(inputs.native_workspace))
+        let steps = if inputs.native_experts {
+            steps.checked_add(inputs.native_workspace)
                 .ok_or(PlacementError::Overflow("GLM native workspaces"))?
         } else { steps };
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Workspace, "steps", steps, basis)));
@@ -333,7 +323,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             if inputs.spark_ranks > 0 {
                 let endpoints = 1 + if inputs.prefill_lanes > 1 { inputs.prefill_lanes } else { 0 };
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
-                    endpoints * inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * if inputs.native_experts { 4 } else { 2 }, Basis::Formula)));
+                    endpoints * inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * 2, Basis::Formula)));
             }
         }
         pool_overhead.push(table_bytes);
@@ -913,7 +903,7 @@ mod tests {
     const HEADS: Option<AttentionPlacement> = Some(AttentionPlacement::Heads);
 
     #[test]
-    fn native_rotated_workspaces_are_exact_and_unsupported_modes_refused() {
+    fn native_split_workspaces_are_exact_and_unsupported_modes_refused() {
         let cfg = config();
         let mut base = inputs(&cfg, &[96 * GIB]);
         base.prefill_lanes = 1;
@@ -925,13 +915,13 @@ mod tests {
         native.native_experts = true;
         native.native_workspace = 123456;
         let ordinary = request(&base).unwrap();
-        let rotated = request(&native).unwrap();
+        let split = request(&native).unwrap();
         let term = |request: &PlacementRequest, name: &str| request.fixed.iter()
             .find(|demand| demand.group == name).unwrap().bytes;
         let h = cfg.hidden as u64;
-        assert_eq!(term(&rotated, "steps") - term(&ordinary, "steps"),
-            (DECODE_ROWS + 65) * (h * 3 - h / 32) + 2 * FLOOR + 123456);
-        assert_eq!(term(&rotated, "Spark intake planes"), 4 * 4096 * h * 4);
+        assert_eq!(term(&split, "steps") - term(&ordinary, "steps"),
+            123456);
+        assert_eq!(term(&split, "Spark intake planes"), 4 * 4096 * h * 2);
         let mut invalid = native.clone(); invalid.prefill_lanes = 2;
         assert!(request(&invalid).is_err());
         let mut invalid = native.clone(); invalid.scratch = None;
@@ -940,7 +930,11 @@ mod tests {
         assert!(request(&invalid).is_err());
         let mut pair = native.clone(); pair.gpus.push(pair.gpus[0]);
         assert!(request(&pair).is_ok());
-        let mut invalid = pair; invalid.spark_ranks = 6;
+        for ranks in 1..=6 {
+            let mut supported = pair.clone(); supported.spark_ranks = ranks;
+            assert!(request(&supported).is_ok());
+        }
+        let mut invalid = pair; invalid.spark_ranks = 7;
         assert!(request(&invalid).is_err());
     }
 

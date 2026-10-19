@@ -189,7 +189,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if args.layout {
             use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};
             anyhow::ensure!(args.spark_tp.is_none() && args.spark_ep.is_none(),
-                "EXLR8 requires canonical TP4, not explicit ownership topology");
+                "EXLR8 requires canonical Spark wire, not explicit ownership topology");
             let dense = dense.as_deref().context("EXLR8 native layout requires --exlr8-dense-from")?;
             let mut native_options = options.clone();
             native_options.placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
