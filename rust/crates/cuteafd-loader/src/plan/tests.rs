@@ -1114,12 +1114,12 @@ fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
     tensors.extend([t("visual.blocks.0.norm.weight", "BF16", &[64]),
         t("audio_encoder.norm.weight", "BF16", &[64])]);
     let dir = snapshot_tp(config, &tensors, Some(4));
-    for (ranks, executable) in [(0, false), (2, true), (3, false), (4, true), (6, false)] {
+    for (ranks, executable) in [(0, false), (2, true), (3, true), (4, true), (6, false)] {
         let report = plan(dir.path(), &sparks(ranks)).unwrap();
         assert_eq!(report.executable(), executable, "{ranks}: {}", render(&report));
         let experts = report.experts.as_ref().unwrap();
         assert_eq!((experts.package.as_str(), experts.block, experts.spark_worlds.as_slice()),
-            ("mimof:fp8 (MXFP4)", 32, &[2, 4][..]));
+            ("mimof:fp8 (MXFP4)", 32, &[2, 3, 4][..]));
         assert_eq!(component(&report, Component::Vision).status, Status::Unused);
         assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("family mimof")));
         assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("follow checkpoint tensors")));
