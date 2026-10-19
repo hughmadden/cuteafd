@@ -384,9 +384,12 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
     ensure!(top1_margin.is_finite() && top1_margin > 0.0 && kl_margin.is_finite() && kl_margin > 0.0,
         "margins must be positive and finite");
     ensure!(bootstrap >= 100, "at least 100 bootstrap replicates required");
+    // A code A/B scores both arms with the same estimator against the same reference, so
+    // a reference-only set's uncalibrated estimator error cancels in the paired difference.
+    let code_change = matches!(pairing, Pairing::CodeChange);
     for run in [a, b] {
-        ensure!(run.kl_kind != "reference-only-top1024-plus-tail"
-            && !run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified"),
+        ensure!(code_change || (run.kl_kind != "reference-only-top1024-plus-tail"
+            && !run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified")),
             "reference-only qualified datasets lack paired engine calibration");
         if let Some(dataset) = &run.dataset {
             crate::fidelity_dataset::ensure_valid_publication(
@@ -406,7 +409,7 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
     }
     ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows && a.dataset == b.dataset,
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
-    let code = matches!(pairing, Pairing::CodeChange);
+    let code = code_change;
     ensure!(a.engine == b.engine && (code || a.settings.get("build") == b.settings.get("build"))
         && (cross || a.settings.get("snapshot") == b.settings.get("snapshot")), "runs use different engines, builds or snapshots");
     let checkpoints = match pairing {
@@ -625,6 +628,9 @@ mod tests {
             assert!(verdict(&scored).label.unwrap().contains("common policy floor"));
             assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).unwrap_err()
                 .to_string().contains("lack paired engine calibration"));
+            // A code A/B is not refused for calibration (this synthetic set fails later checks).
+            assert!(!compare_paired(&scored, &scored, 0.005, 0.005, 100, 1, Pairing::CodeChange)
+                .is_err_and(|e| e.to_string().contains("lack paired engine calibration")));
         }
     }
 
