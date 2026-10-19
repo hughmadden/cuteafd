@@ -595,7 +595,7 @@ mod tests {
         worker.snapshot = snapshot.clone();
         worker.exlr8_manifest = Some("up1".into());
         for endpoint in &mut worker.model_admission.as_mut().unwrap().endpoints {
-            endpoint.ingress = cuteafd_core::SparkIngress::Exlr8Rotated;
+            endpoint.ingress = cuteafd_core::SparkIngress::Fp8K32;
         }
         let identity = WorkerIdentity::from_snapshot_manifest(&snapshot, shape.geometry()?,
             worker.spark_world()?, Some("up1"))?;

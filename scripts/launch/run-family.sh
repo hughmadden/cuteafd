@@ -1634,7 +1634,7 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   [[ "$family" == glm5 ]] || release_die "EXLR8 is supported only for glm5"
   [[ "$exlr8_manifest" == up1 || "$exlr8_manifest" == bit325 ]] || release_die "EXLR8_MANIFEST must be up1 or bit325"
   [[ -n "$exlr8_dense" ]] || release_die "EXLR8_DENSE_FROM must name the compatible official GLM-5.3 FP8 snapshot"
-  [[ "$(get RTX_GPUS 1)" == 2 && "$ranks" == 4 ]] || release_die "EXLR8 requires two RTX GPUs and canonical TP4 Sparks"
+  [[ "$(get RTX_GPUS 1)" == 2 && "$ranks" -ge 1 && "$ranks" -le 6 ]] || release_die "EXLR8 requires two RTX GPUs and 1..6 canonical Spark ranks"
   [[ "$(get SPECULATOR off)" == off ]] || release_die "EXLR8 requires SPECULATOR=off"
   [[ "$(get RTX_EXPERT_LAYERS 0)" == 0 ]] || release_die "EXLR8 cannot onboard routed experts"
   [[ "$attention_placement" == auto || "$attention_placement" == context ]] || release_die "EXLR8 requires context attention"

@@ -324,7 +324,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         }
     };
     census.sample("after_retained_arenas", Some(&library))?;
-    let mut exchange = HostExpertExchange::with_output(config.capacity, config.exlr8_manifest.is_some())?;
+    let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];
     // Transport benchmarks only: answer each request with its response slot
     // as it is, without running the experts.

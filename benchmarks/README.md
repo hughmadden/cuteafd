@@ -79,6 +79,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## GLM 5.3
 
+- 2026-10-19 · Release smoke (supplementary, EXLR8 up1, speculation off; prefill foreign-traffic caveat) · kindlingai/glm-5.3-exlr8-k2-k3-k4 · 2× RTX PRO 6000 + 6× DGX Spark · build be747f19d113 · [report](glm5/2026-10-19-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-up1-max-cand-r1/report.svg)
 - 2026-10-18 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 · 1× RTX PRO 6000 @ gpu-powerd 335/510 W (265–600) + 4× DGX Spark · build v3.0.0-rc4 · [report](glm5/2026-10-18-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min/report.svg)
 - 2026-10-18 · Release smoke · nvidia/GLM-5.3-NVFP4 · 1× RTX PRO 6000 @ gpu-powerd 480/405 W (200–600) + 4× DGX Spark · build v3.0.0-rc4 · [report](glm5/2026-10-18-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min/report.svg)
 - 2026-10-15 · Release smoke · nvidia/GLM-5.3-NVFP4 · 2× RTX PRO 6000 @ gpu-powerd 450/445 W (395–500) + 6× DGX Spark · build 78d27e34a349 · [report](glm5/2026-10-15-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max/report.svg)
