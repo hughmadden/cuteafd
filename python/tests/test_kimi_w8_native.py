@@ -293,7 +293,7 @@ def test_w8_resource_and_timing_report(kind, width):
     with exportable_compilation():
         if kind == "residual":
             program = kimi_residual.compile_kimi_attn_res_rmsnorm_aot(
-                7168, width, "keep" if width == 1 else "add", width == 1, width != 1)
+                7168, width, "keep", width == 1, width != 1)
         else:
             program = kimi_residual.compile_kimi_situ_aot(width)
     program.export_to_c(str(directory), "kernel", "kimi_w8")
