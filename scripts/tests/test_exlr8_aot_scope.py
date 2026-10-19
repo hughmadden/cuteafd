@@ -129,6 +129,9 @@ def test_every_aot_switch_is_explicit_on_cmake():
         cmake = text[text.index('\ncmake \\\n'):]
         cmake = cmake[:cmake.index('\n', cmake.index('-DCUTEAFD_CUDA_ARCHITECTURES'))]
         assert '-DCUTEAFD_ENABLE_EXLR8_AOT=' in cmake
+        mode = 'WIP' if script == 'build-wip-artifacts.sh' else 'RELEASE'
+        assert ('-DCUTEAFD_ENABLE_KIMIK3_AOT="$( [[ "$role" == coordinator ]] && echo '
+                f'"${{CUTEAFD_{mode}_KIMIK3_AOT:-OFF}}" || echo OFF)"') in cmake
         assert '[@]+' not in cmake, f'{script}: conditional CMake argument arrays can leave cached values'
 
 
@@ -149,13 +152,13 @@ def test_spark_programs_manifest_is_installed_on_both_roles():
 
 def test_cmake_appends_exlr8_last_with_role_by_architecture():
     cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
-    assert cmake.index('if(CUTEAFD_ENABLE_STEP5_AOT)') < cmake.index('if(CUTEAFD_ENABLE_EXLR8_AOT)\n  # Last')
+    assert cmake.index('if(CUTEAFD_ENABLE_STEP5_AOT)') < cmake.index('if(CUTEAFD_ENABLE_KIMIK3_AOT)') < cmake.index('if(CUTEAFD_ENABLE_EXLR8_AOT)\n  # Last')
     assert 'set(CUTEAFD_EXLR8_ROLE coordinator)' in cmake and 'set(CUTEAFD_EXLR8_ROLE spark)' in cmake
     # SM121 builds only EXLR8 (never a family table) and only when asked.
     assert 'MATCHES "^121" AND CUTEAFD_ENABLE_EXLR8_AOT AND NOT CUTEAFD_FAMILY_PROGRAMS' in cmake
     assert 'list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --exlr8-role "${CUTEAFD_EXLR8_ROLE}")' in cmake
     top = (ROOT / 'native/CMakeLists.txt').read_text()
-    assert top.count('CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)') == 2  # include + link
+    assert top.count('CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)') == 2  # include + link
     assert 'CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)' in top  # SparkInfer AOT runtime
 
 
@@ -228,3 +231,24 @@ def test_release_inventory_requires_each_roles_exlr8_set(tmp_path):
 def test_launch_key_is_known():
     common = (ROOT / 'scripts/lib/release-common.sh').read_text()
     assert re.search(r'^\s+EXLR8_MANIFEST\) return 0 ;;', common, re.M)
+
+
+def test_kimi_build_key_changes_only_when_enabled():
+    base = {'PATH': '/usr/bin:/bin', 'CUTEAFD_WIP_GLM_AOT': 'ON'}
+    unset = build_key_lines(base)
+    assert 'KIMIK3' not in unset
+    assert build_key_lines({**base, 'CUTEAFD_WIP_KIMIK3_AOT': 'OFF'}) == unset
+    on = build_key_lines({**base, 'CUTEAFD_WIP_KIMIK3_AOT': 'ON'})
+    assert on != unset and 'CUTEAFD_WIP_KIMIK3_AOT=ON\n' in on
+
+
+def test_kimi_switch_is_forwarded_to_coordinator_and_native_dispatch():
+    wip = (ROOT / 'wip.sh').read_text()
+    assert '-e "CUTEAFD_WIP_KIMIK3_AOT=${CUTEAFD_WIP_KIMIK3_AOT:-OFF}"' in wip
+    build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    dispatch = next(line for line in build.splitlines() if line.startswith('elif [[ ( "$role" == coordinator'))
+    assert '${CUTEAFD_WIP_KIMIK3_AOT:-OFF}' in dispatch
+    cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
+    block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)', 1)[1].split('if(CUTEAFD_ENABLE_EXLR8_AOT)', 1)[0]
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3")' in block
