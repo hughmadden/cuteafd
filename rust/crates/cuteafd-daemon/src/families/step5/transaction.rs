@@ -335,8 +335,36 @@ fn abort<E: CopyEngine>(pool: &RefCell<PrefixCache<E, Frontier>>,
     release_at_publish(pool, family, pages)
 }
 
-/// Exclusively borrows the placement and lane through preparation, publication,
-/// or Drop. Shared prefix allocation owns every proposal page reference.
+/// Shared by the serving backend and prefix adapter. Taking before dropping
+/// avoids holding the RefCell borrow while an abandoned Step drains its owners.
+pub(super) struct Pending<T>(Rc<RefCell<Option<T>>>);
+
+impl<T> Clone for Pending<T> {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
+
+impl<T> Default for Pending<T> {
+    fn default() -> Self { Self(Rc::new(RefCell::new(None))) }
+}
+
+impl<T> Pending<T> {
+    pub(super) fn retire(&self) { drop(self.take()); }
+
+    pub(super) fn take(&self) -> Option<T> { self.0.borrow_mut().take() }
+
+    /// Verification cannot touch a reused slot until stale evidence is drained.
+    pub(super) fn verify<O>(&self, work: impl FnOnce() -> Result<(T, O)>) -> Result<O> {
+        self.retire();
+        let (evidence, output) = work()?;
+        let mut pending = self.0.borrow_mut();
+        ensure!(pending.is_none(), "Step-5 pending evidence already occupied");
+        *pending = Some(evidence);
+        Ok(output)
+    }
+}
+
+/// Exclusively borrows native lane owners through preparation, publication or
+/// Drop. Diagnostic steps also borrow a placement and shared page lease.
 pub(super) struct Step<'e, 'a, E: CopyEngine> {
     ranks: Vec<&'e RefCell<CacheRank<'a>>>,
     staging: Vec<&'e Staging<'a>>,
@@ -969,6 +997,75 @@ pub(super) mod tests {
     use super::*;
     use cuteafd_engine::prefix::{BoxError, PrefixConfig, PrefixFamily};
     use cuteafd_hostcache::copy::StubCopyEngine;
+
+    #[test]
+    fn failed_selection_retires_pending_before_same_slot_verification() -> Result<()> {
+        #[derive(Default)]
+        struct DeviceWork {
+            queued: Vec<u32>,
+            writes: Vec<u32>,
+            events: Vec<&'static str>,
+            busy: bool,
+            released: bool,
+        }
+        struct Evidence(Rc<RefCell<DeviceWork>>);
+        impl Drop for Evidence {
+            fn drop(&mut self) {
+                let mut work = self.0.borrow_mut();
+                // A Step may synchronize stale evidence, but never enqueue a
+                // write or release scheduler-owned page references on Drop.
+                assert!(work.queued.is_empty() || !work.released);
+                let queued = std::mem::take(&mut work.queued);
+                work.writes.extend(queued);
+                work.busy = false;
+                work.events.push("retire");
+            }
+        }
+        let pending = Pending::default();
+        let device = Rc::new(RefCell::new(DeviceWork::default()));
+        let mut pool = RefPagePool::new(1, 64);
+        let first = pool.alloc(1)?;
+        pending.verify(|| {
+            let mut work = device.borrow_mut();
+            work.busy = true;
+            work.queued.push(first[0]);
+            work.events.push("verify");
+            Ok((Evidence(device.clone()), ()))
+        })?;
+        // Selection fails before synchronization. The scheduler's failure path
+        // drains the family, then releases pages and the native sequence slot.
+        {
+            let mut work = device.borrow_mut();
+            work.events.push("selection failed");
+            let queued = std::mem::take(&mut work.queued);
+            work.writes.extend(queued);
+            work.events.push("family drain");
+        }
+        pool.release(&first);
+        device.borrow_mut().released = true;
+        device.borrow_mut().events.push("scheduler release");
+        let reused = pool.alloc(1)?;
+        assert_eq!(first, reused);
+        pending.verify(|| {
+            let mut work = device.borrow_mut();
+            assert!(!work.busy);
+            assert_eq!(work.writes, first);
+            assert_eq!(work.events.last(), Some(&"retire"));
+            work.released = false;
+            work.busy = true;
+            work.queued.push(reused[0]);
+            work.events.push("verify reused");
+            Ok((Evidence(device.clone()), ()))
+        })?;
+        assert_eq!(device.borrow().events, ["verify", "selection failed", "family drain",
+            "scheduler release", "retire", "verify reused"]);
+        assert_eq!(device.borrow().writes, first);
+        pending.retire();
+        assert_eq!(device.borrow().writes, [first[0], reused[0]]);
+        pool.release(&reused);
+        assert_eq!(pool.free(), 1);
+        Ok(())
+    }
 
     #[test]
     fn retained_wave_owns_descriptors_and_disjoint_pending_prefixes() {

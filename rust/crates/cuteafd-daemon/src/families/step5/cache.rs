@@ -105,10 +105,39 @@ impl<'a> CacheRank<'a> {
     }
 
     pub fn drain(&self) -> Result<()> {
-        for stream in self.lane_streams.borrow().iter().filter_map(Weak::upgrade) {
-            stream.drain()?;
+        super::execution::collect_lane_results(self.lane_streams.borrow().iter()
+            .filter_map(Weak::upgrade).map(|stream| stream.drain())
+            .chain(std::iter::once_with(|| self.stream.drain())))
+    }
+
+    pub(super) fn validate_reset(&self, sequence: u64) -> Result<()> {
+        self.check_idle(sequence)
+    }
+
+    /// Old KV and summaries remain masked by the zero frontier. Only canonical
+    /// lengths and both pending banks must be initialized before slot reuse.
+    pub(super) fn reset_sequence(&self, sequence: u64) -> Result<()> {
+        self.validate_reset(sequence)?;
+        self.drain()?;
+        let state = &self.layout.ranks[self.rank];
+        let spans = [state.length, state.next_length].into_iter()
+            .chain(state.mtp_lengths.iter().copied())
+            .chain(state.regions.iter().flat_map(|region| [region.pending_key,
+                region.pending_z, region.next_key, region.next_z]));
+        let mut guard = self.stream.cancellation_guard("Step-5 cold sequence reset");
+        for span in spans {
+            let target = self.request_component(span, sequence)?;
+            self.stream.device.run(|| {
+                // SAFETY: an idle private sequence owns these nonpaged banks;
+                // the guard drains errors before any state can be reused.
+                unsafe { self.stream.device.library.cuda_zero_bytes_async(
+                    target, target.bytes, self.stream.raw) }
+            })?;
         }
-        self.stream.drain()
+        self.stream.drain()?;
+        self.pending_bank[sequence as usize].set(false);
+        guard.complete = true;
+        Ok(())
     }
 
     pub fn bytes(&self) -> usize { self.reservation.total }
@@ -355,6 +384,38 @@ pub(super) mod tests {
             activation: Vec::new(), shared_activation: Vec::new(),
         };
         Step5CacheLayout::new(&config, ranks, context, mtp, step).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
+    fn native_cold_slot_reset_clears_both_banks_without_touching_other_slots() -> Result<()> {
+        // SAFETY: the selected library implements the native CUDA ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let layout = layout_for(65, 1, 3, 64);
+        let cache = CacheRank::new(device, layout.clone(), 0, 2, 1, 2, usize::MAX)?;
+        let initial = vec![0xa5; cache.active.buffer.bytes];
+        device.run(|| library.copy_h2d(cache.active.buffer, &initial))?;
+        cache.publish_bank(1);
+        cache.reset_sequence(1)?;
+        let mut actual = vec![0; initial.len()];
+        device.run(|| library.copy_d2h(&mut actual, cache.active.buffer))?;
+        let mut expected = initial;
+        let state = &layout.ranks[0];
+        for span in [state.length, state.next_length].into_iter()
+            .chain(state.mtp_lengths.iter().copied())
+            .chain(state.regions.iter().flat_map(|region| [region.pending_key,
+                region.pending_z, region.next_key, region.next_z])) {
+            let offset = usize::try_from(span.offset * 2 + span.bytes)?;
+            expected[offset..offset + usize::try_from(span.bytes)?].fill(0);
+        }
+        assert_eq!(actual, expected);
+        assert!(!cache.pending_bank[1].get());
+        cache.busy[1].set(true);
+        assert!(cache.reset_sequence(1).is_err());
+        cache.busy[1].set(false);
+        assert!(cache.reset_sequence(2).is_err());
+        Ok(())
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Dense-summary Step-5 storage adapter for the shared exact prefix pool.
 //! The executor still owns admission, page-table publication and committed lengths.
-use super::cache::CacheRank;
+use super::{cache::CacheRank, transaction::Pending};
 use anyhow::{ensure, Result};
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, Mark, MarkSlot, MarkStore, PageOwners,
     PrefixFamily, RestoreContext, RestorePlan, ReuseRule, TailCopy};
@@ -36,11 +36,12 @@ impl Frontier {
     }
 }
 
-pub(super) struct Step5Prefix<'e, 'a> {
+pub(super) struct Step5Prefix<'e, 'a, T = ()> {
     ranks: Vec<&'e RefCell<CacheRank<'a>>>,
     layout: FamilyLayout,
     sequences: u64,
     context: u64,
+    pending: Pending<T>,
 }
 
 fn range(buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> DeviceRange {
@@ -49,6 +50,12 @@ fn range(buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> DeviceRange {
 
 impl<'e, 'a> Step5Prefix<'e, 'a> {
     pub fn new(ranks: Vec<&'e RefCell<CacheRank<'a>>>) -> Result<Self> {
+        Self::with_pending(ranks, Pending::default())
+    }
+}
+
+impl<'e, 'a, T> Step5Prefix<'e, 'a, T> {
+    pub(super) fn with_pending(ranks: Vec<&'e RefCell<CacheRank<'a>>>, pending: Pending<T>) -> Result<Self> {
         ensure!(!ranks.is_empty(), "Step-5 prefix requires cache ranks");
         let first = ranks[0].borrow();
         let shape = first.layout().clone();
@@ -77,7 +84,7 @@ impl<'e, 'a> Step5Prefix<'e, 'a> {
         let layout = FamilyLayout { page_rows: 64, pages: usize::try_from(pages)?, page_bytes,
             mark_bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform };
-        Ok(Self { ranks, layout, sequences, context })
+        Ok(Self { ranks, layout, sequences, context, pending })
     }
 
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
@@ -104,7 +111,7 @@ impl<'e, 'a> Step5Prefix<'e, 'a> {
     }
 }
 
-impl PrefixFamily<Frontier> for Step5Prefix<'_, '_> {
+impl<T> PrefixFamily<Frontier> for Step5Prefix<'_, '_, T> {
     type Placement = Placement;
 
     fn layout(&self) -> FamilyLayout { self.layout }
@@ -113,7 +120,13 @@ impl PrefixFamily<Frontier> for Step5Prefix<'_, '_> {
     fn commit_point(&self, placement: &Placement) -> usize { placement.committed }
 
     fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        self.pending.retire();
         self.validate(placement, placement.committed)?;
+        if placement.committed == 0 {
+            for owner in &self.ranks { owner.borrow().validate_reset(placement.sequence)?; }
+            super::execution::collect_lane_results(self.ranks.iter()
+                .map(|owner| owner.borrow().reset_sequence(placement.sequence)))?;
+        }
         Ok(())
     }
 
@@ -134,6 +147,7 @@ impl PrefixFamily<Frontier> for Step5Prefix<'_, '_> {
     }
 
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut Placement, len: usize) -> Result<(), BoxError> {
+        self.pending.retire();
         let slot = mark.ok_or("Step-5 exact restore requires a positional mark")?;
         self.validate(placement, len)?;
         // Direct callers use local capture bookkeeping. Host-tier restores use
@@ -147,6 +161,7 @@ impl PrefixFamily<Frontier> for Step5Prefix<'_, '_> {
 
     fn restore_with(&self, mark: Option<&Mark>, saved: Option<&Frontier>, placement: &mut Placement,
         plan: &RestorePlan, _context: &RestoreContext<'_>) -> Result<(), BoxError> {
+        self.pending.retire();
         saved.ok_or("Step-5 retained mark frontier absent")?.validate_restore(placement, plan)?;
         let Some(Mark::Slot(slot)) = mark else {
             return Err("Step-5 exact restore requires an arena mark".into());
@@ -164,7 +179,7 @@ impl PrefixFamily<Frontier> for Step5Prefix<'_, '_> {
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        for owner in &self.ranks { owner.borrow().drain()?; }
+        super::execution::collect_lane_results(self.ranks.iter().map(|owner| owner.borrow().drain()))?;
         Ok(())
     }
 
@@ -185,6 +200,37 @@ mod tests {
     use crate::shared::memory::device::cache_test_device;
     use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
     use cuteafd_hostcache::copy::StubCopyEngine;
+
+    #[test]
+    fn prefix_entry_points_retire_pending_before_validation() -> Result<(), BoxError> {
+        use std::{cell::Cell, rc::Rc};
+        struct Evidence(Rc<Cell<usize>>);
+        impl Drop for Evidence {
+            fn drop(&mut self) { self.0.set(self.0.get() + 1); }
+        }
+        let retired = Rc::new(Cell::new(0));
+        let pending = Pending::default();
+        let family = Step5Prefix { ranks: Vec::new(), sequences: 0, context: 0,
+            layout: FamilyLayout { page_rows: 64, pages: 1, page_bytes: 64,
+                mark_bytes: 0, draft_bytes: 0, rule: ReuseRule::EXACT,
+                mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform },
+            pending: pending.clone() };
+        let mut placement = Placement { pages: vec![0], sequence: 0, committed: 1 };
+        pending.verify(|| Ok((Evidence(retired.clone()), ())))?;
+        assert!(family.bind(&mut placement).is_err());
+        assert_eq!(retired.get(), 1);
+        pending.verify(|| Ok((Evidence(retired.clone()), ())))?;
+        assert!(family.restore(None, &mut placement, 1).is_err());
+        assert_eq!(retired.get(), 2);
+        pending.verify(|| Ok((Evidence(retired.clone()), ())))?;
+        let plan = RestorePlan { snapshot_end: 1, target_end: 1,
+            lag: cuteafd_engine::prefix::LaggedState { source_end: 1, replay_start: 1 },
+            fidelity: cuteafd_engine::prefix::RestoreFidelity::Exact };
+        let context = RestoreContext { native_tokens: &[1], media: &[] };
+        assert!(family.restore_with(None, None, &mut placement, &plan, &context).is_err());
+        assert_eq!(retired.get(), 3);
+        Ok(())
+    }
 
     #[test]
     fn retained_frontier_requires_exact_plan_and_fresh_logical_destination() {
