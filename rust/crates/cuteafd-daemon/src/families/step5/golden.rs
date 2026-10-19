@@ -42,7 +42,7 @@ pub(crate) struct GoldenArgs {
     native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     manifest: PathBuf,
-    /// Pinned BF16 reference export containing meta.json and windows/ID/layerNN.bin.
+    /// Pinned official reference export containing meta.json and windows/ID/layerNN.bin.
     #[arg(long)]
     golden: PathBuf,
     #[arg(long)]
@@ -63,6 +63,12 @@ pub(crate) struct GoldenArgs {
     /// Score complete embedding-to-logits execution against the pinned BF16 reference.
     #[arg(long)]
     nll: bool,
+    /// Isolate engine error with native FP8 arithmetic; BF16 remains the fidelity root.
+    #[arg(long)]
+    fp8_diagnostic_reference: bool,
+    /// Compare retained outputs from the same cold target execution.
+    #[arg(long, value_delimiter = ',', requires = "nll", conflicts_with = "prefix_state")]
+    compare_layers: Vec<usize>,
     /// Compare real cold/shared-prefix canonical state and an identical continuation.
     #[arg(long, requires = "nll")]
     prefix_state: bool,
@@ -86,18 +92,33 @@ fn selected_layers() -> Result<Vec<usize>> {
         .collect()
 }
 
-fn reference_identity(meta: &Value) -> Result<()> {
+fn reference_identity(meta: &Value, fp8_diagnostic: bool) -> Result<()> {
+    let (checkpoint, revision) = if fp8_diagnostic {
+        ("stepfun-ai/Step-5-Preview", FP8_REVISION)
+    } else {
+        ("stepfun-ai/Step-5-Preview-BF16", BF16_REVISION)
+    };
     ensure!(
         meta["schema"] == "cuteafd.fidelity.golden/2"
             && meta["family"] == "step5"
-            && meta["checkpoint"] == "stepfun-ai/Step-5-Preview-BF16"
-            && meta["snapshot_identity"]["snapshot_revision"] == BF16_REVISION
+            && meta["checkpoint"] == checkpoint
+            && meta["snapshot_identity"]["snapshot_revision"] == revision
             && meta["mtp"] == false,
-        "Step-5 golden requires the pinned official BF16 target reference"
+        "Step-5 golden requires the explicitly selected pinned official target reference"
     );
+    if fp8_diagnostic {
+        ensure!(meta["diagnostic_only"] == true
+            && meta["fidelity_root"] == "stepfun-ai/Step-5-Preview-BF16"
+            && meta["expert_arithmetic"] == "official act_quant + block-scaled fp8_gemm"
+            && meta["diagnostic_bf16_set_sha256"].as_str().is_some_and(|s|
+                s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())),
+            "native FP8 diagnostic provenance missing or mismatched");
+    } else {
+        ensure!(meta["diagnostic_only"] != true, "diagnostic reference cannot replace fidelity root");
+    }
     let source = &meta["source_pin"];
     for (field, expected) in [
-        ("revision", BF16_REVISION),
+        ("revision", revision),
         (
             "model_sha256",
             "330a166878910b21e37f65669033a84fcaada3b58d7903fc16ef55c496cb1ea5",
@@ -148,6 +169,31 @@ struct Reference {
     tokens: Vec<u32>,
     expected: Vec<f32>,
     positions: Vec<usize>,
+    hidden: Vec<(usize, Vec<f32>)>,
+}
+
+fn hidden_reference(folder: &std::path::Path, layer: usize, full_rows: usize, rows: usize) -> Result<Vec<f32>> {
+    let bytes = std::fs::read(folder.join(format!("layer{layer:02}.bin")))?;
+    ensure!(bytes.len() == full_rows * H * 4, "reference layer shape must cover every input row");
+    let values: Vec<_> = bytes[..rows * H * 4].chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    ensure!(values.iter().all(|v| v.is_finite()), "nonfinite reference hidden payload");
+    Ok(values)
+}
+
+fn hidden_metrics(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
+    ensure!(!actual.is_empty() && actual.len() == expected.len()
+        && actual.iter().chain(expected).all(|v| v.is_finite()), "hidden comparison shape/finite mismatch");
+    let (mut error, mut norm, mut dot, mut ours) = (0., 0., 0., 0.);
+    for (&a, &b) in actual.iter().zip(expected) {
+        let (a, b) = (f64::from(a), f64::from(b));
+        error += (a - b).powi(2);
+        norm += b * b;
+        dot += a * b;
+        ours += a * a;
+    }
+    ensure!(norm > 0. && ours > 0., "zero hidden state norm");
+    Ok((dot / (norm * ours).sqrt(), (error / norm).sqrt()))
 }
 
 fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
@@ -160,7 +206,7 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
         "invalid golden window id"
     );
     let meta: Value = serde_json::from_slice(&std::fs::read(args.golden.join("meta.json"))?)?;
-    reference_identity(&meta)?;
+    reference_identity(&meta, args.fp8_diagnostic_reference)?;
     let tokenizer = format!(
         "{:x}",
         Sha256::digest(std::fs::read(args.snapshot.join("tokenizer.json"))?)
@@ -188,6 +234,13 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
         "cold Step-5 golden requires 1..4096 reference rows"
     );
     ensure!(tokens.iter().all(|&t| (t as usize) < vocab), "reference token outside vocabulary");
+    ensure!(args.compare_layers.iter().all(|&layer| layer <= args.last_layer)
+        && args.compare_layers.windows(2).all(|layers| layers[0] < layers[1])
+        && (args.compare_layers.is_empty() || (args.nll && !args.prefix_state)),
+        "hidden comparison layers must be increasing, executed, and use cold NLL mode");
+    let hidden = args.compare_layers.iter().map(|&layer|
+        Ok((layer, hidden_reference(&folder, layer, tokens.len(), rows)?)))
+        .collect::<Result<Vec<_>>>()?;
     let (expected, positions) = if args.nll {
         ensure!(entry["vocab"].as_u64() == Some(vocab as u64), "reference vocabulary mismatch");
         let positions = entry["positions"].as_array().context("missing scored positions")?.iter()
@@ -203,14 +256,11 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
         (bytes[..scored * vocab * 4].chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(), positions[..scored].to_vec())
     } else {
-        let bytes = std::fs::read(folder.join(format!("layer{:02}.bin", args.last_layer)))?;
-        ensure!(bytes.len() == tokens.len() * H * 4, "reference layer shape must cover every input row");
-        (bytes[..rows * H * 4].chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(), vec![])
+        (hidden_reference(&folder, args.last_layer, tokens.len(), rows)?, vec![])
     };
     ensure!(expected.iter().all(|v| v.is_finite()), "nonfinite reference payload");
     tokens.truncate(rows);
-    Ok(Reference { tokens, expected, positions })
+    Ok(Reference { tokens, expected, positions, hidden })
 }
 
 fn embedding_rows(checkpoint: &Checkpoint, tokens: &[u32], vocab: usize) -> Result<Vec<u8>> {
@@ -490,7 +540,8 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     );
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
-    let Reference { tokens, expected, positions } = reference(&args, cfg.vocab)?;
+    let Reference { tokens, expected, positions, hidden } = reference(&args, cfg.vocab)?;
+    let reference_kind = if args.fp8_diagnostic_reference { "native-FP8 diagnostic" } else { "BF16-root diagnostic" };
     let rows = tokens.len();
     ensure!(!args.prefix_state || (args.nll && args.last_layer == 91),
         "Step-5 prefix state check requires the complete target");
@@ -639,6 +690,13 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
         placement.committed == 0,
         "cold qualification must not publish target state"
     );
+    for (layer, expected) in hidden {
+        let bytes = read_buffer(device, chain.output(layer)?)?;
+        let actual: Vec<_> = bytes.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let (cosine, relative_l2) = hidden_metrics(&actual, &expected)?;
+        println!("Step-5 hidden ladder rows={rows} layer={layer} cosine={cosine:.9} relative_l2={relative_l2:.9} reference={reference_kind}");
+    }
     if let Some(head) = head {
         let actual = head.logits(chain.output(91)?)?;
         let ours = select_scored_rows(&actual, &positions, cfg.vocab)?;
@@ -646,7 +704,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
         let nll = scored_nll(&ours, &targets, cfg.vocab)?;
         let reference_nll = scored_nll(&expected, &targets, cfg.vocab)?;
         let (kl, max_kl) = scored_kl(&expected, &ours, cfg.vocab)?;
-        println!("Step-5 complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (pinned BF16-root diagnostic; no serving/lossless/cache qualification)", targets.len(), nll - reference_nll);
+        println!("Step-5 complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (pinned {reference_kind}; no serving/lossless/cache qualification)", targets.len(), nll - reference_nll);
         return Ok(());
     }
     let mut bytes = vec![0; rows * H * 4];
@@ -659,20 +717,8 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
         actual.iter().all(|v| v.is_finite()),
         "nonfinite Step-5 prefix result"
     );
-    let error = actual
-        .iter()
-        .zip(&expected)
-        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
-        .sum::<f64>();
-    let norm = expected.iter().map(|&b| f64::from(b).powi(2)).sum::<f64>();
-    let dot = actual
-        .iter()
-        .zip(&expected)
-        .map(|(&a, &b)| f64::from(a) * f64::from(b))
-        .sum::<f64>();
-    let ours = actual.iter().map(|&a| f64::from(a).powi(2)).sum::<f64>();
-    ensure!(norm > 0. && ours > 0., "zero hidden state norm");
-    println!("Step-5 prefix rows={rows} layer {}: cosine {:.9} relative_l2 {:.9} (BF16-root diagnostic only; no NLL/KL/full-forward qualification)", args.last_layer, dot / (norm * ours).sqrt(), (error / norm).sqrt());
+    let (cosine, relative_l2) = hidden_metrics(&actual, &expected)?;
+    println!("Step-5 prefix rows={rows} layer {}: cosine {cosine:.9} relative_l2 {relative_l2:.9} ({reference_kind} only; no NLL/KL/full-forward qualification)", args.last_layer);
     Ok(())
 }
 
@@ -726,7 +772,7 @@ mod tests {
     #[test]
     fn reference_requires_pinned_source_and_prefix_proof() {
         let meta = reference_meta();
-        reference_identity(&meta).unwrap();
+        reference_identity(&meta, false).unwrap();
         for pointer in [
             "/source_pin/model_sha256",
             "/snapshot_identity/config_sha256",
@@ -737,8 +783,43 @@ mod tests {
         ] {
             let mut invalid = meta.clone();
             *invalid.pointer_mut(pointer).unwrap() = Value::Null;
-            assert!(reference_identity(&invalid).is_err(), "{pointer}");
+            assert!(reference_identity(&invalid, false).is_err(), "{pointer}");
         }
+    }
+    #[test]
+    fn native_fp8_reference_requires_explicit_diagnostic_provenance() {
+        let mut meta = reference_meta();
+        assert!(reference_identity(&meta, true).is_err());
+        meta["checkpoint"] = "stepfun-ai/Step-5-Preview".into();
+        meta["snapshot_identity"]["snapshot_revision"] = FP8_REVISION.into();
+        meta["prefix_qualification"]["snapshot_identity"] = meta["snapshot_identity"].clone();
+        meta["source_pin"]["revision"] = FP8_REVISION.into();
+        meta["diagnostic_only"] = true.into();
+        meta["fidelity_root"] = "stepfun-ai/Step-5-Preview-BF16".into();
+        meta["expert_arithmetic"] = "official act_quant + block-scaled fp8_gemm".into();
+        meta["diagnostic_bf16_set_sha256"] = "c".repeat(64).into();
+        reference_identity(&meta, true).unwrap();
+        assert!(reference_identity(&meta, false).is_err());
+        for field in ["diagnostic_only", "fidelity_root", "expert_arithmetic", "diagnostic_bf16_set_sha256"] {
+            let mut bad = meta.clone();
+            bad[field] = Value::Null;
+            assert!(reference_identity(&bad, true).is_err(), "{field}");
+        }
+        let mut bad = reference_meta();
+        bad["diagnostic_only"] = true.into();
+        assert!(reference_identity(&bad, false).is_err());
+    }
+    #[test]
+    fn hidden_comparison_checks_geometry_finite_values_and_norms() -> Result<()> {
+        assert_eq!(hidden_metrics(&[1., 2.], &[1., 2.])?, (1., 0.));
+        assert_eq!(hidden_metrics(&[2., 4.], &[1., 2.])?, (1., 1.));
+        assert!(hidden_metrics(&[], &[]).is_err());
+        assert!(hidden_metrics(&[1.], &[1., 2.]).is_err());
+        assert!(hidden_metrics(&[f32::NAN], &[1.]).is_err());
+        assert!(hidden_metrics(&[1.], &[f32::INFINITY]).is_err());
+        assert!(hidden_metrics(&[0.], &[1.]).is_err());
+        assert!(hidden_metrics(&[1.], &[0.]).is_err());
+        Ok(())
     }
     #[test]
     fn reference_reader_checks_extents_tokenizer_and_finite_rows() -> Result<()> {
@@ -776,6 +857,8 @@ mod tests {
             check_headers: true,
             nll: false,
             prefix_state: false,
+            fp8_diagnostic_reference: false,
+            compare_layers: vec![],
         };
         let Reference { tokens, expected: hidden, .. } = reference(&args, 3)?;
         assert_eq!(tokens, [1]);
@@ -818,12 +901,26 @@ mod tests {
         std::fs::write(folder.join("logits.bin"), &logits)?;
         let mut args = GoldenArgs { snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
-            peers: vec![], last_layer: 91, prefill: None, device: 0, check_headers: true, nll: true, prefix_state: false };
+            peers: vec![], last_layer: 91, prefill: None, device: 0, check_headers: true, nll: true, prefix_state: false,
+            fp8_diagnostic_reference: false, compare_layers: vec![] };
         let full = reference(&args, 3)?;
         assert_eq!(full.positions, [1, 3]);
         let targets = full.positions.iter().map(|&p| full.tokens[p]).collect::<Vec<_>>();
         assert_eq!(targets, [1, 2]);
         assert!(scored_nll(&full.expected, &targets, 3)? < 0.02);
+        std::fs::write(folder.join("layer03.bin"), vec![1f32; 4 * H].into_iter()
+            .flat_map(f32::to_le_bytes).collect::<Vec<_>>())?;
+        args.compare_layers = vec![3];
+        let ladder = reference(&args, 3)?;
+        assert_eq!(ladder.hidden[0], (3, vec![1.; 4 * H]));
+        for invalid in [vec![3, 3], vec![4, 3], vec![92], vec![10]] {
+            args.compare_layers = invalid;
+            assert!(reference(&args, 3).is_err());
+        }
+        args.compare_layers = vec![3];
+        args.prefill = Some(3);
+        assert_eq!(reference(&args, 3)?.hidden[0].1.len(), 3 * H);
+        args.compare_layers.clear();
         args.prefill = Some(3);
         let partial = reference(&args, 3)?;
         assert_eq!(partial.positions, [1]);
