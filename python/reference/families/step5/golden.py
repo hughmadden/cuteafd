@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pinned Step-5 BF16 text reference, layer-major and target-only (layers 0-91).
 
+An explicit native-FP8 diagnostic isolates engine error; BF16 remains the fidelity root.
 Uses the release's decoder, FP32 norms/residual/router, clamped SwiGLU, CSA,
 E4M3 indexer, region selector and sparse GQA kernels. Only execution geometry
 changes: fixed-M128 linears and bounded query blocks. SSMax is inactive in the
@@ -20,10 +21,12 @@ import time
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import (CheckpointStorage, finish_golden, load_set,
-                              release_checkpoint, verify_snapshot, write_scored_logits)
+                              release_checkpoint, set_hash, verify_snapshot, write_scored_logits)
 
 CHECKPOINT = "stepfun-ai/Step-5-Preview-BF16"
 REVISION = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1"
+FP8_CHECKPOINT = "stepfun-ai/Step-5-Preview"
+FP8_REVISION = "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc"
 SOURCE_PINS = {
     "model.py": "330a166878910b21e37f65669033a84fcaada3b58d7903fc16ef55c496cb1ea5",
     "kernel.py": "2cd01d57d2d135397d2fd36c203684af7564b5e6c6f5d3853b3d35bedeb548be",
@@ -54,14 +57,71 @@ class SparsePrefillLaunch:
         return invoke
 
 
-def verify_source(snapshot):
-    if snapshot.name != REVISION:
-        raise ValueError("Step-5 reference requires the pinned official BF16 revision")
+def verify_source(snapshot, fp8_diagnostic=False):
+    revision = FP8_REVISION if fp8_diagnostic else REVISION
+    if snapshot.name != revision:
+        raise ValueError("Step-5 reference requires the pinned official revision for its mode")
     pins = {name: hashlib.sha256((snapshot / "inference" / name).read_bytes()).hexdigest()
             for name in SOURCE_PINS}
     if pins != SOURCE_PINS:
         raise ValueError("Step-5 official inference source differs from the pinned release")
-    return {"revision": REVISION, **{name.removesuffix(".py") + "_sha256": pin for name, pin in pins.items()}}
+    return {"revision": revision, **{name.removesuffix(".py") + "_sha256": pin for name, pin in pins.items()}}
+
+
+def reference_manifest(args):
+    """Rebind identical BF16-root tokens to the pinned FP8 arm, diagnostic only."""
+    import copy
+    manifest = load_set(args.windows, "step5")
+    if not args.fp8_diagnostic:
+        return manifest
+    original = manifest.get("diagnostic_bf16_set_sha256", manifest["set_sha256"])
+    if "diagnostic_bf16_set_sha256" not in manifest:
+        if manifest["checkpoint"] != CHECKPOINT:
+            raise ValueError("FP8 diagnostic input must originate from the BF16 fidelity root")
+        arm = manifest.get("reference_snapshot", manifest.get("generation_arm", {}))
+        if arm.get("snapshot_revision") != REVISION:
+            raise ValueError("FP8 diagnostic requires pinned BF16 input provenance")
+    tokenizer = hashlib.sha256((args.snapshot / "tokenizer.json").read_bytes()).hexdigest()
+    if manifest.get("tokenizer_sha256") not in (None, tokenizer):
+        raise ValueError("FP8 diagnostic tokenizer differs from the BF16 input tokens")
+    manifest = copy.deepcopy(manifest)
+    manifest["checkpoint"] = FP8_CHECKPOINT
+    manifest["diagnostic_bf16_set_sha256"] = original
+    manifest["reference_snapshot"] = {
+        "checkpoint": FP8_CHECKPOINT, "precision": "fp8",
+        "snapshot_revision": FP8_REVISION,
+        "tokenizer_sha256": hashlib.sha256((args.snapshot / "tokenizer.json").read_bytes()).hexdigest(),
+        "config_sha256": hashlib.sha256((args.snapshot / "config.json").read_bytes()).hexdigest(),
+    }
+    manifest["set_sha256"] = set_hash(manifest)
+    return manifest
+
+
+def fixed_fp8_rows(function):
+    """Keep official FP8 GEMM M fixed across routed-count changes, no math substitution."""
+    def linear(x, weight, scale):
+        if scale is None:
+            return function(x, weight, scale)
+        import torch
+        from shape_invariant import ROWS
+        flat = x.reshape(-1, x.shape[-1])
+        if not len(flat):
+            return function(x, weight, scale)
+        result = []
+        for start in range(0, len(flat), ROWS):
+            count = min(ROWS, len(flat) - start)
+            padded = flat.new_zeros((ROWS, flat.shape[-1]))
+            padded[:count].copy_(flat[start:start + count])
+            result.append(function(padded, weight, scale)[:count])
+        return torch.cat(result).reshape(*x.shape[:-1], weight.shape[0])
+    return linear
+
+
+def validate_config(config, fp8_diagnostic=False):
+    expected = list(range(3, 88)) if fp8_diagnostic else []
+    quantized = [i for i in config.moe_layer_list if config.is_fp8_expert_layer(i)]
+    if config.num_hidden_layers != 92 or config.tp != 1 or quantized != expected:
+        raise ValueError("Step-5 reference target geometry or native expert format differs")
 
 
 def verify_runtime_source():
@@ -79,9 +139,9 @@ def verify_runtime_source():
             "transformers_source_tree_sha256": lock["source_tree_sha256"]}
 
 
-def load_release(snapshot):
+def load_release(snapshot, fp8_diagnostic=False):
     """Import only hash-checked release modules, never an arbitrary remote package."""
-    verify_source(snapshot)
+    verify_source(snapshot, fp8_diagnostic)
     previous = {name: sys.modules.get(name) for name in ("kernel", "vision_encoder")}
     modules = {}
     try:
@@ -95,6 +155,9 @@ def load_release(snapshot):
             modules[name] = module
         modules["kernel"]._sparse_attn_prefill_kernel = SparsePrefillLaunch(
             modules["kernel"]._sparse_attn_prefill_kernel)
+        if fp8_diagnostic:
+            modules["model"].linear_fp8_or_bf16 = fixed_fp8_rows(
+                modules["kernel"].linear_fp8_or_bf16)
     finally:
         for name, module in previous.items():
             if module is None:
@@ -259,7 +322,7 @@ class Weights:
                 value = self.get(name)
                 target = parameters[name.removeprefix(prefix)]
                 if value.dtype != target.dtype or value.shape != target.shape:
-                    raise ValueError(f"{name}: shape/dtype differs from the native BF16 reference")
+                    raise ValueError(f"{name}: shape/dtype differs from the native reference")
                 target.copy_(value)
                 del value
         release_checkpoint(torch.cuda, self)
@@ -274,7 +337,7 @@ def run_windows(args, ref, kernel, config, weights, extent):
     import platform
     from shape_invariant import qualify
 
-    manifest = load_set(args.windows, "step5")
+    manifest = reference_manifest(args)
     identity = verify_snapshot(manifest, args.snapshot)
     args.out.mkdir(parents=True, exist_ok=True)
     proof = qualify(args, manifest, lambda probe: run_windows(probe, ref, kernel, config, weights, extent))
@@ -341,10 +404,16 @@ def run_windows(args, ref, kernel, config, weights, extent):
             states[i] = None
             del logits, hidden, targets
     finish_golden(args.out, manifest, entries, snapshot_identity=identity, prefix_qualification=proof,
-                  reference="pinned official Step-5 BF16 target decoder; fixed-M128; bounded eager SWA and official sparse GQA",
-                  source_pin={**verify_source(args.snapshot), **args.runtime_source}, seconds=time.monotonic() - started,
+                  reference=("DIAGNOSTIC official Step-5 native FP8 target decoder; act_quant and block-scaled fp8_gemm"
+                             if args.fp8_diagnostic else
+                             "pinned official Step-5 BF16 target decoder; fixed-M128; bounded eager SWA and official sparse GQA"),
+                  diagnostic_only=args.fp8_diagnostic, fidelity_root=CHECKPOINT,
+                  diagnostic_bf16_set_sha256=manifest.get("diagnostic_bf16_set_sha256"),
+                  expert_arithmetic="official act_quant + block-scaled fp8_gemm" if args.fp8_diagnostic else "BF16",
+                  source_pin={**verify_source(args.snapshot, args.fp8_diagnostic), **args.runtime_source}, seconds=time.monotonic() - started,
                   seconds_per_layer=times, nll=loss / total, scored_tokens=total, mtp=False,
-                  use_cache=False, attention="eager", ssmax="checkpoint-only; inactive", dtype="bf16",
+                  use_cache=False, attention="eager", ssmax="checkpoint-only; inactive",
+                  dtype="native_fp8_experts_bf16_tails" if args.fp8_diagnostic else "bf16",
                   native_fp32_parameters="norms, indexer weights, router bias and residual stream",
                   gates={"head": "sigmoid", "ffn": "post-SiLU clamp 7; FP32 product"},
                   sparse_attention_launch=SPARSE_LAUNCH,
@@ -360,28 +429,37 @@ def main():
     parser.add_argument("--windows", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="*")
+    parser.add_argument("--fp8-diagnostic", action="store_true",
+                        help="Pinned native FP8 comparison only; never replaces the BF16 fidelity root")
+    parser.add_argument("--cuda-memory-cap-gib", type=float, default=32,
+                        help="Torch allocator cap, GiB (0 < cap <= 64)")
     parser.add_argument("--prefix-only", action="store_true")
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
-    verify_source(args.snapshot)
-    manifest = load_set(args.windows, "step5")
+    verify_source(args.snapshot, args.fp8_diagnostic)
+    if not 0 < args.cuda_memory_cap_gib <= 64:
+        parser.error("CUDA allocator cap must be greater than zero and at most 64 GiB")
+    manifest = reference_manifest(args)
     identity = verify_snapshot(manifest, args.snapshot)
-    if identity.get("checkpoint") != CHECKPOINT:
-        parser.error("reference manifest must name the official BF16 root")
+    expected = FP8_CHECKPOINT if args.fp8_diagnostic else CHECKPOINT
+    if manifest["checkpoint"] != expected:
+        parser.error("reference manifest checkpoint differs from selected mode")
     args.runtime_source = verify_runtime_source()
-    ref, kernel = load_release(args.snapshot)
+    ref, kernel = load_release(args.snapshot, args.fp8_diagnostic)
     payload = json.loads((args.snapshot / "config.json").read_text())["text_config"]
     config = ref.Step5Config(**payload)
-    if (config.num_hidden_layers != 92 or config.tp != 1
-            or any(config.is_fp8_expert_layer(i) for i in config.moe_layer_list)):
-        parser.error("reference requires all 92 target layers and native BF16 expert weights")
+    validate_config(config, args.fp8_diagnostic)
     if args.check_only:
         print(json.dumps(dict(snapshot_identity=identity,
-                              source_pin={**verify_source(args.snapshot), **args.runtime_source},
+                              source_pin={**verify_source(args.snapshot, args.fp8_diagnostic), **args.runtime_source},
                               sparse_attention_launch=SPARSE_LAUNCH)))
         return
     import torch
     from shape_invariant import install
+    total = torch.cuda.get_device_properties(0).total_memory
+    torch.cuda.set_per_process_memory_fraction(min(1., args.cuda_memory_cap_gib * 2**30 / total))
+    print(f"reference mode={'native-fp8-diagnostic' if args.fp8_diagnostic else 'bf16-fidelity-root'} "
+          f"torch_allocator_cap_gib={args.cuda_memory_cap_gib}", flush=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     install()
