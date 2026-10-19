@@ -63,8 +63,15 @@ pub const QWEN4: ExecutorModes = ExecutorModes { family: "qwen4", modes: &[WHOLE
 pub const STEP5: ExecutorModes = ExecutorModes { family: "step5", modes: &[WHOLE0, WHOLE1, LayerMode::HeadSplit],
     hops: true, attention: AttentionPlacement::Heads };
 
+/// Kimi: TP2 KDA, alternating whole MLA owners and split dense/shared FFNs.
+pub const KIMI_K3: ExecutorModes = ExecutorModes { family: "kimi_k3",
+    modes: &[LayerMode::HeadSplit,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }],
+    hops: true, attention: AttentionPlacement::Layers };
+
 /// Every family's executor set, for lookups by family name.
-pub const EXECUTORS: [ExecutorModes; 7] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4, STEP5];
+pub const EXECUTORS: [ExecutorModes; 8] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4, STEP5, KIMI_K3];
 
 pub fn executor(family: &str) -> Option<ExecutorModes> {
     EXECUTORS.into_iter().find(|e| e.family == family)
