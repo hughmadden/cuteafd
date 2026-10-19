@@ -134,6 +134,10 @@ def test_score_and_held_out_fit(tmp_path):
         row = result['held_out'][split]['all decode']
         assert row['granularity bound']['mean'] <= row['fitted']['mean'] + 1e-12
     assert 'C1 rows=1' in result['in_sample']
+    fine = tp.score(waves, GLM, 6, fit=False, fine_unit=32)['in_sample']['all decode']
+    # Contiguous K32 slices: 11 of 64 units on the heavy ranks, every wave.
+    assert fine['contiguous u32']['mean'] == pytest.approx(11 / 64)
+    assert fine['layer-rotation u32']['mean'] == pytest.approx(11 / 64)
 
 
 def test_score_falls_back_to_row_buckets_without_request_ids(tmp_path):

@@ -311,10 +311,18 @@ def fit_matrices(waves: Waves, view: str, select: np.ndarray, geometry: Geometry
     return out
 
 
-def score(waves: Waves, geometry: Geometry, world: int, fit: bool = True, passes: int = 3) -> dict:
+def score(waves: Waves, geometry: Geometry, world: int, fit: bool = True, passes: int = 3,
+          fine_unit: int | None = None) -> dict:
+    """In-sample shares per wave group for every static rule (plus, with
+    `fine_unit`, the contiguous and layer-rotated slices at that finer unit,
+    e.g. 32 for MXFP4's K32 scale groups), then the held-out fit."""
     layers = np.unique(waves.layer)
     groups = wave_groups(waves)
     rules = {r: static_matrices(r, geometry, world, layers) for r in STATIC_RULES}
+    if fine_unit:
+        fine = Geometry(geometry.experts, geometry.intermediate, fine_unit)
+        for r in ('contiguous', 'layer-rotation'):
+            rules[f'{r} u{fine_unit}'] = static_matrices(r, fine, world, layers)
     result = {'geometry': geometry.__dict__, 'world': world, 'ideal': 1 / world, 'in_sample': {}, 'held_out': {}}
     for name, mask in groups.items():
         row = {}
@@ -492,6 +500,7 @@ def main(argv=None) -> int:
     s.add_argument('--unit', type=int, default=128)
     s.add_argument('--tp', type=int, default=6)
     s.add_argument('--no-fit', action='store_true')
+    s.add_argument('--fine-unit', type=int, help='also score contiguous slices at this unit (32: MXFP4 352/320)')
     s.add_argument('--passes', type=int, default=3)
     s.add_argument('--cache', type=Path, help='parsed-wave .npz cache (written when missing)')
     s.add_argument('--json', type=Path)
@@ -524,7 +533,7 @@ def main(argv=None) -> int:
         if not len(waves.layer):
             print('no decode waves with per-row routes', file=sys.stderr)
             return 2
-        result = score(waves, geometry, args.tp, fit=not args.no_fit, passes=args.passes)
+        result = score(waves, geometry, args.tp, fit=not args.no_fit, passes=args.passes, fine_unit=args.fine_unit)
         print(render_score(result))
     elif args.command == 'synthetic':
         result = synthetic(Geometry(args.experts, args.intermediate, args.unit), args.tp, args.unique, args.waves)
