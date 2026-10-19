@@ -429,9 +429,10 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
         "Quick and legacy Standard must be decode-shaped");
     ensure!(matches!(a.tier.as_str(), "quick" | "standard" | "standard-v2" | "full"), "unknown tier");
     if a.tier != "quick" {
-        ensure!(a.kl_kind == "full-vocabulary" || (a.kl_kind == "qualified-top1024-plus-tail"
-            && a.dataset.as_ref().is_some_and(|d| d["revision"].as_str().is_some_and(|r|
-                r.len() == 40 && r.bytes().all(|c| c.is_ascii_hexdigit())))),
+        let pinned = a.dataset.as_ref().is_some_and(|d| d["revision"].as_str().is_some_and(|r|
+            r.len() == 40 && r.bytes().all(|c| c.is_ascii_hexdigit())));
+        ensure!(a.kl_kind == "full-vocabulary" || (pinned && (a.kl_kind == "qualified-top1024-plus-tail"
+            || (code && a.kl_kind == "reference-only-top1024-plus-tail"))),
             "full tier requires full-vocabulary or revision-pinned qualified top1024 KL");
     }
     let (pa, pb) = (pairs(a)?, pairs(b)?);
