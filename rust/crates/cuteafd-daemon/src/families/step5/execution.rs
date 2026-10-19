@@ -481,6 +481,12 @@ impl<'e, 'a> Execution<'e, 'a> {
         self.only_lane()?.output(layer)
     }
     pub(super) fn head(&self) -> Result<&super::head::TargetHeadOwner<'a>> { self.only_lane()?.head() }
+    pub(super) fn lane_output(&self, lane: usize, layer: usize) -> Result<(Device<'a>, CuteafdDeviceBuffer)> {
+        self.lanes.get(lane).context("Step-5 output lane outside admission")?.output(layer)
+    }
+    pub(super) fn lane_head(&self, lane: usize) -> Result<&super::head::TargetHeadOwner<'a>> {
+        self.lanes.get(lane).context("Step-5 head lane outside admission")?.head()
+    }
     pub(super) fn diagnostic_layer0(&self, rank: usize) -> Result<(&SwaLayer<'a>, &DenseFfn<'a>)> {
         self.only_lane()?.diagnostic_layer0(rank)
     }
