@@ -29,7 +29,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     let mut prefixes = PrefixCache::disabled();
     let image_keys = super::prefix::media_keys(tokens, &[])?;
     let mut request = Active { constraint: None, ticket: console::Ticket::new(id, 0, None), lease,
-        job: NativeRequest { literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
+        job: NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None };
@@ -177,9 +177,22 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
         let memory = crate::shared::prefix::budget::host_memory()?;
         config.bytes = crate::shared::prefix::budget::resolve_bytes(layout, None,
             args.concurrency as usize, args.max_context_tokens as usize, config.chunk_bytes, memory)?;
+        anyhow::ensure!(config.bytes > 0,
+            "automatic host prefix quota resolves to zero; provide a positive quota or disable host retention explicitly");
         config.validate()?;
         tracing::info!(target: "cuteafd::host_cache", required_bytes=required, resolved_bytes=config.bytes,
             "automatic host cache budget (staging and snapshot overhead excluded from token capacity)");
+    }
+    let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
+        page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
+        draft_bytes: layout.draft_bytes as u64 };
+    let max_conversations = geometry.conversations(config.bytes, args.max_context_tokens as u64, config.chunk_bytes);
+    let conversations_50k = geometry.conversations(config.bytes, 50_000, config.chunk_bytes);
+    tracing::info!(mark_bytes = layout.mark_bytes, host_bytes = config.bytes,
+        conversations_max_context = max_conversations, conversations_50k, "host prefix capacity");
+    if config.enabled() && conversations_50k < args.concurrency as u64 + 4 {
+        tracing::warn!(conversations_50k, desired = args.concurrency + 4,
+            "host prefix quota holds fewer 50K conversations than concurrency plus four");
     }
     let host = if config.enabled() && args.prefix_cache_entries > 0 {
         let rows = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
@@ -194,7 +207,7 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
         Some((config, engine))
     } else { None };
     let entries = args.prefix_cache_entries as usize;
-    let prefix = cuteafd_engine::prefix::PrefixConfig { entries, mark_slots: if entries == 0 { 0 } else { 2 * entries + 2 },
+    let prefix = cuteafd_engine::prefix::PrefixConfig { entries, mark_slots: cuteafd_core::prefix::mark_slots_with_host(0, entries as u64, 1, u64::MAX, host.is_some()) as usize,
         keep_logits: true, min_tokens: 1 };
     PrefixCache::new(arenas, prefix, true, host, layout)
 }
@@ -389,6 +402,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     }
                     other => other?,
                 };
+                job.prefix_cache_source.set(restored.cached, restored.source.as_ref().is_some_and(|source| source.host));
                 if let Some(probe) = job.probe.as_ref().filter(|probe| probe.spec.record_state) {
                     if let Some(source) = &restored.source {
                         probe.provenance(serde_json::json!({"prefix_restore": source}));

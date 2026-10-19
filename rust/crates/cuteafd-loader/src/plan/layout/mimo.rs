@@ -225,8 +225,8 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         } else { 0 }
     } else { 0 };
     let mark = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>() + draft_mark;
-    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
-        concurrency, options.mimo_prefix_entries, mark, options.mimo_prefix_mark_bytes));
+    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
+        concurrency, options.mimo_prefix_entries, mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let graphs = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, options.mimo_decode_graphs)?;
     let output = if options.full_prefill_logits { MimoPrefillOutput::AllRows } else { MimoPrefillOutput::LastRow };
     let mut runtime = Vec::new();
@@ -452,7 +452,7 @@ mod tests {
                     let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
                     let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvCache::Int8, 0).unwrap();
                     let mark_bytes = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-                    let slots = cuteafd_core::prefix::mark_slots_for(4, opts.mimo_prefix_entries, mark_bytes, opts.mimo_prefix_mark_bytes);
+                    let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.mimo_prefix_entries, mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
                     let graph = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, graphs).unwrap();
                     let runtime = (0..ranks).map(|rank| {
                         let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4).unwrap();
@@ -599,7 +599,7 @@ mod tests {
                 let context = 256 << 10;
                 let sparks = if pro { 6 } else if ranks == 1 { 2 } else { 4 };
                 let opts = LayoutOptions { rtx_bytes: totals.clone(), head_split: ranks == 2,
-                    pool_tokens: Some(2 << 20), concurrency: 16, mimo_expert_manifest: Some(package),
+                    pool_tokens: Some(2 << 20), concurrency: 16, host_cache_bytes: Some(0), mimo_expert_manifest: Some(package),
                     ..Default::default() };
                 let costs = profile(&checkpoint, &opts, ranks, sparks, 4096, 16, context, None).unwrap();
                 let (experts, expert_workspace, tp2_workspace, onboard) =

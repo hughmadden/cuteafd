@@ -2632,7 +2632,7 @@ fn mimo_draft_prefix_ledger_is_opt_in_and_checked() {
     options.layout.as_mut().unwrap().mimo_prefix_draft = true;
     let marked = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     let bytes = marked.devices[0].items.iter().find(|i| i.group == "DFlash context marks").unwrap().bytes;
-    assert_eq!(bytes, (20 * (1 << 20) + 8) * 42);
+    assert_eq!(bytes, (20 * (1 << 20) + 8) * cuteafd_core::prefix::mark_slots_with_host(16, 20, 1, u64::MAX, true));
     assert_eq!(marked.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
     options.layout.as_mut().unwrap().draft_context_slots = Some(25);
     let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -3304,7 +3304,7 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     let marks = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].by_category()
         .get(&Category::Prefix).copied().unwrap_or(0);
     let layout = |rtx: u64, concurrency: u64| PlanOptions { layout: Some(layout::LayoutOptions { drafter_bytes: 256 << 20,
-        rtx_bytes: vec![rtx], concurrency, pool_tokens: Some(0), ..Default::default() }), ..sparks(4) };
+        rtx_bytes: vec![rtx], concurrency, pool_tokens: Some(0), host_cache_bytes: Some(0), ..Default::default() }), ..sparks(4) };
     // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: the 2C + 2 floor (18 at C8, 34 at C16).
     let mut config = glm5_flash_config(45);
     config["text_config"]["layer_types"] = json!((0..45)
@@ -3332,7 +3332,7 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     // since a two-GPU build with no manifest refuses `context`, #202); no entries, none.
     let knobs = |rtx: usize, entries: u64| PlanOptions { layout: Some(layout::LayoutOptions { drafter_bytes: 256 << 20,
         rtx_bytes: vec![96 << 30; rtx], concurrency: 5, pool_tokens: Some(0), mimo_prefix_entries: entries,
-        mimo_prefix_mark_bytes: 1971 << 20, ..Default::default() }),
+        mimo_prefix_mark_bytes: 1971 << 20, host_cache_bytes: Some(0), ..Default::default() }),
         attention_placement: Some(AttentionPlacement::Heads), ..sparks(4) };
     assert_eq!(cuteafd_core::prefix::mark_slots_for(5, 6, rank.retained_mark_bytes, 1971 << 20), 14);
     let one = plan(dir.path(), &knobs(1, 6)).unwrap().memory_layout.unwrap();
@@ -3360,7 +3360,7 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
     let dir = snapshot(config, &tensors);
     let layout = |pool_marks: bool, prefix_slots: Option<u64>| plan(dir.path(), &PlanOptions {
         layout: Some(layout::LayoutOptions { drafter_bytes: 256 << 20, rtx_bytes: vec![48 << 30], concurrency: 16, pool_tokens: Some(0),
-            glmf_pool_marks: pool_marks, prefix_slots, ..Default::default() }), ..sparks(4) })
+            glmf_pool_marks: pool_marks, prefix_slots, host_cache_bytes: Some(0), ..Default::default() }), ..sparks(4) })
         .unwrap().memory_layout.unwrap();
     let item = |memory: &cuteafd_core::memory_layout::MemoryLayout, group: &str| memory.devices[0].items.iter()
         .filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
@@ -3492,4 +3492,113 @@ fn ple_plan_counts_row_spaces_not_shards_or_global_scale() {
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.mapped_placement.label(), "PLE 2 mapped");
     assert_eq!(report.mapped_placement.scale_bytes, 0);
+}
+
+#[test]
+#[ignore = "CPU geometry ceilings; requires the release-smoke checkpoints under HF_HOME"]
+fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use crate::serving_capacity::{self as capacity, CacheOptions, GlmfIndexCache, KvPlacement};
+    use cuteafd_core::prefix::{HostCacheGeometry, mark_slots_for, mark_slots_with_host};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let matrix: Value = serde_json::from_slice(&std::fs::read(root.join("scripts/bench/release-smoke-v3.json"))?)?;
+    let hf = std::env::var_os("HF_HOME").context("set HF_HOME to the checkpoint cache")?;
+    let hub = std::path::PathBuf::from(hf).join("hub");
+    let gib = (1u64 << 30) as f64;
+    println!("Record-storage ceilings only: no weights, solver redistribution, pool ceilings or lane-table growth; TP2 auto assumes bundled context programs. Host RAM=128 GiB, auto cap=32 GiB. Capacities count one shared KV extent and old one/new two marks per conversation.");
+    println!("| Card | Layout | C | Context | Mark MiB/rank | Slots old/new | Arena GiB old/new aggregate | KV token ceiling gain | Host GiB old/new | Conversations max old/new | Conversations 50K old/new |");
+    println!("| --- | --- | ---: | ---: | --- | --- | --- | ---: | --- | --- | --- |");
+    for entry in matrix["entries"].as_array().context("smoke entries")? {
+        let name = entry["name"].as_str().context("card name")?;
+        let mut settings = BTreeMap::<String, String>::new();
+        for line in std::fs::read_to_string(root.join(entry["config"].as_str().context("card config")?))?.lines() {
+            if let Some((key, value)) = line.trim().split_once('=') {
+                if !key.starts_with('#') { settings.insert(key.to_owned(), value.to_owned()); }
+            }
+        }
+        for values in [&matrix["defaults"]["set"], &entry["set"]] {
+            if let Some(values) = values.as_object() {
+                for (key, value) in values { settings.insert(key.clone(), value.as_str().context("string setting")?.to_owned()); }
+            }
+        }
+        let model_id = settings.get("MODEL_ID").context("MODEL_ID")?;
+        let revision = settings.get("MODEL_REVISION").context("MODEL_REVISION")?;
+        let snapshot = hub.join(format!("models--{}", model_id.replace('/', "--"))).join("snapshots").join(revision);
+        let config = checkpoint::read_json(&snapshot.join("config.json"))?;
+        // Configuration geometry needs names to discover native stages, not tensor payloads/headers.
+        let index = checkpoint::read_json(&snapshot.join("model.safetensors.index.json"))?;
+        let checkpoint = Checkpoint { snapshot, config, quantize_config: None,
+            weight_map: serde_json::from_value(index["weight_map"].clone())?, tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
+        let family = family::detect(&checkpoint).context("recognized family")?;
+        let model = family.open(&checkpoint)?;
+        let id = family.id();
+        let ranks = entry["gpus"].as_array().context("card GPUs")?.len();
+        let number = |key: &str, default: u64| -> anyhow::Result<u64> {
+            settings.get(key).map(|s| s.parse().map_err(anyhow::Error::from)).unwrap_or(Ok(default))
+        };
+        let concurrency = number("CONCURRENCY", if name.ends_with("5090") { 8 } else { 16 })?;
+        let context = number("MAX_CONTEXT_TOKENS", capacity::checkpoint_context_limit(&checkpoint.config)?.context("checkpoint context")?)?;
+        let entries = number("PREFIX_CACHE_ENTRIES", 20)?;
+        let stages = match &model.spec().speculator {
+            Some(spec::SpeculatorSpec::NativeMtp { layers }) => *layers, _ => 0,
+        };
+        let attention = settings.get("ATTENTION_PLACEMENT").filter(|v| v.as_str() != "auto")
+            .map(|v| v.parse::<AttentionPlacement>().map_err(anyhow::Error::msg)).transpose()?
+            .unwrap_or(if ranks == 2 && matches!(id, "glm5_flash" | "deepseek_v4") {
+                AttentionPlacement::Context
+            } else { AttentionPlacement::Heads });
+        let mut options = CacheOptions { coordinator_ranks: ranks,
+            native_mtp_layers: if id == "deepseek_v4" { stages } else if id == "qwen4" { usize::from(stages > 0) } else { 0 },
+            ..Default::default() };
+        options.glmf_index = if ranks == 1 || attention == AttentionPlacement::Context { GlmfIndexCache::Compact } else { GlmfIndexCache::Keys };
+        let mut geometry = if id == "glm5_flash" {
+            let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config)?;
+            capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks, options.glmf_index, 4, options.glmf_decode_rows, attention, 0)?
+        } else { model.cache_geometry(options)?.context("family cache geometry")? };
+        if id == "deepseek_v41" && settings.get("SPECULATOR").is_some_and(|v| v == "dspark") {
+            geometry.ranks[0].retained_mark_bytes += 3 * 128 * 528;
+        }
+        if id == "deepseek_v4" && ranks == 2 && attention == AttentionPlacement::Context {
+            let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, stages)?;
+            let units: u64 = cfg.compress_ratios.iter().map(|&ratio| {
+                let bytes = capacity::deepseek_v4_layer_unit_bytes(ratio);
+                if ratio == 4 { bytes / 2 } else { bytes }
+            }).sum();
+            for rank in &mut geometry.ranks { rank.persistent_unit_bytes = units; }
+            geometry.placement = KvPlacement::PartitionedContext;
+        }
+        ensure!(!settings.get("MIMO_PREFIX_DRAFT").is_some_and(|v| v == "on"), "add bundled draft geometry before using this ceiling with draft prefix retention");
+        let mark: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+        let (lanes, budget) = if id == "deepseek_v41" { (0, u64::MAX) }
+            else { (concurrency, number("PREFIX_CACHE_MARK_MIB", 2048)? * (1 << 20)) };
+        let old_slots = mark_slots_for(lanes, entries, if id == "deepseek_v41" { 1 } else { mark }, budget);
+        let new_slots = mark_slots_with_host(lanes, entries, mark, budget, true);
+        let gain = geometry.ranks.iter().filter(|r| r.persistent_unit_bytes > 0)
+            .map(|r| (old_slots - new_slots) * r.retained_mark_bytes / (r.persistent_unit_bytes + r.pool_metadata_unit_bytes))
+            .min().unwrap_or(0) * geometry.logical_unit_rows;
+        let pages = if geometry.placement == KvPlacement::Replicated { &geometry.ranks[..1] } else { &geometry.ranks[..] };
+        let host = HostCacheGeometry { unit_rows: geometry.logical_unit_rows,
+            page_bytes: pages.iter().map(|r| r.persistent_unit_bytes).sum(), mark_bytes: mark, draft_bytes: 0 };
+        let chunk = host.chunk_bytes();
+        let packed = |n: u64, context: u64, marks: u64| -> u64 {
+            let pages = context.div_ceil(host.unit_rows) * n;
+            [(pages, host.page_bytes), (n * marks, mark.max(1))].into_iter()
+                .map(|(count, size)| count.div_ceil(chunk / size) * chunk).sum()
+        };
+        let old_quota = packed(concurrency + 4, context, 1).min(32 << 30) / chunk * chunk;
+        let new_quota = host.resolve(None, context, concurrency, 128 << 30, chunk).context("host quota")?;
+        let old_capacity = |quota: u64, context: u64| {
+            let (mut low, mut high) = (0, quota / host.page_bytes);
+            while low < high { let mid = low + (high - low) / 2 + 1;
+                if packed(mid, context, 1) <= quota { low = mid; } else { high = mid - 1; }
+            }
+            low
+        };
+        let rank_marks = geometry.ranks.iter().map(|r| format!("{:.3}", r.retained_mark_bytes as f64 / (1 << 20) as f64)).collect::<Vec<_>>().join("/");
+        println!("| {name} | {attention} | {concurrency} | {context} | {rank_marks} | {old_slots}/{new_slots} | {:.3}/{:.3} | {gain} | {:.3}/{:.3} | {}/{} | {}/{} |",
+            (mark * old_slots) as f64 / gib, (mark * new_slots) as f64 / gib, old_quota as f64 / gib, new_quota as f64 / gib,
+            old_capacity(old_quota, context), host.conversations(new_quota, context, chunk),
+            old_capacity(old_quota, 50_000), host.conversations(new_quota, 50_000, chunk));
+    }
+    Ok(())
 }

@@ -675,17 +675,9 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, a
     let family = GlmfPrefix::new(engine, marks, |mark| arena.slots(mark))?;
     anyhow::ensure!(family.slots() == engine.mark_slots, "the prefix mark arena holds {} marks of {} B, the KV \
         admission reserved {}", family.slots(), family.mark_bytes(), engine.mark_slots);
-    // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
-    // and marks on both GPUs, so it keeps device-resident snapshots only.
-    let host = if engine.ranks() > 1 {
-        if args.host_cache_bytes.enabled() && args.prefix_cache_entries > 0 {
-            tracing::warn!("GLM 5.3 Flash head split: the prefix cache's host tier is off (device-resident snapshots only)");
-        }
-        None
-    } else {
-        let template = engine.paged_buffers().first().map(|b| b.records).context("GLM 5.3 Flash has no MLA layer")?;
-        args.host_tier(engine.library, template, family.layout(), engine.max_context, concurrency)?
-    };
+    let host = args.host_config(family.layout(), engine.max_context, concurrency)?.map(|config|
+        CudaCopyEngine::registered_with_owners(engine.library, &family.buffers(), family.arena_owners())
+            .map(|copy| (config, copy))).transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     if marks == PrefixMarks::Pool && host.is_none() && entries > 0 {
@@ -1052,6 +1044,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             };
             let (super::media::Prompt { job, tokens, keys }, request_media) = ready.into_parts();
+            job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, "glm5_flash", &tokens, resume);
             prefix_state_probe(engine, &family, &admitted.placement, &job.probe, "admitted")?;
             let _ = job.events.send(Ok(InferenceChunk::Ready {

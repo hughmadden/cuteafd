@@ -680,6 +680,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let mut placement = admitted.placement;
             // Native ids and this request's grids rebuild positions on EVERY restore.
             engine.bind_request(&mut placement, rope, request_media, &tokens, resume);
+            job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, geometry.family, &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,

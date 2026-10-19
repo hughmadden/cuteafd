@@ -241,6 +241,18 @@ impl From<&str> for NativeFailure {
 const SSE_KEEPALIVE: std::time::Duration =
     std::time::Duration::from_millis(if cfg!(test) { 50 } else { 15_000 });
 
+/// Request-local prefix tier, published before the engine emits Ready.
+#[derive(Clone, Debug, Default)]
+pub struct PrefixCacheSource(Arc<std::sync::atomic::AtomicU8>);
+impl PrefixCacheSource {
+    pub fn set(&self, cached: usize, host: bool) {
+        self.0.store(if cached == 0 { 0 } else if host { 2 } else { 1 }, std::sync::atomic::Ordering::Release);
+    }
+    pub fn name(&self) -> &'static str {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) { 1 => "device", 2 => "host", _ => "miss" }
+    }
+}
+
 pub struct NativeRequest {
     pub prompt: String,
     pub literal_spans: cuteafd_loader::LiteralSpans,
@@ -262,6 +274,7 @@ pub struct NativeRequest {
     /// Benchmark diagnostics for this request (`probe::HEADER`); `None` for every ordinary client.
     pub probe: Option<Arc<probe::Probe>>,
     pub usage: Option<crate::usage::UsageHandle>,
+    pub prefix_cache_source: PrefixCacheSource,
 }
 impl NativeRequest {
     /// The single encoding boundary for every family's rendered chat requests.
@@ -967,6 +980,7 @@ pub(crate) struct Running {
     pub(crate) failure: Arc<Mutex<Option<String>>>,
     pub(crate) image_tokens: usize,
     pub(crate) audio_tokens: usize,
+    prefix_cache_source: PrefixCacheSource,
     /// The prompt usage and matched client stop string, observed as the
     /// generator sees them.
     pub(crate) tap: Arc<Mutex<Tap>>,
@@ -1024,7 +1038,9 @@ impl Submitter {
         // client that stops reading cannot stall the shared scheduler. A request's
         // backlog is bounded by its own max_tokens.
         let (events, mut receive) = mpsc::unbounded_channel();
+        let prefix_cache_source = PrefixCacheSource::default();
         let job = NativeRequest {
+            prefix_cache_source: prefix_cache_source.clone(),
             audio: prepared.audio,
             media: prepared.media,
             prompt,
@@ -1095,7 +1111,7 @@ impl Submitter {
                 }
             }
         };
-        Ok(Running { chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
+        Ok(Running { prefix_cache_source, chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
     }
 }
 
@@ -1158,7 +1174,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
 
 /// Render an accepted request as Chat Completions SSE or JSON.
 async fn respond(running: Running) -> Response {
-    let Running { chunks, failure, image_tokens, audio_tokens, streaming, include_usage, id, model, .. } = running;
+    let Running { chunks, failure, image_tokens, audio_tokens, prefix_cache_source, streaming, include_usage, id, model, .. } = running;
     if streaming {
         let stream = async_stream::stream! {
             let mut chunks = chunks;
@@ -1180,6 +1196,7 @@ async fn respond(running: Running) -> Response {
                     Ok(chunk) => {
                         let mut value = serde_json::to_value(&chunk).unwrap();
                         add_media_usage(&mut value, image_tokens, audio_tokens);
+                        add_prefix_source(&mut value, &prefix_cache_source);
                         if include_usage {
                             let taken = value.get_mut("usage").map(Value::take);
                             if let Some(usage) = taken.filter(Value::is_object) {
@@ -1232,9 +1249,9 @@ async fn respond(running: Running) -> Response {
     if let Some(message) = failure.lock().unwrap().clone() {
         return error(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
-    if image_tokens == 0 && audio_tokens == 0 { return Json(response).into_response(); }
     let mut value = serde_json::to_value(response).expect("chat response serializes");
     add_media_usage(&mut value, image_tokens, audio_tokens);
+    add_prefix_source(&mut value, &prefix_cache_source);
     Json(value).into_response()
 }
 
@@ -1261,6 +1278,30 @@ fn account_output(scope: &crate::usage::UsageHandle, chunk: &ChatChunk) {
         scope.stop(match reason { Finish::Stop => "stop", Finish::Length => "length",
             Finish::ContentFilter => "content_filter", Finish::ToolCalls => "tool_calls",
             Finish::InsufficientSystemResource => "insufficient_system_resource", Finish::Aborted => "cancelled" });
+    }
+}
+
+fn add_prefix_source(response: &mut Value, source: &PrefixCacheSource) {
+    if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
+        usage.insert("prefix_cache_source".into(), json!(source.name()));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prefix_source_is_request_local_and_additive_in_usage() {
+    let source = PrefixCacheSource::default();
+    let other = PrefixCacheSource::default();
+    for (cached, host, expected) in [(0, false, "miss"), (9, false, "device"), (9, true, "host")] {
+        source.clone().set(cached, host);
+        let mut value = json!({"usage": {"prompt_tokens": 12}, "choices": []});
+        add_prefix_source(&mut value, &source);
+        assert_eq!(value["usage"]["prefix_cache_source"], expected);
+        assert_eq!(value["usage"]["prompt_tokens"], 12);
+        assert_eq!(other.name(), "miss");
+        let mut delta = json!({"choices": []});
+        add_prefix_source(&mut delta, &source);
+        assert!(delta.get("usage").is_none(), "stream deltas must not gain usage");
     }
 }
 

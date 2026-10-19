@@ -619,7 +619,7 @@ fn host_tier_restores_evicted_snapshots_exactly_and_shares_identical_prefixes() 
     let (resume, _, mut p) = serve(&mut cache, &fake, 2, &next, &[], 40);
     assert_eq!(resume, first.len());
     let stats = cache.stats();
-    assert_eq!((stats.promotions, stats.host.unwrap().restores), (1, 1));
+    assert_eq!((stats.promotions, stats.mark_promotions, stats.host.unwrap().restores), (1, 0, 1));
     let mut longer = next.clone();
     longer.push(7);
     fake.forward(&mut p, &longer).unwrap();
@@ -837,7 +837,8 @@ fn torture_interleaved_conversations_stay_exact_and_leak_nothing() {
         // Idle: every used page belongs to a retained snapshot (its rows or its mark), every
         // mark to an entry.
         assert_eq!(stats.pages - stats.pages_free, stats.pages_retained, "{stats:?}");
-        assert_eq!(stats.marks_in_use, stats.entries_prompt + stats.entries_turn, "{stats:?}");
+        let retained_marks = if stats.host.is_some() { 0 } else { stats.entries_prompt + stats.entries_turn };
+        assert_eq!(stats.marks_in_use, retained_marks, "host-off retains marks; completed host writes free them: {stats:?}");
         assert_eq!(stats.mark_pages, if pooled { MARK_PAGES * stats.marks_in_use } else { 0 }, "{stats:?}");
         cache.clear(&fake).unwrap();
         assert_eq!((cache.pool().free(), cache.arena().in_use(), cache.stats().mark_pages), (40, 0, 0), "{stats:?}");
@@ -1057,7 +1058,7 @@ fn pool_page_marks_round_trip_exactly_on_the_device_and_through_the_host_tier() 
     let (resume, _, mut r) = serve(&mut cache, &fake, 2, &fork, &[], 40);
     assert_eq!(resume, next.len());
     let stats = cache.stats();
-    assert_eq!((stats.promotions, stats.host.unwrap().restores), (1, 1));
+    assert_eq!((stats.promotions, stats.mark_promotions, stats.host.unwrap().restores), (1, 1, 2));
     let mut longest = fork.clone();
     longest.push(9);
     fake.forward(&mut r, &longest).unwrap();
@@ -1212,17 +1213,23 @@ fn usage_provenance_survives_device_and_host_restore() {
     let prompt = seq(100,26);
     cache.capture_session(Some("creating-request".into()));
     let (_,_,p) = serve(&mut cache,&fake,0,&prompt,&[],40);
+    let device = cache.admit(&fake,&prompt,40,false,
+        |pages| Placement {pages,ring:1,len:0,ring_from:0}).unwrap();
+    let source = device.source.unwrap();
+    assert!(!source.host, "an in-flight mark is still a device hit");
+    assert_eq!(source.session.as_deref(), Some("creating-request"));
+    cache.release(&fake,&device.placement.pages).unwrap();
     fake.mem.borrow_mut().advance(10_000_000);
     cache.tick();
     cache.release(&fake,&p.pages).unwrap();
     cache.capture_session(Some("unrelated-request".into()));
     let mut next = prompt.clone(); next.extend(seq(200,5));
-    for host in [false,true] {
-        if host { cache.clear(&fake).unwrap(); }
+    for full in [false,true] {
+        if full { cache.clear(&fake).unwrap(); }
         let admitted = cache.admit(&fake,&next,40,false,|pages| Placement {pages,ring:1,len:0,ring_from:0}).unwrap();
         let source = admitted.source.unwrap();
         assert_eq!(source.session.as_deref(),Some("creating-request"));
-        assert_eq!(source.host,host);
+        assert!(source.host, "completed marks and full promotions both restore host bytes");
         cache.release(&fake,&admitted.placement.pages).unwrap();
     }
 }
@@ -1260,4 +1267,42 @@ fn private_step_forks_cow_abort_and_failures_preserve_live_lease() {
     fake.fail_copy.set(false);
     fake.forward(&mut placement, &tokens).unwrap();
     cache.release(&fake, &placement.pages).unwrap();
+}
+
+#[test]
+fn two_slot_host_working_set_retains_pages_and_promotes_only_marks_under_pressure() {
+    for pooled in [false, true] {
+        let fake = if pooled { Fake::pooled(160, 4) } else { Fake::new(160, 4, 2) };
+        let mut cache = cache(&fake, 12, 1 << 20);
+        let mut frontiers = Vec::new();
+        for i in 0..6 {
+            let prompt = seq(100 + i * 100, 13);
+            let generated = seq(1000 + i * 100, 3);
+            let (_, turn, p) = serve(&mut cache, &fake, 0, &prompt, &generated, 20);
+            cache.release(&fake, &p.pages).unwrap();
+            assert!(cache.stats().marks_in_use <= 2);
+            frontiers.extend([prompt, turn]);
+        }
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        assert_eq!(cache.stats().marks_in_use, 0);
+        assert_eq!(cache.stats().entries_prompt + cache.stats().entries_turn, 12);
+        assert!(cache.stats().capture_stalls > 0);
+        let pages_before = cache.stats().pages_retained;
+        for frontier in frontiers {
+            let mut next = frontier.clone();
+            next.push(9999);
+            let admitted = cache.admit(&fake, &next, 20, false,
+                |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+            assert_eq!(admitted.resume, frontier.len());
+            assert!(admitted.source.unwrap().host);
+            let mut p = admitted.placement;
+            fake.forward(&mut p, &next).unwrap();
+            cache.release(&fake, &p.pages).unwrap();
+            assert_eq!(cache.stats().marks_in_use, 0);
+        }
+        assert_eq!(cache.stats().pages_retained, pages_before);
+        assert_eq!((cache.stats().mark_promotions, cache.stats().promotions), (12, 0));
+        assert_eq!((cache.stats().host_hits, cache.stats().device_hits), (12, 0));
+    }
 }
