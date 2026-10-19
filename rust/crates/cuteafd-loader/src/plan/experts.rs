@@ -239,7 +239,7 @@ pub fn spark_recipe_with_placement(package: &str, intermediate: usize, world: us
     let exact = exl3 || (!native && intermediate % 128 == 0 && intermediate / 128 >= world);
     let fine = placement == cuteafd_core::tp_units::TpPlacement::Balanced && mxfp4 && !native && world == 6;
     let unit = if fine { 32 } else { 128 };
-    let rule = if fine { placement.rule(unit) } else { cuteafd_core::tp_units::UnitRule::Contiguous };
+    let rule = if fine { placement.rule(unit, intermediate / unit, world) } else { cuteafd_core::tp_units::UnitRule::Contiguous };
     let widths = if exact {
         (0..world).map(|rank| cuteafd_core::tp_units::RankUnits::new(rule, 1, intermediate, unit, 0, world, rank)
             .map(|map| map.resident_units() * unit).map_err(SparkRecipeRefusal::Placement)).collect::<Result<Vec<_>, _>>()?

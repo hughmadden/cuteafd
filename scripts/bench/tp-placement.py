@@ -18,7 +18,9 @@ except `fitted`):
                  scale groups, MiMo) this is 352,352,352,352,320,320.
   layer-rotation contiguous runs shifted by L: the heavy ranks move per layer,
                  every expert of a layer shares them.
-  rotated        EXLR8 FORMAT.md: rank = (U*e + u + L) mod N (#408).
+  rotated        rank = (U*e + u + L) mod N for uneven worlds (#408).
+                 Static policies keep divisible worlds contiguous, unlike the
+                 raw EXLR8 checkpoint ownership primitive in the Rust loader.
   fitted         offline experiment only: per (layer, expert), the set of heavy
                  ranks chosen by local search on fit-half routes.
 
@@ -60,6 +62,10 @@ def unit_owner(rule: str, units: int, expert, unit, layer: int, world: int):
     if not 1 <= world <= units:
         raise ValueError(f'world {world} needs 1..{units} ranks')
     expert, unit = np.asarray(expert), np.asarray(unit)
+    if rule not in STATIC_RULES:
+        raise ValueError('unknown rule ' + rule)
+    if units % world == 0:
+        rule = 'contiguous'
     if rule == 'rotated':
         return (units * expert + unit + layer) % world
     base, extra = divmod(units, world)

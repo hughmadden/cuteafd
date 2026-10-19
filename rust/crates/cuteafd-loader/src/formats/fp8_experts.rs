@@ -353,7 +353,7 @@ impl Fp8ExpertTensors {
     pub fn unit_map(&self, tp: usize, rank: usize, slicing: Slicing) -> Result<cuteafd_core::tp_units::RankUnits> {
         let block = match slicing { Slicing::Blocks(g) => g, Slicing::Padded => self.block() };
         let rule = if slicing == Slicing::Blocks(32) && self.format == ExpertFormat::Mxfp4 {
-            self.placement.rule(block)
+            self.placement.rule(block, self.shape.intermediate / block, tp)
         } else { cuteafd_core::tp_units::UnitRule::Contiguous };
         Ok(cuteafd_core::tp_units::RankUnits::new(rule, self.shape.experts,
             self.shape.intermediate, block, self.slice_layer, tp, rank)?)
@@ -515,7 +515,7 @@ impl Fp8ExpertTensors {
         ensure!(g > 0 && g % self.block() == 0 && (g % 128 == 0 || self.format == ExpertFormat::Mxfp4)
             && i % g == 0 && i / g >= tp,
             "intermediate {i} does not split into whole {g}-row blocks over {tp} ranks");
-        let rule = if g == 32 && self.format == ExpertFormat::Mxfp4 { self.placement.rule(g) }
+        let rule = if g == 32 && self.format == ExpertFormat::Mxfp4 { self.placement.rule(g, i / g, tp) }
             else { cuteafd_core::tp_units::UnitRule::Contiguous };
         let map = cuteafd_core::tp_units::RankUnits::new(rule, 1, i, g, self.slice_layer, tp, rank)?;
         let ranges = map.column_ranges(0)?;
