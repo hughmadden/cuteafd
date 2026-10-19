@@ -88,6 +88,9 @@ pub(crate) enum Commands {
     /// Qualify native dense Qwen3.5/3.8 execution against reference outputs.
     #[command(hide = true)]
     Qwen35Golden(crate::families::qwen3_5::GoldenArgs),
+    /// Qualify a native Step-5 target prefix with real Spark experts.
+    #[command(hide = true)]
+    Step5Golden(crate::families::step5::golden::GoldenArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),

@@ -28,7 +28,7 @@ def decode_fp8(weight, scale):
 
 
 def same_quant_ffn(ref, layer, snapshot, captures, save, manifest):
-    """Bind official MoE control flow to checkpoint-decoded TP4 expert operands.
+    """Bind official MoE control flow to checkpoint-decoded TP4/TP6 expert operands.
 
     The wiring arm reproduces the shared small-row BF16-input arithmetic. The
     exact-decode arm is diagnostic, never a fidelity reference or engine fit.
@@ -39,6 +39,9 @@ def same_quant_ffn(ref, layer, snapshot, captures, save, manifest):
     from shape_invariant import linear
 
     assert snapshot.name == FP8_REVISION
+    tp = int(os.environ.get("CUTEAFD_STEP5_CHAIN_TP", "4"))
+    assert tp in (4, 6)
+    width = 1536 // tp
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
     readers = {}
     decoded = {}
@@ -95,8 +98,8 @@ def same_quant_ffn(ref, layer, snapshot, captures, save, manifest):
         save(f"q_r{rows}_shared", shared)
         for arm in ("wiring", "fp64", "exact_decode"):
             parts = []
-            for rank in range(4):
-                first, end = rank * 384, (rank + 1) * 384
+            for rank in range(tp):
+                first, end = rank * width, (rank + 1) * width
 
                 def project(projection, expert, x):
                     weight = decoded[projection][expert]
@@ -141,7 +144,7 @@ def same_quant_ffn(ref, layer, snapshot, captures, save, manifest):
                 save(f"q_r{rows}_combined", combined)
     manifest["same_quant"] = {
         "checkpoint": "stepfun-ai/Step-5-Preview", "revision": FP8_REVISION,
-        "layer": 3, "tp": 4, "slice": 384, "ingress": "bf16", "maximum_rows": 64,
+        "layer": 3, "tp": tp, "slice": width, "ingress": "bf16", "maximum_rows": 64,
         "wiring": "BF16(E4M3 * F32 block128 scale); F32 accumulate; BF16 per-rank output",
         "fp64": "same BF16 operands; unrounded FP64 projections, activation and sums",
         "exact_decode": "report-only E4M3 * F32 scale; F32 accumulate; BF16 boundaries",

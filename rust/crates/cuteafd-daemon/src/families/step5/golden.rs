@@ -1,0 +1,663 @@
+//! Cold target-prefix qualification. Incomplete prefixes never publish cache state or score logits.
+use super::{
+    cache::CacheRank,
+    chain::TargetChain,
+    prefix::{Frontier, Placement, Step5Prefix},
+    transaction::{Staging, Step},
+};
+use crate::shared::{
+    memory::device::{Allocation, Device},
+    placement::{spark_rings, SparkAdmission},
+    spark_intake::SparkDeviceLink,
+};
+use anyhow::{ensure, Context, Result};
+use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
+use cuteafd_engine::prefix::{PrefixCache, PrefixConfig, PrefixFamily};
+use cuteafd_hostcache::copy::StubCopyEngine;
+use cuteafd_loader::{
+    plan::{checkpoint::Checkpoint, families::step5::Config},
+    serving_capacity::step5::Step5CacheLayout,
+};
+use cuteafd_transport::{
+    expert::{DeviceBuild, SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+    worker_selection::ModelAdmission,
+    ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
+    ExpertV2Dtype, ExpertV2SourceKind, TcpTransportConfig,
+};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::{cell::RefCell, net::SocketAddr, os::unix::fs::FileExt, path::PathBuf};
+
+const H: usize = 4096;
+const FP8_REVISION: &str = "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc";
+const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct GoldenArgs {
+    #[arg(long)]
+    snapshot: PathBuf,
+    #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
+    native_lib: Option<PathBuf>,
+    #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
+    manifest: PathBuf,
+    /// Pinned BF16 reference export containing meta.json and windows/ID/layerNN.bin.
+    #[arg(long)]
+    golden: PathBuf,
+    #[arg(long)]
+    window: String,
+    #[arg(long, value_delimiter = ',')]
+    peers: Vec<SocketAddr>,
+    /// Last target layer, inclusive. Native BF16 routed tails are not qualified yet.
+    #[arg(long, default_value_t = 87)]
+    last_layer: usize,
+    /// Cold prefix rows (at most 4096); omitted uses the complete reference window.
+    #[arg(long)]
+    prefill: Option<usize>,
+    #[arg(long, default_value_t = 0)]
+    device: i32,
+    /// Validate source, reference and routed-layer selection without CUDA.
+    #[arg(long)]
+    check_headers: bool,
+    /// Refused until a complete native embedding-to-logits path is qualified.
+    #[arg(long)]
+    nll: bool,
+}
+
+fn selection(last: usize, peers: usize, hosted: &[usize], nll: bool) -> Result<()> {
+    ensure!((3..=87).contains(&last), "Step-5 golden supports prefixes ending at 3..87; native BF16 tails 88..90 remain unqualified");
+    ensure!(
+        [4, 6].contains(&peers),
+        "Step-5 golden needs canonical TP4 or TP6 real experts"
+    );
+    ensure!(
+        hosted == (3..=last).collect::<Vec<_>>(),
+        "Step-5 golden hosted experts must exactly cover layers 3..{last}"
+    );
+    ensure!(
+        !nll,
+        "Step-5 prefix is not complete embedding-to-logits execution; NLL/KL unavailable"
+    );
+    Ok(())
+}
+
+fn selected_layers() -> Result<Vec<usize>> {
+    std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")
+        .context("golden-run must select --expert-layers")?
+        .split(',')
+        .map(|s| s.parse().context("invalid hosted expert layer"))
+        .collect()
+}
+
+fn reference_identity(meta: &Value) -> Result<()> {
+    ensure!(
+        meta["schema"] == "cuteafd.fidelity.golden/2"
+            && meta["family"] == "step5"
+            && meta["checkpoint"] == "stepfun-ai/Step-5-Preview-BF16"
+            && meta["snapshot_identity"]["snapshot_revision"] == BF16_REVISION
+            && meta["mtp"] == false,
+        "Step-5 golden requires the pinned official BF16 target reference"
+    );
+    let source = &meta["source_pin"];
+    for (field, expected) in [
+        ("revision", BF16_REVISION),
+        (
+            "model_sha256",
+            "330a166878910b21e37f65669033a84fcaada3b58d7903fc16ef55c496cb1ea5",
+        ),
+        (
+            "kernel_sha256",
+            "2cd01d57d2d135397d2fd36c203684af7564b5e6c6f5d3853b3d35bedeb548be",
+        ),
+        (
+            "vision_encoder_sha256",
+            "8943ee555ffd2a32213f6f9f0a7146d1f49566c65c8b7691c37055208cdb6b53",
+        ),
+    ] {
+        ensure!(
+            source[field] == expected,
+            "Step-5 reference source pin differs: {field}"
+        );
+    }
+    for field in ["tokenizer_sha256", "config_sha256"] {
+        ensure!(
+            meta["snapshot_identity"][field]
+                .as_str()
+                .is_some_and(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())),
+            "missing reference identity: {field}"
+        );
+    }
+    let proof = &meta["prefix_qualification"];
+    ensure!(
+        proof["schema"] == "cuteafd.fidelity.prefix/1"
+            && proof["family"] == "step5"
+            && proof["set_sha256"] == meta["set_sha256"]
+            && meta["set_sha256"].is_string()
+            && proof["snapshot_identity"] == meta["snapshot_identity"]
+            && proof["passed"] == true
+            && proof["finite"] == true
+            && proof["rows"] == 512
+            && proof["different_rows"] == serde_json::json!([])
+            && proof["argmax_disagreements"] == 0
+            && proof["lengths"] == serde_json::json!([576, 640])
+            && proof["score_from"] == 64
+            && proof["fixed_rows"] == 128,
+        "Step-5 reference prefix-invariance proof missing or mismatched"
+    );
+    Ok(())
+}
+
+fn reference(args: &GoldenArgs) -> Result<(Vec<u32>, Vec<f32>)> {
+    ensure!(
+        !args.window.is_empty()
+            && args
+                .window
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
+        "invalid golden window id"
+    );
+    let meta: Value = serde_json::from_slice(&std::fs::read(args.golden.join("meta.json"))?)?;
+    reference_identity(&meta)?;
+    let tokenizer = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(args.snapshot.join("tokenizer.json"))?)
+    );
+    ensure!(
+        meta["snapshot_identity"]["tokenizer_sha256"] == tokenizer,
+        "reference tokenizer differs from target"
+    );
+    let folder = args.golden.join("windows").join(&args.window);
+    ensure!(
+        meta["windows"]
+            .as_array()
+            .context("golden windows")?
+            .iter()
+            .any(|w| w["id"] == args.window && w["path"] == format!("windows/{}", args.window)),
+        "window missing from reference inventory"
+    );
+    let bytes = std::fs::read(folder.join("tokens.bin"))?;
+    ensure!(
+        !bytes.is_empty() && bytes.len() % 4 == 0,
+        "invalid golden token extent"
+    );
+    let mut tokens: Vec<_> = bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let rows = args.prefill.unwrap_or(tokens.len());
+    ensure!(
+        (1..=4096).contains(&rows) && rows <= tokens.len(),
+        "cold Step-5 golden requires 1..4096 reference rows"
+    );
+    let hidden = std::fs::read(folder.join(format!("layer{:02}.bin", args.last_layer)))?;
+    ensure!(
+        hidden.len() == tokens.len() * H * 4,
+        "reference layer shape must cover every input row"
+    );
+    tokens.truncate(rows);
+    let hidden: Vec<_> = hidden[..rows * H * 4]
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    ensure!(
+        hidden.iter().all(|v| v.is_finite()),
+        "nonfinite reference hidden state"
+    );
+    Ok((tokens, hidden))
+}
+
+fn embedding_rows(checkpoint: &Checkpoint, tokens: &[u32], vocab: usize) -> Result<Vec<u8>> {
+    let tensor = checkpoint
+        .tensors
+        .iter()
+        .find(|t| t.meta.name == "model.embed_tokens.weight")
+        .context("target embedding")?;
+    ensure!(
+        tensor.meta.dtype == cuteafd_core::DType::Bf16
+            && tensor.meta.shape == [vocab, H]
+            && tokens.iter().all(|&t| (t as usize) < vocab),
+        "native embedding shape/dtype/token extent"
+    );
+    let file = std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?;
+    let mut result = Vec::with_capacity(tokens.len() * H * 4);
+    let mut row = vec![0; H * 2];
+    // One cold golden input, not a serving embedding fallback or expert host hop.
+    for &token in tokens {
+        file.read_exact_at(
+            &mut row,
+            tensor.meta.byte_offset + u64::from(token) * (H * 2) as u64,
+        )?;
+        result.extend(row.chunks_exact(2).flat_map(|b| {
+            (u32::from(u16::from_le_bytes(b.try_into().unwrap())) << 16).to_le_bytes()
+        }));
+    }
+    Ok(result)
+}
+
+fn request(
+    layer: usize,
+    rows: usize,
+    routes: Vec<ExpertProtocolV2RouteEntry>,
+    wire: bytes::Bytes,
+) -> Result<ExpertProtocolV2Request> {
+    let mut request = ExpertProtocolV2Request::new_bytes(
+        layer as u64 + 1,
+        17,
+        layer as u32,
+        H as u32,
+        ExpertV2Dtype::Bf16,
+        (0..rows as u32)
+            .map(|row| ExpertProtocolV2RowDescriptor {
+                row_id: row as u64,
+                source_kind: ExpertV2SourceKind::Prefill,
+                source_request_id: 1,
+                token_position: row as u64,
+                route_offset: row * 8,
+                route_count: 8,
+            })
+            .collect(),
+        routes,
+        wire,
+    )?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
+}
+
+fn link<'a>(
+    device: Device<'a>,
+    args: &GoldenArgs,
+    rows: usize,
+    layers: &[usize],
+) -> Result<SparkDeviceLink<'a>> {
+    let world = SparkWorld::canonical(args.peers.len())?;
+    ensure!(
+        world.supports_device_exchange(),
+        "Step-5 requires native device exchange"
+    );
+    let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
+    let metadata: Value = serde_json::from_slice(&std::fs::read(
+        packages.join("fp8/fp8-step5/manifest.json"),
+    )?)?;
+    let layout = &metadata["layouts"][format!("tp{}", args.peers.len())];
+    ensure!(
+        layout["hidden"] == H
+            && layout["experts"] == 352
+            && layout["top_k"] == 8
+            && layout["intermediate"] == 1536
+            && layout["slice"] == 1536 / args.peers.len()
+            && layout["tp"] == args.peers.len(),
+        "sealed Step-5 FP8 TP geometry"
+    );
+    let compiled = layout["capacities"]
+        .as_array()
+        .context("FP8 capacities")?
+        .iter()
+        .map(|c| c["capacity"].as_u64().context("FP8 capacity integer"))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .context("empty FP8 capacities")?;
+    ensure!(
+        compiled >= rows as u64 && compiled <= 4096,
+        "FP8 package row capacity"
+    );
+    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let config = TcpTransportConfig::default();
+    SparkAdmission::plan(
+        &args.snapshot,
+        ExpertGeometry::STEP5,
+        Some(&catalog),
+        &cuteafd_loader::placement::SparkWorkingSet {
+            rtx_layers: vec![],
+            spark_layers: layers.to_vec(),
+            spark_ranks: args.peers.len(),
+            prefill_lanes: 1,
+        },
+        args.peers.len(),
+        None,
+        ModelAdmission {
+            capacity: rows as u32,
+            compiled_capacity: compiled as u32,
+            endpoints: vec![SparkEndpoint {
+                capacity: rows as u32,
+                ingress: SparkIngress::Bf16,
+            }],
+            rings: spark_rings(config.max_frame_bytes)?,
+        },
+    )?
+    .select(&args.peers)?;
+    let warm = request(
+        3,
+        rows,
+        (0..rows * 8)
+            .map(|i| ExpertProtocolV2RouteEntry {
+                row_index: (i / 8) as u32,
+                expert_id: (i % 352) as u32,
+                gate_weight: 0.,
+            })
+            .collect(),
+        vec![0; rows * H * 2].into(),
+    )?;
+    let build: DeviceBuild = Box::new(|wave, routes, wire| {
+        request(wave.layer as usize, wave.rows as usize, routes, wire)
+    });
+    SparkDeviceLink::new(
+        device.library,
+        device.id,
+        world,
+        &args.peers,
+        rows,
+        8,
+        H * 2,
+        H * 2,
+        config,
+        Some(warm),
+        build,
+    )
+}
+
+pub(crate) fn run(args: GoldenArgs) -> Result<()> {
+    let layers = selected_layers()?;
+    selection(args.last_layer, args.peers.len(), &layers, args.nll)?;
+    ensure!(
+        args.snapshot.file_name().and_then(|s| s.to_str()) == Some(FP8_REVISION),
+        "Step-5 golden requires pinned native FP8 revision"
+    );
+    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let cfg = Config::parse(&checkpoint)?;
+    let (tokens, expected) = reference(&args)?;
+    let rows = tokens.len();
+    let layout = Step5CacheLayout::new(&cfg, 1, rows as u64, 0, rows as u64)?;
+    if args.check_headers {
+        println!("Step-5 headers/reference validated: rows={rows} layers=0..{} TP{}; no CUDA or numerical qualification", args.last_layer, args.peers.len());
+        return Ok(());
+    }
+    cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
+        .map_err(|_| anyhow::anyhow!("Step-5 golden requires an isolated process"))?;
+    // SAFETY: runner supplies the sealed library; every program and device owner drops before it.
+    let library = unsafe {
+        cuteafd_ffi::NativeLibrary::load(
+            args.native_lib.as_ref().context("--native-lib required")?,
+        )?
+    };
+    library.cuda_set_device(args.device)?;
+    let device = Device {
+        library: &library,
+        id: args.device,
+    };
+    let programs = library.programs()?.with_manifest(&args.manifest)?;
+    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5"], programs.names());
+    let pending = crate::shared::inventory::pending_code(
+        &library,
+        args.device,
+        0,
+        false,
+        "step5",
+        "fp8",
+        &selected,
+    )?;
+    let (free, _) = library.cuda_memory_info()?;
+    let available = free as u64;
+    let pages = (rows as u64).div_ceil(64) + 1;
+    let cache_bytes = layout.ranks[0]
+        .bytes
+        .checked_add(layout.geometry.ranks[0].persistent_unit_bytes * pages)
+        .context("golden cache bytes")?;
+    let staging_bytes = Staging::bytes(&layout, 0)? as u64;
+    let input_bytes = (rows * H * 4) as u64;
+    let chain_bytes =
+        TargetChain::required_bytes(&programs, &checkpoint, args.last_layer + 1, rows)?;
+    // Reserve transport construction, transient library use and a separate 2 GiB headroom.
+    let transport = 2u64 << 30;
+    let reserve = pending
+        .checked_add(transport)
+        .and_then(|n| n.checked_add(2u64 << 30))
+        .context("golden reserve")?;
+    let total = [
+        chain_bytes,
+        cache_bytes,
+        staging_bytes,
+        input_bytes,
+        reserve,
+    ]
+    .into_iter()
+    .try_fold(0u64, |a, b| a.checked_add(b))
+    .context("golden admission overflow")?;
+    ensure!(total <= available, "Step-5 golden needs {total} bytes including weights/workspaces/cache/code/transport/headroom, available {available}");
+    tracing::info!(
+        rows,
+        last_layer = args.last_layer,
+        chain_bytes,
+        cache_bytes,
+        staging_bytes,
+        reserve,
+        total,
+        available,
+        "Step-5 cold prefix admission"
+    );
+    let started = std::time::Instant::now();
+    let link = device.run(|| link(device, &args, rows, &layers))?;
+    let (remaining, _) = library.cuda_memory_info()?;
+    let owners = chain_bytes + cache_bytes + staging_bytes + input_bytes + pending + (2u64 << 30);
+    ensure!(
+        owners <= remaining as u64,
+        "Step-5 golden live transport left insufficient admitted owner storage"
+    );
+    let cache = RefCell::new(CacheRank::new(device, layout, 0, 1, 0, pages, remaining)?);
+    let staging = Staging::new(device, &programs, &cache.borrow(), remaining)?;
+    let family = Step5Prefix::new(vec![&cache])?;
+    let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(
+        family.layout(),
+        PrefixConfig {
+            entries: 0,
+            mark_slots: 0,
+            keep_logits: false,
+            min_tokens: 1,
+        },
+        None,
+    )?;
+    let mut placement = pool
+        .admit_cold(&family, 1, 1, |pages| Placement {
+            pages,
+            sequence: 0,
+            committed: 0,
+        })?
+        .placement;
+    let mut chain = TargetChain::load(
+        device,
+        &programs,
+        &checkpoint,
+        args.last_layer + 1,
+        rows,
+        available,
+        &[cache_bytes, staging_bytes, input_bytes, reserve],
+    )?;
+    let input = Allocation::new(device, rows * H * 4)?;
+    library.copy_h2d(
+        input.buffer,
+        &embedding_rows(&checkpoint, &tokens, cfg.vocab)?,
+    )?;
+    tracing::info!(
+        seconds = started.elapsed().as_secs_f64(),
+        "Step-5 cold prefix readiness"
+    );
+    link.arm()?;
+    link.expect(layers.len() as u64);
+    let mut step = Step::begin(
+        vec![&cache],
+        vec![&staging],
+        &mut pool,
+        &mut placement,
+        rows,
+    )?;
+    chain.enqueue_step(&mut step, 0, &input, Some(&link), 0)?;
+    cache.borrow().stream.drain()?;
+    link.check()?;
+    drop(step);
+    ensure!(
+        placement.committed == 0,
+        "prefix qualification must not publish an incomplete target"
+    );
+    let mut bytes = vec![0; rows * H * 4];
+    library.copy_d2h(&mut bytes, chain.output(args.last_layer)?)?;
+    let actual: Vec<_> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    ensure!(
+        actual.iter().all(|v| v.is_finite()),
+        "nonfinite Step-5 prefix result"
+    );
+    let error = actual
+        .iter()
+        .zip(&expected)
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+        .sum::<f64>();
+    let norm = expected.iter().map(|&b| f64::from(b).powi(2)).sum::<f64>();
+    let dot = actual
+        .iter()
+        .zip(&expected)
+        .map(|(&a, &b)| f64::from(a) * f64::from(b))
+        .sum::<f64>();
+    let ours = actual.iter().map(|&a| f64::from(a).powi(2)).sum::<f64>();
+    ensure!(norm > 0. && ours > 0., "zero hidden state norm");
+    println!("Step-5 prefix rows={rows} layer {}: cosine {:.9} relative_l2 {:.9} (BF16-root diagnostic only; no NLL/KL/full-forward qualification)", args.last_layer, dot / (norm * ours).sqrt(), (error / norm).sqrt());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn prefix_scope_requires_exact_real_experts_and_refuses_logits_claims() {
+        for world in [4, 6] {
+            assert!(selection(87, world, &(3..=87).collect::<Vec<_>>(), false).is_ok());
+        }
+        for last in [0, 2, 88, 90, 91, usize::MAX] {
+            assert!(selection(last, 6, &[], false).is_err());
+        }
+        assert!(selection(3, 6, &[3], false).is_ok());
+        assert!(selection(3, 6, &[3, 4], false).is_err());
+        assert!(selection(4, 6, &[4, 3], false).is_err());
+        assert!(selection(3, 2, &[3], false).is_err());
+        assert!(selection(3, 6, &[3], true).is_err());
+    }
+    fn reference_meta() -> Value {
+        let identity = serde_json::json!({"snapshot_revision":BF16_REVISION,
+            "tokenizer_sha256":format!("{:x}", Sha256::digest(b"tokenizer")), "config_sha256":"a".repeat(64)});
+        serde_json::json!({"schema":"cuteafd.fidelity.golden/2", "family":"step5",
+            "checkpoint":"stepfun-ai/Step-5-Preview-BF16", "snapshot_identity":identity,
+            "mtp":false, "set_sha256":"b".repeat(64), "windows":[{"id":"code-1","path":"windows/code-1"}],
+            "source_pin":{"revision":BF16_REVISION,
+                "model_sha256":"330a166878910b21e37f65669033a84fcaada3b58d7903fc16ef55c496cb1ea5",
+                "kernel_sha256":"2cd01d57d2d135397d2fd36c203684af7564b5e6c6f5d3853b3d35bedeb548be",
+                "vision_encoder_sha256":"8943ee555ffd2a32213f6f9f0a7146d1f49566c65c8b7691c37055208cdb6b53"},
+            "prefix_qualification":{"schema":"cuteafd.fidelity.prefix/1", "family":"step5",
+                "set_sha256":"b".repeat(64), "snapshot_identity":identity, "passed":true, "finite":true,
+                "rows":512, "different_rows":[], "argmax_disagreements":0,
+                "lengths":[576,640], "score_from":64, "fixed_rows":128}})
+    }
+    #[test]
+    fn reference_requires_pinned_source_and_prefix_proof() {
+        let meta = reference_meta();
+        reference_identity(&meta).unwrap();
+        for pointer in [
+            "/source_pin/model_sha256",
+            "/snapshot_identity/config_sha256",
+            "/prefix_qualification/passed",
+            "/prefix_qualification/snapshot_identity/tokenizer_sha256",
+            "/prefix_qualification/set_sha256",
+            "/mtp",
+        ] {
+            let mut invalid = meta.clone();
+            *invalid.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(reference_identity(&invalid).is_err(), "{pointer}");
+        }
+    }
+    #[test]
+    fn reference_reader_checks_extents_tokenizer_and_finite_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let golden = root.path().join("golden");
+        let folder = golden.join("windows/code-1");
+        std::fs::create_dir_all(&folder)?;
+        std::fs::write(root.path().join("tokenizer.json"), b"tokenizer")?;
+        std::fs::write(
+            golden.join("meta.json"),
+            serde_json::to_vec(&reference_meta())?,
+        )?;
+        std::fs::write(
+            folder.join("tokens.bin"),
+            [1u32, 2]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )?;
+        let bytes = vec![1f32; 2 * H]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        std::fs::write(folder.join("layer87.bin"), &bytes)?;
+        let mut args = GoldenArgs {
+            snapshot: root.path().into(),
+            native_lib: None,
+            manifest: PathBuf::new(),
+            golden,
+            window: "code-1".into(),
+            peers: vec![],
+            last_layer: 87,
+            prefill: Some(1),
+            device: 0,
+            check_headers: true,
+            nll: false,
+        };
+        let (tokens, hidden) = reference(&args)?;
+        assert_eq!(tokens, [1]);
+        assert_eq!(hidden, vec![1f32; H]);
+        args.prefill = Some(3);
+        assert!(reference(&args).is_err());
+        args.prefill = Some(1);
+        args.window = "../code-1".into();
+        assert!(reference(&args).is_err());
+        args.window = "code-1".into();
+        std::fs::write(folder.join("layer87.bin"), &bytes[..bytes.len() - 4])?;
+        assert!(reference(&args).is_err());
+        let mut nonfinite = bytes.clone();
+        nonfinite[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        std::fs::write(folder.join("layer87.bin"), nonfinite)?;
+        assert!(reference(&args).is_err());
+        std::fs::write(folder.join("layer87.bin"), bytes)?;
+        std::fs::write(root.path().join("tokenizer.json"), b"different")?;
+        assert!(reference(&args).is_err());
+        Ok(())
+    }
+    #[test]
+    fn golden_subcommand_parses_runner_owned_flags() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from([
+            "cuteafd",
+            "step5-golden",
+            "--snapshot",
+            "/snapshot",
+            "--golden",
+            "/reference",
+            "--window",
+            "code-1",
+            "--peers",
+            "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6",
+            "--native-lib",
+            "/lib.so",
+            "--manifest",
+            "/PROGRAMS.json",
+            "--last-layer",
+            "87",
+            "--prefill",
+            "64",
+            "--check-headers",
+        ])
+        .unwrap();
+        let crate::cli::Commands::Step5Golden(args) = cli.command else {
+            panic!("Step-5 golden");
+        };
+        assert_eq!(args.last_layer, 87);
+        assert_eq!(args.peers.len(), 6);
+    }
+}
