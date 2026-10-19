@@ -94,6 +94,9 @@ pub(crate) enum Commands {
     /// Serve an eager native Step-5 target with real Spark experts.
     #[command(hide = true)]
     ServeStep5(crate::families::step5::serve::ServeArgs),
+    /// Compare a cold Kimi decoder prefix against a flagged residual state.
+    #[command(hide = true)]
+    KimiGolden(crate::families::kimi_k3::golden::GoldenArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),
