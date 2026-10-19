@@ -401,6 +401,17 @@ impl FamilyModel for Model {
                 && operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
                 return Ok(());
             }
+            if contract.is_some_and(|tensor| tensor.role == *role && tensor.dtype == DType::U8
+                    && tensor.shape == operand.stored)
+                && role.layer.is_some_and(|layer| (3..88).contains(&layer))
+                && operand.is_nvfp4() && operand.input_scale.is_some_and(|scale|
+                    scale.encoding == crate::plan::format::ScaleEncoding::F32)
+                && operand.companions.is_empty()
+                && operand.stored.len() == 3 && operand.logical.len() == 3
+                && operand.logical[..2] == operand.stored[..2]
+                && operand.stored[2].checked_mul(2) == Some(operand.logical[2]) {
+                return Ok(());
+            }
             if shape_matches && role.layer.is_some_and(|layer| (88..91).contains(&layer))
                 && contract.is_some_and(|tensor| tensor.dtype == DType::Bf16)
                 && operand.encoding == crate::plan::format::Encoding::Bf16
@@ -415,6 +426,9 @@ impl FamilyModel for Model {
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let package = if operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
             "step5:fp8"
+        } else if operand.is_nvfp4() && operand.input_scale.is_some_and(|scale|
+            scale.encoding == crate::plan::format::ScaleEncoding::F32) {
+            "step5:nvfp4"
         } else if operand.encoding == crate::plan::format::Encoding::Bf16
             && operand.scale.is_none() && operand.global_scale.is_none()
             && operand.input_scale.is_none() && operand.companions.is_empty() {

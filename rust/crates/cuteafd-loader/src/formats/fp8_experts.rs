@@ -75,13 +75,16 @@ pub enum ExpertFormat {
 }
 
 impl ExpertFormat {
-    /// The package directory suffix and label (`fp8-glmf`, `fp8-mimop`,
-    /// `fp8-glmf-nvfp4`): FP8 and MXFP4 checkpoints have distinct
-    /// geometries, NVFP4 releases share theirs with the FP8 ones.
-    pub fn package_suffix(self) -> &'static str {
+    /// Canonical native arithmetic package. NVFP4 always quantizes activations
+    /// with the checkpoint's calibrated K16 scales (W4A4), at every row count.
+    pub fn package_name(self, geometry: &str) -> String {
+        format!("fp8-{geometry}{}", self.package_suffix())
+    }
+
+    fn package_suffix(self) -> &'static str {
         match self {
             Self::Fp8Block128 | Self::Mxfp4 => "",
-            Self::Nvfp4 => "-nvfp4",
+            Self::Nvfp4 => "-nvfp4a4",
             Self::Bf16 => "-bf16-weights",
         }
     }
@@ -864,6 +867,16 @@ impl Fp8ExpertTensors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_names_follow_native_math_not_family() {
+        for geometry in ["glm", "glmf", "qwen4", "step5", "future"] {
+            assert_eq!(ExpertFormat::Nvfp4.package_name(geometry), format!("fp8-{geometry}-nvfp4a4"));
+            assert_eq!(ExpertFormat::Fp8Block128.package_name(geometry), format!("fp8-{geometry}"));
+            assert_eq!(ExpertFormat::Mxfp4.package_name(geometry), format!("fp8-{geometry}"));
+            assert_eq!(ExpertFormat::Bf16.package_name(geometry), format!("fp8-{geometry}-bf16-weights"));
+        }
+    }
 
     fn catalog(format: ExpertFormat, intermediate: usize) -> Fp8ExpertTensors {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,

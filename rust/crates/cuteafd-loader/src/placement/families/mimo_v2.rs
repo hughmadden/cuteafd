@@ -168,11 +168,7 @@ pub fn spark_package_directory(lib: &std::path::Path, cfg: &MimoV2Config,
         ("mimo", ExpertFormat::Mxfp4) => "mimof",
         (family, _) => family,
     };
-    let root = lib.join("fp8");
-    let a4 = root.join(format!("fp8-{family}-nvfp4a4"));
-    let package = if format == ExpertFormat::Nvfp4
-        && std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() != Ok("a16") && a4.join(format!("tp{tp}")).is_dir() { a4 }
-        else { root.join(format!("fp8-{family}{}", format.package_suffix())) };
+    let package = lib.join("fp8").join(format.package_name(family));
     Ok(package.join(format!("tp{tp}")))
 }
 

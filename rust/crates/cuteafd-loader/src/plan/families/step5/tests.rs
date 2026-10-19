@@ -651,9 +651,9 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
     for kind in ["fp8", "nvfp4", "bf16"] {
         let dir = snapshot(kind);
         let cp = Checkpoint::open(dir.path()).unwrap();
-        if kind == "fp8" {
+        if kind != "bf16" {
             for world in [4, 6] {
-                assert_eq!(checkpoint_spark_recipe(&cp, world, &[3]).unwrap(), spark_recipe("step5:fp8", 1536, world).unwrap());
+                assert_eq!(checkpoint_spark_recipe(&cp, world, &[3]).unwrap(), spark_recipe(&format!("step5:{kind}"), 1536, world).unwrap());
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..88).collect::<Vec<_>>()).is_ok());
             }
             for world in [1, 2, 3, 5, 7, 8] {
@@ -669,7 +669,7 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
                 assert_eq!(checkpoint_spark_recipe(&cp, world, &layers).unwrap(),
                     spark_recipe("step5:bf16", 1536, world).unwrap());
             }
-            if kind == "fp8" {
+            if kind != "bf16" {
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).is_ok());
             } else {
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).is_err());
@@ -726,5 +726,44 @@ fn routed_admission_rechecks_operand_shape_scale_and_role() {
             assert!(model.accepts(&role, &stem, &mut wrong).is_err());
         }
         assert!(model.accepts(&TensorRole::layer(Component::RoutedExpert, 3), &stem, &mut operand.clone()).is_err());
+    }
+}
+
+#[test]
+fn nvfp4_routed_admission_rechecks_packing_scales_and_role() {
+    let dir = snapshot("nvfp4");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let model = Model::open(&cp).unwrap();
+    let groups = format::group_by_stem(&cp.tensors);
+    for projection in ["gate", "up", "down"] {
+        let stem = format!("model.layers.3.moe.{projection}_proj");
+        let operand = format::detect(&groups[&stem]).unwrap();
+        let role = TensorRole::layer(Component::RoutedExpert, 3);
+        assert!(model.accepts(&role, &stem, &mut operand.clone()).is_ok());
+        assert_eq!(model.experts(&operand).unwrap().package, "step5:nvfp4");
+        for mutation in 0..14 {
+            let mut wrong = operand.clone();
+            match mutation {
+                0 => wrong.logical[0] -= 1,
+                1 => wrong.logical[2] -= 1,
+                2 => wrong.stored[0] -= 1,
+                3 => wrong.encoding = format::Encoding::Int { bits: 8 },
+                4 => wrong.scale = None,
+                5 => wrong.scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+                6 => wrong.scale.as_mut().unwrap().cols = 32,
+                7 => wrong.scale.as_mut().unwrap().rows = format::RowTiling::Uniform { rows: 2 },
+                8 => wrong.global_scale = None,
+                9 => wrong.global_scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+                10 => wrong.input_scale = None,
+                11 => wrong.input_scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+                12 => wrong.companions.push("bias".into()),
+                _ => { wrong.logical.pop(); }
+            }
+            assert!(model.accepts(&role, &stem, &mut wrong).is_err(), "{projection}: mutation {mutation}");
+        }
+        for role in [TensorRole::layer(Component::RoutedExpert, 4),
+            TensorRole::layer(Component::RoutedExpert, 88), TensorRole::layer(Component::DenseFfn, 3)] {
+            assert!(model.accepts(&role, &stem, &mut operand.clone()).is_err());
+        }
     }
 }

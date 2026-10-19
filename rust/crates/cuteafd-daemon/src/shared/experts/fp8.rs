@@ -152,19 +152,21 @@ pub(super) fn package_family(family: Option<&'static str>, format: ExpertFormat)
     }
 }
 
-/// `<libdir>/fp8/fp8-<family>[-nvfp4|-nvfp4a4]/tp<world>`: the package layout
+/// `<libdir>/fp8/fp8-<family>[-nvfp4a4]/tp<world>`: the package layout
 /// serving TP degree `tp` of the process expert geometry in `format` (NVFP4
 /// releases share their geometry with the FP8 ones and get packages of their
-/// own). NVFP4 always uses W4A4 (`-nvfp4a4`), quantizing original BF16
-/// activations with each expert's checkpoint input_scale at every row count.
+/// own). NVFP4 always uses W4A4, quantizing original BF16 activations with
+/// each expert's checkpoint input_scale at every row count.
 pub(crate) fn package_directory(native_lib: &Path, tp: usize, format: ExpertFormat) -> PathBuf {
-    let family = package_family(cuteafd_core::expert_geometry().family(), format);
+    package_directory_for(native_lib, tp, format, cuteafd_core::expert_geometry().family())
+}
+
+fn package_directory_for(native_lib: &Path, tp: usize, format: ExpertFormat,
+    family: Option<&'static str>) -> PathBuf {
+    let family = package_family(family, format);
     let root = native_lib.parent().unwrap_or(Path::new(".")).join("fp8");
     let layout = format!("tp{tp}");
-    if format == ExpertFormat::Nvfp4 {
-        return root.join(format!("fp8-{family}-nvfp4a4")).join(&layout);
-    }
-    root.join(format!("fp8-{family}{}", format.package_suffix())).join(layout)
+    root.join(format.package_name(family)).join(layout)
 }
 
 /// `<libdir>/fp8/fp8-<geometry>-nvfp4a4/tp1`: mandatory coordinator W4A4
@@ -709,11 +711,26 @@ mod tests {
     fn native_bf16_package_locator_is_not_the_fp8_bf16_input_sibling() {
         use cuteafd_loader::formats::fp8_experts::ExpertFormat;
         let root = std::path::Path::new("/exports");
-        assert_eq!(root.join(format!("fp8-step5{}", ExpertFormat::Bf16.package_suffix())),
+        assert_eq!(root.join(ExpertFormat::Bf16.package_name("step5")),
             std::path::Path::new("/exports/fp8-step5-bf16-weights"));
         assert_eq!(cuteafd_core::ExpertGeometry::STEP5.family(), Some("step5"));
         assert_eq!(super::bf16_sibling(std::path::Path::new("/exports/fp8-step5/tp6")).unwrap(),
             std::path::Path::new("/exports/fp8-step5-bf16/tp6"));
+    }
+
+    #[test]
+    fn step5_nvfp4_uses_the_single_native_w4a4_package() {
+        use std::path::Path;
+        use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+        let library = Path::new("/exports/libcuteafd_native.so");
+        for world in [4, 6] {
+            assert_eq!(super::package_directory_for(library, world, ExpertFormat::Nvfp4, Some("step5")),
+                Path::new("/exports/fp8/fp8-step5-nvfp4a4").join(format!("tp{world}")));
+            for family in ["glm", "glmf", "qwen4"] {
+                assert_eq!(super::package_directory_for(library, world, ExpertFormat::Nvfp4, Some(family)),
+                    Path::new("/exports/fp8").join(format!("fp8-{family}-nvfp4a4/tp{world}")));
+            }
+        }
     }
 
     #[test]

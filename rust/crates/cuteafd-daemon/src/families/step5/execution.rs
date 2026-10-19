@@ -176,6 +176,8 @@ pub(super) struct Execution<'e, 'a> {
 struct LaneExecution<'e, 'a> {
     id: usize,
     ownership: ExecutionOwnership,
+    // Destroy executables before their externally pinned native operands.
+    graphs: Vec<RefCell<Option<super::graphs::Graphs<'a>>>>,
     native: NativeLane<'a>,
     caches: Vec<&'e RefCell<CacheRank<'a>>>,
     stages: Vec<&'e Staging<'a>>,
@@ -186,7 +188,6 @@ struct LaneExecution<'e, 'a> {
     rows: usize,
     inventory: Vec<Inventory>,
     requests: Cell<u64>,
-    graphs: Vec<RefCell<Option<super::graphs::Graphs<'a>>>>,
     startup_captures: Cell<Option<u64>>,
     replay: Cell<bool>,
     terminal_output: Cell<Option<CuteafdDeviceBuffer>>,
@@ -595,7 +596,12 @@ fn shutdown_lanes(lanes: &[&LaneExecution<'_, '_>]) -> Result<()> {
         ranks: || collect_lane_results(lanes.iter().map(|lane| lane.drain_compute())),
         links: || collect_lane_results(lanes.iter().map(|lane| lane.quiesce())),
         copies: || collect_lane_results(lanes.iter().map(|lane| lane.drain_copies())),
-        graphs: || Ok(()),
+        graphs: || {
+            for lane in &lanes {
+                for graphs in &lane.graphs { graphs.borrow_mut().take(); }
+            }
+            Ok(())
+        },
         finish: |drained| {
             for lane in &lanes {
                 lane.exchange.finish_terminal(drained);
