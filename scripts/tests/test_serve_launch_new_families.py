@@ -1,4 +1,4 @@
-"""Kimi K3 launches through the shared launcher (run.sh -> run-family.sh), the
+"""Kimi K3 and Step-5 launch through the shared launcher (run.sh -> run-family.sh), the
 example configs and the gate kit, from WIP slots only.
 
 CPU only: docker, ssh, nest and nvidia-smi are stubs that print their argv
@@ -219,3 +219,124 @@ def test_gate_card_ports_stay_unique() -> None:
     for key in ("ADDR", "EXPERT_PORT"):
         values = [entry["set"][key] for entry in matrix["entries"] if key in entry["set"]]
         assert len(values) == len(set(values)), key
+
+
+# --- Step-5 (#274) ---------------------------------------------------------------
+
+STEP5 = {"model_type": "step5_vl", "vision_config": {"depth": 2},
+         "text_config": {"model_type": "step5", "num_hidden_layers": 92, "moe_layer_list": list(range(3, 91))}}
+STEP5_FP8 = "stepfun-ai/Step-5-Preview"
+STEP5_NVFP4 = "stepfun-ai/Step-5-Preview-NVFP4"
+STEP5_PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 100 << 30}
+
+
+def _hosts(count: int) -> str:
+    return "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(count))
+
+
+def _step5(tmp_path: Path, keys: str, *, wip: bool = True, model: str = STEP5_FP8, **kwargs):
+    return _family_launch_result(tmp_path, STEP5, model, "SPECULATOR=off\n" + keys,
+                                 extra_args=("--wip", "s5") if wip else (),
+                                 encoder_plan=kwargs.pop("encoder_plan", STEP5_PLANNED), **kwargs)
+
+
+@pytest.mark.parametrize("model,gpus,sparks", [(STEP5_FP8, 2, 6), (STEP5_NVFP4, 1, 4)])
+def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, sparks: int) -> None:
+    result = _step5(tmp_path, f"SPARK_COUNT={sparks}\nRTX_GPUS={gpus}\n" + _hosts(sparks), model=model)
+    serve = _line(result, "cuteafd serve-step5 --snapshot")
+    assert f"/hf/hub/models--{model.replace('/', '--')}/snapshots/abc" in serve
+    assert len(_flag(serve, "--peers").split(",")) == sparks
+    assert _flag(serve, "--embedding-placement") == "gpu"
+    assert _flag(serve, "--prefix-cache-entries") == "20"
+    assert ((_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")) == (gpus == 2)
+    for absent in ("--max-context", "--pool-tokens", "--rtx-expert-layers", "--vision", "--audio",
+                   "--draft", "--mtp", "--dspark", "--local-experts"):
+        assert absent not in serve.split(), absent
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == sparks and f"--world {sparks}" in workers[0]
+    plan = _line(result, "cuteafd plan")
+    assert "--spark-budget-gib" not in plan.split()
+    assert all(f"--device-budget-bytes {100 << 30} " in worker for worker in workers)
+    assert _flag(plan, "--spark-ranks") == str(sparks) and _flag(plan, "--rtx") == str(gpus)
+    assert "--vision off --audio off" in plan and "--require-ready" not in plan.split()
+    lines = result.stderr.splitlines()
+    probe = next(i for i, line in enumerate(lines) if "dst=/opt/cuteafd-serve-probe" in line)
+    assert lines[probe].endswith("serve-step5 --help ") and probe < lines.index(plan)
+
+
+@pytest.mark.parametrize("keys,diagnostic", [
+    ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to step5"),
+    ("ATTENTION_PLACEMENT=heads\n", "step5 supports only ATTENTION_PLACEMENT=auto"),
+    ("VISION=rtx\n", "step5 bundled media execution is not qualified"),
+    ("SPARK_COUNT=0\n", "Step-5 has no local-expert layout"),
+    ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "Step-5 has no local-expert layout"),
+    ("EMBEDDING=host\n", "step5 serves GPU token embeddings only"),
+    ("RTX_EXPERT_LAYERS=4\n", "unused configuration key: RTX_EXPERT_LAYERS"),
+    ("KV_CACHE=bf16\n", "unused configuration key: KV_CACHE"),
+])
+def test_step5_refuses_unsupported_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:
+    result = _step5(tmp_path, "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6) + keys)
+    assert result.returncode != 0
+    assert diagnostic in result.stderr
+    assert "docker run -d" not in result.stderr and "Traceback" not in result.stderr
+
+
+def test_step5_refuses_release_images_and_slots_without_serve_step5(tmp_path: Path) -> None:
+    keys = "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6)
+    release = _step5(tmp_path / "release", keys, wip=False)
+    assert release.returncode != 0 and "step5 serving is under qualification; run it from a WIP slot" in release.stderr
+    old = _step5(tmp_path / "old", keys, probe_fails=True)
+    assert old.returncode == 2
+    assert "WIP slot s5 has no 'serve-step5' command; build the slot from a commit that serves step5" in old.stderr
+    for result in (release, old):
+        assert "cuteafd plan" not in result.stderr and "docker run -d" not in result.stderr
+
+
+def test_family_table_and_planner_fixtures_name_step5() -> None:
+    out = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"), "/dev/stdin"],
+                         input=json.dumps(STEP5), capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["step5", "step5_vl", "3", "90"]
+    fixtures = json.loads((ROOT / "rust/crates/cuteafd-loader/tests/fixtures/launch-families.json").read_text())
+    assert "step5 step5_vl 3 90" in {case["line"] for case in fixtures}
+
+
+@pytest.mark.parametrize("name,model,revision,gpus,sparks", [
+    ("step5-fp8-max.config", STEP5_FP8, "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc", "2", 6),
+    ("step5-nvfp4-min.config", STEP5_NVFP4, "bc246cc2848e17b37f377eda8fd825c5b3018d1f", "1", 4),
+])
+def test_step5_example_configs(tmp_path: Path, name, model, revision, gpus, sparks) -> None:
+    path = ROOT / "examples/configs" / name
+    values = _keys(path)
+    assert (values["MODEL_ID"], values["MODEL_REVISION"], values["RTX_GPUS"]) == (model, revision, gpus)
+    assert values["SPARK_COUNT"] == str(sparks)
+    assert (values["SPECULATOR"], values["VISION"], values["AUDIO"], values["POOL_TOKENS"]) == ("off", "off", "off", "auto")
+    for rank in range(sparks):
+        assert values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+        assert values[f"SPARK_{rank}_LANE_A"] == f"192.0.2.{rank + 1}"
+    assert f"SPARK_{sparks}_HOST" not in values
+    text = path.read_text()
+    assert not any(needle in text.lower() for needle in PRIVATE)
+    assert f"./run.sh --config examples/configs/{name} --wip SLOT --dry-run" in text
+    keys = "".join(f"{k}={v}\n" for k, v in values.items()
+                   if not k.startswith("SPARK_") and k not in ("MODEL_ID", "MODEL_REVISION", "SPECULATOR"))
+    result = _step5(tmp_path, keys + f"SPARK_COUNT={sparks}\n" + _hosts(sparks), model=model)
+    assert "cuteafd serve-step5 --snapshot" in _line(result, "cuteafd serve-step5 --snapshot")
+
+
+@pytest.mark.parametrize("name,gpus,sparks,package", [
+    ("step5-fp8-max", [0, 1], ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"], "fp8/fp8-step5"),
+    ("step5-nvfp4-min", [1], ["ostrich", "dodo", "emu", "kiwi"], "fp8/fp8-step5-nvfp4"),
+])
+def test_step5_gate_cards_list_and_generate_wip_launches(tmp_path: Path, name, gpus, sparks, package) -> None:
+    card = cards.load_cards(ROOT / "scripts/bench/kits/gate", [name])[0]
+    assert card["family"] == "step5" and card["gpus"] == gpus and card["sparks"] == sparks
+    assert card["profile"] == "smoke"
+    assert cards.slot_needs(card)["spark"] == [package]
+    key = tmp_path / "key"
+    key.write_text("k" * 64 + "\n")
+    key.chmod(0o600)
+    job = cards.generate(card, "cand", {"instance": "t", "slot": "s"}, tmp_path, key, {}, {"fabric"}, None, 1)
+    values = cards.config(Path(job["entry"]["config"]))
+    assert job["entry"]["run_args"] == ["--wip", "s"]
+    assert (values["SPARK_COUNT"], values["RTX_GPUS"]) == (str(len(sparks)), str(len(gpus)))
+    assert values["COORDINATOR_GPU"] == str(gpus[0])
