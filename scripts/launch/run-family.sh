@@ -525,7 +525,8 @@ if [[ $attention_plan_rows != auto && ! $attention_plan_rows =~ ^[1-9][0-9]*$ ]]
 fi
 shared_env_args=(-e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
-  -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill")
+  -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
+  -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi

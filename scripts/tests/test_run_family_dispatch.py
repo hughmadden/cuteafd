@@ -2547,6 +2547,15 @@ def test_qwen_restart_admission_credits_only_its_own_gpu_memory(tmp_path: Path, 
     assert f"--coordinator-gpu-budget-gib {admitted_gib}" in preflight
 
 
+def test_spark_admission_inherits_release_readiness_bound(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model", "",
+                                  preferred_ranks=1,
+                                  extra_env={"CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS": "2400"})
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=2400" in launch
+
+
 def test_qwen_other_formats_skip_the_local_qualification_preflight(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
                                   "", preferred_ranks=1)

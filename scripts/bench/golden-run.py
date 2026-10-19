@@ -783,6 +783,8 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
         if packages is not None:
             env['CUTEAFD_GOLDEN_SPARK_PACKAGES'] = SPARK_PACKAGES
         env.update({k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)})
+    if state.get('sparks'):
+        env['CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS'] = str(state['sparks']['ready_timeout'])
     values = placeholder_values(state)
     for key, value in arm['env'].items():
         env[key] = substitute([value], state['snapshot_container'], **values)[0]
@@ -1109,6 +1111,8 @@ def build_state(args, arms):
     sparks = None
     if args.spark_hosts:
         hosts = parse_hosts(args.spark_hosts)
+        if args.worker_ready_timeout < 1:
+            raise ValueError('--worker-ready-timeout must be positive seconds')
         if not 1 <= args.expert_port <= 65535:
             raise ValueError('--expert-port out of range')
         lanes = spark_lanes(args.config, hosts)
@@ -1185,7 +1189,7 @@ def main(argv=None):
     parser.add_argument('--worker-arg', action='append', default=[], metavar='ARG',
                         help='extra expertd-native argument (repeatable; e.g. --worker-arg=--exl3-schedule)')
     parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET)
-    parser.add_argument('--worker-ready-timeout', type=int, default=1500, help='seconds for every rank to be ready')
+    parser.add_argument('--worker-ready-timeout', type=int, default=1500, help='seconds for worker bootstrap and coordinator model admission')
     parser.add_argument('--worker-poll', type=float, default=5.0, help=argparse.SUPPRESS)
     parser.add_argument('--config', default=str(REPO / 'cuteafd.config'),
                         help='configuration with SPARK_i_HOST/SPARK_i_LANE_A (default cuteafd.config)')
