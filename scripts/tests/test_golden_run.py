@@ -760,3 +760,12 @@ def test_dense_native_test_without_sparks(env, monkeypatch):
     call = runs(env)[0]
     mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
     assert f'{fixtures}:{fixtures}:ro' in mounts and '--network' not in call
+
+
+def test_spark_port_checked_only_at_grant():
+    """A run queued behind another golden must not fail preflight on its port."""
+    import inspect
+    source = inspect.getsource(golden.check_spark)
+    assert "if at_grant else '-'" in source
+    assert "if port!='-':" in golden.REMOTE_CHECK
+    assert inspect.signature(golden.preflight).parameters['at_grant'].default is True

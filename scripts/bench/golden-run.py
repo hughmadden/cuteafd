@@ -373,8 +373,9 @@ if os.environ.get('CUTEAFD_CDI_CHECK')!='off':  # off: script tests only
     cdi=any(re.search(r'^\s*-?\s*name:\s*\W?all\W?\s*$',pathlib.Path(s).read_text(),re.M) for s in ('/var/run/cdi/nvidia.yaml','/etc/cdi/nvidia.yaml') if os.access(s,os.R_OK))
     if not cdi: fail('CDI device nvidia.com/gpu=all is not in /var/run/cdi/nvidia.yaml')
     if not os.path.exists('/dev/infiniband'): fail('no /dev/infiniband')
-s=subprocess.run(['ss','-Hltn','sport = :'+port],capture_output=True,text=True)
-if s.returncode==0 and s.stdout.strip(): fail('port '+port+' is already in use')
+if port!='-':  # checked at grant: an earlier queued run may hold it until then
+    s=subprocess.run(['ss','-Hltn','sport = :'+port],capture_output=True,text=True)
+    if s.returncode==0 and s.stdout.strip(): fail('port '+port+' is already in use')
 ps=subprocess.run(['docker','ps','-a','--format','{{.Names}}'],capture_output=True,text=True,check=True).stdout.split()
 left=[n for n in json.loads(names) if n in ps]
 if left: fail('container '+left[0]+' already exists (a previous run left it; inspect, save its logs and docker rm -f it)')
@@ -394,14 +395,16 @@ print(json.dumps({'root':str(p),'seal_sha256':hashlib.sha256(meta).hexdigest(),'
 '''
 
 
-def check_spark(host, arm, state, coordinator):
-    """The arm's spark-expert slot on HOST (raises ValueError with the host named)."""
+def check_spark(host, arm, state, coordinator, at_grant=True):
+    """The arm's spark-expert slot on HOST (raises ValueError with the host named).
+    The worker port is checked only at grant: before enqueue the run ahead of us
+    in the fair queue may legitimately hold it."""
     root = coordinator.get('wip_root') or '-'
     snap = state['snapshot_container']
     snap_rel = snap[len(HUB) + 1:] if snap.startswith(HUB + '/') else '-'
     names = json.dumps([worker_name(state['task'], arm, r) for r in range(len(state['sparks']['hosts']))])
     argv = ['python3', '-c', REMOTE_CHECK, root, coordinator['slot'], coordinator['instance'], '-',
-            str(state['sparks']['port']), names, snap_rel, snap if snap_rel == '-' else '-']
+            str(state['sparks']['port']) if at_grant else '-', names, snap_rel, snap if snap_rel == '-' else '-']
     try:
         out = ssh(host, shlex.join(argv), timeout=600).stdout
         record = json.loads(out.strip().splitlines()[-1])
@@ -416,8 +419,8 @@ def check_spark(host, arm, state, coordinator):
     return record
 
 
-def check_sparks(state, arm, coordinator):
-    records = {host: check_spark(host, arm, state, coordinator) for host in state['sparks']['hosts']}
+def check_sparks(state, arm, coordinator, at_grant=True):
+    records = {host: check_spark(host, arm, state, coordinator, at_grant) for host in state['sparks']['hosts']}
     first = next(iter(records.values()))
     for host, record in records.items():
         if record['packages'] != first['packages'] or record['artifact_manifest_sha256'] != first['artifact_manifest_sha256']:
@@ -669,7 +672,7 @@ def container_exists(name):
     return name in names
 
 
-def preflight(state, arms):
+def preflight(state, arms, at_grant=True):
     """CPU-only checks, before enqueue and again at grant: every slot sealed and
     unchanged, its image present, no container of ours left over and, with
     --spark-hosts, every Spark's spark-expert slot (see check_spark)."""
@@ -682,7 +685,7 @@ def preflight(state, arms):
             raise ValueError(f"container {container_name(state['task'], name)} already exists "
                              '(a previous run of this task left it; inspect and docker rm it)')
         if state.get('sparks'):
-            slot['sparks'] = check_sparks(state, name, slot)
+            slot['sparks'] = check_sparks(state, name, slot, at_grant)
         records[name] = slot
     previous = state.get('slots')
     if previous:
@@ -1224,7 +1227,7 @@ def main(argv=None):
         for name in arms:
             if len(container_name(args.task, name)) > 128:
                 raise ValueError('task and arm names make a container name over 128 characters')
-        state['slots'] = preflight(state, arms)
+        state['slots'] = preflight(state, arms, at_grant=False)
         state['serving_args'] = serving_args()
         hwlock.check_preflight(args.preflight, args.preflight_timeout)
     except (ValueError, OSError, subprocess.SubprocessError, hwlock.PreflightFailed) as error:
