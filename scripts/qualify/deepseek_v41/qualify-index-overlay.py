@@ -250,11 +250,74 @@ def qualify_partitions(args):
                 cases.append({'partition': partition, 'width': width,
                               'score_bits_equal': True, 'replay_with_changed_metadata': True})
             del batch_graph
+        qualify_long_prefill(score, stream, cases)
         stream.synchronize()
     args.output.write_text(json.dumps({'scope': 'bitwise partition invariance; committed and proposal rows',
         'native_library_sha256': hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
         'cases': cases}, indent=2) + '\n')
     print(f'PASS {len(cases)} bitwise partition/replay cases', flush=True)
+
+
+def qualify_long_prefill(score, stream, cases):
+    """Exercise the full prefix wave, page crossings and mutable pooled tables."""
+    rows, slots, stride = 1436, 16, 8
+    capacity = slots * stride * 256
+    q = torch.randint(256, (rows, 32, 64), device='cuda', dtype=torch.uint8)
+    qs = torch.randint(123, 128, (rows, 32, 4), device='cuda', dtype=torch.uint8)
+    weights = torch.randn(rows, 32, device='cuda').bfloat16()
+    keys = torch.randint(256, (capacity, 64), device='cuda', dtype=torch.uint8)
+    scales = torch.randint(123, 128, (capacity, 4), device='cuda', dtype=torch.uint8)
+    proposals = torch.randint(256, (rows, 64), device='cuda', dtype=torch.uint8)
+    proposal_scales = torch.randint(123, 128, (rows, 4), device='cuda', dtype=torch.uint8)
+    pages = torch.empty(slots, stride, device='cuda', dtype=torch.int32)
+    lengths = torch.zeros(slots, device='cuda', dtype=torch.int64)
+    for step in [2, 1]:
+        width = ((rows // step + 511) // 512) * 512
+        positions = torch.arange(width, device='cuda', dtype=torch.int64).repeat(rows, 1)
+        meta = torch.empty(rows, 6, device='cuda', dtype=torch.int64)
+        local_meta = torch.empty_like(meta)
+        pooled = torch.empty(rows, width, device='cuda')
+        separate = torch.empty_like(pooled)
+
+        def launch(table, published, descriptors, output, slot_count):
+            tensors = [q, qs, weights, keys, scales, table, published, descriptors,
+                       positions, output, proposals, proposal_scales]
+            assert score(*(t.data_ptr() for t in tensors), rows, width, slot_count,
+                         stride, capacity, rows, stream.cuda_stream) == 0
+
+        graph = None
+        for committed in [False, True]:
+            for slot in [3, 11]:
+                # Install a replacement binding and publish its length before replay.
+                pages.copy_(torch.randperm(slots * stride, device='cuda').int().reshape(slots, stride))
+                lengths.zero_()
+                end = rows // step if committed else 0
+                lengths[slot] = end
+                meta[:, 0] = slot
+                meta[:, 1] = (torch.arange(rows, device='cuda') + 1) // step
+                meta[:, 2] = end
+                meta[:, 3] = 0 if committed else rows // step
+                meta[:, 4] = 0 if committed or step == 1 else 1
+                meta[:, 5] = step
+                local_meta.copy_(meta)
+                local_meta[:, 0] = 0
+                separate.fill_(12345)
+                launch(pages[slot], lengths[slot:], local_meta, separate, 1)
+                if graph is None:
+                    launch(pages, lengths, meta, pooled, slots)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        launch(pages, lengths, meta, pooled, slots)
+                pooled.fill_(54321)
+                graph.replay()
+                stream.synchronize()
+                assert torch.equal(separate.view(torch.int32), pooled.view(torch.int32))
+                assert torch.equal(torch.isfinite(pooled), positions < meta[:, 1, None])
+                cases.append({'kind': 'long_prefill', 'rows': rows, 'width': width,
+                              'step': step, 'committed': committed, 'slot': slot,
+                              'score_bits_equal': True, 'replaced_pool_metadata': True})
+                print(f'PASS long prefill rows={rows} step={step} committed={committed} slot={slot}', flush=True)
+        del graph
 
 
 if __name__ == '__main__':
