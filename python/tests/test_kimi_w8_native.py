@@ -281,8 +281,63 @@ def test_situ_official_fp64(intermediate, rows):
     assert torch.equal(out, first), "graph replay is not byte-exact"
 
 
+@pytest.mark.parametrize("hidden", [3584, 7168])
+@pytest.mark.parametrize("rows", [1, 16, 4096])
+@pytest.mark.parametrize("case", ["normal", "zero", "small", "large"])
+@torch.no_grad()
+def test_rmsnorm_official_fp64(hidden, rows, case):
+    from b12x.integration.cuteafd.kimi_residual import compile_kimi_rmsnorm_aot
+    g = torch.Generator().manual_seed(273)
+    x = torch.randn(rows, hidden, generator=g).bfloat16().cuda()
+    if case == "zero":
+        x.zero_()
+    elif case == "small":
+        x *= 2.0 ** -12
+    elif case == "large":
+        x *= 2.0 ** 12
+    norm = official()["KimiRMSNorm"](hidden, eps=1e-5).cuda().bfloat16()
+    norm.weight.copy_((1 + 0.2 * torch.randn(hidden, generator=g)).bfloat16().cuda())
+    baseline = norm(x)
+    out = torch.empty_like(x)
+    program = compile_kimi_rmsnorm_aot(hidden=hidden)
+    program.launch(x, norm.weight, out, scalars=(rows, 1e-5))
+    torch.cuda.synchronize()
+    xx = x.cpu().double()
+    normalized = (xx / (xx.square().mean(-1, keepdim=True) + 1e-5).sqrt()).bfloat16().double()
+    assert_accuracy(out, baseline, normalized * norm.weight.cpu().double())
+    first = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        program.launch(x, norm.weight, out, scalars=(rows, 1e-5))
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(first, out), "RMSNorm graph replay is not byte-exact"
+
+
+@pytest.mark.parametrize("hidden", [3584, 7168])
+@torch.no_grad()
+def test_rmsnorm_same_row_width_and_position(hidden):
+    from b12x.integration.cuteafd.kimi_residual import compile_kimi_rmsnorm_aot
+    g = torch.Generator().manual_seed(273)
+    row = torch.randn(1, hidden, generator=g).bfloat16().cuda()
+    weight = (1 + 0.2 * torch.randn(hidden, generator=g)).bfloat16().cuda()
+    program = compile_kimi_rmsnorm_aot(hidden=hidden)
+    expected = None
+    for rows in (1, 16, 4096):
+        x = row.repeat(rows, 1)
+        out = torch.empty_like(x)
+        program.launch(x, weight, out, scalars=(rows, 1e-5))
+        torch.cuda.synchronize()
+        if expected is None:
+            expected = out[0].clone()
+        for position in {0, min(1, rows - 1), rows - 1}:
+            assert torch.equal(out[position], expected), "RMSNorm depends on width/row position"
+
+
 @pytest.mark.skipif(not os.environ.get("CUTEAFD_KIMI_W8_REPORT"), reason="optional resource/timing report")
-@pytest.mark.parametrize("kind,width", [("residual", 1), ("residual", 2), ("residual", 9)] +
+@pytest.mark.parametrize("kind,width", [("residual", c) for c in (1, 2, 4, 5, 9)] +
+                         [("norm", w) for w in (3584, 7168)] +
                          [("situ", w) for w in (3072, 6144, 16896, 33792)])
 @torch.no_grad()
 def test_w8_resource_and_timing_report(kind, width):
@@ -294,6 +349,8 @@ def test_w8_resource_and_timing_report(kind, width):
         if kind == "residual":
             program = kimi_residual.compile_kimi_attn_res_rmsnorm_aot(
                 7168, width, "keep", width == 1, width != 1)
+        elif kind == "norm":
+            program = kimi_residual.compile_kimi_rmsnorm_aot(hidden=width)
         else:
             program = kimi_residual.compile_kimi_situ_aot(width)
     program.export_to_c(str(directory), "kernel", "kimi_w8")
@@ -304,6 +361,11 @@ def test_w8_resource_and_timing_report(kind, width):
             out = torch.empty_like(delta)
             args = (arena, delta, norm.float() * proj.float(), following, out)
             scalars = (rows, rows + 3, 1e-5)
+        elif kind == "norm":
+            x = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
+            weight = torch.ones(width, device="cuda", dtype=torch.bfloat16)
+            out = torch.empty_like(x)
+            args, scalars = (x, weight, out), (rows, 1e-5)
         else:
             x = torch.randn(rows, 2 * width, device="cuda", dtype=torch.bfloat16)
             out = torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)

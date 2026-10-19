@@ -403,3 +403,16 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
             assert f"attn_res_c{candidates}_{mode}" in calls
     assert {params["intermediate"] for _, op, params, _ in programs if op == "situ"} == {
         3072, 6144, 16896, 33792}
+
+
+def test_kimi_latent_exports_native_norm_and_canonical_projections(exporter):
+    programs = exporter.kimi_latent_programs()
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
+    assert set(calls) == {"rmsnorm_h3584", "rmsnorm_h7168", "latent_down", "latent_up"}
+    for hidden in (3584, 7168):
+        assert calls[f"rmsnorm_h{hidden}"] == ("rmsnorm", {"hidden": hidden},
+            ("kimi_residual", "compile_kimi_rmsnorm_aot", (), {"hidden": hidden}))
+    for direction, width, outputs in (("down", 7168, 3584), ("up", 3584, 7168)):
+        params = dict(width=width, outputs=outputs)
+        assert calls[f"latent_{direction}"] == ("bf16_projection", params,
+            ("pointwise", "compile_bf16_projection_aot", (), params))

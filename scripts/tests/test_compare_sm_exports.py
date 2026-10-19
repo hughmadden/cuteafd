@@ -63,7 +63,9 @@ def test_two_target_counts():
 
 @pytest.mark.parametrize("group,names", [
     ("residual", ["attn_res_c1_keep_append", "attn_res_c2_add_append",
+                  "attn_res_c4_add", "attn_res_c5_add",
                   "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"]),
+    ("latent", ["rmsnorm_h3584", "rmsnorm_h7168", "latent_down", "latent_up"]),
     ("situ", [f"situ_i{width}" for width in (3072, 6144, 16896, 33792)]),
 ])
 def test_kimi_w8_cross_sm_groups(group, names):

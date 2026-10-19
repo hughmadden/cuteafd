@@ -497,7 +497,27 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                         lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
                             g, max_rows=r, max_context=max_context, mode=m)))
     out.extend(kimi_w8_programs())
+    out.extend(kimi_latent_programs())
     return out
+
+
+def kimi_latent_programs():
+    """Checkpoint-native latent projections and two-boundary BF16 RMSNorm."""
+    def norm(width):
+        from b12x.integration.cuteafd import kimi_residual
+        return kimi_residual.compile_kimi_rmsnorm_aot(hidden=width)
+
+    def projection(width, outputs):
+        from b12x.integration.cuteafd import pointwise
+        return pointwise.compile_bf16_projection_aot(width=width, outputs=outputs)
+
+    return [(f"rmsnorm_h{width}", "rmsnorm", {"hidden": width},
+             lambda w=width: norm(w)) for width in (3584, 7168)] + [
+        ("latent_down", "bf16_projection", {"width": 7168, "outputs": 3584},
+         lambda: projection(7168, 3584)),
+        ("latent_up", "bf16_projection", {"width": 3584, "outputs": 7168},
+         lambda: projection(3584, 7168)),
+    ]
 
 
 def kimi_w8_programs():
