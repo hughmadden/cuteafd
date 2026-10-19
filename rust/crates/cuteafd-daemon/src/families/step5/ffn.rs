@@ -106,6 +106,34 @@ impl DensePlan {
         available: u64,
         reservations: &[u64],
     ) -> Result<Self> {
+        Self::prepare_layout(programs, checkpoint, layer, rows, available, reservations,
+            RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?)
+    }
+
+    pub fn for_execution(
+        programs: &Programs<'_>,
+        checkpoint: &Checkpoint,
+        layer: usize,
+        rows: usize,
+        available: u64,
+        reservations: &[u64],
+        rank: usize,
+        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+    ) -> Result<Self> {
+        ensure!(ownership.layer(layer, rank)?.ffn, "Step-5 dense FFN is not owned by rank {rank}");
+        Self::prepare_layout(programs, checkpoint, layer, rows, available, reservations,
+            RankWeightLayout::for_execution(checkpoint, rank, ownership)?)
+    }
+
+    fn prepare_layout(
+        programs: &Programs<'_>,
+        checkpoint: &Checkpoint,
+        layer: usize,
+        rows: usize,
+        available: u64,
+        reservations: &[u64],
+        layout: RankWeightLayout,
+    ) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layer_contract = contract
             .layers
@@ -120,8 +148,7 @@ impl DensePlan {
             limit == 7.0 || limit == 10.0,
             "unsupported Step-5 dense clamp {limit}"
         );
-        // Dense weights are currently replicated under TP2; no collective is implied here.
-        let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
+        // Each admitted owner executes a whole native FFN; no collective is implied.
         let names = [
             format!("model.layers.{layer}.post_attention_layernorm.weight"),
             format!("model.layers.{layer}.mlp.gate_up_proj.weight"),
