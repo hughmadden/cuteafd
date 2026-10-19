@@ -3540,7 +3540,9 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
         let context = number("MAX_CONTEXT_TOKENS", capacity::checkpoint_context_limit(&checkpoint.config)?.context("checkpoint context")?)?;
         let entries = number("PREFIX_CACHE_ENTRIES", 20)?;
         let stages = match &model.spec().speculator {
-            Some(spec::SpeculatorSpec::NativeMtp { layers }) => *layers, _ => 0,
+            Some(spec::SpeculatorSpec::NativeMtp { layers }) => *layers,
+            Some(spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
+            None => 0,
         };
         let attention = settings.get("ATTENTION_PLACEMENT").filter(|v| v.as_str() != "auto")
             .map(|v| v.parse::<AttentionPlacement>().map_err(anyhow::Error::msg)).transpose()?
@@ -3575,8 +3577,10 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
         let mark: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
         let (lanes, budget) = if id == "deepseek_v41" { (0, u64::MAX) }
             else { (concurrency, number("PREFIX_CACHE_MARK_MIB", 2048)? * (1 << 20)) };
-        let old_slots = mark_slots_for(lanes, entries, if id == "deepseek_v41" { 1 } else { mark }, budget);
-        let new_slots = mark_slots_with_host(lanes, entries, mark, budget, true);
+        let (old_slots, new_slots) = if mark == 0 { (0, 0) } else {
+            (mark_slots_for(lanes, entries, if id == "deepseek_v41" { 1 } else { mark }, budget),
+                mark_slots_with_host(lanes, entries, mark, budget, true))
+        };
         let gain = geometry.ranks.iter().filter(|r| r.persistent_unit_bytes > 0)
             .map(|r| (old_slots - new_slots) * r.retained_mark_bytes / (r.persistent_unit_bytes + r.pool_metadata_unit_bytes))
             .min().unwrap_or(0) * geometry.logical_unit_rows;
