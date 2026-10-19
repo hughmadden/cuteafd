@@ -345,3 +345,29 @@ def test_step5_release_derives_native_mixed_packages(tmp_path, monkeypatch, quan
     SCOPE.check_inventory(root, 'expert', [requirement], symbols=set())
     assert sorted(checked) == sorted([(f'fp8/fp8-step5{suffix}', [f'tp{count}']),
                                       ('fp8/fp8-step5-bf16-weights', [f'tp{count}'])])
+
+
+def test_kimi_release_derives_coordinator_programs(tmp_path, monkeypatch):
+    real = SCOPE.scopes_module(REPO)
+    monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
+    (tmp_path / 'kimi.config').write_text(
+        'FAMILY=kimi_k3\nMODEL_ID=fixture/Kimi-K3-EXL3-K2\nSPARK_COUNT=6\nRTX_GPUS=1\n')
+    matrix = tmp_path / 'matrix.json'
+    matrix.write_text(json.dumps(dict(entries=[dict(name='kimi', family='kimi_k3', config='kimi.config')])))
+    derived, _ = SCOPE.derive(tmp_path, matrix, 'kimi', {})
+    assert derived[P + 'KIMIK3_AOT'] == 'ON'
+    assert derived[P + 'STEP5_AOT'] == 'OFF'
+    assert SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs'] == ['kimik3']
+
+
+def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):
+    real = SCOPE.scopes_module(REPO)
+    monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
+    (tmp_path / 'glm.config').write_text(
+        'FAMILY=glm5\nMODEL_ID=fixture/GLM-5.3-EXL3-K4\nSPARK_COUNT=4\nRTX_GPUS=1\n')
+    matrix = tmp_path / 'matrix.json'
+    matrix.write_text(json.dumps(dict(entries=[dict(name='glm', family='glm5', config='glm.config')])))
+    derived, _ = SCOPE.derive(tmp_path, matrix, 'glm', {})
+    assert derived[P + 'KIMIK3_AOT'] == 'OFF'
+    assert derived[P + 'GLM_AOT'] == 'ON'
+    assert SCOPE.requirements(tmp_path, matrix, 'glm')[0]['programs'] == ['glm']

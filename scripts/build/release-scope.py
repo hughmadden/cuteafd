@@ -17,7 +17,7 @@ import re
 import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
-SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8')
+SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
          'FP8_MOE_BF16_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
@@ -193,6 +193,8 @@ def requirements(repo, matrix, scope):
             programs = {'qwen35' if '9b' in values['MODEL_ID'].lower() else 'qwen38'}
         elif family == 'step5':
             programs = {'step5', 'step52'} if dual else {'step5'}
+        elif family == 'kimi_k3':
+            programs = {'kimik3'}
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
                            experts=sorted(experts), spark_experts=sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'])),
                            spark_count=count, spark_tp=tp, dual=dual,

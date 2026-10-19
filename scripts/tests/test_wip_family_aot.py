@@ -28,6 +28,7 @@ CASES = [
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3-K4.25', 0, 'QWEN4', 'qwen4:exl3-k45'),
     ('step5', 'Step-5-Preview-NVFP4', 4, 'STEP5', 'step5:nvfp4'),
     ('step5', 'Step-5-Preview', 6, 'STEP5', 'step5:fp8'),
+    ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23'),
 ]
 
 
@@ -299,3 +300,12 @@ def test_step5_card_union_keeps_native_format_tp_counts():
     assert scopes['CUTEAFD_WIP_STEP5_AOT'] == 'ON'
     assert set(scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {
         'step5:nvfp4=4', 'step5:fp8=6', 'step5:bf16=4', 'step5:bf16=6'}
+
+
+def test_non_kimi_scope_does_not_enable_kimi_programs(tmp_path):
+    path = config_file(tmp_path, 'glm5', 'GLM-5.3-EXL3-K4', 4)
+    _, scopes = aot.config_scopes(aot.read_config(path))
+    assert 'CUTEAFD_WIP_KIMIK3_AOT' not in scopes
+    output = dry_run(tmp_path, path)
+    assert 'CUTEAFD_WIP_KIMIK3_AOT' not in output
+    assert scopes['CUTEAFD_WIP_GLM_AOT'] == 'ON'
