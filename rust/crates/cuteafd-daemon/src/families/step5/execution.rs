@@ -500,29 +500,36 @@ impl<'e, 'a> Execution<'e, 'a> {
     }
     pub(super) fn enqueue_lanes<'s, E: CopyEngine>(&'s self, steps: &mut [&mut Step<'s, 'a, E>],
         inputs: &[&'s Allocation<'a>], request: Request) -> Result<()> {
-        ensure!(steps.len() == self.lanes.len() && inputs.len() == steps.len(),
-            "Step-5 submission lane inventory");
-        for ((lane, step), input) in self.lanes.iter().zip(steps.iter()).zip(inputs) {
+        ensure!(steps.len() == self.lanes.len(), "Step-5 submission lane inventory");
+        let selected: Vec<_> = (0..self.lanes.len()).collect();
+        self.enqueue_selected(&selected, steps, inputs, request)
+    }
+
+    /// Idle lanes retain their private owners; active lanes keep their admitted IDs.
+    pub(super) fn enqueue_selected<'s, E: CopyEngine>(&'s self, selected: &[usize],
+        steps: &mut [&mut Step<'s, 'a, E>], inputs: &[&'s Allocation<'a>], request: Request) -> Result<()> {
+        validate_lane_selection(self.lanes.len(), selected, steps.len(), inputs.len())?;
+        let lanes: Vec<_> = selected.iter().map(|&lane| &self.lanes[lane]).collect();
+        for ((lane, step), input) in lanes.iter().zip(steps.iter()).zip(inputs) {
             step.validate_binding(&lane.caches, &lane.stages, lane.rows)?;
             lane.validate_replications()?;
             ensure!(!input.buffer.ptr.is_null()
                 && input.buffer.device_id == lane.peer.device(lane.ownership.execution().spec().entry_gpu as usize)
                 && input.buffer.bytes >= lane.rows * H * 4, "Step-5 live input allocation");
         }
-        let lanes: Vec<_> = self.lanes.iter().collect();
         pair::submit_scoped(|| collect_lane_results(lanes.iter().map(|lane| lane.peer.require_live())),
             || shutdown_lanes(&lanes), |scope| Step::in_submissions(scope, steps, |steps| {
-                let mut bindings = self.lanes.iter().zip(steps.iter_mut()).zip(inputs)
+                let mut bindings = lanes.iter().copied().zip(steps.iter_mut()).zip(inputs)
                     .map(|((lane, step), input)| {
                         step.compose(lane.ownership.execution().spec().entry_gpu as usize, *input, |_, _| Ok(()))?;
                         Ok(Bindings { execution: lane, step, scope, current: [None, None],
                             input: input.buffer, request, layer: 0, diagnostic: None })
                     }).collect::<Result<Vec<_>>>()?;
-                let exchanges: Vec<_> = self.lanes.iter().map(|lane| (&lane.peer, &lane.hops)).collect();
-                let rows: Vec<_> = self.lanes.iter().map(|lane| lane.rows).collect();
-                attention::layer_pipeline_lanes(scope, self.lanes[0].ownership.execution(), &exchanges,
-                    LaneOrder::Independent, &rows, &mut bindings)?;
-                collect_lane_results(self.lanes.iter().flat_map(|lane| lane.stages.iter())
+                let exchanges: Vec<_> = lanes.iter().map(|lane| (&lane.peer, &lane.hops)).collect();
+                let rows: Vec<_> = lanes.iter().map(|lane| lane.rows).collect();
+                attention::layer_pipeline_selected(scope, lanes[0].ownership.execution(), &exchanges,
+                    selected, LaneOrder::Independent, &rows, &mut bindings)?;
+                collect_lane_results(lanes.iter().flat_map(|lane| lane.stages.iter())
                     .map(|stage| stage.stream.drain()))
             }))
     }
@@ -534,6 +541,14 @@ impl Drop for Execution<'_, '_> {
             tracing::error!(%error, "Step-5 aggregate teardown retained queued owners");
         }
     }
+}
+
+fn validate_lane_selection(admitted: usize, selected: &[usize], steps: usize, inputs: usize) -> Result<()> {
+    ensure!(matches!(admitted, 1 | 2) && !selected.is_empty()
+        && selected.len() == steps && steps == inputs, "Step-5 active lane inventory");
+    ensure!(selected.iter().enumerate().all(|(index, &lane)| lane < admitted
+        && !selected[..index].contains(&lane)), "Step-5 duplicate or unadmitted active lane");
+    Ok(())
 }
 
 fn request_identity(lane: usize, ordinal: u64) -> Result<u64> {
@@ -909,6 +924,23 @@ mod tests {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn active_lane_inventory_preserves_nonzero_and_reordered_ids() -> Result<()> {
+        for selected in [&[0][..], &[1][..], &[0, 1][..], &[1, 0][..]] {
+            validate_lane_selection(2, selected, selected.len(), selected.len())?;
+        }
+        validate_lane_selection(1, &[0], 1, 1)?;
+        for (admitted, selected, steps, inputs) in [
+            (0, &[0][..], 1, 1), (3, &[0][..], 1, 1), (2, &[][..], 0, 0),
+            (1, &[1][..], 1, 1), (2, &[2][..], 1, 1), (2, &[0, 0][..], 2, 2),
+            (2, &[1][..], 0, 1), (2, &[1][..], 1, 0),
+        ] {
+            assert!(validate_lane_selection(admitted, selected, steps, inputs).is_err());
+        }
+        assert_ne!(request_identity(0, 0)?, request_identity(1, 0)?);
+        Ok(())
+    }
 
     #[test]
     fn immutable_bytes_are_shared_and_every_lane_workspace_is_charged() -> Result<()> {
