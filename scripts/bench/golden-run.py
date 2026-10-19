@@ -4,7 +4,7 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
 
   scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4|qwen35|step5 \\
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
-      [--arm-env A:KEY=VALUE] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
+      [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
       [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] \\
       [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--worker-arg ARG]] \\
@@ -166,7 +166,7 @@ def parse_arms(values):
             raise ValueError(f'invalid --arm {value!r} (NAME=WIP_INSTANCE:SLOT)')
         if name in arms:
             raise ValueError(f'duplicate arm {name}')
-        arms[name] = {'instance': instance, 'slot': slot, 'env': {}}
+        arms[name] = {'instance': instance, 'slot': slot, 'env': {}, 'args': []}
     return arms
 
 
@@ -882,15 +882,17 @@ class PowerSampler:
 
 # --------------------------------------------------------------------------- running
 
-def run_args(state):
-    return substitute(state['golden'], state['snapshot_container'], **placeholder_values(state))
+def run_args(state, arm=None):
+    """The golden argv, plus ARM's own --arm-arg tokens appended."""
+    return substitute(state['golden'] + (arm or {}).get('args', []), state['snapshot_container'],
+                      **placeholder_values(state))
 
 
 def run_arm(state, name, repeat, arms):
     arm, slot = arms[name], state['slots'][name]
     out_dir = Path(state['root']) / name / f'r{repeat}'
     out_dir.mkdir(parents=True, exist_ok=False)
-    golden = run_args(state)
+    golden = run_args(state, arm)
     packages, package_digests = spark_package_files(state, name, slot) if state.get('sparks') else (None, None)
     cmd, env = docker_command(state, name, arm, slot, out_dir, golden, packages)
     workers = [dict(host=host, rank=rank, container=worker_name(state['task'], name, rank),
@@ -904,7 +906,7 @@ def run_arm(state, name, repeat, arms):
                   image=slot['image'], image_id=slot['image_id'], image_tags=slot['image_record']['tags'],
                   seal_sha256=slot['seal_sha256'], artifact_manifest_sha256=slot['artifact_manifest_sha256'],
                   slot=f"{slot['instance']}:{slot['slot']}", slot_root=slot['root'], source_commit=slot['source_commit'],
-                  source_dirty=slot['source_dirty'], env=env, arm_env=arm['env'], gpus=state['gpus'],
+                  source_dirty=slot['source_dirty'], env=env, arm_env=arm['env'], arm_args=arm['args'], gpus=state['gpus'],
                   locks=state['locks'], snapshot=state['snapshot'], timeout_s=state['timeout'],
                   power_before=governor_summary())
     print(f"golden-run: {name} r{repeat} -> {out_dir}", flush=True)
@@ -1157,7 +1159,8 @@ def build_state(args, arms):
                  fixtures_writable=bool(args.fixtures_writable), sparks=sparks)
     state['locks'] = locks_for(state['gpus'], sparks['hosts'] if sparks else ())
     state['vocab'] = args.vocab or (vocab_size(snapshot) if args.compare_logits else None)
-    run_args(state)  # every placeholder resolves
+    for arm in arms.values():
+        run_args(state, arm)  # every placeholder resolves, per arm
     for arm in arms.values():
         for value in arm['env'].values():
             substitute([value], container_path, **placeholder_values(state))
@@ -1182,6 +1185,8 @@ def main(argv=None):
     parser.add_argument('--model', required=True, help='HF id (ORG/NAME[@REV]) or snapshot directory; {snapshot} in ARGS')
     parser.add_argument('--arm', action='append', default=[], metavar='NAME=WIP_INSTANCE:SLOT')
     parser.add_argument('--arm-env', action='append', default=[], metavar='ARM:KEY=VALUE')
+    parser.add_argument('--arm-arg', action='append', default=[], metavar='ARM:TOKEN',
+                        help='one extra argv token appended for that arm only (repeatable, in order)')
     parser.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='environment for every arm')
     parser.add_argument('--gpus', default='0,1', help='raptor GPUs, locked gpu0 then gpu1 (default 0,1)')
     raw = parser.add_mutually_exclusive_group()
@@ -1231,6 +1236,11 @@ def main(argv=None):
         if not arms:
             raise ValueError('at least one --arm is required')
         apply_env(arms, args.env, args.arm_env)
+        for value in args.arm_arg:
+            name, sep, token = value.partition(':')
+            if not sep or name not in arms or not token or '\n' in token:
+                raise ValueError(f'--arm-arg {value!r} names no arm (ARM:TOKEN)')
+            arms[name]['args'].append(token)
         pairs = parse_pairs(args.compare_logits, arms)
         state = build_state(args, arms)
         for name in arms:
@@ -1252,7 +1262,7 @@ def main(argv=None):
                 for rank, host in enumerate(state['sparks']['hosts'] if state.get('sparks') else ()):
                     print(f'# {name} r{repeat} expert rank {rank} on {host}\n'
                           f"ssh {host} {shlex.quote(shlex.join(worker_command(state, name, rank, state['slots'][name]['sparks'][host])))}")
-                cmd, _ = docker_command(state, name, arms[name], state['slots'][name], out, run_args(state), packages)
+                cmd, _ = docker_command(state, name, arms[name], state['slots'][name], out, run_args(state, arms[name]), packages)
                 print(f'# {name} r{repeat}\n{shlex.join(cmd)}')
         print('golden-run: preflight pass')
         return 0
