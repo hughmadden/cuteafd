@@ -239,3 +239,80 @@ def test_official_target_norms_all_forward_checkpoint_epsilon(release, monkeypat
     assert decoder.input_layernorm.variance_epsilon == epsilon
     assert decoder.post_attention_layernorm.variance_epsilon == epsilon
     assert model.norm.variance_epsilon == epsilon
+
+
+def test_native_fp8_diagnostic_rebinds_identity_not_tokens(tmp_path, monkeypatch):
+    import copy
+    import hashlib
+    import json
+    snapshot = tmp_path / golden.FP8_REVISION
+    snapshot.mkdir()
+    (snapshot / "tokenizer.json").write_text("tokenizer")
+    (snapshot / "config.json").write_text("fp8 config")
+    manifest = dict(checkpoint=golden.CHECKPOINT, set_sha256="bf16-set",
+                    reference_snapshot=dict(snapshot_revision=golden.REVISION),
+                    tokenizer_sha256=hashlib.sha256(b"tokenizer").hexdigest(),
+                    windows=[dict(tokens=[1, 2, 3], score_from=1)])
+    original = copy.deepcopy(manifest)
+    monkeypatch.setattr(golden, "load_set", lambda *args: manifest)
+    args = SimpleNamespace(snapshot=snapshot, windows=tmp_path, fp8_diagnostic=True)
+    rebound = golden.reference_manifest(args)
+    assert manifest == original
+    assert rebound["windows"] == original["windows"]
+    assert rebound["checkpoint"] == golden.FP8_CHECKPOINT
+    assert rebound["diagnostic_bf16_set_sha256"] == "bf16-set"
+    assert rebound["reference_snapshot"]["snapshot_revision"] == golden.FP8_REVISION
+    assert rebound["set_sha256"] == golden.set_hash(rebound)
+    golden.verify_snapshot(rebound, snapshot)
+    # Nested prefix probes preserve the diagnostic parent identity.
+    monkeypatch.setattr(golden, "load_set", lambda *args: rebound)
+    assert golden.reference_manifest(args) == rebound
+    monkeypatch.setattr(golden, "load_set", lambda *args: manifest)
+    args.fp8_diagnostic = False
+    assert golden.reference_manifest(args) is manifest
+    args.fp8_diagnostic = True
+    manifest["reference_snapshot"]["snapshot_revision"] = "wrong"
+    with pytest.raises(ValueError, match="provenance"):
+        golden.reference_manifest(args)
+    manifest["reference_snapshot"]["snapshot_revision"] = golden.REVISION
+    manifest["tokenizer_sha256"] = "wrong"
+    with pytest.raises(ValueError, match="tokenizer"):
+        golden.reference_manifest(args)
+    with pytest.raises(ValueError, match="revision"):
+        golden.verify_source(snapshot)
+    with pytest.raises(ValueError, match="revision"):
+        golden.verify_source(tmp_path / golden.REVISION, True)
+
+
+def test_native_fp8_diagnostic_rejects_wrong_layer_formats():
+    config = SimpleNamespace(num_hidden_layers=92, tp=1, moe_layer_list=list(range(3, 91)),
+                             is_fp8_expert_layer=lambda i: i < 88)
+    golden.validate_config(config, True)
+    with pytest.raises(ValueError, match="format"):
+        golden.validate_config(config)
+    config.is_fp8_expert_layer = lambda i: i < 89
+    with pytest.raises(ValueError, match="format"):
+        golden.validate_config(config, True)
+    config.is_fp8_expert_layer = lambda i: False
+    golden.validate_config(config)
+    config.tp = 2
+    with pytest.raises(ValueError, match="geometry"):
+        golden.validate_config(config)
+
+
+def test_fixed_native_fp8_rows_preserves_official_dispatch():
+    torch = pytest.importorskip("torch")
+    calls = []
+    weight = torch.ones(3, 4)
+    scale = torch.ones(1, 1)
+    def official(x, w, s):
+        calls.append((len(x), w is weight, s is scale))
+        return x @ w.T
+    wrapped = golden.fixed_fp8_rows(official)
+    x = torch.arange(141 * 4).reshape(141, 4).float()
+    assert torch.equal(wrapped(x, weight, scale), official(x, weight, scale))
+    assert calls[:2] == [(128, True, True), (128, True, True)]
+    assert torch.equal(wrapped(x[:61], weight, scale), wrapped(x, weight, scale)[:61])
+    calls.clear()
+    assert torch.equal(wrapped(x, weight, None), x @ weight.T)
+    assert calls == [(141, True, False)]
