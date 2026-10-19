@@ -362,6 +362,183 @@ impl<'a> KimiFfn<'a> {
     }
 }
 
+/// Native BF16 KDA operands, packed by the shared KDA checkpoint reader.
+#[derive(Clone, Copy, Debug)]
+pub struct KimiKdaWeights {
+    pub input: Buffer, pub forget: Buffer, pub convolution: Buffer,
+    pub a_log: Buffer, pub dt_bias: Buffer, pub norm: Buffer, pub output: Buffer,
+}
+
+/// Each slot occurs in one contiguous row stretch; `first` names that stretch's
+/// first row. Wide prefill is one sequence. Slot values and metadata contents
+/// must address live storage; the caller retains all buffers through replay.
+#[derive(Clone, Copy, Debug)]
+pub struct KimiKdaBatch {
+    pub rows: usize, pub sequences: usize, pub state_slots: usize, pub speculative: bool,
+    pub input: Buffer, pub state: Buffer, pub conv_state: Buffer,
+    pub slots: Buffer, pub first: Buffer, pub normalized: Buffer, pub output: Buffer,
+    pub replay: Option<Buffer>, pub scratch: Buffer,
+}
+
+/// Shared KDA recurrence -> head-local gated norm -> BF16 o_proj partial.
+/// The TP2 meet belongs to the owning engine, never inside this binding.
+pub struct KimiKda<'a> {
+    program: Program<'a>, output: Program<'a>, rows: usize, decode: bool, scratch: usize,
+}
+impl<'a> KimiKda<'a> {
+    pub fn load(programs: &'a Programs<'a>, rows: usize, decode: bool) -> W8Result<Self> {
+        let pointers = ["x", "w_in", "w_fg", "conv_w", "a_log", "dt_bias", "o_norm", "w_o",
+            "conv_state", "state", "slots", "seq_first", "out", "replay", "scratch"];
+        let prefill = [&pointers[..13], &pointers[14..]].concat();
+        let program = programs.program(&format!("kimik3_kda_m{rows}"),
+            if decode { &pointers } else { &prefill })?;
+        let scratch = validate_kda_manifest(program.spec(), rows, decode)?;
+        let output = programs.program("kimik3_ffn_down_i6144", &["x", "w", "out"])?;
+        validate_projection_manifest(output.spec(), 6144, 7168)?;
+        if output.spec().capacity_rows < rows as u32 {
+            return Err(KimiW8Error::Invalid("KDA output capacity"));
+        }
+        Ok(Self { program, output, rows, decode, scratch })
+    }
+
+    pub fn scratch_bytes(&self) -> usize { self.scratch }
+    pub fn state_bytes(slots: usize) -> W8Result<usize> { kda_slot_bytes(slots, 48 * 128 * 128 * 4) }
+    pub fn conv_state_bytes(slots: usize) -> W8Result<usize> { kda_slot_bytes(slots, 3 * 3 * 6144 * 2) }
+    pub const fn replay_bytes() -> usize { 64 * 48 * (3 * 128 * 4 + 4 + 3 * 128 * 2) }
+
+    /// No allocation, synchronization or lazy loading on the launch path.
+    pub fn launch(&self, weights: KimiKdaWeights, b: KimiKdaBatch,
+        stream: *mut c_void) -> W8Result<()> {
+        validate_kda_buffers(weights, b, self.rows, self.decode, self.scratch)?;
+        let mut pointers = [b.input.ptr, weights.input.ptr, weights.forget.ptr,
+            weights.convolution.ptr, weights.a_log.ptr, weights.dt_bias.ptr, weights.norm.ptr,
+            weights.output.ptr, b.conv_state.ptr, b.state.ptr, b.slots.ptr, b.first.ptr,
+            b.normalized.ptr, std::ptr::null_mut(), b.scratch.ptr];
+        if let Some(replay) = b.replay { pointers[13] = replay.ptr; }
+        if !self.decode { pointers[13] = b.scratch.ptr; }
+        let scalars = [Scalar::I32(b.rows as i32), Scalar::I32(i32::from(b.speculative))];
+        // SAFETY: all operands, writes and capacities are checked before either
+        // launch; caller owns slot metadata, ordered state and graph lifetimes.
+        unsafe {
+            self.program.launch(if self.decode { &pointers } else { &pointers[..14] },
+                if self.decode { &scalars } else { &scalars[..1] }, stream)?;
+            self.output.launch(&[b.normalized.ptr, weights.output.ptr, b.output.ptr],
+                &[Scalar::I32(b.rows as i32)], stream)?;
+        }
+        Ok(())
+    }
+}
+
+/// Commit accepted speculative rows into all contiguous KDA layer pools.
+/// Tables are `[slot, first_row, accepted_rows]` per sequence; the caller
+/// guarantees in-range, non-overlapping sequences and a matching replay step.
+pub struct KimiKdaCommit<'a> { program: Program<'a> }
+impl<'a> KimiKdaCommit<'a> {
+    pub fn load(programs: &'a Programs<'a>) -> W8Result<Self> {
+        let program = programs.program("kimik3_kda_commit", &["state", "conv_state", "replay", "tables"])?;
+        validate_kda_commit_manifest(program.spec())?;
+        Ok(Self { program })
+    }
+
+    pub fn launch(&self, sequences: usize, layers: usize, slots: usize,
+        state: Buffer, conv_state: Buffer, replay: Buffer, tables: Buffer,
+        stream: *mut c_void) -> W8Result<()> {
+        let requirements = kda_commit_requirements(sequences, layers, slots, state, conv_state, replay, tables)?;
+        validate_w8_buffers(&requirements, state.device_id)?;
+        reject_writers(&requirements, &[0, 1])?;
+        // SAFETY: checked pool extents and disjoint writes; the caller retains
+        // replay, tables, state and stream through completion/graph replay.
+        unsafe { self.program.launch(&[state.ptr, conv_state.ptr, replay.ptr, tables.ptr],
+            &[Scalar::I32(sequences as i32), Scalar::I32(layers as i32), Scalar::I32(slots as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn kda_slot_bytes(slots: usize, per_slot: usize) -> W8Result<usize> {
+    if slots == 0 || slots > i32::MAX as usize { return Err(KimiW8Error::Invalid("KDA state slots")); }
+    slots.checked_mul(per_slot).ok_or(KimiW8Error::Invalid("KDA extent overflow"))
+}
+
+fn validate_kda_manifest(spec: &ProgramSpec, rows: usize, decode: bool) -> W8Result<usize> {
+    let g = &spec.geometry;
+    if rows != if decode { 64 } else { 4096 } || spec.capacity_rows as usize != rows
+        || spec.scalar_kinds != if decode { &b"ii"[..] } else { &b"i"[..] }
+        || [("hidden", 7168), ("heads", 48), ("head_dim", 128), ("max_rows", rows), ("in_width", 24752)]
+            .iter().any(|&(key, n)| g[key].as_u64() != Some(n as u64))
+        || g["eps"].as_f64() != Some(1e-5) || g["lower_bound"].as_f64() != Some(-5.0)
+        || g["output_kind"].as_str() != Some("norm") || g["output_gate"].as_str() != Some("full_rank")
+        || g["o_norm_dtype"].as_str() != Some("float32") || g["beta_sigmoid_dtype"].as_str() != Some("float32")
+        || g["use_gate_in_kernel"].as_bool() != Some(true) || g["safe_gate"].as_bool() != Some(true)
+        || !g["state_dtype"].is_null() || !g["state_rounding"].is_null()
+        || (decode && g["bf16_decode"].as_bool() != Some(true))
+        || (!decode && !g["bf16_decode"].is_null()) || !g["replay_rows"].is_null()
+        || (decode && !g["chunked_min_rows"].is_null())
+        || (!decode && g["chunked_min_rows"].as_u64() != Some(64)) {
+        return Err(KimiW8Error::Invalid("KDA manifest geometry/scalars"));
+    }
+    let align = |n: usize| n.div_ceil(1024) * 1024;
+    let base = align(rows * 24752 * 2) + align(rows * 2 * 6144 * 2)
+        + align(rows * 3 * 6144 * 2) + 2 * align(rows * 6144 * 2);
+    let scratch = spec.scratch.get("scratch").copied()
+        .and_then(|n| usize::try_from(n).ok()).ok_or(KimiW8Error::Invalid("KDA scratch manifest"))?;
+    if spec.scratch.len() != 1 || scratch < base || (decode && scratch != base)
+        || (!decode && scratch == base) || scratch % 1024 != 0 {
+        return Err(KimiW8Error::Invalid("KDA scratch manifest"));
+    }
+    Ok(scratch)
+}
+
+fn validate_kda_commit_manifest(spec: &ProgramSpec) -> W8Result<()> {
+    let g = &spec.geometry;
+    if spec.scalar_kinds != b"iii" || !spec.scratch.is_empty()
+        || [("heads", 48), ("channels", 3 * 6144), ("replay_rows", 64), ("replay_bytes", KimiKda::replay_bytes())]
+            .iter().any(|&(key, n)| g[key].as_u64() != Some(n as u64))
+        || !g["state_dtype"].is_null() || !g["state_rounding"].is_null() {
+        return Err(KimiW8Error::Invalid("KDA commit manifest"));
+    }
+    Ok(())
+}
+
+fn validate_kda_buffers(w: KimiKdaWeights, b: KimiKdaBatch, capacity: usize,
+    decode: bool, scratch: usize) -> W8Result<()> {
+    if b.rows == 0 || b.rows > capacity || b.rows > i32::MAX as usize
+        || b.sequences == 0 || b.sequences > b.rows || b.sequences > b.state_slots
+        || (!decode && (b.speculative || (b.rows > 64 && b.sequences != 1)))
+        || b.replay.is_some() != decode {
+        return Err(KimiW8Error::Invalid("KDA batch/replay geometry"));
+    }
+    let buffers = [(b.input, b.rows * 7168 * 2), (w.input, 24752 * 7168 * 2),
+        (w.forget, 6144 * 128 * 2), (w.convolution, 3 * 6144 * 4 * 4), (w.a_log, 48 * 4),
+        (w.dt_bias, 6144 * 4), (w.norm, 128 * 4), (w.output, 7168 * 6144 * 2),
+        (b.conv_state, KimiKda::conv_state_bytes(b.state_slots)?), (b.state, KimiKda::state_bytes(b.state_slots)?),
+        (b.slots, b.rows * 4), (b.first, b.rows * 4), (b.normalized, b.rows * 6144 * 2),
+        (b.output, b.rows * 7168 * 2), (b.scratch, scratch),
+        (b.replay.unwrap_or(b.scratch), KimiKda::replay_bytes())];
+    let active = if decode { &buffers[..] } else { &buffers[..15] };
+    validate_w8_buffers(active, b.input.device_id)?;
+    reject_writers(active, if decode { &[8, 9, 12, 13, 14, 15] } else { &[8, 9, 12, 13, 14] })
+}
+
+fn reject_writers(buffers: &[(Buffer, usize)], writers: &[usize]) -> W8Result<()> {
+    for &writer in writers {
+        for other in 0..buffers.len() {
+            if writer != other { reject_overlap(buffers[writer], buffers[other])?; }
+        }
+    }
+    Ok(())
+}
+
+fn kda_commit_requirements(sequences: usize, layers: usize, slots: usize,
+    state: Buffer, conv_state: Buffer, replay: Buffer, tables: Buffer) -> W8Result<[(Buffer, usize); 4]> {
+    if sequences == 0 || sequences > slots || sequences > i32::MAX as usize || !(1..=69).contains(&layers) {
+        return Err(KimiW8Error::Invalid("KDA commit dimensions"));
+    }
+    let layer_bytes = |bytes: usize| bytes.checked_mul(layers).ok_or(KimiW8Error::Invalid("KDA extent overflow"));
+    Ok([(state, layer_bytes(KimiKda::state_bytes(slots)?)?),
+        (conv_state, layer_bytes(KimiKda::conv_state_bytes(slots)?)?),
+        (replay, layer_bytes(KimiKda::replay_bytes())?), (tables, sequences * 3 * 4)])
+}
+
 /// Native RMSNorm: F32 normalization -> BF16 -> BF16 weight product -> BF16.
 /// Unlike a one-round affine norm, this preserves the checkpoint's intermediate.
 pub struct KimiRmsNorm<'a> {
@@ -686,6 +863,97 @@ mod tests {
         let wrapping = Buffer { ptr: (usize::MAX - 15) as *mut c_void, ..a };
         assert!(validate_w8_buffers(&[(wrapping, 16)], 0).is_err());
         assert!(reject_overlap((wrapping, 16), (a, 16)).is_err());
+    }
+
+    fn kda_spec(decode: bool) -> ProgramSpec {
+        let rows = if decode { 64 } else { 4096 };
+        let align = |n: usize| n.div_ceil(1024) * 1024;
+        let scratch = align(rows * 24752 * 2) + align(rows * 2 * 6144 * 2)
+            + align(rows * 3 * 6144 * 2) + 2 * align(rows * 6144 * 2);
+        ProgramSpec { name: "test_kda".into(), pointers: vec![],
+            scalar_kinds: if decode { b"ii".to_vec() } else { b"i".to_vec() },
+            scratch: [("scratch".into(), (scratch + if decode { 0 } else { 1024 }) as u64)].into_iter().collect(),
+            capacity_rows: rows as u32,
+            geometry: serde_json::json!({"hidden": 7168, "heads": 48, "head_dim": 128,
+                "max_rows": rows, "in_width": 24752, "lower_bound": -5.0, "eps": 1e-5,
+                "output_kind": "norm", "output_gate": "full_rank", "o_norm_dtype": "float32",
+                "beta_sigmoid_dtype": "float32", "use_gate_in_kernel": true, "safe_gate": true,
+                "bf16_decode": if decode { Some(true) } else { None },
+                "chunked_min_rows": if decode { None } else { Some(64) }}) }
+    }
+
+    #[test]
+    fn kda_manifests_reject_substitute_numerics_and_wrong_replay_geometry() {
+        assert_eq!(KimiKda::state_bytes(1).unwrap(), 3 * 1024 * 1024);
+        assert_eq!(KimiKda::conv_state_bytes(1).unwrap(), 110592);
+        assert_eq!(KimiKda::replay_bytes(), 7090176);
+        assert!(KimiKda::state_bytes(0).is_err());
+        assert!(KimiKda::state_bytes(usize::MAX).is_err());
+        for decode in [false, true] {
+            let spec = kda_spec(decode);
+            let rows = spec.capacity_rows as usize;
+            validate_kda_manifest(&spec, rows, decode).unwrap();
+            for (key, value) in [("heads", serde_json::json!(96)), ("in_width", serde_json::json!(24704)),
+                ("output_kind", serde_json::json!("projection")), ("output_gate", serde_json::json!("low_rank")),
+                ("o_norm_dtype", serde_json::json!("bfloat16")), ("beta_sigmoid_dtype", serde_json::json!("bfloat16")),
+                ("state_dtype", serde_json::json!("bfloat16")), ("replay_rows", serde_json::json!(128)),
+                ("safe_gate", serde_json::json!(false)), ("eps", serde_json::json!(1e-6))] {
+                let mut wrong = spec.clone(); wrong.geometry[key] = value;
+                assert!(validate_kda_manifest(&wrong, rows, decode).is_err(), "{key}");
+            }
+            let mut wrong = spec.clone(); wrong.scalar_kinds = b"iii".to_vec();
+            assert!(validate_kda_manifest(&wrong, rows, decode).is_err());
+            let mut wrong = spec.clone(); wrong.scratch.insert("scratch".into(), 0);
+            assert!(validate_kda_manifest(&wrong, rows, decode).is_err());
+            assert!(validate_kda_manifest(&spec, rows / 2, decode).is_err());
+        }
+        let spec = ProgramSpec { name: "commit".into(), pointers: vec![], scalar_kinds: b"iii".to_vec(),
+            scratch: Default::default(), capacity_rows: 64,
+            geometry: serde_json::json!({"heads": 48, "channels": 18432, "replay_rows": 64,
+                "replay_bytes": KimiKda::replay_bytes()}) };
+        validate_kda_commit_manifest(&spec).unwrap();
+        let mut wrong = spec.clone(); wrong.geometry["replay_bytes"] = serde_json::json!(1);
+        assert!(validate_kda_commit_manifest(&wrong).is_err());
+    }
+
+    fn kda_buffers(decode: bool) -> (KimiKdaWeights, KimiKdaBatch) {
+        let buffer = |index: usize| Buffer { ptr: (index * 0x100000000usize) as *mut c_void,
+            bytes: 0x40000000, device_id: 0, flags: 0 };
+        (KimiKdaWeights { input: buffer(1), forget: buffer(2), convolution: buffer(3),
+            a_log: buffer(4), dt_bias: buffer(5), norm: buffer(6), output: buffer(7) },
+            KimiKdaBatch { rows: 16, sequences: 2, state_slots: 4, speculative: decode,
+                input: buffer(8), state: buffer(9), conv_state: buffer(10), slots: buffer(11),
+                first: buffer(12), normalized: buffer(13), output: buffer(14),
+                replay: decode.then(|| buffer(15)), scratch: buffer(16) })
+    }
+
+    #[test]
+    fn kda_admission_checks_every_writer_and_prefill_sequence_limit() {
+        for decode in [false, true] {
+            let (w, b) = kda_buffers(decode);
+            let capacity = if decode { 64 } else { 4096 };
+            validate_kda_buffers(w, b, capacity, decode, 1024).unwrap();
+            assert!(validate_kda_buffers(w, KimiKdaBatch { rows: 0, ..b }, capacity, decode, 1024).is_err());
+            assert!(validate_kda_buffers(w, KimiKdaBatch { state_slots: 0, ..b }, capacity, decode, 1024).is_err());
+            assert!(validate_kda_buffers(w, KimiKdaBatch { output: w.input, ..b }, capacity, decode, 1024).is_err());
+            assert!(validate_kda_buffers(w, KimiKdaBatch { normalized: b.input, ..b }, capacity, decode, 1024).is_err());
+            assert!(validate_kda_buffers(w, KimiKdaBatch { scratch: b.state, ..b }, capacity, decode, 1024).is_err());
+            assert!(validate_kda_buffers(w, KimiKdaBatch { conv_state: b.state, ..b }, capacity, decode, 1024).is_err());
+            assert!(validate_kda_buffers(w, KimiKdaBatch { replay: if decode { None } else { Some(b.scratch) }, ..b },
+                capacity, decode, 1024).is_err());
+            assert!(validate_kda_buffers(KimiKdaWeights { norm: Buffer { bytes: 511, ..w.norm }, ..w },
+                b, capacity, decode, 1024).is_err());
+            assert!(validate_kda_buffers(w, KimiKdaBatch { input: Buffer { device_id: 1, ..b.input }, ..b },
+                capacity, decode, 1024).is_err());
+        }
+        let (w, b) = kda_buffers(false);
+        assert!(validate_kda_buffers(w, KimiKdaBatch { rows: 65, ..b }, 4096, false, 1024).is_err());
+        assert!(validate_kda_buffers(w, KimiKdaBatch { speculative: true, ..b }, 4096, false, 1024).is_err());
+        validate_kda_buffers(w, KimiKdaBatch { rows: 4096, sequences: 1, ..b }, 4096, false, 1024).unwrap();
+        let requirements = kda_commit_requirements(2, 69, 4, b.state, b.conv_state, b.scratch, b.first).unwrap();
+        assert_eq!(requirements[0].1, 69 * 4 * 3 * 1024 * 1024);
+        assert!(kda_commit_requirements(2, 70, 4, b.state, b.conv_state, b.scratch, b.first).is_err());
+        assert!(kda_commit_requirements(5, 69, 4, b.state, b.conv_state, b.scratch, b.first).is_err());
     }
 
     #[test]

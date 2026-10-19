@@ -352,6 +352,12 @@ def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode
         if op == "kda":
             assert kwargs["output_kind"] == "norm"
             assert kwargs["decode"] == (kwargs["max_rows"] == decode_rows)
+    # KDA reuses the identical shared-FFN down projection, without a second export.
+    output = [p for p in programs if p[0] == "ffn_down_i6144"]
+    assert len(output) == 1
+    _, op, params, thunk = output[0]
+    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168}
+    assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
 
 
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
