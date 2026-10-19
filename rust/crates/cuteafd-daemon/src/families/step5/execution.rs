@@ -53,7 +53,19 @@ impl RankAdmission {
 enum Attention<'a> { Sliding(SwaLayer<'a>), Sparse(CsaLayer<'a>) }
 enum Ffn<'a> { Dense(DenseFfn<'a>), Routed(RoutedFfn<'a>) }
 struct Layer<'a> { attention: Attention<'a>, ffn: Ffn<'a> }
-impl Layer<'_> {
+impl<'a> Layer<'a> {
+    fn new_lane(&self) -> Result<Self> {
+        let attention = match &self.attention {
+            Attention::Sliding(owner) => Attention::Sliding(owner.new_lane()?),
+            Attention::Sparse(owner) => Attention::Sparse(owner.new_lane()?),
+        };
+        let ffn = match &self.ffn {
+            Ffn::Dense(owner) => Ffn::Dense(owner.new_lane()?),
+            Ffn::Routed(owner) => Ffn::Routed(owner.new_lane()?),
+        };
+        Ok(Self { attention, ffn })
+    }
+
     fn input(&self) -> CuteafdDeviceBuffer {
         match &self.attention { Attention::Sliding(l) => l.input(), Attention::Sparse(l) => l.input() }
     }
@@ -68,11 +80,91 @@ impl Layer<'_> {
     }
 }
 
-/// Mutable native objects are deliberately admitted for ONE lane only. Sharing
-/// immutable weights with separate lane workspaces is a prerequisite to serving.
+/// A private lane retains component Rc owners; it never reloads their operands.
+struct NativeLane<'a> {
+    ranks: [Vec<Option<Layer<'a>>>; 2],
+    head: Option<super::head::TargetHeadOwner<'a>>,
+}
+impl<'a> NativeLane<'a> {
+    fn new_lane(&self) -> Result<Self> {
+        let mut ranks = [Vec::new(), Vec::new()];
+        for (destination, source) in ranks.iter_mut().zip(&self.ranks) {
+            *destination = source.iter().map(|layer| layer.as_ref().map(Layer::new_lane).transpose())
+                .collect::<Result<_>>()?;
+        }
+        let head = self.head.as_ref().map(super::head::TargetHeadOwner::new_lane).transpose()?;
+        Ok(Self { ranks, head })
+    }
+}
+
+/// Native rank allocation is atomic with respect to admission: every rank is
+/// checked before the first load, and later lanes allocate only private workspace.
+struct NativeLanes<'a> {
+    lanes: Vec<NativeLane<'a>>,
+}
+impl<'a> NativeLanes<'a> {
+    fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: &ExecutionOwnership, devices: [Device<'a>; 2], rows: usize,
+        count: usize, available: [u64; 2], reservations: [u64; 2]) -> Result<Self> {
+        ensure!(ownership.ranks() == 2 && matches!(count, 1 | 92), "Step-5 native rank/layer inventory");
+        let lanes = usize::try_from(ownership.execution().spec().lanes)?;
+        let head_rank = ownership.execution().spec().head_gpu as usize;
+        ensure!(head_rank < 2, "Step-5 final head rank");
+        let head_plan = (count == 92).then(||
+            super::head::HeadPlan::for_execution(programs, checkpoint, rows, ownership)).transpose()?;
+        let mut admission = [RankAdmission { immutable: 0, workspace: 0 }; 2];
+        for (rank, plan) in admission.iter_mut().enumerate() {
+            *plan = Execution::rank_admission(programs, checkpoint, ownership, rank, rows, count)?;
+            if rank == head_rank {
+                if let Some(head) = &head_plan { *plan = plan.with_head(head)?; }
+            }
+        }
+        admit_native_lanes(admission, lanes, available, reservations, || {
+            let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+            let mut ranks: [Vec<Option<Layer<'a>>>; 2] = [Vec::new(), Vec::new()];
+            for rank in 0..2 {
+                let device = devices[rank];
+                let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
+                for layer in 0..count {
+                    if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
+                    let attention = if contract.layers[layer].sliding.is_some() {
+                        Attention::Sliding(SwaLayer::for_execution(device, programs, checkpoint, layer,
+                            rows, Some(rope.clone()), available[rank], &[], rank, ownership)?)
+                    } else {
+                        Attention::Sparse(CsaLayer::for_execution(device, programs, checkpoint, layer,
+                            rows, Some(rope.clone()), available[rank], &[], rank, ownership)?)
+                    };
+                    let ffn = if contract.layers[layer].dense_activation.is_some() {
+                        let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
+                        Ffn::Dense(DenseFfn::load_plan(device, programs, checkpoint, plan)?)
+                    } else {
+                        let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
+                        Ffn::Routed(RoutedFfn::load(device, programs, checkpoint, layer, plan)?)
+                    };
+                    ranks[rank].push(Some(Layer { attention, ffn }));
+                }
+            }
+            let head = head_plan.map(|plan| super::head::TargetHeadOwner::load(devices[head_rank],
+                programs, checkpoint, plan, available[head_rank], &[])).transpose()?;
+            let first = NativeLane { ranks, head };
+            let mut owners = Vec::with_capacity(lanes);
+            for _ in 1..lanes { owners.push(first.new_lane()?); }
+            owners.insert(0, first);
+            Ok(Self { lanes: owners })
+        })
+    }
+}
+
+fn admit_native_lanes<T>(admission: [RankAdmission; 2], lanes: usize,
+    available: [u64; 2], reservations: [u64; 2], allocate: impl FnOnce() -> Result<T>) -> Result<T> {
+    for rank in 0..2 { admission[rank].check(lanes, available[rank], &[reservations[rank]])?; }
+    allocate()
+}
+
+/// Transport/cache bindings remain one lane until their namespaces are qualified.
 pub(super) struct Execution<'e, 'a> {
     ownership: ExecutionOwnership,
-    ranks: [Vec<Option<Layer<'a>>>; 2],
+    native: NativeLane<'a>,
     caches: [&'e RefCell<CacheRank<'a>>; 2],
     stages: [&'e Staging<'a>; 2],
     peer: PeerExchange<'a>,
@@ -152,10 +244,9 @@ impl<'e, 'a> Execution<'e, 'a> {
         count: usize) -> Result<Self> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        ensure!(ownership.ranks() == 2 && ownership.execution().spec().lanes == 1,
+            "Step-5 transport/cache binding explicitly admits exactly one lane and two ranks");
         for rank in 0..2 {
-            let required = Self::required_bytes_count(programs, checkpoint, &ownership, rank, rows, count)?;
-            ensure!(required.checked_add(reservations[rank]).is_some_and(|n| n <= available[rank]),
-                "Step-5 native rank {rank} exceeds preallocation admission");
             ensure!(rows as u64 <= ownership.execution().spec().rows,
                 "Step-5 live rows exceed execution plan");
             let cache = caches[rank].borrow();
@@ -168,6 +259,10 @@ impl<'e, 'a> Execution<'e, 'a> {
         let devices = [caches[0].borrow().stream.device, caches[1].borrow().stream.device];
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "Step-5 rank devices/library differ");
+        let mut owners = NativeLanes::load(programs, checkpoint, &ownership, devices,
+            rows, count, available, reservations)?;
+        let native = owners.lanes.pop().context("Step-5 admitted native lane missing")?;
+        ensure!(owners.lanes.is_empty(), "Step-5 one-lane binding received extra workspaces");
         let native_ranks = std::array::from_fn(|rank| RankDevice { device: devices[rank].id,
             stream: caches[rank].borrow().stream.raw });
         let peer = devices[0].run(|| PeerExchange::new_abortable(devices[0].library, native_ranks, 8, rows * H * 4))?;
@@ -176,29 +271,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         hops.attach_abort([peer.abort_word(0)?.context("Step-5 lead abort")?,
             peer.abort_word(1)?.context("Step-5 peer abort")?])?;
         hops.validate_binding(ownership.execution(), &peer)?;
-        let mut ranks: [Vec<Option<Layer<'a>>>; 2] = [Vec::new(), Vec::new()];
-        for rank in 0..2 {
-            let device = devices[rank];
-            let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
-            for layer in 0..count {
-                if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
-                let attention = if contract.layers[layer].sliding.is_some() {
-                    Attention::Sliding(SwaLayer::for_execution(device, programs, checkpoint, layer,
-                        rows, Some(rope.clone()), available[rank], &[], rank, &ownership)?)
-                } else {
-                    Attention::Sparse(CsaLayer::for_execution(device, programs, checkpoint, layer,
-                        rows, Some(rope.clone()), available[rank], &[], rank, &ownership)?)
-                };
-                let ffn = if contract.layers[layer].dense_activation.is_some() {
-                    let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, &ownership)?;
-                    Ffn::Dense(DenseFfn::load_plan(device, programs, checkpoint, plan)?)
-                } else {
-                    let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, &ownership)?;
-                    Ffn::Routed(RoutedFfn::load(device, programs, checkpoint, layer, plan)?)
-                };
-                ranks[rank].push(Some(Layer { attention, ffn }));
-            }
-        }
+        let ranks = &native.ranks;
         let bytes = RouteStaging::new(rows, 8, H * 2)?.bytes;
         let pinned = [RefCell::new(HostAllocation::new(devices[0].library, bytes)?),
             RefCell::new(HostAllocation::new(devices[1].library, bytes)?)];
@@ -246,14 +319,14 @@ impl<'e, 'a> Execution<'e, 'a> {
             }
             inventory.push(state);
         }
-        let execution = Self { ownership, ranks, caches, stages, peer, hops,
+        let execution = Self { ownership, native, caches, stages, peer, hops,
             sequence: RefCell::new(HeadSequence::new(0)?), lanes: lanes.map(RefCell::new), pinned, rows, inventory };
         if count == 92 { execution.validate_replications()?; }
         Ok(execution)
     }
 
     fn layer(&self, rank: usize, layer: usize) -> Result<&Layer<'a>> {
-        self.ranks[rank].get(layer).and_then(Option::as_ref).context("Step-5 missing live layer owner")
+        self.native.ranks[rank].get(layer).and_then(Option::as_ref).context("Step-5 missing live layer owner")
     }
     pub fn output(&self, layer: usize) -> Result<(Device<'a>, CuteafdDeviceBuffer)> {
         let rank = match self.ownership.execution().mode(layer)? {
@@ -261,6 +334,9 @@ impl<'e, 'a> Execution<'e, 'a> {
             LayerMode::ContextSplit => anyhow::bail!("Step-5 context output unsupported"),
         };
         Ok((self.caches[rank].borrow().stream.device, self.layer(rank, layer)?.output()))
+    }
+    pub(super) fn head(&self) -> Result<&super::head::TargetHeadOwner<'a>> {
+        self.native.head.as_ref().context("Step-5 final head not loaded for this diagnostic")
     }
     pub(super) fn diagnostic_layer0(&self, rank: usize) -> Result<(&SwaLayer<'a>, &DenseFfn<'a>)> {
         let layer = self.layer(rank, 0)?;
@@ -271,7 +347,7 @@ impl<'e, 'a> Execution<'e, 'a> {
 
     pub(super) fn enqueue_layer0<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
         input: &'s Allocation<'a>, directory: &'s std::path::Path) -> Result<()> {
-        ensure!(self.ranks.iter().all(|layers| layers.len() == 1), "layer-zero diagnostic must load only layer zero");
+        ensure!(self.native.ranks.iter().all(|layers| layers.len() == 1), "layer-zero diagnostic must load only layer zero");
         step.validate_binding(&self.caches, &self.stages, self.rows)?;
         pair::submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
             step.in_submission(scope, |step| {
@@ -679,6 +755,24 @@ mod admission_tests {
         assert!(plan.check(2, plan.bytes(2)? - 1, &[]).is_err());
         assert!(RankAdmission { immutable: u64::MAX, workspace: 0 }.with_head(&head).is_err());
         assert!(RankAdmission { immutable: 0, workspace: u64::MAX }.with_head(&head).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn all_ranks_are_admitted_before_the_allocation_callback() -> Result<()> {
+        let admission = [RankAdmission { immutable: 100, workspace: 20 },
+            RankAdmission { immutable: 200, workspace: 30 }];
+        let calls = std::cell::Cell::new(0);
+        let allocate = || { calls.set(calls.get() + 1); Ok(()) };
+        // Rank zero fits, but rank one must fail without loading either rank.
+        assert!(admit_native_lanes(admission, 2, [140, 259], [0, 0], allocate).is_err());
+        assert_eq!(calls.get(), 0);
+        assert!(admit_native_lanes(admission, 2, [140, 260], [0, 1], allocate).is_err());
+        assert_eq!(calls.get(), 0);
+        assert!(admit_native_lanes(admission, 3, [u64::MAX; 2], [0; 2], allocate).is_err());
+        assert_eq!(calls.get(), 0);
+        admit_native_lanes(admission, 2, [147, 269], [7, 9], allocate)?;
+        assert_eq!(calls.get(), 1);
         Ok(())
     }
 

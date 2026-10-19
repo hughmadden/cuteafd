@@ -799,7 +799,6 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let devices = [args.device, peer_device].map(|id| Device { library: &library, id });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5", "step52"], programs.names());
-    let head_plan = HeadPlan::for_execution(&programs, checkpoint, rows, &ownership)?;
     let head_rank = ownership.execution().spec().head_gpu as usize;
     let pages = (rows as u64).div_ceil(64) + 1;
     let mut available = [0u64; 2];
@@ -809,7 +808,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let mut reservations = [0u64; 2];
     for rank in 0..2 {
         available[rank] = devices[rank].run(|| library.cuda_memory_info()).map(|(free, _)| free as u64)?;
-        chain_bytes[rank] = Execution::required_bytes(&programs, checkpoint, &ownership, rank, rows)?;
+        let admission = Execution::serving_admission(&programs, checkpoint, &ownership, rank, rows)?;
+        chain_bytes[rank] = admission.check(1, u64::MAX, &[])?;
         cache_bytes[rank] = layout.ranks[rank].bytes.checked_add(layout.geometry.ranks[rank].persistent_unit_bytes * pages)
             .context("Step-5 shared cache overflow")?;
         staging_bytes[rank] = Staging::bytes(&layout, rank)? as u64;
@@ -820,8 +820,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         // native code and independent headroom are charged before allocations.
         let peer = (8 * rows * H * 4) as u64 + hops[rank] + (2 << 20);
         let input = if rank == 0 { (rows * H * 4) as u64 } else { 0 };
-        let head = if rank == head_rank { head_plan.bytes() } else { 0 };
-        reservations[rank] = [cache_bytes[rank], staging_bytes[rank], peer, input, head, pending,
+        reservations[rank] = [cache_bytes[rank], staging_bytes[rank], peer, input, pending,
             2u64 << 30, 2u64 << 30].into_iter().try_fold(0u64, |n, bytes| n.checked_add(bytes))
             .context("Step-5 shared reservation overflow")?;
         let total = chain_bytes[rank].checked_add(reservations[rank]).context("Step-5 shared admission overflow")?;
@@ -846,8 +845,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let mut placement = pool.admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
     let execution = Execution::load(&programs, checkpoint, ownership, [&caches[0], &caches[1]],
         [&stages[0], &stages[1]], rows, available, reservations, lanes)?;
-    let head = TargetHeadOwner::load(devices[head_rank], &programs, checkpoint, head_plan,
-        available[head_rank], &[])?;
+    let head = execution.head()?;
     let input = Allocation::new(devices[0], rows * H * 4)?;
     devices[0].run(|| library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?))?;
     tracing::info!(seconds=started.elapsed().as_secs_f64(), "Step-5 shared one-lane readiness");
