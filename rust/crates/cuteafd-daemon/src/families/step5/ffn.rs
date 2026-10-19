@@ -318,11 +318,19 @@ impl<'a> DenseFfn<'a> {
         Ok(())
     }
 
+    pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
+        super::weights::validate_live_weights(device.id, &self.weights)
+    }
+
     pub fn input(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
         self.planes[0].buffer
     }
     pub fn output(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
         self.planes[5].buffer
+    }
+
+    pub(super) fn diagnostic_planes(&self) -> [(cuteafd_ffi::CuteafdDeviceBuffer, bool); 4] {
+        [0, 1, 4, 5].map(|i| (self.planes[i].buffer, matches!(i, 1 | 4)))
     }
 
     // The containing layer owns this stream ahead of the FFN fields and drains

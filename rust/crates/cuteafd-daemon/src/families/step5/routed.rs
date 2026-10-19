@@ -322,6 +322,10 @@ impl<'a> RoutedFfn<'a> {
             layer,
         })
     }
+    pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
+        super::weights::validate_live_weights(device.id, &self.weights)
+    }
+
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.planes[INPUT].buffer
     }
@@ -404,17 +408,19 @@ impl<'a> RoutedFfn<'a> {
         Ok(())
     }
 
-    /// Produce native BF16 wire rows and biased top-8 routes without choosing a transport.
-    pub fn frontend_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+    /// A receiving replica needs the native shared expert, not another router/wave.
+    pub fn normalize_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.check_stream(rows, stream)?;
         let p = |i: usize| self.planes[i].buffer.ptr;
+        let weight = self.weights[0].buffer.ptr;
+        self.launch(0, &[p(INPUT), weight, weight, weight, weight, weight, p(NORM)], rows, stream)
+    }
+
+    /// Produce native BF16 wire rows and biased top-8 routes without choosing a transport.
+    pub fn frontend_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        self.normalize_on(rows, stream)?;
+        let p = |i: usize| self.planes[i].buffer.ptr;
         let w = |i: usize| self.weights[i].buffer.ptr;
-        self.launch(
-            0,
-            &[p(INPUT), w(0), w(0), w(0), w(0), w(0), p(NORM)],
-            rows,
-            stream,
-        )?;
         self.launch(1, &[p(NORM), w(1), p(LOGITS)], rows, stream)?;
         stream.device.run(|| {
             // SAFETY: disjoint admitted logits planes and routes remain live through the stream drain.

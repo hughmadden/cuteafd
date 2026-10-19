@@ -35,9 +35,18 @@ impl HeadPlan {
     }
 
     pub fn prepare(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize) -> Result<Self> {
+        Self::prepare_layout(programs, checkpoint, rows, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?)
+    }
+
+    pub fn for_execution(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize,
+        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership) -> Result<Self> {
+        Self::prepare_layout(programs, checkpoint, rows, RankWeightLayout::for_execution(checkpoint,
+            ownership.execution().spec().head_gpu as usize, ownership)?)
+    }
+
+    fn prepare_layout(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize, layout: RankWeightLayout) -> Result<Self> {
         let planes = Self::plane_bytes(rows)?;
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
         let weights = [("model.norm.weight", DType::F32, vec![H]),
             ("lm_head.weight", DType::Bf16, vec![V, H])]
             .into_iter().map(|(name, dtype, shape)| {

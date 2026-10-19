@@ -68,6 +68,8 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             }).collect();
             let head = if ranks == 1 { 0 } else { 1 };
             let owners = ExecutionOwnership::new(&cfg, ranks, ownership::plan(&modes, 0, head)).unwrap();
+            assert_eq!(owners.routed_wave_ranks().unwrap(),
+                if ranks == 1 || policy == 1 { vec![0] } else { vec![0, 1] });
             let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64).unwrap();
             assert_eq!(layout.geometry.placement, if ranks == 1 { KvPlacement::SingleDevice }
                 else { KvPlacement::PartitionedLayers });

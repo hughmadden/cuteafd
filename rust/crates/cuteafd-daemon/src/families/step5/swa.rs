@@ -179,7 +179,11 @@ pub(super) struct SwaLayer<'a> {
 
 impl<'a> SwaLayer<'a> {
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
-        Ok(Admission::new(rows, &[], 0, 0, u64::MAX, &[])?.bytes)
+        Self::workspace_for_heads(rows, 64)
+    }
+
+    pub fn workspace_for_heads(rows: usize, heads: usize) -> Result<u64> {
+        Ok(Admission::for_heads(rows, heads, &[], 0, 0, u64::MAX, &[])?.bytes)
     }
 
     pub fn load(
@@ -570,10 +574,29 @@ impl<'a> SwaLayer<'a> {
         Ok(self.planes[DELTA].buffer)
     }
 
+    pub(super) fn diagnostic_norm(&self) -> CuteafdDeviceBuffer {
+        self.planes[NORM].buffer
+    }
+
+    pub(super) fn diagnostic_attention(&self) -> [(CuteafdDeviceBuffer, bool); 2] {
+        // In head-split mode NORM holds the once-rounded merged O delta.
+        [(self.planes[if self.heads == 32 { NORM } else { DELTA }].buffer, true),
+            (self.planes[POST].buffer, false)]
+    }
+
+    pub(super) fn diagnostic_dense(&self) -> Result<&DenseFfn<'a>> {
+        self.ffn.as_ref().context("SWA diagnostic requires embedded dense FFN")
+    }
+
     /// Ordered rank0 + rank1 projection, one BF16 narrowing, then F32 residual.
     /// The caller retains the exchange and invokes this on its cache stream.
     pub fn merge_partial_on(&self, rows: usize, values: [*const std::ffi::c_void; 2],
         stream: &Stream<'a>) -> Result<()> {
+        self.merge_partial_capture_on(rows, values, stream, None)
+    }
+
+    pub(super) fn merge_partial_capture_on(&self, rows: usize, values: [*const std::ffi::c_void; 2],
+        stream: &Stream<'a>, capture: Option<(&std::path::Path, usize)>) -> Result<()> {
         ensure!(self.heads == 32 && (1..=self.admission.rows).contains(&rows)
             && values.iter().all(|value| !value.is_null())
             && stream.device.id == self.stream.device.id
@@ -584,6 +607,11 @@ impl<'a> SwaLayer<'a> {
         // attention and is large enough for the rounded hidden-width delta.
         self.launch_on(stream, 11, &[values[0].cast_mut(), values[1].cast_mut(), p(POST)],
             &[Scalar::I32(rows as i32)])?;
+        if let Some((directory, rank)) = capture {
+            stream.drain()?;
+            super::golden::dump_plane(directory, &format!("rank{rank}-merged_o_f32"),
+                stream.device, self.planes[POST].buffer, rows, false)?;
+        }
         stream.device.run(|| {
             // SAFETY: disjoint admitted same-device planes survive cache-stream drainage.
             unsafe { stream.device.library.cuda_f32_to_bf16_async(self.planes[POST].buffer,
@@ -726,6 +754,10 @@ impl<'a> SwaLayer<'a> {
         )
     }
 
+    pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
+        super::weights::validate_live_weights(device.id, &self.weights)
+    }
+
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.planes[X].buffer
     }
@@ -742,6 +774,21 @@ impl<'a> SwaLayer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_head_workspace_charges_the_f32_partial_at_every_row_capacity() -> Result<()> {
+        for rows in 1..=4096 {
+            let split = Admission::for_heads(rows, 32, &[], 0, 0, u64::MAX, &[])?;
+            let whole = Admission::for_heads(rows, 64, &[], 0, 0, u64::MAX, &[])?;
+            assert_eq!(split.planes[DELTA], (rows * H * 4).max(256));
+            assert_eq!(SwaLayer::workspace_for_heads(rows, 32)?, split.bytes);
+            assert!(split.bytes <= whole.bytes);
+        }
+        assert!(SwaLayer::workspace_for_heads(0, 32).is_err());
+        assert!(SwaLayer::workspace_for_heads(4097, 32).is_err());
+        assert!(SwaLayer::workspace_for_heads(64, 16).is_err());
+        Ok(())
+    }
+
     fn fixture(root: &std::path::Path, manifest: &serde_json::Value, key: &str) -> Result<Vec<u8>> {
         use sha2::{Digest, Sha256};
         let bytes = std::fs::read(root.join(format!("{key}.bin")))?;

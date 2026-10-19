@@ -14,6 +14,7 @@ use cuteafd_hostcache::copy::CopyEngine;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeSet,
+    rc::Rc,
 };
 
 fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -191,6 +192,13 @@ impl<'a> Staging<'a> {
     pub fn allocation_bytes(&self) -> usize {
         self.bytes
     }
+
+    pub fn owns_compressor(&self, cache: &CacheRank<'_>, layer: usize) -> bool {
+        self.cache_owner == cache.identity() && self.sparse.is_some()
+            && cache.layout().ranks[cache.rank()].regions.iter().position(|r| r.layer == layer)
+                .and_then(|index| self.raw.get(index))
+                .is_some_and(|(key, logits)| !key.buffer.ptr.is_null() && !logits.buffer.ptr.is_null())
+    }
 }
 
 /// Exclusively borrows the placement and lane through preparation, publication,
@@ -208,9 +216,31 @@ pub(super) struct Step<'e, 'a, E: CopyEngine> {
     base: usize,
     failed: bool,
     inputs: Vec<&'e Allocation<'a>>,
+    submission: Rc<Cell<bool>>,
 }
 
 impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
+    pub fn validate_binding(&self, ranks: &[&RefCell<CacheRank<'a>>],
+        stages: &[&Staging<'a>], rows: usize) -> Result<()> {
+        ensure!(!self.failed && self.rows == rows && ranks.len() == self.ranks.len()
+            && stages.len() == self.staging.len()
+            && self.ranks.iter().zip(ranks).all(|(actual, expected)| std::ptr::eq(*actual, *expected))
+            && self.staging.iter().zip(stages).all(|(actual, expected)| std::ptr::eq(*actual, *expected)),
+            "Step-5 pipeline transaction owner/stream/row binding differs");
+        Ok(())
+    }
+
+    /// A whole-pipeline guard must publish peer aborts before any local drain.
+    pub fn in_submission<T>(&mut self,
+        _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+        work: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let _mode = SubmissionMode::enter(self.submission.clone())?;
+        let result = work(self);
+        if result.is_err() { self.failed = true; }
+        result
+    }
+
     pub fn begin(
         ranks: Vec<&'e RefCell<CacheRank<'a>>>,
         staging: Vec<&'e Staging<'a>>,
@@ -263,6 +293,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             base,
             failed: false,
             inputs: Vec::new(),
+            submission: Rc::new(Cell::new(false)),
         };
         let positions: Vec<u8> = (base..end).flat_map(|p| (p as i64).to_le_bytes()).collect();
         let table: Vec<u8> = step
@@ -331,6 +362,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let mut guard = cache
             .stream
             .cancellation_guard("Step-5 projection callback");
+        guard.complete = self.submission.get();
         let result = work(
             input_owner,
             StepInputs {
@@ -360,6 +392,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let cache = self.ranks.get(rank).context("Step-5 composition rank")?.borrow();
         self.failed = true;
         let mut guard = cache.stream.cancellation_guard("Step-5 composition callback");
+        guard.complete = self.submission.get();
         let stage = self.staging[rank];
         let result = work(owner, StepInputs {
             stream: &cache.stream,
@@ -424,6 +457,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             };
         self.failed = true;
         let mut guard = cache.stream.cancellation_guard("Step-5 attention callback");
+        guard.complete = self.submission.get();
         let result = work(
             input_owner,
             AttentionRead {
@@ -477,6 +511,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let state = &cache.layout().ranks[rank];
         let sequence = self.placement.sequence;
         let mut guard = cache.stream.cancellation_guard("Step-5 staged layer");
+        guard.complete = self.submission.get();
         if let Some(ring) = state.sliding.iter().find(|r| r.layer == layer && !r.mtp) {
             ensure!(index.is_none(), "SWA must not carry indexer state");
             let row = ring.key.bytes as usize / cache.layout().ring.rows as usize;
@@ -626,6 +661,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             let mut guard = cache
                 .stream
                 .cancellation_guard("Step-5 prepare publication");
+            guard.complete = self.submission.get();
             let sequence = self.placement.sequence;
             let raw_offset = (self.base % 8 + accepted) / 8 * 8;
             let tail = end % 8;
@@ -672,6 +708,18 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         self.placement.committed = end;
         Ok(())
     }
+}
+
+struct SubmissionMode(Rc<Cell<bool>>);
+impl SubmissionMode {
+    fn enter(active: Rc<Cell<bool>>) -> Result<Self> {
+        ensure!(!active.get(), "Step-5 nested submission scope");
+        active.set(true);
+        Ok(Self(active))
+    }
+}
+impl Drop for SubmissionMode {
+    fn drop(&mut self) { self.0.set(false); }
 }
 
 impl<E: CopyEngine> Drop for Step<'_, '_, E> {
@@ -737,6 +785,22 @@ pub(super) mod tests {
     use super::*;
     use cuteafd_engine::prefix::{BoxError, PrefixConfig, PrefixFamily};
     use cuteafd_hostcache::copy::StubCopyEngine;
+
+    #[test]
+    fn submission_mode_resets_on_success_error_and_unwind_without_nested_reset() {
+        let active = Rc::new(Cell::new(false));
+        for panic in [false, true] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = SubmissionMode::enter(active.clone()).unwrap();
+                assert!(active.get());
+                assert!(SubmissionMode::enter(active.clone()).is_err());
+                assert!(active.get());
+                if panic { panic!("partial pipeline enqueue"); }
+            }));
+            assert_eq!(result.is_err(), panic);
+            assert!(!active.get());
+        }
+    }
 
     #[test]
     fn peer_without_csa_has_no_compressor_workspace_charge() -> Result<()> {

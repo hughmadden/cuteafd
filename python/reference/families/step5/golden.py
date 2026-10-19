@@ -206,6 +206,76 @@ def norm_accuracy_fp64(x, weight, epsilon, *, zero_centered=True, bias=None,
     return value
 
 
+def swa_head_partition_fp64(hidden, weights, positions, *, rank=0, ranks=1,
+                            query_heads=64, kv_heads=4, dim=192, theta=10000.,
+                            epsilon=1e-5, window=512, bf16_boundaries=False):
+    """CPU slice/wiring oracle, not a native GEMM or flash reduction emulator.
+
+    Row-slice Q/K/V/g and column-slice O exactly as RankWeightLayout/pack.
+    Return unrounded F64 O partials so callers can test merge boundaries.
+    """
+    import numpy as np
+    if ranks not in (1, 2) or not 0 <= rank < ranks or query_heads % kv_heads or kv_heads % ranks:
+        raise ValueError("SWA head partition geometry")
+    x = np.asarray(hidden, dtype=np.float64)
+    positions = np.asarray(positions, dtype=np.int64)
+    if x.ndim != 2 or positions.shape != (len(x),) or dim % 2 or window < 1:
+        raise ValueError("SWA hidden/positions geometry")
+    if not np.all(np.diff(positions) > 0):
+        raise ValueError("SWA positions must increase")
+
+    def boundary(value):
+        if not bf16_boundaries:
+            return value
+        value = np.asarray(value, dtype=np.float32)
+        bits = value.view(np.uint32)
+        rounded = (bits + np.uint32(0x7fff) + ((bits >> 16) & 1)) & np.uint32(0xffff0000)
+        return rounded.view(np.float32).astype(np.float64)
+
+    def norm(value, weight):
+        return boundary(value / np.sqrt(np.mean(value * value, axis=-1, keepdims=True)
+                                       + float(np.float32(epsilon))) * (np.asarray(weight) + 1.))
+
+    local_q, local_kv = query_heads // ranks, kv_heads // ranks
+    q_slice = slice(rank * local_q, (rank + 1) * local_q)
+    kv_slice = slice(rank * local_kv, (rank + 1) * local_kv)
+    normalized = norm(x, weights['input_norm'])
+
+    def project(name, heads, selection):
+        matrix = np.asarray(weights[name]).reshape(heads, dim, x.shape[1])[selection]
+        return boundary(normalized @ matrix.reshape(-1, x.shape[1]).T).reshape(len(x), -1, dim)
+
+    q = norm(project('q', query_heads, q_slice), weights['q_norm'])
+    k = norm(project('k', kv_heads, kv_slice), weights['k_norm'])
+    v = project('v', kv_heads, kv_slice)
+    phase = positions[:, None] * theta ** (-np.arange(0, dim, 2, dtype=np.float64) / dim)
+    cos, sin = boundary(np.cos(phase))[:, None], boundary(np.sin(phase))[:, None]
+
+    def rope(value):
+        real, imaginary = value[..., :dim // 2], value[..., dim // 2:]
+        return boundary(np.concatenate((real * cos - imaginary * sin,
+                                        real * sin + imaginary * cos), axis=-1))
+
+    q, k = rope(q), rope(k)
+    attention = np.empty_like(q)
+    for row, position in enumerate(positions):
+        keep = (positions <= position) & (positions > position - window)
+        for head in range(local_q):
+            group = head // (local_q // local_kv)
+            scores = k[keep, group] @ q[row, head] / np.sqrt(dim)
+            probabilities = np.exp(scores - scores.max())
+            probabilities /= probabilities.sum()
+            attention[row, head] = probabilities @ v[keep, group]
+    attention = boundary(attention)
+    gate_logits = boundary(normalized @ np.asarray(weights['g'])[q_slice].T)
+    gates = boundary(1. / (1. + np.exp(-gate_logits)))
+    gated = boundary(attention * gates[..., None])
+    output = np.asarray(weights['o']).reshape(x.shape[1], query_heads, dim)[:, q_slice]
+    partial = gated.reshape(len(x), -1) @ output.reshape(x.shape[1], -1).T
+    return dict(partial=partial, attention=attention, gated=gated, q=q, k=k, v=v,
+                query_heads=np.arange(query_heads)[q_slice], kv_heads=np.arange(kv_heads)[kv_slice])
+
+
 def sliding_attention(query, key, value, window):
     """Fixed 128-query, (window+127)-key SDPA, without quadratic masks."""
     import torch

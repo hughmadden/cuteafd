@@ -202,6 +202,12 @@ impl<'a> TargetChain<'a> {
             .context("Step-5 chain output layer")?
             .output())
     }
+    pub(super) fn diagnostic_layer0(&self) -> Result<&SwaLayer<'a>> {
+        match &self.layers.first().context("Step-5 missing layer zero")?.attention {
+            Attention::Sliding(owner) => Ok(owner),
+            _ => anyhow::bail!("Step-5 layer zero must be SWA"),
+        }
+    }
     pub fn enqueue_step<'e, E: CopyEngine>(
         &'e mut self,
         step: &mut Step<'e, 'a, E>,
