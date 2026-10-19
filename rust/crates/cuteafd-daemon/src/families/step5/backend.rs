@@ -16,6 +16,14 @@ fn verify_kind(speculative: bool) -> cuteafd_transport::ExpertV2SourceKind {
     else { cuteafd_transport::ExpertV2SourceKind::Decode }
 }
 
+fn ungraphed_kind(speculative: bool, kind: scheduler::UngraphedKind) -> cuteafd_transport::ExpertV2SourceKind {
+    if speculative { return verify_kind(true); }
+    match kind {
+        scheduler::UngraphedKind::Scoring => cuteafd_transport::ExpertV2SourceKind::Prefill,
+        scheduler::UngraphedKind::Decode => cuteafd_transport::ExpertV2SourceKind::Decode,
+    }
+}
+
 const H: usize = 4096;
 const V: usize = 128896;
 type Evidence<'e, 'a> = Step<'e, 'a, CudaCopyEngine<'a>>;
@@ -324,10 +332,11 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         self.state.verify(|lane| self.execute(lane, sequences, pool, verify_kind(speculative))).map(Some)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+        kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.retire();
-        if speculative { self.state.verify(|lane| self.execute(lane, sequences, pool, verify_kind(speculative))).map(Some) }
-        else { self.immediate(sequences, pool, cuteafd_transport::ExpertV2SourceKind::Prefill).map(Some) }
+        let source = ungraphed_kind(speculative, kind);
+        if speculative { self.state.verify(|lane| self.execute(lane, sequences, pool, source)).map(Some) }
+        else { self.immediate(sequences, pool, source).map(Some) }
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
@@ -370,6 +379,19 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ungraphed_source_metadata_preserves_scoring_decode_and_speculation() {
+        use cuteafd_transport::ExpertV2SourceKind::{Decode, MtpVerify, Prefill};
+        use scheduler::UngraphedKind;
+        assert_eq!(ungraphed_kind(false, UngraphedKind::Scoring), Prefill);
+        assert_eq!(ungraphed_kind(false, UngraphedKind::Decode), Decode);
+        for kind in [UngraphedKind::Scoring, UngraphedKind::Decode] {
+            assert_eq!(ungraphed_kind(true, kind), MtpVerify);
+        }
+        assert_eq!(verify_kind(false), Decode);
+        assert_eq!(verify_kind(true), MtpVerify);
+    }
 
     #[test]
     fn immediate_accept_matches_consumes_and_retires_exact_wave() -> Result<()> {
