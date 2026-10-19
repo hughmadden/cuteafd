@@ -1239,22 +1239,69 @@ impl Drop for SparkLink<'_> {
     }
 }
 
-/// A prefill lane (transport on its own thread) and the intake its waves
-/// land in (dropped in that order: the lane joins its thread first).
+/// Retains external landing, pinned sources and their loaded library unless
+/// the complete QP/compute/copy retirement handshake has succeeded.
+struct LaneOwners<T>(Option<T>);
+impl<T> LaneOwners<T> {
+    fn release(&mut self) { self.0.take(); }
+}
+impl<T> Drop for LaneOwners<T> {
+    fn drop(&mut self) {
+        if let Some(owners) = self.0.take() {
+            std::mem::forget(owners);
+            tracing::error!("retaining terminal lane intake without complete quiescence and consumer drainage");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_owner_tests {
+    use super::*;
+    struct Owner(std::rc::Rc<Cell<usize>>);
+    impl Drop for Owner { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+
+    #[test]
+    fn unproved_lane_release_retains_intake_and_loaded_library() {
+        let drops = std::rc::Rc::new(Cell::new(0));
+        drop(LaneOwners(Some((Owner(drops.clone()), Owner(drops.clone())))));
+        assert_eq!(drops.get(), 0);
+        let mut released = LaneOwners(Some((Owner(drops.clone()), Owner(drops.clone()))));
+        released.release();
+        drop(released);
+        assert_eq!(drops.get(), 2);
+    }
+}
+
+/// A prefill lane and its external intake. Keep this owner whole: joining a
+/// thread alone is not proof that RDMA writes or queued copies have stopped.
 pub(crate) struct SparkLane<'a> {
     pub(crate) lane: SparkExpertLane,
-    pub(crate) intake: SparkIntake<'a>,
+    pub(crate) intake: std::rc::Rc<SparkIntake<'a>>,
+    terminal: LaneOwners<(std::rc::Rc<SparkIntake<'a>>, Arc<NativeLibrary>)>,
 }
 
 impl<'a> SparkLane<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>, capacity: u32,
+    pub(crate) fn new(library: &'a Arc<NativeLibrary>, world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>, capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
+        library.rdma_rc_endpoint_quiesce_available()?;
         let mode = transport_mode(library, peers.len(), capacity as usize, row_bytes)?;
-        let intake = SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?;
-        // SAFETY: the lane drops (joining its thread) before its intake, and
-        // every submit goes through `submit`, which calls `before_dispatch`.
+        let intake = std::rc::Rc::new(SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?);
+        let terminal = LaneOwners(Some((intake.clone(), library.clone())));
+        // SAFETY: the terminal guard retains the intake and its actual loaded
+        // library until checked QP quiescence and all consumers are drained.
         let lane = unsafe { intake.spawn_lane(world, peers, capacity, config)? };
-        Ok(Self { lane, intake })
+        Ok(Self { lane, intake, terminal })
+    }
+
+    pub(crate) fn terminal_quiesce(&mut self) -> Result<()> { self.lane.terminal_quiesce() }
+
+    /// Called only after the submission's compute streams and intake copies
+    /// drain successfully, never merely because the transport thread joined.
+    pub(crate) fn terminal_release(&mut self) -> Result<()> {
+        self.lane.terminal_release()?;
+        self.intake.terminal_release_payloads()?;
+        self.terminal.release();
+        Ok(())
     }
 
     pub(crate) fn world_size(&self) -> usize {

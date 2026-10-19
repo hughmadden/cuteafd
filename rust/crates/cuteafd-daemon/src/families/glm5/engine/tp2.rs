@@ -116,31 +116,47 @@ impl<'a> GlmEngine<'a> {
             TerminalState::Active => self.terminal.set(TerminalState::Aborting),
             state => return Err(TerminalPeerError::Closed(state).into()),
         }
-        let result = (|| {
-            self.abort_tp2()?;
-            if let Some(exchange) = &self.exchange { exchange.drain_compute()?; }
-            else {
-                // SAFETY: one-GPU stream and all its queued storage remain owned.
-                unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
-            }
-            if let Some(pair) = &self.tp2 { pair.routes.drain_compute()?; }
-            // Existing SparkLane Drop joins outstanding waves before its intake
-            // is freed. Here only retire compute/copy/graph owners; no new QP API.
-            for lane in self.lanes.borrow().iter() { lane.intake.terminal_drain_copies()?; }
-            for rank in 0..self.ranks() {
-                self.on(rank, || {
-                    if rank == 0 { self.graphs.borrow_mut().clear(); }
-                    else { self.peer()?.graphs.borrow_mut().clear(); }
-                    Ok(())
-                })?;
-            }
-            Ok(())
-        })();
-        let drained = result.is_ok();
-        self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
-        for exchange in self.exchange.iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
-            exchange.finish_terminal(drained);
-        }
+        let result = crate::shared::experts::rtx::pair::teardown(&mut crate::shared::experts::rtx::pair::Teardown {
+            abort: || self.abort_tp2(),
+            ranks: || {
+                if let Some(exchange) = &self.exchange { exchange.drain_compute()?; }
+                else {
+                    // SAFETY: one-GPU stream and all its queued storage remain owned.
+                    unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+                }
+                if let Some(pair) = &self.tp2 { pair.routes.drain_compute()?; }
+                Ok(())
+            },
+            links: || {
+                let mut failures = Vec::new();
+                for lane in self.lanes.borrow_mut().iter_mut() {
+                    if let Err(error) = lane.terminal_quiesce() { failures.push(format!("{error:#}")); }
+                }
+                ensure!(failures.is_empty(), "GLM lane quiescence: {}", failures.join("; "));
+                Ok(())
+            },
+            copies: || {
+                for lane in self.lanes.borrow().iter() { lane.intake.terminal_drain_copies()?; }
+                Ok(())
+            },
+            graphs: || {
+                for rank in 0..self.ranks() {
+                    self.on(rank, || {
+                        if rank == 0 { self.graphs.borrow_mut().clear(); }
+                        else { self.peer()?.graphs.borrow_mut().clear(); }
+                        Ok(())
+                    })?;
+                }
+                for lane in self.lanes.borrow_mut().iter_mut() { lane.terminal_release()?; }
+                Ok(())
+            },
+            finish: |drained| {
+                self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
+                    exchange.finish_terminal(drained);
+                }
+            },
+        });
         result
     }
 

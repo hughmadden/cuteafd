@@ -377,7 +377,7 @@ pub(crate) struct Opened {
     pub catalog: cuteafd_loader::OfficialV41Catalog,
     dense_catalog: Option<cuteafd_loader::OfficialV41Catalog>,
     pub cfg: GlmDsaConfig,
-    pub library: NativeLibrary,
+    pub library: std::sync::Arc<NativeLibrary>,
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
@@ -406,7 +406,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
             cfg.hidden, cfg.vocab_size, false)?;
         dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
     }
-    let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
+    let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
     Ok(Opened { snapshot: args.snapshot.clone(), catalog, dense_catalog, cfg, library })
 }
