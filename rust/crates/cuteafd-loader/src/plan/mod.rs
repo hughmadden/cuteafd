@@ -14,6 +14,7 @@ pub mod layout;
 pub mod names;
 pub mod rope;
 pub mod spec;
+pub mod spark_range;
 #[doc(hidden)]
 pub mod testing;
 
@@ -146,6 +147,8 @@ impl ExpertPlacement {
 /// Planning options that cannot describe a deployment.
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
+    #[error(transparent)]
+    SparkRange(#[from] spark_range::RangeRefusal),
     #[error("invalid {option}: {reason}")]
     InvalidOption { option: &'static str, reason: String },
     #[error(transparent)]
@@ -220,6 +223,9 @@ pub struct PlanReport {
     /// A single diagnostic when an unspecified Spark count falls back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spark_count_warning: Option<String>,
+    /// Policy refusal, distinct from absent executable packages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spark_range_refusal: Option<spark_range::RangeRefusal>,
     /// Resolved prefill shape, including V4.1 automatic capacity admission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_rows: Option<u64>,
@@ -320,15 +326,14 @@ impl PlanOptions {
         }
     }
 
-    /// Rejects options that describe no deployment: Spark worlds the
-    /// transport does not run (it runs 1 through 6; 0 is the local-only
-    /// placement) and empty budgets.
+    /// Rejects counts outside the shared world ceiling and empty budgets.
+    /// Zero is the local-only placement.
     pub fn validate(&self) -> Result<(), PlanError> {
         if let ExpertPlacement::Sparks { ranks } = self.placement {
-            if !experts::TRANSPORT_WORLDS.contains(&ranks) {
+            if !(1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks) {
                 return Err(PlanError::InvalidOption {
                     option: "spark ranks",
-                    reason: format!("{ranks}: the expert transport runs 1 through 6 Spark ranks \
+                    reason: format!("{ranks}: the expert transport runs 1 through 8 Spark ranks \
                         (0 places every routed expert on the coordinator)"),
                 });
             }
@@ -495,6 +500,21 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
 }
 
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
+    let mut report = plan_unrestricted(input, options)?;
+    match spark_range::admit(input, options, &report) {
+        Ok(()) => {},
+        Err(PlanError::SparkRange(refusal)) => {
+            report.placement_supported = false;
+            report.hints.push(Hint { what: refusal.to_string(),
+                how: "Choose a Spark count within the checkpoint's supported range.".into() });
+            report.spark_range_refusal = Some(refusal);
+        },
+        Err(error) => return Err(error),
+    }
+    Ok(report)
+}
+
+fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
     options.validate()?;
     let checkpoint = input.checkpoint();
     let mut report = PlanReport {
@@ -532,6 +552,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         placement: options.placement,
         spark_ranks: options.placement.spark_ranks(),
         spark_count_warning: None,
+        spark_range_refusal: None,
         prefill_rows: None,
         prefill_lanes: None,
         prefill_selection: None,

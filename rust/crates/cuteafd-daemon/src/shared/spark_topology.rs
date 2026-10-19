@@ -219,7 +219,12 @@ mod tests {
         let error = world(Some(SparkTopology::NATIVE_TP3_EP1), 4).unwrap_err().to_string();
         assert!(error.contains("topology 3x1"), "{error}");
         assert!(error.contains("needs 3 physical ranks but 4 were given"), "{error}");
-        for count in [0, 7, 8] { assert!(world(None, count).is_err()); }
+        for count in [0, cuteafd_core::MAX_SPARK_WORLD + 1] { assert!(world(None, count).is_err()); }
+        for count in [7, 8] {
+            let resolved = world(None, count).unwrap();
+            assert_eq!(resolved.topology().world_size(), count);
+            assert!(!resolved.supports_device_exchange());
+        }
     }
 
     #[test]
@@ -245,7 +250,7 @@ mod tests {
 
     #[test]
     fn approved_layouts_require_their_exact_rank_count() {
-        for (tp, ep) in [(1u8, 1u8), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (2, 2), (3, 2), (2, 3)] {
+        for (tp, ep) in [(1u8, 1u8), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (2, 2), (3, 2), (2, 3)] {
             let expected = topology(tp, ep);
             let resolved = resolve(Some(tp), Some(ep), expected.world_size(), "serve-native")
                 .unwrap()
@@ -258,7 +263,7 @@ mod tests {
 
     #[test]
     fn unapproved_layouts_and_ranges_are_rejected() {
-        for (tp, ep) in [(7u8, 1u8), (8, 1), (9, 1), (2, 4), (4, 2), (3, 3), (0, 1), (6, 2), (6, 3)] {
+        for (tp, ep) in [(9u8, 1u8), (2, 4), (4, 2), (3, 3), (0, 1), (6, 2), (6, 3)] {
             let world = tp as usize * ep as usize;
             assert!(resolve(Some(tp), Some(ep), world, "serve-native").is_err(), "{tp}x{ep}");
         }

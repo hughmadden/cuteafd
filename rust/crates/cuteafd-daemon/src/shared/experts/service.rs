@@ -815,12 +815,14 @@ mod tests {
 
     #[test]
     fn unqualified_transport_worlds_are_rejected_before_shard_selection() {
-        for world in [0, 7, 8, 9] {
+        for world in [0, cuteafd_core::MAX_SPARK_WORLD + 1] {
             assert!(crate::shared::spark_topology::world(None, world).is_err(), "TP{world}");
         }
-        for rank in 0..5 {
-            assert_eq!(config(5, rank, None).selection(7).unwrap(),
-                ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 5 });
+        for world in [5, 7, 8] {
+            for rank in 0..world {
+                assert_eq!(config(world, rank, None).selection(7).unwrap(),
+                    ExpertLayer::BackboneExl3Tp { layer: 7, rank, world });
+            }
         }
     }
 

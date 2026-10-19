@@ -139,6 +139,7 @@ fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanErro
 }
 
 pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
+    if args.spark_range { args.layout = true; }
     if args.deployment {
         args.layout = true;
         if let Some(value) = &args.kv_pool_size {
@@ -192,6 +193,10 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
     if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+        if args.spark_range {
+            return Err(PlanError::InvalidOption { option: "--spark-range", reason:
+                "EXLR8 range geometry requires its native manifest and dense companion planner".into() }.into());
+        }
         anyhow::ensure!(!(args.files || args.fetch || args.role.is_some()),
             "EXLR8 file manifests and fetching are not supported");
         let dense = args.exlr8_dense_from.as_deref().map(|source| -> Result<PathBuf> {
@@ -336,6 +341,12 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         return Ok(());
     }
     options.vision = glm_flash_vision(&args, family, &snapshot);
+    if args.spark_range {
+        let columns = cuteafd_loader::plan::PlanInput::open(&snapshot)?.spark_ranges(&options)?;
+        if args.json { println!("{}", serde_json::to_string_pretty(&columns)?); }
+        else { print!("{}", cuteafd_loader::plan::spark_range::render(&columns)); }
+        return Ok(());
+    }
     let report = plan_spark_count(&snapshot, &options, args.available_sparks, args.spark_ranks)?;
     if args.json || args.deployment {
         if let Some(warning) = &report.spark_count_warning { eprintln!("warning: {warning}"); }
@@ -791,6 +802,7 @@ mod tests {
             hf_home: None,
             spark_ranks: Some(spark_ranks),
             available_sparks: 6,
+            spark_range: false,
             spark_budget_gib: Some(100.0),
             coordinator_weight_budget_gib: 80.0,
             json: true,
@@ -1173,6 +1185,17 @@ mod tests {
                     _ => unreachable!(),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn spark_range_cli_is_header_only_and_excludes_other_output_modes() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--spark-range", "--json"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+        assert!(args.spark_range && args.json);
+        for mode in ["--deployment", "--files", "--fetch"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--spark-range", mode]).is_err());
         }
     }
 

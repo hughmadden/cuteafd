@@ -170,7 +170,7 @@ impl WorkerSelection {
                 && manifest.sha256.len() == 64 && manifest.sha256.bytes().all(|c| c.is_ascii_hexdigit()),
                 "invalid worker manifest identity");
         }
-        ensure!((1..=6).contains(&self.identity.world), "unsupported worker world");
+        ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&(self.identity.world as usize)), "unsupported worker world");
         ensure!(self.identity.geometry.iter().all(|&value| value > 0), "invalid worker geometry");
         let [tp, ep] = self.identity.topology;
         let topology = crate::expert::SparkTopology::new(tp, ep)?;
@@ -1620,6 +1620,33 @@ mod tests {
         assert!(WorkerSelection::new(invalid, &[]).is_err());
         assert!(WorkerSelection::new(identity(), &[u32::MAX as usize - 1, u32::MAX as usize]).is_err());
     }
+    #[test]
+    fn seven_and_eight_rank_manifest_selections_round_trip() -> Result<()> {
+        for world in [7, 8] {
+            let mut identity = identity();
+            identity.world = world;
+            identity.topology = [world as u8, 1];
+            identity.ownership_wire = false;
+            identity.manifest = Some(cuteafd_loader::plan::checkpoint::identity::ManifestIdentity {
+                name: "up1".into(), sha256: "a".repeat(64),
+            });
+            let selection = WorkerSelection::new(identity.clone(), &[13, 14, 20])?;
+            let encoded = serde_json::to_vec(&selection)?;
+            let decoded: WorkerSelection = serde_json::from_slice(&encoded)?;
+            decoded.validate_for(&identity)?;
+            assert_eq!(decoded, selection);
+            for rank in 0..world as usize {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let mut client = TcpStream::connect(listener.local_addr()?)?;
+                let (server, _) = listener.accept()?;
+                write(&mut client, &Start { message: "worker_selection_start".into(), rank,
+                    selection: selection.clone(), digest: selection.digest()? })?;
+                assert_eq!(receive_worker_selection(&server, rank, Duration::from_secs(3))?, selection);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn worker_identity_requires_topology_and_wire_without_compatibility_defaults() {
         let encoded = serde_json::to_value(identity()).unwrap();
