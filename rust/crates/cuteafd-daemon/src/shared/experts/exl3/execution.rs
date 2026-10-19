@@ -209,9 +209,11 @@ impl Manifest {
         }
     }
     fn validate_native_contract(&self) -> Result<()> {
-        ensure!(self.descriptor_rows.is_none_or(|rows| rows == 3)
-            && self.native_info_version.is_none_or(|version| version == 2),
-            "EXL3 descriptor/version mismatch");
+        let legacy = self.descriptor_rows.is_none_or(|rows| rows == 3)
+            && self.native_info_version.is_none_or(|version| version == 2);
+        let compact = self.descriptor_rows == Some(7) && self.native_info_version == Some(3)
+            && self.bits.len() == 2 && !self.wire_input()?;
+        ensure!(legacy || compact, "EXL3 descriptor/version mismatch");
         Ok(())
     }
     fn workspace_bytes(&self, format: Exl3InputFormat) -> Result<usize> {
@@ -391,7 +393,8 @@ impl<'a> Exl3Modules<'a> {
             let kernel = unsafe { V41Exl3Kernel::load(directory.join("libcuteafd_exl3.so"))? };
             let info = kernel.info();
             ensure!(
-                info.hidden == meta.hidden
+                info.version == meta.native_info_version.unwrap_or(2)
+                    && info.hidden == meta.hidden
                     && info.intermediate == meta.intermediate
                     && info.experts == meta.experts
                     && info.capacity == meta.capacity
@@ -534,7 +537,9 @@ impl<'a> Exl3Execution<'a> {
         meta.validate_native_contract()?;
         let device = library.cuda_get_device()?;
         for weight in weights.iter() {
-            let descriptor_rows = 3;
+            let descriptor_rows = meta.descriptor_rows.unwrap_or(3);
+            ensure!(weight.layout.unit_map.is_some() == (descriptor_rows == 7),
+                "EXL3 compact storage/native contract mismatch");
             ensure!(weight.buffer("descriptor_map")?.bytes == descriptor_rows * meta.experts * meta.bits.len() * 4,
                 "EXL3 resident descriptor extent mismatch");
             ensure!(
@@ -1024,11 +1029,26 @@ mod tests {
         });
         let parse = |value| serde_json::from_value::<Manifest>(value).unwrap();
         assert!(parse(original.clone()).validate_native_contract().is_ok());
-        for (rows, version, accepted) in [(3, 2, true), (4, 2, false), (3, 3, false)] {
+        for (rows, version, accepted) in [(3, 2, true), (7, 3, true), (4, 2, false), (7, 2, false),
+                (3, 3, false), (7, 4, false)] {
             let mut value = original.clone();
             value["descriptor_rows"] = rows.into();
             value["native_info_version"] = version.into();
             assert_eq!(parse(value).validate_native_contract().is_ok(), accepted);
+        }
+        for (rows, version) in [(Some(7), None), (None, Some(3))] {
+            let mut value = original.clone();
+            value["descriptor_rows"] = serde_json::json!(rows);
+            value["native_info_version"] = serde_json::json!(version);
+            assert!(parse(value).validate_native_contract().is_err());
+        }
+        for (bits, input) in [(vec![2, 3, 4], "bf16"), (vec![3, 4], "e4m3_k32")] {
+            let mut value = original.clone();
+            value["descriptor_rows"] = 7.into();
+            value["native_info_version"] = 3.into();
+            value["bits"] = serde_json::json!(bits);
+            value["input_format"] = input.into();
+            assert!(parse(value).validate_native_contract().is_err());
         }
         assert_eq!(parse(original.clone()).group_rows().unwrap(), 8);
         for block in [8, 16, 32, 64] {
