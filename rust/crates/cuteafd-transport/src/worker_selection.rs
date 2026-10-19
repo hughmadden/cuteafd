@@ -1143,7 +1143,7 @@ mod tests {
             let selection = WorkerSelection::new(WorkerIdentity {
                 checkpoint: "0".repeat(64), manifest: None,
                 geometry: [4096, 352, 8, 1536, 91], world: 6,
-                topology: [6, 1], ownership_wire: false,
+                topology: [6, 1], ownership_wire: false, placement: Default::default(),
             }, &(3..91).collect::<Vec<_>>())?.with_model(model)?;
             let mut reports = Vec::new();
             for rank in 0..6 {
@@ -1153,7 +1153,7 @@ mod tests {
                 report.runtime.workspace_bytes = 199584768;
                 report.slices = (3..91).map(|layer| cuteafd_core::SparkSlice {
                     layer, first: rank * 256, width: 256, stored_width: 256,
-                    tiers: vec![], projection_counts: vec![],
+                    unit_map: None, tiers: vec![], projection_counts: vec![],
                 }).collect();
                 report.host_exchange_bytes = 640 * (4096 * 2 + 8 * 8);
                 report.row_indices_bytes = 640 * 4;
