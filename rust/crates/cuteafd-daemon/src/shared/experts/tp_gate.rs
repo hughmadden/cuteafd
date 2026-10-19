@@ -2,7 +2,7 @@
 use anyhow::{ensure, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
 use cuteafd_loader::formats::fp8_experts::ExpertFormat;
-use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission,
+use cuteafd_transport::{expert::{SparkTopology, SparkWorld}, worker_selection::ModelAdmission,
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertV2Dtype, ExpertV2SourceKind, TcpTransportConfig,
     protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
@@ -56,6 +56,42 @@ fn validate_source(catalog: &cuteafd_loader::OfficialV41Catalog, family: &str, f
     Ok(geometry)
 }
 
+fn checkpoint_world(catalog: &cuteafd_loader::OfficialV41Catalog, ranks: usize) -> Result<SparkWorld> {
+    let native = catalog.exl3().is_none() && catalog.fp8().is_none();
+    let topology = if native && ranks != 4 {
+        Some(SparkTopology::new(u8::try_from(ranks)?, 1)?)
+    } else {
+        crate::shared::spark_topology::for_checkpoint(None, ranks,
+            catalog.exl3().is_some() && catalog.routed_experts().geometry()?.family() == Some("v41"))
+    };
+    let world = crate::shared::spark_topology::world(topology, ranks)?;
+    crate::shared::spark_topology::require_wire(world, catalog)?;
+    Ok(world)
+}
+
+#[test]
+fn checkpoint_world_preserves_generic_wire_and_native_tp6_ownership() -> Result<()> {
+    use cuteafd_loader::plan::testing as fixture;
+    let root = tempfile::tempdir()?;
+    fixture::write_v41_snapshot(root.path());
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    assert_eq!(checkpoint_world(&catalog, 4)?, SparkWorld::canonical(4)?);
+    assert_eq!(checkpoint_world(&catalog, 6)?, SparkWorld::owned(SparkTopology::NATIVE_TP6_EP1)?);
+    let root = tempfile::tempdir()?;
+    fixture::write_v41_exl3_snapshot(root.path(), 3);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    assert_eq!(checkpoint_world(&catalog, 3)?, SparkWorld::owned(SparkTopology::NATIVE_TP3_EP1)?);
+    let root = tempfile::tempdir()?;
+    let mut config = fixture::glm5_config();
+    config["quantization_config"] = fixture::exl3_compact(4);
+    let tensors = fixture::glm5_tensors(|name, n, k| (0..256).flat_map(|expert|
+        fixture::exl3(&name.replace(".experts.0.", &format!(".experts.{expert}.")), n, k, 4)).collect());
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    assert_eq!(checkpoint_world(&catalog, 6)?, SparkWorld::canonical(6)?);
+    Ok(())
+}
+
 #[test]
 fn requests_use_checkpoint_geometry_and_two_repeated_oracle_rows() -> Result<()> {
     for geometry in [ExpertGeometry::DEEPSEEK_V41, ExpertGeometry::GLM5,
@@ -86,6 +122,7 @@ fn native_tp_rank_sum() -> Result<()> {
     ensure!(peers.len() == world, "rank-sum world disagrees with launched peers");
     let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
     let geometry = validate_source(&catalog, &family, &format)?;
+    let spark_world = checkpoint_world(&catalog, world)?;
     cuteafd_core::set_expert_geometry(geometry)
         .map_err(|_| anyhow::anyhow!("rank-sum process already selected another expert geometry"))?;
     ensure!(layers.iter().all(|&l| l >= catalog.routed_experts().first_layer && l < geometry.layers as usize),
@@ -99,7 +136,7 @@ fn native_tp_rank_sum() -> Result<()> {
     let config = TcpTransportConfig::default();
     SparkAdmission::plan(&snapshot, geometry, Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),
-            spark_ranks: world, prefill_lanes: 1 }, world, None,
+            spark_ranks: world, prefill_lanes: 1 }, world, spark_world.ownership_topology(),
         ModelAdmission { capacity: 16, compiled_capacity: 4096,
             endpoints: vec![SparkEndpoint { capacity: 16, ingress: SparkIngress::Bf16 }],
             rings: spark_rings(config.max_frame_bytes)? })?.select(&peers)?;
@@ -108,7 +145,7 @@ fn native_tp_rank_sum() -> Result<()> {
     let output = DeviceAllocation::new(&library, 16 * h * 2)?;
     library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
     let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-    let mut link = SparkLink::new(&library, SparkWorld::canonical(world)?, &peers, 16, config, h * 2)?;
+    let mut link = SparkLink::new(&library, spark_world, &peers, 16, config, h * 2)?;
     link.enable_terminal_ownership(library.clone())?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let result = runtime.block_on(async {
