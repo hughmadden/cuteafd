@@ -108,7 +108,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
             *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 routed residency overflow")?;
         }
     }
-    ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget_bytes),
+    ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget()),
         "EXLR8 routed resident bytes exceed Spark budget before live workspace admission");
     let programs = read_json(layout.workspace_manifest.as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;

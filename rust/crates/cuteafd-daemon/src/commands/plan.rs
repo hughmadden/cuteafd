@@ -206,7 +206,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         let report = cuteafd_loader::plan::exlr8::inspect(&snapshot,
             args.exlr8_manifest.as_deref().unwrap_or("bit325"), dense.as_deref(),
             args.spark_ranks.unwrap_or(args.available_sparks), args.rtx,
-            options.spark_budget_bytes, options.coordinator_budget_bytes)?;
+            options.spark_budget(), options.coordinator_budget_bytes)?;
         if args.json { println!("{}", serde_json::to_string_pretty(&report)?); }
         else { print!("{}", report.render()); }
         anyhow::ensure!(!args.require_ready, "EXLR8 is unsupported: add the kernels listed in the plan");
