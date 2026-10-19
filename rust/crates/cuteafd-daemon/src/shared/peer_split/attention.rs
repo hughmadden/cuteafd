@@ -14,29 +14,56 @@ pub(crate) fn replicate_terminal(exchange: &PeerExchange<'_>, source: cuteafd_ff
     replicate_terminal_with(exchange, source, destination, bytes)
 }
 
+/// Copy an already-rounded per-layer result without arithmetic. Admission must
+/// validate_routed_replications with actual destination identities first. Queue
+/// the receiver's last read before the next bidirectional head exchange; a flag
+/// wait alone never proves that the destination is reusable. Both buffers and
+/// this exchange belong to the enclosing whole-submission terminal owner.
+pub(crate) fn replicate_result(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    exchange: &PeerExchange<'_>, from: usize, slot: usize,
+    source: cuteafd_ffi::CuteafdDeviceBuffer, destination: cuteafd_ffi::CuteafdDeviceBuffer,
+    bytes: usize) -> Result<()> {
+    ensure!(slot != DIRECT, "layer result requires an admitted publication slot");
+    replicate_with(exchange, from, slot, source, destination, bytes)
+}
+
 trait TerminalProtocol {
     fn device(&self, rank: usize) -> i32;
-    fn publish(&self, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()>;
-    fn land(&self) -> Result<()>;
+    fn validate(&self, slot: usize) -> Result<()>;
+    fn publish(&self, from: usize, slot: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()>;
+    fn land(&self, at: usize, slot: usize) -> Result<()>;
 }
 
 impl TerminalProtocol for PeerExchange<'_> {
     fn device(&self, rank: usize) -> i32 { self.device(rank) }
-    fn publish(&self, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
-        self.push_to(0, DIRECT, source, destination, bytes)
+    fn validate(&self, slot: usize) -> Result<()> {
+        self.require_live()?;
+        if slot != DIRECT { self.recv(0, slot)?; self.recv(1, slot)?; }
+        Ok(())
     }
-    fn land(&self) -> Result<()> { self.wait(1, DIRECT) }
+    fn publish(&self, from: usize, slot: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+        self.push_to(from, slot, source, destination, bytes)
+    }
+    fn land(&self, at: usize, slot: usize) -> Result<()> { self.wait(at, slot) }
 }
 
 fn replicate_terminal_with(exchange: &impl TerminalProtocol, source: cuteafd_ffi::CuteafdDeviceBuffer,
     destination: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
+    replicate_with(exchange, 0, DIRECT, source, destination, bytes)
+}
+
+fn replicate_with(exchange: &impl TerminalProtocol, from: usize, slot: usize,
+    source: cuteafd_ffi::CuteafdDeviceBuffer, destination: cuteafd_ffi::CuteafdDeviceBuffer,
+    bytes: usize) -> Result<()> {
+    ensure!(from < 2, "result copy source rank");
     ensure!(bytes > 0 && bytes <= source.bytes && bytes <= destination.bytes,
-        "terminal residual copy exceeds live source or destination storage");
+        "result copy exceeds live source or destination storage");
     ensure!(!source.ptr.is_null() && !destination.ptr.is_null()
-        && source.device_id == exchange.device(0) && destination.device_id == exchange.device(1)
-        && source.device_id != destination.device_id, "terminal residual copy has invalid rank storage");
-    exchange.publish(source.ptr, destination.ptr, bytes)?;
-    exchange.land()
+        && source.device_id == exchange.device(from) && destination.device_id == exchange.device(1 - from)
+        && source.device_id != destination.device_id, "result copy has invalid rank storage");
+    exchange.validate(slot)?;
+    exchange.publish(from, slot, source.ptr, destination.ptr, bytes)?;
+    exchange.land(1 - from, slot)
 }
 
 #[cfg(test)]
@@ -54,14 +81,20 @@ mod terminal_tests {
 
     impl TerminalProtocol for CopyProtocol {
         fn device(&self, rank: usize) -> i32 { [3, 7][rank] }
-        fn publish(&self, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
-            assert_eq!((source as usize, destination as usize), (1, 2));
+        fn validate(&self, slot: usize) -> Result<()> {
+            ensure!(slot == DIRECT || slot < 8, "invalid result publication slot");
+            Ok(())
+        }
+        fn publish(&self, from: usize, slot: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+            assert!(from < 2 && (slot == DIRECT || slot < 8));
+            assert_eq!((source as usize, destination as usize), (1 + from, 2 - from));
             self.calls.borrow_mut().push("publish");
             ensure!(!self.fail_publish, "injected terminal publication failure");
             self.destination.borrow_mut()[..bytes].copy_from_slice(&self.source[..bytes]);
             Ok(())
         }
-        fn land(&self) -> Result<()> {
+        fn land(&self, at: usize, slot: usize) -> Result<()> {
+            assert!(at < 2 && (slot == DIRECT || slot < 8));
             self.calls.borrow_mut().push("land");
             Ok(())
         }
@@ -84,6 +117,40 @@ mod terminal_tests {
         assert_eq!(&exchange.destination.borrow()[..bytes], exchange.source.as_slice());
         assert_eq!(&exchange.destination.borrow()[bytes..], &[0xa5; 16]);
         assert_eq!(*exchange.calls.borrow(), ["publish", "land"]);
+    }
+
+    #[test]
+    fn routed_result_copy_preserves_native_residual_join_on_both_ranks() {
+        let source: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        for from in 0..2 {
+            let bytes = source.len();
+            let exchange = CopyProtocol { source: source.clone(), destination: RefCell::new(vec![0xa5; bytes + 16]),
+                calls: RefCell::new(Vec::new()), fail_publish: false };
+            let buffers = buffers(bytes);
+            replicate_with(&exchange, from, 4, buffers[from], buffers[1 - from], bytes).unwrap();
+            let joined = |wire: &[u8]| wire.chunks_exact(2).enumerate().map(|(i, bits)| {
+                let routed = f32::from_bits((u16::from_le_bytes(bits.try_into().unwrap()) as u32) << 16);
+                let shared = f32::from_bits(([0x0000u32, 0x8000, 0x3f80, 0xbf80][i % 4]) << 16);
+                let residual = [0.0f32, -0.0, 16777216.0, -0.25][i % 4];
+                // Match the native join's parentheses, not (residual+routed)+shared.
+                (residual + (routed + shared)).to_bits()
+            }).collect::<Vec<_>>();
+            assert_eq!(&exchange.destination.borrow()[..bytes], source.as_slice());
+            assert_eq!(joined(&source), joined(&exchange.destination.borrow()[..bytes]));
+            assert_eq!(&exchange.destination.borrow()[bytes..], &[0xa5; 16]);
+            assert_eq!(*exchange.calls.borrow(), ["publish", "land"]);
+        }
+    }
+
+    #[test]
+    fn routed_result_rejects_rank_slot_and_extent_before_publication() {
+        let exchange = CopyProtocol { source: vec![0; 8], destination: RefCell::new(vec![0; 8]),
+            calls: RefCell::new(Vec::new()), fail_publish: false };
+        let [source, destination] = buffers(8);
+        for (from, slot, bytes) in [(2, 4, 8), (0, 8, 8), (0, 4, 0), (0, 4, 9)] {
+            assert!(replicate_with(&exchange, from, slot, source, destination, bytes).is_err());
+        }
+        assert!(exchange.calls.borrow().is_empty());
     }
 
     #[test]

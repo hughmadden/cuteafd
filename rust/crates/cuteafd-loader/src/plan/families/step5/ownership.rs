@@ -1,6 +1,6 @@
 //! Pre-allocation binding of the shared layer plan to native Step-5 owners.
 use super::Config;
-use crate::placement::{FfnMode, LayerExecutionPlan, LayerMode};
+use crate::placement::{FfnMode, LayerExecutionPlan, LayerMode, RoutedReplication};
 use anyhow::{ensure, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +9,9 @@ pub struct LayerRank {
     pub kv_heads: usize,
     /// Whole native FFN replicas, not unqualified tensor-parallel halves.
     pub ffn: bool,
+    /// Dispatches and reduces the single Spark wave. A head-split peer keeps
+    /// its native shared FFN but only receives the BF16 routed result.
+    pub routed_wave: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +49,26 @@ impl ExecutionOwnership {
                     anyhow::bail!("Step-5 split FFN has no qualified native half-width executor"),
             }
         }
-        Ok(Self { ranks, execution, full: cfg.full.clone(), moe: cfg.moe.clone() })
+        let owners = Self { ranks, execution, full: cfg.full.clone(), moe: cfg.moe.clone() };
+        for lane in 0..owners.execution.spec().lanes as usize {
+            owners.execution.validate_routed_replications(&owners.routed_replications(lane)?)?;
+        }
+        Ok(owners)
+    }
+
+    /// Publication flags 0..4 belong exclusively to head partials. Routed
+    /// copies use 4..8, with one full native receive allocation per layer/lane.
+    /// The ordinal counts actual routed copies, not physical layer parity.
+    pub fn routed_replications(&self, lane: usize) -> Result<Vec<Option<RoutedReplication>>> {
+        ensure!(lane < self.execution.spec().lanes as usize, "Step-5 routed lane outside admission");
+        let mut ordinal = 0;
+        Ok(self.execution.modes().iter().enumerate().map(|(layer, mode)| {
+            if *mode != LayerMode::HeadSplit || !self.moe[layer] { return None; }
+            let copy = RoutedReplication { source: 0, slot: 4 + 2 * lane + ordinal % 2,
+                storage: 1 + lane * self.execution.modes().len() + layer };
+            ordinal += 1;
+            Some(copy)
+        }).collect())
     }
 
     pub fn ranks(&self) -> usize { self.ranks }
@@ -65,9 +87,11 @@ impl ExecutionOwnership {
             LayerMode::Whole { gpu, .. } => {
                 let owns = rank == usize::from(gpu);
                 LayerRank { query_heads: if owns { 64 } else { 0 },
-                    kv_heads: if owns { 4 } else { 0 }, ffn: owns }
+                    kv_heads: if owns { 4 } else { 0 }, ffn: owns,
+                    routed_wave: owns && self.moe[layer] }
             }
-            LayerMode::HeadSplit => LayerRank { query_heads: 32, kv_heads: 2, ffn: true },
+            LayerMode::HeadSplit => LayerRank { query_heads: 32, kv_heads: 2, ffn: true,
+                routed_wave: rank == 0 && self.moe[layer] },
             LayerMode::ContextSplit => unreachable!("validated modes"),
         })
     }
