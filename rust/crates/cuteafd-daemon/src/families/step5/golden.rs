@@ -259,7 +259,7 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
         ensure!(tail["schema"] == "cuteafd.step5.tail-diagnostic/1" && tail["diagnostic_only"] == true
             && tail["source_meta_sha256"] == source_sha && tail["original_layer91_byte_exact"] == true,
             "tail continuation provenance missing or mismatched");
-        let files = args.compare_layers.iter().filter(|l| (88..=90).contains(l))
+        let files = args.compare_layers.iter().filter(|&l| (88..=90).contains(l))
             .map(|l| format!("layer{l:02}.bin"))
             .chain(args.compare_final_norm.then_some("final_norm.bin".into()));
         for file in files {
