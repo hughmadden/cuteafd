@@ -69,6 +69,9 @@ pub(crate) struct GoldenArgs {
     /// Compare retained outputs from the same cold target execution.
     #[arg(long, value_delimiter = ',', requires = "nll", conflicts_with = "prefix_state")]
     compare_layers: Vec<usize>,
+    /// Compare the post-layer-91 BF16 final-norm plane to an explicit reference export.
+    #[arg(long, requires = "nll", conflicts_with = "prefix_state")]
+    compare_final_norm: bool,
     /// Compare real cold/shared-prefix canonical state and an identical continuation.
     #[arg(long, requires = "nll")]
     prefix_state: bool,
@@ -170,10 +173,15 @@ struct Reference {
     expected: Vec<f32>,
     positions: Vec<usize>,
     hidden: Vec<(usize, Vec<f32>)>,
+    final_norm: Option<Vec<f32>>,
 }
 
 fn hidden_reference(folder: &std::path::Path, layer: usize, full_rows: usize, rows: usize) -> Result<Vec<f32>> {
-    let bytes = std::fs::read(folder.join(format!("layer{layer:02}.bin")))?;
+    hidden_file(folder.join(format!("layer{layer:02}.bin")), full_rows, rows)
+}
+
+fn hidden_file(path: PathBuf, full_rows: usize, rows: usize) -> Result<Vec<f32>> {
+    let bytes = std::fs::read(path)?;
     ensure!(bytes.len() == full_rows * H * 4, "reference layer shape must cover every input row");
     let values: Vec<_> = bytes[..rows * H * 4].chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -241,6 +249,25 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
     let hidden = args.compare_layers.iter().map(|&layer|
         Ok((layer, hidden_reference(&folder, layer, tokens.len(), rows)?)))
         .collect::<Result<Vec<_>>>()?;
+    ensure!(!args.compare_final_norm || (args.nll && !args.prefix_state),
+        "final norm comparison requires cold NLL mode");
+    let final_norm = args.compare_final_norm.then(||
+        hidden_file(folder.join("final_norm.bin"), tokens.len(), rows)).transpose()?;
+    if args.fp8_diagnostic_reference && (args.compare_final_norm || args.compare_layers.iter().any(|l| (88..=90).contains(l))) {
+        let tail: Value = serde_json::from_slice(&std::fs::read(args.golden.join("tail-diagnostic.json"))?)?;
+        let source_sha = format!("{:x}", Sha256::digest(std::fs::read(args.golden.join("meta.json"))?));
+        ensure!(tail["schema"] == "cuteafd.step5.tail-diagnostic/1" && tail["diagnostic_only"] == true
+            && tail["source_meta_sha256"] == source_sha && tail["original_layer91_byte_exact"] == true,
+            "tail continuation provenance missing or mismatched");
+        let files = args.compare_layers.iter().filter(|l| (88..=90).contains(l))
+            .map(|l| format!("layer{l:02}.bin"))
+            .chain(args.compare_final_norm.then_some("final_norm.bin".into()));
+        for file in files {
+            let sha = format!("{:x}", Sha256::digest(std::fs::read(folder.join(&file))?));
+            ensure!(tail["files"][format!("windows/{}/{file}", args.window)] == sha,
+                "tail diagnostic payload digest differs: {file}");
+        }
+    }
     let (expected, positions) = if args.nll {
         ensure!(entry["vocab"].as_u64() == Some(vocab as u64), "reference vocabulary mismatch");
         let positions = entry["positions"].as_array().context("missing scored positions")?.iter()
@@ -260,7 +287,7 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
     };
     ensure!(expected.iter().all(|v| v.is_finite()), "nonfinite reference payload");
     tokens.truncate(rows);
-    Ok(Reference { tokens, expected, positions, hidden })
+    Ok(Reference { tokens, expected, positions, hidden, final_norm })
 }
 
 fn embedding_rows(checkpoint: &Checkpoint, tokens: &[u32], vocab: usize) -> Result<Vec<u8>> {
@@ -540,7 +567,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     );
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
-    let Reference { tokens, expected, positions, hidden } = reference(&args, cfg.vocab)?;
+    let Reference { tokens, expected, positions, hidden, final_norm } = reference(&args, cfg.vocab)?;
     let reference_kind = if args.fp8_diagnostic_reference { "native-FP8 diagnostic" } else { "BF16-root diagnostic" };
     let rows = tokens.len();
     ensure!(!args.prefix_state || (args.nll && args.last_layer == 91),
@@ -699,6 +726,10 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     }
     if let Some(head) = head {
         let actual = head.logits(chain.output(91)?)?;
+        if let Some(expected) = final_norm {
+            let (cosine, relative_l2) = hidden_metrics(&head.normalized()?, &expected)?;
+            println!("Step-5 hidden ladder rows={rows} layer=final_norm cosine={cosine:.9} relative_l2={relative_l2:.9} reference={reference_kind}");
+        }
         let ours = select_scored_rows(&actual, &positions, cfg.vocab)?;
         let targets = positions.iter().map(|&p| tokens[p]).collect::<Vec<_>>();
         let nll = scored_nll(&ours, &targets, cfg.vocab)?;
@@ -859,6 +890,7 @@ mod tests {
             prefix_state: false,
             fp8_diagnostic_reference: false,
             compare_layers: vec![],
+            compare_final_norm: false,
         };
         let Reference { tokens, expected: hidden, .. } = reference(&args, 3)?;
         assert_eq!(tokens, [1]);
@@ -902,7 +934,7 @@ mod tests {
         let mut args = GoldenArgs { snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
             peers: vec![], last_layer: 91, prefill: None, device: 0, check_headers: true, nll: true, prefix_state: false,
-            fp8_diagnostic_reference: false, compare_layers: vec![] };
+            fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false };
         let full = reference(&args, 3)?;
         assert_eq!(full.positions, [1, 3]);
         let targets = full.positions.iter().map(|&p| full.tokens[p]).collect::<Vec<_>>();

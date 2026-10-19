@@ -327,3 +327,35 @@ def test_native_fp8_diagnostic_consumes_top_level_quantization_metadata():
     payload["text_config"]["quantization_config"] = dict(quant_method="wrong")
     with pytest.raises(ValueError, match="conflicting"):
         golden.decoder_config(payload)
+
+
+def test_tail_diagnostic_requires_original_reference_identity_and_tokens(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    identity = dict(snapshot_revision=golden.FP8_REVISION)
+    manifest = dict(set_sha256="a" * 64, windows=[dict(id="code-1", tokens=[1, 2])])
+    meta = dict(diagnostic_only=True, checkpoint=golden.FP8_CHECKPOINT,
+                source_pin=dict(revision=golden.FP8_REVISION), set_sha256="a" * 64,
+                snapshot_identity=identity,
+                prefix_qualification=dict(passed=True, finite=True, snapshot_identity=identity,
+                                          set_sha256="a" * 64),
+                windows=[dict(id="code-1", path="windows/code-1")])
+    monkeypatch.setattr(golden, "reference_manifest", lambda args: manifest)
+    monkeypatch.setattr(golden, "verify_snapshot", lambda *args: identity)
+    folder = tmp_path / "windows/code-1"
+    folder.mkdir(parents=True)
+    tokens = b"\x01\0\0\0\x02\0\0\0"
+    (folder / "tokens.bin").write_bytes(tokens)
+    args = SimpleNamespace(out=tmp_path, snapshot=tmp_path, fp8_diagnostic=True)
+    payload = json.dumps(meta).encode()
+    (tmp_path / "meta.json").write_bytes(payload)
+    assert golden.diagnostic_source(args) == (manifest, meta, hashlib.sha256(payload).hexdigest())
+    for field in ["diagnostic_only", "checkpoint", "source_pin", "set_sha256", "snapshot_identity", "prefix_qualification"]:
+        bad = dict(meta, **{field: None})
+        (tmp_path / "meta.json").write_text(json.dumps(bad))
+        with pytest.raises(ValueError, match="completed pinned"):
+            golden.diagnostic_source(args)
+    (tmp_path / "meta.json").write_bytes(payload)
+    (folder / "tokens.bin").write_bytes(tokens[:-1])
+    with pytest.raises(ValueError, match="tokens differ"):
+        golden.diagnostic_source(args)
