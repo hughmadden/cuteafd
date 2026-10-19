@@ -3,7 +3,7 @@ use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::serving_capacity::step5::{ByteSpan, Step5CacheLayout};
-use std::cell::Cell;
+use std::{cell::{Cell, RefCell}, rc::{Rc, Weak}};
 
 /// Checked cache-only reservations. Weights, code, workspace and transport must
 /// be subtracted before supplying the available bytes to `CacheRank::new`.
@@ -38,11 +38,11 @@ impl Reservation {
     }
 }
 
-/// One rank owns its stream before its storage so destruction drains first.
-/// The executor must enqueue all reads/writes on this stream (or join it with
-/// an explicit device event) and must retain the owner for every graph replay.
+/// Maintenance owns its stream; transactions use registered lane streams.
+/// Boundary operations join every live lane before copying shared state.
 pub(super) struct CacheRank<'a> {
     pub stream: Stream<'a>,
+    lane_streams: RefCell<Vec<Weak<Stream<'a>>>>,
     active: Allocation<'a>,
     marks: Option<Allocation<'a>>,
     pages: Option<Allocation<'a>>,
@@ -78,7 +78,7 @@ impl<'a> CacheRank<'a> {
         let marks = if reservation.marks > 0 { Some(Allocation::new(device, reservation.marks)?) } else { None };
         let page_count = pages;
         let pages = if reservation.pages > 0 { Some(Allocation::new(device, reservation.pages)?) } else { None };
-        let owner = Self { stream, active, marks, pages, page_count, layout, rank, sequences, slots,
+        let owner = Self { stream, lane_streams: RefCell::new(Vec::new()), active, marks, pages, page_count, layout, rank, sequences, slots,
             marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
         let mut guard = owner.stream.cancellation_guard("Step-5 cache initialization");
         device.run(|| {
@@ -90,6 +90,25 @@ impl<'a> CacheRank<'a> {
         guard.complete = true;
         drop(guard);
         Ok(owner)
+    }
+
+    pub fn register_lane(&self, stream: &Rc<Stream<'a>>) -> Result<()> {
+        ensure!(stream.device.id == self.stream.device.id
+            && std::ptr::eq(stream.device.library, self.stream.device.library),
+            "Step-5 cache lane stream device mismatch");
+        let mut streams = self.lane_streams.borrow_mut();
+        streams.retain(|stream| stream.strong_count() > 0);
+        ensure!(streams.iter().all(|other| !other.ptr_eq(&Rc::downgrade(stream))),
+            "Step-5 duplicate cache lane stream");
+        streams.push(Rc::downgrade(stream));
+        Ok(())
+    }
+
+    pub fn drain(&self) -> Result<()> {
+        for stream in self.lane_streams.borrow().iter().filter_map(Weak::upgrade) {
+            stream.drain()?;
+        }
+        self.stream.drain()
     }
 
     pub fn bytes(&self) -> usize { self.reservation.total }
@@ -144,6 +163,7 @@ impl<'a> CacheRank<'a> {
         ensure!(rows <= cuteafd_loader::serving_capacity::step5::PAGE_ROWS as usize,
             "Step-5 CSA tail longer than a page");
         ensure!(from != to, "Step-5 CSA COW requires distinct pages");
+        self.drain()?;
         let source = self.page_views(from)?;
         let target = self.page_views(to)?;
         let mut guard = self.stream.cancellation_guard("Step-5 CSA tail copy");
@@ -225,6 +245,7 @@ impl<'a> CacheRank<'a> {
     /// This captures every nonpaged byte at the exact committed frontier only.
     pub fn capture(&mut self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
         self.check_idle(sequence)?;
+        self.drain()?;
         let copies = self.snapshot_copies(sequence, slot, frontier)?;
         let marks = self.marks.as_ref().context("Step-5 prefix retention is disabled")?.buffer;
         self.marks_at[usize::try_from(slot)?] = None;
@@ -248,6 +269,7 @@ impl<'a> CacheRank<'a> {
 
     pub fn restore(&mut self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
         self.check_idle(sequence)?;
+        self.drain()?;
         let copies = self.snapshot_copies(sequence, slot, frontier)?;
         ensure!(self.marks_at[usize::try_from(slot)?] == Some(frontier),
             "Step-5 mark is absent or belongs to a different frontier");
@@ -258,6 +280,7 @@ impl<'a> CacheRank<'a> {
     /// bookkeeping cannot identify a slot that the host tier just overwrote.
     pub fn restore_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
         self.check_idle(sequence)?;
+        self.drain()?;
         let copies = self.snapshot_copies(sequence, slot, frontier)?;
         self.restore_copies(copies)
     }

@@ -3,7 +3,7 @@ use super::{
     cache::CacheRank,
     prefix::{Frontier, Placement, Step5Prefix},
 };
-use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_engine::prefix::PrefixCache;
 use cuteafd_ffi::{
@@ -39,6 +39,7 @@ struct RegionScratch<'a> {
 }
 
 pub(super) struct Staging<'a> {
+    pub stream: Rc<Stream<'a>>,
     raw: Vec<(Allocation<'a>, Allocation<'a>)>,
     sparse: Option<RegionScratch<'a>>,
     rows: usize,
@@ -155,7 +156,10 @@ impl<'a> Staging<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
         let table_width = usize::try_from(cache.layout().context.div_ceil(64))?;
+        let stream = Rc::new(Stream::new(device)?);
+        cache.register_lane(&stream)?;
         let owner = Self {
+            stream,
             raw,
             sparse,
             positions: Allocation::new(device, (rows * 8).max(256))?,
@@ -193,6 +197,14 @@ impl<'a> Staging<'a> {
         self.bytes
     }
 
+    pub(super) fn validate_cache(&self, cache: &CacheRank<'_>) -> Result<()> {
+        ensure!(self.cache_owner == cache.identity()
+            && self.stream.device.id == cache.stream.device.id
+            && std::ptr::eq(self.stream.device.library, cache.stream.device.library),
+            "Step-5 staging cache binding differs");
+        Ok(())
+    }
+
     pub fn owns_compressor(&self, cache: &CacheRank<'_>, layer: usize) -> bool {
         self.cache_owner == cache.identity() && self.sparse.is_some()
             && cache.layout().ranks[cache.rank()].regions.iter().position(|r| r.layer == layer)
@@ -201,12 +213,34 @@ impl<'a> Staging<'a> {
     }
 }
 
+// Only these scoped operations borrow the shared allocator. A live Step owns
+// page references, never a RefMut that could cross a callback or a device wait.
+fn fork_at_begin<E: CopyEngine>(pool: &RefCell<PrefixCache<E, Frontier>>,
+    family: &Step5Prefix<'_, '_>, pages: &[u32], base: usize, end: usize,
+) -> Result<Vec<u32>> {
+    Ok(pool.try_borrow_mut().context("Step-5 prefix pool already borrowed")?
+        .fork_step(family, pages, base, end)?)
+}
+
+fn release_at_publish<E: CopyEngine>(pool: &RefCell<PrefixCache<E, Frontier>>,
+    family: &Step5Prefix<'_, '_>, pages: &[u32],
+) -> Result<()> {
+    pool.try_borrow_mut().context("Step-5 prefix pool already borrowed")?.release(family, pages)?;
+    Ok(())
+}
+
+fn abort<E: CopyEngine>(pool: &RefCell<PrefixCache<E, Frontier>>,
+    family: &Step5Prefix<'_, '_>, pages: &[u32],
+) -> Result<()> {
+    release_at_publish(pool, family, pages)
+}
+
 /// Exclusively borrows the placement and lane through preparation, publication,
 /// or Drop. Shared prefix allocation owns every proposal page reference.
 pub(super) struct Step<'e, 'a, E: CopyEngine> {
     ranks: Vec<&'e RefCell<CacheRank<'a>>>,
     staging: Vec<&'e Staging<'a>>,
-    pool: &'e mut PrefixCache<E, Frontier>,
+    pool: &'e RefCell<PrefixCache<E, Frontier>>,
     placement: &'e mut Placement,
     pages: Option<Vec<u32>>,
     complete: Vec<BTreeSet<usize>>,
@@ -241,10 +275,24 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         result
     }
 
+    pub(super) fn in_submissions<T>(
+        _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+        steps: &mut [&mut Self],
+        work: impl FnOnce(&mut [&mut Self]) -> Result<T>,
+    ) -> Result<T> {
+        let _modes = steps.iter().map(|step| SubmissionMode::enter(step.submission.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let result = work(steps);
+        if result.is_err() {
+            for step in steps { step.failed = true; }
+        }
+        result
+    }
+
     pub fn begin(
         ranks: Vec<&'e RefCell<CacheRank<'a>>>,
         staging: Vec<&'e Staging<'a>>,
-        pool: &'e mut PrefixCache<E, Frontier>,
+        pool: &'e RefCell<PrefixCache<E, Frontier>>,
         placement: &'e mut Placement,
         rows: usize,
     ) -> Result<Self> {
@@ -274,7 +322,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 "Step-5 staging belongs to another cache owner"
             );
         }
-        let pages = pool.fork_step(&family, &placement.pages, base, end)?;
+        let pages = fork_at_begin(pool, &family, &placement.pages, base, end)?;
         for (cache, stage) in ranks.iter().zip(&staging) {
             cache.borrow().busy[placement.sequence as usize].set(true);
             stage.busy.set(true);
@@ -301,24 +349,23 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             .iter()
             .flat_map(|p| (*p as i32).to_le_bytes())
             .collect();
-        for (owner, stage) in step.ranks.iter().zip(&step.staging) {
-            let cache = owner.borrow();
+        for stage in &step.staging {
             ensure!(
                 step.pages().len() <= stage.table_width,
                 "Step-5 proposal table capacity"
             );
-            cache.stream.device.run(|| {
+            stage.stream.device.run(|| {
                 // SAFETY: the step owns metadata until its Drop drain; ordered uploads retain sources.
                 unsafe {
-                    cache.stream.device.library.copy_h2d_ordered(
+                    stage.stream.device.library.copy_h2d_ordered(
                         stage.positions.buffer,
                         &positions,
-                        cache.stream.raw,
+                        stage.stream.raw,
                     )?;
-                    cache.stream.device.library.copy_h2d_ordered(
+                    stage.stream.device.library.copy_h2d_ordered(
                         stage.page_table.buffer,
                         &table,
-                        cache.stream.raw,
+                        stage.stream.raw,
                     )
                 }
             })?;
@@ -330,7 +377,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         self.pages.as_deref().expect("unpublished Step-5 step")
     }
 
-    /// Every producer/consumer joins the cache stream. Failure poisons this
+    /// Every producer/consumer uses its private lane stream. Failure poisons this
     /// proposal, and Drop drains before any borrowed layer owner can retire.
     pub fn project<O, T>(
         &mut self,
@@ -359,14 +406,14 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             "Step-5 duplicate projection"
         );
         self.failed = true;
-        let mut guard = cache
+        let mut guard = stage
             .stream
             .cancellation_guard("Step-5 projection callback");
         guard.complete = self.submission.get();
         let result = work(
             input_owner,
             StepInputs {
-                stream: &cache.stream,
+                stream: &stage.stream,
                 positions: stage.positions.buffer,
                 requests: stage.requests.buffer,
                 rows: self.rows,
@@ -381,7 +428,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         result
     }
 
-    /// Pin non-attention owners and order chain copies/FFNs on the cache stream.
+    /// Pin non-attention owners and order chain copies/FFNs on the lane stream.
     pub fn compose<O, T>(
         &mut self,
         rank: usize,
@@ -391,11 +438,11 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         ensure!(!self.failed, "Step-5 failed step cannot compose");
         let cache = self.ranks.get(rank).context("Step-5 composition rank")?.borrow();
         self.failed = true;
-        let mut guard = cache.stream.cancellation_guard("Step-5 composition callback");
-        guard.complete = self.submission.get();
         let stage = self.staging[rank];
+        let mut guard = stage.stream.cancellation_guard("Step-5 composition callback");
+        guard.complete = self.submission.get();
         let result = work(owner, StepInputs {
-            stream: &cache.stream,
+            stream: &stage.stream,
             positions: stage.positions.buffer,
             requests: stage.requests.buffer,
             rows: self.rows,
@@ -456,13 +503,13 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 )
             };
         self.failed = true;
-        let mut guard = cache.stream.cancellation_guard("Step-5 attention callback");
+        let mut guard = stage.stream.cancellation_guard("Step-5 attention callback");
         guard.complete = self.submission.get();
         let result = work(
             input_owner,
             AttentionRead {
                 inputs: StepInputs {
-                    stream: &cache.stream,
+                    stream: &stage.stream,
                     positions: stage.positions.buffer,
                     requests: stage.requests.buffer,
                     rows: self.rows,
@@ -485,7 +532,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         result
     }
 
-    /// BF16 projections are ordered on the cache stream. Borrowed allocations
+    /// BF16 projections are ordered on the lane stream. Borrowed allocations
     /// remain live through Drop's drain, including partial-enqueue cancellation.
     pub fn stage(
         &mut self,
@@ -510,7 +557,8 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let cache = self.ranks[rank].borrow();
         let state = &cache.layout().ranks[rank];
         let sequence = self.placement.sequence;
-        let mut guard = cache.stream.cancellation_guard("Step-5 staged layer");
+        let stage = self.staging[rank];
+        let mut guard = stage.stream.cancellation_guard("Step-5 staged layer");
         guard.complete = self.submission.get();
         if let Some(ring) = state.sliding.iter().find(|r| r.layer == layer && !r.mtp) {
             ensure!(index.is_none(), "SWA must not carry indexer state");
@@ -531,7 +579,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             {
                 for (target, source) in targets.into_iter().zip(sources) {
                     copy(
-                        &cache,
+                        &stage.stream,
                         view(target, run.slot as usize * row, run.rows as usize * row)?,
                         view(source, run.offset as usize * row, run.rows as usize * row)?,
                     )?;
@@ -559,13 +607,13 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             for ((target, previous), source) in raw.into_iter().zip([old.0, old.1]).zip([ik, iz]) {
                 if pending > 0 {
                     copy(
-                        &cache,
+                        &stage.stream,
                         view(target, 0, pending * 512)?,
                         view(previous, 0, pending * 512)?,
                     )?;
                 }
                 copy(
-                    &cache,
+                    &stage.stream,
                     view(target, pending * 512, self.rows * 512)?,
                     view(source, 0, self.rows * 512)?,
                 )?;
@@ -577,7 +625,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 let count = (64 - position % 64).min(self.base + self.rows - position);
                 for (target, source) in [targets.0, targets.1].into_iter().zip([key, value]) {
                     copy(
-                        &cache,
+                        &stage.stream,
                         view(target, (page * 64 + position % 64) * row, count * row)?,
                         view(source, (position - self.base) * row, count * row)?,
                     )?;
@@ -590,7 +638,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 let target = cache.request_component(summary, sequence)?;
                 let output = view(target, self.base / 8 * 256, completed * 256)?;
                 let sparse = stage.sparse.as_ref().context("Step-5 CSA compressor owner")?;
-                cache.stream.device.run(|| {
+                stage.stream.device.run(|| {
                     // SAFETY: admitted raw staging, immutable metadata, summary suffix and
                     // scratch belong to this lane; no old visible summary is overwritten.
                     unsafe {
@@ -607,7 +655,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                                 Scalar::I32(completed as i32),
                                 Scalar::I64((pending + self.rows) as i64),
                             ],
-                            cache.stream.raw,
+                            stage.stream.raw,
                         )
                     }
                 })?;
@@ -658,7 +706,8 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         }
         for (rank, owner) in self.ranks.iter().enumerate() {
             let cache = owner.borrow();
-            let mut guard = cache
+            let stage = self.staging[rank];
+            let mut guard = stage
                 .stream
                 .cancellation_guard("Step-5 prepare publication");
             guard.complete = self.submission.get();
@@ -671,10 +720,10 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                     self.staging[rank].raw[at].0.buffer,
                     self.staging[rank].raw[at].1.buffer,
                 ]) {
-                    zero(&cache, target)?;
+                    zero(&stage.stream, target)?;
                     if tail > 0 {
                         copy(
-                            &cache,
+                            &stage.stream,
                             view(target, 0, tail * 512)?,
                             view(source, raw_offset * 512, tail * 512)?,
                         )?;
@@ -682,25 +731,25 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 }
             }
             let target = cache.length(sequence, true)?;
-            cache.stream.device.run(|| {
+            stage.stream.device.run(|| {
                 // SAFETY: private length bank on this stream; source is retained by the library.
                 unsafe {
-                    cache.stream.device.library.copy_h2d_ordered(
+                    stage.stream.device.library.copy_h2d_ordered(
                         target,
                         &(end as u64).to_le_bytes(),
-                        cache.stream.raw,
+                        stage.stream.raw,
                     )
                 }
             })?;
             guard.complete = true;
         }
-        for owner in &self.ranks {
-            owner.borrow().stream.drain()?;
+        for stage in &self.staging {
+            stage.stream.drain()?;
         }
         let family = Step5Prefix::new(self.ranks.clone())?;
         // Release can fail only before the selector changes. Both leases are
         // retained until all device work is known complete.
-        self.pool.release(&family, &self.placement.pages)?;
+        release_at_publish(self.pool, &family, &self.placement.pages)?;
         for owner in &self.ranks {
             owner.borrow().publish_bank(self.placement.sequence);
         }
@@ -725,11 +774,8 @@ impl Drop for SubmissionMode {
 impl<E: CopyEngine> Drop for Step<'_, '_, E> {
     fn drop(&mut self) {
         if self.pages.is_some() {
-            for owner in &self.ranks {
-                owner
-                    .borrow()
-                    .stream
-                    .drain_or_abort("Step-5 abandoned proposal");
+            for stage in &self.staging {
+                stage.stream.drain_or_abort("Step-5 abandoned proposal");
             }
         }
         for (owner, stage) in self.ranks.iter().zip(&self.staging) {
@@ -740,7 +786,7 @@ impl<E: CopyEngine> Drop for Step<'_, '_, E> {
             return;
         };
         if let Ok(family) = Step5Prefix::new(self.ranks.clone()) {
-            if let Err(error) = self.pool.release(&family, &pages) {
+            if let Err(error) = abort(self.pool, &family, &pages) {
                 for owner in &self.ranks {
                     owner.borrow().poisoned.set(true);
                 }
@@ -751,30 +797,30 @@ impl<E: CopyEngine> Drop for Step<'_, '_, E> {
 }
 
 fn copy(
-    cache: &CacheRank<'_>,
+    stream: &Stream<'_>,
     target: CuteafdDeviceBuffer,
     source: CuteafdDeviceBuffer,
 ) -> Result<()> {
-    cache.stream.device.run(|| {
+    stream.device.run(|| {
         // SAFETY: checked disjoint views and caller-owned inputs remain live through the step drain.
         unsafe {
-            cache.stream.device.library.copy_d2d_async(
+            stream.device.library.copy_d2d_async(
                 target,
                 source,
                 source.bytes,
-                cache.stream.raw,
+                stream.raw,
             )
         }
     })
 }
-fn zero(cache: &CacheRank<'_>, target: CuteafdDeviceBuffer) -> Result<()> {
-    cache.stream.device.run(|| {
+fn zero(stream: &Stream<'_>, target: CuteafdDeviceBuffer) -> Result<()> {
+    stream.device.run(|| {
         // SAFETY: private pending bank is not read by the committed frontier.
         unsafe {
-            cache.stream.device.library.cuda_zero_bytes_async(
+            stream.device.library.cuda_zero_bytes_async(
                 target,
                 target.bytes,
-                cache.stream.raw,
+                stream.raw,
             )
         }
     })
@@ -909,7 +955,7 @@ pub(super) mod tests {
         let refs: Vec<_> = owners.iter().collect();
         let lanes: Vec<_> = stages.iter().collect();
         let family = Step5Prefix::new(refs.clone())?;
-        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(
+        let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(
             family.layout(),
             PrefixConfig {
                 entries: 0,
@@ -918,7 +964,7 @@ pub(super) mod tests {
                 min_tokens: 1,
             },
             None,
-        )?;
+        )?);
         let input = |bytes| -> Result<Allocation<'_>> {
             let allocation = Allocation::new(device, bytes)?;
             // BF16 1.0, valid for both raw projections and compressor logits.
@@ -930,8 +976,39 @@ pub(super) mod tests {
         let value = input(key.buffer.bytes)?;
         let ik = input(64 * 512)?;
         let iz = input(64 * 512)?;
+        let second_stages = owners.iter()
+            .map(|owner| Staging::new(device, &programs, &owner.borrow(), usize::MAX))
+            .collect::<Result<Vec<_>>>()?;
+        for (first, second) in stages.iter().zip(&second_stages) {
+            assert_ne!(first.stream.raw, second.stream.raw);
+        }
+        let mut first = pool.borrow_mut().admit_cold(&family, 1, 1, |pages|
+            Placement { pages, sequence: 0, committed: 0 })?.placement;
+        let mut second = pool.borrow_mut().admit_cold(&family, 1, 1, |pages|
+            Placement { pages, sequence: 1, committed: 0 })?.placement;
+        let free = pool.borrow().pool().free();
+        {
+            let mut first_step = Step::begin(refs.clone(), lanes.clone(), &pool, &mut first, 64)?;
+            first_step.stage(0, 0, &key, &value, None)?;
+            // The first lane has queued work and retains its owned lease, not a pool borrow.
+            assert!(pool.try_borrow_mut().is_ok());
+            let mut second_step = Step::begin(refs.clone(), second_stages.iter().collect(),
+                &pool, &mut second, 64)?;
+            second_step.stage(0, 0, &key, &value, None)?;
+            assert!(first_step.pages().iter().all(|page| !second_step.pages().contains(page)));
+            // Cache capture on the busy sequence remains forbidden even though the allocator is free.
+            assert!(owners[0].borrow_mut().capture(0, 0, 0).is_err());
+            drop(second_step);
+            first_step.stage(1, 0, &key, &value, None)?;
+        }
+        assert_eq!(pool.borrow().pool().free(), free);
+        assert_eq!((first.committed, second.committed), (0, 0));
+        pool.borrow_mut().release(&family, &first.pages)?;
+        pool.borrow_mut().release(&family, &second.pages)?;
+        assert_eq!(pool.borrow().pool().free(), 40);
+
         for base in [0, 7, 63, 511, 575, 576] {
-            let mut placement = pool
+            let mut placement = pool.borrow_mut()
                 .admit_cold(&family, base.max(1), base.max(1), |pages| Placement {
                     pages,
                     sequence: 0,
@@ -939,7 +1016,7 @@ pub(super) mod tests {
                 })?
                 .placement;
             let old_pages = placement.pages.clone();
-            let old_free = pool.pool().free();
+            let old_free = pool.borrow().pool().free();
             // Seed arbitrary old visible bytes, including pending and summary state.
             for owner in &owners {
                 let cache = owner.borrow();
@@ -993,7 +1070,7 @@ pub(super) mod tests {
                 })
                 .collect::<Result<Vec<_>>>()?;
             {
-                let mut step = Step::begin(refs.clone(), lanes.clone(), &mut pool, &mut placement, 64)?;
+                let mut step = Step::begin(refs.clone(), lanes.clone(), &pool, &mut placement, 64)?;
                 assert!(step.compose(2, &key, |_, _| Ok(())).is_err());
                 step.compose(0, &key, |_, meta| {
                     assert_eq!(meta.rows, 64);
@@ -1015,9 +1092,9 @@ pub(super) mod tests {
             }
             assert_eq!(placement.pages, old_pages);
             assert_eq!(placement.committed, base);
-            assert_eq!(pool.pool().free(), old_free);
+            assert_eq!(pool.borrow().pool().free(), old_free);
             let compose_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                let mut step = Step::begin(refs.clone(), lanes.clone(), &mut pool, &mut placement, 64)?;
+                let mut step = Step::begin(refs.clone(), lanes.clone(), &pool, &mut placement, 64)?;
                 step.compose(0, &key, |_, _| -> Result<()> {
                     panic!("injected composition panic");
                 })
@@ -1025,11 +1102,11 @@ pub(super) mod tests {
             assert!(compose_panic.is_err());
             assert_eq!(placement.pages, old_pages);
             assert_eq!(placement.committed, base);
-            assert_eq!(pool.pool().free(), old_free);
+            assert_eq!(pool.borrow().pool().free(), old_free);
             let killed =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                     let mut step =
-                        Step::begin(refs.clone(), lanes.clone(), &mut pool, &mut placement, 64)?;
+                        Step::begin(refs.clone(), lanes.clone(), &pool, &mut placement, 64)?;
                     step.stage(0, 0, &key, &value, None)?;
                     step.stage(0, 3, &key, &value, Some((&ik, &iz)))?;
                     assert!(owners[0].borrow_mut().restore(0, 0, base as u64).is_err());
@@ -1038,7 +1115,7 @@ pub(super) mod tests {
             assert!(killed.is_err());
             assert_eq!(placement.committed, base);
             assert_eq!(placement.pages, old_pages);
-            assert_eq!(pool.pool().free(), old_free);
+            assert_eq!(pool.borrow().pool().free(), old_free);
             for (rank, owner) in owners.iter().enumerate() {
                 assert_eq!(mark(owner, 0, 2, base)?, saved[rank]);
                 let after = old_pages
@@ -1052,14 +1129,14 @@ pub(super) mod tests {
                 assert_eq!(mark(owner, 1, 2, base)?, other[rank]);
             }
             // An incomplete target cannot publish even after valid layer writes.
-            let mut step = Step::begin(refs.clone(), lanes.clone(), &mut pool, &mut placement, 64)?;
+            let mut step = Step::begin(refs.clone(), lanes.clone(), &pool, &mut placement, 64)?;
             step.stage(0, 0, &key, &value, None)?;
             assert!(step.publish(1).is_err());
             assert_eq!(placement.committed, base);
             for accepted in [0, 1, 7, 8, 63, 64] {
                 let before = placement.committed;
                 let mut step =
-                    Step::begin(refs.clone(), lanes.clone(), &mut pool, &mut placement, 64)?;
+                    Step::begin(refs.clone(), lanes.clone(), &pool, &mut placement, 64)?;
                 for rank in 0..2 {
                     for layer in 0..92 {
                         step.stage(
@@ -1088,8 +1165,8 @@ pub(super) mod tests {
                     assert_eq!(mark(owner, 0, 2, placement.committed)?, committed);
                 }
             }
-            pool.release(&family, &placement.pages)?;
-            assert_eq!(pool.pool().free(), 40);
+            pool.borrow_mut().release(&family, &placement.pages)?;
+            assert_eq!(pool.borrow().pool().free(), 40);
         }
         Ok(())
     }

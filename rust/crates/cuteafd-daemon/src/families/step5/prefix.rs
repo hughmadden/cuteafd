@@ -148,7 +148,7 @@ impl PrefixFamily<Frontier> for Step5Prefix<'_, '_> {
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        for owner in &self.ranks { owner.borrow().stream.drain()?; }
+        for owner in &self.ranks { owner.borrow().drain()?; }
         Ok(())
     }
 

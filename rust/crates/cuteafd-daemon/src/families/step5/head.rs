@@ -70,17 +70,29 @@ impl HeadPlan {
     }
 
     pub fn bytes(&self) -> u64 { self.bytes }
+
+    pub(super) fn workspace_bytes(&self) -> u64 {
+        self.planes.iter().map(|&n| n as u64).sum()
+    }
+
+    pub(super) fn immutable_bytes(&self) -> u64 {
+        self.bytes - self.workspace_bytes()
+    }
+}
+
+struct HeadWeights<'a> {
+    norm: Program<'a>,
+    weights: Vec<Allocation<'a>>,
+    epsilon: f32,
 }
 
 pub(super) struct TargetHeadOwner<'a> {
     // Drain before programs, library handles, weights and workspace retire.
     stream: Stream<'a>,
     head: VocabularyHead<'a>,
-    norm: Program<'a>,
-    weights: Vec<Allocation<'a>>,
     planes: Vec<Allocation<'a>>,
     rows: usize,
-    epsilon: f32,
+    immutable: std::rc::Rc<HeadWeights<'a>>,
 }
 
 impl<'a> TargetHeadOwner<'a> {
@@ -93,13 +105,27 @@ impl<'a> TargetHeadOwner<'a> {
             let norm = programs.program("step5_final_norm", POINTERS)?;
             let weights = plan.weights.iter().map(|w| load_operand(device, checkpoint, &plan.layout, w))
                 .collect::<Result<Vec<_>>>()?;
-            let planes = plan.planes.iter().map(|&n| Allocation::new(device, n))
+            Self::workspace(device, plan.rows, std::rc::Rc::new(HeadWeights {
+                norm, weights, epsilon: plan.epsilon,
+            }))
+        })
+    }
+
+    /// Every lane has its own BLAS handle, stream, norm/logit planes and scratch.
+    pub(super) fn new_lane(&self) -> Result<Self> {
+        Self::workspace(self.stream.device, self.rows, self.immutable.clone())
+    }
+
+    fn workspace(device: Device<'a>, rows: usize,
+        immutable: std::rc::Rc<HeadWeights<'a>>) -> Result<Self> {
+        device.run(|| {
+            let planes = HeadPlan::plane_bytes(rows)?.iter().map(|&n| Allocation::new(device, n))
                 .collect::<Result<Vec<_>>>()?;
-            // SAFETY: admitted workspace is retained after the head handle, on this device.
+            // SAFETY: private workspace survives the private handle on this device.
             let head = unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
-                H as u32, plan.rows as u32, V as u32)? };
+                H as u32, rows as u32, V as u32)? };
             let stream = Stream::new(device)?;
-            Ok(Self { stream, head, norm, weights, planes, rows: plan.rows, epsilon: plan.epsilon })
+            Ok(Self { stream, head, planes, rows, immutable })
         })
     }
 
@@ -118,15 +144,15 @@ impl<'a> TargetHeadOwner<'a> {
         self.stream.device.run(|| {
             let library = self.stream.device.library;
             let p = self.planes.iter().map(|p| p.buffer.ptr).collect::<Vec<_>>();
-            let weight = self.weights[0].buffer.ptr;
+            let weight = self.immutable.weights[0].buffer.ptr;
             // SAFETY: all extents were admitted; disjoint owners and input remain live until drain.
             unsafe {
                 library.cuda_f32_to_bf16_async(input, self.planes[0].buffer,
                     self.rows * H, self.stream.raw)?;
-                self.norm.launch(&[p[0], weight, weight, weight, weight, weight, p[1]],
-                    &[Scalar::I32(self.rows as i32), Scalar::F32(self.epsilon)], self.stream.raw)?;
+                self.immutable.norm.launch(&[p[0], weight, weight, weight, weight, weight, p[1]],
+                    &[Scalar::I32(self.rows as i32), Scalar::F32(self.immutable.epsilon)], self.stream.raw)?;
                 target_head::launch(TargetHead::configured(), &self.head, p[1],
-                    self.weights[1].buffer.ptr, p[2].cast(), self.rows, self.stream.raw)?;
+                    self.immutable.weights[1].buffer.ptr, p[2].cast(), self.rows, self.stream.raw)?;
             }
             self.stream.drain()?;
             guard.complete = true;
@@ -141,8 +167,45 @@ impl<'a> TargetHeadOwner<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    pub(in super::super) fn admission_plan(rows: usize) -> HeadPlan {
+        let planes = HeadPlan::plane_bytes(rows).unwrap();
+        HeadPlan {
+            layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![], resident_bytes: 0 },
+            weights: vec![], planes, rows, epsilon: 1e-5,
+            bytes: ((H * 4 + V * H * 2) as u64) + planes.iter().map(|&n| n as u64).sum::<u64>(),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires sealed native library, pinned Step-5 snapshot and CUDA"]
+    fn native_lane_shares_weights_and_isolates_workspace() -> Result<()> {
+        // SAFETY: the operator supplies the matching sealed native library.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library.programs()?.with_manifest(std::path::Path::new(
+            &std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let checkpoint = Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let plan = HeadPlan::prepare(&programs, &checkpoint, 1)?;
+        let owner = TargetHeadOwner::load(device, &programs, &checkpoint, plan, u64::MAX, &[])?;
+        let lane = owner.new_lane()?;
+        ensure!(std::rc::Rc::ptr_eq(&owner.immutable, &lane.immutable)
+            && owner.stream.raw != lane.stream.raw
+            && owner.planes.iter().zip(&lane.planes).all(|(a, b)|
+                a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
+            "Step-5 lane immutable/private storage identities");
+        let immutable = lane.immutable.clone();
+        drop(owner);
+        ensure!(std::rc::Rc::strong_count(&immutable) == 2,
+            "Step-5 weights must survive the original lane");
+        lane.stream.drain()?;
+        drop(lane);
+        ensure!(std::rc::Rc::strong_count(&immutable) == 1,
+            "Step-5 lane must release its immutable reference after drainage");
+        Ok(())
+    }
+
     #[test]
     fn final_planes_charge_both_bf16_boundaries_logits_and_head_workspace() {
         for rows in [1, 64, 640, 4096] {

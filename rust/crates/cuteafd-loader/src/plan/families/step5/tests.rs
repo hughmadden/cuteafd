@@ -70,6 +70,8 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             let owners = ExecutionOwnership::new(&cfg, ranks, ownership::plan(&modes, 0, head)).unwrap();
             assert_eq!(owners.routed_wave_ranks().unwrap(),
                 if ranks == 1 || policy == 1 { vec![0] } else { vec![0, 1] });
+            assert_eq!(owners.routed_endpoints().unwrap(),
+                if ranks == 1 || policy == 1 { 1 } else { 2 });
             let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64).unwrap();
             assert_eq!(layout.geometry.placement, if ranks == 1 { KvPlacement::SingleDevice }
                 else { KvPlacement::PartitionedLayers });
@@ -254,6 +256,8 @@ fn step5_routed_replication_bindings_are_single_wave_and_disjoint_from_heads() {
         assert!(lanes[1].iter().flatten().all(|peer| peer.slot != copy.slot && peer.storage != copy.storage));
     }
     assert!(two.routed_replications(2).is_err());
+    assert_eq!(ownership.routed_endpoints().unwrap(), 2);
+    assert_eq!(two.routed_endpoints().unwrap(), 4);
 }
 
 #[test]

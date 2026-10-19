@@ -745,7 +745,7 @@ mod tests {
         let cache = RefCell::new(CacheRank::new(device, layout, 0, 1, 2, 4, usize::MAX)?);
         let staging = Staging::new(device, &programs, &cache.borrow(), usize::MAX)?;
         let family = Step5Prefix::new(vec![&cache])?;
-        let mut pool = PrefixCache::<StubCopyEngine, Frontier>::new(
+        let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(
             family.layout(),
             PrefixConfig {
                 entries: 0,
@@ -754,7 +754,7 @@ mod tests {
                 min_tokens: 1,
             },
             None,
-        )?;
+        )?);
         let mut chain = TargetChain::load(
             device,
             &programs,
@@ -774,7 +774,7 @@ mod tests {
             Ok::<_, anyhow::Error>(result)
         };
         for rows in [1, 7, 8, 9, 64] {
-            let mut placement = pool
+            let mut placement = pool.borrow_mut()
                 .admit_cold(&family, 1, 1, |pages| Placement {
                     pages,
                     sequence: 0,
@@ -782,7 +782,7 @@ mod tests {
                 })?
                 .placement;
             let initial_pages = placement.pages.clone();
-            let free = pool.pool().free();
+            let free = pool.borrow().pool().free();
             let data = fixture(
                 &root,
                 &manifest,
@@ -801,12 +801,12 @@ mod tests {
                 let mut step = Step::begin(
                     vec![&cache],
                     vec![&staging],
-                    &mut pool,
+                    &pool,
                     &mut placement,
                     rows,
                 )?;
                 chain.enqueue_step(&mut step, 0, &input, link.as_ref(), 0)?;
-                cache.borrow().stream.drain()?;
+                cache.borrow().drain()?;
                 if let Some(link) = &link {
                     link.check()?;
                 }
@@ -836,7 +836,7 @@ mod tests {
                 ensure!(
                     placement.committed == 0
                         && placement.pages == initial_pages
-                        && pool.pool().free() == free,
+                        && pool.borrow().pool().free() == free,
                     "chain abort changed committed cache"
                 );
             }
@@ -873,7 +873,7 @@ mod tests {
                 let mut step = Step::begin(
                     vec![&cache],
                     vec![&staging],
-                    &mut pool,
+                    &pool,
                     &mut placement,
                     rows,
                 )?;
@@ -881,7 +881,7 @@ mod tests {
                 step.compose(0, ffn, |ffn, meta| {
                     ffn.enqueue_on(rows, 0, link, meta.stream)
                 })?;
-                cache.borrow().stream.drain()?;
+                cache.borrow().drain()?;
                 link.check()?;
                 drop(step);
                 let actual = read(ffn.output(), rows * H * 4)?;
@@ -897,7 +897,7 @@ mod tests {
                 eprintln!("exact-decode report-only rows={rows} native_rel_l2={} materialization_rel_l2={}",
                     relative(&values(&actual,4)?,&exact),relative(&values(&official,4)?,&exact));
             }
-            pool.release(&family, &placement.pages)?;
+            pool.borrow_mut().release(&family, &placement.pages)?;
         }
         Ok(())
     }

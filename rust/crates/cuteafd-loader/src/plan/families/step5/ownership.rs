@@ -81,7 +81,13 @@ impl ExecutionOwnership {
         Ok(())
     }
 
-    /// Persistent transports are per owning rank, not per simultaneous wave.
+    /// Every persistent lane connects once for each routed-wave owning rank.
+    pub fn routed_endpoints(&self) -> Result<usize> {
+        self.routed_wave_ranks()?.len().checked_mul(usize::try_from(self.execution.spec().lanes)?)
+            .ok_or_else(|| anyhow::anyhow!("Step-5 routed endpoint count overflow"))
+    }
+
+    /// Owning ranks within a lane, not the total number of persistent transports.
     pub fn routed_wave_ranks(&self) -> Result<Vec<usize>> {
         let mut ranks = Vec::new();
         for rank in 0..self.ranks {

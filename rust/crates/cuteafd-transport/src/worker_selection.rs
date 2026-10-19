@@ -1143,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn step5_two_rank_clients_replay_admission_and_retained_endpoint_credit() -> Result<()> {
+    fn step5_two_rank_two_lane_clients_replay_admission_and_retained_endpoint_credit() -> Result<()> {
         use cuteafd_core::{SparkEndpoint, SparkIngress, ExpertGeometry};
         use std::sync::atomic::Ordering;
         let geometry = ExpertGeometry::STEP5;
@@ -1152,7 +1152,7 @@ mod tests {
         for clients in [0, 9, usize::MAX] {
             assert!(ModelAdmission::for_clients(geometry, endpoint, 4096, rings, clients).is_err());
         }
-        for clients in [1, 2] {
+        for clients in [1, 2, 4] {
             let model = ModelAdmission::for_clients(geometry, endpoint, 4096, rings, clients)?;
             assert_eq!(model.ring_bytes(geometry)?, clients * 134217728);
             let selection = WorkerSelection::new(WorkerIdentity {
@@ -1184,7 +1184,7 @@ mod tests {
                     servers.push(scope.spawn(move || -> Result<()> {
                         let installed = InstalledModelAdmission::new(rank, selection.clone(), Some(report))?;
                         listener.set_nonblocking(true)?;
-                        for _ in 0..2 {
+                        for _ in 0..3 {
                             let deadline = std::time::Instant::now() + Duration::from_secs(10);
                             let mut stream = loop {
                                 match listener.accept() {
@@ -1203,7 +1203,9 @@ mod tests {
                     }));
                 }
                 select_model_admission(&peers, &selection, Duration::from_secs(5))?;
-                assert_eq!(require_peer_clients(&peers, endpoint, 2).is_ok(), clients == 2);
+                for required in [1, 2, 4] {
+                    assert_eq!(require_peer_clients(&peers, endpoint, required).is_ok(), clients >= required);
+                }
                 for peer in &peers {
                     assert_eq!(seals().lock().unwrap()[peer].endpoints.used.load(Ordering::Acquire), 0);
                 }
@@ -1227,21 +1229,31 @@ mod tests {
                     assert_eq!(endpoints.used.load(Ordering::Acquire).count_ones(), 1);
                     validate_endpoint_request(&selection, 0, &header)?;
                 }
-                let mut second = Vec::new();
-                for &peer in &peers {
-                    match reserve_peer_endpoint(peer, &header, None) {
-                        Ok(Some(lease)) => { assert_eq!(clients, 2); assert_eq!(lease.index(), 1); second.push(lease); }
-                        Err(error) => {
-                            assert_eq!(clients, 1);
-                            assert!(error.to_string().contains("has no free ModelAdmission endpoint for capacity None / Bf16"));
-                        }
-                        _ => panic!("typed endpoint lease missing"),
+                let mut remaining = Vec::new();
+                for index in 1..clients {
+                    header.request_id += 1;
+                    for &peer in &peers {
+                        let lease = reserve_peer_endpoint(peer, &header, None)?.expect("typed endpoint lease");
+                        assert_eq!(lease.index(), u32::try_from(index)?);
+                        remaining.push(lease);
                     }
                 }
+                select_model_admission(&peers, &selection, Duration::from_secs(5))?;
+                for &peer in &peers {
+                    assert_eq!(seals().lock().unwrap()[&peer].endpoints.used.load(Ordering::Acquire).count_ones(), clients as u32);
+                    let error = reserve_peer_endpoint(peer, &header, None).err().expect("endpoint exhaustion");
+                    assert!(error.to_string().contains("has no free ModelAdmission endpoint for capacity None / Bf16"));
+                }
                 for server in servers { server.join().unwrap()?; }
-                drop(second);
+                drop(remaining);
                 drop(first);
-                for peer in peers { seals().lock().unwrap().remove(&peer); }
+                for peer in peers {
+                    assert_eq!(seals().lock().unwrap()[&peer].endpoints.used.load(Ordering::Acquire), 0);
+                    let lease = reserve_peer_endpoint(peer, &header, None)?.expect("released endpoint reusable");
+                    assert_eq!(lease.index(), 0);
+                    drop(lease);
+                    seals().lock().unwrap().remove(&peer);
+                }
                 Ok(())
             })?;
         }
