@@ -406,55 +406,67 @@ mod tests {
     #[test]
     fn compact_owned_payloads_match_offsets_and_even_layouts_are_unchanged() -> Result<()> {
         use cuteafd_core::tp_units::TpPlacement;
-        for world in [2, 3, 4, 6] {
-            let manifest = fixture(&[3, 4]);
-            let mut total_weights = 0;
-            let mut resident_bytes = Vec::new();
-            for rank in 0..world {
-                let old = manifest.residency(V41Exl3Layer::Backbone(0), world, rank)?;
-                let plan = manifest.residency_with_placement(V41Exl3Layer::Backbone(0), world,
-                    rank, TpPlacement::Balanced)?;
-                if 18 % world == 0 {
-                    assert_eq!(serde_json::to_value(&plan)?, serde_json::to_value(&old)?);
-                    assert!(plan.unit_map.is_none());
-                } else {
-                    let map = plan.unit_map.as_ref().unwrap();
-                    let stride = plan.experts * plan.tiers.len();
-                    let descriptor = &plan.buffers.iter().find(|b| b.name == "descriptor_map").unwrap().initial_words;
-                    assert_eq!(descriptor.len(), 7 * stride);
-                    for (expert, loads) in plan.loads.chunks_exact(9).enumerate() {
-                        assert_eq!(descriptor[3 * stride + expert] as usize, map.experts[expert].len() * 128);
-                        for (projection, loads) in loads.chunks_exact(3).enumerate() {
-                            let load = &loads[0];
-                            assert_eq!(load.expert, Some(expert));
-                            assert_eq!(load.destinations[0].1, descriptor[(4 + projection) * stride + expert] as usize * 4);
-                            let tier = descriptor[projection * stride + expert] >> 9;
-                            assert_eq!(load.bytes, 5120 * map.experts[expert].len() * 128 * plan.tiers[tier as usize] / 8);
+        for (hidden, intermediate, experts, tiers) in [
+            (5120, 2304, 384, [3, 4]), (6144, 2048, 256, [4, 5]),
+        ] {
+            for world in [2, 3, 4, 6] {
+                let manifest = fixture_geometry(&tiers, hidden, intermediate, experts);
+                let units = intermediate / 128;
+                let mut total_weights = 0;
+                let mut resident_bytes = Vec::new();
+                let mut allocated_bytes = Vec::new();
+                for rank in 0..world {
+                    let old = manifest.residency(V41Exl3Layer::Backbone(0), world, rank)?;
+                    let plan = manifest.residency_with_placement(V41Exl3Layer::Backbone(0), world,
+                        rank, TpPlacement::Balanced)?;
+                    if units % world == 0 {
+                        assert_eq!(serde_json::to_value(&plan)?, serde_json::to_value(&old)?);
+                        assert!(plan.unit_map.is_none());
+                    } else {
+                        let map = plan.unit_map.as_ref().unwrap();
+                        let stride = plan.experts * plan.tiers.len();
+                        let descriptor = &plan.buffers.iter().find(|b| b.name == "descriptor_map").unwrap().initial_words;
+                        assert_eq!(descriptor.len(), 7 * stride);
+                        for (expert, loads) in plan.loads.chunks_exact(9).enumerate() {
+                            assert_eq!(descriptor[3 * stride + expert] as usize, map.experts[expert].len() * 128);
+                            for (projection, loads) in loads.chunks_exact(3).enumerate() {
+                                let load = &loads[0];
+                                assert_eq!(load.expert, Some(expert));
+                                assert_eq!(load.destinations[0].1, descriptor[(4 + projection) * stride + expert] as usize * 4);
+                                let tier = descriptor[projection * stride + expert] >> 9;
+                                assert_eq!(load.bytes, hidden * map.experts[expert].len() * 128 * plan.tiers[tier as usize] / 8);
+                            }
                         }
                     }
+                    for (buffer_id, buffer) in plan.buffers.iter().enumerate().filter(|(_, b)|
+                        b.name.ends_with("_w13") || b.name.ends_with("_w2")) {
+                        let mut spans: Vec<_> = plan.loads.iter().flat_map(|load| load.destinations.iter()
+                            .filter(move |(index, _)| *index == buffer_id)
+                            .map(move |(_, offset)| (*offset, *offset + load.bytes))).collect();
+                        spans.sort_unstable();
+                        let mut end = 0;
+                        for (start, next) in spans { assert_eq!(start, end); end = next; }
+                        assert_eq!(end, buffer.bytes);
+                        total_weights += buffer.bytes;
+                    }
+                    resident_bytes.push((old.bytes(), plan.bytes()));
+                    allocated_bytes.push((old.device_arena_layout()?.1, plan.device_arena_layout()?.1));
                 }
-                for (buffer_id, buffer) in plan.buffers.iter().enumerate().filter(|(_, b)|
-                    b.name.ends_with("_w13") || b.name.ends_with("_w2")) {
-                    let mut spans: Vec<_> = plan.loads.iter().flat_map(|load| load.destinations.iter()
-                        .filter(move |(index, _)| *index == buffer_id)
-                        .map(move |(_, offset)| (*offset, *offset + load.bytes))).collect();
-                    spans.sort_unstable();
-                    let mut end = 0;
-                    for (start, next) in spans { assert_eq!(start, end); end = next; }
-                    assert_eq!(end, buffer.bytes);
-                    total_weights += buffer.bytes;
+                let source_weights: usize = manifest.projections.values().map(|p| p.trellis_bytes()).sum();
+                assert_eq!(total_weights, source_weights);
+                if units % world != 0 {
+                    // Balancing redistributes storage: small legacy ranks grow,
+                    // while the maximum rank (the admission bottleneck) shrinks.
+                    assert!(resident_bytes.iter().map(|(_, new)| new).max()
+                        < resident_bytes.iter().map(|(old, _)| old).max());
+                    assert!(allocated_bytes.iter().map(|(_, new)| new).max()
+                        < allocated_bytes.iter().map(|(old, _)| old).max());
+                } else {
+                    assert!(allocated_bytes.iter().all(|(old, new)| old == new));
                 }
-                resident_bytes.push((old.bytes(), plan.bytes()));
+                eprintln!("EXL3 H{hidden}/I{intermediate}/E{experts} TP{world} payload bytes old/compact: {resident_bytes:?}");
+                eprintln!("EXL3 H{hidden}/I{intermediate}/E{experts} TP{world} allocated arena bytes old/compact: {allocated_bytes:?}");
             }
-            let source_weights: usize = manifest.projections.values().map(|p| p.trellis_bytes()).sum();
-            assert_eq!(total_weights, source_weights);
-            if 18 % world != 0 {
-                // Balancing redistributes storage: small legacy ranks grow,
-                // while the maximum rank (the admission bottleneck) shrinks.
-                assert!(resident_bytes.iter().map(|(_, new)| new).max()
-                    < resident_bytes.iter().map(|(old, _)| old).max());
-            }
-            eprintln!("EXL3 TP{world} admission payload bytes old/compact: {resident_bytes:?}");
         }
         Ok(())
     }
@@ -476,11 +488,17 @@ mod tests {
     }
 
     fn fixture(tiers: &[usize]) -> V41Exl3Manifest {
-        let config = OfficialV41Config::from_json(include_bytes!("official-v41-config.json"),
-        )
-        .unwrap();
+        fixture_geometry(tiers, 5120, 2304, 384)
+    }
+
+    fn fixture_geometry(tiers: &[usize], hidden: usize, intermediate: usize, experts: usize) -> V41Exl3Manifest {
+        let config = OfficialV41Config::from_json(include_bytes!("official-v41-config.json")).unwrap();
+        let mut shape = crate::RoutedExpertShape::of_v41(&config);
+        shape.hidden = hidden;
+        shape.intermediate = intermediate;
+        shape.experts = experts;
         let mut projections = BTreeMap::new();
-        for expert in 0..384 {
+        for expert in 0..experts {
             for (index, (name, kind)) in [
                 ("w1", V41Exl3ProjectionKind::Gate),
                 ("w3", V41Exl3ProjectionKind::Up),
@@ -496,14 +514,14 @@ mod tests {
                         name,
                         kind,
                         bits: tiers[(expert + index) % tiers.len()],
-                        input_features: if index == 2 { 2304 } else { 5120 },
-                        output_features: if index == 2 { 5120 } else { 2304 },
+                        input_features: if index == 2 { intermediate } else { hidden },
+                        output_features: if index == 2 { hidden } else { intermediate },
                     },
                 );
             }
         }
         V41Exl3Manifest {
-            experts: crate::RoutedExpertShape::of_v41(&config),
+            experts: shape,
             config: Some(config),
             naming: crate::V41Exl3Naming::CheckpointNative,
             decoder_tiers: crate::families::deepseek_v41::v41_exl3::decoder_family(&projections).unwrap(),
