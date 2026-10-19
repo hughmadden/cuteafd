@@ -43,10 +43,18 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
     let mut report = input.plan(&PlanOptions::default()).unwrap();
     let mut options = layout::LayoutOptions { host_memory: Some((64 << 30, 64 << 30)),
         host_cache_bytes: Some(0), ..Default::default() };
-    for (mode, quota, expected) in [(MediaMode::Rtx(Some(0)), None, (64u64 << 30) / 20),
-        (MediaMode::Spark(Some(0)), Some(2 << 30), 2 << 30),
-        (MediaMode::Rtx(Some(0)), Some(0), 0), (MediaMode::Off, Some(2 << 30), 0)] {
-        report.vision = mode;
+    for (vision, audio, quota, expected) in [
+        (MediaMode::Rtx(Some(0)), MediaMode::Off, None, (64u64 << 30) / 20),
+        (MediaMode::Spark(Some(0)), MediaMode::Off, Some(2 << 30), 2 << 30),
+        (MediaMode::Rtx(Some(0)), MediaMode::Off, Some(0), 0),
+        (MediaMode::Off, MediaMode::Off, Some(2 << 30), 0),
+        (MediaMode::Off, MediaMode::Rtx(Some(0)), None, (64u64 << 30) / 20),
+        (MediaMode::Off, MediaMode::Spark(Some(0)), Some(2 << 30), 2 << 30),
+        (MediaMode::Off, MediaMode::Rtx(Some(0)), Some(0), 0),
+        (MediaMode::Rtx(Some(0)), MediaMode::Rtx(Some(0)), Some(2 << 30), 2 << 30),
+    ] {
+        report.vision = vision;
+        report.audio = audio;
         options.media_cache_bytes = quota;
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         let media: u64 = report.host_ledger.as_ref().unwrap().items.iter()

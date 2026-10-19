@@ -1101,7 +1101,10 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         push(Category::Embedding, "embedding", "checkpoint", bytes, Basis::Exact);
     }
     push(Category::Tables, "mapped-scales/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
-    if matches!(family, "mimo_v2" | "qwen4" | "glm5_flash") && report.vision != super::MediaMode::Off {
+    let media_cache_loaded = (matches!(family, "mimo_v2" | "qwen4" | "glm5_flash")
+        && report.vision != super::MediaMode::Off)
+        || (family == "mimo_v2" && report.audio != super::MediaMode::Off);
+    if media_cache_loaded {
         let media = options.media_cache_bytes.unwrap_or((8u64 << 30).min(total / 20));
         push(Category::Embedding, "media/embedding-cache", "host quota", media, Basis::Formula);
     }
