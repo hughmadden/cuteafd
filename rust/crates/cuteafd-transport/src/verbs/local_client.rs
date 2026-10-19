@@ -337,6 +337,11 @@ impl LocalTp4Client {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn terminal_ready_for_test(&self) -> bool {
+        self.terminal_owned() && !self.terminal_failed && !self.terminal_quiesced
+            && self.sessions.iter().all(Option::is_none)
+    }
     pub(crate) fn terminal_owned(&self) -> bool { self.terminal_owner.is_some() }
     pub(crate) fn terminal_retained(&self) -> bool {
         self.terminal_owner.as_ref().is_some_and(|owner|owner.load(Ordering::Acquire))

@@ -56,6 +56,16 @@ pub struct SparkExpertLane {
     quiesced: bool,
 }
 
+// Landing installation resets the transport, so terminal ownership must be
+// enabled afterward, but still before the first connection or bootstrap.
+unsafe fn prepare_transport(transport: &mut SparkExperts, landing: Option<Vec<DeviceLanding>>) -> Result<()> {
+    if landing.is_some() {
+        // SAFETY: the lane's caller retains these ranges until terminal release.
+        unsafe { transport.set_gpu_landing(landing)? };
+    }
+    transport.enable_terminal_ownership()
+}
+
 impl SparkExpertLane {
     /// Transport bound to a declared world whose rank payloads land in `landing`.
     ///
@@ -75,11 +85,8 @@ impl SparkExpertLane {
         let (ready_tx, ready) = mpsc::channel::<Result<usize>>();
         let thread = std::thread::Builder::new().name("v41-roce-lane".into()).spawn(move || {
             let setup = build().and_then(|mut transport| {
-                transport.enable_terminal_ownership()?;
-                if landing.is_some() {
-                    // SAFETY: forwarded from this constructor's contract.
-                    unsafe { transport.set_gpu_landing(landing)? };
-                }
+                // SAFETY: forwarded from this constructor's contract.
+                unsafe { prepare_transport(&mut transport, landing)? };
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
                 Ok((transport, runtime))
             });
@@ -203,6 +210,19 @@ impl Drop for SparkExpertLane {
 mod tests {
     use super::super::SparkTopology;
     use super::*;
+
+    #[test]
+    fn terminal_ownership_follows_landing_setup_before_connection() -> Result<()> {
+        let peers = vec!["127.0.0.1:1".parse()?];
+        let mut transport = SparkExperts::new_world(SparkWorld::canonical(1)?, &peers, 1,
+            TcpTransportConfig { timing: false, timeout: Duration::from_secs(1), max_frame_bytes: 64 << 20 })?;
+        // SAFETY: setup never connects or dereferences these dummy ranges.
+        unsafe { prepare_transport(&mut transport, Some(vec![DeviceLanding { ptr: 1, bytes: 10240 }]))? };
+        assert!(transport.terminal_ready_for_test());
+        transport.terminal_quiesce()?;
+        transport.terminal_release()?;
+        Ok(())
+    }
 
     #[test]
     fn terminal_control_requires_reply_and_preserves_failed_lane() -> Result<()> {
