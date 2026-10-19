@@ -14,6 +14,36 @@ const BLOCKS: usize = WIDTH / 8;
 // Per-layer projection graphs have a separate residency limit.
 const MAX_RETAINED_DECODE_GRAPHS: usize = 512;
 const DECODE_WIDTH_BUCKET: usize = 512;
+const AUDIT_WIDTH: usize = 2048;
+const AUDIT_SOURCE_BYTES: usize = 2048 * 68;
+
+struct AsyncAuditRow<'a> {
+    host: HostAllocation<'a>,
+    pending: Option<(usize, usize, usize, String)>,
+}
+struct AsyncAudit<'a> {
+    metadata: DeviceAllocation<'a>,
+    scores: DeviceAllocation<'a>,
+    layers: Vec<AsyncAuditRow<'a>>,
+    score_bytes: usize,
+}
+impl<'a> AsyncAudit<'a> {
+    fn new(library: &'a NativeLibrary, capacity: usize) -> Result<Option<Self>> {
+        if !std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "async") {
+            return Ok(None);
+        }
+        let score_bytes = capacity * AUDIT_WIDTH * 4;
+        Ok(Some(Self {
+            metadata: DeviceAllocation::new(library, capacity * 48)?,
+            scores: DeviceAllocation::new(library, score_bytes)?,
+            layers: (0..8).map(|_| Ok(AsyncAuditRow {
+                host: HostAllocation::new(library, score_bytes * 2 + capacity * 48
+                    + AUDIT_SOURCE_BYTES * 2 + 32768)?, pending: None,
+            })).collect::<Result<_>>()?,
+            score_bytes,
+        }))
+    }
+}
 
 fn tile_width(max_length: usize, bucket: usize) -> usize {
     max_length.max(1).div_ceil(bucket).saturating_mul(bucket).min(WIDTH)
@@ -118,6 +148,7 @@ pub(crate) struct IndexSelectionWave<'a> {
     pending: Option<Ready>,
     in_flight: bool,
     audit: bool,
+    async_audit: Option<AsyncAudit<'a>>,
 }
 fn slice(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
     debug_assert!(offset + bytes <= b.bytes);
@@ -176,6 +207,7 @@ impl<'a> IndexSelectionWave<'a> {
             pending: None,
             in_flight: false,
             audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),
+            async_audit: AsyncAudit::new(library, capacity)?,
         })
     }
     /// Only selected IDs and source candidate blocks survive another stage.
@@ -207,6 +239,7 @@ impl<'a> IndexSelectionWave<'a> {
             candidates: library.v41_candidate_blocks()?, graph: None,
             graphs: crate::shared::decode_graph::GraphBank::new(None), retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0, ready: None, pending: None, in_flight: false,
             audit: source.audit,
+            async_audit: AsyncAudit::new(library, capacity)?,
         };
         source.shared_scratch_busy = Some(busy);
         Ok(value)
@@ -641,6 +674,10 @@ impl<'a> IndexSelectionWave<'a> {
             // SAFETY: execute_inner retains its inputs; the audit drains before reading scratch.
             unsafe { self.audit_scores(query, requests, rows, width)?; }
         }
+        if self.async_audit.is_some() && launched.is_ok() {
+            // SAFETY: snapshots are retained until the completed-step hook.
+            unsafe { self.enqueue_async_audit(query, requests, &metadata, rows, width)?; }
+        }
         let ready = Ready { origin: query.origin(), layer: query.layer, rows, bindings };
         if defer {
             launched?;
@@ -649,6 +686,101 @@ impl<'a> IndexSelectionWave<'a> {
             launched.and(self.synchronize())?;
             self.ready = Some(ready);
         }
+        Ok(())
+    }
+    /// Inspect retained snapshots only after the target step has completed.
+    pub fn finish_audit(&mut self) -> Result<()> {
+        let Some(audit) = self.async_audit.as_mut() else { return Ok(()) };
+        // SAFETY: querying does not drain or change stream ordering.
+        ensure!(unsafe { self.stream.library.cuda_stream_query(self.stream.raw)? },
+            "async index audit inspected before target completion");
+        for row in &mut audit.layers {
+            let Some((layer, bytes, source_end, description)) = row.pending.take() else { continue };
+            let data = row.host.bytes();
+            let pooled = &data[..bytes];
+            let old = &data[audit.score_bytes..audit.score_bytes + bytes];
+            let mismatch = pooled.chunks_exact(4).zip(old.chunks_exact(4)).position(|(a, b)| a != b);
+            let hash = |data: &[u8]| data.iter().fold(0xcbf29ce484222325u64,
+                |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
+            tracing::info!(target: "cuteafd::index_audit", layer, %description,
+                pooled_hash = hash(pooled), old_hash = hash(old),
+                source_hash = hash(&data[audit.score_bytes * 2..source_end]), ?mismatch,
+                "asynchronous live index scorer audit after target step");
+            ensure!(mismatch.is_none(), "asynchronous index audit mismatch at layer {layer} element {mismatch:?}");
+        }
+        Ok(())
+    }
+    /// # Safety
+    /// Inputs and pinned destinations remain live until finish_audit after step completion.
+    unsafe fn enqueue_async_audit(&mut self, query: &IndexQueryOutput<'_>,
+        requests: &[SelectionRequest<'_>], metadata: &[[u64; 6]], rows: usize, width: usize) -> Result<()> {
+        ensure!(requests.len() == 1 && width <= AUDIT_WIDTH,
+            "async index audit is limited to one short-context golden request");
+        let p = requests[0].proposal;
+        ensure!(p.cache.rows <= 2048 && (p.packed.bytes + p.scales.bytes <= AUDIT_SOURCE_BYTES
+            || metadata[0][3] == 0), "async index audit source exceeds diagnostic bounds");
+        let layer = [2, 8, 14, 20, 24, 28, 32, 36].iter().position(|&l| l == query.layer).unwrap();
+        let positions = slice(self.b(3), 0, rows * width * 8);
+        let pooled = slice(self.b(4), 0, rows * width * 4);
+        let audit = self.async_audit.as_mut().unwrap();
+        let saved = &mut audit.layers[layer];
+        ensure!(saved.pending.is_none(), "async index audit slot reused before target completion");
+        let library = self.stream.library;
+        let stream = self.stream.raw;
+        let mut host = saved.host.buffer;
+        let metadata_offset = audit.score_bytes * 2;
+        for (i, values) in metadata.iter().enumerate() {
+            for (j, &value) in values.iter().enumerate() {
+                saved.host.bytes_mut()[metadata_offset + i * 48 + j * 8..metadata_offset + i * 48 + j * 8 + 8]
+                    .copy_from_slice(&(if j == 0 { 0 } else { value }).to_ne_bytes());
+            }
+        }
+        // SAFETY: destinations are disjoint bounded regions of retained pinned storage.
+        unsafe {
+            library.copy_d2h_host_buffer_async(host, pooled, pooled.bytes, stream)?;
+            host.ptr = saved.host.buffer.ptr.cast::<u8>().add(metadata_offset).cast();
+            host.bytes = rows * 48;
+            library.copy_host_buffer_h2d_async(audit.metadata.buffer, host, rows * 48, stream)?;
+            self.score.execute_overlay(query.packed, query.scales, query.head_weights,
+                p.cache.packed, p.cache.scales, p.cache.device_pages, p.cache.device_rows,
+                slice(audit.metadata.buffer, 0, rows * 48), positions,
+                slice(audit.scores.buffer, 0, rows * width * 4), p.packed, p.scales,
+                p.capacity, rows, width, 1, p.cache.device_pages.bytes / 4,
+                p.cache.packed.bytes / 64, stream)?;
+            host = saved.host.buffer;
+            host.ptr = host.ptr.cast::<u8>().add(audit.score_bytes).cast();
+            host.bytes = audit.score_bytes;
+            library.copy_d2h_host_buffer_async(host, audit.scores.buffer, pooled.bytes, stream)?;
+        }
+        let mut cursor = metadata_offset + rows * 48;
+        let mut snapshot = |buffer: CuteafdDeviceBuffer| -> Result<()> {
+            if buffer.bytes == 0 { return Ok(()) }
+            ensure!(cursor + buffer.bytes <= saved.host.buffer.bytes, "async audit snapshot capacity exceeded");
+            let mut host = saved.host.buffer;
+            // SAFETY: cursor is bounded above and retained until stream completion.
+            unsafe {
+                host.ptr = host.ptr.cast::<u8>().add(cursor).cast(); host.bytes = buffer.bytes;
+                library.copy_d2h_host_buffer_async(host, buffer, buffer.bytes, stream)?;
+            }
+            cursor += buffer.bytes;
+            Ok(())
+        };
+        snapshot(p.cache.device_rows)?;
+        snapshot(slice(p.cache.device_pages, 0, p.cache.rows.div_ceil(256) * 4))?;
+        for (i, &page) in p.cache.pages.iter().take(p.cache.rows.div_ceil(256)).enumerate() {
+            let count = (p.cache.rows - i * 256).min(256);
+            snapshot(slice(p.cache.packed, page as usize * 256 * 64, count * 64))?;
+            snapshot(slice(p.cache.scales, page as usize * 256 * 4, count * 4))?;
+        }
+        if metadata[0][3] > 0 {
+            snapshot(p.packed)?;
+            snapshot(p.scales)?;
+        }
+        saved.pending = Some((query.layer, pooled.bytes, cursor, format!(
+            "first={} last={} rows={rows} width={width} slot={} old_pages={:?} pool_pages={:?} keys={:?} proposals={:?} initialized={} descriptor={:?} stream={:?}",
+            requests[0].positions[0], requests[0].positions[rows - 1], p.cache.slot,
+            p.cache.device_pages.ptr, p.cache.pool_pages.ptr, p.cache.packed.ptr, p.packed.ptr,
+            p.cache.rows, metadata[0], stream)));
         Ok(())
     }
     /// Compare live pooled addressing with the original per-request ABI after dispatch.
@@ -762,6 +894,11 @@ impl Drop for IndexSelectionWave<'_> {
         if let Err(error) = self.abort_pending() { crate::shared::decode_graph::fatal_drain(Err(error), "pending index selection"); }
         if let Err(error) = self.clear_graph() {
             crate::shared::decode_graph::fatal_drain(Err(error), "index selection");
+        }
+        if self.async_audit.is_some() {
+            if let Err(error) = self.synchronize().and_then(|()| self.finish_audit()) {
+                tracing::error!(%error, "final asynchronous index audit failed");
+            }
         }
     }
 }
