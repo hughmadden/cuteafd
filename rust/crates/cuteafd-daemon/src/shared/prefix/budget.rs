@@ -33,7 +33,7 @@ impl HostBudget {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct HostMemory {
+pub(crate) struct HostMemory {
     pub total: u64,
     pub available: u64,
 }
@@ -41,7 +41,7 @@ pub(super) struct HostMemory {
 /// Bound against live available RAM and every readable cgroup ancestor's
 /// remaining hard limit. Already-used mapped weights and staging are counted
 /// by the operating system, rather than subtracted from total RAM twice.
-pub(super) fn host_memory() -> Result<HostMemory> {
+pub(crate) fn host_memory() -> Result<HostMemory> {
     let text = std::fs::read_to_string("/proc/meminfo").context("reading host memory for automatic prefix budget")?;
     let mut memory = meminfo(&text)?;
     let cgroups = std::fs::read_to_string("/proc/self/cgroup").context("reading prefix-cache cgroup membership")?;
@@ -111,10 +111,30 @@ pub(super) fn retained_bytes(layout: FamilyLayout, entries: usize, max_context: 
     chunks.checked_mul(chunk).context("automatic host prefix budget overflow")
 }
 
-pub(super) fn automatic_bytes(required: u64, chunk: u64, memory: HostMemory, headroom: u64) -> u64 {
-    let available = memory.available.saturating_sub(headroom.max(memory.total / 10));
-    let ceiling = available / chunk * chunk;
-    required.min(ceiling)
+pub(crate) fn automatic_bytes(required: u64, chunk: u64, memory: HostMemory, _headroom: u64) -> u64 {
+    required.min(cuteafd_core::prefix::default_host_cache_bytes(memory.total)) / chunk * chunk
+}
+
+/// The live ledger is attribution only: those pinned bytes are already absent
+/// from MemAvailable. Deferred scoring and the reserve still need admission.
+pub(crate) fn admit(bytes: u64, deferred: u64, headroom: u64) -> Result<cuteafd_core::memory_layout::HostLayout> {
+    use cuteafd_core::memory_layout::{Basis, Category, HostLayout, Item, ItemLifetime};
+    let memory = host_memory()?;
+    let snapshot = cuteafd_ffi::memory_ledger::snapshot();
+    let mut items: Vec<_> = snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1).into_iter()
+        .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
+        .collect();
+    items.push(Item::new(Category::Workspace, "scoring/full-logits", "FP32", deferred, Basis::Formula)
+        .with_lifetime(ItemLifetime::PostReadyReserve));
+    let ledger = HostLayout::new(memory.total, memory.available, headroom.max(memory.total / 10), bytes, items)
+        .context("host admission byte count overflow")?;
+    ensure!(ledger.shortfall_bytes == 0,
+        "coordinator host memory cannot admit prefix cache {} plus deferred consumers {} and reserve {}: available {}, total {}, resident {}, shortfall {} bytes",
+        bytes, ledger.deferred_bytes, ledger.reserve_bytes, memory.available, memory.total,
+        ledger.resident_bytes, ledger.shortfall_bytes);
+    tracing::info!(host_budget_bytes = bytes, host_ledger = %serde_json::to_string(&ledger)?,
+        "coordinator host memory admitted");
+    Ok(ledger)
 }
 
 #[cfg(test)]
@@ -123,13 +143,15 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     #[test]
-    fn auto_respects_available_memory_headroom_and_nested_cgroup_pressure() -> Result<()> {
+    fn auto_is_a_fixed_fraction_capped_at_32_gib_and_respects_cgroup_total() -> Result<()> {
+        assert_eq!(cuteafd_core::prefix::default_host_cache_bytes(183 * GIB), 32 * GIB);
+        assert_eq!(cuteafd_core::prefix::default_host_cache_bytes(64 * GIB), 16 * GIB);
         let mut memory = meminfo("MemTotal: 134217728 kB\nMemAvailable: 100663296 kB\n")?;
-        assert_eq!(automatic_bytes(200 * GIB, GIB, memory, 8 * GIB), 83 * GIB);
+        assert_eq!(automatic_bytes(200 * GIB, GIB, memory, 8 * GIB), 32 * GIB);
         apply_cgroup(&mut memory, &(64 * GIB).to_string(), &(40 * GIB).to_string())?;
         assert_eq!(automatic_bytes(200 * GIB, GIB, memory, 8 * GIB), 16 * GIB);
         apply_cgroup(&mut memory, &(48 * GIB).to_string(), &(44 * GIB).to_string())?;
-        assert_eq!(automatic_bytes(200 * GIB, GIB, memory, 8 * GIB), 0);
+        assert_eq!(automatic_bytes(200 * GIB, GIB, memory, 8 * GIB), 12 * GIB);
         apply_cgroup(&mut memory, "max", "0")?;
         assert_eq!(memory.available, 4 * GIB);
         assert!(meminfo("MemTotal: 100 kB\n").is_err());
@@ -143,7 +165,7 @@ mod tests {
             draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
         // Five snapshots: 10 page slabs in five chunks; five marks in one.
         assert_eq!(retained_bytes(layout, 2, 65, 1024)?, 6 * 1024);
-        let memory = HostMemory { total: 10000, available: 9900 };
+        let memory = HostMemory { total: 32768, available: 32000 };
         assert_eq!(automatic_bytes(6 * 1024, 1024, memory, 0), 6 * 1024);
         assert_eq!(automatic_bytes(100 * 1024, 1024, memory, 0), 8 * 1024);
         assert!(retained_bytes(layout, usize::MAX, usize::MAX, 1024).is_err());

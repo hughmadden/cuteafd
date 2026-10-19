@@ -109,6 +109,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         }
     }
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
+    report.prefill_lanes = Some(working.prefill_lanes);
     // Reapply after admission has selected its executable suffix and lane count.
     charge_spark_devices(report, model, checkpoint, options, SPARK, &working, spark_endpoints("glm5", working.prefill_lanes),
         &mut sparks, &mut notes, |device| format!("{} I/O admission", device.name()));

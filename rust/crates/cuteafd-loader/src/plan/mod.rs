@@ -162,6 +162,10 @@ pub struct RoleReadiness {
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
     pub mapped_placement: crate::formats::mapped_preload::MappedPlacement,
+    /// Coordinator-host admission including estimated owner bounds, separate from mapped-scale preload.
+    pub host_budget_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_ledger: Option<cuteafd_core::memory_layout::HostLayout>,
     pub attention_placement: crate::placement::AttentionPlacement,
     /// What the caller asked for (None: auto); families whose solver resolves
     /// auto itself (GLM 5.3) take this rather than the resolved default.
@@ -216,6 +220,9 @@ pub struct PlanReport {
     /// Resolved prefill shape, including V4.1 automatic capacity admission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_rows: Option<u64>,
+    /// Solver-selected GLM prefill lanes, shared by device and host admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_lanes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_selection: Option<String>,
     /// The package and layouts that serve this checkpoint's routed experts.
@@ -467,6 +474,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     let checkpoint = input.checkpoint();
     let mut report = PlanReport {
         mapped_placement: Default::default(),
+        host_budget_bytes: 0,
+        host_ledger: None,
         attention_placement: options.attention_placement.unwrap_or_default(),
         requested_attention: options.attention_placement,
         vision: options.vision,
@@ -498,6 +507,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         spark_ranks: options.placement.spark_ranks(),
         spark_count_warning: None,
         prefill_rows: None,
+        prefill_lanes: None,
         prefill_selection: None,
         experts: None,
         placement_supported: true,
@@ -773,6 +783,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             }
         }
         report.memory_layout = Some(memory);
+        layout::charge_host(&mut report, &layout_options, checkpoint, false)?;
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -1092,6 +1103,13 @@ pub fn render(report: &PlanReport) -> String {
         let p = &report.mapped_placement;
         let _ = writeln!(out, "{}; scales {} bytes / cap {} bytes; host preload {} bytes / budget {} bytes ({})",
             p.label(), p.scale_bytes, p.cap_bytes, p.preloaded_bytes, p.host_budget_bytes, p.reason);
+    }
+    if let Some(host) = &report.host_ledger {
+        let _ = writeln!(out, "host       cache {} bytes; consumers {} bytes; reserve {} bytes; headroom {} bytes; shortfall {} bytes",
+            host.host_budget_bytes, host.deferred_bytes, host.reserve_bytes, host.headroom_bytes, host.shortfall_bytes);
+        for item in &host.items {
+            let _ = writeln!(out, "host item  {}: {} bytes ({:?})", item.group, item.bytes, item.basis);
+        }
     }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if let Some(selection) = &report.prefill_selection { let _ = writeln!(out, "{selection}"); }

@@ -231,6 +231,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
 /// its mark arena sized for `lanes` decoding sequences.
 fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: usize)
     -> Result<(Qwen4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_rows } else { 64 },
+        engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "Qwen 3.8 Flash Next restores exact snapshots only (GDN state)");

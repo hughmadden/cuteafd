@@ -368,6 +368,8 @@ impl Trace {
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
 fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs)
     -> Result<(GlmPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
+        engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     let family = GlmPrefix::new(engine, args.prefix_partial == Toggle::On)?;
     let template = engine.paged_buffers().first().map(|b| b.0).context("GLM has no layers")?;

@@ -49,7 +49,9 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         ensure!(args.prefix_partial == Toggle::Off, "dense Qwen supports exact prefix frontiers only");
         let family = DensePrefix::new(self.engine)?;
         let layout = family.layout();
-        let host = args.host_config(layout, self.geometry().max_context)?.map(|config|
+        let shape = self.geometry();
+        let args = &args.with_scoring(shape.decode_rows, shape.decode_rows, shape.vocab_size)?;
+        let host = args.host_config(layout, shape.max_context)?.map(|config|
             CudaCopyEngine::registered_owned(self.library, family.snapshot_owners()).map(|copy| (config, copy))).transpose()?;
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };

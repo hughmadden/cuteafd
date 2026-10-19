@@ -176,12 +176,20 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
         let spare_tokens = (u64::from(args.concurrency) + 2*u64::from(args.prefix_cache_entries))*512;
         let budget = super::prefix::host_budget(layout, raw_tokens.saturating_sub(spare_tokens),
             args.prefix_cache_entries, args.max_context_tokens, config.chunk_bytes)?;
-        config.bytes = budget.pinned_bytes;
+        let memory = crate::shared::prefix::budget::host_memory()?;
+        config.bytes = crate::shared::prefix::budget::automatic_bytes(
+            budget.pinned_bytes, config.chunk_bytes, memory, 0);
         config.validate()?;
-        tracing::info!(target: "cuteafd::host_cache", capacity=?budget,
+        tracing::info!(target: "cuteafd::host_cache", capacity=?budget, resolved_bytes=config.bytes,
             "automatic host cache budget (staging and snapshot overhead excluded from token capacity)");
     }
     let host = if config.enabled() && args.prefix_cache_entries > 0 {
+        let rows = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
+            .context("invalid V4.1 prefill capacity for host logits")?;
+        let logits = cuteafd_core::memory_layout::host_logits_bytes(
+            u64::from(rows), u64::from(rows),
+            super::scores::VOCAB as u64).context("V4.1 host logits reservation overflow")?;
+        crate::shared::prefix::budget::admit(config.bytes, logits, 8 << 30)?;
         let engine = crate::shared::prefix::CudaCopyEngine::registered_with_owners(lib,
             &requests.cache().source_buffers(), arenas.owners())?;
         tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");

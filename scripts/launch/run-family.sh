@@ -940,7 +940,7 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   --coordinator-gpu-budget-gib "$profile_gib" --coordinator-weight-budget-gib "$profile_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
-  --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" \
+  --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES" \
   --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")")"
 release_validate_deployment "$count_plan" deepseek_v41
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
@@ -2369,6 +2369,14 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t=map(float,sys.argv[1:3]);b=float(sys.argv[3]) if sys.argv[3] else t/1024;print(max(0,min(f/1024,b-(t-f)/1024)))' "$free_mib" "$total_mib" "$coordinator_budget")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  # Read the effective serve argv, including family modes that enable auto.
+  plan_host_cache=0
+  for ((i=0; i<${#family_args[@]}; i++)); do
+    [[ "${family_args[i]}" != --host-cache-bytes ]] || plan_host_cache="${family_args[i+1]}"
+    [[ "${family_args[i]}" != --media-cache-bytes ]] || plan_draft_args+=(--media-cache-bytes "${family_args[i+1]}")
+  done
+  plan_draft_args+=(--host-cache-bytes "$plan_host_cache")
+  [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
   if [[ "$family" == qwen3_5 ]]; then
     plan_draft_args+=(--state-slots "$effective_concurrency" --prefill-rows 4096
       --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
@@ -2379,7 +2387,6 @@ audio_encoder_hash=""
       --context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
       --prefill-rows 4096 --expert-input "${expert_input:-fp8}")
     [[ -z "${local_layers:-}" ]] || plan_draft_args+=(--rtx-expert-layers "$local_layers")
-    [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
     [[ "$(get DECODE_GRAPHS off)" != on ]] || plan_draft_args+=(--mimo-decode-graphs)
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || plan_draft_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")

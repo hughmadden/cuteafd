@@ -38,6 +38,11 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
+                host_cache_bytes: match args.host_cache_bytes {
+                    crate::shared::prefix::HostBudget::Auto => None,
+                    crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
+                },
+                media_cache_bytes: args.media_cache_bytes,
                 rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib)?; args.rtx],
                 spark_allocation_budget_bytes: Some(budget_bytes("--spark-budget-gib", args.spark_budget_gib)?),
                 pool_tokens: args.pool_tokens,
@@ -763,6 +768,8 @@ mod tests {
             state_slots: None,
             mark_lanes: None,
             prefix_slots: None,
+            host_cache_bytes: crate::shared::prefix::HostBudget::Auto,
+            media_cache_bytes: None,
             prefix_cache_entries: 20,
             prefix_cache_mark_mib: 2048,
             mimo_prefix_draft: false,

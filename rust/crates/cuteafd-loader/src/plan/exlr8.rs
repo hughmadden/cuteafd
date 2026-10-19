@@ -153,6 +153,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
                 | cuteafd_core::memory_layout::Category::Embedding)).map(|i| i.bytes).sum())]);
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
+    super::layout::charge_host(&mut report, layout, &checkpoint, true)?;
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id,
         dense_from: dense.display().to_string() }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })

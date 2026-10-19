@@ -17,7 +17,7 @@ pub(crate) struct PrefixArgs {
     #[arg(long, env = "CUTEAFD_MIMO_PREFIX_DRAFT", default_value_t = false)]
     pub mimo_prefix_draft: bool,
     #[arg(skip)]
-    pub mimo_host_cap: bool,
+    pub scoring_host_bytes: u64,
     /// Retained snapshots per bank (prompts, completed turns); 0 turns the prefix cache off.
     #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = 20)]
     pub prefix_cache_entries: usize,
@@ -29,7 +29,7 @@ pub(crate) struct PrefixArgs {
     /// Shortest prompt or turn worth a snapshot.
     #[arg(long, default_value_t = 64)]
     pub prefix_cache_min_tokens: usize,
-    /// Pinned retained-prefix memory: auto sizes both banks within available host RAM,
+    /// Pinned retained-prefix memory: auto caps both banks at min(32GiB, 25% of host RAM),
     /// a byte count fixes the quota (e.g. 64GiB), and 0 disables the host tier.
     #[arg(long, env = "CUTEAFD_HOST_CACHE_BYTES", default_value = "0")]
     pub host_cache_bytes: HostBudget,
@@ -84,6 +84,13 @@ impl MarkRule {
 }
 
 impl PrefixArgs {
+    pub fn with_scoring(&self, rows: usize, lane_rows: usize, vocab: usize) -> Result<Self> {
+        let mut args = self.clone();
+        args.scoring_host_bytes = cuteafd_core::memory_layout::host_logits_bytes(rows as u64, lane_rows as u64, vocab as u64)
+            .ok_or_else(|| anyhow::anyhow!("host logits reservation overflow"))?;
+        Ok(args)
+    }
+
     /// The device mark arena's knobs for `lanes` decoding sequences.
     pub fn mark_rule(&self, lanes: usize) -> MarkRule {
         MarkRule { lanes, entries: self.prefix_cache_entries,
@@ -128,7 +135,6 @@ impl PrefixArgs {
                 let memory = budget::host_memory()?;
                 let required = budget::retained_bytes(layout, self.prefix_cache_entries, max_context, chunk)?;
                 let bytes = budget::automatic_bytes(required, chunk, memory, self.host_cache_headroom_bytes);
-                let bytes = if self.mimo_host_cap { bytes.min(mimo_host_ceiling(memory.available, chunk)) } else { bytes };
                 tracing::info!(required_bytes = required, resolved_bytes = bytes, available_bytes = memory.available,
                     total_bytes = memory.total, headroom_bytes = self.host_cache_headroom_bytes,
                     "automatic retained-prefix host budget (does not add active KV capacity)");
@@ -138,6 +144,7 @@ impl PrefixArgs {
         if bytes == 0 {
             return Ok(None);
         }
+        budget::admit(bytes, self.scoring_host_bytes, self.host_cache_headroom_bytes)?;
         let config = cuteafd_hostcache::config::Config {
             bytes,
             chunk_bytes: chunk.min(bytes),
@@ -156,10 +163,6 @@ impl PrefixArgs {
         self.host_config(layout, max_context)?.map(|config|
             CudaCopyEngine::new(library, template).map(|engine| (config, engine))).transpose()
     }
-}
-
-fn mimo_host_ceiling(available: u64, chunk: u64) -> u64 {
-    ((32u64 << 30).min(available / 5 * 2)) / chunk * chunk
 }
 
 /// Ids of the `markers` (message-start tokens such as `<|user|>`) that `tokenizer.json`'s added
@@ -227,26 +230,6 @@ mod tests {
     }
 
     #[test]
-    fn mimo_auto_ceiling_is_bounded_and_chunk_aligned() {
-        let gib = 1u64 << 30;
-        assert_eq!(mimo_host_ceiling(100 * gib, gib), 32 * gib);
-        assert_eq!(mimo_host_ceiling(20 * gib, gib), 8 * gib);
-        assert_eq!(mimo_host_ceiling(gib, gib), 0);
-    }
-
-    #[test]
-    fn mimo_cap_preserves_explicit_disabled_and_fixed_budgets() {
-        let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
-        let mut disabled = Cli::parse_from(["serve", "--host-cache-bytes", "0"]).prefix;
-        disabled.mimo_host_cap = true;
-        assert!(disabled.host_config(layout, 32768).unwrap().is_none());
-        let mut fixed = Cli::parse_from(["serve", "--host-cache-bytes", "64GiB"]).prefix;
-        fixed.mimo_host_cap = true;
-        assert_eq!(fixed.host_config(layout, 32768).unwrap().unwrap().bytes, 64 << 30);
-    }
-
-    #[test]
     fn media_quota_is_carved_before_auto_prefix_sizing() {
         let prefix = Cli::parse_from(["serve", "--host-cache-bytes", "auto"]).prefix;
         let memory = budget::HostMemory { total: 100 << 30, available: 80 << 30 };
@@ -289,10 +272,10 @@ mod tests {
         let invalid = FamilyLayout { page_rows: 0, pages: 0, page_bytes: 0, mark_bytes: 0,
             draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
         assert!(cli.prefix.host_config(invalid, 0).unwrap().is_none());
-        let cli = Cli::parse_from(["serve", "--host-cache-bytes", "64GiB"]);
+        let cli = Cli::parse_from(["serve", "--host-cache-bytes", "1MiB", "--host-cache-headroom-bytes", "0"]);
         let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
             draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
         let config = cli.prefix.host_config(layout, 32768).unwrap().unwrap();
-        assert_eq!((config.bytes, config.max_tokens), (64 << 30, 32768));
+        assert_eq!((config.bytes, config.max_tokens), (1 << 20, 32768));
     }
 }

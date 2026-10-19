@@ -7,6 +7,73 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
+fn host_ledger_uses_fixed_quota_and_reports_other_owners_and_refusal() {
+    use cuteafd_core::memory_layout::ItemLifetime;
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    for (total, expected) in [(183u64, 32u64), (64, 16)] {
+        let mut report = input.plan(&PlanOptions::default()).unwrap();
+        let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)),
+            full_prefill_logits: true, ..Default::default() };
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        let host = report.host_ledger.as_ref().unwrap();
+        assert_eq!(report.host_budget_bytes, expected << 30);
+        assert_eq!(host.host_budget_bytes, report.host_budget_bytes);
+        assert!(host.items.iter().all(|i| i.lifetime == ItemLifetime::PostReadyReserve));
+        for owner in ["workspace/router", "staging/tables-and-sync", "scoring/full-logits"] {
+            assert!(host.items.iter().any(|i| i.group == owner && i.bytes > 0), "{owner}");
+        }
+        assert!(host.host_budget_bytes + host.deferred_bytes + host.reserve_bytes <= host.total_bytes);
+        assert_eq!(host.shortfall_bytes, 0);
+        options.host_memory = Some((total << 30, 8 << 30));
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert!(!report.fits);
+        assert!(report.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
+        assert!(report.hints.iter().any(|h| h.what.contains("coordinator host memory shortfall")));
+        options.host_cache_bytes = Some(0);
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert_eq!(report.host_budget_bytes, 0);
+    }
+}
+
+#[test]
+fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&PlanOptions::default()).unwrap();
+    let mut options = layout::LayoutOptions { host_memory: Some((64 << 30, 64 << 30)),
+        host_cache_bytes: Some(0), ..Default::default() };
+    for (mode, quota, expected) in [(MediaMode::Rtx(Some(0)), None, (64u64 << 30) / 20),
+        (MediaMode::Spark(Some(0)), Some(2 << 30), 2 << 30),
+        (MediaMode::Rtx(Some(0)), Some(0), 0), (MediaMode::Off, Some(2 << 30), 0)] {
+        report.vision = mode;
+        options.media_cache_bytes = quota;
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        let media: u64 = report.host_ledger.as_ref().unwrap().items.iter()
+            .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum();
+        assert_eq!(media, expected);
+    }
+}
+
+#[test]
+fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&PlanOptions::default()).unwrap();
+    report.prefill_rows = Some(4096);
+    let options = layout::LayoutOptions { host_memory: Some((183 << 30, 183 << 30)),
+        host_cache_bytes: Some(0), prefill_lanes: 3, full_prefill_logits: true, ..Default::default() };
+    let vocab = report.spec.as_ref().unwrap().vocab as u64;
+    for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096 * 4), ("glm5", 4096 * 4)] {
+        report.family = Some(family.into());
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        let logits = report.host_ledger.as_ref().unwrap().items.iter()
+            .find(|item| item.group == "scoring/full-logits").unwrap().bytes;
+        assert_eq!(logits, rows * vocab * 4, "{family}");
+    }
+}
+
+#[test]
 fn family_native_placement_bypasses_legacy_layout_and_refuses_closed() {
     struct Native { spec: spec::ModelSpec, refuse: bool }
     impl FamilyModel for Native {
