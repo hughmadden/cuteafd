@@ -411,6 +411,23 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
         3072, 6144, 16896, 33792}
 
 
+def test_kimi_routes_reuse_shared_kernels_at_hidden_and_latent_widths(exporter):
+    programs = exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)
+    calls = {stem: (op, params, thunk) for stem, op, params, thunk in programs}
+    assert len(calls) == len(programs)
+    for stem, geometry in (("router_scores", {"hidden": 7168, "routed_experts": 896, "top_k": 16}),
+                           ("expert_input_quant", {"hidden": 3584})):
+        op, params, thunk = calls[stem]
+        module, function, args, kwargs = thunk()
+        assert op == stem and params == {} and kwargs == {}
+        assert module == "glmf" and function == f"compile_glmf_{stem}_aot"
+        assert len(args) == 1 and vars(args[0]) == geometry
+    # KDA output already uses this canonical BF16 projection; no duplicate export.
+    op, params, thunk = calls["ffn_down_i6144"]
+    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168}
+    assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
+
+
 def test_kimi_latent_exports_native_norm_and_canonical_projections(exporter):
     programs = exporter.kimi_latent_programs()
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}

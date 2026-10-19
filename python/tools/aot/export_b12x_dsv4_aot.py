@@ -498,7 +498,23 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                             g, max_rows=r, max_context=max_context, mode=m)))
     out.extend(kimi_w8_programs())
     out.extend(kimi_latent_programs())
+    out.extend(kimi_route_programs())
     return out
+
+
+def kimi_route_programs():
+    """Reuse the shared BF16 router and FP8-K32 wire kernels at Kimi widths."""
+    from types import SimpleNamespace
+    from b12x.integration.cuteafd import glmf
+
+    router = SimpleNamespace(hidden=7168, routed_experts=896, top_k=16)
+    latent = SimpleNamespace(hidden=3584)
+    return [
+        ("router_scores", "router_scores", {},
+         lambda: glmf.compile_glmf_router_scores_aot(router)),
+        ("expert_input_quant", "expert_input_quant", {},
+         lambda: glmf.compile_glmf_expert_input_quant_aot(latent)),
+    ]
 
 
 def kimi_latent_programs():
