@@ -140,11 +140,25 @@ pub struct ColumnRange {
     pub counts: Vec<CountLayout>,
 }
 
-fn geometry(report: &PlanReport) -> Option<(u64, usize, usize)> {
+/// A header-only family may reject execution before publishing its expert
+/// contract. Recover that contract from the same family and tensor detector;
+/// this supplies policy geometry, never a serving-fit witness.
+fn header_experts(input: &PlanInput, report: &PlanReport) -> Option<super::family::ExpertContract> {
+    let checkpoint = input.checkpoint();
+    let family = super::family::detect(checkpoint)?;
+    let model = family.open(checkpoint).ok()?;
+    let spec = report.spec.as_ref()?;
+    let tensors = checkpoint.tensors.iter().filter(|tensor|
+        family.classify(spec, &tensor.meta.name).is_some_and(|role| role.component == Component::RoutedExpert))
+        .cloned().collect::<Vec<_>>();
+    super::format::group_by_stem(&tensors).values().find_map(|members|
+        super::format::detect(members).ok().and_then(|operand| model.experts(&operand)))
+}
+
+fn geometry(report: &PlanReport, contract: &super::family::ExpertContract) -> Option<(u64, usize, usize)> {
     let moe = report.spec.as_ref()?.moe.as_ref()?;
     let routed = report.components.iter().filter(|component| component.component == Component::RoutedExpert)
         .map(|component| component.bytes).sum();
-    let contract = report.experts.as_ref()?;
     let recipe = (1..=MAX_SPARKS).find_map(|world|
         super::experts::spark_recipe(&contract.package, moe.intermediate, world).ok())?;
     let unit = match recipe.slicing {
@@ -162,7 +176,8 @@ fn geometric_fit(report: &PlanReport) -> bool {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let Some(memory) = &report.memory_layout else { return false; };
     if !report.fits || report.config_error.is_some() || !report.unclassified.is_empty()
-        || !report.missing_shards.is_empty() || report.components.iter().any(|c| c.rejected > 0)
+        || !report.missing_shards.is_empty() || report.components.iter().any(|c|
+            c.rejected > 0 && !matches!(c.status, super::Status::Unused | super::Status::Disabled))
         || memory.devices.iter().any(|device| device.used_bytes() > device.capacity_bytes) {
         return false;
     }
@@ -190,7 +205,11 @@ impl PlanInput {
                 options.placement = ExpertPlacement::from_spark_ranks(sparks);
                 super::plan_unrestricted(self, &options)
             }).collect::<Result<Vec<_>, _>>()?;
-            let Some((routed, intermediate, unit_columns)) = reports.iter().find_map(geometry) else { continue; };
+            let contract = reports.iter().find_map(|report| report.experts.clone())
+                .or_else(|| header_experts(self, &reports[0]));
+            let Some(contract) = contract else { continue; };
+            let Some((routed, intermediate, unit_columns)) = reports.iter()
+                .find_map(|report| geometry(report, &contract)) else { continue; };
             let executable_minimum = reports.iter().position(PlanReport::wip_launchable);
             let own_minimum = reports.iter().position(geometric_fit);
             let (minimum, geometric_witness_rtx_gpus) = match (own_minimum, one_rtx_minimum) {
@@ -200,7 +219,7 @@ impl PlanInput {
                 (None, None) => (None, None),
             };
             if rtx_gpus == 1 { one_rtx_minimum = minimum; }
-            let package = &reports.iter().find(|report| report.experts.is_some()).unwrap().experts.as_ref().unwrap().package;
+            let package = &contract.package;
             let shipped_maximum = shipped_worlds(package).into_iter().max().unwrap_or(0);
             let policy = SparkRange::new(0, routed, intermediate, unit_columns, shipped_maximum)?;
             let range = minimum.map(|minimum| SparkRange::new(minimum, routed, intermediate,
@@ -216,7 +235,7 @@ impl PlanInput {
                         crate::formats::fp8_experts::Slicing::Blocks(unit) => unit,
                         crate::formats::fp8_experts::Slicing::Padded => unit_columns,
                     }).unwrap_or(unit_columns);
-                    let source_block_columns = if padded { reports[sparks].experts.as_ref().unwrap().block } else { count_unit };
+                    let source_block_columns = if padded { contract.block } else { count_unit };
                     let rule = if padded || sparks == 0 { UnitRule::Contiguous }
                         else { balanced_rule(intermediate, count_unit, sparks) };
                     let classes = if sparks == 0 { vec![] } else if padded {
@@ -257,8 +276,10 @@ impl PlanInput {
 /// Only a request above the policy ceiling needs to search for the minimum
 /// override. Ordinary admission keeps its one-plan readiness cost.
 pub(super) fn admit(input: &PlanInput, options: &PlanOptions, report: &PlanReport) -> Result<(), PlanError> {
-    let Some((routed, intermediate, unit)) = geometry(report) else { return Ok(()); };
-    let shipped = shipped_worlds(&report.experts.as_ref().unwrap().package).into_iter().max().unwrap_or(0);
+    let contract = report.experts.clone().or_else(|| header_experts(input, report));
+    let Some(contract) = contract else { return Ok(()); };
+    let Some((routed, intermediate, unit)) = geometry(report, &contract) else { return Ok(()); };
+    let shipped = shipped_worlds(&contract.package).into_iter().max().unwrap_or(0);
     let requested = options.placement.spark_ranks();
     let policy = SparkRange::new(0, routed, intermediate, unit, shipped)?;
     if requested <= policy.maximum { return Ok(()); }
@@ -305,6 +326,44 @@ pub fn render(columns: &[ColumnRange]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_draft_rejections_do_not_invalidate_a_complete_witness() {
+        use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
+        use super::super::{testing, Status};
+        let dir = tempfile::tempdir().unwrap();
+        testing::write_snapshot(dir.path(), &testing::qwen4_config(1), &[], None);
+        let mut report = PlanInput::open(dir.path()).unwrap().plan(&PlanOptions::default()).unwrap();
+        report.fits = true;
+        report.spark_ranks = 0;
+        report.placement = ExpertPlacement::Local;
+        report.placement_supported = true;
+        report.runtime = Some(super::super::family::RuntimeStatus::Serving);
+        report.config_error = None;
+        report.unclassified.clear();
+        report.missing_shards.clear();
+        report.role_readiness.clear();
+        report.components.clear();
+        report.memory_layout = Some(MemoryLayout {
+            devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: 1024,
+                items: vec![Item::new(Category::Experts, "routed", "", 512, Basis::Estimated)], kv_tokens: 0 }],
+            pool_tokens: 0, waste: vec![], notes: vec![],
+        });
+        report.components.push(super::super::ComponentPlan { component: Component::Speculator,
+            owner: super::super::Owner::Rtx, tensors: 1, bytes: 0, formats: BTreeMap::new(),
+            status: Status::Disabled, rejected: 1, rejections: vec![] });
+        for status in [Status::Disabled, Status::Unused] {
+            report.components[0].status = status;
+            assert!(geometric_fit(&report));
+        }
+        report.components[0].status = Status::MissingKernel;
+        assert!(!geometric_fit(&report));
+        report.components[0].status = Status::Disabled;
+        report.memory_layout.as_mut().unwrap().devices[0].capacity_bytes = 511;
+        assert!(!geometric_fit(&report));
+        report.memory_layout.as_mut().unwrap().devices[0].items.clear();
+        assert!(!geometric_fit(&report));
+    }
 
     #[test]
     fn planner_accepts_seven_and_eight_but_not_nine() {

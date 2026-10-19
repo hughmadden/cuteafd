@@ -234,3 +234,4 @@ def test_real_checkpoint_rank_sums(record_property):
     output = os.environ.get('CUTEAFD_SPARK_RANGE_SUM_RESULTS')
     if output:
         Path(output).write_text(json.dumps(dict(cases=results, coverage=coverage), indent=2) + '\n')
+    assert all(row['qualified'] for row in coverage), [row for row in coverage if not row['qualified']]
