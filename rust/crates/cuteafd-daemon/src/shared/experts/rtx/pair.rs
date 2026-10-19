@@ -1015,6 +1015,33 @@ impl SubmissionOwners for TestSubmission<'_> {
 mod tests {
     use super::*;
     #[test]
+    fn failed_lane_quiescence_retains_endpoint_mr_and_intake_before_copies() {
+        struct Owner(std::rc::Rc<Cell<usize>>);
+        impl Drop for Owner { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let drops = std::rc::Rc::new(Cell::new(0));
+        let owners = RefCell::new(Some([Owner(drops.clone()), Owner(drops.clone()), Owner(drops.clone())]));
+        let events = RefCell::new(Vec::new());
+        let result = teardown(&mut Teardown {
+            abort: || { events.borrow_mut().push("abort"); Ok(()) },
+            ranks: || { events.borrow_mut().push("ranks"); Ok(()) },
+            links: || { events.borrow_mut().push("quiesce"); anyhow::bail!("injected lane QP destroy failure") },
+            copies: || { events.borrow_mut().push("copies"); Ok(()) },
+            graphs: || { events.borrow_mut().push("graphs"); Ok(()) },
+            finish: |drained: bool| {
+                assert!(!drained);
+                events.borrow_mut().push("retain");
+                assert!(owners.borrow().is_some());
+            },
+        });
+        assert!(result.unwrap_err().to_string().contains("link quiescence"));
+        assert_eq!(*events.borrow(), ["abort", "ranks", "quiesce", "retain"]);
+        assert_eq!(drops.get(), 0);
+        assert!(owners.borrow().is_some());
+        drop(owners);
+        assert_eq!(drops.get(), 3);
+    }
+
+    #[test]
     fn submission_faults_abort_then_drain_before_return_and_reject_replay() {
         for failure in 0..12 {
             let owners = RefCell::new(TestSubmission::new(None));

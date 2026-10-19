@@ -2408,7 +2408,7 @@ mod long_graph_tests {
 
 impl Drop for GlmEngine<'_> {
     fn drop(&mut self) {
-        if self.tp2.is_some() || self.layer_execution.is_some()
+        if self.tp2.is_some() || self.layer_execution.is_some() || !self.lanes.borrow().is_empty()
             || (self.native_experts.is_some() && self.peer.is_some()) {
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }

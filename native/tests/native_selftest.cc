@@ -1,4 +1,5 @@
 #include "cuteafd_native.h"
+#include "../shared/src/rdma_endpoint_destroy.h"
 
 #include <cassert>
 #include <cstring>
@@ -138,6 +139,37 @@ std::vector<unsigned char> protocol_v2_frame(uint16_t kind, size_t payload_bytes
   return frame;
 }
 
+void test_rdma_destroy_failure_retains_registrations() {
+  struct Endpoint {
+    int* qp;
+    bool landing_registered = true;
+    bool rings_registered = true;
+    bool released = false;
+  };
+  int qp = 1;
+  Endpoint endpoint{&qp};
+  unsigned attempts = 0;
+  const auto release = [&](Endpoint* owner) {
+    assert(owner->qp == nullptr);
+    owner->landing_registered = false;
+    owner->rings_registered = false;
+    owner->released = true;
+  };
+  assert(!cuteafd::destroy_rdma_endpoint(&endpoint, [&](int* live) {
+    ++attempts;
+    assert(live == &qp);
+    return 1;
+  }, release));
+  assert(attempts == 1 && endpoint.qp == &qp);
+  assert(endpoint.landing_registered && endpoint.rings_registered && !endpoint.released);
+  assert(cuteafd::destroy_rdma_endpoint(&endpoint, [&](int*) { ++attempts; return 0; }, release));
+  assert(attempts == 2 && endpoint.released && !endpoint.landing_registered);
+  // Explicit checked quiesce may have destroyed the QP already.
+  Endpoint quiesced{nullptr};
+  assert(cuteafd::destroy_rdma_endpoint(&quiesced, [](int*) { assert(false); return 1; }, release));
+  assert(quiesced.released);
+}
+
 void test_rdma_abi() {
   unsigned char endpoint_byte = 0;
   assert(cuteafd_rdma_rc_endpoint_post_recv_at(nullptr, 0, 1, 1) ==
@@ -256,6 +288,7 @@ int main() {
   test_host_buffer_copy_roundtrip();
   test_error_propagation();
   test_nccl_abi();
+  test_rdma_destroy_failure_retains_registrations();
   test_rdma_abi();
   std::cout << "cuteafd_native_selftest passed\n";
   return 0;

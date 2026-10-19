@@ -154,6 +154,8 @@ impl SparkExperts {
     pub fn enable_terminal_ownership(&mut self) -> Result<()> {
         self.clients.enable_terminal_ownership()
     }
+    #[cfg(test)]
+    pub(super) fn terminal_ready_for_test(&self) -> bool { self.clients.terminal_ready_for_test() }
     pub fn terminal_owned(&self) -> bool { self.clients.terminal_owned() }
     pub fn terminal_released(&self) -> bool { self.clients.terminal_released() }
     pub fn terminal_quiesce(&mut self) -> Result<()> { self.clients.terminal_quiesce() }
