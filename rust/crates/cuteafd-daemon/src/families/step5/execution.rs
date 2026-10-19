@@ -445,7 +445,7 @@ impl Drop for LaneExecution<'_, '_> {
 
 // Attempt every owner in a phase, even if an earlier owner fails. In particular,
 // every abort publication precedes the first compute drain across all lanes.
-fn collect_lane_results(results: impl IntoIterator<Item = Result<()>>) -> Result<()> {
+pub(super) fn collect_lane_results(results: impl IntoIterator<Item = Result<()>>) -> Result<()> {
     let failures: Vec<_> = results.into_iter().filter_map(Result::err)
         .map(|error| format!("{error:#}")).collect();
     ensure!(failures.is_empty(), "Step-5 lane owners: {}", failures.join("; "));

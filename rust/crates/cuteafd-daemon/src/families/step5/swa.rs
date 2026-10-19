@@ -639,11 +639,10 @@ impl<'a> SwaLayer<'a> {
             &self.planes[VPAGES],
             None,
         )?;
-        step.attend(rank, self.immutable.layer, &*self, |layer, read| {
-            let rows = read.inputs.rows;
-            let stream = read.inputs.stream;
-            layer.read_on(read)?;
-            layer.dense_on(rows, stream)
+        step.attend(rank, self.immutable.layer, &*self, |layer, read| layer.read_attention_on(read))?;
+        step.compose(rank, &*self, |layer, input| {
+            layer.finish_on(input.rows, input.stream)?;
+            layer.dense_on(input.rows, input.stream)
         })
     }
 
@@ -658,7 +657,8 @@ impl<'a> SwaLayer<'a> {
             layer.project_on(input.rows, input.positions, input.stream)
         })?;
         step.stage(rank, self.immutable.layer, &self.planes[KPAGES], &self.planes[VPAGES], None)?;
-        step.attend(rank, self.immutable.layer, self, |layer, read| layer.read_on(read))
+        step.attend(rank, self.immutable.layer, self, |layer, read| layer.read_attention_on(read))?;
+        step.compose(rank, self, |layer, input| layer.finish_on(input.rows, input.stream))
     }
 
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
@@ -666,44 +666,56 @@ impl<'a> SwaLayer<'a> {
             input.heads == self.immutable.heads
                 && input.stream.device.id == self.stream.device.id
                 && std::ptr::eq(input.stream.device.library, self.stream.device.library)
-                && input
-                    .base
-                    .checked_add(input.rows)
-                    .is_some_and(|end| end <= self.immutable.rope.tables.plan.extent as usize),
+                && input.extent <= self.immutable.rope.tables.plan.extent as usize,
             "SWA owner device/head/rotary extent mismatch"
         );
         Ok(())
     }
 
     fn read_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
+        let rows = read.inputs.rows;
+        let stream = read.inputs.stream;
+        ensure!(read.start == 0, "SWA diagnostic must start at row zero");
+        self.read_attention_on(read)?;
+        self.finish_on(rows, stream)
+    }
+
+    fn read_attention_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
         self.check_input(&read.inputs)?;
         let input = &read.inputs;
+        ensure!(read.start.checked_add(input.rows).is_some_and(|end| end <= self.admission.rows),
+            "SWA sequence row extent");
+        let positions = CuteafdDeviceBuffer { ptr: input.positions.ptr.wrapping_byte_add(read.start * 8),
+            bytes: input.positions.bytes - read.start * 8, ..input.positions };
+        let requests = CuteafdDeviceBuffer { ptr: input.requests.ptr.wrapping_byte_add(read.start * 4),
+            bytes: input.requests.bytes - read.start * 4, ..input.requests };
         self.launch_on(
             input.stream,
             6,
             &[
-                input.positions.ptr,
-                input.requests.ptr,
+                positions.ptr,
+                requests.ptr,
                 self.planes[SELECTED].buffer.ptr,
             ],
             &[Scalar::I32(input.rows as i32)],
         )?;
         self.attend_on(
+            read.start,
             input.rows,
-            input.positions,
-            input.requests,
+            positions,
+            requests,
             read.key,
             read.value,
             read.table,
             read.table_width,
             read.pages,
             input.stream,
-        )?;
-        self.finish_on(input.rows, input.stream)
+        )
     }
 
     fn attend(&self, rows: usize) -> Result<()> {
         self.attend_on(
+            0,
             rows,
             self.planes[POSITIONS].buffer,
             self.planes[REQUESTS].buffer,
@@ -718,6 +730,7 @@ impl<'a> SwaLayer<'a> {
 
     fn attend_on(
         &self,
+        start: usize,
         rows: usize,
         positions: CuteafdDeviceBuffer,
         requests: CuteafdDeviceBuffer,
@@ -729,22 +742,24 @@ impl<'a> SwaLayer<'a> {
         stream: &Stream<'a>,
     ) -> Result<()> {
         let p = |i: usize| self.planes[i].buffer.ptr;
+        let query = p(QUERY).wrapping_byte_add(start * self.immutable.heads * 192 * 2);
+        let output = p(ATTN).wrapping_byte_add(start * self.immutable.heads * 192 * 2);
         self.launch_on(
             stream,
             7,
             &[
-                p(QUERY),
+                query,
                 key.ptr,
                 value.ptr,
-                p(QUERY),
-                p(QUERY),
+                query,
+                query,
                 table.ptr,
                 requests.ptr,
                 p(SELECTED),
                 positions.ptr,
-                p(QUERY),
-                p(QUERY),
-                p(ATTN),
+                query,
+                query,
+                output,
             ],
             &[
                 Scalar::I64(pages as i64),
