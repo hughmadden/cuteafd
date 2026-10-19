@@ -8,18 +8,22 @@ use cuteafd_transport::{expert::{SparkTopology, SparkWorld}, worker_selection::M
     protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use crate::shared::{memory::{DeviceAllocation, LoadStream}, placement::{spark_rings, SparkAdmission},
     spark_intake::SparkLink};
-use super::tp_reference::{error, expert, input, outputs, reference, route_weight};
+use super::tp_reference::{error, expert, outputs, reference, route_weight, wire_input};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-fn request(geometry: ExpertGeometry, layer: usize, rows: usize) -> Result<ExpertProtocolV2Request> {
-    let (h, k) = (geometry.hidden as usize, geometry.topk as usize);
-    let mut wire = vec![0u8; rows * h * 2];
-    for row in 0..rows {
-        for (col, value) in input(geometry, row) {
-            let bits = ((value as f32).to_bits() >> 16) as u16;
-            wire[(row * h + col) * 2..][..2].copy_from_slice(&bits.to_le_bytes());
-        }
-    }
+fn checkpoint_ingress(snapshot: &std::path::Path) -> Result<(SparkIngress, ExpertV2Dtype)> {
+    let checkpoint = cuteafd_loader::plan::Checkpoint::inventory(snapshot)?;
+    Ok(if checkpoint.spark_input_is_bf16() {
+        (SparkIngress::Bf16, ExpertV2Dtype::Bf16)
+    } else { (SparkIngress::Fp8K32, ExpertV2Dtype::Fp8E4m3Ue8m0K32) })
+}
+
+fn request(geometry: ExpertGeometry, layer: usize, rows: usize, dtype: ExpertV2Dtype)
+    -> Result<ExpertProtocolV2Request> {
+    let k = geometry.topk as usize;
+    let pitch = dtype.row_bytes(geometry.hidden as usize)?;
+    let mut wire = Vec::with_capacity(rows * pitch);
+    for row in 0..rows { wire.extend(wire_input(geometry, row, dtype)?); }
     let routes = (0..rows).flat_map(|row| (0..k).map(move |slot| ExpertProtocolV2RouteEntry {
         row_index: row as u32, expert_id: expert(geometry, layer, row, slot) as u32,
         gate_weight: route_weight(geometry, slot),
@@ -30,7 +34,7 @@ fn request(geometry: ExpertGeometry, layer: usize, rows: usize) -> Result<Expert
         route_count: k as u32,
     }).collect();
     let mut request = ExpertProtocolV2Request::new_bytes(layer as u64 + rows as u64, 521,
-        layer as u32, geometry.hidden, ExpertV2Dtype::Bf16, descriptors, routes, wire.into())?;
+        layer as u32, geometry.hidden, dtype, descriptors, routes, wire.into())?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
 }
@@ -96,11 +100,40 @@ fn checkpoint_world_preserves_generic_wire_and_native_tp6_ownership() -> Result<
 fn requests_use_checkpoint_geometry_and_two_repeated_oracle_rows() -> Result<()> {
     for geometry in [ExpertGeometry::DEEPSEEK_V41, ExpertGeometry::GLM5,
         ExpertGeometry::MIMO_V2_FLASH, ExpertGeometry::MIMO_V26_PRO] {
-        let small = request(geometry, 3, 1)?;
-        let wide = request(geometry, 3, 16)?;
-        assert_eq!(small.header.hidden_dim, geometry.hidden);
-        assert_eq!(wide.header.hidden_dim, geometry.hidden);
+        for dtype in [ExpertV2Dtype::Bf16, ExpertV2Dtype::Fp8E4m3Ue8m0K32] {
+            let small = request(geometry, 3, 1, dtype)?;
+            let wide = request(geometry, 3, 16, dtype)?;
+            let pitch = dtype.row_bytes(geometry.hidden as usize)?;
+            assert_eq!(small.header.hidden_dim, geometry.hidden);
+            assert_eq!(wide.header.hidden_dim, geometry.hidden);
+            assert_eq!(small.header.hidden_dtype, dtype);
+            assert_eq!(wide.header.hidden_row_stride_bytes as usize, pitch);
+            assert_eq!(small.hidden_payload.len(), pitch);
+            assert_eq!(wide.hidden_payload.len(), 16 * pitch);
+            assert_eq!(&wide.hidden_payload[..pitch], &small.hidden_payload[..]);
+            for row in 2..16 {
+                assert_eq!(&wide.hidden_payload[row * pitch..(row + 1) * pitch],
+                    &wide.hidden_payload[(row % 2) * pitch..(row % 2 + 1) * pitch]);
+            }
+        }
     }
+    Ok(())
+}
+
+#[test]
+fn gate_ingress_matches_production_checkpoint_contract() -> Result<()> {
+    use cuteafd_loader::plan::testing as fixture;
+    for (write, ingress, dtype) in [
+        (fixture::write_v41_snapshot as fn(&std::path::Path), SparkIngress::Fp8K32, ExpertV2Dtype::Fp8E4m3Ue8m0K32),
+        (fixture::write_v41_nvfp4_snapshot, SparkIngress::Bf16, ExpertV2Dtype::Bf16),
+    ] {
+        let root = tempfile::tempdir()?;
+        write(root.path());
+        assert_eq!(checkpoint_ingress(root.path())?, (ingress, dtype));
+    }
+    let root = tempfile::tempdir()?;
+    fixture::write_v41_exl3_snapshot(root.path(), 4);
+    assert_eq!(checkpoint_ingress(root.path())?, (SparkIngress::Fp8K32, ExpertV2Dtype::Fp8E4m3Ue8m0K32));
     Ok(())
 }
 
@@ -122,6 +155,8 @@ fn native_tp_rank_sum() -> Result<()> {
     ensure!(peers.len() == world, "rank-sum world disagrees with launched peers");
     let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
     let geometry = validate_source(&catalog, &family, &format)?;
+    let (ingress, dtype) = checkpoint_ingress(&snapshot)?;
+    let row_bytes = dtype.row_bytes(geometry.hidden as usize)?;
     let spark_world = checkpoint_world(&catalog, world)?;
     cuteafd_core::set_expert_geometry(geometry)
         .map_err(|_| anyhow::anyhow!("rank-sum process already selected another expert geometry"))?;
@@ -129,7 +164,7 @@ fn native_tp_rank_sum() -> Result<()> {
         "rank-sum layer is outside the checkpoint's routed set");
     let columns = outputs(geometry);
     let mut references = BTreeMap::new();
-    for &layer in &layers { references.insert(layer, reference(&catalog, geometry, layer, &columns)?); }
+    for &layer in &layers { references.insert(layer, reference(&catalog, geometry, layer, &columns, dtype)?); }
     // SAFETY: the official runner supplies the verified sealed native artifact.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? });
     library.cuda_set_device(0)?;
@@ -138,23 +173,23 @@ fn native_tp_rank_sum() -> Result<()> {
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),
             spark_ranks: world, prefill_lanes: 1 }, world, spark_world.ownership_topology(),
         ModelAdmission { capacity: 16, compiled_capacity: 4096,
-            endpoints: vec![SparkEndpoint { capacity: 16, ingress: SparkIngress::Bf16 }],
+            endpoints: vec![SparkEndpoint { capacity: 16, ingress }],
             rings: spark_rings(config.max_frame_bytes)? })?.select(&peers)?;
     let h = geometry.hidden as usize;
     let zero = DeviceAllocation::new(&library, 16 * h * 2)?;
     let output = DeviceAllocation::new(&library, 16 * h * 2)?;
     library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
     let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-    let mut link = SparkLink::new(&library, spark_world, &peers, 16, config, h * 2)?;
+    let mut link = SparkLink::new(&library, spark_world, &peers, 16, config, row_bytes)?;
     link.enable_terminal_ownership(library.clone())?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let result = runtime.block_on(async {
-        link.bootstrap(&request(geometry, layers[0], 16)?)?;
+        link.bootstrap(&request(geometry, layers[0], 16, dtype)?)?;
         let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
         let mut metrics = Vec::new();
         for &layer in &layers {
             for rows in [1, 16] {
-                let request = request(geometry, layer, rows)?;
+                let request = request(geometry, layer, rows, dtype)?;
                 let wave = link.dispatch(&request)?;
                 link.receive(wave, rows, stream.raw).await?;
                 // SAFETY: full-width buffers and rank planes stay owned until

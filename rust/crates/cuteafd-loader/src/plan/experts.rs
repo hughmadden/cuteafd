@@ -134,9 +134,14 @@ pub enum SparkRecipeRefusal {
     Placement(cuteafd_core::tp_units::UnitMapError),
 }
 
-/// Enumerate recipes from the format policy and this checkpoint's geometry.
+/// Enumerate qualified worlds from the format policy and checkpoint geometry.
 pub fn spark_worlds(package: &str, intermediate: usize) -> Vec<usize> {
-    TRANSPORT_WORLDS.into_iter().filter(|&world| spark_recipe(package, intermediate, world).is_ok()).collect()
+    let key = package.split_whitespace().next().unwrap_or(package);
+    TRANSPORT_WORLDS.into_iter().filter(|&world| {
+        // TP3 is packaged for explicit qualification, not yet a supported world.
+        !(key == "mimof:fp8" && world == 3)
+            && spark_recipe(package, intermediate, world).is_ok()
+    }).collect()
 }
 
 /// Validate every hosted routed operand against its checkpoint family and derive
@@ -532,7 +537,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(spark_worlds("mimof:fp8", 2048), [2, 3, 4]);
+        assert_eq!(spark_worlds("mimof:fp8", 2048), [2, 4]);
+        assert!(spark_recipe("mimof:fp8", 2048, 3).is_ok());
         assert_eq!(spark_worlds("mimop:fp8", 2048), [2, 6]);
         assert_eq!(spark_worlds("qwen4:exl3-k45", 640), [1, 2, 3, 4]);
         assert_eq!(spark_worlds("qwen4:nvfp4", 640), [2, 3, 4, 6]);

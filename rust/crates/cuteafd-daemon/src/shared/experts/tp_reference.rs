@@ -4,6 +4,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::{DType, ExpertGeometry};
 use cuteafd_loader::{OfficialV41Catalog, V41Exl3ProjectionKind};
 use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8Projection};
+use cuteafd_transport::ExpertV2Dtype;
 
 pub(super) fn bf16(value: f64) -> f64 {
     let bits = (value as f32).to_bits();
@@ -53,6 +54,68 @@ fn element(format: ExpertFormat, weights: &[u8], scales: &[u8], columns: usize,
 pub(super) fn input(geometry: ExpertGeometry, row: usize) -> Vec<(usize, f64)> {
     (0..8).map(|slot| ((slot * 769 + 31) % geometry.hidden as usize,
         if (row + slot) % 2 == 0 { 0.5 } else { -0.25 })).collect()
+}
+
+// Scalar wire oracle: BF16 source rounding, power-of-two range scaling, then
+// E4M3 nearest-even. This uses no candidate GPU quantizer or packed weights.
+fn quantize_input(values: &[f64], dtype: ExpertV2Dtype) -> Result<Vec<u8>> {
+    let pitch = dtype.row_bytes(values.len())?;
+    let values: Vec<_> = values.iter().copied().map(bf16).collect();
+    if dtype == ExpertV2Dtype::Bf16 {
+        return Ok(values.iter().flat_map(|&value|
+            (((value as f32).to_bits() >> 16) as u16).to_le_bytes()).collect());
+    }
+    ensure!(dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32, "unsupported gate input dtype");
+    let mut wire = vec![0; pitch];
+    for (group, block) in values.chunks_exact(32).enumerate() {
+        let amax = block.iter().fold(1e-4f32, |amax, &v| amax.max((v as f32).abs()));
+        let bits = (amax * (1f32 / 448.)).to_bits();
+        let rounded = if bits & 0x7fffff == 0 { bits }
+            else { bits.wrapping_add(0x800000) & 0x7f800000 };
+        let exponent = ((rounded >> 23) & 255) as u8;
+        ensure!((1..255).contains(&exponent), "nonfinite gate input scale");
+        wire[values.len() + group] = exponent;
+        let scale = 2f64.powi(i32::from(exponent) - 127);
+        for (col, &value) in block.iter().enumerate() {
+            let magnitude = (value / scale).abs().min(448.);
+            let mut best = 0u8;
+            let mut distance = f64::INFINITY;
+            for code in 0..=126u8 {
+                let delta = (e4m3(code)? - magnitude).abs();
+                if delta < distance || (delta == distance && code & 1 == 0) {
+                    best = code;
+                    distance = delta;
+                }
+            }
+            wire[group * 32 + col] = best | if value.is_sign_negative() { 128 } else { 0 };
+        }
+    }
+    Ok(wire)
+}
+
+pub(super) fn wire_input(geometry: ExpertGeometry, row: usize, dtype: ExpertV2Dtype) -> Result<Vec<u8>> {
+    let mut values = vec![0.; geometry.hidden as usize];
+    for (column, value) in input(geometry, row) { values[column] = value; }
+    quantize_input(&values, dtype)
+}
+
+fn decoded_input(geometry: ExpertGeometry, row: usize, dtype: ExpertV2Dtype) -> Result<Vec<(usize, f64)>> {
+    let wire = wire_input(geometry, row, dtype)?;
+    let mut values = Vec::new();
+    for col in 0..geometry.hidden as usize {
+        let value = match dtype {
+            ExpertV2Dtype::Bf16 => f32::from_bits(u32::from(u16::from_le_bytes(
+                [wire[col * 2], wire[col * 2 + 1]])) << 16) as f64,
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32 => {
+                let exponent = wire[geometry.hidden as usize + col / 32];
+                ensure!(exponent != 255, "NaN gate wire scale");
+                e4m3(wire[col])? * 2f64.powi(i32::from(exponent) - 127)
+            }
+            _ => anyhow::bail!("unsupported gate input dtype"),
+        };
+        if value != 0. { values.push((col, value)); }
+    }
+    Ok(values)
 }
 
 pub(super) fn expert(geometry: ExpertGeometry, layer: usize, row: usize, slot: usize) -> usize {
@@ -108,7 +171,7 @@ fn native_projections(catalog: &OfficialV41Catalog, layer: usize, id: usize)
 }
 
 fn native_expert(catalog: &OfficialV41Catalog, geometry: ExpertGeometry, layer: usize,
-    id: usize, row: usize, columns: &[usize]) -> Result<Vec<f64>> {
+    id: usize, input: &[(usize, f64)], columns: &[usize]) -> Result<Vec<f64>> {
     let (format, projections) = native_projections(catalog, layer, id)?;
     let (h, i) = (geometry.hidden as usize, geometry.intermediate as usize);
     let activation = catalog.fp8().and_then(|t| t.activation(layer)).unwrap_or(geometry.activation());
@@ -116,7 +179,7 @@ fn native_expert(catalog: &OfficialV41Catalog, geometry: ExpertGeometry, layer: 
     for (col, hidden) in hidden.iter_mut().enumerate() {
         let mut gu = [0.; 2];
         for projection in 0..2 {
-            for (index, value) in input(geometry, row) {
+            for &(index, value) in input {
                 gu[projection] += element(format, &projections[projection].0,
                     &projections[projection].1, h, col, index)? * value;
             }
@@ -217,11 +280,11 @@ fn exl3_projection(catalog: &OfficialV41Catalog, name: &str, input: &[f64],
 }
 
 fn exl3_expert(catalog: &OfficialV41Catalog, geometry: ExpertGeometry, layer: usize,
-    id: usize, row: usize, columns: &[usize]) -> Result<Vec<f64>> {
+    id: usize, input: &[(usize, f64)], columns: &[usize]) -> Result<Vec<f64>> {
     let manifest = catalog.exl3().context("EXL3 manifest")?;
     let name = |kind| manifest.naming.projection(false, layer, id, kind);
     let mut x = vec![0.; geometry.hidden as usize];
-    for (column, value) in input(geometry, row) { x[column] += value; }
+    for &(column, value) in input { x[column] += value; }
     let gate = exl3_projection(catalog, &name(V41Exl3ProjectionKind::Gate), &x, None)?;
     let up = exl3_projection(catalog, &name(V41Exl3ProjectionKind::Up), &x, None)?;
     // EXL3 is compared to the unrounded mathematical source oracle, including
@@ -236,14 +299,15 @@ fn exl3_expert(catalog: &OfficialV41Catalog, geometry: ExpertGeometry, layer: us
 }
 
 pub(super) fn reference(catalog: &OfficialV41Catalog, geometry: ExpertGeometry,
-    layer: usize, columns: &[usize]) -> Result<Vec<Vec<f64>>> {
+    layer: usize, columns: &[usize], dtype: ExpertV2Dtype) -> Result<Vec<Vec<f64>>> {
     let mut result = vec![vec![0.; columns.len()]; 2];
     for (row, output) in result.iter_mut().enumerate() {
+        let input = decoded_input(geometry, row, dtype)?;
         for slot in 0..geometry.topk as usize {
             let id = expert(geometry, layer, row, slot);
             let values = if catalog.exl3().is_some() {
-                exl3_expert(catalog, geometry, layer, id, row, columns)?
-            } else { native_expert(catalog, geometry, layer, id, row, columns)? };
+                exl3_expert(catalog, geometry, layer, id, &input, columns)?
+            } else { native_expert(catalog, geometry, layer, id, &input, columns)? };
             for (output, value) in output.iter_mut().zip(values) {
                 *output += value * f64::from(route_weight(geometry, slot));
             }
@@ -261,6 +325,29 @@ pub(super) fn error(actual: &[f64], expected: &[f64]) -> Result<(f64, f64)> {
     let relative = (actual.iter().zip(expected).map(|(a, b)| (a - b).powi(2)).sum::<f64>() / norm).sqrt();
     let cosine = actual.iter().zip(expected).map(|(a, b)| a * b).sum::<f64>() / (norm * actual_norm).sqrt();
     Ok((relative, cosine))
+}
+
+#[test]
+fn k32_wire_roundtrip_preserves_sparse_oracle_and_uses_nearest_even() -> Result<()> {
+    let dtype = ExpertV2Dtype::Fp8E4m3Ue8m0K32;
+    let mut values = vec![0.; 64];
+    values[..5].copy_from_slice(&[448., 1.0625, 1.1875, -1.0625, -1.1875]);
+    let wire = quantize_input(&values, dtype)?;
+    assert_eq!(&wire[..5], &[0x7e, 0x38, 0x3a, 0xb8, 0xba]);
+    assert_eq!(&wire[64..], &[127, 105]);
+    for geometry in [ExpertGeometry::DEEPSEEK_V41, ExpertGeometry::GLM5,
+        ExpertGeometry::MIMO_V2_FLASH, ExpertGeometry::MIMO_V26_PRO] {
+        for row in 0..2 {
+            for dtype in [ExpertV2Dtype::Bf16, dtype] {
+                assert_eq!(wire_input(geometry, row, dtype)?.len(), dtype.row_bytes(geometry.hidden as usize)?);
+                let decoded = decoded_input(geometry, row, dtype)?;
+                let mut expected = input(geometry, row);
+                expected.sort_by_key(|&(column, _)| column);
+                assert_eq!(decoded, expected, "{geometry:?}, row={row}, dtype={dtype:?}");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]
