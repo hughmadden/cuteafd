@@ -14,6 +14,14 @@ pub(super) struct Placement {
     pub committed: usize,
 }
 
+impl crate::shared::qwen::scheduler::Placement for Placement {
+    fn len(&self) -> usize { self.committed }
+    fn set_len(&mut self, len: usize) { self.committed = len; }
+    fn units(&self) -> &[u32] { &self.pages }
+    fn slot(&self) -> i32 { self.sequence as i32 }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+}
+
 /// Carried by both device and host entries. Actual stage lengths are in the mark.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Frontier {
@@ -85,6 +93,12 @@ impl<'e, 'a, T> Step5Prefix<'e, 'a, T> {
             mark_bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform };
         Ok(Self { ranks, layout, sequences, context, pending })
+    }
+
+    pub(super) fn slots(&self) -> usize { self.ranks[0].borrow().slots() as usize }
+
+    pub(super) fn snapshot_owners(&self) -> Vec<std::rc::Rc<crate::shared::memory::device::Allocation<'a>>> {
+        self.ranks.iter().flat_map(|rank| rank.borrow().snapshot_owners()).collect()
     }
 
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {

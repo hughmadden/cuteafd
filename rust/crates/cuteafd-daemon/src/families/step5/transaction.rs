@@ -225,6 +225,8 @@ impl<'a> Staging<'a> {
         device.run(|| device.library.copy_h2d(owner.ring_table.buffer, &table))?;
         Ok(owner)
     }
+    pub(super) fn positions(&self) -> CuteafdDeviceBuffer { self.positions.buffer }
+
     pub fn allocation_bytes(&self) -> usize {
         self.bytes
     }

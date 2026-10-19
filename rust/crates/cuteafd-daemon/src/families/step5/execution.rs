@@ -186,6 +186,10 @@ struct LaneExecution<'e, 'a> {
     rows: usize,
     inventory: Vec<Inventory>,
     requests: Cell<u64>,
+    graphs: Vec<RefCell<Option<super::graphs::Graphs<'a>>>>,
+    startup_captures: Cell<Option<u64>>,
+    replay: Cell<bool>,
+    terminal_output: Cell<Option<CuteafdDeviceBuffer>>,
 }
 
 enum Exchange<'a> {
@@ -425,7 +429,9 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
         }
         let execution = Self { id, ownership, native, caches, stages, exchange,
             sequence: RefCell::new(HeadSequence::new(id)?), lanes: lanes.into_iter().map(RefCell::new).collect(),
-            pinned, rows, inventory, requests: Cell::new(0) };
+            pinned, rows, inventory, requests: Cell::new(0),
+            graphs: (0..devices.len()).map(|_| RefCell::new(None)).collect(),
+            startup_captures: Cell::new(None), replay: Cell::new(false), terminal_output: Cell::new(None) };
         if count == 92 { execution.validate_replications()?; }
         Ok(execution)
     }
@@ -499,6 +505,51 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
         self.ownership.execution().validate_routed_replications(&copies)?;
         Ok(())
     }
+    fn graph_arithmetic(&self, key: super::graphs::Key) -> Result<()> {
+        use super::graphs::Op;
+        ensure!(key.lane == self.id && key.rank < self.stages.len() && key.rows <= self.rows,
+            "Step-5 graph key differs from retained lane");
+        let stage = self.stages[key.rank];
+        match key.op {
+            Op::Projection(layer) => match &self.layer(key.rank, layer)?.attention {
+                Attention::Sliding(owner) => owner.project_on(key.rows, stage.positions(), &stage.stream),
+                Attention::Sparse(owner) => owner.project_on(key.rows, stage.positions(), &stage.stream),
+            },
+            Op::SlidingFinish(layer) => {
+                let Attention::Sliding(owner) = &self.layer(key.rank, layer)?.attention else {
+                    anyhow::bail!("Step-5 sliding graph bound to CSA");
+                };
+                owner.finish_on(key.rows, &stage.stream)
+            }
+            Op::Dense(layer) => {
+                let Ffn::Dense(owner) = &self.layer(key.rank, layer)?.ffn else {
+                    anyhow::bail!("Step-5 dense graph bound to routed FFN");
+                };
+                owner.enqueue_on(key.rows, &stage.stream)
+            }
+            Op::Frontend(layer) | Op::Shared(layer) | Op::Join(layer) => {
+                let Ffn::Routed(owner) = &self.layer(key.rank, layer)?.ffn else {
+                    anyhow::bail!("Step-5 routed graph bound to dense FFN");
+                };
+                match key.op {
+                    Op::Frontend(_) if self.ownership.layer(layer, key.rank)?.routed_wave => owner.frontend_on(key.rows, &stage.stream),
+                    Op::Frontend(_) => owner.normalize_on(key.rows, &stage.stream),
+                    Op::Shared(_) => owner.shared_on(key.rows, &stage.stream),
+                    Op::Join(_) => owner.finish_on(key.rows, &stage.stream),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    fn replay(&self, rank: usize, rows: usize, op: super::graphs::Op,
+        stream: &crate::shared::memory::device::Stream<'a>) -> Result<bool> {
+        if !self.replay.get() { return Ok(false); }
+        self.graphs.get(rank).context("Step-5 graph rank")?.borrow_mut().as_mut()
+            .context("Step-5 startup graph bank absent")?
+            .launch(super::graphs::Key { lane: self.id, rank, rows, op }, stream)
+    }
+
     fn shutdown(&self) -> Result<()> { shutdown_lanes(&[self]) }
 
     fn quiesce(&self) -> Result<()> {
@@ -556,7 +607,98 @@ fn shutdown_lanes(lanes: &[&LaneExecution<'_, '_>]) -> Result<()> {
     Ok(())
 }
 
+pub(super) struct ReplayScope<'s, 'e, 'a> {
+    execution: &'s Execution<'e, 'a>,
+    previous: Vec<bool>,
+}
+impl Drop for ReplayScope<'_, '_, '_> {
+    fn drop(&mut self) {
+        for (lane, &previous) in self.execution.lanes.iter().zip(&self.previous) { lane.replay.set(previous); }
+    }
+}
+
 impl<'e, 'a> Execution<'e, 'a> {
+    pub(super) fn require_startup_graphs(&self) -> Result<()> {
+        ensure!(self.lanes.iter().all(|lane| lane.startup_captures.get().is_some()),
+            "Step-5 serving requires startup graph capture");
+        self.require_live()
+    }
+
+    pub(super) fn replay_scope(&self, enabled: bool) -> ReplayScope<'_, 'e, 'a> {
+        let previous = self.lanes.iter().map(|lane| lane.replay.replace(enabled)).collect();
+        ReplayScope { execution: self, previous }
+    }
+
+    pub(super) fn validate_lane_caches(&self, lane: usize, caches: &[&RefCell<CacheRank<'a>>], rows: usize) -> Result<()> {
+        let owner = self.lanes.get(lane).context("Step-5 backend lane")?;
+        ensure!(owner.rows == rows && caches.len() == owner.caches.len()
+            && caches.iter().zip(&owner.caches).all(|(left, right)| std::ptr::eq(*left, *right)),
+            "Step-5 backend cache owners differ from execution");
+        Ok(())
+    }
+
+    pub(super) fn lane_terminal_output(&self, lane: usize) -> Result<(Device<'a>, CuteafdDeviceBuffer)> {
+        let owner = self.lanes.get(lane).context("Step-5 terminal lane")?;
+        let rank = owner.ownership.execution().spec().head_gpu as usize;
+        Ok((owner.device(rank)?, owner.terminal_output.get().context("Step-5 terminal wave absent")?))
+    }
+
+    pub(super) fn warm_graphs(&self, reserved: &cuteafd_loader::placement::inventory::StartupGraphs<super::graphs::Key>) -> Result<()> {
+        let first = self.lanes.first().context("Step-5 missing execution lane")?;
+        let expected = super::graphs::inventory(&first.ownership, first.rows)?;
+        ensure!(reserved == &expected, "Step-5 graph warm list differs from admission");
+        ensure!(self.lanes.iter().all(|lane| lane.startup_captures.get().is_none()),
+            "Step-5 startup graphs already captured");
+        for lane in &self.lanes {
+            for rank in 0..lane.stages.len() {
+                let keys: Vec<_> = reserved.keys.iter().copied().filter(|key|
+                    key.lane == lane.id && key.rank == rank).collect();
+                let stage = lane.stages[rank];
+                stage.stream.device.run(|| {
+                    // SAFETY: startup owns the metadata plane; every projection reads initialized positions.
+                    unsafe { stage.stream.device.library.cuda_zero_bytes_async(
+                        stage.positions(), stage.positions().bytes, stage.stream.raw) }
+                })?;
+                for layer in lane.native.ranks[rank].iter().flatten() {
+                    match &layer.attention {
+                        Attention::Sliding(owner) => owner.initialize_graph_planes(&stage.stream)?,
+                        Attention::Sparse(owner) => owner.initialize_graph_planes(&stage.stream)?,
+                    }
+                    match &layer.ffn {
+                        Ffn::Dense(owner) => owner.initialize_graph_planes(&stage.stream)?,
+                        Ffn::Routed(owner) => owner.initialize_graph_planes(&stage.stream)?,
+                    }
+                }
+                stage.stream.drain()?;
+                let graphs = super::graphs::Graphs::capture(&stage.stream, &keys, |key| lane.graph_arithmetic(key))?;
+                *lane.graphs[rank].borrow_mut() = Some(graphs);
+            }
+        }
+        let baseline = cuteafd_ffi::graph_captures();
+        for lane in &self.lanes { lane.startup_captures.set(Some(baseline)); lane.replay.set(true); }
+        Ok(())
+    }
+
+    pub(super) fn require_live(&self) -> Result<()> {
+        for lane in &self.lanes {
+            lane.exchange.require_live()?;
+            ensure!(lane.caches.iter().all(|cache| !cache.borrow().poisoned.get()), "Step-5 poisoned cache");
+            if let Some(startup) = lane.startup_captures.get() {
+                super::graphs::check_captures(startup, cuteafd_ffi::graph_captures())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_replay(&self, enabled: bool) {
+        for lane in &self.lanes { lane.replay.set(enabled); }
+    }
+    pub(super) fn lane_count(&self) -> usize { self.lanes.len() }
+    pub(super) fn lane_stages(&self, lane: usize) -> Result<Vec<&'e Staging<'a>>> {
+        Ok(self.lanes.get(lane).context("Step-5 staging lane")?.stages.clone())
+    }
+    pub(super) fn ownership(&self) -> &ExecutionOwnership { &self.lanes[0].ownership }
+
     fn only_lane(&self) -> Result<&LaneExecution<'e, 'a>> {
         ensure!(self.lanes.len() == 1, "Step-5 singleton diagnostic requires one lane");
         Ok(&self.lanes[0])
@@ -617,6 +759,13 @@ impl<'e, 'a> Execution<'e, 'a> {
                 let rows: Vec<_> = bindings.iter().map(|binding| binding.step.rows()).collect();
                 attention::layer_pipeline_selected_instances(scope, lanes[0].ownership.execution(), &exchanges,
                     selected, LaneOrder::Independent, &rows, &mut bindings)?;
+                for binding in &bindings {
+                    let head = binding.execution.ownership.execution().spec().head_gpu as usize;
+                    let output = binding.current[head].context("Step-5 pipeline omitted terminal head output")?;
+                    ensure!(output.device_id == binding.execution.device(head)?.id,
+                        "Step-5 terminal output rank mismatch");
+                    binding.execution.terminal_output.set(Some(output));
+                }
                 collect_lane_results(lanes.iter().flat_map(|lane| lane.stages.iter())
                     .map(|stage| stage.stream.drain()))
             }))
@@ -668,9 +817,12 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         let owner = self.execution.layer(rank, layer)?;
         let source = self.current[rank].unwrap_or(self.input);
         self.copy(rank, owner.input(), source)?;
+        let execution = self.execution;
         match &owner.attention {
-            Attention::Sliding(owner) => owner.enqueue_attention_step(self.step, rank),
-            Attention::Sparse(owner) => owner.enqueue_attention_step(self.step, rank),
+            Attention::Sliding(owner) => owner.enqueue_attention_segments(self.step, rank,
+                |op, meta| execution.replay(rank, meta.rows, op, meta.stream)),
+            Attention::Sparse(owner) => owner.enqueue_attention_segments(self.step, rank,
+                |op, meta| execution.replay(rank, meta.rows, op, meta.stream)),
         }
     }
 }
@@ -737,10 +889,14 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
             let local = execution.layer(rank, layer)?;
             self.copy(rank, local.ffn_input(), local.post())?;
             match &local.ffn {
-                Ffn::Dense(ffn) => self.step.compose(rank, ffn, |ffn, meta| ffn.enqueue_on(meta.rows, meta.stream))?,
+                Ffn::Dense(ffn) => self.step.compose(rank, ffn, |ffn, meta| {
+                    if execution.replay(rank, meta.rows, super::graphs::Op::Dense(layer), meta.stream)? { return Ok(()); }
+                    ffn.enqueue_on(meta.rows, meta.stream)
+                })?,
                 Ffn::Routed(ffn) => {
                     let dispatch = execution.ownership.layer(layer, rank)?.routed_wave;
                     self.step.compose(rank, ffn, |ffn, meta| {
+                        if execution.replay(rank, meta.rows, super::graphs::Op::Frontend(layer), meta.stream)? { return Ok(()); }
                         if dispatch { ffn.frontend_on(meta.rows, meta.stream) }
                         else { ffn.normalize_on(meta.rows, meta.stream) }
                     })?;
@@ -775,7 +931,10 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         })))?;
                         wave = Some(rank);
                     }
-                    self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
+                    self.step.compose(rank, ffn, |ffn, meta| {
+                        if execution.replay(rank, meta.rows, super::graphs::Op::Shared(layer), meta.stream)? { return Ok(()); }
+                        ffn.shared_on(meta.rows, meta.stream)
+                    })?;
                 }
             }
             self.current[rank] = Some(local.output());
@@ -807,10 +966,16 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                 ffn.routed_output(), destination.routed_output(), self.step.rows() * H * 2)?;
             for at in 0..2 {
                 let Ffn::Routed(ffn) = &execution.layer(at, layer)?.ffn else { anyhow::bail!("Step-5 native routed join missing"); };
-                self.step.compose(at, ffn, |ffn, meta| ffn.finish_on(meta.rows, meta.stream))?;
+                self.step.compose(at, ffn, |ffn, meta| {
+                    if execution.replay(at, meta.rows, super::graphs::Op::Join(layer), meta.stream)? { return Ok(()); }
+                    ffn.finish_on(meta.rows, meta.stream)
+                })?;
             }
         } else {
-            self.step.compose(rank, ffn, |ffn, meta| ffn.finish_on(meta.rows, meta.stream))?;
+            self.step.compose(rank, ffn, |ffn, meta| {
+                if execution.replay(rank, meta.rows, super::graphs::Op::Join(layer), meta.stream)? { return Ok(()); }
+                ffn.finish_on(meta.rows, meta.stream)
+            })?;
         }
         Ok(())
     }

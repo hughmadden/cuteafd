@@ -44,8 +44,8 @@ pub(super) struct CacheRank<'a> {
     pub stream: Stream<'a>,
     lane_streams: RefCell<Vec<Weak<Stream<'a>>>>,
     active: Allocation<'a>,
-    marks: Option<Allocation<'a>>,
-    pages: Option<Allocation<'a>>,
+    marks: Option<Rc<Allocation<'a>>>,
+    pages: Option<Rc<Allocation<'a>>>,
     page_count: u64,
     layout: Step5CacheLayout,
     rank: usize,
@@ -75,9 +75,9 @@ impl<'a> CacheRank<'a> {
         // Allocate all storage before enqueueing initialization: failed allocation
         // cannot release an earlier plane still being initialized asynchronously.
         let active = Allocation::new(device, reservation.active)?;
-        let marks = if reservation.marks > 0 { Some(Allocation::new(device, reservation.marks)?) } else { None };
+        let marks = if reservation.marks > 0 { Some(Rc::new(Allocation::new(device, reservation.marks)?)) } else { None };
         let page_count = pages;
-        let pages = if reservation.pages > 0 { Some(Allocation::new(device, reservation.pages)?) } else { None };
+        let pages = if reservation.pages > 0 { Some(Rc::new(Allocation::new(device, reservation.pages)?)) } else { None };
         let owner = Self { stream, lane_streams: RefCell::new(Vec::new()), active, marks, pages, page_count, layout, rank, sequences, slots,
             marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
         let mut guard = owner.stream.cancellation_guard("Step-5 cache initialization");
@@ -146,6 +146,10 @@ impl<'a> CacheRank<'a> {
         self.pages.as_ref().map_or(CuteafdDeviceBuffer {
             ptr: std::ptr::null_mut(), bytes: 0, ..self.active.buffer
         }, |pages| pages.buffer)
+    }
+    /// Complete registered snapshot inventory, not just one slot or page view.
+    pub(super) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        self.marks.iter().chain(self.pages.iter()).cloned().collect()
     }
     pub fn layout(&self) -> &Step5CacheLayout { &self.layout }
     pub fn rank(&self) -> usize { self.rank }
