@@ -2,3 +2,4 @@
 pub mod config;
 pub mod kda;
 pub mod reference;
+pub mod w8;
