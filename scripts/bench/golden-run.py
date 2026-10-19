@@ -454,6 +454,8 @@ def worker_command(state, arm, rank, record):
         cmd += ['-v', f'{source}:{target}:ro']
     env = {'PATH': f'{SLOT_BIN}:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
+           # As the coordinator gets it: workers resolve installed programs and packages from it.
+           'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json',
            'RUST_LOG': 'info', **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env']}
     for key, value in env.items():
         cmd += ['-e', f'{key}={value}']
@@ -767,12 +769,14 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
         cmd += ['-v', f"{state['fixtures']}:{state['fixtures']}"]
     if mode != 'golden':
         cmd += ['-w', SOURCE]
+    # The sealed program manifest in every mode: family goldens read it from the
+    # environment as well as from --manifest.
     env = {'PATH': f'{SLOT_BIN}:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
-           'RUST_LOG': 'info'}
+           'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json', 'RUST_LOG': 'info'}
     if mode != 'golden':
         env.update(PYTHONPATH=f'/source/third_party/sparkinfer:{SOURCE}/python/reference',
-                   PYTHONDONTWRITEBYTECODE='1', CUTEAFD_PROGRAM_MANIFEST=f'{SLOT_SHARE}/PROGRAMS.json')
+                   PYTHONDONTWRITEBYTECODE='1')
     env['CUTEAFD_GOLDEN_SNAPSHOT'] = state['snapshot_container']
     env['CUTEAFD_GOLDEN_OUT'] = OUT
     if state.get('fixtures'):
