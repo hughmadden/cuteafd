@@ -94,6 +94,14 @@ impl<'a> TargetHeadOwner<'a> {
         })
     }
 
+    /// Inspect the already-drained norm plane without introducing another target launch.
+    pub fn normalized(&self) -> Result<Vec<f32>> {
+        let mut bytes = vec![0; self.rows * H * 2];
+        self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut bytes, self.planes[1].buffer))?;
+        Ok(bytes.chunks_exact(2).map(|b|
+            f32::from_bits(u32::from(u16::from_le_bytes(b.try_into().unwrap())) << 16)).collect())
+    }
+
     /// Caller drains the target chain first; this method drains before releasing its input borrow.
     pub fn logits(&self, input: CuteafdDeviceBuffer) -> Result<Vec<f32>> {
         ensure!(input.bytes >= self.rows * H * 4, "Step-5 final hidden extent");

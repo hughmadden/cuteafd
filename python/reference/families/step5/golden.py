@@ -434,6 +434,131 @@ def run_windows(args, ref, kernel, config, weights, extent):
                                 capability=list(torch.cuda.get_device_capability(0))))
 
 
+def diagnostic_source(args):
+    """Bind a tail/head probe to the completed native FP8 reference, not a new golden."""
+    meta_bytes = (args.out / "meta.json").read_bytes()
+    meta = json.loads(meta_bytes)
+    manifest = reference_manifest(args)
+    identity = verify_snapshot(manifest, args.snapshot)
+    proof = meta.get("prefix_qualification") or {}
+    if not (args.fp8_diagnostic and meta.get("diagnostic_only") is True
+            and meta.get("checkpoint") == FP8_CHECKPOINT
+            and (meta.get("source_pin") or {}).get("revision") == FP8_REVISION
+            and meta.get("set_sha256") == manifest["set_sha256"]
+            and meta.get("snapshot_identity") == identity
+            and proof.get("passed") is True and proof.get("finite") is True
+            and proof.get("snapshot_identity") == identity
+            and proof.get("set_sha256") == manifest["set_sha256"]):
+        raise ValueError("tail/head diagnostic needs the completed pinned native FP8 reference and prefix proof")
+    for window, entry in zip(manifest["windows"], meta["windows"], strict=True):
+        if entry["id"] != window["id"] or entry["path"] != f"windows/{window['id']}":
+            raise ValueError("tail/head reference window inventory mismatch")
+        expected = b"".join(struct.pack("<I", token) for token in window["tokens"])
+        if (args.out / entry["path"] / "tokens.bin").read_bytes() != expected:
+            raise ValueError("tail/head reference tokens differ")
+    return manifest, meta, hashlib.sha256(meta_bytes).hexdigest()
+
+
+def tail_diagnostic(args, ref, kernel, config, weights, extent):
+    """Continue saved layer 87 through four official layers, preserving source proof."""
+    import numpy as np
+    import torch
+    manifest, meta, source_sha = diagnostic_source(args)
+    states, sources = [], []
+    for window, entry in zip(manifest["windows"], meta["windows"], strict=True):
+        path = args.out / entry["path"] / "layer87.bin"
+        values = np.fromfile(path, dtype="<f4")
+        if values.size != len(window["tokens"]) * config.hidden_size or not np.isfinite(values).all():
+            raise ValueError("tail diagnostic layer-87 input extent or finite mismatch")
+        states.append(torch.from_numpy(values.reshape(-1, config.hidden_size)))
+        sources.append(dict(id=window["id"], layer87_sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+    with torch.inference_mode():
+        rope = {}
+        for layer_id in range(88, 92):
+            with torch.device("meta"):
+                layer = ref.Step5DecoderLayer(config, layer_id, dtype=torch.bfloat16)
+            layer = layer.to_empty(device="cuda").eval()
+            weights.load_layer(layer, layer_id)
+            layer.self_attn.build_rope(max_position=extent, device=torch.device("cuda"), shared_cache=rope)
+            for i, entry in enumerate(meta["windows"]):
+                hidden = layer_forward(layer, kernel, states[i].cuda(), extent)
+                if not torch.isfinite(hidden).all():
+                    raise ValueError(f"nonfinite tail diagnostic at layer {layer_id}")
+                states[i] = hidden.cpu()
+                path = args.out / entry["path"] / f"layer{layer_id:02d}.bin"
+                payload = states[i].numpy().astype("<f4").tobytes()
+                if layer_id == 91 and path.read_bytes() != payload:
+                    raise ValueError("tail-only continuation differs from original layer-91 state")
+                if layer_id != 91:
+                    path.write_bytes(payload)
+            del layer, hidden
+            release_checkpoint(torch.cuda, weights)
+            print(f"tail diagnostic layer {layer_id}: finite; original layer91 byte check enforced", flush=True)
+        norm = ref.Step5RMSNorm(config.hidden_size, eps=config.rms_norm_eps).cuda()
+        norm.weight.copy_(weights.get("model.norm.weight").cuda())
+        for state, entry in zip(states, meta["windows"], strict=True):
+            norm(state.cuda().bfloat16()).float().cpu().numpy().astype("<f4").tofile(
+                args.out / entry["path"] / "final_norm.bin")
+    files = {f"{entry['path']}/{name}": hashlib.sha256((args.out / entry["path"] / name).read_bytes()).hexdigest()
+             for entry in meta["windows"] for name in ["layer88.bin", "layer89.bin", "layer90.bin", "layer91.bin", "final_norm.bin"]}
+    (args.out / "tail-diagnostic.json").write_text(json.dumps(dict(
+        schema="cuteafd.step5.tail-diagnostic/1", diagnostic_only=True, source_meta_sha256=source_sha,
+        sources=sources, files=files, original_layer91_byte_exact=True,
+        source_pin=verify_source(args.snapshot, True)), indent=2) + "\n")
+
+
+def cpu_head_check(args):
+    """BF16 products and FP32 sums, as in the shared head; no CUDA or target execution."""
+    import numpy as np
+    import torch
+    manifest, meta, source_sha = diagnostic_source(args)
+    torch.set_num_threads(16)
+    weights = Weights(args.snapshot)
+    head = weights.get("lm_head.weight")
+    scale = weights.get("model.norm.weight")
+    if head.dtype != torch.bfloat16 or head.shape != (128896, 4096) or scale.dtype != torch.float32:
+        raise ValueError("CPU head source operands disagree with engine BF16/F32 layout")
+    epsilon = decoder_config(json.loads((args.snapshot / "config.json").read_text()))["rms_norm_eps"]
+    result = dict(schema="cuteafd.step5.cpu-head/1", diagnostic_only=True, source_meta_sha256=source_sha, windows=[])
+    with torch.inference_mode():
+        head = head.float()
+        for window, entry in zip(manifest["windows"], meta["windows"], strict=True):
+            folder = args.out / entry["path"]
+            residual = torch.from_numpy(np.fromfile(folder / "layer91.bin", dtype="<f4").reshape(-1, 4096))
+            if len(residual) != len(window["tokens"]) or not torch.isfinite(residual).all():
+                raise ValueError("CPU head final hidden extent or finite mismatch")
+            narrowed = residual.bfloat16().float()
+            normalized = (narrowed * torch.rsqrt(narrowed.square().mean(-1, keepdim=True) + epsilon)
+                          * (scale + 1)).bfloat16()
+            positions = entry["positions"]
+            selected = normalized[torch.tensor(positions) - 1].float()
+            reference = np.memmap(folder / "logits.bin", dtype="<f4", mode="r", shape=(len(positions), 128896))
+            kls, rounded_kls, nlls, rounded_nlls = [], [], [], []
+            max_error, rounded_max_error, equal = 0., 0., 0
+            for start in range(0, len(positions), 16):
+                stop = min(start + 16, len(positions))
+                actual = (selected[start:stop] @ head.T).double()
+                expected = torch.from_numpy(np.array(reference[start:stop])).double()
+                rounded = actual.bfloat16().double()
+                lp = expected - torch.logsumexp(expected, -1, keepdim=True)
+                targets = torch.tensor([window["tokens"][p] for p in positions[start:stop]])
+                for values, kl, nll in [(actual, kls, nlls), (rounded, rounded_kls, rounded_nlls)]:
+                    lq = values - torch.logsumexp(values, -1, keepdim=True)
+                    kl.extend((lp.exp() * (lp - lq)).sum(-1).tolist())
+                    nll.extend((-lq[torch.arange(stop - start), targets]).tolist())
+                max_error = max(max_error, (actual - expected).abs().max().item())
+                rounded_max_error = max(rounded_max_error, (rounded - expected).abs().max().item())
+                equal += (rounded == expected).sum().item()
+            result["windows"].append(dict(id=entry["id"], rows=len(positions), reference_nll=entry["nll"],
+                fp32_head_nll=sum(nlls) / len(nlls), fp32_head_mean_kl=sum(kls) / len(kls), fp32_head_max_kl=max(kls),
+                bf16_rounded_nll=sum(rounded_nlls) / len(rounded_nlls),
+                bf16_rounded_mean_kl=sum(rounded_kls) / len(rounded_kls), bf16_rounded_max_kl=max(rounded_kls),
+                fp32_head_max_absolute_error=max_error, bf16_rounded_max_absolute_error=rounded_max_error,
+                bf16_rounded_equal_fraction=equal / reference.size))
+    (args.out / "cpu-head-check.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result, indent=2), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
@@ -444,6 +569,11 @@ def main():
                         help="Pinned native FP8 comparison only; never replaces the BF16 fidelity root")
     parser.add_argument("--cuda-memory-cap-gib", type=float, default=32,
                         help="Torch allocator cap, GiB (0 < cap <= 64)")
+    diagnostic = parser.add_mutually_exclusive_group()
+    diagnostic.add_argument("--tail-diagnostic", action="store_true",
+                            help="Extend an existing native FP8 reference from saved layer 87")
+    diagnostic.add_argument("--cpu-head-check", action="store_true",
+                            help="Replay final norm and BF16-products/FP32-sums head without CUDA")
     parser.add_argument("--prefix-only", action="store_true")
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
@@ -456,6 +586,9 @@ def main():
     if manifest["checkpoint"] != expected:
         parser.error("reference manifest checkpoint differs from selected mode")
     args.runtime_source = verify_runtime_source()
+    if args.cpu_head_check:
+        cpu_head_check(args)
+        return
     ref, kernel = load_release(args.snapshot, args.fp8_diagnostic)
     payload = json.loads((args.snapshot / "config.json").read_text())
     config = ref.Step5Config(**decoder_config(payload))
@@ -476,7 +609,10 @@ def main():
     install()
     extent = max(len(w["tokens"]) for w in manifest["windows"])
     extent = ((extent + 127) // 128) * 128
-    run_windows(args, ref, kernel, config, Weights(args.snapshot), extent)
+    if args.tail_diagnostic:
+        tail_diagnostic(args, ref, kernel, config, Weights(args.snapshot), extent)
+    else:
+        run_windows(args, ref, kernel, config, Weights(args.snapshot), extent)
 
 
 if __name__ == "__main__":
