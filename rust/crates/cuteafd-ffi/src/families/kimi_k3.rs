@@ -618,6 +618,105 @@ impl<'a> KimiLatent<'a> {
     }
 }
 
+/// Device-resident U32 ids and F32 weights, both `[rows, 16]`.
+/// Local experts consume these directly; Spark staging belongs to the shared exchange.
+#[derive(Clone, Copy, Debug)]
+pub struct KimiRoutes { pub ids: Buffer, pub weights: Buffer }
+
+/// Native BF16 router projection followed by E896/K16 sigmoid selection.
+/// The checkpoint correction bias selects experts, but does not weight their outputs.
+pub struct KimiRouter<'a> {
+    scores: Program<'a>, library: &'a crate::NativeLibrary, rows: usize,
+}
+impl<'a> KimiRouter<'a> {
+    pub fn load(programs: &'a Programs<'a>) -> W8Result<Self> {
+        let scores = programs.program("kimik3_router_scores", &["x", "w", "logits"])?;
+        validate_router_manifest(scores.spec())?;
+        let rows = scores.spec().capacity_rows as usize;
+        Ok(Self { scores, library: programs.library(), rows })
+    }
+
+    pub fn launch(&self, rows: usize, input: Buffer, weight: Buffer, bias: Buffer,
+        logits: Buffer, routes: KimiRoutes, stream: *mut c_void) -> W8Result<()> {
+        validate_router_buffers(rows, self.rows, input, weight, bias, logits, routes)?;
+        // SAFETY: dense operands and disjoint device outputs are checked before
+        // either launch; the caller retains every buffer through completion/replay.
+        unsafe {
+            self.scores.launch(&[input.ptr, weight.ptr, logits.ptr], &[Scalar::I32(rows as i32)], stream)?;
+            self.library.router_select(logits.ptr, bias.ptr, std::ptr::null(), std::ptr::null(),
+                routes.ids.ptr, routes.weights.ptr, rows, 896, 16, 1.0, true, stream)?;
+        }
+        Ok(())
+    }
+}
+
+/// Shared FP8-K32 expert wire quantizer, specialized at the latent width 3584.
+pub struct KimiExpertInput<'a> { program: Program<'a>, rows: usize }
+impl<'a> KimiExpertInput<'a> {
+    pub const ROW_BYTES: usize = 3584 + 3584 / 32;
+
+    pub fn load(programs: &'a Programs<'a>) -> W8Result<Self> {
+        let program = programs.program("kimik3_expert_input_quant",
+            &["source_ptr", "values_ptr", "scale_rows_ptr", "scale_mma_ptr"])?;
+        validate_expert_input_manifest(program.spec())?;
+        let rows = program.spec().capacity_rows as usize;
+        Ok(Self { program, rows })
+    }
+
+    /// `grid` comes from the shared device-sized launch policy, cached at startup.
+    pub fn launch(&self, rows: usize, grid: usize, input: Buffer, wire: Buffer,
+        stream: *mut c_void) -> W8Result<()> {
+        validate_expert_input_buffers(rows, self.rows, grid, input, wire)?;
+        // SAFETY: wire contains the interleaved values/scales at stride ROW_BYTES;
+        // scale_mma is unused in wire mode. Caller owns storage through replay.
+        unsafe {
+            self.program.launch(&[input.ptr, wire.ptr, wire.ptr.cast::<u8>().add(3584).cast(), wire.ptr],
+                &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)], stream)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_router_manifest(spec: &ProgramSpec) -> W8Result<()> {
+    validate_w8_manifest(spec, b"i")?;
+    if [("hidden", 7168), ("experts", 896), ("top_k", 16)].iter()
+        .any(|&(key, n)| spec.geometry[key].as_u64() != Some(n)) {
+        return Err(KimiW8Error::Invalid("router manifest geometry"));
+    }
+    Ok(())
+}
+
+fn validate_router_buffers(rows: usize, capacity: usize, input: Buffer, weight: Buffer,
+    bias: Buffer, logits: Buffer, routes: KimiRoutes) -> W8Result<()> {
+    if rows == 0 || rows > capacity || rows > i32::MAX as usize {
+        return Err(KimiW8Error::Invalid("router rows/capacity"));
+    }
+    let buffers = [(input, rows * 7168 * 2), (weight, 896 * 7168 * 2), (bias, 896 * 4),
+        (logits, rows * 896 * 4), (routes.ids, rows * 16 * 4), (routes.weights, rows * 16 * 4)];
+    validate_w8_buffers(&buffers, input.device_id)?;
+    reject_writers(&buffers, &[3, 4, 5])
+}
+
+fn validate_expert_input_manifest(spec: &ProgramSpec) -> W8Result<()> {
+    validate_w8_manifest(spec, b"ii")?;
+    if [("hidden", 3584), ("row_bytes", KimiExpertInput::ROW_BYTES), ("expected_m", 80)].iter()
+        .any(|&(key, n)| spec.geometry[key].as_u64() != Some(n as u64))
+        || spec.geometry["amax_floor"].as_f64() != Some(1e-4) {
+        return Err(KimiW8Error::Invalid("expert wire manifest geometry"));
+    }
+    Ok(())
+}
+
+fn validate_expert_input_buffers(rows: usize, capacity: usize, grid: usize,
+    input: Buffer, wire: Buffer) -> W8Result<()> {
+    if rows == 0 || rows > capacity || rows > i32::MAX as usize || grid == 0 || grid > i32::MAX as usize {
+        return Err(KimiW8Error::Invalid("expert wire rows/grid/capacity"));
+    }
+    let buffers = [(input, rows * 3584 * 2), (wire, rows * KimiExpertInput::ROW_BYTES)];
+    validate_w8_buffers(&buffers, input.device_id)?;
+    reject_writers(&buffers, &[1])
+}
+
 fn validate_norm_manifest(spec: &ProgramSpec, hidden: usize) -> W8Result<()> {
     validate_w8_manifest(spec, b"if")?;
     if !matches!(hidden, 3584 | 7168) || spec.geometry["hidden"].as_u64() != Some(hidden as u64) {
@@ -785,6 +884,77 @@ mod tests {
             }
         }
         assert_eq!(count, 32);
+    }
+
+    #[test]
+    fn router_and_expert_wire_reject_stale_manifests_before_launch() {
+        let site = KimiResidualSite { candidates: 1, prefix: KimiPrefixMode::Keep, append: true };
+        let mut router = residual_spec(site);
+        router.scalar_kinds = b"i".to_vec();
+        router.geometry = serde_json::json!({"hidden": 7168, "experts": 896, "top_k": 16});
+        validate_router_manifest(&router).unwrap();
+        for key in ["hidden", "experts", "top_k"] {
+            let mut bad = router.clone(); bad.geometry[key] = serde_json::json!(1);
+            assert!(validate_router_manifest(&bad).is_err());
+        }
+        let mut wire = residual_spec(site);
+        wire.scalar_kinds = b"ii".to_vec();
+        wire.geometry = serde_json::json!({"hidden": 3584, "row_bytes": 3696, "expected_m": 80, "amax_floor": 1e-4});
+        validate_expert_input_manifest(&wire).unwrap();
+        for key in ["hidden", "row_bytes", "expected_m", "amax_floor"] {
+            let mut bad = wire.clone(); bad.geometry[key] = serde_json::json!(1);
+            assert!(validate_expert_input_manifest(&bad).is_err());
+        }
+        for (spec, validate) in [(router, validate_router_manifest as fn(&ProgramSpec) -> W8Result<()>),
+            (wire, validate_expert_input_manifest)] {
+            let mut bad = spec.clone(); bad.scalar_kinds.clear(); assert!(validate(&bad).is_err());
+            let mut bad = spec.clone(); bad.capacity_rows = 0; assert!(validate(&bad).is_err());
+            let mut bad = spec.clone(); bad.scratch.insert("scratch".into(), 1); assert!(validate(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn device_routes_and_wire_require_disjoint_admitted_storage() {
+        let buffer = |index, bytes| Buffer { ptr: (0x10000000usize * index) as *mut c_void,
+            bytes, device_id: 0, flags: 0 };
+        let rows = 64;
+        let input = buffer(1, rows * 7168 * 2);
+        let weight = buffer(2, 896 * 7168 * 2);
+        let bias = buffer(3, 896 * 4);
+        let logits = buffer(4, rows * 896 * 4);
+        let routes = KimiRoutes { ids: buffer(5, rows * 16 * 4), weights: buffer(6, rows * 16 * 4) };
+        validate_router_buffers(rows, rows, input, weight, bias, logits, routes).unwrap();
+        for writer in 3..6 {
+            for other in 0..6 {
+                if writer == other { continue; }
+                let mut buffers = [input, weight, bias, logits, routes.ids, routes.weights];
+                buffers[writer].ptr = buffers[other].ptr;
+                assert!(validate_router_buffers(rows, rows, buffers[0], buffers[1], buffers[2], buffers[3],
+                    KimiRoutes { ids: buffers[4], weights: buffers[5] }).is_err());
+            }
+        }
+        for bad in [Buffer { bytes: 1, ..routes.ids }, Buffer { device_id: 1, ..routes.ids },
+            Buffer { ptr: std::ptr::null_mut(), ..routes.ids },
+            Buffer { ptr: (routes.ids.ptr as usize + 1) as *mut c_void, ..routes.ids }] {
+            assert!(validate_router_buffers(rows, rows, input, weight, bias, logits,
+                KimiRoutes { ids: bad, ..routes }).is_err());
+        }
+        for n in [0, rows + 1, usize::MAX] {
+            assert!(validate_router_buffers(n, rows, input, weight, bias, logits, routes).is_err());
+        }
+        let latent = buffer(1, rows * 3584 * 2);
+        let wire = buffer(2, rows * KimiExpertInput::ROW_BYTES);
+        validate_expert_input_buffers(rows, rows, 170, latent, wire).unwrap();
+        for grid in [0, usize::MAX] {
+            assert!(validate_expert_input_buffers(rows, rows, grid, latent, wire).is_err());
+        }
+        for n in [0, rows + 1, usize::MAX] {
+            assert!(validate_expert_input_buffers(n, rows, 1, latent, wire).is_err());
+        }
+        for bad in [Buffer { bytes: wire.bytes - 1, ..wire }, Buffer { device_id: 1, ..wire },
+            Buffer { ptr: latent.ptr, ..wire }, Buffer { ptr: std::ptr::null_mut(), ..wire }] {
+            assert!(validate_expert_input_buffers(rows, rows, 1, latent, bad).is_err());
+        }
     }
 
     #[test]

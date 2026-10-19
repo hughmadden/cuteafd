@@ -4988,21 +4988,16 @@ impl<'a> GlmfEngine<'a> {
         shared: impl FnOnce() -> Result<()>) -> Result<SparkExpertWave> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 { h * 2 } else { h + h / 32 }));
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
+            if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
+        let route_bytes = layout.route_bytes;
         let staging = w.router_host.borrow_mut();
-        let host = staging.buffer;
-        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
-            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: host.bytes - offset,
-            ..host
-        };
         let timer = std::time::Instant::now();
         // SAFETY: the pinned regions are large enough; the sync completes them.
         unsafe {
-            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }, wire_bytes, self.stream)?;
+            layout.enqueue(self.library, staging.buffer,
+                [w.route_ids.buffer, w.route_weights.buffer,
+                    if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }], self.stream)?;
             self.library.cuda_event_record(self.routes_ready, self.stream)?;
         }
         // The shared expert queues behind the copies and runs during the exchange;
@@ -5016,11 +5011,8 @@ impl<'a> GlmfEngine<'a> {
         if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
             probe.staged(index, &staged[..route_bytes]);
         }
-        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
-        let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
-            row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),
-        }).collect();
-        let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
+        let routes = layout.routes(staged)?;
+        let wire = layout.wire(staged)?.to_vec();
         drop(staging);
         let request = spark_request(h, topk, index, t, routes, wire, kind, self.spark_bf16)?;
         if self.split_audit && !decode && t >= 256 {

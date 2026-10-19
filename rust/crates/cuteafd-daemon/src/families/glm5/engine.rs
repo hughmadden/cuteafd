@@ -19,7 +19,7 @@ use cuteafd_transport::expert::{
     SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
 use cuteafd_transport::{
-    EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED, ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
+    EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED, ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
@@ -1599,15 +1599,10 @@ impl<'a> GlmEngine<'a> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let native = self.native_experts.as_ref();
         if let Some(native) = native { native.rotate(layer_index, w, t, self.stream)?; }
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 || native.is_some() { h * 2 } else { h + h / 32 }));
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
+            if self.spark_bf16 || native.is_some() { h * 2 } else { h + h / 32 })?;
+        let route_bytes = layout.route_bytes;
         let staging = w.router_host.borrow_mut();
-        let host = staging.buffer;
-        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
-            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: host.bytes - offset,
-            ..host
-        };
         let timer = std::time::Instant::now();
         // SAFETY: the pinned regions are large enough; the sync completes them
         // (and this workspace's previous plane uploads, freeing its staging).
@@ -1624,9 +1619,9 @@ impl<'a> GlmEngine<'a> {
             None => None,
         };
         unsafe {
-            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 && native.is_none() { w.x.buffer } else { w.wire.buffer }, wire_bytes, self.stream)?;
+            layout.enqueue(self.library, staging.buffer,
+                [w.route_ids.buffer, w.route_weights.buffer,
+                    if self.spark_bf16 && native.is_none() { w.x.buffer } else { w.wire.buffer }], self.stream)?;
             self.library.cuda_stream_synchronize(self.stream)?;
         }
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
@@ -2246,14 +2241,11 @@ pub(crate) fn configured_lanes() -> usize {
 fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, decode: bool,
     bf16: bool, native: bool) -> Result<ExpertProtocolV2Request> {
     let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
-    let (route_bytes, wire_bytes) = (t * topk * 4, t * (if bf16 || native { h * 2 } else { h + h / 32 }));
-    ensure!(staged.len() >= 2 * route_bytes + wire_bytes, "staged routes and wire rows are short");
-    let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
-    let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
-        row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),
-    }).collect();
-    let mut wire = vec![0u8; wire_bytes];
-    copy_parallel(&mut wire, &staged[2 * route_bytes..2 * route_bytes + wire_bytes]);
+    let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
+        if bf16 || native { h * 2 } else { h + h / 32 })?;
+    let routes = layout.routes(staged)?;
+    let mut wire = vec![0u8; layout.wire_bytes];
+    copy_parallel(&mut wire, layout.wire(staged)?);
     let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
         if native { ExpertV2Dtype::F16 } else if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
         (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
