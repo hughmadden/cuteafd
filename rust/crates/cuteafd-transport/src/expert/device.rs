@@ -471,6 +471,18 @@ mod tests {
     }
 
     #[test]
+    fn canonical_tp6_requires_six_device_landing_planes() -> Result<()> {
+        let peers = (0..6).map(|rank| ([127, 0, 0, 1], 19000 + rank).into()).collect();
+        // SAFETY: the missing landing planes are rejected before the mailbox is inspected.
+        let result = unsafe { SparkDeviceLane::spawn(SparkWorld::canonical(6)?, peers, 64,
+            TcpTransportConfig::default(), vec![], 0, 0, 0, 8, 4096 * 2, None, None,
+            Box::new(|_, _, _| panic!("refused lane must not build requests"))) };
+        assert_eq!(result.err().expect("missing TP6 planes must refuse").to_string(),
+            "a device lane needs one landing range per rank");
+        Ok(())
+    }
+
+    #[test]
     fn mailbox_layout_keeps_routes_and_rows_apart() {
         // DeepSeek V4 Flash decode: 64 rows x 6 routes, 4096 + 128 wire bytes.
         let (capacity, topk, wire) = (64, 6, 4096 + 128);
