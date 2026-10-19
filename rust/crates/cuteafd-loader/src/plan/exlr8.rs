@@ -744,7 +744,8 @@ fn manifest(
 
 /// EXLR8 FORMAT.md unit ownership, independent of any precomputed index slice.
 pub fn owner(units: usize, expert: usize, unit: usize, layer: usize, ranks: usize) -> usize {
-    (units * expert + unit + layer) % ranks
+    cuteafd_core::tp_units::unit_owner(cuteafd_core::tp_units::UnitRule::Rotated,
+        units, expert, unit, layer, ranks).expect("validated EXLR8 unit geometry")
 }
 
 fn geometry(

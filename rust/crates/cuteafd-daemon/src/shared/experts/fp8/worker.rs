@@ -25,6 +25,11 @@ pub(crate) struct Fp8Worker<'a> {
     timing: Option<super::super::execution::timing::WorkerTiming<'a>>,
 }
 
+fn validate_worker_layers(layers: &[usize]) -> Result<()> {
+    ensure!(!layers.is_empty(), "FP8 worker has no layers");
+    super::validate_layer_ids(layers)
+}
+
 impl<'a> Fp8Worker<'a> {
     pub(crate) fn capacity(&self) -> usize { self.capacity }
     /// Device bytes the worker adds to its resident layers for `capacity`.
@@ -39,8 +44,7 @@ impl<'a> Fp8Worker<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
         let geometry = cuteafd_core::expert_geometry();
         let (hidden, topk, capacity) = (geometry.hidden as usize, geometry.topk as usize, capacity as usize);
-        ensure!(!experts.layers.is_empty(), "FP8 worker has no layers");
-        ensure!(experts.layers.windows(2).all(|w| w[1].layer == w[0].layer + 1), "FP8 worker layers must be contiguous");
+        validate_worker_layers(&experts.layers.iter().map(|layer| layer.layer).collect::<Vec<_>>())?;
         ensure!(experts.module.info().capacity_for(capacity).is_some(), "FP8 package lacks capacity {capacity}");
         ensure!(experts.wire_input() || matches!(experts.module.info().weights,
             cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4 | cuteafd_ffi::fp8_moe::Fp8MoeWeights::Bf16),
@@ -185,5 +189,18 @@ impl<'a> Fp8Worker<'a> {
                 .context("FP8 response chunk")?)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn width_group_accepts_sparse_layers_but_not_empty_or_duplicate_ids() {
+        for layers in [&[3][..], &[3, 4, 5][..], &[3, 6, 7, 8, 9, 12][..]] {
+            super::validate_worker_layers(layers).unwrap();
+        }
+        for layers in [&[][..], &[3, 3][..], &[6, 3][..]] {
+            assert!(super::validate_worker_layers(layers).is_err());
+        }
     }
 }

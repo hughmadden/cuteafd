@@ -527,7 +527,9 @@ impl Residency {
             *count = count.checked_add(1).context("EXLR8 projection count overflow")?;
         }
         let width = u32::try_from(self.units.checked_mul(128).context("EXLR8 slice width overflow")?)?;
-        Ok(cuteafd_core::SparkSlice { layer: u32::try_from(self.layer)?, first: 0,
+        let map = cuteafd_core::tp_units::RankUnits::new(cuteafd_core::tp_units::UnitRule::Rotated,
+            self.experts, self.units * 128, 128, self.layer, self.world, self.rank)?;
+        Ok(cuteafd_core::SparkSlice { unit_map: Some(map.fingerprint()), layer: u32::try_from(self.layer)?, first: 0,
             width, stored_width: width, tiers: vec![2, 3, 4], projection_counts: counts.to_vec() })
     }
 

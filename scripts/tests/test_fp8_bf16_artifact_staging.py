@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import ctypes
 import shutil
+import sys
 
 import pytest
 
@@ -18,6 +19,7 @@ REVISION = json.loads((REPO / "third_party/sparkinfer.lock.json").read_text())["
 spec = importlib.util.spec_from_file_location("fp8_package", TOOL)
 package_tool = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
+sys.modules[spec.name] = package_tool
 spec.loader.exec_module(package_tool)
 preflight_spec = importlib.util.spec_from_file_location("bf16_preflight", REPO / "scripts/launch/preflight-fp8-bf16.py")
 preflight = importlib.util.module_from_spec(preflight_spec)
@@ -57,6 +59,30 @@ def test_qwen_tp5_exact_slice_has_no_padding():
     assert package_tool.exact_widths(640, 5) == [128] * 5
     assert "tp5" in package_tool.spark_layouts(640)
     assert not any(layout.startswith(("tp6", "tp7", "tp8")) for layout in package_tool.spark_layouts(640))
+
+
+def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
+    assert package_tool.exact_widths(2048, 6, 32) == [352, 352, 352, 352, 320, 320]
+    assert package_tool.exact_widths(2048, 6, 16) == []
+    # Importing geometry is CPU-only; no exporter or CUDA context is involved.
+    from dataclasses import dataclass, replace
+
+    @dataclass(frozen=True)
+    class Geometry:
+        intermediate: int = 2048
+        weights: str = "mxfp4"
+        tp: int = 1
+
+        def with_tp(self, tp):
+            return replace(self, tp=tp)
+
+    base = Geometry()
+    for width in (352, 320, 384, 256):
+        tp, geometry = package_tool.layout_geometry(base, f"tp6-w{width}")
+        assert tp == 6
+        assert geometry.slice == width
+    with pytest.raises(SystemExit, match="no rank"):
+        package_tool.layout_geometry(base, "tp6-w336")
 
 
 @pytest.mark.parametrize("counts,expected", [("", ""), ("5", "--layouts;tp5"),

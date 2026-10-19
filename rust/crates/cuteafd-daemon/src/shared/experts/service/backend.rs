@@ -60,7 +60,11 @@ impl<'a> Weights<'a> {
                 cuteafd_loader::V41Exl3Layer::Backbone(layer) => Ok(layer),
                 _ => anyhow::bail!("draft layer in resident Spark backbone"),
             }).collect(),
-            Self::Fp8(experts) => Ok(experts.iter().flat_map(|group| &group.layers).map(|layer| layer.layer).collect()),
+            Self::Fp8(experts) => {
+                let mut ids = experts.iter().flat_map(|group| &group.layers).map(|layer| layer.layer).collect::<Vec<_>>();
+                ids.sort_unstable();
+                Ok(ids)
+            },
         }
     }
 
@@ -82,7 +86,7 @@ impl<'a> Weights<'a> {
                 };
                 resident = resident.checked_add(u64::try_from(weight.resident_bytes()?)?)
                     .context("native resident sum overflow")?;
-                slices.push(SparkSlice { layer: u32::try_from(weight.layer.layer())?,
+                slices.push(SparkSlice { unit_map: None, layer: u32::try_from(weight.layer.layer())?,
                     first: u32::try_from(rank.checked_mul(info.logical_intermediate as usize)
                         .context("native slice start overflow")?)?,
                     width: info.logical_intermediate, stored_width: info.kernel_intermediate,
@@ -96,7 +100,7 @@ impl<'a> Weights<'a> {
                 };
                 resident = resident.checked_add(u64::try_from(weight.resident_bytes())?)
                     .context("EXL3 resident sum overflow")?;
-                slices.push(SparkSlice { layer: u32::try_from(layer)?,
+                slices.push(SparkSlice { unit_map: None, layer: u32::try_from(layer)?,
                     first: u32::try_from(plan.intermediate_start)?, width: u32::try_from(plan.intermediate)?,
                     stored_width: u32::try_from(plan.intermediate)?,
                     tiers: plan.tiers.iter().copied().map(u32::try_from).collect::<Result<_, _>>()?,
@@ -121,6 +125,7 @@ impl<'a> Weights<'a> {
                 }
             }
         }
+        slices.sort_unstable_by_key(|slice| slice.layer);
         Ok((resident, slices))
     }
 
@@ -205,14 +210,22 @@ impl<'a> Weights<'a> {
                 let mut workers = Vec::with_capacity(experts.len());
                 let mut bindings = Vec::new();
                 for (group, experts) in experts.iter().enumerate() {
-                    bindings.extend((0..experts.layers.len()).map(|index| (group, index)));
+                    bindings.extend(experts.layers.iter().enumerate().map(|(index, layer)| (layer.layer, group, index)));
                     workers.push(Fp8Worker::new(library, experts.clone(), config.capacity)?);
                 }
+                let bindings = fp8_bindings(bindings)?;
                 Execution::Fp8(Fp8Groups { workers, bindings, selected: 0,
                     read_bytes: experts.iter().map(|group| group.weight_read_bytes()).max().unwrap_or(0) })
             }
         })
     }
+}
+
+fn fp8_bindings(mut layers: Vec<(usize, usize, usize)>) -> Result<Vec<(usize, usize)>> {
+    layers.sort_unstable_by_key(|&(layer, _, _)| layer);
+    ensure!(layers.windows(2).all(|pair| pair[0].0 != pair[1].0),
+        "native expert groups contain duplicate absolute layers");
+    Ok(layers.into_iter().map(|(_, group, index)| (group, index)).collect())
 }
 
 fn retained_host_terms(mut bytes: impl Iterator<Item = usize>)
@@ -580,6 +593,17 @@ mod tests {
     use super::*;
     use cuteafd_loader::{formats::fp8_experts::Slicing,
         plan::experts::{InstalledSparkRecipeRefusal, SparkRecipeRefusal}};
+
+    #[test]
+    fn rotated_width_groups_bind_in_absolute_layer_order() -> Result<()> {
+        let layers = [vec![3, 4, 5, 8, 9], vec![6, 7, 10]];
+        let bindings = layers.iter().enumerate().flat_map(|(group, layers)|
+            layers.iter().enumerate().map(move |(index, &layer)| (layer, group, index))).collect();
+        assert_eq!(fp8_bindings(bindings)?,
+            [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (0, 3), (0, 4), (1, 2)]);
+        assert!(fp8_bindings(vec![(3, 0, 0), (3, 1, 0)]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn fp8_load_recipe_refuses_unqualified_package_before_installation() -> Result<()> {

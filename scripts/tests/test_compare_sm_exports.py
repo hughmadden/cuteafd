@@ -74,6 +74,13 @@ def test_kimi_w8_cross_sm_groups(group, names):
                    ["--geometry", "kimik3", "--only", ",".join(names)])
 
 
+def test_mimop_k32_tp6_uses_production_exact_slice_export():
+    job = next(job for job in compare_sm.jobs("all") if job[0] == "routed-mimop-tp6")
+    assert job == ("routed-mimop-tp6", "package_fp8_moe_aot.py",
+                   ["--geometry", "mimop", "--capacities", compare_sm.CAPACITIES,
+                    "--layouts", "tp6", "--exact-slices"])
+
+
 def test_identical_object_ignores_context_metadata(tmp_path):
     report = compare_sm.compare(*exports(tmp_path))
     assert report["programs"][0]["classification"] == "identical"

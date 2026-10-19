@@ -187,3 +187,29 @@ def test_cli(tmp_path, capsys):
     assert tp.main(['score', str(empty), '--experts', '256']) == 2
     with pytest.raises(ValueError):
         tp.Geometry(256, 2000, 128).units
+
+
+@pytest.mark.parametrize('rule,experts,intermediate,unit,layer,world,rank,expected', [
+    ('contiguous', 256, 2048, 128, 40, 6, 4,
+     '79b5adba7abcd261e5647d3009a1e22b4596cad2dfd2526188b2f3ff9bdb0050'),
+    ('layer-rotation', 384, 2048, 32, 77, 6, 1,
+     'f5b8719aad670d16f996bd88d91d6c654f50aad555dba8993a1df5fd14105f77'),
+    ('rotated', 256, 2048, 128, 3, 6, 0,
+     '1211457b2cd49f09d118754400217a0db80d3a537958c2996bd6b89e3cefecd3'),
+    ('rotated', 512, 640, 128, 77, 4, 3,
+     'f44725d538ecc935c4f32fb1321229f5296415b6c6493892f03e02f2c898cfbe'),
+])
+def test_rust_shared_map_fingerprints(rule, experts, intermediate, unit, layer, world, rank, expected):
+    import hashlib
+    import struct
+
+    mapping = tp.rank_units(rule, tp.Geometry(experts, intermediate, unit), layer, world, rank)
+    digest = hashlib.sha256(b'cuteafd-tp-units-v1')
+    for value in (layer, rank, world, unit, intermediate // unit, experts):
+        digest.update(struct.pack('<Q', value))
+    for units in mapping.units.values():
+        for value in (len(units), *units):
+            digest.update(struct.pack('<Q', value))
+    assert digest.hexdigest() == expected
+    source = (ROOT / 'rust/crates/cuteafd-core/src/tp_units.rs').read_text()
+    assert expected in source

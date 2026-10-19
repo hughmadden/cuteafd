@@ -129,6 +129,9 @@ def jobs(scope):
     result.extend((f"routed-{geometry}-tp2", "package_fp8_moe_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES, "--layouts", "tp2", "--exact-slices"])
                   for geometry in ROUTED_GEOMETRIES if not geometry.startswith("glmfdense"))
+    result.append(("routed-mimop-tp6", "package_fp8_moe_aot.py",
+                   ["--geometry", "mimop", "--capacities", CAPACITIES,
+                    "--layouts", "tp6", "--exact-slices"]))
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
@@ -182,6 +185,9 @@ def export_routed(extra, output):
             widths = sorted(set(package.exact_widths(base.intermediate, tp)), reverse=True)
             if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
                 layouts += [f"tp{tp}-w{width}" for width in widths]
+            if base.weights == "mxfp4" and tp == 6:
+                layouts += [f"tp{tp}-w{width}" for width in sorted(
+                    set(package.exact_widths(base.intermediate, tp, 32)), reverse=True)]
     records = []
     for layout in layouts:
         _, g = package.layout_geometry(base, layout)

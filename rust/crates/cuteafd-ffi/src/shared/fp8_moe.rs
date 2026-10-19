@@ -55,7 +55,7 @@ pub struct Fp8MoeInfo {
     pub activation: Fp8MoeActivation,
     pub projection: Fp8MoeProjection,
     pub capacities: Vec<usize>,
-    /// The weight format; packed FP4 slices are zero-padded to 128.
+    /// The weight format; MXFP4 also supports exact K32 slices.
     pub weights: Fp8MoeWeights,
 }
 
@@ -89,15 +89,17 @@ impl Fp8MoeInfo {
                 _ => Fp8MoeWeights::Bf16,
             },
         };
-        // Slices are the widest rank range, zero-padded to 128 (MXFP4 32-blocks
-        // or FP8 128-blocks split unevenly, TP6 of 2048: 384).
-        // The padded width every rank stores, or (exact layouts) one rank's own
-        // whole 128-row blocks: blocks / tp or one more.
-        let blocks = info.intermediate / 128;
-        let exact = info.intermediate % 128 == 0 && info.tp > 0 && blocks >= info.tp
-            && (info.slice == blocks / info.tp * 128 || info.slice == blocks.div_ceil(info.tp) * 128);
-        let sliced = info.slice % 128 == 0 && info.slice >= 128 && (exact || (info.slice * info.tp >= info.intermediate
-            && (info.slice - 128) * info.tp < info.intermediate));
+        // Legacy packages store H128 exact or padded slices. Native MXFP4 may
+        // additionally store exact K32 units; recipe validation narrows support.
+        let exact = |unit: usize| {
+            let blocks = info.intermediate / unit;
+            info.intermediate % unit == 0 && info.tp > 0 && blocks >= info.tp
+                && (info.slice == blocks / info.tp * unit || info.slice == blocks.div_ceil(info.tp) * unit)
+        };
+        let sliced = (info.slice % 128 == 0 && info.slice >= 128
+            && (exact(128) || (info.slice * info.tp >= info.intermediate
+                && (info.slice - 128) * info.tp < info.intermediate)))
+            || (info.weights == Fp8MoeWeights::Mxfp4 && exact(32));
         ensure!(info.tp > 0 && sliced && info.hidden > 0 && info.hidden % 128 == 0
             && info.experts > 0 && (1..=16).contains(&info.topk)
             && info.swiglu_limit.is_finite() && info.swiglu_limit >= 0.0
@@ -409,6 +411,38 @@ mod metadata_tests {
             let mut w = words();
             w[8] = limit.to_bits();
             assert!(Fp8MoeInfo::from_words(w).is_err());
+        }
+    }
+
+    #[test]
+    fn exact_k32_slices_require_mxfp4_and_balanced_unit_widths() {
+        for input in [1, 7] {
+            for width in [256, 320, 352, 384] {
+                let mut w = words();
+                w[2] = width;
+                w[3] = 384;
+                w[6] = 6;
+                w[7] = input;
+                assert_eq!(Fp8MoeInfo::from_words(w).unwrap().slice, width as usize);
+            }
+            for width in [0, 288, 336, 368, 416] {
+                let mut w = words();
+                w[2] = width;
+                w[6] = 6;
+                w[7] = input;
+                assert!(Fp8MoeMetadata::from_words_and_scratch(w, |_| {
+                    panic!("invalid slice must not query workspace")
+                }).is_err());
+            }
+        }
+        for format in [1, 4, 5] {
+            for width in [320, 352] {
+                let mut w = words();
+                w[0] = 5 | format << 8 | 1 << 16 | 1 << 24;
+                w[2] = width;
+                w[6] = 6;
+                assert!(Fp8MoeInfo::from_words(w).is_err());
+            }
         }
     }
 

@@ -290,13 +290,15 @@ extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void*
 """
 
 
-def exact_widths(intermediate: int, tp: int) -> list[int]:
+def exact_widths(intermediate: int, tp: int, unit: int = 128) -> list[int]:
     """Stored widths of TP ranks owning whole 128-row blocks exactly (TP6 of
     2048: 384, 384, 384, 384, 256, 256), as the worker's exact layouts expect."""
-    blocks = intermediate // 128
-    if not 1 <= tp <= 6 or intermediate % 128 or blocks < tp:
+    if unit not in (32, 128):
         return []
-    return [(blocks // tp + (rank < blocks % tp)) * 128 for rank in range(tp)]
+    blocks = intermediate // unit
+    if not 1 <= tp <= 6 or intermediate % unit or blocks < tp:
+        return []
+    return [(blocks // tp + (rank < blocks % tp)) * unit for rank in range(tp)]
 
 
 def spark_layouts(intermediate: int, *, exact: bool = True) -> list[str]:
@@ -340,7 +342,10 @@ def layout_geometry(base, layout: str):
         raise SystemExit(f"{layout}: intermediate {base.intermediate} needs a nonempty whole-H128 slice per rank")
     g = base.with_tp(tp)
     if width:
-        if int(width) not in exact_widths(base.intermediate, tp):
+        widths = exact_widths(base.intermediate, tp)
+        if base.weights == "mxfp4" and tp == 6:
+            widths += exact_widths(base.intermediate, tp, 32)
+        if int(width) not in widths:
             raise SystemExit(f"{layout}: no rank of TP{tp} owns {width} rows of {base.intermediate} exactly")
         g = with_width(g, int(width))
     return tp, g
@@ -423,6 +428,11 @@ def build(args: argparse.Namespace) -> None:
             widths = sorted(set(exact_widths(base.intermediate, tp)), reverse=True)
             if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
                 layouts += [f"tp{tp}-w{w}" for w in widths if f"tp{tp}-w{w}" not in layouts]
+    # Fine-unit MXFP4 programs coexist with the qualified H128 layouts while
+    # balanced placement is gated. One width is selected for each rank/layer.
+    if args.exact_slices and base.weights == "mxfp4" and args.role == "spark" and "tp6" in layouts:
+        layouts += [f"tp6-w{width}" for width in sorted(set(exact_widths(base.intermediate, 6, 32)), reverse=True)
+                    if f"tp6-w{width}" not in layouts]
     wire = input_kind(args.role, base.weights, args.input) == "wire"
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")

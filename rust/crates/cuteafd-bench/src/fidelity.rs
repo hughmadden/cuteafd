@@ -284,8 +284,10 @@ fn absolute(run: &Run) -> bool {
 /// Precision switches: the only settings a same-checkpoint pair may change. Scheduling,
 /// layout and unknown knobs stay fixed. GLM 5.3 Flash's kda-state (its KDA recurrent
 /// state's storage) and target-head (the target LM head's GEMM) change numerics only.
+/// TP placement changes which ranks sum which expert K columns, changing reduction numerics.
 const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-fp8", "fp8-prefill",
-    "fp8-decode", "mtp-fp8-head", "kv-cache", "kv-format", "expert-input", "kda-state", "target-head"];
+    "fp8-decode", "mtp-fp8-head", "kv-cache", "kv-format", "expert-input", "kda-state", "target-head",
+    "CUTEAFD_TP_PLACEMENT"];
 
 /// Quant selection: settings a cross-checkpoint pair may also change, beside the precision
 /// switches. Exact names only; each one picks which weights serve, nothing else.
@@ -749,6 +751,29 @@ mod tests {
         assert!(compare(&a, &a, 0.005, 0.005, 100, 1).is_err());
         a = b.clone(); a.settings["family"] = serde_json::json!("other");
         assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+    }
+
+    #[test]
+    fn code_pairing_accepts_tp_reduction_numerics_but_not_unknown_settings() {
+        let mut b = run(3, 8);
+        b.settings = serde_json::json!({"model": "checkpoint", "build": {"commit": "base"}, "settings": []});
+        for baseline in [None, Some("round-robin")] {
+            b.settings["settings"] = serde_json::json!([]);
+            if let Some(value) = baseline {
+                b.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({
+                    "name": "CUTEAFD_TP_PLACEMENT", "value": value}));
+            }
+            let mut a = b.clone();
+            a.settings["build"]["commit"] = serde_json::json!("candidate");
+            a.settings["settings"] = serde_json::json!([
+                {"name": "CUTEAFD_TP_PLACEMENT", "value": "balanced"}]);
+            assert!(compare_paired(&a, &b, 0.005, 0.005, 100, 1, Pairing::CodeChange).unwrap().pass);
+            a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({
+                "name": "CUTEAFD_UNKNOWN_TP", "value": "on"}));
+            let error = compare_paired(&a, &b, 0.005, 0.005, 100, 1, Pairing::CodeChange)
+                .unwrap_err().to_string();
+            assert!(error.contains("different nonprecision server settings"), "{error}");
+        }
     }
 
     #[test]

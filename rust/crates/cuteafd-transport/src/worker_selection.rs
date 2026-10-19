@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, io::{BufRead, BufReader, Read, Write}, net::{So
     path::Path, sync::{Mutex, OnceLock}, time::Duration};
 
 const CONTROL_LIMIT: usize = 64 * 1024;
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 fn check_version(actual: u64, expected: u32) -> Result<()> {
     ensure!(actual == u64::from(expected),
@@ -24,6 +24,7 @@ pub struct WorkerIdentity {
     world: u32,
     topology: [u8; 2],
     ownership_wire: bool,
+    placement: cuteafd_core::tp_units::TpPlacement,
 }
 
 impl WorkerIdentity {
@@ -41,7 +42,9 @@ impl WorkerIdentity {
         Ok(Self { checkpoint: identity.fingerprint, manifest: identity.manifest,
             geometry: [geometry.hidden, geometry.experts, geometry.topk, geometry.intermediate, geometry.layers],
             world: u32::try_from(world)?, topology: [selected.topology().tp(), selected.topology().ep()],
-            ownership_wire: selected.ownership_topology().is_some() })
+            ownership_wire: selected.ownership_topology().is_some(),
+            placement: if manifest.is_some() { cuteafd_core::tp_units::TpPlacement::Balanced }
+                else { cuteafd_core::tp_units::TpPlacement::active()? } })
     }
 }
 
@@ -184,7 +187,7 @@ impl WorkerSelection {
 
     pub fn validate_for(&self, identity: &WorkerIdentity) -> Result<()> {
         self.validate()?;
-        ensure!(&self.identity == identity, "worker checkpoint/geometry/topology identity mismatch");
+        ensure!(&self.identity == identity, "worker checkpoint/geometry/topology/placement identity mismatch");
         Ok(())
     }
 }
@@ -847,7 +850,7 @@ impl Drop for EndpointReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), manifest: None, geometry: [6144, 384, 8, 2048, 70], world: 2, topology: [2, 1], ownership_wire: false } }
+    fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), manifest: None, geometry: [6144, 384, 8, 2048, 70], world: 2, topology: [2, 1], ownership_wire: false, placement: Default::default() } }
     #[test]
     fn exlr8_bootstrap_refuses_different_manifest_name_or_content() {
         use cuteafd_loader::plan::checkpoint::identity::ManifestIdentity;
@@ -910,7 +913,7 @@ mod tests {
             write(&mut client, &serde_json::json!({"message":message,
                 "selection":{"version":1,"identity":{"legacy":true}}}))?;
             let error = read::<serde_json::Value>(&server).unwrap_err().to_string();
-            assert!(error.contains("version 1; expected 2"), "{error}");
+            assert!(error.contains("version 1; expected 3"), "{error}");
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let mut client = TcpStream::connect(listener.local_addr()?)?;
@@ -918,31 +921,13 @@ mod tests {
         write(&mut client, &serde_json::json!({"message":"worker_selection_start",
             "selection":{"version":1}}))?;
         let error = receive_worker_selection(&server, 0, Duration::from_secs(3)).unwrap_err();
-        assert!(error.to_string().contains("version 1; expected 2"));
+        assert!(error.to_string().contains("version 1; expected 3"));
         let rejection = read::<serde_json::Value>(&client).unwrap_err();
-        assert!(rejection.to_string().contains("version 1; expected 2"));
-        // A v1 decoder accepts the unchanged HF envelope shape far enough to
-        // issue its own clear version refusal when presented with v2.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct V1Identity {
-            checkpoint: String, geometry: [u32; 5], world: u32,
-            topology: [u8; 2], ownership_wire: bool,
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct V1Selection {
-            version: u32, identity: V1Identity, ranges: Vec<LayerRange>, model: Option<ModelAdmission>,
-        }
+        assert!(rejection.to_string().contains("version 1; expected 3"));
         let envelope = serde_json::to_value(admission_selection())?;
         assert!(envelope["identity"].get("manifest").is_none());
-        let legacy: V1Selection = serde_json::from_value(envelope)?;
-        assert_eq!(legacy.identity.checkpoint.len(), 64);
-        assert_eq!((legacy.identity.world, legacy.identity.topology, legacy.identity.ownership_wire), (1, [1, 1], false));
-        assert_eq!(legacy.identity.geometry[0], 6144);
-        assert!(!legacy.ranges.is_empty() && legacy.model.is_some());
-        assert!(check_version(u64::from(legacy.version), 1).unwrap_err()
-            .to_string().contains("version 2; expected 1"));
+        assert_eq!(envelope["identity"]["placement"], "round-robin");
+        assert_eq!(envelope["version"], VERSION);
         Ok(())
     }
 
@@ -994,7 +979,7 @@ mod tests {
     fn admission_report(selection: &WorkerSelection) -> cuteafd_core::ModelAdmissionResponse {
         use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkRuntimeInventory, SparkSlice};
         ModelAdmissionResponse { rank: 0, resident_bytes: 1 << 30,
-            slices: vec![SparkSlice { layer: 13, first: 0, width: 2048, stored_width: 2048,
+            slices: vec![SparkSlice { unit_map: None, layer: 13, first: 0, width: 2048, stored_width: 2048,
                 tiers: vec![], projection_counts: vec![] }],
             runtime: SparkRuntimeInventory { detail: Default::default(), sample: RuntimeSample { device: 0, arch: "sm_121".into(),
                 sms: 48, driver: "test".into(), total_bytes: 121 << 30, free_bytes: 100 << 30,
@@ -1081,7 +1066,7 @@ mod tests {
         selection.ranges = WorkerSelection::new(selection.identity.clone(), &[13, 15, 20])?.ranges;
         let mut report = admission_report(&selection);
         let slice = report.slices[0].clone();
-        report.slices = selection.layers().into_iter().map(|layer| cuteafd_core::SparkSlice {
+        report.slices = selection.layers().into_iter().map(|layer| cuteafd_core::SparkSlice { unit_map: None,
             layer: layer as u32, ..slice.clone()
         }).collect();
         let installed = InstalledModelAdmission::new(0, selection.clone(), Some(report.clone()))?;
@@ -1158,7 +1143,7 @@ mod tests {
             let selection = WorkerSelection::new(WorkerIdentity {
                 checkpoint: "0".repeat(64), manifest: None,
                 geometry: [4096, 352, 8, 1536, 91], world: 6,
-                topology: [6, 1], ownership_wire: false,
+                topology: [6, 1], ownership_wire: false, placement: Default::default(),
             }, &(3..91).collect::<Vec<_>>())?.with_model(model)?;
             let mut reports = Vec::new();
             for rank in 0..6 {
@@ -1168,7 +1153,7 @@ mod tests {
                 report.runtime.workspace_bytes = 199584768;
                 report.slices = (3..91).map(|layer| cuteafd_core::SparkSlice {
                     layer, first: rank * 256, width: 256, stored_width: 256,
-                    tiers: vec![], projection_counts: vec![],
+                    unit_map: None, tiers: vec![], projection_counts: vec![],
                 }).collect();
                 report.host_exchange_bytes = 640 * (4096 * 2 + 8 * 8);
                 report.row_indices_bytes = 640 * 4;
@@ -1633,6 +1618,9 @@ mod tests {
         for invalid in [vec![70], vec![14, 13], vec![13, 13]] { assert!(WorkerSelection::new(identity(), &invalid).is_err()); }
         let mut other = identity(); other.checkpoint = "1".repeat(64);
         assert!(selection.validate_for(&other).is_err());
+        let mut other = identity(); other.placement = cuteafd_core::tp_units::TpPlacement::Balanced;
+        assert!(selection.validate_for(&other).unwrap_err().to_string().contains("placement"));
+        assert_ne!(selection.digest().unwrap(), WorkerSelection::new(other, &[13, 14, 15, 20]).unwrap().digest().unwrap());
         assert_ne!(selection.digest().unwrap(), WorkerSelection::new(identity(), &[14, 15, 20]).unwrap().digest().unwrap());
         assert!(WorkerSelection::new(identity(), &[]).unwrap().ranges().is_empty());
         let mut invalid = identity(); invalid.world = 9;
