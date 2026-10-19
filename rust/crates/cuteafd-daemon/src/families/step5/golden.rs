@@ -573,6 +573,15 @@ pub(super) fn split_ownership(cfg: &Config, rows: usize) -> Result<cuteafd_loade
     cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership::new(cfg, 2, LayerExecutionPlan::new(&placement, spec)?)
 }
 
+fn shared_diagnostic_verdict(nll: f64, reference_nll: f64, kl: f64, max_kl: f64) -> Result<()> {
+    let delta = nll - reference_nll;
+    ensure!([nll, reference_nll, delta, kl, max_kl].into_iter().all(f64::is_finite),
+        "Step-5 shared diagnostic produced nonfinite scores");
+    ensure!(delta <= 0.01 && kl <= 0.03,
+        "Step-5 shared diagnostic exceeds stop bar: delta_nll={delta:.12} (<=0.01), mean_kl={kl:.12} (<=0.03)");
+    Ok(())
+}
+
 fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     reference: Reference, layers: &[usize]) -> Result<()> {
     use super::execution::Execution;
@@ -593,7 +602,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     library.cuda_set_device(args.device)?;
     let devices = [args.device, peer_device].map(|id| Device { library: &library, id });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5"], programs.names());
+    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5", "step52"], programs.names());
     let head_plan = HeadPlan::for_execution(&programs, checkpoint, rows, &ownership)?;
     let head_rank = ownership.execution().spec().head_gpu as usize;
     let pages = (rows as u64).div_ceil(64) + 1;
@@ -670,6 +679,10 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let reference_nll = scored_nll(&reference.expected, &targets, cfg.vocab)?;
     let (kl, max_kl) = scored_kl(&reference.expected, &ours, cfg.vocab)?;
     println!("Step-5 shared complete target rows={rows} lanes=1 scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (no serving/lossless/cache qualification)", targets.len(), nll-reference_nll);
+    // Engine-only stop bars do not measure quantization error against the BF16 root.
+    if args.fp8_diagnostic_reference {
+        shared_diagnostic_verdict(nll, reference_nll, kl, max_kl)?;
+    }
     Ok(())
 }
 
@@ -873,6 +886,22 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_diagnostic_enforces_finite_scores_and_inclusive_stop_bars() {
+        assert!(shared_diagnostic_verdict(0.01, 0.0, 0.03, 0.7).is_ok());
+        assert!(shared_diagnostic_verdict(2.493438096150, 2.492457464922,
+            0.021612583211, 0.613037691297).is_ok());
+        assert!(shared_diagnostic_verdict(0.01f64.next_up(), 0.0, 0.03, 0.7).is_err());
+        assert!(shared_diagnostic_verdict(0.01, 0.0, 0.03f64.next_up(), 0.7).is_err());
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for index in 0..4 {
+                let mut scores = [2.0, 2.0, 0.02, 0.7];
+                scores[index] = value;
+                assert!(shared_diagnostic_verdict(scores[0], scores[1], scores[2], scores[3]).is_err());
+            }
+        }
+        assert!(shared_diagnostic_verdict(f64::MAX, -f64::MAX, 0.02, 0.7).is_err());
+    }
     #[test]
     fn prefix_state_admits_three_sequences_three_marks_and_cow_pages() -> Result<()> {
         let layout = super::super::cache::tests::layout_at(640);
