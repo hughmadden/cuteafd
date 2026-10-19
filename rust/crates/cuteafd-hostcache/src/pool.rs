@@ -342,6 +342,19 @@ impl SlabPool {
         self.slabs_free[ci] * size + self.free_chunks.len() as u64 * per_chunk * size
     }
 
+    /// Whether all requested slabs fit together, including per-class chunk fragmentation.
+    pub(crate) fn can_take(&self, counts: [u64; 4]) -> bool {
+        let mut chunks = 0;
+        for (class, count) in Class::ALL.into_iter().zip(counts) {
+            if count == 0 { continue; }
+            let size = self.layout.size(class);
+            if size == 0 { return false; }
+            let missing = count.saturating_sub(self.slabs_free[class.index()]);
+            chunks += missing.div_ceil((self.chunk_bytes / size) as u64);
+        }
+        chunks <= self.free_chunks.len() as u64
+    }
+
     /// Per-class held, free and carved-chunk counts, in [`Class::ALL`] order.
     pub fn occupancy(&self) -> [(Class, ClassOccupancy); Class::ALL.len()] {
         Class::ALL.map(|class| {

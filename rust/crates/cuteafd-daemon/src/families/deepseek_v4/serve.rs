@@ -566,11 +566,11 @@ fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs
     } else if engine.ranks() > 1 {
         // SAFETY of the registration: the engine (and its pools) outlives the cache, which
         // `schedule` drops first.
-        args.host_config(family.layout(), engine.max_context)?.map(|config|
+        args.host_config(family.layout(), engine.max_context, engine.shape.sequences)?.map(|config|
             crate::shared::prefix::CudaCopyEngine::registered(engine.library, &family.buffers())
                 .map(|copy| (config, copy))).transpose()?
     } else {
-        args.host_tier(engine.library, family.template(), family.layout(), engine.max_context)?
+        args.host_tier(engine.library, family.template(), family.layout(), engine.max_context, engine.shape.sequences)?
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();

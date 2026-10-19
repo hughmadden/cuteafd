@@ -25,7 +25,8 @@ const GLM_FLASH_ENCODER_SCRATCH_BYTES: u64 = 791_907_584;
 /// The hardware and serving shape to lay out.
 #[derive(Debug, Clone)]
 pub struct LayoutOptions {
-    /// None selects min(32 GiB, 25% host total); Some(0) disables the host tier.
+    /// None sizes full-context KV for concurrency + 4, capped at min(32 GiB, 25% host RAM).
+    /// Explicit bytes bypass both; Some(0) disables the host tier.
     pub host_cache_bytes: Option<u64>,
     /// None selects min(8 GiB, 5% host total) when a supported media tower is loaded.
     pub media_cache_bytes: Option<u64>,
@@ -1112,8 +1113,35 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     }
     let tier_disabled = options.rtx_bytes.len() > 1 && (family == "glm5_flash"
         || (family == "glm5" && report.attention_placement == crate::placement::AttentionPlacement::Heads));
-    let cache = if options.mimo_prefix_entries == 0 || tier_disabled { 0 } else {
-        options.host_cache_bytes.unwrap_or_else(|| cuteafd_core::prefix::default_host_cache_bytes(total)) };
+    let cache = if options.mimo_prefix_entries == 0 || tier_disabled { 0 } else if let Some(bytes) = options.host_cache_bytes { bytes } else {
+        let requirements = report.cache_requirements.as_ref().context("missing host cache geometry")?;
+        let geometry = requirements.target_only_layouts.iter().find(|g| g.ranks.len() == options.rtx_bytes.len())
+            .context("host cache layout unavailable")?;
+        let owners = if geometry.placement == crate::serving_capacity::KvPlacement::Replicated {
+            &geometry.ranks[..1]
+        } else { &geometry.ranks[..] };
+        let pages = owners.iter().try_fold(0u64, |n, r| n.checked_add(r.persistent_unit_bytes))
+            .context("host cache pages overflow")?;
+        let marks = owners.iter().try_fold(0u64, |n, r| n.checked_add(r.retained_mark_bytes))
+            .context("host cache marks overflow")?;
+        let manifest = options.workspace_manifest.as_deref().or_else(|| {
+            let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
+            path.is_file().then_some(path)
+        }).and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let policy = if matches!(family, "mimo_v2" | "deepseek_v41") {
+            ContextPolicy::Checkpoint
+        } else { ContextPolicy::ManifestBounded };
+        let context = resolved_context(policy, options.context_tokens,
+            requirements.checkpoint_max_context_tokens.unwrap_or(0), manifest.as_ref());
+        let concurrency = if options.concurrency > 0 { options.concurrency } else {
+            cuteafd_core::serving_capacity::default_concurrency(options.rtx_bytes.first().copied().unwrap_or(0))
+        };
+        let chunk = (256u64 << 20).max(pages).max(marks);
+        let required = cuteafd_core::prefix::host_cache_required_bytes(context, concurrency,
+            geometry.logical_unit_rows, pages, marks.max(1), 0, chunk).context("host cache budget overflow")?;
+        required.min(cuteafd_core::prefix::default_host_cache_bytes(total)) / chunk * chunk
+    };
     let host = HostLayout::new(total, available, (8 << 30).max(total / 10), cache, items)
         .context("coordinator host total overflow")?;
     ensure!(host.total_bytes > 0, "coordinator host memory is zero");

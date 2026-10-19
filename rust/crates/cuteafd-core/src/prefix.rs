@@ -20,6 +20,39 @@ pub const fn default_host_cache_bytes(total: u64) -> u64 {
     if quarter < 32 << 30 { quarter } else { 32 << 30 }
 }
 
+/// Full-context inactive KV quota, with four sequences of overage. Explicit quotas bypass it.
+pub fn host_cache_required_bytes(context: u64, concurrency: u64,
+    unit_rows: u64, page_bytes: u64, mark_bytes: u64, draft_bytes: u64, chunk: u64) -> Option<u64> {
+    if context == 0 || unit_rows == 0 || page_bytes == 0 || chunk == 0 { return None; }
+    let snapshots = concurrency.checked_add(4)?;
+    let pages = context.div_ceil(unit_rows).checked_mul(snapshots)?;
+    let mut chunks = 0u64;
+    for (count, bytes) in [(pages, page_bytes), (snapshots, mark_bytes), (snapshots, draft_bytes)] {
+        if bytes == 0 { continue; }
+        let per = chunk / bytes;
+        if per == 0 { return None; }
+        chunks = chunks.checked_add(count.div_ceil(per))?;
+    }
+    chunks.checked_mul(chunk)
+}
+
+#[cfg(test)]
+mod host_budget_tests {
+    use super::*;
+    #[test]
+    fn concurrency_default_and_small_host_cap() {
+        let required = |concurrency| host_cache_required_bytes(1 << 20, concurrency, 512, 4096, 1024, 0, 1 << 20).unwrap();
+        assert_eq!(required(1), 41 << 20);
+        assert_eq!(required(16), 161 << 20);
+        // Tail and draft are distinct size classes, each requiring its own chunk.
+        assert_eq!(host_cache_required_bytes(1, 1, 1, 1, 1, 1, 1024), Some(3072));
+        let small_host = 128 << 20;
+        assert_eq!(required(16).min(default_host_cache_bytes(small_host)), 32 << 20);
+        assert_eq!(default_host_cache_bytes(256 << 30), 32 << 30);
+        assert!(host_cache_required_bytes(u64::MAX, u64::MAX, 1, 4096, 1024, 0, 1 << 20).is_none());
+    }
+}
+
 /// Position-addressed window with enough append-only space for one uncommitted step.
 /// Snapshots retain only `window` visible rows, never speculative slack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +441,18 @@ impl<T> Radix<T> {
         self.root.collect(&mut values);
         values
     }
+    /// Values in this bank's eviction order, without changing the access clocks.
+    pub fn eviction_order(&self) -> Vec<&T> {
+        fn collect<'a, T>(node: &'a Node<T>, out: &mut Vec<(u64, &'a T)>) {
+            if let Some((clock, value)) = &node.value { out.push((*clock, value)); }
+            for child in node.children.values() { collect(child, out); }
+        }
+        let mut values = Vec::with_capacity(self.entries);
+        collect(&self.root, &mut values);
+        values.sort_unstable_by_key(|(clock, _)| *clock);
+        values.into_iter().map(|(_, value)| value).collect()
+    }
+
     /// The bound this bank was created with; zero disables retention entirely.
     pub fn limit(&self) -> usize {
         self.limit

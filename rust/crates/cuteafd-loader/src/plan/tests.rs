@@ -7,14 +7,14 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
-fn host_ledger_uses_fixed_quota_and_reports_other_owners_and_refusal() {
+fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
     use cuteafd_core::memory_layout::ItemLifetime;
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
     for (total, expected) in [(183u64, 32u64), (64, 16)] {
         let mut report = input.plan(&PlanOptions::default()).unwrap();
         let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)),
-            full_prefill_logits: true, ..Default::default() };
+            full_prefill_logits: true, context_tokens: 1 << 40, ..Default::default() };
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         let host = report.host_ledger.as_ref().unwrap();
         assert_eq!(report.host_budget_bytes, expected << 30);
@@ -30,9 +30,33 @@ fn host_ledger_uses_fixed_quota_and_reports_other_owners_and_refusal() {
         assert!(!report.fits);
         assert!(report.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
         assert!(report.hints.iter().any(|h| h.what.contains("coordinator host memory shortfall")));
+        options.host_cache_bytes = Some(40 << 30);
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert_eq!(report.host_budget_bytes, 40 << 30); // Explicit quota bypasses both caps.
         options.host_cache_bytes = Some(0);
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         assert_eq!(report.host_budget_bytes, 0);
+    }
+}
+
+#[test]
+fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&PlanOptions::default()).unwrap();
+    let geometry = &report.cache_requirements.as_ref().unwrap().target_only_layouts[0];
+    let rank = &geometry.ranks[0];
+    let (rows, page, mark) = (geometry.logical_unit_rows, rank.persistent_unit_bytes, rank.retained_mark_bytes);
+    let chunk = (256u64 << 20).max(page).max(mark);
+    for concurrency in [1, 16] {
+        let expected = cuteafd_core::prefix::host_cache_required_bytes(1 << 20, concurrency,
+            rows, page, mark.max(1), 0, chunk).unwrap().min(32 << 30);
+        for entries in [1, 2000] {
+            let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries, ..Default::default() };
+            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            assert_eq!(report.host_budget_bytes, expected);
+        }
     }
 }
 

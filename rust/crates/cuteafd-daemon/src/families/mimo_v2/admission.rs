@@ -259,7 +259,7 @@ pub(super) fn preflight(
                 page_owners: Default::default(),
             };
             prefix.with_scoring(if args.full_prefill_logits { args.prefill_rows } else { 64 },
-                args.prefill_rows, cfg.vocab_size)?.host_config(layout, args.max_context)?
+                args.prefill_rows, cfg.vocab_size)?.host_config(layout, args.max_context, concurrency)?
         }
         None => None,
     };

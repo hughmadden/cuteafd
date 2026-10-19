@@ -90,25 +90,12 @@ fn apply_cgroup(memory: &mut HostMemory, limit: &str, current: &str) -> Result<(
     Ok(())
 }
 
-/// Two retained banks plus one incoming snapshot. Count slab fragmentation
-/// separately per class, as the pinned pool does; duplicated GPU copies do
-/// not create extra logical retained entries.
-pub(super) fn retained_bytes(layout: FamilyLayout, entries: usize, max_context: usize, chunk: u64) -> Result<u64> {
-    ensure!(layout.page_rows > 0 && layout.page_bytes > 0 && max_context > 0 && chunk > 0,
-        "invalid family geometry for automatic host prefix budget");
-    let snapshots = (entries as u64).checked_mul(2).and_then(|v| v.checked_add(1))
-        .context("prefix snapshot count overflow")?;
-    let pages = (max_context as u64).div_ceil(layout.page_rows as u64).checked_mul(snapshots)
-        .context("prefix snapshot page count overflow")?;
-    let mut chunks = 0u64;
-    for (slabs, bytes) in [(pages, layout.page_bytes as u64), (snapshots, layout.mark_bytes.max(1) as u64),
-        (snapshots, layout.draft_bytes as u64)] {
-        if bytes == 0 { continue }
-        let per_chunk = chunk / bytes;
-        ensure!(per_chunk > 0, "prefix slab {bytes} exceeds pinned chunk {chunk}");
-        chunks = chunks.checked_add(slabs.div_ceil(per_chunk)).context("prefix chunk count overflow")?;
-    }
-    chunks.checked_mul(chunk).context("automatic host prefix budget overflow")
+/// Full-context KV for max concurrency plus four; independent of device retention counts.
+pub(crate) fn retained_bytes(layout: FamilyLayout, concurrency: usize, max_context: usize, chunk: u64) -> Result<u64> {
+    cuteafd_core::prefix::host_cache_required_bytes(max_context as u64, concurrency as u64,
+        layout.page_rows as u64, layout.page_bytes as u64,
+        layout.mark_bytes.max(1) as u64, layout.draft_bytes as u64, chunk)
+        .context("invalid geometry or overflow for automatic host prefix budget")
 }
 
 pub(crate) fn automatic_bytes(required: u64, chunk: u64, memory: HostMemory, _headroom: u64) -> u64 {
@@ -163,8 +150,8 @@ mod tests {
     fn auto_never_allocates_more_than_full_retention_or_a_fractional_chunk() -> Result<()> {
         let layout = FamilyLayout { page_rows: 64, pages: 100, page_bytes: 512, mark_bytes: 140,
             draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
-        // Five snapshots: 10 page slabs in five chunks; five marks in one.
-        assert_eq!(retained_bytes(layout, 2, 65, 1024)?, 6 * 1024);
+        // Six full-context snapshots: twelve pages in six chunks, six marks in one.
+        assert_eq!(retained_bytes(layout, 2, 65, 1024)?, 7 * 1024);
         let memory = HostMemory { total: 32768, available: 32000 };
         assert_eq!(automatic_bytes(6 * 1024, 1024, memory, 0), 6 * 1024);
         assert_eq!(automatic_bytes(100 * 1024, 1024, memory, 0), 8 * 1024);

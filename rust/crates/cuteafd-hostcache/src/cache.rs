@@ -881,7 +881,6 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         metrics.pages_shared += total - copied;
         metrics.store_bytes += bytes;
         self.metrics.record_store(now.saturating_sub(issued_ns));
-        self.evict_to_quota();
     }
 
     /// Release a pending store's plan, if it still holds one.
@@ -905,71 +904,25 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         self.metrics.get_mut().store_drain_timeouts += 1;
     }
 
-    /// Evict in the engine's order until the pool is at or under `quota`, dropping the payloads
-    /// of the evicted snapshots.
-    fn evict_to(&mut self, quota: u64) {
-        while self
-            .snapshots
-            .as_ref()
-            .is_some_and(|snapshots| snapshots.bytes_used() > quota)
-        {
-            if !self.evict_one() {
-                break;
-            }
+    /// Synchronous host work at store planning (deferred until device eviction in OnEvict mode),
+    /// never at copy completion.
+    fn plan_store_evicting(&mut self, meta: &SnapshotMeta,
+        device_pages: &[Vec<DevicePageId>; COMPRESSORS]) -> Option<StorePlan> {
+        let snapshots = self.snapshots.as_mut()?;
+        let started = std::time::Instant::now();
+        let (victims, freed) = snapshots.make_room(meta, device_pages);
+        if !victims.is_empty() {
+            for key in &victims { self.payloads.remove(key); }
+            let metrics = self.metrics.get_mut();
+            metrics.host_evictions += victims.len() as u64;
+            metrics.host_evicted_bytes += freed;
+            let eviction_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            metrics.host_eviction_ns += eviction_ns;
+            tracing::debug!(target: "cuteafd::hostcache", victims = victims.len(), freed_bytes = freed,
+                host_evictions = metrics.host_evictions, host_evicted_bytes = metrics.host_evicted_bytes,
+                eviction_ns, "host cache store-pressure eviction");
         }
-    }
-
-    /// Evict the next unpinned snapshot in the store's order (least recently used unless built
-    /// with `EvictionOrder::Banks`), dropping its payload; `false` when only pinned snapshots
-    /// remain. Invariant: a pinned snapshot is never evicted.
-    fn evict_one(&mut self) -> bool {
-        let Some(snapshots) = self.snapshots.as_mut() else {
-            return false;
-        };
-        let Some((key, freed)) = snapshots.evict_one() else {
-            return false;
-        };
-        self.payloads.remove(&key);
-        let metrics = self.metrics.get_mut();
-        metrics.host_evictions += 1;
-        metrics.host_evicted_bytes += freed;
-        true
-    }
-
-    /// The quota a commit evicts to: the configured quota exactly. The pool guarantees
-    /// `bytes_used <= config.bytes`, so this is the LRU trim for a full pool; class-level
-    /// exhaustion is handled by the retry loop in `plan_store_evicting`.
-    fn evict_to_quota(&mut self) {
-        self.evict_to(self.config.bytes);
-    }
-
-    /// Plan a store, evicting the next unpinned snapshot (`evict_one`) on `PoolExhausted` and
-    /// retrying, bounded by the resident snapshot count. `None` when every unpinned snapshot has
-    /// been evicted and a class is still exhausted.
-    fn plan_store_evicting(
-        &mut self,
-        meta: &SnapshotMeta,
-        device_pages: &[Vec<DevicePageId>; COMPRESSORS],
-    ) -> Option<StorePlan> {
-        let mut attempts = self.snapshots.as_ref().map_or(0, Snapshots::len);
-        let mut pending_meta = Some(meta.clone());
-        loop {
-            let result = self
-                .snapshots
-                .as_mut()?
-                .plan_store(pending_meta.take()?, device_pages);
-            match result {
-                Ok(plan) => return Some(plan),
-                Err(_) if attempts > 0 => {
-                    attempts -= 1;
-                    if !self.evict_one() {
-                        return None;
-                    }
-                    pending_meta = Some(meta.clone());
-                }
-                Err(_) => return None,
-            }
-        }
+        snapshots.plan_store(meta.clone(), device_pages).ok()
     }
 
     /// Plan and issue a store's copies, evicting unpinned snapshots if a class is exhausted.

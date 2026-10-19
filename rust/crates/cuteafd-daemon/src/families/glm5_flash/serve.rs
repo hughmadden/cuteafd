@@ -667,7 +667,7 @@ mod media_tests {
 /// its marks in pool units or in the mark arena `arena`, sized by its rule over the engine's own
 /// marks: the `engine.mark_slots` the KV admission reserved ([`super::prefix::ArenaMarks::slots_on`]).
 fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, arena): (PrefixMarks,
-    super::prefix::ArenaMarks)) -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    super::prefix::ArenaMarks), concurrency: usize) -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
         engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
@@ -678,13 +678,13 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, a
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
     // and marks on both GPUs, so it keeps device-resident snapshots only.
     let host = if engine.ranks() > 1 {
-        if args.host_cache_bytes.enabled() && entries > 0 {
+        if args.host_cache_bytes.enabled() && args.prefix_cache_entries > 0 {
             tracing::warn!("GLM 5.3 Flash head split: the prefix cache's host tier is off (device-resident snapshots only)");
         }
         None
     } else {
         let template = engine.paged_buffers().first().map(|b| b.records).context("GLM 5.3 Flash has no MLA layer")?;
-        args.host_tier(engine.library, template, family.layout(), engine.max_context)?
+        args.host_tier(engine.library, template, family.layout(), engine.max_context, concurrency)?
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
@@ -878,7 +878,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce())
     -> Result<()> {
-    let (family, mut cache) = prefix_cache(engine, prefix, marks)?;
+    let (family, mut cache) = prefix_cache(engine, prefix, marks, max_sequences)?;
     // Made before the KV pool when start-up admitted it from measured memory.
     let mut selector = match engine.take_selector() {
         Some(selector) => selector,
