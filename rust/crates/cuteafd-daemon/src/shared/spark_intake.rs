@@ -126,7 +126,12 @@ impl IntakeChoice {
 pub(crate) fn probe_gpu_landing(library: &NativeLibrary) -> Result<GpuLandingProbe> {
     ensure!(!std::env::var("CUTEAFD_GPU_LANDING_PROBE").is_ok_and(|v| v == "unavailable"),
         "GPU landing probe forced unavailable");
-    cuteafd_transport::gpu_landing_probe(library, None, 64 << 20, 8)
+    let probe = cuteafd_transport::gpu_landing_probe(library, None, 64 << 20, 8)?;
+    let link = landing_pcie_link(library);
+    tracing::info!(cuda_device = probe.cuda_device, gpu_gbps = probe.gpu_gbps,
+        host_gbps = probe.host_gbps, pcie_generation = ?link.as_ref().and_then(|link| link.generation),
+        pcie_width = ?link.as_ref().and_then(|link| link.width), usable = probe.usable(), "GPU landing probe");
+    Ok(probe)
 }
 
 fn device_choice_available(choice: &IntakeChoice) -> bool {
