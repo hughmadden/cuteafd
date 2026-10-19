@@ -1040,8 +1040,10 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
     let pages = if cache.placement == KvPlacement::Replicated { &cache.ranks[..1] } else { &cache.ranks[..] };
     let page_bytes = pages.iter().try_fold(0u64, |n, r| n.checked_add(r.persistent_unit_bytes))
         .context("host cache pages overflow")?;
-    // Even replicated pages have distinct per-owner recurrent/window marks.
-    let mut mark_bytes = cache.ranks.iter().try_fold(0u64, |n, r| n.checked_add(r.retained_mark_bytes))
+    // V4 stores the lead's complete mark once, then publishes its backbone prefix
+    // to the peer. Other families retain distinct per-owner positional state.
+    let marks = if id == "deepseek_v4" { &cache.ranks[..1] } else { &cache.ranks[..] };
+    let mut mark_bytes = marks.iter().try_fold(0u64, |n, r| n.checked_add(r.retained_mark_bytes))
         .context("host cache marks overflow")?;
     if id == "deepseek_v41" && shape.native_layers > 0 {
         ensure!(shape.native_layers == 3, "V4.1 dSpark retains all three stages");

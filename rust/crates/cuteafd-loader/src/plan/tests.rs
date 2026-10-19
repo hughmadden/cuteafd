@@ -3558,6 +3558,10 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
         if id == "deepseek_v41" && settings.get("SPECULATOR").is_some_and(|v| v == "dspark") {
             geometry.ranks[0].retained_mark_bytes += 3 * 128 * 528;
         }
+        // Host snapshots store one complete logical page, not the sum of physical
+        // Context records (which include a C128 replica on each peer).
+        let host_pages = if geometry.placement == KvPlacement::Replicated { &geometry.ranks[..1] } else { &geometry.ranks[..] };
+        let host_page_bytes = host_pages.iter().map(|r| r.persistent_unit_bytes).sum();
         if id == "deepseek_v4" && ranks == 2 && attention == AttentionPlacement::Context {
             let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, stages)?;
             let units: u64 = cfg.compress_ratios.iter().map(|&ratio| {
@@ -3576,13 +3580,13 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
         let gain = geometry.ranks.iter().filter(|r| r.persistent_unit_bytes > 0)
             .map(|r| (old_slots - new_slots) * r.retained_mark_bytes / (r.persistent_unit_bytes + r.pool_metadata_unit_bytes))
             .min().unwrap_or(0) * geometry.logical_unit_rows;
-        let pages = if geometry.placement == KvPlacement::Replicated { &geometry.ranks[..1] } else { &geometry.ranks[..] };
+        let host_mark = if id == "deepseek_v4" { geometry.ranks[0].retained_mark_bytes } else { mark };
         let host = HostCacheGeometry { unit_rows: geometry.logical_unit_rows,
-            page_bytes: pages.iter().map(|r| r.persistent_unit_bytes).sum(), mark_bytes: mark, draft_bytes: 0 };
+            page_bytes: host_page_bytes, mark_bytes: host_mark, draft_bytes: 0 };
         let chunk = host.chunk_bytes();
         let packed = |n: u64, context: u64, marks: u64| -> u64 {
             let pages = context.div_ceil(host.unit_rows) * n;
-            [(pages, host.page_bytes), (n * marks, mark.max(1))].into_iter()
+            [(pages, host.page_bytes), (n * marks, host_mark.max(1))].into_iter()
                 .map(|(count, size)| count.div_ceil(chunk / size) * chunk).sum()
         };
         let old_quota = packed(concurrency + 4, context, 1).min(32 << 30) / chunk * chunk;
