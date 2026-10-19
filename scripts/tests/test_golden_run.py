@@ -626,8 +626,19 @@ def test_run_timeout_tears_down_workers(spark_env, monkeypatch):
 
 def test_sigterm_tears_down_workers_and_releases_locks(spark_env, monkeypatch):
     import threading
+    import time
     monkeypatch.setenv('STUB_RUN_SLEEP', '30')
-    threading.Timer(1.5, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+    # Signal once the coordinator container exists (under load a fixed delay can
+    # fire before the workers start, which tests nothing).
+    def signal_when_running():
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if spark_env['state'].exists() and any(
+                    n.get('name') == 'golden-gr-a' for n in json.loads(spark_env['state'].read_text() or '{}').values()):
+                break
+            time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGTERM)
+    threading.Thread(target=signal_when_running, daemon=True).start()
     assert golden.main(spark_argv(spark_env)) == 130
     assert json.loads(spark_env['state'].read_text()) == {}
     for name in ('sparks', 'gpu1', 'rhea', 'moa'):
