@@ -117,6 +117,17 @@ def fixed_fp8_rows(function):
     return linear
 
 
+def decoder_config(payload):
+    """The release stores expert quantization beside text_config, not inside it."""
+    text = dict(payload["text_config"])
+    if "quantization_config" in payload:
+        quantization = payload["quantization_config"]
+        if "quantization_config" in text and text["quantization_config"] != quantization:
+            raise ValueError("conflicting Step-5 expert quantization metadata")
+        text["quantization_config"] = quantization
+    return text
+
+
 def validate_config(config, fp8_diagnostic=False):
     expected = list(range(3, 88)) if fp8_diagnostic else []
     quantized = [i for i in config.moe_layer_list if config.is_fp8_expert_layer(i)]
@@ -446,8 +457,8 @@ def main():
         parser.error("reference manifest checkpoint differs from selected mode")
     args.runtime_source = verify_runtime_source()
     ref, kernel = load_release(args.snapshot, args.fp8_diagnostic)
-    payload = json.loads((args.snapshot / "config.json").read_text())["text_config"]
-    config = ref.Step5Config(**payload)
+    payload = json.loads((args.snapshot / "config.json").read_text())
+    config = ref.Step5Config(**decoder_config(payload))
     validate_config(config, args.fp8_diagnostic)
     if args.check_only:
         print(json.dumps(dict(snapshot_identity=identity,
