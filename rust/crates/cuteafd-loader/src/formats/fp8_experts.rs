@@ -346,7 +346,8 @@ impl Fp8ExpertTensors {
 
     pub fn exact_slicing(&self, tp: usize) -> Slicing {
         if self.placement == cuteafd_core::tp_units::TpPlacement::Balanced
-            && self.format == ExpertFormat::Mxfp4 && tp == 6 { Slicing::Blocks(32) }
+            && self.format == ExpertFormat::Mxfp4 && matches!(tp, 3 | 6)
+            && self.shape.intermediate / 128 % tp != 0 { Slicing::Blocks(32) }
         else { Slicing::Blocks(128) }
     }
 
@@ -1308,43 +1309,55 @@ mod tests {
                 .write_all_at(&bytes, located.offset)?;
         }
         let slicing = Slicing::Blocks(32);
-        for layer in [0, 3, 40, 77] {
-            tensors.slice_layer = layer;
-            for expert in 0..shape.experts {
-                for projection in Fp8Projection::ALL {
-                    let (w, s) = tensors.projection_bytes(projection);
-                    let mut weights = vec![0; w];
-                    let mut scales = vec![0; s];
-                    tensors.read_projection_once(0, expert, projection, &mut weights, &mut scales)?;
-                    let mut reconstructed = [vec![0; w], vec![0; s]];
-                    for rank in 0..6 {
-                        let sizes = tensors.slice_bytes_with(projection, 6, rank, slicing)?;
-                        let mut weight = vec![0; sizes.0];
-                        let mut scale = vec![0; sizes.1];
-                        tensors.read_slice_with(0, expert, projection, 6, rank, slicing,
-                            &mut weight, &mut scale, &mut Vec::new())?;
-                        let windows = tensors.projection_slices(projection, 6, rank, slicing)?;
-                        if projection == Fp8Projection::Down {
-                            assert_eq!(windows[1].destination_pitch, 12);
-                            assert_eq!(scale.len(), 256 * 12);
-                        }
-                        for (index, (window, actual, source)) in windows.into_iter()
-                            .zip([weight, scale]).zip([&weights, &scales])
-                            .map(|((window, actual), source)| (window, actual, source)).enumerate() {
-                            for row in 0..window.rows {
-                                let src = window.source_offset + row * window.source_pitch;
-                                let dst = row * window.destination_pitch;
-                                assert_eq!(&actual[dst..dst + window.width], &source[src..src + window.width]);
-                                assert!(actual[dst + window.width..dst + window.destination_pitch].iter().all(|&b| b == 0));
-                                reconstructed[index][src..src + window.width].copy_from_slice(&actual[dst..dst + window.width]);
+        for (tp, scale_pitch) in [(3, 24), (6, 12)] {
+            assert_eq!(tensors.exact_slicing(tp), slicing);
+            for layer in [0, 3, 40, 77] {
+                tensors.slice_layer = layer;
+                for expert in 0..shape.experts {
+                    for projection in Fp8Projection::ALL {
+                        let (w, s) = tensors.projection_bytes(projection);
+                        let mut weights = vec![0; w];
+                        let mut scales = vec![0; s];
+                        tensors.read_projection_once(0, expert, projection, &mut weights, &mut scales)?;
+                        let mut reconstructed = [vec![0; w], vec![0; s]];
+                        for rank in 0..tp {
+                            let sizes = tensors.slice_bytes_with(projection, tp, rank, slicing)?;
+                            let mut weight = vec![0; sizes.0];
+                            let mut scale = vec![0; sizes.1];
+                            tensors.read_slice_with(0, expert, projection, tp, rank, slicing,
+                                &mut weight, &mut scale, &mut Vec::new())?;
+                            let windows = tensors.projection_slices(projection, tp, rank, slicing)?;
+                            if projection == Fp8Projection::Down {
+                                assert_eq!(windows[1].destination_pitch, scale_pitch);
+                                assert_eq!(scale.len(), 256 * scale_pitch);
+                            }
+                            for (index, (window, actual, source)) in windows.into_iter()
+                                .zip([weight, scale]).zip([&weights, &scales])
+                                .map(|((window, actual), source)| (window, actual, source)).enumerate() {
+                                for row in 0..window.rows {
+                                    let src = window.source_offset + row * window.source_pitch;
+                                    let dst = row * window.destination_pitch;
+                                    assert_eq!(&actual[dst..dst + window.width], &source[src..src + window.width]);
+                                    assert!(actual[dst + window.width..dst + window.destination_pitch].iter().all(|&b| b == 0));
+                                    reconstructed[index][src..src + window.width].copy_from_slice(&actual[dst..dst + window.width]);
+                                }
                             }
                         }
+                        assert_eq!(reconstructed, [weights, scales]);
                     }
-                    assert_eq!(reconstructed, [weights, scales]);
                 }
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn exact_even_mxfp4_preserves_h128_slicing() {
+        let mut tensors = catalog(ExpertFormat::Mxfp4, 2304);
+        tensors.placement = cuteafd_core::tp_units::TpPlacement::Balanced;
+        for tp in [3, 6] {
+            assert_eq!(tensors.exact_slicing(tp), Slicing::Blocks(128));
+        }
     }
 
     #[test]

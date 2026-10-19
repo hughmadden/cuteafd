@@ -228,14 +228,14 @@ pub fn spark_recipe_with_placement(package: &str, intermediate: usize, world: us
         else if native { matches!(world, 2 | 3 | 4 | 6) }
         else if exl3 { matches!(world, 2 | 3 | 4 | 6) || (family == "qwen4" && world == 1) }
         else if nvfp4 { matches!(world, 2 | 3 | 4 | 6) || (family == "glmf" && world == 5) }
-        else if mxfp4 { if family == "mimof" { matches!(world, 2 | 4) } else { matches!(world, 2 | 6) } }
+        else if mxfp4 { if family == "mimof" { matches!(world, 2 | 3 | 4) } else { matches!(world, 2 | 6) } }
         else { matches!(world, 2 | 4 | 6) && (intermediate % (128 * world) == 0 || world == 6) };
     if !packaged {
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
     }
     let exact = exl3 || (!native && intermediate % 128 == 0 && intermediate / 128 >= world);
     let balanced = placement == cuteafd_core::tp_units::TpPlacement::Balanced;
-    let fine = balanced && mxfp4 && !native && world == 6 && intermediate / 128 % world != 0;
+    let fine = balanced && mxfp4 && !native && matches!(world, 3 | 6) && intermediate / 128 % world != 0;
     // Compact GLM K4/K5 is executable for qualification, not a default change.
     let compact = balanced && family == "glm" && format == "exl3-k45"
         && world == 6 && intermediate / 128 % world != 0;
@@ -299,6 +299,31 @@ mod tests {
         for (package, world) in [("glmf:exl3-k4", 6), ("step5:fp8", 6)] {
             assert!(matches!(spark_recipe_with_placement(package, 2048, world, TpPlacement::Balanced),
                 Err(SparkRecipeRefusal::UnsupportedPlacement { .. })));
+        }
+    }
+
+    #[test]
+    fn balanced_mimo_flash_tp3_rotates_exact_k32_widths() {
+        use cuteafd_core::tp_units::{TpPlacement, UnitRule};
+        let recipe = spark_recipe_with_placement("mimof:fp8", 2048, 3, TpPlacement::Balanced).unwrap();
+        assert_eq!(recipe.slicing, crate::formats::fp8_experts::Slicing::Blocks(32));
+        assert_eq!(recipe.rule, UnitRule::LayerRotation);
+        assert_eq!(recipe.widths, [704, 672, 672]);
+        assert_eq!(recipe.required_layouts, ["tp3-w704", "tp3-w672"]);
+        for layer in [0, 1, 2, 40, 77] {
+            let widths = (0..3).map(|rank| recipe.width_for_layer(rank, layer).unwrap()).collect::<Vec<_>>();
+            assert_eq!(widths.iter().sum::<usize>(), 2048);
+            for rank in 0..3 { assert_eq!(widths[(rank + layer) % 3], recipe.widths[rank]); }
+        }
+        for rank in 0..3 {
+            assert_eq!((0..3).map(|layer| recipe.width_for_layer(rank, layer).unwrap()).sum::<usize>(), 2048);
+        }
+        let legacy = spark_recipe_with_placement("mimof:fp8", 2048, 3, TpPlacement::RoundRobin).unwrap();
+        assert_eq!(legacy.widths, [768, 640, 640]);
+        assert_eq!(legacy.required_layouts, ["tp3-w768", "tp3-w640"]);
+        for world in [2, 4] {
+            assert_eq!(spark_recipe_with_placement("mimof:fp8", 2048, world, TpPlacement::Balanced).unwrap(),
+                spark_recipe_with_placement("mimof:fp8", 2048, world, TpPlacement::RoundRobin).unwrap());
         }
     }
 
@@ -507,7 +532,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(spark_worlds("mimof:fp8", 2048), [2, 4]);
+        assert_eq!(spark_worlds("mimof:fp8", 2048), [2, 3, 4]);
         assert_eq!(spark_worlds("mimop:fp8", 2048), [2, 6]);
         assert_eq!(spark_worlds("qwen4:exl3-k45", 640), [1, 2, 3, 4]);
         assert_eq!(spark_worlds("qwen4:nvfp4", 640), [2, 3, 4, 6]);
