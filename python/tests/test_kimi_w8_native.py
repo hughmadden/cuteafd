@@ -92,8 +92,9 @@ def inputs(rows, candidates, case):
 
 
 @pytest.mark.parametrize("intermediate", [3072, 6144, 16896, 33792])
+@pytest.mark.parametrize("compensation", ["direct", "compensated", "gate_up_only", "down_only"])
 @torch.no_grad()
-def test_ffn_chain_official_fp64(intermediate):
+def test_ffn_chain_official_fp64(intermediate, compensation):
     from b12x.integration.cuteafd import kimi_residual, pointwise
     # The full-width projections use the production hidden size; M16 bounds
     # FP64 work while exercising a genuine batched dense/shared FFN chain.
@@ -106,13 +107,28 @@ def test_ffn_chain_official_fp64(intermediate):
     for parameter in mlp.parameters():
         parameter.copy_((torch.randn(parameter.shape, generator=g) * 0.01).bfloat16().cuda())
     baseline = mlp(x)
+    if os.environ.get("CUTEAFD_KIMI_W8_PROFILE_OFFICIAL") == "1":
+        torch.cuda.synchronize()
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                               torch.profiler.ProfilerActivity.CUDA]) as profile:
+            mlp(x)
+        torch.cuda.synchronize()
+        kernels = sorted({event.name for event in profile.events()
+                          if event.device_type == torch.autograd.DeviceType.CUDA})
+        print(json.dumps(dict(official_projection_profile=dict(
+            intermediate=intermediate, rows=rows, hidden=hidden, kernels=kernels,
+            torch_version=torch.__version__, cuda_version=torch.version.cuda,
+            allow_bf16_reduced_precision_reduction=
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction))))
     packed = torch.cat((mlp.gate_proj.weight, mlp.up_proj.weight), 0)
     projected = torch.empty(rows, 2 * intermediate, dtype=torch.bfloat16, device="cuda")
     activated = torch.empty(rows, intermediate, dtype=torch.bfloat16, device="cuda")
     out = torch.empty_like(x)
-    gate_up = pointwise.compile_bf16_projection_aot(width=hidden, outputs=2 * intermediate)
+    gate_up_options = {"compensated": True} if compensation in ("compensated", "gate_up_only") else {}
+    down_options = {"compensated": True} if compensation in ("compensated", "down_only") else {}
+    gate_up = pointwise.compile_bf16_projection_aot(width=hidden, outputs=2 * intermediate, **gate_up_options)
     activation = kimi_residual.compile_kimi_situ_aot(intermediate)
-    down = pointwise.compile_bf16_projection_aot(width=intermediate, outputs=hidden)
+    down = pointwise.compile_bf16_projection_aot(width=intermediate, outputs=hidden, **down_options)
     gate_up.launch(x, packed, projected, scalars=(rows,))
     activation.launch(projected, activated, scalars=(rows,))
     down.launch(activated, mlp.down_proj.weight, out, scalars=(rows,))
