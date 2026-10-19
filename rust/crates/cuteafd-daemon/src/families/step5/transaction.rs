@@ -254,9 +254,12 @@ pub(super) struct Step<'e, 'a, E: CopyEngine> {
 }
 
 impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
+    pub(super) fn rows(&self) -> usize { self.rows }
+
     pub fn validate_binding(&self, ranks: &[&RefCell<CacheRank<'a>>],
         stages: &[&Staging<'a>], rows: usize) -> Result<()> {
-        ensure!(!self.failed && self.rows == rows && ranks.len() == self.ranks.len()
+        validate_active_rows(self.rows, rows)?;
+        ensure!(!self.failed && ranks.len() == self.ranks.len()
             && stages.len() == self.staging.len()
             && self.ranks.iter().zip(ranks).all(|(actual, expected)| std::ptr::eq(*actual, *expected))
             && self.staging.iter().zip(stages).all(|(actual, expected)| std::ptr::eq(*actual, *expected)),
@@ -759,6 +762,11 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
     }
 }
 
+pub(super) fn validate_active_rows(rows: usize, capacity: usize) -> Result<()> {
+    ensure!(rows > 0 && rows <= capacity, "Step-5 active rows outside admitted capacity");
+    Ok(())
+}
+
 struct SubmissionMode(Rc<Cell<bool>>);
 impl SubmissionMode {
     fn enter(active: Rc<Cell<bool>>) -> Result<Self> {
@@ -831,6 +839,17 @@ pub(super) mod tests {
     use super::*;
     use cuteafd_engine::prefix::{BoxError, PrefixConfig, PrefixFamily};
     use cuteafd_hostcache::copy::StubCopyEngine;
+
+    #[test]
+    fn active_rows_do_not_require_a_full_admitted_bucket() {
+        for capacity in [1, 16, 64, 640, 4096] {
+            for rows in 1..=capacity { validate_active_rows(rows, capacity).unwrap(); }
+            for rows in [0, capacity + 1, usize::MAX] {
+                assert!(validate_active_rows(rows, capacity).is_err());
+            }
+        }
+        assert!(validate_active_rows(1, 0).is_err());
+    }
 
     #[test]
     fn submission_mode_resets_on_success_error_and_unwind_without_nested_reset() {

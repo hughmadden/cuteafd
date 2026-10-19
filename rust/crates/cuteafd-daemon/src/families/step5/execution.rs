@@ -389,7 +389,7 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
         pair::submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
             step.in_submission(scope, |step| {
                 step.compose(0, input, |_, _| Ok(()))?;
-                attention::replicate_terminal(&self.peer, input.buffer, self.layer(1, 0)?.input(), self.rows * H * 4)?;
+                attention::replicate_terminal(&self.peer, input.buffer, self.layer(1, 0)?.input(), step.rows() * H * 4)?;
                 let mut binding = Bindings { execution: self, step, scope,
                     current: [None, Some(self.layer(1, 0)?.input())], input: input.buffer,
                     request: super::golden::request, layer: 0, diagnostic: Some(directory) };
@@ -515,7 +515,7 @@ impl<'e, 'a> Execution<'e, 'a> {
             lane.validate_replications()?;
             ensure!(!input.buffer.ptr.is_null()
                 && input.buffer.device_id == lane.peer.device(lane.ownership.execution().spec().entry_gpu as usize)
-                && input.buffer.bytes >= lane.rows * H * 4, "Step-5 live input allocation");
+                && input.buffer.bytes >= step.rows() * H * 4, "Step-5 live input allocation");
         }
         pair::submit_scoped(|| collect_lane_results(lanes.iter().map(|lane| lane.peer.require_live())),
             || shutdown_lanes(&lanes), |scope| Step::in_submissions(scope, steps, |steps| {
@@ -526,7 +526,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                             input: input.buffer, request, layer: 0, diagnostic: None })
                     }).collect::<Result<Vec<_>>>()?;
                 let exchanges: Vec<_> = lanes.iter().map(|lane| (&lane.peer, &lane.hops)).collect();
-                let rows: Vec<_> = lanes.iter().map(|lane| lane.rows).collect();
+                let rows: Vec<_> = bindings.iter().map(|binding| binding.step.rows()).collect();
                 attention::layer_pipeline_selected(scope, lanes[0].ownership.execution(), &exchanges,
                     selected, LaneOrder::Independent, &rows, &mut bindings)?;
                 collect_lane_results(lanes.iter().flat_map(|lane| lane.stages.iter())
@@ -568,7 +568,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
     fn copy(&mut self, rank: usize, destination: CuteafdDeviceBuffer, source: CuteafdDeviceBuffer) -> Result<()> {
         ensure!(destination.device_id == self.execution.peer.device(rank)
             && source.device_id == destination.device_id && !source.ptr.is_null() && !destination.ptr.is_null()
-            && source.bytes >= self.execution.rows * H * 4 && destination.bytes >= self.execution.rows * H * 4,
+            && source.bytes >= self.step.rows() * H * 4 && destination.bytes >= self.step.rows() * H * 4,
             "Step-5 residual copy live rank extent");
         if source.ptr == destination.ptr { return Ok(()); }
         self.step.compose(rank, self.execution, |_, meta| meta.stream.device.run(|| {
@@ -598,7 +598,7 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
         ensure!(matches!(hop.at, HopPoint::Entry | HopPoint::BeforeLayer(_) | HopPoint::Exit),
             "Step-5 whole native FFN never broadcasts after attention");
         self.current[hop.to as usize] = Some(CuteafdDeviceBuffer { ptr: residual,
-            bytes: self.execution.rows * H * 4, device_id: self.execution.peer.device(hop.to as usize), flags: 0 });
+            bytes: self.step.rows() * H * 4, device_id: self.execution.peer.device(hop.to as usize), flags: 0 });
         Ok(())
     }
     fn heads(&mut self, layer: usize) -> Result<()> {
@@ -612,14 +612,14 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
                 let (owner, _) = self.execution.diagnostic_layer0(rank)?;
                 let device = self.execution.caches[rank].borrow().stream.device;
                 super::golden::dump_plane(directory, &format!("rank{rank}-attention_input"), device,
-                    owner.diagnostic_norm(), self.execution.rows, true)?;
+                    owner.diagnostic_norm(), self.step.rows(), true)?;
                 super::golden::dump_plane(directory, &format!("rank{rank}-o_partial"), device,
-                    owner.projection_partial()?, self.execution.rows, false)?;
+                    owner.projection_partial()?, self.step.rows(), false)?;
             }
         }
         let execution = self.execution;
         attention::head_partials(self.scope, &execution.peer, &mut execution.sequence.borrow_mut(),
-            execution.rows * H, HeadPrecision::F32, self)
+            self.step.rows() * H, HeadPrecision::F32, self)
     }
     fn context(&mut self, _layer: usize, _ordinal: usize) -> Result<()> {
         anyhow::bail!("Step-5 context split has no qualified binding")
@@ -658,7 +658,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                     })?;
                     if dispatch {
                         ensure!(wave.is_none(), "Step-5 duplicate routed Spark wave");
-                        let layout = RouteStaging::new(execution.rows, 8, H * 2)?;
+                        let layout = RouteStaging::new(self.step.rows(), 8, H * 2)?;
                         let host = execution.pinned[rank].borrow();
                         self.step.compose(rank, ffn, |ffn, meta| {
                             meta.stream.device.run(|| {
@@ -672,7 +672,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         let routes = layout.routes(host.bytes())?;
                         let wire = bytes::Bytes::copy_from_slice(layout.wire(host.bytes())?);
                         let request = self.request;
-                        let rows = execution.rows;
+                        let rows = self.step.rows();
                         let mut lane = execution.lanes[rank].borrow_mut();
                         let lane = lane.as_mut().context("Step-5 routed wave lane missing")?;
                         let device = lane.device;
@@ -680,7 +680,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         let next = ordinal.checked_add(1).context("Step-5 request sequence exhausted")?;
                         let identity = request_identity(execution.id, ordinal)?;
                         execution.requests.set(next);
-                        device.run(|| lane.get_mut().submit(execution.rows, Box::new(move || {
+                        device.run(|| lane.get_mut().submit(self.step.rows(), Box::new(move || {
                             let mut wave = request(layer, rows, routes, wire)?;
                             wave.header.request_id = identity;
                             Ok(wave)
@@ -716,7 +716,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
             let Ffn::Routed(destination) = &execution.layer(1 - rank, layer)?.ffn else { anyhow::bail!("Step-5 routed replica missing"); };
             let binding = execution.ownership.routed_replications(execution.id)?[layer].context("Step-5 routed publication binding")?;
             attention::replicate_result(self.scope, &execution.peer, rank, binding.slot,
-                ffn.routed_output(), destination.routed_output(), execution.rows * H * 2)?;
+                ffn.routed_output(), destination.routed_output(), self.step.rows() * H * 2)?;
             for at in 0..2 {
                 let Ffn::Routed(ffn) = &execution.layer(at, layer)?.ffn else { anyhow::bail!("Step-5 native routed join missing"); };
                 self.step.compose(at, ffn, |ffn, meta| ffn.finish_on(meta.rows, meta.stream))?;
