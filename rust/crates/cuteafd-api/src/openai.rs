@@ -51,6 +51,7 @@ pub enum ModelEncoding {
     Glm(Arc<glm5::GlmEncoding>),
     /// Qwen 3.8 Flash Next: the checkpoint's chat template and Qwen3-Coder XML tool calls.
     Qwen(Arc<qwen4::QwenEncoding>),
+    Step5(Arc<step5::Step5Encoding>),
 }
 
 impl ModelEncoding {
@@ -60,6 +61,7 @@ impl ModelEncoding {
             Self::DeepseekV4 | Self::DeepseekV41 => vec![DEEPSEEK_EOS_TOKEN_ID],
             Self::Glm(encoding) => encoding.tokens().eos.clone(),
             Self::Qwen(encoding) => encoding.tokens().eos.clone(),
+            Self::Step5(encoding) => encoding.tokens().eos.clone(),
         }
     }
 
@@ -68,6 +70,7 @@ impl ModelEncoding {
             Self::DeepseekV4 | Self::DeepseekV41 => DEEPSEEK_THINK_CLOSE_TOKEN_ID,
             Self::Glm(encoding) => encoding.tokens().think_close,
             Self::Qwen(encoding) => encoding.tokens().think_close,
+            Self::Step5(encoding) => encoding.tokens().think_close,
         }
     }
 }
@@ -179,10 +182,11 @@ impl ModelProfile {
     /// Token ids that end generation for one request.
     fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
         match &self.encoding {
-            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) => {
+            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) => {
                 let mut ids = match &self.encoding {
                     ModelEncoding::Glm(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Qwen(encoding) => encoding.stop_token_ids(tools_declared),
+                    ModelEncoding::Step5(encoding) => encoding.stop_token_ids(tools_declared),
                     _ => unreachable!(),
                 };
                 ids.extend(&self.eos_token_ids);
@@ -207,7 +211,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{deepseek, glm5, qwen4};
+use chat::{deepseek, glm5, qwen4, step5};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -542,6 +546,7 @@ type ChatChunks = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk,
 enum Templated {
     Glm(Arc<glm5::GlmEncoding>),
     Qwen(Arc<qwen4::QwenEncoding>),
+    Step5(Arc<step5::Step5Encoding>),
 }
 
 impl Templated {
@@ -552,6 +557,10 @@ impl Templated {
         match self {
             Self::Glm(encoding) => glm5::resolve_glm_thinking(body, encoding.thinking_off()),
             Self::Qwen(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
+            Self::Step5(_) => {
+                step5::prompt::validate_thinking(body)?;
+                Ok(glm5::GlmThinking { enabled: true, effort: None })
+            }
         }
     }
 }
@@ -561,6 +570,7 @@ enum OutputProcessor {
     Deepseek(glm5::GlmStreamProcessor<ChatGenerator, deepseek::parser::DeepseekOutputParser>),
     Glm(glm5::GlmStreamProcessor<ChatGenerator>),
     Qwen(glm5::GlmStreamProcessor<ChatGenerator, qwen4::QwenOutputParser>),
+    Step5(glm5::GlmStreamProcessor<ChatGenerator, step5::Step5OutputParser>),
 }
 
 impl OutputProcessor {
@@ -569,6 +579,7 @@ impl OutputProcessor {
             Self::Deepseek(processor) => Box::pin(processor.process(input)),
             Self::Glm(processor) => Box::pin(processor.process(input)),
             Self::Qwen(processor) => Box::pin(processor.process(input)),
+            Self::Step5(processor) => Box::pin(processor.process(input)),
         }
     }
 }
@@ -702,6 +713,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let glm = match &profile.encoding {
         ModelEncoding::Glm(encoding) => Some(Templated::Glm(encoding.clone())),
         ModelEncoding::Qwen(encoding) => Some(Templated::Qwen(encoding.clone())),
+        ModelEncoding::Step5(encoding) => Some(Templated::Step5(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -810,7 +822,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let response_validator = constraints::response_validator(response_format.as_ref()).map_err(Rejection::bad)?;
     let syntax = match &glm_request {
         Some((Templated::Glm(_), _, _)) => tools::ToolSyntax::GlmXml,
-        Some((Templated::Qwen(_), _, _)) => tools::ToolSyntax::QwenXml,
+        Some((Templated::Qwen(_), _, _)) | Some((Templated::Step5(_), _, _)) => tools::ToolSyntax::QwenXml,
         None => tools::ToolSyntax::Dsml,
     };
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
@@ -846,6 +858,23 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
             (prompt, Vec::new(), OutputProcessor::Glm(glm5::GlmStreamProcessor::new(generator, parser)))
+        }
+        Some((Templated::Step5(encoding), raw, _thinking)) => {
+            let tool_choice = match (selection.name(), selection.required) {
+                (Some(name), _) => step5::Step5ToolChoice::Named(name.to_owned()),
+                (None, true) => step5::Step5ToolChoice::Required,
+                (None, false) => step5::Step5ToolChoice::Auto,
+            };
+            let options = step5::Step5PromptOptions {
+                tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
+                tool_choice, response_format };
+            let prompt = if expanded_media_probe { String::new() } else {
+                encoding.render(&raw, &options).map_err(Rejection::bad)?
+            };
+            let parser = step5::Step5OutputParser::new(step5::Step5ParserOptions {
+                tools: tools_declared.then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+            (prompt, Vec::new(), OutputProcessor::Step5(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Qwen(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
@@ -1493,6 +1522,63 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE);
         }
     }
+    #[tokio::test]
+    async fn step5_rejects_unsupported_thinking_off_before_admission() {
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let profile = ModelProfile::new("step5-test", ModelEncoding::Step5(Arc::new(step5::fixtures::encoding())));
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+        let body = json!({"model": "step5-test", "messages": [{"role": "user", "content": "Hi"}],
+            "enable_thinking": false, "max_tokens": 8});
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn step5_dispatch_uses_own_prompt_stops_and_reasoning_parser() {
+        for streaming in [false, true] {
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                assert!(job.prompt.starts_with(step5::BOS));
+                assert!(job.prompt.ends_with("<|im_start|>assistant\n<think>"));
+                assert!(job.stop_token_ids.contains(&128_007));
+                assert!(job.stop_token_ids.contains(&128_008));
+                assert!(!job.stop_token_ids.contains(&248_046));
+                for event in [
+                    InferenceChunk::Ready { system_fingerprint: None,
+                        prompt_usage: PromptUsage { prompt_tokens: 12, prompt_cache_hit_tokens: 0 } },
+                    InferenceChunk::Text { content: "Plan</think>Answer".into(), content_tokens: 4 },
+                    InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop },
+                ] { job.events.send(Ok(event)).unwrap(); }
+            });
+            let profile = ModelProfile::new("step5-test", ModelEncoding::Step5(Arc::new(step5::fixtures::encoding())));
+            assert_eq!(engine::system_placement(&profile), engine::SystemPlacement::Anywhere);
+            assert!(!profile.capabilities.vision && !profile.capabilities.audio);
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+            let body = json!({"model": "step5-test", "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 8, "stream": streaming});
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            if streaming {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.contains("reasoning_content") && text.contains("Plan") && text.contains("Answer"));
+                assert!(text.ends_with("data: [DONE]\n\n"));
+            } else {
+                let result: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(result["choices"][0]["message"]["reasoning_content"], "Plan");
+                assert_eq!(result["choices"][0]["message"]["content"], "Answer");
+            }
+            worker.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn streaming_include_usage_emits_spec_shaped_usage_chunk() {
         let profiles = [ModelProfile::default(),

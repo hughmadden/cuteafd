@@ -106,6 +106,7 @@ struct Call {
 #[derive(Debug)]
 pub struct QwenOutputParser {
     options: QwenParserOptions,
+    turn_markers: &'static [&'static str],
     mode: Mode,
     pending: String,
     call: Option<Call>,
@@ -116,10 +117,15 @@ pub struct QwenOutputParser {
 }
 
 impl QwenOutputParser {
-    pub fn new(mut options: QwenParserOptions) -> Self {
+    pub fn new(options: QwenParserOptions) -> Self {
+        Self::with_turn_markers(options, &STOP_MARKERS)
+    }
+
+    /// The XML call grammar is shared; each checkpoint owns its turn stops.
+    pub fn with_turn_markers(mut options: QwenParserOptions, turn_markers: &'static [&'static str]) -> Self {
         options.stop_sequences.retain(|sequence| !sequence.is_empty());
         let mode = if options.thinking { Mode::Reasoning } else { Mode::Content };
-        Self { options, mode, pending: String::new(), call: None, calls: 0,
+        Self { options, turn_markers, mode, pending: String::new(), call: None, calls: 0,
             content_started: false, held_whitespace: String::new(), stop: None }
     }
 
@@ -175,7 +181,7 @@ impl QwenOutputParser {
 
     fn markers(&self) -> Vec<(&str, Marker)> {
         let mut markers = vec![(THINK_OPEN, Marker::ThinkOpen), (THINK_CLOSE, Marker::ThinkClose)];
-        markers.extend(STOP_MARKERS.iter().map(|marker| (*marker, Marker::Stop)));
+        markers.extend(self.turn_markers.iter().map(|marker| (*marker, Marker::Stop)));
         if self.tools_enabled() {
             if self.mode == Mode::Content { markers.push((TOOL_CALL, Marker::Call)); }
         } else {
