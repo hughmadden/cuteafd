@@ -300,6 +300,10 @@ def test_step5_card_union_keeps_native_format_tp_counts():
     assert scopes['CUTEAFD_WIP_STEP5_AOT'] == 'ON'
     assert set(scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {
         'step5:nvfp4=4', 'step5:fp8=6', 'step5:bf16=4', 'step5:bf16=6'}
+    # The FP8 card's BF16 rows need the BF16-input sibling; it is derived, not hand-set (#516).
+    assert scopes['CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES'] == 'step5'
+    nvfp4_only = aot.family_scopes(cards[:1], configs.__getitem__)
+    assert 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES' not in nvfp4_only
 
 
 def test_non_kimi_scope_does_not_enable_kimi_programs(tmp_path):
