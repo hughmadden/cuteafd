@@ -52,8 +52,10 @@ pub(super) struct Model {
     complete: bool,
     /// Routed formats observed (`exl3-k2`, ...).
     expert_formats: Vec<String>,
-    /// Coordinator text bytes by TP2 residency (embedding and head excluded).
+    /// Coordinator text bytes by TP2 residency (embedding, head and MLA excluded).
     coordinator: Residency,
+    /// MLA operands by layer, held whole on the owner or head-split explicitly.
+    mla: Vec<Residency>,
 }
 
 /// Coordinator text weights by how a two-GPU head split holds them.
@@ -139,8 +141,9 @@ impl Model {
             }
         }
         let spec = spec(&cfg, checkpoint);
+        let mla = vec![Residency::default(); cfg.layers];
         let mut model = Self { cfg, spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
-            coordinator: Residency::default() };
+            coordinator: Residency::default(), mla };
         let mut headers = BTreeMap::new();
         for tensor in &checkpoint.tensors { headers.insert(tensor.meta.name.as_str(), &tensor.meta); }
         for (name, expected) in &model.tensors {
@@ -155,9 +158,12 @@ impl Model {
         for tensor in &checkpoint.tensors {
             if let Some(role) = KIMI_K3.classify(&model.spec, &tensor.meta.name) {
                 *model.bytes.entry(role.component).or_default() += tensor.meta.byte_length;
-                if let Some((_, rest)) = text(&tensor.meta.name).and_then(|r| indexed(r, "layers."))
+                if let Some((layer, rest)) = text(&tensor.meta.name).and_then(|r| indexed(r, "layers."))
                     .filter(|_| role.component != Component::RoutedExpert) {
-                    let bucket = if replicated(rest) { &mut model.coordinator.replicated } else { &mut model.coordinator.split };
+                    let residency = if role.component == Component::Attention && model.cfg.attention[layer] == KimiAttention::Mla {
+                        &mut model.mla[layer]
+                    } else { &mut model.coordinator };
+                    let bucket = if replicated(rest) { &mut residency.replicated } else { &mut residency.split };
                     *bucket += tensor.meta.byte_length;
                 } else if matches!(role.component, Component::Norm | Component::ResidualMix) {
                     model.coordinator.replicated += tensor.meta.byte_length;

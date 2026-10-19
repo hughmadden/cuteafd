@@ -128,6 +128,37 @@ fn release_headers_classify_and_name_every_missing_kernel() {
 }
 
 #[test]
+fn context_names_the_missing_native_abi_instead_of_claiming_fit() {
+    let dir = snapshot(false);
+    let mut options = with_layout(6, None);
+    options.attention_placement = Some(crate::placement::AttentionPlacement::Context);
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(!report.placement_supported && !report.fits);
+    assert!(report.hints.iter().any(|h| h.what.contains("owned-page query exchange/LSE-combine ABI")), "{:?}", report.hints);
+    assert!(report.memory_layout.as_ref().unwrap().devices.is_empty());
+}
+
+#[test]
+fn mla_headers_leave_fixed_tp2_residency_exactly_once() {
+    let dir = snapshot(false);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = Model::open(&checkpoint).unwrap();
+    let mut mla_layers = 0;
+    for (layer, r) in model.mla.iter().enumerate() {
+        if model.cfg.attention[layer] == KimiAttention::Mla {
+            mla_layers += 1;
+            assert_eq!(r.replicated, 30_281_728);
+            assert_eq!(r.split + r.replicated, 464_392_192);
+        } else { assert_eq!((r.split, r.replicated), (0, 0)); }
+    }
+    assert_eq!(mla_layers, 24);
+    let components: u64 = model.bytes.iter().filter(|(c, _)| !matches!(c,
+        Component::Embedding | Component::LmHead | Component::RoutedExpert | Component::Vision)).map(|(_, n)| n).sum();
+    assert_eq!(model.coordinator.split + model.coordinator.replicated
+        + model.mla.iter().map(|r| r.split + r.replicated).sum::<u64>(), components);
+}
+
+#[test]
 fn header_contract_refuses_other_shapes_and_dtypes() {
     for (name, dtype, shape) in [("self_attn.A_log", "F32", vec![96usize]), ("self_attn.o_norm.weight", "BF16", vec![128])] {
         let dir = tempfile::tempdir().unwrap();
@@ -165,10 +196,40 @@ fn max_card_charges_spark_runtime_and_onboards_layers_as_the_fallback() {
     assert!(category(sparks[0], Category::Runtime) > 0 && category(sparks[0], Category::Transport) > 0);
     assert!(!report.hints.iter().any(|h| h.what.contains("over the 108.00 GiB Spark budget")), "{:#?}", report.hints);
     assert!(report.hints.iter().any(|h| h.what.starts_with("spark0 full memory layout needs")), "{:#?}", report.hints);
-    for rtx in device(memory, DeviceKind::Rtx) {
-        assert_eq!(category(rtx, Category::Experts), 0);
-        // Replicated text weights are charged whole on each GPU, not halved.
-        assert!(gib(category(rtx, Category::Weights) + category(rtx, Category::Embedding)) > 55.0);
+    assert_eq!(report.attention_placement, crate::placement::AttentionPlacement::Layers);
+    let rtx = device(memory, DeviceKind::Rtx);
+    for gpu in &rtx {
+        assert_eq!(category(gpu, Category::Experts), 0);
+        assert!(gib(category(gpu, Category::Weights) + category(gpu, Category::Embedding)) > 55.0);
+        assert_eq!(category(gpu, Category::Reserved), 2 * super::GIB);
+        assert!(gpu.free_bytes() >= 0);
+        assert_eq!(gpu.items.iter().find(|i| i.group == "layers").unwrap().bytes, 12 * 464_392_192);
+    }
+    assert_eq!(rtx[0].used_bytes(), rtx[1].used_bytes());
+    assert_eq!(category(rtx[0], Category::Kv), category(rtx[1], Category::Kv));
+    for gpu in 0..2 {
+        let owners: Vec<_> = (0..24).filter(|ordinal| ordinal % 2 == gpu)
+            .map(|ordinal| if ordinal == 23 { 92 } else { ordinal * 4 + 3 }).collect();
+        assert!(memory.notes.iter().any(|n| n.starts_with(&format!("RTX{gpu}: owned MLA layers {owners:?};"))), "{:?}", memory.notes);
+    }
+    // Explicit heads keeps both full latent caches and replicates only low-rank operands.
+    let mut heads = with_layout(6, None);
+    heads.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
+    heads.layout.as_mut().unwrap().pool_tokens = Some(262_144);
+    let heads_report = plan::plan(dir.path(), &heads).unwrap();
+    assert_eq!(heads_report.attention_placement, crate::placement::AttentionPlacement::Heads);
+    let head_gpus = device(heads_report.memory_layout.as_ref().unwrap(), DeviceKind::Rtx);
+    for gpu in 0..2 {
+        assert_eq!(category(head_gpus[gpu], Category::Weights) - category(rtx[gpu], Category::Weights), 363_380_736);
+        assert_eq!(head_gpus[gpu].items.iter().find(|i| i.group == "layers").unwrap().bytes, 5_936_087_040);
+    }
+    let mut owned = with_layout(6, None);
+    owned.attention_placement = Some(crate::placement::AttentionPlacement::Layers);
+    owned.layout.as_mut().unwrap().pool_tokens = Some(262_144);
+    let owned_report = plan::plan(dir.path(), &owned).unwrap();
+    let owned_gpus = device(owned_report.memory_layout.as_ref().unwrap(), DeviceKind::Rtx);
+    for gpu in 0..2 {
+        assert_eq!(category(head_gpus[gpu], Category::Kv) - category(owned_gpus[gpu], Category::Kv), 12 * 1152 * 262_144);
     }
     // Four onboarded layers (two per GPU, 6.92 GiB each) bring the Sparks under the device and keep >= 256K KV.
     let mut options = with_layout(6, None);

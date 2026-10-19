@@ -10,7 +10,8 @@ const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 const FLOOR: u64 = 262_144;
 const PAGE: u64 = 64;
-const MODES: &[LayerMode] = &[LayerMode::HeadSplit, LayerMode::ContextSplit];
+const MODES: &[LayerMode] = &[LayerMode::HeadSplit,
+    LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
 /// Spark EXL3 workspace across the capacity set, estimated until the Kimi
 /// package manifest records it (Gemini review of #273: ~430 MiB at m4096).
 const SPARK_EXL3_WORKSPACE: u64 = 512 * MIB;
@@ -31,6 +32,12 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         report.hints.push(Hint { what, how: how.into() });
     };
     report.bytes_by_owner.clear();
+    report.attention_placement = report.requested_attention.unwrap_or(AttentionPlacement::Layers);
+    if report.requested_attention == Some(AttentionPlacement::Context) {
+        refusal(report, "Kimi K3 context attention placement has no owned-page query exchange/LSE-combine ABI".into(),
+            "Use layers (owned MLA with split KDA/FFNs) or explicitly select heads; context requires a new native ABI.");
+        return memory;
+    }
     if !model.complete {
         refusal(report, "Kimi K3 placement cannot infer fit from missing safetensors headers".into(),
             "Place every shard's header locally (nest replicate) or plan from a complete snapshot.");
@@ -50,7 +57,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         return memory;
     }
     if gpus != 2 || !opts.head_split {
-        refusal(report, "Kimi K3 targets two coordinator GPUs with a head split".into(),
+        refusal(report, "Kimi K3 targets two coordinator GPUs with split KDA and FFNs".into(),
             "Use --rtx 2; one RTX cannot hold 105.7 GiB of BF16 text weights.");
         return memory;
     }
@@ -62,14 +69,15 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let edge = |c| *model.bytes.get(&c).unwrap_or(&0);
     let (embedding, head) = (edge(Component::Embedding), edge(Component::LmHead));
     let residency = model.coordinator;
-    report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + residency.split + residency.replicated);
+    let mla_weights: u64 = model.mla.iter().map(|r| r.split + r.replicated).sum();
+    report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + residency.split + residency.replicated + mla_weights);
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
     let slots = opts.concurrency.max(1) + 2;
     let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / 2;
     let mut fixed = Vec::new();
     for gpu in 0..2u8 {
         fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", residency.split / 2, Basis::Exact));
-        fixed.push(Demand::new(gpu, Category::Weights, "text weights replicated (low-rank A, routers, latent proj, norms)",
+        fixed.push(Demand::new(gpu, Category::Weights, "text weights replicated (KDA low-rank A, routers, latent proj, norms)",
             residency.replicated, Basis::Exact));
         fixed.push(Demand::new(gpu, if gpu == 0 { Category::Embedding } else { Category::Weights },
             if gpu == 0 { "token embedding" } else { "lm head" }, if gpu == 0 { embedding } else { head }, Basis::Exact));
@@ -81,9 +89,10 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let layers = (0..cfg.layers).map(|layer| {
         let mla = cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla;
         LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
-            weights: ModeBytes::default(),
+            weights: ModeBytes { whole: model.mla[layer].split + model.mla[layer].replicated,
+                split: [model.mla[layer].split / 2 + model.mla[layer].replicated; 2] },
             kv_unit: KvDemand { unit_bytes_whole: if mla { record } else { 0 }, unit_bytes_split: if mla { [record; 2] } else { [0; 2] },
-                unit_bytes_context: mla.then_some([record / 2; 2]) },
+                unit_bytes_context: None },
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
             experts: (!cfg.dense[layer]).then_some(cost), modes: if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } }
     }).collect();
@@ -99,22 +108,36 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             ceiling: opts.target_pool_tokens.max(requested_pool.unwrap_or(0)).max(FLOOR), unit_rows: PAGE },
         layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
         expert_workspace: 0, tp2_workspace: [0; 2], onboard, expert_gpus: 2, minimum_expert_layers: 0,
-        policy: LayerPolicy { default: vec![LayerMode::HeadSplit],
-            attention: vec![(AttentionClass::Mla, AttentionPlacement::Context)], ..Default::default() },
+        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating,
+            attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, AttentionPlacement::Heads)],
+            ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: 0, lanes: 0,
             entry_gpu: 0, head_gpu: 1, terminal: TerminalHome::Replicated },
-        executor: ExecutorModes { family: "kimi_k3 metadata only", modes: MODES, hops: false, attention: AttentionPlacement::Context },
+        executor: ExecutorModes { family: "kimi_k3 metadata only", modes: MODES, hops: true, attention: AttentionPlacement::Layers },
     };
     let onboarded = match solve(&request) {
         Ok(placed) => {
             memory.pool_tokens = placed.pool_tokens;
+            report.attention_placement = placed.attention_placement;
             for gpu in 0..2 {
-                memory.devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu],
-                    items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens });
+                let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu],
+                    items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
+                // The solver subtracts this guard from availability, not from its item ledger.
+                device.items.push(Item::new(Category::Reserved, "coordinator headroom", "", opts.headroom_bytes, Basis::Formula)
+                    .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve));
+                let owned = placed.layers.iter().enumerate().filter_map(|(layer, assignment)|
+                    matches!(assignment.mode, LayerMode::Whole { gpu: owner, .. } if usize::from(owner) == gpu).then_some(layer))
+                    .collect::<Vec<_>>();
+                let categories = device.by_category();
+                memory.notes.push(format!("RTX{gpu}: owned MLA layers {owned:?}; weights {} B, KV/state {} B, total {} B, \
+                    reserved {} B, remaining {} B (header lower bound)",
+                    categories.get(&Category::Weights).unwrap_or(&0) + categories.get(&Category::Embedding).unwrap_or(&0),
+                    categories.get(&Category::Kv).unwrap_or(&0), device.used_bytes(), opts.headroom_bytes, device.free_bytes()));
+                memory.devices.push(device);
             }
-            memory.notes.push(format!("MLA latent {} B/token over {} layers (context split halves it per GPU); \
+            memory.notes.push(format!("MLA latent {} B/token over {} layers; {} placement, KDA and FFNs split TP2; \
                 pool {} tokens with {} routed layers on RTX ({:.2} GiB each)", cfg.mla_record_values() * 2 * cfg.mla_layers(),
-                cfg.mla_layers(), placed.pool_tokens, placed.onboard_layers, layer_bytes as f64 / GIB as f64));
+                cfg.mla_layers(), placed.attention_placement, placed.pool_tokens, placed.onboard_layers, layer_bytes as f64 / GIB as f64));
             placed.onboard_layers as u64
         }
         Err(error) => {
