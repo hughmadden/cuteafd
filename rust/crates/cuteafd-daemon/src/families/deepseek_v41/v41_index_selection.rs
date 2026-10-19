@@ -117,6 +117,7 @@ pub(crate) struct IndexSelectionWave<'a> {
     ready: Option<Ready>,
     pending: Option<Ready>,
     in_flight: bool,
+    audit: bool,
 }
 fn slice(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
     debug_assert!(offset + bytes <= b.bytes);
@@ -174,6 +175,7 @@ impl<'a> IndexSelectionWave<'a> {
             ready: None,
             pending: None,
             in_flight: false,
+            audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),
         })
     }
     /// Only selected IDs and source candidate blocks survive another stage.
@@ -204,6 +206,7 @@ impl<'a> IndexSelectionWave<'a> {
             capacity, score: library.v41_index_scores()?, top: library.v41_index_topk()?,
             candidates: library.v41_candidate_blocks()?, graph: None,
             graphs: crate::shared::decode_graph::GraphBank::new(None), retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0, ready: None, pending: None, in_flight: false,
+            audit: source.audit,
         };
         source.shared_scratch_busy = Some(busy);
         Ok(value)
@@ -634,6 +637,10 @@ impl<'a> IndexSelectionWave<'a> {
             unsafe { self.stream.library.cuda_graph_census_call(self.stream.raw, c"index", rows, capture,
                 crate::shared::decode_graph::census::arm(), dispatch) }
         } else { dispatch() };
+        if self.audit && launched.is_ok() {
+            // SAFETY: execute_inner retains its inputs; the audit drains before reading scratch.
+            unsafe { self.audit_scores(query, requests, rows, width)?; }
+        }
         let ready = Ready { origin: query.origin(), layer: query.layer, rows, bindings };
         if defer {
             launched?;
@@ -642,6 +649,93 @@ impl<'a> IndexSelectionWave<'a> {
             launched.and(self.synchronize())?;
             self.ready = Some(ready);
         }
+        Ok(())
+    }
+    /// Compare live pooled addressing with the original per-request ABI after dispatch.
+    /// # Safety
+    /// Same input lifetimes as execute_inner; this diagnostic drains its own stream.
+    unsafe fn audit_scores(&self, query: &IndexQueryOutput<'_>, requests: &[SelectionRequest<'_>],
+        rows: usize, width: usize) -> Result<()> {
+        self.synchronize()?;
+        let library = self.stream.library;
+        let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
+            let mut bytes = vec![0; buffer.bytes];
+            if !bytes.is_empty() { library.copy_d2h(&mut bytes, buffer)?; }
+            Ok(bytes)
+        };
+        let hash = |bytes: &[u8]| bytes.iter().fold(0xcbf29ce484222325u64,
+            |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
+        let pooled = read(slice(self.b(4), 0, rows * width * 4))?;
+        let mut metadata = read(slice(self.b(0), 0, rows * 48))?;
+        for row in metadata.chunks_exact_mut(48) { row[..8].fill(0); }
+        let local = DeviceAllocation::new(library, metadata.len())?;
+        library.copy_h2d(local.buffer, &metadata)?;
+        let mut offset = 0;
+        for (request, r) in requests.iter().enumerate() {
+            let p = r.proposal;
+            let n = r.positions.len();
+            let slots = p.cache.pool_rows.bytes / 8;
+            let stride = p.cache.device_pages.bytes / 4;
+            let page_bytes = p.cache.rows.div_ceil(256) * 4;
+            let local_pages = read(slice(p.cache.device_pages, 0, page_bytes))?;
+            let pool_pages = read(slice(p.cache.pool_pages, p.cache.slot * stride * 4, page_bytes))?;
+            let local_length = read(p.cache.device_rows)?;
+            let pool_length = read(slice(p.cache.pool_rows, p.cache.slot * 8, 8))?;
+            let mut key_hash = 0u64;
+            let mut scale_hash = 0u64;
+            for (i, page) in pool_pages.chunks_exact(4).enumerate() {
+                let page = u32::from_ne_bytes(page.try_into().unwrap()) as usize;
+                let count = (p.cache.rows - i * 256).min(256);
+                key_hash ^= hash(&read(slice(p.cache.packed, page * 256 * 64, count * 64))?);
+                scale_hash ^= hash(&read(slice(p.cache.scales, page * 256 * 4, count * 4))?);
+            }
+            let descriptor = p.metadata(r.positions[0])?;
+            let mut proposal_hash = 0u64;
+            let mut proposal_scale_hash = 0u64;
+            if descriptor[3] > 0 {
+                let packed = read(p.packed)?;
+                let scales = read(p.scales)?;
+                for row in 0..descriptor[3] as usize {
+                    let physical = descriptor[4] as usize + row * descriptor[5] as usize;
+                    proposal_hash ^= hash(&packed[physical * 64..(physical + 1) * 64]);
+                    proposal_scale_hash ^= hash(&scales[physical * 4..(physical + 1) * 4]);
+                }
+            }
+            tracing::info!(target: "cuteafd::index_audit", layer = query.layer, request,
+                first = r.positions[0], last = r.positions[n - 1], rows = n, width,
+                old_slot = 0, pool_slot = p.cache.slot, slots, stride,
+                old_pages = ?p.cache.device_pages.ptr, pool_pages = ?p.cache.pool_pages.ptr,
+                keys = ?p.cache.packed.ptr, proposals = ?p.packed.ptr,
+                host_initialized_rows = p.cache.rows, published_rows = u64::from_ne_bytes(pool_length[..8].try_into().unwrap()),
+                start = descriptor[2], count = descriptor[3], proposal_offset = descriptor[4], step = descriptor[5],
+                key_hash, scale_hash, proposal_hash, proposal_scale_hash,
+                table_equal = local_pages == pool_pages, length_equal = local_length == pool_length,
+                "live index scorer source audit");
+            ensure!(local_pages == pool_pages && local_length == pool_length,
+                "index audit table mismatch at layer {} request {request}", query.layer);
+            // SAFETY: all original inputs are drained and retained; only scratch scores are overwritten.
+            unsafe {
+                self.score.execute_overlay(
+                    slice(query.packed, offset * 2048, n * 2048),
+                    slice(query.scales, offset * 128, n * 128),
+                    slice(query.head_weights, offset * 64, n * 64),
+                    p.cache.packed, p.cache.scales, p.cache.device_pages, p.cache.device_rows,
+                    slice(local.buffer, offset * 48, n * 48),
+                    slice(self.b(3), offset * width * 8, n * width * 8),
+                    slice(self.b(4), offset * width * 4, n * width * 4),
+                    p.packed, p.scales, p.capacity, n, width, 1, stride,
+                    p.cache.packed.bytes / 64, self.stream.raw)?;
+            }
+            offset += n;
+        }
+        self.synchronize()?;
+        let old = read(slice(self.b(4), 0, rows * width * 4))?;
+        let mismatch = pooled.chunks_exact(4).zip(old.chunks_exact(4)).position(|(a, b)| a != b);
+        tracing::info!(target: "cuteafd::index_audit", layer = query.layer, rows, width,
+            pooled_hash = hash(&pooled), old_hash = hash(&old), ?mismatch,
+            "live index scorer bitwise audit");
+        ensure!(mismatch.is_none(), "index scorer audit mismatch at layer {} row {:?}",
+            query.layer, mismatch.map(|i| (i / width, i % width)));
         Ok(())
     }
     /// Borrow completed selection storage. Consumers validate its retained source
