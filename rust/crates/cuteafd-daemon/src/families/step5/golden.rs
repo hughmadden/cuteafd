@@ -1,12 +1,14 @@
-//! Cold target-prefix qualification. Incomplete prefixes never publish cache state or score logits.
+//! Cold target qualification. Partial prefixes never score logits; no run publishes cache state.
 use super::{
     cache::CacheRank,
     chain::TargetChain,
+    head::{HeadPlan, TargetHeadOwner},
     prefix::{Frontier, Placement, Step5Prefix},
     transaction::{Staging, Step},
 };
 use crate::shared::{
     memory::device::{Allocation, Device},
+    golden_scores::{select_scored_rows, scored_nll, scored_kl},
     placement::{spark_rings, SparkAdmission},
     spark_intake::SparkDeviceLink,
 };
@@ -47,7 +49,7 @@ pub(crate) struct GoldenArgs {
     window: String,
     #[arg(long, value_delimiter = ',')]
     peers: Vec<SocketAddr>,
-    /// Last target layer, inclusive. Native BF16 routed tails are not qualified yet.
+    /// Last target layer, inclusive; logits require the complete target through layer 91.
     #[arg(long, default_value_t = 87)]
     last_layer: usize,
     /// Cold prefix rows (at most 4096); omitted uses the complete reference window.
@@ -58,25 +60,18 @@ pub(crate) struct GoldenArgs {
     /// Validate source, reference and routed-layer selection without CUDA.
     #[arg(long)]
     check_headers: bool,
-    /// Refused until a complete native embedding-to-logits path is qualified.
+    /// Score complete embedding-to-logits execution against the pinned BF16 reference.
     #[arg(long)]
     nll: bool,
 }
 
 fn selection(last: usize, peers: usize, hosted: &[usize], nll: bool) -> Result<()> {
-    ensure!((3..=87).contains(&last), "Step-5 golden supports prefixes ending at 3..87; native BF16 tails 88..90 remain unqualified");
-    ensure!(
-        [4, 6].contains(&peers),
-        "Step-5 golden needs canonical TP4 or TP6 real experts"
-    );
-    ensure!(
-        hosted == (3..=last).collect::<Vec<_>>(),
-        "Step-5 golden hosted experts must exactly cover layers 3..{last}"
-    );
-    ensure!(
-        !nll,
-        "Step-5 prefix is not complete embedding-to-logits execution; NLL/KL unavailable"
-    );
+    ensure!((3..=91).contains(&last), "Step-5 golden supports target layers 3..91");
+    ensure!([4, 6].contains(&peers), "Step-5 golden needs canonical TP4 or TP6 real experts");
+    let final_routed = last.min(90);
+    ensure!(hosted == (3..=final_routed).collect::<Vec<_>>(),
+        "Step-5 golden hosted experts must exactly cover layers 3..{final_routed}");
+    ensure!(!nll || last == 91, "NLL/KL requires complete target execution through dense layer 91");
     Ok(())
 }
 
@@ -146,7 +141,13 @@ fn reference_identity(meta: &Value) -> Result<()> {
     Ok(())
 }
 
-fn reference(args: &GoldenArgs) -> Result<(Vec<u32>, Vec<f32>)> {
+struct Reference {
+    tokens: Vec<u32>,
+    expected: Vec<f32>,
+    positions: Vec<usize>,
+}
+
+fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
     ensure!(
         !args.window.is_empty()
             && args
@@ -166,14 +167,9 @@ fn reference(args: &GoldenArgs) -> Result<(Vec<u32>, Vec<f32>)> {
         "reference tokenizer differs from target"
     );
     let folder = args.golden.join("windows").join(&args.window);
-    ensure!(
-        meta["windows"]
-            .as_array()
-            .context("golden windows")?
-            .iter()
-            .any(|w| w["id"] == args.window && w["path"] == format!("windows/{}", args.window)),
-        "window missing from reference inventory"
-    );
+    let entry = meta["windows"].as_array().context("golden windows")?
+        .iter().find(|w| w["id"] == args.window && w["path"] == format!("windows/{}", args.window))
+        .context("window missing from reference inventory")?;
     let bytes = std::fs::read(folder.join("tokens.bin"))?;
     ensure!(
         !bytes.is_empty() && bytes.len() % 4 == 0,
@@ -188,21 +184,30 @@ fn reference(args: &GoldenArgs) -> Result<(Vec<u32>, Vec<f32>)> {
         (1..=4096).contains(&rows) && rows <= tokens.len(),
         "cold Step-5 golden requires 1..4096 reference rows"
     );
-    let hidden = std::fs::read(folder.join(format!("layer{:02}.bin", args.last_layer)))?;
-    ensure!(
-        hidden.len() == tokens.len() * H * 4,
-        "reference layer shape must cover every input row"
-    );
+    ensure!(tokens.iter().all(|&t| (t as usize) < vocab), "reference token outside vocabulary");
+    let (expected, positions) = if args.nll {
+        ensure!(entry["vocab"].as_u64() == Some(vocab as u64), "reference vocabulary mismatch");
+        let positions = entry["positions"].as_array().context("missing scored positions")?.iter()
+            .map(|p| usize::try_from(p.as_u64().context("invalid scored position")?).map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(!positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
+            && positions.windows(2).all(|p| p[0] < p[1]), "invalid scored positions");
+        let bytes = std::fs::read(folder.join("logits.bin"))?;
+        ensure!(bytes.len() == positions.len().checked_mul(vocab).and_then(|n| n.checked_mul(4))
+            .context("reference logit extent overflow")?, "reference scored logit extent");
+        let scored = positions.partition_point(|&p| p < rows);
+        ensure!(scored > 0, "selected prefix has no scored reference positions");
+        (bytes[..scored * vocab * 4].chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(), positions[..scored].to_vec())
+    } else {
+        let bytes = std::fs::read(folder.join(format!("layer{:02}.bin", args.last_layer)))?;
+        ensure!(bytes.len() == tokens.len() * H * 4, "reference layer shape must cover every input row");
+        (bytes[..rows * H * 4].chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(), vec![])
+    };
+    ensure!(expected.iter().all(|v| v.is_finite()), "nonfinite reference payload");
     tokens.truncate(rows);
-    let hidden: Vec<_> = hidden[..rows * H * 4]
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-        .collect();
-    ensure!(
-        hidden.iter().all(|v| v.is_finite()),
-        "nonfinite reference hidden state"
-    );
-    Ok((tokens, hidden))
+    Ok(Reference { tokens, expected, positions })
 }
 
 fn embedding_rows(checkpoint: &Checkpoint, tokens: &[u32], vocab: usize) -> Result<Vec<u8>> {
@@ -364,7 +369,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     );
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
-    let (tokens, expected) = reference(&args)?;
+    let Reference { tokens, expected, positions } = reference(&args, cfg.vocab)?;
     let rows = tokens.len();
     let layout = Step5CacheLayout::new(&cfg, 1, rows as u64, 0, rows as u64)?;
     if args.check_headers {
@@ -406,6 +411,8 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     let input_bytes = (rows * H * 4) as u64;
     let chain_bytes =
         TargetChain::required_bytes(&programs, &checkpoint, args.last_layer + 1, rows)?;
+    let head_plan = args.nll.then(|| HeadPlan::prepare(&programs, &checkpoint, rows)).transpose()?;
+    let head_bytes = head_plan.as_ref().map_or(0, HeadPlan::bytes);
     // Reserve transport construction, transient library use and a separate 2 GiB headroom.
     let transport = 2u64 << 30;
     let reserve = pending
@@ -414,6 +421,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
         .context("golden reserve")?;
     let total = [
         chain_bytes,
+        head_bytes,
         cache_bytes,
         staging_bytes,
         input_bytes,
@@ -427,6 +435,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
         rows,
         last_layer = args.last_layer,
         chain_bytes,
+        head_bytes,
         cache_bytes,
         staging_bytes,
         reserve,
@@ -437,7 +446,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     let started = std::time::Instant::now();
     let link = device.run(|| link(device, &args, rows, &layers))?;
     let (remaining, _) = library.cuda_memory_info()?;
-    let owners = chain_bytes + cache_bytes + staging_bytes + input_bytes + pending + (2u64 << 30);
+    let owners = chain_bytes + head_bytes + cache_bytes + staging_bytes + input_bytes + pending + (2u64 << 30);
     ensure!(
         owners <= remaining as u64,
         "Step-5 golden live transport left insufficient admitted owner storage"
@@ -469,8 +478,10 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
         args.last_layer + 1,
         rows,
         available,
-        &[cache_bytes, staging_bytes, input_bytes, reserve],
+        &[head_bytes, cache_bytes, staging_bytes, input_bytes, reserve],
     )?;
+    let head = head_plan.map(|plan| TargetHeadOwner::load(device, &programs, &checkpoint, plan,
+        available, &[chain_bytes, cache_bytes, staging_bytes, input_bytes, reserve])).transpose()?;
     let input = Allocation::new(device, rows * H * 4)?;
     library.copy_h2d(
         input.buffer,
@@ -495,8 +506,18 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     drop(step);
     ensure!(
         placement.committed == 0,
-        "prefix qualification must not publish an incomplete target"
+        "cold qualification must not publish target state"
     );
+    if let Some(head) = head {
+        let actual = head.logits(chain.output(91)?)?;
+        let ours = select_scored_rows(&actual, &positions, cfg.vocab)?;
+        let targets = positions.iter().map(|&p| tokens[p]).collect::<Vec<_>>();
+        let nll = scored_nll(&ours, &targets, cfg.vocab)?;
+        let reference_nll = scored_nll(&expected, &targets, cfg.vocab)?;
+        let (kl, max_kl) = scored_kl(&expected, &ours, cfg.vocab)?;
+        println!("Step-5 complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (pinned BF16-root diagnostic; no serving/lossless/cache qualification)", targets.len(), nll - reference_nll);
+        return Ok(());
+    }
     let mut bytes = vec![0; rows * H * 4];
     library.copy_d2h(&mut bytes, chain.output(args.last_layer)?)?;
     let actual: Vec<_> = bytes
@@ -532,9 +553,14 @@ mod tests {
         for world in [4, 6] {
             assert!(selection(87, world, &(3..=87).collect::<Vec<_>>(), false).is_ok());
         }
-        for last in [0, 2, 88, 90, 91, usize::MAX] {
+        for last in [0, 2, 92, usize::MAX] {
             assert!(selection(last, 6, &[], false).is_err());
         }
+        for last in [88, 89, 90, 91] {
+            assert!(selection(last, 6, &(3..=last.min(90)).collect::<Vec<_>>(), last == 91).is_ok());
+        }
+        assert!(selection(91, 6, &(3..=91).collect::<Vec<_>>(), true).is_err());
+        assert!(selection(90, 6, &(3..=90).collect::<Vec<_>>(), true).is_err());
         assert!(selection(3, 6, &[3], false).is_ok());
         assert!(selection(3, 6, &[3, 4], false).is_err());
         assert!(selection(4, 6, &[4, 3], false).is_err());
@@ -609,26 +635,78 @@ mod tests {
             check_headers: true,
             nll: false,
         };
-        let (tokens, hidden) = reference(&args)?;
+        let Reference { tokens, expected: hidden, .. } = reference(&args, 3)?;
         assert_eq!(tokens, [1]);
         assert_eq!(hidden, vec![1f32; H]);
         args.prefill = Some(3);
-        assert!(reference(&args).is_err());
+        assert!(reference(&args, 3).is_err());
         args.prefill = Some(1);
         args.window = "../code-1".into();
-        assert!(reference(&args).is_err());
+        assert!(reference(&args, 3).is_err());
         args.window = "code-1".into();
         std::fs::write(folder.join("layer87.bin"), &bytes[..bytes.len() - 4])?;
-        assert!(reference(&args).is_err());
+        assert!(reference(&args, 3).is_err());
         let mut nonfinite = bytes.clone();
         nonfinite[..4].copy_from_slice(&f32::NAN.to_le_bytes());
         std::fs::write(folder.join("layer87.bin"), nonfinite)?;
-        assert!(reference(&args).is_err());
+        assert!(reference(&args, 3).is_err());
         std::fs::write(folder.join("layer87.bin"), bytes)?;
         std::fs::write(root.path().join("tokenizer.json"), b"different")?;
-        assert!(reference(&args).is_err());
+        assert!(reference(&args, 3).is_err());
         Ok(())
     }
+    #[test]
+    fn full_target_scores_reference_positions_without_a_layer91_hidden_fixture() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let golden = root.path().join("golden");
+        let folder = golden.join("windows/code-1");
+        std::fs::create_dir_all(&folder)?;
+        std::fs::write(root.path().join("tokenizer.json"), b"tokenizer")?;
+        let mut meta = reference_meta();
+        meta["windows"][0]["positions"] = serde_json::json!([1, 3]);
+        meta["windows"][0]["vocab"] = 3.into();
+        let write_meta = |meta: &Value| -> Result<()> {
+            Ok(std::fs::write(golden.join("meta.json"), serde_json::to_vec(meta)?)?)
+        };
+        write_meta(&meta)?;
+        std::fs::write(folder.join("tokens.bin"), [0u32, 1, 0, 2].into_iter()
+            .flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
+        let logits = [0f32, 5., 0., 0., 0., 5.].into_iter()
+            .flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+        std::fs::write(folder.join("logits.bin"), &logits)?;
+        let mut args = GoldenArgs { snapshot: root.path().into(), native_lib: None,
+            manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
+            peers: vec![], last_layer: 91, prefill: None, device: 0, check_headers: true, nll: true };
+        let full = reference(&args, 3)?;
+        assert_eq!(full.positions, [1, 3]);
+        let targets = full.positions.iter().map(|&p| full.tokens[p]).collect::<Vec<_>>();
+        assert_eq!(targets, [1, 2]);
+        assert!(scored_nll(&full.expected, &targets, 3)? < 0.02);
+        args.prefill = Some(3);
+        let partial = reference(&args, 3)?;
+        assert_eq!(partial.positions, [1]);
+        assert_eq!(partial.expected, [0., 5., 0.]);
+        args.prefill = Some(1);
+        assert!(reference(&args, 3).is_err());
+        args.prefill = None;
+        for invalid in [serde_json::json!([0, 3]), serde_json::json!([3, 1]),
+            serde_json::json!([1, 1]), serde_json::json!([1, 4]), serde_json::json!([])] {
+            let mut bad = meta.clone();
+            bad["windows"][0]["positions"] = invalid;
+            write_meta(&bad)?;
+            assert!(reference(&args, 3).is_err());
+        }
+        write_meta(&meta)?;
+        assert!(reference(&args, 4).is_err());
+        std::fs::write(folder.join("logits.bin"), &logits[..logits.len() - 4])?;
+        assert!(reference(&args, 3).is_err());
+        let mut bad = logits;
+        bad[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        std::fs::write(folder.join("logits.bin"), bad)?;
+        assert!(reference(&args, 3).is_err());
+        Ok(())
+    }
+
     #[test]
     fn golden_subcommand_parses_runner_owned_flags() {
         use clap::Parser;
