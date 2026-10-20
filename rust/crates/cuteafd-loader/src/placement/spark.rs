@@ -171,6 +171,15 @@ impl SparkAssignment {
                 SparkResidentLayout::Fp8 { world, rank, slicing } => {
                     let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?
                         .for_layer(layer)?;
+                    // Exact-even mixed layers share source ranges, but seal each
+                    // format's native units just as its independent worker group does.
+                    let slicing = match slicing {
+                        crate::formats::fp8_experts::Slicing::Blocks(block)
+                            if world > 0 && geometry.intermediate as usize % (block * world) == 0
+                                && geometry.intermediate as usize % (tensors.block() * world) == 0 =>
+                            tensors.exact_slicing(world),
+                        other => other,
+                    };
                     let (first, width) = tensors.rank_range_with(world, rank, slicing)?;
                     slice.unit_map = Some(tensors.unit_map(world, rank, slicing)?.fingerprint());
                     slice.first = u32::try_from(first)?;
