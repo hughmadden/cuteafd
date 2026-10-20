@@ -18,6 +18,187 @@ mod tp_gate;
 #[cfg(test)]
 mod tp_reference;
 
+/// Shuffle checkpoint traffic independently per rank, but retain the caller's
+/// layer-indexed residency. Admission must finish before invoking this loader.
+fn load_in_rank_order<T>(layers: &[usize], rank: usize,
+    mut load: impl FnMut(usize, usize) -> anyhow::Result<T>) -> anyhow::Result<Vec<T>> {
+    let mut order: Vec<_> = (0..layers.len()).collect();
+    let mut state = 0x6a09_e667_f3bc_c909u64.wrapping_add(rank as u64);
+    for end in (1..order.len()).rev() {
+        // SplitMix64 and rejection sampling make a reproducible Fisher-Yates
+        // permutation without a process-global RNG or modulo bias.
+        let bound = (end + 1) as u64;
+        let threshold = bound.wrapping_neg() % bound;
+        let slot = loop {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = state;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            value ^= value >> 31;
+            if value >= threshold { break (value % bound) as usize; }
+        };
+        order.swap(end, slot);
+    }
+    let mut weights: Vec<_> = (0..layers.len()).map(|_| None).collect();
+    for index in order { weights[index] = Some(load(index, layers[index])?); }
+    Ok(weights.into_iter().map(|weight| weight.expect("every layer loaded once")).collect())
+}
+
+#[cfg(test)]
+mod load_order_tests {
+    use super::load_in_rank_order;
+    use anyhow::Result;
+    use std::{collections::BTreeSet, fs::OpenOptions, os::unix::fs::FileExt};
+    use cuteafd_loader::{formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection, Slicing},
+        plan::testing as fixture, RoutedExpertShape};
+
+    #[test]
+    fn rank_permutations_are_reproducible_and_preserve_sparse_layer_slots() -> Result<()> {
+        let layers = [3, 8, 13, 21, 34, 55, 89, 144];
+        let mut orders = BTreeSet::new();
+        for rank in 0..6 {
+            let mut order = Vec::new();
+            let loaded = load_in_rank_order(&layers, rank, |index, layer| {
+                assert_eq!(layers[index], layer);
+                order.push(layer);
+                Ok(layer)
+            })?;
+            assert_eq!(loaded, layers);
+            let mut repeated = Vec::new();
+            load_in_rank_order(&layers, rank, |_, layer| { repeated.push(layer); Ok(()) })?;
+            assert_eq!(order, repeated);
+            assert_ne!(order, layers);
+            assert!(orders.insert(order));
+        }
+        assert!(load_in_rank_order::<()>(&[], 0, |_, _| unreachable!())?.is_empty());
+        assert_eq!(load_in_rank_order(&[19], usize::MAX, |_, layer| Ok(layer))?, [19]);
+        assert!(load_in_rank_order::<()>(&layers, 0, |_, _| anyhow::bail!("read failure")).is_err());
+        Ok(())
+    }
+
+    // Distinct finite payloads expose layer/rank/offset mix-ups that zero-filled
+    // fixture files would hide. MCG and ModelOpt scalars retain valid values.
+    fn fill_payloads(root: &std::path::Path) -> Result<()> {
+        let path = root.join("model-00001-of-00001.safetensors");
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut size = [0; 8];
+        file.read_exact_at(&mut size, 0)?;
+        let size = u64::from_le_bytes(size);
+        let mut bytes = vec![0; size as usize];
+        file.read_exact_at(&mut bytes, 8)?;
+        let header: serde_json::Value = serde_json::from_slice(&bytes)?;
+        for (name, entry) in header.as_object().unwrap() {
+            let start = entry["data_offsets"][0].as_u64().unwrap();
+            let end = entry["data_offsets"][1].as_u64().unwrap();
+            let tag = name.bytes().fold(0u8, |v, b| v.wrapping_add(b));
+            let mut payload: Vec<_> = (0..end-start).map(|i| tag.wrapping_add(i as u8) & 31).collect();
+            if name.ends_with(".mcg") { payload.copy_from_slice(&0xcbac1fedu32.to_le_bytes()); }
+            if name.ends_with(".input_scale") || name.ends_with(".weight_scale_2") {
+                payload.copy_from_slice(&1.0f32.to_le_bytes());
+            }
+            file.write_all_at(&payload, 8 + size + start)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_native_checkpoint_weights_and_admission_are_byte_identical() -> Result<()> {
+        let shape = RoutedExpertShape { layers: 5, first_layer: 1, experts: 2, topk: 1,
+            hidden: 128, intermediate: 768, draft_stages: 0, draft_experts: 0 };
+        let layers = [1, 3, 4];
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4, ExpertFormat::Bf16] {
+            let root = tempfile::tempdir()?;
+            let mut tensors = Vec::new();
+            for layer in 1..5 { for expert in 0..shape.experts {
+                for (projection, n, k) in [("gate", 768, 128), ("up", 768, 128), ("down", 128, 768)] {
+                    let name = format!("model.layers.{layer}.mlp.experts.{expert}.{projection}_proj");
+                    tensors.extend(match format {
+                        ExpertFormat::Fp8Block128 => fixture::fp8(&name, n, k, None),
+                        ExpertFormat::Mxfp4 => fixture::mxfp4(&name, n, k),
+                        ExpertFormat::Nvfp4 => fixture::nvfp4(&name, n, k),
+                        ExpertFormat::Bf16 => vec![fixture::t(format!("{name}.weight"), "BF16", &[n, k])],
+                    });
+                }
+            }}
+            fixture::write_snapshot(root.path(), &serde_json::json!({}), &tensors, None);
+            fill_payloads(root.path())?;
+            let tensors = Fp8ExpertTensors::read(root.path(), shape)?;
+            for rank in 0..6 {
+                let load = |layer| -> Result<(Vec<u8>, [usize; 3])> {
+                    let budget = tensors.layer_load(layer, 6, rank, Slicing::Blocks(128))?;
+                    let mut bytes = Vec::new();
+                    for expert in 0..shape.experts { for projection in Fp8Projection::ALL {
+                        let (w, s) = tensors.slice_bytes_with(projection, 6, rank, Slicing::Blocks(128))?;
+                        let (mut w, mut s) = (vec![0; w], vec![0; s]);
+                        tensors.read_slice_with(layer, expert, projection, 6, rank, Slicing::Blocks(128),
+                            &mut w, &mut s, &mut Vec::new())?;
+                        bytes.extend(w); bytes.extend(s);
+                    }}
+                    Ok((bytes, [budget.resident, budget.pinned, budget.host]))
+                };
+                let sequential = layers.iter().map(|&layer| load(layer)).collect::<Result<Vec<_>>>()?;
+                let shuffled = load_in_rank_order(&layers, rank, |_, layer| load(layer))?;
+                assert_eq!(sequential, shuffled, "{format:?} rank {rank}");
+                let totals = |weights: &[(Vec<u8>, [usize; 3])]| weights.iter().fold([0; 3], |a, (_, b)|
+                    [a[0] + b[0], a[1].max(b[1]), a[2].max(b[2])]);
+                assert_eq!(totals(&sequential), totals(&shuffled));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_exl3_residency_and_admission_are_byte_identical() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut config = fixture::glm5_config();
+        for (key, value) in [("hidden_size", 128), ("moe_intermediate_size", 768),
+            ("n_routed_experts", 2), ("num_experts_per_tok", 1), ("num_hidden_layers", 5)] {
+            config[key] = value.into();
+        }
+        config["indexer_types"] = serde_json::json!(["full", "shared", "shared", "shared", "shared"]);
+        config["mlp_layer_types"] = serde_json::json!(["dense", "sparse", "sparse", "sparse", "sparse"]);
+        config["quantization_config"] = fixture::exl3_compact(4);
+        let mut tensors = Vec::new();
+        for layer in 1..5 { for expert in 0..2 {
+            for (projection, n, k) in [("gate", 768, 128), ("up", 768, 128), ("down", 128, 768)] {
+                tensors.extend(fixture::exl3(&format!("model.layers.{layer}.mlp.experts.{expert}.{projection}_proj"), n, k, 4));
+            }
+        }}
+        fixture::write_snapshot(root.path(), &config, &tensors, None);
+        fill_payloads(root.path())?;
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let layers = [1, 3, 4];
+        for rank in 0..6 {
+            let load = |layer| -> Result<(Vec<Vec<u8>>, [usize; 4])> {
+                let selection = super::layer::ExpertLayer::BackboneExl3Tp { layer, rank, world: 6 };
+                let plan = super::exl3::planned_residency(&catalog, selection)?;
+                let budget = super::exl3::Exl3Weights::plan(&catalog, selection)?;
+                let mut buffers: Vec<_> = plan.buffers.iter().map(|b| {
+                    let mut bytes = vec![0; b.bytes.max(16)];
+                    for (dst, word) in bytes.chunks_exact_mut(4).zip(&b.initial_words) {
+                        dst.copy_from_slice(&word.to_le_bytes());
+                    }
+                    bytes
+                }).collect();
+                let mut scratch = vec![0; budget.read_scratch_bytes];
+                for (index, job) in plan.loads.iter().enumerate() {
+                    let mut bytes = vec![0; job.bytes];
+                    plan.read_into(&catalog, index, &mut bytes, &mut scratch)?;
+                    for &(buffer, offset) in &job.destinations {
+                        buffers[buffer][offset..offset + job.bytes].copy_from_slice(&bytes);
+                    }
+                }
+                Ok((buffers, [budget.resident_bytes, budget.device_staging_bytes,
+                    budget.pinned_host_bytes, budget.read_scratch_bytes]))
+            };
+            let sequential = layers.iter().map(|&layer| load(layer)).collect::<Result<Vec<_>>>()?;
+            let shuffled = load_in_rank_order(&layers, rank, |_, layer| load(layer))?;
+            assert_eq!(sequential, shuffled, "EXL3 rank {rank}");
+        }
+        Ok(())
+    }
+}
+
 /// Frozen compatibility set shared by native and EXL3 expert execution.
 /// Launch capacity may vary; every decode variant must match canonical m1 sums.
 #[derive(Debug)]

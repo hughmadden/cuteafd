@@ -364,13 +364,13 @@ impl<'a> Fp8Experts<'a> {
         let mut experts = Self::prepare_with_modules(library, tensors, directory, bf16_directory,
             layers, tp, rank, capacity, budget, modules)?;
         let slicing = tensors.slicing_for_directory(directory, tp);
-        experts.layers = layers.iter().copied().map(|layer| {
+        experts.layers = super::load_in_rank_order(layers, rank, |_, layer| {
             let started = std::time::Instant::now();
             let loaded = Fp8Layer::load_with(library, &tensors.for_layer(layer)?, layer, tp, rank, slicing)?;
             tracing::info!(layer, tp, rank, elapsed_ms = started.elapsed().as_millis() as u64,
                 "FP8 expert layer resident");
             Ok(loaded)
-        }).collect::<Result<Vec<_>>>()?;
+        })?;
         Ok(experts)
     }
 
