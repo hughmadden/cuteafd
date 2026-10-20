@@ -348,3 +348,75 @@ fn cache_geometry_requires_tp2_and_preserves_physical_mla_copies() {
     assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2,
         attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).is_err());
 }
+
+#[test]
+fn core_k6_headers_charge_native_bytes_but_do_not_claim_runtime_support() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_kimi_core_snapshot(dir.path(), false);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = Model::open(&checkpoint).unwrap();
+    assert_eq!(model.core.projections.len(), 926);
+    assert!(!model.native_serving_admission());
+    assert!(!dir.path().join("quantize_config.json").exists());
+    let source: u64 = model.core.projections.values().map(|p| p.source_bytes).sum();
+    assert_eq!(source, 40_323_110_520);
+    let kv_a = &model.core.projections[&format!("{TEXT}layers.3.self_attn.kv_a_proj_with_mqa")];
+    assert_eq!(kv_a.shape, [576, 7168]);
+    assert_eq!(kv_a.stored_outputs, 640);
+    let original = snapshot(false);
+    let bf16 = Model::open(&Checkpoint::open(original.path()).unwrap()).unwrap();
+    let weights = |model: &Model, gpu: usize| {
+        model.coordinator.split / 2 + model.coordinator.replicated - model.frontends[1 - gpu]
+            + model.mla.iter().enumerate().filter(|(layer, _)| model.cfg.attention[*layer] == KimiAttention::Mla)
+                .enumerate().filter(|(ordinal, _)| ordinal % 2 == gpu).map(|(_, (_, r))| r.split + r.replicated).sum::<u64>()
+            + if gpu == 0 { model.bytes[&Component::Embedding] } else {
+                model.core.projections.get("language_model.lm_head").map_or(model.bytes[&Component::LmHead],
+                    |p| p.resident_bytes(1).unwrap()) }
+    };
+    let freed = [weights(&bf16, 0) - weights(&model, 0), weights(&bf16, 1) - weights(&model, 1)];
+    assert_eq!(freed, [32_815_041_536, 34_282_705_920]);
+    for (stem, projection) in &model.core.projections {
+        let members = checkpoint.tensors.iter().filter(|t| format::split_stem(&t.meta.name).0 == stem)
+            .cloned().collect::<Vec<_>>();
+        let mut operand = format::detect(format::group_by_stem(&members).values().next().unwrap()).unwrap();
+        assert_eq!(operand.exl3_bits(), Some(6));
+        assert_eq!(operand.logical, [projection.stored_outputs, projection.shape[1]]);
+        let role = KIMI_K3.classify(&model.spec, &format!("{stem}.trellis")).unwrap();
+        assert!(model.accepts(&role, stem, &mut operand).unwrap_err().contains("no BF16 fallback"));
+    }
+}
+
+#[test]
+fn core_header_validation_rejects_wrong_bits_keep_list_and_duplicate_bf16() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_kimi_core_snapshot(dir.path(), false);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    for corruption in ["bits", "duplicate", "keep-list", "missing-scale", "shape", "codebook"] {
+        let mut changed = Checkpoint::open(dir.path()).unwrap();
+        let stem = format!("{TEXT}layers.0.self_attn.q_proj");
+        let trellis = changed.tensors.iter_mut().find(|t| t.meta.name == format!("{stem}.trellis")).unwrap();
+        match corruption {
+            "bits" => { trellis.meta.shape[2] = 80; trellis.meta.byte_length = trellis.meta.byte_length / 6 * 5; }
+            "duplicate" => {
+                let mut tensor = checkpoint.tensors[0].clone();
+                tensor.meta.name = format!("{stem}.weight");
+                changed.weight_map.insert(tensor.meta.name.clone(), tensor.shard.clone());
+                changed.tensors.push(tensor);
+            }
+            "keep-list" => {
+                for tensor in &mut changed.tensors {
+                    if tensor.meta.name.starts_with(&format!("{stem}.")) {
+                        tensor.meta.name = tensor.meta.name.replace("self_attn.q_proj", "self_attn.f_a_proj");
+                    }
+                }
+            }
+            "missing-scale" => changed.tensors.retain(|t| t.meta.name != format!("{stem}.svh")),
+            "shape" => trellis.meta.shape[0] -= 1,
+            "codebook" => {
+                changed.tensors.iter_mut().find(|t| t.meta.name == format!("{stem}.mcg")).unwrap().meta.name = format!("{stem}.mul1");
+            }
+            _ => unreachable!(),
+        }
+        assert!(Model::open(&changed).is_err(), "accepted {corruption}");
+    }
+}

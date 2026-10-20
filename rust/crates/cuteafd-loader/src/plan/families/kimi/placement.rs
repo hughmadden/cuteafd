@@ -70,8 +70,13 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     }
     let requested_pool = opts.pool_tokens.filter(|n| *n > 0);
     let edge = |c| *model.bytes.get(&c).unwrap_or(&0);
-    let (embedding, head) = (edge(Component::Embedding), edge(Component::LmHead));
+    let (embedding, head) = (edge(Component::Embedding), model.core.projections.get("language_model.lm_head")
+        .map_or(edge(Component::LmHead), |p| p.resident_bytes(1).expect("validated core dimensions")));
     let residency = model.coordinator;
+    if !model.core.projections.is_empty() {
+        memory.notes.push(format!("Kimi K6 core: {} header-native projections; payload + H128 scale vectors charged without BF16 expansion; native runtime binding pending",
+            model.core.projections.len()));
+    }
     let mla_weights: u64 = model.mla.iter().map(|r| r.split + r.replicated).sum();
     report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + residency.split + residency.replicated + mla_weights);
     report.bytes_by_owner.insert("routed expert weights".into(), experts);

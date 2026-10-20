@@ -21,8 +21,26 @@ pub fn write_kimi_tokenizer(snapshot: &Path) {
 
 /// Real Kimi geometry with one sparse shard per layer, below the header limit.
 pub fn write_kimi_snapshot(dir: &Path, all: bool) {
-    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    write_kimi_tensors(dir, kimi_k3_tensors(all));
+}
+
+/// Sparse K6 header fixture only, not a numerically quantized checkpoint.
+/// The payload is intentionally unsuitable for layer-forward qualification.
+pub fn write_kimi_core_snapshot(dir: &Path, all: bool) {
+    let mut tensors = Vec::new();
     for tensor in kimi_k3_tensors(all) {
+        if let Some(stem) = tensor.0.strip_suffix(".weight").filter(|stem|
+            crate::families::kimi_k3::core::split(stem).is_some()) {
+            let n = if stem.ends_with(".kv_a_proj_with_mqa") { tensor.2[0].next_multiple_of(128) } else { tensor.2[0] };
+            tensors.extend(exl3(stem, n, tensor.2[1], 6));
+        } else { tensors.push(tensor); }
+    }
+    write_kimi_tensors(dir, tensors);
+}
+
+fn write_kimi_tensors(dir: &Path, tensors: Vec<Tensor>) {
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in tensors {
         let shard = tensor.0.split(".layers.").nth(1)
             .and_then(|tail| tail.split('.').next())
             .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
