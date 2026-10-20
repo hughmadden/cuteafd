@@ -119,13 +119,14 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
     if !serving && args.split_device.is_none() && partial { return Ok(()); }
     ensure!(matches!(args.exlr8_manifest.as_deref(), Some("up1" | "bit325")),
         "EXLR8 full execution currently admits up1 or bit325 only");
-    ensure!(args.split_device.is_some_and(|device| device != args.device)
+    ensure!(args.split_device.is_none_or(|device| device != args.device)
         && (1..=6).contains(&peers.split(',').count()) && args.layers.is_none_or(|count| count == layers),
-        "EXLR8 full execution requires two coordinators, 1..=6 Spark ranks and all backbone layers");
+        "EXLR8 full execution requires one or two distinct coordinators, 1..=6 Spark ranks and all backbone layers");
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
         .map_err(anyhow::Error::msg)?;
-    ensure!(attention.is_none_or(|placement| placement == AttentionPlacement::Context),
-        "EXLR8 full execution requires context attention placement");
+    let expected = if args.split_device.is_some() { AttentionPlacement::Context } else { AttentionPlacement::Heads };
+    ensure!(attention.is_none_or(|placement| placement == expected),
+        "EXLR8 full execution requires {expected} attention placement for the selected coordinators");
     Ok(())
 }
 
@@ -209,6 +210,13 @@ mod draft_cli_tests {
             assert!(native_activation(&candidate, 3, 78, true).is_ok());
             candidate.attention_placement = "auto".into();
             assert!(native_activation(&candidate, 3, 78, false).is_ok());
+        }
+        for mode in ["heads", "auto"] {
+            let mut one = args.clone();
+            one.split_device = None;
+            one.attention_placement = mode.into();
+            assert!(native_activation(&one, 3, 78, true).is_ok());
+            assert!(native_activation(&one, 3, 78, false).is_ok());
         }
         let mut six = args.clone();
         six.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1".into());
