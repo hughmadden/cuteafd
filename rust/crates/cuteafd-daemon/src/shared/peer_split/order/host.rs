@@ -305,7 +305,6 @@ pub(crate) mod glm {
                 }
                 attention(&mut s, 1, layer, lane, context);
                 attention(&mut s, 0, layer, lane, context);
-                s.sync(0, format!("paired attention L{layer} lane{lane}"));
                 // Treat arbitrary driver backpressure inside the FFN as a host
                 // sync: both streams must progress from already queued publications.
                 s.sync(1, format!("peer FFN enqueue L{layer} lane{lane}"));
@@ -449,7 +448,8 @@ mod glm_tests {
             assert_eq!(check(&schedule.streams()), Ok(()));
             let error = check_host(&schedule).unwrap_err();
             assert_eq!(error.sync, "wide peer FFN enqueue");
-            assert_eq!(error.blocked[1].as_deref(), Some("gpu1 attn wait L3 lane0"));
+            let blocked = if lanes == 1 { "gpu1 attn wait L3 lane0" } else { "gpu1 attn wait L2 lane1" };
+            assert_eq!(error.blocked[1].as_deref(), Some(blocked));
         }
     }
 

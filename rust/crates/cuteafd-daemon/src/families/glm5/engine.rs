@@ -1008,7 +1008,6 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.push(0, attended, w.delta.buffer.ptr, bytes)?;
                     self.exchange()?.wait(0, attended)?;
                     self.norm_full(0, w, layer.ptr("post_norm")?, 2, rows, w.delta.buffer.ptr, self.recv(0, attended)?)?;
-                    self.paired_attention_ready()?;
                     self.peer_ffn(index, 0, w1, rows, cap, bytes)?;
                 }
                 None => self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
@@ -1133,14 +1132,6 @@ impl<'a> GlmEngine<'a> {
         exchange.push(1, attended, w1.delta.buffer.ptr, bytes)?;
         exchange.wait(1, attended)?;
         self.norm_full(1, w1, layer.ptr("post_norm")?, 2, rows, w1.delta.buffer.ptr, self.recv(1, attended)?)
-    }
-
-    /// Bound host lookahead by completed paired attention, not driver enqueue capacity.
-    /// A wide FFN may block while enqueueing; its inputs must already be runnable.
-    fn paired_attention_ready(&self) -> Result<()> {
-        // SAFETY: both attention publications are queued and all operands remain owned.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
-        Ok(())
     }
 
     fn peer_ffn(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar,
@@ -1758,7 +1749,6 @@ impl<'a> GlmEngine<'a> {
                 self.exchange()?.push(0, attended, w.delta.buffer.ptr, bytes_of_lane(lane))?;
                 self.exchange()?.wait(0, attended)?;
                 self.norm_full(0, w, layer.ptr("post_norm")?, 2, rows, w.delta.buffer.ptr, self.recv(0, attended)?)?;
-                self.paired_attention_ready()?;
                 self.peer_ffn(index, lane, peer_workspaces.as_ref().context("peer workspaces")?.get(lane)?,
                     rows, cap, bytes_of_lane(lane))?;
             } else {
