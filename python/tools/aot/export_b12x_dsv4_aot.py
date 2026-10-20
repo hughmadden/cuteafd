@@ -797,9 +797,9 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "kimi_k6_dense", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "kimi_k6_dense", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, kimi_k6_dense and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, kimi_k6_dense, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -825,6 +825,12 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
+        if name == "kimi_split":
+            from export_b12x_kimi_split_aot import programs as kimi_split_programs
+            manifest["families"][name] = {"abi_version": 1}
+            work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
+                     for suffix, thunk, capacity in kimi_split_programs()]
+            continue
         if name == "kimi_k6_dense":
             from export_b12x_kimi_k6_dense_aot import programs as kimi_dense_programs, row_policies
             manifest["families"][name] = {
@@ -934,7 +940,7 @@ def main() -> None:
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
-        stem = f"{family}_{suffix}"
+        stem = suffix if family == "kimi_split" else f"{family}_{suffix}"
         # Card-specific split/merge plans retain their numerics and matching
         # scratch layouts. Native load selects once, before graph capture.
         plan_sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)

@@ -809,9 +809,10 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
       printf 'host-isa coordinator %s spark grace\n' "$wip_coordinator_host_isa"
       printf 'spark-tp-roles %s\nbf16 %s\naudio %s\n' "$wip_spark_tp_roles" "$bf16_families" "$audio_aot"
       for key in EXL3_AOT NVFP4_AOT DSV4_MAX_CONTEXT DSV4_AOT GLM_AOT CONTEXT_SPLIT_AOT MIMO_AOT MIMO_GEOMETRIES \
-        GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT QWEN_DENSE_AOT STEP5_AOT KIMIK3_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
+        GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT QWEN_DENSE_AOT STEP5_AOT KIMIK3_AOT KIMIK6_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
         EXL3_BITS VISION_ATTENTION_AOT CARGO_FEATURES; do
         [[ "$key" != KIMIK3_AOT || "${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" != OFF ]] || continue
+        [[ "$key" != KIMIK6_AOT || "${CUTEAFD_WIP_KIMIK6_AOT:-OFF}" != OFF ]] || continue
         local_name="CUTEAFD_WIP_$key"
         printf '%s=%s\n' "$local_name" "${!local_name:-<default>}"
       done
@@ -1286,6 +1287,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_QWEN_DENSE_AOT=${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF}" \
     -e "CUTEAFD_WIP_STEP5_AOT=${CUTEAFD_WIP_STEP5_AOT:-OFF}" \
     -e "CUTEAFD_WIP_KIMIK3_AOT=${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" \
+    -e "CUTEAFD_WIP_KIMIK6_AOT=${CUTEAFD_WIP_KIMIK6_AOT:-OFF}" \
     ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
     -e "CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES:-${CUTEAFD_WIP_EXPERT_FAMILIES:-}}" \
     -e "CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \
