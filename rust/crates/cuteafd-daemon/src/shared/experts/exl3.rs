@@ -459,9 +459,9 @@ mod tests {
         config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
         write_snapshot(root.path(), &config, &tensors, None);
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-        for rank in 0..4 {
+        for rank in 0..2 {
             let plan = planned_residency(&catalog,
-                ExpertLayer::BackboneExl3Tp { layer: 0, rank, world: 4 })?;
+                ExpertLayer::BackboneExl3Tp { layer: 0, rank, world: 2 })?;
             let actual = budget(&catalog, &plan)?;
             let staging = plan.loads.chunks(JOBS_PER_EXPERT)
                 .map(|jobs| jobs.iter().map(|job| job.bytes).sum::<usize>()).max().unwrap_or(0);

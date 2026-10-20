@@ -253,7 +253,6 @@ impl OfficialV41Catalog {
     /// One complete physical projection read, counted at the I/O boundary.
     /// TP2 callers validate that the union of their slices covers this extent.
     pub fn read_projection_once(&self, name: &str, destination: &mut [u8]) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
         let tensor = self.tensor(name)?;
         let bytes = usize::try_from(tensor.metadata.byte_length)?;
         ensure!(destination.len() == bytes, "projection staging size mismatch for {name}");
@@ -333,7 +332,6 @@ impl OfficialV41Catalog {
                 dst.len() >= bytes,
                 "replicated expert scalar {name} needs {bytes} bytes"
             );
-            use std::os::unix::fs::FileExt;
             let tensor = self.tensor(name)?;
             self.shard_file(&tensor.shard)?
                 .read_exact_at(&mut dst[..bytes], tensor.metadata.byte_offset)
@@ -377,7 +375,6 @@ impl OfficialV41Catalog {
         &self, name: &str, spark_rank: Option<usize>, partitions: usize, axis: Option<usize>, bytes: usize,
         dst: &mut [u8], scratch: &mut [u8],
     ) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
         ensure!(
             dst.len() >= bytes,
             "tensor staging buffer for {name} needs {bytes} bytes"
@@ -458,7 +455,6 @@ impl OfficialV41Catalog {
             Ok(table)
         };
         if let Some(ple) = self.exl3.as_ref().and_then(|m| m.ple_quantization.as_ref()) {
-            use std::os::unix::fs::FileExt;
             let prefix = format!("layers.{layer}.engram.embed");
             let tensor = self.tensor(&format!("{prefix}.weight_scale_2"))?;
             let mut bytes = [0; 4];
