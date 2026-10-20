@@ -1,6 +1,6 @@
 mod families;
 mod shared;
-pub use shared::{audio, exlr8, fp8_moe, mla_draft, peer_exchange, programs, vision};
+pub use shared::{audio, exlr8, fp8_moe, glm_stage, mla_draft, peer_exchange, programs, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
     KimiFfn, KimiFfnBatch, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit,

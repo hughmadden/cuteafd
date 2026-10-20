@@ -74,6 +74,13 @@ def test_kimi_w8_cross_sm_groups(group, names):
                    ["--geometry", "kimik3", "--only", ",".join(names)])
 
 
+@pytest.mark.parametrize("geometry", ["glm_stage", "glm2_stage"])
+def test_glm_stage_cross_sm_groups(geometry):
+    name = geometry.replace("_", "-")
+    job = next(job for job in compare_sm.jobs("all") if job[0] == name)
+    assert job == (name, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
+
+
 def test_mimop_k32_tp6_uses_production_exact_slice_export():
     job = next(job for job in compare_sm.jobs("all") if job[0] == "routed-mimop-tp6")
     assert job == ("routed-mimop-tp6", "package_fp8_moe_aot.py",
