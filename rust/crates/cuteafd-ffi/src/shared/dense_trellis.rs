@@ -488,6 +488,22 @@ mod policy_tests {
         assert!(DenseTrellisPolicy::from_geometry_metadata(&family,6144,7168,2,"mul1").is_err());
     }
     #[test]
+    fn vocabulary_head_live_rows_use_native_below_64_and_chunk_at_64() {
+        for book in ["mcg","mul1"] {
+            let mut value=policy();
+            for (key,value_new) in [("shape",serde_json::json!("lm_head")),
+                ("input_features",serde_json::json!(7168)),("output_features",serde_json::json!(163840)),
+                ("sharded_side",serde_json::json!(1)),("codebook",serde_json::json!(book)),
+                ("weight_scratch_bytes",serde_json::json!(128*7168*2))] {value[key]=value_new;}
+            let family=serde_json::json!({"abi_version":1,"row_policies":[value]});
+            let head=DenseTrellisPolicy::from_geometry_metadata(&family,7168,163840,1,book).unwrap();
+            for rows in [1,8,16,63] {assert_eq!(head.route(rows).unwrap(),DenseTrellisRoute::Native);}
+            assert_eq!(head.route(64).unwrap(),DenseTrellisRoute::Chunk);
+            assert_eq!(head.route(4096).unwrap(),DenseTrellisRoute::Chunk);
+        }
+    }
+
+    #[test]
     fn package_policy_owns_exact_64_row_boundary_and_scratch() {
         let p=DenseTrellisPolicy::parse(&policy()).unwrap();
         for corrupt in [DenseTrellisPolicy{chunk_columns:0,..p.clone()},

@@ -48,6 +48,7 @@ pub(crate) struct GlobalLayout {
     hidden: usize,
     vocab: usize,
     operands: BTreeMap<&'static str, usize>,
+    core_head: Option<CoreWeightLayout>,
 }
 
 impl GlobalLayout {
@@ -55,14 +56,25 @@ impl GlobalLayout {
         ensure!(!cfg.tie_embeddings, "Kimi global weights require the checkpoint's untied head");
         let matrix = extent(&[cfg.vocab_size, cfg.hidden, 2])?;
         Ok([Self { rank: 0, hidden: cfg.hidden, vocab: cfg.vocab_size,
-                operands: BTreeMap::from([("embedding", matrix)]) },
+                core_head: None, operands: BTreeMap::from([("embedding", matrix)]) },
             Self { rank: 1, hidden: cfg.hidden, vocab: cfg.vocab_size,
-                operands: BTreeMap::from([("head", matrix), ("output.score", extent(&[cfg.hidden, 4])?),
+                core_head: None, operands: BTreeMap::from([("head", matrix), ("output.score", extent(&[cfg.hidden, 4])?),
                     ("output.norm", extent(&[cfg.hidden, 2])?)]) }])
     }
 
+    pub(crate) fn pair_with_core(cfg: &KimiK3Config, inventory: &CoreInventory) -> Result<[Self; 2]> {
+        let mut pair=Self::pair(cfg)?;
+        if let Some(head)=inventory.get_weight("language_model.lm_head") {
+            ensure!(head.shape==[cfg.vocab_size,cfg.hidden],"Kimi K6 head inventory geometry");
+            pair[1].operands.remove("head");
+            pair[1].core_head=Some(CoreWeightLayout::new(head,TrellisSide::Output,0,1)?);
+        }
+        Ok(pair)
+    }
+
     pub(crate) fn bytes(&self) -> Result<usize> {
-        self.operands.values().try_fold(0usize, |sum, bytes| sum.checked_add(*bytes)
+        self.operands.values().copied().chain(self.core_head.iter().map(|head|head.bytes))
+            .try_fold(0usize, |sum, bytes| sum.checked_add(bytes)
             .context("Kimi global weight extent overflow"))
     }
 
@@ -71,17 +83,29 @@ impl GlobalLayout {
     }
 
     pub(crate) fn pack(&self, cfg: &KimiK3Config, mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<PackedGlobal> {
-        ensure!(Self::pair(cfg)?[self.rank] == *self, "Kimi global packing differs from admitted geometry");
-        let name = if self.rank == 0 { "language_model.model.embed_tokens.weight" } else { "language_model.lm_head.weight" };
-        let tensor = read(name)?;
-        check(&tensor, DType::Bf16, &[self.vocab, self.hidden])?;
-        let mut operands = BTreeMap::from([(if self.rank == 0 { "embedding" } else { "head" }, tensor.bytes)]);
+        ensure!(self.rank<2,"Kimi global rank outside admission");
+        let mut expected=Self::pair(cfg)?;
+        if let Some(head)=&self.core_head {
+            ensure!(self.rank==1 && head.stem=="language_model.lm_head" && head.shape==[self.vocab,self.hidden]
+                && head.side==TrellisSide::Output && head.rank==0 && head.ranks==1,"Kimi global K6 head geometry");
+            expected[1].operands.remove("head");
+            expected[1].core_head=Some(head.clone());
+        }
+        ensure!(expected[self.rank] == *self, "Kimi global packing differs from admitted geometry");
+        let mut operands=BTreeMap::new();
+        let core_head=if let Some(head)=&self.core_head {Some(head.read(&mut read)?)} else {
+            let name = if self.rank == 0 { "language_model.model.embed_tokens.weight" } else { "language_model.lm_head.weight" };
+            let tensor=read(name)?;
+            check(&tensor,DType::Bf16,&[self.vocab,self.hidden])?;
+            operands.insert(if self.rank==0 {"embedding"} else {"head"},tensor.bytes);
+            None
+        };
         if self.rank == 1 {
             let output = w8::load_residual(cfg, ResidualWeightSite::Output, &mut read)?;
             operands.insert("output.score", output.score);
             operands.insert("output.norm", output.norm.bytes);
         }
-        let packed = PackedGlobal { rank: self.rank, operands };
+        let packed = PackedGlobal { rank: self.rank, operands, core_head };
         self.check(&packed)?;
         Ok(packed)
     }
@@ -90,6 +114,8 @@ impl GlobalLayout {
         ensure!(packed.rank == self.rank && packed.operands.len() == self.operands.len()
             && self.operands.iter().all(|(name, bytes)| packed.operands.get(name).is_some_and(|data| data.len() == *bytes)),
             "Kimi packed global operands differ from admission");
+        ensure!(self.core_head.is_some()==packed.core_head.is_some(),"Kimi packed head format differs from admission");
+        if let (Some(layout),Some(head))=(&self.core_head,&packed.core_head) {layout.check(head)?;}
         Ok(())
     }
 
@@ -103,22 +129,26 @@ impl GlobalLayout {
             device.run(|| device.library.copy_h2d(allocation.buffer, &bytes))?;
             Ok((name, allocation))
         }).collect::<Result<_>>()?;
-        Ok(GlobalWeights { operands })
+        let core_head=packed.core_head.map(|head|self.core_head.as_ref().unwrap().upload(device,head)).transpose()?;
+        Ok(GlobalWeights { operands, core_head })
     }
 }
 
 pub(crate) struct PackedGlobal {
     rank: usize,
     operands: BTreeMap<&'static str, Vec<u8>>,
+    core_head: Option<LoadedDenseTrellis>,
 }
 
 pub(crate) struct GlobalWeights<'a> {
     operands: BTreeMap<&'static str, Allocation<'a>>,
+    pub(crate) core_head: Option<CoreWeights<'a>>,
 }
 
 impl GlobalWeights<'_> {
     pub(super) fn check_device(&self, device: Device<'_>) -> Result<()> {
-        ensure!(self.operands.values().all(|allocation| allocation.device.id == device.id
+        ensure!(self.operands.values().chain(self.core_head.iter().flat_map(|weights|
+            [&weights.payload,&weights.suh,&weights.svh])).all(|allocation| allocation.device.id == device.id
             && std::ptr::eq(allocation.device.library, device.library)), "Kimi global weight owner differs from IO device");
         Ok(())
     }
@@ -224,6 +254,16 @@ impl LayerLayout {
                     ("ffn.up", "up_proj", [width, cfg.hidden], TrellisSide::Output),
                     ("ffn.down", "down_proj", [cfg.hidden, width], TrellisSide::Input),
                 ] { layout.projection(name, &format!("{shared}.{leaf}"), shape, side, rank, 2, inventory)?; }
+            }
+            if !cfg.dense[layer] && rank==routed_owner(cfg,layer)? {
+                let root=format!("{root}.block_sparse_moe");
+                for (name,leaf,shape) in [("latent.down","routed_expert_down_proj",[cfg.latent,cfg.hidden]),
+                    ("latent.up","routed_expert_up_proj",[cfg.hidden,cfg.latent])] {
+                    if native(&format!("{root}.{leaf}")) {
+                        layout.operands.remove(name);
+                        layout.projection(name,&format!("{root}.{leaf}"),shape,TrellisSide::Output,0,1,inventory)?;
+                    }
+                }
             }
             if !attention_split || !layout.attention.present() { continue; }
             let shard = if attention_ranks == 1 { 0 } else { rank };
@@ -363,17 +403,28 @@ impl PackedLayer {
             ] { pack_projection_pair(&layouts, &mut pair, name, &format!("{root}.{leaf}"), shape, side, &[0, 1], &mut read)?; }
         }
         if !cfg.dense[layer] {
-            let latent = w8::load_latent(cfg, layer, &mut read)?;
-            let base = format!("language_model.model.layers.{layer}.block_sparse_moe.gate");
-            let router = read(&format!("{base}.weight"))?;
-            let bias = read(&format!("{base}.e_score_correction_bias"))?;
-            check(&router, DType::Bf16, &[cfg.experts, cfg.hidden])?;
-            check(&bias, DType::F32, &[cfg.experts])?;
-            let rank = &mut pair[routed_owner(cfg, layer)?];
-            for (name, bytes) in [("latent.down", latent.down.bytes), ("latent.norm", latent.norm.bytes),
-                ("latent.up", latent.up.bytes), ("router.weight", router.bytes), ("router.bias", bias.bytes)] {
-                rank.operands.insert(name, bytes);
+            let owner=routed_owner(cfg,layer)?;
+            let root=format!("language_model.model.layers.{layer}.block_sparse_moe");
+            if layouts[owner].core.contains_key("latent.down") {
+                for (name,leaf,shape) in [("latent.down","routed_expert_down_proj",[cfg.latent,cfg.hidden]),
+                    ("latent.up","routed_expert_up_proj",[cfg.hidden,cfg.latent])] {
+                    pack_projection_pair(&layouts,&mut pair,name,&format!("{root}.{leaf}"),shape,TrellisSide::Output,
+                        &[owner],&mut read)?;
+                }
+                let norm=read(&format!("{root}.routed_expert_norm.weight"))?;
+                check(&norm,DType::Bf16,&[cfg.latent])?;
+                pair[owner].operands.insert("latent.norm",norm.bytes);
+            } else {
+                let latent=w8::load_latent(cfg,layer,&mut read)?;
+                for (name,bytes) in [("latent.down",latent.down.bytes),("latent.norm",latent.norm.bytes),
+                    ("latent.up",latent.up.bytes)] {pair[owner].operands.insert(name,bytes);}
             }
+            let router=read(&format!("{root}.gate.weight"))?;
+            let bias=read(&format!("{root}.gate.e_score_correction_bias"))?;
+            check(&router,DType::Bf16,&[cfg.experts,cfg.hidden])?;
+            check(&bias,DType::F32,&[cfg.experts])?;
+            pair[owner].operands.insert("router.weight",router.bytes);
+            pair[owner].operands.insert("router.bias",bias.bytes);
         }
         match kind {
             KimiAttention::Kda => {
@@ -831,7 +882,7 @@ mod tests {
 
 /// Inert until explicit K6 admission: native bytes remain compressed on device.
 /// The caller selects ownership from the shared layer placement before packing.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CoreWeightLayout {
     pub stem: String, pub side: cuteafd_loader::formats::dense_trellis::TrellisSide,
     pub rank: usize, pub ranks: usize, pub shape: [usize;2], pub bytes: usize,
@@ -1082,6 +1133,62 @@ mod core_owner_tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn native_latent_pair_is_whole_on_routed_owner_with_norm_and_router_bf16() -> Result<()> {
+        let cfg=fixture_config();
+        for layer in [1,2,3] {
+            let core=inventory(layer,&[("block_sparse_moe.routed_expert_down_proj",[cfg.latent,cfg.hidden]),
+                ("block_sparse_moe.routed_expert_up_proj",[cfg.hidden,cfg.latent])]);
+            core.validate_runtime_groups(&cfg)?;
+            let layouts=LayerLayout::pair_with_core(&cfg,layer,LayerMode::HeadSplit,&core)?;
+            let packed=PackedLayer::pair_with_core(&cfg,layer,LayerMode::HeadSplit,&core,
+                |name|mixed_tensor(&cfg,&core,name))?;
+            let owner=routed_owner(&cfg,layer)?;
+            for rank in 0..2 {
+                layouts[rank].check(&packed[rank])?;
+                assert_eq!(layouts[rank].bytes()?,packed[rank].bytes()?);
+                assert_eq!(packed[rank].core.len(),if rank==owner {2}else{0});
+                for name in ["latent.down","latent.up"] {assert!(!packed[rank].operands.contains_key(name));}
+            }
+            for name in ["latent.down","latent.up"] {
+                let projection=&layouts[owner].core[name];
+                assert_eq!((projection.rank,projection.ranks,projection.side),(0,1,TrellisSide::Output));
+            }
+            for name in ["latent.norm","router.weight","router.bias"] {
+                assert!(packed[owner].operands.contains_key(name));
+                assert!(!packed[1-owner].operands.contains_key(name));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_head_is_terminal_only_and_packs_no_bf16_shadow() -> Result<()> {
+        let mut cfg=fixture_config();cfg.vocab_size=128;
+        let stem="language_model.lm_head".to_owned();
+        let core=CoreInventory{projections:BTreeMap::from([(stem.clone(),CoreProjection{
+            stem,bits:6,codebook:Exl3Codebook::Mul1,shape:[cfg.vocab_size,cfg.hidden],
+            stored_outputs:cfg.vocab_size,split:CoreSplit::Whole,source_bytes:0})])};
+        let baseline=GlobalLayout::pair(&cfg)?;
+        let layouts=GlobalLayout::pair_with_core(&cfg,&core)?;
+        assert_eq!(layouts[0],baseline[0]);
+        assert!(!layouts[1].operands.contains_key("head"));
+        let head=layouts[1].core_head.as_ref().unwrap();
+        assert_eq!((head.rank,head.ranks,head.side),(0,1,TrellisSide::Output));
+        assert_eq!(layouts[1].bytes()?,baseline[1].bytes()?-cfg.vocab_size*cfg.hidden*2+head.bytes);
+        let mut names=Vec::new();
+        let mut packed=layouts[1].pack(&cfg,|name|{
+            names.push(name.to_owned());mixed_tensor(&cfg,&core,name)
+        })?;
+        assert!(!names.iter().any(|name|name=="language_model.lm_head.weight"));
+        assert_eq!(names.iter().filter(|name|name.starts_with("language_model.lm_head.")).count(),4);
+        assert_eq!(packed.operands.len(),2);
+        assert!(packed.core_head.is_some());
+        packed.core_head.as_mut().unwrap().shard.svh.pop();
+        assert!(layouts[1].check(&packed).is_err());
         Ok(())
     }
 

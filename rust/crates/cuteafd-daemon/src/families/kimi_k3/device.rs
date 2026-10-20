@@ -784,10 +784,16 @@ impl<'a> LocalLane<'a> {
         let logits = self.lane.buffer("router logits")?;
         let router = weights.buffer("router.weight")?;
         let bias = weights.buffer("router.bias")?;
-        let down = weights.buffer("latent.down")?;
         self.lane.stream.device.run(|| {
             self.programs.router.launch(rows, input, router, bias, logits, routes, self.lane.stream.raw)?;
-            self.programs.latent.down(rows, input, down, latent, self.lane.stream.raw)?;
+            if weights.is_core("latent.down") {
+                let programs=self.programs.core.as_ref().context("K6 latent programs not resolved")?;
+                let scratch=self.lane.core.as_ref().context("K6 latent scratch not admitted")?;
+                let down=weights.core("latent.down")?;
+                programs.projection(down)?.local(rows,input,down,scratch,latent,self.lane.stream.raw)?;
+            } else {
+                self.programs.latent.down(rows,input,weights.buffer("latent.down")?,latent,self.lane.stream.raw)?;
+            }
             self.programs.wire.launch(rows, self.programs.wire_grid.blocks(rows, 3584), latent, wire, self.lane.stream.raw)?;
             Ok(())
         })?;
@@ -802,9 +808,16 @@ impl<'a> LocalLane<'a> {
         let normalized = self.plane("latent normalized", rows, 3584)?;
         let output = self.plane("routed output", rows, 7168)?;
         let norm_weight = weights.buffer("latent.norm")?;
-        let up_weight = weights.buffer("latent.up")?;
         self.lane.stream.device.run(|| {
-            self.programs.latent.up(rows, combined, norm_weight, normalized, up_weight, output, self.lane.stream.raw)?;
+            if weights.is_core("latent.up") {
+                let programs=self.programs.core.as_ref().context("K6 latent programs not resolved")?;
+                let scratch=self.lane.core.as_ref().context("K6 latent scratch not admitted")?;
+                programs.norm.launch(rows,combined,norm_weight,normalized,self.lane.stream.raw)?;
+                let up=weights.core("latent.up")?;
+                programs.projection(up)?.local(rows,normalized,up,scratch,output,self.lane.stream.raw)?;
+            } else {
+                self.programs.latent.up(rows,combined,norm_weight,normalized,weights.buffer("latent.up")?,output,self.lane.stream.raw)?;
+            }
             Ok(())
         })?;
         Ok(output)
@@ -950,18 +963,26 @@ pub(crate) struct IoLayout {
     rows: usize,
     hidden: usize,
     vocab: usize,
+    core_head: bool,
 }
 
 impl IoLayout {
     pub(crate) fn new(cfg: &KimiK3Config, rank: usize, rows: usize) -> Result<Self> {
         ensure!(cfg.hidden == 7168 && cfg.vocab_size == 163840, "Kimi native IO hidden/vocabulary geometry");
         ensure!(rank < 2 && (1..=4096).contains(&rows), "Kimi IO rank/row geometry");
-        Ok(Self { rank, rows, hidden: cfg.hidden, vocab: cfg.vocab_size })
+        Ok(Self { rank, rows, hidden: cfg.hidden, vocab: cfg.vocab_size, core_head:false })
+    }
+
+    pub(crate) fn with_core(cfg:&KimiK3Config,rank:usize,rows:usize,
+        core:&cuteafd_loader::families::kimi_k3::core::CoreInventory)->Result<Self> {
+        let mut layout=Self::new(cfg,rank,rows)?;
+        layout.core_head=rank==1 && core.get_weight("language_model.lm_head").is_some();
+        Ok(layout)
     }
 
     fn extents(&self) -> [usize; 3] {
         if self.rank == 0 { [self.rows * 4, 0, 0] }
-        else { [0, self.rows.min(64) * self.vocab * 4, VOCABULARY_HEAD_WORKSPACE] }
+        else { [0, self.rows.min(64) * self.vocab * 4, if self.core_head {0}else{VOCABULARY_HEAD_WORKSPACE}] }
     }
 
     pub(crate) fn demand(&self, lane: usize) -> Result<Demand> {
@@ -975,7 +996,8 @@ impl IoLayout {
         ensure!(stream.device.id == device.id && std::ptr::eq(stream.device.library, device.library),
             "Kimi IO stream differs from admitted lane device");
         weights.check_device(device)?;
-        weights.buffer(if self.rank == 0 { "embedding" } else { "head" })?;
+        ensure!(weights.core_head.is_some()==self.core_head,"Kimi head storage differs from admitted IO format");
+        if !self.core_head {weights.buffer(if self.rank == 0 { "embedding" } else { "head" })?;}
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi token IO");
         let [ids, logits, workspace] = self.extents();
         let allocate = |bytes| -> Result<Option<Allocation<'a>>> {
@@ -1042,9 +1064,17 @@ impl TokenIo<'_> {
 
     /// Reuses at most 64 logits rows. Callers consume/download each span before
     /// the next projection; wide prefill never allocates a full-context logit tensor.
-    pub(crate) fn project(&self, input: CuteafdDeviceBuffer, rows: usize) -> Result<CuteafdDeviceBuffer> {
+    pub(crate) fn project(&self, input: CuteafdDeviceBuffer, rows: usize, local:&LocalLane<'_>) -> Result<CuteafdDeviceBuffer> {
         ensure!(self.layout.rank == 1 && (1..=self.layout.rows.min(64)).contains(&rows),
             "Kimi head rows exceed admitted IO capacity");
+        self.check_lane(local,1)?;
+        if let Some(weight)=&self.weights.core_head {
+            let programs=local.programs.core.as_ref().context("K6 head programs not resolved")?;
+            let scratch=local.lane.core.as_ref().context("K6 head scratch not admitted")?;
+            let logits=self.logits.as_ref().context("K6 logits not admitted")?.buffer;
+            self.stream.device.run(||programs.projection(weight)?.local(rows,input,weight,scratch,logits,self.stream.raw))?;
+            return view(logits,0,rows*self.layout.vocab*4);
+        }
         let head = self.head.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi terminal head absent"))?;
         let logits = self.logits.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi terminal logits absent"))?.buffer;
         ensure!(input.device_id == self.stream.device.id && !input.ptr.is_null()
@@ -1333,7 +1363,7 @@ mod tests {
         let weights = Rc::new(layout[0].upload(device, packed)?);
         let weak = Rc::downgrade(&weights);
         let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
-        let io = IoLayout { rank: 0, rows: 16, hidden: 4, vocab: 8 }
+        let io = IoLayout { rank: 0, rows: 16, hidden: 4, vocab: 8, core_head:false }
             .allocate(device, stream.clone(), weights.clone())?;
         drop(weights);
         drop(stream);
@@ -1388,6 +1418,25 @@ mod tests {
         Ok(())
     }
 
+
+    #[test]
+    fn native_head_reuses_layer_scratch_and_drops_only_legacy_head_workspace() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::core::{CoreInventory,CoreProjection,CoreSplit};
+        use cuteafd_loader::formats::exl3_storage::Exl3Codebook;
+        let cfg=KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let stem="language_model.lm_head".to_owned();
+        let core=CoreInventory{projections:BTreeMap::from([(stem.clone(),CoreProjection{stem,bits:6,
+            codebook:Exl3Codebook::Mcg,shape:[cfg.vocab_size,cfg.hidden],stored_outputs:cfg.vocab_size,
+            source_bytes:0,split:CoreSplit::Whole})])};
+        for rows in [1,8,64,4096] {
+            assert_eq!(IoLayout::with_core(&cfg,0,rows,&core)?,IoLayout::new(&cfg,0,rows)?);
+            let native=IoLayout::with_core(&cfg,1,rows,&core)?;
+            assert_eq!(native.extents(),[0,rows.min(64)*cfg.vocab_size*4,0]);
+            assert_eq!(IoLayout::new(&cfg,1,rows)?.demand(0)?.bytes-native.demand(0)?.bytes,
+                VOCABULARY_HEAD_WORKSPACE as u64);
+        }
+        Ok(())
+    }
 
     #[test]
     fn fused_residual_schedule_matches_every_layer_and_output_frontier() {

@@ -365,8 +365,8 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let one_mark = KdaLayout::new(cfg, state_slots, 1, inputs.lanes)?;
     let mark_demands = (0..2).map(|rank| one_mark.demands(rank).map(|demands| demands[2].clone()))
         .collect::<Result<Vec<_>>>()?;
-    let global_layouts = GlobalLayout::pair(cfg)?;
-    let io_layouts = [IoLayout::new(cfg, 0, inputs.rows)?, IoLayout::new(cfg, 1, inputs.rows)?];
+    let global_layouts = GlobalLayout::pair_with_core(cfg,&core)?;
+    let io_layouts = [IoLayout::with_core(cfg, 0, inputs.rows, &core)?, IoLayout::with_core(cfg, 1, inputs.rows, &core)?];
     let rtx = inputs.rtx.take();
     let spark_budget = inputs.spark_budget.take();
     let mut request = request(inputs)?;
@@ -469,7 +469,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
             "Kimi startup graph reserve supplied twice");
         fixed.push(graph);
     }
-    for layout in GlobalLayout::pair(cfg)? {
+    for layout in GlobalLayout::pair_with_core(cfg,&i.core)? {
         let demand = layout.demand()?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
             "Kimi global weight charge supplied twice");
@@ -490,7 +490,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         fixed.push(demand);
     }
     for rank in 0..2 {
-        let layout = IoLayout::new(cfg, rank, i.rows)?;
+        let layout = IoLayout::with_core(cfg, rank, i.rows, &i.core)?;
         for lane in 0..i.lanes {
             let demand = layout.demand(lane)?;
             ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
@@ -758,16 +758,31 @@ pub(super) mod tests {
             (1,"self_attn.o_proj",[7168,12288],7168),
             (2,"block_sparse_moe.shared_experts.gate_proj",[6144,7168],6144),
             (2,"block_sparse_moe.shared_experts.up_proj",[6144,7168],6144),
-            (2,"block_sparse_moe.shared_experts.down_proj",[7168,6144],7168)] {
+            (2,"block_sparse_moe.shared_experts.down_proj",[7168,6144],7168),
+            (1,"block_sparse_moe.routed_expert_down_proj",[3584,7168],3584),
+            (1,"block_sparse_moe.routed_expert_up_proj",[7168,3584],7168),
+            (2,"block_sparse_moe.routed_expert_down_proj",[3584,7168],3584),
+            (2,"block_sparse_moe.routed_expert_up_proj",[7168,3584],7168)] {
             let stem=format!("language_model.model.layers.{layer}.{leaf}");
             core.projections.insert(stem.clone(),CoreProjection{split:split(&stem).unwrap(),stem,
                 bits:6,codebook:Exl3Codebook::Mul1,shape,stored_outputs,source_bytes:0});
         }
+        let stem="language_model.lm_head".to_owned();
+        core.projections.insert(stem.clone(),CoreProjection{split:split(&stem).unwrap(),stem,bits:6,
+            codebook:Exl3Codebook::Mul1,shape:[cfg.vocab_size,cfg.hidden],stored_outputs:cfg.vocab_size,source_bytes:0});
         for attention in [None,Some(AttentionPlacement::Heads)] {
             let mut i=inputs(&cfg);i.core=core.clone();i.attention=attention;
             let mixed=admit(i)?;
             let mut i=inputs(&cfg);i.attention=attention;
             let original=admit(i)?;
+            let expected_global=GlobalLayout::pair_with_core(&cfg,&core)?;
+            for rank in 0..2 {
+                assert_eq!(mixed.global_layouts[rank],expected_global[rank]);
+                assert_eq!(mixed.placement.items[rank].iter().find(|item|item.group=="Kimi global weights").unwrap().bytes,
+                    expected_global[rank].bytes()? as u64);
+                assert_eq!(mixed.io_layouts[rank],IoLayout::with_core(&cfg,rank,mixed.lane_layouts[0][rank].rows(),&core)?);
+            }
+            assert!(mixed.global_layouts[1].bytes()?<original.global_layouts[1].bytes()?);
             let mut freed=[0;2];
             for (layer,assignment) in mixed.placement.layers.iter().enumerate() {
                 let expected=LayerLayout::pair_with_core(&cfg,layer,assignment.mode,&core)?;

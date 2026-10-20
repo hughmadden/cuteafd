@@ -149,7 +149,7 @@ pub(crate) struct CorePrograms<'a> {
     pub layout:ProjectionLayout,
     pub kda:[KimiKdaCore<'a>;2],
     pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
-    pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,pub add:F32Add<'a>,
+    pub norm:cuteafd_ffi::KimiRmsNorm<'a>,pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,pub add:F32Add<'a>,
 }
 impl<'a> CorePrograms<'a> {
     pub(crate) fn load(programs:&'a Programs<'a>,cfg:&cuteafd_loader::families::kimi_k3::config::KimiK3Config,
@@ -176,7 +176,19 @@ impl<'a> CorePrograms<'a> {
                 }
             }
         }
-        let Some(layout)=layout else {anyhow::bail!("Kimi K6 inventory has no bound layer projections");};
+        if let Some(head)=inventory.get_weight("language_model.lm_head") {
+            let weight=super::weights::CoreWeightLayout::new(head,
+                cuteafd_loader::formats::dense_trellis::TrellisSide::Output,0,1)?;
+            let key=projection_key(weight.shape,weight.side,weight.codebook);
+            let projection=Projection::load_geometry(programs,key.0,key.1,key.2,&key.3,rows.min(64),TrellisDType::F32)?;
+            let mut required=ProjectionLayout::new(&projection.program,rows.min(64))?;
+            // Head logits are consumed in <=64-row spans, while this scratch
+            // owner also serves full-capacity serialized layer projections.
+            required.rows=rows;
+            if let Some(layout)=&mut layout {layout.merge(&required)?;}else{layout=Some(required);}
+            projections.insert(key,projection);
+        }
+        let Some(layout)=layout else {anyhow::bail!("Kimi K6 inventory has no bound projections");};
         let kda=[KimiKdaCore::load(programs,"kda_core_h48_m64",64,true)?,
             KimiKdaCore::load(programs,"kda_core_h48_m4096",4096,false)?];
         let mut mla=BTreeMap::new();
@@ -186,7 +198,7 @@ impl<'a> CorePrograms<'a> {
             mla.insert((heads,stride,capacity),KimiMlaSplit::load(programs,
                 [&names[0],&names[1],&names[2]],heads,capacity,stride)?);
         }}}
-        Ok(Some(Self{projections,layout,kda,mla,situ:KimiSitu::load(programs,3072)?,
+        Ok(Some(Self{projections,layout,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,3072)?,
             copy:programs.library().v41_peer_copy()?,add:programs.library().f32_add()?}))
     }
     pub(crate) fn projection(&self,weights:&CoreWeights<'_>)->Result<&Projection<'a>> {
