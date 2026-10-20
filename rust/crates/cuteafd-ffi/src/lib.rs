@@ -1643,13 +1643,26 @@ impl NativeLibrary {
     ) -> Result<CuteafdXGrammarCompiler<'a>> {
         let path = CString::new(tokenizer_json_path.to_string_lossy().as_bytes())
             .context("XGrammar tokenizer path contains a NUL byte")?;
-        let create: Symbol<XGrammarCompilerCreateFn> =
-            unsafe { self.lib.get(b"cuteafd_xgrammar_compiler_create")? };
+        self.xgrammar_compiler_input(&path, b"cuteafd_xgrammar_compiler_create", vocab_size, stop_token_ids)
+    }
+
+    /// Compile from the already loaded checkpoint tokenizer, including native TikToken snapshots.
+    pub fn xgrammar_compiler_json<'a>(&'a self, tokenizer_json: &str, vocab_size: usize,
+        stop_token_ids: &[i32]) -> Result<CuteafdXGrammarCompiler<'a>> {
+        let json = CString::new(tokenizer_json).context("XGrammar tokenizer JSON contains a NUL byte")?;
+        self.xgrammar_compiler_input(&json, b"cuteafd_xgrammar_compiler_create_json", vocab_size, stop_token_ids)
+    }
+
+    fn xgrammar_compiler_input<'a>(&'a self, input: &std::ffi::CStr, symbol: &[u8], vocab_size: usize,
+        stop_token_ids: &[i32]) -> Result<CuteafdXGrammarCompiler<'a>> {
+        // SAFETY: both native entry points share this signature and consume input before returning.
+        let create: Symbol<XGrammarCompilerCreateFn> = unsafe { self.lib.get(symbol)? };
         let mut handle = std::ptr::null_mut();
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
+        // SAFETY: the input and stop-token slices remain live; native code initializes the owned handle.
         let status = unsafe {
             create(
-                path.as_ptr(),
+                input.as_ptr(),
                 vocab_size,
                 if stop_token_ids.is_empty() {
                     std::ptr::null()

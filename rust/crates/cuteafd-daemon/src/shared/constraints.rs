@@ -31,7 +31,8 @@ impl<'a> Compiler<'a> {
     pub fn matcher(&mut self, spec: &NativeConstraint) -> Result<State<'a>> {
         if self.compiler.is_none() {
             let stops: Vec<i32> = self.stops.iter().map(|&s| s as i32).collect();
-            self.compiler = Some(self.library.xgrammar_compiler(&self.tokenizer, self.vocab, &stops)?);
+            let tokenizer = grammar_tokenizer_json(&self.tokenizer)?;
+            self.compiler = Some(self.library.xgrammar_compiler_json(&tokenizer, self.vocab, &stops)?);
         }
         let grammar = if let Some(grammar) = self.grammars.get(spec) { grammar.clone() } else {
             let grammar = Arc::new(self.compiler.as_ref().unwrap().compile(
@@ -47,6 +48,15 @@ impl<'a> Compiler<'a> {
         self.order.push_back(spec.clone());
         Ok(State { matcher: grammar.matcher()?, mask: vec![0; self.vocab.div_ceil(32)], stops: self.stops.clone(),
             terminated: false })
+    }
+}
+
+fn grammar_tokenizer_json(tokenizer: &std::path::Path) -> Result<String> {
+    if tokenizer.file_name().is_some_and(|name| name == "tokenizer.json") {
+        let snapshot = tokenizer.parent().ok_or_else(|| anyhow::anyhow!("grammar tokenizer has no parent"))?;
+        cuteafd_loader::cached_tokenizer(snapshot)?.grammar_tokenizer_json()
+    } else {
+        cuteafd_loader::LoadedTokenizer::from_file(tokenizer)?.grammar_tokenizer_json()
     }
 }
 
@@ -221,6 +231,40 @@ impl State<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grammar_input_uses_loaded_tiktoken_without_tokenizer_json() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_tokenizer(dir.path());
+        let document = grammar_tokenizer_json(&dir.path().join("tokenizer.json"))?;
+        let value: serde_json::Value = serde_json::from_str(&document)?;
+        assert_eq!(value["model"]["type"], "BPE");
+        assert!(value["added_tokens"].as_array().unwrap().iter()
+            .any(|token| token["content"] == "<|open|>" && token["id"] == 256));
+        assert_eq!(crate::shared::prefix::marker_ids(dir.path(), &["missing", "<|open|>"])?, [256]);
+        assert!(!dir.path().join("tokenizer.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn native_grammar_accepts_tiktoken_snapshot_when_library_present() -> Result<()> {
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else { return Ok(()); };
+        // SAFETY: the library outlives every compiler and matcher in this test.
+        let library = unsafe { NativeLibrary::load(path)? };
+        let dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_tokenizer(dir.path());
+        let mut compiler = Compiler::with_vocab(&library, dir.path().join("tokenizer.json"), 512, vec![257]);
+        let spec = cuteafd_api::openai::NativeConstraint(serde_json::json!({
+            "type":"structural_tag", "format":{"type":"ds41_json_schema", "strict":true, "json_schema":{
+                "type":"object","properties":{"x":{"const":"a"}},"required":["x"],"additionalProperties":false
+            }}
+        }).to_string());
+        let mut state = compiler.matcher(&spec)?;
+        for byte in br#"{"x":"a"}"# { state.accept(u32::from(*byte))?; }
+        assert!(state.matcher.is_completed()?);
+        assert!(!dir.path().join("tokenizer.json").exists());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn kimi_xtml_constraints_use_native_string_tags() {

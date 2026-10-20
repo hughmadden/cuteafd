@@ -6,6 +6,19 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+/// Tiny native TikToken snapshot, deliberately without tokenizer.json.
+pub fn write_kimi_tokenizer(snapshot: &Path) {
+    use base64::Engine;
+    let ranks = (0..=255u8).map(|byte| format!("{} {byte}\n",
+        base64::engine::general_purpose::STANDARD.encode([byte]))).collect::<String>();
+    fs::write(snapshot.join("tiktoken.model"), ranks).unwrap();
+    fs::write(snapshot.join("tokenization_kimi.py"), format!("{}\nnum_reserved_special_tokens = 256\n",
+        crate::tokenizer::tiktoken::KIMI_PATTERN.join("\n"))).unwrap();
+    fs::write(snapshot.join("tokenizer_config.json"), json!({"added_tokens_decoder": {
+        "256": {"content": "<|open|>"}, "257": {"content": "<|end_of_msg|>"}
+    }}).to_string()).unwrap();
+}
+
 /// (name, safetensors dtype, shape).
 pub type Tensor = (String, &'static str, Vec<usize>);
 
