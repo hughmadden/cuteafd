@@ -360,6 +360,8 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         (repo / "scripts/build").mkdir(parents=True, exist_ok=True)
         (repo / "scripts/build/verify-sparkinfer-source.py").write_text(
             f"import sys\nprint({lock['revision']!r}) if '--print-revision' in sys.argv else None\n")
+        from launcher_sandbox import stub_cuda_capacity
+        stub_cuda_capacity(repo / "scripts/lib/release-common.sh", 97887 * 2**20)
         if launcher_source:
             shutil.copy(launcher_source, repo / "scripts/launch/run-family.sh")
             (repo / "scripts/launch/run-family.sh").chmod(0o755)

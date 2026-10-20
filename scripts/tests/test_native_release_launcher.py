@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 import json
 import shlex
@@ -21,12 +22,48 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_cuda_capacity_matches_uuid_not_cuda_ordinal_and_creates_no_context(self) -> None:
+        import contextlib
+        import ctypes
+        import io
+        import uuid
+        from unittest.mock import patch
+        source = (ROOT / 'scripts/lib/release-common.sh').read_text().split("<<'PYCAPACITY'\n", 1)[1].split('\nPYCAPACITY', 1)[0]
+        wanted = 'GPU-00000000-0000-0000-0000-000000000001'
+        identities = [uuid.UUID(wanted[4:]).bytes, bytes(16)]
+        calls = []
+        class Function:
+            def __init__(self, name): self.name = name
+            def __call__(self, *args):
+                calls.append(self.name)
+                if self.name == 'cuInit': return 0
+                if self.name == 'cuDeviceGetCount': args[0]._obj.value = 2
+                elif self.name == 'cuDeviceGet': args[0]._obj.value = args[1].value
+                elif self.name == 'cuDeviceGetUuid_v2': args[0]._obj[:] = identities[args[1].value]
+                elif self.name == 'cuDeviceTotalMem_v2': args[0]._obj.value = 101_973_491_712 + args[1].value
+                else: raise AssertionError('unexpected CUDA operation: ' + self.name)
+                return 0
+        class Driver:
+            def __getattr__(self, name): return Function(name)
+        with patch.object(ctypes, 'CDLL', return_value=Driver()), patch.object(sys, 'argv', ['-', wanted]):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output): exec(source, {})
+        self.assertEqual(output.getvalue().strip(), '101973491712')
+        self.assertNotIn('cuCtxCreate', calls)
+        for identity, driver, message in [
+            ('GPU-00000000-0000-0000-0000-000000000099', Driver(), 'no CUDA device matches UUID'),
+            (wanted, OSError('libcuda.so.1 unavailable'), 'libcuda.so.1 unavailable'),
+        ]:
+            with patch.object(ctypes, 'CDLL', side_effect=driver if isinstance(driver, Exception) else None,
+                              return_value=driver), patch.object(sys, 'argv', ['-', identity]):
+                with self.assertRaisesRegex(SystemExit, message): exec(source, {})
+
     def test_coordinator_capacity_registry_boundary_and_invalid_inputs(self) -> None:
         for total, budget, expected in [('98304', '', 16), ('32768', '', 8), ('98304', '32', 8),
                                         ('98304', '32.001', 16), ('32768', '96', 8)]:
             result = subprocess.run(['bash', '-c',
                 'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
-                'test', total, budget], cwd=ROOT, text=True, capture_output=True)
+                'test', str(int(total) * 2**20) if total.isdigit() else total, budget], cwd=ROOT, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             gib, concurrency = result.stdout.split()
             self.assertEqual(float(gib), min(float(total) / 1024, float(budget) if budget else float('inf')))
@@ -34,7 +71,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
         for total, budget in [('0', ''), ('NaN', ''), ('98304', 'inf'), ('98304', '0'), ('bad', '')]:
             result = subprocess.run(['bash', '-c',
                 'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
-                'test', total, budget], cwd=ROOT, text=True, capture_output=True)
+                'test', str(int(total) * 2**20) if total.isdigit() else total, budget], cwd=ROOT, text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('capacity registry', result.stderr)
 
@@ -50,7 +87,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                             source + '\npub const SMALL_CARD_DEFAULT_CONCURRENCY: u64 = 8;\n']:
                 (root / registry).write_text(changed)
                 result = subprocess.run(['bash', '-c',
-                    'source scripts/lib/release-common.sh; repo_root="$1"; release_coordinator_profile 98304',
+                    'source scripts/lib/release-common.sh; repo_root="$1"; release_coordinator_profile 103079215104',
                     'test', str(root)], cwd=ROOT, text=True, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('capacity registry', result.stderr)

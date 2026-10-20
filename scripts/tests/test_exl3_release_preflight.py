@@ -93,6 +93,8 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
                 path = binary / tool
                 path.write_text(f'#!{sys.executable}\n' + MOCK)
                 path.chmod(0o755)
+            from launcher_sandbox import stub_cuda_python
+            stub_cuda_python(binary, gpu_mib * 2**20)
             snapshot = directory / 'hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277'
             snapshot.mkdir(parents=True)
             (snapshot / 'config.json').write_text(json.dumps(

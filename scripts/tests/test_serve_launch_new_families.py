@@ -362,3 +362,14 @@ def test_step5_gate_cards_list_and_generate_wip_launches(tmp_path: Path, name, g
     assert job["entry"]["run_args"] == ["--wip", "s"]
     assert (values["SPARK_COUNT"], values["RTX_GPUS"]) == (str(len(sparks)), str(len(gpus)))
     assert values["COORDINATOR_GPU"] == str(gpus[0])
+
+
+@pytest.mark.parametrize("family", ["kimi", "step5"])
+def test_qualifying_family_capacity_uses_cuda_total(tmp_path, family):
+    total = 101_973_491_712
+    kwargs = dict(cuda_total_bytes=total, gpu_total_mib=97887, gpu_free_mib=97887)
+    result = (_kimi(tmp_path, **kwargs) if family == "kimi"
+              else _step5(tmp_path, "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6), **kwargs))
+    plan = _line(result, "cuteafd plan")
+    assert float(_flag(plan, "--coordinator-gpu-budget-gib")) == total / 2**30
+    assert float(_flag(plan, "--coordinator-weight-budget-gib")) == total / 2**30
