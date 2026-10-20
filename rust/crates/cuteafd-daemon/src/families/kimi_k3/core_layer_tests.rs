@@ -317,6 +317,23 @@ fn mla_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
     Ok(())
 }
 
+fn compare_ffn_truth(source:&Source,device:Device<'_>,actual:Buffer,count:usize,layer:usize,rank:usize,
+    stage:&str,path:&str)->Result<()> {
+    let truth=read(&source.root.join("ffn-f64-truth.safetensors"),
+        &format!("{}.layer{layer}.rank{rank}.{stage}",source.book))?;
+    ensure!(truth.info.dtype==DType::Unknown("F64".into()) && truth.info.shape==[1,count] && truth.bytes.len()==count*8,
+        "F64 FFN truth geometry");
+    let reference=truth.bytes.chunks_exact(8).map(|v|f64::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
+    let mut bytes=vec![0;count*2];device.run(||device.library.copy_d2h(&mut bytes,actual))?;
+    let values=bf16(&bytes);
+    let (relative,peak)=errors(&values,&reference)?;
+    let (cosine,signed)=error_bias(&values,&reference);
+    let radial=cosine.map_or(0.,|value|relative*value);
+    let cosine=cosine.map_or_else(||"undefined".into(),|value|value.to_string());
+    eprintln!("K6 F64-truth book={} layer={layer} rank={rank} rows=1 path={path} stage={stage} rel_l2={relative} max_abs_over_peak={peak} error_ref_cosine={cosine} radial_fraction={radial} mean_signed_over_mean_abs_ref={signed}",source.book);
+    Ok(())
+}
+
 fn shared_ffn(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:&Source,cfg:&KimiK3Config,
     layer:usize,rows:usize)->Result<()> {
     use cuteafd_ffi::{KimiFfn,KimiFfnMode,KimiFfnBatch,KimiSitu};
@@ -326,7 +343,13 @@ fn shared_ffn(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source
     let fused=device.run(||Ok(KimiFfn::load(base,3072,KimiFfnMode::Direct)?))?;
     let situ=device.run(||Ok(KimiSitu::load(base,3072)?))?;
     let copy=device.run(||device.library.v41_peer_copy())?;
-    let input=upload(device,&input(rows,7168))?;
+    let input_bytes=input(rows,7168);
+    if rows==1 {
+        let truth_input=read(&source.root.join("ffn-f64-truth.safetensors"),"input")?;
+        ensure!(truth_input.info.dtype==DType::Bf16 && truth_input.info.shape==[1,7168]
+            && truth_input.bytes==input_bytes,"F64 FFN truth must use identical input bytes");
+    }
+    let input=upload(device,&input_bytes)?;
     let mut native=Vec::new();let mut refs=Vec::new();
     for (rank,packed) in packed.iter().enumerate() {
         let stem=format!("language_model.model.layers.{layer}.block_sparse_moe.shared_experts");
@@ -349,6 +372,19 @@ fn shared_ffn(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source
         stream.drain_or_abort("K6 shared FFN case");result?;
         compare(source,device,activated.buffer,activated_ref.buffer,rows*3072,&format!("layer={layer} FFN rank={rank} rows={rows} activation"))?;
         compare(source,device,output.buffer,reference.buffer,rows*7168,&format!("layer={layer} FFN rank={rank} rows={rows} output"))?;
+        if rows==1 {
+            let mut packed=vec![0;6144*2];
+            device.run(||device.library.copy_d2h(&mut packed,gate_up_ref.buffer))?;
+            let reference_gate=upload(device,&packed[..3072*2])?;
+            let reference_up=upload(device,&packed[3072*2..])?;
+            for (stage,count,k6,bf16) in [("gate",3072,gate_out.buffer,reference_gate.buffer),
+                ("up",3072,up_out.buffer,reference_up.buffer),
+                ("activation",3072,activated.buffer,activated_ref.buffer),
+                ("output",7168,output.buffer,reference.buffer)] {
+                compare_ffn_truth(source,device,k6,count,layer,rank,stage,"k6")?;
+                compare_ffn_truth(source,device,bf16,count,layer,rank,stage,"bf16")?;
+            }
+        }
         native.push(output);refs.push(reference);
     }
     Ok(())
@@ -391,6 +427,26 @@ fn layer_diagnostics_collect_failures_without_relaxing_tolerance() {
     assert!(failures[0].contains("book=mcg") && failures[0].contains("max_abs="));
     drop(failures);
     assert!(source.report("nonfinite",&[f64::NAN],&[1.]).is_err());
+}
+
+#[test]
+#[ignore="requires CPU F64 truth fixtures and test-only dense/split library"]
+fn k6_shared_ffn_f64_truth_diagnostics() -> Result<()> {
+    let root=PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
+    let cfg=KimiK3Config::read(Path::new(&std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?))?;
+    // SAFETY: authorized immutable runner-selected base and test-only library paths.
+    let library=unsafe{NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)?};
+    // SAFETY: test-only linkage, never used by production serving.
+    let fixture=unsafe{NativeLibrary::load(root.join("full-programs/libkimi_k6_full.so"))?};
+    let device=Device{library:&library,id:0};
+    let base=device.run(||library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?)))?;
+    let programs=device.run(||fixture.programs()?.with_manifest(&root.join("full-programs/dsv4_programs.json")))?;
+    for book in ["mcg","mul1"] {
+        let source=Source{root:root.join("full-layers"),book:book.into(),failures:Default::default()};
+        for layer in [1,3] {shared_ffn(device,&base,&programs,&source,&cfg,layer,1)?;}
+        // Composed-stage errors are recorded; model-level KL is the acceptance gate.
+    }
+    Ok(())
 }
 
 #[test]
