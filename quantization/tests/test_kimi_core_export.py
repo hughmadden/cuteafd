@@ -219,6 +219,35 @@ def test_mla_logical_padding_requires_full_stored_tensors(tmp_path):
     assert expected[module + ".svh"] == ("F16", [640])
 
 
+def test_durability_pass_flushes_target_files_then_directories(tmp_path, monkeypatch):
+    import os
+    source, target = tmp_path / "source", tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    (source / "original.json").write_text("source is never flushed")
+    nested = target / "quantization-errors/core-k6"
+    nested.mkdir(parents=True)
+    (nested / "evidence.json").write_text("new evidence")
+    (target / "README.md").write_text("new card")
+    seen = []
+    fsync = os.fsync
+
+    def record(descriptor):
+        seen.append(Path(os.readlink(f"/proc/self/fd/{descriptor}")))
+        fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record)
+    export._fsync_tree(target)
+    assert set(seen) == {nested / "evidence.json", nested, nested.parent,
+                         target / "README.md", target}
+    assert seen.index(nested / "evidence.json") < seen.index(nested) < seen.index(nested.parent) < seen.index(target)
+    assert seen.index(target / "README.md") < seen.index(target)
+    assert seen[-1] == target
+    (target / "external-link").symlink_to(source / "original.json")
+    with pytest.raises(ValueError, match="symlink"):
+        export._fsync_tree(target)
+
+
 def test_final_inventory_and_mixed_metadata(tmp_path, monkeypatch):
     source_dir, output = tmp_path / "source", tmp_path / "output"
     source_dir.mkdir()
@@ -265,7 +294,14 @@ def test_final_inventory_and_mixed_metadata(tmp_path, monkeypatch):
     evidence = tmp_path / "evidence"
     evidence.mkdir()
     (evidence / "projection.json").write_text('{"metric_status": "ok"}')
+    flushed = []
+    fsync_tree = export._fsync_tree
+    def note_durable(directory):
+        fsync_tree(directory)
+        flushed.append(directory)
+    monkeypatch.setattr(export, "_fsync_tree", note_durable)
     summary = export.finalize_export(source, selection, {head: candidates[head]}, output, "identity", evidence)
+    assert flushed[-1] == output
     assert summary["payload_bytes"] == target_bytes
     index = json.loads((output / "model.safetensors.index.json").read_text())
     assert index["metadata"]["total_size"] == target_bytes

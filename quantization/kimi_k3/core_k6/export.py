@@ -4,12 +4,13 @@ from __future__ import annotations
 from contextlib import ExitStack
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 
 from ..uniform_k2.storage import (assemble_shard, atomic_json, canonical,
-                                  read_header, verify_receipt)
+                                  fsync_directory, read_header, verify_receipt)
 from .recipe import (BASE_REPO, BASE_REVISION, BASE_PAYLOAD_BYTES, BASE_TENSOR_COUNT,
                      MCG_MULTIPLIER, MODULE_COUNT, SELECTED_BF16_BYTES,
                      SELECTED_K6_BYTES, SUFFIXES, TARGET_PAYLOAD_BYTES,
@@ -180,6 +181,33 @@ def _copy_assets(source, export):
         shutil.copytree(old_errors, export / "quantization-errors/base-k2", dirs_exist_ok=True)
 
 
+def _fsync_tree(root):
+    """Make copied publication content durable before retiring recovery state.
+
+    Iterate directory entries lazily, keeping only one descriptor per recursion
+    level. Fsync files before their containing directories, then each directory
+    before its parent. Never follow a link outside the owned export tree.
+    """
+    root = Path(root)
+    if root.is_symlink():
+        raise ValueError("refuse symlink export directory during durability pass")
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                raise ValueError(f"refuse symlink in export durability pass: {entry.path}")
+            if entry.is_dir(follow_symlinks=False):
+                _fsync_tree(entry.path)
+            elif entry.is_file(follow_symlinks=False):
+                descriptor = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            else:
+                raise ValueError(f"unexpected special file in export: {entry.path}")
+    fsync_directory(root)
+
+
 def finalize_export(source, selection, head_replacements, export, identity, evidence_root):
     """Audit the entire standard checkpoint inventory and publish mixed metadata."""
     export = Path(export)
@@ -265,6 +293,10 @@ def finalize_export(source, selection, head_replacements, export, identity, evid
         shutil.copyfile(path, target)
     atomic_json(export / "quantization-provenance.json", identity)
     (export / "README.md").write_text(_model_card(identity))
+    # The caller publishes its complete marker and retires the final frontier
+    # immediately after return. Include copyfile/write_text assets and evidence,
+    # not only the individually committed safetensors/JSON producer files.
+    _fsync_tree(export)
     return dict(tensors=len(weight_map), payload_bytes=total, shards=94,
                 core_projections=MODULE_COUNT, routed_projections=247296,
                 replaced_bf16_bytes=SELECTED_BF16_BYTES, core_k6_bytes=SELECTED_K6_BYTES)
