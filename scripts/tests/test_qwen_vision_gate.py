@@ -107,7 +107,11 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     tables = {node.targets[0].id: ast.literal_eval(node.value) for node in skinny.body
               if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
               and node.targets[0].id in ("DECODE_TMA_TILES", "SKINNY_TILES_BY_ROWS")}
-    assert set(tables["DECODE_TMA_TILES"]) == {(2560, 6144), (16480, 2560), (13952, 2560), (2560, 640), (10240, 320)}
+    # Qwen's row-tiled shapes are pinned exactly; other families' keys (Step-5's, fork #71)
+    # must not alias a Qwen [N, K].
+    qwen_tiles = {(2560, 6144), (16480, 2560), (13952, 2560), (2560, 640), (10240, 320)}
+    step5_tiles = {(4096, 12288), (4096, 6144), (384, 4096), (3072, 4096)}
+    assert set(tables["DECODE_TMA_TILES"]) == qwen_tiles | step5_tiles
     for (n, k), entries in tables["SKINNY_TILES_BY_ROWS"].items():
         assert len({t for _, _, _, t in entries}) == 1
         assert entries[-1][0] == scalar_rule(n, k)
