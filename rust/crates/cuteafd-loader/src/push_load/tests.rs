@@ -1,0 +1,439 @@
+use super::*;
+use nest_push::{client::Conn, proto::Request};
+use socket2::{Domain, SockAddr, Socket, Type};
+use std::{cell::Cell, fs::File, os::fd::AsRawFd, sync::mpsc, thread};
+use tempfile::{NamedTempFile, TempDir};
+
+struct Server {
+    _directory: TempDir,
+    client: PushClient,
+    thread: thread::JoinHandle<()>,
+}
+
+impl Server {
+    fn new(script: impl FnOnce(Conn) + Send + 'static) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("push.sock");
+        let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+        socket.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        socket.listen(1).unwrap();
+        let thread = thread::spawn(move || {
+            let (peer, _) = socket.accept().unwrap();
+            let conn = Conn::from_fd(peer.into());
+            conn.set_timeout(Some(Duration::from_secs(2))).unwrap();
+            script(conn);
+        });
+        Self {
+            client: PushClient {
+                socket: path.to_str().unwrap().into(),
+                timeout: Duration::from_millis(50),
+            },
+            _directory: directory,
+            thread,
+        }
+    }
+
+    fn finish(self) {
+        self.thread.join().unwrap();
+    }
+}
+
+fn request(conn: &Conn) -> Request {
+    let mut bytes = Vec::new();
+    assert!(conn.recv(&mut bytes).unwrap().is_some());
+    proto::decode(&bytes).unwrap()
+}
+
+fn event(conn: &Conn, event: Event) {
+    conn.send(&proto::encode(&event), None).unwrap();
+}
+
+fn created(conn: &Conn) {
+    assert!(matches!(
+        request(conn),
+        Request::Create {
+            version: proto::VERSION,
+            ..
+        }
+    ));
+    event(
+        conn,
+        Event::Created {
+            group: 7,
+            token: 11,
+        },
+    );
+}
+
+fn push_shard() -> NamedTempFile {
+    let shard = NamedTempFile::new().unwrap();
+    rustix::fs::setxattr(
+        shard.path(),
+        HOSTS_XATTR,
+        b"[]",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .unwrap();
+    shard
+}
+
+fn assert_fallback(client: &PushClient, push: impl FnOnce(&PushClient) -> io::Result<()>) {
+    let shards = [push_shard(), push_shard()];
+    let calls = Cell::new(0);
+    let loaded = load_group_with_client(
+        &shards.iter().map(|p| p.path()).collect::<Vec<_>>(),
+        client,
+        push,
+        || {
+            calls.set(calls.get() + 1);
+            Ok::<_, ()>(())
+        },
+    )
+    .unwrap();
+    assert_eq!(calls.get(), 1, "whole mount group runs exactly once");
+    assert!(matches!(
+        loaded.route,
+        LoadRoute::Mount {
+            reason: MountReason::PushFailed(_)
+        }
+    ));
+}
+
+#[test]
+fn absent_attribute_missing_file_and_empty_group_use_mount_without_push() {
+    let shard = NamedTempFile::new().unwrap();
+    let push_shard = push_shard();
+    let missing = shard.path().with_extension("missing");
+    for shards in [
+        vec![shard.path()],
+        vec![&missing],
+        vec![],
+        vec![push_shard.path(), shard.path()],
+    ] {
+        let loaded = load_group(
+            &shards,
+            |_| -> io::Result<u32> { panic!("push must not run") },
+            || Ok::<_, ()>(42),
+        )
+        .unwrap();
+        assert_eq!(loaded.value, 42);
+        assert!(matches!(
+            loaded.route,
+            LoadRoute::Mount {
+                reason: MountReason::NoPushShard
+            }
+        ));
+    }
+}
+
+#[test]
+fn empty_hosts_is_still_sparknest_and_snapshot_symlinks_are_followed() {
+    let shard = push_shard();
+    let directory = tempfile::tempdir().unwrap();
+    let link = directory.path().join("shard");
+    std::os::unix::fs::symlink(shard.path(), &link).unwrap();
+    assert!(is_push_shard(&link));
+    rustix::fs::setxattr(
+        shard.path(),
+        HOSTS_XATTR,
+        b"",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .unwrap();
+    assert!(is_push_shard(shard.path()));
+}
+
+#[test]
+fn absent_socket_restarts_whole_group() {
+    let directory = tempfile::tempdir().unwrap();
+    let client = PushClient {
+        socket: directory.path().join("absent").to_str().unwrap().into(),
+        timeout: Duration::from_millis(50),
+    };
+    assert_fallback(&client, |c| c.create(vec![], vec![]).map(|_| ()));
+}
+
+#[test]
+fn create_refusal_failure_disconnect_and_bad_wire_restart_whole_group() {
+    for response in [
+        Some(Event::Refused("old server".into())),
+        Some(Event::Failed {
+            reason: "source gone".into(),
+            missing: vec![],
+        }),
+        None,
+    ] {
+        let server = Server::new(move |conn| {
+            assert!(matches!(request(&conn), Request::Create { .. }));
+            if let Some(response) = response {
+                event(&conn, response);
+            }
+        });
+        assert_fallback(&server.client, |c| c.create(vec![], vec![]).map(|_| ()));
+        server.finish();
+    }
+    let server = Server::new(|conn| {
+        request(&conn);
+        conn.send(&[255], None).unwrap();
+    });
+    assert_fallback(&server.client, |c| c.create(vec![], vec![]).map(|_| ()));
+    server.finish();
+}
+
+#[test]
+fn start_refusal_and_stream_failure_restart_whole_group() {
+    for fail_at_start in [true, false] {
+        let server = Server::new(move |conn| {
+            created(&conn);
+            assert!(matches!(request(&conn), Request::Patterns(_)));
+            assert!(matches!(request(&conn), Request::Entries(_)));
+            assert_eq!(request(&conn), Request::Start);
+            if fail_at_start {
+                event(&conn, Event::Refused("plan rejected".into()));
+            } else {
+                event(&conn, Event::Planned(Forecast::default()));
+                event(
+                    &conn,
+                    Event::Progress {
+                        done: 16,
+                        total: 32,
+                    },
+                );
+                event(
+                    &conn,
+                    Event::Failed {
+                        reason: "partial load".into(),
+                        missing: vec![],
+                    },
+                );
+            }
+        });
+        assert_fallback(&server.client, |c| {
+            let group = c.create(vec![], vec![])?;
+            group.patterns(vec![])?;
+            group.entries(vec![])?;
+            group.start()?;
+            loop {
+                if group.next()? == Event::Done {
+                    return Ok(());
+                }
+            }
+        });
+        server.finish();
+    }
+}
+
+#[test]
+fn join_refusal_restarts_whole_group_and_passes_a_real_fd() {
+    let server = Server::new(|conn| {
+        let mut bytes = Vec::new();
+        let received_fd = conn.recv(&mut bytes).unwrap().unwrap().unwrap();
+        let join: Request = proto::decode(&bytes).unwrap();
+        assert!(matches!(
+            join,
+            Request::Join {
+                group: 7,
+                rank: 1,
+                ..
+            }
+        ));
+        assert_eq!(File::from(received_fd).metadata().unwrap().len(), 4096);
+        event(&conn, Event::Refused("registration failed".into()));
+    });
+    let ring = tempfile::tempfile().unwrap();
+    ring.set_len(4096).unwrap();
+    assert_fallback(&server.client, |c| {
+        c.join(JoinArgs {
+            group: 7,
+            token: 11,
+            rank: 1,
+            ring_fd: ring.as_raw_fd(),
+            slots: 1,
+            slot_bytes: 4096,
+        })
+        .map(|_| ())
+    });
+    server.finish();
+}
+
+#[test]
+fn idle_create_is_bounded_and_cancels_before_mount() {
+    let (unblock, blocked) = mpsc::channel();
+    let server = Server::new(move |conn| {
+        request(&conn);
+        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            conn.event().unwrap().is_none(),
+            "group socket closed before fallback"
+        );
+    });
+    assert_fallback(&server.client, |c| {
+        let error = match c.create(vec![], vec![]) {
+            Ok(_) => panic!("hung server succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Err(error)
+    });
+    unblock.send(()).unwrap();
+    server.finish();
+}
+
+#[test]
+fn success_skips_mount_and_mount_error_is_preserved() {
+    let shard = push_shard();
+    let success = load_group(
+        &[shard.path()],
+        |_| Ok(7),
+        || -> Result<_, ()> { panic!("mount must not run") },
+    )
+    .unwrap();
+    assert_eq!(success.value, 7);
+    assert!(matches!(success.route, LoadRoute::Push));
+    let result = load_group(
+        &[shard.path()],
+        |_| -> io::Result<()> { Err(io::Error::other("push failed")) },
+        || Err("mount error"),
+    );
+    assert_eq!(result.unwrap_err(), "mount error");
+}
+
+#[test]
+fn done_progress_rank_release_and_group_cancel_use_shared_protocol() {
+    let server = Server::new(|conn| {
+        created(&conn);
+        assert_eq!(request(&conn), Request::Start);
+        event(&conn, Event::Planned(Forecast::default()));
+        event(
+            &conn,
+            Event::Progress {
+                done: 32,
+                total: 32,
+            },
+        );
+        event(&conn, Event::Done);
+        assert!(conn.event().unwrap().is_none());
+    });
+    {
+        let group = server.client.create(vec![], vec![]).unwrap();
+        assert_eq!(group.credentials(), (7, 11));
+        group.start().unwrap();
+        assert!(matches!(group.next().unwrap(), Event::Progress { .. }));
+        assert_eq!(group.next().unwrap(), Event::Done);
+    }
+    server.finish();
+    let server = Server::new(|conn| {
+        assert!(matches!(request(&conn), Request::Join { .. }));
+        event(&conn, Event::Joined);
+        event(&conn, Event::Filled { slot: 0, len: 4096 });
+        assert_eq!(request(&conn), Request::Release { slot: 0 });
+        event(&conn, Event::Done);
+    });
+    let ring = tempfile::tempfile().unwrap();
+    let rank = server
+        .client
+        .join(JoinArgs {
+            group: 7,
+            token: 11,
+            rank: 1,
+            ring_fd: ring.as_raw_fd(),
+            slots: 1,
+            slot_bytes: 4096,
+        })
+        .unwrap();
+    assert_eq!(rank.next().unwrap(), Event::Filled { slot: 0, len: 4096 });
+    rank.release(0).unwrap();
+    assert_eq!(rank.next().unwrap(), Event::Done);
+    server.finish();
+}
+
+#[test]
+fn join_start_and_stream_idle_deadlines_fall_back() {
+    for phase in ["join", "start", "next"] {
+        let (unblock, blocked) = mpsc::channel();
+        let server = Server::new(move |conn| {
+            if phase == "join" {
+                assert!(matches!(request(&conn), Request::Join { .. }));
+            } else {
+                created(&conn);
+                assert_eq!(request(&conn), Request::Start);
+                if phase == "next" {
+                    event(&conn, Event::Planned(Forecast::default()));
+                }
+            }
+            blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(conn.event().unwrap().is_none());
+        });
+        let ring = tempfile::tempfile().unwrap();
+        assert_fallback(&server.client, |client| {
+            let attempt = || -> io::Result<()> {
+                if phase == "join" {
+                    client.join(JoinArgs {
+                        group: 7,
+                        token: 11,
+                        rank: 1,
+                        ring_fd: ring.as_raw_fd(),
+                        slots: 1,
+                        slot_bytes: 4096,
+                    })?;
+                } else {
+                    let group = client.create(vec![], vec![])?;
+                    group.start()?;
+                    group.next()?;
+                }
+                Ok(())
+            };
+            let error = attempt().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{phase}");
+            Err(error)
+        });
+        unblock.send(()).unwrap();
+        server.finish();
+    }
+}
+
+#[test]
+fn full_socket_backlog_cannot_hang_model_loading() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("full.sock");
+    let listener = Socket::new(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+    listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+    listener.listen(0).unwrap();
+    // Linux admits backlog + 1 connections. Leave the first unaccepted.
+    let _occupant = Conn::connect(path.to_str().unwrap()).unwrap();
+    let client = PushClient {
+        socket: path.to_str().unwrap().into(),
+        timeout: Duration::from_millis(50),
+    };
+    assert_fallback(&client, |client| {
+        let error = match client.create(vec![], vec![]) {
+            Ok(_) => panic!("full listener backlog connected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Err(error)
+    });
+}
+
+#[test]
+fn eof_refusal_failure_and_wrong_phase_events_are_errors() {
+    for response in [
+        None,
+        Some(Event::Refused("refused".into())),
+        Some(Event::Failed {
+            reason: "failed".into(),
+            missing: vec![],
+        }),
+        Some(Event::Joined),
+    ] {
+        let server = Server::new(move |conn| {
+            created(&conn);
+            if let Some(e) = response {
+                event(&conn, e);
+            }
+        });
+        let group = server.client.create(vec![], vec![]).unwrap();
+        assert!(group.next().is_err());
+        server.finish();
+    }
+}
