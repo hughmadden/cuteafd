@@ -170,14 +170,9 @@ impl PrefixArgs {
     }
 }
 
-/// Ids of the `markers` (message-start tokens such as `<|user|>`) that `tokenizer.json`'s added
-/// tokens define, for intermediate snapshot points at message boundaries.
+/// Explicit added-token message boundaries from the checkpoint's native tokenizer.
 pub(crate) fn marker_ids(snapshot: &std::path::Path, markers: &[&str]) -> Result<Vec<u32>> {
-    let text = std::fs::read_to_string(snapshot.join("tokenizer.json"))?;
-    let tokenizer: serde_json::Value = serde_json::from_str(&text)?;
-    let added = tokenizer["added_tokens"].as_array().map_or(&[][..], Vec::as_slice);
-    Ok(markers.iter().filter_map(|marker| added.iter().find(|t| t["content"] == *marker)
-        .and_then(|t| t["id"].as_u64()).map(|id| id as u32)).collect())
+    Ok(cuteafd_loader::cached_tokenizer(snapshot)?.added_token_ids(markers))
 }
 
 /// Positions of any of `markers` in `tokens` (message boundaries, in order).

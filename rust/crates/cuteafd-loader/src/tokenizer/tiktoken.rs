@@ -14,7 +14,7 @@ use std::path::Path;
 /// The split pattern of the bundled `tokenization_kimi.py` (`pat_str`). It is
 /// Python code, not data, so the reader requires the shipped file to contain
 /// these alternatives verbatim rather than trusting a stale copy.
-const KIMI_PATTERN: [&str; 8] = [
+pub(crate) const KIMI_PATTERN: [&str; 8] = [
     r"[\p{Han}]+",
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
