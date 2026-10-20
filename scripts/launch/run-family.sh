@@ -153,6 +153,7 @@ PREFIX_CACHE_ENTRIES
 HOST_CACHE_BYTES
 MAX_OUTPUT_TOKENS
 THERMAL
+SHARD_HOLDERS
 API_KEY_FILE
 ENABLE_BENCH
 CONSOLE_ASSETS
@@ -563,6 +564,13 @@ if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi
 shared_worker_env_args=(-e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
+# SHARD_HOLDERS: `shard=host;...` placement of the checkpoint's shard files, so
+# Spark workers load file groups round-robin across holders. Absent keeps
+# the plain layer order.
+shard_holders="$(get SHARD_HOLDERS)"
+[[ -z "$shard_holders" || "$shard_holders" =~ ^[A-Za-z0-9._-]+=[A-Za-z0-9._-]+(\;[A-Za-z0-9._-]+=[A-Za-z0-9._-]+)*$ ]] ||
+  release_die "SHARD_HOLDERS must be shard=host pairs separated by ';'"
+[[ -z "$shard_holders" ]] || shared_worker_env_args+=(-e "CUTEAFD_SHARD_HOLDERS=$shard_holders")
 }
 shared_bench_nonce_args() {
 bench_nonce_env_args=()
