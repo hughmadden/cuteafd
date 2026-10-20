@@ -348,10 +348,11 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         Self::Placement::new(units, slot, super::engine::history_of(&self.engine.cfg, &[]))
     }
     fn bind_request(&self, placement: &mut Self::Placement, coordinates: Self::Coordinates,
-        media: cuteafd_engine::media::RequestMedia, tokens: &[u32], resume: usize) {
+        media: cuteafd_engine::media::RequestMedia, tokens: &[u32], resume: usize) -> Result<()> {
         placement.rope = coordinates;
         placement.media = Some(media);
         placement.history = super::engine::history_of(&self.engine.cfg, &tokens[..resume]);
+        Ok(())
     }
     fn history(&self, placement: &Self::Placement) -> Self::History { placement.history.clone() }
     fn prefetch(&self, tokens: &[u32], next: &[u32]) {

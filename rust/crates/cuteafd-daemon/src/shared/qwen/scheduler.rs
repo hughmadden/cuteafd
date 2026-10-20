@@ -99,7 +99,7 @@ pub(crate) trait Backend<'a> {
     fn coordinates(&self, tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<Self::Coordinates>;
     fn placement(&self, units: Vec<u32>, slot: i32) -> Self::Placement;
     fn bind_request(&self, placement: &mut Self::Placement, coordinates: Self::Coordinates,
-        media: RequestMedia, tokens: &[u32], resume: usize);
+        media: RequestMedia, tokens: &[u32], resume: usize) -> Result<()>;
     fn history(&self, placement: &Self::Placement) -> Self::History;
     fn prefetch(&self, tokens: &[u32], next: &[u32]);
     fn require_live(&self) -> Result<()>;
@@ -305,7 +305,8 @@ impl Trace {
 }
 
 /// Gives a finished or failed sequence's units and state slot back.
-fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>>(family: &F, cache: &mut PrefixCache<CudaCopyEngine<'_>, M>, slots: &mut Vec<i32>,
+fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>,
+    E: cuteafd_hostcache::copy::CopyEngine>(family: &F, cache: &mut PrefixCache<E, M>, slots: &mut Vec<i32>,
     placement: &P, family_name: &str, cancel: impl FnOnce() -> Result<()>) {
     if let Err(error) = cancel() {
         tracing::error!(%error, family = family_name, "cancel failed; sequence units and state slot quarantined");
@@ -316,6 +317,20 @@ fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>>(
         return;
     }
     slots.push(placement.slot());
+}
+
+/// Binding follows prefix restore but precedes Ready. Failed bindings never
+/// publish success, and only the existing cancellation/release path recycles them.
+fn bound_before_ready(bound: Result<()>, release: impl FnOnce(),
+    events: &mpsc::UnboundedSender<std::result::Result<InferenceChunk, NativeFailure>>) -> bool {
+    match bound {
+        Ok(()) => true,
+        Err(error) => {
+            release();
+            let _ = events.send(Err(NativeFailure::Worker(format!("request binding: {error:#}"))));
+            false
+        }
+    }
 }
 
 /// Verify and selection can fail before synchronizing their streams. Cache
@@ -471,9 +486,19 @@ mod readiness_tests {
         let source = source.split_once("\nfn media_failure").unwrap().0;
         let releases = source.lines().filter(|line| line.contains("release(&family,")
             || line.contains("release_failed(&family,")).collect::<Vec<_>>();
-        assert_eq!(releases.len(), 8);
+        assert_eq!(releases.len(), 9);
         assert!(releases.iter().all(|line| line.contains("|| engine.cancel(")));
         assert!(source.contains("for request in &active { engine.cancel(&request.placement)?; }"));
+    }
+
+    #[test]
+    fn restored_request_binding_failure_precedes_ready_and_reports_to_client() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        let bound = source.find("let bound = engine.bind_request(").unwrap();
+        let guarded = source[bound..].find("if !bound_before_ready(").unwrap() + bound;
+        let ready = source[bound..].find("InferenceChunk::Ready").unwrap() + bound;
+        assert!(bound < guarded && guarded < ready);
+        assert!(source[guarded..ready].contains("}, &job.events) { continue; }"));
     }
 
     #[test]
@@ -724,7 +749,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             admissions += 1;
             let mut placement = admitted.placement;
             // Native ids and this request's grids rebuild positions on EVERY restore.
-            engine.bind_request(&mut placement, rope, request_media, &tokens, resume);
+            let bound = engine.bind_request(&mut placement, rope, request_media, &tokens, resume);
+            if !bound_before_ready(bound, || {
+                release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
+            }, &job.events) { continue; }
             job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, geometry.family, &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
@@ -1279,18 +1307,35 @@ mod failed_release_tests {
         landed: RefCell<Vec<u32>>,
         drains: Cell<usize>,
         fail_on: Cell<usize>,
+        mark_bytes: Cell<usize>,
+        marks: RefCell<std::collections::BTreeMap<MarkSlot, u64>>,
+        live: Cell<Option<(i32, u64)>>,
+        restores: Cell<usize>,
     }
     impl PrefixFamily for Queued {
         type Placement = Placed;
         fn layout(&self) -> FamilyLayout {
-            FamilyLayout { page_rows: 64, pages: 2, page_bytes: 64, mark_bytes: 0,
+            FamilyLayout { page_rows: 64, pages: 2, page_bytes: 64, mark_bytes: self.mark_bytes.get(),
                 draft_bytes: 0, rule: ReuseRule::EXACT, mark_store: MarkStore::Arena,
                 page_owners: PageOwners::Uniform }
         }
         fn pages<'p>(&self, placement: &'p Placed) -> &'p [u32] { &placement.pages }
         fn commit_point(&self, _: &Placed) -> usize { 64 }
-        fn capture(&self, _: MarkSlot, _: &Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
-        fn restore(&self, _: Option<MarkSlot>, _: &mut Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn capture(&self, mark: MarkSlot, placement: &Placed, _: usize) -> Result<(), BoxError> {
+            if self.mark_bytes.get() == 0 { return Ok(()); }
+            let (slot, value) = self.live.get().ok_or("missing request state")?;
+            assert_eq!(slot, placement.slot);
+            self.marks.borrow_mut().insert(mark, value);
+            Ok(())
+        }
+        fn restore(&self, mark: Option<MarkSlot>, placement: &mut Placed, _: usize) -> Result<(), BoxError> {
+            if let Some(mark) = mark {
+                let value = *self.marks.borrow().get(&mark).ok_or("missing retained mark")?;
+                self.live.set(Some((placement.slot, value)));
+                self.restores.set(self.restores.get() + 1);
+            }
+            Ok(())
+        }
         fn copy_rows(&self, _: TailCopy) -> Result<(), BoxError> { Ok(()) }
         fn drain(&self) -> Result<(), BoxError> {
             let call = self.drains.get() + 1;
@@ -1310,6 +1355,74 @@ mod failed_release_tests {
         let placement = cache.admit_cold(family, 64, 64, |pages| Placed { pages, slot: 7 })
             .unwrap().placement;
         (cache, placement)
+    }
+
+    #[test]
+    fn bind_failure_after_restore_cancels_request_but_preserves_snapshot_and_slot_reuse() {
+        let family = Queued::default();
+        family.mark_bytes.set(8);
+        let mut cache = PrefixCache::<StubCopyEngine>::new(family.layout(), PrefixConfig {
+            entries: 1, mark_slots: 1, keep_logits: false, min_tokens: 0,
+        }, None).unwrap();
+        let mut slots = vec![7];
+        let tokens = vec![1; 64];
+        let original = cache.admit_cold(&family, 64, 64,
+            |pages| Placed { pages, slot: slots.pop().unwrap() }).unwrap().placement;
+        family.live.set(Some((7, 0x1234)));
+        assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &original,
+            After { greedy: Some(2), logits: None }).unwrap());
+        release(&family, &mut cache, &mut slots, &original, "test", || {
+            family.live.set(None);
+            Ok(())
+        });
+        let retained = family.marks.borrow().clone();
+        assert_eq!(cache.arena().in_use(), 1);
+        let restored = cache.admit(&family, &tokens, 128, false,
+            |pages| Placed { pages, slot: slots.pop().unwrap() }).unwrap();
+        assert_eq!(restored.resume, 64);
+        assert!(restored.source.is_some());
+        assert_eq!(family.live.get(), Some((7, 0x1234)));
+        let placement = restored.placement;
+        let private = placement.pages[1];
+        assert_eq!(cache.pool().refs(private), 1);
+        let (events, mut client) = mpsc::unbounded_channel();
+        let cancelled = Cell::new(false);
+        let bound: Result<()> = (|| {
+            family.live.set(Some((7, 0xbad)));
+            anyhow::bail!("injected bind failure after restore");
+        })();
+        assert!(!bound_before_ready(bound, || {
+            release(&family, &mut cache, &mut slots, &placement, "test", || {
+                assert_eq!(family.live.take(), Some((7, 0xbad)));
+                cancelled.set(true);
+                Ok(())
+            });
+        }, &events));
+        assert!(cancelled.get());
+        assert_eq!(family.live.get(), None);
+        assert_eq!(slots, [7]);
+        assert_eq!(cache.pool().refs(private), 0);
+        assert_eq!(cache.pool().refs(original.pages[0]), 1);
+        assert_eq!(cache.arena().in_use(), 1, "retained mark is not request-owned");
+        assert_eq!(*family.marks.borrow(), retained);
+        assert!(matches!(client.try_recv().unwrap(), Err(NativeFailure::Worker(message))
+            if message.contains("injected bind failure")));
+        assert!(client.try_recv().is_err(), "failed binding must not publish Ready");
+        let next = cache.admit(&family, &tokens, 128, false,
+            |pages| Placed { pages, slot: slots.pop().unwrap() }).unwrap();
+        assert_eq!(next.resume, 64);
+        assert_eq!(next.placement.slot, 7);
+        assert_eq!(family.restores.get(), 2);
+        assert_eq!(family.live.get(), Some((7, 0x1234)));
+        assert!(bound_before_ready(Ok(()), || panic!("successful bind released"), &events));
+        assert!(client.try_recv().is_err());
+        release(&family, &mut cache, &mut slots, &next.placement, "test", || {
+            family.live.set(None);
+            Ok(())
+        });
+        cache.clear(&family).unwrap();
+        assert_eq!(cache.arena().in_use(), 0);
+        assert_eq!(cache.pool().free(), 2);
     }
 
     #[test]
