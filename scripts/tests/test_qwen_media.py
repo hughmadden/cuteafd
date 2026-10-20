@@ -367,9 +367,12 @@ def test_real_cpu_official_tower_output_selects_merged_pooler(tmp_path, monkeypa
     assert torch.equal(result, official.pooler_output)
 
 
-def test_qwen_media_prefix_adjusted_lengths_and_full_vocab_bits(tmp_path):
+def test_qwen_media_prefix_adjusted_lengths_and_full_vocab_bits(tmp_path, monkeypatch):
     from fidelity_windows import (SET_SCHEMA, bucket, finish_golden, qualify_prefix,
                                   set_hash, validate_qualification, write_scored_logits)
+    # Keep media targets in the toy vocabulary scored by the shared NLL writer.
+    for name, token_id in (("START_ID", 20), ("IMAGE_ID", 21), ("END_ID", 22)):
+        monkeypatch.setattr(media, name, token_id)
     w = window()
     w["tokens"] = [17] * 100 + w["tokens"] + [18] * 700
     w["roles"] = ["ctx"] * len(w["tokens"])
@@ -380,6 +383,8 @@ def test_qwen_media_prefix_adjusted_lengths_and_full_vocab_bits(tmp_path):
     manifest["set_sha256"] = set_hash(manifest)
     identity = {"snapshot_revision": "pinned", "modeling_sha256": media.MODELING_SHA256}
     a = types.SimpleNamespace(out=tmp_path, windows=tmp_path / "windows.json", layers=None)
+    # The adjusted scored interval includes the native end-of-image token.
+    vocab = max(w["tokens"]) + 1
     changed = False
 
     def execute(args):
@@ -387,7 +392,7 @@ def test_qwen_media_prefix_adjusted_lengths_and_full_vocab_bits(tmp_path):
         entries = []
         for i, probe in enumerate(panel["windows"]):
             media.validate_window(probe)
-            logits = np.zeros((len(probe["tokens"]) - probe["score_from"], 32), dtype=np.float32)
+            logits = np.zeros((len(probe["tokens"]) - probe["score_from"], vocab), dtype=np.float32)
             if changed and i:
                 logits[0, -1] = np.float32(1e-8)  # Same top-1 is not enough.
             entries.append(write_scored_logits(args.out, probe, logits))
@@ -396,6 +401,7 @@ def test_qwen_media_prefix_adjusted_lengths_and_full_vocab_bits(tmp_path):
     proof = qualify_prefix(a, manifest, execute)
     assert proof["lengths"] == [108 + 512, 108 + 576] and proof["rows"] == 512
     assert proof["finite"] and proof["passed"] and proof["media"] == w["media"]
+    assert proof["vocab"] == vocab
     validate_qualification(proof, manifest, identity)
     changed = True
     with pytest.raises(ValueError, match="prefix invariance failed"):
