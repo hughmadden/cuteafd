@@ -48,10 +48,20 @@ pub struct MlaDraftCacheLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftCacheView {
-    /// Page-aligned absolute start; kernel lengths/queries are relative to it.
+    /// Absolute start, page-aligned relative to the slot's storage origin.
+    /// Kernel lengths/queries are relative to this start; RoPE stays absolute.
     pub base_position: usize,
     pub cache_seqlen: usize,
     pub pages: Vec<i32>,
+}
+
+/// A cold continuation binds one immutable storage origin to one slot. Rebind
+/// after slot reuse or prefix restore; never move the origin of retained rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlaDraftCacheSlot {
+    layer: MlaDraftCacheLayer,
+    slot: usize,
+    valid_from: usize,
 }
 
 impl MlaDraftCacheLayer {
@@ -59,33 +69,48 @@ impl MlaDraftCacheLayer {
     pub fn table_width(&self) -> usize { self.table_width }
     pub fn slots(&self) -> usize { self.slots }
 
-    /// Absolute positions keep RoPE unchanged; only storage addresses wrap.
-    pub fn row(&self, slot: usize, position: usize) -> Result<usize> {
-        if slot >= self.slots || position >= self.context {
-            return Err(unsupported("MLA draft row outside admitted slot/context"));
+    pub fn bind(&self, slot: usize, valid_from: usize) -> Result<MlaDraftCacheSlot> {
+        if slot >= self.slots || valid_from >= self.context {
+            return Err(unsupported("MLA draft origin outside admitted slot/context"));
         }
-        Ok(slot * self.rows_per_slot + position % self.rows_per_slot)
+        Ok(MlaDraftCacheSlot { layer: self.clone(), slot, valid_from })
+    }
+}
+
+impl MlaDraftCacheSlot {
+    pub fn valid_from(&self) -> usize { self.valid_from }
+
+    /// Producer positions remain absolute for RoPE; only storage is rebased.
+    pub fn row(&self, position: usize) -> Result<usize> {
+        if position < self.valid_from || position >= self.layer.context {
+            return Err(unsupported("MLA draft row outside bound origin/context"));
+        }
+        Ok(self.slot * self.layer.rows_per_slot + (position - self.valid_from) % self.layer.rows_per_slot)
     }
 
     /// No state is published here. A rejected block can be overwritten without
     /// rolling back the committed ring or changing its live frontier.
-    pub fn block_view(&self, slot: usize, anchor: usize, rows: usize) -> Result<MlaDraftCacheView> {
+    pub fn block_view(&self, anchor: usize, rows: usize) -> Result<MlaDraftCacheView> {
+        let layer = &self.layer;
         let end = anchor.checked_add(rows).ok_or_else(|| unsupported("MLA draft block overflow"))?;
-        if slot >= self.slots || rows == 0 || rows > self.block || end > self.context {
-            return Err(unsupported("MLA draft block outside admitted slot/context"));
+        if anchor < self.valid_from || rows == 0 || rows > layer.block || end > layer.context {
+            return Err(unsupported("MLA draft block outside bound origin/context"));
         }
-        let begin = self.window.map_or(0, |window| anchor.saturating_sub(window));
-        let base_position = begin / self.page_rows * self.page_rows;
-        let pages_per_slot = self.rows_per_slot / self.page_rows;
-        let first = base_position / self.page_rows;
-        let count = (end - base_position).div_ceil(self.page_rows);
-        if count > self.table_width {
+        let relative_anchor = anchor - self.valid_from;
+        let begin = layer.window.map_or(0, |window| relative_anchor.saturating_sub(window));
+        let base = begin / layer.page_rows * layer.page_rows;
+        let base_position = self.valid_from + base;
+        let pages_per_slot = layer.rows_per_slot / layer.page_rows;
+        let first = base / layer.page_rows;
+        let count = (end - base_position).div_ceil(layer.page_rows);
+        if count > layer.table_width {
             return Err(unsupported("MLA draft view exceeds admitted page table"));
         }
-        // An unaligned live span may name the same physical page at both ends;
-        // attention masks the stale prefix and suffix of those virtual pages.
+        // Origin-relative pages exclude stale rows before an unaligned cold
+        // restore, including full attention (which has no lower-bound mask).
+        // Sliding wrapped spans may repeat a page; the window masks its prefix.
         let pages = (first..first + count).map(|page|
-            (slot * pages_per_slot + page % pages_per_slot) as i32).collect();
+            (self.slot * pages_per_slot + page % pages_per_slot) as i32).collect();
         Ok(MlaDraftCacheView { base_position, cache_seqlen: end - base_position, pages })
     }
 }
@@ -362,21 +387,21 @@ mod tests {
             let full = &layout.layers[4];
             assert_eq!(full.rows_per_slot(), context);
             assert_eq!(full.table_width(), context / 64);
-            assert!(full.block_view(7, context - cfg.block, cfg.block).is_ok());
-            assert!(full.block_view(7, context - cfg.block + 1, cfg.block).is_err());
-            assert!(full.row(8, 0).is_err());
-            assert!(full.row(0, context).is_err());
-            assert!(full.block_view(0, 0, 0).is_err());
-            assert!(full.block_view(0, 0, cfg.block + 1).is_err());
-            assert!(full.block_view(0, usize::MAX, cfg.block).is_err());
+            assert!(full.bind(7, 0).unwrap().block_view(context - cfg.block, cfg.block).is_ok());
+            assert!(full.bind(7, 0).unwrap().block_view(context - cfg.block + 1, cfg.block).is_err());
+            assert!(full.bind(8, 0).is_err());
+            assert!(full.bind(0, 0).unwrap().row(context).is_err());
+            assert!(full.bind(0, 0).unwrap().block_view(0, 0).is_err());
+            assert!(full.bind(0, 0).unwrap().block_view(0, cfg.block + 1).is_err());
+            assert!(full.bind(0, 0).unwrap().block_view(usize::MAX, cfg.block).is_err());
         }
         assert!(cfg.cache_layout(0, 262144).is_err());
         assert!(cfg.cache_layout(8, 1048577).is_err());
         assert!(cfg.cache_layout(usize::MAX, 1048576).is_err());
         let small = cfg.cache_layout(2, 7).unwrap();
         assert!(small.layers.iter().all(|l| l.rows_per_slot() == 64));
-        assert!(small.layers[0].block_view(0, 0, 7).is_ok());
-        assert!(small.layers[0].block_view(0, 0, 8).is_err());
+        assert!(small.layers[0].bind(0, 0).unwrap().block_view(0, 7).is_ok());
+        assert!(small.layers[0].bind(0, 0).unwrap().block_view(0, 8).is_err());
     }
 
     #[test]
@@ -393,36 +418,106 @@ mod tests {
                 for slot in 0..3 {
                     let mut ring = vec![u64::MAX; 3 * capacity];
                     for neighbor in 0..3 {
+                        let bound = layer.bind(neighbor, 0).unwrap();
                         for pos in begin..anchor {
-                            ring[layer.row(neighbor, pos).unwrap()] = tag(neighbor, pos);
+                            ring[bound.row(pos).unwrap()] = tag(neighbor, pos);
                         }
                     }
+                    let bound = layer.bind(slot, 0).unwrap();
                     // Two rejected proposals at the same frontier must both
                     // leave every committed row and every neighboring slot exact.
                     for attempt in 0..2 {
                         for pos in anchor..anchor + cfg.block {
-                            ring[layer.row(slot, pos).unwrap()] = (attempt as u64) << 48 | tag(slot, pos);
+                            ring[bound.row(pos).unwrap()] = (attempt as u64) << 48 | tag(slot, pos);
                         }
                         for neighbor in 0..3 {
+                            let neighbor_bound = layer.bind(neighbor, 0).unwrap();
                             for pos in begin..anchor {
-                                assert_eq!(ring[layer.row(neighbor, pos).unwrap()], tag(neighbor, pos),
+                                assert_eq!(ring[neighbor_bound.row(pos).unwrap()], tag(neighbor, pos),
                                     "anchor {anchor}, slot {slot}, neighbor {neighbor}, live row {pos}");
                             }
                         }
-                        let view = layer.block_view(slot, anchor, cfg.block).unwrap();
+                        let view = bound.block_view(anchor, cfg.block).unwrap();
                         assert!(view.pages.len() <= layer.table_width());
                         assert_eq!(view.cache_seqlen, anchor + cfg.block - view.base_position);
                         saw_repeated_page |= view.pages.first() == view.pages.last() && view.pages.len() > 1;
                         for pos in begin..anchor + cfg.block {
                             let relative = pos - view.base_position;
                             let row = view.pages[relative / 64] as usize * 64 + relative % 64;
-                            assert_eq!(row, layer.row(slot, pos).unwrap());
+                            assert_eq!(row, bound.row(pos).unwrap());
                         }
                     }
                 }
             }
         }
         assert!(saw_repeated_page, "unaligned wrapped spans exercise virtual page duplication");
+    }
+
+    #[test]
+    fn cold_prefix_restore_rebases_storage_without_exposing_stale_prefix_rows() {
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        let layout = cfg.cache_layout(3, 262144).unwrap();
+        for layer in [&layout.layers[0], &layout.layers[4]] {
+            let capacity = layer.rows_per_slot();
+            assert!(layer.bind(0, 262144).is_err());
+            assert!(layer.bind(3, 17).is_err());
+            for origin in (0..64).chain([4095, 4096, 4097, 262144 - 16]) {
+                let bound = layer.bind(1, origin).unwrap();
+                assert_eq!(bound.valid_from(), origin);
+                assert_eq!(bound.row(origin).unwrap(), capacity);
+                if origin > 0 {
+                    assert!(bound.row(origin - 1).is_err());
+                    assert!(bound.block_view(origin - 1, cfg.block).is_err());
+                }
+                // The full layer begins cold at offset zero, not at the
+                // absolute origin's offset inside a pre-existing page.
+                let cold = bound.block_view(origin, cfg.block).unwrap();
+                assert_eq!(cold.base_position, origin);
+                assert_eq!(cold.cache_seqlen, cfg.block);
+                assert_eq!(cold.pages, [capacity as i32 / 64]);
+                let relative_anchors = if layer.window.is_some() {
+                    vec![0, 1, 63, 64, 4095, 4096, 4097, 4159, 4160, 8321, 12481]
+                } else { vec![0, 1, 63, 64, 127] };
+                for offset in relative_anchors {
+                    let anchor = origin + offset;
+                    if anchor + cfg.block > 262144 { continue; }
+                    let begin = layer.window.map_or(origin, |w| anchor.saturating_sub(w).max(origin));
+                    let mut ring = vec![usize::MAX; capacity * 3];
+                    for position in begin..anchor {
+                        ring[bound.row(position).unwrap()] = position;
+                    }
+                    let view = bound.block_view(anchor, cfg.block).unwrap();
+                    assert_eq!((view.base_position - origin) % 64, 0);
+                    assert!(view.base_position >= origin);
+                    assert_eq!(view.cache_seqlen, anchor + cfg.block - view.base_position);
+                    for attempt in 0..2 {
+                        for position in anchor..anchor + cfg.block {
+                            ring[bound.row(position).unwrap()] = position + attempt * 262144;
+                        }
+                        for position in begin..anchor {
+                            assert_eq!(ring[bound.row(position).unwrap()], position);
+                        }
+                        // Exactly the attention-visible rows map to this
+                        // continuation; rejected proposals preserve live history.
+                        for position in begin..anchor + cfg.block {
+                            let relative = position - view.base_position;
+                            let physical = view.pages[relative / 64] as usize * 64 + relative % 64;
+                            assert_eq!(physical, bound.row(position).unwrap());
+                            assert_eq!((anchor as i64) - position as i64,
+                                ((anchor - origin) as i64) - (position - origin) as i64);
+                            assert_ne!(ring[physical], usize::MAX);
+                        }
+                        assert!(ring[..capacity].iter().all(|&row| row == usize::MAX));
+                        assert!(ring[2 * capacity..].iter().all(|&row| row == usize::MAX));
+                    }
+                }
+                // Slot reuse or another cold restore creates a new binding;
+                // an old binding keeps its original coordinate system intact.
+                let replacement = layer.bind(1, origin + 1).unwrap();
+                assert_eq!(replacement.row(origin + 1).unwrap(), capacity);
+                assert_eq!(bound.row(origin + 1).unwrap(), capacity + 1);
+            }
+        }
     }
 
     #[test]
