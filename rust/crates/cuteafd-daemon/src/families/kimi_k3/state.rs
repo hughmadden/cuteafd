@@ -7,6 +7,63 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKda};
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, placement::Demand};
 use std::rc::Rc;
 
+/// A replay belongs to exactly one verified batch until accept or discard.
+/// Placement.len is scheduler-owned and may already have advanced at accept.
+pub(crate) struct Provisional {
+    pub sequences: Vec<(super::prefix::Placement, Vec<u32>, usize)>,
+}
+
+pub(crate) struct Accepted<'p> {
+    pub placement: &'p super::prefix::Placement,
+    pub start: usize,
+    pub first_row: usize,
+    pub rows: &'p [u32],
+    pub kept: Option<usize>,
+}
+
+impl Provisional {
+    pub(crate) fn new(sequences: &[(&mut super::prefix::Placement, &[u32])], slots: usize) -> Result<Self> {
+        ensure!(!sequences.is_empty(), "Kimi provisional batch is empty");
+        let mut first = 0usize;
+        let mut seen = std::collections::BTreeSet::new();
+        let sequences = sequences.iter().map(|(placement, tokens)| {
+            ensure!(placement.slot < slots && seen.insert(placement.slot)
+                && placement.len == placement.state_len && !tokens.is_empty(),
+                "Kimi provisional slot/frontier is invalid or repeated");
+            let start = first;
+            first = first.checked_add(tokens.len()).context("Kimi provisional rows overflow")?;
+            ensure!(first <= 64 && placement.len.checked_add(tokens.len()).is_some(),
+                "Kimi provisional batch exceeds native replay rows");
+            Ok(((**placement).clone(), tokens.to_vec(), start))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self { sequences })
+    }
+
+    /// Validate every selection before returning the native SoA commit table.
+    /// None means explicit discard, not a zero-row replay or an emitted bonus.
+    pub(crate) fn tables(&self, accepted: &[Accepted<'_>]) -> Result<Vec<i32>> {
+        ensure!(accepted.len() == self.sequences.len(), "Kimi accept batch differs from replay");
+        let mut selected = Vec::new();
+        for ((original, rows, first), accepted) in self.sequences.iter().zip(accepted) {
+            let placement = accepted.placement;
+            ensure!(placement.slot == original.slot && placement.units == original.units
+                && placement.state_len == original.state_len && accepted.start == original.len
+                && accepted.first_row == *first && accepted.rows == rows,
+                "Kimi accept identity/frontier differs from provisional replay");
+            if let Some(keep) = accepted.kept {
+                ensure!((1..=rows.len()).contains(&keep) && placement.len == original.len + keep,
+                    "Kimi accept must commit exactly the kept input rows");
+                selected.push((placement.slot as i32, *first as i32, keep as i32));
+            } else {
+                ensure!((original.len..=original.len + rows.len()).contains(&placement.len),
+                    "Kimi discarded placement is outside verified input rows");
+            }
+        }
+        Ok((0..3).flat_map(|column| selected.iter().map(move |&(slot, first, keep)|
+            [slot, first, keep][column])).collect())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KdaLayout {
     ordinals: Vec<Option<usize>>,
@@ -214,6 +271,84 @@ impl<'a> KdaBank<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provisional_fixture() -> Result<(Provisional, Vec<super::super::prefix::Placement>, Vec<Vec<u32>>)> {
+        let mut placements = vec![
+            super::super::prefix::Placement { units: vec![1, 2], slot: 1, len: 65, state_len: 65 },
+            super::super::prefix::Placement { units: vec![3], slot: 0, len: 9, state_len: 9 },
+        ];
+        let rows = vec![vec![10, 11, 12, 13], vec![20, 21, 22]];
+        let mut sequences = placements.iter_mut().zip(&rows).map(|(p, t)| (p, t.as_slice())).collect::<Vec<_>>();
+        let pending = Provisional::new(&mut sequences, 2)?;
+        drop(sequences);
+        Ok((pending, placements, rows))
+    }
+
+    #[test]
+    fn provisional_accept_uses_verified_start_and_exact_input_soa_not_bonus() -> Result<()> {
+        let (pending, mut placements, rows) = provisional_fixture()?;
+        for first in 1..=4 {
+            for second in 1..=3 {
+                placements[0].len = 65 + first;
+                placements[1].len = 9 + second;
+                let accepted = [Accepted { placement: &placements[0], start: 65, first_row: 0,
+                    rows: &rows[0], kept: Some(first) }, Accepted { placement: &placements[1], start: 9,
+                    first_row: 4, rows: &rows[1], kept: Some(second) }];
+                assert_eq!(pending.tables(&accepted)?, vec![1, 0, 0, 4, first as i32, second as i32]);
+                // Provisional verification never publishes either recurrent frontier.
+                assert_eq!(placements[0].state_len, 65);
+                assert_eq!(placements[1].state_len, 9);
+            }
+        }
+        placements[0].len = 69;
+        placements[1].len = 12;
+        for keep in [None, Some(2)] {
+            placements[1].len = if keep.is_some() { 11 } else { 12 };
+            let accepted = [Accepted { placement: &placements[0], start: 65, first_row: 0,
+                rows: &rows[0], kept: None }, Accepted { placement: &placements[1], start: 9,
+                first_row: 4, rows: &rows[1], kept: keep }];
+            assert_eq!(pending.tables(&accepted)?, if keep.is_some() { vec![0, 4, 2] } else { vec![] });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provisional_accept_rejects_bad_later_member_before_any_commit_table() -> Result<()> {
+        let (pending, placements, rows) = provisional_fixture()?;
+        for bad in 0..8 {
+            let mut placements = placements.clone();
+            placements[0].len = 67;
+            placements[1].len = 11;
+            let mut start = 9;
+            let mut first = 4;
+            let mut tokens = rows[1].clone();
+            let mut kept = Some(2);
+            match bad {
+                0 => placements[1].slot = 1,
+                1 => placements[1].units = vec![8],
+                2 => placements[1].state_len = 11,
+                3 => start = 11,
+                4 => first = 0,
+                5 => tokens[1] = 99,
+                6 => kept = Some(0),
+                7 => kept = Some(4),
+                _ => unreachable!(),
+            }
+            let accepted = [Accepted { placement: &placements[0], start: 65, first_row: 0,
+                rows: &rows[0], kept: Some(2) }, Accepted { placement: &placements[1], start,
+                first_row: first, rows: &tokens, kept }];
+            assert!(pending.tables(&accepted).is_err(), "accepted bad member {bad}");
+        }
+        assert!(pending.tables(&[]).is_err());
+        let mut placements = placements.clone();
+        placements[1].slot = placements[0].slot;
+        let sequences = placements.iter_mut().zip(&rows).map(|(p, t)| (p, t.as_slice())).collect::<Vec<_>>();
+        assert!(Provisional::new(&sequences, 2).is_err());
+        let mut placement = placements[0].clone();
+        assert!(Provisional::new(&[(&mut placement, &[1; 65])], 2).is_err());
+        assert!(Provisional::new(&[], 2).is_err());
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]

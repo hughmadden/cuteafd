@@ -510,6 +510,24 @@ impl<'a> LocalLane<'a> {
         Ok(())
     }
 
+    pub(crate) fn commit_kda(&self, tables: &[i32]) -> Result<()> {
+        ensure!(!tables.is_empty() && tables.len() % 3 == 0 && tables.len() / 3 <= self.kda.slots(),
+            "Kimi accepted replay table outside admission");
+        let [state, conv, replay, table] = self.kda.commit_operands(self.lane_index)?;
+        let bytes = tables.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let layers = self.cfg.attention.iter().filter(|kind|
+            **kind == cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda).count();
+        let stream = self.stream();
+        stream.device.run(|| {
+            // SAFETY: ordered copy fence, not a compute drain. The admitted table
+            // and replay remain live on the exact producer/commit stream.
+            unsafe { stream.device.library.copy_h2d_ordered(view(table, 0, bytes.len())?, &bytes, stream.raw)?; }
+            self.programs.commit.launch(tables.len() / 3, layers, self.kda.slots(),
+                state, conv, replay, table, stream.raw)?;
+            Ok(())
+        })
+    }
+
     pub(crate) fn enable_replay(&mut self, enabled: bool) { self.replay_enabled = enabled; }
 
     fn replay(&mut self, rows: usize, op: super::graphs::Op) -> Result<bool> {

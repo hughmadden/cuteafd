@@ -20,6 +20,7 @@ pub(crate) struct Engine<'a> {
     lanes: RefCell<Lanes<'a>>,
     prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
     startup_captures: Cell<Option<u64>>,
+    provisional: RefCell<Option<super::state::Provisional>>,
     hops: HopLink<'a>,
     peer: PeerExchange<'a>,
     // PeerExchange and HopLink borrow raw handles; keep their exact streams
@@ -178,7 +179,8 @@ impl<'a> Engine<'a> {
         let streams = local.iter().map(|pair| pair.each_ref().map(|local| local.stream().clone())).collect();
         let execution = Execution::new(plan, &peer, &hops, exchange_streams.clone(), streams)?;
         Ok(Self { execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
-            prefix: RefCell::new(None), startup_captures: Cell::new(None), hops, peer, exchange_streams })
+            prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
+            hops, peer, exchange_streams })
     }
 
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
@@ -241,8 +243,25 @@ impl<'a> Engine<'a> {
         sequences: &mut [(&mut super::prefix::Placement, &[u32])],
         pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool)
         -> Result<crate::shared::token_io::DeviceLogits> {
+        self.step_device_mode(sequences, pool, logit_rows, graphed, false)
+    }
+
+    pub(crate) fn verify_device(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool, graphed: bool)
+        -> Result<crate::shared::token_io::DeviceLogits> {
+        let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
+            rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi verify rows overflow")))?;
+        self.step_device_mode(sequences, pool, rows, graphed, true)
+    }
+
+    fn step_device_mode(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool, speculative: bool)
+        -> Result<crate::shared::token_io::DeviceLogits> {
         self.require_live()?;
+        ensure!(self.provisional.borrow().is_none(), "Kimi pending verify must be accepted or discarded before reuse");
         let family = self.prefix_family()?;
+        let provisional = if speculative { Some(super::state::Provisional::new(sequences, self.geometry()?.slots)?) }
+            else { None };
         let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
             rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi submission rows overflow")))?;
         ensure!(!sequences.is_empty() && logit_rows > 0 && logit_rows <= rows && logit_rows <= 64,
@@ -264,7 +283,7 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, io, experts } = &mut *lanes;
             for binding in &mut local[0] { binding.enable_replay(graphed); }
             let result = self.execution.run(scope, &self.peer, &self.hops,
-                &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], false,
+                &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
                 super::layers::Output::Normalized);
             for binding in &mut local[0] { binding.enable_replay(true); }
             let normalized = result?[0];
@@ -279,10 +298,50 @@ impl<'a> Engine<'a> {
         // A nested native operator capturing here is a contract violation too.
         // Abort/drain before propagating it, never release live graph operands.
         if let Err(error) = self.require_live() { self.shutdown()?; return Err(error); }
-        for (placement, tokens) in sequences {
-            family.commit(placement, placement.len, tokens.len())?;
+        if speculative {
+            *self.provisional.borrow_mut() = provisional;
+        } else {
+            for (placement, tokens) in sequences {
+                family.commit(placement, placement.len, tokens.len())?;
+            }
         }
         Ok(output)
+    }
+
+    pub(crate) fn accept_provisional<D, H>(&self,
+        verified: &mut [crate::shared::qwen::scheduler::Verified<'_, super::prefix::Placement, D, H>]) -> Result<()> {
+        self.require_live()?;
+        let result = (|| {
+            let pending = self.provisional.borrow();
+            let pending = pending.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi accept has no provisional verify"))?;
+            let accepted = verified.iter().map(|sequence| super::state::Accepted {
+                placement: sequence.placement, start: sequence.start, first_row: sequence.first_row,
+                rows: sequence.rows, kept: sequence.kept.map(|(rows, _)| rows),
+            }).collect::<Vec<_>>();
+            let tables = pending.tables(&accepted)?;
+            let family = self.prefix_family()?;
+            for sequence in verified.iter() {
+                family.check_provisional(sequence.placement, sequence.start, sequence.rows.len())?;
+            }
+            submit_scoped(|| self.require_live(), || self.shutdown(), |_| {
+                let lanes = self.lanes.try_borrow()?;
+                self.execution.commit_kda(&lanes.local[0], &tables)
+            })?;
+            // Host publication follows the all-rank enqueue; future attention
+            // joins the exact accepted-state events, without a compute drain.
+            for sequence in verified {
+                if let Some((keep, _)) = sequence.kept {
+                    family.commit(sequence.placement, sequence.start, keep)?;
+                } else {
+                    use cuteafd_engine::prefix::PrefixFamily;
+                    family.discard(sequence.placement).map_err(|error| anyhow::anyhow!("{error}"))?;
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() { self.shutdown()?; }
+        self.provisional.borrow_mut().take();
+        result
     }
 
     fn shutdown(&self) -> Result<()> {
@@ -329,6 +388,7 @@ impl<'a> Engine<'a> {
     /// Never applies output mixing, normalization or vocabulary projection.
     pub(crate) fn prefix_residual(&self, tokens: &[u32], pages: &[u32],
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<f32>> {
+        ensure!(self.provisional.borrow().is_none(), "Kimi diagnostic cannot overwrite pending verify");
         submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
             ensure!(!tokens.is_empty(), "Kimi diagnostic prefix has no tokens");
@@ -355,6 +415,7 @@ impl<'a> Engine<'a> {
     /// Sequential cold diagnostics reuse a single recurrent slot. Each rank's
     /// reset follows its own completed lane work; no binding/storage teardown.
     pub(crate) fn reset_cold_state(&self) -> Result<()> {
+        ensure!(self.provisional.borrow().is_none(), "Kimi reset cannot overwrite pending verify");
         let lanes = self.lanes.try_borrow()?;
         ensure!(lanes.local.len() == 1, "Kimi cold diagnostic reset needs one lane");
         for local in &lanes.local[0] {
@@ -374,6 +435,7 @@ impl<'a> Engine<'a> {
         mut consume: impl FnMut(usize, usize, usize, &[f32]) -> Result<()>) -> Result<()> {
         // A truncated inventory has no meaningful model output mix or logits.
         self.lanes.try_borrow()?.local[0][1].config().release_geometry()?;
+        ensure!(self.provisional.borrow().is_none(), "Kimi diagnostic cannot overwrite pending verify");
         submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
             ensure!(!tokens.is_empty() && tokens.len() == sequences.len() && tokens.len() <= lanes.local.len(),

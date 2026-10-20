@@ -94,13 +94,13 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative, "Kimi speculative state commit is not qualified; use no drafter");
+        if speculative { return self.engine.verify_device(sequences, pool, true).map(Some); }
         let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         self.engine.step_device(sequences, pool, rows, true).map(Some)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         _kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative, "Kimi speculative state commit is not qualified; use no drafter");
+        if speculative { return self.engine.verify_device(sequences, pool, false).map(Some); }
         let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         self.engine.step_device(sequences, pool, rows, false).map(Some)
     }
@@ -118,10 +118,14 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         -> Result<Vec<Vec<u32>>> { anyhow::bail!("Kimi drafter is not qualified") }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, NoDraft, ()>], speculative: bool, draft: bool)
         -> Result<()> {
-        ensure!(!speculative && !draft, "Kimi requires no drafter");
-        for sequence in verified {
-            ensure!(sequence.placement.state_len == sequence.start + sequence.rows.len(),
-                "Kimi non-speculative state did not commit all input rows");
+        ensure!(!draft, "Kimi drafter is not qualified");
+        if speculative {
+            self.engine.accept_provisional(verified)?;
+        } else {
+            for sequence in verified {
+                ensure!(sequence.placement.state_len == sequence.start + sequence.rows.len(),
+                    "Kimi non-speculative state did not commit all input rows");
+            }
         }
         // Shared token selection completed the producing stream before accept.
         // Record one steady census, never a per-step sampler or a compute drain.

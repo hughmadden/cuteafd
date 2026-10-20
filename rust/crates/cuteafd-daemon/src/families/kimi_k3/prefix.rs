@@ -115,6 +115,13 @@ impl<'a> KimiPrefix<'a> {
         Ok(())
     }
 
+    /// Accept observes the original state frontier, not the scheduler's emitted
+    /// token length. Validate all members before any accepted replay is queued.
+    pub(crate) fn check_provisional(&self, placement: &Placement, start: usize, rows: usize) -> Result<()> {
+        let original = Placement { len: start, ..placement.clone() };
+        self.check_append(&original, rows)
+    }
+
     /// Publish only after a complete non-speculative pass or exact accepted-state commit.
     pub(crate) fn commit(&self, placement: &mut Placement, start: usize, rows: usize) -> Result<()> {
         let end = start.checked_add(rows).context("Kimi prefix frontier overflow")?;

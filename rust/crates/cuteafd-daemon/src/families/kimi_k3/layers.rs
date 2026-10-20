@@ -94,6 +94,27 @@ impl<'a> Execution<'a> {
         bindings.iter_mut().map(|binding| binding.output(output)).collect()
     }
 
+    /// Accepted replay writes every KDA layer on this lane. Publish those exact
+    /// streams into the same dependency chain consumed by the next attention.
+    pub(crate) fn commit_kda(&self, locals: &[LocalLane<'a>; 2], tables: &[i32]) -> Result<()> {
+        if tables.is_empty() { return Ok(()); }
+        let lane = locals[0].lane_index();
+        let bound = self.lanes.get(lane).context("Kimi commit lane outside admission")?;
+        ensure!(locals[1].lane_index() == lane && (0..2).all(|rank|
+            Rc::ptr_eq(locals[rank].stream(), &bound.streams[rank])),
+            "Kimi commit streams differ from replay lane");
+        for local in locals { local.commit_kda(tables)?; }
+        for (layer, kind) in locals[0].config().attention.iter().enumerate() {
+            if *kind != cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda { continue; }
+            let mut ready = self.state_ready[layer].borrow_mut();
+            for rank in 0..2 {
+                ready[rank].record(locals[rank].stream())?;
+                self.state_pending[layer][rank].set(true);
+            }
+        }
+        Ok(())
+    }
+
     /// Validate every borrowed link before entering the shared executor. No
     /// device guard spans the submission or an asynchronous yield.
     pub(crate) fn protocol<'e>(&'e self, peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>)
