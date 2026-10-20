@@ -1920,19 +1920,17 @@ if [[ $family =~ ^(glm5|qwen4|qwen3_5|deepseek_v4)$ ]]; then
 fi
 # Kimi K3 and Step-5: unset or auto POOL_TOKENS leaves the KV pool to the serve
 # command's own automatic admission (no --pool-tokens). Kimi's RTX_EXPERT_LAYERS
-# is the fixed count of routed layers onboarded to the RTX pair (unset:
-# serve-kimi's default).
+# is auto (default: the planner picks the RTX-onboarded routed layers and marks)
+# or a fixed count, which admission must then fit.
 if ((qualifying)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
 fi
 if [[ $family == kimi_k3 ]]; then
-  local_layers="$(get RTX_EXPERT_LAYERS)"
-  if [[ -n "$local_layers" ]]; then
-    [[ "$local_layers" =~ ^[0-9]+$ ]] ||
-      release_die "Kimi K3 RTX_EXPERT_LAYERS is a fixed routed-layer count (N, N% or all), not $local_layers"
-    family_args+=(--rtx-expert-layers "$local_layers")
-  fi
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "Kimi K3 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
+  family_args+=(--rtx-expert-layers "$local_layers")
 fi
 # DECODE_SHARE: the share of the time running requests keep while prompts
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next

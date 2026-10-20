@@ -60,9 +60,10 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--max-sequences") == "16"
     assert _flag(serve, "--embedding-placement") == "gpu"
     assert _flag(serve, "--prefix-cache-entries") == "20"
-    # serve-kimi's own defaults stay its own: compiled 1M context, automatic KV pool,
-    # its onboarded-layer default; it takes no speculator or media options.
-    for absent in ("--max-context", "--pool-tokens", "--rtx-expert-layers", "--vision", "--audio",
+    # serve-kimi's own defaults stay its own: compiled 1M context, automatic KV pool;
+    # the planner picks the onboarded layers; it takes no speculator or media options.
+    assert _flag(serve, "--rtx-expert-layers") == "auto"
+    for absent in ("--max-context", "--pool-tokens", "--vision", "--audio",
                    "--draft", "--mtp", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -110,7 +111,7 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
     ("RTX_GPUS=1\n", "TP2 attention on two RTX GPUs"),
     ("COORDINATOR_SPLIT=off\n", "TP2 attention on two RTX GPUs"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
-    ("RTX_EXPERT_LAYERS=auto\n", "fixed routed-layer count"),
+    ("RTX_EXPERT_LAYERS=max\n", "auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=94\n", "RTX_EXPERT_LAYERS must be"),
     ("KV_CACHE=bf16\n", "unused configuration key: KV_CACHE"),
     ("SPECULATOR_MODEL_ID=x/y\n", "unused configuration key: SPECULATOR_MODEL_ID"),
@@ -173,7 +174,8 @@ def test_kimi_example_config_is_the_max_card() -> None:
     values = _keys(EXAMPLE)
     assert values["MODEL_ID"] == KIMI_ID
     assert values["MODEL_REVISION"] == "acba35b61a672561652b16a96fca1be85c1bd875"
-    assert (values["RTX_GPUS"], values["SPARK_COUNT"], values["RTX_EXPERT_LAYERS"]) == ("2", "6", "5")
+    assert (values["RTX_GPUS"], values["SPARK_COUNT"]) == ("2", "6")
+    assert "RTX_EXPERT_LAYERS" not in values
     assert (values["SPECULATOR"], values["VISION"], values["AUDIO"], values["POOL_TOKENS"]) == ("off", "off", "off", "auto")
     for absent in ("MAX_CONTEXT_TOKENS", "SPARK_DEVICE_BUDGET_BYTES", "KV_CACHE", "CONCURRENCY"):
         assert absent not in values
@@ -191,7 +193,7 @@ def test_kimi_example_config_launches_through_run_family(tmp_path: Path) -> None
     result = _family_launch_result(tmp_path, KIMI, KIMI_ID, keys + "SPARK_COUNT=6\n" + SIX,
                                    extra_args=("--wip", "k3"), encoder_plan=PLANNED)
     serve = _line(result, "cuteafd serve-kimi --snapshot")
-    assert _flag(serve, "--rtx-expert-layers") == "5"
+    assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert "--pool-tokens" not in serve.split() and "--max-context" not in serve.split()
 
 
