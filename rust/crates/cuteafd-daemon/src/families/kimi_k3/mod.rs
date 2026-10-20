@@ -22,3 +22,5 @@ pub(crate) mod core_runtime;
 pub(crate) mod reference;
 #[cfg(test)]
 mod core_native_tests;
+#[cfg(test)]
+mod core_layer_tests;

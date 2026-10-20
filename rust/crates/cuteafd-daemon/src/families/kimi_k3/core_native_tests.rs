@@ -19,7 +19,7 @@ fn tensors(path: &Path) -> Result<BTreeMap<String,LoadedTensor>> {
             source_path:path.into(),bytes,elapsed_micros:0,sha256:String::new()}))
     }).collect()
 }
-fn bf16(bytes: &[u8]) -> Vec<f64> {
+pub(super) fn bf16(bytes: &[u8]) -> Vec<f64> {
     bytes.chunks_exact(2).map(|b|f32::from_bits(u32::from(u16::from_le_bytes([b[0],b[1]]))<<16)as f64).collect()
 }
 fn f16(bytes: &[u8]) -> Vec<f64> {
@@ -32,7 +32,7 @@ fn f16(bytes: &[u8]) -> Vec<f64> {
             _=>sign*(1.+f64::from(mantissa)/1024.)*2f64.powi(i32::from(exponent)-15)}
     }).collect()
 }
-fn errors(actual: &[f64], reference: &[f64]) -> Result<(f64,f64)> {
+pub(super) fn errors(actual: &[f64], reference: &[f64]) -> Result<(f64,f64)> {
     ensure!(!actual.is_empty() && actual.len()==reference.len(),"native oracle extent");
     ensure!(actual.iter().chain(reference).all(|x|x.is_finite()),"native oracle nonfinite");
     let squared=actual.iter().zip(reference).map(|(a,b)|(a-b).powi(2)).sum::<f64>();

@@ -400,6 +400,27 @@ impl<'a> KimiFfn<'a> {
         Ok(Self { gate_up, situ, down, rows, width: intermediate })
     }
 
+    /// Standalone BF16 projection with this FFN's gate/up geometry. It also
+    /// provides a same-weight reduction-order control for projected seams.
+    pub fn project_gate_up(&self,rows:usize,input:Buffer,weight:Buffer,output:Buffer,
+        stream:*mut c_void)->W8Result<()> {
+        validate_projection_buffers(rows,self.rows,7168,2*self.width,input,weight,output)?;
+        // SAFETY: resolved program, checked geometry/devices/disjoint output;
+        // the caller retains every operand until the stream drains.
+        unsafe {self.gate_up.launch(&[input.ptr,weight.ptr,output.ptr],&[Scalar::I32(rows as i32)],stream)?;}
+        Ok(())
+    }
+
+    /// Standalone down projection, retaining the existing BF16 reduction.
+    pub fn project_down(&self,rows:usize,input:Buffer,weight:Buffer,output:Buffer,
+        stream:*mut c_void)->W8Result<()> {
+        validate_projection_buffers(rows,self.rows,self.width,7168,input,weight,output)?;
+        // SAFETY: resolved program with validated dense disjoint operands;
+        // the caller retains all storage through completion.
+        unsafe {self.down.launch(&[input.ptr,weight.ptr,output.ptr],&[Scalar::I32(rows as i32)],stream)?;}
+        Ok(())
+    }
+
     pub fn launch(&self, b: KimiFfnBatch, stream: *mut c_void) -> W8Result<()> {
         if b.rows == 0 || b.rows > self.rows { return Err(KimiW8Error::Invalid("FFN rows/capacity")); }
         let row_bytes = b.rows.checked_mul(7168 * 2).ok_or(KimiW8Error::Invalid("FFN extent overflow"))?;
