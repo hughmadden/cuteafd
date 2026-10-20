@@ -236,6 +236,66 @@ fn qwen_snapshot(bits: usize) -> tempfile::TempDir {
     dir
 }
 
+#[test]
+fn step5_mtp_selection_leaves_other_family_ownership_unchanged() {
+    use spec::DraftOwnership;
+    for family in family::registry().iter().filter(|family| family.id() != "step5") {
+        for selected in ["off", "mtp", "dspark", "dflash2", "unknown"] {
+            let previous = match (family.id(), selected) {
+                ("mimo_v2" | "qwen4", "mtp") => DraftOwnership::NativeMtp,
+                ("deepseek_v4" | "deepseek_v41", "dspark") => DraftOwnership::BundledDspark,
+                _ => DraftOwnership::None,
+            };
+            assert_eq!(DraftOwnership::selected(family.id(), selected), previous,
+                "{} {selected}", family.id());
+        }
+    }
+}
+
+fn assert_pre_step5_role_sets_unchanged(checkpoint: &Checkpoint) {
+    use files::{required_tensors, ReadRole};
+    use spec::DraftOwnership;
+    let family = family::detect(checkpoint).unwrap();
+    assert_ne!(family.id(), "step5");
+    let model = family.open(checkpoint).unwrap();
+    for role in [ReadRole::Coordinator { local_experts: false, speculator: false },
+        ReadRole::Coordinator { local_experts: false, speculator: true },
+        ReadRole::Coordinator { local_experts: true, speculator: true },
+        ReadRole::Spark { rank: 0, world: 4 }, ReadRole::Drafter, ReadRole::ExternalDrafter,
+        ReadRole::Vision, ReadRole::Audio] {
+        // Freeze the ownership selection before Step-5 was added, independently
+        // of the current selector used by required_tensors.
+        let previous = match role {
+            ReadRole::Coordinator { speculator: true, .. } | ReadRole::Drafter => match family.id() {
+                "mimo_v2" | "qwen4" => DraftOwnership::NativeMtp,
+                "deepseek_v4" | "deepseek_v41" => DraftOwnership::BundledDspark,
+                _ => DraftOwnership::None,
+            },
+            _ => DraftOwnership::None,
+        };
+        let before = checkpoint.tensor_names().filter(|name| {
+            let Some(tensor) = family.classify(model.spec(), name) else { return false };
+            if !previous.includes(tensor.component) { return false; }
+            match role {
+                ReadRole::Coordinator { local_experts, speculator } => match tensor.component {
+                    Component::RoutedExpert => local_experts,
+                    Component::Speculator | Component::SpeculatorExpert => speculator,
+                    Component::Vision | Component::Audio => false,
+                    _ => true,
+                },
+                ReadRole::Spark { .. } => tensor.component == Component::RoutedExpert,
+                ReadRole::Drafter => matches!(tensor.component, Component::Speculator | Component::SpeculatorExpert),
+                ReadRole::ExternalDrafter => false,
+                ReadRole::Vision => tensor.component == Component::Vision,
+                ReadRole::Audio => tensor.component == Component::Audio,
+            }
+        }).map(str::to_owned).collect::<std::collections::BTreeSet<_>>();
+        let after = required_tensors(checkpoint, role).unwrap();
+        assert_eq!(serde_json::to_vec(&before).unwrap(), serde_json::to_vec(&after).unwrap(),
+            "{} {role:?}: resident tensor sets must remain byte-identical", family.id());
+    }
+}
+
 fn unused_checkpoint_draft_bytes(config: Value, native: Tensor, v4: bool) {
     use spec::DraftOwnership;
     use files::{required_tensors, ReadRole};
@@ -253,6 +313,7 @@ fn unused_checkpoint_draft_bytes(config: Value, native: Tensor, v4: bool) {
         write_snapshot(dir.path(), &config, &natives, None);
     } else { write_snapshot(dir.path(), &config, &natives, None); }
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    assert_pre_step5_role_sets_unchanged(&checkpoint);
     let family = family::detect(&checkpoint).unwrap();
     for selected in ["off", "dflash2"] {
         let ownership = DraftOwnership::selected(family.id(), selected);

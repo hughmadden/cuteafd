@@ -99,10 +99,13 @@ fn coordinator_headers_include_native_mtp_only_when_selected() -> anyhow::Result
             let layout = coordinator::RankWeightLayout::for_mtp_stage(&on, stage)?;
             assert_eq!(layout.operands.len(), 16);
             for operand in &layout.operands {
-                let header = on.tensors.iter().find(|tensor| tensor.meta.name == operand.name)
-                    .expect("indexed predictor tensor must resolve to its own shard header");
-                assert_eq!(on.weight_map.get(&operand.name), Some(&header.shard));
-                assert!(!off_names.contains(&operand.name));
+                assert!(!operand.sources.is_empty(), "native operand must retain source headers");
+                for source in &operand.sources {
+                    let header = on.tensors.iter().find(|tensor| tensor.meta.name == source.meta.name)
+                        .expect("indexed predictor source must resolve to its own shard header");
+                    assert_eq!(on.weight_map.get(&source.meta.name), Some(&header.shard));
+                    assert!(!off_names.contains(&source.meta.name));
+                }
             }
         }
         assert_eq!(names(&Checkpoint::coordinator(path, false, false)?), off_names);
