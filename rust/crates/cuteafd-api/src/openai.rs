@@ -55,6 +55,14 @@ pub enum ModelEncoding {
 }
 
 impl ModelEncoding {
+    /// Whether the active chat renderer can render a thinking-off request.
+    pub fn supports_thinking_off(&self) -> bool {
+        match self {
+            Self::Step5(encoding) => encoding.supports_thinking_off(),
+            _ => true,
+        }
+    }
+
     /// The checkpoint's end-of-sequence token ids.
     pub fn eos_token_ids(&self) -> Vec<u32> {
         match self {
@@ -384,6 +392,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
 pub(crate) fn model_record(state: &NativeState) -> Value {
     let owner = state.profile.id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
     let mut model = json!({"id":state.profile.id,"object":"model","owned_by":owner,
+        "supports_thinking_off":state.profile.encoding.supports_thinking_off(),
         "capabilities":state.profile.capabilities,"max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()});
     if let ModelEncoding::Glm(encoding) = &state.profile.encoding {
         if let Some(provenance) = encoding.template_provenance() {

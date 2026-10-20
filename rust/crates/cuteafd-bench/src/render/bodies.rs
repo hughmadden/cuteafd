@@ -318,6 +318,7 @@ impl<'a> View<'a> {
             y += chips(doc, t, 120.0, y, w - 120.0, &items, t.series[0]) + 6.0;
         }
         y += row(doc, t, 0.0, y, w, "Speculator", &c.speculator_label());
+        y += row(doc, t, 0.0, y, w, "Thinking", c.thinking_label());
         y += row(doc, t, 0.0, y, w, "Capacity", &self.report.capacity().line());
         if let Some(layout) = &c.layout {
             y += row(doc, t, 0.0, y, w, "Layout", layout);
@@ -365,7 +366,7 @@ impl<'a> View<'a> {
             doc.text(x, 80.0, Font::new(11.0, t.ink2), &fit(sub, 11.0, headline_width));
         };
         let code_tokens = b.card.decode_of("code").and_then(|d| d.runs.first()).map_or(0, |r| r.completion_tokens);
-        big(doc, 0.0, "C1 CODE DECODE", &rate(code), "tps", &format!("thinking off · {code_tokens} tokens"),
+        big(doc, 0.0, "C1 CODE DECODE", &rate(code), "tps", &format!("{} · {code_tokens} tokens", self.report.server.configuration.thinking_label()),
             t.series[0]);
         decode_scaling(doc, t, self.report, headline_width + 24.0, 12.0, headline_width, 0.48);
         let prefill_x = 2.0 * (headline_width + 24.0);

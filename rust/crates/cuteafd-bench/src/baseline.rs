@@ -37,8 +37,8 @@ fn messages(text: &str) -> Value {
     json!([{"role": "user", "content": text}])
 }
 
-fn plain(text: &str, max_tokens: u64) -> Value {
-    json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}})
+pub(crate) fn plain(client: &crate::client::Client, text: &str, max_tokens: u64) -> Value {
+    crate::request::thinking_off(&client.configuration, json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}}))
 }
 
 /// Expected seconds of the whole baseline at `rates`.
@@ -143,7 +143,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let mut run = Run {
         client, info, progress, max_context,
         baseline: Baseline { fingerprint: fingerprint.into(), run_id: run_id.into(), created: now_rfc3339(),
-            card: BasicCard { capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0, thermal: None, fabric: vec![] },
+            card: BasicCard { thinking: Some(info.configuration.thinking_label().into()), capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0, thermal: None, fabric: vec![] },
     };
     // Warm-up: first-use workspaces, graphs and tables (untimed), and a two-point
     // fit of tokens per filler word for the prefill case.
@@ -152,16 +152,16 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let mut fit = Vec::new();
     for (i, words) in [300usize, 900].into_iter().enumerate() {
         let text = format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(17 + i as u64, words));
-        let chat = client.chat(plain(&text, 8), None).context("warm-up request")?;
+        let chat = client.chat(plain(client, &text, 8), None).context("warm-up request")?;
         fit.push((words as f64, chat.timing.prompt_tokens as f64));
     }
-    client.chat(plain(&format!("[{}] {}", nonce(), CONTENT[0].1), 32), None).context("warm-up decode")?;
+    client.chat(plain(client, &format!("[{}] {}", nonce(), CONTENT[0].1), 32), None).context("warm-up decode")?;
     run.baseline.card.warmup_s = Some(warmup.elapsed().as_secs_f64());
     // C1 decode per content type.
     for (i, (content, prompt)) in CONTENT.iter().enumerate() {
         run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
         let fabric_mark = client.fabric_mark();
-        let chat = client.chat(plain(&format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
+        let chat = client.chat(plain(client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
             .with_context(|| format!("{content} decode"))?;
         if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/{content}/c1"), true) {
             run.baseline.fabric.push(phase);
@@ -207,15 +207,15 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let warm_target = (target + 512.0).min(max_context.saturating_sub(64) as f64);
     let warm_words = ((warm_target - intercept) / slope).max(64.0) as usize;
     let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(98, warm_words));
-    client.chat(plain(&text, 1), None).context("8K prefill warm-up")?;
+    client.chat(plain(client, &text, 1), None).context("8K prefill warm-up")?;
     let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(99, words));
     // Prime this exact lane shape and its routed expert accesses too. A cold
     // probe neither reads nor retains a prefix, so the timed ordinary request
     // still performs its full prefill and normal snapshot work.
-    client.chat(plain(&text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
+    client.chat(plain(client, &text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
         .context("8K prefill route warm-up")?;
     let fabric_mark = client.fabric_mark();
-    let chat = client.chat(plain(&text, 1), None).context("8K prefill")?;
+    let chat = client.chat(plain(client, &text, 1), None).context("8K prefill")?;
     if let Some(phase) = client.fabric_since(fabric_mark, "prefill/8k", true) { run.baseline.fabric.push(phase); }
     let t = chat.timing.clone();
     anyhow::ensure!(t.cached_tokens == 0, "8K cold prefill reused {} cached tokens", t.cached_tokens);
@@ -322,25 +322,25 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
     // Prompt end: the first request computes and retains, the second restores it whole.
     let text = format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), filler(31, 1100));
-    let first = probed(client, plain(&text, 2), rows(2))?;
+    let first = probed(client, plain(client, &text, 2), rows(2))?;
     if !honoured(&first) {
         unsupported(check);
         return Ok(());
     }
-    let restored = probed(client, plain(&text, 2), rows(2))?;
+    let restored = probed(client, plain(client, &text, 2), rows(2))?;
     // Turn end. Long enough to clear the cache's minimum snapshot size and several units; the
     // answer runs past 25 tokens, so the turn ends at its length limit and the turn snapshot is
     // followed by a decode step.
     let turn_text = format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
         nonce(), filler(57, 900));
-    let turn = probed(client, plain(&turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
-    let reference = probed(client, plain(&turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
+    let turn = probed(client, plain(client, &turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
+    let reference = probed(client, plain(client, &turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
     let mut ids = turn.prompt_ids.clone();
     ids.extend(&turn.generated[..turn.generated.len().saturating_sub(1)]);
     // The turn's own generated ids are the prompt, so it is not comparable between arms.
-    let again = probed(client, plain("cache probe", 2),
+    let again = probed(client, plain(client, "cache probe", 2),
         ProbeSpec { prompt_ids: Some(ids), output_dependent: true, ..rows(2) })?;
-    let cold = probed(client, plain(&turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
+    let cold = probed(client, plain(client, &turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
     let verdict = Restores::judge(&first, &restored, &turn, &reference, &again, &cold);
     check.set("prompt_tokens", restored.prompt_ids.len() as u64);
     check.set("prompt_restored", restored.cached_tokens as u64);
@@ -469,13 +469,13 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let text = format!("[{tag}] {}", CONTENT[0].1);
     let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, record_rows: TOKENS as usize, top_k: 2,
         ..ProbeSpec::default() };
-    let on = run.client.chat(plain(&text, TOKENS), Some(spec(false)))?;
+    let on = run.client.chat(plain(run.client, &text, TOKENS), Some(spec(false)))?;
     let on_record = probe_of(&on)?;
     if !honoured(on_record) {
         unsupported(check);
         return Ok(());
     }
-    let off = run.client.chat(plain(&text, TOKENS), Some(spec(true)))?;
+    let off = run.client.chat(plain(run.client, &text, TOKENS), Some(spec(true)))?;
     let off_record = probe_of(&off)?;
     let (a, b) = (&on_record.generated, &off_record.generated);
     let same = a.iter().zip(b).take_while(|(x, y)| x == y).count();
@@ -490,7 +490,7 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     // without drafts, always (#533: drafts-off nondeterminism hid behind
     // on/off agreement). Rows that differ here are run-to-run nondeterminism,
     // not anything a verify does.
-    let again = run.client.chat(plain(&text, TOKENS), Some(spec(true)))?;
+    let again = run.client.chat(plain(run.client, &text, TOKENS), Some(spec(true)))?;
     let again_record = probe_of(&again)?;
     let same_again = b.iter().zip(&again_record.generated).take_while(|(x, y)| x == y).count();
     let repeat = RowNoise::between(again_record, off_record, off_record.prompt_ids.len() + same_again);
@@ -510,14 +510,14 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
             check.summary = format!("{speculator}: {} greedy tokens identical with drafts on and off {rates}{repeat_note}", a.len());
         } else {
             // Plain decode must reproduce itself; agreement with drafts on cannot excuse it.
-            check.set("replay", replay(&tag, &text, TOKENS, off_record));
+            check.set("replay", replay(&run.info.configuration, &tag, &text, TOKENS, off_record));
             check.status = CheckStatus::Fail;
             check.summary = format!("{speculator}: drafts on and off agree, but plain decode does not repeat {rates}{repeat_note}");
         }
         return Ok(());
     }
     // Any divergence keeps what replays it (the verdict below may still pass a near tie).
-    check.set("replay", replay(&tag, &text, TOKENS, off_record));
+    check.set("replay", replay(&run.info.configuration, &tag, &text, TOKENS, off_record));
     // Evidence for numerics vs state: how far the drafted run's rows already
     // were from the one-row run's on the identical prefix. A flip within that
     // noise is rounding; noise that is zero until a point and then grows
@@ -562,9 +562,9 @@ pub(crate) fn top_two_margin(record: &ProbeRecord, position: usize) -> Option<f6
 
 /// What replays one probed request exactly: the nonce, the request text and the prompt ids the
 /// engine ran. Random nonces are otherwise lost, so every lossless failure keeps this.
-pub(crate) fn replay(nonce: &str, text: &str, max_tokens: u64, record: &ProbeRecord) -> Value {
-    json!({"nonce": nonce, "text": text, "max_tokens": max_tokens, "thinking": "disabled", "temperature": 0,
-        "prompt_ids": record.prompt_ids})
+pub(crate) fn replay(configuration: &crate::report::Configuration, nonce: &str, text: &str, max_tokens: u64, record: &ProbeRecord) -> Value {
+    crate::request::thinking_off(configuration, json!({"nonce": nonce, "text": text, "max_tokens": max_tokens, "thinking": "disabled", "temperature": 0,
+        "prompt_ids": record.prompt_ids}))
 }
 
 /// The lossless verdict for a drafts-on vs drafts-off flip.
@@ -767,13 +767,13 @@ fn template(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
 fn c1_c4(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let text = format!("[{}] {}", nonce(), CONTENT[1].1);
     let probe = || Some(ProbeSpec { cold: true, record_rows: 64, top_k: 2, ..ProbeSpec::default() });
-    let one = run.client.chat(plain(&text, 64), probe())?;
+    let one = run.client.chat(plain(run.client, &text, 64), probe())?;
     let client = run.client.clone();
     let four: Vec<Result<Chat>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..4).map(|_| {
             let client = client.clone();
             let text = text.clone();
-            scope.spawn(move || client.chat(plain(&text, 64), probe()))
+            scope.spawn(move || client.chat(plain(&client, &text, 64), probe()))
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("thread panicked")))).collect()
     });
@@ -909,7 +909,7 @@ mod tests {
     fn a_divergence_keeps_what_replays_it() {
         let record = ProbeRecord { prompt_ids: vec![3, 1, 4], ..ProbeRecord::default() };
         let text = format!("[{}] {}", "0a1b2c3d4e", CONTENT[0].1);
-        assert_eq!(replay("0a1b2c3d4e", &text, 128, &record), json!({"nonce": "0a1b2c3d4e", "text": text,
+        assert_eq!(replay(&crate::report::Configuration::default(), "0a1b2c3d4e", &text, 128, &record), json!({"nonce": "0a1b2c3d4e", "text": text,
             "max_tokens": 128, "thinking": "disabled", "temperature": 0, "prompt_ids": [3, 1, 4]}));
     }
 

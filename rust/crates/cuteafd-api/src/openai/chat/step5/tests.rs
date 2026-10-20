@@ -25,12 +25,32 @@ fn own_template_matches_official_transformers_goldens() {
     }
 }
 
+#[tokio::test]
+async fn models_advertises_active_renderer_thinking_capability() {
+    use crate::openai::{router_for_model, ConsoleHub, ModelEncoding, ModelProfile, NativeLimits};
+    use axum::{body::{to_bytes, Body}, http::Request};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+    for (renderer, supported) in [(ModelEncoding::Step5(Arc::new(encoding())), false),
+        (ModelEncoding::DeepseekV41, true)] {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5), ConsoleHub::disabled(), ModelProfile::new("test/model", renderer));
+        let response = app.oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(body["data"][0]["supports_thinking_off"], supported);
+    }
+}
+
 #[test]
 fn checkpoint_thinking_and_token_contract_is_not_qwen() {
     let body = json!({"messages": [{"role": "user", "content": "Hi"}]});
     assert_eq!(encoding().render(&body, &options(&body)).unwrap(),
         format!("{BOS}<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>"));
     let tokens = encoding();
+    assert!(!tokens.supports_thinking_off());
+    assert!(!crate::openai::ModelEncoding::Step5(std::sync::Arc::new(encoding())).supports_thinking_off());
+    assert!(crate::openai::ModelEncoding::DeepseekV41.supports_thinking_off());
     assert_eq!(tokens.tokens().bos, 0);
     assert_eq!(tokens.tokens().eos, [128_007]);
     assert_eq!(tokens.tokens().think_close, 128_799);

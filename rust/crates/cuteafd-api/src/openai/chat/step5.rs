@@ -31,6 +31,9 @@ pub struct Step5Encoding {
 }
 
 impl Step5Encoding {
+    /// The official template always opens reasoning.
+    pub fn supports_thinking_off(&self) -> bool { false }
+
     pub fn new(source: impl Into<String>, tokens: Step5TokenIds, bos_token: String) -> Result<Self> {
         anyhow::ensure!(!tokens.eos.is_empty(), "Step-5 EOS token list must not be empty");
         Ok(Self { template: ChatTemplate::new(source).context("compile Step-5 chat template")?, tokens, bos_token })

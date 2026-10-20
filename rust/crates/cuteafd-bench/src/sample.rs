@@ -22,6 +22,7 @@ pub fn report(failed: bool) -> Report {
     let setting = |name: &str, value: &str, default: Option<&str>, source: &str| Setting { name: name.into(),
         value: Some(value.into()), default: default.map(str::to_string), source: source.into() };
     let configuration = Configuration {
+        supports_thinking_off: None,
         snapshot: Some("/mnt/sparknest/hf-home/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa".into()),
         quant: vec![QuantGroup { group: "attention".into(), formats: vec!["fp8_block".into()] },
             QuantGroup { group: "routed expert".into(), formats: vec!["mxfp4".into()] },
@@ -62,7 +63,7 @@ pub fn report(failed: bool) -> Report {
     quality.settle();
     let baseline = Baseline {
         fingerprint: "3f9a2c41d07be5a1".into(), run_id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
-        card: BasicCard { decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
+        card: BasicCard { thinking: None, decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
             concurrency: [(1, 187.3, 187.3), (4, 640.0, 158.0), (8, 960.0, 118.0), (16, 1280.0, 78.0)]
                 .into_iter().map(|(width, aggregate_tok_s, per_stream_median_tok_s)| ConcurrentRate {
                     width, aggregate_tok_s, per_stream_median_tok_s, decode_s: 319.0 / per_stream_median_tok_s,

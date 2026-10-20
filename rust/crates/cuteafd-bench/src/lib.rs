@@ -22,6 +22,7 @@ pub mod profiles;
 pub mod publish;
 pub mod quality;
 pub mod reference;
+pub mod request;
 pub mod render;
 pub mod report;
 pub mod runner;
