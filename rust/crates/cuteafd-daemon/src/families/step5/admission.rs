@@ -57,6 +57,18 @@ mod tests {
 
     #[test]
     fn public_max_card_planner_equals_measured_daemon_before_allocation() -> Result<()> {
+        planner_equals_measured_daemon(false)
+    }
+
+    #[test]
+    fn public_nvfp4_min_card_planner_equals_measured_daemon_before_allocation() -> Result<()> {
+        planner_equals_measured_daemon(true)
+    }
+
+    fn planner_equals_measured_daemon(nvfp4: bool) -> Result<()> {
+        let ranks = if nvfp4 { 1 } else { 2 };
+        let sparks = if nvfp4 { 4 } else { 6 };
+        let package = if nvfp4 { "fp8-step5-nvfp4a4" } else { "fp8-step5" };
         let dir = tempfile::tempdir()?;
         let source: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -85,7 +97,24 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        testing::write_snapshot(dir.path(), &source["config"], &tensors, None);
+        let (config, tensors) = if nvfp4 {
+            let config = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+                "/../cuteafd-loader/src/plan/families/step5/fixtures/official-nvfp4-config.json")))?;
+            let mut native = Vec::new();
+            for (name, dtype, shape) in tensors {
+                if name.ends_with("weight_scale_inv") { continue; }
+                if dtype == "F8_E4M3" {
+                    let stem = name.strip_suffix(".weight").unwrap();
+                    let [e, n, k]: [usize; 3] = shape.try_into().unwrap();
+                    native.push(testing::t(&name, "U8", &[e, n, k / 2]));
+                    native.push(testing::t(format!("{stem}.weight_scale"), "F8_E4M3", &[e, n, k / 16]));
+                    native.push(testing::t(format!("{stem}.weight_scale_2"), "F32", &[e]));
+                    native.push(testing::t(format!("{stem}.input_scale"), "F32", &[e]));
+                } else { native.push((name, dtype, shape)); }
+            }
+            (config, native)
+        } else { (source["config"].clone(), tensors) };
+        testing::write_snapshot(dir.path(), &config, &tensors, None);
         // Export metadata only: no fabricated executor, library or CUDA pointers.
         let ops = [
             "hidden_norm",
@@ -120,15 +149,17 @@ mod tests {
             serde_json::json!({"capacities": {"max_context": 1048576}, "programs": entries});
         let path = dir.path().join("PROGRAMS.json");
         std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
-        let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
+        let prefixes: &[&str] = if ranks == 2 { &["step5", "step52"] } else { &["step5"] };
+        let programs = ProgramSet::from_manifest(&manifest, prefixes);
         let checkpoint = Checkpoint::coordinator(dir.path(), false, false)?;
         for (context, pool, launchable) in [
             (262_144, Some(262_144), true),
             (1_048_576, None, true),
             (1_048_576, Some(262_144), false),
         ] {
+            let launchable = launchable && !(nvfp4 && host == Some(0) && entries != 0);
             let opts = LayoutOptions {
-                rtx_bytes: vec![96 << 30; 2],
+                rtx_bytes: vec![96 << 30; ranks],
                 pool_tokens: pool,
                 context_tokens: context,
                 workspace_manifest: Some(path.clone()),
@@ -137,13 +168,14 @@ mod tests {
             let report = plan::plan(
                 dir.path(),
                 &PlanOptions {
-                    placement: ExpertPlacement::Sparks { ranks: 6 },
+                    placement: ExpertPlacement::Sparks { ranks: sparks },
                     draft_ownership: Some(plan::spec::DraftOwnership::None),
                     layout: Some(opts.clone()),
                     ..Default::default()
                 },
             )?;
-            assert_eq!(report.wip_launchable(), launchable, "{:?}", report.hints);
+            assert_eq!(report.wip_launchable(), launchable,
+                "nvfp4={nvfp4} context={context} pool={pool:?} host={host:?} entries={entries}: {:?}", report.hints);
             assert!(!report.executable());
             let mut code = Vec::new();
             let gpus = opts
@@ -155,8 +187,8 @@ mod tests {
                     code.push(
                         inventory::loaded_code_allowance(
                             "step5",
-                            "step5:fp8",
-                            true,
+                            package,
+                            ranks == 2,
                             rank as u8,
                             &arch,
                             Some(&programs),
@@ -175,8 +207,8 @@ mod tests {
             let mut inputs = RuntimeInputs {
                 inventory: Inventory {
                     gpus,
-                    spark_ranks: 6,
-                    peer_access: true,
+                    spark_ranks: sparks,
+                    peer_access: ranks == 2,
                 },
                 rows: 256,
                 sequences: 16,
@@ -194,9 +226,16 @@ mod tests {
             };
             let live = checkpoint_admission(&checkpoint, &inputs);
             if !launchable {
-                let error = live.err().expect("explicit pool below requested context");
+                let error = live.err().expect("both edges must refuse the unsupported allocation");
                 let refusal = error.to_string();
-                assert!(refusal.contains("compiled/max-context floor of 1048576"));
+                if pool == Some(262_144) {
+                    assert!(refusal.contains("compiled/max-context floor of 1048576"));
+                } else {
+                    assert!(nvfp4 && host == Some(0) && entries == 20);
+                    assert!(refusal.contains("exact retained marks") && refusal.contains("do not fit on rtx0"), "{refusal}");
+                    inputs.marks.entries = 0;
+                    assert!(checkpoint_admission(&checkpoint, &inputs).is_ok());
+                }
                 assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)));
                 continue;
             }

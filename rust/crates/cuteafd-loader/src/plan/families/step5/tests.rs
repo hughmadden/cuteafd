@@ -427,7 +427,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
 }
 
 #[test]
-fn nvfp4_stacked_scales_and_bf16_root_are_named_not_executed() {
+fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
     let dir = snapshot("nvfp4");
     let cp = Checkpoint::open(dir.path()).unwrap();
     let model = Model::open(&cp).unwrap();
@@ -440,14 +440,39 @@ fn nvfp4_stacked_scales_and_bf16_root_are_named_not_executed() {
             assert_eq!(operand.scale.unwrap().grid,vec![352,1536,256]);
         }
     }
-    let result = report(dir.path(),1,96,4,Some(262_144));
-    assert!(result.config_error.is_none(),"{:?}",result.config_error);
-    assert!(!result.wip_launchable() && !result.native_serving_admitted);
-    assert!(result.hints.iter().any(|h| h.what.contains("NVFP4/BF16")));
+    for (context, pool) in [(262_144, Some(262_144)), (1_048_576, None)] {
+        let result = report_context(dir.path(), 1, 96, 4, pool, context);
+        assert!(result.config_error.is_none(), "{:?}", result.config_error);
+        assert!(result.wip_launchable() && result.native_serving_admitted, "{:?}", result.hints);
+        assert!(!result.executable());
+        assert_eq!(result.min_spark_ranks, Some(4));
+        let memory = result.memory_layout.unwrap();
+        assert_eq!(memory.devices.len(), 5);
+        if let Some(tokens) = pool {
+            assert_eq!(memory.pool_tokens, tokens);
+        } else {
+            assert!((262_144..=context).contains(&memory.pool_tokens));
+        }
+        assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+        let endpoint = cuteafd_core::SparkEndpoint { capacity: 256, ingress: cuteafd_core::SparkIngress::Bf16 };
+        let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
+            depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        let lane_rings = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::STEP5, rings).unwrap();
+        for device in &memory.devices[1..] {
+            assert!(device.items.iter().any(|item| item.format == "W4A4"));
+            let mapped = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
+            assert_eq!(mapped.bytes, 2 * lane_rings as u64, "one endpoint per execution lane");
+        }
+    }
+    for (gpus, gib, ranks) in [(2, 96, 4), (1, 32, 4), (1, 96, 6), (1, 96, 0)] {
+        let result = report(dir.path(), gpus, gib, ranks, None);
+        assert!(!result.wip_launchable() && !result.native_serving_admitted);
+        assert!(result.hints.iter().any(|h| h.what.contains("unqualified")), "{:?}", result.hints);
+    }
     let dir = snapshot("bf16");
     let r = report(dir.path(),2,96,6,None);
     assert!(r.config_error.is_none(),"{:?}",r.config_error);
-    assert!(r.hints.iter().any(|h| h.what.contains("NVFP4/BF16")));
+    assert!(r.hints.iter().any(|h| h.what.contains("BF16 target format")));
 }
 
 #[test]

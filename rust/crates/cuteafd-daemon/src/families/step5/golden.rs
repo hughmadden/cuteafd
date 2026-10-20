@@ -32,6 +32,7 @@ use std::{cell::RefCell, net::SocketAddr, os::unix::fs::FileExt, path::PathBuf};
 
 const H: usize = 4096;
 const FP8_REVISION: &str = "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc";
+const NVFP4_REVISION: &str = "bc246cc2848e17b37f377eda8fd825c5b3018d1f";
 const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
@@ -445,8 +446,10 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: u
         && clients % prefill_lanes == 0, "Step-5 persistent lane endpoint inventory");
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
+    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let format = catalog.fp8().context("Step-5 golden requires native expert headers")?.format();
     let metadata: Value = serde_json::from_slice(&std::fs::read(
-        packages.join("fp8/fp8-step5/manifest.json"),
+        packages.join("fp8").join(format.package_name("step5")).join("manifest.json"),
     )?)?;
     let layout = &metadata["layouts"][format!("tp{}", args.peers.len())];
     ensure!(
@@ -471,7 +474,6 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: u
         compiled >= rows as u64 && compiled <= 4096,
         "FP8 package row capacity"
     );
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     let config = TcpTransportConfig::default();
     SparkAdmission::plan(
         &args.snapshot,
@@ -944,14 +946,26 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     Ok(())
 }
 
+fn checkpoint_identity(revision: Option<&str>, format: cuteafd_loader::formats::fp8_experts::ExpertFormat,
+    fp8_diagnostic: bool) -> Result<()> {
+    use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+    ensure!(matches!((revision, format),
+        (Some(FP8_REVISION), ExpertFormat::Fp8Block128)
+        | (Some(NVFP4_REVISION), ExpertFormat::Nvfp4)),
+        "Step-5 golden requires matching pinned native FP8 or NVFP4 revision and expert headers");
+    ensure!(!fp8_diagnostic || format == ExpertFormat::Fp8Block128,
+        "native-FP8 diagnostic reference cannot qualify an NVFP4 checkpoint; use the BF16 root");
+    Ok(())
+}
+
 pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     diagnostic_selection(&args)?;
     let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
     if args.dump_layer0.is_none() { selection(args.last_layer, args.peers.len(), &layers, args.nll)?; }
-    ensure!(
-        args.snapshot.file_name().and_then(|s| s.to_str()) == Some(FP8_REVISION),
-        "Step-5 golden requires pinned native FP8 revision"
-    );
+    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let format = catalog.fp8().context("Step-5 golden requires native expert headers")?.format();
+    checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), format,
+        args.fp8_diagnostic_reference)?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
     let reference = reference(&args, cfg.vocab)?;
@@ -988,7 +1002,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
         0,
         false,
         "step5",
-        "fp8",
+        &format.package_name("step5"),
         &selected,
     )?;
     let (free, _) = library.cuda_memory_info()?;
@@ -1559,6 +1573,25 @@ mod tests {
         bad[..4].copy_from_slice(&f32::NAN.to_le_bytes());
         std::fs::write(folder.join("logits.bin"), bad)?;
         assert!(reference(&args, 3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn golden_checkpoint_revision_and_native_format_must_agree() -> Result<()> {
+        use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+        checkpoint_identity(Some(FP8_REVISION), ExpertFormat::Fp8Block128, false)?;
+        checkpoint_identity(Some(FP8_REVISION), ExpertFormat::Fp8Block128, true)?;
+        checkpoint_identity(Some(NVFP4_REVISION), ExpertFormat::Nvfp4, false)?;
+        for (revision, format, diagnostic) in [
+            (Some(FP8_REVISION), ExpertFormat::Nvfp4, false),
+            (Some(NVFP4_REVISION), ExpertFormat::Fp8Block128, false),
+            (Some(NVFP4_REVISION), ExpertFormat::Nvfp4, true),
+            (Some(BF16_REVISION), ExpertFormat::Bf16, false),
+            (Some("unpinned"), ExpertFormat::Nvfp4, false),
+            (None, ExpertFormat::Fp8Block128, false),
+        ] {
+            assert!(checkpoint_identity(revision, format, diagnostic).is_err());
+        }
         Ok(())
     }
 
