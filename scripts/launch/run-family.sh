@@ -1631,7 +1631,7 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   [[ -n "$exlr8_dense" ]] || release_die "EXLR8_DENSE_FROM must name the compatible official GLM-5.3 FP8 snapshot"
   exlr8_gpu_count="$(get RTX_GPUS 1)"
   [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 6 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..6 canonical Spark ranks"
-  [[ "$(get SPECULATOR off)" == off || "$(get SPECULATOR off)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
+  [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
   [[ "$(get RTX_EXPERT_LAYERS 0)" == 0 ]] || release_die "EXLR8 cannot onboard routed experts"
   exlr8_attention=heads
   [[ "$exlr8_gpu_count" != 2 ]] || exlr8_attention=context
@@ -1651,7 +1651,6 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   fi
   exlr8_plan_args=(--exlr8-manifest "$exlr8_manifest" --exlr8-dense-from "$exlr8_dense")
   spark_worker_args+=" --exlr8-manifest $exlr8_manifest"
-  cfg[SPECULATOR]="$(get SPECULATOR off)"
   cfg[RTX_EXPERT_LAYERS]=0
 fi
 # SPECULATOR picks the drafter. Unset, each family takes the speculator its

@@ -60,17 +60,30 @@ def exlr8_entry(manifest: str = "up1", **overrides: str) -> dict:
     return entry
 
 
-def test_exlr8_dflash2_reuses_glm_drafter_and_preserves_native_workers() -> None:
+@pytest.mark.parametrize("speculator", ["dflash2", "off", "unset"])
+def test_exlr8_uses_glm_drafter_default_and_explicit_opt_out(speculator: str, tmp_path: Path) -> None:
     entry = exlr8_entry()
-    entry["set"]["SPECULATOR"] = "dflash2"
-    result = capture(ROOT, "exlr8-dflash2", release_entry=entry)
+    launcher = None
+    if speculator == "unset":
+        launcher = tmp_path / "run-family.sh"
+        source = ROOT / "scripts/launch/run-family.sh"
+        # The release fixture has explicit settings; remove both before resolution.
+        launcher.write_text(source.read_text().replace(
+            'exlr8_manifest="$(get EXLR8_MANIFEST)"',
+            'unset \'cfg[SPECULATOR]\' \'cfg[SPECULATOR_MODEL_ID]\'\n'
+            'exlr8_manifest="$(get EXLR8_MANIFEST)"'))
+    else:
+        entry["set"]["SPECULATOR"] = speculator
+    result = capture(ROOT, f"exlr8-{speculator}", release_entry=entry, launcher_source=launcher)
     plan = result["plans"][0]
-    assert plan[plan.index("--speculator") + 1] == "dflash2"
-    assert "--drafter-snapshot" in plan
+    selected = "off" if speculator == "off" else "dflash2"
+    assert plan[plan.index("--speculator") + 1] == selected
     for run in result["containers"]:
         command = parse_run(run["argv"])["command"]
         if "serve-glm" in command:
-            assert "--draft" in command
+            assert ("--draft" in command) == (selected == "dflash2")
+            if selected == "dflash2":
+                assert "models--incoai--GLM-5.3-DFlash2/snapshots/" in command[command.index("--draft") + 1]
             assert "--exlr8-dense-from" in command
         else:
             assert "expertd-native" in command
