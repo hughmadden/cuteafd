@@ -247,7 +247,7 @@ pub(crate) struct EngineArgs {
     /// Serving always uses the shared BF16 tensor head at every row count. The target's own
     /// arithmetic and the FP8 head (--fp8-head) remain unchanged.
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_DRAFT_HEAD", default_value = "exact")]
-    pub draft_head: crate::families::glm5::DraftHead,
+    pub draft_head: crate::shared::speculation::dflash::DraftHead,
     /// The FP8 drafter's GEMMs (DFlash2 and dSpark): `w8a16` (default: BF16 activations, exact
     /// in f16, on the W8A16 GEMV in passes of 64 rows), `wide` (the same bits in passes of 128
     /// rows: one read of the weights at 16 sequences), or `w8a8`: one draft block (8 rows) as
@@ -472,7 +472,7 @@ mod draft_cli_tests {
     /// `--draft-head`: exact by default (the target's own head route), tensor on request.
     #[test]
     fn draft_head_defaults_to_exact_and_takes_tensor() {
-        use crate::families::glm5::DraftHead;
+        use crate::shared::speculation::dflash::DraftHead;
         assert_eq!(parse(&[]).draft_head, DraftHead::Exact);
         assert_eq!(parse(&["--draft-head", "exact"]).draft_head, DraftHead::Exact);
         assert_eq!(parse(&["--draft-head", "tensor"]).draft_head, DraftHead::Tensor);
@@ -1347,11 +1347,11 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
             .context("DFlash target has no lm_head.weight")?;
         // The drafter borrows the target's one head: BF16, or the FP8 head made from it.
-        crate::families::glm5::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
+        crate::shared::speculation::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
         if dspark::is_dspark(snapshot)? {
             dspark::check_checkpoint(snapshot, cfg.hidden, cfg.vocab_size, cfg.layers)?;
         } else {
-            crate::families::glm5::dflash::check_checkpoint(snapshot, args.draft_fp8,
+            crate::shared::speculation::dflash::check_checkpoint(snapshot, args.draft_fp8,
                 args.draft_context_slots, args.draft_sequences)?;
         }
     }
@@ -1578,7 +1578,7 @@ impl Opened {
                 let cfg = dspark::DsparkConfig::read(path)?;
                 (cfg.hidden, cfg.vocab, cfg.taps.clone(), cfg.drafts())
             } else {
-                let cfg = crate::families::glm5::dflash::DflashConfig::read(path)?;
+                let cfg = crate::shared::speculation::dflash::DflashConfig::read(path)?;
                 (cfg.hidden, cfg.vocab, cfg.taps.clone(), cfg.drafts())
             };
             ensure!(hidden == self.cfg.hidden && vocab == self.cfg.vocab_size && taps.iter().all(|&l| l < layers),
@@ -1989,15 +1989,15 @@ impl Opened {
             ::from_fp8_option(args.draft_fp8);
         let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
         let drafter = if let Some(prepared) = prepared {
-            use crate::families::glm5::dflash::{DflashConfig, GlmDrafter};
+            use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
             let cfg = DflashConfig::read(snapshot)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "DFlash2 does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;
-            let file = crate::families::glm5::dflash::prefetch(snapshot).join()
+            let file = crate::shared::speculation::dflash::prefetch(snapshot).join()
                 .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
             let device = prepared.stream.device;
-            let draft = device.own(|| GlmDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
+            let draft = device.own(|| DflashDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
                 slots, args.draft_sequences.min(slots), mask, true, representation, args.fp8_scales, args.draft_linear))?;
             dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {

@@ -22,11 +22,11 @@
 //! the official GLM 5.3 Flash tensors bit for bit, as in every GLM 5.3 Flash
 //! quant), borrowed as the target keeps them ([`TargetHead`]: BF16, or its
 //! FP8-only head). The GEMM weights are resident once, BF16 or (default) E4M3
-//! packed at load, like the DFlash2 drafter ([`crate::families::glm5::dflash`]).
+//! packed at load, like the DFlash2 drafter ([`crate::shared::speculation::dflash`]).
 //! Drafts only steer speculation: the
 //! verify step keeps output identical to plain greedy decoding.
 //! python/reference/families/glm5_flash/dspark/reference.py is the oracle.
-use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, ReplayDrafter, TargetHead};
+use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, ReplayDrafter, TargetHead};
 use crate::shared::fp8_linear;
 use crate::shared::token_io::TokenEmbedding;
 use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
@@ -34,7 +34,7 @@ use cuteafd_ffi::NativeLibrary;
 use anyhow::{ensure, Result};
 use std::path::Path;
 use std::ffi::c_void;
-use crate::families::glm5::DraftHead;
+use crate::shared::speculation::dflash::DraftHead;
 pub(crate) use crate::shared::speculation::block_dspark::{
     is_dspark, check_checkpoint, prefetch, DsparkConfig, DsparkDrafter, MAX_SEQUENCES,
 };
@@ -42,7 +42,7 @@ pub(crate) use crate::shared::speculation::block_dspark::{
 /// The GLM 5.3 Flash drafter: DFlash2 or dSpark, behind one interface the
 /// engine (taps), the serve loop and glmf-golden use.
 pub(crate) enum Drafter<'a> {
-    Dflash2(crate::families::glm5::dflash::GlmDrafter<'a>),
+    Dflash2(crate::shared::speculation::dflash::DflashDrafter<'a>),
     RemoteDflash(super::remote_dflash::RemoteDflash<'a>),
     Dspark(DsparkDrafter<'a>),
 }
@@ -96,14 +96,14 @@ impl<'a> Drafter<'a> {
             return Ok(Self::Dspark(DsparkDrafter::load(library, snapshot, tensors, stream, slots,
                 sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows)?));
         }
-        let cfg = crate::families::glm5::dflash::DflashConfig::read(snapshot)?;
+        let cfg = crate::shared::speculation::dflash::DflashConfig::read(snapshot)?;
         ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
             "the DFlash2 drafter does not fit this target");
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
-        let file = crate::families::glm5::dflash::prefetch(snapshot).join()
+        let file = crate::shared::speculation::dflash::prefetch(snapshot).join()
             .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-        Ok(Self::Dflash2(crate::families::glm5::dflash::GlmDrafter::load(library, snapshot, file, stream, slots,
+        Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load(library, snapshot, file, stream, slots,
             sequences, mask, true, representation, scales, fp8_rows)?))
     }
 

@@ -1,6 +1,6 @@
 //! Dense-target binding of the shared block drafter and online draft policy.
 use super::{engine::{DenseEngine, DrafterBytes}, GoldenArgs};
-use crate::families::glm5::dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS};
+use crate::shared::speculation::dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS};
 use crate::shared::{draft::{binding, clock::RoundTimes, evidence::{Censor, DraftSource, Evidence}, routes::RoundRoutes},
     fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{block_dspark::{self, DsparkConfig, DsparkDrafter},
         target::{verify_commit, AcceptedPrefix, VerifyRequest, VerifyRow}}};

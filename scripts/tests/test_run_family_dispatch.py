@@ -423,7 +423,7 @@ def test_glmf_tp2_combine_consumes_shared_before_reusing_exchange_slot() -> None
 def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
     remote = (family / "remote_dflash.rs").read_text()
-    shared = (family.parent / "glm5/dflash.rs").read_text()
+    shared = (family.parent.parent / "shared/speculation/dflash.rs").read_text()
     update = shared.split("    pub(crate) fn update_with(", 1)[1].split("    fn put(", 1)[0]
     assert update.index("self.put(&self.context_positions") < update.index("ready()?")
     assert update.index("self.put(&self.context_slots") < update.index("ready()?") < update.index("self.linear(")

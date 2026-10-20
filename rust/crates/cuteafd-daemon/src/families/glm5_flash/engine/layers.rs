@@ -153,8 +153,8 @@ impl<'a> GlmfEngine<'a> {
         }
         let mut bindings = [Bindings { engine: self, work: [w, w1], tables: [tables, tables1],
             owners: self.layer_owners(), lane: 0, rows, graphed, on_layer, prepared: Cell::new(None),
-            tap: (rows.saturating_sub(crate::families::glm5::dflash::TAP_ROWS),
-                rows.min(crate::families::glm5::dflash::TAP_ROWS), 0) }];
+            tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS),
+                rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0) }];
         self.layer_pipeline(scope, &mut bindings)?;
         if self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
         self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
@@ -186,12 +186,12 @@ impl<'a> GlmfEngine<'a> {
                 "per-layer lane needs unpacked rows within its workspace");
             self.load_streams(w, tokens, false)?;
             self.inject_media(w, tables, media)?;
-            let tap_start = (total - total.min(crate::families::glm5::dflash::TAP_ROWS)).max(first).min(first + rows);
+            let tap_start = (total - total.min(crate::shared::speculation::dflash::TAP_ROWS)).max(first).min(first + rows);
             let n = first + rows - tap_start;
             bindings.push(Bindings { engine: self, work: [w, peers.get(lane)?],
                 tables: [&ranked[lane][0], &ranked[lane][1]], owners: self.layer_owners(),
                 lane, rows, graphed: false, on_layer: None, prepared: Cell::new(None), tap: (tap_start - first, n,
-                    tap_start.saturating_sub(total - total.min(crate::families::glm5::dflash::TAP_ROWS))) });
+                    tap_start.saturating_sub(total - total.min(crate::shared::speculation::dflash::TAP_ROWS))) });
             first += rows;
         }
         self.prepare_route_checks(&bindings.iter().map(|binding| binding.rows).collect::<Vec<_>>())?;

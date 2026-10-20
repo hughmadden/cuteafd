@@ -1,7 +1,7 @@
 //! Shared Qwen3-backbone block dSpark runtime; target lifecycles stay in bindings.
-use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, HeadLaunch, ReplayDrafter, ReplayMode, TargetHead,
+use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, HeadLaunch, ReplayDrafter, ReplayMode, TargetHead,
     TAP_ROWS};
-use crate::families::glm5::DraftHead;
+use crate::shared::speculation::dflash::DraftHead;
 use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
 use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
@@ -714,7 +714,7 @@ impl<'a> DsparkDrafter<'a> {
             match head {
                 HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(&w.head,
                     w.n.buffer.ptr.cast(), weight.cast(), w.logits.buffer.ptr.cast(), rows, s)?,
-                HeadRef::Bf16(weight) => crate::families::glm5::launch_draft_head(l, &w.head, w.n.buffer.ptr,
+                HeadRef::Bf16(weight) => crate::shared::speculation::dflash::launch_draft_head(l, &w.head, w.n.buffer.ptr,
                     weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
