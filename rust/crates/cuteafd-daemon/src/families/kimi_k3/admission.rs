@@ -657,9 +657,10 @@ pub(super) mod tests {
     #[test]
     fn mla_draft_admission_pins_exact_inventory_and_allocates_once_before_target() -> Result<()> {
         let cfg = cfg();
+        let full = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for context in [262144, 1048576] {
             let mut i = inputs(&cfg);
-            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, context,
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, context,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             let layout = draft_layout(i.state_slots, i.state_slots, context);
             let (demand, peak) = layout.demands(1)?;
@@ -669,7 +670,7 @@ pub(super) mod tests {
             assert!(request.startup.contains(&peak));
             assert!(!request.fixed.iter().any(|d| d.group == peak.group));
             let mut i = inputs(&cfg);
-            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, context,
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, context,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             i.draft = Some(layout.clone());
             let mut admitted = admit(i)?;
