@@ -522,7 +522,15 @@ pub fn admit_with(
                 hops: inputs.hops(),
                 executor: EXECUTOR,
             };
-            let placement = solve(&request)?;
+            let placement = solve(&request).map_err(|error| {
+                if !inputs.marks.host && marks > 0
+                    && error.to_string().contains("do not fit on")
+                {
+                    anyhow::anyhow!("{error}; Step-5 device-only prefix retention with HOST_CACHE_BYTES=0 does not fit at request context {context}; enable --host-cache-bytes auto (HOST_CACHE_BYTES=auto), or lower --max-context/--context-tokens (MAX_CONTEXT_TOKENS), for example to 262144")
+                } else {
+                    error
+                }
+            })?;
             ensure!(
                 placement.pool_tokens >= FLOOR,
                 "Step-5 aggregate pool is below the 256K agentic floor"
@@ -704,6 +712,7 @@ mod tests {
         for ranks in [1, 2] {
             let mut inputs = inputs(ranks);
             inputs.context = EXTENT;
+            inputs.requested_pool = None;
             inputs.marks.host = true;
             for entries in [0, 20, 200] {
                 inputs.marks.entries = entries;
