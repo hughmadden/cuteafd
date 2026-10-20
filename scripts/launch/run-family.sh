@@ -169,7 +169,7 @@ EOF
     return
   fi
   # Kimi K3 and Step-5 (WIP slots only): the shared serve contract and Spark
-  # workers, with no speculator, media or family modes yet.
+  # workers, no media or family modes yet; Step-5 takes an opt-in MTP depth.
   if [[ "$1" == kimi_k3 || "$1" == step5 ]]; then
     cat <<'EOF'
 ATTENTION_PLACEMENT
@@ -196,6 +196,7 @@ PROFILE_EXPERT_INPUT_SAMPLE
 PROFILE_EXPERT_ROUTE_WEIGHTS
 EOF
     [[ "$1" != kimi_k3 ]] || echo RTX_EXPERT_LAYERS
+    [[ "$1" != step5 ]] || echo SPECULATOR_DEPTH
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -1492,8 +1493,8 @@ case "$family" in
 esac
 # Kimi K3 (#273) and Step-5 (#274) are under qualification: WIP slots only,
 # automatic attention placement, text only (their bundled vision towers are not
-# in scope), GPU token embeddings and no speculator (Kimi ships no MTP head;
-# neither family's drafter is wired into serving).
+# in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5's native
+# MTP is opt-in (SPECULATOR=mtp) while it qualifies, never a default.
 qualifying=0
 [[ "$family" != kimi_k3 && "$family" != step5 ]] || qualifying=1
 if ((qualifying)); then
@@ -1663,7 +1664,7 @@ fi
 #            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2);
 #            MiMo V2.6 Flash/Pro: the snapshot's own dflash/ drafter unless
 #            SPECULATOR_MODEL_ID names one (Pro needs SPARK_COUNT=6)
-#   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
+#   mtp      MiMo V2 Flash, Qwen 3.8, Step-5 (opt-in): the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (qualified local Qwen default 3; otherwise 1)
 #   dspark   DeepSeek V4 (its own drafter); GLM 5.3 Flash: the dSpark
 #            checkpoint SPECULATOR_MODEL_ID (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview)
@@ -1727,7 +1728,7 @@ if [[ -z "$speculator" ]]; then
 fi
 case "$family:$speculator" in
   qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
-  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
+  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|step5:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
