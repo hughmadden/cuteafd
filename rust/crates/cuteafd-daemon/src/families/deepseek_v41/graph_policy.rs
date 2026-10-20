@@ -3,7 +3,8 @@ use anyhow::{ensure, Result};
 
 pub(super) const MAX_DECODE_ROWS: u32 = cuteafd_core::V41_VERIFY_ROWS as u32;
 
-pub(super) const SMALL_CARD_FIXED_ROWS: &str = "1,6,16,24,32,40,43,48";
+/// Rows 1-6 cover C1 neural verify widths: the target row plus up to five dSpark drafts.
+pub(super) const SMALL_CARD_FIXED_ROWS: &str = "1,2,3,4,5,6,16,24,32,40,43,48";
 static FIXED_SHAPES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
 
 pub(super) fn profile_fixed_shapes(total_bytes: usize, explicit: Option<&str>) -> Result<Option<Vec<u32>>> {
@@ -72,7 +73,7 @@ mod tests {
     #[test]
     fn small_card_profile_defaults_to_qualified_bank_and_preserves_overrides() {
         assert_eq!(profile_fixed_shapes(32usize << 30, None).unwrap(),
-            Some(vec![1, 6, 16, 24, 32, 40, 43, 48]));
+            Some(vec![1, 2, 3, 4, 5, 6, 16, 24, 32, 40, 43, 48]));
         assert_eq!(profile_fixed_shapes(32usize << 30, Some("")).unwrap(), None);
         assert_eq!(profile_fixed_shapes(32usize << 30, Some("1,6")).unwrap(), Some(vec![1, 6]));
         assert_eq!(profile_fixed_shapes(96usize << 30, None).unwrap(), None);
