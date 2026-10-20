@@ -79,8 +79,10 @@ mod load_order_tests {
     fn exlr8_fixture(root: &std::path::Path, layers: &[usize]) -> Result<()> {
         use serde_json::json;
         use std::io::Write;
-        fn write(path: &std::path::Path, metadata: serde_json::Value,
+        fn write(path: &std::path::Path, mut metadata: serde_json::Value,
             tensors: Vec<(String, &'static str, Vec<usize>, Vec<u8>)>) -> Result<Vec<usize>> {
+            metadata["format"] = json!("exlr8-v2");
+            metadata["scheme"] = json!("exlr8-e4m3-v2");
             let mut header = serde_json::Map::from_iter([("__metadata__".into(), metadata)]);
             let mut offsets = vec![];
             let mut end = 0;
