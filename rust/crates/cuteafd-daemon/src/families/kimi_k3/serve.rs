@@ -4,6 +4,7 @@ use crate::shared::{prefix::PrefixArgs, qwen::scheduler::{self, Backend}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{chat::kimi::KimiEncoding, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
 use std::{net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
+use cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT;
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
@@ -15,8 +16,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission targets 2M tokens on the reference coordinator pair.
     #[arg(long)] pub pool_tokens: Option<u64>,
-    #[arg(long, default_value_t = 1_048_576)] pub max_context: usize,
-    #[arg(long, default_value_t = 5)] pub rtx_expert_layers: usize,
+    /// API request ceiling only; native allocation keeps the compiled 1M extent.
+    #[arg(long, default_value_t = COMPILED_CONTEXT)] pub max_context: usize,
+    #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
+    /// Complete per-rank allocation ceiling, estimated until the first worker census.
+    #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long, default_value_t = 32768)] pub max_output: u32,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
@@ -29,12 +33,18 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
+    fn api_limits(&self, compiled_context: usize) -> Result<NativeLimits> {
+        NativeLimits::new(u32::try_from(self.max_context.min(compiled_context))?, self.max_output)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(self.device >= 0 && self.split_device >= 0 && self.device != self.split_device,
             "Kimi serving requires two distinct coordinator devices");
         ensure!(self.peers.len() == 6 && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == 6,
             "Kimi serving requires six distinct real Spark endpoints");
-        ensure!((1..=1_048_576).contains(&self.max_context), "Kimi context exceeds the compiled 1M extent");
+        ensure!((1..=COMPILED_CONTEXT).contains(&self.max_context), "Kimi context exceeds the compiled 1M extent");
+        ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0),
+            "Kimi requires a finite positive estimated --spark-budget-gib");
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Kimi serving requires exact prefix frontiers");
         ensure!(matches!(self.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu),
@@ -78,7 +88,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
                 devices: [worker_args.device, worker_args.split_device], native_lib: &worker_args.native_lib,
                 peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
-                rows: 4096, slots, marks, max_context: worker_args.max_context,
+                spark_budget_gib: worker_args.spark_budget_gib,
+                rows: 4096, slots, marks, max_context: COMPILED_CONTEXT,
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None,
             })?;
@@ -108,8 +119,10 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         }
         result
     });
-    let max_context = ready_rx.await.context("Kimi worker exited before readiness")??;
-    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    let compiled_context = ready_rx.await.context("Kimi worker exited before readiness")??;
+    let limits = args.api_limits(compiled_context)?;
+    tracing::info!(api_max_context = limits.context(), compiled_max_context = compiled_context,
+        "Kimi API and compiled context limits");
     let snapshot = args.snapshot.clone();
     let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
         "kimi_k3", profile.id.clone(), snapshot.clone())));
@@ -145,9 +158,23 @@ mod tests {
         let defaults = args(&["--peers", peers])?;
         defaults.validate()?;
         assert_eq!(defaults.max_context, 1_048_576);
-        assert_eq!(defaults.rtx_expert_layers, 5);
+        assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
         assert_eq!(defaults.max_sequences, 16);
         assert_eq!(defaults.pool_tokens, None);
+        assert_eq!(defaults.spark_budget_gib, None);
+        assert_eq!(defaults.api_limits(COMPILED_CONTEXT)?.context(), COMPILED_CONTEXT as u32);
+        let limited = args(&["--peers", peers, "--max-context", "262144"])?;
+        limited.validate()?;
+        let limits = limited.api_limits(COMPILED_CONTEXT)?;
+        assert_eq!(limits.context(), 262144);
+        assert_eq!(limits.output_for_prompt(262143, 32768)?, 1);
+        assert!(limits.output_for_prompt(262144, 1).is_err());
+        assert_eq!(args(&["--peers", peers, "--rtx-expert-layers", "3"])?.rtx_expert_layers,
+            cuteafd_loader::placement::Onboard::Layers(3));
+        args(&["--peers", peers, "--rtx-expert-layers", "auto", "--spark-budget-gib", "108"])?.validate()?;
+        for budget in ["0", "NaN", "inf"] {
+            assert!(args(&["--peers", peers, "--spark-budget-gib", budget])?.validate().is_err());
+        }
         assert!(args(&[])?.validate().is_err());
         for extra in [["--split-device", "0"], ["--max-context", "1048577"],
             ["--embedding-placement", "host"], ["--prefix-partial", "on"]] {

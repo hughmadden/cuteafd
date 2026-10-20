@@ -5,6 +5,14 @@ pub mod mla;
 pub mod reference;
 pub mod w8;
 
+pub const COMPILED_CONTEXT: usize = 1_048_576;
+pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
+
+/// Offline ceiling only; the first full worker load/steady census qualifies it.
+pub const SPARK_ESTIMATED_WORKSPACE_BYTES: u64 = 512 << 20;
+pub const SPARK_ESTIMATED_RESERVE_BYTES: u64 =
+    cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + SPARK_ESTIMATED_WORKSPACE_BYTES;
+
 /// Validate sealed role artifacts at runtime, never during checkpoint planning.
 pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path) -> anyhow::Result<()> {
     use crate::plan::checkpoint::read_json;

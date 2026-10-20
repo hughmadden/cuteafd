@@ -213,8 +213,10 @@ impl<'a> Exl3Tp2<'a> {
     ) -> Result<usize> {
         let paths = selected_directories(package, max_rows, row_policy, selection)?;
         for path in &paths {
-            let manifest: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?;
+            let metadata = path.join("v41_exl3.json");
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata)
+                .with_context(|| format!("read EXL3 TP2 workspace metadata {}", metadata.display()))?)
+                .with_context(|| format!("parse EXL3 TP2 workspace metadata {}", metadata.display()))?;
             ensure!(
                 manifest["hidden"].as_u64() == Some(hidden as u64)
                     && manifest["capacity"].as_u64()
