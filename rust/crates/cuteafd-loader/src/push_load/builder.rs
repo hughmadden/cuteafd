@@ -64,38 +64,10 @@ pub struct CheckedPlan {
 }
 
 impl CheckedPlan {
-    /// Preserve pattern IDs while bounding each sequenced-packet message.
-    /// The plan is checked before this call, so no source byte has moved yet.
+    /// The shared client batches automatically, preserving pattern IDs.
     pub fn upload(&self, group: &super::PushGroup) -> std::io::Result<()> {
-        use nest_push::proto::{self, Request};
-        let mut batch = Vec::new();
-        let mut encoded_bytes = 16;
-        for pattern in &self.plan.patterns {
-            let size = proto::encode(pattern).len();
-            if size + 16 > proto::MAX_MSG {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "push pattern exceeds message limit",
-                ));
-            }
-            if encoded_bytes + size > proto::MAX_MSG {
-                group.patterns(std::mem::take(&mut batch))?;
-                encoded_bytes = 16;
-            }
-            encoded_bytes += size;
-            batch.push(pattern.clone());
-        }
-        if !batch.is_empty() {
-            group.patterns(batch)?;
-        }
-        // Every Entry is at most 46 postcard bytes, plus the vector header.
-        for entries in self.plan.entries.chunks(4096) {
-            debug_assert!(
-                proto::encode(&Request::Entries(entries.to_vec())).len() < proto::MAX_MSG
-            );
-            group.entries(entries.to_vec())?;
-        }
-        Ok(())
+        group.patterns(self.plan.patterns.clone())?;
+        group.entries(self.plan.entries.clone())
     }
 }
 
@@ -176,6 +148,49 @@ impl Builder {
         }
         if add(relative, extent.src_len)? > source.bytes || extent.dst_len > destination.bytes {
             return Err(invalid("tensor image exceeds source or destination view"));
+        }
+        if nest_push::proto::encode(&pattern).len() + 16 > nest_push::proto::MAX_MSG {
+            let axis = pattern
+                .dims
+                .iter()
+                .position(|d| matches!(d.steps, Steps::Indices(_)))
+                .ok_or_else(|| invalid("oversized pattern has no index list to split"))?;
+            if pattern.dims[..axis]
+                .iter()
+                .any(|d| !matches!(d.steps, Steps::Count(1)))
+            {
+                return Err(invalid(
+                    "oversized interleaved index list needs multipart protocol support",
+                ));
+            }
+            let Steps::Indices(indices) = &pattern.dims[axis].steps else {
+                unreachable!()
+            };
+            // Five bytes per u32 is a conservative postcard bound; reserve room
+            // for all dimension metadata and the request/vector envelopes.
+            let chunk_len = (nest_push::proto::MAX_MSG - 256) / 5;
+            for (chunk, indices) in indices.chunks(chunk_len).enumerate() {
+                let mut part = pattern.clone();
+                part.dims[axis].steps = Steps::Indices(indices.to_vec());
+                let shift = mul(
+                    mul(chunk as u64, chunk_len as u64)?,
+                    pattern.dims[axis].dst_stride,
+                )?;
+                self.entry(
+                    source,
+                    Destination {
+                        offset: add(destination.offset, shift)?,
+                        bytes: destination
+                            .bytes
+                            .checked_sub(shift)
+                            .ok_or_else(|| invalid("split index list exceeds destination"))?,
+                        ..destination
+                    },
+                    part,
+                    relative,
+                )?;
+            }
+            return Ok(());
         }
         let file = self.file(&source.path)?;
         let pattern = self.pattern(pattern)?;
@@ -333,7 +348,8 @@ impl Builder {
         columns: &[Range<u64>],
         destination: Destination,
     ) -> Result<()> {
-        if rows == 0 || columns.is_empty()
+        if rows == 0
+            || columns.is_empty()
             || columns
                 .iter()
                 .any(|r| r.start >= r.end || r.end > source_pitch)
@@ -429,6 +445,71 @@ impl Builder {
         )
     }
 
+    /// Place source tensors into the current EXL3 layer's arena offsets.
+    /// Generated descriptor words remain the arena owner's responsibility.
+    pub fn exl3_residency(
+        &mut self,
+        catalog: &crate::OfficialV41Catalog,
+        residency: &crate::V41Exl3Residency,
+        offsets: &[usize],
+        destination: Destination,
+    ) -> Result<()> {
+        if offsets.len() != residency.buffers.len() {
+            return Err(invalid("EXL3 buffer offset count mismatch"));
+        }
+        for (buffer, &offset) in residency.buffers.iter().zip(offsets) {
+            if add(offset as u64, buffer.bytes.max(16) as u64)? > destination.bytes {
+                return Err(invalid("EXL3 buffer outside arena view"));
+            }
+        }
+        for load in &residency.loads {
+            for &(buffer, relative) in &load.destinations {
+                let target_buffer = residency
+                    .buffers
+                    .get(buffer)
+                    .ok_or_else(|| invalid("EXL3 destination buffer absent"))?;
+                if relative
+                    .checked_add(load.bytes)
+                    .is_none_or(|end| end > target_buffer.bytes)
+                {
+                    return Err(invalid("EXL3 load exceeds destination buffer"));
+                }
+                let target = Destination {
+                    rank: destination.rank,
+                    offset: add(
+                        destination.offset,
+                        add(offsets[buffer] as u64, relative as u64)?,
+                    )?,
+                    bytes: load.bytes as u64,
+                };
+                if let Some(units) = &residency.unit_map {
+                    self.exl3(
+                        catalog,
+                        &load.tensor,
+                        units,
+                        load.expert
+                            .ok_or_else(|| invalid("EXL3 compact load lacks expert"))?,
+                        target,
+                    )?;
+                } else {
+                    let slice =
+                        catalog.exl3_tensor_slice(&load.tensor, residency.world, residency.rank)?;
+                    self.rows(
+                        &Self::v41_source(catalog, &load.tensor)?,
+                        slice.column_start_bytes as u64,
+                        u32::try_from(slice.rows).map_err(|_| invalid("too many EXL3 rows"))?,
+                        u32::try_from(slice.selected_row_bytes)
+                            .map_err(|_| invalid("EXL3 width exceeds u32"))?,
+                        slice.source_row_bytes as u64,
+                        slice.selected_row_bytes as u64,
+                        target,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Preserve the existing V4.1 staging region order and its alignment gaps.
     /// MXFP4 and NVFP4 share the same native row/column partition operation;
     /// NVFP4 scalar regions are replicated verbatim rather than TP sliced.
@@ -511,6 +592,7 @@ impl Builder {
         scale: Destination,
     ) -> Result<()> {
         use crate::formats::fp8_experts::ExpertFormat;
+        let tensors = tensors.for_layer_metadata(layer)?;
         let name = tensors.name(layer, expert, projection);
         let [w, mut s] = tensors.projection_slices(projection, world, rank, slicing)?;
         let (source, _) = tensors.push_source(&name)?;
@@ -733,6 +815,30 @@ impl Builder {
 
     pub fn finish(self) -> Result<CheckedPlan> {
         let totals = self.plan.check(&self.file_sizes, &self.arenas)?;
+        #[cfg(test)]
+        {
+            let largest = self
+                .plan
+                .patterns
+                .iter()
+                .filter_map(|pattern| {
+                    pattern.dims.iter().find_map(|dim| match &dim.steps {
+                        Steps::Indices(indices) => {
+                            Some((indices.len(), nest_push::proto::encode(pattern).len()))
+                        }
+                        _ => None,
+                    })
+                })
+                .max()
+                .unwrap_or_default();
+            eprintln!(
+                "push plan: {} entries, {} patterns; max Indices {} items / {} encoded bytes",
+                self.plan.entries.len(),
+                self.plan.patterns.len(),
+                largest.0,
+                largest.1
+            );
+        }
         Ok(CheckedPlan {
             plan: self.plan,
             file_sizes: self.file_sizes,

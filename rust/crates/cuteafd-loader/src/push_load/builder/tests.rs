@@ -249,6 +249,41 @@ fn real_exl3_tp4_tp6_bytes_match_existing_gathers() {
                 jobs.push((units.clone(), name, destination, gather));
             }
         }
+        let resident = (0..world)
+            .map(|rank| {
+                catalog
+                    .exl3()
+                    .unwrap()
+                    .balanced_residency(crate::V41Exl3Layer::Backbone(layer), world, rank)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let layouts = resident
+            .iter()
+            .map(|r| r.device_arena_layout().unwrap())
+            .collect::<Vec<_>>();
+        let mut resident_builder =
+            Builder::new(&snapshot, layouts.iter().map(|(_, n)| *n as u64).collect());
+        for (rank, (residency, (offsets, bytes))) in resident.iter().zip(&layouts).enumerate() {
+            resident_builder
+                .exl3_residency(
+                    &catalog,
+                    residency,
+                    offsets,
+                    Destination {
+                        rank: rank as u32,
+                        offset: 0,
+                        bytes: *bytes as u64,
+                    },
+                )
+                .unwrap();
+        }
+        let resident_plan = resident_builder.finish().unwrap();
+        eprintln!(
+            "EXL3 TP{world} full layer: {} checked entries, {} patterns",
+            resident_plan.plan.entries.len(),
+            resident_plan.plan.patterns.len()
+        );
         let mut builder = Builder::new(&snapshot, sizes);
         for (units, name, destination, _) in &jobs {
             builder
@@ -494,4 +529,69 @@ fn real_exlr8_tp4_tp6_plan_counts_and_verified_unit_bytes() {
             }
         }
     }
+}
+
+#[test]
+fn oversized_index_list_splits_without_expanding_outer_rows() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("weights");
+    let bytes = (0..400_000).map(|n| n as u8).collect::<Vec<_>>();
+    std::fs::write(&path, &bytes).unwrap();
+    let source = Source {
+        path,
+        offset: 0,
+        bytes: bytes.len() as u64,
+    };
+    let pattern = Pattern {
+        run: 1,
+        dims: vec![Dim {
+            steps: Steps::Indices((0..400_000).collect()),
+            src_stride: 1,
+            dst_stride: 1,
+        }],
+    };
+    assert!(nest_push::proto::encode(&pattern).len() > 1 << 20);
+    let destination = Destination {
+        rank: 0,
+        offset: 0,
+        bytes: source.bytes,
+    };
+    let mut builder = Builder::new(root.path(), vec![source.bytes]);
+    builder
+        .entry(&source, destination, pattern.clone(), 0)
+        .unwrap();
+    let plan = builder.finish().unwrap();
+    assert!(plan.plan.entries.len() > 1);
+    assert!(plan
+        .plan
+        .patterns
+        .iter()
+        .all(|p| nest_push::proto::encode(p).len() + 16 <= nest_push::proto::MAX_MSG));
+    assert_eq!(land(&plan, root.path())[0], bytes);
+    let mut interleaved = pattern;
+    interleaved.dims.insert(
+        0,
+        Dim {
+            steps: Steps::Count(2),
+            src_stride: source.bytes,
+            dst_stride: source.bytes,
+        },
+    );
+    let mut builder = Builder::new(root.path(), vec![2 * source.bytes]);
+    let error = builder
+        .entry(
+            &Source {
+                bytes: 2 * source.bytes,
+                ..source
+            },
+            Destination {
+                bytes: 2 * destination.bytes,
+                ..destination
+            },
+            interleaved,
+            0,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("multipart protocol support"));
+    assert!(builder.plan.entries.is_empty(), "do not expand outer rows");
 }

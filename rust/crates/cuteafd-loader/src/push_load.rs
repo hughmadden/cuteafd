@@ -123,7 +123,7 @@ impl PushGroup {
         self.coordinator.patterns(patterns)
     }
 
-    /// Entries must be batched below `proto::MAX_MSG` by the plan builder.
+    /// The shared client batches entries below the socket message limit.
     pub fn entries(&self, entries: Vec<Entry>) -> io::Result<()> {
         self.coordinator.entries(entries)
     }

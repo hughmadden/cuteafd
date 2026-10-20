@@ -416,6 +416,69 @@ fn full_socket_backlog_cannot_hang_model_loading() {
 }
 
 #[test]
+fn checked_plan_upload_batches_messages_without_changing_ids() {
+    use super::builder::CheckedPlan;
+    use nest_push::plan::{Dim, Entry, Pattern, Plan, Steps, Totals};
+    let patterns = (0..2)
+        .map(|_| Pattern {
+            run: 1,
+            dims: vec![Dim {
+                steps: Steps::Indices((0..40_000).collect()),
+                src_stride: 1,
+                dst_stride: 1,
+            }],
+        })
+        .collect::<Vec<_>>();
+    let entries = (0..9000)
+        .map(|i| Entry {
+            file: 0,
+            pattern: i % 2,
+            src_base: 0,
+            dst_base: u64::from(i) * 40_000,
+            rank: 0,
+        })
+        .collect::<Vec<_>>();
+    let want_patterns = patterns.clone();
+    let want_entries = entries.clone();
+    let server = Server::new(move |conn| {
+        created(&conn);
+        let mut patterns = Vec::new();
+        let mut entries = Vec::new();
+        while patterns.len() < want_patterns.len() {
+            let Request::Patterns(batch) = request(&conn) else {
+                panic!("expected patterns")
+            };
+            assert!(proto::encode(&Request::Patterns(batch.clone())).len() <= proto::MAX_MSG);
+            patterns.extend(batch);
+        }
+        while entries.len() < want_entries.len() {
+            let Request::Entries(batch) = request(&conn) else {
+                panic!("expected entries")
+            };
+            assert!(proto::encode(&Request::Entries(batch.clone())).len() <= proto::MAX_MSG);
+            entries.extend(batch);
+        }
+        assert_eq!(patterns, want_patterns);
+        assert_eq!(entries, want_entries);
+    });
+    let group = server.client.create(vec![], vec![]).unwrap();
+    CheckedPlan {
+        plan: Plan {
+            files: vec!["weights".into()],
+            patterns,
+            entries,
+        },
+        file_sizes: vec![],
+        arenas: vec![],
+        totals: Totals::default(),
+    }
+    .upload(&group)
+    .unwrap();
+    drop(group);
+    server.finish();
+}
+
+#[test]
 fn eof_refusal_failure_and_wrong_phase_events_are_errors() {
     for response in [
         None,
