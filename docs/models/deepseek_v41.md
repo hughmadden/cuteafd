@@ -31,7 +31,9 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
 - Speculator: three-stage dSpark drafter (`markov_head`, `confidence_head`,
   `main_proj`) with adaptive width from a calibrated confidence and cost
   model.
-- KV format: compressed MLA latent in FP8 32x32 blocks; a specialized
+- KV format: compressed MLA latent as E2M1 with one E4M3 scale per 16
+  values (288 B per row), MXFP4 index keys (68 B per row) and an MXFP8
+  sliding window (528 B per token per layer); a specialized
   exact prefix cache — radix banks keyed by token ids, shared
   FP4 pages, a copied SWA "front", pinned-host tier in `cuteafd-hostcache`.
 - RTX/Spark layouts: the v2 native MXFP4 minimum is 1 RTX + 3 Sparks;
