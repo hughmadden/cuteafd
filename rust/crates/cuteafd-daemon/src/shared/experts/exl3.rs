@@ -116,11 +116,12 @@ fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<Exper
         .map(|b| b.initial_words.len() * 4)
         .max()
         .unwrap_or(0);
-    // Batch 64 source rows per pread, matching the native FP4 loader policy.
+    // Admit a fabric-bandwidth-delay window in pageable host RAM.
     let scratch = plan
         .scratch_bytes(catalog)?
         .checked_mul(64)
-        .context("EXL3 scratch overflow")?;
+        .context("EXL3 scratch overflow")?
+        .max(cuteafd_loader::EXPERT_READ_WINDOW_BYTES);
     Ok(ExpertLoadBudget {
         resident_bytes: arena_layout(plan)?.1,
         device_staging_bytes: 0,
@@ -445,6 +446,35 @@ impl<'a> Exl3Weights<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn larger_read_windows_preserve_device_and_pinned_admission() -> Result<()> {
+        use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(1, 4);
+        let tensors: Vec<_> = tensors.into_iter().filter(|tensor| !tensor.name.contains(".experts.")
+            || tensor.name.contains(".experts.0.")).collect();
+        let mut config = qwen4_config(1);
+        config["text_config"]["num_experts"] = serde_json::json!(1);
+        config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+        write_snapshot(root.path(), &config, &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        for rank in 0..4 {
+            let plan = planned_residency(&catalog,
+                ExpertLayer::BackboneExl3Tp { layer: 0, rank, world: 4 })?;
+            let actual = budget(&catalog, &plan)?;
+            let staging = plan.loads.chunks(JOBS_PER_EXPERT)
+                .map(|jobs| jobs.iter().map(|job| job.bytes).sum::<usize>()).max().unwrap_or(0);
+            let init = plan.buffers.iter().map(|buffer| buffer.initial_words.len() * 4).max().unwrap_or(0);
+            assert_eq!(actual.resident_bytes, arena_layout(&plan)?.1);
+            assert_eq!(actual.device_staging_bytes, 0);
+            assert_eq!(actual.pinned_host_bytes, staging.max(init) * EXPERT_READ_LANES * BANKS);
+            let previous = plan.scratch_bytes(&catalog)? * 64 * EXPERT_READ_LANES * BANKS;
+            assert_eq!(actual.read_scratch_bytes,
+                previous.max(cuteafd_loader::EXPERT_READ_WINDOW_BYTES * EXPERT_READ_LANES * BANKS));
+        }
+        Ok(())
+    }
 
     #[test]
     fn declared_shard_residency_selection_admits_whole_experts() -> Result<()> {
