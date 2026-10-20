@@ -611,7 +611,7 @@ mod tests {
         let slots = 8;
         let mark_bytes = super::super::state::KdaLayout::new(&cfg, slots, 1, 1)?.mark_bytes() * 2;
         let marks = crate::shared::prefix::MarkRule { lanes: slots, entries: 20,
-            budget_bytes: 2 << 30 }.slots(mark_bytes);
+            budget_bytes: 2 << 30, host: true }.slots(mark_bytes);
         let package = artifacts.join("exl3").join(crate::shared::experts::exl3::package_name("kimik3",
             catalog.exl3().context("EXL3 manifest")?.decoder_tiers())).join("rtx-tp2");
         let mut rtx = admission::plan_rtx(&cfg, &catalog, package.clone(), rows, 92)
