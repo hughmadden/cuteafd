@@ -39,6 +39,18 @@ impl Provisional {
         Ok(Self { sequences })
     }
 
+    /// Cancellation is request-owned: never clear another slot's replay.
+    pub(crate) fn cancel(&mut self, placement: &super::prefix::Placement) -> Result<()> {
+        if let Some(index) = self.sequences.iter().position(|(original, _, _)| original.slot == placement.slot) {
+            let (original, rows, _) = &self.sequences[index];
+            ensure!(placement.units == original.units && placement.state_len == original.state_len
+                && (original.len..=original.len + rows.len()).contains(&placement.len),
+                "Kimi cancel identity/frontier differs from provisional replay");
+            self.sequences.remove(index);
+        }
+        Ok(())
+    }
+
     /// Validate every selection before returning the native SoA commit table.
     /// None means explicit discard, not a zero-row replay or an emitted bonus.
     pub(crate) fn tables(&self, accepted: &[Accepted<'_>]) -> Result<Vec<i32>> {
@@ -282,6 +294,24 @@ mod tests {
         let pending = Provisional::new(&mut sequences, 2)?;
         drop(sequences);
         Ok((pending, placements, rows))
+    }
+
+    #[test]
+    fn provisional_cancellation_checks_identity_and_retains_other_requests() -> Result<()> {
+        let (mut pending, placements, _) = provisional_fixture()?;
+        let mut stale = placements[1].clone();
+        stale.units = vec![99];
+        assert!(pending.cancel(&stale).is_err());
+        assert_eq!(pending.sequences.len(), 2);
+        pending.cancel(&placements[0])?;
+        assert_eq!(pending.sequences.len(), 1);
+        assert_eq!(pending.sequences[0].0.slot, placements[1].slot);
+        assert_eq!(pending.sequences[0].2, 4);
+        pending.cancel(&placements[0])?;
+        assert_eq!(pending.sequences.len(), 1);
+        pending.cancel(&placements[1])?;
+        assert!(pending.sequences.is_empty());
+        Ok(())
     }
 
     #[test]

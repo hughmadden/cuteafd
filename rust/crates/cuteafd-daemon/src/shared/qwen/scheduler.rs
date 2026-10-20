@@ -124,6 +124,8 @@ pub(crate) trait Backend<'a> {
         -> Result<Vec<Vec<u32>>>;
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool, draft: bool) -> Result<()>;
+    /// Drop any unaccepted replay owned by this request before its storage is released.
+    fn cancel(&self, _placement: &Self::Placement) -> Result<()> { Ok(()) }
     fn probe_begin(&self, rows: usize);
     fn probe_end(&self);
     fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T>;
@@ -304,9 +306,14 @@ impl Trace {
 
 /// Gives a finished or failed sequence's units and state slot back.
 fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>>(family: &F, cache: &mut PrefixCache<CudaCopyEngine<'_>, M>, slots: &mut Vec<i32>,
-    placement: &P, family_name: &str) {
+    placement: &P, family_name: &str, cancel: impl FnOnce() -> Result<()>) {
+    if let Err(error) = cancel() {
+        tracing::error!(%error, family = family_name, "cancel failed; sequence units and state slot quarantined");
+        return;
+    }
     if let Err(error) = cache.release(family, placement.units()) {
         tracing::error!(%error, family = family_name, "releasing sequence units");
+        return;
     }
     slots.push(placement.slot());
 }
@@ -316,7 +323,11 @@ fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>>(
 /// On either failure, retain both the page references and the state slot.
 fn release_failed<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>,
     E: cuteafd_hostcache::copy::CopyEngine>(family: &F, cache: &mut PrefixCache<E, M>,
-    slots: &mut Vec<i32>, placement: &P) -> std::result::Result<(), cuteafd_engine::prefix::PrefixError> {
+    slots: &mut Vec<i32>, placement: &P, cancel: impl FnOnce() -> Result<()>)
+    -> std::result::Result<(), cuteafd_engine::prefix::PrefixError> {
+    cancel().map_err(|source| cuteafd_engine::prefix::PrefixError::Family {
+        what: "failed step cancel", source: source.into(),
+    })?;
     family.drain().map_err(|source| cuteafd_engine::prefix::PrefixError::Family {
         what: "failed step drain", source,
     })?;
@@ -452,6 +463,17 @@ mod readiness_tests {
             // Only the live diagnostic decode advances generated rows.
             "&mutrows,spec,UngraphedKind::Decode,",
         ]);
+    }
+
+    #[test]
+    fn scheduler_cancels_every_request_release_and_failed_accept() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        let source = source.split_once("\nfn media_failure").unwrap().0;
+        let releases = source.lines().filter(|line| line.contains("release(&family,")
+            || line.contains("release_failed(&family,")).collect::<Vec<_>>();
+        assert_eq!(releases.len(), 8);
+        assert!(releases.iter().all(|line| line.contains("|| engine.cancel(")));
+        assert!(source.contains("for request in &active { engine.cancel(&request.placement)?; }"));
     }
 
     #[test]
@@ -690,7 +712,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let ready = match ready.reconcile(resume) {
                 Ok(ready) => ready,
                 Err(waiter) => {
-                    release(&family, &mut cache, &mut free_slots, &admitted.placement, geometry.family);
+                    release(&family, &mut cache, &mut free_slots, &admitted.placement, geometry.family, || engine.cancel(&admitted.placement));
                     let events = waiter.job.job.events.clone();
                     if let Err((_, error)) = media.enqueue(waiter) {
                         let _ = events.send(Err(media_failure(error)));
@@ -722,7 +744,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
                 }
-                release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
+                release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
                 continue;
             }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.media.len(),
@@ -843,7 +865,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         tracing::warn!("prefill failed: {error:#}");
                         let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     }
-                    release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
+                    release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
                     continue;
                 }
                 // A whole-prompt hit selects from its retained logits; a prefill selected already.
@@ -861,7 +883,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     Ok(first) => first,
                     Err(error) => {
                         tracing::warn!("{error:#}");
-                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
+                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
                         continue;
                     }
                 };
@@ -915,7 +937,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                                 }
                                 request.ticket.done(request.generated);
-                                release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family)
+                                release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family, || engine.cancel(&request.placement))
                             }
                         }
                     }
@@ -923,7 +945,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         tracing::warn!("admission failed: {error:#}");
                         let _ = job_events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         retain_prompt(&mut cache, &placement);
-                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
+                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
                     }
                 }
             }
@@ -1054,7 +1076,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 for request in active.drain(..) {
                     if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    if let Err(error) = release_failed(&family, &mut cache, &mut free_slots, &request.placement) {
+                    if let Err(error) = release_failed(&family, &mut cache, &mut free_slots, &request.placement, || engine.cancel(&request.placement)) {
                         tracing::error!(%error, family = geometry.family, slot = request.placement.slot(),
                             "failed step units and state slot quarantined");
                     }
@@ -1136,8 +1158,12 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 rows, first_row, kept: *kept, finished });
             first_row += rows.len();
         }
-        engine.accept(&mut verified, spec, neural)?;
+        let accepted = engine.accept(&mut verified, spec, neural);
         drop(verified);
+        if let Err(error) = accepted {
+            for request in &active { engine.cancel(&request.placement)?; }
+            return Err(error);
+        }
         let commit_us = console::us(commit_timer);
         if let Some(shared) = shared.as_mut() {
             let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
@@ -1210,7 +1236,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     tracing::warn!("turn snapshot not retained: {error:#}");
                 }
             }
-            release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family);
+            release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family, || engine.cancel(&request.placement));
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats);
@@ -1294,7 +1320,7 @@ mod failed_release_tests {
         family.writes.borrow_mut().extend(&placement.pages);
         assert_eq!(family.drains.get(), 0);
         assert_eq!(cache.pool().refs(placement.pages[0]), 1);
-        release_failed(&family, &mut cache, &mut slots, &placement).unwrap();
+        release_failed(&family, &mut cache, &mut slots, &placement, || Ok(())).unwrap();
         assert_eq!(family.drains.get(), 1);
         assert!(family.writes.borrow().is_empty());
         assert_eq!(*family.landed.borrow(), placement.pages);
@@ -1307,13 +1333,53 @@ mod failed_release_tests {
     }
 
     #[test]
+    fn verify_then_selection_failure_cancels_replay_before_release_and_slot_reuse() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        let mut slots = Vec::new();
+        let pending = Cell::new(false);
+        let selected: Result<()> = (|| {
+            assert!(!pending.replace(true));
+            family.writes.borrow_mut().extend(&placement.pages);
+            anyhow::bail!("injected token selection failure");
+        })();
+        assert!(selected.is_err());
+        let cache_refs_before_release = cache.pool().refs(placement.pages[0]);
+        release_failed(&family, &mut cache, &mut slots, &placement, || {
+            assert!(pending.replace(false));
+            assert_eq!(family.drains.get(), 0);
+            assert_eq!(cache_refs_before_release, 1);
+            Ok(())
+        }).unwrap();
+        assert!(!pending.get());
+        assert_eq!(family.drains.get(), 1);
+        let next = cache.admit_cold(&family, 64, 64, |pages| Placed { pages, slot: slots.pop().unwrap() })
+            .unwrap().placement;
+        assert_eq!(next.pages, placement.pages);
+        assert_eq!(next.slot, placement.slot);
+        assert!(!pending.replace(true), "next verify must not inherit failed replay");
+    }
+
+    #[test]
+    fn cancellation_failure_quarantines_without_releasing_or_draining() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        let mut slots = vec![9];
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement,
+            || anyhow::bail!("injected replay identity failure")).is_err());
+        assert_eq!(family.drains.get(), 0);
+        assert_eq!(slots, [9]);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 1);
+    }
+
+    #[test]
     fn failed_step_quarantines_pages_and_slot_when_unconditional_drain_fails() {
         let family = Queued::default();
         let (mut cache, placement) = admit(&family);
         let mut slots = vec![9];
         family.writes.borrow_mut().extend(&placement.pages);
         family.fail_on.set(1);
-        assert!(release_failed(&family, &mut cache, &mut slots, &placement).is_err());
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement, || Ok(())).is_err());
         assert_eq!(family.drains.get(), 1);
         assert_eq!(*family.writes.borrow(), placement.pages);
         assert!(family.landed.borrow().is_empty());
@@ -1335,7 +1401,7 @@ mod failed_release_tests {
         assert_eq!(cache.pool().refs(placement.pages[0]), 2);
         family.fail_on.set(2);
         let mut slots = vec![9];
-        assert!(release_failed(&family, &mut cache, &mut slots, &placement).is_err());
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement, || Ok(())).is_err());
         assert_eq!(family.drains.get(), 2);
         assert_eq!(slots, [9]);
         assert_eq!(cache.pool().refs(placement.pages[0]), 2);

@@ -137,6 +137,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         }
         Ok(())
     }
+    fn cancel(&self, placement: &Placement) -> Result<()> { self.engine.cancel_provisional(placement) }
     fn probe_begin(&self, _rows: usize) {}
     fn probe_end(&self) {}
     fn probe_finish<T>(&self, _observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }

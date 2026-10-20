@@ -344,6 +344,15 @@ impl<'a> Engine<'a> {
         result
     }
 
+    pub(crate) fn cancel_provisional(&self, placement: &super::prefix::Placement) -> Result<()> {
+        let mut pending = self.provisional.try_borrow_mut()?;
+        if let Some(replay) = pending.as_mut() {
+            replay.cancel(placement)?;
+            if replay.sequences.is_empty() { pending.take(); }
+        }
+        Ok(())
+    }
+
     fn shutdown(&self) -> Result<()> {
         if self.peer.terminal_state() == TerminalState::Drained { return Ok(()); }
         let lanes = self.lanes.try_borrow_mut()?;
