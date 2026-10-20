@@ -211,31 +211,7 @@ pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: us
 /// in the movable; publisher streams/modules belong to the sampled baseline.
 pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u64)
     -> Result<MovableDemands, PlacementError> {
-    if hidden == 0 || vocab == 0 || taps == 0 || rows == 0 || rows > i32::MAX as u64 {
-        return Err(PlacementError::Inventory("GLM Flash remote DFlash bridge geometry"));
-    }
-    let mul = |a: u64, b: u64| a.checked_mul(b)
-        .ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge"));
-    let hidden_rows = mul(mul(rows, hidden)?, 2)?.max(256);
-    let bytes = [
-        ("DFlash bridge taps", mul(mul(mul(2048, taps)?, hidden)?, 2)?.max(256)),
-        ("DFlash bridge input ids", mul(rows, 4)?.max(256)),
-        ("DFlash bridge gathered input", hidden_rows),
-        ("DFlash bridge normalized hidden", hidden_rows),
-        ("DFlash bridge logits", mul(mul(rows, vocab)?, 4)?.max(256)),
-        ("DFlash bridge head scratch", 4 << 20),
-    ];
-    let mut demands: Vec<_> = bytes.into_iter().map(|(group, bytes)|
-        Demand::new(0, Category::Drafter, group, bytes, Basis::Formula)).collect();
-    for gpu in 0..2 {
-        demands.push(Demand::new(gpu, Category::Transport, "DFlash bridge exchange",
-            draft::BRIDGE_EXCHANGE_BYTES, Basis::Formula));
-    }
-    for gpu in 0..2 {
-        demands.iter().filter(|d| d.gpu == gpu).try_fold(0u64, |sum, d|
-            sum.checked_add(d.bytes).ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge")))?;
-    }
-    Ok(MovableDemands { placement_gpu: 1, demands })
+    draft::remote_dflash_bridge_demands(hidden, vocab, taps, rows, 0)
 }
 
 /// Opt-in until the remote executor's hardware gates qualify its default.
