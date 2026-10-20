@@ -329,6 +329,107 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "CPU-only: requires real checkpoint headers and sealed native export metadata"]
+    fn native_mtp_serve_startup_dry_run() -> Result<()> {
+        use cuteafd_loader::{placement::{self, Baseline}, plan::{self, layout::LayoutOptions}};
+        let mut args = args();
+        args.snapshot = std::env::var("CUTEAFD_STEP5_SNAPSHOT")?.into();
+        args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
+        args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
+        args.split_device = Some(1);
+        args.prefill_rows = 256;
+        args.max_sequences = 16;
+        args.prefix.host_cache_bytes = crate::shared::prefix::HostBudget::Auto;
+        args.peers = (1..=6).map(|port| format!("127.0.0.1:{port}").parse()).collect::<std::result::Result<_, _>>()?;
+        args.max_context = 1_048_576;
+        args.pool_tokens = None;
+        let checkpoint = Checkpoint::coordinator(&args.snapshot, false, true)?;
+        let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+        catalog.select_draft(DraftOwnership::None)?;
+        ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "routed geometry");
+        let format = catalog.fp8().context("native experts")?.format();
+        let package = args.native_lib.parent().context("native package")?.join("fp8")
+            .join(format.package_name("step5")).join("manifest.json");
+        let metadata = plan::checkpoint::read_json(&package)?;
+        let compiled = compiled_capacity(&metadata, args.prefill_rows)?;
+        let manifest = plan::checkpoint::read_json(&args.manifest)?;
+        ensure!(manifest["programs"].as_array().context("native programs")?.iter()
+            .all(|program| program.get("card_plans").is_none()),
+            "CPU-only startup needs exports without runtime SM selection");
+        // SAFETY: only export metadata is read; no CUDA init, device or allocation calls.
+        let library = unsafe { NativeLibrary::load(&args.native_lib)? };
+        let programs = library.programs()?.with_manifest(&args.manifest)?;
+        let capacity = placement::inventory::PRO_TOTAL_BYTES;
+        let arch = placement::inventory::ArchContext::coordinator(capacity, None);
+        let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
+        let mut inputs = RuntimeInputs {
+            inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
+                baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
+                headroom_bytes: LayoutOptions::default().headroom_bytes }; 2], spark_ranks: 6, peer_access: true },
+            rows: 256, sequences: 16, context: args.max_context, requested_pool: None,
+            marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
+            pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
+                "step5", &format.package_name("step5"), true, rank, &arch, Some(&selected)).bytes).collect(),
+            startup: vec![],
+        };
+        for depth in 1..=3 {
+            args.mtp = depth;
+            args.validate()?;
+            inputs.startup.clear();
+            let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
+            inputs.startup = admitted.placement.items.iter().enumerate().map(|(rank, items)|
+                Demand::new(rank as u8, cuteafd_core::memory_layout::Category::Workspace,
+                    "Step-5 retained loading peak", items.iter().map(|item| item.bytes).sum(),
+                    cuteafd_core::memory_layout::Basis::Exact)).collect();
+            let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
+            let endpoint = SparkEndpoint { capacity: args.prefill_rows, ingress: SparkIngress::Bf16 };
+            let clients = admitted.ownership.routed_endpoints()?;
+            SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
+                rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: 6, prefill_lanes: 1 },
+                6, None, ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, compiled,
+                    spark_rings(TcpTransportConfig::default().max_frame_bytes)?, clients)?)?;
+            super::super::execution::bootstrap_request(inputs.rows, 1)?;
+            let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
+            for rank in 0..2 {
+                let mut native = Execution::serving_admission(&programs, &checkpoint,
+                    &admitted.ownership, rank, inputs.rows)?;
+                if rank == head_rank {
+                    native.workspace = native.workspace.max(
+                        plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(depth))?);
+                }
+                let native = native.check(u64::MAX, &[])?;
+                let total = admitted.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
+                ensure!(native <= total && total <= inputs.inventory.gpus[rank].available(),
+                    "native allocation exceeds solved startup budget at rank {rank}");
+            }
+            let predictor = plan::families::step5::coordinator::RankWeightLayout::for_mtp(
+                &checkpoint, usize::from(depth))?.resident_bytes;
+            let total = admitted.placement.items[head_rank].iter().map(|item| item.bytes).sum::<u64>();
+            ensure!(predictor <= total
+                && admitted.cache.ranks[head_rank].mtp_lengths.len() == usize::from(depth),
+                "predictor runtime exceeds admitted owners/cache");
+            for stage in 0..usize::from(depth) {
+                super::super::mtp::InputPlan::prepare(&programs, &checkpoint, stage, inputs.rows)?;
+                super::super::head::HeadPlan::for_mtp_stage(&programs, &checkpoint, stage, inputs.rows)?;
+                super::super::ffn::DensePlan::for_mtp_stage(&programs, &checkpoint,
+                    stage, inputs.rows, u64::MAX, &[])?;
+            }
+            let planned = plan::plan(&args.snapshot, &plan::PlanOptions {
+                placement: plan::ExpertPlacement::from_spark_ranks(6),
+                draft_ownership: Some(DraftOwnership::NativeMtp),
+                layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2],
+                    native_mtp_layers: usize::from(depth), workspace_manifest: Some(args.manifest.clone()),
+                    ..Default::default() }), ..Default::default()
+            })?;
+            ensure!(planned.wip_launchable(), "MTP depth {depth}: {:?}", planned.hints);
+            ensure!(planned.solver_placement.as_ref() == Some(&admitted.placement),
+                "planned/measured MTP startup differs at depth {depth}");
+            eprintln!("Step-5 CPU serve startup: depth={depth} real_headers=true installed_exports=true admission=true CUDA_initialized=false");
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires sealed native exports, full target weights and real Spark workers"]
     fn live_mtp_target_abort_restore_and_fresh_marks_are_exact() -> Result<()> {
         use crate::shared::qwen::scheduler::DraftState as _;

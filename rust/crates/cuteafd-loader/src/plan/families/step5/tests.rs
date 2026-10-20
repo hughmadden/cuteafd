@@ -121,6 +121,57 @@ fn coordinator_headers_include_native_mtp_only_when_selected() -> anyhow::Result
 }
 
 #[test]
+fn native_mtp_contract_accepts_only_validated_predictor_headers() -> anyhow::Result<()> {
+    let fixture = snapshot("fp8");
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let cp = Checkpoint::coordinator(path, false, true)?;
+        let model = Model::open(&cp)?;
+        let groups = format::group_by_stem(&cp.tensors);
+        let scale = format::TensorScale { encoding: format::ScaleEncoding::F32 };
+        let mut count = 0;
+        for (stem, members) in &groups {
+            let Some(role) = STEP5.classify(model.spec(), stem) else { continue; };
+            if role.component != Component::Speculator { continue; }
+            let operand = format::detect(members)?;
+            assert!(model.accepts(&role, stem, &mut operand.clone()).is_ok(), "{stem}");
+            for mutation in 0..8 {
+                let mut wrong = operand.clone();
+                match mutation {
+                    0 => wrong.logical[0] -= 1,
+                    1 => wrong.stored[0] -= 1,
+                    2 => wrong.encoding = format::Encoding::F16,
+                    3 => wrong.global_scale = Some(scale),
+                    4 => wrong.input_scale = Some(scale),
+                    5 => wrong.scale = Some(format::BlockScale {
+                        tensor: "weight_scale_inv".into(), encoding: format::ScaleEncoding::F32,
+                        direction: format::ScaleDirection::Multiply,
+                        rows: format::RowTiling::Uniform { rows: 128 }, cols: 128, grid: vec![1, 1],
+                    }),
+                    6 => wrong.container = "F16".into(),
+                    _ => wrong.companions.push("bias".into()),
+                }
+                assert!(model.accepts(&role, stem, &mut wrong).is_err(), "{stem} mutation {mutation}");
+            }
+            for wrong in [TensorRole::layer(Component::Speculator, 91),
+                TensorRole::layer(Component::Speculator, 95), TensorRole::layer(Component::Attention, role.layer.unwrap())] {
+                assert!(model.accepts(&wrong, stem, &mut operand.clone()).is_err(), "{stem} {wrong:?}");
+            }
+            let unknown = format!("model.layers.{}.unvalidated", role.layer.unwrap());
+            assert!(model.accepts(&role, &unknown, &mut operand.clone()).is_err());
+            count += 1;
+        }
+        assert_eq!(count, 51, "only the qualified 17 operands per stage may be admitted");
+        assert!(STEP5.component_hint(Component::Speculator).is_none());
+        Ok(())
+    };
+    check(fixture.path())?;
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_HEADER_SNAPSHOT") {
+        check(std::path::Path::new(&snapshot))?;
+    }
+    Ok(())
+}
+
+#[test]
 fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> anyhow::Result<()> {
     use crate::placement::{inventory::{self, ArchContext}, *};
     use super::admission::{self, MarkRule, RuntimeInputs};
@@ -178,6 +229,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 ..Default::default()
             }), ..Default::default()
         })?;
+        assert!(planned.wip_launchable(), "depth {depth}: {:?}", planned.hints);
         let memory = planned.memory_layout.as_ref().expect("depth-aware Step-5 layout");
         assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
         for rank in 0..2 {
