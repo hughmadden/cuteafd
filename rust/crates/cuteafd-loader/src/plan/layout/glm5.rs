@@ -430,7 +430,7 @@ mod tests {
                     assert_eq!(memory.devices.len(), gpus);
                     assert_eq!(memory.pool_tokens, default.max(context));
                     assert_eq!(placement.pool_tokens, default.max(context));
-                    assert_eq!(placement.attention, if gpus == 2 { crate::placement::AttentionPlacement::Context }
+                    assert_eq!(placement.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Context }
                         else { crate::placement::AttentionPlacement::Heads });
                 }
             }
