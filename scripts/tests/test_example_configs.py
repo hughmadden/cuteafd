@@ -125,9 +125,11 @@ def _stubs(tmp_path: Path) -> Path:
         (bin_dir / tool).chmod(0o755)
     (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
     (bin_dir / "nvidia-smi").write_text('#!/usr/bin/env bash\ncase "$*" in *memory.total*) echo 98304 ;; '
-                                        '*memory.free*) echo 97000 ;; *) printf "%s\\n" 0 1 ;; esac\n')
+                                        '*memory.free*) echo 97000 ;; *query-gpu=uuid*) echo GPU-00000000-0000-0000-0000-000000000000 ;; *) printf "%s\\n" 0 1 ;; esac\n')
     for tool in ("curl", "nvidia-smi"):
         (bin_dir / tool).chmod(0o755)
+    from launcher_sandbox import stub_cuda_python
+    stub_cuda_python(bin_dir, 98304 * 2**20)
     return bin_dir
 
 
