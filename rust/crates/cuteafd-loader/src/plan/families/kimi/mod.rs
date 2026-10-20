@@ -61,6 +61,7 @@ pub(super) struct Model {
     /// MLA operands by layer, held whole on the owner or head-split explicitly.
     mla: Vec<Residency>,
     core: crate::families::kimi_k3::core::CoreInventory,
+    native_k6: bool,
 }
 
 /// Coordinator text weights by how a two-GPU head split holds them.
@@ -149,7 +150,7 @@ impl Model {
         let mla = vec![Residency::default(); cfg.layers];
         let mut model = Self { cfg, snapshot: checkpoint.snapshot.clone(), spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
             coordinator: Residency::default(), frontends: [0; 2], mla,
-            core: crate::families::kimi_k3::core::CoreInventory::default() };
+            core: crate::families::kimi_k3::core::CoreInventory::default(), native_k6: false };
         model.core = crate::families::kimi_k3::core::CoreInventory::from_checkpoint(&model.cfg, checkpoint,
             &model.tensors.iter().map(|(name, tensor)| (name.clone(), tensor.shape.clone())).collect())?;
         let mut headers = BTreeMap::new();
@@ -303,7 +304,14 @@ impl Family for KimiK3 {
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
-    fn native_serving_admission(&self) -> bool { self.core.projections.is_empty() }
+    fn configure(&mut self, options: &crate::plan::PlanOptions) -> Result<(), ConfigError> {
+        if options.native_k6 {
+            self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)?;
+        }
+        self.native_k6 = options.native_k6;
+        Ok(())
+    }
+    fn native_serving_admission(&self) -> bool { self.native_k6 || self.core.projections.is_empty() }
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }
@@ -324,6 +332,11 @@ impl FamilyModel for Model {
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         if let Some(projection) = self.core.projections.get(stem) {
+            if self.native_k6 {
+                return super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits: 6 })
+                    && operand.logical == [projection.stored_outputs, projection.shape[1]],
+                    || format!("{stem}: expected header-native K6 {:?}", projection.shape));
+            }
             return Err(format!("{stem}: header-native K{} core {:?} needs the Kimi shared trellis ABI/package and runtime rotations; no BF16 fallback",
                 projection.bits, projection.shape));
         }

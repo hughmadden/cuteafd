@@ -2,7 +2,7 @@
 //! Serving admission remains closed until full-layer and TP2 gates qualify it.
 use super::weights::CoreWeights;
 use crate::shared::memory::device::{Allocation,Device};
-use anyhow::{ensure,Result};
+use anyhow::{ensure,Context,Result};
 use cuteafd_core::memory_layout::{Basis,Category};
 use cuteafd_loader::placement::Demand;
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer,programs::Programs,
@@ -16,27 +16,25 @@ use std::ffi::c_void;
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub(crate) struct ProjectionLayout { extents:BTreeMap<&'static str,usize>, rows:usize }
 impl ProjectionLayout {
-    pub(crate) fn new(program:&DenseTrellisDispatch<'_>,rows:usize)->Result<Self> {
-        let p=program.policy();p.route(rows)?;
-        let w=program.workspace();
-        let multiply=|a:usize,b:usize|a.checked_mul(b).ok_or_else(||anyhow::anyhow!("K6 projection scratch overflow"));
-        let mut extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),("scales",w.block_scales),
-            ("partial",w.partial),("accumulator",w.accumulator)]);
-        if rows>=64 {
-            extents.insert("chunk weights",p.weight_scratch);
-            extents.insert("chunk output",multiply(rows,multiply(p.chunk_columns,4)?)?);
-        }
-        Ok(Self{extents,rows})
-    }
     fn merge(&mut self,other:&Self)->Result<()> {
-        ensure!(self.rows==other.rows,"K6 scratch row capacities differ");
-        for (&name,&bytes) in &other.extents {
-            self.extents.entry(name).and_modify(|value|*value=(*value).max(bytes)).or_insert(bytes);
-        }
-        self.bytes()?;Ok(())
+        let mut layout=cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout {
+            extents:self.extents.clone(), rows:self.rows };
+        layout.merge(&cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout {
+            extents:other.extents.clone(),rows:other.rows })?;
+        self.extents=layout.extents;Ok(())
     }
     pub(crate) fn bytes(&self)->Result<usize> {
-        self.extents.values().try_fold(0usize,|sum,&v|sum.checked_add(v).ok_or_else(||anyhow::anyhow!("K6 scratch sum overflow")))
+        cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout {
+            extents:self.extents.clone(),rows:self.rows }.bytes()
+    }
+    pub(crate) fn new(program:&DenseTrellisDispatch<'_>,rows:usize)->Result<Self> {
+        let p=program.policy();p.route(rows)?;
+        let layout=cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout::new(p.input,p.output,rows,p.chunk_columns,p.weight_scratch)?;
+        let w=program.workspace();
+        ensure!([("rotated",w.rotated),("table",w.pointer_table),("scales",w.block_scales),
+            ("partial",w.partial),("accumulator",w.accumulator)].iter()
+            .all(|(name,bytes)|layout.extents.get(name)==Some(bytes)),"K6 package/planner scratch mismatch");
+        Ok(Self{extents:layout.extents,rows:layout.rows})
     }
     pub(crate) fn demand(&self,device:u8)->Result<Demand> {
         Ok(Demand::new(device,Category::Workspace,"Kimi K6 projection scratch",self.bytes()? as u64,Basis::Exact))
@@ -189,6 +187,10 @@ impl<'a> CorePrograms<'a> {
             projections.insert(key,projection);
         }
         let Some(layout)=layout else {anyhow::bail!("Kimi K6 inventory has no bound projections");};
+        let planned=cuteafd_loader::families::kimi_k3::core::projection_scratch(cfg,inventory,rows,
+            programs.family_metadata("kimi_k6_dense")?)?.context("K6 planned scratch absent")?;
+        ensure!(layout.extents==planned.extents && layout.rows==planned.rows,
+            "K6 runtime/planner aggregate scratch differs");
         let kda=[KimiKdaCore::load(programs,"kda_core_h48_m64",64,true)?,
             KimiKdaCore::load(programs,"kda_core_h48_m4096",4096,false)?];
         let mut mla=BTreeMap::new();
@@ -220,6 +222,95 @@ fn projection_key(shape:[usize;2],side:cuteafd_loader::formats::dense_trellis::T
 #[cfg(test)]
 mod runtime_layout_tests {
     use super::*;
+    #[test]
+    fn planner_and_runtime_native_core_bytes_agree_on_and_off()->Result<()> {
+        use cuteafd_loader::{families::kimi_k3::{config::{KimiK3Config,KimiAttention},core::{self,CoreCharges,CoreInventory}},
+            plan::{testing,Checkpoint},placement::{LayerMode,FfnMode}};
+        use cuteafd_ffi::dense_trellis::{DenseTrellisGeometry,TrellisDType};
+        use super::super::weights::{CoreWeightLayout,LayerLayout};
+        use cuteafd_loader::formats::dense_trellis::TrellisSide;
+        let dir=tempfile::tempdir()?;
+        testing::write_kimi_core_snapshot(dir.path(),false);
+        let checkpoint=Checkpoint::open(dir.path())?;
+        let cfg=KimiK3Config::from_hf(&checkpoint.config)?;
+        let inventory=cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?;
+        let mut geometries=BTreeMap::new();
+        for layer in 0..cfg.layers {
+            for mode in [LayerMode::HeadSplit,LayerMode::Whole{gpu:0,ffn:FfnMode::Split}] {
+                if cfg.attention[layer]==KimiAttention::Kda && mode!=LayerMode::HeadSplit {continue;}
+                for rank in LayerLayout::pair_with_core(&cfg,layer,mode,&inventory)? {
+                    for weight in rank.core_layouts() {
+                        let projection=&inventory.projections[&weight.stem];
+                        // Local native allocations contain only compressed payload and vectors.
+                        assert_eq!(weight.bytes as u64,projection.resident_bytes(weight.ranks)?);
+                        geometries.insert(projection_key(weight.shape,weight.side,weight.codebook),());
+                    }
+                }
+            }
+        }
+        let head=CoreWeightLayout::new(inventory.get_weight("language_model.lm_head").unwrap(),TrellisSide::Output,0,1)?;
+        geometries.insert(projection_key(head.shape,head.side,head.codebook),());
+        let policies=geometries.keys().map(|(k,n,side,book)|{
+            let chunk=if k*n*2<=256*1024*1024 {*n}else{128};
+            serde_json::json!({"input_features":k,"output_features":n,"sharded_side":side,"codebook":book,
+                "threshold_rows":64,"below":"shared_native","at_or_above":"chunk_dequant_bf16",
+                "chunk_output_dtype":"f32","stitch_before_output_transform":true,"chunk_columns":chunk,
+                "weight_scratch_bytes":k*chunk*2,"chunk_output_scratch_bytes_per_row":chunk*4})
+        }).collect::<Vec<_>>();
+        let mut programs=Vec::new();
+        let mut program=|name:String,bytes:usize| programs.push(serde_json::json!({"name":name,
+            "scratch_bytes_at_capacity":{"scratch":bytes}}));
+        for capacity in [64,4096] {
+            program(format!("kimik3_kda_m{capacity}"),1024);
+            program(format!("kda_core_h48_m{capacity}"),2048);
+            for heads in [48,96] {
+                let suffix=if heads==48 {""}else{"_h96"};
+                program(format!("kimik3_mla_producer{suffix}_m{capacity}"),4096);
+                for stride in [576,640] {program(format!("mla_rank_norm_h{heads}_kv{stride}_m{capacity}"),2048);}
+            }
+        }
+        let metadata=serde_json::json!({"abi_version":1,"row_policies":policies});
+        let manifest=serde_json::json!({"programs":programs,"families":{"kimi_k6_dense":metadata}});
+        for rows in [1,16,63,64,4096] {
+            for on in [false,true] {
+                let empty=CoreInventory::default();
+                let core=if on {&inventory}else{&empty};
+                let charged=CoreCharges::from_package(&cfg,core,rows,&manifest)?;
+                let mut runtime:Option<ProjectionLayout>=None;
+                if on {
+                    for ((k,n,side,_),()) in &geometries {
+                        let live=if *n==cfg.vocab_size {rows.min(64)}else{rows};
+                        let w=DenseTrellisGeometry{input:*k,output:*n,bits:6,side:*side,rows:live,
+                            input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
+                        let mut extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
+                            ("scales",w.block_scales),("partial",w.partial),("accumulator",w.accumulator)]);
+                        if live>=64 {
+                            let chunk=if k*n*2<=256*1024*1024 {*n}else{128};
+                            extents.insert("chunk weights",k*chunk*2);
+                            extents.insert("chunk output",live*chunk*4);
+                        }
+                        let layout=ProjectionLayout{extents,rows};
+                        if let Some(runtime)=&mut runtime {runtime.merge(&layout)?;}else{runtime=Some(layout);}
+                    }
+                }
+                assert_eq!(charged.projection.as_ref().map(|p|&p.extents),runtime.as_ref().map(|p|&p.extents));
+                assert_eq!(charged.receive,super::super::startup::exchange_demands(rows,false,on)?[0].bytes as usize
+                    -256-256-(((cuteafd_loader::placement::HOP_SLOTS+1)*16)as usize).max(256));
+                let expected_stages=if on {core::lane_extents(rows,1024,4096,2048,2048)?}else{BTreeMap::new()};
+                assert_eq!(charged.stages,expected_stages);
+                let sum=charged.demands()?.iter().filter(|d|d.gpu==0).map(|d|d.bytes).sum::<u64>();
+                assert_eq!(sum,runtime.as_ref().map_or(Ok(0),|p|p.bytes())? as u64
+                    +expected_stages.values().sum::<usize>() as u64+charged.receive as u64);
+            }
+        }
+        // A duplicate exact geometry is ambiguous, never selected by table order.
+        let mut duplicate=manifest.clone();
+        let first=duplicate["families"]["kimi_k6_dense"]["row_policies"][0].clone();
+        duplicate["families"]["kimi_k6_dense"]["row_policies"].as_array_mut().unwrap().push(first);
+        assert!(CoreCharges::from_package(&cfg,&inventory,64,&duplicate).is_err());
+        Ok(())
+    }
+
     #[test]
     fn serialized_projections_charge_memberwise_high_water_not_per_layer_sum()->Result<()> {
         let mut shared=ProjectionLayout{rows:64,extents:BTreeMap::from([("rotated",256),("partial",4096),

@@ -2460,6 +2460,9 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t=map(float,sys.argv[1:3]);b=float(sys.argv[3]) if sys.argv[3] else t/1024;print(max(0,min(f/1024,b-(t-f)/1024)))' "$free_mib" "$total_mib" "$coordinator_budget")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  if [[ "$family" == kimi_k3 && "$(get NATIVE_K6 off)" == on ]]; then
+    plan_draft_args+=(--native-k6)
+  fi
   # Read the effective serve argv, including family modes that enable auto.
   plan_host_cache=0
   for ((i=0; i<${#family_args[@]}; i++)); do

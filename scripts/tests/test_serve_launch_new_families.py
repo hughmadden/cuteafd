@@ -225,8 +225,10 @@ def test_gate_card_ports_stay_unique() -> None:
 
 @pytest.mark.parametrize("keys,flag", [("", False), ("NATIVE_K6=off\n", False), ("NATIVE_K6=on\n", True)])
 def test_kimi_native_k6_is_opt_in(tmp_path: Path, keys: str, flag: bool) -> None:
-    serve = _line(_kimi(tmp_path, keys), "cuteafd serve-kimi --snapshot")
+    result = _kimi(tmp_path, keys)
+    serve = _line(result, "cuteafd serve-kimi --snapshot")
     assert ("--native-k6" in serve.split()) == flag
+    assert ("--native-k6" in _line(result, "cuteafd plan").split()) == flag
 
 
 def test_kimi_native_k6_rejects_other_values(tmp_path: Path) -> None:

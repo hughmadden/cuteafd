@@ -75,6 +75,174 @@ impl CoreProjection {
     }
 }
 
+/// Serialized native projections share maxima per scratch plane, not their sum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionScratchLayout {
+    pub extents: BTreeMap<&'static str, usize>,
+    pub rows: usize,
+}
+impl ProjectionScratchLayout {
+    pub fn new(k: usize, n: usize, rows: usize, chunk: usize, weights: usize) -> Result<Self> {
+        ensure!((1..=4096).contains(&rows) && k > 0 && n > 0 && k % 128 == 0 && n % 128 == 0,
+            "Kimi K6 scratch geometry");
+        ensure!(chunk > 0 && chunk % 128 == 0 && n % chunk == 0
+            && k.checked_mul(chunk).and_then(|v| v.checked_mul(2)) == Some(weights)
+            && weights <= 256 * 1024 * 1024, "Kimi K6 chunk policy geometry");
+        let product = |values: &[usize]| values.iter().try_fold(1usize, |a, b| a.checked_mul(*b))
+            .context("Kimi K6 scratch overflow");
+        let mut extents = BTreeMap::from([
+            ("rotated", product(&[rows, k, 2])?), ("table", 8), ("scales", k / 128 * 2),
+            ("partial", product(&[rows, k.div_ceil(1024), n, 4])?),
+            ("accumulator", product(&[rows, n, 4])?),
+        ]);
+        if rows >= 64 {
+            extents.insert("chunk weights", weights);
+            extents.insert("chunk output", product(&[rows, chunk, 4])?);
+        }
+        let layout = Self { extents, rows };
+        layout.bytes()?;
+        Ok(layout)
+    }
+    pub fn merge(&mut self, other: &Self) -> Result<()> {
+        ensure!(self.rows == other.rows, "Kimi K6 scratch row capacities differ");
+        for (&name, &bytes) in &other.extents {
+            self.extents.entry(name).and_modify(|v| *v = (*v).max(bytes)).or_insert(bytes);
+        }
+        self.bytes()?;
+        Ok(())
+    }
+    pub fn bytes(&self) -> Result<usize> {
+        self.extents.values().try_fold(0usize, |a, b| a.checked_add(*b)).context("Kimi K6 scratch sum overflow")
+    }
+}
+
+/// Named split-stage outputs retained beside the fused lane's existing arena.
+pub fn intermediate_extents(rows: usize) -> Result<BTreeMap<&'static str, usize>> {
+    [("K6 q",6144,2),("K6 k",6144,2),("K6 v",6144,2),("K6 gate",12288,2),
+        ("K6 q_a",1536,2),("K6 kv_a",640,2),("K6 q_b",18432,2),("K6 normalized",12288,2),
+        ("K6 FFN gate",3072,2),("K6 FFN up",3072,2),("K6 attention partial",7168,4),
+        ("K6 FFN partial",7168,4),("K6 reduced",7168,4)].into_iter()
+        .map(|(name,width,element)| Ok((name,rows.checked_mul(width*element).context("K6 lane intermediate overflow")?)))
+        .collect()
+}
+
+/// Split entrypoints can need separate scratch larger than the fused plane.
+pub fn lane_extents(rows: usize, base_kda: usize, base_mla: usize,
+    split_kda: usize, split_mla: usize) -> Result<BTreeMap<&'static str, usize>> {
+    let mut extents=intermediate_extents(rows)?;
+    if split_kda>base_kda {extents.insert("K6 KDA scratch",split_kda);}
+    if split_mla>base_mla {extents.insert("K6 MLA scratch",split_mla);}
+    Ok(extents)
+}
+
+/// Inert installed-package inspection, with no CUDA load or payload read.
+pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize) -> Result<BTreeMap<&'static str,usize>> {
+    let programs=manifest["programs"].as_array().context("Kimi K6 package program list")?;
+    let scratch=|name: &str| -> Result<usize> {
+        let entries=programs.iter().filter(|p|p["name"]==name).collect::<Vec<_>>();
+        ensure!(entries.len()==1,"Kimi K6 package requires exactly one {name}");
+        let scratch=entries[0]["scratch_bytes_at_capacity"].as_object().context("Kimi program scratch map")?;
+        scratch.values().try_fold(0usize,|sum,value|sum.checked_add(usize::try_from(value.as_u64()?).ok()?))
+            .context("Kimi package scratch extent")
+    };
+    let mut base_kda=0;let mut split_kda=0;let mut base_mla=0;let mut split_mla=0;
+    for capacity in [64,4096] {
+        base_kda=base_kda.max(scratch(&format!("kimik3_kda_m{capacity}"))?);
+        split_kda=split_kda.max(scratch(&format!("kda_core_h48_m{capacity}"))?);
+        for heads in [48,96] {
+            let suffix=if heads==48 {""}else{"_h96"};
+            base_mla=base_mla.max(scratch(&format!("kimik3_mla_producer{suffix}_m{capacity}"))?);
+            for stride in [576,640] {
+                split_mla=split_mla.max(scratch(&format!("mla_rank_norm_h{heads}_kv{stride}_m{capacity}"))?);
+            }
+        }
+    }
+    lane_extents(rows,base_kda,base_mla,split_kda,split_mla)
+}
+
+pub fn needs_f32_partials(cfg: &KimiK3Config, core: &CoreInventory) -> bool {
+    (0..cfg.layers).any(|layer| ["self_attn.o_proj", "block_sparse_moe.shared_experts.down_proj"]
+        .iter().any(|leaf| core.get_weight(&format!("language_model.model.layers.{layer}.{leaf}")).is_some()))
+}
+
+pub fn exchange_recv_bytes(rows: usize, f32: bool) -> Result<usize> {
+    ensure!((1..=4096).contains(&rows), "Kimi exchange row capacity");
+    Ok((rows * 7168 * if f32 {4} else {2}).max(256))
+}
+
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct CoreCharges {
+    pub projection: Option<ProjectionScratchLayout>,
+    pub stages: BTreeMap<&'static str,usize>,
+    pub receive: usize,
+}
+impl CoreCharges {
+    pub fn from_package(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
+        manifest: &serde_json::Value) -> Result<Self> {
+        Ok(Self {
+            projection: projection_scratch(cfg,core,rows,&manifest["families"]["kimi_k6_dense"] )?,
+            stages: if core.projections.is_empty() {BTreeMap::new()}else{package_lane_extents(manifest,rows)?},
+            receive: exchange_recv_bytes(rows,needs_f32_partials(cfg,core))?,
+        })
+    }
+    pub fn demands(&self) -> Result<Vec<crate::placement::Demand>> {
+        use cuteafd_core::memory_layout::{Basis,Category};
+        let projection=self.projection.as_ref().map_or(Ok(0),|layout|layout.bytes())?;
+        let stages=self.stages.values().try_fold(0usize,|sum,bytes|sum.checked_add(*bytes))
+            .context("K6 stage scratch overflow")?;
+        Ok((0..2).flat_map(|gpu|[
+            crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 projection scratch",projection as u64,Basis::Exact),
+            crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 split-stage operands",stages as u64,Basis::Exact),
+            crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 peer receive",self.receive as u64,Basis::Exact),
+        ]).collect())
+    }
+}
+
+/// The package owns chunk geometry. Headers select projections; no second export table.
+pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
+    metadata: &serde_json::Value) -> Result<Option<ProjectionScratchLayout>> {
+    if core.projections.is_empty() { return Ok(None); }
+    core.validate_runtime_groups(cfg)?;
+    ensure!(metadata["abi_version"] == 1, "Kimi K6 row-policy ABI");
+    let policies = metadata["row_policies"].as_array().context("Kimi K6 row-policy list")?;
+    let mut combined: Option<ProjectionScratchLayout> = None;
+    for projection in core.projections.values() {
+        let head = projection.stem == "language_model.lm_head";
+        let mla = projection.stem.contains(".self_attn.") && projection.stem
+            .strip_prefix("language_model.model.layers.").and_then(|s| s.split_once('.'))
+            .and_then(|(layer,_)| layer.parse::<usize>().ok()).is_some_and(|layer|
+                cfg.attention[layer] == super::config::KimiAttention::Mla);
+        let worlds: &[usize] = if projection.split == CoreSplit::Whole { &[1] }
+            else if mla { &[1,2] } else { &[2] };
+        for &world in worlds {
+            let (mut n, mut k) = (projection.stored_outputs, projection.shape[1]);
+            let side = if world == 1 || projection.split != CoreSplit::Input {1} else {2};
+            if world == 2 { if side == 1 { n /= 2; } else { k /= 2; } }
+            let book = match projection.codebook {
+                crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
+                crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1",
+            };
+            let matching = policies.iter().filter(|p| p["input_features"] == k && p["output_features"] == n
+                && p["sharded_side"] == side && p["codebook"] == book).collect::<Vec<_>>();
+            ensure!(matching.len() == 1, "{}: expected one K6 row policy for K{k}/N{n}/side{side}/{book}, found {}",
+                projection.stem, matching.len());
+            let policy = matching[0];
+            ensure!(policy["threshold_rows"] == 64 && policy["below"] == "shared_native"
+                && policy["at_or_above"] == "chunk_dequant_bf16" && policy["chunk_output_dtype"] == "f32"
+                && policy["stitch_before_output_transform"] == true, "Kimi K6 row-policy route");
+            let integer = |key: &str| policy[key].as_u64().and_then(|v| usize::try_from(v).ok())
+                .with_context(|| format!("Kimi K6 row-policy {key}"));
+            let chunk = integer("chunk_columns")?;
+            ensure!(integer("chunk_output_scratch_bytes_per_row")? == chunk * 4, "Kimi K6 chunk output extent");
+            let mut layout = ProjectionScratchLayout::new(k,n,if head {rows.min(64)} else {rows},
+                chunk,integer("weight_scratch_bytes")?)?;
+            layout.rows = rows;
+            if let Some(combined) = &mut combined { combined.merge(&layout)?; } else { combined = Some(layout); }
+        }
+    }
+    Ok(combined)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CoreInventory {
     pub projections: BTreeMap<String, CoreProjection>,
@@ -227,5 +395,24 @@ mod tests {
             assert!(p.resident_bytes(3).is_err());
             if split != CoreSplit::Whole { assert!(p.resident_bytes(2).unwrap() > (p.source_bytes - 4) / 2); }
         }
+    }
+}
+
+#[cfg(test)]
+mod scratch_admission_tests {
+    use super::*;
+    #[test]
+    fn row_policy_scratch_uses_native_ceiling_and_adds_chunk_only_at_64() -> Result<()> {
+        for rows in [1,8,16,63,64,4096] {
+            let layout=ProjectionScratchLayout::new(7168,6144,rows,6144,7168*6144*2)?;
+            assert_eq!(layout.extents["partial"],rows*7*6144*4);
+            assert_eq!(layout.extents.contains_key("chunk weights"),rows>=64);
+            assert_eq!(layout.extents.contains_key("chunk output"),rows>=64);
+            assert_eq!(exchange_recv_bytes(rows,true)?,rows*7168*4);
+            assert_eq!(exchange_recv_bytes(rows,false)?,rows*7168*2);
+        }
+        assert!(ProjectionScratchLayout::new(7168,6144,0,6144,7168*6144*2).is_err());
+        assert!(ProjectionScratchLayout::new(7168,6144,64,128,1).is_err());
+        Ok(())
     }
 }

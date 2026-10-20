@@ -473,3 +473,31 @@ fn core_header_validation_rejects_wrong_bits_keep_list_and_duplicate_bf16() {
         assert!(Model::open(&changed).is_err(), "accepted {corruption}");
     }
 }
+
+#[test]
+fn native_k6_opt_in_accepts_header_formats_and_leaves_default_closed() -> Result<()> {
+    let dir=tempfile::tempdir()?;
+    testing::write_kimi_core_snapshot(dir.path(),false);
+    let checkpoint=Checkpoint::open(dir.path())?;
+    let mut model=Model::open(&checkpoint)?;
+    let options=PlanOptions {native_k6:true,..Default::default()};
+    model.configure(&options).map_err(anyhow::Error::msg)?;
+    assert!(model.native_serving_admission());
+    for (stem,projection) in &model.core.projections {
+        let members=checkpoint.tensors.iter().filter(|t|format::split_stem(&t.meta.name).0==stem)
+            .cloned().collect::<Vec<_>>();
+        let mut operand=format::detect(format::group_by_stem(&members).values().next().unwrap())
+            .map_err(|error|anyhow::anyhow!("{error:?}"))?;
+        let role=KIMI_K3.classify(&model.spec,&format!("{stem}.trellis")).unwrap();
+        model.accepts(&role,stem,&mut operand).map_err(anyhow::Error::msg)?;
+        assert_eq!(operand.logical,[projection.stored_outputs,projection.shape[1]]);
+    }
+    model.configure(&PlanOptions::default()).map_err(anyhow::Error::msg)?;
+    assert!(!model.native_serving_admission());
+    // With no native operands, enabling the opt-in changes no ledger or verdict.
+    let bf16=snapshot(false);
+    let off=plan::plan(bf16.path(),&PlanOptions::default())?;
+    let on=plan::plan(bf16.path(),&options)?;
+    assert_eq!(serde_json::to_value(off)?,serde_json::to_value(on)?);
+    Ok(())
+}

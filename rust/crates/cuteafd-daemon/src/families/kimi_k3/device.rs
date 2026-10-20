@@ -197,15 +197,9 @@ impl<'a> NativePrograms<'a> {
             // Split producers consume the same named scratch planes as fused
             // producers; admission retains the larger exact requirement.
             let kda=core.kda.iter().map(|p|p.scratch_bytes()).max().unwrap_or(0);
-            if kda>layout.operands["KDA scratch"] {layout.operands.insert("K6 KDA scratch",kda);}
             let mla=core.mla.values().map(|p|p.scratch_bytes()).max().unwrap_or(0);
-            if mla>layout.operands["MLA producer scratch"] {layout.operands.insert("K6 MLA scratch",mla);}
-            for (name,width,element) in [("K6 q",6144,2),("K6 k",6144,2),("K6 v",6144,2),("K6 gate",12288,2),
-                ("K6 q_a",1536,2),("K6 kv_a",640,2),("K6 q_b",18432,2),("K6 normalized",12288,2),
-                ("K6 FFN gate",3072,2),("K6 FFN up",3072,2),("K6 attention partial",7168,4),
-                ("K6 FFN partial",7168,4),("K6 reduced",7168,4)] {
-                layout.operands.insert(name,rows.checked_mul(width*element).context("K6 lane intermediate overflow")?);
-            }
+            layout.operands.extend(cuteafd_loader::families::kimi_k3::core::lane_extents(rows,
+                layout.operands["KDA scratch"],layout.operands["MLA producer scratch"],kda,mla)?);
             layout.bytes()?;
         }
         Ok(layout)

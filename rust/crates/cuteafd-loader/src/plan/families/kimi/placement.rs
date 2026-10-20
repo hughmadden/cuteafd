@@ -74,7 +74,8 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         .map_or(edge(Component::LmHead), |p| p.resident_bytes(1).expect("validated core dimensions")));
     let residency = model.coordinator;
     if !model.core.projections.is_empty() {
-        memory.notes.push(format!("Kimi K6 core: {} header-native projections; payload + H128 scale vectors charged without BF16 expansion; native runtime binding pending",
+        let status=if model.native_k6 {"experimental native execution enabled"}else{"native runtime binding pending"};
+        memory.notes.push(format!("Kimi K6 core: {} header-native projections; payload + H128 scale vectors charged without BF16 expansion; {status}",
             model.core.projections.len()));
     }
     let mla_weights: u64 = model.mla.iter().map(|r| r.split + r.replicated).sum();
@@ -104,6 +105,24 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         fixed.push(Demand::new(gpu, if gpu == 0 { Category::Embedding } else { Category::Weights },
             if gpu == 0 { "token embedding" } else { "lm head" }, if gpu == 0 { embedding } else { head }, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Kv, format!("KDA FP32 state + BF16 conv, {slots} slots, 48 heads"), state, Basis::Formula));
+    }
+    if model.native_k6 && !model.core.projections.is_empty() {
+        let extra=(|| -> anyhow::Result<_> {
+            use crate::families::kimi_k3::core;
+            let path=opts.workspace_manifest.as_deref().unwrap_or_else(||
+                std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+            let manifest:serde_json::Value=serde_json::from_slice(&std::fs::read(path)?)?;
+            let rows=usize::try_from(if opts.prefill_rows>0 {opts.prefill_rows}else{4096})?;
+            core::CoreCharges::from_package(cfg,&model.core,rows,&manifest)?.demands()
+        })();
+        match extra {
+            Ok(demands)=>fixed.extend(demands),
+            Err(error)=>{
+                refusal(report,format!("Kimi native K6 package admission refused: {error:#}"),
+                    "Supply the matching K6 PROGRAMS.json through --workspace-manifest.");
+                return memory;
+            }
+        }
     }
     let inventory = (|| -> anyhow::Result<_> {
         let catalog = crate::read_expert_catalog(&model.snapshot)?;

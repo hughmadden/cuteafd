@@ -20,6 +20,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
     let mut options = PlanOptions {
+        native_k6: args.native_k6,
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
@@ -755,6 +756,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            native_k6: false,
             exlr8_manifest: None,
             exlr8_dense_from: None,
             mapped_scale_preload_gib: 0.0,

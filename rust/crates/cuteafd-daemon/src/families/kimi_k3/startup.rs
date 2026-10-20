@@ -173,18 +173,7 @@ fn validate_core(cfg:&KimiK3Config,core:&cuteafd_loader::families::kimi_k3::core
     core.validate_runtime_groups(cfg)
 }
 
-fn needs_f32_partials(cfg:&KimiK3Config,core:&cuteafd_loader::families::kimi_k3::core::CoreInventory)->bool {
-    (0..cfg.layers).any(|layer| {
-        let root=format!("language_model.model.layers.{layer}");
-        [format!("{root}.self_attn.o_proj"),format!("{root}.block_sparse_moe.shared_experts.down_proj")]
-            .iter().any(|stem|core.get_weight(stem).is_some())
-    })
-}
-
-fn exchange_recv_bytes(rows:usize,f32_partials:bool)->Result<usize> {
-    ensure!((1..=4096).contains(&rows), "Kimi exchange row capacity");
-    Ok((rows*HIDDEN*if f32_partials {4}else{2}).max(256))
-}
+use cuteafd_loader::families::kimi_k3::core::{needs_f32_partials,exchange_recv_bytes};
 
 pub(super) fn exchange_demands(rows: usize, diagnostics: bool,f32_partials:bool) -> Result<Vec<Demand>> {
     let recv=exchange_recv_bytes(rows,f32_partials)?;
