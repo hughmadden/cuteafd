@@ -69,6 +69,10 @@ def jobs(scope):
                   for mode, rows in (("decode", 64), ("verify", 64), ("extend", 4096))]
         result.append((f"kimi-mla-h{heads}", "export_b12x_dsv4_aot.py",
                        ["--geometry", "kimik3", "--only", ",".join(names)]))
+    result.append(("mla-draft-h64", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join([
+                       "mla_draft_producer_m64", "mla_draft_output_m64",
+                       "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64"])]))
     result.append(("kimi-residual", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join([
                        "attn_res_c1_keep_append", "attn_res_c2_add_append",

@@ -499,6 +499,29 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     out.extend(kimi_w8_programs())
     out.extend(kimi_latent_programs())
     out.extend(kimi_route_programs())
+    out.extend(mla_draft_programs(decode_rows, max_context))
+    return out
+
+
+def mla_draft_programs(max_rows: int, max_context: int):
+    """Shared rotary MLA drafter; checkpoint scales are runtime ABI inputs."""
+    from b12x.integration.cuteafd import kimi_mla
+
+    def build(op, window=None):
+        g = kimi_mla.MlaDraftGeometry(window_size=window)
+        fn = getattr(kimi_mla, f"compile_mla_draft_{op}_aot")
+        kwargs = {"max_rows": max_rows}
+        if op == "attention":
+            kwargs["max_context"] = max_context
+        return fn(g, **kwargs)
+
+    out = [(f"mla_draft_{op}_m{max_rows}", f"mla_draft_{op}", {"max_rows": max_rows},
+            lambda op=op: build(op)) for op in ("producer", "output")]
+    for window in (None, 4096):
+        suffix = "full" if window is None else f"w{window}"
+        out.append((f"mla_draft_attention_{suffix}_m{max_rows}", "mla_draft_attention",
+                    {"max_rows": max_rows, "window_size": window, "max_context": max_context},
+                    lambda window=window: build("attention", window)))
     return out
 
 
