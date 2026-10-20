@@ -10,6 +10,12 @@ mtp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mtp)
 
 
+def test_mtp_runtime_gates_coordinator_checkpoint_headers_on_admitted_depth():
+    serve = (PATH.parents[4] / "rust/crates/cuteafd-daemon/src/families/step5/serve.rs").read_text()
+    backend = serve.split("fn with_backend<T>(", 1)[1].split("pub async fn", 1)[0]
+    assert "Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?" in backend
+
+
 def test_mtp_shared_arena_target_history_and_logits_retire_before_prefill_draft():
     root = PATH.parents[4]
     backend = (root / "rust/crates/cuteafd-daemon/src/families/step5/backend.rs").read_text()

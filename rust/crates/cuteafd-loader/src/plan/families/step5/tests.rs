@@ -70,6 +70,54 @@ fn report_context(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, po
 }
 
 #[test]
+fn coordinator_headers_include_native_mtp_only_when_selected() -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+    let fixture = snapshot("fp8");
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let off = Checkpoint::coordinator(path, false, false)?;
+        let on = Checkpoint::coordinator(path, false, true)?;
+        let inventory = Checkpoint::inventory(path)?;
+        let model = Model::open(&inventory)?;
+        let names = |cp: &Checkpoint| cp.tensors.iter()
+            .map(|tensor| tensor.meta.name.clone()).collect::<BTreeSet<_>>();
+        let off_names = names(&off);
+        let on_names = names(&on);
+        let expected_off = inventory.tensor_names().filter(|name| {
+            model.tensors.get(*name).is_some_and(|tensor| !matches!(tensor.role.component,
+                Component::Speculator | Component::SpeculatorExpert | Component::RoutedExpert
+                    | Component::Vision | Component::Audio))
+        }).map(str::to_owned).collect::<BTreeSet<_>>();
+        assert_eq!(off_names, expected_off, "MTP-off target resident set changed");
+        let predictors = inventory.tensor_names().filter(|name| {
+            (92..95).any(|layer| name.starts_with(&format!("model.layers.{layer}.")))
+        }).map(str::to_owned).collect::<BTreeSet<_>>();
+        assert!(!predictors.is_empty());
+        assert_eq!(on_names.difference(&off_names).cloned().collect::<BTreeSet<_>>(), predictors);
+        assert!(off_names.is_subset(&on_names));
+        assert_eq!(off.weight_map, on.weight_map);
+        for stage in 0..3 {
+            let layout = coordinator::RankWeightLayout::for_mtp_stage(&on, stage)?;
+            assert_eq!(layout.operands.len(), 16);
+            for operand in &layout.operands {
+                let header = on.tensors.iter().find(|tensor| tensor.meta.name == operand.name)
+                    .expect("indexed predictor tensor must resolve to its own shard header");
+                assert_eq!(on.weight_map.get(&operand.name), Some(&header.shard));
+                assert!(!off_names.contains(&operand.name));
+            }
+        }
+        assert_eq!(names(&Checkpoint::coordinator(path, false, false)?), off_names);
+        eprintln!("Step-5 coordinator headers: target={} predictor={} stages=3 index_bound=true mtp_off_unchanged=true",
+            off_names.len(), predictors.len());
+        Ok(())
+    };
+    check(fixture.path())?;
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_HEADER_SNAPSHOT") {
+        check(std::path::Path::new(&snapshot))?;
+    }
+    Ok(())
+}
+
+#[test]
 fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> anyhow::Result<()> {
     use crate::placement::{inventory::{self, ArchContext}, *};
     use super::admission::{self, MarkRule, RuntimeInputs};

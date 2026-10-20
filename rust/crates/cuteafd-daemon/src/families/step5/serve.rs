@@ -104,7 +104,7 @@ fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crat
 fn with_backend<T>(args: &ServeArgs,
     run: impl FnOnce(&Step5Backend<'_, '_>, usize) -> Result<T>) -> Result<T> {
     args.validate()?;
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?;
     let cfg = Config::parse(&checkpoint)?;
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(DraftOwnership::None)?;
