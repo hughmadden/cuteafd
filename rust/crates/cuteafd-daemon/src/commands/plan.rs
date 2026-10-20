@@ -712,7 +712,7 @@ mod tests {
             ("auto", None, false, false, "EXLR8 requires GPU embedding"),
             ("off", None, false, false, "EXLR8 requires GPU embedding"),
             ("auto", Some("off"), false, false, "EXLR8 requires GPU embedding"),
-            ("auto", Some("mtp"), false, false, "supports off or dflash2 speculation"),
+            ("auto", Some("mtp"), false, false, "SPECULATOR=mtp does not apply to glm5"),
             ("dflash2", Some("mtp"), false, false, "EXLR8 requires GPU embedding"),
             ("auto", Some("mtp"), true, false, "EXLR8 requires GPU embedding"),
             ("auto", None, true, true, "--no-speculator conflicts with --include-speculator"),
