@@ -212,7 +212,7 @@ async fn run() -> Result<()> {
         Commands::Qwen4Golden(args) => families::qwen4::run_golden(args).await,
         Commands::Qwen35Golden(args) => families::qwen3_5::run_golden(args).await,
         Commands::Step5Golden(args) => families::step5::golden::run(args),
-        Commands::KimiGolden(args) => families::kimi_k3::golden::run(args),
+        Commands::KimiGolden(args) => families::kimi_k3::golden::run_golden(args).await,
         Commands::ServeKimi(args) => families::kimi_k3::serve::run(args).await,
         Commands::ServeStep5(args) => families::step5::serve::run_serve(args).await,
         Commands::ServeQwen35(args) => families::qwen3_5::serve::run_serve(args).await,
