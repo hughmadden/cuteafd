@@ -64,15 +64,18 @@ pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_s
         Err(error) if capacity_error(&error) => error.to_string(),
         Err(error) => return Err(error),
     };
+    let mut final_reason = reason.clone();
     // Descend rather than assume the discrete owner/onboard chooser is monotone.
     for slots in (minimum_slots..legacy_slots).rev() {
         match trial(slots) {
             Ok(placement) => return Ok((placement, MarkSelection { legacy_slots, slots, reduction_reason: Some(reason) })),
-            Err(error) if capacity_error(&error) => {},
+            Err(error) if capacity_error(&error) => final_reason = error.to_string(),
             Err(error) => return Err(error),
         }
     }
-    Err(PlacementError::PrefixMarks { minimum: minimum_slots, reason })
+    Err(PlacementError::PrefixMarks { minimum: minimum_slots,
+        reason: format!("tried {} complete-mark counts ({} down to {}); final attempt with {} marks: {}",
+            legacy_slots - minimum_slots + 1, legacy_slots, minimum_slots, minimum_slots, final_reason) })
 }
 
 /// Places `request`. Pure arithmetic over the request: the planner and the
