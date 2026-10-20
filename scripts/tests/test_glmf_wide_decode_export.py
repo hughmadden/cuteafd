@@ -363,7 +363,9 @@ def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
 def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_rows, prefill_rows):
     programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
-    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs if op.startswith("mla_") or op == "dense_mla"}
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs
+             if op in ("mla_producer", "mla_output", "dense_mla")}
+    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 4
     assert len(calls) == 2 * (2 * len({decode_rows, prefill_rows}) + 3)
     for heads in (48, 96):
         suffix = "" if heads == 48 else "_h96"
