@@ -456,7 +456,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         for device in &memory.devices[1..] {
             assert!(device.items.iter().any(|item| item.format == "W4A4"));
             let mapped = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
-            assert_eq!(mapped.bytes, 2 * lane_rings as u64, "one endpoint per execution lane");
+            assert_eq!(mapped.bytes, lane_rings as u64, "one main transport endpoint");
         }
     }
     for (gpus, gib, ranks) in [(2, 96, 4), (1, 32, 4), (1, 96, 6), (1, 96, 0)] {
