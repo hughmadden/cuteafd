@@ -100,6 +100,8 @@
       "off",
       "--prefix-cache-entries",
       "20",
+      "--host-cache-bytes",
+      "auto",
       "--fp8-decode",
       "--fp8-snapshot",
       "/hf/hub/models--zai-org--GLM-5.3-Flash/snapshots/companion-revision",

@@ -100,6 +100,8 @@
       "3",
       "--prefix-cache-entries",
       "20",
+      "--host-cache-bytes",
+      "auto",
       "--kv-cache",
       "fp8",
       "--pool-tokens",

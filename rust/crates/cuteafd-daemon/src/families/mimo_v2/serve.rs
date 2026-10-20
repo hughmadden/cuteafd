@@ -442,8 +442,7 @@ fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, conc
         -> Result<Option<cuteafd_hostcache::config::Config>>)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
-    let budget = args.prefix_cache_mark_mib.checked_mul(1 << 20).context("MiMo mark budget overflows")?;
-    let family = MimoPrefix::new_with_draft(engine, |mark| MarkArena::slots_for(concurrency, entries, mark, budget),
+    let family = MimoPrefix::new_with_draft(engine, |mark| args.mark_rule(concurrency).slots(mark),
         args.prefix_partial == Toggle::On, args.mimo_prefix_draft)?;
     let layout = family.layout();
     // Serving consumes the quota resolved before loading; diagnostics may
@@ -691,6 +690,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 }
             };
             let (super::media::Prompt { job, tokens, keys }, request_media) = ready.into_parts();
+            job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, "mimo_v2", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,

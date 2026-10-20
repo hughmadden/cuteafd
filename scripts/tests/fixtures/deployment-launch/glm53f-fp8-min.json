@@ -100,6 +100,8 @@
       "off",
       "--prefix-cache-entries",
       "20",
+      "--host-cache-bytes",
+      "auto",
       "--kda-fp8",
       "row128",
       "--pool-tokens",

@@ -503,10 +503,7 @@ fn worker(
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     cuteafd_ffi::memory_ledger::relabel_other("v41/vision");
     admission::startup_phase(&lib, "v41/vision", device_total)?;
-    let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else {
-        (args.prefix_cache_entries as usize).checked_mul(2).and_then(|n| n.checked_add(2))
-            .context("snapshot slot count overflow")?
-    };
+    let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let prefix_arenas = prefix::Arenas::new(
         crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
         draft.as_ref().map(|d| d.mark_device()), snapshot_slots)?;

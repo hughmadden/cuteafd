@@ -287,6 +287,7 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
     assert "--max-sequences 8" in launch
+    assert launch.count("--host-cache-bytes") == 1 and "--host-cache-bytes auto" in launch
     assert f"--prefix-cache-entries {entries}" in launch
     assert f"--prefix-point-boundaries {boundaries}" in launch
     if "PREFIX_CACHE_MARK_MIB" in cache_keys:
@@ -1683,10 +1684,10 @@ def test_glmf_prefix_marks_are_forwarded(tmp_path, keys, expected):
     ("GLM5_FLASH_PREFIX_MARKS=pool\n", "auto"),
     ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=64GiB\n", "64GiB"),
     ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=0\n", None),
-    ("GLM5_FLASH_PREFIX_MARKS=arena\n", None),
-    ("", None),
+    ("GLM5_FLASH_PREFIX_MARKS=arena\n", "auto"),
+    ("", "auto"),
 ])
-def test_glmf_pool_marks_turn_the_host_tier_on(tmp_path, keys, expected):
+def test_glmf_marks_default_to_host_retention(tmp_path, keys, expected):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
@@ -2295,7 +2296,7 @@ def test_qwen_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None:
     default = _family_launch_lines(tmp_path / "b", config, "Qwen/Qwen3.8-Flash-Next", "")
     launch = [l for l in default.splitlines() if "cuteafd serve-qwen4" in l]
     assert "--prefix-cache-entries 20" in launch[0]
-    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens 0" in launch[0]
+    assert "--host-cache-bytes auto" in launch[0] and "--pool-tokens 0" in launch[0]
 
 
 @pytest.mark.parametrize("setting, expected", [("", "0"), ("auto", "0"), ("73728", "73728")])
@@ -2321,7 +2322,7 @@ def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None
     launch = [l for l in default.splitlines() if "cuteafd serve-dsv4" in l]
     assert "--prefix-cache-entries 20" in launch[0]
     # The pool defaults to auto (planner admission), as the release cards ran.
-    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens 0" in launch[0]
+    assert "--host-cache-bytes auto" in launch[0] and "--pool-tokens 0" in launch[0]
 
 
 def test_glm_flash_drafts_with_its_default_speculator(tmp_path: Path) -> None:
@@ -2906,7 +2907,7 @@ def test_glmf_auto_defaults_and_encoder_plan_agree(tmp_path, split, fixed, local
     assert result.stderr.count("GLM5_FLASH_DECODE_ROWS=auto ->") == 1
     assert result.stderr.count("GLM5_FLASH_INDEX_CACHE=auto ->") == 1
     assert result.stderr.count("GLM5_FLASH_REPLAY_RECORDS=auto ->") == 1
-    assert "--host-cache-bytes auto" not in serve
+    assert serve.count("--host-cache-bytes") == 1 and "--host-cache-bytes auto" in serve
 
 
 @pytest.mark.parametrize("index,state,missing", [

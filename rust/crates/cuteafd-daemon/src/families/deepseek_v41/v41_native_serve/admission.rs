@@ -162,7 +162,7 @@ pub(super) fn admit_startup(
     let mut startup = vec![owners::vocabulary_load_phase(&weights, &target,
         VocabularyHead::plan(catalog)? as u64)?];
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
-    let slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * u64::from(args.prefix_cache_entries) + 2 };
+    let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
         2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, slots)?;
     let draft = if args.dspark {
@@ -174,8 +174,8 @@ pub(super) fn admit_startup(
                 lib, catalog, capacity, args.concurrency,
                 if args.dspark_draft_limit > 5 { 7 } else { 5 }, Some(&directory))?;
         startup.extend(target_owners.draft_load_phases(&draft)?);
-        draft.marks = resident::prefix_bytes(u64::from(args.prefix_cache_entries), true, 1)[0]
-            - resident::prefix_bytes(u64::from(args.prefix_cache_entries), false, 1)[0];
+        draft.marks = resident::prefix_arena_bytes(slots, true, 1)[0]
+            - resident::prefix_arena_bytes(slots, false, 1)[0];
         Some(draft)
     } else { None };
     if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
