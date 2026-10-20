@@ -87,7 +87,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
         inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
             baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
             headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
-        rows: 256, sequences: 16, lanes: 2, context: 1_048_576,
+        rows: 256, sequences: 16, context: 1_048_576,
         requested_pool: Some(1_048_576),
         marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
         pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
@@ -103,7 +103,9 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
         assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
         assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
         let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
-        let workspace = native::mtp_forecast_workspace(inputs.rows, depth)? * inputs.lanes as u64;
+        let ownership = inputs.ownership(&Config::parse(&cp)?)?;
+        let target = native::rank_admission(&cp, &ownership, 0, inputs.rows)?.workspace;
+        let workspace = target.max(native::mtp_forecast_workspace(inputs.rows, depth)?) - target;
         let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
             .map(|item| item.bytes).sum::<u64>();
         let active_delta = admitted.reservations[0].active - baseline.reservations[0].active;

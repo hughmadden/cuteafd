@@ -214,12 +214,12 @@ impl<'a> SwaLayer<'a> {
     pub(super) fn for_mtp_stage(
         device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         stage: usize, rows: usize, rope: std::rc::Rc<TargetTables<'a>>,
-        available: u64, reservations: &[u64],
+        available: u64, reservations: &[u64], arena: &Arena<'a>,
     ) -> Result<Self> {
         let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
         let cfg = Config::parse(checkpoint)?;
         Self::load_layout(device, programs, checkpoint, cfg.layers + stage, rows,
-            Some(rope), available, reservations, layout, 64, true, None)
+            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)))
     }
 
     fn load_layout(
@@ -408,7 +408,12 @@ impl<'a> SwaLayer<'a> {
             )?),
         };
         let ffn = dense
-            .map(|plan| DenseFfn::load_plan(device, programs, checkpoint, plan))
+            .map(|plan| {
+                let ffn_arena = arena.map(|(arena, offset)| Ok((arena, offset + usize::try_from(
+                    cuteafd_loader::plan::families::step5::native::plane_bytes(&admission.planes)?)?)))
+                    .transpose()?;
+                DenseFfn::load_plan_in(device, programs, checkpoint, plan, ffn_arena)
+            })
             .transpose()?;
         let weights = weights
             .into_iter()

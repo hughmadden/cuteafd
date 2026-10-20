@@ -132,24 +132,33 @@ pub fn mtp_metadata_planes(rows: usize) -> Result<[usize; 5]> {
     Ok([rows * 8, rows * 8, rows * 4, pages * 4, 8].map(|n| n.max(256)))
 }
 
-/// Conservative private predictor lane recipe for offline fit forecasts.
-/// Whole SWA/dense/head workspaces are retained per stage; no aliasing or
-/// recomputation saving is credited before a native owner proves it.
+/// One sequential predictor scratch recipe, shared with the target arena.
+/// Only greedy token/status words survive across stages within a draft chain.
 pub fn mtp_forecast_workspace(rows: usize, depth: usize) -> Result<u64> {
     ensure!(depth <= 3, "Step-5 predictor depth must be 0..=3");
-    let mut stage = 0u64;
-    for bytes in swa_planes(rows, 64)?.into_iter().chain(dense_planes(rows)?)
-        .chain(head_planes(rows)?) {
-        stage = stage.checked_add(bytes as u64).context("Step-5 MTP workspace overflow")?;
-    }
-    // Independent normalized inputs, concat, EH output and F32 residual;
-    // include source/position/length scratch rather than assuming reuse.
-    let metadata = mtp_metadata_planes(rows)?.into_iter().sum::<usize>() as u64;
-    let input = (rows as u64).checked_mul((H * 16) as u64)
-        .and_then(|n| n.checked_add(metadata.max(rows as u64 * 64)))
-        .context("Step-5 MTP input scratch overflow")?;
-    stage.checked_add(input).and_then(|n| n.checked_mul(depth as u64))
+    if depth == 0 { return Ok(0); }
+    mtp_scratch_core(rows)?.checked_add((depth * 256) as u64)
         .context("Step-5 MTP workspace overflow")
+}
+
+pub fn mtp_input_planes(rows: usize) -> Result<[usize; 6]> {
+    ensure!((1..=4096).contains(&rows), "Step-5 predictor input rows");
+    Ok([2, 2, 2, 4, 2, 4].map(|element| rows * H * element))
+}
+
+pub fn mtp_input_offset(rows: usize) -> Result<u64> {
+    layer_workspace(rows, false, 64, false)
+}
+
+pub fn mtp_metadata_offset(rows: usize) -> Result<u64> {
+    mtp_input_offset(rows)?.checked_add(plane_bytes(&mtp_input_planes(rows)?)?)
+        .context("Step-5 predictor input offset overflow")
+}
+
+pub fn mtp_scratch_core(rows: usize) -> Result<u64> {
+    Ok(mtp_metadata_offset(rows)?.checked_add(plane_bytes(&mtp_metadata_planes(rows)?[..4])?)
+        .context("Step-5 predictor metadata offset overflow")?
+        .max(plane_bytes(&head_planes(rows)?)?))
 }
 
 pub fn rank_admission(
