@@ -122,10 +122,15 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
         let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
         let checkpoint = Checkpoint::coordinator(dir.path(), false, false)?;
-        for pool in [Some(262_144), None] {
+        for (context, pool, launchable) in [
+            (262_144, Some(262_144), true),
+            (1_048_576, None, true),
+            (1_048_576, Some(262_144), false),
+        ] {
             let opts = LayoutOptions {
                 rtx_bytes: vec![96 << 30; 2],
                 pool_tokens: pool,
+                context_tokens: context,
                 workspace_manifest: Some(path.clone()),
                 ..Default::default()
             };
@@ -138,7 +143,7 @@ mod tests {
                     ..Default::default()
                 },
             )?;
-            assert!(report.wip_launchable(), "{:?}", report.hints);
+            assert_eq!(report.wip_launchable(), launchable, "{:?}", report.hints);
             assert!(!report.executable());
             let mut code = Vec::new();
             let gpus = opts
@@ -176,7 +181,7 @@ mod tests {
                 rows: 256,
                 sequences: 16,
                 lanes: 2,
-                context: 1_048_576,
+                context,
                 requested_pool: pool,
                 marks: admission::MarkRule {
                     lanes: 16,
@@ -187,7 +192,15 @@ mod tests {
                 pending_code: code,
                 startup: vec![],
             };
-            let live = checkpoint_admission(&checkpoint, &inputs)?;
+            let live = checkpoint_admission(&checkpoint, &inputs);
+            if !launchable {
+                let error = live.err().expect("explicit pool below requested context");
+                let refusal = error.to_string();
+                assert!(refusal.contains("compiled/max-context floor of 1048576"));
+                assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)));
+                continue;
+            }
+            let live = live?;
             assert_eq!(report.solver_placement.as_ref(), Some(&live.placement));
             assert!(live.cache.context >= 262_144 && live.cache.context <= 1_048_576);
             for (rank, reservation) in live.reservations.iter().enumerate() {

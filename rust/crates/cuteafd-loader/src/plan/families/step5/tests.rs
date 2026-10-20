@@ -57,10 +57,14 @@ fn native_manifest(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn report(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>) -> PlanReport {
+    report_context(dir, gpus, gib, ranks, pool, 0)
+}
+
+fn report_context(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>, context: u64) -> PlanReport {
     let manifest = native_manifest(dir);
     plan::plan(dir, &PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
         draft_ownership: Some(spec::DraftOwnership::None),
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool,
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool, context_tokens: context,
             workspace_manifest: Some(manifest), ..Default::default() }),
         ..Default::default() }).unwrap()
 }
@@ -397,12 +401,15 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
 #[test]
 fn card_memory_conclusions_and_request_vs_pool_extent() {
     let dir = snapshot("fp8");
-    let r = report(dir.path(), 2, 96, 6, Some(262_144));
+    let r = report_context(dir.path(), 2, 96, 6, Some(262_144), 262_144);
     assert!(r.wip_launchable(), "{:?}", r.hints);
     assert!(!r.executable());
     assert!(r.native_serving_admitted);
     assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
     assert!(r.memory_layout.as_ref().unwrap().devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+    let r = report(dir.path(), 2, 96, 6, Some(262_144));
+    assert!(!r.wip_launchable());
+    assert!(r.hints.iter().any(|h| h.what.contains("compiled/max-context floor of 1048576")), "{:?}", r.hints);
     for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
         assert!(!r.wip_launchable() && !r.native_serving_admitted);
@@ -680,7 +687,7 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
                 assert!(checkpoint_spark_recipe(&cp, world, &layers).is_err());
             }
         }
-        let r = report(dir.path(), 2, 96, 6, Some(262_144));
+        let r = report(dir.path(), 2, 96, 6, None);
         assert!(!r.executable());
         assert_eq!(r.wip_launchable(), kind == "fp8", "{:?}", r.hints);
         assert_eq!(r.native_serving_admitted, kind == "fp8");
