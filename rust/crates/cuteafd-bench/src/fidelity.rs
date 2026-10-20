@@ -267,6 +267,8 @@ pub fn verdict(run: &Run) -> Verdict {
     generated.records.clear();
     let label = if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference") {
         Some("reference; common policy floor, not engine calibration".into())
+    } else if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
+        Some("reference-only qualified; common policy floor, not engine calibration".into())
     } else {
         (run.tier == crate::fidelity_dataset::STANDARD_TIER).then(||
             run.dataset.as_ref().and_then(|d| d["standard_subset"]["mode"].as_str())
@@ -635,6 +637,21 @@ mod tests {
                 scored.dataset.as_mut().unwrap()["revision"] = serde_json::Value::Null;
                 assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn reference_only_scores_are_not_paired_calibration() {
+        for tier in ["quick", "full", crate::fidelity_dataset::STANDARD_TIER] {
+            let mut scored = run(8, 512);
+            scored.tier = tier.into();
+            scored.kl_kind = "reference-only-top1024-plus-tail".into();
+            scored.dataset = Some(serde_json::json!({"qualification":"reference-only qualified"}));
+            assert!(verdict(&scored).label.unwrap().contains("common policy floor"));
+            assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).unwrap_err()
+                .to_string().contains("lack paired engine calibration"));
+            assert!(!compare_paired(&scored, &scored, 0.005, 0.005, 100, 1, Pairing::CodeChange)
+                .is_err_and(|e| e.to_string().contains("lack paired engine calibration")));
         }
     }
 

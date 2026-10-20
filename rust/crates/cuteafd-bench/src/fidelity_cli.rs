@@ -300,6 +300,8 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             reference_sha256: digest.clone(), tier: if standard { crate::fidelity_dataset::STANDARD_TIER.into() } else { args.tier.clone() }, path_shape: shape,
             kl_kind: if dataset_identity.as_ref().is_some_and(|d| d["qualification"] == "reference") {
                 "reference-top1024-plus-tail"
+            } else if dataset_identity.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
+                "reference-only-top1024-plus-tail"
             } else if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
                 else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
             dataset: dataset_identity.clone(), reference_selection: selection.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows, engine, settings,

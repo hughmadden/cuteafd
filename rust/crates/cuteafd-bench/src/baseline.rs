@@ -274,6 +274,8 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         f.kl, 100.0 * f.top1, f.positions);
     if scored.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference") {
         check.summary.push_str(" · reference");
+    } else if scored.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
+        check.summary.push_str(" · reference-only qualified");
     }
     Ok(())
 }

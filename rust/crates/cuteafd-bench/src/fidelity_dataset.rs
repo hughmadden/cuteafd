@@ -328,7 +328,7 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
     ensure!(panel["set_sha256"] == manifest["set_sha256"] && qualification["set_sha256"] == manifest["set_sha256"]
         && qualification["qualifies"] == true, "unqualified or mismatched dataset set");
     qualification_label(&qualification, manifest)?;
-    if qualification["kind"] == "reference" {
+    if matches!(qualification["kind"].as_str(), Some("reference" | "reference_only")) {
         ensure!(panel["checkpoint"] == manifest["checkpoint"]
             && manifest["checkpoint"] == manifest["root_checkpoint"]["id"]
             && panel["windows"].as_array().is_some_and(|w| w.len() == 64),
@@ -378,7 +378,7 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
 fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
     ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
         "unqualified or mismatched dataset set");
-    if qualification["kind"] == "reference" {
+    if matches!(qualification["kind"].as_str(), Some("reference" | "reference_only")) {
         let proof = &qualification["prefix_qualification"];
         let provenance = &qualification["reference_provenance"];
         ensure!(qualification["schema"] == "cuteafd.fidelity.qualification/1"
@@ -454,7 +454,7 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                 .is_some_and(|(a, b)| a.is_finite() && (a - b).abs() <= 1e-8)
             && qualification["nll"].as_f64().is_some_and(|x| x.is_finite() && x >= 0.0),
             "incomplete reference-only provenance");
-        return Ok("reference");
+        return Ok(if qualification["kind"] == "reference_only" { "reference-only qualified" } else { "reference" });
     }
     ensure!(qualification["kind"].is_null() || qualification["kind"] == "paired", "unknown qualification kind");
     for shape in ["decode", "prefill"] {
@@ -513,6 +513,58 @@ mod tests {
                 "use_cache":false,"attention":"eager",
                 "gates":{"kda_a_log_zero_padding":{"active_heads":96,"layers":padding}}}});
         (qualification, manifest)
+    }
+
+    #[test]
+    fn cached_published_qualifications_and_manifests_load() {
+        fn visit(root: &Path, sets: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { visit(&path, sets); }
+                else if path.file_name().is_some_and(|name| name == "qualification.json") {
+                    sets.push(path.parent().unwrap().to_path_buf());
+                }
+            }
+        }
+        let Some(home) = std::env::var_os("HOME") else { return; };
+        let cache = PathBuf::from(home).join(".cache/cuteafd/fidelity");
+        if !cache.is_dir() { return; }
+        let mut sets = Vec::new();
+        visit(&cache, &mut sets);
+        sets.sort();
+        for root in sets {
+            let manifest: Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+            let qualification: Value = serde_json::from_slice(&std::fs::read(root.join("qualification.json")).unwrap()).unwrap();
+            let label = qualification_label(&qualification, &manifest)
+                .unwrap_or_else(|e| panic!("{}: {e}", manifest["config"]));
+            let reference = load(&root, &manifest)
+                .unwrap_or_else(|e| panic!("{}: {e}", manifest["config"]));
+            assert!(!reference.windows.is_empty());
+            eprintln!("loaded {}: {label}", manifest["config"]);
+        }
+    }
+
+    #[test]
+    fn published_qualification_kinds_keep_their_labels_and_evidence() {
+        let (reference, manifest) = kimi_reference_qualification();
+        for (kind, label) in [("reference", "reference"), ("reference_only", "reference-only qualified")] {
+            let mut qualification = reference.clone();
+            qualification["kind"] = json!(kind);
+            assert_eq!(qualification_label(&qualification, &manifest).unwrap(), label);
+            qualification["prefix_qualification"]["passed"] = json!(false);
+            assert!(qualification_label(&qualification, &manifest).is_err());
+        }
+        let mut paired = json!({"set_sha256":"sealed", "qualifies":true, "shapes":{}});
+        for shape in ["decode", "prefill"] {
+            paired["shapes"][shape] = json!({"qualifies":true, "pass_verdict":true,
+                "original_pass":true, "delta_difference":0.0, "bound_difference":0.0});
+        }
+        for kind in [Value::Null, json!("paired")] {
+            paired["kind"] = kind;
+            assert_eq!(qualification_label(&paired, &manifest).unwrap(), "paired qualified");
+        }
+        paired["kind"] = json!("unknown");
+        assert!(qualification_label(&paired, &manifest).is_err());
     }
 
     #[test]
@@ -964,7 +1016,7 @@ mod tests {
                 assert_eq!(standard_windows(&reference, shape, true).unwrap().len(), 32);
             }
             let qualification: Value = serde_json::from_slice(&std::fs::read(root.join("qualification.json")).unwrap()).unwrap();
-            let expected = "reference";
+            let expected = if qualification["kind"] == "reference_only" { "reference-only qualified" } else { "reference" };
             assert_eq!(qualification_label(&qualification, &manifest).unwrap(), expected);
             let cache = tempfile::tempdir().unwrap();
             let revision = "a".repeat(40);
