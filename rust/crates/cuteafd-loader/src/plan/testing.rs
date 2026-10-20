@@ -748,3 +748,69 @@ pub fn kimi_k3_config() -> Value {
         "vision_config": {"vt_num_hidden_layers": 27},
     })
 }
+
+/// Release tensor headers. Only routed layer 1 includes experts unless `all`.
+pub fn kimi_k3_tensors(all: bool) -> Vec<Tensor> {
+    use crate::families::kimi_k3::config::{KimiAttention, KimiK3Config};
+    let cfg = KimiK3Config::from_hf(&kimi_k3_config()).unwrap();
+    let mut out = Vec::new();
+    let p = "language_model.model.";
+    out.push(t(format!("{p}embed_tokens.weight"), "BF16", &[163840, 7168]));
+    out.push(t("language_model.lm_head.weight", "BF16", &[163840, 7168]));
+    for name in ["norm", "output_attn_res_norm"] { out.push(t(format!("{p}{name}.weight"), "BF16", &[7168])); }
+    out.push(t(format!("{p}output_attn_res_proj.weight"), "BF16", &[1, 7168]));
+    for layer in 0..93 {
+        let b = format!("{p}layers.{layer}");
+        for n in ["input_layernorm", "post_attention_layernorm", "self_attention_res_norm", "mlp_res_norm"] {
+            out.push(t(format!("{b}.{n}.weight"), "BF16", &[7168]));
+        }
+        for n in ["self_attention_res_proj", "mlp_res_proj"] { out.push(t(format!("{b}.{n}.weight"), "BF16", &[1, 7168])); }
+        let a = format!("{b}.self_attn");
+        out.push(t(format!("{a}.g_proj.weight"), "BF16", &[12288, 7168]));
+        out.push(t(format!("{a}.o_proj.weight"), "BF16", &[7168, 12288]));
+        if cfg.attention[layer] == KimiAttention::Kda {
+            for proj in ["q", "k", "v"] {
+                out.push(t(format!("{a}.{proj}_proj.weight"), "BF16", &[12288, 7168]));
+                out.push(t(format!("{a}.{proj}_conv1d.weight"), "F32", &[12288, 1, 4]));
+            }
+            out.push(t(format!("{a}.f_a_proj.weight"), "BF16", &[128, 7168]));
+            out.push(t(format!("{a}.f_b_proj.weight"), "BF16", &[12288, 128]));
+            out.push(t(format!("{a}.b_proj.weight"), "BF16", &[96, 7168]));
+            out.push(t(format!("{a}.A_log"), "F32", &[128]));
+            out.push(t(format!("{a}.dt_bias"), "F32", &[12288]));
+            out.push(t(format!("{a}.o_norm.weight"), "F32", &[128]));
+        } else {
+            out.push(t(format!("{a}.q_a_proj.weight"), "BF16", &[1536, 7168]));
+            out.push(t(format!("{a}.q_a_layernorm.weight"), "BF16", &[1536]));
+            out.push(t(format!("{a}.q_b_proj.weight"), "BF16", &[18432, 1536]));
+            out.push(t(format!("{a}.kv_a_proj_with_mqa.weight"), "BF16", &[576, 7168]));
+            out.push(t(format!("{a}.kv_a_layernorm.weight"), "BF16", &[512]));
+            out.push(t(format!("{a}.kv_b_proj.weight"), "BF16", &[24576, 512]));
+        }
+        if layer == 0 {
+            for (proj, n, k) in [("gate", 33792, 7168), ("up", 33792, 7168), ("down", 7168, 33792)] {
+                out.push(t(format!("{b}.mlp.{proj}_proj.weight"), "BF16", &[n, k]));
+            }
+            continue;
+        }
+        let m = format!("{b}.block_sparse_moe");
+        out.push(t(format!("{m}.gate.weight"), "BF16", &[896, 7168]));
+        out.push(t(format!("{m}.gate.e_score_correction_bias"), "F32", &[896]));
+        out.push(t(format!("{m}.routed_expert_down_proj.weight"), "BF16", &[3584, 7168]));
+        out.push(t(format!("{m}.routed_expert_up_proj.weight"), "BF16", &[7168, 3584]));
+        out.push(t(format!("{m}.routed_expert_norm.weight"), "BF16", &[3584]));
+        for (proj, n, k) in [("gate", 6144, 7168), ("up", 6144, 7168), ("down", 7168, 6144)] {
+            out.push(t(format!("{m}.shared_experts.{proj}_proj.weight"), "BF16", &[n, k]));
+        }
+        if all || layer == 1 {
+            for e in 0..896 {
+                for (w, n, k) in [("w1", 3072, 3584), ("w3", 3072, 3584), ("w2", 3584, 3072)] {
+                    out.extend(exl3(&format!("{m}.experts.{e}.{w}"), n, k, 2));
+                }
+            }
+        }
+    }
+    out.push(t("vision_tower.encoder.blocks.0.wqkv.weight", "BF16", &[1536, 1024]));
+    out.push(t("mm_projector.proj.0.weight", "BF16", &[4096, 4096]));
+    out
+}

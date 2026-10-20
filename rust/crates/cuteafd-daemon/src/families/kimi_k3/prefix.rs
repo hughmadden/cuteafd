@@ -60,7 +60,7 @@ impl<'a> KimiPrefix<'a> {
         ensure!(kda[0].stream.device.id != kda[1].stream.device.id
             && std::ptr::eq(kda[0].stream.device.library, kda[1].stream.device.library),
             "Kimi prefix requires exact TP2 native owners");
-        let mut page_bytes = 0usize;
+        let mut resident = [0; 2];
         for rank in 0..2 {
             ensure!(kda[rank].stream.device.id == mla[rank].stream.device.id
                 && std::ptr::eq(kda[rank].stream.device.library, mla[rank].stream.device.library),
@@ -68,9 +68,13 @@ impl<'a> KimiPrefix<'a> {
             for (lane, reader) in kda[rank].readers().iter().enumerate() { mla[rank].check_reader(lane, reader)?; }
             for (layer, kind) in cfg.attention.iter().enumerate() {
                 if *kind == KimiAttention::Kda { kda[rank].slot(layer, 0)?; }
-                else if mla[rank].layer(layer).is_ok() { page_bytes += MLA_PAGE_ROWS * MLA_RECORD_BYTES; }
+                else if mla[rank].layer(layer).is_ok() { resident[rank] += 1; }
             }
         }
+        let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry(cfg, resident)?;
+        let page_bytes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes as usize).sum();
+        let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes as usize).sum();
+        ensure!(mark_bytes == kda[0].mark_bytes() + kda[1].mark_bytes(), "Kimi prefix KDA shard geometry differs");
         ensure!(page_bytes > 0, "Kimi prefix has no resident MLA pages");
         let joins = |rank: usize| -> Result<_> {
             let device = kda[rank].stream.device;
@@ -79,7 +83,7 @@ impl<'a> KimiPrefix<'a> {
         };
         let joins = [joins(0)?, joins(1)?];
         let layout = FamilyLayout { page_rows: MLA_PAGE_ROWS, pages: mla[0].pages(), page_bytes,
-            mark_bytes: kda[0].mark_bytes() + kda[1].mark_bytes(), draft_bytes: 0,
+            mark_bytes, draft_bytes: 0,
             rule: PREFIX_REUSE, mark_store: MarkStore::Arena, page_owners: Default::default() };
         let live = RefCell::new(vec![None; kda[0].slots()]);
         Ok(Self(Rc::new(Inner { kda, mla, cfg: cfg.clone(), context, layout, joins, live })))
@@ -281,6 +285,44 @@ mod tests {
     use crate::shared::memory::device::Device;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
     use cuteafd_loader::placement::AttentionPlacement;
+
+    #[test]
+    fn planner_equals_daemon_owned_and_head_split_host_layout() -> Result<()> {
+        use cuteafd_loader::{plan::{checkpoint::Checkpoint, family}, serving_capacity::{CacheOptions, KvPlacement}};
+        let checkpoint = Checkpoint { snapshot: Default::default(),
+            config: cuteafd_loader::plan::testing::kimi_k3_config(), quantize_config: None,
+            weight_map: cuteafd_loader::plan::testing::kimi_k3_tensors(false).into_iter()
+                .map(|(name, ..)| (name, "fixture.safetensors".into())).collect(),
+            tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
+        let model = family::detect(&checkpoint).context("Kimi family")?.open(&checkpoint)?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        for attention in [AttentionPlacement::Layers, AttentionPlacement::Heads] {
+            let planned = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+                attention_placement: Some(attention), ..Default::default() })?.context("host layout")?;
+            let mut input = super::super::admission::tests::inputs(&cfg);
+            input.attention = Some(attention);
+            let admitted = super::super::admission::admit(input)?;
+            let executor = cuteafd_loader::placement::families::executor("kimi_k3")
+                .context("Kimi serve executor registry entry")?;
+            executor.check(&admitted.placement)?;
+            assert_eq!(executor.attention, AttentionPlacement::Layers);
+            assert_eq!(planned.logical_unit_rows, MLA_PAGE_ROWS as u64);
+            assert_eq!(planned.placement, KvPlacement::PartitionedLayers,
+                "host copies every physical owner, including both head-split MLA copies");
+            for rank in 0..2 {
+                let mla = super::super::mla::CacheLayout::new(&cfg, &admitted.placement, rank)?;
+                let kda = super::super::state::KdaLayout::new(&cfg, 2, 2, 2)?;
+                let units = admitted.placement.pool_tokens / MLA_PAGE_ROWS as u64;
+                assert_eq!(planned.ranks[rank].persistent_unit_bytes, mla.bytes() as u64 / units);
+                assert_eq!(planned.ranks[rank].retained_mark_bytes, kda.mark_bytes() as u64);
+                assert_eq!(planned.ranks[rank].active_state_per_sequence_bytes, kda.mark_bytes() as u64);
+            }
+            let pages = planned.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>();
+            assert_eq!(pages, 1_769_472 * if attention == AttentionPlacement::Heads { 2 } else { 1 });
+            assert_eq!(planned.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>(), 449_372_160);
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
