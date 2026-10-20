@@ -125,9 +125,9 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
         }).collect::<Vec<_>>();
         eprintln!("Step-5 full-context forecast {}", serde_json::json!({
             "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
-            "sequences": inputs.sequences, "lanes": inputs.lanes, "rows": inputs.rows,
+            "sequences": inputs.sequences, "rows": inputs.rows,
             "marks": admitted.marks, "predictor_weights": weights,
-            "predictor_lane_workspace": workspace,
+            "predictor_arena_growth": workspace,
             "active_delta": active_delta, "mark_delta": marks_delta, "ranks": by_category }));
     }
     assert!(admission::forecast_mtp(&cp, &inputs, 4).is_err());

@@ -71,9 +71,11 @@ impl<'a> CacheRank<'a> {
             "Step-5 cache lane stream device mismatch");
         let mut streams = self.lane_streams.borrow_mut();
         streams.retain(|stream| stream.strong_count() > 0);
-        ensure!(streams.iter().all(|other| !other.ptr_eq(&Rc::downgrade(stream))),
-            "Step-5 duplicate cache lane stream");
-        streams.push(Rc::downgrade(stream));
+        // Sequential target/predictor owners share one stream; retain it once.
+        let stream = Rc::downgrade(stream);
+        if streams.iter().all(|other| !other.ptr_eq(&stream)) {
+            streams.push(stream);
+        }
         Ok(())
     }
 

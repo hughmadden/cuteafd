@@ -342,7 +342,7 @@ mod tests {
                     |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
                 let mut source_draft = super::super::mtp::DraftState::default();
                 backend.bind_request(&mut source, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier)?,
-                    &tokens, 0);
+                    &tokens, 0)?;
                 prefill(&mut source, &mut source_draft, 0, frontier, pool.pool())?;
                 source_draft.close(tokens[frontier]);
                 let expected = backend.diagnostic_state(&source)?;
@@ -352,7 +352,7 @@ mod tests {
                     |pages| Placement { pages, sequence: 1, committed: 0 })?.placement;
                 let mut cold_draft = super::super::mtp::DraftState::default();
                 backend.bind_request(&mut cold, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier)?,
-                    &tokens, 0);
+                    &tokens, 0)?;
                 prefill(&mut cold, &mut cold_draft, 0, frontier, pool.pool())?;
                 ensure!(expected == backend.diagnostic_state(&cold)?, "live fresh mark differs at {frontier}");
                 let restored = pool.admit(&family, &tokens[..frontier + 1], frontier + 4, false,
@@ -361,7 +361,7 @@ mod tests {
                 let mut restored = restored.placement;
                 let mut restored_draft = super::super::mtp::DraftState::default();
                 backend.bind_request(&mut restored, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier)?,
-                    &tokens, frontier);
+                    &tokens, frontier)?;
                 ensure!(expected == backend.diagnostic_state(&restored)?, "live restore mark differs at {frontier}");
                 // Each independent continuation gets a private append lease,
                 // exactly as the scheduler's page ownership requires.
