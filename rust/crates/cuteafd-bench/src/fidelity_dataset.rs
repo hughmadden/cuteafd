@@ -64,6 +64,9 @@ pub const STANDARD_SPLIT_SHA256: &str = "2af36f78359d9ce7f37d0d2d4740c57ca11f0a7
 pub const STANDARD_FALLBACK: &str = "decode only; prefill not admitted";
 // Window ids, positions and blocks are model-independent; buckets/gen rows depend on tokenization/generations.
 const STANDARD_BUCKET_DIFF_MAX: i32 = 3;
+/// Scored generated rows each standard half needs to load (TJ, 2026-10-20).
+/// Every published set clears it; new sets are packaged against 10,000.
+pub const STANDARD_GENERATED_MIN: usize = 6_500;
 
 /// Sealed after balancing all seven published text sets, not sampled at runtime.
 /// Each half has A/B/C/D/E counts 13/6/5/3/5. The singleton legacy anchor
@@ -120,8 +123,11 @@ pub fn standard_windows(reference: &Reference, path: &str, admitted: bool) -> Re
         }
         ensure!(blocks == BTreeMap::from([("A",13), ("B",6), ("C",5), ("D",3), ("E",5)]),
             "standard-v2 block stratification differs");
-        ensure!(roles.get("ctx").copied().unwrap_or(0) > 0 && roles.get("gen").copied().unwrap_or(0) > 0,
+        ensure!(roles.get("ctx").copied().unwrap_or(0) > 0,
             "standard-v2 requires context and generated rows in each half");
+        let generated = roles.get("gen").copied().unwrap_or(0);
+        ensure!(generated >= STANDARD_GENERATED_MIN,
+            "standard-v2 half has {generated} scored generated rows, under {STANDARD_GENERATED_MIN}");
         buckets.push(counts);
     }
     ensure!(buckets[0].keys().chain(buckets[1].keys()).all(|k|
@@ -751,6 +757,17 @@ mod tests {
         }
         assert!(standard_windows(&reference,"decode",true).is_ok());
         assert!(standard_windows(&reference,"prefill",true).is_ok());
+        // The decode half has 8,998 scored generated rows; keep exactly the floor, then one fewer.
+        for keep in [STANDARD_GENERATED_MIN, STANDARD_GENERATED_MIN - 1] {
+            reference = saved.clone();
+            let mut excess = 8998 - keep;
+            for w in reference.windows.iter_mut().filter(|w| STANDARD_DECODE.contains(&w.id.as_str())) {
+                for pos in w.positions.iter().map(|p| p.pos).collect::<Vec<_>>() {
+                    if excess > 0 && w.roles[pos] == "gen" { w.roles[pos] = "ctx".into(); excess -= 1; }
+                }
+            }
+            assert_eq!(standard_windows(&reference,"decode",true).is_ok(), keep == STANDARD_GENERATED_MIN, "{keep}");
+        }
         reference = saved;
         for w in &mut reference.windows {
             if STANDARD_DECODE.contains(&w.id.as_str()) { w.bucket = "2-8K".into(); }
