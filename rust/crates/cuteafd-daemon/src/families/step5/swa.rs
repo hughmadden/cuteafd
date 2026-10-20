@@ -409,9 +409,9 @@ impl<'a> SwaLayer<'a> {
         };
         let ffn = dense
             .map(|plan| {
-                let ffn_arena = arena.map(|(arena, offset)| Ok((arena, offset + usize::try_from(
-                    cuteafd_loader::plan::families::step5::native::plane_bytes(&admission.planes)?)?)))
-                    .transpose()?;
+                let attention_bytes = usize::try_from(
+                    cuteafd_loader::plan::families::step5::native::plane_bytes(&admission.planes)?)?;
+                let ffn_arena = arena.map(|(arena, offset)| (arena, offset + attention_bytes));
                 DenseFfn::load_plan_in(device, programs, checkpoint, plan, ffn_arena)
             })
             .transpose()?;
