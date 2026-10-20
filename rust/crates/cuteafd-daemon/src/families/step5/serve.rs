@@ -300,25 +300,46 @@ mod tests {
         args
     }
 
+    fn live_mtp_args() -> ServeArgs {
+        let mut args = args();
+        args.split_device = Some(1);
+        args.prefill_rows = 64;
+        args.max_sequences = 3;
+        args.mtp = 3;
+        // Smallest supported request context; the checkpoint's 1M compiled extent stays unchanged.
+        args.max_context = 262_144;
+        args.pool_tokens = Some(args.max_context);
+        args.prefix.prefix_cache_entries = 1;
+        args.prefix.prefix_cache_min_tokens = 1;
+        args
+    }
+
+    #[test]
+    fn live_mtp_fixture_context_and_explicit_pool_agree() -> Result<()> {
+        let args = live_mtp_args();
+        args.validate()?;
+        assert_eq!(args.max_context, 262_144);
+        assert_eq!(args.pool_tokens, Some(args.max_context));
+        let policy = cuteafd_loader::placement::PoolPolicy::resolve(
+            &[96 << 30; 2], args.max_context, args.pool_tokens, 64, false);
+        policy.validate_explicit()?;
+        assert_eq!(policy.compiled_context, args.max_context);
+        assert!(args.max_context >= 640 + u64::from(args.mtp));
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires sealed native exports, full target weights and real Spark workers"]
     fn live_mtp_target_abort_restore_and_fresh_marks_are_exact() -> Result<()> {
         use crate::shared::qwen::scheduler::DraftState as _;
         use cuteafd_engine::prefix::{After, PrefixFamily, SnapshotKind};
         use super::super::prefix::Placement;
-        let mut args = args();
+        let mut args = live_mtp_args();
         args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
         args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
         args.peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?.split(',')
             .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
-        args.split_device = Some(1);
-        args.prefill_rows = 64;
-        args.max_sequences = 3;
-        args.mtp = 3;
-        args.pool_tokens = Some(262_144);
-        args.prefix.prefix_cache_entries = 1;
-        args.prefix.prefix_cache_min_tokens = 1;
         let windows: serde_json::Value = serde_json::from_slice(&std::fs::read(
             std::path::Path::new(&std::env::var("CUTEAFD_GOLDEN_FIXTURES")?).join("windows.json"))?)?;
         let tokens = windows["windows"][0]["tokens"].as_array().context("live exactness tokens")?
