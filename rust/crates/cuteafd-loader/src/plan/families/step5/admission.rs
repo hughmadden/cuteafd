@@ -162,7 +162,6 @@ pub struct RuntimeInputs {
     pub inventory: Inventory,
     pub rows: usize,
     pub sequences: usize,
-    pub lanes: usize,
     pub context: u64,
     pub requested_pool: Option<u64>,
     pub marks: MarkRule,
@@ -207,9 +206,8 @@ impl RuntimeInputs {
         ensure!(
             (1..=4096).contains(&self.rows)
                 && (1..=64).contains(&self.sequences)
-                && self.sequences <= self.rows
-                && matches!(self.lanes, 1 | 2),
-            "Step-5 rows, sequence slots or lane capacity"
+                && self.sequences <= self.rows,
+            "Step-5 rows or sequence slots"
         );
         ensure!(
             cfg.max_context == EXTENT && (FLOOR..=EXTENT).contains(&self.context),
@@ -237,7 +235,7 @@ impl RuntimeInputs {
             storage: HopStorage::ReceiveSlots,
             row_bytes: 4096 * 4,
             rows: self.rows as u64,
-            lanes: self.lanes as u64,
+            lanes: 1,
             entry_gpu: 0,
             head_gpu: 0,
             terminal: TerminalHome::AttentionOwner,
@@ -345,7 +343,6 @@ pub fn admit_with(
             let marks = inputs.marks.slots(mark_bytes);
             let mut fixed = Vec::new();
             let mut reservations = Vec::new();
-            let wave_ranks = ownership.routed_wave_ranks()?;
             for rank in 0..ranks {
                 let reservation = Reservation::new(
                     &cache,
@@ -371,8 +368,8 @@ pub fn admit_with(
                 );
                 add(
                     Category::Workspace,
-                    "Step-5 private native lane workspace",
-                    scaled(native[rank].workspace, inputs.lanes)?,
+                    "Step-5 native workspace",
+                    native[rank].workspace,
                 );
                 add(
                     Category::Kv,
@@ -387,10 +384,7 @@ pub fn admit_with(
                 add(
                     Category::Workspace,
                     "Step-5 private transaction staging",
-                    scaled(
-                        staging_bytes(&cache, rank, inputs.sequences)? as u64,
-                        inputs.lanes,
-                    )?,
+                    staging_bytes(&cache, rank, inputs.sequences)? as u64,
                 );
                 add(
                     Category::Runtime,
@@ -405,8 +399,8 @@ pub fn admit_with(
                     );
                     add(
                         Category::Workspace,
-                        "Step-5 private input lanes",
-                        scaled(input_bytes(inputs.rows)?, inputs.lanes)?,
+                        "Step-5 input",
+                        input_bytes(inputs.rows)?,
                     );
                     let capacity = inputs.rows.min(64);
                     add(
@@ -418,18 +412,13 @@ pub fn admit_with(
                         ])?,
                     );
                 }
-                if wave_ranks.contains(&rank) {
+                if rank == usize::from(ownership.execution().spec().entry_gpu) {
                     add(
                         Category::Transport,
                         "Step-5 Spark intake planes",
-                        scaled(
-                            scaled(
-                                (inputs.rows as u64 * 4096 * 2).max(256),
-                                inputs.inventory.spark_ranks,
-                            )?,
-                            inputs.lanes,
-                        )?,
+                        scaled((inputs.rows as u64 * 4096 * 2).max(256), inputs.inventory.spark_ranks)?,
                     );
+                    add(Category::Workspace, "Step-5 routed reply", (inputs.rows as u64 * 4096 * 2).max(256));
                 }
                 if ranks == 2 {
                     let progress = if inputs.peer_diagnostics {
@@ -442,16 +431,13 @@ pub fn admit_with(
                     add(
                         Category::Transport,
                         "Step-5 private peer and hop control",
-                        scaled(
-                            checked_sum([
+                        checked_sum([
                                 8 * (inputs.rows as u64 * 4096 * 4).max(256),
                                 256,
                                 256,
                                 256,
                                 progress,
                             ])?,
-                            inputs.lanes,
-                        )?,
                     );
                 }
                 reservations.push(reservation);
@@ -638,7 +624,6 @@ mod tests {
             },
             rows: 64,
             sequences: 16,
-            lanes: 2,
             context: FLOOR,
             requested_pool: Some(FLOOR),
             marks: MarkRule {
@@ -670,7 +655,7 @@ mod tests {
             let inputs = inputs(ranks);
             let admission = run(&inputs)?;
             assert_eq!(admission.ownership.ranks(), ranks);
-            assert_eq!(admission.ownership.execution().spec().lanes, 2);
+            assert_eq!(admission.ownership.execution().spec().lanes, 1);
             assert_eq!(admission.cache.context, FLOOR);
             assert_eq!(admission.placement.pool_tokens, FLOOR);
             assert!(admission
@@ -816,7 +801,7 @@ mod tests {
             };
             assert_eq!(
                 transport(&retained)? - transport(&base)?,
-                9 * 48 as u64 * inputs.lanes as u64
+                9 * 48 as u64
             );
         }
         inputs.startup.push(Demand::new(

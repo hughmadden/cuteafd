@@ -83,15 +83,19 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
         for (ranks, policy) in [(1, 0), (2, 0), (2, 1), (2, 2)] {
             let modes: Vec<_> = (0..cfg.layers).map(|l| {
                 if ranks == 2 && !cfg.full[l] && policy != 2 { LayerMode::HeadSplit }
-                else { LayerMode::Whole { gpu: if ranks == 1 || policy == 1 { 0 }
+                else { LayerMode::Whole { gpu: if ranks == 1 || policy != 0 { 0 }
                     else { ((l / 4) % 2) as u8 }, ffn: FfnMode::Owner } }
             }).collect();
+            if ranks == 2 && policy == 2 {
+                let alternating: Vec<_> = (0..cfg.layers).map(|layer|
+                    LayerMode::Whole { gpu: ((layer / 4) % 2) as u8, ffn: FfnMode::Owner }).collect();
+                let error = ExecutionOwnership::new(&cfg, ranks, ownership::plan(&alternating, 0, 1))
+                    .unwrap_err().to_string();
+                assert!(error.contains("without an intervening head exchange"), "{error}");
+            }
             let head = if ranks == 1 { 0 } else { 1 };
             let owners = ExecutionOwnership::new(&cfg, ranks, ownership::plan(&modes, 0, head)).unwrap();
-            assert_eq!(owners.routed_wave_ranks().unwrap(),
-                if ranks == 1 || policy == 1 { vec![0] } else { vec![0, 1] });
-            assert_eq!(owners.routed_endpoints().unwrap(),
-                if ranks == 1 || policy == 1 { 1 } else { 2 });
+            assert_eq!(owners.routed_endpoints().unwrap(), 1);
             let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64).unwrap();
             assert_eq!(layout.geometry.placement, if ranks == 1 { KvPlacement::SingleDevice }
                 else { KvPlacement::PartitionedLayers });
@@ -259,37 +263,16 @@ fn step5_routed_replication_bindings_are_single_wave_and_disjoint_from_heads() {
         LayerMode::Whole { gpu: ((layer / 4) % 2) as u8, ffn: FfnMode::Owner }
     } else { LayerMode::HeadSplit }).collect();
     let ownership = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0)).unwrap();
-    let copies = ownership.routed_replications(0).unwrap();
-    assert_eq!(copies.iter().flatten().count(), 66);
-    for (ordinal, (layer, copy)) in copies.iter().enumerate().filter_map(|(l, c)| c.map(|c| (l, c))).enumerate() {
+    let copies = ownership.routed_replications().unwrap();
+    assert_eq!(copies.iter().flatten().count(), 77);
+    for (layer, copy) in copies.iter().enumerate().filter_map(|(l, c)| c.map(|c| (l, c))) {
         assert_eq!(copy.source, 0);
-        assert_eq!(copy.slot, 4 + ordinal % 2);
+        assert_eq!(copy.slot, if cfg.full[layer] { 5 } else { 4 });
         assert_eq!(copy.storage, layer + 1);
-        assert!(cfg.moe[layer] && !cfg.full[layer]);
+        assert!(cfg.moe[layer]);
     }
     ownership.execution().validate_routed_replications(&copies).unwrap();
-    assert!(ownership.routed_replications(1).is_err());
-    let mut spec = ownership.execution().spec();
-    spec.lanes = 2;
-    let mut placement = crate::placement::Placement {
-        pool_tokens: 0, pool_limits: crate::placement::PoolLimits(vec![]),
-        attention_placement: crate::placement::AttentionPlacement::Layers, attention_by_kind: vec![],
-        peer_row_bytes: 0, onboard_layers: 0,
-        layers: modes.iter().map(|&mode| crate::placement::LayerAssignment {
-            mode, experts: crate::placement::ExpertHome::Spark }).collect(),
-        movables: vec![], expert_ranges: vec![], residual: ownership.execution().homes().to_vec(),
-        hops: vec![], tp2: None, items: vec![],
-    };
-    placement.hops = crate::placement::plan_hops(&modes, &spec).unwrap();
-    let two = ExecutionOwnership::new(&cfg, 2,
-        crate::placement::LayerExecutionPlan::new(&placement, spec).unwrap()).unwrap();
-    let lanes = [two.routed_replications(0).unwrap(), two.routed_replications(1).unwrap()];
-    for copy in lanes[0].iter().flatten() {
-        assert!(lanes[1].iter().flatten().all(|peer| peer.slot != copy.slot && peer.storage != copy.storage));
-    }
-    assert!(two.routed_replications(2).is_err());
-    assert_eq!(ownership.routed_endpoints().unwrap(), 2);
-    assert_eq!(two.routed_endpoints().unwrap(), 4);
+    assert_eq!(ownership.routed_endpoints().unwrap(), 1);
 }
 
 #[test]
@@ -588,6 +571,27 @@ fn unknown_tensor_and_context_ownership_fail_closed() {
     assert!(!r.wip_launchable() && !r.native_serving_admitted);
     assert!(r.config_error.as_deref().is_some_and(|e| e.contains("context")));
     assert!(r.hints.iter().any(|h|h.what.contains("executor not implemented")));
+}
+
+#[test]
+fn planner_rejects_all_whole_swa_before_serving_admission() {
+    use crate::placement::AttentionPlacement;
+    let dir = snapshot("fp8");
+    let manifest = native_manifest(dir.path());
+    for (attention, head_split) in [(Some(AttentionPlacement::Layers), true), (None, false)] {
+        let result = plan::plan(dir.path(), &PlanOptions {
+            placement: ExpertPlacement::Sparks { ranks: 6 },
+            draft_ownership: Some(spec::DraftOwnership::None),
+            attention_placement: attention,
+            layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2],
+                head_split, workspace_manifest: Some(manifest.clone()), ..Default::default() }),
+            ..Default::default()
+        }).unwrap();
+        assert!(!result.wip_launchable() && !result.native_serving_admitted);
+        assert!(result.hints.iter().any(|hint| hint.what.contains(
+            "two-GPU execution requires head-split SWA with alternating whole-owned CSA")),
+            "{:?}", result.hints);
+    }
 }
 
 #[test]

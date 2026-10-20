@@ -74,59 +74,35 @@ impl ImmediateWave {
 struct BackendState<T> {
     pending: Pending<T>,
     immediate: ImmediateWave,
-    next_lane: Cell<usize>,
-    active_lane: Cell<Option<usize>>,
-    lanes: usize,
     fail_verify_once: Cell<bool>,
 }
 impl<T> BackendState<T> {
-    fn new(lanes: usize, fail_verify_once: bool) -> Result<Self> {
-        ensure!(matches!(lanes, 1 | 2), "Step-5 backend requires one or two native lanes");
-        Ok(Self { pending: Pending::default(), immediate: ImmediateWave::default(),
-            next_lane: Cell::new(0), active_lane: Cell::new(None), lanes,
-            fail_verify_once: Cell::new(fail_verify_once) })
+    fn new(fail_verify_once: bool) -> Self {
+        Self { pending: Pending::default(), immediate: ImmediateWave::default(),
+            fail_verify_once: Cell::new(fail_verify_once) }
     }
 
-    fn retire(&self) {
-        self.pending.retire();
-        self.immediate.retire();
-        self.active_lane.set(None);
-    }
-
-    fn take_pending(&self) -> Option<T> {
-        let pending = self.pending.take();
-        self.active_lane.set(None);
-        pending
-    }
-
-    fn submit<O>(&self, work: impl FnOnce(usize) -> Result<O>) -> Result<O> {
+    fn retire(&self) { self.pending.retire(); self.immediate.retire(); }
+    fn take_pending(&self) -> Option<T> { self.pending.take() }
+    fn submit<O>(&self, work: impl FnOnce() -> Result<O>) -> Result<O> {
         self.retire();
-        let lane = self.next_lane.get();
-        self.active_lane.set(Some(lane));
-        match work(lane) {
-            Ok(output) => {
-                self.next_lane.set((lane + 1) % self.lanes);
-                Ok(output)
-            }
-            Err(error) => {
-                self.retire();
-                Err(error)
-            }
-        }
+        let result = work();
+        if result.is_err() { self.retire(); }
+        result
     }
 
-    fn post_execution<O>(&self, lane: usize, completed: O) -> Result<O> {
+    fn post_execution<O>(&self, completed: O) -> Result<O> {
         // Real target work succeeded. Dropping its Step drains before either
         // eager publication or pending evidence can advance the frontier.
         if self.fail_verify_once.replace(false) {
-            tracing::warn!(lane, "Step-5 injected post-execution verify failure");
-            anyhow::bail!("Step-5 injected post-execution verify failure on lane {lane}");
+            tracing::warn!( "Step-5 injected post-execution verify failure");
+            anyhow::bail!("Step-5 injected post-execution verify failure");
         }
         Ok(completed)
     }
 
-    fn verify<O>(&self, work: impl FnOnce(usize) -> Result<(T, O)>) -> Result<O> {
-        self.submit(|lane| self.pending.verify(|| self.post_execution(lane, work(lane)?)))
+    fn verify<O>(&self, work: impl FnOnce() -> Result<(T, O)>) -> Result<O> {
+        self.submit(|| self.pending.verify(|| self.post_execution(work()?)))
     }
 }
 impl<T> Drop for BackendState<T> {
@@ -167,7 +143,7 @@ pub(super) struct Step5Backend<'e, 'a> {
     execution: &'e Execution<'e, 'a>,
     ranks: Vec<&'e RefCell<CacheRank<'a>>>,
     embedding: &'e TokenEmbedding<'a>,
-    inputs: Vec<&'e Inputs<'a>>,
+    inputs: &'e Inputs<'a>,
     profile: RefCell<[f64; 2]>,
     rows: usize,
     context: usize,
@@ -177,10 +153,9 @@ pub(super) struct Step5Backend<'e, 'a> {
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
     pub(super) fn new(execution: &'e Execution<'e, 'a>, ranks: Vec<&'e RefCell<CacheRank<'a>>>,
-        embedding: &'e TokenEmbedding<'a>, inputs: Vec<&'e Inputs<'a>>) -> Result<Self> {
+        embedding: &'e TokenEmbedding<'a>, inputs: &'e Inputs<'a>) -> Result<Self> {
         execution.require_live()?;
-        ensure!(ranks.len() == execution.ownership().ranks()
-            && inputs.len() == execution.lane_count(), "Step-5 backend owner inventory");
+        ensure!(ranks.len() == execution.ownership().ranks(), "Step-5 backend owner inventory");
         let first = ranks.first().context("Step-5 backend missing cache")?.borrow();
         let context = usize::try_from(first.layout().context)?;
         let sequences = usize::try_from(first.sequences())?;
@@ -188,33 +163,30 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         drop(first);
         ensure!(sequences <= i32::MAX as usize && embedding.vocab() == V && embedding.hidden() == H,
             "Step-5 scheduler slots or embedding geometry differ from admission");
-        let rows = inputs[0].rows;
+        let rows = inputs.rows;
         let entry = execution.ownership().execution().spec().entry_gpu as usize;
         let entry_device = ranks[entry].borrow().stream.device;
         ensure!(embedding.placement() == crate::shared::token_io::EmbedPlacement::Gpu
             && embedding.owner().id == entry_device.id
             && std::ptr::eq(embedding.owner().library, entry_device.library),
             "Step-5 embedding must be GPU-resident on the admitted entry device/library");
-        for (lane, input) in inputs.iter().enumerate() {
-            let stages = execution.lane_stages(lane)?;
-            ensure!(input.rows == rows && input.residual.device.id == stages[entry].stream.device.id
-                && std::ptr::eq(input.residual.device.library, library),
-                "Step-5 input owner differs from admitted execution lane");
-            execution.validate_lane_caches(lane, &ranks, rows)?;
-        }
+        let stages = execution.stages();
+        ensure!(inputs.residual.device.id == stages[entry].stream.device.id
+            && std::ptr::eq(inputs.residual.device.library, library), "Step-5 input owner differs from execution");
+        execution.validate_caches(&ranks, rows)?;
         let fail_verify_once = match std::env::var("CUTEAFD_DIAG_STEP5_FAIL_VERIFY_ONCE") {
             Err(std::env::VarError::NotPresent) => false,
             Ok(value) if value == "1" => true,
             _ => anyhow::bail!("CUTEAFD_DIAG_STEP5_FAIL_VERIFY_ONCE must be unset or 1"),
         };
-        Ok(Self { state: BackendState::new(inputs.len(), fail_verify_once)?, execution, ranks, embedding, inputs,
+        Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
             profile: RefCell::new([0.0; 2]), rows, context, sequences, library })
     }
 
-    fn execute(&self, lane: usize, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
+    fn execute(&self, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
         kind: cuteafd_transport::ExpertV2SourceKind) -> Result<(Evidence<'e, 'a>, DeviceLogits)> {
         self.execution.require_live()?;
-        let input = self.inputs[lane];
+        let input = self.inputs;
         let mut first_row = 0usize;
         let descriptors = sequences.iter().map(|(placement, tokens)| {
             let descriptor = SequenceRows { sequence: placement.sequence, start: first_row,
@@ -224,7 +196,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         }).collect::<Vec<_>>();
         ensure!(first_row <= input.rows, "Step-5 wave exceeds admitted input rows");
         // begin_wave validates the scheduler's actual COW pages before any input writes.
-        let stages = self.execution.lane_stages(lane)?;
+        let stages = self.execution.stages();
         let mut step = Step::begin_wave(self.ranks.clone(), stages.clone(), &descriptors, pool)?;
         let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
         let entry = self.execution.ownership().execution().spec().entry_gpu as usize;
@@ -238,10 +210,10 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
                     input.residual.buffer, meta.rows * H, meta.stream.raw)
             }
         }))?;
-        self.execution.enqueue_selected(&[lane], &mut [&mut step], &[&input.residual], kind)?;
-        let (device, output) = self.execution.lane_terminal_output(lane)?;
+        self.execution.enqueue(&mut step, &input.residual, kind)?;
+        let (device, output) = self.execution.terminal_output()?;
         let head_rank = self.execution.ownership().execution().spec().head_gpu as usize;
-        let head = self.execution.lane_head(lane)?;
+        let head = self.execution.head()?;
         let logits = step.compose(head_rank, head, |head, meta| {
             ensure!(device.id == meta.stream.device.id, "Step-5 final output/head device mismatch");
             head.device_logits_on(output, meta.rows, meta.stream)
@@ -251,14 +223,13 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
 
     fn immediate(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
         kind: cuteafd_transport::ExpertV2SourceKind) -> Result<DeviceLogits> {
-        self.state.submit(|lane| {
+        self.state.submit(|| {
             let submitted = ImmediateWave::record(sequences);
-            let (step, logits) = self.state.post_execution(lane, self.execute(lane, sequences, pool, kind)?)?;
+            let (step, logits) = self.state.post_execution(self.execute( sequences, pool, kind)?)?;
             let mut accepted = sequences.iter_mut().map(|(placement, tokens)| (&mut **placement, tokens.len()))
                 .collect::<Vec<_>>();
             step.publish_wave(&mut accepted)?;
             *self.state.immediate.0.borrow_mut() = Some(submitted);
-            self.state.active_lane.set(None);
             Ok(logits)
         })
     }
@@ -335,13 +306,13 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        self.state.verify(|lane| self.execute(lane, sequences, pool, verify_kind(speculative))).map(Some)
+        self.state.verify(|| self.execute( sequences, pool, verify_kind(speculative))).map(Some)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.retire();
         let source = ungraphed_kind(speculative, kind);
-        if speculative { self.state.verify(|lane| self.execute(lane, sequences, pool, source)).map(Some) }
+        if speculative { self.state.verify(|| self.execute( sequences, pool, source)).map(Some) }
         else { self.immediate(sequences, pool, source).map(Some) }
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
@@ -444,125 +415,42 @@ mod tests {
     }
 
     #[test]
-    fn backend_verify_failure_drains_and_readmits_same_slot_on_same_lane() -> Result<()> {
-        use std::rc::Rc;
-        struct Evidence {
-            slot: u64,
-            drained: Rc<RefCell<Vec<u64>>>,
-            pending: Pending<Evidence>,
-        }
-        impl Drop for Evidence {
-            fn drop(&mut self) {
-                // Drain callbacks may inspect the shared evidence slot: no
-                // RefCell borrow can survive taking the abandoned Step.
-                assert!(self.pending.take().is_none());
-                self.drained.borrow_mut().push(self.slot);
-            }
-        }
-        for lanes in [1, 2] {
-            for lane in 0..lanes {
-                let state = BackendState::new(lanes, true)?;
-                state.next_lane.set(lane);
-                let drained = Rc::new(RefCell::new(Vec::new()));
-                let mut placement = Placement { sequence: 7, pages: vec![3], committed: 65 };
-                let make = || Evidence { slot: 7, drained: drained.clone(), pending: state.pending.clone() };
-                state.pending.verify(|| Ok((make(), ())))?;
-                *state.immediate.0.borrow_mut() = Some(ImmediateWave::record(&[(&mut placement, &[11])]));
-                state.active_lane.set(Some(lane));
-                let failed = state.verify(|selected| {
-                    assert_eq!(selected, lane);
-                    assert_eq!(&*drained.borrow(), &[7], "old evidence drains before reused-slot work");
-                    assert!(state.immediate.0.borrow().is_none());
-                    Ok((make(), 99u32))
-                });
-                assert!(failed.unwrap_err().to_string().contains("injected post-execution"));
-                assert_eq!(&*drained.borrow(), &[7, 7], "failed native Step is dropped before error returns");
-                assert!(state.pending.take().is_none());
-                assert!(state.immediate.0.borrow().is_none());
-                assert_eq!(state.active_lane.get(), None);
-                assert_eq!(state.next_lane.get(), lane);
-                assert_eq!(placement.committed, 65, "failure publishes no frontier");
-
-                // Scheduler owns releasing/rebinding pages. Model that boundary
-                // here without claiming a CPU probe executes native reset kernels.
-                placement.pages = vec![9];
-                placement.committed = 0;
-                let output = state.verify(|selected| {
-                    assert_eq!(selected, lane, "recovery uses the failed native lane");
-                    assert!(state.pending.take().is_none());
-                    assert!(state.immediate.0.borrow().is_none());
-                    assert_eq!((placement.sequence, placement.committed), (7, 0));
-                    Ok((make(), 101u32))
-                })?;
-                assert_eq!(output, 101);
-                assert_eq!(state.active_lane.get(), Some(lane));
-                assert_eq!(state.next_lane.get(), (lane + 1) % lanes);
-                drop(state.take_pending());
-                assert_eq!(state.active_lane.get(), None);
-                assert_eq!(&*drained.borrow(), &[7, 7, 7]);
-
-                let failed: Result<()> = state.verify(|selected| {
-                    assert_eq!(selected, (lane + 1) % lanes);
-                    anyhow::bail!("verify work failed before publication")
-                });
-                assert!(failed.is_err());
-                assert!(state.pending.take().is_none());
-                assert_eq!(state.active_lane.get(), None);
-                assert_eq!(state.next_lane.get(), (lane + 1) % lanes);
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn eager_failure_drains_before_publication_and_reuses_failed_lane() -> Result<()> {
+    fn backend_failure_drains_before_reuse_and_frontier_publication() -> Result<()> {
         use std::rc::Rc;
         struct Evidence(Rc<Cell<usize>>);
-        impl Drop for Evidence {
-            fn drop(&mut self) { self.0.set(self.0.get() + 1); }
-        }
-        for lanes in [1, 2] {
-            for lane in 0..lanes {
-                let state = BackendState::<Evidence>::new(lanes, true)?;
-                state.next_lane.set(lane);
-                let drained = Rc::new(Cell::new(0));
-                let published = Cell::new(false);
-                let failed: Result<()> = state.submit(|selected| {
-                    assert_eq!(selected, lane);
-                    let _step = state.post_execution(selected, Evidence(drained.clone()))?;
-                    published.set(true);
-                    Ok(())
-                });
-                assert!(failed.unwrap_err().to_string().contains("injected post-execution"));
-                assert!(!published.get());
-                assert_eq!(drained.get(), 1);
-                assert!(state.pending.take().is_none());
-                assert!(state.immediate.0.borrow().is_none());
-                assert_eq!(state.active_lane.get(), None);
-                assert_eq!(state.next_lane.get(), lane);
-                state.submit(|selected| {
-                    assert_eq!(selected, lane);
-                    let _step = state.post_execution(selected, Evidence(drained.clone()))?;
-                    published.set(true);
-                    Ok(())
-                })?;
-                assert!(published.get());
-                assert_eq!(drained.get(), 2);
-                assert_eq!(state.next_lane.get(), (lane + 1) % lanes);
-            }
-        }
+        impl Drop for Evidence { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let drains = Rc::new(Cell::new(0));
+        let state = BackendState::new(true);
+        assert!(state.verify(|| Ok((Evidence(drains.clone()), 7))).is_err());
+        assert_eq!(drains.get(), 1);
+        assert!(state.take_pending().is_none());
+        assert_eq!(state.verify(|| Ok((Evidence(drains.clone()), 8)))?, 8);
+        assert_eq!(drains.get(), 1);
+        drop(state.take_pending());
+        assert_eq!(drains.get(), 2);
+        let frontier = Cell::new(0);
+        state.fail_verify_once.set(true);
+        assert!(state.submit(|| {
+            let evidence = state.post_execution(Evidence(drains.clone()))?;
+            frontier.set(1);
+            drop(evidence);
+            Ok(())
+        }).is_err());
+        assert_eq!(frontier.get(), 0);
+        assert_eq!(drains.get(), 3);
+        state.submit(|| { frontier.set(1); Ok(()) })?;
+        assert_eq!(frontier.get(), 1);
         Ok(())
     }
-
     #[test]
     fn failed_execution_does_not_consume_post_execution_injection() -> Result<()> {
-        let state = BackendState::<()>::new(2, true)?;
-        let failed: Result<()> = state.submit(|_| anyhow::bail!("execution failed"));
+        let state = BackendState::<()>::new(true);
+        let failed: Result<()> = state.submit(|| anyhow::bail!("execution failed"));
         assert!(failed.is_err());
         assert!(state.fail_verify_once.get());
-        assert!(state.verify(|_| Ok(((), ()))).is_err());
+        assert!(state.verify(|| Ok(((), ()))).is_err());
         assert!(!state.fail_verify_once.get());
-        state.verify(|_| Ok(((), ())))?;
+        state.verify(|| Ok(((), ())))?;
         Ok(())
     }
 

@@ -61,9 +61,6 @@ pub(crate) struct GoldenArgs {
     /// Shared native pipeline qualification on two distinct devices.
     #[arg(long, conflicts_with = "prefix_state")]
     split_device: Option<i32>,
-    /// Explicit cold diagnostic lane count; not a serving/default qualification.
-    #[arg(long, default_value_t = 1)]
-    diagnostic_lanes: usize,
     /// Poison reusable target scratch between layers; logits must remain byte-exact.
     #[arg(long, requires = "split_device")]
     poison_scratch: bool,
@@ -100,10 +97,7 @@ pub(crate) struct GoldenArgs {
 }
 
 fn diagnostic_selection(args: &GoldenArgs) -> Result<()> {
-    ensure!(matches!(args.diagnostic_lanes, 1 | 2)
-        && (args.diagnostic_lanes == 1 || (args.split_device.is_some() && args.nll
-            && args.last_layer == 91 && !args.prefix_state && args.dump_layer0.is_none())),
-        "two diagnostic lanes require complete cold shared NLL execution");
+
     ensure!(args.dump_layer0.is_none() || (args.last_layer == 0 && !args.nll
         && !args.prefix_state && args.peers.is_empty() && args.compare_layers.is_empty()
         && args.save_logits.is_none() && args.dump_residuals.is_none() && !args.compare_final_norm),
@@ -443,10 +437,7 @@ pub(super) fn request(
     Ok(request)
 }
 
-fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: usize,
-    prefill_lanes: usize) -> Result<(SparkWorld, TcpTransportConfig)> {
-    ensure!(matches!(prefill_lanes, 1 | 2) && clients >= prefill_lanes
-        && clients % prefill_lanes == 0, "Step-5 persistent lane endpoint inventory");
+fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<(SparkWorld, TcpTransportConfig)> {
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
@@ -486,22 +477,22 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: u
             rtx_layers: vec![],
             spark_layers: layers.to_vec(),
             spark_ranks: args.peers.len(),
-            prefill_lanes: u64::try_from(prefill_lanes)?,
+            prefill_lanes: 1,
         },
         args.peers.len(),
         None,
         ModelAdmission::for_clients(ExpertGeometry::STEP5,
             SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16 },
-            compiled as u32, spark_rings(config.max_frame_bytes)?, clients)?,
+            compiled as u32, spark_rings(config.max_frame_bytes)?, 1)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
-        SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16 }, clients)?;
+        SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16 }, 1)?;
     Ok((world, config))
 }
 
 fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<SparkDeviceLink<'a>> {
-    let (world, config) = expert_admission(args, rows, layers, 1, 1)?;
+    let (world, config) = expert_admission(args, rows, layers)?;
     ensure!(world.supports_device_exchange(), "Step-5 diagnostic requires native device exchange");
     let warm = request(
         3,
@@ -652,17 +643,12 @@ fn check_prefix_state<'a>(
 }
 
 pub(super) fn split_ownership(cfg: &Config, rows: usize) -> Result<cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership> {
-    split_ownership_lanes(cfg, rows, 1)
-}
-
-fn split_ownership_lanes(cfg: &Config, rows: usize, lanes: usize) -> Result<cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership> {
     use cuteafd_loader::placement::*;
-    ensure!(matches!(lanes, 1 | 2), "Step-5 diagnostic lane count");
     let modes = (0..cfg.layers).map(|layer| if cfg.full[layer] {
         LayerMode::Whole { gpu: ((layer / 4) % 2) as u8, ffn: FfnMode::Owner }
     } else { LayerMode::HeadSplit }).collect::<Vec<_>>();
     let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
-        rows: rows as u64, lanes: lanes as u64, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+        rows: rows as u64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
     let placement = cuteafd_loader::placement::Placement { pool_tokens: 0, pool_limits: PoolLimits(vec![]),
         attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![], peer_row_bytes: 0,
         onboard_layers: 0, layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
@@ -748,7 +734,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
         let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let execution = Execution::load_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
-            vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), vec![None, None], 1, 17)?;
+            vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), None, 1, 17)?;
         let input = Allocation::new(devices[0], rows * H * 4)?;
         devices[0].run(|| library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?))?;
         let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
@@ -798,25 +784,19 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     Ok(())
 }
 
-fn diagnostic_lane_bytes(bytes: u64, lanes: usize) -> Result<u64> {
-    ensure!(matches!(lanes, 1 | 2), "Step-5 diagnostic lane count");
-    bytes.checked_mul(lanes as u64).context("Step-5 diagnostic lane bytes overflow")
-}
-
 fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     reference: Reference, layers: &[usize]) -> Result<()> {
     use super::execution::Execution;
-    use crate::shared::spark_intake::SparkLane;
+    use crate::shared::spark_intake::SparkLink;
     use std::sync::Arc;
     let peer_device = args.split_device.context("Step-5 split device")?;
     ensure!(args.device >= 0 && peer_device >= 0 && args.device != peer_device
         && args.nll && args.last_layer == 91 && !args.prefix_state,
         "Step-5 shared golden requires distinct devices and complete cold target");
     let rows = reference.tokens.len();
-    let lane_count = args.diagnostic_lanes;
-    let ownership = split_ownership_lanes(cfg, rows, lane_count)?;
+    let ownership = split_ownership(cfg, rows)?;
     let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64)?;
-    if args.check_headers { println!("Step-5 shared headers/reference validated: rows={rows} ranks=2 lanes={lane_count}; no CUDA or numerical qualification"); return Ok(()); }
+    if args.check_headers { println!("Step-5 shared headers/reference validated: rows={rows} ranks=2; no CUDA or numerical qualification"); return Ok(()); }
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 golden requires an isolated process"))?;
     // SAFETY: sealed runner library outlives every allocation, transport and program.
@@ -826,8 +806,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5", "step52"], programs.names());
     let head_rank = ownership.execution().spec().head_gpu as usize;
-    let pages = ((rows as u64).div_ceil(64) + 1).checked_mul(lane_count as u64)
-        .context("Step-5 diagnostic proposal-page capacity overflow")?;
+    let pages = (rows as u64).div_ceil(64) + 1;
     let mut available = [0u64; 2];
     let mut chain_bytes = [0u64; 2];
     let mut cache_bytes = [0u64; 2];
@@ -836,8 +815,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     for rank in 0..2 {
         available[rank] = devices[rank].run(|| library.cuda_memory_info()).map(|(free, _)| free as u64)?;
         let admission = Execution::serving_admission(&programs, checkpoint, &ownership, rank, rows)?;
-        chain_bytes[rank] = admission.check(lane_count, u64::MAX, &[])?;
-        cache_bytes[rank] = layout.ranks[rank].bytes.checked_mul(lane_count as u64)
+        chain_bytes[rank] = admission.check( u64::MAX, &[])?;
+        cache_bytes[rank] = Some(layout.ranks[rank].bytes)
             .and_then(|active| layout.geometry.ranks[rank].persistent_unit_bytes.checked_mul(pages)
                 .and_then(|pages| active.checked_add(pages)))
             .context("Step-5 shared cache overflow")?;
@@ -847,105 +826,78 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
             .context("Step-5 shared hop charge")?;
         // Eight peer receive slots, hop buffers/control, intake construction,
         // native code and independent headroom are charged before allocations.
-        let peer = diagnostic_lane_bytes((8 * rows * H * 4) as u64 + (2 << 20), lane_count)?
+        let peer = ((8 * rows * H * 4) as u64 + (2 << 20))
             .checked_add(hops[rank]).context("Step-5 private peer/hop overflow")?;
-        let input = if rank == 0 { diagnostic_lane_bytes((rows * H * 4) as u64, lane_count)? } else { 0 };
-        reservations[rank] = [cache_bytes[rank], diagnostic_lane_bytes(staging_bytes[rank], lane_count)?, peer, input, pending,
-            diagnostic_lane_bytes(2u64 << 30, lane_count)?, 2u64 << 30].into_iter().try_fold(0u64, |n, bytes| n.checked_add(bytes))
+        let input = if rank == 0 { (rows * H * 6) as u64 } else { 0 };
+        reservations[rank] = [cache_bytes[rank], staging_bytes[rank], peer, input, pending,
+            2u64 << 30, 2u64 << 30].into_iter().try_fold(0u64, |n, bytes| n.checked_add(bytes))
             .context("Step-5 shared reservation overflow")?;
         let total = chain_bytes[rank].checked_add(reservations[rank]).context("Step-5 shared admission overflow")?;
         ensure!(total <= available[rank], "Step-5 shared rank {rank} needs {total} bytes, available {}", available[rank]);
-        tracing::info!(rank, rows, lanes=lane_count, chain_bytes=chain_bytes[rank], cache_bytes=cache_bytes[rank],
+        tracing::info!(rank, rows, chain_bytes=chain_bytes[rank], cache_bytes=cache_bytes[rank],
             staging_bytes=staging_bytes[rank], peer, pending, total, available=available[rank], "Step-5 shared golden admission");
     }
     let started = std::time::Instant::now();
-    let caches = [RefCell::new(CacheRank::new(devices[0], layout.clone(), 0, lane_count as u64, 0, pages, cache_bytes[0] as usize)?),
-        RefCell::new(CacheRank::new(devices[1], layout, 1, lane_count as u64, 0, pages, cache_bytes[1] as usize)?)];
-    let stages = (0..lane_count).map(|_| Ok([
-        Staging::new(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize)?,
-        Staging::new(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize)?,
-    ])).collect::<Result<Vec<_>>>()?;
-    let wave_ranks = ownership.routed_wave_ranks()?;
-    let (world, config) = expert_admission(args, rows, layers, ownership.routed_endpoints()?, lane_count)?;
-    let mut transports = Vec::with_capacity(lane_count);
-    for _ in 0..lane_count {
-        let mut lanes = [None, None];
-        for &rank in &wave_ranks {
-            lanes[rank] = Some(devices[rank].own(|| SparkLane::new(&library, world,
-                args.peers.clone(), rows as u32, config.clone(), H * 2))?);
-        }
-        transports.push(lanes);
-    }
+    let caches = [RefCell::new(CacheRank::new(devices[0], layout.clone(), 0, 1, 0, pages, cache_bytes[0] as usize)?),
+        RefCell::new(CacheRank::new(devices[1], layout, 1, 1, 0, pages, cache_bytes[1] as usize)?)];
+    let stages = [Staging::new(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize)?,
+        Staging::new(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize)?];
+    let (world, config) = expert_admission(args, rows, layers)?;
+    let transport = devices[0].own(|| {
+        let mut link = SparkLink::new(&library, world, &args.peers, rows as u32, config, H * 2)?;
+        link.enable_terminal_ownership(library.clone())?;
+        link.bootstrap(&super::execution::bootstrap_request(rows, 17)?)?;
+        Ok(link)
+    })?;
     let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
     let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), PrefixConfig {
         entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?);
-    let mut placements = (0..lane_count).map(|lane| Ok(pool.borrow_mut().admit_cold(&family, 1, 1,
-        |pages| Placement { pages, sequence: lane as u64, committed: 0 })?.placement))
-        .collect::<Result<Vec<_>>>()?;
-    let execution = Execution::load_lanes_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
-        stages.iter().map(|stage| vec![&stage[0], &stage[1]]).collect(), rows,
-        available.to_vec(), reservations.to_vec(), transports.into_iter().map(Vec::from).collect(), 92, 17)?;
+    let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1,
+        |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+    let execution = Execution::load_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
+        vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), Some(transport), 92, 17)?;
     if args.poison_scratch { execution.poison_scratch_between_layers(); }
     let retained_layers = reference.hidden.iter().map(|(layer, _)| *layer).chain(args.dump_layers.iter().copied())
         .collect::<Vec<_>>();
     execution.retain_diagnostic_outputs(&retained_layers)?;
     let embeddings = embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?;
-    let inputs = (0..lane_count).map(|_| {
-        let input = Allocation::new(devices[0], rows * H * 4)?;
-        devices[0].run(|| library.copy_h2d(input.buffer, &embeddings))?;
-        Ok(input)
-    }).collect::<Result<Vec<_>>>()?;
-    tracing::info!(lanes=lane_count, seconds=started.elapsed().as_secs_f64(), "Step-5 shared readiness");
-    let mut steps = placements.iter_mut().zip(&stages).map(|(placement, stage)| Step::begin(
-        vec![&caches[0], &caches[1]], vec![&stage[0], &stage[1]], &pool, placement, rows))
-        .collect::<Result<Vec<_>>>()?;
-    execution.enqueue_lanes(&mut steps.iter_mut().collect::<Vec<_>>(),
-        &inputs.iter().collect::<Vec<_>>(), ExpertV2SourceKind::Prefill)?;
-    drop(steps);
-    ensure!(placements.iter().all(|placement| placement.committed == 0),
-        "Step-5 shared cold golden must not publish state");
-    let mut first_logits = None::<Vec<f32>>;
-    for lane in 0..lane_count {
-        let head = execution.lane_head(lane)?;
+    let input = Allocation::new(devices[0], rows * H * 4)?;
+    devices[0].run(|| library.copy_h2d(input.buffer, &embeddings))?;
+    tracing::info!(seconds=started.elapsed().as_secs_f64(), "Step-5 shared readiness");
+    let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
+    execution.enqueue(&mut step, &input, ExpertV2SourceKind::Prefill)?;
+    drop(step);
+    ensure!(placement.committed == 0, "Step-5 shared cold golden must not publish state");
+    {
+        let head = execution.head()?;
         for (layer, expected) in &reference.hidden {
-            let actual = execution.diagnostic_output(lane, *layer)?;
+            let actual = execution.diagnostic_output(*layer)?;
             let (cosine, relative_l2) = hidden_metrics(&actual, expected)?;
-            println!("Step-5 shared hidden rows={rows} lane={lane} layer={layer} cosine={cosine:.9} relative_l2={relative_l2:.9}");
+            println!("Step-5 shared hidden rows={rows} layer={layer} cosine={cosine:.9} relative_l2={relative_l2:.9}");
         }
-        let (_, output) = execution.lane_terminal_output(lane)?;
+        let (_, output) = execution.terminal_output()?;
         ensure!(output.device_id == devices[head_rank].id, "Step-5 shared final head owner");
         let actual = head.logits(output)?;
-        if let Some(first) = &first_logits {
-            ensure!(first.len() == actual.len() && first.iter().zip(&actual)
-                .all(|(a, b)| a.to_bits() == b.to_bits()), "Step-5 identical diagnostic lanes differ in logit bits");
-        } else if lane_count > 1 { first_logits = Some(actual.clone()); }
         let normalized = (args.dump_residuals.is_some() || reference.final_norm.is_some())
             .then(|| head.normalized()).transpose()?;
-        let mut lane_args = args.clone();
-        if lane_count > 1 {
-            lane_args.save_logits = args.save_logits.as_ref().map(|path| path.join(format!("lane{lane}")));
-            lane_args.dump_residuals = args.dump_residuals.as_ref().map(|path| path.join(format!("lane{lane}")));
-        }
-        save_diagnostics(&lane_args, &reference.tokens, &reference.positions, cfg.vocab,
-            &actual, normalized.as_deref(), |layer| {
-                execution.diagnostic_output(lane, layer)
-            })?;
+        save_diagnostics(args, &reference.tokens, &reference.positions, cfg.vocab,
+            &actual, normalized.as_deref(), |layer| execution.diagnostic_output(layer))?;
         if let Some(expected) = &reference.final_norm {
             let (cosine, relative_l2) = hidden_metrics(normalized.as_deref().context("final norm inspection")?, &expected)?;
-            println!("Step-5 shared hidden rows={rows} lane={lane} layer=final_norm cosine={cosine:.9} relative_l2={relative_l2:.9}");
+            println!("Step-5 shared hidden rows={rows} layer=final_norm cosine={cosine:.9} relative_l2={relative_l2:.9}");
         }
         let ours = select_scored_rows(&actual, &reference.positions, cfg.vocab)?;
         let targets = reference.positions.iter().map(|&p| reference.tokens[p]).collect::<Vec<_>>();
         let nll = scored_nll(&ours, &targets, cfg.vocab)?;
         let reference_nll = scored_nll(&reference.expected, &targets, cfg.vocab)?;
         let (kl, max_kl) = scored_kl(&reference.expected, &ours, cfg.vocab)?;
-        println!("Step-5 shared complete target rows={rows} lanes={lane_count} lane={lane} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (no serving/lossless/cache qualification)", targets.len(), nll-reference_nll);
+        println!("Step-5 shared complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (no serving/lossless/cache qualification)", targets.len(), nll-reference_nll);
         // Engine-only stop bars do not measure quantization error against the BF16 root.
         if args.fp8_diagnostic_reference {
             shared_diagnostic_verdict(nll, reference_nll, kl, max_kl)?;
         }
     }
-    for placement in &placements { pool.borrow_mut().release(&family, &placement.pages)?; }
+    pool.borrow_mut().release(&family, &placement.pages)?;
     Ok(())
 }
 
@@ -1178,27 +1130,6 @@ mod tests {
         ].into_iter().chain(flags.iter().copied()))?;
         let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
         Ok(args)
-    }
-
-    #[test]
-    fn diagnostic_lanes_are_explicit_bounded_and_require_the_shared_cold_target() -> Result<()> {
-        assert_eq!(diagnostic_args(&[])?.diagnostic_lanes, 1);
-        let args = diagnostic_args(&["--nll", "--split-device", "1", "--diagnostic-lanes", "2"])?;
-        diagnostic_selection(&args)?;
-        for flags in [vec!["--nll"], vec!["--split-device", "1"], vec![]] {
-            let mut flags = flags;
-            flags.extend(["--diagnostic-lanes", "2"]);
-            assert!(diagnostic_selection(&diagnostic_args(&flags)?).is_err());
-        }
-        for lanes in ["0", "3", "18446744073709551615"] {
-            assert!(diagnostic_selection(&diagnostic_args(&["--nll", "--split-device", "1",
-                "--diagnostic-lanes", lanes])?).is_err());
-        }
-        assert_eq!(diagnostic_lane_bytes(123, 1)?, 123);
-        assert_eq!(diagnostic_lane_bytes(123, 2)?, 246);
-        assert!(diagnostic_lane_bytes(u64::MAX, 2).is_err());
-        assert!(diagnostic_lane_bytes(0, 0).is_err());
-        Ok(())
     }
 
     #[test]
@@ -1480,7 +1411,7 @@ mod tests {
             prefill: Some(1),
             device: 0,
             split_device: None,
-            diagnostic_lanes: 1, poison_scratch: false,
+             poison_scratch: false,
             check_headers: true,
             nll: false,
             prefix_state: false,
@@ -1533,7 +1464,7 @@ mod tests {
         std::fs::write(folder.join("logits.bin"), &logits)?;
         let mut args = GoldenArgs { snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
-            peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None, diagnostic_lanes: 1, poison_scratch: false, check_headers: true, nll: true, prefix_state: false,
+            peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None,  poison_scratch: false, check_headers: true, nll: true, prefix_state: false,
             fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false,
             save_logits: None, dump_residuals: None, dump_layers: vec![], dump_layer0: None };
         let full = reference(&args, 3)?;

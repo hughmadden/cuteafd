@@ -99,9 +99,6 @@ pub(super) struct TargetHeadOwner<'a> {
 impl<'a> TargetHeadOwner<'a> {
     pub(super) fn device(&self) -> Device<'a> { self.stream.device }
     pub(super) fn workspace_bytes(&self) -> u64 { HeadPlan::plane_bytes(self.rows).expect("admitted rows").iter().sum::<usize>() as u64 }
-    pub(super) fn new_lane_in(&self, arena: &Arena<'a>) -> Result<Self> {
-        Self::workspace(self.stream.device, self.rows, self.immutable.clone(), Some((arena, 0)))
-    }
 
     pub fn load(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         plan: HeadPlan, available: u64, reservations: &[u64]) -> Result<Self> {
