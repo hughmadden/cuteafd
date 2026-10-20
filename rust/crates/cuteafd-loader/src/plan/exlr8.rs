@@ -15,6 +15,7 @@ use super::format::{
 };
 
 pub mod residency;
+pub mod dense;
 
 /// Native selection is distinct from the ordinary GLM launch description.
 #[derive(Debug, Clone, Serialize)]
