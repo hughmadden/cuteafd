@@ -1737,7 +1737,7 @@ pub mod testing {
             }
             crate::cache::TickReport {
                 completed,
-                failed: Vec::new(),
+                ..Default::default()
             }
         }
         fn before_device_evict(&mut self, ticket: Option<StoreTicket>) -> EvictDecision {

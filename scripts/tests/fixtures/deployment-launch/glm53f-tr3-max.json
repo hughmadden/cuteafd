@@ -104,6 +104,8 @@
       "off",
       "--prefix-cache-entries",
       "20",
+      "--host-cache-bytes",
+      "auto",
       "--device",
       "0",
       "--split-device",

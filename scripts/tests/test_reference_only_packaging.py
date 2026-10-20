@@ -18,9 +18,9 @@ def test_policy_tripwires_do_not_newly_fail_current_cards():
     assert policy == dict(top1_min=.90, kl_max=.06,
                           tripwires=dict(confident_top1_min=.96, top3_min=.97,
                                          confident_drop_margin=.01, top3_drop_margin=.005))
-    cards = set(re.findall(r'benchmarks/[^\s\"<>)]*/card.svg', (ROOT / 'README.md').read_text()))
-    assert cards
-    reports = {str(Path(name).with_name('report.json')) for name in cards}
+    reports = {Path(name).parent / 'report.json' for name in re.findall(
+        r'benchmarks/[^"\s]+/card\.svg', (ROOT / 'README.md').read_text())}
+    assert reports
     checked = 0
     for name in reports:
         report = json.loads((ROOT / name).read_text())

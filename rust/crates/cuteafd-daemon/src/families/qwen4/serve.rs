@@ -186,8 +186,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry(&opened.cfg,
             opened.cfg.layers, args.mtp > 0, args.kv_format)?;
         let mark = geometry.ranks[0].retained_mark_bytes as usize;
-        let slots = MarkArena::slots_for(max_sequences, prefix.prefix_cache_entries, mark,
-            prefix.prefix_cache_mark_mib << 20);
+        let slots = prefix.mark_rule(max_sequences).slots(mark);
         args.planner_prefix_bytes = Some(slots as u64 * mark as u64);
     }
     let mut ready = Some(ready);
@@ -234,9 +233,8 @@ fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: u
     let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_rows } else { 64 },
         engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
-    let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "Qwen 3.8 Flash Next restores exact snapshots only (GDN state)");
-    let family = Qwen4Prefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
+    let family = Qwen4Prefix::new(engine, |mark| args.mark_rule(lanes).slots(mark))?;
     let host = args.host_config(family.layout(), engine.max_context, lanes)?.map(|config|
         CudaCopyEngine::registered_owned(engine.library, family.snapshot_owners()).map(|copy| (config, copy)))
         .transpose()?;

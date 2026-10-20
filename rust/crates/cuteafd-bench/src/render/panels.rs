@@ -127,6 +127,9 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     doc.end();
     y += 22.0;
     let mut notes = Vec::new();
+    if dataset["qualification"] == "reference" {
+        notes.push("reference".to_string());
+    }
     if reference_only {
         notes.push("reference-only qualified: reference logits without paired engine calibration, so the verdict uses the common floors".to_string());
     }
@@ -783,12 +786,12 @@ fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
 #[cfg(test)]
 mod context_load_tests {
     #[test]
-    fn fidelity_card_labels_reference_only_qualification() {
+    fn fidelity_card_labels_reference() {
         let value = serde_json::json!({"dataset":{"config":"dense-bf16","revision":"a".repeat(40),
-            "qualification":"reference-only qualified"}});
+            "qualification":"reference"}});
         let mut doc = super::Doc::new(900.0, 300.0);
         super::fidelity(&mut doc, &super::super::theme::NORMAL, &value, 900.0);
-        assert!(doc.finish().contains("reference-only qualified"));
+        assert!(doc.finish().contains("reference"));
     }
 
     #[test]

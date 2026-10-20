@@ -119,6 +119,9 @@ pub struct Entry {
     /// Cold prefill at these prompt lengths, in the same sweep (`[8192]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_lengths: Option<Vec<u64>>,
+    /// Output tokens per sweep decode request (default `crate::sweep::TOKENS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_tokens: Option<u64>,
     /// `false` runs explicit panels without the server's baseline (basic card
     /// + quick quality); default true. Needs a server build that honours it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,6 +259,7 @@ impl Entry {
             post_load_c1: self.post_load_c1.or(defaults.post_load_c1),
             post_load_repeat: self.post_load_repeat.or(defaults.post_load_repeat),
             prefill_lengths: self.prefill_lengths.clone().or_else(|| defaults.prefill_lengths.clone()),
+            sweep_tokens: self.sweep_tokens.or(defaults.sweep_tokens),
             baseline: self.baseline.or(defaults.baseline),
             window: self.window.clone().or_else(|| defaults.window.clone()),
             lossless_set: self.lossless_set.clone().or_else(|| defaults.lossless_set.clone()),
@@ -754,9 +758,10 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
-                e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(),
+                e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
+                e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.fabric.unwrap_or(true), e.set);
         }
         return Ok(());
@@ -895,6 +900,8 @@ fn write_config(entry: &Entry, repo: &Path, configs: &Path, parallel: bool) -> R
     let mut text = std::fs::read_to_string(&base).with_context(|| format!("{}", base.display()))?;
     text.push_str(&format!("\n# bench smoke entry {}\n", entry.name));
     let mut set = entry.set.clone();
+    // Smoke drives the run through /v1/bench, which the launcher serves only on request.
+    set.insert("ENABLE_BENCH".into(), "on".into());
     if parallel && entry.family.as_deref() != Some("deepseek_v41") {
         // Distinct coordinator containers for launches side by side.
         set.entry("INSTANCE".into()).or_insert_with(|| entry.name.clone());
@@ -1069,7 +1076,8 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 })
             });
             let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
-                entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true), open);
+                entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true),
+                entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open);
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;
@@ -1464,5 +1472,6 @@ mod tests {
         assert!(!config.contains_key("BENCH_SIMULATED"));
         assert!(!config.contains_key("BENCH_HARDWARE_CLASS"));
         assert_eq!(config.get("MODEL_ID").map(String::as_str), Some("a/b"));
+        assert_eq!(config.get("ENABLE_BENCH").map(String::as_str), Some("on"));
     }
 }

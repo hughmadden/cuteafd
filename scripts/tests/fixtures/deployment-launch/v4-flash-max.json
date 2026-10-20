@@ -103,6 +103,8 @@
       "off",
       "--prefix-cache-entries",
       "20",
+      "--host-cache-bytes",
+      "auto",
       "--pool-tokens",
       "0",
       "--device",

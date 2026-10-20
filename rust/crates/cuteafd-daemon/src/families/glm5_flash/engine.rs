@@ -2838,6 +2838,14 @@ impl<'a> GlmfEngine<'a> {
         }).transpose()
     }
 
+    pub(crate) fn replicated_kv(&self) -> bool {
+        self.ranks() > 1 && !self.context_kv() && self.layer_execution.is_none()
+    }
+
+    pub(crate) fn pool_mark_buffers(&self) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
+        (0..self.ranks()).filter_map(|rank| self.caches_of(rank).pool_mark_backing.as_ref().map(|b| b.buffer)).collect()
+    }
+
     /// Every MLA layer's paged buffers: latent records (528 B per row), indexer token keys
     /// (512 B per row; `--index-cache keys` only), both in 64-row MLA pages, and the pool-key
     /// cache (8448 B per pool page).

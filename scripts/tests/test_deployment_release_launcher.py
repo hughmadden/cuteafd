@@ -70,7 +70,7 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
     assert plan[plan.index("--exlr8-manifest") + 1] == manifest
     dense = plan[plan.index("--exlr8-dense-from") + 1]
     assert dense.startswith("/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
-    assert "CUTEAFD_GLM_PREFILL_LANES=1" in plan
+    assert "CUTEAFD_GLM_PREFILL_LANES=3" in plan
     assert len(result["containers"]) == 5
     for run in result["containers"]:
         parsed = parse_run(run["argv"])
@@ -78,10 +78,25 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
         assert command[command.index("--exlr8-manifest") + 1] == manifest
         if "serve-glm" in command:
             assert command[command.index("--exlr8-dense-from") + 1] == dense
-            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "1"
+            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "3"
         else:
             assert "expertd-native" in command
             assert "--exlr8-dense-from" not in command
+
+
+@pytest.mark.parametrize("lanes", ["1", "2", "3", "4"])
+def test_exlr8_launcher_preserves_explicit_prefill_lanes(lanes: str, tmp_path: Path) -> None:
+    source = ROOT / "scripts/launch/run-family.sh"
+    launcher = tmp_path / "run-family.sh"
+    launcher.write_text(source.read_text().replace(
+        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"',
+        f'    CUTEAFD_GLM_PREFILL_LANES={lanes}\n'
+        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"'))
+    result = capture(ROOT, f"exlr8-lanes-{lanes}", release_entry=exlr8_entry(),
+        launcher_source=launcher)
+    assert f"CUTEAFD_GLM_PREFILL_LANES={lanes}" in result["plans"][0]
+    coordinator = parse_run(result["containers"][0]["argv"])
+    assert coordinator["env"]["CUTEAFD_GLM_PREFILL_LANES"] == lanes
 
 
 @pytest.mark.parametrize("ranks", range(1, 7))
@@ -133,6 +148,23 @@ def test_host_cache_and_full_logits_reach_plan_and_serve(quota: str, full: str) 
     assert ("--full-prefill-logits" in serve) == (full == "on")
 
 
+@pytest.mark.parametrize("family", ["deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"])
+@pytest.mark.parametrize("quota", [None, "0", "16GiB"])
+def test_generic_host_default_matches_plan_and_serve(family: str, quota: str | None) -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["family"] == family))
+    entry["set"].pop("HOST_CACHE_BYTES", None)
+    if quota is not None:
+        entry["set"]["HOST_CACHE_BYTES"] = quota
+    result = capture(ROOT, f"host-default-{family}-{quota}", release_entry=entry)
+    plan = result["plans"][0]
+    serve = parse_run(result["containers"][0]["argv"])["command"]
+    expected = quota if quota is not None else "auto"
+    assert plan[plan.index("--host-cache-bytes") + 1] == expected
+    assert serve.count("--host-cache-bytes") == int(expected != "0")
+    if expected != "0":
+        assert serve[serve.index("--host-cache-bytes") + 1] == expected
+
+
 @pytest.mark.parametrize("quota", [None, "0", "2GiB"])
 @pytest.mark.parametrize("vision", ["off", "rtx"])
 def test_effective_media_cache_quota_reaches_plan(quota: str | None, vision: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -165,7 +197,8 @@ def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> 
     plan = result["plans"][0]
     serve = parse_run(result["containers"][0]["argv"])["command"]
     actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
-    assert actual == ("auto" if enabled == "on" else "0")
+    assert serve.count("--host-cache-bytes") == 1
+    assert actual == "auto"
     assert plan[plan.index("--host-cache-bytes") + 1] == actual
 
 

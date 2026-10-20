@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -485,6 +486,17 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
     assert prefill['prompt_token_hashes'] == ['73b4ebf8f4958775'] and prefill['follow_up_prompts'] == 1
     decode = cards.summarize_job(job(dict(name='d', profile='panels:', levels=[1, 16], set={}, sparks=[])), 0)
     assert decode['status'] == 'failed' and 'per-request console rounds' in decode['error']
+    # Fidelity-only runs (no baseline) score through the probe endpoint and decode nothing either.
+    def with_report(entry):
+        made = job(entry)
+        report = Path(made['state']) / 'reports' / entry['name'] / 'report.json'
+        report.write_text(json.dumps({'panels': [{'id': 'fidelity', 'status': 'pass'}]}))
+        return made
+    fidelity = cards.summarize_job(with_report(dict(name='f', profile='panels:fidelity', baseline=False, set={}, sparks=[])), 0)
+    assert 'per-request console rounds' not in (fidelity.get('error') or ''), fidelity.get('error')
+    # A fidelity panel beside the baseline still decodes, so it keeps the check.
+    mixed = cards.summarize_job(with_report(dict(name='m', profile='panels:fidelity', set={}, sparks=[])), 0)
+    assert 'per-request console rounds' in (mixed.get('error') or '')
 
 
 def _coordinator_log(deterministic, follow_up_tokens):
@@ -958,8 +970,21 @@ def test_post_load_repeat_reaches_every_job(entry, tmp_path, monkeypatch):
         assert matrix['post_load_c1'] is True and matrix['post_load_repeat'] is True
 
 
+def test_sweep_tokens_reach_every_job(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave', '--repeats', '1',
+        '--arm', 'a=b:s', '--arm', 'c=d:s', '--state', str(state), '--panels', 'none', '--levels', '1,16',
+        '--sweep-tokens', '1536', '--dry-run'])
+    assert cards.main() == 0
+    for job in json.loads((state / 'plan.json').read_text())['jobs']:
+        matrix = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
+        assert matrix['sweep_tokens'] == 1536
+
+
 @pytest.mark.parametrize('extra,match', [(['--post-load-c1'], 'needs --levels'),
     (['--levels', '1,16', '--post-load-repeat'], 'needs --post-load-c1'), (['--panels', 'none'], 'runs nothing'),
+    (['--sweep-tokens', '1536'], 'needs --levels'), (['--levels', '1,16', '--sweep-tokens', '0'], '1..8192'),
     (['--levels', '1,1'], 'distinct'), (['--panels', 'bogus'], 'unknown requested panel')])
 def test_subset_flags_refuse_nonsense(entry, tmp_path, monkeypatch, extra, match):
     kit = _kit(tmp_path, entry)
@@ -1815,3 +1840,15 @@ def test_summary_row_records_the_launcher(tmp_path):
     job = dict(card='c', arm='a', repeat=1, simulated=True, state=str(tmp_path), launcher=dict(repo='/r', commit='abc'),
                entry=dict(name='c', set={}))
     assert cards.summarize_job(job, 1)['launcher'] == dict(repo='/r', commit='abc')
+
+
+def test_every_required_smoke_field_is_advertised_by_the_dry_run():
+    # binary_supports looks for FIELD= in the smoke dry-run line; a field wip-cards can
+    # require but smoke.rs never prints would refuse every binary, however new.
+    source = (ROOT / 'scripts/bench/wip-cards.py').read_text()
+    block = source[source.index("    fields = ['fabric']"):source.index('    for job in {j[\'launcher\'][\'repo\']')]
+    required = {name for name in re.findall(r"\['([a-z_0-9]+)'\]", block) if name not in ('entry', 'launcher', 'repo')}
+    dry_run = (ROOT / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
+    line = next(text for text in dry_run.splitlines() if 'api_key_file={}' in text)
+    advertised = set(re.findall(r'([a-z_0-9]+)=\{', line))
+    assert required <= advertised, sorted(required - advertised)

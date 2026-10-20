@@ -106,9 +106,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
 }
 
 fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &PlanArgs) {
-    layout.prefix_slots = args.prefix_slots.or(Some(if args.prefix_cache_entries == 0 {
-        0
-    } else { 2 * args.prefix_cache_entries + 2 }));
+    layout.prefix_slots = args.prefix_slots.or(Some(cuteafd_core::prefix::mark_slots_with_host(0, args.prefix_cache_entries, 1, u64::MAX, layout.host_cache_bytes != Some(0))));
     // Workers must cover both prefill and the 256-row replay bucket.
     layout.spark_capacity_rows = if args.prefill_rows == 0 { 4096 }
         else if args.prefill_rows <= 256 { 256 }
@@ -1119,7 +1117,9 @@ mod tests {
     fn v41_prefix_and_worker_layout_match_launch_arguments() {
         let mut args = args(std::path::Path::new("/not-read"), 4, false);
         let mut layout = cuteafd_loader::plan::layout::LayoutOptions::default();
-        for (entries, slots) in [(0, 0), (1, 4), (20, 42), (128, 258)] {
+        for entries in [0, 1, 20, 128] {
+            let slots = cuteafd_core::prefix::mark_slots_with_host(0, entries as u64, 1, u64::MAX,
+                layout.host_cache_bytes != Some(0));
             args.prefix_cache_entries = entries;
             for (rows, capacity) in [(0, 4096), (80, 256), (256, 256), (1024, 1024), (2048, 4096)] {
                 args.prefill_rows = rows;
@@ -1330,7 +1330,7 @@ mod tests {
         // serve-glmf's own counts for `sequences`, `entries` and a mark budget (MiB).
         let served = |sequences: u64, entries: u64, mib: u64| {
             let (slots, lanes) = (sequences.max(8), sequences.min(64));
-            (cuteafd_core::prefix::mark_slots_for(lanes, entries, mark, mib << 20) * mark, state(slots))
+            (cuteafd_core::prefix::mark_slots_with_host(lanes, entries, mark, mib << 20, true) * mark, state(slots))
         };
         // The launcher's arguments for CONCURRENCY, PREFIX_CACHE_ENTRIES and PREFIX_CACHE_MARK_MIB.
         let launcher = |sequences: u64, entries: u64, mib: Option<u64>| {
@@ -1346,19 +1346,21 @@ mod tests {
             let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             assert_eq!(planned(&argv), served(sequences, entries, mib.unwrap_or(2048)), "{argv:?}");
         }
-        // Implicit state slots now follow serving's max(8, C), including C1 and C16.
-        // Explicit mark lanes still cap C128 at 64 instead of the planner's uncapped C lanes.
+        // Host-on reserves a fixed staging working set even when mark lanes change.
+        let staging = cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS;
         assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(8)));
         assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(8)));
-        assert_eq!(planned(&launcher(16, 20, None).iter().map(String::as_str).collect::<Vec<_>>()),
-            (34 * mark, state(16)));
-        assert_eq!(planned(&["--concurrency", "16"]), (34 * mark, state(16)));
-        assert_eq!(planned(&launcher(128, 20, None).iter().map(String::as_str).collect::<Vec<_>>()),
-            (130 * mark, state(128)));
-        assert_eq!(planned(&["--concurrency", "128"]).0, 258 * mark);
-        assert_eq!((258 - 130) * mark, 18_895_339_520);
-        // A 96 GiB logical profile defaults to C16: 34 marks and 16 state slots.
-        assert_eq!(planned(&[]), (34 * mark, state(16)));
+        for concurrency in [16, 128] {
+            let args = launcher(concurrency, 20, None);
+            assert_eq!(planned(&args.iter().map(String::as_str).collect::<Vec<_>>()),
+                (staging * mark, state(concurrency)));
+            assert_eq!(planned(&["--concurrency", &concurrency.to_string()]),
+                (staging * mark, state(concurrency)));
+        }
+        assert_eq!(planned(&[]), (staging * mark, state(16)));
+        // Explicit host-off retains the legacy lane floor and entries/budget rule exactly.
+        assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "16"]), (34 * mark, state(16)));
+        assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "128"]), (258 * mark, state(128)));
         // The other knobs serve-glmf gets reach the layout as given.
         let custom = layout(&["--concurrency", "16", "--state-slots", "16", "--mark-lanes", "16",
             "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);

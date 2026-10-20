@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 /// Output tokens per request (the concurrency panel's width).
 pub const TOKENS: u64 = 192;
+/// Upper bound for a sweep's per-request output length.
+pub const MAX_TOKENS: u64 = 8192;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Point {
@@ -112,10 +114,11 @@ impl Prompts {
 
 /// Measures concurrency `c`; `repeat` re-sends those prompts instead of drawing fresh ones.
 /// Returns the point and the prompts used.
-fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, on_timed: &mut OnTimed) -> Result<(Point, Prompts)> {
+fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tokens: u64, on_timed: &mut OnTimed)
+    -> Result<(Point, Prompts)> {
     let prompts = repeat.cloned().unwrap_or_else(|| Prompts::fresh(c));
     let batch = |texts: &[String]| -> Vec<Result<Timed>> {
-        wave(client, texts.iter().map(|text| plain(text, TOKENS)).collect())
+        wave(client, texts.iter().map(|text| plain(text, tokens)).collect())
     };
     // A repeat only means something if nothing came from the prefix cache.
     let uncached = |results: Vec<Result<Timed>>| -> Result<Vec<Result<Timed>>> {
@@ -191,12 +194,18 @@ pub fn parse_lengths(text: &str) -> Result<Vec<u64>, String> {
 /// Runs the sweep against `url`; `api_key` is the server's bearer key.
 pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, post_load_repeat: bool,
     prefill_lengths: &[u64]) -> Result<Sweep> {
-    run_windowed(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths, false, None)
+    run_windowed(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths, false, TOKENS, None)
 }
 
-/// [`run`], calling `on_timed` once just before the first timed request.
+/// [`run`], calling `on_timed` once just before the first timed request. `tokens`
+/// is each decode request's output length ([`TOKENS`] by default; longer runs give
+/// a profiled wave more decode steps at every width).
+#[allow(clippy::too_many_arguments)]
 pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
-    post_load_repeat: bool, prefill_lengths: &[u64], fabric: bool, mut on_timed: OnTimed) -> Result<Sweep> {
+    post_load_repeat: bool, prefill_lengths: &[u64], fabric: bool, tokens: u64, mut on_timed: OnTimed) -> Result<Sweep> {
+    if !(1..=MAX_TOKENS).contains(&tokens) {
+        bail!("sweep tokens must be 1..={MAX_TOKENS}, got {tokens}");
+    }
     if post_load_repeat && !(post_load_c1 && levels.contains(&1)) {
         bail!("post_load_repeat needs post_load_c1 and a levels list that includes 1 (it replays the levels C1)");
     }
@@ -214,13 +223,13 @@ pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
     let mark = client.thermal_mark();
     let mut c1_prompts = None;
     for &c in levels {
-        let (point, prompts) = measure(&client, c, "levels", None, &mut on_timed)?;
+        let (point, prompts) = measure(&client, c, "levels", None, tokens, &mut on_timed)?;
         if c == 1 && post_load_repeat { c1_prompts = Some(prompts); }
         sweep.points.push(point);
     }
     if post_load_c1 {
         let (phase, repeat) = if post_load_repeat { ("post_load_repeat", c1_prompts.as_ref()) } else { ("post_load", None) };
-        sweep.points.push(measure(&client, 1, phase, repeat, &mut on_timed)?.0);
+        sweep.points.push(measure(&client, 1, phase, repeat, tokens, &mut on_timed)?.0);
     }
     if !levels.is_empty() || post_load_c1 {
         if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("decode".into(), window); }

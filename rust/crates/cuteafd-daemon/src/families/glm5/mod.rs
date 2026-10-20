@@ -138,7 +138,6 @@ fn native_dense_format(config: &serde_json::Value) -> Result<()> {
 
 fn spark_model(lanes: usize, bf16: bool, native: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     ensure!(lanes > 0, "GLM Spark admission requires at least one prefill lane");
-    ensure!(!native || lanes == 1, "EXLR8 currently requires serial prefill");
     let ingress = if native { cuteafd_core::SparkIngress::Fp8K32 }
         else if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
     let endpoints = 1 + if lanes > 1 { lanes } else { 0 };
@@ -172,13 +171,15 @@ mod draft_cli_tests {
                         else { cuteafd_core::SparkIngress::Fp8K32 }));
             }
         }
-        let native = spark_model(1, false, true)?;
-        native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
-        assert_eq!(native.endpoints.len(), 1);
-        assert_eq!(native.endpoints[0].ingress, cuteafd_core::SparkIngress::Fp8K32);
-        assert_eq!(native.rings.max_frame_bytes,
-            cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity)?);
-        assert!(spark_model(2, false, true).is_err());
+        for lanes in 1..=4 {
+            let native = spark_model(lanes, false, true)?;
+            native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
+            assert_eq!(native.endpoints.len(), if lanes == 1 { 1 } else { lanes + 1 });
+            assert!(native.endpoints.iter().all(|endpoint|
+                endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
+            assert_eq!(native.rings.max_frame_bytes,
+                cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity)?);
+        }
         assert!(spark_model(0, false, false).is_err());
         Ok(())
     }
@@ -556,9 +557,7 @@ impl Opened {
             self.library.cuda_set_device(args.device)?;
             context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
         }
-        let prefill_lanes = if native { 1 } else {
-            glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize
-        };
+        let prefill_lanes = glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize;
         let prefill_lanes = if owners.is_some() { prefill_lanes.min(2) } else { prefill_lanes };
         let exchange_f32 = glm::local_exchange_f32()?;
         let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),
@@ -617,7 +616,7 @@ impl Opened {
             args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, owners.as_deref(), native) })?;
         let native_owners = native_plans.into_iter().zip(&devices).map(|(plan, &device)| {
             self.library.cuda_set_device(device)?;
-            engine::exlr8::NativeExperts::load(&self.library, &programs, plan)
+            engine::exlr8::NativeExperts::load(&self.library, plan)
         }).collect::<Result<Vec<_>>>()?;
         self.library.cuda_set_device(args.device)?;
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()

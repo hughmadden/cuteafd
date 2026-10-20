@@ -69,9 +69,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let experts = glmf::expert_costs(&catalog, ranks == 2 && available.is_some())?;
         let geometry = crate::serving_capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks,
             index, state.bytes(), decode_rows, attention.mode, 0)?;
-        let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
+        let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
             options.glmf_mark_lanes.unwrap_or(sequences), options.mimo_prefix_entries,
-            geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum(), options.mimo_prefix_mark_bytes));
+            geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum(), options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
         let shared = if options.glmf_shared_replay { crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, ranks, decode_rows)? } else { 0 };
         let step_workspace = |placement: &ExpertPlacement, lanes| manifest.and_then(|m|
             glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,

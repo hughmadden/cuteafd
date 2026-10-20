@@ -82,6 +82,11 @@ impl PrefixFamily<LagMeta> for Lagged {
     fn capture_ready(&self, ticket: CaptureTicket) -> Result<bool, BoxError> {
         Ok(!self.queued.borrow().iter().any(|&(t, ..)| t == ticket))
     }
+    fn wait_capture(&self, _: CaptureTicket) -> Result<(), BoxError> {
+        if self.stuck.get() { return Err("queued copies did not drain".into()); }
+        self.land();
+        Ok(())
+    }
     fn abort_capture(&self, ticket: CaptureTicket) -> Result<(), BoxError> {
         if self.stuck.get() { return Err("queued copies did not drain".into()); }
         self.queued.borrow_mut().retain(|&(t, ..)| t != ticket);
@@ -341,4 +346,40 @@ fn a_pending_capture_keeps_the_only_mark_and_skips_competing_capture() {
     cache.clear(&family).unwrap();
     assert_eq!(cache.pool().free(), 64);
     assert_eq!(cache.arena().in_use(), 0);
+}
+
+#[test]
+fn queued_captures_publish_oldest_under_two_slot_pressure_without_losing_tickets() {
+    let family = Lagged::new(96, 4, 2);
+    let mut cache = lag_cache(&family, 8, 1 << 20);
+    let mut tickets = Vec::new();
+    let mut prompts = Vec::new();
+    for i in 0..4 {
+        let prompt = seq(100 + 100 * i, 13);
+        let mut p = cache.admit_cold(&family, prompt.len(), 16,
+            |pages| Placement { pages, ring: i as usize, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = family.fake.forward(&mut p, &prompt).unwrap();
+        let captured = cache.queue_capture(&family, SnapshotKind::Prompt, &prompt, &[], &p,
+            After::from_logits(&logits, true)).unwrap();
+        let Captured::Queued(ticket) = captured else { panic!("queued capture") };
+        tickets.push(ticket);
+        prompts.push((prompt, p));
+        assert!(cache.arena().in_use() <= 2);
+    }
+    family.land();
+    for ticket in tickets { assert!(cache.poll_capture(&family, ticket).unwrap()); }
+    family.fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    assert_eq!(cache.arena().in_use(), 0);
+    for (prompt, p) in prompts {
+        cache.release(&family, &p.pages).unwrap();
+        let mut next = prompt.clone(); next.push(42);
+        let admitted = cache.admit(&family, &next, 16, false,
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(admitted.resume, prompt.len());
+        let mut p = admitted.placement;
+        family.fake.forward(&mut p, &next).unwrap();
+        cache.release(&family, &p.pages).unwrap();
+    }
+    assert!(cache.stats().capture_stalls > 0);
 }

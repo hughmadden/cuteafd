@@ -272,7 +272,9 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     crate::quality::apply_fidelity(run.info, check);
     check.summary = format!("KL {:.3} · top-1 {:.1}% · {} generated / 4096 total rows · 8 windows",
         f.kl, 100.0 * f.top1, f.positions);
-    if scored.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
+    if scored.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference") {
+        check.summary.push_str(" · reference");
+    } else if scored.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
         check.summary.push_str(" · reference-only qualified");
     }
     Ok(())
@@ -486,9 +488,34 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("decode_tok_s_off", off.timing.decode_tok_s());
     let rates = format!("({} vs {} tok/s)", crate::render::rate(on.timing.decode_tok_s()),
         crate::render::rate(off.timing.decode_tok_s()));
+    // Whether one-row decoding is reproducible at all: the same request again
+    // without drafts, always (#533: drafts-off nondeterminism hid behind
+    // on/off agreement). Rows that differ here are run-to-run nondeterminism,
+    // not anything a verify does.
+    let again = run.client.chat(plain(&text, TOKENS), Some(spec(true)))?;
+    let again_record = probe_of(&again)?;
+    let same_again = b.iter().zip(&again_record.generated).take_while(|(x, y)| x == y).count();
+    let repeat = RowNoise::between(again_record, off_record, off_record.prompt_ids.len() + same_again);
+    check.set("repeat_identical_prefix", same_again as u64);
+    check.set("repeat_rows_identical", repeat.identical as u64);
+    check.set("repeat_noise_max", repeat.max);
+    if let Some(row) = repeat.first_differing {
+        check.set("repeat_first_differing_row", row as u64);
+    }
+    let repeat_note = format!("; drafts off twice: {same_again} of {} tokens identical, {} of {} rows byte-identical, \
+        up to {:.3} nats", b.len(), repeat.identical, repeat.compared, repeat.max);
+    let decode_repeats = same_again == b.len() && again_record.generated.len() == b.len()
+        && repeat.identical == repeat.compared;
     if a == b {
-        check.status = CheckStatus::Pass;
-        check.summary = format!("{speculator}: {} greedy tokens identical with drafts on and off {rates}", a.len());
+        if decode_repeats {
+            check.status = CheckStatus::Pass;
+            check.summary = format!("{speculator}: {} greedy tokens identical with drafts on and off {rates}{repeat_note}", a.len());
+        } else {
+            // Plain decode must reproduce itself; agreement with drafts on cannot excuse it.
+            check.set("replay", replay(&tag, &text, TOKENS, off_record));
+            check.status = CheckStatus::Fail;
+            check.summary = format!("{speculator}: drafts on and off agree, but plain decode does not repeat {rates}{repeat_note}");
+        }
         return Ok(());
     }
     // Any divergence keeps what replays it (the verdict below may still pass a near tie).
@@ -500,18 +527,6 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let noise = RowNoise::between(on_record, off_record, off_record.prompt_ids.len() + same);
     noise.record(check);
     check.set("prefix_noise_rows", json!(&noise.rows));
-    // And whether one-row decoding is even reproducible: the same request
-    // again without drafts. Rows that differ here are run-to-run
-    // nondeterminism (reduction order), not anything a verify does.
-    let again = run.client.chat(plain(&text, TOKENS), Some(spec(true)))?;
-    let again_record = probe_of(&again)?;
-    let same_again = b.iter().zip(&again_record.generated).take_while(|(x, y)| x == y).count();
-    let repeat = RowNoise::between(again_record, off_record, off_record.prompt_ids.len() + same_again);
-    check.set("repeat_identical_prefix", same_again as u64);
-    check.set("repeat_rows_identical", repeat.identical as u64);
-    check.set("repeat_noise_max", repeat.max);
-    let repeat_note = format!("; drafts off twice: {same_again} of {} tokens identical, {} of {} rows byte-identical, \
-        up to {:.3} nats", b.len(), repeat.identical, repeat.compared, repeat.max);
     // Verify rows and single-row steps may round differently: a flip where the
     // top two candidates are within rounding of each other is a tie, not a loss.
     let position = off_record.prompt_ids.len() + same;
@@ -526,8 +541,6 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     if let Some(m) = margins.0.or(margins.1) {
         check.set("divergence_margin", m);
     }
-    let decode_repeats = same_again == b.len() && again_record.generated.len() == b.len()
-        && repeat.identical == repeat.compared;
     check.status = flip_verdict(tie, decode_repeats, &noise);
     check.summary = if tie {
         format!("{speculator}: identical up to token {same} of {}, then a near-tie flips \
@@ -596,6 +609,8 @@ pub(crate) struct RowNoise {
     pub(crate) median: f64,
     /// Generated-token index of the first row more than 0.01 nats apart.
     pub(crate) first_over: Option<usize>,
+    /// Generated-token index of the first row whose bytes differ.
+    pub(crate) first_differing: Option<usize>,
     pub(crate) rows: Vec<RowNoiseSample>,
 }
 
@@ -613,6 +628,9 @@ impl RowNoise {
             }
             noise.compared += 1;
             noise.identical += usize::from(row.hash == other.hash);
+            if row.hash != other.hash && noise.first_differing.is_none() {
+                noise.first_differing = Some(row.position.saturating_sub(start));
+            }
             let delta = f64::from((x.1 - y.1).abs());
             if delta > 0.01 && noise.first_over.is_none() {
                 noise.first_over = Some(row.position.saturating_sub(start));
@@ -883,7 +901,7 @@ mod tests {
             row(13, "z", vec![(3, -0.3), (2, -0.4)])], ..ProbeRecord::default() };
         // Position 13 is the flip: it is outside the identical prefix.
         let noise = RowNoise::between(&on, &off, 13);
-        assert_eq!((noise.compared, noise.identical, noise.first_over), (3, 1, Some(2)));
+        assert_eq!((noise.compared, noise.identical, noise.first_over, noise.first_differing), (3, 1, Some(2), Some(1)));
         assert!((noise.max - 0.1).abs() < 1e-6 && (noise.median - 0.005).abs() < 1e-6, "{noise:?}");
         assert!(noise.describe().contains("1 of 3 rows byte-identical"));
         assert_eq!(RowNoise::between(&on, &ProbeRecord::default(), 13).describe(), "");

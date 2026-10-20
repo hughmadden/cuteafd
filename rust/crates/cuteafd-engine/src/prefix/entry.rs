@@ -65,6 +65,8 @@ pub(crate) struct Entry<M> {
     pub last_use: u64,
     /// The host tier's write-behind copy, when one was issued.
     pub ticket: Option<StoreTicket>,
+    /// Host-only mark; if the host evicts this key, restoring it is a cache miss.
+    pub host_mark: Option<cuteafd_hostcache::snapshot::Key>,
 }
 
 impl<M> Entry<M> {
