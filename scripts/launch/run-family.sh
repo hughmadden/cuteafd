@@ -195,7 +195,7 @@ PROFILE_NSYS_GPU_METRICS
 PROFILE_EXPERT_INPUT_SAMPLE
 PROFILE_EXPERT_ROUTE_WEIGHTS
 EOF
-    [[ "$1" != kimi_k3 ]] || echo RTX_EXPERT_LAYERS
+    [[ "$1" != kimi_k3 ]] || printf '%s\n' RTX_EXPERT_LAYERS NATIVE_K6
     [[ "$1" != step5 ]] || echo SPECULATOR_DEPTH
     _spark_slot_keys HOST LANE_A
     return
@@ -1928,6 +1928,13 @@ if [[ $family == kimi_k3 ]]; then
   [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
     release_die "Kimi K3 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
   family_args+=(--rtx-expert-layers "$local_layers")
+  # NATIVE_K6: serve the checkpoint's EXL3 K6 core tensors natively (opt-in
+  # while it qualifies; needs a slot built with CUTEAFD_WIP_KIMIK6_AOT=ON).
+  case "$(get NATIVE_K6 off)" in
+    on) family_args+=(--native-k6) ;;
+    off) ;;
+    *) release_die "NATIVE_K6 must be on or off" ;;
+  esac
 fi
 # DECODE_SHARE: the share of the time running requests keep while prompts
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
