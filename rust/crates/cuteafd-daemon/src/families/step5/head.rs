@@ -7,7 +7,7 @@ use crate::shared::{
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{
-    programs::{Program, Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE},
+    programs::{Program, Programs, Scalar, VocabularyHead},
     CuteafdDeviceBuffer,
 };
 use cuteafd_loader::plan::{
@@ -31,7 +31,7 @@ pub(super) struct HeadPlan {
 impl HeadPlan {
     fn plane_bytes(rows: usize) -> Result<[usize; 4]> {
         ensure!((1..=4096).contains(&rows), "Step-5 head row capacity must be 1..4096");
-        Ok([rows * H * 2, rows * H * 2, rows * V * 4, VOCABULARY_HEAD_WORKSPACE])
+        cuteafd_loader::plan::families::step5::native::head_planes(rows)
     }
 
     pub fn prepare(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize) -> Result<Self> {
@@ -137,32 +137,42 @@ impl<'a> TargetHeadOwner<'a> {
             f32::from_bits(u32::from(u16::from_le_bytes(b.try_into().unwrap())) << 16)).collect())
     }
 
-    /// Caller drains the target chain first; this method drains before releasing its input borrow.
-    pub fn logits(&self, input: CuteafdDeviceBuffer) -> Result<Vec<f32>> {
-        ensure!(input.bytes >= self.rows * H * 4, "Step-5 final hidden extent");
-        let mut guard = self.stream.cancellation_guard("Step-5 final head input borrow");
-        self.stream.device.run(|| {
-            let library = self.stream.device.library;
+    /// The transaction retains this owner and input through the lane stream's drain.
+    pub(super) fn device_logits_on(&self, input: CuteafdDeviceBuffer, rows: usize,
+        stream: &Stream<'a>) -> Result<crate::shared::token_io::DeviceLogits> {
+        super::transaction::validate_active_rows(rows, self.rows)?;
+        ensure!(!input.ptr.is_null() && input.bytes >= rows * H * 4
+            && input.device_id == self.stream.device.id && stream.device.id == input.device_id
+            && std::ptr::eq(stream.device.library, self.stream.device.library),
+            "Step-5 final hidden extent/device/stream");
+        let mut guard = stream.cancellation_guard("Step-5 final head input borrow");
+        stream.device.run(|| {
+            let library = stream.device.library;
             let p = self.planes.iter().map(|p| p.buffer.ptr).collect::<Vec<_>>();
             let weight = self.immutable.weights[0].buffer.ptr;
-            // SAFETY: all extents were admitted; disjoint owners and input remain live until drain.
+            // SAFETY: admitted lane-private planes, head handle and input stay live
+            // through the transaction drain; runtime rows never exceed capacity.
             unsafe {
-                library.cuda_f32_to_bf16_async(input, self.planes[0].buffer,
-                    self.rows * H, self.stream.raw)?;
+                library.cuda_f32_to_bf16_async(input, self.planes[0].buffer, rows * H, stream.raw)?;
                 self.immutable.norm.launch(&[p[0], weight, weight, weight, weight, weight, p[1]],
-                    &[Scalar::I32(self.rows as i32), Scalar::F32(self.immutable.epsilon)], self.stream.raw)?;
+                    &[Scalar::I32(rows as i32), Scalar::F32(self.immutable.epsilon)], stream.raw)?;
                 target_head::launch(TargetHead::configured(), &self.head, p[1],
-                    self.immutable.weights[1].buffer.ptr, p[2].cast(), self.rows, self.stream.raw)?;
+                    self.immutable.weights[1].buffer.ptr, p[2].cast(), rows, stream.raw)?;
             }
-            self.stream.drain()?;
             guard.complete = true;
-            let mut bytes = vec![0; self.rows * V * 4];
-            library.copy_d2h(&mut bytes, self.planes[2].buffer)?;
-            let values = bytes.chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
-            ensure!(values.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
-            Ok(values)
+            Ok(crate::shared::token_io::DeviceLogits { ptr: p[2].cast_const(), rows, vocab: V,
+                stride: V, stream: stream.raw, greedy: None })
         })
+    }
+
+    /// Caller drains the target chain first; this diagnostic downloads all rows.
+    pub fn logits(&self, input: CuteafdDeviceBuffer) -> Result<Vec<f32>> {
+        let mut guard = self.stream.cancellation_guard("Step-5 diagnostic head input borrow");
+        let logits = self.device_logits_on(input, self.rows, &self.stream)?;
+        let values = self.stream.device.run(|| logits.to_host(self.stream.device.library))?;
+        guard.complete = true;
+        ensure!(values.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
+        Ok(values)
     }
 }
 

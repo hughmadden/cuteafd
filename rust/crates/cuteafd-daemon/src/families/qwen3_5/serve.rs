@@ -132,7 +132,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         Ok(Some(output))
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
+        _kind: scheduler::UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         self.verify_device(sequences, speculative, pool)
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }

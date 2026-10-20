@@ -101,8 +101,8 @@ impl<'a> DeploymentSpec<'a> {
     }
 
     pub fn from_exlr8(native: &'a super::exlr8::NativePlan, options: &'a DeploymentOptions) -> Result<Self> {
-        ensure!(options.rtx_gpus == 2 && options.spark_tp.is_none() && options.spark_ep.is_none()
-            && options.speculator == "off", "EXLR8 deployment requires two RTX, canonical Spark wire and no speculator");
+        ensure!((1..=2).contains(&options.rtx_gpus) && options.spark_tp.is_none() && options.spark_ep.is_none()
+            && options.speculator == "off", "EXLR8 deployment requires one or two RTX GPUs, canonical Spark wire and no speculator");
         Self::build(&native.report, options, Some(native))
     }
 
@@ -243,15 +243,24 @@ mod tests {
             sparks: SparkRequirements { resident_bytes_per_rank: vec![100; 4],
                 k1_workspace: "checked_by_worker_live_admission" } };
         let mut options = DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
-        let deployment = DeploymentSpec::from_exlr8(&native, &options).unwrap();
-        assert!(!deployment.executable && deployment.wip_launchable);
-        let value = serde_json::to_value(deployment).unwrap();
-        assert_eq!(value["version"], 1);
-        assert_eq!(value["exlr8"]["manifest"], "up1");
-        assert_eq!(value["exlr8"]["set_id"], "checkpoint-set");
-        assert_eq!(value["exlr8"]["dense_from"], "official-fp8");
-        assert_eq!(value["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([100, 100, 100, 100]));
-        assert_eq!(value["spark_requirements"]["k1_workspace"], "checked_by_worker_live_admission");
+        for gpus in 0..=3 {
+            options.rtx_gpus = gpus;
+            if !(1..=2).contains(&gpus) {
+                assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+                continue;
+            }
+            let deployment = DeploymentSpec::from_exlr8(&native, &options).unwrap();
+            assert!(!deployment.executable && deployment.wip_launchable);
+            let value = serde_json::to_value(deployment).unwrap();
+            assert_eq!(value["version"], 1);
+            assert_eq!(value["exlr8"]["manifest"], "up1");
+            assert_eq!(value["exlr8"]["set_id"], "checkpoint-set");
+            assert_eq!(value["exlr8"]["dense_from"], "official-fp8");
+            assert_eq!(value["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([100, 100, 100, 100]));
+            assert_eq!(value["spark_requirements"]["k1_workspace"], "checked_by_worker_live_admission");
+            assert_eq!(value["rtx_gpus"], gpus);
+        }
+        options.rtx_gpus = 1;
         options.spark_tp = Some(4);
         options.spark_ep = Some(1);
         assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());

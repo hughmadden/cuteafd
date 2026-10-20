@@ -70,11 +70,11 @@ impl Panel for Structured {
         for (i, (name, prompt, schema)) in list.iter().enumerate() {
             ctx.progress.step(i as f64 / list.len() as f64, *name);
             let text = format!("[{}] {prompt} Reply in JSON.", nonce());
-            let mut body = plain(&text, 400);
+            let mut body = plain(ctx.client, &text, 400);
             body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": name, "strict": true,
                 "schema": schema}});
             let constrained = ctx.client.chat(body, None)?;
-            let free = ctx.client.chat(plain(&text, 400), None)?;
+            let free = ctx.client.chat(plain(ctx.client, &text, 400), None)?;
             let compiled = jsonschema::JSONSchema::options().with_draft(jsonschema::Draft::Draft202012).compile(schema)
                 .map_err(|e| anyhow::anyhow!("schema {name}: {e}"))?;
             let parsed: Option<Value> = serde_json::from_str(constrained.content.trim()).ok();
@@ -134,7 +134,7 @@ impl Panel for Needle {
                 parts.insert(at.min(parts.len()), &needle);
                 let prompt = format!("[{}] {}\n\nWhat is the secret passphrase mentioned in the text above? Reply \
                     with the passphrase only.", nonce(), parts.join(" "));
-                let chat = ctx.client.chat(plain(&prompt, 24), None);
+                let chat = ctx.client.chat(plain(ctx.client, &prompt, 24), None);
                 let (found, tokens) = match &chat {
                     Ok(chat) => (chat.content.contains(&secret), chat.timing.prompt_tokens),
                     Err(_) => (false, 0),
@@ -346,7 +346,7 @@ impl Panel for IfEval {
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let items = ifeval_items();
-        let bodies = items.iter().map(|(prompt, _)| plain(prompt, 700)).collect();
+        let bodies = items.iter().map(|(prompt, _)| plain(ctx.client, prompt, 700)).collect();
         let results = batched(ctx, bodies, common::concurrency(ctx.info).clamp(1, 4), "prompt");
         let (mut rows, mut prompt_ok, mut checks, mut checks_ok) = (Vec::new(), 0, 0, 0);
         for ((prompt, rules), result) in items.iter().zip(results) {

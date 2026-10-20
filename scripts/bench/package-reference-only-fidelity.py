@@ -82,6 +82,19 @@ def compact_tensors(full, window):
                 next_token_log_prob=next_lps)
 
 
+# Scored generated rows each standard half of a newly packaged set needs (TJ, 2026-10-20).
+# The loader admits published sets from 6,500; new sets are built to this larger floor.
+NEW_SET_GENERATED_MIN = 10_000
+
+
+def require_new_set_generated_rows(rows):
+    short = {half: rows[f'{half}_generated_positions'] for half in ('decode', 'prefill')
+             if rows[f'{half}_generated_positions'] < NEW_SET_GENERATED_MIN}
+    if short:
+        raise ValueError(f'new fidelity sets need {NEW_SET_GENERATED_MIN:,} scored generated rows per half; '
+                         + ', '.join(f'{half} has {count:,}' for half, count in short.items()))
+
+
 def standard_generated_rows(panel):
     """Report natural row counts using the consumer's fixed split, never resample."""
     source = (REPO / 'rust/crates/cuteafd-bench/src/fidelity_dataset.rs').read_text()
@@ -331,6 +344,7 @@ def package(source, out, config, tokenizer_path, license_path):
     runtime = read('platform.json')
     provenance['runtime'] = validate_runtime_platform(runtime)
     generated_rows = standard_generated_rows(panel)
+    require_new_set_generated_rows(generated_rows)
     role_metrics = reference_role_metrics(validation)
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
                          **role_metrics, standard_generated_rows=generated_rows,

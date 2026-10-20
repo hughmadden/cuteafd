@@ -52,9 +52,18 @@ pub enum ModelEncoding {
     /// Qwen 3.8 Flash Next: the checkpoint's chat template and Qwen3-Coder XML tool calls.
     Qwen(Arc<qwen4::QwenEncoding>),
     Kimi(Arc<kimi::KimiEncoding>),
+    Step5(Arc<step5::Step5Encoding>),
 }
 
 impl ModelEncoding {
+    /// Whether the active chat renderer can render a thinking-off request.
+    pub fn supports_thinking_off(&self) -> bool {
+        match self {
+            Self::Step5(encoding) => encoding.supports_thinking_off(),
+            _ => true,
+        }
+    }
+
     /// The checkpoint's end-of-sequence token ids.
     pub fn eos_token_ids(&self) -> Vec<u32> {
         match self {
@@ -62,6 +71,7 @@ impl ModelEncoding {
             Self::Glm(encoding) => encoding.tokens().eos.clone(),
             Self::Qwen(encoding) => encoding.tokens().eos.clone(),
             Self::Kimi(encoding) => encoding.eos_token_ids(),
+            Self::Step5(encoding) => encoding.tokens().eos.clone(),
         }
     }
 
@@ -71,6 +81,7 @@ impl ModelEncoding {
             Self::Glm(encoding) => Some(encoding.tokens().think_close),
             Self::Qwen(encoding) => Some(encoding.tokens().think_close),
             Self::Kimi(_) => None,
+            Self::Step5(encoding) => Some(encoding.tokens().think_close),
         }
     }
 }
@@ -183,10 +194,11 @@ impl ModelProfile {
     /// Token ids that end generation for one request.
     fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
         match &self.encoding {
-            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) => {
+            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) => {
                 let mut ids = match &self.encoding {
                     ModelEncoding::Glm(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Qwen(encoding) => encoding.stop_token_ids(tools_declared),
+                    ModelEncoding::Step5(encoding) => encoding.stop_token_ids(tools_declared),
                     _ => unreachable!(),
                 };
                 ids.extend(&self.eos_token_ids);
@@ -211,7 +223,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{deepseek, glm5, kimi, qwen4};
+use chat::{deepseek, glm5, kimi, qwen4, step5};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -384,6 +396,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
 pub(crate) fn model_record(state: &NativeState) -> Value {
     let owner = state.profile.id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
     let mut model = json!({"id":state.profile.id,"object":"model","owned_by":owner,
+        "supports_thinking_off":state.profile.encoding.supports_thinking_off(),
         "capabilities":state.profile.capabilities,"max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()});
     if let ModelEncoding::Glm(encoding) = &state.profile.encoding {
         if let Some(provenance) = encoding.template_provenance() {
@@ -547,6 +560,7 @@ enum Templated {
     Glm(Arc<glm5::GlmEncoding>),
     Qwen(Arc<qwen4::QwenEncoding>),
     Kimi(Arc<kimi::KimiEncoding>),
+    Step5(Arc<step5::Step5Encoding>),
 }
 
 impl Templated {
@@ -557,6 +571,10 @@ impl Templated {
         match self {
             Self::Glm(encoding) => glm5::resolve_glm_thinking(body, encoding.thinking_off()),
             Self::Qwen(_) | Self::Kimi(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
+            Self::Step5(_) => {
+                step5::prompt::validate_thinking(body)?;
+                Ok(glm5::GlmThinking { enabled: true, effort: None })
+            }
         }
     }
 }
@@ -567,6 +585,7 @@ enum OutputProcessor {
     Glm(glm5::GlmStreamProcessor<ChatGenerator>),
     Qwen(glm5::GlmStreamProcessor<ChatGenerator, qwen4::QwenOutputParser>),
     Kimi(glm5::GlmStreamProcessor<ChatGenerator, kimi::KimiOutputParser>),
+    Step5(glm5::GlmStreamProcessor<ChatGenerator, step5::Step5OutputParser>),
 }
 
 impl OutputProcessor {
@@ -576,6 +595,7 @@ impl OutputProcessor {
             Self::Glm(processor) => Box::pin(processor.process(input)),
             Self::Qwen(processor) => Box::pin(processor.process(input)),
             Self::Kimi(processor) => Box::pin(processor.process(input)),
+            Self::Step5(processor) => Box::pin(processor.process(input)),
         }
     }
 }
@@ -712,6 +732,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         ModelEncoding::Glm(encoding) => Some(Templated::Glm(encoding.clone())),
         ModelEncoding::Qwen(encoding) => Some(Templated::Qwen(encoding.clone())),
         ModelEncoding::Kimi(encoding) => Some(Templated::Kimi(encoding.clone())),
+        ModelEncoding::Step5(encoding) => Some(Templated::Step5(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -820,7 +841,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let response_validator = constraints::response_validator(response_format.as_ref()).map_err(Rejection::bad)?;
     let syntax = match &glm_request {
         Some((Templated::Glm(_), _, _)) => tools::ToolSyntax::GlmXml,
-        Some((Templated::Qwen(_), _, _)) => tools::ToolSyntax::QwenXml,
+        Some((Templated::Qwen(_), _, _)) | Some((Templated::Step5(_), _, _)) => tools::ToolSyntax::QwenXml,
         Some((Templated::Kimi(_), _, _)) => tools::ToolSyntax::KimiXtml,
         None => tools::ToolSyntax::Dsml,
     };
@@ -878,6 +899,23 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
             (prompt, Vec::new(), OutputProcessor::Glm(glm5::GlmStreamProcessor::new(generator, parser)))
+        }
+        Some((Templated::Step5(encoding), raw, _thinking)) => {
+            let tool_choice = match (selection.name(), selection.required) {
+                (Some(name), _) => step5::Step5ToolChoice::Named(name.to_owned()),
+                (None, true) => step5::Step5ToolChoice::Required,
+                (None, false) => step5::Step5ToolChoice::Auto,
+            };
+            let options = step5::Step5PromptOptions {
+                tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
+                tool_choice, response_format };
+            let prompt = if expanded_media_probe { String::new() } else {
+                encoding.render(&raw, &options).map_err(Rejection::bad)?
+            };
+            let parser = step5::Step5OutputParser::new(step5::Step5ParserOptions {
+                tools: tools_declared.then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+            (prompt, Vec::new(), OutputProcessor::Step5(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Qwen(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
@@ -1525,6 +1563,63 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE);
         }
     }
+    #[tokio::test]
+    async fn step5_rejects_unsupported_thinking_off_before_admission() {
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let profile = ModelProfile::new("step5-test", ModelEncoding::Step5(Arc::new(step5::fixtures::encoding())));
+        let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+        let body = json!({"model": "step5-test", "messages": [{"role": "user", "content": "Hi"}],
+            "enable_thinking": false, "max_tokens": 8});
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn step5_dispatch_uses_own_prompt_stops_and_reasoning_parser() {
+        for streaming in [false, true] {
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                assert!(job.prompt.starts_with(step5::BOS));
+                assert!(job.prompt.ends_with("<|im_start|>assistant\n<think>"));
+                assert!(job.stop_token_ids.contains(&128_007));
+                assert!(job.stop_token_ids.contains(&128_008));
+                assert!(!job.stop_token_ids.contains(&248_046));
+                for event in [
+                    InferenceChunk::Ready { system_fingerprint: None,
+                        prompt_usage: PromptUsage { prompt_tokens: 12, prompt_cache_hit_tokens: 0 } },
+                    InferenceChunk::Text { content: "Plan</think>Answer".into(), content_tokens: 4 },
+                    InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop },
+                ] { job.events.send(Ok(event)).unwrap(); }
+            });
+            let profile = ModelProfile::new("step5-test", ModelEncoding::Step5(Arc::new(step5::fixtures::encoding())));
+            assert_eq!(engine::system_placement(&profile), engine::SystemPlacement::Anywhere);
+            assert!(!profile.capabilities.vision && !profile.capabilities.audio);
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+            let body = json!({"model": "step5-test", "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 8, "stream": streaming});
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            if streaming {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.contains("reasoning_content") && text.contains("Plan") && text.contains("Answer"));
+                assert!(text.ends_with("data: [DONE]\n\n"));
+            } else {
+                let result: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(result["choices"][0]["message"]["reasoning_content"], "Plan");
+                assert_eq!(result["choices"][0]["message"]["content"], "Answer");
+            }
+            worker.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn streaming_include_usage_emits_spec_shaped_usage_chunk() {
         let profiles = [ModelProfile::default(),

@@ -118,7 +118,7 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     -> Result<(Point, Prompts)> {
     let prompts = repeat.cloned().unwrap_or_else(|| Prompts::fresh(c));
     let batch = |texts: &[String]| -> Vec<Result<Timed>> {
-        wave(client, texts.iter().map(|text| plain(text, tokens)).collect())
+        wave(client, texts.iter().map(|text| plain(client, text, tokens)).collect())
     };
     // A repeat only means something if nothing came from the prefix cache.
     let uncached = |results: Vec<Result<Timed>>| -> Result<Vec<Result<Timed>>> {
@@ -155,7 +155,7 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
 /// with a fresh prefix (it must reuse no cached tokens).
 fn prefill(client: &Client, lengths: &[u64], max_context: u64, on_timed: &mut OnTimed) -> Result<Vec<PrefillPoint>> {
     let ask = |words: usize, seed: u64| -> Result<crate::client::Chat> {
-        client.chat(plain(&format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(seed, words)), 1), None)
+        client.chat(plain(client, &format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(seed, words)), 1), None)
     };
     let (a, b) = (ask(300, 101)?, ask(900, 102)?);
     let slope = (b.timing.prompt_tokens as f64 - a.timing.prompt_tokens as f64) / 600.0;

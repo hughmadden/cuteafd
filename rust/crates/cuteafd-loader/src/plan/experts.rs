@@ -208,7 +208,8 @@ pub fn spark_recipe_with_placement(package: &str, intermediate: usize, world: us
     let (family, format) = key.split_once(':').ok_or_else(|| SparkRecipeRefusal::UnknownPackage(package.into()))?;
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p");
     let exl3 = format.starts_with("exl3-k") && matches!(family, "v41" | "dsv4f" | "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
-    let nvfp4 = matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4");
+    let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4"))
+        || (family == "step5" && format == "nvfp4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
     let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4" | "step5");
     let bf16 = family == "step5" && format == "bf16";
@@ -368,7 +369,11 @@ mod tests {
                 assert_eq!(spark_recipe("step5:bf16", 1536, world).unwrap(),
                     spark_recipe("step5:fp8", 1536, world).unwrap());
             } else { assert!(spark_recipe("step5:bf16", 1536, world).is_err()); }
-            for format in ["nvfp4", "nvfp4a4", "mxfp4", "exl3-k34"] {
+            if matches!(world, 4 | 6) {
+                assert_eq!(spark_recipe("step5:nvfp4", 1536, world).unwrap(),
+                    spark_recipe("step5:fp8", 1536, world).unwrap());
+            } else { assert!(spark_recipe("step5:nvfp4", 1536, world).is_err()); }
+            for format in ["nvfp4a4", "mxfp4", "exl3-k34"] {
                 assert!(spark_recipe(&format!("step5:{format}"), 1536, world).is_err());
             }
         }

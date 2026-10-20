@@ -1192,6 +1192,8 @@ type CudaF32ToBf16AsyncFn = unsafe extern "C" fn(
     count: usize,
     cuda_stream: *mut c_void,
 ) -> CuteafdStatus;
+type CudaAccumulateBf16ToF32AsyncFn =
+    unsafe extern "C" fn(*const u16, *mut f32, usize, *mut c_void) -> CuteafdStatus;
 type CudaGatherRowsF32ToFp8E4m3RowScaledAsyncFn = unsafe extern "C" fn(
     src: *const f32,
     row_indices: *const u32,
@@ -3260,6 +3262,28 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_cuda_zero_bytes_async", status)
     }
 
+    /// Add BF16 values into a disjoint F32 plane on the same device.
+    ///
+    /// # Safety
+    /// The stream belongs to the buffers' device. Both allocations remain live,
+    /// and source and destination are initialized before this stream reads them.
+    pub unsafe fn cuda_accumulate_bf16_to_f32_async(
+        &self,
+        src: CuteafdDeviceBuffer,
+        dst: CuteafdDeviceBuffer,
+        count: usize,
+        cuda_stream: *mut c_void,
+    ) -> Result<()> {
+        validate_bf16_to_f32_accumulation(src, dst, count)?;
+        if count == 0 { return Ok(()); }
+        // SAFETY: the native symbol has this ABI; the caller retains the stream and buffers.
+        let kernel: Symbol<CudaAccumulateBf16ToF32AsyncFn> =
+            unsafe { self.lib.get(b"cuteafd_cuda_accumulate_bf16_to_f32_async")? };
+        // SAFETY: validated extents; initialization and ordering are the caller's contract.
+        let status = unsafe { kernel(src.ptr.cast::<u16>(), dst.ptr.cast::<f32>(), count, cuda_stream) };
+        self.status_to_result("cuteafd_cuda_accumulate_bf16_to_f32_async", status)
+    }
+
     pub fn cuda_f32_to_bf16(
         &self,
         src: CuteafdDeviceBuffer,
@@ -4935,6 +4959,30 @@ fn validate_row_gather_f32_to_nvfp4_e2m1_fp8_e4m3_buffers(
 }
 
 
+fn validate_bf16_to_f32_accumulation(
+    src: CuteafdDeviceBuffer,
+    dst: CuteafdDeviceBuffer,
+    count: usize,
+) -> Result<()> {
+    if count == 0 { return Ok(()); }
+    let context = "cuteafd_cuda_accumulate_bf16_to_f32_async";
+    validate_u16_buffer_values(context, src, count)?;
+    validate_f32_buffer_values(context, dst, count)?;
+    anyhow::ensure!(src.device_id >= 0 && src.device_id == dst.device_id,
+        "{context} source/destination devices differ");
+    let source = src.ptr as usize;
+    let destination = dst.ptr as usize;
+    anyhow::ensure!(source % 2 == 0 && destination % 4 == 0,
+        "{context} unaligned source/destination");
+    let source_end = source.checked_add(count.checked_mul(2).context("BF16 extent overflow")?)
+        .context("BF16 address overflow")?;
+    let destination_end = destination.checked_add(checked_f32_bytes(context, count)?)
+        .context("F32 address overflow")?;
+    anyhow::ensure!(source_end <= destination || destination_end <= source,
+        "{context} source/destination overlap");
+    Ok(())
+}
+
 fn validate_f32_to_bf16_buffers(
     context: &str,
     src: CuteafdDeviceBuffer,
@@ -5601,6 +5649,31 @@ mod tests {
             device_id: 0,
             flags: 0,
         }
+    }
+
+    #[test]
+    fn bf16_accumulation_checks_live_extents_devices_and_disjointness() -> Result<()> {
+        let src = synthetic_device_buffer(0x1000, 32);
+        let dst = synthetic_device_buffer(0x2000, 64);
+        validate_bf16_to_f32_accumulation(src, dst, 16)?;
+        validate_bf16_to_f32_accumulation(CuteafdDeviceBuffer::default(), CuteafdDeviceBuffer::default(), 0)?;
+        for (source, destination, count) in [
+            (src, dst, 17),
+            (CuteafdDeviceBuffer { bytes: 30, ..src }, dst, 16),
+            (src, CuteafdDeviceBuffer { bytes: 60, ..dst }, 16),
+            (src, CuteafdDeviceBuffer { device_id: 1, ..dst }, 16),
+            (CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), ..src }, dst, 16),
+            (src, CuteafdDeviceBuffer { ptr: 0x1010 as *mut c_void, ..dst }, 16),
+            (src, CuteafdDeviceBuffer { ptr: 0xff0 as *mut c_void, ..dst }, 16),
+            (CuteafdDeviceBuffer { ptr: 0x1001 as *mut c_void, ..src }, dst, 16),
+            (src, CuteafdDeviceBuffer { ptr: 0x2002 as *mut c_void, ..dst }, 16),
+            (synthetic_device_buffer(usize::MAX - 1, 32), dst, 16),
+            (src, dst, usize::MAX),
+        ] {
+            assert!(validate_bf16_to_f32_accumulation(source, destination, count).is_err());
+        }
+        validate_bf16_to_f32_accumulation(src, synthetic_device_buffer(0x1020, 64), 16)?;
+        Ok(())
     }
 
     /* ---- v4.1 GPU target-sampler: ABI pin + validator ---- */

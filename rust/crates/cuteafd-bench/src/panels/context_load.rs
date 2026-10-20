@@ -66,13 +66,13 @@ fn base(run: &str, length: u64, words: usize) -> Value {
     json!([{"role": "system", "content": format!("[{run}-{length}] You are a helpful assistant. Reference notes:\n{}", filler(4242, words))},
         {"role": "user", "content": "Read the reference notes. Reply with the single word OK."}])
 }
-fn body(messages: Value, output: u64) -> Value {
-    json!({"messages": messages, "max_tokens": output, "temperature": 0, "thinking": {"type": "disabled"}})
+pub(crate) fn body(configuration: &crate::report::Configuration, messages: Value, output: u64) -> Value {
+    crate::request::thinking_off(configuration, json!({"messages": messages, "max_tokens": output, "temperature": 0, "thinking": {"type": "disabled"}}))
 }
-fn request(base: &Value, run: &str, phase: &str, c: usize, i: usize, output: u64) -> Value {
+pub(crate) fn request(configuration: &crate::report::Configuration, base: &Value, run: &str, phase: &str, c: usize, i: usize, output: u64) -> Value {
     let mut messages = base.as_array().unwrap().clone();
     messages.push(json!({"role": "user", "content": format!("[{run}-{phase}-C{c}-{i}] Ignore the notes. Write a complete Python LRU cache module with TTL, a background janitor and pytest tests. Output only code.")}));
-    body(json!(messages), output)
+    body(configuration, json!(messages), output)
 }
 
 fn fit(
@@ -224,8 +224,8 @@ impl Panel for ContextLoad {
         let mut bases = Vec::new();
         // As in the cold-prefill sweep, two short requests calibrate filler
         // token density before the one long base is built.
-        let a = ctx.client.chat(body(base(&run, 300, 300), 1), None)?;
-        let b = ctx.client.chat(body(base(&run, 900, 900), 1), None)?;
+        let a = ctx.client.chat(body(&ctx.info.configuration, base(&run, 300, 300), 1), None)?;
+        let b = ctx.client.chat(body(&ctx.info.configuration, base(&run, 900, 900), 1), None)?;
         let slope = (b.timing.prompt_tokens as f64 - a.timing.prompt_tokens as f64) / 600.0;
         let slope = if slope.is_finite() && slope > 0.3 {
             slope
@@ -257,7 +257,7 @@ impl Panel for ContextLoad {
             );
             let words = ((length as f64 - intercept) / slope).max(8.0) as usize;
             let messages = base(&run, length, words);
-            let cold = match ctx.client.chat(body(messages.clone(), 1), None) {
+            let cold = match ctx.client.chat(body(&ctx.info.configuration, messages.clone(), 1), None) {
                 Ok(chat) => chat,
                 Err(error) => {
                     for &c in &options.levels {
@@ -297,7 +297,7 @@ impl Panel for ContextLoad {
                 );
                 let bodies = |phase| {
                     (0..c)
-                        .map(|i| request(&retained, &run, phase, c, i, output))
+                        .map(|i| request(&ctx.info.configuration, &retained, &run, phase, c, i, output))
                         .collect()
                 };
                 // Every request of a retained-base batch re-renders the
@@ -416,12 +416,12 @@ mod tests {
     fn common_base_and_distinct_suffixes() {
         let b = base("test", 32768, 100);
         assert_eq!(b, base("test", 32768, 100));
-        let a = request(&b, "test", "timed", 8, 0, 256);
-        let c = request(&b, "test", "timed", 8, 1, 256);
+        let a = request(&crate::report::Configuration::default(), &b, "test", "timed", 8, 0, 256);
+        let c = request(&crate::report::Configuration::default(), &b, "test", "timed", 8, 1, 256);
         assert_eq!(a["messages"][0], c["messages"][0]);
         assert_eq!(a["messages"][1], c["messages"][1]);
         assert_ne!(a["messages"][2], c["messages"][2]);
-        assert_ne!(a, request(&b, "test", "warm", 8, 0, 256));
+        assert_ne!(a, request(&crate::report::Configuration::default(), &b, "test", "warm", 8, 0, 256));
     }
     #[test]
     fn pool_fit_uses_shared_not_copied_base() {

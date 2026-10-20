@@ -65,8 +65,13 @@ pub const KIMI_K3: ExecutorModes = ExecutorModes { family: "kimi_k3",
         LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }],
     hops: true, attention: AttentionPlacement::Layers };
 
+/// Step-5: SWA head-split on a pair, alternating whole-owned CSA layers;
+/// one GPU owns every layer. No context-split executor is qualified.
+pub const STEP5: ExecutorModes = ExecutorModes { family: "step5", modes: &[WHOLE0, WHOLE1, LayerMode::HeadSplit],
+    hops: true, attention: AttentionPlacement::Heads };
+
 /// Every family's executor set, for lookups by family name.
-pub const EXECUTORS: [ExecutorModes; 7] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4, KIMI_K3];
+pub const EXECUTORS: [ExecutorModes; 8] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4, KIMI_K3, STEP5];
 
 pub fn executor(family: &str) -> Option<ExecutorModes> {
     EXECUTORS.into_iter().find(|e| e.family == family)

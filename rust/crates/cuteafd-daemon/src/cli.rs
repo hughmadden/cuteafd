@@ -97,6 +97,9 @@ pub(crate) enum Commands {
     /// Serve Kimi K3 with TP2 attention and six real Spark expert ranks.
     #[command(hide = true)]
     ServeKimi(crate::families::kimi_k3::serve::ServeArgs),
+    /// Serve an eager native Step-5 target with real Spark experts.
+    #[command(hide = true)]
+    ServeStep5(crate::families::step5::serve::ServeArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),

@@ -13,6 +13,13 @@ pub(crate) enum Drafts {
     Neural { depth: usize, fixed: bool },
 }
 
+/// Ungraphed rows can replay prompt tokens or advance a live decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UngraphedKind {
+    Scoring,
+    Decode,
+}
+
 pub(crate) struct Geometry {
     pub family: &'static str,
     pub vocab_size: usize,
@@ -105,7 +112,7 @@ pub(crate) trait Backend<'a> {
         pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
-        pool: &cuteafd_engine::prefix::RefPagePool)
+        kind: UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value;
@@ -432,6 +439,22 @@ mod readiness_tests {
     use std::cell::Cell;
 
     #[test]
+    fn ungraphed_callers_distinguish_scoring_replay_from_live_decode() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        let calls = source.split("engine.verify_device_ungraphed(").skip(1)
+            .map(|call| call.split_once("cache.pool()").unwrap().0
+                .chars().filter(|c| !c.is_whitespace()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(calls, [
+            // Teacher-forced rows, then decode-shaped cold prompt replay.
+            "&mut[(placement,chunk)],false,UngraphedKind::Scoring,",
+            "&mut[(&mutp.placement,chunk)],false,UngraphedKind::Scoring,",
+            // Only the live diagnostic decode advances generated rows.
+            "&mutrows,spec,UngraphedKind::Decode,",
+        ]);
+    }
+
+    #[test]
     fn scheduler_prefix_cache_is_initialized_before_readiness() {
         let source = include_str!("scheduler.rs");
         let schedule = source.split_once("\npub(crate) fn schedule").unwrap().1;
@@ -692,7 +715,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     geometry.decode_rows, probe::verify_rows(&job.probe), geometry.full_prefill_logits, &mut placement,
                     |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows, cache.pool())?
                         .map(probe::ScoreLogits::Device)),
-                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false, cache.pool())?
+                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false,
+                        UngraphedKind::Scoring, cache.pool())?
                         .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
@@ -757,7 +781,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
                         .is_some_and(|step| step.decode);
                     let logits = if decode {
-                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false, cache.pool())?
+                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false,
+                            UngraphedKind::Scoring, cache.pool())?
                     } else { engine.prefill_device(&mut p.placement, chunk, 1, cache.pool())? };
                     if end == p.tokens.len() {
                         // The first token, while this prompt's logits are the workspace's.
@@ -1005,7 +1030,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let timer = Instant::now();
         engine.probe_begin(tokens.len());
         let step = if diagnostic {
-            engine.verify_device_ungraphed(&mut rows, spec, cache.pool())
+            engine.verify_device_ungraphed(&mut rows, spec, UngraphedKind::Decode, cache.pool())
         } else {
             engine.verify_device(&mut rows, spec, cache.pool())
         }.and_then(|logits| logits.context("decode needs every layer"))
