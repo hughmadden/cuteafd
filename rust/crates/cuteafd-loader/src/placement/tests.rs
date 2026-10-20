@@ -1725,8 +1725,19 @@ fn kimi_c8_marks_reduce_only_after_context_and_fixed_floors() {
     }
     // Even one byte short of one complete mark is a typed refusal.
     for gpu in &mut req.inventory.gpus { gpu.baseline = Baseline::Measured { free_bytes: 44 * GIB - 3 * mark - 1 }; }
-    assert!(matches!(solve_with_marks(&req, legacy, 1, &parts),
-        Err(PlacementError::PrefixMarks { minimum: 1, .. })));
+    let mut final_attempt = req.clone();
+    for demand in &mut final_attempt.fixed {
+        if demand.group == "Kimi exact KDA marks" { demand.bytes = mark; }
+    }
+    let expected = solve(&final_attempt).unwrap_err().to_string();
+    let Err(PlacementError::PrefixMarks { minimum: 1, reason }) = solve_with_marks(&req, legacy, 1, &parts)
+        else { panic!("one-mark shortfall must be a typed refusal") };
+    assert!(reason.contains("tried 18 complete-mark counts (18 down to 1)"));
+    assert!(reason.ends_with(&format!("final attempt with 1 marks: {expected}")));
+    let Err(PlacementError::PrefixMarks { reason, .. }) = solve_with_marks(&final_attempt, 1, 1, &parts)
+        else { panic!("single attempted count must retain its diagnostic") };
+    assert!(reason.contains("tried 1 complete-mark counts (1 down to 1)"));
+    assert!(reason.ends_with(&expected));
     req.fixed[0].bytes -= 1;
     assert!(matches!(solve_with_marks(&req, legacy, 1, &parts),
         Err(PlacementError::Inventory(_)) | Err(PlacementError::PrefixMarks { .. })));
