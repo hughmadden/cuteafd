@@ -298,14 +298,17 @@ pub(super) fn conservative_grouping(loaded: cuteafd_transport::worker_selection:
 }
 
 #[derive(Default)]
-struct ExpertGroupBytes { resident: usize, scratch: usize, transient: usize }
+struct ExpertGroupBytes { resident: usize, scratch: usize, host: usize, pinned: usize }
 impl ExpertGroupBytes {
-    fn add(&mut self, layer_bytes: usize, layers: usize, scratch: usize, transient: usize) -> Result<()> {
+    fn add(&mut self, layer_bytes: usize, layers: usize, scratch: usize) -> Result<()> {
         self.resident = self.resident.checked_add(layer_bytes.checked_mul(layers)
             .context("expert resident overflow")?).context("expert resident sum overflow")?;
         self.scratch = self.scratch.checked_add(scratch.max(256)).context("expert scratch sum overflow")?;
-        self.transient = self.transient.max(transient);
         Ok(())
+    }
+    fn load(&mut self, load: cuteafd_loader::formats::fp8_experts::Fp8LayerLoad) {
+        self.host = self.host.max(load.host);
+        self.pinned = self.pinned.max(load.pinned);
     }
     fn permanent(&self) -> Result<usize> {
         self.resident.checked_add(self.scratch).context("expert permanent overflow")
@@ -442,13 +445,37 @@ mod admission_tests {
     #[test]
     fn group_admission_sums_retained_storage_but_maxes_load_transients() {
         let mut bytes = super::ExpertGroupBytes::default();
-        bytes.add(1000, 3, 100, 2000).unwrap();
-        bytes.add(2000, 2, 500, 1500).unwrap();
+        use cuteafd_loader::formats::fp8_experts::Fp8LayerLoad;
+        bytes.add(1000, 3, 100).unwrap();
+        bytes.load(Fp8LayerLoad { resident: 1000, host: 2000, pinned: 1000 });
+        bytes.add(2000, 2, 500).unwrap();
+        bytes.load(Fp8LayerLoad { resident: 2000, host: 1500, pinned: 2000 });
         assert_eq!(bytes.resident, 7000);
         assert_eq!(bytes.scratch, 756);
-        assert_eq!(bytes.transient, 2000);
+        assert_eq!((bytes.host, bytes.pinned), (2000, 2000));
         assert_eq!(bytes.permanent().unwrap(), 7756);
-        assert!(bytes.add(usize::MAX, 2, 0, 0).is_err());
+        assert!(bytes.add(usize::MAX, 2, 0).is_err());
+    }
+
+    #[test]
+    fn step5_mixed_load_projection_owners_fit_unchanged_100_gib_budget() {
+        use cuteafd_loader::formats::fp8_experts::Fp8LayerLoad;
+        let mut bytes = super::ExpertGroupBytes::default();
+        // The rejected max-card receipt: remove only its old fictitious load
+        // transient and retain the identical native resident/scratch owners.
+        let permanent = 100_826_826_752usize;
+        bytes.load(Fp8LayerLoad { resident: 1_107_566_592,
+            host: 469_860_352, pinned: 369_098_752 });
+        bytes.load(Fp8LayerLoad { resident: 2_214_592_512,
+            host: 738_197_504, pinned: 738_197_504 });
+        let headroom = cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES as usize;
+        let peak = permanent + bytes.host + bytes.pinned + headroom;
+        assert_eq!(peak, 104_987_576_320);
+        assert!(peak < 100 << 30);
+        // The pinned owner from the larger group must survive even if a later
+        // group has smaller host buffers.
+        bytes.load(Fp8LayerLoad { resident: 10, host: 1, pinned: 2 });
+        assert_eq!((bytes.host, bytes.pinned), (738_197_504, 738_197_504));
     }
 }
 
@@ -489,24 +516,26 @@ pub(super) fn load_fp8<'a>(
     let mut totals = ExpertGroupBytes::default();
     let mut budgets = Vec::with_capacity(groups.len());
     for group in &groups {
-        let bytes = crate::shared::experts::fp8::Fp8Layer::bytes_for(&group.tensors,
-            config.world, config.rank, group.slicing)?;
-        let reader = bytes.checked_mul(config.world).and_then(|n| n.checked_mul(16))
-            .context("expert reader scratch overflow")?.div_ceil(group.tensors.shape().experts);
-        let transient = bytes.checked_mul(2).and_then(|n| n.checked_add(reader))
-            .context("expert host staging overflow")?;
-        totals.add(bytes, group.layers.len(), group.scratch, transient)?;
-        budgets.push(bytes.checked_mul(group.layers.len()).and_then(|n| n.checked_add(group.scratch))
-            .context("expert group budget overflow")?);
+        let mut resident = 0usize;
+        for &layer in &group.layers {
+            let tensors = group.tensors.for_layer_metadata(layer)?;
+            let load = tensors.layer_load(layer, config.world, config.rank, group.slicing)?;
+            resident = resident.checked_add(load.resident).context("expert group resident overflow")?;
+            totals.load(load);
+        }
+        // Upload staging survives projection/group boundaries until the worker
+        // releases it before execution arenas are allocated.
+        totals.add(resident, 1, group.scratch)?;
+        budgets.push(resident.checked_add(group.scratch).context("expert group budget overflow")?);
     }
     let permanent = totals.permanent()?;
-    let peak = spark_admission_budget(config, permanent, 0, totals.transient, 0, workspace)?;
+    let peak = spark_admission_budget(config, permanent, 0, totals.pinned, totals.host, workspace)?;
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "native expert groups exceed budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
     tracing::info!(groups = groups.len(), resident = totals.resident, scratch = totals.scratch,
-        transient = totals.transient, workspace, "native expert groups admitted before allocation");
+        host = totals.host, pinned = totals.pinned, workspace, "native expert groups admitted before allocation");
     let mut owners = Vec::with_capacity(groups.len());
     for (group, budget) in groups.into_iter().zip(budgets) {
         owners.push(Rc::new(Fp8Experts::load_with_modules(library, &group.tensors, &group.directory,

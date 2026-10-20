@@ -83,7 +83,7 @@ fn installed_variants(module: &Fp8MoeModule)
 }
 
 /// Parallel readers per layer load.
-const READERS: usize = 16;
+const READERS: usize = cuteafd_loader::formats::fp8_experts::FP8_LOAD_READERS;
 
 fn validate_layer_ids(layers: &[usize]) -> Result<()> {
     ensure!(layers.windows(2).all(|pair| pair[0] < pair[1]),
@@ -242,8 +242,9 @@ impl<'a> Fp8Layer<'a> {
         let mut gate_inputs = Vec::new();
         for projection in Fp8Projection::ALL {
             let (w_bytes, s_bytes) = tensors.slice_bytes_with(projection, tp, rank, slicing)?;
-            let mut weights = vec![0u8; experts * w_bytes];
-            let mut scales = vec![0u8; tensors.scale_region_bytes_with(projection, tp, rank, slicing)?];
+            let load = tensors.projection_load(layer, projection, tp, rank, slicing)?;
+            let mut weights = vec![0u8; load.weights];
+            let mut scales = vec![0u8; load.scales];
             // NVFP4: the experts' FP32 alphas, then their input scales, follow the scale grids.
             let (grids, scalars) = scales.split_at_mut(experts * s_bytes);
             let nvfp4 = !scalars.is_empty();
@@ -260,7 +261,7 @@ impl<'a> Fp8Layer<'a> {
             let per = jobs.len().div_ceil(READERS);
             std::thread::scope(|scope| -> Result<()> {
                 let handles: Vec<_> = jobs.chunks_mut(per).map(|chunk| scope.spawn(move || -> Result<()> {
-                    let mut staging = Vec::new();
+                    let mut staging = Vec::with_capacity(load.reader_staging);
                     for (expert, w, s, (alpha, input)) in chunk.iter_mut() {
                         tensors.read_slice_with(layer, *expert, projection, tp, rank, slicing, w, s, &mut staging)?;
                         if nvfp4 {
