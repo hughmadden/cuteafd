@@ -721,6 +721,7 @@ pub(crate) struct DflashDrafter<'a> {
     /// The mask token's embedding row.
     mask_row: Vec<u8>,
     workspace: RefCell<Option<Workspace<'a>>>,
+    startup_primed: Cell<bool>,
     representation: GlmDraftRepresentation,
     fp8_workspace: Option<Dev<'a>>,
     /// How the borrowed BF16 head runs past one draft block ([`DraftHead`]; GLM 5.3
@@ -1008,6 +1009,7 @@ impl<'a> DflashDrafter<'a> {
             }),
             mask_row,
             workspace: RefCell::new(None),
+            startup_primed: Cell::new(false),
             representation,
             confidence_directory: snapshot.into(),
             confidence_scales: scales,
@@ -1111,7 +1113,7 @@ impl<'a> DflashDrafter<'a> {
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaDraftCacheState::new(layout.cache().clone())?),
                 layout, slots: owners.take("context_slots")? }),
-            mask_row: Vec::new(), workspace: RefCell::new(Some(workspace)), representation,
+            mask_row: Vec::new(), workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
             confidence_directory: snapshot.into(), confidence_scales: scales,
@@ -1379,23 +1381,39 @@ impl<'a> DflashDrafter<'a> {
             bytes, self.stream) }
     }
 
-    /// Explicit serving startup admission; other callers retain lazy allocation.
+    /// Shared startup path for every serving DFlash family; diagnostics may
+    /// still allocate their GQA workspace lazily. Priming never borrows a target.
     pub(crate) fn prepare_workspace(&self) -> Result<()> {
+        self.prime_remote()
+    }
+
+    /// Prime common and typed attention compute before any bridge wait. Only
+    /// startup uses zero inputs/logits; all cache bindings return to cold state.
+    pub(crate) fn prime_remote(&self) -> Result<()> {
+        if self.startup_primed.get() { return Ok(()); }
+        let result = self.prime_isolated();
+        if result.is_err() {
+            // SAFETY: startup still owns all operands; no bridge waits have been published.
+            if unsafe { self.library.cuda_stream_synchronize(self.stream) }.is_err() {
+                self.library.quarantine_module_after_failed_drain();
+            }
+        }
+        result
+    }
+
+    fn prime_isolated(&self) -> Result<()> {
         if self.workspace.borrow().is_none() {
             ensure!(matches!(self.context, DraftContext::Gqa(_)), "MLA draft lost its admitted workspace");
             *self.workspace.borrow_mut() = Some(self.workspace(self.max_sequences)?);
         }
-        Ok(())
-    }
-
-    /// Prime remote compute in isolation, before either device can queue a
-    /// bridge wait. Startup-only zero inputs/logits never use a private target
-    /// embedding or head, and the context rings return to their cold state.
-    pub(crate) fn prime_remote(&self) -> Result<()> {
-        self.prepare_workspace()?;
+        self.prime_metadata()?;
+        if matches!(self.context, DraftContext::Mla(_)) { self.reset_context(0, 0)?; }
         self.library.cuda_zero_bytes(self.taps.buffer, self.taps.buffer.bytes)?;
         self.update(&(0..TAP_ROWS).map(|tap_row| ContextRow { tap_row, slot: 0,
             position: tap_row }).collect::<Vec<_>>())?;
+        if matches!(self.context, DraftContext::Mla(_)) {
+            for slot in 0..self.slots { self.reset_context(slot, TAP_ROWS)?; }
+        }
         // SAFETY: this drafter owns its live startup stream.
         unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
         let input = |_: &[u32], out: CuteafdDeviceBuffer, stream: *mut c_void| {
@@ -1414,12 +1432,41 @@ impl<'a> DflashDrafter<'a> {
             self.draft_device_with(&sequences, &input, TargetHead::Launch(Box::new(head)))?;
         }
         for layer in &self.layers {
-            let layer = layer.attention.gqa()?;
-            for ring in [&layer.k_ring, &layer.v_ring] {
-                self.library.cuda_zero_bytes(ring.buffer, ring.buffer.bytes)?;
+            if let DraftAttention::Gqa(layer) = &layer.attention {
+                for ring in [&layer.k_ring, &layer.v_ring] {
+                    self.library.cuda_zero_bytes(ring.buffer, ring.buffer.bytes)?;
+                }
             }
         }
+        for slot in 0..self.slots { self.discard_context(slot)?; }
+        self.startup_primed.set(true);
         Ok(())
+    }
+
+    fn prime_metadata(&self) -> Result<()> {
+        let workspace = self.workspace.borrow();
+        let w = workspace.as_ref().context("DFlash startup workspace missing")?;
+        let mut buffers = vec![&self.context_positions, &w.positions, &w.anchors, &w.ids];
+        match (&self.context, &w.attention) {
+            (DraftContext::Gqa(context), AttentionWorkspace::Gqa(attention)) => {
+                buffers.extend([&context.slots, &attention.tables]);
+            }
+            (DraftContext::Mla(context), AttentionWorkspace::Mla(attention)) => {
+                buffers.extend([&context.slots, &attention.positions, &attention.slots,
+                    &attention.lengths, &attention.query_offsets]);
+                for layer in &self.layers {
+                    let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA startup layer mismatch") };
+                    buffers.push(&layer.page_table);
+                }
+            }
+            _ => anyhow::bail!("DFlash startup context/workspace mismatch"),
+        }
+        for buffer in buffers {
+            // Startup reserves each full pinned entry: ordered copy fence, not a compute drain.
+            self.put(buffer, &vec![0; buffer.buffer.bytes])?;
+        }
+        // SAFETY: startup owns every destination and its stream; no peer waits exist yet.
+        unsafe { self.library.cuda_stream_synchronize(self.stream) }
     }
 
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {

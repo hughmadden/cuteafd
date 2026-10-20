@@ -471,6 +471,15 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert "0..TAP_ROWS" in isolated and "1..=self.max_sequences" in isolated
     assert "self.draft_device_with(" in isolated
     assert isolated.index("self.draft_device_with(") < isolated.index("for ring in")
+    assert "DraftAttention::Gqa(layer)" in isolated and "self.discard_context(slot)?" in isolated
+    assert "buffers.push(&layer.page_table)" in isolated
+    assert "&attention.lengths, &attention.query_offsets" in isolated
+    head_trip = bridge.split("    pub fn round_trip_head(", 1)[1].split("\n}\n", 1)[0]
+    assert "head_route(self.head_rank," in head_trip
+    route = bridge.split("fn head_route(", 1)[1].split("impl<'a> Prepared", 1)[0]
+    assert route.index("if rank == 1 { return head(true); }") < route.index("send_hidden()?")
+    assert "head(hidden, logits, self.stream.raw)" in head_trip
+    assert "head(target_hidden.cast_const(), target_logits.cast_mut(), self.exchange.stream(0))" in head_trip
     startup = (family / "mod.rs").read_text().split("    pub fn with_engine<", 1)[1]
     assert startup.index("draft.prime(&engine.embedding, engine.draft_head())?") < startup.index("let result = with_startup_graphs(")
 

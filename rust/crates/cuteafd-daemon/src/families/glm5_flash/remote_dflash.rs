@@ -49,6 +49,8 @@ impl<'a> RemoteDflash<'a> {
         let inventory = cuteafd_loader::placement::families::glm5_flash::remote_dflash_bridge_demands(
             c.hidden as u64, c.vocab as u64, c.taps.len() as u64, rows as u64)?;
         let bridge = RemoteBridge::new(prepared);
+        ensure!(bridge.head_rank() == 0 && bridge.head_device() == bridge.target_device(),
+            "GLM Flash target head must remain on its owning rank 0");
         let device = Device { library, id: bridge.target_device() };
         let target = device.own(|| {
             let _scope = cuteafd_ffi::memory_ledger::scope("drafter/bridge");
@@ -92,22 +94,25 @@ impl<'a> RemoteDflash<'a> {
     }
 
     fn launch_head(&self, head: &TargetHead<'_>, rows: usize, serving: bool) -> Result<()> {
+        self.launch_head_at(head, self.target.hidden.buffer.ptr.cast_const(),
+            self.target.logits.buffer.ptr, rows, serving, self.bridge.exchange.stream(0))
+    }
+
+    fn launch_head_at(&self, head: &TargetHead<'_>, hidden: *const c_void, logits: *mut c_void,
+        rows: usize, serving: bool, stream: *mut c_void) -> Result<()> {
         self.target.device.run(|| match head {
             TargetHead::Bf16(weight) if serving => {
                 // SAFETY: target-owned weight and admitted scratch stay live on this stream.
                 unsafe { crate::shared::draft::launch_bf16_head(&self.target.head,
-                    self.target.hidden.buffer.ptr.cast(), weight.buffer.ptr.cast(),
-                    self.target.logits.buffer.ptr.cast(), rows, self.bridge.exchange.stream(0)) }
+                    hidden.cast(), weight.buffer.ptr.cast(), logits.cast(), rows, stream) }
             }
             TargetHead::Bf16(weight) => {
                 // SAFETY: target head and admitted operands share the target stream.
                 unsafe { crate::shared::speculation::dflash::launch_draft_head(self.draft.device.library,
-                    &self.target.head, self.target.hidden.buffer.ptr.cast_const(), weight.buffer.ptr.cast_const(),
-                    self.target.logits.buffer.ptr.cast(), rows, self.draft.cfg.hidden, self.draft.cfg.vocab,
-                    self.bridge.exchange.stream(0), self.draft.draft_head_mode()) }
+                    &self.target.head, hidden, weight.buffer.ptr.cast_const(), logits.cast(), rows,
+                    self.draft.cfg.hidden, self.draft.cfg.vocab, stream, self.draft.draft_head_mode()) }
             }
-            TargetHead::Launch(launch) => launch(self.target.hidden.buffer.ptr.cast_const(),
-                self.target.logits.buffer.ptr.cast(), rows, self.bridge.exchange.stream(0)),
+            TargetHead::Launch(launch) => launch(hidden, logits.cast(), rows, stream),
         })
     }
 
@@ -208,7 +213,8 @@ impl<'a> RemoteDflash<'a> {
             let launch = |hidden: *const c_void, logits: *mut f32, rows: usize, stream: *mut c_void| {
                 ensure!(stream == self.bridge.stream.raw && rows <= self.rows, "remote draft head capacity/stream");
                 self.bridge.round_trip_head(hidden, self.target.hidden.buffer.ptr,
-                    rows * self.draft.cfg.hidden * 2, || self.launch_head(&head, rows, serving),
+                    rows * self.draft.cfg.hidden * 2,
+                    |hidden, logits, stream| self.launch_head_at(&head, hidden, logits, rows, serving, stream),
                     self.target.logits.buffer.ptr.cast_const(), logits.cast(), rows * self.draft.cfg.vocab * 4)
             };
             self.draft.device.run(|| self.draft.draft_device_with(sequences, &input,
@@ -285,7 +291,7 @@ mod tests {
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
             let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw },
-                RankDevice { device: 1, stream: peer_target.raw }, IDENTITY)?;
+                RankDevice { device: 1, stream: peer_target.raw }, 0, IDENTITY)?;
             let local = DflashDrafter::load(&library, &draft_path, file.clone(), lead.raw, 4, 4,
                 mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8)?;
             let draft_device = prepared.stream.device;
