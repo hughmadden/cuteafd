@@ -10,6 +10,37 @@ mtp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mtp)
 
 
+def test_mtp_shared_arena_target_history_and_logits_retire_before_prefill_draft():
+    root = PATH.parents[4]
+    backend = (root / "rust/crates/cuteafd-daemon/src/families/step5/backend.rs").read_text()
+    scheduler = (root / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
+
+    def ordered(source, *events):
+        cursor = 0
+        for event in events:
+            cursor = source.index(event, cursor) + len(event)
+
+    execute = backend.split("    fn execute(", 1)[1].split("    fn immediate(", 1)[0]
+    ordered(execute, "self.execution.enqueue(", "self.execution.terminal_output()?",
+            "cache.request_component(history, sequence.sequence)?",
+            "super::mtp::slice(output,", "cuda_f32_to_bf16_async(source, destination,",
+            "head.device_logits_on(output, meta.rows, meta.stream)", "Ok((step, logits))")
+    immediate = backend.split("    fn immediate(", 1)[1].split("impl Drop", 1)[0]
+    ordered(immediate, "self.execute(", "step.publish_wave(&mut accepted)?", "Ok(logits)")
+    prefill = backend.split("    fn prefill_device(", 1)[1].split("    fn verify_device(", 1)[0]
+    ordered(prefill, "self.immediate(", "return Ok(None)", "Ok(Some(logits))")
+    draft = backend.split("    fn prefill_draft(", 1)[1].split("    fn draft(", 1)[0]
+    assert "mtp.prefill(" in draft
+
+    # These consumers must remain in the final-chunk branch before the hook that
+    # aliases target scratch, including retained prompt/probe rows and selection.
+    chunk = scheduler.split("let finished = prefills.round(|p|", 1)[1].split("p.done += chunk.len();", 1)[0]
+    ordered(chunk, "engine.prefill_device(", "if end == p.tokens.len() {",
+            "p.prompt_row = Some(logits.row_host(", "probe::device_rows(",
+            "selector.select(&logits, &batch)?", "p.first = Some(take(",
+            "if neural && !probe::no_speculation(", "engine.prefill_draft(")
+
+
 def test_mtp_semantics_provenance_is_complete_and_fail_closed(tmp_path):
     assert mtp.VLLM_COMMIT == "dde9aca41cd3ccceb1ffa902933b6678a09c83ce"
     assert set(mtp.VLLM_SOURCES) == {"vllm/models/step5/nvidia/mtp.py",
