@@ -1,6 +1,7 @@
 //! Bounded direct reads of packed EXL3 tensors, retaining complete H128 blocks.
 use crate::{OfficialV41Catalog, V41Exl3Projection, V41Exl3ProjectionKind};
 use anyhow::{ensure, Context, Result};
+#[cfg(test)]
 use std::{fs::File, os::unix::fs::FileExt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +105,7 @@ fn tensor_gather(p: &V41Exl3Projection, suffix: &str,
     Ok(V41Exl3TensorGather { rows, source_row_bytes, columns, selected_row_bytes })
 }
 
-fn read_gather(file: &File, offset: u64, gather: &V41Exl3TensorGather,
+fn read_gather(file: &impl crate::expert_reader::PositionedRead, offset: u64, gather: &V41Exl3TensorGather,
     dst: &mut [u8], scratch: &mut [u8]) -> Result<()> {
     ensure!(dst.len() >= gather.bytes() && scratch.len() >= gather.scratch_bytes(),
         "EXL3 gather staging or scratch too small");
@@ -199,7 +200,7 @@ impl OfficialV41Catalog {
         dst: &mut [u8], scratch: &mut [u8]) -> Result<usize> {
         let gather = self.exl3_tensor_gather(name, map, expert)?;
         let tensor = self.tensor(name)?;
-        let file = File::open(self.snapshot().join(&tensor.shard))?;
+        let file = self.shard_file(&tensor.shard)?;
         read_gather(&file, tensor.metadata.byte_offset, &gather, dst, scratch)?;
         Ok(gather.bytes())
     }
@@ -243,14 +244,14 @@ impl OfficialV41Catalog {
             "EXL3 read scratch too small"
         );
         let tensor = self.tensor(name)?;
-        let file = File::open(self.snapshot().join(&tensor.shard))?;
+        let file = self.shard_file(&tensor.shard)?;
         read_slice(&file, tensor.metadata.byte_offset, slice, dst, scratch)?;
         Ok(slice.bytes())
     }
 }
 
 fn read_slice(
-    file: &File,
+    file: &impl crate::expert_reader::PositionedRead,
     offset: u64,
     slice: V41Exl3TensorSlice,
     dst: &mut [u8],
@@ -362,7 +363,10 @@ mod tests {
     fn gathered_h128_units_preserve_source_bytes_and_reconstruct_every_projection() -> Result<()> {
         use cuteafd_core::tp_units::RankUnits;
         let dir = tempfile::tempdir()?;
-        let file = File::options().create_new(true).read(true).write(true).open(dir.path().join("gather"))?;
+        let path = dir.path().join("gather");
+        let file = File::options().create_new(true).read(true).write(true).open(&path)?;
+        let reader = crate::expert_reader::ExpertReader::default();
+        let cached = reader.open(&path)?;
         let offset = (1u64 << 31) + 64;
         for intermediate in [2048, 2304] {
             for world in [2, 3, 4, 6] {
@@ -383,7 +387,12 @@ mod tests {
                                     let map = RankUnits::new(rule, 4, intermediate, 128, layer, world, rank)?;
                                     let gather = tensor_gather(&projection, suffix, &map, 3)?;
                                     let mut got = vec![0xa5; gather.bytes()];
-                                    read_gather(&file, offset, &gather, &mut got, &mut vec![0; gather.scratch_bytes() * 3])?;
+                                    read_gather(&cached, offset, &gather, &mut got,
+                                        &mut vec![0; crate::EXPERT_READ_WINDOW_BYTES.max(gather.scratch_bytes())])?;
+                                    let mut legacy = vec![0; gather.bytes()];
+                                    read_gather(&file, offset, &gather, &mut legacy,
+                                        &mut vec![0; gather.scratch_bytes() * 3])?;
+                                    assert_eq!(got, legacy);
                                     let mut cursor = 0;
                                     for row in 0..gather.rows {
                                         for range in &gather.columns {
@@ -410,6 +419,35 @@ mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fabric_windows_match_legacy_glm_k4_rows_for_all_six_ranks() -> Result<()> {
+        use cuteafd_core::tp_units::RankUnits;
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("trellis");
+        let file = File::options().create_new(true).write(true).read(true).open(&path)?;
+        let p = V41Exl3Projection { name: "test".into(), kind: V41Exl3ProjectionKind::Gate,
+            bits: 4, input_features: 6144, output_features: 2048 };
+        let payload: Vec<u8> = (0..p.trellis_bytes()).map(|i| (i * 31 + i / 251) as u8).collect();
+        let offset = (1u64 << 31) + 128;
+        file.write_all_at(&payload, offset)?;
+        let reader = crate::expert_reader::ExpertReader::default();
+        let cached = reader.open(&path)?;
+        for rank in 0..6 {
+            let map = RankUnits::new(cuteafd_core::tp_units::balanced_rule(128, 16, 6),
+                4, 2048, 128, 3, 6, rank)?;
+            let gather = tensor_gather(&p, "trellis", &map, 3)?;
+            let mut old = vec![0; gather.bytes()];
+            let mut new = vec![0; gather.bytes()];
+            read_gather(&file, offset, &gather, &mut old, &mut vec![0; gather.scratch_bytes() * 64])?;
+            let (_, bytes) = OfficialV41Catalog::count_storage_reads(|| {
+                read_gather(&cached, offset, &gather, &mut new, &mut vec![0; crate::EXPERT_READ_WINDOW_BYTES])
+            })?;
+            assert_eq!(old, new, "rank {rank}");
+            assert_eq!(bytes, payload.len(), "I/O pool must preserve caller byte accounting");
         }
         Ok(())
     }

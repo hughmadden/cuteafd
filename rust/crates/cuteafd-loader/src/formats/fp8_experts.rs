@@ -37,6 +37,7 @@ use crate::families::deepseek_v41::v41_catalog::RoutedExpertShape;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -127,6 +128,7 @@ fn input_scale_name(weight: &str) -> String {
 /// Where every routed FP8 expert tensor lives in the snapshot.
 #[derive(Debug, Clone)]
 pub struct Fp8ExpertTensors {
+    reader: Arc<crate::expert_reader::ExpertReader>,
     snapshot: PathBuf,
     shape: RoutedExpertShape,
     /// `model.` or `model.language_model.`: where the decoder layers live.
@@ -238,6 +240,12 @@ fn stacked_projection<'a>(name: &'a str, prefix: &str) -> Option<(usize, Fp8Proj
 }
 
 impl Fp8ExpertTensors {
+    pub(crate) fn shard_file(&self, shard: &str) -> std::io::Result<crate::expert_reader::ShardFile> {
+        self.reader.open(&self.snapshot.join(shard))
+    }
+
+    pub(crate) fn finish_reads(&self) { self.reader.clear(); }
+
     pub fn name(&self, layer: usize, expert: usize, projection: Fp8Projection) -> String {
         if self.mtp_layers && layer >= self.shape.layers {
             let stage = layer - self.shape.layers;
@@ -331,7 +339,7 @@ impl Fp8ExpertTensors {
             }
             _ => Vec::new(),
         };
-        let mut catalog = Self { snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers,
+        let mut catalog = Self { reader: Default::default(), snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers,
             format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), activations,
             slice_layer: first_selected_layer(shape, layers), coordinator: false };
         let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
@@ -763,7 +771,7 @@ impl Fp8ExpertTensors {
         let located = self.located(name)?;
         ensure!(located.dtype == DType::F32 && located.bytes == 4, "{name}: expected one FP32 value");
         let mut bytes = [0u8; 4];
-        std::fs::File::open(self.snapshot.join(&located.shard))?.read_exact_at(&mut bytes, located.offset)
+        self.reader.open(&self.snapshot.join(&located.shard))?.read_exact_at(&mut bytes, located.offset)
             .with_context(|| format!("reading {name}"))?;
         Ok(bytes)
     }
@@ -791,13 +799,13 @@ impl Fp8ExpertTensors {
         ensure!((weight.len(), scale.len()) == sizes, "{name}: shared projection buffers have the wrong size");
         let w = self.located(&name)?;
         if self.format == ExpertFormat::Bf16 {
-            std::fs::File::open(self.snapshot.join(&w.shard))?.read_exact_at(weight, w.offset)?;
+            self.reader.open(&self.snapshot.join(&w.shard))?.read_exact_at(weight, w.offset)?;
             return Ok(weight.len());
         }
         let suffix = if self.format.packed_fp4() { "_scale" } else { "_scale_inv" };
         let s = self.located(&format!("{name}{suffix}"))?;
         let read = |located: &Located, out: &mut [u8]| -> Result<()> {
-            std::fs::File::open(self.snapshot.join(&located.shard))?.read_exact_at(out, located.offset)
+            self.reader.open(&self.snapshot.join(&located.shard))?.read_exact_at(out, located.offset)
                 .with_context(|| format!("reading shared projection {name}"))
         };
         read(w, weight)?;
@@ -862,7 +870,7 @@ impl Fp8ExpertTensors {
         let (first, len) = self.rank_range_with(tp, rank, slicing)?;
         let w = self.located(name)?;
         let s = self.located(&format!("{name}_scale"))?;
-        let open = |shard: &str| std::fs::File::open(self.snapshot.join(shard));
+        let open = |shard: &str| self.reader.open(&self.snapshot.join(shard));
         let (w_file, s_file) = (open(&w.shard)?, open(&s.shard)?);
         weight.fill(0);
         scale.fill(0);
@@ -910,7 +918,7 @@ impl Fp8ExpertTensors {
         ensure!(weight.len() == weight_bytes && scale.len() == scale_bytes, "{name}: slice buffers of the wrong size");
         if self.format == ExpertFormat::Bf16 {
             let w = self.located(&name)?;
-            let file = std::fs::File::open(self.snapshot.join(&w.shard))?;
+            let file = self.reader.open(&self.snapshot.join(&w.shard))?;
             let (first, len) = self.rank_range_with(tp, rank, slicing)?;
             weight.fill(0);
             if projection == Fp8Projection::Down {
@@ -930,7 +938,7 @@ impl Fp8ExpertTensors {
         }
         let w = self.located(&name)?;
         let s = self.located(&format!("{name}_scale_inv"))?;
-        let open = |shard: &str| std::fs::File::open(self.snapshot.join(shard));
+        let open = |shard: &str| self.reader.open(&self.snapshot.join(shard));
         let (w_file, s_file) = (open(&w.shard)?, open(&s.shard)?);
         let (first, len) = self.rank_range_with(tp, rank, slicing)?;
         let (scale_rows, scale_cols) = (rows.div_ceil(128), cols.div_ceil(128));
@@ -990,7 +998,7 @@ mod tests {
     fn catalog(format: ExpertFormat, intermediate: usize) -> Fp8ExpertTensors {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
             draft_stages: 0, draft_experts: 0 };
-        Fp8ExpertTensors { snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, format,
+        Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, format,
             tensors: Arc::new(HashMap::new()), activations: Vec::new(), slice_layer: 0, coordinator: false }
     }
 

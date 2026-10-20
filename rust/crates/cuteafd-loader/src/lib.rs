@@ -1,3 +1,5 @@
+mod expert_reader;
+pub use expert_reader::EXPERT_READ_WINDOW_BYTES;
 pub mod kda;
 pub mod families;
 pub mod media;
