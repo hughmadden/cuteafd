@@ -3651,6 +3651,15 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
             }
             low
         };
+        println!("{name}: mark_bytes_per_rank={:?}", geometry.ranks.iter().map(|r| r.retained_mark_bytes).collect::<Vec<_>>());
+        if id == "deepseek_v4" {
+            let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, stages)?;
+            let heads = capacity::deepseek_v4_cache_geometry(&cfg, 2, 4096, stages)?;
+            let bytes: u64 = heads.ranks.iter().map(|rank| rank.retained_mark_bytes).sum();
+            let slots = mark_slots_with_host(concurrency, entries, bytes, budget, false);
+            println!("{name}: TP2 Heads host-off follow-up: slots={slots}->2 requires multi-replica host restore; freed_GiB_per_GPU={:?}",
+                heads.ranks.iter().map(|rank| (slots - 2) as f64 * rank.retained_mark_bytes as f64 / gib).collect::<Vec<_>>());
+        }
         let rank_marks = geometry.ranks.iter().map(|r| format!("{:.3}", r.retained_mark_bytes as f64 / (1 << 20) as f64)).collect::<Vec<_>>().join("/");
         println!("| {name} | {attention} | {concurrency} | {context} | {rank_marks} | {old_slots}/{new_slots} | {:.3}/{:.3} | {gain} | {:.3}/{:.3} | {}/{} | {}/{} |",
             (mark * old_slots) as f64 / gib, (mark * new_slots) as f64 / gib, old_quota as f64 / gib, new_quota as f64 / gib,
