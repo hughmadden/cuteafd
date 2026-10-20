@@ -583,6 +583,9 @@ pub(super) fn load_exl3<'a>(
     let pinned = plans.iter().map(|p| p.pinned_host_bytes).max().unwrap_or(0);
     let scratch = plans.iter().map(|p| p.read_scratch_bytes).max().unwrap_or(0);
     let peak = spark_admission_budget(config, resident, staging, pinned, scratch, workspace)?;
+    tracing::info!(rank=config.rank, resident_bytes=resident, device_staging_bytes=staging,
+        pinned_host_bytes=pinned, read_scratch_bytes=scratch, load_peak_bytes=peak.load_peak,
+        serve_peak_bytes=peak.serve_peak, "EXL3 Spark admitted loader peak");
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
     let mut remaining = config.device_budget;
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, layer| {

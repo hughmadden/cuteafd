@@ -299,6 +299,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         load_weights(&library, &catalog, &config, &mut modules)
     };
+    catalog.finish_expert_reads();
     let (weights, remaining) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {

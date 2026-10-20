@@ -227,7 +227,7 @@ impl V41Nvfp4Staging<'_> {
                 _ => tensor.metadata.byte_length.max(range.len() as u64),
             };
             let _ = slot;
-            let file = std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?;
+            let file = self.catalog.shard_file(&tensor.shard)?;
             let status = unsafe {
                 libc::posix_fadvise(
                     file.as_raw_fd(),
@@ -259,9 +259,8 @@ impl V41Nvfp4Staging<'_> {
         );
         for (slot, (name, range)) in self.names.iter().zip(&self.ranges).enumerate() {
             if slot >= 6 || matches!(self.selection, V41ExpertSelection::BackboneFull { .. }) {
-                use std::os::unix::fs::FileExt;
                 let tensor = self.catalog.tensor(name)?;
-                std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?
+                self.catalog.shard_file(&tensor.shard)?
                     .read_exact_at(&mut staging[range.clone()], tensor.metadata.byte_offset)
                     .with_context(|| format!("staging NVFP4 tensor {name}"))?;
             } else if let V41ExpertSelection::BackboneTp { world, rank, .. } = self.selection {

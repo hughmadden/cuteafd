@@ -138,7 +138,8 @@ impl<'a> Nvfp4Side<'a> {
             read_scratch_bytes: staging
                 .minimum_read_scratch_bytes()
                 .checked_mul(64 * EXPERT_READ_LANES)
-                .context("NVFP4 read scratch overflow")?,
+                .context("NVFP4 read scratch overflow")?
+                .max(cuteafd_loader::EXPERT_READ_WINDOW_BYTES * EXPERT_READ_LANES),
         })
     }
 

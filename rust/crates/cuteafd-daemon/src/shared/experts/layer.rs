@@ -340,7 +340,8 @@ impl<'a> ExpertWeights<'a> {
             read_scratch_bytes: first
                 .minimum_read_scratch_bytes()
                 .checked_mul(64 * EXPERT_READ_LANES)
-                .context("expert read scratch overflow")?,
+                .context("expert read scratch overflow")?
+                .max(cuteafd_loader::EXPERT_READ_WINDOW_BYTES * EXPERT_READ_LANES),
         };
         Ok((budget, sizes, info.logical_intermediate, experts))
     }
