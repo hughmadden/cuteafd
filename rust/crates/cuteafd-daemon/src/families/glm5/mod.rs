@@ -108,8 +108,7 @@ pub(crate) struct EngineArgs {
 
 fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving: bool) -> Result<()> {
     use cuteafd_loader::placement::{AttentionPlacement, Onboard};
-    ensure!(args.draft.is_none() && !args.skip_routed_experts,
-        "EXLR8 requires no drafter and real Spark experts");
+    ensure!(!args.skip_routed_experts, "EXLR8 requires real Spark experts");
     ensure!(matches!(args.rtx_expert_layers, Onboard::Auto | Onboard::Layers(0)),
         "EXLR8 requires no coordinator-local routed experts");
     let peers = args.peers.as_deref().context("EXLR8 requires Spark peers")?;
@@ -221,6 +220,9 @@ mod draft_cli_tests {
         let mut six = args.clone();
         six.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1".into());
         assert!(native_activation(&six, 3, 78, true).is_ok());
+        let mut drafting = args.clone();
+        drafting.draft = Some("/draft".into());
+        assert!(native_activation(&drafting, 3, 78, true).is_ok());
         for bad in 0..9 {
             let mut candidate = args.clone();
             match bad {
@@ -230,7 +232,7 @@ mod draft_cli_tests {
                 3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1,g:1".into()),
                 4 => candidate.layers = Some(4),
                 5 => candidate.attention_placement = "heads".into(),
-                6 => candidate.draft = Some("/draft".into()),
+                6 => candidate.exlr8_manifest = None,
                 7 => candidate.skip_routed_experts = true,
                 _ => candidate.rtx_expert_layers = cuteafd_loader::placement::Onboard::Layers(1),
             }
@@ -414,7 +416,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         None
     };
     if let Some(snapshot) = &args.draft {
-        dflash::check_snapshot_target_bf16_head(&args.snapshot,
+        dflash::check_snapshot_target_bf16_head(args.exlr8_dense_from.as_deref().unwrap_or(&args.snapshot),
             cfg.hidden, cfg.vocab_size, false)?;
         dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
     }

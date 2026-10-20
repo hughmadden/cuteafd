@@ -60,6 +60,23 @@ def exlr8_entry(manifest: str = "up1", **overrides: str) -> dict:
     return entry
 
 
+def test_exlr8_dflash2_reuses_glm_drafter_and_preserves_native_workers() -> None:
+    entry = exlr8_entry()
+    entry["set"]["SPECULATOR"] = "dflash2"
+    result = capture(ROOT, "exlr8-dflash2", release_entry=entry)
+    plan = result["plans"][0]
+    assert plan[plan.index("--speculator") + 1] == "dflash2"
+    assert "--drafter-snapshot" in plan
+    for run in result["containers"]:
+        command = parse_run(run["argv"])["command"]
+        if "serve-glm" in command:
+            assert "--draft" in command
+            assert "--exlr8-dense-from" in command
+        else:
+            assert "expertd-native" in command
+            assert "--draft" not in command
+
+
 @pytest.mark.parametrize("manifest", ["up1", "bit325"])
 def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: str) -> None:
     result = capture(ROOT, f"exlr8-{manifest}", release_entry=exlr8_entry(manifest))
@@ -120,7 +137,7 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
     ({"RTX_GPUS": "1"}, "heads attention"),
     ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
     ({"SPARK_COUNT": "7"}, "canonical Spark ranks"),
-    ({"SPECULATOR": "dflash2"}, "SPECULATOR=off"),
+    ({"SPECULATOR": "mtp"}, "SPECULATOR=off or dflash2"),
     ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),
     ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),
 ])
