@@ -192,7 +192,7 @@ pub enum Slicing {
 /// Use unequal native-unit slices only when every rank's width is packaged.
 /// An incomplete Spark tree or CUTEAFD_FP8_EXACT_SLICES=0 selects the legacy
 /// padded layout, except exact-even native splits need no width-specific package.
-/// NVFP4 always retains its kernel's H128-padded storage pitch.
+/// NVFP4 retains H128 storage padding unless its exact-even width needs none.
 /// The worker validates its width against the planner recipe
 /// before allocation; the coordinator package tree never defines Spark slicing.
 pub fn exact_layout_directory(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize,
@@ -205,7 +205,7 @@ fn exact_layout_directory_with(directory: &Path, tensors: &Fp8ExpertTensors, tp:
     rank: usize, enabled: bool) -> (PathBuf, Slicing) {
     if tp == 0 || rank >= tp { return (directory.to_path_buf(), Slicing::Padded); }
     let padded = (directory.to_path_buf(), tensors.slicing_for_directory(directory, tp));
-    if tensors.format() == ExpertFormat::Nvfp4 && !tensors.coordinator { return padded; }
+    if tensors.needs_nvfp4_padding(tp) { return padded; }
     if !enabled || tp < 2 { return padded; }
     let (Some(package), Some(layout)) = (directory.parent(), directory.file_name().and_then(|name| name.to_str()))
         else { return padded; };
@@ -403,6 +403,11 @@ impl Fp8ExpertTensors {
         Slicing::Blocks(if self.coordinator { 128 } else { self.block() })
     }
 
+    fn needs_nvfp4_padding(&self, tp: usize) -> bool {
+        self.format == ExpertFormat::Nvfp4 && !self.coordinator
+            && (tp == 0 || self.shape.intermediate == 0 || self.shape.intermediate % (128 * tp) != 0)
+    }
+
     pub fn unit_map(&self, tp: usize, rank: usize, slicing: Slicing) -> Result<cuteafd_core::tp_units::RankUnits> {
         let block = match slicing { Slicing::Blocks(g) => g, Slicing::Padded => self.block() };
         let rule = self.slice_rule(self.shape.intermediate / block, tp);
@@ -411,7 +416,7 @@ impl Fp8ExpertTensors {
     }
 
     pub fn slicing_for_directory(&self, directory: &Path, tp: usize) -> Slicing {
-        if self.format == ExpertFormat::Nvfp4 && !self.coordinator {
+        if self.needs_nvfp4_padding(tp) {
             Slicing::Padded
         } else if directory.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains("-w"))
             || (tp > 0 && self.shape.intermediate > 0 && self.shape.intermediate % (self.block() * tp) == 0) {
@@ -1596,7 +1601,7 @@ mod tests {
                                 let (directory, slicing) = exact_layout_directory_with(Path::new("tp"),
                                     &tensors, world, rank, true);
                                 assert_eq!(directory, Path::new("tp"));
-                                assert_eq!(slicing, Slicing::Padded);
+                                assert_eq!(slicing, recipe.slicing);
                                 let map = tensors.unit_map(world, rank, slicing)?;
                                 assert_eq!(map.unit_columns, 16);
                                 let live = tensors.rank_range(world, rank)?;
@@ -1662,7 +1667,7 @@ mod tests {
             ("mimof:fp8", ExpertFormat::Mxfp4), ("mimop:fp8", ExpertFormat::Mxfp4),
             ("glm:fp8", ExpertFormat::Fp8Block128), ("glmf:fp8", ExpertFormat::Fp8Block128),
             ("qwen4:fp8", ExpertFormat::Fp8Block128), ("step5:fp8", ExpertFormat::Fp8Block128),
-            ("step5:bf16", ExpertFormat::Bf16),
+            ("step5:bf16", ExpertFormat::Bf16), ("step5:nvfp4", ExpertFormat::Nvfp4),
             ("glm:nvfp4", ExpertFormat::Nvfp4), ("glm:nvfp4a4", ExpertFormat::Nvfp4),
             ("glmf:nvfp4", ExpertFormat::Nvfp4), ("glmf:nvfp4a4", ExpertFormat::Nvfp4),
             ("qwen4:nvfp4", ExpertFormat::Nvfp4), ("qwen4:nvfp4a4", ExpertFormat::Nvfp4),
@@ -1707,8 +1712,7 @@ mod tests {
             for tp in [2, 4] {
                 let directory = PathBuf::from(format!("tp{tp}"));
                 let slicing = tensors.slicing_for_directory(&directory, tp);
-                assert_eq!(slicing, if format == ExpertFormat::Nvfp4 { Slicing::Padded }
-                    else { Slicing::Blocks(tensors.block()) });
+                assert_eq!(slicing, Slicing::Blocks(tensors.block()));
                 for rank in 0..tp {
                     assert_eq!(tensors.rank_range_with(tp, rank, slicing)?, tensors.rank_range(tp, rank)?);
                     assert_eq!(tensors.rank_width(tp, rank, slicing)?, tensors.rank_width(tp, rank, Slicing::Padded)?);

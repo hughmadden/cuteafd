@@ -75,6 +75,18 @@ pub enum InstalledSparkRecipeRefusal {
 }
 
 impl SparkRecipe {
+    fn same_ownership(&self, other: &Self) -> bool {
+        let slicing_matches = self.slicing == other.slicing
+            || (matches!(self.slicing, crate::formats::fp8_experts::Slicing::Blocks(_))
+                && matches!(other.slicing, crate::formats::fp8_experts::Slicing::Blocks(_))
+                && self.rule == cuteafd_core::tp_units::UnitRule::Contiguous
+                && other.rule == cuteafd_core::tp_units::UnitRule::Contiguous);
+        // Different native scale units can describe the same exact contiguous
+        // source ranges in mixed-format layers; storage and packages must agree.
+        slicing_matches && self.widths == other.widths && self.rule == other.rule
+            && self.required_layouts == other.required_layouts
+    }
+
     pub fn rank_for_layer(&self, rank: usize, layer: usize) -> usize {
         if self.rule == cuteafd_core::tp_units::UnitRule::LayerRotation {
             (rank + self.widths.len() - layer % self.widths.len()) % self.widths.len()
@@ -184,7 +196,7 @@ pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize, lay
             .with_context(|| format!("Spark admission tensor {stem}: no package for {}", operand.label()))?;
         let recipe = spark_recipe(&contract.package, intermediate, world)
             .with_context(|| format!("Spark admission tensor {stem}"))?;
-        ensure!(selected.as_ref().is_none_or(|previous| previous == &recipe),
+        ensure!(selected.as_ref().is_none_or(|previous: &SparkRecipe| previous.same_ownership(&recipe)),
             "Spark admission tensor {stem}: routed formats require conflicting Spark recipes");
         selected = Some(recipe);
     }
@@ -236,7 +248,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     // rotate contiguous native-unit ranges by layer, retaining NVFP4 padding.
     let rule = if compact { cuteafd_core::tp_units::UnitRule::Rotated }
         else { cuteafd_core::tp_units::layer_rule(intermediate / block, world) };
-    let exact = exl3 || (!native && !nvfp4);
+    let exact = exl3 || (!native && (!nvfp4 || intermediate % (128 * world) == 0));
     let widths = if compact {
         vec![(intermediate / block).div_ceil(world) * block; world]
     } else if exact {
@@ -402,8 +414,9 @@ mod tests {
                     spark_recipe("step5:fp8", 1536, world).unwrap());
             } else { assert!(spark_recipe("step5:bf16", 1536, world).is_err()); }
             if matches!(world, 4 | 6) {
-                assert_eq!(spark_recipe("step5:nvfp4", 1536, world).unwrap(),
-                    spark_recipe("step5:fp8", 1536, world).unwrap());
+                let nvfp4 = spark_recipe("step5:nvfp4", 1536, world).unwrap();
+                assert_eq!(nvfp4.slicing, Slicing::Blocks(16));
+                assert!(nvfp4.same_ownership(&spark_recipe("step5:fp8", 1536, world).unwrap()));
             } else { assert!(spark_recipe("step5:nvfp4", 1536, world).is_err()); }
             for format in ["nvfp4a4", "mxfp4", "exl3-k34"] {
                 assert!(spark_recipe(&format!("step5:{format}"), 1536, world).is_err());
@@ -424,6 +437,31 @@ mod tests {
             }
             assert!(matches!(spark_recipe(package, 640, 5), Err(SparkRecipeRefusal::MissingPackage { .. })));
         }
+    }
+
+    #[test]
+    fn mixed_native_units_require_identical_exact_source_and_storage_ranges() {
+        use crate::formats::fp8_experts::Slicing;
+        use cuteafd_core::tp_units::UnitRule;
+        let nvfp4 = spark_recipe("step5:nvfp4", 1536, 6).unwrap();
+        let bf16 = spark_recipe("step5:bf16", 1536, 6).unwrap();
+        assert!(nvfp4.same_ownership(&bf16));
+        assert!(bf16.same_ownership(&nvfp4));
+        let mut incompatible = bf16.clone();
+        incompatible.slicing = Slicing::Padded;
+        assert!(!nvfp4.same_ownership(&incompatible));
+        incompatible = bf16.clone();
+        incompatible.widths[0] += 128;
+        assert!(!nvfp4.same_ownership(&incompatible));
+        incompatible = bf16.clone();
+        incompatible.rule = UnitRule::LayerRotation;
+        assert!(!nvfp4.same_ownership(&incompatible));
+        incompatible = bf16;
+        incompatible.required_layouts = vec!["tp6-w256".into()];
+        assert!(!nvfp4.same_ownership(&incompatible));
+        let qwen = spark_recipe("qwen4:nvfp4", 640, 2).unwrap();
+        assert_eq!(qwen.slicing, Slicing::Padded);
+        assert_eq!(qwen.widths, [384, 384]);
     }
 
     #[test]
@@ -494,7 +532,7 @@ mod tests {
             ("qwen4:fp8", 640, &[]),
             ("step5:fp8", 1536, &[4, 6]),
             ("step5:bf16", 1536, &[4, 6]),
-            ("step5:nvfp4", 1536, &[]),
+            ("step5:nvfp4", 1536, &[4, 6]),
             ("kimik3:exl3-k23", 3072, &[6]),
         ];
         // Spark ownership is independent of the number of coordinator GPUs.
