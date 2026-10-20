@@ -188,7 +188,7 @@ pub struct GlmInputs<'a> {
     pub gpus: Vec<(u64, Baseline)>,
     pub headroom_bytes: u64,
     pub spark_ranks: usize,
-    /// Native FP8 K32 ingress, BF16 partials and bounded per-GPU shared execution.
+    /// Native FP8 K32 ingress, BF16 partials and bounded per-step shared execution.
     pub native_experts: bool,
     pub native_workspace: u64,
     /// Coordinator-only diagnostics replace routed FFNs with zero intake planes.
@@ -252,11 +252,10 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         || inputs.prefill_rows == 0 || inputs.prefill_rows > 4096 || inputs.max_context == 0 {
         return Err(PlacementError::Inventory("GLM rank/lane/step/context geometry"));
     }
-    if inputs.native_experts && (inputs.prefill_lanes != 1
-        || inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
+    if inputs.native_experts && (inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
         || !inputs.experts.is_empty() || inputs.drafter_bytes != 0 || inputs.scratch.is_none()
         || inputs.native_workspace == 0) {
-        return Err(PlacementError::Inventory("EXLR8 requires serial measured workspaces, real Spark experts and 1..=6 ranks"));
+        return Err(PlacementError::Inventory("EXLR8 requires measured workspaces, real Spark experts and 1..=6 ranks"));
     }
     let geometry = glm_cache_geometry(cfg, inputs.layers, gpus)
         .map_err(|_| PlacementError::Inventory("GLM cache geometry"))?;
@@ -300,7 +299,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             }
         };
         let steps = if inputs.native_experts {
-            steps.checked_add(inputs.native_workspace)
+            steps.checked_add(inputs.native_workspace.checked_mul(1 + inputs.prefill_lanes)
+                .ok_or(PlacementError::Overflow("GLM native lane workspaces"))?)
                 .ok_or(PlacementError::Overflow("GLM native workspaces"))?
         } else { steps };
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Workspace, "steps", steps, basis)));
@@ -920,10 +920,19 @@ mod tests {
             .find(|demand| demand.group == name).unwrap().bytes;
         let h = cfg.hidden as u64;
         assert_eq!(term(&split, "steps") - term(&ordinary, "steps"),
-            123456);
+            2 * 123456);
         assert_eq!(term(&split, "Spark intake planes"), 4 * 4096 * h * 2);
-        let mut invalid = native.clone(); invalid.prefill_lanes = 2;
-        assert!(request(&invalid).is_err());
+        for lanes in 1..=4 {
+            let mut parallel = native.clone(); parallel.prefill_lanes = lanes;
+            let mut ordinary = base.clone(); ordinary.prefill_lanes = lanes;
+            assert_eq!(term(&request(&parallel).unwrap(), "steps")
+                - term(&request(&ordinary).unwrap(), "steps"), (1 + lanes) * 123456);
+            let endpoints = 1 + if lanes > 1 { lanes } else { 0 };
+            assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"),
+                endpoints * 4 * 4096 * h * 2);
+        }
+        let mut invalid = native.clone(); invalid.native_workspace = u64::MAX;
+        assert!(matches!(request(&invalid), Err(PlacementError::Overflow(_))));
         let mut invalid = native.clone(); invalid.scratch = None;
         assert!(request(&invalid).is_err());
         let mut invalid = native.clone(); invalid.spark_ranks = 0;

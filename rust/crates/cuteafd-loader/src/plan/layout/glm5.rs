@@ -356,7 +356,9 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,
-        native_workspace: workspace, skip_routed_experts: false, prefill_rows: rows, prefill_lanes: 1,
+        native_workspace: workspace, skip_routed_experts: false, prefill_rows: rows,
+        prefill_lanes: glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
+            else { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 }),
         max_context: context, automatic_context: false, scratch: Some(scratch), drafter_bytes: 0,
         drafter_staging: 0, pending_code: Vec::new(), experts: Vec::new(), expert_workspace: 0,
         tp2_workspace: [0; 2], requested_pool: Some(requested_pool), onboard: Onboard::Layers(0),
@@ -370,7 +372,7 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         device.kv_tokens = placement.pool_tokens;
     }
     Ok((MemoryLayout { devices, pool_tokens: placement.pool_tokens, waste: vec![],
-        notes: vec![format!("EXLR8 serial native TP2 shared owners; context {context}; {}", placement.summary())] }, placement))
+        notes: vec![format!("EXLR8 native TP2 shared owners; context {context}; {}", placement.summary())] }, placement))
 }
 
 /// The planner's packed owners, excluding a host-mapped embedding when selected.

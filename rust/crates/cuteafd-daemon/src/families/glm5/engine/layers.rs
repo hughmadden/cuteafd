@@ -104,6 +104,11 @@ impl<'a> GlmEngine<'a> {
         self.run_layer_pipeline(scope, LaneOrder::Independent, &mut bindings)?;
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
         if self.weights.layers.len() < self.cfg.layers { return Ok(None); }
+        if wanted == 0 {
+            // SAFETY: the completed pipeline owns this stream and its KV writes.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            return Ok(None);
+        }
         self.launch_head(w, rows, wanted)?;
         if tables[0].decode && rows == wanted { self.select_greedy(w, rows)?; }
         Ok(Some(self.device_logits(w, wanted, tables[0].decode && rows == wanted)))
