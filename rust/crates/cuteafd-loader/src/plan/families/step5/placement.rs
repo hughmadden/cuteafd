@@ -69,10 +69,6 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         }
     }
     let requested = opts.pool_tokens.filter(|n| *n > 0);
-    if requested.is_some_and(|n| n < FLOOR) {
-        refusal(report, "Step-5 pool below 256K agentic floor is not a supported card recipe".into());
-        return memory;
-    }
     let tokens_per_layer = (2*cfg.groups*cfg.dim*2) as u64;
     let full = cfg.full[..cfg.layers].iter().filter(|full| **full).count() as u64;
     let per_token = full*(tokens_per_layer+256/8);
@@ -80,14 +76,22 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         per_token as f64*FLOOR as f64/GIB as f64, per_token as f64*(1<<20) as f64/GIB as f64));
     memory.notes.push(format!("Proposed FP8 K/V ideal lower bound only (NOT selected or quality-qualified): {} bytes/token plus scales/padding", full*(tokens_per_layer/2+256/8)));
     let slots = opts.concurrency.max(1);
+    // Header-only plan uses the minimum 64-row step. Runtime charges its actual
+    // prefill/verify extent before allocating, never treating slack as pool-fixed.
+    let ring_rows = 576u64;
+    let slack_per_sequence = ((cfg.layers as u64-full)+cfg.mtp as u64)
+        * (ring_rows-cfg.window as u64)*tokens_per_layer;
+    memory.notes.push(format!("Append-only SWA/MTP slack lower bound: {slack_per_sequence} bytes per admitted sequence across coordinator ranks at step64; {slots} sequences charge {} bytes. Runtime charges larger prefill steps separately.", slack_per_sequence*slots));
     let mut fixed = Vec::new();
     for gpu in 0..gpus {
         fixed.push(Demand::new(gpu as u8, Category::Weights, "target + 3 MTP stages, vision conservatively replicated", per_gpu, Basis::Formula));
         // SWA target and MTP rings retain original BF16 rows. CSA pending K/Z
         // is shared across provider groups, so replicated on both head owners.
-        let rings = ((cfg.layers as u64-full)+cfg.mtp as u64)*cfg.window as u64*tokens_per_layer*slots/gpus as u64;
-        fixed.push(Demand::new(gpu as u8, Category::Kv, "SWA512 target + MTP rings, no speculative slack", rings, Basis::Formula));
-        fixed.push(Demand::new(gpu as u8, Category::Kv, "pending CSA-8 index K/Z FP32 lower bound", full*8*256*2*4*slots, Basis::Formula));
+        let target_rings = (cfg.layers as u64-full)*ring_rows*tokens_per_layer*slots/gpus as u64;
+        let mtp_rings = if gpu == 0 { cfg.mtp as u64*ring_rows*tokens_per_layer*slots } else { 0 };
+        let rings = target_rings + mtp_rings;
+        fixed.push(Demand::new(gpu as u8, Category::Kv, "SWA512 target + MTP rings with per-sequence step64 slack", rings, Basis::Formula));
+        fixed.push(Demand::new(gpu as u8, Category::Kv, "CSA-8 pending BF16 K/Z, two banks per sequence", full*8*256*2*2*2*slots, Basis::Formula));
     }
     let mode = if gpus == 1 { SINGLE } else { LayerMode::HeadSplit };
     let layers = (0..cfg.layers).map(|layer| {
@@ -107,7 +111,8 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             capacity_bytes: *bytes, headroom_bytes: opts.headroom_bytes,
             baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }).collect(), spark_ranks: ranks, peer_access: gpus == 2 },
         attention_placement: Some(AttentionPlacement::Heads), context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
-        pool: PoolPolicy { requested, target: opts.target_pool_tokens.max(FLOOR), floor: FLOOR,
+        pool: PoolPolicy { compiled_context: opts.context_tokens,
+            requested, target: opts.target_pool_tokens.max(FLOOR), floor: FLOOR,
             ceiling: opts.target_pool_tokens.max(requested.unwrap_or(0)).max(FLOOR), unit_rows: PAGE },
         layers, pool_overhead: vec![0;gpus], pool_bounded: vec![summaries], fixed, startup: Vec::new(), movables: vec![],
         expert_workspace: 0, tp2_workspace: [0;2], onboard: Onboard::Auto, expert_gpus: 0, minimum_expert_layers: 0,

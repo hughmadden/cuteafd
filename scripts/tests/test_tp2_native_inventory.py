@@ -98,6 +98,61 @@ def test_compiled_registration_inventory_forwards_and_preloads_every_new_kernel(
     assert "CUDA registration ABI changed" in result.stderr
 
 
+def test_shared_bf16_add_native_wrapper_accepts_buffer_sized_widths(tmp_path):
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    native = (ROOT / "native/shared/cuda/route_reduce.cu").read_text()
+    overlap = native.split("bool overlaps(", 1)[1].split("// Deterministic", 1)[0]
+    wrapper = native.split('extern "C" int32_t cuteafd_add_tp2_shared_async', 1)[1].split(
+        'extern "C" int32_t cuteafd_reduce_tp2_experts_async', 1)[0]
+    # Compile the real host validation and grid sizing, replacing only CUDA launch.
+    wrapper, replacements = re.subn(
+        r"add_tp2_shared<<<blocks, 256, 0, static_cast<cudaStream_t>\(stream\)>>>\(.*?count\);",
+        "launch_add(blocks, count);", wrapper, flags=re.S)
+    assert replacements == 1
+    source = tmp_path / "shared-add.cc"
+    source.write_text(r'''
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+static constexpr int cudaErrorInvalidValue = 1;
+static unsigned launches = 0, launched_blocks = 0;
+static size_t launched_count = 0;
+static void launch_add(unsigned blocks, size_t count) {
+  ++launches; launched_blocks = blocks; launched_count = count;
+}
+static int cudaGetLastError() { return 0; }
+''' + "bool overlaps(" + overlap + '\nextern "C" int32_t cuteafd_add_tp2_shared_async' + wrapper + r'''
+int main() {
+  for (size_t hidden : {size_t(5120), size_t(7168)}) {
+    for (size_t rows : {size_t(1), size_t(16), size_t(4096)}) {
+      const size_t count = rows * hidden, bytes = count * 2;
+      const auto a = reinterpret_cast<const uint16_t*>(uintptr_t(0x1000));
+      const auto b = reinterpret_cast<const uint16_t*>(uintptr_t(0x1000 + bytes));
+      auto output = reinterpret_cast<uint16_t*>(uintptr_t(0x1000 + 2 * bytes));
+      assert(cuteafd_add_tp2_shared_async(a, b, output, count, nullptr) == 0);
+      assert(launched_count == count);
+      assert(launched_blocks == ((count + 255) / 256 < 4096 ? (count + 255) / 256 : 4096));
+      const auto before = launches;
+      assert(cuteafd_add_tp2_shared_async(a, b, output, 0, nullptr) == 1);
+      assert(cuteafd_add_tp2_shared_async(a, b, output, SIZE_MAX / 2 + 1, nullptr) == 1);
+      assert(cuteafd_add_tp2_shared_async(a, b, output, SIZE_MAX, nullptr) == 1);
+      assert(cuteafd_add_tp2_shared_async(a, b, const_cast<uint16_t*>(a), count, nullptr) == 1);
+      const auto wrapped = reinterpret_cast<const uint16_t*>(UINTPTR_MAX - 1);
+      assert(cuteafd_add_tp2_shared_async(wrapped, b, output, count, nullptr) == 1);
+      assert(launches == before);
+    }
+  }
+}
+''')
+    # Initializer-list support is needed only by the standalone test harness.
+    result = subprocess.run([compiler, "-std=c++17", "-include", "initializer_list", str(source),
+                             "-o", str(tmp_path / "shared-add")], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    subprocess.run([str(tmp_path / "shared-add")], check=True, capture_output=True)
+
+
 def test_cuda_build_attests_real_header_and_always_wraps_registration():
     cmake = (ROOT / "native/CMakeLists.txt").read_text()
     assert 'crt/host_runtime.h" CUTEAFD_CUDA_HOST_RUNTIME' in cmake

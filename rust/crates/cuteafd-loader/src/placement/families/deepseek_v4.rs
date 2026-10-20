@@ -36,6 +36,8 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 /// checkpoint, the program manifest and the CLI.
 #[derive(Debug, Clone)]
 pub struct V4Inputs<'a> {
+    /// True only when the operator left context automatic.
+    pub automatic_context: bool,
     pub cfg: &'a DeepseekV4Config,
     /// Header-derived uploads; no attention weights hidden in the baseline.
     pub weights: crate::families::deepseek_v4::resident::WeightInventory,
@@ -76,8 +78,8 @@ pub struct V4Inputs<'a> {
     pub onboard: Onboard,
     /// Probe-only all-row logits on the lead GPU.
     pub full_prefill_logits: u64,
-    /// Per GPU, the measured code it holds at ready (`placement::inventory::loaded_code`, 0 without an
-    /// entry). Part of the baseline on both sides; on a PRO card the reserve envelope covers it
+    /// Per GPU, the calibrated or formula-based code it holds at ready. Part of the baseline on
+    /// both sides; on a PRO card the reserve envelope covers it
     /// (it always did: the code loads after the runtime's sample), so it does not shrink the pool twice.
     pub code_bytes: Vec<u64>,
     /// The build's C4 token-split programs (`manifest_context`): `None` keeps every layer
@@ -291,7 +293,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         inventory: Inventory { gpus: budgets, spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: POOL_CEILING_TOKENS, ..PoolPolicy::resolve(
             &inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), inputs.max_context, inputs.requested_pool,
-            geometry_unit, inputs.spark_ranks == 0) },
+            geometry_unit, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context) },
         layers,
         pool_overhead,
         fixed,
@@ -328,8 +330,9 @@ pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
 /// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs.
 pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
     let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
-    (0..gpus).map(|rank| crate::placement::loaded_code(family, experts, gpus == 2, rank as u8).map_or(0, |c| c.bytes))
-        .collect()
+    let arch = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES);
+    (0..gpus).map(|rank| crate::placement::inventory::loaded_code_allowance(
+        family, experts, gpus == 2, rank as u8, arch, None).bytes).collect()
 }
 
 /// V4 defaults uniformly to pool-first placement. Explicit `max` remains

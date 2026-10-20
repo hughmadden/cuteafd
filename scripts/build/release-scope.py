@@ -17,7 +17,7 @@ import re
 import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
-SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'AUDIO', 'CONTEXT_SPLIT')
+SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
          'FP8_MOE_BF16_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
@@ -191,12 +191,17 @@ def requirements(repo, matrix, scope):
             programs = {'qwen4'}
         elif family == 'qwen3_5':
             programs = {'qwen35' if '9b' in values['MODEL_ID'].lower() else 'qwen38'}
+        elif family == 'step5':
+            programs = {'step5', 'step52'} if dual else {'step5'}
+        elif family == 'kimi_k3':
+            programs = {'kimik3'}
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
                            experts=sorted(experts), spark_experts=sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'])),
                            spark_count=count, spark_tp=tp, dual=dual,
                            roles=sorted(tokens(scopes['CUTEAFD_WIP_SPARK_TP_ROLES'])),
                            nvfp4='nvfp4' in values.get('MODEL_ID', '').lower(),
                            audio=scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON',
+                           exlr8=scopes.get('CUTEAFD_WIP_EXLR8_AOT') == 'ON',
                            context_split=family in ('deepseek_v4', 'glm5', 'glm5_flash') and dual))
     if scope == 'all':
         result.append(dict(name='v2.0.0-export-floor', family='release_floor', programs=sorted(PREVIOUS_RELEASE_FLOOR['MIMO_GEOMETRIES']),
@@ -293,6 +298,16 @@ def check_inventory(root, role, wanted, symbols=None):
                     require(any(p.get('op') == 'scored_index_topk'
                                 for p in programs if p.get('family') == entry['programs'][0]),
                             'PROGRAMS.json missing context-split programs')
+            if entry.get('exlr8'):
+                # Each role's table carries the fork's EXLR8 set for that role (the
+                # exporter records it); the coordinator's sits beside the family programs.
+                exlr8_role = 'coordinator' if role == 'coordinator' else 'spark'
+                manifest = read_json(share / 'PROGRAMS.json')
+                recorded = manifest.get('families', {}).get('exlr8', {})
+                names = {p.get('name') for p in manifest.get('programs', []) if p.get('family') == 'exlr8'}
+                require(recorded.get('role') == exlr8_role, f'PROGRAMS.json has no EXLR8 {exlr8_role} programs')
+                require(names and names == set(recorded.get('programs', [])),
+                        f'PROGRAMS.json EXLR8 programs {sorted(names)} differ from the recorded set')
             if entry['family'] == 'deepseek_v41':
                 require(bool(read_json(share / 'V41_EXPERT_AOT.json').get('variants')), 'V41_EXPERT_AOT.json has no variants')
                 if role == 'expert':
@@ -322,15 +337,15 @@ def check_inventory(root, role, wanted, symbols=None):
                     if role == 'coordinator' and entry['dual']:
                         layouts.extend(['rtx-tp2-rank0', 'rtx-tp2-rank1'] if family == 'qwen4' else ['rtx-tp2'])
                     check_package(root, f'exl3/exl3-{family}-{kind[5:]}', layouts, role, verified)
-                elif kind in ('fp8', 'nvfp4', 'nvfp4a4'):
-                    suffix = '' if kind == 'fp8' else '-' + kind
+                elif kind in ('fp8', 'nvfp4', 'nvfp4a4') or item == 'step5:bf16':
+                    suffix = '-bf16-weights' if item == 'step5:bf16' else '' if kind == 'fp8' else '-' + kind
                     layouts = [f'tp{entry["spark_tp"]}'] if role == 'expert' else ['tp1']
                     if role == 'coordinator' and entry['dual'] and family != 'glmfdense':
                         layouts.append('tp2')
                         if family == 'qwen4' and kind.startswith('nvfp4'):
                             layouts.extend(['tp2-w384', 'tp2-w256'])
                     check_package(root, f'fp8/fp8-{family}{suffix}', layouts, role, verified)
-                    if kind == 'nvfp4':
+                    if kind == 'nvfp4' and family != 'step5':
                         check_package(root, f'fp8/fp8-{family}-nvfp4a4', layouts, role, verified)
                     if family == 'qwen4' and kind.startswith('nvfp4') and role == 'coordinator':
                         check_package(root, 'fp8/fp8-qwen4', ['tp1'], role, verified)

@@ -1429,7 +1429,8 @@ impl Opened {
             && self.experts.as_ref().is_some_and(|c| c.exl3().is_some());
         let code_package = if local_tp2_exl3 { "exl3-tp2-local" } else { "*" };
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
-            crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", code_package))
+            crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", code_package,
+                &placement::ProgramSet::from_names(&["glmf", "glmf2"], programs.names())))
             .collect::<Result<Vec<_>>>()?;
         let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
@@ -1502,7 +1503,7 @@ impl Opened {
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
-        let inputs = admission::GlmfInputs { attention, cfg: &self.cfg, layers, local_tp2_exl3,
+        let inputs = admission::GlmfInputs { automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3,
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
             pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,

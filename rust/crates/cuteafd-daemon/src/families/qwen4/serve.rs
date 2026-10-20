@@ -231,11 +231,13 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
 /// its mark arena sized for `lanes` decoding sequences.
 fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: usize)
     -> Result<(Qwen4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_rows } else { 64 },
+        engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "Qwen 3.8 Flash Next restores exact snapshots only (GDN state)");
     let family = Qwen4Prefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
-    let host = args.host_config(family.layout(), engine.max_context)?.map(|config|
+    let host = args.host_config(family.layout(), engine.max_context, lanes)?.map(|config|
         CudaCopyEngine::registered_owned(engine.library, family.snapshot_owners()).map(|copy| (config, copy)))
         .transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
@@ -318,6 +320,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     type History = cuteafd_loader::families::qwen4::NgramHistory;
     type Coordinates = cuteafd_loader::families::qwen4::RopePositions;
     type Encoder = crate::shared::qwen::Encoder;
+    type Meta = ();
     type Prefix = Qwen4Prefix<'e, 'a>;
 
     fn geometry(&self) -> scheduler::Geometry {
@@ -358,15 +361,18 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     }
     fn require_live(&self) -> Result<()> { self.engine.require_live() }
     fn log_table_stats(&self, phase: &str) { self.engine.log_table_stats(phase); }
-    fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], rows: usize)
+    fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], rows: usize,
+        _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.prefill_device(placement, tokens, None, None, rows)
     }
-    fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool)
+    fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
+        _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.verify_device(sequences, speculative)
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool)
+    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
+        _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.verify_device_ungraphed(sequences, speculative)
     }

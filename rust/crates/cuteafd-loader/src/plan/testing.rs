@@ -292,6 +292,7 @@ pub fn glm5_flash_config(layers: usize) -> Value {
         "architectures": ["Glm5NextForConditionalGeneration"], "model_type": "glm5_next",
         "quantization_config": FP8_BLOCK.clone(), "text_config": {
             "model_type": "glm5_next_text", "vocab_size": 64, "hidden_size": 4096, "num_hidden_layers": layers,
+            "max_position_embeddings": 1048576,
             "layer_types": (0..layers).map(|l| if l % 2 == 1 { "deepseek_sparse_attention" } else { "linear_attention" })
                 .collect::<Vec<_>>(),
             "mlp_layer_types": (0..layers).map(|l| if l == 0 { "dense" } else { "sparse" }).collect::<Vec<_>>(),
@@ -356,6 +357,7 @@ pub fn qwen4_config(layers: usize) -> Value {
         "architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp",
         "quantization_config": exl3_compact(4), "text_config": {
             "model_type": "qwen4_exp_text", "vocab_size": 64, "hidden_size": 2560, "num_hidden_layers": layers,
+            "max_position_embeddings": 262144,
             "layer_types": (0..layers).map(|l| if l % 4 == 3 { "full_attention" } else { "linear_attention" })
                 .collect::<Vec<_>>(),
             "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
@@ -471,7 +473,7 @@ pub fn write_v4_snapshot(path: &Path) {
 
 pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
     // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
-    let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
+    let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4", "max_position_embeddings": 1048576});
     let mut ratios = vec![0, 0];
     ratios.extend([4, 128, 4]);
     let args = json!({
@@ -713,4 +715,36 @@ fn write_v41_snapshot_format(dir: &Path, nvfp4: bool, exl3_bits: Option<usize>) 
     }
     fs::write(dir.join("model.safetensors.index.json"),
         serde_json::to_vec(&json!({"weight_map":weight_map})).unwrap()).unwrap();
+}
+
+/// Kimi K3's release `config.json` (vision and tokenizer fields elided).
+pub fn kimi_k3_config() -> Value {
+    let full: Vec<usize> = (1..=23).map(|i| 4 * i).chain([93]).collect();
+    let kda: Vec<usize> = (1..=93).filter(|l| !full.contains(l)).collect();
+    let linear = json!({"full_attn_layers": full, "kda_layers": kda, "gate_lower_bound": -5.0,
+        "head_dim": 128, "num_heads": 96, "short_conv_kernel_size": 4, "use_full_rank_gate": true});
+    let mut text = json!({
+        "model_type": "kimi_linear", "architectures": ["KimiLinearForCausalLM"],
+        "activation_situ_beta": 4.0, "activation_situ_linear_beta": 25.0, "attn_res_block_size": 12,
+        "first_k_dense_replace": 1, "hidden_act": "situ", "hidden_size": 7168, "intermediate_size": 33792,
+        "kv_lora_rank": 512, "latent_moe_use_norm": true, "max_position_embeddings": 1048576,
+        "mla_use_nope": true, "mla_use_output_gate": true, "moe_intermediate_size": 3072, "moe_layer_freq": 1,
+        "moe_renormalize": true, "moe_router_activation_func": "sigmoid", "num_attention_heads": 96,
+    });
+    let more = json!({
+        "num_expert_group": 1, "num_experts": 896, "num_experts_per_token": 16, "num_hidden_layers": 93,
+        "num_key_value_heads": 96, "num_nextn_predict_layers": 0, "num_shared_experts": 2, "q_lora_rank": 1536,
+        "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "rms_norm_eps": 1e-5, "routed_expert_hidden_size": 3584,
+        "routed_scaling_factor": 1.0, "tie_word_embeddings": false, "topk_group": 1, "topk_method": "noaux_tc",
+        "use_grouped_topk": true, "v_head_dim": 128, "vocab_size": 163840, "eos_token_id": 163586,
+    });
+    for (key, value) in more.as_object().unwrap() { text[key] = value.clone(); }
+    text["linear_attn_config"] = linear;
+    json!({
+        "architectures": ["KimiK3ForConditionalGeneration"], "model_type": "kimi_k3",
+        "tie_word_embeddings": false,
+        "quantization_config": {"bits": 2.0, "checkpoint_format": "exl3", "format": "exl3", "quant_method": "exl3"},
+        "text_config": text,
+        "vision_config": {"vt_num_hidden_layers": 27},
+    })
 }

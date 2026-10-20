@@ -29,6 +29,8 @@ pub struct SparkExperts {
     world: SparkWorld,
     /// A [`SparkExpertWave`] was dispatched and not yet received.
     wave_open: bool,
+    /// The opt-in route log (`PROFILE=expert-routes`); `None` when off.
+    route_tap: Option<crate::route_log::Tap>,
 }
 
 /// A dispatched wave that does not borrow its transport, so several
@@ -88,11 +90,7 @@ impl SparkExperts {
             !config.timeout.is_zero(),
             "native RoCE timeout must be positive"
         );
-        ensure!(
-            config.max_frame_bytes >= 128 + 10240 + 40 + 6 * 12
-                && config.max_frame_bytes <= 64 * 1024 * 1024,
-            "invalid native RoCE frame budget"
-        );
+        super::validate_frame_budget(capacity, config.max_frame_bytes)?;
         for rank in 0..peers.len() {
             ensure!(
                 executors[rank] != 0 && !executors[..rank].contains(&executors[rank]),
@@ -111,6 +109,7 @@ impl SparkExperts {
             max_frame_bytes: config.max_frame_bytes,
             world,
             wave_open: false,
+            route_tap: crate::route_log::Tap::from_global(),
         })
     }
     pub fn capacity(&self) -> u32 {
@@ -155,6 +154,8 @@ impl SparkExperts {
     pub fn enable_terminal_ownership(&mut self) -> Result<()> {
         self.clients.enable_terminal_ownership()
     }
+    #[cfg(test)]
+    pub(super) fn terminal_ready_for_test(&self) -> bool { self.clients.terminal_ready_for_test() }
     pub fn terminal_owned(&self) -> bool { self.clients.terminal_owned() }
     pub fn terminal_released(&self) -> bool { self.clients.terminal_released() }
     pub fn terminal_quiesce(&mut self) -> Result<()> { self.clients.terminal_quiesce() }
@@ -220,6 +221,8 @@ impl SparkExperts {
         if let Err(error) = &result { crate::health::record_failure(format!("expert write failed: {error:#}")); }
         if result.is_err() {
             self.reset_connections();
+        } else if let Some(tap) = &mut self.route_tap {
+            tap.record(request, self.executors.len());
         }
         result
     }
@@ -400,6 +403,9 @@ impl SparkExperts {
             }
         };
         self.clients.dispatch(request)?;
+        if let Some(tap) = &mut self.route_tap {
+            tap.record(request, self.executors.len());
+        }
         Ok(receiver)
     }
 }

@@ -31,6 +31,9 @@ FAMILIES = {
     "mimo_v2": "mimo_v2",
     "qwen4_exp": "qwen4",
     "qwen3_5": "qwen3_5",
+    "step5_vl": "step5",
+    "step5": "step5",
+    "kimi_k3": "kimi_k3",
 }
 
 
@@ -71,6 +74,16 @@ def _dense_prefix(text: dict, layers: int) -> int:
     return first
 
 
+def _step5_routed(text: dict) -> list[int]:
+    routed = text.get("moe_layer_list")
+    if (text.get("model_type") != "step5" or type(text.get("num_hidden_layers")) is not int
+            or text["num_hidden_layers"] != 92 or not isinstance(routed, list)
+            or any(type(layer) is not int for layer in routed)
+            or sorted(routed) != list(range(3, 91))):
+        raise SystemExit("unsupported Step-5 routed layer map")
+    return sorted(routed)
+
+
 def describe(config: dict) -> tuple[str, str, int, int]:
     text = config.get("text_config", config)
     kind = config.get("model_type", "?")
@@ -78,11 +91,14 @@ def describe(config: dict) -> tuple[str, str, int, int]:
     if family is None:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
-    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5"):
+    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3"):
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
-    if family == "glm5":
+    if family == "step5":
+        routed = _step5_routed(text)
+        first, last = routed[0], routed[-1]
+    elif family == "glm5":
         first = _dense_prefix(text, layers)
     elif family == "glm5_flash":
         kinds = {"linear_attention": "kda", "deepseek_sparse_attention": "mla"}
@@ -103,6 +119,12 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         if dense is None:
             dense = [layer == 0 for layer in range(layers)]
         first = dense.index(False) if False in dense else layers
+    elif family == "kimi_k3":
+        # Dense prefix first_k_dense_replace (layer 0), then every layer routed.
+        first = text.get("first_k_dense_replace", 0)
+        if type(first) is not int or not 0 <= first < layers or text.get("moe_layer_freq", 1) != 1:
+            raise SystemExit("unsupported kimi_k3 MoE layer pattern")
+        last = layers - 1
     elif family in ("qwen4", "qwen3_5"):
         kinds = {"linear_attention": "gdn", "full_attention": "full"}
         if _pattern(text, layers, {"layer_types": kinds}) is None:
@@ -123,6 +145,8 @@ def routed_layers(config: dict) -> int | None:
     if type(layers) is not int or layers <= 0:
         raise SystemExit("invalid num_hidden_layers")
     family = FAMILIES.get(config.get("model_type"))
+    if family == "step5":
+        return len(_step5_routed(text))
     if family in ("deepseek_v41", "deepseek_v4", "qwen4"):
         return layers
     if family == "glm5":
@@ -133,6 +157,9 @@ def routed_layers(config: dict) -> int | None:
     if family == "glm5_flash":
         # Reuse the runtime-equivalent pattern checks, including agreement.
         describe(config)
+    if family == "kimi_k3":
+        _, _, first, last = describe(config)
+        return last - first + 1
     dense = _pattern(text, layers, {"mlp_layer_types": {"dense": True, "sparse": False},
                                     "moe_layer_freq": {0: True, 1: False}})
     if dense is not None:

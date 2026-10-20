@@ -36,6 +36,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     type History = ();
     type Coordinates = ();
     type Encoder = crate::shared::qwen::Encoder;
+    type Meta = ();
     type Prefix = DensePrefix<'e, 'a>;
 
     fn geometry(&self) -> scheduler::Geometry {
@@ -45,11 +46,13 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     }
     fn library(&self) -> &'a NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
-    fn prefix_cache(&self, args: &PrefixArgs, _lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
+    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
         ensure!(args.prefix_partial == Toggle::Off, "dense Qwen supports exact prefix frontiers only");
         let family = DensePrefix::new(self.engine)?;
         let layout = family.layout();
-        let host = args.host_config(layout, self.geometry().max_context)?.map(|config|
+        let shape = self.geometry();
+        let args = &args.with_scoring(shape.decode_rows, shape.decode_rows, shape.vocab_size)?;
+        let host = args.host_config(layout, shape.max_context, lanes)?.map(|config|
             CudaCopyEngine::registered_owned(self.library, family.snapshot_owners()).map(|copy| (config, copy))).transpose()?;
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
@@ -87,7 +90,8 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         self.engine.borrow().require_live()
     }
     fn log_table_stats(&self, _phase: &str) {}
-    fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize) -> Result<Option<DeviceLogits>> {
+    fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(self.pending.borrow().is_none(), "dense prefill during pending verify");
         let mut engine = self.engine.borrow_mut();
         ensure!(engine.slot_position(placement.slot)? == placement.len, "dense prefill placement/state frontier differs");
@@ -97,7 +101,8 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         placement.state_len = placement.len;
         Ok(Some(output))
     }
-    fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool) -> Result<Option<DeviceLogits>> {
+    fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
+        _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(self.pending.borrow().is_none(), "dense verify requires prior commit");
         let slots = sequences.iter().map(|(placement, _)| placement.slot).collect::<Vec<_>>();
         let mut engine = self.engine.borrow_mut();
@@ -126,8 +131,9 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         }
         Ok(Some(output))
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool) -> Result<Option<DeviceLogits>> {
-        self.verify_device(sequences, speculative)
+    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
+        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
+        self.verify_device(sequences, speculative, pool)
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {

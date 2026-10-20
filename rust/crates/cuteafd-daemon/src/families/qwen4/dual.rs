@@ -64,16 +64,13 @@ impl Opened {
         let mut pending = [0; 2];
         for rank in 0..2 {
             pending[rank] = crate::shared::inventory::pending_code(&self.library, devices[rank].id,
-                rank, true, "qwen4", code)?;
-            if cuteafd_loader::placement::loaded_code("qwen4", code, true, rank as u8).is_none() {
-                pending[rank] += cuteafd_loader::placement::ArchContext::for_device(
-                    &inventory.gpus[rank].arch, inventory.gpus[rank].total_bytes).cublas_bytes;
-            }
+                rank, true, "qwen4", code,
+                &cuteafd_loader::placement::ProgramSet::from_manifest(&manifests[rank], &["qwen4"]))?;
         }
         let baselines = inventory.baselines(&[]);
         let enabled = engine::startup_graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
             std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
-        let placement = qwen4::dual_placement(&qwen4::QwenDualInputs {
+        let placement = qwen4::dual_placement(&qwen4::QwenDualInputs { automatic_context: automatic_context,
             owner_manifests: manifests.each_ref().map(Some),
             mark_slots: inputs.mark_bytes / mark_bytes, admission: inputs,
             gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: baselines[rank].0,

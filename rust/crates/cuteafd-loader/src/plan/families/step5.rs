@@ -1,10 +1,12 @@
-//! Step-5 release metadata only. Native kernels are deliberately not advertised.
+//! Step-5 release contracts. Whole-model serving remains fail-closed.
 use std::collections::BTreeMap;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{DType, FfnActivation};
 use crate::plan::{checkpoint::Checkpoint, family::*, format::QuantOperand, names::indexed, spec::*};
 
 mod placement;
+pub mod coordinator;
+pub mod ownership;
 #[cfg(test)]
 mod tests;
 
@@ -13,6 +15,7 @@ pub static STEP5: Step5 = Step5;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub norm_eps: f32,
     pub hidden: usize,
     pub vocab: usize,
     pub layers: usize,
@@ -31,12 +34,15 @@ pub struct Config {
     pub moe: Vec<bool>,
     pub theta: Vec<f64>,
     pub rotary: Vec<usize>,
+    pub rope_scaling: Option<crate::plan::rope::Llama3>,
+    pub scale_full: bool,
+    pub scale_sliding: bool,
     pub activation: Vec<FfnActivation>,
     pub shared_activation: Vec<FfnActivation>,
 }
 
 impl Config {
-    fn parse(checkpoint: &Checkpoint) -> Result<Self> {
+    pub fn parse(checkpoint: &Checkpoint) -> Result<Self> {
         let v = checkpoint.config.get("text_config").unwrap_or(&checkpoint.config);
         ensure!(v["model_type"] == "step5", "expected nested text_config.model_type=step5");
         let int = |key: &str| -> Result<usize> {
@@ -88,11 +94,26 @@ impl Config {
             ("sparse_indexer_num_k_heads", 1), ("num_provider_groups", 4), ("topk", 512), ("region_block_size", 8)] {
             ensure!(sparse[key].as_u64() == Some(expected), "unsupported Step-5 sparse_config.{key}: {}", sparse[key]);
         }
-        let cfg = Self { hidden: int("hidden_size")?, vocab: int("vocab_size")?, layers, mtp,
+        let norm_eps = v["rms_norm_eps"].as_f64().filter(|v| v.is_finite() && *v > 0.0)
+            .context("Step-5 requires positive finite rms_norm_eps")? as f32;
+        ensure!(norm_eps.is_finite() && norm_eps > 0.0 && v["norm_dtype"] == "float32",
+            "Step-5 requires representable positive epsilon and norm_dtype=float32");
+        let rope_scaling = v.get("rope_scaling").filter(|v| !v.is_null())
+            .map(crate::plan::rope::Llama3::parse).transpose()?;
+        let types = v.get("yarn_only_types").filter(|v| !v.is_null())
+            .map(|v| v.as_array().context("Step-5 yarn_only_types must be an array")).transpose()?;
+        if let Some(types) = types {
+            ensure!(types.iter().all(|v| v == "full_attention" || v == "sliding_attention"),
+                "unsupported Step-5 yarn_only_types");
+        }
+        let enabled = |kind: &str| types.is_none_or(|types| types.is_empty()
+            || types.iter().any(|v| v == kind));
+        let cfg = Self { norm_eps, hidden: int("hidden_size")?, vocab: int("vocab_size")?, layers, mtp,
             dense: int("intermediate_size")?, experts: int("moe_num_experts")?, intermediate: int("moe_intermediate_size")?,
             shared: int("share_expert_dim")?, topk: int("moe_top_k")?, heads: int("num_attention_heads")?,
             groups: int("num_attention_groups")?, dim, window: int("sliding_window")?,
             max_context: int("max_position_embeddings")? as u64, full, moe, theta, rotary,
+            rope_scaling, scale_full: enabled("full_attention"), scale_sliding: enabled("sliding_attention"),
             activation: activations("swiglu_limits")?, shared_activation: activations("swiglu_limits_shared")? };
         ensure!((cfg.hidden, cfg.experts, cfg.intermediate, cfg.heads, cfg.groups, cfg.dim, cfg.window)
             == (4096, 352, 1536, 64, 4, 192, 512), "unsupported Step-5 release geometry");
@@ -112,6 +133,23 @@ impl Config {
         ensure!(cfg.full[..layers].iter().filter(|v| **v).count() == 23
             && cfg.full.iter().enumerate().all(|(l, full)| *full == (l < layers && l % 4 == 3)), "unsupported Step-5 full/SWA layer map");
         Ok(cfg)
+    }
+
+    pub fn rope_recipe(&self, layer: usize, indexer: bool) -> Result<crate::plan::rope::Recipe> {
+        ensure!(layer < self.layers + self.mtp, "Step-5 rotary layer out of range");
+        ensure!(!indexer || self.full[layer], "Step-5 indexer requires full attention");
+        let scaled = if self.full[layer] { self.scale_full } else { self.scale_sliding };
+        crate::plan::rope::Recipe::new(if indexer { 32 } else { self.rotary[layer] }, self.theta[layer],
+            if scaled { self.rope_scaling } else { None })
+    }
+
+    pub fn rope_tables(&self) -> Result<crate::plan::rope::Tables> {
+        let mut recipes = Vec::new();
+        for layer in 0..self.layers + self.mtp {
+            recipes.push(self.rope_recipe(layer, false)?);
+            if self.full[layer] { recipes.push(self.rope_recipe(layer, true)?); }
+        }
+        crate::plan::rope::Tables::new(self.max_context as usize, recipes)
     }
 }
 
@@ -341,15 +379,52 @@ impl Family for Step5 {
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
+    fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
+        -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        let layout = crate::serving_capacity::step5::Step5CacheLayout::new(
+            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers, options.prefill_rows.max(64))?;
+        Ok(Some(layout.geometry))
+    }
     fn activation(&self, layer: usize, shared: bool) -> Option<FfnActivation> {
         if shared { self.cfg.shared_activation.get(layer) } else { self.cfg.activation.get(layer) }.copied()
     }
-    fn accepts(&self, role: &TensorRole, stem: &str, _operand: &mut QuantOperand) -> Result<(), String> {
+    fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         if !self.tensors.contains_key(stem) && !self.tensors.contains_key(&format!("{stem}.weight")) {
             return Err(format!("{stem}: unknown Step-5 tensor; add a validated header contract"));
         }
+        if role.component == Component::RoutedExpert {
+            let contract = self.tensors.get(&format!("{stem}.weight"));
+            let shape_matches = contract.is_some_and(|tensor| tensor.role == *role
+                && tensor.shape == operand.logical && tensor.shape == operand.stored);
+            if shape_matches && role.layer.is_some_and(|layer| (3..88).contains(&layer))
+                && contract.is_some_and(|tensor| tensor.dtype == DType::F8E4M3)
+                && operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
+                return Ok(());
+            }
+            if shape_matches && role.layer.is_some_and(|layer| (88..91).contains(&layer))
+                && contract.is_some_and(|tensor| tensor.dtype == DType::Bf16)
+                && operand.encoding == crate::plan::format::Encoding::Bf16
+                && operand.scale.is_none() && operand.global_scale.is_none()
+                && operand.input_scale.is_none() && operand.companions.is_empty() {
+                return Ok(());
+            }
+        }
         let hint = STEP5.component_hint(role.component).expect("every component has a hint");
         Err(format!("{stem}: {}: {}", hint.what, hint.how))
+    }
+    fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
+        let package = if operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
+            "step5:fp8"
+        } else if operand.encoding == crate::plan::format::Encoding::Bf16
+            && operand.scale.is_none() && operand.global_scale.is_none()
+            && operand.input_scale.is_none() && operand.companions.is_empty() {
+            "step5:bf16"
+        } else { return None; };
+        Some(ExpertContract {
+            package: package.into(), block: 128,
+            spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.intermediate),
+            local: Err("Step-5 coordinator-local routed experts are not qualified".into()),
+        })
     }
     fn placement(&self, _input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)

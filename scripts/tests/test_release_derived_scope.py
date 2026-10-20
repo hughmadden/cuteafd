@@ -298,7 +298,7 @@ def test_format_counts_reach_nvfp4_but_not_exl3(fixture_repo, tmp_path):
         ('fp8_moe.cmake', '    foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)',
          '    if(requested_layouts)', 'set(count_family qwen4)\nset(entry qwen4:nvfp4)', 'requested_layouts'),
         ('exl3.cmake', '  foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)',
-         '  if(CUTEAFD_EXL3_ROLE', 'set(CUTEAFD_EXL3_GEOMETRY qwen4)', 'requested_counts'),
+         '\n  if(CUTEAFD_EXL3_ROLE STREQUAL "spark" AND', 'set(CUTEAFD_EXL3_GEOMETRY qwen4)', 'requested_counts'),
     ]:
         source = (REPO / 'native/cmake/shared' / filename).read_text()
         block = start + source.split(start, 1)[1].split(end, 1)[0]
@@ -318,3 +318,56 @@ def test_v2_v41_role_floor_requires_native_roles_not_nvfp4(tmp_path):
     floor = [e for e in SCOPE.requirements(repo, matrix, 'all') if e['name'].startswith('v2.0.0-v41-tp')]
     assert sorted(e['spark_tp'] for e in floor) == [2, 3, 4, 6]
     assert not any(e['nvfp4'] for e in floor)
+
+
+@pytest.mark.parametrize('quant,count,gpus', [('nvfp4', 4, 1), ('fp8', 6, 2)])
+def test_step5_release_derives_native_mixed_packages(tmp_path, monkeypatch, quant, count, gpus):
+    real = SCOPE.scopes_module(REPO)
+    monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
+    (tmp_path / 'step.config').write_text(
+        f'FAMILY=step5\nMODEL_ID=fixture/step5-{quant}\nSPARK_COUNT={count}\nRTX_GPUS={gpus}\n')
+    matrix = tmp_path / 'matrix.json'
+    matrix.write_text(json.dumps(dict(entries=[dict(name='step5', family='step5', config='step.config')])))
+    derived, _ = SCOPE.derive(tmp_path, matrix, 'step5', {})
+    assert derived[P + 'STEP5_AOT'] == 'ON'
+    assert SCOPE.tokens(derived[P + 'EXPERT_FAMILIES']) == {f'step5:{quant}', 'step5:bf16'}
+    requirement = SCOPE.requirements(tmp_path, matrix, 'step5')[0]
+    assert requirement['programs'] == (['step5', 'step52'] if gpus == 2 else ['step5'])
+    checked = []
+    monkeypatch.setattr(SCOPE, 'check_package', lambda root, package, layouts, role, verified: checked.append((package, layouts)))
+    root = tmp_path / 'image'
+    write_json(root / 'share/PROGRAMS.json', dict(programs=[dict(family=family) for family in requirement['programs']]))
+    SCOPE.check_inventory(root, 'coordinator', [requirement], symbols=set())
+    suffix = '' if quant == 'fp8' else '-nvfp4'
+    assert sorted(checked) == sorted([(f'fp8/fp8-step5{suffix}', ['tp1', 'tp2'] if gpus == 2 else ['tp1']),
+                                      ('fp8/fp8-step5-bf16-weights', ['tp1', 'tp2'] if gpus == 2 else ['tp1'])])
+    checked.clear()
+    SCOPE.check_inventory(root, 'expert', [requirement], symbols=set())
+    assert sorted(checked) == sorted([(f'fp8/fp8-step5{suffix}', [f'tp{count}']),
+                                      ('fp8/fp8-step5-bf16-weights', [f'tp{count}'])])
+
+
+def test_kimi_release_derives_coordinator_programs(tmp_path, monkeypatch):
+    real = SCOPE.scopes_module(REPO)
+    monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
+    (tmp_path / 'kimi.config').write_text(
+        'FAMILY=kimi_k3\nMODEL_ID=fixture/Kimi-K3-EXL3-K2\nSPARK_COUNT=6\nRTX_GPUS=1\n')
+    matrix = tmp_path / 'matrix.json'
+    matrix.write_text(json.dumps(dict(entries=[dict(name='kimi', family='kimi_k3', config='kimi.config')])))
+    derived, _ = SCOPE.derive(tmp_path, matrix, 'kimi', {})
+    assert derived[P + 'KIMIK3_AOT'] == 'ON'
+    assert derived[P + 'STEP5_AOT'] == 'OFF'
+    assert SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs'] == ['kimik3']
+
+
+def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):
+    real = SCOPE.scopes_module(REPO)
+    monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
+    (tmp_path / 'glm.config').write_text(
+        'FAMILY=glm5\nMODEL_ID=fixture/GLM-5.3-EXL3-K4\nSPARK_COUNT=4\nRTX_GPUS=1\n')
+    matrix = tmp_path / 'matrix.json'
+    matrix.write_text(json.dumps(dict(entries=[dict(name='glm', family='glm5', config='glm.config')])))
+    derived, _ = SCOPE.derive(tmp_path, matrix, 'glm', {})
+    assert derived[P + 'KIMIK3_AOT'] == 'OFF'
+    assert derived[P + 'GLM_AOT'] == 'ON'
+    assert SCOPE.requirements(tmp_path, matrix, 'glm')[0]['programs'] == ['glm']

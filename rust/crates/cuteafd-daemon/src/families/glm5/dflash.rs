@@ -1357,12 +1357,12 @@ mod checkpoint_header_tests {
     }
 
     #[test]
-    fn target_head_guard_reads_checkpoint_when_actual_expert_catalog_has_no_head() {
+    fn target_head_guard_checks_checkpoint_independently_of_catalog_headers() {
         let fixture = expert_only_snapshot();
         let catalog = cuteafd_loader::read_expert_catalog(&fixture.0).unwrap();
         assert!(catalog.fp8().is_some());
-        assert!(catalog.tensors().is_empty());
-        assert!(catalog.tensor("lm_head.weight").is_err());
+        assert_eq!(catalog.tensors().len(), 1);
+        assert_eq!(catalog.tensor("lm_head.weight").unwrap().metadata.dtype, DType::Bf16);
         check_snapshot_target_bf16_head(&fixture.0, 128, 16, false).unwrap();
         assert!(check_snapshot_target_bf16_head(&fixture.0, 128, 16, true).is_err());
         assert!(check_snapshot_target_bf16_head(&fixture.0, 128, 32, false).is_err());

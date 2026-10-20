@@ -1,16 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 
 use super::{
-    checked_u32, checked_usize, debug_checksum_enabled, decode_route_entry, decode_row_descriptor,
-    encode_route_entry, encode_row_descriptor, payload_checksum, precompile_warmup_enabled,
-    push_u16, push_u32, push_u64, read_u16, read_u32, read_u64, request_header_len_from_flags,
-    response_fp8_e4m3_row_scaled_enabled, response_nvfp4_e2m1_fp8_e4m3_enabled,
-    spark_collective_part_count, spark_reduction_enabled, spark_row_sharded_reduction_enabled,
-    stream_data_enabled, stream_final_enabled, stream_plan_enabled, validate_common_header,
-    validate_flags, validate_header_len, ExpertProtocolV2Request, ExpertProtocolV2RequestHeader,
-    ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertProtocolV2WireStats,
-    ExpertV2Dtype, CHECKSUM_LEN, EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
+    CHECKSUM_LEN, EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
     EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP,
     EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
     EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3, EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION,
@@ -19,8 +11,16 @@ use super::{
     EXPERT_PROTOCOL_V2_MAX_SPARK_COLLECTIVE_PARTS, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
     EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN, EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
     EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK,
-    EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT, MAGIC, REQUEST_CHECKSUM_OFFSET,
-    REQUEST_KIND, VERSION,
+    EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT, ExpertProtocolV2Request,
+    ExpertProtocolV2RequestHeader, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
+    ExpertProtocolV2WireStats, ExpertV2Dtype, MAGIC, REQUEST_CHECKSUM_OFFSET, REQUEST_KIND,
+    VERSION, checked_u32, checked_usize, debug_checksum_enabled, decode_route_entry,
+    decode_row_descriptor, encode_route_entry, encode_row_descriptor, payload_checksum,
+    precompile_warmup_enabled, push_u16, push_u32, push_u64, read_u16, read_u32, read_u64,
+    request_header_len_from_flags, response_fp8_e4m3_row_scaled_enabled,
+    response_nvfp4_e2m1_fp8_e4m3_enabled, spark_collective_part_count, spark_reduction_enabled,
+    spark_row_sharded_reduction_enabled, stream_data_enabled, stream_final_enabled,
+    stream_plan_enabled, validate_common_header, validate_flags, validate_header_len,
 };
 
 impl ExpertProtocolV2Request {
@@ -138,7 +138,6 @@ impl ExpertProtocolV2Request {
         request.validate()?;
         Ok(request)
     }
-
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_stream_plan_with_hidden_stride(
@@ -321,7 +320,6 @@ impl ExpertProtocolV2Request {
     pub fn header_len(&self) -> usize {
         request_header_len_from_flags(self.header.flags)
     }
-
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();

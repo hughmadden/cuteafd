@@ -7,6 +7,16 @@ use cuteafd_loader::placement::{SparkAssignment, SparkResidentLayout, SparkWorki
 use cuteafd_transport::{expert::SparkTopology, worker_selection::{ModelAdmission, WorkerIdentity, WorkerSelection}};
 use std::{net::SocketAddr, path::Path, time::Duration};
 
+const ADMISSION_TIMEOUT_ENV: &str = "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS";
+
+fn admission_timeout(value: Option<&str>) -> Result<Duration> {
+    let seconds = value.unwrap_or("1200").parse::<u64>()
+        .with_context(|| format!("{ADMISSION_TIMEOUT_ENV} must be positive integer seconds"))?;
+    ensure!(seconds > 0 && std::time::Instant::now().checked_add(Duration::from_secs(seconds)).is_some(),
+        "{ADMISSION_TIMEOUT_ENV} must be positive, representable seconds");
+    Ok(Duration::from_secs(seconds))
+}
+
 /// Header-derived expectations exist before workers load or coordinator owners allocate.
 pub(crate) struct SparkAdmission {
     selection: WorkerSelection,
@@ -18,15 +28,46 @@ impl SparkAdmission {
         catalog: Option<&cuteafd_loader::OfficialV41Catalog>, working: &SparkWorkingSet,
         world: usize, topology: Option<SparkTopology>,
         model: ModelAdmission) -> Result<Self> {
+        Self::plan_manifest(snapshot, geometry, catalog, working, world, topology, model, None)
+    }
+
+    pub(crate) fn plan_manifest(snapshot: &Path, geometry: ExpertGeometry,
+        catalog: Option<&cuteafd_loader::OfficialV41Catalog>, working: &SparkWorkingSet,
+        world: usize, topology: Option<SparkTopology>, model: ModelAdmission,
+        manifest: Option<&str>) -> Result<Self> {
         ensure!(working.spark_layers.is_empty() || working.spark_ranks == world,
             "Spark admission working-set world differs from launched peers");
-        let identity = WorkerIdentity::from_snapshot(snapshot, geometry,
-            crate::shared::spark_topology::world(topology, world)?)?;
+        let identity = WorkerIdentity::from_snapshot_manifest(snapshot, geometry,
+            crate::shared::spark_topology::world(topology, world)?, manifest)?;
         let selection = WorkerSelection::new(identity, &working.spark_layers)?.with_model(model.clone())?;
         // Idle workers still acknowledge the identity, but need no storage package.
         let assignments = if working.spark_layers.is_empty() {
             (0..world).map(|rank| Ok(SparkAssignment { rank: u32::try_from(rank)?, resident_bytes: 0,
                 slices: vec![], io: Default::default() })).collect::<Result<Vec<_>>>()?
+        } else if let Some(manifest) = manifest {
+            use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
+            let catalog = catalog.context("EXLR8 Spark admission needs native catalog")?;
+            ensure!(catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8
+                && catalog.routed_experts().geometry()? == geometry,
+                "EXLR8 Spark admission catalog differs from coordinator");
+            crate::shared::spark_topology::require_world(
+                crate::shared::spark_topology::world(topology, world)?, catalog, &working.spark_layers)?;
+            ensure!(model.endpoints.iter().all(|endpoint|
+                endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32),
+                "EXLR8 Spark admission requires FP8 K32 endpoints");
+            (0..world).map(|rank| {
+                let mut assignment = SparkAssignment { rank: u32::try_from(rank)?, resident_bytes: 0,
+                    slices: vec![], io: working.rank_endpoints_io(rank, geometry, &model.endpoints, model.rings)? };
+                for &layer in &working.spark_layers {
+                    ensure!(layer >= catalog.routed_experts().first_layer && layer < geometry.layers as usize,
+                        "EXLR8 selected layer outside native backbone");
+                    let layout = Residency::plan(snapshot, manifest, layer, world, rank, ExpertSet::Routed)?;
+                    assignment.resident_bytes = assignment.resident_bytes.checked_add(layout.resident_bytes as u64)
+                        .context("EXLR8 Spark assignment resident overflow")?;
+                    assignment.slices.push(layout.spark_slice()?);
+                }
+                Ok(assignment)
+            }).collect::<Result<Vec<_>>>()?
         } else {
             let catalog = catalog.context("Spark admission needs routed checkpoint headers")?;
             ensure!(catalog.routed_experts().geometry()? == geometry,
@@ -35,7 +76,7 @@ impl SparkAdmission {
             let tp = topology.map_or(world, |topology| topology.tp() as usize);
             let headers = cuteafd_loader::plan::files::open_role(snapshot,
                 cuteafd_loader::plan::files::ReadRole::Spark { rank: 0, world: tp })?;
-            let recipe = cuteafd_loader::plan::experts::checkpoint_spark_recipe(&headers, tp)?;
+            let recipe = cuteafd_loader::plan::experts::checkpoint_spark_recipe(&headers, tp, &working.spark_layers)?;
             (0..world).map(|rank| {
                 let shard = topology.map(|topology| topology.tp_rank(rank)).transpose()?
                     .map_or(rank, usize::from);
@@ -63,9 +104,12 @@ impl SparkAdmission {
     }
 
     pub(crate) fn start(self, peers: &[SocketAddr]) -> Result<PendingSparkAdmission> {
+        let value = std::env::var(ADMISSION_TIMEOUT_ENV).ok();
+        let timeout = admission_timeout(value.as_deref())?;
         let pending = cuteafd_transport::worker_selection::start_model_admission(
-            peers, &self.selection, Duration::from_secs(1200))?;
-        Ok(PendingSparkAdmission { plan: self, pending })
+            peers, &self.selection, timeout)
+            .with_context(|| format!("Spark worker admission start failed (timeout {} s)", timeout.as_secs()))?;
+        Ok(PendingSparkAdmission { plan: self, pending, timeout })
     }
 
     pub(crate) fn select(self, peers: &[SocketAddr]) -> Result<()> {
@@ -76,11 +120,13 @@ impl SparkAdmission {
 pub(crate) struct PendingSparkAdmission {
     plan: SparkAdmission,
     pending: cuteafd_transport::worker_selection::PendingModelAdmission,
+    timeout: Duration,
 }
 
 impl PendingSparkAdmission {
     pub(crate) fn wait(self) -> Result<()> {
-        let reports = self.pending.wait()?;
+        let reports = self.pending.wait()
+            .with_context(|| format!("Spark worker admission failed (timeout {} s)", self.timeout.as_secs()))?;
         self.plan.reconcile(&reports)?;
         for report in reports {
             tracing::info!(rank = report.rank, resident_bytes = report.resident_bytes,
@@ -95,6 +141,41 @@ impl PendingSparkAdmission {
 mod tests {
     use super::*;
     use cuteafd_core::{RuntimeSample, SparkEndpoint, SparkIngress, SparkRuntimeInventory};
+
+    #[test]
+    fn admission_timeout_uses_launch_bound_and_rejects_invalid_values() -> Result<()> {
+        assert_eq!(admission_timeout(Some("2400"))?, Duration::from_secs(2400));
+        assert_eq!(admission_timeout(None)?, Duration::from_secs(1200));
+        for value in ["", "0", "-1", "1.5", "invalid", "18446744073709551615"] {
+            let error = format!("{:#}", admission_timeout(Some(value)).unwrap_err());
+            assert!(error.contains(ADMISSION_TIMEOUT_ENV), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn admission_timeout_failure_names_the_configured_bound() -> Result<()> {
+        let plan = idle_plan()?;
+        let listeners = (0..2).map(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let peers = listeners.iter().map(|listener| listener.local_addr())
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _streams = listeners.into_iter().map(|listener| listener.accept().unwrap())
+                .collect::<Vec<_>>();
+            let _ = hold.recv_timeout(Duration::from_secs(5));
+        });
+        let timeout = Duration::from_secs(1);
+        let pending = cuteafd_transport::worker_selection::start_model_admission(
+            &peers, &plan.selection, timeout)?;
+        let result = PendingSparkAdmission { plan, pending, timeout }.wait();
+        let _ = release.send(());
+        worker.join().unwrap();
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("Spark worker admission failed (timeout 1 s)"), "{error}");
+        Ok(())
+    }
 
     fn idle_plan() -> Result<SparkAdmission> {
         let root = tempfile::tempdir()?;
@@ -149,6 +230,49 @@ mod tests {
             }
             assert!(plan.reconcile(&changed).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn exlr8_spark_plan_reconciles_native_manifest_when_supplied() -> Result<()> {
+        let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else { return Ok(()); };
+        let snapshot = Path::new(&snapshot);
+        let mut catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        let shape = catalog.routed_experts();
+        let selected = [shape.first_layer];
+        for ranks in 1..=6 {
+            crate::shared::spark_topology::require_world(
+                cuteafd_transport::expert::SparkWorld::canonical(ranks)?, &catalog, &selected)?;
+        }
+        assert!(crate::shared::spark_topology::require_world(
+            cuteafd_transport::expert::SparkWorld::owned(SparkTopology::NATIVE_TP4_EP1)?, &catalog, &selected).is_err());
+        let canonical = cuteafd_transport::expert::SparkWorld::canonical(4)?;
+        crate::shared::spark_topology::require_wire(canonical, &catalog)?;
+        for layers in [vec![], vec![shape.first_layer, shape.first_layer],
+            vec![shape.first_layer + 1, shape.first_layer], vec![0], vec![shape.layers]] {
+            let error = crate::shared::spark_topology::require_world(canonical, &catalog, &layers).unwrap_err();
+            assert!(error.to_string().contains("hosted layers"), "{layers:?}: {error:#}");
+        }
+        let geometry = catalog.routed_experts().geometry()?;
+        let working = SparkWorkingSet { spark_layers: vec![catalog.routed_experts().first_layer],
+            spark_ranks: 4, prefill_lanes: 1, ..Default::default() };
+        let mut model = fixture_model();
+        model.endpoints.iter_mut().for_each(|endpoint| endpoint.ingress = SparkIngress::Fp8K32);
+        let plan = SparkAdmission::plan_manifest(snapshot, geometry, Some(&catalog), &working,
+            4, None, model.clone(), Some("up1"))?;
+        assert_eq!(plan.selection.layers(), working.spark_layers);
+        for assignment in &plan.assignments {
+            assert!(assignment.resident_bytes > 0);
+            assert_eq!(assignment.slices[0].first, 0);
+            assert_eq!(assignment.slices[0].width, 2048);
+            assert_eq!(assignment.slices[0].tiers, [2, 3, 4]);
+            assert_eq!(assignment.slices[0].projection_counts.iter().flatten().sum::<u32>(), 256 * 16 * 3 / 4);
+        }
+        check_reports(&plan)?;
+        model.endpoints[0].ingress = SparkIngress::Bf16;
+        assert!(SparkAdmission::plan_manifest(snapshot, geometry, Some(&catalog), &working,
+            4, None, model, Some("up1")).is_err());
         Ok(())
     }
 
@@ -285,7 +409,7 @@ mod tests {
                 2 => reports[1].host_exchange_bytes = 1,
                 3 => reports[1].row_indices_bytes = 1,
                 4 => reports[1].runtime.sample.arch.clear(),
-                _ => reports[1].slices.push(cuteafd_core::SparkSlice { layer: 13,
+                _ => reports[1].slices.push(cuteafd_core::SparkSlice { unit_map: None, layer: 13,
                     first: 0, width: 128, stored_width: 128, tiers: vec![], projection_counts: vec![] }),
             }
             let error = format!("{:#}", plan.reconcile(&reports).unwrap_err());

@@ -58,6 +58,7 @@ pub fn stored_slice(intermediate: usize, block: usize, tp: usize) -> Option<usiz
 pub struct SparkRecipe {
     pub slicing: crate::formats::fp8_experts::Slicing,
     pub widths: Vec<usize>,
+    pub rule: cuteafd_core::tp_units::UnitRule,
     pub required_layouts: Vec<String>,
 }
 
@@ -74,8 +75,19 @@ pub enum InstalledSparkRecipeRefusal {
 }
 
 impl SparkRecipe {
+    pub fn rank_for_layer(&self, rank: usize, layer: usize) -> usize {
+        if self.rule == cuteafd_core::tp_units::UnitRule::LayerRotation {
+            (rank + self.widths.len() - layer % self.widths.len()) % self.widths.len()
+        } else { rank }
+    }
+
+    pub fn width_for_layer(&self, rank: usize, layer: usize) -> Option<usize> {
+        if rank >= self.widths.len() { return None; }
+        self.widths.get(self.rank_for_layer(rank, layer)).copied()
+    }
+
     /// Validate an explicit Spark package root, never the coordinator tree.
-    /// Installation can narrow a qualified recipe but cannot create one.
+    /// Installation can narrow a registered recipe but cannot create one.
     pub fn validate_installed(&self, root: &std::path::Path, rank: usize,
         selected_slicing: crate::formats::fp8_experts::Slicing, selected_width: usize)
         -> Result<(), InstalledSparkRecipeRefusal> {
@@ -116,6 +128,10 @@ pub enum SparkRecipeRefusal {
     MissingPackage { package: String, world: usize },
     #[error("unknown Spark package recipe: {0}")]
     UnknownPackage(String),
+    #[error("balanced TP placement is not qualified for {package} at TP{world}; requires MXFP4 TP6")]
+    UnsupportedPlacement { package: String, world: usize },
+    #[error("{0}")]
+    Placement(cuteafd_core::tp_units::UnitMapError),
 }
 
 /// Enumerate recipes from the format policy and this checkpoint's geometry.
@@ -123,15 +139,29 @@ pub fn spark_worlds(package: &str, intermediate: usize) -> Vec<usize> {
     TRANSPORT_WORLDS.into_iter().filter(|&world| spark_recipe(package, intermediate, world).is_ok()).collect()
 }
 
-/// Validate every routed operand against its checkpoint family and derive one
-/// qualified storage recipe without inspecting any installed package tree.
-pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize) -> anyhow::Result<SparkRecipe> {
+/// Validate every hosted routed operand against its checkpoint family and derive
+/// one qualified storage recipe without inspecting any installed package tree.
+pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize, layers: &[usize]) -> anyhow::Result<SparkRecipe> {
     use anyhow::{ensure, Context};
     let family = super::family::detect(checkpoint).context("Spark admission: unsupported checkpoint family")?;
     let model = family.open(checkpoint)?;
     let intermediate = model.spec().moe.as_ref().context("Spark admission: checkpoint has no routed experts")?.intermediate;
+    ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1]),
+        "Spark admission: hosted layers must be nonempty, sorted and unique");
+    for &layer in layers {
+        ensure!(model.spec().layers.get(layer).is_some_and(|spec| spec.ffn == super::spec::FfnKind::Moe),
+            "Spark admission: hosted layer {layer} is not a routed target layer");
+    }
     let modelopt = crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config)?;
-    let required = super::files::required_tensors(checkpoint, super::files::ReadRole::Spark { rank: 0, world })?;
+    let required = super::files::required_tensors(checkpoint, super::files::ReadRole::Spark { rank: 0, world })?
+        .into_iter().filter(|name| family.classify(model.spec(), name)
+            .and_then(|role| role.layer).is_some_and(|layer| layers.binary_search(&layer).is_ok()))
+        .collect::<std::collections::BTreeSet<_>>();
+    for &layer in layers {
+        ensure!(required.iter().any(|name| family.classify(model.spec(), name)
+            .is_some_and(|role| role.layer == Some(layer))),
+            "Spark admission: hosted layer {layer} has no routed expert headers");
+    }
     let tensors = checkpoint.tensors.iter().filter(|tensor| required.contains(&tensor.meta.name))
         .cloned().collect::<Vec<_>>();
     let present = tensors.iter().map(|tensor| tensor.meta.name.as_str()).collect::<std::collections::BTreeSet<_>>();
@@ -163,29 +193,42 @@ pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize) -> 
     selected.context("Spark admission: missing routed expert storage recipe")
 }
 
-/// Qualified recipes only: optional installation checks cannot widen this set.
+/// Registered recipes only: optional installation checks cannot widen this set.
+/// Step-5 TP6 geometry is registered for qualification; its hardware gate is pending.
 /// TP5 support is added per format only after its hardware gate passes.
 pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<SparkRecipe, SparkRecipeRefusal> {
+    spark_recipe_with_placement(package, intermediate, world,
+        cuteafd_core::tp_units::TpPlacement::active().map_err(SparkRecipeRefusal::Placement)?)
+}
+
+pub fn spark_recipe_with_placement(package: &str, intermediate: usize, world: usize,
+    placement: cuteafd_core::tp_units::TpPlacement) -> Result<SparkRecipe, SparkRecipeRefusal> {
     use crate::formats::fp8_experts::Slicing;
     let key = package.split_whitespace().next().unwrap_or(package);
     let (family, format) = key.split_once(':').ok_or_else(|| SparkRecipeRefusal::UnknownPackage(package.into()))?;
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p");
-    let exl3 = format.starts_with("exl3-k") && matches!(family, "v41" | "dsv4f" | "dsv4p" | "glm" | "glmf" | "qwen4");
+    let exl3 = format.starts_with("exl3-k") && matches!(family, "v41" | "dsv4f" | "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
     let nvfp4 = matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
-    let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4");
-    if !(exl3 || nvfp4 || mxfp4 || fp8) {
+    let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4" | "step5");
+    let bf16 = family == "step5" && format == "bf16";
+    if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
+    if placement == cuteafd_core::tp_units::TpPlacement::Balanced && !(mxfp4 && !native && world == 6) {
+        return Err(SparkRecipeRefusal::UnsupportedPlacement { package: key.into(), world });
+    }
     // V4.1 EXL3 TP6 remains unqualified pending a capped-local fidelity gate.
-    if family == "v41" && exl3 && world == 6 {
+    // Kimi K3's only Spark layout is TP6 width 512 (#273: TP4 needs 160 GiB/rank).
+    if (family == "v41" && exl3 && world == 6) || (family == "kimik3" && world != 6) {
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
     }
     let block = if nvfp4 && !native && !matches!(world, 1 | 5) { 16 } else { 128 };
     if !(1..=6).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
     }
-    let packaged = if native { matches!(world, 2 | 3 | 4 | 6) }
+    let packaged = if family == "step5" { matches!(world, 4 | 6) }
+        else if native { matches!(world, 2 | 3 | 4 | 6) }
         else if exl3 { matches!(world, 2 | 3 | 4 | 6) || (family == "qwen4" && world == 1) }
         else if nvfp4 { matches!(world, 2 | 3 | 4 | 6) || (family == "glmf" && world == 5) }
         else if mxfp4 { if family == "mimof" { matches!(world, 2 | 4) } else { matches!(world, 2 | 6) } }
@@ -194,9 +237,12 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
     }
     let exact = exl3 || (!native && intermediate % 128 == 0 && intermediate / 128 >= world);
+    let fine = placement == cuteafd_core::tp_units::TpPlacement::Balanced && mxfp4 && !native && world == 6;
+    let unit = if fine { 32 } else { 128 };
+    let rule = if fine { placement.rule(unit) } else { cuteafd_core::tp_units::UnitRule::Contiguous };
     let widths = if exact {
-        let blocks = intermediate / 128;
-        (0..world).map(|rank| (blocks / world + usize::from(rank < blocks % world)) * 128).collect::<Vec<_>>()
+        (0..world).map(|rank| cuteafd_core::tp_units::RankUnits::new(rule, 1, intermediate, unit, 0, world, rank)
+            .map(|map| map.resident_units() * unit).map_err(SparkRecipeRefusal::Placement)).collect::<Result<Vec<_>, _>>()?
     } else {
         vec![stored_slice(intermediate, if native { 128 } else { block }, world)
             .ok_or(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block })?; world]
@@ -207,12 +253,44 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         let mut unique = widths.clone(); unique.sort_unstable_by(|a, b| b.cmp(a)); unique.dedup();
         unique.into_iter().map(|width| format!("tp{world}-w{width}")).collect()
     } else { vec![format!("tp{world}")] };
-    Ok(SparkRecipe { slicing: if exact { Slicing::Blocks(128) } else { Slicing::Padded }, widths, required_layouts })
+    Ok(SparkRecipe { slicing: if exact { Slicing::Blocks(unit) } else { Slicing::Padded }, widths, rule, required_layouts })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checkpoint_spark_recipe(checkpoint: &super::super::Checkpoint, world: usize) -> anyhow::Result<SparkRecipe> {
+        let family = super::super::family::detect(checkpoint).unwrap();
+        let model = family.open(checkpoint)?;
+        let layers = model.spec().layers.iter().enumerate()
+            .filter_map(|(layer, spec)| (spec.ffn == super::super::spec::FfnKind::Moe).then_some(layer)).collect::<Vec<_>>();
+        super::checkpoint_spark_recipe(checkpoint, world, &layers)
+    }
+
+    #[test]
+    fn balanced_mxfp4_tp6_rotates_one_exact_width_per_layer() {
+        use cuteafd_core::tp_units::{TpPlacement, UnitRule};
+        let recipe = spark_recipe_with_placement("mimop:fp8", 2048, 6, TpPlacement::Balanced).unwrap();
+        assert_eq!(recipe.slicing, crate::formats::fp8_experts::Slicing::Blocks(32));
+        assert_eq!(recipe.rule, UnitRule::LayerRotation);
+        assert_eq!(recipe.widths, [352, 352, 352, 352, 320, 320]);
+        assert_eq!(recipe.required_layouts, ["tp6-w352", "tp6-w320"]);
+        for layer in [0, 3, 40, 77] {
+            let widths = (0..6).map(|rank| recipe.width_for_layer(rank, layer).unwrap()).collect::<Vec<_>>();
+            assert_eq!(widths.iter().sum::<usize>(), 2048);
+            assert_eq!(widths.iter().filter(|&&width| width == 352).count(), 4);
+            for rank in 0..6 { assert_eq!(widths[(rank + layer) % 6], recipe.widths[rank]); }
+        }
+        for rank in 0..6 {
+            assert_eq!((0..6).map(|layer| recipe.width_for_layer(rank, layer).unwrap()).sum::<usize>(), 2048);
+        }
+        assert_eq!(recipe.width_for_layer(6, 1), None);
+        for (package, world) in [("mimop:fp8", 2), ("glmf:exl3-k4", 6), ("step5:fp8", 6)] {
+            assert!(matches!(spark_recipe_with_placement(package, 2048, world, TpPlacement::Balanced),
+                Err(SparkRecipeRefusal::UnsupportedPlacement { .. })));
+        }
+    }
 
     #[test]
     fn checkpoint_recipes_follow_headers_without_installed_packages() {
@@ -274,6 +352,26 @@ mod tests {
     #[test]
     fn recipes_preserve_exact_tp6_and_legacy_nvfp4() {
         use crate::formats::fp8_experts::Slicing;
+        let step5 = spark_recipe("step5:fp8", 1536, 4).unwrap();
+        assert_eq!(step5.slicing, Slicing::Blocks(128));
+        assert_eq!(step5.widths, [384; 4]);
+        assert_eq!(step5.required_layouts, ["tp4"]);
+        let step5_tp6 = spark_recipe("step5:fp8", 1536, 6).unwrap();
+        assert_eq!(step5_tp6.slicing, Slicing::Blocks(128));
+        assert_eq!(step5_tp6.widths, [256; 6]);
+        assert_eq!(step5_tp6.widths.iter().sum::<usize>(), 1536);
+        assert_eq!(step5_tp6.required_layouts, ["tp6"]);
+        assert_eq!(spark_worlds("step5:fp8", 1536), [4, 6]);
+        for world in 0..=8 {
+            if !matches!(world, 4 | 6) { assert!(spark_recipe("step5:fp8", 1536, world).is_err()); }
+            if matches!(world, 4 | 6) {
+                assert_eq!(spark_recipe("step5:bf16", 1536, world).unwrap(),
+                    spark_recipe("step5:fp8", 1536, world).unwrap());
+            } else { assert!(spark_recipe("step5:bf16", 1536, world).is_err()); }
+            for format in ["nvfp4", "nvfp4a4", "mxfp4", "exl3-k34"] {
+                assert!(spark_recipe(&format!("step5:{format}"), 1536, world).is_err());
+            }
+        }
         for package in ["mimo:fp8", "mimop:fp8 (MXFP4)", "glm:nvfp4", "glmf:exl3-k34"] {
             let recipe = spark_recipe(package, 2048, 6).unwrap();
             assert_eq!(recipe.slicing, Slicing::Blocks(128));

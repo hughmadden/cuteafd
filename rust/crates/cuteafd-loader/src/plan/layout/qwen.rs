@@ -204,7 +204,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
-    let inputs = crate::placement::families::qwen4::QwenInputs {
+    let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
         admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: shape.prefill_rows, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
@@ -266,11 +266,13 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> MemoryLayout {
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &capacity)| {
         let arch = crate::placement::ArchContext::for_device("sm_120", capacity);
-        let modules = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &["qwen4"]).module_bytes())
-            .unwrap_or(34 * MIB);
+        let programs = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &["qwen4"]))
+            .unwrap_or_else(|| crate::placement::ProgramSet::from_names(&["qwen4"], []));
+        let allowance = crate::placement::inventory::loaded_code_allowance("qwen4", local_package(report),
+            true, rank as u8, arch, Some(&programs));
         DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: capacity,
             items: vec![Item::new(Category::Runtime, "context+modules", "SM120",
-                arch.context_bytes + arch.cublas_bytes + arch.peer_context_bytes + modules, Basis::Formula)], kv_tokens: 0 }
+                arch.context_bytes + allowance.bytes, allowance.basis)], kv_tokens: 0 }
     }).collect::<Vec<_>>();
     let mut notes = vec![format!("resolved context {context} tokens"),
         "Qwen whole-layer attention ranges; all routed experts native TP2; head and MTP on rtx0".into()];
@@ -343,7 +345,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let headroom = options.headroom_bytes.max(3 * GIB);
-    let inputs = qwen4::QwenDualInputs {
+    let inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
         owner_manifests,
         admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.state_slots.unwrap_or(concurrency),

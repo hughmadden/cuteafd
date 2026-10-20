@@ -51,6 +51,7 @@ METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 # Before -> after table: baseline card metrics, then the client sweep's levels
 # (sweep C<n>) and post-load C1, which are separate measurements.
 SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', 'kl', 'top1', 'pool', 'readiness_s')
+FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
 PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'context_load', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort', 'spec_lossless_set'}
@@ -960,6 +961,12 @@ def summarize_job(job, exit_code):
         for switch, suffix in PROFILER_REPORTS.items():
             if switch in profile['switches'] and not any(r['name'].endswith(suffix) and r['bytes'] for r in profile['reports']):
                 fail(row, f'PROFILE={switch} produced no {suffix} report in {profile["dir"]}', 'measurement')
+        if 'expert-routes' in profile['switches']:
+            logs = sorted(Path(profile['dir']).glob('expert-routes-*.jsonl'))
+            profile['expert_routes'] = [{'name': p.name, 'bytes': p.stat().st_size} for p in logs]
+            profile['expert_inputs'] = len(list(Path(profile['dir']).glob('expert-input-*.safetensors')))
+            if not any(p.stat().st_size for p in logs):
+                fail(row, f'PROFILE=expert-routes wrote no route log in {profile["dir"]}', 'measurement')
     trace_path = job['entry']['set'].get('SPECULATION_TRACE')
     if trace_path and job.get('trace'):
         path = Path(trace_path)
@@ -1015,7 +1022,13 @@ def summarize_job(job, exit_code):
         # token hash above is what matches their requests.
         prefill_only = bool(job['entry'].get('prefill_lengths')) and not job['entry'].get('levels') \
             and job['entry'].get('profile') == 'panels:'
-        if not row['requests'] and not prefill_only:
+        # Fidelity panels score fixed windows through the probe endpoint and
+        # decode nothing, so a fidelity-only run has no console rounds either.
+        profile = job['entry'].get('profile') or ''
+        fidelity_only = not job['entry'].get('levels') and profile.startswith('panels:') \
+            and set(filter(None, profile[len('panels:'):].split(','))) <= FIDELITY_PANELS \
+            and job['entry'].get('baseline') is False
+        if not row['requests'] and not (prefill_only or fidelity_only):
             fail(row, 'matched prompts produced no per-request console rounds')
     row['fabric_caveats'] = fabric_assessment(row['fabric'])
     row['ab_verdict'] = 'rerun' if row['fabric_caveats'] else 'eligible'
@@ -1486,7 +1499,7 @@ BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_E
               'COORDINATOR_GPU_UUID', 'COORDINATOR_GPU_PCI_BUS_ID', 'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
               'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS',
-              'COORDINATOR_DOCKER_INFERENCE', 'SPARK_EXPERT_DOCKER_INFERENCE'}
+              'PROFILE_EXPERT_INPUT_SAMPLE', 'PROFILE_EXPERT_ROUTE_WEIGHTS', 'COORDINATOR_DOCKER_INFERENCE', 'SPARK_EXPERT_DOCKER_INFERENCE'}
 
 
 def build_lock_mode(revision):
@@ -1719,6 +1732,8 @@ def main():
                         'to <job>/lossless-rows/spec-lossless-rows-*/ with a manifest.json; needs --panels with spec_lossless_set')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
+    parser.add_argument('--sweep-tokens', type=int, metavar='N', help='output tokens per --levels decode request '
+                        '(default 192); longer runs give profiled waves more decode steps at every width')
     parser.add_argument('--post-load-repeat', action='store_true', help='make that post-load C1 re-send the levels C1 prompts '
                         '(needs PREFIX_CACHE_ENTRIES=0; the sweep fails if a repeat hits the cache)')
     parser.add_argument('--context-lengths', metavar='N,N', help='shared base contexts for context_load (256..1048576; default 32768,131072)')
@@ -1820,6 +1835,8 @@ def main():
         parser.error('--post-load-c1 needs --levels')
     if args.post_load_repeat and not args.post_load_c1:
         parser.error('--post-load-repeat needs --post-load-c1')
+    if args.sweep_tokens is not None and not (args.levels and 1 <= args.sweep_tokens <= 8192):
+        parser.error('--sweep-tokens needs --levels and 1..8192 tokens')
     levels = None
     if args.levels:
         levels = [int(x) for x in args.levels.split(',') if x.strip()]
@@ -1879,6 +1896,8 @@ def main():
             card['prefill_lengths'] = prefill_lengths
         if levels:
             card['levels'] = levels
+            if args.sweep_tokens is not None:
+                card['sweep_tokens'] = args.sweep_tokens
             if args.post_load_c1:
                 card['post_load_c1'] = True
                 if args.post_load_repeat:
@@ -1998,6 +2017,7 @@ def main():
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+        (['sweep_tokens'] if args.sweep_tokens is not None else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \

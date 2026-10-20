@@ -11,7 +11,8 @@ use std::rc::Rc;
 pub(super) enum Weights<'a> {
     Full(Vec<ExpertWeights<'a>>),
     Exl3(Rc<Vec<Exl3Weights<'a>>>),
-    Fp8(Rc<Fp8Experts<'a>>),
+    Fp8(Vec<Rc<Fp8Experts<'a>>>),
+    Exlr8(Vec<crate::shared::experts::exlr8::Exlr8Weights<'a>>),
 }
 
 impl<'a> Weights<'a> {
@@ -20,6 +21,11 @@ impl<'a> Weights<'a> {
             Self::Full(weights) => weights.iter().map(|w| w.budget).collect(),
             Self::Exl3(weights) => weights.iter().map(|w| w.budget).collect(),
             Self::Fp8(_) => return vec![],
+            Self::Exlr8(weights) => weights.iter().map(|weight| {
+                let mut budget = weight.budget;
+                budget.read_scratch_bytes -= weight.layout.host_bytes();
+                budget
+            }).collect(),
         };
         let terms = [
             ("device", "expert_load_staging", budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)),
@@ -33,21 +39,32 @@ impl<'a> Weights<'a> {
         }).collect()
     }
 
+    pub(super) fn retained_host_inventory(&self) -> Result<Vec<cuteafd_core::expert_geometry::SparkAllocationTerm>> {
+        let Self::Exlr8(weights) = self else { return Ok(vec![]); };
+        retained_host_terms(weights.iter().map(|weight| weight.layout.host_bytes()))
+    }
+
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Full(weights) => weights.len(),
+            Self::Exlr8(weights) => weights.len(),
             Self::Exl3(weights) => weights.len(),
-            Self::Fp8(experts) => experts.layers.len(),
+            Self::Fp8(experts) => experts.iter().map(|group| group.layers.len()).sum(),
         }
     }
     pub(super) fn layer_ids(&self) -> Result<Vec<usize>> {
         match self {
             Self::Full(weights) => Ok(weights.iter().map(|weight| weight.layer.layer()).collect()),
+            Self::Exlr8(weights) => Ok(weights.iter().map(|weight| weight.layout.layer).collect()),
             Self::Exl3(weights) => weights.iter().map(|weight| match weight.layout.layer {
                 cuteafd_loader::V41Exl3Layer::Backbone(layer) => Ok(layer),
                 _ => anyhow::bail!("draft layer in resident Spark backbone"),
             }).collect(),
-            Self::Fp8(experts) => Ok(experts.layers.iter().map(|layer| layer.layer).collect()),
+            Self::Fp8(experts) => {
+                let mut ids = experts.iter().flat_map(|group| &group.layers).map(|layer| layer.layer).collect::<Vec<_>>();
+                ids.sort_unstable();
+                Ok(ids)
+            },
         }
     }
 
@@ -69,7 +86,7 @@ impl<'a> Weights<'a> {
                 };
                 resident = resident.checked_add(u64::try_from(weight.resident_bytes()?)?)
                     .context("native resident sum overflow")?;
-                slices.push(SparkSlice { layer: u32::try_from(weight.layer.layer())?,
+                slices.push(SparkSlice { unit_map: None, layer: u32::try_from(weight.layer.layer())?,
                     first: u32::try_from(rank.checked_mul(info.logical_intermediate as usize)
                         .context("native slice start overflow")?)?,
                     width: info.logical_intermediate, stored_width: info.kernel_intermediate,
@@ -83,7 +100,7 @@ impl<'a> Weights<'a> {
                 };
                 resident = resident.checked_add(u64::try_from(weight.resident_bytes())?)
                     .context("EXL3 resident sum overflow")?;
-                slices.push(SparkSlice { layer: u32::try_from(layer)?,
+                slices.push(SparkSlice { unit_map: None, layer: u32::try_from(layer)?,
                     first: u32::try_from(plan.intermediate_start)?, width: u32::try_from(plan.intermediate)?,
                     stored_width: u32::try_from(plan.intermediate)?,
                     tiers: plan.tiers.iter().copied().map(u32::try_from).collect::<Result<_, _>>()?,
@@ -91,20 +108,34 @@ impl<'a> Weights<'a> {
                         u32::try_from(counts[0])?, u32::try_from(counts[1])?, u32::try_from(counts[2])?,
                     ])).collect::<Result<_, std::num::TryFromIntError>>()? });
             },
+            Self::Exlr8(weights) => for weight in weights {
+                let layout = &weight.layout;
+                resident = resident.checked_add(layout.resident_bytes as u64).context("EXLR8 resident sum overflow")?;
+                slices.push(layout.spark_slice()?);
+            },
             Self::Fp8(experts) => {
-                resident = u64::try_from(experts.resident_bytes())?;
-                for layer in &experts.layers {
-                    ensure!(layer.slice.stored_width as usize == experts.module.info().slice,
-                        "loaded FP8 slice differs from installed package");
-                    slices.push(layer.slice.clone());
+                for group in experts {
+                    resident = resident.checked_add(u64::try_from(group.resident_bytes())?)
+                        .context("native expert group resident overflow")?;
+                    for layer in &group.layers {
+                        ensure!(layer.slice.stored_width as usize == group.module.info().slice,
+                            "loaded native slice differs from installed package");
+                        slices.push(layer.slice.clone());
+                    }
                 }
             }
         }
+        slices.sort_unstable_by_key(|slice| slice.layer);
         Ok((resident, slices))
     }
 
     pub(super) fn validate_ingress(&self, library: &NativeLibrary,
         model: &cuteafd_transport::worker_selection::ModelAdmission) -> Result<()> {
+        if matches!(self, Self::Exlr8(_)) {
+            ensure!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32),
+                "EXLR8 backend requires FP8 K32 ingress");
+            return Ok(());
+        }
         let (fp8, bf16) = match self {
             Self::Full(weights) => {
                 let first = weights.first().context("sealed native worker has no weights")?;
@@ -113,7 +144,10 @@ impl<'a> Weights<'a> {
                     input == cuteafd_transport::ExpertV2Dtype::Bf16 as u32)
             }
             Self::Exl3(_) => (true, false),
-            Self::Fp8(experts) => (experts.wire_input(), !experts.wire_input() || experts.bf16_module.is_some()),
+            Self::Exlr8(_) => unreachable!("validated above"),
+            Self::Fp8(experts) => (
+                experts.iter().all(|group| group.wire_input()),
+                experts.iter().all(|group| !group.wire_input() || group.bf16_module.is_some())),
         };
         for endpoint in &model.endpoints {
             let supported = supports_ingress(endpoint.ingress, fp8, bf16);
@@ -130,8 +164,9 @@ impl<'a> Weights<'a> {
             Self::Full(weights) => weights.first().map(|weight| weight.intermediate()),
             // EXL3 packs its own tiered layout; the logical intermediate is the
             // checkpoint's own value, reported by the EXL3 weights themselves.
-            Self::Exl3(_) => None,
-            Self::Fp8(experts) => Some(experts.module.info().slice),
+            Self::Exl3(_) | Self::Exlr8(_) => None,
+            Self::Fp8(experts) => experts.first().map(|group| group.module.info().slice)
+                .filter(|width| experts.iter().all(|group| group.module.info().slice == *width)),
         }
     }
     pub(super) fn execution(
@@ -142,6 +177,8 @@ impl<'a> Weights<'a> {
         modules: &mut super::modules::WarmModules<'a>,
     ) -> Result<Execution<'_, 'a>> {
         Ok(match self {
+            Self::Exlr8(weights) => Execution::Exlr8(super::exlr8::Worker::new(library,
+                modules.exlr8()?, weights, config, remaining)?),
             Self::Full(weights) => {
                 let mut execution = weights[0].execution(config.compiled_capacity()?, config.capacity, remaining)?;
                 execution.install_native_group(config.native_group()?)?;
@@ -167,18 +204,119 @@ impl<'a> Weights<'a> {
                 Execution::Exl3(execution)
             }
             Self::Fp8(experts) => {
-                ensure!(fp8_worker_workspace(config)? <= remaining,
-                    "FP8 worker workspace exceeds the device budget");
-                Execution::Fp8(Fp8Worker::new(library, experts.clone(), config.capacity)?)
+                let workspace = fp8_worker_workspace(config)?.checked_mul(experts.len())
+                    .context("expert group workspace overflow")?;
+                ensure!(workspace <= remaining, "expert worker workspace exceeds the device budget");
+                let mut workers = Vec::with_capacity(experts.len());
+                let mut bindings = Vec::new();
+                for (group, experts) in experts.iter().enumerate() {
+                    bindings.extend(experts.layers.iter().enumerate().map(|(index, layer)| (layer.layer, group, index)));
+                    workers.push(Fp8Worker::new(library, experts.clone(), config.capacity)?);
+                }
+                let bindings = fp8_bindings(bindings)?;
+                Execution::Fp8(Fp8Groups { workers, bindings, selected: 0,
+                    read_bytes: experts.iter().map(|group| group.weight_read_bytes()).max().unwrap_or(0) })
             }
         })
+    }
+}
+
+fn fp8_bindings(mut layers: Vec<(usize, usize, usize)>) -> Result<Vec<(usize, usize)>> {
+    layers.sort_unstable_by_key(|&(layer, _, _)| layer);
+    ensure!(layers.windows(2).all(|pair| pair[0].0 != pair[1].0),
+        "native expert groups contain duplicate absolute layers");
+    Ok(layers.into_iter().map(|(_, group, index)| (group, index)).collect())
+}
+
+fn retained_host_terms(mut bytes: impl Iterator<Item = usize>)
+    -> Result<Vec<cuteafd_core::expert_geometry::SparkAllocationTerm>> {
+    let bytes = bytes.try_fold(0usize, |total, bytes|
+        total.checked_add(bytes).context("EXLR8 retained host inventory overflow"))?;
+    Ok(vec![cuteafd_core::expert_geometry::SparkAllocationTerm {
+        space: "host".into(), scope: "experts/weights/exlr8_plan".into(),
+        tensor: None, format: Some("exlr8".into()), bytes: u64::try_from(bytes)?,
+        allocations: 0,
+        method: "checkpoint residency host payload; sum across retained layers; admitted separately from native device/pinned workspace; allocation count not sampled".into(),
+    }])
+}
+
+#[cfg(test)]
+#[test]
+fn exlr8_retained_host_inventory_sums_layers_instead_of_transient_max() {
+    let terms = retained_host_terms([7, 11, 13].into_iter()).unwrap();
+    assert_eq!(terms.len(), 1);
+    assert_eq!(terms[0].space, "host");
+    assert_eq!(terms[0].bytes, 31);
+    assert!(terms[0].method.contains("retained layers"));
+    assert!(retained_host_terms([usize::MAX, 1].into_iter()).is_err());
+}
+
+/// One shared worker per homogeneous native package, indexed by absolute layer.
+/// Each worker owns its stream and input/output buffers; admission sums all of them.
+pub(super) struct Fp8Groups<'a> {
+    workers: Vec<Fp8Worker<'a>>,
+    bindings: Vec<(usize, usize)>,
+    selected: usize,
+    read_bytes: usize,
+}
+impl<'a> Fp8Groups<'a> {
+    fn bind_layer(&mut self, index: usize) -> Result<()> {
+        let &(group, layer) = self.bindings.get(index).context("requested expert layer is not resident")?;
+        self.workers[group].bind_layer(layer)?;
+        self.selected = group;
+        Ok(())
+    }
+    fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
+        rank: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
+        if self.workers.len() == 1 { return self.workers[0].installed_grouping(loaded, rank); }
+        conservative_grouping(loaded, rank, self.workers.first().context("no expert workers")?.capacity(), self.read_bytes)
+    }
+    unsafe fn execute_mapped_request(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
+        exchange: &mut HostExpertExchange, slot: CuteafdDeviceBuffer, hidden: Option<CuteafdDeviceBuffer>)
+        -> Result<Option<ExpertProtocolV2DeviceResponseRef<'static>>> {
+        // SAFETY: the selected worker retains the same input/output and stream contract.
+        unsafe { self.workers[self.selected].execute_mapped_request(request, executor_id, exchange, slot, hidden) }
+    }
+    fn execute_host_chunks<F>(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
+        exchange: &mut HostExpertExchange, row_indices: &mut [u32], max_frame_bytes: usize, sink: F) -> Result<()>
+        where F: FnMut(ExpertProtocolV2ResponseRef<'_>) -> Result<()> {
+        self.workers[self.selected].execute_host_chunks(request, executor_id, exchange, row_indices, max_frame_bytes, sink)
+    }
+}
+
+pub(super) fn conservative_grouping(loaded: cuteafd_transport::worker_selection::WorkerSelection,
+    rank: usize, capacity: usize, read_bytes: usize)
+    -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
+    use cuteafd_transport::worker_selection::{ExpertGroupingSelector, ExpertTrafficContract,
+        InstalledExpertGrouping, InstalledExpertVariant};
+    // One report spans heterogeneous packages. Charge every routed occurrence
+    // at the largest expert extent, explicitly not an installed kernel tile.
+    let variant = InstalledExpertVariant::from_piecewise_queries(capacity,
+        ExpertTrafficContract::ConservativeRouteUpperBound, |_| Ok(1))?;
+    InstalledExpertGrouping::new(loaded, rank, capacity, ExpertGroupingSelector::Fp8Nearest,
+        vec![variant])?.with_weight_read_bytes(read_bytes)
+}
+
+#[derive(Default)]
+struct ExpertGroupBytes { resident: usize, scratch: usize, transient: usize }
+impl ExpertGroupBytes {
+    fn add(&mut self, layer_bytes: usize, layers: usize, scratch: usize, transient: usize) -> Result<()> {
+        self.resident = self.resident.checked_add(layer_bytes.checked_mul(layers)
+            .context("expert resident overflow")?).context("expert resident sum overflow")?;
+        self.scratch = self.scratch.checked_add(scratch.max(256)).context("expert scratch sum overflow")?;
+        self.transient = self.transient.max(transient);
+        Ok(())
+    }
+    fn permanent(&self) -> Result<usize> {
+        self.resident.checked_add(self.scratch).context("expert permanent overflow")
     }
 }
 
 pub(super) enum Execution<'w, 'a> {
     Full(ExpertExecution<'w, 'a>),
     Exl3(Exl3Worker<'a>),
-    Fp8(Fp8Worker<'a>),
+    Fp8(Fp8Groups<'a>),
+    Exlr8(super::exlr8::Worker<'w, 'a>),
 }
 impl<'w, 'a> Execution<'w, 'a> {
     pub(super) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
@@ -187,6 +325,7 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Full(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Exl3(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Fp8(execution) => execution.installed_grouping(loaded, rank).map(Some),
+            Self::Exlr8(execution) => execution.grouping(loaded, rank).map(Some),
         }
     }
     pub(super) fn bind_layer(&mut self, weights: &'w Weights<'a>, index: usize) -> Result<()> {
@@ -198,7 +337,23 @@ impl<'w, 'a> Execution<'w, 'a> {
             ),
             (Self::Exl3(execution), Weights::Exl3(_)) => execution.bind_layer(index),
             (Self::Fp8(execution), Weights::Fp8(_)) => execution.bind_layer(index),
+            (Self::Exlr8(execution), Weights::Exlr8(_)) => execution.bind_layer(index),
             _ => anyhow::bail!("expert backend/weight mismatch"),
+        }
+    }
+    /// # Safety
+    /// The transport retains all mapped views until execution drains and emission completes.
+    pub(super) unsafe fn execute_mapped(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
+        exchange: &mut HostExpertExchange, mapped: cuteafd_transport::ProtocolV2RequestDevicePayload)
+        -> Result<Option<ExpertProtocolV2DeviceResponseRef<'static>>> {
+        match self {
+            // SAFETY: the caller retains every mapped owner through the worker drain.
+            Self::Exlr8(execution) => unsafe { execution.execute_mapped(request, executor_id, exchange, mapped) },
+            _ => match mapped.response_slot {
+                // SAFETY: existing backends receive the same retained mapped views.
+                Some(slot) => unsafe { self.execute_mapped_request(request, executor_id, exchange, slot, Some(mapped.hidden_payload)) },
+                None => Ok(None),
+            }
         }
     }
     pub(super) unsafe fn execute_mapped_request(
@@ -217,6 +372,7 @@ impl<'w, 'a> Execution<'w, 'a> {
                 execution.execute_mapped_request(request, executor_id, exchange, slot, hidden)
             }
             Self::Fp8(execution) => execution.execute_mapped_request(request, executor_id, exchange, slot, hidden),
+            Self::Exlr8(_) => Ok(None),
         }
     }
     pub(super) fn execute_host_chunks<F>(
@@ -251,6 +407,8 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Fp8(execution) => {
                 execution.execute_host_chunks(request, executor_id, exchange, row_indices, max_frame_bytes, sink)
             }
+            Self::Exlr8(execution) => execution.execute_host_chunks(request, executor_id, exchange,
+                row_indices, max_frame_bytes, sink),
         }
     }
 }
@@ -262,10 +420,6 @@ fn supports_ingress(ingress: cuteafd_core::SparkIngress, fp8: bool, bf16: bool) 
         // FP8 remains legal at every row count, including the BF16 decode extent.
         cuteafd_core::SparkIngress::Bf16Decode { .. } => fp8 && bf16,
     }
-}
-
-fn fp8_resident_budget(available: usize, resident: usize, serve_peak: usize) -> usize {
-    available.saturating_sub(serve_peak.saturating_sub(resident))
 }
 
 #[cfg(test)]
@@ -286,13 +440,15 @@ mod admission_tests {
     }
 
     #[test]
-    fn fp8_load_transients_do_not_reduce_serve_residency() {
-        // The load and serve peaks fit independently, not simultaneously.
-        let (available, resident, staging, scratch, serve_overhead) = (100, 70, 25, 10, 20);
-        assert!(resident + staging <= available);
-        assert!(resident + scratch + serve_overhead <= available);
-        assert_eq!(super::fp8_resident_budget(available, resident, resident + serve_overhead), 80);
-        assert_eq!(super::fp8_resident_budget(10, 20, 40), 0);
+    fn group_admission_sums_retained_storage_but_maxes_load_transients() {
+        let mut bytes = super::ExpertGroupBytes::default();
+        bytes.add(1000, 3, 100, 2000).unwrap();
+        bytes.add(2000, 2, 500, 1500).unwrap();
+        assert_eq!(bytes.resident, 7000);
+        assert_eq!(bytes.scratch, 756);
+        assert_eq!(bytes.transient, 2000);
+        assert_eq!(bytes.permanent().unwrap(), 7756);
+        assert!(bytes.add(usize::MAX, 2, 0, 0).is_err());
     }
 }
 
@@ -310,7 +466,7 @@ fn fp8_worker_workspace(config: &NativeExpertServiceConfig) -> Result<usize> {
 }
 
 // Installation can narrow the checkpoint's qualified recipe, never widen it.
-fn validate_fp8_recipe(package: &str, intermediate: usize, world: usize,
+pub(super) fn validate_fp8_recipe(package: &str, intermediate: usize, world: usize,
     directory: &std::path::Path, rank: usize,
     slicing: cuteafd_loader::formats::fp8_experts::Slicing, width: usize) -> Result<()> {
     let recipe = cuteafd_loader::plan::experts::spark_recipe(package, intermediate, world)?;
@@ -323,66 +479,41 @@ fn validate_fp8_recipe(package: &str, intermediate: usize, world: usize,
 /// this rank's intermediate slice, run by the `fp8-<family>` package.
 pub(super) fn load_fp8<'a>(
     library: &'a NativeLibrary,
-    catalog: &OfficialV41Catalog,
+    _catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
-    modules: crate::shared::experts::fp8::Fp8Modules,
+    groups: Vec<super::modules::Fp8Group>,
 ) -> Result<(Weights<'a>, usize)> {
-    let tensors = catalog.fp8().context("FP8 residency requires the checkpoint's FP8 experts")?;
-    // FP8 slices are whole 128-row blocks (TP2/TP4 of 2048); MXFP4 slices are
-    // whole 32-blocks padded to 128 (MiMo V2.6 Pro: TP6, TP2), NVFP4 ones whole
-    // 16-blocks padded to 128 (TP3 as well). `slice` checks it; the package
-    // directory has a layout per built world.
-    ensure!(config.spark_world()?.wire() == cuteafd_transport::expert::SparkWire::Canonical,
-        "FP8/MXFP4/NVFP4 programs require canonical Spark wire");
-    tensors.slice(config.world)?;
-    let directory = config.fp8_package.clone()
-        .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&config.library, config.world, tensors.format()));
-    let (directory, slicing) = crate::shared::experts::fp8::exact_layout(&directory, tensors, config.world, config.rank);
-    let family = crate::shared::experts::fp8::package_family(cuteafd_core::expert_geometry().family(), tensors.format());
-    let format = if tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4 { "nvfp4" } else { "fp8" };
-    validate_fp8_recipe(&format!("{family}:{format}"), tensors.shape().intermediate,
-        config.world, &directory, config.rank, slicing,
-        tensors.rank_width(config.world, config.rank, slicing)?)?;
-    if config.world == 5 {
-        ensure!(
-            slicing == cuteafd_loader::formats::fp8_experts::Slicing::Blocks(128)
-                || tensors.shape().intermediate as usize % (128 * config.world) == 0,
-            "Spark TP{} requires every whole-H128 rank-width package beside {}; padded fallback is not supported for this new count",
-            config.world, directory.display()
-        );
+    ensure!(!groups.is_empty(), "native expert worker has no resident groups");
+    let workspace = fp8_worker_workspace(config)?.checked_mul(groups.len())
+        .context("expert group workspace overflow")?;
+    let mut totals = ExpertGroupBytes::default();
+    let mut budgets = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let bytes = crate::shared::experts::fp8::Fp8Layer::bytes_for(&group.tensors,
+            config.world, config.rank, group.slicing)?;
+        let reader = bytes.checked_mul(config.world).and_then(|n| n.checked_mul(16))
+            .context("expert reader scratch overflow")?.div_ceil(group.tensors.shape().experts);
+        let transient = bytes.checked_mul(2).and_then(|n| n.checked_add(reader))
+            .context("expert host staging overflow")?;
+        totals.add(bytes, group.layers.len(), group.scratch, transient)?;
+        budgets.push(bytes.checked_mul(group.layers.len()).and_then(|n| n.checked_add(group.scratch))
+            .context("expert group budget overflow")?);
     }
-    let layers = config.resident_layers(catalog.routed_experts().layers)?;
-    let workspace = fp8_worker_workspace(config)?;
-    let budget = config.device_budget.checked_sub(workspace).context("FP8 worker workspace exceeds the budget")?;
-    tracing::info!(rank = config.rank, world = config.world, layer_ids = ?layers, layer_count = layers.len(),
-        package = %directory.display(), "FP8 Spark residency plan");
-    // The BF16-input sibling package, when built, lets the coordinator send unquantized rows.
-    let bf16 = crate::shared::experts::fp8::bf16_sibling(&directory).filter(|d| d.is_dir());
-    let layer_bytes = crate::shared::experts::fp8::Fp8Layer::bytes_for(tensors, config.world, config.rank, slicing)?;
-    let resident = layer_bytes.checked_mul(layers.len()).context("FP8 resident overflow")?;
-    // Per-projection pageable buffers and parallel reader scratch are temporary;
-    // reserve two whole layers conservatively for the host upload transients.
-    let reader_scratch = layer_bytes.checked_mul(config.world).and_then(|bytes| bytes.checked_mul(16))
-        .context("FP8 reader scratch overflow")?.div_ceil(tensors.shape().experts);
-    let host_staging = layer_bytes.checked_mul(2).and_then(|bytes| bytes.checked_add(reader_scratch))
-        .context("FP8 host staging overflow")?;
-    let peak = spark_admission_budget(config, resident, 0, host_staging, 0, workspace)?;
+    let permanent = totals.permanent()?;
+    let peak = spark_admission_budget(config, permanent, 0, totals.transient, 0, workspace)?;
+    ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+        "native expert groups exceed budget: load {} serve {} budget {}",
+        peak.load_peak, peak.serve_peak, config.device_budget);
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
-    // Loading buffers are gone before package scratch and worker storage exist;
-    // admit their peak above, rather than subtracting both lifetimes here.
-    let actual_budget = fp8_resident_budget(library.cuda_allocatable_memory_info()?.0, resident, peak.serve_peak);
-    let budget = budget.min(actual_budget);
-    let experts = Fp8Experts::load_with_modules(library, tensors, &directory, bf16.as_deref(), &layers,
-        config.world, config.rank, config.capacity as usize, budget, Some(modules))?;
-    if let Some(bf16) = bf16 {
-        tracing::info!(package = %bf16.display(), "FP8 experts also take BF16 rows");
+    tracing::info!(groups = groups.len(), resident = totals.resident, scratch = totals.scratch,
+        transient = totals.transient, workspace, "native expert groups admitted before allocation");
+    let mut owners = Vec::with_capacity(groups.len());
+    for (group, budget) in groups.into_iter().zip(budgets) {
+        owners.push(Rc::new(Fp8Experts::load_with_modules(library, &group.tensors, &group.directory,
+            group.bf16_directory.as_deref(), &group.layers, config.world, config.rank,
+            config.capacity as usize, budget, Some(group.modules.context("native group modules already consumed")?))?));
     }
-    tracing::info!(rank = config.rank, ?slicing, width = tensors.rank_width(config.world, config.rank, slicing)?,
-        "FP8 expert slice layout");
-    let resident: usize = experts.layers.len()
-        * crate::shared::experts::fp8::Fp8Layer::bytes_for(tensors, config.world, config.rank, slicing)?;
-    let remaining = config.device_budget.saturating_sub(resident);
-    Ok((Weights::Fp8(Rc::new(experts)), remaining))
+    Ok((Weights::Fp8(owners), config.device_budget - permanent))
 }
 
 pub(super) fn load_exl3<'a>(
@@ -460,6 +591,17 @@ mod tests {
     use super::*;
     use cuteafd_loader::{formats::fp8_experts::Slicing,
         plan::experts::{InstalledSparkRecipeRefusal, SparkRecipeRefusal}};
+
+    #[test]
+    fn rotated_width_groups_bind_in_absolute_layer_order() -> Result<()> {
+        let layers = [vec![3, 4, 5, 8, 9], vec![6, 7, 10]];
+        let bindings = layers.iter().enumerate().flat_map(|(group, layers)|
+            layers.iter().enumerate().map(move |(index, &layer)| (layer, group, index))).collect();
+        assert_eq!(fp8_bindings(bindings)?,
+            [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (0, 3), (0, 4), (1, 2)]);
+        assert!(fp8_bindings(vec![(3, 0, 0), (3, 1, 0)]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn fp8_load_recipe_refuses_unqualified_package_before_installation() -> Result<()> {

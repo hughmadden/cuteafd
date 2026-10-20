@@ -31,6 +31,26 @@ fn widen(bytes: &[u8], dtype: DType) -> Result<Vec<u8>> {
     }
 }
 
+/// Explicit operand conversion, only for checkpoints whose computation rounds
+/// FP32 parameters before use. Native BF16 sources remain byte-identical.
+pub(crate) fn materialize_bf16(bytes: &[u8], dtype: DType) -> Result<Vec<u8>> {
+    match dtype {
+        DType::Bf16 => {
+            ensure!(bytes.len() % 2 == 0, "incomplete BF16 tensor");
+            Ok(bytes.to_vec())
+        }
+        DType::F32 => {
+            ensure!(bytes.len() % 4 == 0, "incomplete FP32 tensor");
+            Ok(bytes.chunks_exact(4).flat_map(|b| {
+                let value = f32::from_le_bytes(b.try_into().unwrap());
+                let rounded = cuteafd_core::dense_attention::OutputPrecision::Bf16.round(value);
+                ((rounded.to_bits() >> 16) as u16).to_le_bytes()
+            }).collect())
+        }
+        other => anyhow::bail!("expected BF16 or FP32 operand, found {other:?}"),
+    }
+}
+
 fn row_layout(tensors: &[(Vec<u8>, DType, Vec<usize>)], pad_rows: usize) -> Result<(usize, usize)> {
     let first = tensors.first().context("empty Qwen row concatenation")?;
     ensure!(first.2.len() == 2 && first.2[0] > 0 && first.2[1] > 0, "expected nonempty BF16 matrix");
@@ -147,6 +167,31 @@ mod tests {
         assert_eq!(widen(&widened, DType::F32)?, widened);
         assert!(widen(&[0], DType::Bf16).is_err());
         assert!(widen(&[0; 3], DType::F32).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_operand_materialization_rounds_ties_to_even_and_preserves_native_bytes() -> Result<()> {
+        let native: Vec<_> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        assert_eq!(materialize_bf16(&native, DType::Bf16)?, native);
+        // Independent expected upper words on either side of every finite BF16
+        // midpoint, including signed zero, subnormals and finite overflow.
+        for upper in 0..=u16::MAX {
+            if upper & 0x7f80 == 0x7f80 { continue; }
+            for lower in [0, 0x7fff, 0x8000, 0x8001, 0xffff] {
+                let bits = (u32::from(upper) << 16) | lower;
+                let carry = lower > 0x8000 || (lower == 0x8000 && upper & 1 != 0);
+                let expected = upper.wrapping_add(u16::from(carry));
+                assert_eq!(materialize_bf16(&bits.to_le_bytes(), DType::F32)?, expected.to_le_bytes());
+            }
+        }
+        for (bits, expected) in [(0x7f80_0000u32, 0x7f80u16), (0xff80_0000, 0xff80),
+            (0x7f80_0001, 0x7fc0), (0xff80_0001, 0xffc0)] {
+            assert_eq!(materialize_bf16(&bits.to_le_bytes(), DType::F32)?, expected.to_le_bytes());
+        }
+        assert!(materialize_bf16(&[0], DType::Bf16).is_err());
+        assert!(materialize_bf16(&[0;3], DType::F32).is_err());
+        assert!(materialize_bf16(&[0;4], DType::F8E4M3).is_err());
         Ok(())
     }
 

@@ -188,6 +188,9 @@ pub struct GlmInputs<'a> {
     pub gpus: Vec<(u64, Baseline)>,
     pub headroom_bytes: u64,
     pub spark_ranks: usize,
+    /// Native FP8 K32 ingress, BF16 partials and bounded per-GPU shared execution.
+    pub native_experts: bool,
+    pub native_workspace: u64,
     /// Coordinator-only diagnostics replace routed FFNs with zero intake planes.
     pub skip_routed_experts: bool,
     pub prefill_rows: u64,
@@ -249,6 +252,12 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         || inputs.prefill_rows == 0 || inputs.prefill_rows > 4096 || inputs.max_context == 0 {
         return Err(PlacementError::Inventory("GLM rank/lane/step/context geometry"));
     }
+    if inputs.native_experts && (inputs.prefill_lanes != 1
+        || inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
+        || !inputs.experts.is_empty() || inputs.drafter_bytes != 0 || inputs.scratch.is_none()
+        || inputs.native_workspace == 0) {
+        return Err(PlacementError::Inventory("EXLR8 requires serial measured workspaces, real Spark experts and 1..=6 ranks"));
+    }
     let geometry = glm_cache_geometry(cfg, inputs.layers, gpus)
         .map_err(|_| PlacementError::Inventory("GLM cache geometry"))?;
     if inputs.skip_routed_experts && (!inputs.experts.is_empty() || inputs.spark_ranks != 0
@@ -290,10 +299,14 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 (bytes, Basis::Estimated)
             }
         };
+        let steps = if inputs.native_experts {
+            steps.checked_add(inputs.native_workspace)
+                .ok_or(PlacementError::Overflow("GLM native workspaces"))?
+        } else { steps };
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Workspace, "steps", steps, basis)));
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "decode graph allowance", graphs, Basis::Estimated)));
         if let Some(&bytes) = inputs.pending_code.get(rank).filter(|&&bytes| bytes > 0) {
-            rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "pending loaded code", bytes, Basis::Calibrated)));
+            rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "pending loaded code", bytes, Basis::Formula)));
         }
         if gpus == 2 {
             let slots = 4 * inputs.prefill_lanes;
@@ -363,7 +376,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             capacity_bytes, baseline, headroom_bytes: inputs.headroom_bytes }).collect(),
             spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: 1 << 31, ..PoolPolicy::resolve(&cards, inputs.max_context,
-            inputs.requested_pool, PAGE_ROWS, inputs.spark_ranks == 0) },
+            inputs.requested_pool, PAGE_ROWS, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context) },
         layers, pool_overhead, fixed, startup, movables,
         expert_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.expert_workspace } else { 0 },
         tp2_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.tp2_workspace } else { [0; 2] },
@@ -874,7 +887,7 @@ mod tests {
     fn inputs<'a>(cfg: &'a GlmDsaConfig, cards: &[u64]) -> GlmInputs<'a> {
         GlmInputs { cfg, layers: cfg.layers, gpus: cards.iter().enumerate().map(|(rank, &total)| (total,
             Baseline::Planned { context_bytes: GIB, loaded_bytes: if rank == 0 { 14 * GIB } else { 12 * GIB } })).collect(),
-            headroom_bytes: 2 * GIB, spark_ranks: 4, skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
+            headroom_bytes: 2 * GIB, spark_ranks: 4, native_experts: false, native_workspace: 0, skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
             max_context: 1 << 20, automatic_context: true, scratch: Some([GlmScratch { programs: 16 << 20, topk: 1 << 20 }; 2]),
             drafter_bytes: 3 * GIB, drafter_staging: 0, pending_code: vec![],
             experts: (cfg.first_moe_layer..cfg.layers).map(|_| ExpertCost {
@@ -888,6 +901,42 @@ mod tests {
     /// solve must request `heads` explicitly: auto resolves to `context`,
     /// which fails closed without its programs (issue #202).
     const HEADS: Option<AttentionPlacement> = Some(AttentionPlacement::Heads);
+
+    #[test]
+    fn native_split_workspaces_are_exact_and_unsupported_modes_refused() {
+        let cfg = config();
+        let mut base = inputs(&cfg, &[96 * GIB]);
+        base.prefill_lanes = 1;
+        base.prefill_rows = 65;
+        base.experts.clear();
+        base.drafter_bytes = 0;
+        base.drafter_staging = 0;
+        let mut native = base.clone();
+        native.native_experts = true;
+        native.native_workspace = 123456;
+        let ordinary = request(&base).unwrap();
+        let split = request(&native).unwrap();
+        let term = |request: &PlacementRequest, name: &str| request.fixed.iter()
+            .find(|demand| demand.group == name).unwrap().bytes;
+        let h = cfg.hidden as u64;
+        assert_eq!(term(&split, "steps") - term(&ordinary, "steps"),
+            123456);
+        assert_eq!(term(&split, "Spark intake planes"), 4 * 4096 * h * 2);
+        let mut invalid = native.clone(); invalid.prefill_lanes = 2;
+        assert!(request(&invalid).is_err());
+        let mut invalid = native.clone(); invalid.scratch = None;
+        assert!(request(&invalid).is_err());
+        let mut invalid = native.clone(); invalid.spark_ranks = 0;
+        assert!(request(&invalid).is_err());
+        let mut pair = native.clone(); pair.gpus.push(pair.gpus[0]);
+        assert!(request(&pair).is_ok());
+        for ranks in 1..=6 {
+            let mut supported = pair.clone(); supported.spark_ranks = ranks;
+            assert!(request(&supported).is_ok());
+        }
+        let mut invalid = pair; invalid.spark_ranks = 7;
+        assert!(request(&invalid).is_err());
+    }
 
     #[test]
     fn planner_equals_runtime_glm5() {
@@ -944,6 +993,7 @@ mod tests {
             i.expert_workspace = 0;
             i.tp2_workspace = [0; 2];
             i.drafter_bytes = 0;
+            i.max_context = 65536;
             i.requested_pool = Some(65536);
             i.onboard = Onboard::Layers(0);
             assert!(solve(&request(&i).unwrap()).is_err(), "normal Spark-free execution must fail closed");
@@ -974,6 +1024,7 @@ mod tests {
             Onboard::ExpertsFirst { pool_floor: 262144 }] {
             let mut planned = inputs(&cfg, &[96 * GIB; 2]);
             planned.onboard = onboard;
+            planned.max_context = 65536;
             planned.requested_pool = Some(65536);
             for cost in &mut planned.experts {
                 cost.half = [Bytes2 { resident: 1 << 20, staging: 0 }; 2];
@@ -997,6 +1048,7 @@ mod tests {
             assert_eq!(solve_working_set(&measured, serial, HEADS).unwrap(), (p, working));
         }
         let mut input = inputs(&cfg, &[96 * GIB; 2]);
+        input.max_context = 65536;
         input.requested_pool = Some(65536);
         for onboard in [Onboard::Layers(0), Onboard::Fraction(0.0), Onboard::Layers(2)] {
             input.onboard = onboard;
@@ -1020,6 +1072,7 @@ mod tests {
     fn component_rows_follow_empty_rtx_and_empty_spark_branches() {
         let cfg = config();
         let mut input = inputs(&cfg, &[96 * GIB; 2]);
+        input.max_context = 65536;
         input.requested_pool = Some(65536);
         input.onboard = Onboard::Layers(0);
         let without_rtx = solve_working_set(&input, [64 << 20; 2], HEADS).unwrap();
@@ -1137,6 +1190,7 @@ mod tests {
         input.requested_pool = Some(2 << 20);
         assert!(matches!(solve_working_set(&input, serial, HEADS), Err(PlacementError::PoolDoesNotFit { .. })));
         input.experts.clear();
+        input.max_context = 65536;
         input.requested_pool = Some(65536);
         assert_eq!(solve_working_set(&input, serial, HEADS).unwrap().0.onboard_layers, 0);
         input.onboard = Onboard::Layers(1);
@@ -1227,7 +1281,7 @@ mod tests {
                 .unwrap().unwrap();
             let planned = GlmInputs { prefill_rows: 64, experts: local.experts.clone(),
                 expert_workspace: 0, tp2_workspace: local.workspace(), drafter_bytes: 0,
-                requested_pool: Some(65536), onboard, ..inputs(&cfg, &[96 * GIB; 2]) };
+                max_context: 65536, requested_pool: Some(65536), onboard, ..inputs(&cfg, &[96 * GIB; 2]) };
             let mut runtime = planned.clone();
             for (total, baseline) in &mut runtime.gpus {
                 let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
@@ -1527,7 +1581,7 @@ mod tests {
                 for onboard in [Onboard::Auto, Onboard::Layers(0), Onboard::Layers(1), Onboard::Fraction(1.0)] {
                     let planned = GlmInputs { prefill_rows: rows, experts: local.experts.clone(),
                         expert_workspace: 0, tp2_workspace: local.workspace(),
-                        drafter_bytes: 0, requested_pool: Some(65536), onboard, ..inputs(&cfg, &[96 * GIB; 2]) };
+                        drafter_bytes: 0, max_context: 65536, requested_pool: Some(65536), onboard, ..inputs(&cfg, &[96 * GIB; 2]) };
                     let mut runtime = planned.clone();
                     for (total, baseline) in &mut runtime.gpus {
                         let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
@@ -1704,6 +1758,7 @@ mod tests {
             i.experts.clear();
             i.onboard = Onboard::Layers(0);
             i.prefill_lanes = 1;
+            i.max_context = 32768;
             i.requested_pool = Some(32768);
             let placed = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Layers)).unwrap().0;
             let expected = attention_owners(&cfg, layers).unwrap();
@@ -1806,6 +1861,7 @@ mod tests {
         // One GPU never runs context, even where the build could.
         let mut one = inputs(&cfg, &[96 * GIB]);
         one.context = Some(CONTEXT_SCRATCH);
+        one.max_context = 65536;
         one.requested_pool = Some(65536);
         assert_eq!(solve_working_set(&one, [0; 2], None).unwrap().0.attention_placement, AttentionPlacement::Heads);
         assert!(solve_working_set(&one, [0; 2], Some(AttentionPlacement::Context)).is_err());

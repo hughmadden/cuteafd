@@ -72,7 +72,11 @@ def main():
     candidates = list(filter(None, args.fallback.split(',')))
     if any(host not in ('rhea', 'moa') for host in candidates):
         parser.error('fallback seeds must be rhea or moa')
-    start = Path(f'/proc/{args.owner}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    try:
+        start = Path(f'/proc/{args.owner}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    except (OSError, IndexError):
+        return  # the owner is already gone: nothing to acquire for
+
     stopping = False
     def stop(signum, frame):
         nonlocal stopping

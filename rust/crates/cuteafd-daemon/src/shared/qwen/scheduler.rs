@@ -77,13 +77,15 @@ pub(crate) trait Backend<'a> {
     type History;
     type Coordinates;
     type Encoder: Encoder;
-    type Prefix: PrefixFamily<Placement = Self::Placement>;
+    type Meta: Clone + Default;
+    type Prefix: PrefixFamily<Self::Meta, Placement = Self::Placement>;
 
     fn geometry(&self) -> Geometry;
+    fn message_starts(&self) -> &[&str] { &MESSAGE_STARTS }
     fn library(&self) -> &'a NativeLibrary;
     fn profile(&self) -> &RefCell<[f64; 2]>;
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
-        -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)>;
+        -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Self::Meta>)>;
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)>;
     fn probe_features(&self, prompt: &Prompt, media: &mut RequestMedia,
         cache: &mut cuteafd_engine::media::EmbeddingCache, snapshot: &Path) -> Result<()>;
@@ -95,11 +97,15 @@ pub(crate) trait Backend<'a> {
     fn prefetch(&self, tokens: &[u32], next: &[u32]);
     fn require_live(&self) -> Result<()>;
     fn log_table_stats(&self, phase: &str);
-    fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize)
+    // Family write validation uses the actual cache pool after admission/COW.
+    fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize,
+        pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
-    fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool)
+    fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
+        pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool)
+    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
+        pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value;
@@ -290,12 +296,26 @@ impl Trace {
 }
 
 /// Gives a finished or failed sequence's units and state slot back.
-fn release<P: Placement, F: PrefixFamily<Placement = P>>(family: &F, cache: &mut PrefixCache<CudaCopyEngine<'_>>, slots: &mut Vec<i32>,
+fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>>(family: &F, cache: &mut PrefixCache<CudaCopyEngine<'_>, M>, slots: &mut Vec<i32>,
     placement: &P, family_name: &str) {
     if let Err(error) = cache.release(family, placement.units()) {
         tracing::error!(%error, family = family_name, "releasing sequence units");
     }
     slots.push(placement.slot());
+}
+
+/// Verify and selection can fail before synchronizing their streams. Cache
+/// dirtiness tracks prefix copies, not backend writes, so drain unconditionally.
+/// On either failure, retain both the page references and the state slot.
+fn release_failed<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>,
+    E: cuteafd_hostcache::copy::CopyEngine>(family: &F, cache: &mut PrefixCache<E, M>,
+    slots: &mut Vec<i32>, placement: &P) -> std::result::Result<(), cuteafd_engine::prefix::PrefixError> {
+    family.drain().map_err(|source| cuteafd_engine::prefix::PrefixError::Family {
+        what: "failed step drain", source,
+    })?;
+    cache.release(family, placement.units())?;
+    slots.push(placement.slot());
+    Ok(())
 }
 
 #[derive(Clone, Copy, Default, serde::Serialize)]
@@ -386,8 +406,8 @@ mod verify_tests {
 }
 
 /// Serving statistics for `/v1/stats`.
-fn publish<E: Encoder>(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
-    cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<Prompt, E>,
+fn publish<E: Encoder, M: Clone + Default>(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
+    cache: &PrefixCache<CudaCopyEngine<'_>, M>, media: &MediaAdmission<Prompt, E>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
@@ -501,7 +521,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     // Publish readiness only after all fallible scheduler-owned startup work.
     let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
         let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
-        let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
+        let markers = crate::shared::prefix::marker_ids(snapshot, engine.message_starts())?;
         let grammars = crate::shared::constraints::Compiler::with_vocab(
             engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
         let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
@@ -669,9 +689,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let scored = probe::score(engine.library(), &job.probe, &tokens, from, geometry.prefill_rows,
                     geometry.decode_rows, probe::verify_rows(&job.probe), geometry.full_prefill_logits, &mut placement,
-                    |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows)?
+                    |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows, cache.pool())?
                         .map(probe::ScoreLogits::Device)),
-                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false)?
+                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false, cache.pool())?
                         .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
@@ -736,8 +756,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
                         .is_some_and(|step| step.decode);
                     let logits = if decode {
-                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false)?
-                    } else { engine.prefill_device(&mut p.placement, chunk, 1)? };
+                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false, cache.pool())?
+                    } else { engine.prefill_device(&mut p.placement, chunk, 1, cache.pool())? };
                     if end == p.tokens.len() {
                         // The first token, while this prompt's logits are the workspace's.
                         let mut logits = logits.context("prefill produced no logits")?;
@@ -831,7 +851,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe)).then(|| p.keys.tokens().to_vec());
                 let spans = p.keys.spans().to_vec();
                 let session = p.ticket.session();
-                let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &B::Placement| {
+                let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>, B::Meta>, placement: &B::Placement| {
                     if let (Some(prompt), Some(logits)) = (&prompt, &logits) {
                         cache.capture_session(session.clone());
                         if let Err(error) = cache.capture_media(&family, SnapshotKind::Prompt, prompt, &spans, placement,
@@ -984,9 +1004,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let timer = Instant::now();
         engine.probe_begin(tokens.len());
         let step = if diagnostic {
-            engine.verify_device_ungraphed(&mut rows, spec)
+            engine.verify_device_ungraphed(&mut rows, spec, cache.pool())
         } else {
-            engine.verify_device(&mut rows, spec)
+            engine.verify_device(&mut rows, spec, cache.pool())
         }.and_then(|logits| logits.context("decode needs every layer"))
             .and_then(|logits| {
                 // Each row draws at the position after it, masked along its sequence's drafts.
@@ -1008,7 +1028,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 for request in active.drain(..) {
                     if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family);
+                    if let Err(error) = release_failed(&family, &mut cache, &mut free_slots, &request.placement) {
+                        tracing::error!(%error, family = geometry.family, slot = request.placement.slot(),
+                            "failed step units and state slot quarantined");
+                    }
                 }
                 continue;
             }
@@ -1179,6 +1202,120 @@ fn media_failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::opena
     }
 }
 
+
+#[cfg(test)]
+mod failed_release_tests {
+    use super::*;
+    use cuteafd_engine::prefix::{After, BoxError, FamilyLayout, MarkSlot, MarkStore,
+        PageOwners, PrefixConfig, ReuseRule, TailCopy};
+    use cuteafd_hostcache::copy::{DeviceRange, StubCopyEngine};
+    use std::cell::Cell;
+
+    #[derive(Clone)]
+    struct Placed { pages: Vec<u32>, slot: i32 }
+    impl Placement for Placed {
+        fn len(&self) -> usize { 64 }
+        fn set_len(&mut self, _: usize) {}
+        fn units(&self) -> &[u32] { &self.pages }
+        fn slot(&self) -> i32 { self.slot }
+        fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    }
+
+    #[derive(Default)]
+    struct Queued {
+        writes: RefCell<Vec<u32>>,
+        landed: RefCell<Vec<u32>>,
+        drains: Cell<usize>,
+        fail_on: Cell<usize>,
+    }
+    impl PrefixFamily for Queued {
+        type Placement = Placed;
+        fn layout(&self) -> FamilyLayout {
+            FamilyLayout { page_rows: 64, pages: 2, page_bytes: 64, mark_bytes: 0,
+                draft_bytes: 0, rule: ReuseRule::EXACT, mark_store: MarkStore::Arena,
+                page_owners: PageOwners::Uniform }
+        }
+        fn pages<'p>(&self, placement: &'p Placed) -> &'p [u32] { &placement.pages }
+        fn commit_point(&self, _: &Placed) -> usize { 64 }
+        fn capture(&self, _: MarkSlot, _: &Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn restore(&self, _: Option<MarkSlot>, _: &mut Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn copy_rows(&self, _: TailCopy) -> Result<(), BoxError> { Ok(()) }
+        fn drain(&self) -> Result<(), BoxError> {
+            let call = self.drains.get() + 1;
+            self.drains.set(call);
+            if self.fail_on.get() == call { return Err("injected drain failure".into()); }
+            self.landed.borrow_mut().extend(self.writes.borrow_mut().drain(..));
+            Ok(())
+        }
+        fn page_segments(&self, _: u32) -> Vec<DeviceRange> { Vec::new() }
+        fn mark_segments(&self, _: MarkSlot) -> Vec<DeviceRange> { Vec::new() }
+    }
+
+    fn admit(family: &Queued) -> (PrefixCache<StubCopyEngine>, Placed) {
+        let mut cache = PrefixCache::new(family.layout(), PrefixConfig {
+            entries: 1, mark_slots: 0, keep_logits: false, min_tokens: 0,
+        }, None).unwrap();
+        let placement = cache.admit_cold(family, 64, 64, |pages| Placed { pages, slot: 7 })
+            .unwrap().placement;
+        (cache, placement)
+    }
+
+    #[test]
+    fn failed_step_drains_backend_writes_with_a_clean_prefix_cache_before_reuse() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        let mut slots = Vec::new();
+        family.writes.borrow_mut().extend(&placement.pages);
+        assert_eq!(family.drains.get(), 0);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 1);
+        release_failed(&family, &mut cache, &mut slots, &placement).unwrap();
+        assert_eq!(family.drains.get(), 1);
+        assert!(family.writes.borrow().is_empty());
+        assert_eq!(*family.landed.borrow(), placement.pages);
+        assert_eq!(slots, [7]);
+        assert_eq!(cache.pool().free(), 2);
+        let next = cache.admit_cold(&family, 64, 64, |pages| Placed { pages, slot: slots.pop().unwrap() })
+            .unwrap().placement;
+        assert_eq!(next.pages, placement.pages);
+        assert_eq!(next.slot, 7);
+    }
+
+    #[test]
+    fn failed_step_quarantines_pages_and_slot_when_unconditional_drain_fails() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        let mut slots = vec![9];
+        family.writes.borrow_mut().extend(&placement.pages);
+        family.fail_on.set(1);
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement).is_err());
+        assert_eq!(family.drains.get(), 1);
+        assert_eq!(*family.writes.borrow(), placement.pages);
+        assert!(family.landed.borrow().is_empty());
+        assert_eq!(slots, [9]);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 1);
+        assert_eq!(cache.pool().free(), 1);
+        let next = cache.admit_cold(&family, 64, 64, |pages| Placed { pages, slot: 9 })
+            .unwrap().placement;
+        assert_ne!(next.pages, placement.pages);
+    }
+
+    #[test]
+    fn failed_step_keeps_slot_and_page_references_when_cache_release_fails() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        // Capture makes the cache dirty; its release performs a second drain.
+        cache.capture(&family, SnapshotKind::Prompt, &[1; 64], &placement, After::default()).unwrap();
+        assert_eq!(family.drains.get(), 0);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 2);
+        family.fail_on.set(2);
+        let mut slots = vec![9];
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement).is_err());
+        assert_eq!(family.drains.get(), 2);
+        assert_eq!(slots, [9]);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 2);
+        assert_eq!(cache.pool().free(), 1);
+    }
+}
 
 #[cfg(test)]
 mod media_failure_tests {

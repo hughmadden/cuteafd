@@ -327,6 +327,12 @@ impl LocalVerbsExpertConnection {
         grouping: Option<&crate::worker_selection::InstalledExpertGrouping>,
         pending: Option<(RingReservation, Option<crate::worker_selection::EndpointReservation>)>,
     ) -> Result<Self> {
+        // Allocate the per-QP prefix only after selection budget admission and
+        // before native rings. Bulk payloads stay in the mapped send ring.
+        let response_frame = match pending.as_ref().and_then(|(_, endpoint)| endpoint.as_ref()) {
+            Some(endpoint) => ExpertProtocolV2FrameBuffer::for_endpoint_response(endpoint.contract().0)?,
+            None => ExpertProtocolV2FrameBuffer::new(),
+        };
         let rdma_device = verbs_host_rdma_device_for_stream(&stream)?;
         let mut endpoint = NativeRdmaEndpoint::create_from_wire_bytes_mapped_on_device(
             Arc::clone(&library),
@@ -420,7 +426,7 @@ impl LocalVerbsExpertConnection {
             response_ring,
             request_recv_view,
             response_send_view,
-            response_frame: ExpertProtocolV2FrameBuffer::new(),
+            response_frame,
             request_recv_sequence: 0,
             response_send_sequence: 0,
             response_send_in_flight: 0,
@@ -788,7 +794,7 @@ mod budget_tests {
         })?;
         let report = ModelAdmissionResponse {
             rank: 0, resident_bytes: 1,
-            slices: vec![SparkSlice { layer: 13, first: 0, width: 1024, stored_width: 1024,
+            slices: vec![SparkSlice { unit_map: None, layer: 13, first: 0, width: 1024, stored_width: 1024,
                 tiers: vec![], projection_counts: vec![] }],
             runtime: SparkRuntimeInventory { detail: Default::default(), sample: RuntimeSample {
                 device: 0, total_bytes: 121 << 30, free_bytes: 100 << 30, context_bytes: 1,
@@ -919,7 +925,7 @@ mod budget_tests {
     fn placement_selection(layers: &[usize]) -> crate::worker_selection::WorkerSelection {
         let identity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [6144, 384, 8, 2048, 70],
-            "world": 2, "topology": [2, 1], "ownership_wire": false
+            "world": 2, "topology": [2, 1], "ownership_wire": false, "placement": "round-robin"
         })).unwrap();
         crate::worker_selection::WorkerSelection::new(identity, layers).unwrap()
     }

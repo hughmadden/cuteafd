@@ -2092,8 +2092,13 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let expected_response_wire_bytes = verbs_host_expected_response_wire_bytes(request)?;
         let (request_wire_bytes, expected_response_wire_bytes) = match capacity {
             Some(rows) => {
-                let (max_request, max_response) = crate::protocol_v2::compact_expert_wire_bytes(
-                    cuteafd_core::expert_geometry(), rows, request.header.hidden_dtype == ExpertV2Dtype::Bf16)?;
+                let ingress = if request.header.hidden_dtype == ExpertV2Dtype::Bf16 {
+                    cuteafd_core::SparkIngress::Bf16
+                } else {
+                    cuteafd_core::SparkIngress::Fp8K32
+                };
+                let (max_request, max_response) = cuteafd_core::SparkEndpoint { capacity: rows, ingress }
+                    .wire_bytes(cuteafd_core::expert_geometry()).context("invalid expert endpoint wire geometry")?;
                 (request_wire_bytes.max(max_request), expected_response_wire_bytes.max(max_response))
             }
             None => (request_wire_bytes, expected_response_wire_bytes),
@@ -3290,29 +3295,20 @@ fn protocol_v2_request_device_payload(
     execution_lane: u32,
 ) -> Result<ProtocolV2RequestDevicePayload> {
     let storage_start = request_storage.as_ptr() as usize;
-    let hidden_start = request.hidden_payload().as_ptr() as usize;
-    anyhow::ensure!(
-        hidden_start >= storage_start,
-        "ProtocolV2 hidden payload starts before its mapped frame"
-    );
-    let hidden_offset = hidden_start - storage_start;
-    let hidden_end = hidden_offset
-        .checked_add(request.hidden_payload().len())
-        .context("ProtocolV2 mapped hidden payload end overflow")?;
-    anyhow::ensure!(
-        hidden_end <= request_storage.len() && hidden_end <= frame.bytes,
-        "ProtocolV2 mapped hidden payload [{hidden_offset}, {hidden_end}) exceeds frame bytes {}",
-        frame.bytes
-    );
+    let mapped = |bytes: &[u8], label: &str| -> Result<CuteafdDeviceBuffer> {
+        let offset = (bytes.as_ptr() as usize).checked_sub(storage_start)
+            .with_context(|| format!("ProtocolV2 {label} starts before its mapped frame"))?;
+        let end = offset.checked_add(bytes.len())
+            .context("ProtocolV2 mapped payload end overflow")?;
+        anyhow::ensure!(end <= request_storage.len(),
+            "ProtocolV2 mapped {label} exceeds host frame bytes");
+        protocol_v2_device_buffer_slice(frame, offset, bytes.len(), label)
+    };
     Ok(ProtocolV2RequestDevicePayload {
         execution_lane,
         response_slot,
-        hidden_payload: CuteafdDeviceBuffer {
-            ptr: unsafe { frame.ptr.cast::<u8>().add(hidden_offset).cast() },
-            bytes: request.hidden_payload().len(),
-            device_id: frame.device_id,
-            flags: frame.flags,
-        },
+        routes: mapped(request.route_bytes(), "route records")?,
+        hidden_payload: mapped(request.hidden_payload(), "hidden payload")?,
     })
 }
 
@@ -5469,6 +5465,34 @@ mod persistent_tests {
     }
 
     #[test]
+    fn expected_native_response_wire_bytes_cover_bf16_at_each_capacity() -> Result<()> {
+        let geometry = cuteafd_core::ExpertGeometry::GLM5;
+        for capacity in [1, 64, 4096] {
+            let mut request = persistent_chunk_request(1);
+            // Only the header is used by this size calculation; no large allocation.
+            request.header.row_count = capacity;
+            request.header.hidden_dim = geometry.hidden;
+            request.header.hidden_dtype = ExpertV2Dtype::Fp8E4m3Ue8m0K32;
+            request.header.hidden_row_stride_bytes = geometry.hidden + geometry.hidden / 32;
+            request.header.flags = crate::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            let endpoint = cuteafd_core::SparkEndpoint { capacity,
+                ingress: cuteafd_core::SparkIngress::Fp8K32 };
+            let (_, response) = endpoint.wire_bytes(geometry).unwrap();
+            for debug in [false, true] {
+                if debug { request.header.flags |= crate::EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM; }
+                let expected = response + if debug { 32 } else { 0 };
+                assert_eq!(verbs_host_expected_response_wire_bytes(&request)?, expected);
+                let budget = crate::expert::native_frame_budget(geometry, capacity)?;
+                assert!(expected <= budget);
+                let (_, ring) = persistent_ring_geometry(budget, 128, expected, 8 << 20, 4096, 8)?;
+                assert!(ring.slot_capacity_bytes >= expected);
+                assert!(persistent_ring_geometry(expected - 1, 128, expected, 8 << 20, 4096, 8).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mapped_request_device_payload_preserves_hidden_offset() {
         let frame = persistent_chunk_request(3).encode().unwrap();
         let request = ExpertProtocolV2RequestView::parse(&frame).unwrap();
@@ -5501,6 +5525,38 @@ mod persistent_tests {
             payload.hidden_payload.flags,
             CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST
         );
+    }
+
+    #[test]
+    fn mapped_request_device_payload_preserves_routes_and_refuses_short_frames() {
+        let mut owned = persistent_chunk_request(3);
+        owned.routes = (0..3).map(|row| crate::ExpertProtocolV2RouteEntry {
+            row_index: row, expert_id: row + 7, gate_weight: 0.125 * (row + 1) as f32,
+        }).collect();
+        for (row, descriptor) in owned.rows.iter_mut().enumerate() {
+            descriptor.route_offset = row as u32;
+            descriptor.route_count = 1;
+        }
+        owned.header.route_count = 3;
+        owned.header.route_bytes = 36;
+        let frame = owned.encode().unwrap();
+        let request = ExpertProtocolV2RequestView::parse(&frame).unwrap();
+        let offset = request.route_bytes().as_ptr() as usize - frame.as_ptr() as usize;
+        let buffer = CuteafdDeviceBuffer {
+            ptr: 0x100000_usize as *mut std::ffi::c_void, bytes: frame.len(), device_id: 2,
+            flags: CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST,
+        };
+        let mapped = protocol_v2_request_device_payload(&frame, &request, buffer, None, 0).unwrap();
+        assert_eq!(mapped.routes.ptr as usize, 0x100000 + offset);
+        assert_eq!(mapped.routes.bytes, 36);
+        assert_eq!(mapped.routes.device_id, 2);
+        assert_eq!(mapped.routes.flags, CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST);
+        for bytes in [offset + 35, frame.len() - 1] {
+            assert!(protocol_v2_request_device_payload(&frame, &request,
+                CuteafdDeviceBuffer { bytes, ..buffer }, None, 0).is_err());
+        }
+        assert!(protocol_v2_request_device_payload(&frame[..offset + 35], &request,
+            buffer, None, 0).is_err());
     }
 
     fn persistent_chunk_request(row_count: usize) -> ExpertProtocolV2Request {

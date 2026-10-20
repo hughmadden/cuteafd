@@ -1,5 +1,6 @@
 #include "cuteafd_native.h"
 #include "graph_census_path.h"
+#include "rdma_endpoint_destroy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -497,17 +498,15 @@ void drain_rdma_rc_cq_events(ibv_comp_channel* channel) {
   }
 }
 
-void destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
-  if (endpoint == nullptr) {
-    return;
-  }
-  if (endpoint->qp != nullptr) {
-    const int rc = ibv_destroy_qp(endpoint->qp);
+bool destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
+  return cuteafd::destroy_rdma_endpoint(endpoint, [](ibv_qp* qp) {
+    const int rc = ibv_destroy_qp(qp);
     if (rc != 0) {
-      std::fprintf(stderr, "warning: ibv_destroy_qp qp=%p rc=%d errno=%d\n",
-                   static_cast<void*>(endpoint->qp), rc, errno);
+      std::fprintf(stderr, "warning: ibv_destroy_qp qp=%p rc=%d errno=%d; retaining endpoint and registrations\n",
+                   static_cast<void*>(qp), rc, errno);
     }
-  }
+    return rc;
+  }, [](CuteafdRdmaRcEndpointHandle* endpoint) {
   const auto deregister = [](ibv_mr* mr) {
     const int rc = ibv_dereg_mr(mr);
     if (rc != 0) {
@@ -575,6 +574,7 @@ void destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
   std::free(endpoint->recv_buffer);
 #endif
   delete endpoint;
+  });
 }
 #endif
 
@@ -4718,7 +4718,10 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle) {
     return ok();
   }
 #if CUTEAFD_NATIVE_ENABLE_RDMA
-  destroy_rdma_rc_endpoint(static_cast<CuteafdRdmaRcEndpointHandle*>(handle));
+  if (!destroy_rdma_rc_endpoint(static_cast<CuteafdRdmaRcEndpointHandle*>(handle))) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+                "ibv_destroy_qp failed; endpoint, registrations and landing owners retained");
+  }
   return ok();
 #else
   return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,

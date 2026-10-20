@@ -1,12 +1,18 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use sha2::{Digest, Sha256};
 
 /// Maximum FP8 K32 ingress and compact BF16 partial frames for a configured lane.
 /// Shared by worker admission and the coordinator's first-connect negotiation.
-pub fn compact_expert_wire_bytes(geometry: cuteafd_core::ExpertGeometry, capacity: u32, bf16: bool) -> Result<(usize, usize)> {
-    geometry.compact_wire_bytes(capacity, bf16).context("expert wire size overflow")
+pub fn compact_expert_wire_bytes(
+    geometry: cuteafd_core::ExpertGeometry,
+    capacity: u32,
+    bf16: bool,
+) -> Result<(usize, usize)> {
+    geometry
+        .compact_wire_bytes(capacity, bf16)
+        .context("expert wire size overflow")
 }
 
 const MAGIC: &[u8; 8] = b"CUTEAFD3";
@@ -173,6 +179,7 @@ pub struct ExpertProtocolV2WireStats {
 #[derive(Debug, Default)]
 pub struct ExpertProtocolV2FrameBuffer {
     bytes: Vec<u8>,
+    response_row_capacity: Option<u32>,
 }
 
 impl ExpertProtocolV2FrameBuffer {
@@ -183,7 +190,23 @@ impl ExpertProtocolV2FrameBuffer {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(capacity),
+            response_row_capacity: None,
         }
+    }
+
+    pub(crate) fn for_endpoint_response(endpoint: cuteafd_core::SparkEndpoint) -> Result<Self> {
+        let capacity = endpoint.response_prefix_bytes().context("invalid response prefix capacity")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(capacity)?;
+        anyhow::ensure!(bytes.capacity() == capacity, "response prefix allocation exceeds admission");
+        Ok(Self { bytes, response_row_capacity: Some(endpoint.capacity) })
+    }
+
+    fn check_response_rows(&self, rows: u32) -> Result<()> {
+        if let Some(capacity) = self.response_row_capacity {
+            anyhow::ensure!(rows <= capacity, "response rows {rows} exceed admitted prefix capacity {capacity}");
+        }
+        Ok(())
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -237,6 +260,7 @@ impl ExpertProtocolV2FrameBuffer {
         &mut self,
         response: &ExpertProtocolV2Response,
     ) -> Result<&[u8]> {
+        self.check_response_rows(response.header.row_count)?;
         response.encode_prefix_into(&mut self.bytes)?;
         Ok(self.as_slice())
     }
@@ -245,6 +269,7 @@ impl ExpertProtocolV2FrameBuffer {
         &mut self,
         response: &ExpertProtocolV2ResponseRef<'_>,
     ) -> Result<&[u8]> {
+        self.check_response_rows(response.header.row_count)?;
         response.encode_prefix_into(&mut self.bytes)?;
         Ok(self.as_slice())
     }
@@ -253,6 +278,7 @@ impl ExpertProtocolV2FrameBuffer {
         &mut self,
         response: &ExpertProtocolV2DeviceResponseRef<'_>,
     ) -> Result<&[u8]> {
+        self.check_response_rows(response.header.row_count)?;
         response.encode_prefix_into(&mut self.bytes)?;
         Ok(self.as_slice())
     }
@@ -510,7 +536,8 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
     // never present in a response.
     if label == "request" && flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG != 0 {
         let native_allowed = crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
-            | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
+            | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+            | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
         if flags & !native_allowed != 0 || flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0 {
             bail!("native group ownership requires the native compact request contract");
         }

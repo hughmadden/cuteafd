@@ -23,10 +23,19 @@ fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
         config.max_frame_bytes = model.rings.max_frame_bytes;
         config.rdma_endpoints = model.endpoints.len();
         config.bf16_ingress = model.endpoints.iter().any(|endpoint|
-            !matches!(endpoint.ingress, cuteafd_core::SparkIngress::Fp8K32));
+            matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16
+                | cuteafd_core::SparkIngress::Bf16Decode { .. }));
         config.model_admission = Some(model.clone());
     }
     config.selected_layers = Some(selected);
+    Ok(())
+}
+
+pub(super) fn admit_worker_selection(config: &mut NativeExpertServiceConfig,
+    selection: &cuteafd_transport::worker_selection::WorkerSelection, catalog: &OfficialV41Catalog) -> Result<()> {
+    apply_worker_selection(config, selection, catalog.routed_experts().first_layer,
+        catalog.routed_experts().layers)?;
+    if !selection.ranges().is_empty() { validate_topology(config, catalog)?; }
     Ok(())
 }
 
@@ -44,7 +53,7 @@ mod selection_tests {
         // Every backend consumes the same exact selected IDs within checkpoint bounds.
         let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
-            snapshot: dir.path().into(), rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
+            snapshot: dir.path().into(), exlr8_manifest: None, rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
             rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_tp2: false, bf16_ingress: false };
         let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80, compiled_capacity: 80,
             endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 80,
@@ -166,7 +175,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let topology = crate::shared::spark_topology::for_checkpoint(
         config.declared_world.ownership_topology(), config.world, v41 && catalog.exl3().is_some());
     config.declared_world = crate::shared::spark_topology::world(topology, config.world)?;
-    validate_topology(&config, &catalog)?;
+    crate::shared::spark_topology::require_wire(config.spark_world()?, &catalog)?;
     let geometry = catalog.routed_experts().geometry()?;
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
         && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
@@ -216,11 +225,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             }
         };
         let selected = (|| -> Result<_> {
-            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
-                &config.snapshot, geometry, config.spark_world()?)?;
+            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot_manifest(
+                &config.snapshot, geometry, config.spark_world()?, config.exlr8_manifest.as_deref())?;
             selection.validate_for(&identity)?;
-            apply_worker_selection(&mut config, &selection, catalog.routed_experts().first_layer,
-                catalog.routed_experts().layers)?;
+            admit_worker_selection(&mut config, &selection, &catalog)?;
             Ok(selection)
         })();
         let selection = match selected {
@@ -264,7 +272,21 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // Existing media owners belong to the baseline, not expert residency/workspace.
     let baseline = cuteafd_ffi::memory_ledger::snapshot();
     census.sample("before_expert_modules", Some(&library))?;
-    let mut modules = match super::modules::WarmModules::load(&library, &catalog, &config) {
+    let programs = (|| -> Result<_> {
+        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+            let path = config.library.parent().context("native library directory")?
+                .join("../share/PROGRAMS.json");
+            Ok(Some(library.programs()?.with_manifest(&path)?))
+        } else { Ok(None) }
+    })();
+    let programs = match programs {
+        Ok(programs) => programs,
+        Err(error) => {
+            let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
+            return Err(error);
+        }
+    };
+    let mut modules = match super::modules::WarmModules::load(&library, &catalog, &config, programs.as_ref()) {
         Ok(modules) => modules,
         Err(error) => {
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
@@ -335,6 +357,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 let (resident_bytes, slices) = weights.loaded_residency(&library, config.compiled_capacity()?)?;
                 let mut runtime = measured_worker_runtime(&library, &baseline, resident_bytes, &census)?;
                 runtime.detail.load_transient = weights.load_inventory();
+                runtime.detail.allocations.extend(weights.retained_host_inventory()?);
                 tracing::info!(target: "cuteafd::spark_memory", rank = config.rank,
                     record = %serde_json::to_string(&runtime)?, "Spark retained runtime inventory");
                 let host_exchange_bytes = exchange.ids.capacity().checked_mul(std::mem::size_of::<i32>())
@@ -424,15 +447,18 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // logical intermediate this worker actually loaded. A captured log can then
     // be hashed and checked against the declared topology, instead of trusting a
     // hand-written value; the role comes from the same selection the loader used.
-    let loaded = if catalog.exl3().is_some() {
-        config.exl3_selection(resident[0])?
+    let role = if config.exlr8_manifest.is_some() {
+        None
+    } else if catalog.exl3().is_some() {
+        Some(config.exl3_selection(resident[0])?.role())
     } else {
-        config.selection(resident[0])?
+        Some(config.selection(resident[0])?.role())
     };
     tracing::info!(
         rank = config.rank,
         world = config.world,
-        role = loaded.role(),
+        role,
+        format = ?catalog.format(),
         intermediate = weights.intermediate(),
         capacity = config.capacity,
         layer_ids = ?resident,
@@ -496,6 +522,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         let mut index = 0;
         while index < connections.len() {
             let mut execution_failed = false;
+            let mut executed = false;
             let wait = (wait_index == Some(index)).then_some(idle_wait);
             let result = connections[index].poll(wait, |view, mapped, emit| {
                 // The wire parser has validated framing and identities. Reject
@@ -539,17 +566,20 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 let layer = resident.binary_search(&(request.layer() as usize))
                     .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
                 execution.bind_layer(&weights, layer)?;
-                if let Some(slot) = mapped.response_slot {
+                if mapped.response_slot.is_some() {
                     // The mapped frame's hidden rows are device-visible, so the
                     // worker copies them on its stream instead of uploading.
-                    let response = unsafe { execution.execute_mapped_request(&request,
-                        executor_id, &mut exchange, slot, Some(mapped.hidden_payload)) };
+                    // SAFETY: the transport retains the mapped slots through execution and emission.
+                    let response = unsafe { execution.execute_mapped(&request,
+                        executor_id, &mut exchange, mapped) };
                     let response = match response {
                         Ok(response) => response,
                         Err(error) => { execution_failed = true; return Err(error); }
                     };
                     if let Some(response) = response {
-                        return emit(ProtocolV2ExecutorResponseRef::Device(response));
+                        emit(ProtocolV2ExecutorResponseRef::Device(response))?;
+                        executed = request.rows() > 0;
+                        return Ok(());
                     }
                 }
                 let mut emit_failed = false;
@@ -566,12 +596,21 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     },
                 );
                 execution_failed = result.is_err() && !emit_failed;
+                executed = result.is_ok() && request.rows() > 0;
                 result
             });
             match result {
                 Ok(processed) => {
                     progressed |= processed;
-                    if processed && pending_steady_log {
+                    if processed && executed && pending_steady_log {
+                        if census.enabled() {
+                            library.cuda_device_synchronize()?;
+                            census.sample("steady_after_first_expert_request", Some(&library))?;
+                            let retained = cuteafd_ffi::memory_ledger::snapshot();
+                            let detail = census.detail(&baseline, &retained, library.cuda_get_device()?)?;
+                            tracing::info!(target: "cuteafd::spark_memory", record = %serde_json::to_string(&detail)?,
+                                "Spark steady runtime census");
+                        }
                         log_spark_memory_if_enabled(
                             &library,
                             &config,

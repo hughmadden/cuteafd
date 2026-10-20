@@ -555,7 +555,7 @@ PYSTATE
 # release_profile_docker_args sets RELEASE_PROFILE_ARGS (docker environment and
 # mount arguments, for the coordinator and every Spark worker) in the caller's
 # shell, so a bad value stops the launch. Arguments: PROFILE PROFILE_DIR HOST.
-release_profile_switches='census transport-timing expert-timing draft-timing nsys ncu'
+release_profile_switches='census transport-timing expert-timing expert-routes draft-timing nsys ncu'
 # nsys sessions are per container; the window is opened and closed with
 # `docker exec <coordinator> nsys start|stop --session=$RELEASE_NSYS_SESSION`.
 RELEASE_NSYS_SESSION=cuteafd-profile
@@ -576,6 +576,8 @@ release_profile_docker_args() {
         -e CUTEAFD_STARTUP_MEMORY_PROBE=1) ;;
       transport-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_PROTOCOL_V2_TCP_TIMING=1) ;;
       expert-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_TIMING=1) ;;
+      expert-routes) [[ -n "$dir" ]] || release_die "PROFILE=expert-routes needs PROFILE_DIR (the route log goes there)"
+        RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_ROUTES=1) ;;
       draft-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_DRAFT_TIMING=1) ;;
       # Process wrappers (release_profile_wrapper), coordinator only.
       nsys|ncu) [[ -n "$dir" ]] || release_die "PROFILE=$switch needs PROFILE_DIR (the report goes there)" ;;
@@ -589,6 +591,27 @@ release_profile_docker_args() {
     [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE_DIR must be an absolute directory"
     RELEASE_PROFILE_ARGS+=(-v "$dir:$dir" -e "CUTEAFD_PROFILE_DIR=$dir")
   fi
+}
+
+# With PROFILE=expert-routes, coordinator only: PROFILE_EXPERT_INPUT_SAMPLE=N
+# saves the MoE input rows of the first N serving layer-steps (default 64, 0 =
+# none); PROFILE_EXPERT_ROUTE_WEIGHTS=on also logs the gate weights of each
+# narrow wave (off by default). Sets RELEASE_PROFILE_SAMPLE_ARGS (coordinator
+# docker environment). Arguments: PROFILE SAMPLE WEIGHTS.
+release_profile_sample_args() {
+  local profile="$1" sample="$2" weights="${3-}"
+  RELEASE_PROFILE_SAMPLE_ARGS=()
+  if [[ -n "$sample" ]]; then
+    [[ ",$profile," == *,expert-routes,* ]] || release_die "PROFILE_EXPERT_INPUT_SAMPLE needs PROFILE=expert-routes"
+    [[ "$sample" =~ ^(0|[1-9][0-9]{0,5})$ ]] || release_die "PROFILE_EXPERT_INPUT_SAMPLE must be 0..999999 layer-steps"
+    RELEASE_PROFILE_SAMPLE_ARGS+=(-e "CUTEAFD_EXPERT_INPUT_SAMPLE=$sample")
+  fi
+  case "$weights" in
+    ""|off) ;;
+    on) [[ ",$profile," == *,expert-routes,* ]] || release_die "PROFILE_EXPERT_ROUTE_WEIGHTS needs PROFILE=expert-routes"
+      RELEASE_PROFILE_SAMPLE_ARGS+=(-e CUTEAFD_EXPERT_ROUTES_WEIGHTS=1) ;;
+    *) release_die "PROFILE_EXPERT_ROUTE_WEIGHTS must be on or off" ;;
+  esac
 }
 
 # Print the profiler to exec. The container calls this with the tool name only,
@@ -729,9 +752,11 @@ release_profile_wrapper() {
 release_known_key() {
   case "$1" in
     FAMILY) return 0 ;; # Optional build family when checkpoint metadata is not local.
+    EXLR8_MANIFEST) return 0 ;; # Published EXLR8 manifest name; builds derive EXLR8 programs from it.
+    EXLR8_DENSE_FROM) return 0 ;;
     SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE) return 0 ;;
     DRAFT_SURVIVAL_LENGTHS|DRAFT_POLICY|DRAFT_ROW_COST) return 0 ;;
-    FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|GATEWAY) return 0 ;;
+    MAPPED_SCALE_PRELOAD_GIB|FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|GATEWAY) return 0 ;;
     GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
@@ -741,7 +766,7 @@ release_known_key() {
     GLM5_FLASH_TARGET_HEAD) return 0 ;;
     TARGET_HEAD) return 0 ;;
     GLM5_FLASH_EXL3_SCHEDULE) return 0 ;;
-    RDMA_BOND_BALANCE|HOST_ISA) return 0 ;;
+    RDMA_BOND_BALANCE|HOST_ISA|TP_PLACEMENT) return 0 ;;
     GLM5_FLASH_KDA_STATE) return 0 ;;
     GLM5_FLASH_PREFIX_MARKS) return 0 ;;
     GLM5_FLASH_REPLAY_RECORDS) return 0 ;;
@@ -749,7 +774,7 @@ release_known_key() {
     GLM5_FLASH_PREFILL_BATCH) return 0 ;;
     GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
-    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NSYS_GPU_METRICS) return 0 ;;
+    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NSYS_GPU_METRICS|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
@@ -993,9 +1018,11 @@ release_load_config() {
   PROFILE_NCU_COUNT=
   PROFILE_NCU_SET=
   PROFILE_NSYS_GPU_METRICS=
+  PROFILE_EXPERT_INPUT_SAMPLE=
+  PROFILE_EXPERT_ROUTE_WEIGHTS=
   ADDR=0.0.0.0:8000
   EXPERT_PORT=19441
-  CUTEAFD_EXPORT_HOST=oliver
+  CUTEAFD_EXPORT_HOST=
   WIP_BUILD_SEED=kakapo
   COORDINATOR_DOCKER_DEV=cuteafd-coordinator-dev
   COORDINATOR_DOCKER_INFERENCE=cuteafd-coordinator

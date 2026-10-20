@@ -560,3 +560,29 @@ fn on_evict_deferred_store_commits_clean_through_the_evict_path() {
     assert_eq!(cache.payload(hit.key), Some(&1));
     assert_eq!(cache.metrics().device_evictions, 1);
 }
+
+/// Serving's eager-store mode may complete copies while decoding, but never selects host victims.
+#[test]
+fn decode_hooks_never_evict_host_snapshots() {
+    let mut cache = quota_cache(4, StoreMode::OnRetain);
+    let mut device = Device::new(DEVICE_BYTES);
+    for n in 0..20 {
+        let snapshot = snap(&mut device, SnapshotKind::Turn, &seq(n * 100, 9), &[id(n, 1)]);
+        write_snapshot(cache.engine_mut(), &snapshot);
+        let outcome = cache.store(&snapshot, n as u64);
+        let ticket = match outcome {
+            cuteafd_hostcache::cache::StoreOutcome::Issued(ticket) => ticket,
+            other => panic!("store failed: {other:?}"),
+        };
+        let before = cache.metrics().host_evictions;
+        cache.engine_mut().advance(1_000_000_000);
+        cache.tick();
+        cache.lookup(&snapshot.meta.tokens);
+        cache.before_device_evict(Some(ticket));
+        cache.prefill_hold();
+        cache.tick();
+        assert_eq!(cache.metrics().host_evictions, before);
+    }
+    assert!(cache.metrics().host_evictions > 0);
+    assert!(cache.metrics().host_eviction_ns > 0);
+}

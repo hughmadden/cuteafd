@@ -27,12 +27,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let cfg = MimoV2Config::from_hf(&checkpoint.config).ok();
         let base = cfg.as_ref().and_then(|cfg| cfg.program_family().ok()).unwrap_or("mimo");
         let families = std::iter::once(base.to_string()).chain((ranks == 2).then(|| format!("{base}2"))).collect::<Vec<_>>();
-        let runtime = match crate::placement::loaded_code(base, "*", ranks == 2, rank as u8) {
-            Some(code) => Item::new(Category::Runtime, "context+modules", "",
-                crate::placement::ArchContext::coordinator(total, None).context_bytes + code.bytes, Basis::Calibrated),
-            None => Item::new(Category::Runtime, "context+modules", "", planned_context(manifest, &families, total)
-                + if ranks == 2 { crate::placement::ArchContext::for_device("sm_120", total).peer_context_bytes } else { 0 }, Basis::Formula),
-        };
+        let runtime = runtime_item(manifest, &families, "*", ranks == 2, rank, total);
         DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total,
             items: vec![runtime], kv_tokens: 0 }
     }).collect::<Vec<_>>();
@@ -166,8 +161,10 @@ fn spark_experts(input: &super::super::PlanInput, _options: &LayoutOptions,
     let catalog = input.expert_catalog()?;
     let tensors = catalog.fp8().context("MiMo Spark expert headers")?;
     let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
-    let remote = cfg.dense.iter().filter(|&&dense| !dense).count().checked_sub(onboard)
-        .context("MiMo onboard exceeds routed layers")?;
+    let routed = cfg.dense.iter().enumerate().filter_map(|(layer, &dense)| (!dense).then_some(layer))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(onboard <= routed.len(), "MiMo onboard exceeds routed layers");
+    let remote = &routed[onboard..];
     let ranks = sparks.len();
     use crate::formats::fp8_experts::ExpertFormat;
     let family = match (cfg.program_family()?, tensors.format()) {
@@ -181,9 +178,12 @@ fn spark_experts(input: &super::super::PlanInput, _options: &LayoutOptions,
         tensors.shape().intermediate, ranks)?;
     for spark in sparks {
         let slicing = recipe.slicing;
-        let bytes = crate::placement::families::mimo_v2::expert_layer_bytes(tensors,
-            ranks, spark.index as usize, slicing)?
-            .checked_mul(remote as u64).context("MiMo Spark expert bytes overflow")?;
+        let bytes = remote.iter().try_fold(0u64, |total, &layer| {
+            let view = tensors.for_layer_metadata(layer)?;
+            let bytes = crate::placement::families::mimo_v2::expert_layer_bytes(&view,
+                ranks, spark.index as usize, slicing)?;
+            total.checked_add(bytes).context("MiMo Spark expert bytes overflow")
+        })?;
         let format = match slicing { crate::formats::fp8_experts::Slicing::Padded => "native padded blocks",
             crate::formats::fp8_experts::Slicing::Blocks(_) => "native exact blocks" };
         spark.items.push(Item::new(Category::Experts, "routed_expert", format, bytes, Basis::Exact));
@@ -311,6 +311,7 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
             let expected_weights = match tensors.format() {
                 crate::formats::fp8_experts::ExpertFormat::Fp8Block128 => "fp8",
                 crate::formats::fp8_experts::ExpertFormat::Mxfp4 => "mxfp4",
+                crate::formats::fp8_experts::ExpertFormat::Bf16 => "bf16",
                 crate::formats::fp8_experts::ExpertFormat::Nvfp4 => "nvfp4",
             };
             anyhow::ensure!(info["input"] == "bf16" && info["tp"].as_u64() == Some(ranks as u64)
@@ -371,7 +372,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let lanes = resolve_transport_lanes(spark_ranks > 0, cfg.program_family()?,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
         else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
-    let inputs = crate::placement::families::mimo_v2::MimoInputs {
+    let inputs = crate::placement::families::mimo_v2::MimoInputs { automatic_context: options.context_tokens == 0,
         cfg: &cfg, profile: &profiles.steady, layers: cfg.layers, kv: MimoKvCache::Int8, mtp_stages: 0,
         gpus: devices.iter().enumerate().map(|(rank, device)| (options.rtx_bytes[rank],
             crate::placement::Baseline::Planned { context_bytes: 0,
@@ -604,7 +605,7 @@ mod tests {
                 let (experts, expert_workspace, tp2_workspace, onboard) =
                     expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
                 let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
-                let inputs = MimoInputs { cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
+                let inputs = MimoInputs { automatic_context: opts.context_tokens == 0, cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
                     kv: MimoKvCache::Int8, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
                         (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
                     headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,

@@ -8,4 +8,7 @@ pub mod exl3_storage;
 pub(crate) mod expert_format;
 pub mod fp8_experts;
 pub mod mapped_table;
+pub mod mapped_preload;
 pub mod modelopt;
+
+pub mod native_dense;

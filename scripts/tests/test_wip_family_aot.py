@@ -26,6 +26,9 @@ CASES = [
     ('mimo_v2', 'MiMo-V2.6-Flash', 4, 'MIMO', 'mimof:fp8'),
     ('mimo_v2', 'MiMo-V2.6-Pro', 6, 'MIMO', 'mimop:fp8'),
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3-K4.25', 0, 'QWEN4', 'qwen4:exl3-k45'),
+    ('step5', 'Step-5-Preview-NVFP4', 4, 'STEP5', 'step5:nvfp4'),
+    ('step5', 'Step-5-Preview', 6, 'STEP5', 'step5:fp8'),
+    ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23'),
 ]
 
 
@@ -55,6 +58,10 @@ def test_config_scopes_match_equivalent_single_card(tmp_path, family, model, cou
         assert derived['CUTEAFD_WIP_CONTEXT_SPLIT_AOT'] == 'ON'
     if count == 0:
         assert derived['CUTEAFD_WIP_EXPERT_FAMILIES'] == ''
+    if family == 'step5':
+        assert set(derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')) == {scope, 'step5:bf16'}
+        assert set(derived['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')) == {scope, 'step5:bf16'}
+        assert set(derived['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {f'{scope}={count}', f'step5:bf16={count}'}
 
 
 def dry_run(tmp_path, path, overrides=None):
@@ -206,6 +213,19 @@ def test_dense_cards_and_direct_configs_use_checkpoint_geometry(tmp_path, monkey
         aot.config_scopes(values)
 
 
+@pytest.mark.parametrize('count', [0, 4])
+def test_kimi_k3_refuses_every_layout_but_tp6(count):
+    values = dict(MODEL_ID='test/Kimi-K3-EXL3-K2', SPARK_COUNT=str(count), RTX_GPUS='2')
+    with pytest.raises(ValueError, match='TP6 only'):
+        aot.family_scopes([dict(family='kimi_k3', name='kimi-k3-exl3-k2', config=None)], lambda _: values)
+
+
+def test_kimi_k3_routed_range_from_its_own_config():
+    config = dict(model_type='kimi_k3', text_config=dict(num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1))
+    assert aot.checkpoint_family.describe(config) == ('kimi_k3', 'kimi_k3', 1, 92)
+    assert aot.checkpoint_family.routed_layers(config) == 92
+
+
 @pytest.mark.parametrize('operation', ['card', 'config', 'seal'])
 def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
     with pytest.raises(ValueError, match='no WIP AOT scope mapping for unknown'):
@@ -226,6 +246,7 @@ def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
     ('mimo_v2', 'MiMo-V2.6-Pro', 6, 'MIMO', 'mimop:fp8', 'mimop:fp8', 'mimop=6', '',
      {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_MIMO_GEOMETRIES': 'mimop'}),
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '', {}),
+    ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23', 'kimik3:exl3-k23', 'kimik3=6', '', {}),
 ])
 def test_existing_family_scope_outputs_are_unchanged(family, model, count, program,
         coordinator, spark, counts, roles, extra):
@@ -236,3 +257,62 @@ def test_existing_family_scope_outputs_are_unchanged(family, model, count, progr
     if program:
         expected[f'CUTEAFD_WIP_{program}_AOT'] = 'ON'
     assert aot.family_scopes([dict(family=family, name=model.lower(), config=None)], lambda _: values) == expected
+
+
+@pytest.mark.parametrize('kind', ['step5_vl', 'step5'])
+def test_step5_metadata_build_scope_and_routed_extent(tmp_path, monkeypatch, kind):
+    monkeypatch.setenv('HF_HOME', str(tmp_path))
+    text = dict(model_type='step5', num_hidden_layers=92, moe_layer_list=list(range(3, 91)))
+    config = dict(model_type=kind, text_config=text) if kind == 'step5_vl' else text
+    snapshot = tmp_path / 'hub/models--test--step5/snapshots/revision'
+    snapshot.mkdir(parents=True)
+    (snapshot / 'config.json').write_text(json.dumps(config))
+    family, scopes = aot.config_scopes(dict(MODEL_ID='test/step5', MODEL_REVISION='revision', SPARK_COUNT='6'))
+    assert family == 'step5'
+    assert scopes['CUTEAFD_WIP_STEP5_AOT'] == 'ON'
+    assert aot.checkpoint_family.describe(config) == ('step5', kind, 3, 90)
+    assert aot.checkpoint_family.routed_layers(config) == 88
+    text['moe_layer_list'][-1] = 91
+    with pytest.raises(SystemExit, match='routed layer map'):
+        aot.checkpoint_family.describe(config)
+
+
+def test_step5_bf16_input_sibling_is_allowed_in_wip(tmp_path):
+    config = config_file(tmp_path, 'step5', 'Step-5-Preview', 6)
+    output = dry_run(tmp_path, config, {'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES': 'step5'})
+    assert 'WIP AOT scopes (step5)' in output
+    # Derived without the environment, and the derived value reaches the build (#516).
+    derived = dry_run(tmp_path, config)
+    assert 'FP8 BF16-input siblings: step5' in derived
+    wip = (ROOT / 'wip.sh').read_text()
+    pattern = wip.split("bf16_family_pattern='^(", 1)[1].split(')', 1)[0]
+    build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    allowed = build.split('case "$bf16_family" in', 1)[1].split(') ;;', 1)[0].strip()
+    assert set(pattern.split('|')) == set(allowed.split('|'))
+    assert 'step5' in allowed.split('|')
+    with pytest.raises(AssertionError, match='must be a semicolon list'):
+        dry_run(tmp_path, config, {'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES': 'step5;unknown'})
+
+
+def test_step5_card_union_keeps_native_format_tp_counts():
+    cards = [dict(family='step5', name='step5-nvfp4', config='min'),
+             dict(family='step5', name='step5-fp8', config='max')]
+    configs = {'min': dict(MODEL_ID='stepfun-ai/Step-5-Preview-NVFP4', SPARK_COUNT='4', RTX_GPUS='1'),
+               'max': dict(MODEL_ID='stepfun-ai/Step-5-Preview', SPARK_COUNT='6', RTX_GPUS='2')}
+    scopes = aot.family_scopes(cards, configs.__getitem__)
+    assert scopes['CUTEAFD_WIP_STEP5_AOT'] == 'ON'
+    assert set(scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {
+        'step5:nvfp4=4', 'step5:fp8=6', 'step5:bf16=4', 'step5:bf16=6'}
+    # The FP8 card's BF16 rows need the BF16-input sibling; it is derived, not hand-set (#516).
+    assert scopes['CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES'] == 'step5'
+    nvfp4_only = aot.family_scopes(cards[:1], configs.__getitem__)
+    assert 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES' not in nvfp4_only
+
+
+def test_non_kimi_scope_does_not_enable_kimi_programs(tmp_path):
+    path = config_file(tmp_path, 'glm5', 'GLM-5.3-EXL3-K4', 4)
+    _, scopes = aot.config_scopes(aot.read_config(path))
+    assert 'CUTEAFD_WIP_KIMIK3_AOT' not in scopes
+    output = dry_run(tmp_path, path)
+    assert 'CUTEAFD_WIP_KIMIK3_AOT' not in output
+    assert scopes['CUTEAFD_WIP_GLM_AOT'] == 'ON'

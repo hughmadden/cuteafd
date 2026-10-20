@@ -5,8 +5,20 @@
 # (CUTEAFD_ENABLE_MIMO_AOT, geometries CUTEAFD_MIMO_GEOMETRIES: "mimo", V2.6 Pro "mimop") and GLM 5.3 Flash
 # (CUTEAFD_ENABLE_GLMF_AOT, geometry "glmf") and Qwen 3.8 Flash Next
 # (CUTEAFD_ENABLE_QWEN4_AOT, geometry "qwen4") share one table and manifest.
-if(NOT CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
-  message(FATAL_ERROR "coordinator programs require the SM120 build")
+# EXLR8 (CUTEAFD_ENABLE_EXLR8_AOT, geometry "exlr8") joins the same table last:
+# on SM120 the fork's coordinator programs beside the family programs, on SM121
+# (the Spark expert build) its routed serving programs alone.
+set(CUTEAFD_FAMILY_PROGRAMS OFF)
+if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR
+   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT)
+  set(CUTEAFD_FAMILY_PROGRAMS ON)
+endif()
+if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
+  set(CUTEAFD_EXLR8_ROLE coordinator)
+elseif(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^121" AND CUTEAFD_ENABLE_EXLR8_AOT AND NOT CUTEAFD_FAMILY_PROGRAMS)
+  set(CUTEAFD_EXLR8_ROLE spark)
+else()
+  message(FATAL_ERROR "coordinator programs require the SM120 build (SM121 builds only the EXLR8 Spark programs)")
 endif()
 set(CUTEAFD_PROGRAM_GEOMETRY "")
 if(CUTEAFD_ENABLE_DSV4_AOT)
@@ -52,6 +64,28 @@ if(CUTEAFD_ENABLE_QWEN_DENSE_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},qwen35,qwen38")
   endif()
 endif()
+if(CUTEAFD_ENABLE_STEP5_AOT)
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "step5,step52")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},step5,step52")
+  endif()
+endif()
+if(CUTEAFD_ENABLE_KIMIK3_AOT)
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3")
+  endif()
+endif()
+if(CUTEAFD_ENABLE_EXLR8_AOT)
+  # Last: every family program keeps its object and table index.
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "exlr8")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8")
+  endif()
+endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
 string(TOLOWER "${CUTEAFD_CONTEXT_SPLIT_AOT}" context_split_aot)
 if(NOT context_split_aot MATCHES "^(off|on|only)$")
@@ -61,6 +95,10 @@ set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
   --glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"
   --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}" --context-split "${context_split_aot}")
+if(CUTEAFD_ENABLE_EXLR8_AOT)
+  # Without EXLR8 the export arguments (and the stamp) are unchanged.
+  list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --exlr8-role "${CUTEAFD_EXLR8_ROLE}")
+endif()
 set(stamp "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs.stamp")
 file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\n")
 # The program list lives in the exporter; objects are collected into one
@@ -76,6 +114,8 @@ add_custom_command(
     --output-dir "${CUTEAFD_DSV4_DIR}" ${CUTEAFD_DSV4_EXPORT_ARGS}
   COMMAND sh -c "${CMAKE_AR} qcs '${CUTEAFD_DSV4_ARCHIVE}' '${CUTEAFD_DSV4_DIR}'/*.o"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py" "${stamp}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_step5_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting coordinator programs (${CUTEAFD_PROGRAM_GEOMETRY})"
   VERBATIM)

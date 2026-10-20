@@ -31,7 +31,7 @@ mod tests;
 
 pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
-pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, TerminalHome, Transition, HOP_SLOTS};
+pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
 
@@ -607,6 +607,8 @@ impl std::fmt::Display for PoolLimits {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PlacementError {
+    #[error("explicit KV pool of {requested} tokens is below the compiled/max-context floor of {floor} tokens; increase --pool-tokens (POOL_TOKENS, or KV_POOL_SIZE for a byte pool), or lower --max-context/--max-context-tokens (MAX_CONTEXT_TOKENS) to match")]
+    RequestedBelowContext { requested: u64, floor: u64 },
     #[error("placement inventory is invalid: {0}")]
     Inventory(&'static str),
     #[error("explicit KV pool of {requested} tokens does not fit beside admitted demands (fits {fit}); {limits}")]

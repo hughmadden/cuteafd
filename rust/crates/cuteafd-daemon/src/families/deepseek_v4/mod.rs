@@ -367,7 +367,9 @@ pub(crate) fn with_engine<T>(
         } else { 0 };
         let gpus = devices.iter().enumerate().map(|(rank, &device)| {
             let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
-                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog))?;
+                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog),
+                &cuteafd_loader::placement::ProgramSet::from_manifest(&loaded.manifest,
+                    &[loaded.family, &format!("{}2", loaded.family)]))?;
             crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
                 Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending)
@@ -444,7 +446,9 @@ pub(crate) fn with_engine<T>(
         // silently relocate a loaded layer or shrink the promised pool.
         let measured_gpus = devices.iter().enumerate().map(|(rank, &device)| {
             let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
-                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog))?;
+                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog),
+                &cuteafd_loader::placement::ProgramSet::from_manifest(&loaded.manifest,
+                    &[loaded.family, &format!("{}2", loaded.family)]))?;
             crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
                 Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))
@@ -454,8 +458,7 @@ pub(crate) fn with_engine<T>(
             Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
         let measured_inputs = admission::Inputs { gpus: measured_gpus, loaded_modes: Some(&loaded_modes), ..inputs };
         let mut measured_request = admission::request(args, &measured_inputs)?;
-        measured_request.pool.requested = Some(placement.pool_tokens);
-        measured_request.pool.floor = placement.pool_tokens;
+        measured_request.pool.pin_selected(placement.pool_tokens);
         measured_request.onboard = cuteafd_loader::placement::Onboard::Layers(placement.onboard_layers);
         let checked = cuteafd_loader::placement::solve_frozen(&measured_request, &placement)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 measured frozen admission: {error}"))?;

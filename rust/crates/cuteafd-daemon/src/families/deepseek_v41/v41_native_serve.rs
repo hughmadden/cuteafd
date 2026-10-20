@@ -317,7 +317,8 @@ fn worker(
     let topology = crate::shared::spark_topology::for_checkpoint(
         topology, args.peers.len(), catalog.exl3().is_some());
     let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
-    crate::shared::spark_topology::require_world(spark_world, &catalog)?;
+    crate::shared::spark_topology::require_world(spark_world, &catalog,
+        &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;
     // Check reduction support before CUDA allocation or readiness publication.
     lib.v41_compact_reducer()?
         .require_rank_count(spark_world.topology().world_size() as u32)?;
@@ -390,7 +391,9 @@ fn worker(
     // both layers for both active lanes so the second lane can gather early.
     let gather_slots = 2 * cuteafd_core::ENGRAM_LAYERS.len();
     let pipeline =
-        unsafe { cuteafd_loader::EngramPipeline::new(&catalog, map, rows, gather_slots, rows * 64 * 1024)? };
+        unsafe { cuteafd_loader::EngramPipeline::new(&catalog, map, rows, gather_slots, rows * 64 * 1024,
+            cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
+    cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());
     let engram_weights = [0, 1]
         .map(|i| EngramLayerWeights::load(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024))
         .into_iter()

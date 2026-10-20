@@ -166,8 +166,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let draft = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s,
         snapshot_wait: args.mimo_snapshot_wait };
-    let mut prefix = args.prefix.clone();
-    prefix.mimo_host_cap = args.mimo_host_cache;
+    let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let vision = args.vision;
     let audio = args.audio;
@@ -433,7 +432,9 @@ impl Active<'_> {
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
 pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
-    prefix_cache_with(engine, args, concurrency, |layout| args.host_config(layout, engine.max_context))
+    let args = args.with_scoring(if engine.full_prefill_logits() { engine.prefill_rows } else { 64 },
+        engine.prefill_rows, engine.cfg.vocab_size)?;
+    prefix_cache_with(engine, &args, concurrency, |layout| args.host_config(layout, engine.max_context, concurrency))
 }
 
 fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize,
@@ -447,7 +448,13 @@ fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, conc
     let layout = family.layout();
     // Serving consumes the quota resolved before loading; diagnostics may
     // resolve it here. Register all pools/mark arenas on their actual GPUs.
+    let scoring = args.with_scoring(if engine.full_prefill_logits() { engine.prefill_rows } else { 64 },
+        engine.prefill_rows, engine.cfg.vocab_size)?;
     let host = host_config(layout)?.map(|config| {
+        // Preflight resolved the quota before loading. Re-admit with all pinned
+        // engine and transport owners now resident, without charging them twice.
+        crate::shared::prefix::budget::admit(config.bytes, scoring.scoring_host_bytes,
+            args.host_cache_headroom_bytes)?;
         CudaCopyEngine::registered_owned(engine.library, family.host_owners()).map(|copy| (config, copy))
     }).transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
@@ -1086,6 +1093,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         // A sequence whose grammar fails is failed alone after the step; an
         // error inside `submit` would end the engine.
         let mut poisoned: Vec<Option<String>> = vec![None; active.len()];
+        cuteafd_transport::route_log::step(|| active.iter().zip(&sequences).map(|(a, s)| (a.ticket.id(), s.len() as u32)).collect());
         engine.probe_begin(tokens.len());
         let step = engine.submit(|| {
             let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
@@ -1558,6 +1566,7 @@ fn prefill_one(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
     let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
     let count = end - p.done;
     let retain = cache.enabled() && !probe::cold(&p.job.probe);
+    cuteafd_transport::route_log::step(|| vec![(p.ticket.id(), count as u32)]);
     let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
         let start = p.placement.len;
         let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
@@ -1638,6 +1647,7 @@ fn prefill_batch(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
     let ends = pair.each_ref().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len()));
     let starts = pair.each_ref().map(|p| p.placement.len);
     let counts = [ends[0] - pair[0].done, ends[1] - pair[1].done];
+    cuteafd_transport::route_log::step(|| vec![(pair[0].ticket.id(), counts[0] as u32), (pair[1].ticket.id(), counts[1] as u32)]);
     let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
         let [a, b] = &mut pair;
         let logits = engine.prefill_pair_media_device([

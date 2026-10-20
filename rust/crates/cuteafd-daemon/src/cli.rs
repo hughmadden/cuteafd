@@ -52,6 +52,9 @@ pub(crate) enum Commands {
     Plan(PlanArgs),
     /// Report RDMA ports, link and PCIe rates, subnets and the rail plan.
     Fabric(FabricArgs),
+    /// Validate a built library's program table against its PROGRAMS.json (WIP/release seal).
+    #[command(hide = true)]
+    ProgramsCheck(crate::commands::programs_check::ProgramsCheckArgs),
     /// Serve a checkpoint through the OpenAI API; the family comes from
     /// --snapshot's config.json (or --family). `serve --family ID --help` lists
     /// that family's options.
@@ -85,6 +88,9 @@ pub(crate) enum Commands {
     /// Qualify native dense Qwen3.5/3.8 execution against reference outputs.
     #[command(hide = true)]
     Qwen35Golden(crate::families::qwen3_5::GoldenArgs),
+    /// Qualify a native Step-5 target prefix with real Spark experts.
+    #[command(hide = true)]
+    Step5Golden(crate::families::step5::golden::GoldenArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),
@@ -125,6 +131,12 @@ pub(crate) struct FabricArgs {
     /// CUDA device the probe lands in.
     #[arg(long, default_value_t = 0)]
     pub(crate) device: i32,
+    /// Run untimed host-to-device traffic before the landing probe.
+    #[arg(long)]
+    pub(crate) landing_warmup: bool,
+    /// Run the landing probe this many times back to back (at most five).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=5))]
+    pub(crate) landing_repeats: u32,
     /// Also measure GPU<->GPU peer transfers (copy engine, SM pull/push,
     /// pinned-host bounce; one-way, hops and two-way exchanges, eager and
     /// graph-captured) between the two `--p2p-devices`, idle and under
@@ -141,6 +153,15 @@ pub(crate) struct FabricArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    /// Published EXLR8 manifest name (defaults to bit325).
+    #[arg(long)]
+    pub(crate) exlr8_manifest: Option<String>,
+    /// Native non-expert operands from an architecture-matched official checkpoint.
+    #[arg(long)]
+    pub(crate) exlr8_dense_from: Option<String>,
+    /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
+    pub mapped_scale_preload_gib: f64,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
     pub(crate) vision_replicas: u32,
     /// Vision policy (auto does not imply an implemented encoder).
@@ -169,9 +190,10 @@ pub(crate) struct PlanArgs {
     /// Spark inventory available to automatic selection.
     #[arg(long, default_value_t = 6)]
     pub(crate) available_sparks: usize,
-    /// Routed-expert weight budget per Spark rank, GiB.
-    #[arg(long, default_value_t = 100.0)]
-    pub(crate) spark_budget_gib: f64,
+    /// Routed-expert weight budget per Spark rank, GiB (unset: the family's
+    /// default, 100 GiB for most; Kimi K3 108 GiB).
+    #[arg(long)]
+    pub(crate) spark_budget_gib: Option<f64>,
     /// Weight budget of the coordinator GPU, GiB (its own tensors, plus every
     /// routed expert with --spark-ranks 0).
     #[arg(long, alias = "coordinator-budget-gib", default_value_t = 80.0)]
@@ -357,6 +379,13 @@ pub(crate) struct PlanArgs {
     /// Prefix mark arena slots (0 disables marks).
     #[arg(long)]
     pub(crate) prefix_slots: Option<u64>,
+    /// Pinned prompt-cache quota for --layout (auto: full-context KV for concurrency + 4,
+    /// capped at min(32GiB, 25% host RAM); explicit bytes override both).
+    #[arg(long, default_value = "auto")]
+    pub(crate) host_cache_bytes: crate::shared::prefix::HostBudget,
+    /// Host media embedding-cache quota for --layout (default min(8GiB, 5% RAM)).
+    #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
+    pub(crate) media_cache_bytes: Option<u64>,
     /// MiMo and GLM 5.3 Flash retained snapshots per bank for --layout (matches serving).
     #[arg(long, default_value_t = 20)]
     pub(crate) prefix_cache_entries: u64,
@@ -456,6 +485,9 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Official local snapshot directory, including all shard headers.
     #[arg(long)]
     pub(crate) snapshot: PathBuf,
+    /// Published native EXLR8 manifest; binds the worker bootstrap identity.
+    #[arg(long)]
+    pub(crate) exlr8_manifest: Option<String>,
     /// Spark-role native library built with V4.1 expert AOT kernels.
     #[arg(long)]
     pub(crate) native_lib: PathBuf,
@@ -566,6 +598,44 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fabric_landing_diagnostics_are_bounded_and_opt_in() {
+        use clap::Parser;
+        let super::Commands::Fabric(args) = super::Cli::try_parse_from(["cuteafd", "fabric"]).unwrap().command
+            else { panic!("expected fabric"); };
+        assert!(!args.landing_warmup);
+        assert_eq!(args.landing_repeats, 1);
+        let super::Commands::Fabric(args) = super::Cli::try_parse_from(
+            ["cuteafd", "fabric", "--landing-warmup", "--landing-repeats", "3"]).unwrap().command
+            else { panic!("expected fabric"); };
+        assert!(args.landing_warmup);
+        assert_eq!(args.landing_repeats, 3);
+        for repeats in ["0", "6", "-1"] {
+            assert!(super::Cli::try_parse_from(["cuteafd", "fabric", "--landing-repeats", repeats]).is_err());
+        }
+    }
+
+    #[test]
+    fn mapped_scale_cap_defaults_to_zero_and_accepts_a_cap() {
+        use clap::Parser;
+        for (flags, cap) in [(vec![], 0.0), (vec!["--mapped-scale-preload-gib", "8"], 8.0),
+            (vec!["--mapped-scale-preload-gib", "0.5"], 0.5)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected plan"); };
+            assert_eq!(args.mapped_scale_preload_gib, cap);
+        }
+        for value in ["-1", "NaN", "inf", "1e100", "invalid"] {
+            assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model",
+                "--mapped-scale-preload-gib", value]).is_err(), "{value}");
+        }
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from([
+            "cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--mapped-scale-preload-gib", "0"]).unwrap().command
+            else { panic!("expected native serve"); };
+        assert_eq!(args.mapped_scale_preload_gib, 0.0);
+    }
+
     #[test]
     fn plan_mimo_prefix_marks_stay_experimental_and_off() {
         use clap::{CommandFactory, Parser};
@@ -856,6 +926,9 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
+    /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
+    pub mapped_scale_preload_gib: f64,
     /// Checked Spark vision replicas; omitted for local RTX fallback.
     #[arg(long)]
     pub vision_peers: Option<String>,
@@ -930,9 +1003,13 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(0..=128))]
     pub prefix_cache_entries: u32,
 
-    /// Pinned snapshot memory: auto sizes logical GPU+RAM capacity above retained entries * context; 0 disables it.
+    /// Pinned snapshot memory: auto sizes full-context KV for concurrency + 4,
+    /// capped at min(32GiB, 25% host RAM); explicit bytes override both; 0 disables it.
     #[arg(long, default_value = "0", env = "CUTEAFD_HOST_CACHE_BYTES")]
     pub host_cache_bytes: crate::shared::prefix::HostBudget,
+    /// KV tokens kept free after host pressure eviction (0 disables batching).
+    #[arg(long, default_value_t = cuteafd_core::prefix::DEFAULT_HOST_CACHE_EVICT_TOKENS)]
+    pub host_cache_evict_tokens: u64,
     /// Pinned allocation and registration granularity for the snapshot cache.
     #[arg(long, default_value_t = 256 << 20, env = "CUTEAFD_HOST_CACHE_CHUNK_BYTES")]
     pub host_cache_chunk_bytes: u64,
@@ -993,7 +1070,7 @@ pub(crate) struct NativeServeArgs {
     #[arg(long)] pub snapshot: PathBuf,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)] pub model_id: Option<String>,
-    #[arg(long)] pub native_lib: PathBuf,
+    #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long,value_delimiter=',',num_args=1..)] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long,default_value="127.0.0.1:8000")] pub listen: String,
     /// Replicated-group tensor-parallel degree inside one Spark group (opt-in; all-or-none with --spark-ep).
@@ -1056,6 +1133,7 @@ impl NativeServeArgs {
         let config = Config {
             bytes: self.host_cache_bytes.explicit_bytes(),
             chunk_bytes: self.host_cache_chunk_bytes,
+            eviction_headroom: [0; 4],
             store: match self.host_cache_store {
                 HostCacheStore::OnRetain => StoreMode::OnRetain,
                 HostCacheStore::OnEvict => StoreMode::OnEvict,
@@ -1076,4 +1154,10 @@ impl NativeServeArgs {
 pub(crate) fn reject_peer_expert_ranges(text: &str) -> Result<bool, String> {
     if text == "false" { return Ok(false); }
     Err("GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); drop --peer-expert-ranges".into())
+}
+
+fn parse_scale_preload_gib(value: &str) -> Result<f64, String> {
+    let gib: f64 = value.parse::<f64>().map_err(|error| error.to_string())?;
+    cuteafd_loader::plan::mapped_scale_preload_bytes(gib).map_err(|error| error.to_string())?;
+    Ok(gib)
 }

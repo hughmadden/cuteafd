@@ -1,7 +1,7 @@
 //! Device-owned TP2 shared-expert weights and one rank's lane workspace.
 use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, PeerTransfer, Stream}};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{CuteafdDeviceBuffer, V41Bf16Add, V41Fp8Plan, V41SharedSwiGlu};
+use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add, V41Fp8Plan, V41SharedSwiGlu};
 use cuteafd_loader::OfficialV41Catalog;
 use std::rc::Rc;
 
@@ -14,7 +14,7 @@ pub(crate) struct Wave<'a> {
     staging: [Allocation<'a>; 2],
     output: [Allocation<'a>; 2],
     ranks: [RankWave<'a>; 2],
-    add: V41Bf16Add<'a>,
+    add: Bf16Add<'a>,
     capacity: u32,
 }
 impl<'a> Wave<'a> {
@@ -38,7 +38,7 @@ impl<'a> Wave<'a> {
             ready: [Event::new(d0)?, Event::new(d1)?],
             staging: [Allocation::new(d0,bytes)?, Allocation::new(d1,bytes)?],
             output: [Allocation::new(d0,bytes)?, Allocation::new(d1,bytes)?],
-            ranks, add: d0.library.v41_bf16_add()?, capacity,
+            ranks, add: d0.library.bf16_add()?, capacity,
         })
     }
     /// # Safety

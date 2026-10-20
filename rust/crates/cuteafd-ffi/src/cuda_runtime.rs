@@ -46,6 +46,23 @@ const RTLD_NOLOAD: c_int = 0x10;
 /// `libcudart.so.12`.
 const SONAMES: [&str; 2] = ["libcudart.so.13", "libcudart.so.12"];
 
+/// PCI identity of a CUDA ordinal, including CUDA_VISIBLE_DEVICES remapping.
+/// Bind only the runtime already loaded by the native library.
+pub fn device_pci_bus_id(device: i32) -> Option<String> {
+    type PciBusIdFn = unsafe extern "C" fn(*mut c_char, c_int, c_int) -> c_int;
+    SONAMES.iter().find_map(|soname| {
+        // SAFETY: NOLOAD cannot initialize a second CUDA runtime.
+        let library = unsafe { Library::open(Some(soname), RTLD_NOW | RTLD_NOLOAD) }.ok()?;
+        // SAFETY: cudaDeviceGetPCIBusId has this signature in both supported runtimes.
+        let call: PciBusIdFn = unsafe { *library.get(b"cudaDeviceGetPCIBusId").ok()? };
+        let mut bus_id = [0 as c_char; 32];
+        // SAFETY: bus_id is a writable buffer of the declared size.
+        if unsafe { call(bus_id.as_mut_ptr(), bus_id.len() as c_int, device) } != 0 { return None; }
+        // SAFETY: the successful call writes a NUL-terminated PCI bus id.
+        Some(unsafe { std::ffi::CStr::from_ptr(bus_id.as_ptr()) }.to_string_lossy().into_owned())
+    })
+}
+
 /// `cudaMemcpySrcAccessOrderStream`: the source is accessed in stream order, matching how the
 /// engine already holds source memory alive until the event after the copy.
 const CUDA_MEMCPY_SRC_ACCESS_ORDER_STREAM: c_uint = 1;

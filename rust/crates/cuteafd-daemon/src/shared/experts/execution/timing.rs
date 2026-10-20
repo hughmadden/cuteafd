@@ -32,6 +32,28 @@ fn safe_host(host: &str) -> String {
 
 fn enabled(value: Option<&str>) -> bool { value == Some("1") }
 
+#[derive(serde::Serialize)]
+struct WorkerSample<'a> {
+    event: &'static str,
+    host: &'a str,
+    rank: usize,
+    request_id: u64,
+    layer: u32,
+    rows: u32,
+    executor_id: u64,
+    format: &'a str,
+    completed_unix_ns: u64,
+    compute_us: f32,
+}
+impl WorkerSample<'_> {
+    fn write_to(&self, output: &mut impl std::io::Write) -> Result<()> {
+        serde_json::to_writer(&mut *output, self)?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+        Ok(())
+    }
+}
+
 /// Startup-only diagnostics shared by every Spark weight format.
 /// The measured pipeline includes device routing and output reduction, not host copies.
 pub(crate) struct WorkerTiming<'a> {
@@ -65,19 +87,14 @@ impl<'a> WorkerTiming<'a> {
     /// Called after the worker's existing stream completion, never adds a GPU wait.
     pub(crate) unsafe fn publish(&mut self, request_id: u64, layer: u32, rows: u32, executor_id: u64,
         format: &str) -> Result<()> {
-        use std::io::Write;
         let [start, end] = &self.events;
         // SAFETY: the caller completed the stream containing both event records.
         let compute_us = unsafe { start.library.cuda_event_elapsed_ms(start.raw, end.raw)? } * 1000.0;
         let unix_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos().min(u64::MAX as u128) as u64;
         if let Some(output) = &mut self.output {
-            serde_json::to_writer(&mut *output, &serde_json::json!({
-                "event": "expert_compute", "host": self.host, "rank": self.rank,
-                "request_id": request_id, "layer": layer, "rows": rows, "executor_id": executor_id,
-                "format": format, "completed_unix_ns": unix_ns, "compute_us": compute_us,
-            }))?;
-            output.write_all(b"\n")?;
-            output.flush()?;
+            WorkerSample { event: "expert_compute", host: &self.host, rank: self.rank,
+                request_id, layer, rows, executor_id, format, completed_unix_ns: unix_ns,
+                compute_us }.write_to(output)?;
         } else {
             tracing::debug!(target: "cuteafd::expert_timing", host=%self.host, rank=self.rank,
                 request_id, layer, rows, executor_id, format, compute_us, completed_unix_ns=unix_ns,
@@ -89,6 +106,27 @@ impl<'a> WorkerTiming<'a> {
 
 #[cfg(test)]
 mod worker_tests {
+    #[test]
+    fn worker_spans_emit_the_same_jsonl_contract_for_exlr8_and_existing_formats() -> anyhow::Result<()> {
+        let mut output = Vec::new();
+        for format in ["native", "exl3", "fp8_moe", "exlr8"] {
+            super::WorkerSample { event: "expert_compute", host: "worker", rank: 2,
+                request_id: 17, layer: 3, rows: 65, executor_id: 23, format,
+                completed_unix_ns: 29, compute_us: 31.5 }.write_to(&mut output)?;
+        }
+        let text = String::from_utf8(output)?;
+        assert!(text.ends_with('\n'));
+        let records = text.lines().map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 4);
+        for (record, format) in records.iter().zip(["native", "exl3", "fp8_moe", "exlr8"]) {
+            assert_eq!(record, &serde_json::json!({"event": "expert_compute", "host": "worker",
+                "rank": 2, "request_id": 17, "layer": 3, "rows": 65, "executor_id": 23,
+                "format": format, "completed_unix_ns": 29, "compute_us": 31.5}));
+        }
+        Ok(())
+    }
+
     #[test]
     fn timing_requires_explicit_one() {
         assert!(super::enabled(Some("1")));

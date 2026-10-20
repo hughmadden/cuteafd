@@ -3,6 +3,7 @@
 pub mod checkpoint;
 pub mod deployment;
 pub mod experts;
+pub mod exlr8;
 pub mod encoder;
 pub mod families;
 pub mod family;
@@ -11,6 +12,7 @@ pub mod format;
 pub mod launch;
 pub mod layout;
 pub mod names;
+pub mod rope;
 pub mod spec;
 #[doc(hidden)]
 pub mod testing;
@@ -159,7 +161,15 @@ pub struct RoleReadiness {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
+    pub mapped_placement: crate::formats::mapped_preload::MappedPlacement,
+    /// Coordinator-host admission including estimated owner bounds, separate from mapped-scale preload.
+    pub host_budget_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_ledger: Option<cuteafd_core::memory_layout::HostLayout>,
     pub attention_placement: crate::placement::AttentionPlacement,
+    /// The routed-expert weight budget per Spark rank this plan used
+    /// (explicit, or the family's default).
+    pub spark_budget_bytes: u64,
     /// What the caller asked for (None: auto); families whose solver resolves
     /// auto itself (GLM 5.3) take this rather than the resolved default.
     #[serde(skip)]
@@ -213,6 +223,9 @@ pub struct PlanReport {
     /// Resolved prefill shape, including V4.1 automatic capacity admission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_rows: Option<u64>,
+    /// Solver-selected GLM prefill lanes, shared by device and host admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_lanes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_selection: Option<String>,
     /// The package and layouts that serve this checkpoint's routed experts.
@@ -261,14 +274,18 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    pub mapped_scale_preload_bytes: u64,
+    /// Available host budget override for offline planning; live cgroup-aware sample otherwise.
+    pub mapped_scale_host_budget_bytes: Option<u64>,
     /// Resolved target-checkpoint draft ownership; absent keeps family defaults.
     pub draft_ownership: Option<spec::DraftOwnership>,
     pub attention_placement: Option<crate::placement::AttentionPlacement>,
     pub vision: MediaMode,
     pub audio: MediaMode,
     pub placement: ExpertPlacement,
-    /// Routed-expert bytes one Spark rank may hold (weights only).
-    pub spark_budget_bytes: u64,
+    /// Routed-expert bytes one Spark rank may hold (weights only); `None`
+    /// takes the family's default (`FamilyModel::spark_budget_bytes`).
+    pub spark_budget_bytes: Option<u64>,
     /// Weight bytes the coordinator GPU may hold (its own tensors, plus every
     /// routed expert in the local-only placement).
     pub coordinator_budget_bytes: u64,
@@ -279,12 +296,14 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
+            mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
             attention_placement: None,
             vision: MediaMode::Auto,
             audio: MediaMode::Auto,
             placement: ExpertPlacement::Sparks { ranks: 6 },
-            spark_budget_bytes: 100 << 30,
+            spark_budget_bytes: None,
             coordinator_budget_bytes: 80 << 30,
             layout: None,
         }
@@ -292,6 +311,15 @@ impl Default for PlanOptions {
 }
 
 impl PlanOptions {
+    /// An explicit Spark ceiling applies to the complete layout as well as
+    /// weights. Unset keeps the separate historical device/family defaults.
+    pub fn apply_spark_budget(&mut self) {
+        if let (Some(bytes), Some(layout)) = (self.spark_budget_bytes, &mut self.layout) {
+            layout.spark_bytes = bytes;
+            layout.spark_allocation_budget_bytes = Some(bytes);
+        }
+    }
+
     /// Rejects options that describe no deployment: Spark worlds the
     /// transport does not run (it runs 1 through 6; 0 is the local-only
     /// placement) and empty budgets.
@@ -305,12 +333,29 @@ impl PlanOptions {
                 });
             }
         }
-        for (option, bytes) in [("Spark budget", self.spark_budget_bytes), ("coordinator budget", self.coordinator_budget_bytes)] {
+        for (option, bytes) in [("Spark budget", self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)), ("coordinator budget", self.coordinator_budget_bytes)] {
             if bytes == 0 {
                 return Err(PlanError::InvalidOption { option, reason: "must be positive".into() });
             }
         }
         Ok(())
+    }
+}
+
+/// A scale preload cap accepts zero to disable it, unlike device budgets.
+pub fn mapped_scale_preload_bytes(gib: f64) -> Result<u64, PlanError> {
+    if gib == 0.0 { Ok(0) } else { budget_bytes("--mapped-scale-preload-gib", gib) }
+}
+
+/// The shared routed-expert weight budget per Spark rank, for families
+/// without their own (`FamilyModel::spark_budget_bytes`).
+pub const DEFAULT_SPARK_BUDGET_BYTES: u64 = 100 << 30;
+
+impl PlanOptions {
+    /// Routed-expert bytes per Spark rank: explicit, else the shared default
+    /// (`plan` resolves an unset budget to the family's before using it).
+    pub fn spark_budget(&self) -> u64 {
+        self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)
     }
 }
 
@@ -453,7 +498,11 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     options.validate()?;
     let checkpoint = input.checkpoint();
     let mut report = PlanReport {
+        mapped_placement: Default::default(),
+        host_budget_bytes: 0,
+        host_ledger: None,
         attention_placement: options.attention_placement.unwrap_or_default(),
+        spark_budget_bytes: options.spark_budget(),
         requested_attention: options.attention_placement,
         vision: options.vision,
         audio: resolve_audio(options.audio, &checkpoint.snapshot)?,
@@ -484,6 +533,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         spark_ranks: options.placement.spark_ranks(),
         spark_count_warning: None,
         prefill_rows: None,
+        prefill_lanes: None,
         prefill_selection: None,
         experts: None,
         placement_supported: true,
@@ -565,7 +615,15 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         }
     };
     report.vision = model.vision_mode(options.vision);
+    // An unset Spark budget is the family's own (Kimi K3 admits more than the
+    // shared default); an explicit --spark-budget-gib always wins.
+    let mut resolved = options.clone();
+    resolved.apply_spark_budget();
+    resolved.spark_budget_bytes = Some(options.spark_budget_bytes.unwrap_or_else(|| model.spark_budget_bytes()));
+    let options = &resolved;
+    report.spark_budget_bytes = options.spark_budget();
     let spec = model.spec();
+    report.spec = Some(spec.clone());
     let ownership = options.draft_ownership.unwrap_or_else(|| {
         let native = options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0);
         spec::DraftOwnership::selected(family.id(), if !native { "off" }
@@ -622,6 +680,32 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             }
             None => report.unclassified.push(tensor.meta.name.clone()),
         }
+    }
+    // Count logical random-read tensors, not storage shards or global scalars.
+    let mapped = by_component.get(&Component::MappedTable).map(Vec::as_slice).unwrap_or(&[]);
+    let mut names = BTreeSet::new();
+    let mut scales = 0;
+    let mut scale_bytes = 0;
+    for tensor in mapped {
+        let meta = &tensor.meta;
+        if meta.shape.len() != 2 || meta.shape[0] <= 1 { continue }
+        let (stem, suffix) = format::split_stem(&meta.name);
+        if !matches!(suffix, "weight" | "scale" | "weight_scale" | "weight_scale_inv") { continue }
+        // Qwen splits one row space into shard_N tensors.
+        let logical = stem.rsplit_once(".shard_").map_or(stem, |(prefix, _)| prefix);
+        if names.insert((logical.to_owned(), suffix.to_owned())) && matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") {
+            scales += 1;
+        }
+        if matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") { scale_bytes += meta.byte_length; }
+    }
+    let host_budget = if scales == 0 { 0 } else {
+        options.mapped_scale_host_budget_bytes.unwrap_or_else(||
+            crate::formats::mapped_preload::host_budget_bytes().unwrap_or(0))
+    };
+    report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
+        names.len(), scales, scale_bytes, options.mapped_scale_preload_bytes, host_budget);
+    if report.mapped_placement.preloaded_bytes > 0 {
+        report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);
     }
     // The expert staging's own verdict on the routed experts.
     let catalog = (family.expert_catalog() && by_component.contains_key(&Component::RoutedExpert))
@@ -733,6 +817,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             }
         }
         report.memory_layout = Some(memory);
+        layout::charge_host(&mut report, &layout_options, checkpoint, false)?;
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -753,8 +838,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget_bytes,
-            spark_allocation_budget_bytes: Some(options.spark_budget_bytes), glm5_drafter_disabled: true,
+        let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
+            spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
         let _ = family_layout(model.as_ref(), input, &mut report, &inventory, options.placement)?;
@@ -812,7 +897,6 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             how: "The component bytes are a checkpoint inventory, not a serving-fit result; implement and gate the runtime first.".into(),
         });
     }
-    report.spec = Some(spec.clone());
     Ok(report)
 }
 
@@ -829,7 +913,8 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     let bytes_of = |owner: Owner| -> u64 {
         report.components.iter().filter(|c| c.owner == owner && !matches!(c.component, Component::Vision | Component::Audio)).map(|c| c.bytes).sum()
     };
-    let (routed, rtx, mapped) = (bytes_of(Owner::SparkSliced), bytes_of(Owner::Rtx), bytes_of(Owner::HostMapped));
+    let (routed, rtx, mapped) = (bytes_of(Owner::SparkSliced), bytes_of(Owner::Rtx),
+        bytes_of(Owner::HostMapped).saturating_sub(report.mapped_placement.preloaded_bytes));
     for (owner, bytes) in [(Owner::Rtx, rtx), (Owner::SparkSliced, routed), (Owner::HostMapped, mapped)] {
         if bytes > 0 {
             *report.bytes_by_owner.entry(owner.label(options.placement)).or_default() += bytes;
@@ -867,7 +952,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             }
             experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
         };
-        let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget_bytes as f64);
+        let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget() as f64);
         report.min_spark_ranks = contract.as_ref().and_then(|c| c.spark_worlds.iter().copied().find(|&r| fits_on(r)));
         let advice = match report.min_spark_ranks {
             Some(ranks) => format!("Use {ranks} Spark ranks (--spark-ranks {ranks})"),
@@ -903,7 +988,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                     report.hints.push(Hint {
                         what: format!("routed experts need {:.1} GiB on the widest of {ranks} Spark ranks, over the \
                             {:.0} GiB budget", gib(routed as f64 * report.spark_rank_share),
-                            gib(options.spark_budget_bytes as f64)),
+                            gib(options.spark_budget() as f64)),
                         how: format!("{advice}, keep bottom layers' experts resident on the RTX cards, or quantize \
                             the experts further (EXL3 K2-K3)."),
                     });
@@ -935,11 +1020,14 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             },
         }
     }
-    if options.placement != ExpertPlacement::Local && rtx as f64 > coordinator {
+    // The weight budget is per coordinator GPU; a head-split layout spreads
+    // the backbone over each GPU it names.
+    let gpus = options.layout.as_ref().filter(|l| l.head_split).map_or(1, |l| l.rtx_bytes.len().max(1));
+    if options.placement != ExpertPlacement::Local && rtx as f64 > coordinator * gpus as f64 {
         report.fits = false;
         report.hints.push(Hint {
-            what: format!("coordinator weights need {:.1} GiB, over the {:.0} GiB coordinator budget",
-                gib(rtx as f64), gib(coordinator)),
+            what: format!("coordinator weights need {:.1} GiB, over the {:.0} GiB coordinator budget{}",
+                gib(rtx as f64), gib(coordinator * gpus as f64), if gpus > 1 { format!(" ({gpus} GPUs)") } else { String::new() }),
             how: "Split the backbone over two coordinator GPUs or move components to Sparks.".into(),
         });
     }
@@ -1047,6 +1135,18 @@ pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanRepo
 pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    if report.mapped_placement.mapped + report.mapped_placement.preloaded > 0 {
+        let p = &report.mapped_placement;
+        let _ = writeln!(out, "{}; scales {} bytes / cap {} bytes; host preload {} bytes / budget {} bytes ({})",
+            p.label(), p.scale_bytes, p.cap_bytes, p.preloaded_bytes, p.host_budget_bytes, p.reason);
+    }
+    if let Some(host) = &report.host_ledger {
+        let _ = writeln!(out, "host       cache {} bytes; consumers {} bytes; reserve {} bytes; headroom {} bytes; shortfall {} bytes",
+            host.host_budget_bytes, host.deferred_bytes, host.reserve_bytes, host.headroom_bytes, host.shortfall_bytes);
+        for item in &host.items {
+            let _ = writeln!(out, "host item  {}: {} bytes ({:?})", item.group, item.bytes, item.basis);
+        }
+    }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if let Some(selection) = &report.prefill_selection { let _ = writeln!(out, "{selection}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
@@ -1118,6 +1218,8 @@ pub fn render(report: &PlanReport) -> String {
                         format!("swa-gqa w{window}{}", if *sinks { "+sink" } else { "" })
                     }
                     AttentionKind::Kda => "kda".into(),
+                    AttentionKind::Mla { rope, output_gate } => format!("mla{}{}",
+                        if *rope { "" } else { " nope" }, if *output_gate { "+gate" } else { "" }),
                     AttentionKind::GatedDeltaNet => "gated-deltanet".into(),
                 };
                 *kinds.entry(label).or_default() += 1;
@@ -1266,7 +1368,8 @@ pub fn render(report: &PlanReport) -> String {
             (true, true) => "fits",
             (true, false) => "DOES NOT FIT",
         };
-        let _ = writeln!(out, "capacity   routed experts need {min}; at {at}: {verdict}");
+        let _ = writeln!(out, "capacity   routed experts need {min}; at {at}: {verdict} (Spark budget {:.1} GiB/rank)",
+            report.spark_budget_bytes as f64 / GIB);
     }
     let _ = writeln!(out, "\nverdict    {}", if report.executable() { "READY to serve" } else { "NOT servable by this build" });
     if !report.hints.is_empty() {

@@ -30,6 +30,7 @@ pub struct KvCapacity {
 
 struct State {
     kv: Mutex<Option<KvCapacity>>,
+    mapped: Mutex<Option<cuteafd_loader::formats::mapped_preload::MappedPlacement>>,
     context: Mutex<ServerContext>,
     phases: Mutex<Vec<(String, SystemTime)>>,
     started: SystemTime,
@@ -42,6 +43,7 @@ fn state() -> &'static State {
     STATE.get_or_init(|| State {
         context: Mutex::new(ServerContext::default()),
         kv: Mutex::new(None),
+        mapped: Mutex::new(None),
         phases: Mutex::new(Vec::new()),
         started: process_start().unwrap_or_else(SystemTime::now),
         ready: OnceLock::new(),
@@ -221,4 +223,12 @@ mod tests {
         apply_resolved(&mut settings, "pool-tokens", "1024");
         assert_eq!(settings.iter().filter(|s| s.name == "pool-tokens").count(), 1);
     }
+}
+
+/// Resolved resident/mapped table owners, published only after preload admission.
+pub fn set_mapped_placement(placement: cuteafd_loader::formats::mapped_preload::MappedPlacement) {
+    if let Ok(mut slot) = state().mapped.lock() { *slot = Some(placement); }
+}
+pub fn mapped_placement() -> Option<cuteafd_loader::formats::mapped_preload::MappedPlacement> {
+    state().mapped.lock().ok().and_then(|slot| slot.clone())
 }

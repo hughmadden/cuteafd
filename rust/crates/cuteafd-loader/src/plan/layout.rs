@@ -15,6 +15,9 @@ pub(crate) mod qwen;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
+/// Historical offline GB10 device capacity estimate, not a measured admission.
+/// Kept distinct from the family's weights-only default until load/steady census.
+pub const DEFAULT_SPARK_DEVICE_BYTES: u64 = 108 * GIB;
 // 2026-10-07 SM120/SM121 resident ledger at the fixed 4096-image-token capacity:
 // native scratch_glm's aligned arenas, including its dedicated 4 MiB BLAS workspace.
 const GLM_FLASH_ENCODER_SCRATCH_BYTES: u64 = 791_907_584;
@@ -22,6 +25,13 @@ const GLM_FLASH_ENCODER_SCRATCH_BYTES: u64 = 791_907_584;
 /// The hardware and serving shape to lay out.
 #[derive(Debug, Clone)]
 pub struct LayoutOptions {
+    /// None sizes full-context KV for concurrency + 4, capped at min(32 GiB, 25% host RAM).
+    /// Explicit bytes bypass both; Some(0) disables the host tier.
+    pub host_cache_bytes: Option<u64>,
+    /// None selects min(8 GiB, 5% host total) when a supported media tower is loaded.
+    pub media_cache_bytes: Option<u64>,
+    /// Deterministic host/cgroup sample for offline inventory tests.
+    pub host_memory: Option<(u64, u64)>,
     /// Usable bytes of each coordinator GPU (1 or 2).
     pub rtx_bytes: Vec<u64>,
     /// Number of Spark vision tower replicas (default one).
@@ -151,12 +161,14 @@ pub struct LayoutOptions {
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
+            host_cache_bytes: None,
+            media_cache_bytes: None,
+            host_memory: None,
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
             vision_replicas: 1,
             host_embedding: false,
             force_gpu_embedding: false,
-            // 121.7 GiB GB10 minus the host OS and sparknestd measured idle (~13 GiB).
-            spark_bytes: 108 * GIB,
+            spark_bytes: DEFAULT_SPARK_DEVICE_BYTES,
             spark_allocation_budget_bytes: None,
             head_split: true,
             prefill_rows: 0,
@@ -247,6 +259,16 @@ mod scoring_workspace_tests {
     use super::*;
 
     #[test]
+    fn unknown_package_runtime_item_uses_manifest_formula() {
+        let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}]});
+        let item = runtime_item(Some(&manifest), &["qwen4".into()], "unmeasured", false, 0, 96 << 30);
+        let arch = crate::placement::ArchContext::for_device("sm_120", 96 << 30);
+        assert_eq!(item.basis, Basis::Formula);
+        assert_eq!(item.bytes, arch.context_bytes + arch.cublas_bytes + 34 * MIB);
+        assert!(item.bytes > arch.context_bytes);
+    }
+
+    #[test]
     fn full_rows_are_opt_in_and_reserve_the_family_output_delta() {
         assert!(!LayoutOptions::default().full_prefill_logits);
         assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
@@ -305,7 +327,7 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
         .and_then(|bytes| bytes.checked_add(legacy.row_indices))
         .ok_or(crate::placement::PlacementError::Overflow("Spark legacy I/O"))?;
     device.items.retain(|item| !matches!(item.group.as_str(), "expert waves" | "expert intake"
-        | "host expert exchange" | "expert row indices" | "rdma rings")
+        | "host expert exchange" | "expert row indices" | "endpoint response prefixes" | "rdma rings")
         && item.group != cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP);
     if working.selected_ranks().contains(&rank) {
         device.items.push(cuteafd_core::memory_layout::spark_runtime_residual());
@@ -315,6 +337,7 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
             io.intake, Basis::Formula));
         device.items.push(Item::new(Category::Workspace, "host expert exchange", "", io.host_exchange, Basis::Formula));
         device.items.push(Item::new(Category::Workspace, "expert row indices", "", io.row_indices, Basis::Formula));
+        device.items.push(Item::new(Category::Transport, "endpoint response prefixes", "", io.endpoint_staging, Basis::Formula));
         device.items.push(Item::new(Category::Transport, "rdma rings", "", io.mapped_rings, Basis::Formula));
     }
     Ok(())
@@ -519,13 +542,12 @@ impl Shape {
 /// peer context under a split.
 pub fn runtime_item(manifest: Option<&serde_json::Value>, programs: &[String], package: &str, split: bool,
     rank: usize, total_bytes: u64) -> Item {
-    match crate::placement::loaded_code(&programs[0], package, split, rank as u8) {
-        Some(code) => Item::new(Category::Runtime, "context+modules", "",
-            crate::placement::ArchContext::coordinator(total_bytes, None).context_bytes + code.bytes, Basis::Calibrated),
-        None => Item::new(Category::Runtime, "context+modules", "", planned_context(manifest, programs, total_bytes)
-            + if split { crate::placement::ArchContext::for_device("sm_120", total_bytes).peer_context_bytes } else { 0 },
-            Basis::Formula),
-    }
+    let arch = crate::placement::ArchContext::coordinator(total_bytes, None);
+    let families = programs.iter().map(String::as_str).collect::<Vec<_>>();
+    let set = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &families));
+    let allowance = crate::placement::inventory::loaded_code_allowance(&programs[0], package,
+        split, rank as u8, &arch, set.as_ref());
+    Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
 }
 
 /// Program families (manifest name prefixes) a coordinator GPU loads: `base`
@@ -576,7 +598,13 @@ pub(crate) fn push_resident(devices: &mut [DeviceLayout], ranks: &[Vec<(String, 
 /// The host-mapped table note (engram/PLE tables live on the host; the
 /// device budget holds only their staging).
 pub(crate) fn mapped_table_note(report: &PlanReport, notes: &mut Vec<String>) {
-    let mapped: u64 = report.components.iter().filter(|c| c.component == Component::MappedTable).map(|c| c.bytes).sum();
+    let p = &report.mapped_placement;
+    if p.mapped + p.preloaded > 0 {
+        notes.push(format!("{}; {} host-resident scale bytes charged against {} available bytes (cap {} bytes)",
+            p.label(), p.preloaded_bytes, p.host_budget_bytes, p.cap_bytes));
+    }
+    let mapped: u64 = report.components.iter().filter(|c| c.component == Component::MappedTable).map(|c| c.bytes).sum::<u64>()
+        .saturating_sub(p.preloaded_bytes);
     if mapped > 0 { notes.push(format!("host-mapped table backing: {:.2} GiB (device budget includes staging only)", mapped as f64 / GIB as f64)); }
 }
 
@@ -682,14 +710,6 @@ pub(crate) fn local_package(report: &PlanReport) -> &'static str {
     let package = report.experts.as_ref().map(|e| e.package.as_str()).unwrap_or("");
     if report.placement != ExpertPlacement::Local { "none" }
     else if package.contains("exl3") { "exl3" } else { "fp8" }
-}
-
-/// The planner's runtime baseline on a GPU of `total_bytes`: arch context + the selected modules.
-fn planned_context(manifest: Option<&serde_json::Value>, families: &[String], total_bytes: u64) -> u64 {
-    let names = families.iter().map(String::as_str).collect::<Vec<_>>();
-    let modules = manifest.map_or(32 * MIB, |m| crate::placement::ProgramSet::from_manifest(m, &names).module_bytes());
-    let arch = crate::placement::ArchContext::coordinator(total_bytes, None);
-    arch.context_bytes + arch.cublas_bytes + modules
 }
 
 /// GLM 5.3 Flash's step workspaces on one GPU from its program manifest: the bytes its engine
@@ -974,4 +994,217 @@ pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
      4096*4304*4, 4096*4304*2, 4096*4608*4, 4096*4608*2, 4096*2560*4,
      n*16*16*3, 3*256*4, n*2*4, n*4*4, n*4*4, 16384*16*4, 2*4, 4*MIB]
         .into_iter().map(|b| b.div_ceil(256)*256).sum()
+}
+
+/// Resolve the serving representation, not the inventory's target-only defaults.
+fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint)
+    -> anyhow::Result<(cuteafd_core::prefix::HostCacheGeometry, u64, u64)> {
+    use anyhow::{Context, ensure};
+    use crate::serving_capacity::{CacheOptions, KvPlacement};
+    let family = super::family::detect(checkpoint).context("missing host cache family")?;
+    let model = family.open(checkpoint)?;
+    let id = family.id();
+    let policy = ShapePolicy {
+        context: if matches!(id, "mimo_v2" | "deepseek_v41") { ContextPolicy::Checkpoint }
+            else { ContextPolicy::ManifestBounded },
+        prefill_rows: (id == "deepseek_v41").then_some(2048),
+        all_native_stages: id == "deepseek_v4",
+    };
+    let admitted_rows = report.prefill_rows;
+    let shape = Shape::resolve(report, model.as_ref(), options, policy);
+    report.prefill_rows = admitted_rows;
+    let ranks = if id == "deepseek_v41" || options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
+    let selected = CacheOptions { coordinator_ranks: ranks,
+        native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
+        qwen_kv: options.qwen_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
+        glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
+        glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
+    // Qwen's dual-owner layout partitions whole layers. Its host snapshot
+    // concatenates those owners, so its aggregate is the single-owner geometry.
+    let cache = model.cache_geometry(if id == "qwen4" { CacheOptions { coordinator_ranks: 1, ..selected } }
+        else { selected })?.context("host cache layout unavailable")?;
+    ensure!(!cache.ranks.is_empty(), "host cache has no owners");
+    let pages = if cache.placement == KvPlacement::Replicated { &cache.ranks[..1] } else { &cache.ranks[..] };
+    let page_bytes = pages.iter().try_fold(0u64, |n, r| n.checked_add(r.persistent_unit_bytes))
+        .context("host cache pages overflow")?;
+    // Even replicated pages have distinct per-owner recurrent/window marks.
+    let mut mark_bytes = cache.ranks.iter().try_fold(0u64, |n, r| n.checked_add(r.retained_mark_bytes))
+        .context("host cache marks overflow")?;
+    if id == "deepseek_v41" && shape.native_layers > 0 {
+        ensure!(shape.native_layers == 3, "V4.1 dSpark retains all three stages");
+        mark_bytes = mark_bytes.checked_add(3 * 128 * 528).context("dSpark mark overflow")?;
+    }
+    if id == "mimo_v2" && options.mimo_prefix_draft {
+        let dir = checkpoint.snapshot.join("dflash");
+        let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
+            let cfg = crate::families::mimo_v2::draft_config::DflashConfig::read(&dir)?;
+            crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_width() as u64)?
+        } else if dir.join("config.json").is_file() {
+            let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings.max(shape.concurrency))
+                .map_err(anyhow::Error::msg)?.0
+        } else { 0 };
+        mark_bytes = mark_bytes.checked_add(draft).context("MiMo draft mark overflow")?;
+    }
+    let mut context = shape.context_tokens;
+    if id == "deepseek_v4" && options.context_tokens == 0 {
+        if let Some(memory) = &report.memory_layout {
+            if memory.pool_tokens < context { context = memory.pool_tokens.saturating_sub(256); }
+        }
+    }
+    Ok((cuteafd_core::prefix::HostCacheGeometry { unit_rows: cache.logical_unit_rows,
+        page_bytes, mark_bytes, draft_bytes: 0 }, context, shape.concurrency))
+}
+
+/// Offline host owners are future allocations, unlike the runtime's live pinned
+/// ledger. The OS sample excludes external consumers, not this unstarted server.
+pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint, native: bool) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+    use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
+    let Some(spec) = report.spec.as_ref() else { return Ok(()) };
+    let family = report.family.as_deref().unwrap_or("");
+    let (total, available) = options.host_memory.map_or_else(
+        crate::formats::mapped_preload::host_memory, Ok)?;
+    let rows = if family == "deepseek_v41" {
+        let requested = if options.prefill_rows == 0 { 2048 } else { options.prefill_rows };
+        u64::from(cuteafd_core::coordinator_programs::v41_live_rows(u32::try_from(requested)?)
+            .context("invalid V4.1 live prefill rows for host admission")?)
+    } else { report.prefill_rows.unwrap_or(options.prefill_rows.max(4096)) };
+    let ranks = report.memory_layout.as_ref().map_or(0, |m| m.devices.iter()
+        .filter(|d| d.kind == DeviceKind::Spark).count());
+    let lanes = match family {
+        "glm5" if native => 1,
+        "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
+            glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
+        "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
+            else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES },
+        "mimo_v2" => {
+            let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
+            let configured = if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
+                else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() };
+            crate::families::mimo_v2::admission::resolve_transport_lanes(ranks > 0,
+                cfg.program_family()?, configured.as_deref())? as u64
+        }
+        _ => 1,
+    };
+    let lanes = report.prefill_lanes.unwrap_or(lanes);
+    let hidden = spec.hidden as u64;
+    let topk = spec.moe.as_ref().map_or(0, |m| m.top_k as u64);
+    let mut items = Vec::new();
+    let mut push = |category, group: &str, format: &str, bytes, basis| {
+        items.push(Item::new(category, group, format, bytes, basis)
+            .with_lifetime(ItemLifetime::PostReadyReserve));
+    };
+    if ranks > 0 {
+        let geometry = ExpertGeometry { hidden: u32::try_from(hidden)?,
+            experts: u32::try_from(spec.moe.as_ref().context("Spark layout without MoE geometry")?.experts)?,
+            topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
+            layers: u32::try_from(spec.layers.len())? };
+        let endpoints = spark_endpoints(family, lanes);
+        let bf16 = native || matches!(family, "glm5" | "qwen4");
+        let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
+            else { SparkIngress::Fp8K32 };
+        let endpoint = SparkEndpoint { capacity: u32::try_from(rows)?, ingress };
+        let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
+        let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+            depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        let bytes = (endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64)
+            .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
+            .context("coordinator host rings overflow")?;
+        push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
+        // Host-mode intake is the upper bound; auto/GPU landing can use less.
+        let intake = rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
+            .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
+            .context("coordinator intake overflow")?;
+        push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
+    }
+    let work_rows = rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
+    let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
+        .context("host routing stride overflow")?).context("host routing workspace overflow")?;
+    push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
+    let mut staging = work_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8))
+        .and_then(|n| n.checked_add(2 << 20)).context("host staging overflow")?;
+    if family == "qwen4" {
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
+        let pool = report.memory_layout.as_ref().map_or(0, |m| m.pool_tokens);
+        // Decode owns a table per row; prefill owns one. Charge the full
+        // record and compressed-pool tables, even on partitioned owners.
+        let tables = pool.div_ceil(64).checked_add(pool.div_ceil(64 * 4))
+            .and_then(|n| n.checked_mul(64 + lanes)).and_then(|n| n.checked_mul(4))
+            .context("Qwen host page tables overflow")?;
+        let stride = (cfg.ple_rows() as u64).checked_mul(8)
+            .and_then(|n| n.checked_add(64))
+            .and_then(|n| hidden.checked_mul(10).and_then(|h| n.checked_add(h)))
+            .context("Qwen host row metadata overflow")?;
+        staging = work_rows.checked_mul(stride).and_then(|n| n.checked_add(tables))
+            .and_then(|n| n.checked_add(256 * (lanes + 1)))
+            .and_then(|n| n.checked_mul(options.rtx_bytes.len() as u64))
+            .context("Qwen host staging overflow")?;
+    }
+    push(Category::Staging, "staging/tables-and-sync", "row metadata", staging, Basis::Estimated);
+    let score_lanes = if matches!(family, "glm5" | "glm5_flash") { lanes } else { 1 };
+    let score_rows = if options.full_prefill_logits { rows.checked_mul(score_lanes).context("host scoring rows overflow")? }
+        else if family == "deepseek_v41" { rows.max(256) } else { 64 };
+    let logits = host_logits_bytes(score_rows, rows, spec.vocab as u64).context("host logits overflow")?;
+    push(Category::Workspace, "scoring/full-logits", "FP32", logits, Basis::Formula);
+    if family == "qwen4" {
+        // Decode and prefill arenas coexist on each owner. A peer may need
+        // fewer output rows; charge the all-owner upper bound.
+        let pinned_rows = 64u64.checked_add(if options.full_prefill_logits { rows } else { 1 })
+            .and_then(|n| n.checked_mul(options.rtx_bytes.len() as u64))
+            .context("Qwen pinned logits rows overflow")?;
+        let pinned = host_logits_bytes(pinned_rows, pinned_rows, spec.vocab as u64)
+            .context("Qwen pinned logits overflow")?;
+        push(Category::Workspace, "workspace/logits-host", "FP32 all-owner upper bound", pinned, Basis::Estimated);
+    }
+    if options.host_embedding || report.memory_layout.as_ref().is_some_and(|m|
+        m.notes.iter().any(|n| n.starts_with("embedding placement: host"))) {
+        let bytes = report.components.iter().filter(|c| c.component == Component::Embedding)
+            .try_fold(0u64, |n, c| n.checked_add(c.bytes)).context("host embedding overflow")?;
+        push(Category::Embedding, "embedding", "checkpoint", bytes, Basis::Exact);
+    }
+    push(Category::Tables, "mapped-scales/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
+    let media_cache_loaded = (matches!(family, "mimo_v2" | "qwen4" | "glm5_flash")
+        && report.vision != super::MediaMode::Off)
+        || (family == "mimo_v2" && report.audio != super::MediaMode::Off);
+    if media_cache_loaded {
+        let media = options.media_cache_bytes.unwrap_or((8u64 << 30).min(total / 20));
+        push(Category::Embedding, "media/embedding-cache", "host quota", media, Basis::Formula);
+    }
+    let tier_disabled = options.rtx_bytes.len() > 1 && (family == "glm5_flash"
+        || (matches!(family, "glm5" | "deepseek_v4")
+            && report.attention_placement == crate::placement::AttentionPlacement::Heads));
+    let family = family.to_owned();
+    let cache = if options.mimo_prefix_entries == 0 || tier_disabled || options.host_cache_bytes == Some(0) { 0 } else {
+        let resolved = selected_host_geometry(report, options, checkpoint).and_then(|(geometry, context, concurrency)| {
+            geometry.resolve(options.host_cache_bytes, context, concurrency, total, geometry.chunk_bytes())
+                .with_context(|| format!("invalid host snapshot geometry {geometry:?}, context {context}, concurrency {concurrency}"))
+        });
+        match resolved {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report.fits = false;
+                report.placement_supported = false;
+                report.hints.push(super::Hint {
+                    what: format!("{family} host prefix cache unsupported (requested {}): {error:#}",
+                        options.host_cache_bytes.map_or_else(|| "auto bytes".into(), |n| format!("{n} bytes"))),
+                    how: "Add exact retained page and mark geometry and a host restore implementation for this family/shape, or disable the host tier with --host-cache-bytes 0.".into(),
+                });
+                options.host_cache_bytes.unwrap_or(0)
+            }
+        }
+    };
+    let host = HostLayout::new(total, available, (8 << 30).max(total / 10), cache, items)
+        .context("coordinator host total overflow")?;
+    ensure!(host.total_bytes > 0, "coordinator host memory is zero");
+    report.host_budget_bytes = cache;
+    if host.shortfall_bytes > 0 {
+        report.fits = false;
+        report.hints.push(super::Hint { what: format!("{family} coordinator host memory shortfall {} bytes: prefix cache {}, other consumers {}, reserve {}, available {}",
+            host.shortfall_bytes, cache, host.deferred_bytes, host.reserve_bytes, available),
+            how: "Reduce --host-cache-bytes or the scoring/transport shape, or free host memory.".into() });
+    }
+    report.host_ledger = Some(host);
+    Ok(())
 }

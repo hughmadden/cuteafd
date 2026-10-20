@@ -45,6 +45,7 @@ CHECKPOINT_CONTEXTS = {
     "qwen4": ("Qwen/Qwen3.8-Flash-Next", 262144),
     "qwen35": ("Qwen/Qwen3.5-9B", 262144),
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
+    "step5": ("stepfun-ai/Step-5-Preview", 1048576),
 }
 
 
@@ -472,6 +473,104 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     return programs
 
 
+def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """Kimi KDA plus NoPE MLA at 48 heads/rank and 96 heads/context rank."""
+    from b12x.integration.cuteafd import glmf, kimi_mla
+
+    out = [("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g))]
+    for rows in sorted({decode_rows, prefill_rows}):
+        decode = rows == decode_rows
+        params = {"max_rows": rows, "output_kind": "norm", "decode": decode}
+        out.append((f"kda_m{rows}", "kda", params,
+                    lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
+    for heads in (48, 96):
+        mla = kimi_mla.KimiMlaGeometry(heads=heads)
+        suffix = "" if heads == 48 else "_h96"
+        for rows in sorted({decode_rows, prefill_rows}):
+            for op, fn in (("mla_producer", kimi_mla.compile_kimi_mla_producer_aot),
+                           ("mla_output", kimi_mla.compile_kimi_mla_output_aot)):
+                out.append((f"{op}{suffix}_m{rows}", op, {"max_rows": rows, "heads": heads},
+                            lambda r=rows, g=mla, fn=fn: fn(g, max_rows=r)))
+        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+            out.append((f"dense_mla_{mode}{suffix}_m{rows}", "dense_mla",
+                        {"mode": mode, "max_rows": rows, "heads": heads},
+                        lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
+                            g, max_rows=r, max_context=max_context, mode=m)))
+    out.extend(kimi_w8_programs())
+    out.extend(kimi_latent_programs())
+    out.extend(kimi_route_programs())
+    return out
+
+
+def kimi_route_programs():
+    """Reuse the shared BF16 router and FP8-K32 wire kernels at Kimi widths."""
+    from types import SimpleNamespace
+    from b12x.integration.cuteafd import glmf
+
+    router = SimpleNamespace(hidden=7168, routed_experts=896, top_k=16)
+    latent = SimpleNamespace(hidden=3584)
+    return [
+        ("router_scores", "router_scores", {},
+         lambda: glmf.compile_glmf_router_scores_aot(router)),
+        ("expert_input_quant", "expert_input_quant", {},
+         lambda: glmf.compile_glmf_expert_input_quant_aot(latent)),
+    ]
+
+
+def kimi_latent_programs():
+    """Checkpoint-native latent projections and two-boundary BF16 RMSNorm."""
+    def norm(width):
+        from b12x.integration.cuteafd import kimi_residual
+        return kimi_residual.compile_kimi_rmsnorm_aot(hidden=width)
+
+    def projection(width, outputs):
+        from b12x.integration.cuteafd import pointwise
+        return pointwise.compile_bf16_projection_aot(width=width, outputs=outputs)
+
+    return [(f"rmsnorm_h{width}", "rmsnorm", {"hidden": width},
+             lambda w=width: norm(w)) for width in (3584, 7168)] + [
+        ("latent_down", "bf16_projection", {"width": 7168, "outputs": 3584},
+         lambda: projection(7168, 3584)),
+        ("latent_up", "bf16_projection", {"width": 3584, "outputs": 7168},
+         lambda: projection(3584, 7168)),
+    ]
+
+
+def kimi_w8_programs():
+    """Static residual sites, but runtime rows/arena stride for exact row invariance."""
+    def build_residual(params):
+        from b12x.integration.cuteafd import kimi_residual
+        return kimi_residual.compile_kimi_attn_res_rmsnorm_aot(**params)
+
+    def build_situ(width):
+        from b12x.integration.cuteafd import kimi_residual
+        return kimi_residual.compile_kimi_situ_aot(intermediate=width)
+
+    def build_projection(params):
+        from b12x.integration.cuteafd import pointwise
+        return pointwise.compile_bf16_projection_aot(**params)
+
+    out = []
+    sites = [(1, "keep", True, False)]
+    sites.extend((c, mode, append, True) for c in range(2, 10)
+                 for mode, append in (("add", False), ("replace", False), ("keep", False)))
+    sites.extend((c, "add", True, True) for c in range(2, 9))
+    for candidates, mode, append, mix in sites:
+        params = dict(hidden=7168, candidates=candidates, prefix_mode=mode,
+                      append=append, has_mix=mix)
+        name = f"attn_res_c{candidates}_{mode}" + ("_append" if append else "")
+        out.append((name, "attn_res_rmsnorm", params,
+                    lambda kw=params: build_residual(kw)))
+    for width in (3072, 6144, 16896, 33792):
+        out.append((f"situ_i{width}", "situ", {"intermediate": width},
+                    lambda w=width: build_situ(w)))
+        for op, params in (("gate_up", {"width": 7168, "outputs": 2 * width}),
+                           ("down", {"width": width, "outputs": 7168})):
+            out.append((f"ffn_{op}_i{width}", "bf16_projection", params,
+                        lambda kw=params: build_projection(kw)))
+    return out
+
+
 def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """Qwen 3.8 Flash Next programs, same (stem suffix, op, params, thunk) shape as ``programs``.
     Hyper-connection, head, MoE-front and PLE programs serve any row count (their
@@ -638,7 +737,13 @@ def main() -> None:
                              "glm2 (GLM 5.x, one GPU of a two-GPU head split), mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), "
                              "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), mimof/mimof2 (V2.6 Flash MOPD), "
                              "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
-                             "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B)")
+                             "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
+                             "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
+                             "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
+                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands)")
+    parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
+                        help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
+                             "family programs), spark = routed K1 serving and grouping, all = every program")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
                         help="with glmf: also the decode and verify programs at this many rows (serve "
@@ -664,13 +769,17 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35 and/or qwen38")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
+    kimi_kda = None
+    if "kimik3" in geometries:
+        from b12x.integration.cuteafd import KDAGeometry
+        kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only):
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries != ["exlr8"]):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -688,6 +797,21 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
+        if name == "exlr8_dense":
+            from export_b12x_exlr8_dense_aot import programs as dense_programs
+            manifest["families"][name] = {"abi_version": 1}
+            work += [(name, *item) for item in dense_programs()]
+            continue
+        if name == "exlr8":
+            continue  # appended after every other family, below
+        if name in ("step5", "step52"):
+            from export_b12x_step5_aot import programs as step5_programs
+            heads = 64 if name == "step5" else 32
+            extent = geometry_context(name, args.max_context)
+            manifest["families"][name] = {"heads": heads, "groups": heads // 16, "head_dim": 192}
+            manifest["family_capacities"][name] = {"max_context": extent}
+            work += [(name, *item) for item in step5_programs(heads, args.prefill_rows, extent)]
+            continue
         # mimop2: V2.6 Pro split over two GPUs by heads (64 query / 4 KV heads each, the
         # dense MLP by intermediate).
         mimo2 = dataclasses.replace(MIMO_V2_FLASH, name="mimo_v2_flash_tp2", heads=MIMO_V2_FLASH.heads // 2,
@@ -719,10 +843,11 @@ def main() -> None:
         g = {"flash": FLASH, "flash2": dsv4_half["flash2"], "pro": PRO, "pro2": dsv4_half["pro2"], "glm": GLM53,
              "glm2": glm2, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO,
              "mimo2": mimo2, "mimop2": mimop2, "mimof": MIMO_V26_FLASH, "mimof2": mimof2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT,
-             "qwen35": QWEN35_9B, "qwen38": QWEN38_27B}[name]
+             "qwen35": QWEN35_9B, "qwen38": QWEN38_27B,
+             "kimik3": kimi_kda}[name]
         family = {"flash": "dsv4f", "flash2": "dsv4f2", "pro": "dsv4p", "pro2": "dsv4p2", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
                   "mimo2": "mimo2", "mimop2": "mimop2", "mimof": "mimof", "mimof2": "mimof2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4",
-                  "qwen35": "qwen35", "qwen38": "qwen38"}[name]
+                  "qwen35": "qwen35", "qwen38": "qwen38", "kimik3": "kimik3"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
         extent = geometry_context(name, args.max_context)
         manifest["family_capacities"][family] = {"max_context": extent}
@@ -731,7 +856,7 @@ def main() -> None:
                 "mimo2": mimo_head_split_programs, "mimop2": mimo_head_split_programs,
                 "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
-                "qwen4": qwen4_programs}.get(name, programs)
+                "qwen4": qwen4_programs, "kimik3": kimi_kda_programs}.get(name, programs)
         if name in ("qwen35", "qwen38"):
             # These exports target the named official checkpoints' native norm storage.
             norm_dtype = torch.float32 if name == "qwen35" else torch.bfloat16
@@ -761,6 +886,14 @@ def main() -> None:
                                         moe_inter=GLM53_FLASH.moe_inter // 2)
             work.append(("glmf2", "kda_commit_c", "kda_commit", {"index_cache": "compact"},
                          lambda: glmf.compile_glmf_kda_commit_c_aot(glmf2)))
+    if "exlr8" in geometries:
+        # Last, so every other family's objects and table indices are unchanged.
+        # The fork owns the program list and its role split.
+        from export_b12x_exlr8_aot import programs as exlr8_programs
+        exlr8_work = exlr8_programs(role=args.exlr8_role)
+        manifest["families"]["exlr8"] = {"hidden": 6144, "units": 16, "top_k": 8, "role": args.exlr8_role,
+                                         "programs": [f"exlr8_{item[0]}" for item in exlr8_work]}
+        work += [("exlr8", *item) for item in exlr8_work]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

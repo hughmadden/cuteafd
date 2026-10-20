@@ -142,6 +142,8 @@ pub(crate) struct HopLink<'a> {
     ranks: [RankDevice; 2],
     ends: [End<'a>; 2],
     spec: HopSpec,
+    /// A private instance retains logical plan identity but owns only physical lane zero.
+    private_lane: Option<usize>,
     /// The placement's hops; a hop's index here keys its slot.
     hops: Vec<Hop>,
     /// Receive slots per lane on each GPU (`min(hops into it, HOP_SLOTS)`).
@@ -193,7 +195,25 @@ impl<'a> HopLink<'a> {
                 })
             })
         };
-        Ok(Self { library, ranks, ends: [end(0)?, end(1)?], spec, hops: hops.to_vec(), per_lane, abort: None })
+        Ok(Self { library, ranks, ends: [end(0)?, end(1)?], spec, private_lane: None,
+            hops: hops.to_vec(), per_lane, abort: None })
+    }
+
+    /// Independent streams carry one logical lane, so allocate only its slots.
+    pub(crate) fn new_private_lane(library: &'a NativeLibrary, ranks: [RankDevice; 2],
+        hops: &[Hop], spec: HopSpec, lane: usize) -> Result<Self> {
+        let allocation = private_lane_spec(spec, lane)?;
+        let mut link = Self::new(library, ranks, hops, allocation)?;
+        link.spec = spec;
+        link.private_lane = Some(lane);
+        Ok(link)
+    }
+
+    pub(crate) fn validate_dispatch(&self, lane: usize, shared: bool) -> Result<()> {
+        ensure!((lane as u64) < self.spec.lanes, "hop dispatch lane outside admission");
+        ensure!(self.private_lane.is_none_or(|owner| owner == lane && !shared),
+            "private hop instance differs from pipeline lane");
+        Ok(())
     }
 
     /// Startup-only borrowing of the routed exchange's abort words. The
@@ -240,7 +260,8 @@ impl<'a> HopLink<'a> {
         let (to, slot) = self.slot_of(index)?;
         ensure!((lane as u64) < self.spec.lanes, "hop lane {lane} of {}", self.spec.lanes);
         ensure!(rows as u64 <= self.spec.rows, "hop of {rows} rows past {}", self.spec.rows);
-        let (flag, recv) = (lane * HOP_SLOTS as usize + slot, lane * self.per_lane[to] + slot);
+        let physical_lane = physical_lane(self.spec, self.private_lane, lane)?;
+        let (flag, recv) = (physical_lane * HOP_SLOTS as usize + slot, physical_lane * self.per_lane[to] + slot);
         let from = 1 - to;
         let destination = self.ends[to].recv.get(recv).context("hop receive slot")?.buffer.ptr;
         let bytes = rows * usize::try_from(self.spec.row_bytes)?;
@@ -272,10 +293,53 @@ impl<'a> HopLink<'a> {
     }
 }
 
+fn private_lane_spec(spec: HopSpec, lane: usize) -> Result<HopSpec> {
+    ensure!((lane as u64) < spec.lanes, "private hop lane outside admission");
+    Ok(HopSpec { lanes: 1, ..spec })
+}
+
+fn physical_lane(spec: HopSpec, private: Option<usize>, lane: usize) -> Result<usize> {
+    ensure!((lane as u64) < spec.lanes, "hop lane outside admission");
+    if let Some(owner) = private {
+        ensure!(owner == lane, "private hop instance belongs to another lane");
+        Ok(0)
+    } else { Ok(lane) }
+}
+
 #[cfg(test)]
 mod cuda_tests {
     use super::*;
     use cuteafd_loader::placement::{plan_hops, FfnMode, LayerMode};
+
+    #[test]
+    fn private_hop_instances_charge_one_lane_and_sum_to_the_admitted_forecast() -> Result<()> {
+        let (w0, w1) = (LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
+            LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner });
+        for lanes in [1, 2] {
+            for modes in [vec![w0, w0], vec![w0, w1], vec![w0, w1, w0, w1, w0, w1]] {
+                let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: 16384,
+                    rows: 640, lanes, entry_gpu: 0, head_gpu: 0,
+                    terminal: cuteafd_loader::placement::TerminalHome::AttentionOwner };
+                let hops = plan_hops(&modes, &spec)?;
+                let admitted = hop_buffer_bytes(&hops, &spec, 2).unwrap();
+                let single = hop_buffer_bytes(&hops, &HopSpec { lanes: 1, ..spec }, 2).unwrap();
+                let mut total = [0u64; 2];
+                for lane in 0..lanes as usize {
+                    let allocation = private_lane_spec(spec, lane)?;
+                    assert_eq!(allocation.lanes, 1);
+                    let bytes = hop_buffer_bytes(&hops, &allocation, 2).unwrap();
+                    assert_eq!(bytes, single);
+                    assert_eq!(physical_lane(spec, Some(lane), lane)?, 0);
+                    assert_eq!(physical_lane(spec, None, lane)?, lane);
+                    for rank in 0..2 { total[rank] += bytes[rank]; }
+                    assert!(physical_lane(spec, Some(lane), 1 - lane).is_err());
+                }
+                assert_eq!(total.as_slice(), admitted);
+                assert!(private_lane_spec(spec, lanes as usize).is_err());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn direct_input_binding_rejects_receive_storage_and_wrong_endpoints() -> Result<()> {
@@ -334,9 +398,20 @@ mod cuda_tests {
             let link = HopLink::new(&library, ranks, &hops, spec)?;
             let charged = hop_buffer_bytes(&hops, &spec, 2).unwrap();
             assert_eq!([link.receive_bytes(0), link.receive_bytes(1)], [charged[0], charged[1]]);
+            let private = (0..2).map(|lane| HopLink::new_private_lane(&library, ranks, &hops, spec, lane))
+                .collect::<Result<Vec<_>>>()?;
+            let single = hop_buffer_bytes(&hops, &HopSpec { lanes: 1, ..spec }, 2).unwrap();
+            for rank in 0..2 {
+                for instance in &private { assert_eq!(instance.receive_bytes(rank), single[rank]); }
+                assert_eq!(private.iter().map(|instance| instance.receive_bytes(rank)).sum::<u64>(), charged[rank]);
+            }
             let rows = 17;
             let bytes = rows * spec.row_bytes as usize;
             for lane in 0..2 {
+                let link = &private[lane];
+                assert!(link.validate_dispatch(1 - lane, false).is_err());
+                assert!(link.validate_dispatch(lane, true).is_err());
+                link.validate_dispatch(lane, false)?;
                 for (index, hop) in hops.iter().enumerate() {
                     let from = usize::from(hop.from);
                     let pattern: Vec<u8> = (0..bytes).map(|i| (i * 7 + lane * 13 + index * 31) as u8).collect();

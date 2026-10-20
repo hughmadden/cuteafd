@@ -4988,21 +4988,16 @@ impl<'a> GlmfEngine<'a> {
         shared: impl FnOnce() -> Result<()>) -> Result<SparkExpertWave> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 { h * 2 } else { h + h / 32 }));
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
+            if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
+        let route_bytes = layout.route_bytes;
         let staging = w.router_host.borrow_mut();
-        let host = staging.buffer;
-        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
-            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: host.bytes - offset,
-            ..host
-        };
         let timer = std::time::Instant::now();
         // SAFETY: the pinned regions are large enough; the sync completes them.
         unsafe {
-            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }, wire_bytes, self.stream)?;
+            layout.enqueue(self.library, staging.buffer,
+                [w.route_ids.buffer, w.route_weights.buffer,
+                    if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }], self.stream)?;
             self.library.cuda_event_record(self.routes_ready, self.stream)?;
         }
         // The shared expert queues behind the copies and runs during the exchange;
@@ -5016,11 +5011,8 @@ impl<'a> GlmfEngine<'a> {
         if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
             probe.staged(index, &staged[..route_bytes]);
         }
-        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
-        let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
-            row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),
-        }).collect();
-        let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
+        let routes = layout.routes(staged)?;
+        let wire = layout.wire(staged)?.to_vec();
         drop(staging);
         let request = spark_request(h, topk, index, t, routes, wire, kind, self.spark_bf16)?;
         if self.split_audit && !decode && t >= 256 {
@@ -5619,17 +5611,18 @@ mod prefill_lane_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
-            // canon-fp8-decode: the threshold is the programs' capacity, not the thin tile.
-            ("integration/cuteafd/glmf.py", 0x80a2_3e92_49ed_5766_u64),
-            // Proxy fences only: canonical BF16/FP8 MMA geometry, arithmetic
-            // routes and capacity thresholds are unchanged.
+            // Shared KDA geometry keeps GLM's low-rank gates, BF16 norm and rounded beta;
+            // projection routes and capacity-based thresholds are unchanged.
+            ("integration/cuteafd/glmf.py", 0xb51f_2224_6aff_2bd4_u64),
+            // b729115b uses canonical BF16 MMA at every positive row count.
+            // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             ("integration/cuteafd/_glm_kernels.py", 0x7f20_e05f_fd23_f141),
             ("integration/cuteafd/_fp8_weights.py", 0xab87_f59d_f17b_3556),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
-            // Dense Qwen geometry only: glmf/glmf2 retain all 88 objects and 90 headers
-            // byte-identically against 515a0b94 at both 188 and 170 SMs (2b792f04 export gate).
-            ("integration/cuteafd/_common.py", 0x9d74_ed3b_938b_e00a),
+            // KDAGeometry import/export and signed-byte operand registration only;
+            // 34317cc1 adds Int8 without changing BF16/FP8 mappings or projection routes.
+            ("integration/cuteafd/_common.py", 0x7e63_b6fc_ae75_9f0a),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
             ("gemm/bf16_gemv/_skinny.py", 0x3351_3301_8c37_3f8f),

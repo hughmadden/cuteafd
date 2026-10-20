@@ -7,6 +7,124 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
+fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
+    use cuteafd_core::memory_layout::ItemLifetime;
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    for (total, expected) in [(183u64, 32u64), (64, 16)] {
+        let mut report = input.plan(&PlanOptions::default()).unwrap();
+        let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)),
+            full_prefill_logits: true, context_tokens: 1 << 40, ..Default::default() };
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        let host = report.host_ledger.as_ref().unwrap();
+        assert_eq!(report.host_budget_bytes, expected << 30);
+        assert_eq!(host.host_budget_bytes, report.host_budget_bytes);
+        assert!(host.items.iter().all(|i| i.lifetime == ItemLifetime::PostReadyReserve));
+        for owner in ["workspace/router", "staging/tables-and-sync", "scoring/full-logits"] {
+            assert!(host.items.iter().any(|i| i.group == owner && i.bytes > 0), "{owner}");
+        }
+        assert!(host.host_budget_bytes + host.deferred_bytes + host.reserve_bytes <= host.total_bytes);
+        assert_eq!(host.shortfall_bytes, 0);
+        options.host_memory = Some((total << 30, 8 << 30));
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert!(!report.fits);
+        assert!(report.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
+        assert!(report.hints.iter().any(|h| h.what.contains("coordinator host memory shortfall")));
+        options.host_cache_bytes = Some(40 << 30);
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert_eq!(report.host_budget_bytes, 40 << 30); // Explicit quota bypasses both caps.
+        options.host_cache_bytes = Some(0);
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert_eq!(report.host_budget_bytes, 0);
+    }
+}
+
+#[test]
+fn real_layout_charges_host_and_names_unsupported_snapshot_geometry() {
+    let mut config = mimo_flash_config();
+    config.as_object_mut().unwrap().remove("max_position_embeddings");
+    let dir = snapshot(config, &mimo_flash_tensors());
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+    }), ..sparks(4) };
+    let report = plan(dir.path(), &options).unwrap();
+    assert!(report.spec.is_some() && report.host_ledger.is_some());
+    assert!(!report.fits && !report.placement_supported);
+    assert!(report.hints.iter().any(|h| h.what.contains("mimo_v2 host prefix cache unsupported")
+        && h.what.contains("auto bytes") && h.what.contains("context 0")), "{}", render(&report));
+    options.layout.as_mut().unwrap().host_cache_bytes = Some(1234567);
+    let explicit = plan(dir.path(), &options).unwrap();
+    assert_eq!(explicit.host_budget_bytes, 1234567);
+    assert_eq!(explicit.host_ledger.as_ref().unwrap().host_budget_bytes, 1234567);
+}
+
+#[test]
+fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&PlanOptions::default()).unwrap();
+    let geometry = &report.cache_requirements.as_ref().unwrap().target_only_layouts[0];
+    let rank = &geometry.ranks[0];
+    let (rows, page, mark) = (geometry.logical_unit_rows, rank.persistent_unit_bytes, rank.retained_mark_bytes);
+    let chunk = (256u64 << 20).max(page).max(mark);
+    for concurrency in [1, 16] {
+        let expected = cuteafd_core::prefix::host_cache_required_bytes(1 << 20, concurrency,
+            rows, page, mark.max(1), 0, chunk).unwrap().min(32 << 30);
+        for entries in [1, 2000] {
+            let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries, ..Default::default() };
+            layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+            assert_eq!(report.host_budget_bytes, expected);
+        }
+    }
+}
+
+#[test]
+fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&PlanOptions::default()).unwrap();
+    let mut options = layout::LayoutOptions { host_memory: Some((64 << 30, 64 << 30)),
+        host_cache_bytes: Some(0), ..Default::default() };
+    for (vision, audio, quota, expected) in [
+        (MediaMode::Rtx(Some(0)), MediaMode::Off, None, (64u64 << 30) / 20),
+        (MediaMode::Spark(Some(0)), MediaMode::Off, Some(2 << 30), 2 << 30),
+        (MediaMode::Rtx(Some(0)), MediaMode::Off, Some(0), 0),
+        (MediaMode::Off, MediaMode::Off, Some(2 << 30), 0),
+        (MediaMode::Off, MediaMode::Rtx(Some(0)), None, (64u64 << 30) / 20),
+        (MediaMode::Off, MediaMode::Spark(Some(0)), Some(2 << 30), 2 << 30),
+        (MediaMode::Off, MediaMode::Rtx(Some(0)), Some(0), 0),
+        (MediaMode::Rtx(Some(0)), MediaMode::Rtx(Some(0)), Some(2 << 30), 2 << 30),
+    ] {
+        report.vision = vision;
+        report.audio = audio;
+        options.media_cache_bytes = quota;
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        let media: u64 = report.host_ledger.as_ref().unwrap().items.iter()
+            .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum();
+        assert_eq!(media, expected);
+    }
+}
+
+#[test]
+fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&PlanOptions::default()).unwrap();
+    report.prefill_rows = Some(4096);
+    let options = layout::LayoutOptions { host_memory: Some((183 << 30, 183 << 30)),
+        host_cache_bytes: Some(0), prefill_lanes: 3, full_prefill_logits: true, ..Default::default() };
+    let vocab = report.spec.as_ref().unwrap().vocab as u64;
+    for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096 * 4), ("glm5", 4096 * 4)] {
+        report.family = Some(family.into());
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        let logits = report.host_ledger.as_ref().unwrap().items.iter()
+            .find(|item| item.group == "scoring/full-logits").unwrap().bytes;
+        assert_eq!(logits, rows * vocab * 4, "{family}");
+    }
+}
+
+#[test]
 fn family_native_placement_bypasses_legacy_layout_and_refuses_closed() {
     struct Native { spec: spec::ModelSpec, refuse: bool }
     impl FamilyModel for Native {
@@ -159,7 +277,9 @@ fn v41_unused_native_draft_bytes_are_absent_and_selected_dspark_stays() {
 }
 
 fn sparks(ranks: usize) -> PlanOptions {
-    PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), ..PlanOptions::default() }
+    PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
+        // Fixtures compare repeated plans, independent of concurrent host allocations.
+        mapped_scale_host_budget_bytes: Some(64 << 30), ..PlanOptions::default() }
 }
 
 fn component(report: &PlanReport, component: Component) -> &ComponentPlan {
@@ -428,7 +548,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             }).collect::<Vec<_>>();
             assert_eq!(pre_weight, gpus);
             let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
-                headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, skip_routed_experts: false,
+                headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, native_experts: false, native_workspace: 0, skip_routed_experts: false,
                 prefill_rows: 4096,
                 prefill_lanes: 3, max_context: 65536, automatic_context: options.context_tokens == 0, scratch: None, drafter_bytes: 0,
                 drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
@@ -777,11 +897,11 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
         }
         let scratch = crate::placement::families::glm5_flash::expert_workspace(&catalog,
             Some(&share.join("PROGRAMS.json")), 4096, tp).unwrap();
-        assert_eq!(scratch, 4096*16 + 6*(32+256) + 4096*4096*if tp == 2 {4} else {2});
+        assert_eq!(scratch, 4096*16 + 5*(32+256) + 4096*4096*if tp == 2 {4} else {2});
         for rows in [2, 4, 9, 16] {
             let scratch = crate::placement::families::glm5_flash::expert_workspace(&catalog,
                 Some(&share.join("PROGRAMS.json")), rows, tp).unwrap();
-            assert_eq!(scratch, 80*16 + 3*(32+256) + rows*4096*if tp == 2 {4} else {2});
+            assert_eq!(scratch, 80*16 + 2*(32+256) + rows*4096*if tp == 2 {4} else {2});
         }
         // Narrow admission must require m80 even though m16 fits the live rows.
         std::fs::remove_file(root.join(format!("rtx-tp{tp}/m80/v41_exl3.json"))).unwrap();
@@ -1294,7 +1414,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
         compiled_c128_width(&manifest, "dsv4f").unwrap() * 128, 1, scratch).unwrap();
     for gib in [31.8, 95.5] {
         let total = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib).unwrap().0;
-        for context in [16384, 32512, 131072] {
+        for context in [16384, 32512, 32768] {
             let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
                 rtx_bytes: vec![total], context_tokens: context, pool_tokens: Some(32768),
                 workspace_manifest: Some(path.clone()), ..Default::default()
@@ -1503,8 +1623,26 @@ fn invalid_budgets_are_typed_option_errors() {
     }
     assert_eq!(budget_bytes("--spark-budget-gib", 100.0).unwrap(), 100 << 30);
     let dir = qwen_snapshot(4);
-    for options in [PlanOptions { spark_budget_bytes: 0, ..sparks(4) }, PlanOptions { coordinator_budget_bytes: 0, ..sparks(0) }] {
+    for options in [PlanOptions { spark_budget_bytes: Some(0), ..sparks(4) }, PlanOptions { coordinator_budget_bytes: 0, ..sparks(0) }] {
         assert!(matches!(plan(dir.path(), &options), Err(PlanError::InvalidOption { .. })));
+    }
+}
+
+#[test]
+fn explicit_spark_ceiling_updates_all_layout_budgets_without_changing_defaults() {
+    assert_eq!(DEFAULT_SPARK_BUDGET_BYTES, 100 << 30);
+    assert_eq!(super::families::kimi::SPARK_BUDGET_BYTES, 108 << 30);
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions::default()), ..Default::default() };
+    options.apply_spark_budget();
+    assert_eq!(options.spark_budget_bytes, None);
+    assert_eq!(options.layout.as_ref().unwrap().spark_bytes, 108 << 30);
+    assert_eq!(options.layout.as_ref().unwrap().spark_allocation_budget_bytes, None);
+    for budget in [82 << 30, 112 << 30] {
+        options.spark_budget_bytes = Some(budget);
+        options.apply_spark_budget();
+        assert_eq!(options.spark_budget(), budget);
+        assert_eq!(options.layout.as_ref().unwrap().spark_bytes, budget);
+        assert_eq!(options.layout.as_ref().unwrap().spark_allocation_budget_bytes, Some(budget));
     }
 }
 
@@ -1515,9 +1653,9 @@ fn capacity_suggests_a_packaged_rank_count() {
     let routed = component(&plan(dir.path(), &sparks(2)).unwrap(), Component::RoutedExpert).bytes;
     // Qwen's 5 blocks over 2, 3, 4 ranks: the widest holds 3/5, 2/5, 2/5 (padded to 128 rows).
     let budget = (routed as f64 * 0.45) as u64;
-    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: budget, ..sparks(2) }).unwrap();
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: Some(budget), ..sparks(2) }).unwrap();
     assert!(!report.fits && report.min_spark_ranks == Some(3), "{}", render(&report));
-    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: budget, ..sparks(3) }).unwrap();
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: Some(budget), ..sparks(3) }).unwrap();
     assert!(report.fits && report.executable(), "{}", render(&report));
 }
 
@@ -1533,10 +1671,10 @@ fn capacity_counts_the_widest_rank_of_an_uneven_split() {
     tensors.extend(fp8("model.language_model.layers.1.mlp.experts.0.down_proj", 4096, 2048, None));
     let dir = snapshot(glm5_flash_config(2), &tensors);
     let routed = component(&plan(dir.path(), &sparks(6)).unwrap(), Component::RoutedExpert).bytes as f64;
-    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: (routed * 0.18) as u64, ..sparks(6) }).unwrap();
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: Some((routed * 0.18) as u64), ..sparks(6) }).unwrap();
     assert!((report.spark_rank_share - 3.0 / 16.0).abs() < 1e-12, "{}", report.spark_rank_share);
     assert!(!report.fits, "3/16 of the routed bytes exceeds 0.18");
-    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: (routed * 0.19) as u64, ..sparks(6) }).unwrap();
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: Some((routed * 0.19) as u64), ..sparks(6) }).unwrap();
     assert!(report.fits && report.min_spark_ranks == Some(6), "{}", render(&report));
 }
 
@@ -1712,7 +1850,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs { attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        let input = glmf::GlmfInputs { automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
@@ -1776,7 +1914,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 placement::SparkRingGeometry { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
                     alignment: 4096, endpoints: working.prefill_lanes as usize }).unwrap();
             for (group, bytes) in [("expert intake", io.intake), ("host expert exchange", io.host_exchange),
-                ("expert row indices", io.row_indices), ("rdma rings", io.mapped_rings)] {
+                ("expert row indices", io.row_indices), ("endpoint response prefixes", io.endpoint_staging),
+                ("rdma rings", io.mapped_rings)] {
                 let item = device.items.iter().find(|item| item.group == group).unwrap();
                 assert_eq!((item.bytes, item.basis), (bytes, cuteafd_core::memory_layout::Basis::Formula));
             }
@@ -2231,8 +2370,12 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
         plans.insert(name.into(), value);
     }
     let actual = Value::Object(plans);
-    let expected: Value = serde_json::from_str(include_str!(
+    let mut expected: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/glmf-startup-plans.json")).unwrap();
+    // The fixture now declares its real context ceiling for host admission.
+    for report in expected.as_object_mut().unwrap().values_mut() {
+        report["cache_requirements"]["checkpoint_max_context_tokens"] = json!(1_048_576);
+    }
     // The shared solver cannot admit this historical A_log-only checkpoint.
     // Preserve the old snapshot/hash as provenance, but require a named refusal
     // instead of manufacturing resident weights and an executable layout.
@@ -2262,6 +2405,7 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     // exact Spark I/O; this fixture remains the unchanged historical reference.
     let mut legacy = expected;
     for report in legacy.as_object_mut().unwrap().values_mut() {
+        report["cache_requirements"]["checkpoint_max_context_tokens"] = Value::Null;
         assert_eq!(report.as_object_mut().unwrap().shift_remove("attention_placement"), Some(json!("heads")));
         let notes = report["memory_layout"]["notes"].as_array_mut().unwrap();
         assert_eq!(notes.remove(1), json!("attention placement heads"));
@@ -2526,7 +2670,8 @@ fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle
     let dir = snapshot(qwen4_config(48), &[]);
     let options = PlanOptions {
         layout: Some(layout::LayoutOptions {
-            rtx_bytes: vec![12 << 30, 96 << 30], head_split: false, pool_tokens: Some(0), ..Default::default()
+            rtx_bytes: vec![12 << 30, 96 << 30], head_split: false, pool_tokens: Some(0),
+            context_tokens: 32768, ..Default::default()
         }), ..sparks(0)
     };
     let report = plan(dir.path(), &options).unwrap();
@@ -2667,7 +2812,8 @@ fn layout_charges_local_routed_experts_to_the_coordinator() {
 fn default_uses_all_sparks_and_explicit_unsupported_count_refuses() {
     let dir = qwen_snapshot(4);
     let options = PlanOptions {
-        layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), ..Default::default() }),
+        // This single linear-layer package has no paged KV host tier.
+        layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), host_cache_bytes: Some(0), ..Default::default() }),
         ..sparks(6)
     };
     let all = plan_spark_count(dir.path(), &options, 4, None).unwrap();
@@ -3001,7 +3147,7 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
     let mut tensors = mimo_flash_mopd_tensors();
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(config, &tensors, Some(4));
-    let options = |budget: u64| PlanOptions { vision: super::MediaMode::Spark(None), spark_budget_bytes: budget,
+    let options = |budget: u64| PlanOptions { vision: super::MediaMode::Spark(None), spark_budget_bytes: Some(budget),
         layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), concurrency: 4,
             spark_allocation_budget_bytes: Some(budget),
             onboard: Some(crate::placement::Onboard::Layers(0)), ..Default::default() }), ..sparks(4) };
@@ -3310,4 +3456,40 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }
         }
     }
+}
+
+#[test]
+fn mapped_scale_plan_is_all_or_nothing_and_charges_host_bytes() {
+    let dir = snapshot(v41_config(), &[
+        t("layers.1.engram.embed.weight", "F8_E4M3", &[16, 64]),
+        t("layers.1.engram.embed.scale", "F8_E8M0", &[16, 2]),
+        t("layers.14.engram.embed.weight", "F8_E4M3", &[16, 64]),
+        t("layers.14.engram.embed.scale", "F8_E8M0", &[16, 2]),
+    ]);
+    for (cap, host, preloaded) in [(64, 64, 2), (63, 64, 0), (64, 63, 0), (0, 64, 0)] {
+        let report = plan(dir.path(), &PlanOptions { mapped_scale_preload_bytes: cap,
+            mapped_scale_host_budget_bytes: Some(host), ..Default::default() }).unwrap();
+        let p = &report.mapped_placement;
+        assert_eq!((p.mapped, p.preloaded, p.scale_bytes), (4 - preloaded, preloaded, 64));
+        assert_eq!(p.preloaded_bytes, if preloaded > 0 { 64 } else { 0 });
+        assert_eq!(report.bytes_by_owner.get("host-preloaded").copied().unwrap_or(0), p.preloaded_bytes);
+        assert!(render(&report).contains(&p.label()));
+    }
+}
+
+#[test]
+fn ple_plan_counts_row_spaces_not_shards_or_global_scale() {
+    let mut config = qwen4_config(2);
+    config["text_config"]["ple_layer_ids"] = json!([1, 2]);
+    let mut tensors = qwen4_coordinator(&config, false);
+    for layer in 0..2 {
+        let prefix = format!("model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding");
+        tensors.push((format!("{prefix}.shard_0.weight"), "F8_E4M3", vec![16, 160]));
+        tensors.push((format!("{prefix}.shard_1.weight"), "F8_E4M3", vec![16, 160]));
+        tensors.push((format!("{prefix}.weight_scale"), "BF16", vec![1]));
+    }
+    let dir = snapshot(config, &tensors);
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    assert_eq!(report.mapped_placement.label(), "PLE 2 mapped");
+    assert_eq!(report.mapped_placement.scale_bytes, 0);
 }

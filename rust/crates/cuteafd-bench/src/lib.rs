@@ -84,6 +84,8 @@ pub fn ready(listener: &tokio::net::TcpListener) {
     if let Ok(addr) = listener.local_addr() {
         context::mark_ready(addr);
     }
+    // The opt-in expert route log records serving waves only (start-up waves carry synthetic routes).
+    cuteafd_transport::route_log::mark_serving();
     tokio::spawn(async {
         let reason = terminate().await;
         if GRACEFUL.load(std::sync::atomic::Ordering::Relaxed) { return; }

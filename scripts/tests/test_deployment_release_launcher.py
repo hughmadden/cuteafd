@@ -32,8 +32,16 @@ def test_deployment_preserves_release_container_commands(entry: dict) -> None:
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
         before, after = parse_run(old["argv"]), parse_run(new["argv"])
+        # MiMo Pro configs select balanced TP placement (#521); every other card stays round-robin.
+        before["env"]["CUTEAFD_TP_PLACEMENT"] = "balanced" if "mimo-v26-pro" in entry["config"] else "round-robin"
+        if old["host"] == "coordinator":
+            # capture() bounds readiness to 30s; admission now shares that deadline.
+            before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
         # Includes the byte-identical V4.1 fingerprint. Other families have no
         # resolved-config fingerprint today; adding a fabricated one is a failure.
+        if entry["family"] == "deepseek_v41" and "serve-native" in before["command"]:
+            position = before["command"].index("--max-output-tokens") + 2
+            before["command"][position:position] = ["--mapped-scale-preload-gib", "0"]
         assert after == before, (entry["name"], old["host"])
     assert all("--deployment" in plan for plan in current["plans"])
 
@@ -46,7 +54,134 @@ def test_all_family_deployment_dry_run_starts_no_serving_containers(entry: dict)
     assert "--deployment" in result["plans"][0]
 
 
+def exlr8_entry(manifest: str = "up1", **overrides: str) -> dict:
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "glm53-exl3-max"))
+    entry["set"].update(SPARK_COUNT="4", SPECULATOR="off", RTX_EXPERT_LAYERS="0",
+        ATTENTION_PLACEMENT="context", EXLR8_MANIFEST=manifest,
+        EXLR8_DENSE_FROM="deepseek-ai/DeepSeek-V4.1-Flash", **overrides)
+    return entry
+
+
+@pytest.mark.parametrize("manifest", ["up1", "bit325"])
+def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: str) -> None:
+    result = capture(ROOT, f"exlr8-{manifest}", release_entry=exlr8_entry(manifest))
+    assert len(result["plans"]) == 1
+    plan = result["plans"][0]
+    assert plan[plan.index("--exlr8-manifest") + 1] == manifest
+    dense = plan[plan.index("--exlr8-dense-from") + 1]
+    assert dense.startswith("/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
+    assert "CUTEAFD_GLM_PREFILL_LANES=1" in plan
+    assert len(result["containers"]) == 5
+    for run in result["containers"]:
+        parsed = parse_run(run["argv"])
+        command = parsed["command"]
+        assert command[command.index("--exlr8-manifest") + 1] == manifest
+        if "serve-glm" in command:
+            assert command[command.index("--exlr8-dense-from") + 1] == dense
+            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "1"
+        else:
+            assert "expertd-native" in command
+            assert "--exlr8-dense-from" not in command
+
+
+@pytest.mark.parametrize("ranks", range(1, 7))
+def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int) -> None:
+    entry = exlr8_entry()
+    entry["set"]["SPARK_COUNT"] = str(ranks)
+    result = capture(ROOT, f"exlr8-world-{ranks}", release_entry=entry)
+    assert len(result["containers"]) == ranks + 1
+    workers = [parse_run(run["argv"])["command"] for run in result["containers"][1:]]
+    for rank, command in enumerate(workers):
+        assert command[command.index("--rank") + 1] == str(rank)
+        assert command[command.index("--world") + 1] == str(ranks)
+
+
+@pytest.mark.parametrize("overrides,reason", [
+    ({"EXLR8_MANIFEST": "other"}, "EXLR8_MANIFEST"),
+    ({"EXLR8_DENSE_FROM": ""}, "EXLR8_DENSE_FROM"),
+    ({"RTX_GPUS": "1"}, "two RTX"),
+    ({"SPARK_COUNT": "7"}, "canonical Spark ranks"),
+    ({"SPECULATOR": "dflash2"}, "SPECULATOR=off"),
+    ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),
+    ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),
+])
+def test_exlr8_launcher_refuses_unsupported_route(overrides: dict, reason: str) -> None:
+    entry = exlr8_entry()
+    entry["set"].update(overrides)
+    with pytest.raises(RuntimeError, match=reason):
+        capture(ROOT, "exlr8-refusal", release_entry=entry, dry_run=True)
+
+
 def test_deployment_goldens_cover_the_complete_release_matrix() -> None:
     assert {p.stem for p in FIXTURES.glob("*.json")} == {e["name"] for e in ENTRIES}
     assert {e["family"] for e in ENTRIES} == {
         "deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"}
+
+
+@pytest.mark.parametrize("quota", ["0", "auto", "16GiB"])
+@pytest.mark.parametrize("full", ["off", "on"])
+def test_host_cache_and_full_logits_reach_plan_and_serve(quota: str, full: str) -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "glm53-exl3-max"))
+    entry["set"].update(HOST_CACHE_BYTES=quota, FULL_PREFILL_LOGITS=full)
+    result = capture(ROOT, f"host-budget-{quota}-{full}", release_entry=entry)
+    plan = result["plans"][0]
+    serve = parse_run(result["containers"][0]["argv"])["command"]
+    assert plan[plan.index("--host-cache-bytes") + 1] == quota
+    actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
+    assert actual == quota
+    assert ("--full-prefill-logits" in plan) == (full == "on")
+    assert ("--full-prefill-logits" in serve) == (full == "on")
+
+
+@pytest.mark.parametrize("quota", [None, "0", "2GiB"])
+@pytest.mark.parametrize("vision", ["off", "rtx"])
+def test_effective_media_cache_quota_reaches_plan(quota: str | None, vision: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import v41_launch_capture
+
+    original_checkpoint = v41_launch_capture.release_checkpoint
+    monkeypatch.setattr(v41_launch_capture, "release_checkpoint",
+        lambda family, model: {**original_checkpoint(family, model), "vision_config": {"hidden_size": 1024}})
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo26-flash-min"))
+    entry["set"].update(VISION=vision)
+    entry["set"].pop("MEDIA_CACHE_BYTES", None)
+    if quota is not None:
+        entry["set"]["MEDIA_CACHE_BYTES"] = quota
+    result = capture(ROOT, f"media-budget-{quota}-{vision}", release_entry=entry)
+    plan = result["plans"][0]
+    serve = parse_run(result["containers"][0]["argv"])["command"]
+    expected = vision != "off" and quota is not None
+    for command in (plan, serve):
+        assert ("--media-cache-bytes" in command) == expected
+        if expected:
+            assert command[command.index("--media-cache-bytes") + 1] == quota
+
+
+@pytest.mark.parametrize("enabled", ["off", "on"])
+def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo26-flash-min"))
+    entry["set"].pop("HOST_CACHE_BYTES", None)
+    entry["set"]["MIMO_HOST_CACHE"] = enabled
+    result = capture(ROOT, f"implicit-host-cache-{enabled}", release_entry=entry)
+    plan = result["plans"][0]
+    serve = parse_run(result["containers"][0]["argv"])["command"]
+    actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
+    assert actual == ("auto" if enabled == "on" else "0")
+    assert plan[plan.index("--host-cache-bytes") + 1] == actual
+
+
+@pytest.mark.parametrize("policy", ["round-robin", "balanced"])
+def test_tp_placement_reaches_planner_coordinator_and_workers(policy: str) -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo-pro-max"))
+    entry["set"]["TP_PLACEMENT"] = policy
+    result = capture(ROOT, f"tp-placement-{policy}", release_entry=entry)
+    assert f"CUTEAFD_TP_PLACEMENT={policy}" in result["plans"][0]
+    assert len(result["containers"]) == 7
+    for container in result["containers"]:
+        assert parse_run(container["argv"])["env"]["CUTEAFD_TP_PLACEMENT"] == policy
+
+
+def test_tp_placement_rejects_unknown_policy_before_launch() -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo-pro-max"))
+    entry["set"]["TP_PLACEMENT"] = "fitted"
+    with pytest.raises(RuntimeError, match="TP_PLACEMENT"):
+        capture(ROOT, "tp-placement-invalid", release_entry=entry)

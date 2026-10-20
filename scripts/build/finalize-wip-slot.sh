@@ -36,6 +36,13 @@ fi
   cd "$build_output"
   sha256sum -c ARTIFACT_SHA256SUMS
 )
+# EXLR8 slots: the engine's own fail-closed loader opens the built table with its
+# manifest (pointer/scalar ABI, scratch, geometry) and requires the role's programs.
+if [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then
+  "$build_output/cuteafd" programs-check --native-lib "$build_output/libcuteafd_native.so" \
+    --manifest "$build_output/PROGRAMS.json" \
+    --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)"
+fi
 
 slot_root="/wip/slots/$slot/$role"
 incoming="/wip/incoming/${slot}.${role}.$$"

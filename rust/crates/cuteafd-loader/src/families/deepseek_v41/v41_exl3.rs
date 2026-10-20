@@ -108,9 +108,9 @@ impl V41Exl3Projection {
         );
         let blocks = intermediate / 128;
         ensure!(blocks >= world, "EXL3 partition would be empty");
-        let count = blocks / world + usize::from(rank < blocks % world);
-        let start = rank * (blocks / world) + rank.min(blocks % world);
-        Ok(start * 128..(start + count) * 128)
+        let map = cuteafd_core::tp_units::RankUnits::new(cuteafd_core::tp_units::UnitRule::Contiguous,
+            1, intermediate, 128, 0, world, rank)?;
+        map.column_ranges(0)?.into_iter().next().context("empty EXL3 partition")
     }
 }
 

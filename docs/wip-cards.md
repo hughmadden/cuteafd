@@ -88,7 +88,11 @@ and arms for cleanup. Source worktrees are retained for inspection.
   fails its row. `--set CARD:PROFILE=census,transport-timing,expert-timing`
   turns profiling on in the coordinator and every Spark worker
   (`CUTEAFD_PROFILE_HOST` names the physical host); the per-job `profile/`
-  directory collects every host's files.
+  directory collects every host's files. `PROFILE=expert-routes` logs every
+  serving Spark wave's top-k expert ids (`expert-routes-HOST.jsonl`, plus GLM
+  5.3 MoE input samples capped by `PROFILE_EXPERT_INPUT_SAMPLE`); a row whose
+  log is missing or empty fails. Score it with
+  `scripts/bench/expert-route-balance.py LOG --tp 4,6`.
 - Preflight runs before any queue ticket and again at grant (smoke's prelaunch
   hook): no serving container of ours exists, the arm is sealed on every host,
   the slot holds the expert packages and audio entry the card needs (the same

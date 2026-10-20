@@ -415,7 +415,7 @@ __global__ void finish_local(const T* routed, const __nv_bfloat16* shared,
 }
 extern "C" int32_t cuteafd_add_tp2_shared_async(const uint16_t* a,
     const uint16_t* b, uint16_t* output, size_t count, void* stream) {
-  if (!count || count > uint64_t(4096) * cuteafd_expert_hidden() || !a || !b || !output ||
+  if (!count || count > SIZE_MAX / 2 || !a || !b || !output ||
       reinterpret_cast<uintptr_t>(a) % 2 || reinterpret_cast<uintptr_t>(b) % 2 ||
       reinterpret_cast<uintptr_t>(output) % 2) return cudaErrorInvalidValue;
   const auto bytes = count * 2;

@@ -7,14 +7,59 @@
 //! the BF16 `[rows, H]` route sum of the slice: the Spark rank partial of the
 //! compact BF16 response, or the whole layer at TP1 on the coordinator.
 pub(crate) mod worker;
+#[cfg(test)]
+#[path = "fp8/checkpoint_tests.rs"]
+mod checkpoint_tests;
 
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeModule, Fp8MoePrefill, Fp8MoeWeights, FP8_MOE_POINTERS};
+use cuteafd_ffi::fp8_moe::{Fp8MoeActivation, Fp8MoeProjection, Fp8MoeMetadata, Fp8MoeInfo, Fp8MoeModule, Fp8MoePrefill, Fp8MoeWeights, FP8_MOE_POINTERS};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection, Slicing};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+
+pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize],
+    tp: usize, rank: usize, slicing: Slicing) -> Result<()> {
+    let shape = tensors.shape();
+    let weights = match tensors.format() {
+        ExpertFormat::Bf16 => Fp8MoeWeights::Bf16,
+        ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
+        ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
+        ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
+    };
+    ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
+        && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
+        && layers.iter().all(|&layer| tensors.for_layer(layer)
+            .and_then(|view| view.rank_width(tp, rank, slicing)).is_ok_and(|width| width == info.slice)),
+        "expert package does not serve checkpoint geometry/storage at TP{tp}: {info:?}");
+    ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input,
+        "native BF16/NVFP4 weights require BF16 input");
+    for &layer in layers {
+        tensors.validate_layer(layer)?;
+        let activation = tensors.activation(layer).unwrap_or(shape.geometry()?.activation());
+        let (mode, limit) = match activation {
+            cuteafd_core::FfnActivation::SiluBf16Product { limit } =>
+                (Fp8MoeActivation::SiluBf16Product, limit.unwrap_or(0.0)),
+            cuteafd_core::FfnActivation::SiluPostClampFp32Product { limit } =>
+                (Fp8MoeActivation::SiluPostClampFp32Product, limit),
+            cuteafd_core::FfnActivation::Situ { .. } =>
+                anyhow::bail!("expert layer {layer}: native FP8 packages do not export the checkpoint's Situ activation"),
+        };
+        info.validate_activation(mode, limit, Fp8MoeProjection::Bf16)
+            .with_context(|| format!("expert layer {layer}"))?;
+    }
+    Ok(())
+}
+
+pub(super) fn package_metadata(directory: &Path, tensors: &Fp8ExpertTensors, layers: &[usize],
+    tp: usize, rank: usize, slicing: Slicing) -> Result<Fp8MoeMetadata> {
+    // SAFETY: only trusted generated native packages are accepted by the service.
+    let metadata = unsafe { Fp8MoeMetadata::read(directory) }
+        .with_context(|| format!("expert package {}", directory.display()))?;
+    validate_checkpoint_contract(&metadata.info, tensors, layers, tp, rank, slicing)?;
+    Ok(metadata)
+}
 
 fn traffic_contract(contract: cuteafd_ffi::fp8_moe::Fp8MoeTrafficContract)
     -> cuteafd_transport::worker_selection::ExpertTrafficContract {
@@ -62,10 +107,11 @@ fn resident_admission(layer_bytes: usize, layers: usize, primary_scratch: usize,
 
 /// Both programs share the same resident slice and scratch arena. Input dtype
 /// and compiled capacities may differ, but the weight layout and arithmetic may not.
-fn validate_bf16_package(main: &Fp8MoeInfo, bf16: &Fp8MoeInfo, capacity: usize) -> Result<usize> {
+pub(super) fn validate_bf16_package(main: &Fp8MoeInfo, bf16: &Fp8MoeInfo, capacity: usize) -> Result<usize> {
     ensure!(!bf16.wire_input && bf16.weights == main.weights && bf16.hidden == main.hidden
         && bf16.experts == main.experts && bf16.topk == main.topk && bf16.intermediate == main.intermediate
-        && bf16.tp == main.tp && bf16.slice == main.slice && bf16.swiglu_limit == main.swiglu_limit,
+        && bf16.tp == main.tp && bf16.slice == main.slice && bf16.swiglu_limit == main.swiglu_limit
+        && bf16.activation == main.activation && bf16.projection == main.projection,
         "{bf16:?} is not the BF16-input form of the primary FP8 package {main:?}");
     bf16.capacity_for(capacity)
         .with_context(|| format!("BF16-input FP8 package has no capacity for {capacity} rows"))
@@ -153,14 +199,14 @@ pub(crate) fn bf16_sibling(directory: &Path) -> Option<PathBuf> {
 pub(crate) struct Fp8Layer<'a> {
     pub layer: usize,
     pub(crate) slice: cuteafd_core::SparkSlice,
-    regions: Vec<DeviceAllocation<'a>>,
+    regions: Vec<Option<DeviceAllocation<'a>>>,
 }
 
 impl<'a> Fp8Layer<'a> {
     fn loaded_slice(tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize,
         slicing: Slicing) -> Result<cuteafd_core::SparkSlice> {
         let (first, width) = tensors.rank_range_with(tp, rank, slicing)?;
-        Ok(cuteafd_core::SparkSlice { layer: u32::try_from(layer)?, first: u32::try_from(first)?,
+        Ok(cuteafd_core::SparkSlice { unit_map: Some(tensors.unit_map(tp, rank, slicing)?.fingerprint()), layer: u32::try_from(layer)?, first: u32::try_from(first)?,
             width: u32::try_from(width)?, stored_width: u32::try_from(tensors.rank_width(tp, rank, slicing)?)?,
             tiers: vec![], projection_counts: vec![] })
     }
@@ -203,8 +249,11 @@ impl<'a> Fp8Layer<'a> {
             let mut alpha_slots: Vec<(&mut [u8], &mut [u8])> =
                 alphas.chunks_exact_mut(4).zip(inputs.chunks_exact_mut(4)).collect();
             alpha_slots.resize_with(experts, Default::default);
+            let grids: Vec<&mut [u8]> = if s_bytes == 0 {
+                (0..experts).map(|_| &mut [][..]).collect()
+            } else { grids.chunks_exact_mut(s_bytes).collect() };
             let mut jobs: Vec<(usize, &mut [u8], &mut [u8], (&mut [u8], &mut [u8]))> = weights.chunks_exact_mut(w_bytes)
-                .zip(grids.chunks_exact_mut(s_bytes)).zip(alpha_slots).enumerate()
+                .zip(grids).zip(alpha_slots).enumerate()
                 .map(|(e, ((w, s), a))| (e, w, s, a)).collect();
             let per = jobs.len().div_ceil(READERS);
             std::thread::scope(|scope| -> Result<()> {
@@ -237,8 +286,11 @@ impl<'a> Fp8Layer<'a> {
                 }
             }
             for bytes in [&weights, &scales] {
-                let region = DeviceAllocation::new(library, bytes.len())?;
-                library.copy_h2d(region.buffer, bytes)?;
+                let region = if bytes.is_empty() { None } else {
+                    let region = DeviceAllocation::new(library, bytes.len())?;
+                    library.copy_h2d(region.buffer, bytes)?;
+                    Some(region)
+                };
                 regions.push(region);
             }
         }
@@ -247,7 +299,7 @@ impl<'a> Fp8Layer<'a> {
     }
 
     fn pointers(&self) -> [*mut c_void; 6] {
-        std::array::from_fn(|i| self.regions[i].buffer.ptr)
+        std::array::from_fn(|i| self.regions[i].as_ref().map_or(std::ptr::null_mut(), |region| region.buffer.ptr))
     }
 }
 
@@ -308,12 +360,10 @@ impl<'a> Fp8Experts<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         let mut experts = Self::prepare_with_modules(library, tensors, directory, bf16_directory,
             layers, tp, rank, capacity, budget, modules)?;
-        let slicing = if directory.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("-w")) {
-            Slicing::Blocks(128)
-        } else { Slicing::Padded };
+        let slicing = tensors.slicing_for_directory(directory, tp);
         experts.layers = layers.iter().copied().map(|layer| {
             let started = std::time::Instant::now();
-            let loaded = Fp8Layer::load_with(library, tensors, layer, tp, rank, slicing)?;
+            let loaded = Fp8Layer::load_with(library, &tensors.for_layer(layer)?, layer, tp, rank, slicing)?;
             tracing::info!(layer, tp, rank, elapsed_ms = started.elapsed().as_millis() as u64,
                 "FP8 expert layer resident");
             Ok(loaded)
@@ -334,12 +384,13 @@ impl<'a> Fp8Experts<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         validate_layer_ids(layers)?;
         // `tp<n>-w<width>` layouts store each rank's own whole 128-row blocks (see `exact_layout`).
-        let slicing = match directory.file_name().and_then(|n| n.to_str()).and_then(|n| n.split_once("-w")) {
-            Some(_) => Slicing::Blocks(128),
-            None => Slicing::Padded,
-        };
+        let slicing = tensors.slicing_for_directory(directory, tp);
         for &layer in layers {
             tensors.validate_layer(layer)?;
+        }
+        package_metadata(directory, tensors, layers, tp, rank, slicing)?;
+        if let Some(directory) = bf16_directory {
+            package_metadata(directory, tensors, layers, tp, rank, slicing)?;
         }
         let modules = match modules {
             Some(modules) => modules,
@@ -350,17 +401,7 @@ impl<'a> Fp8Experts<'a> {
         let Fp8Modules { module, bf16, .. } = modules;
         let info = module.info().clone();
         let shape = tensors.shape();
-        let weights = match tensors.format() {
-            ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
-            ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
-            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
-        };
-        ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
-            && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
-            && info.slice == tensors.rank_width(tp, rank, slicing)?,
-            "FP8 package {} ({info:?}) does not serve this checkpoint at TP{tp}", directory.display());
-        ensure!(tensors.format() != ExpertFormat::Nvfp4 || !info.wire_input,
-            "NVFP4 experts require a BF16-input package; rebuild {}", directory.display());
+        validate_checkpoint_contract(&info, tensors, layers, tp, rank, slicing)?;
         let top = info.capacity_for(capacity)
             .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;
         let primary_scratch = module.scratch_bytes(top)?;
@@ -410,7 +451,7 @@ impl<'a> Fp8Experts<'a> {
                         let (weights, _) = tensors.slice_bytes_with(projection, 2, rank, slicing[rank])?;
                         for bytes in [weights * tensors.shape().experts,
                             tensors.scale_region_bytes_with(projection, 2, rank, slicing[rank])?] {
-                            regions.push(DeviceAllocation::new(devices[rank].library, bytes)?);
+                            regions.push(if bytes == 0 { None } else { Some(DeviceAllocation::new(devices[rank].library, bytes)?) });
                         }
                     }
                     owners[rank].layers.push(Fp8Layer { layer,
@@ -517,15 +558,17 @@ impl<'a> Fp8Experts<'a> {
                         for (slot, projection) in Fp8Projection::ALL.into_iter().enumerate() {
                             let windows = tensors.projection_slices(projection, 2, rank, slicing[rank])?;
                             let regions = &owners[rank].layers[index].regions;
-                            upload(devices[rank], host.buffer, offsets[slot], regions[2 * slot].buffer,
+                            upload(devices[rank], host.buffer, offsets[slot], regions[2 * slot].as_ref().unwrap().buffer,
                                 expert * windows[0].destination_bytes, windows[0], full_bytes, streams[rank].raw)?;
-                            upload(devices[rank], host.buffer, offsets[slot] + sizes[slot].0, regions[2 * slot + 1].buffer,
-                                expert * windows[1].destination_bytes, windows[1], full_bytes, streams[rank].raw)?;
+                            if let Some(region) = &regions[2 * slot + 1] {
+                                upload(devices[rank], host.buffer, offsets[slot] + sizes[slot].0, region.buffer,
+                                    expert * windows[1].destination_bytes, windows[1], full_bytes, streams[rank].raw)?;
+                            }
                             if tensors.format() == ExpertFormat::Nvfp4 {
                                 let grid_bytes = windows[1].destination_bytes * tensors.shape().experts;
                                 for scalar in 0..2 {
                                     let source = offsets[slot] + sizes[slot].0 + sizes[slot].1 - 8 + scalar * 4;
-                                    upload(devices[rank], host.buffer, source, regions[2 * slot + 1].buffer,
+                                    upload(devices[rank], host.buffer, source, regions[2 * slot + 1].as_ref().unwrap().buffer,
                                         grid_bytes + scalar * tensors.shape().experts * 4 + expert * 4,
                                         Fp8MatrixSlice { source_offset: 0, source_pitch: 4, destination_pitch: 4,
                                             width: 4, rows: 1, destination_bytes: 4 }, full_bytes, streams[rank].raw)?;
@@ -555,7 +598,7 @@ impl<'a> Fp8Experts<'a> {
 
     /// Exact device allocation sizes, without querying CUDA after admission.
     pub fn resident_bytes(&self) -> usize {
-        self.layers.iter().flat_map(|layer| &layer.regions).map(|region| region.buffer.bytes).sum()
+        self.layers.iter().flat_map(|layer| layer.regions.iter().flatten()).map(|region| region.buffer.bytes).sum()
     }
 
     pub fn scratch_bytes(&self) -> usize {
@@ -630,6 +673,48 @@ mod tests {
     use super::{resident_admission, validate_bf16_package};
     use clap::Parser;
     use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
+
+    #[test]
+    fn native_bf16_load_contract_rejects_wrong_storage_rounding_limit_and_input() {
+        use cuteafd_ffi::fp8_moe::{Fp8MoeActivation, Fp8MoeProjection};
+        use cuteafd_loader::plan::testing::{t,write_snapshot};
+        use cuteafd_loader::formats::fp8_experts::{Fp8ExpertTensors,Slicing};
+        let dir = tempfile::tempdir().unwrap();
+        let shape = cuteafd_loader::RoutedExpertShape { layers:1,first_layer:0,experts:2,topk:1,
+            hidden:128,intermediate:1536,draft_stages:0,draft_experts:0 };
+        let fixture = [("gate",1536,128),("up",1536,128),("down",128,1536)].map(|(p,n,k)|
+            t(format!("model.layers.0.moe.{p}_proj.weight"),"BF16",&[2,n,k]));
+        // A real declaration supplies the activation independently of this reduced test geometry.
+        let source: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-loader/src/plan/families/step5/fixtures/official-fp8.json"))).unwrap();
+        write_snapshot(dir.path(),&source["config"],&fixture,None);
+        let tensors = Fp8ExpertTensors::read(dir.path(),shape).unwrap();
+        let info = Fp8MoeInfo {hidden:128,slice:256,experts:2,topk:1,intermediate:1536,tp:6,
+            wire_input:false,swiglu_limit:7.0,activation:Fp8MoeActivation::SiluPostClampFp32Product,
+            projection:Fp8MoeProjection::Bf16,capacities:vec![16],weights:Fp8MoeWeights::Bf16};
+        super::validate_checkpoint_contract(&info,&tensors,&[0],6,0,Slicing::Padded).unwrap();
+        for mutation in 0..4 {
+            let mut wrong = info.clone();
+            match mutation {
+                0 => wrong.weights = Fp8MoeWeights::Fp8,
+                1 => wrong.activation = Fp8MoeActivation::SiluBf16Product,
+                2 => wrong.swiglu_limit = 10.0,
+                _ => wrong.wire_input = true,
+            }
+            assert!(super::validate_checkpoint_contract(&wrong,&tensors,&[0],6,0,Slicing::Padded).is_err());
+        }
+    }
+
+    #[test]
+    fn native_bf16_package_locator_is_not_the_fp8_bf16_input_sibling() {
+        use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+        let root = std::path::Path::new("/exports");
+        assert_eq!(root.join(format!("fp8-step5{}", ExpertFormat::Bf16.package_suffix())),
+            std::path::Path::new("/exports/fp8-step5-bf16-weights"));
+        assert_eq!(cuteafd_core::ExpertGeometry::STEP5.family(), Some("step5"));
+        assert_eq!(super::bf16_sibling(std::path::Path::new("/exports/fp8-step5/tp6")).unwrap(),
+            std::path::Path::new("/exports/fp8-step5-bf16/tp6"));
+    }
 
     #[test]
     fn exact_layer_ids_are_ordered_unique_and_may_be_sparse_or_empty() {
@@ -726,7 +811,7 @@ mod tests {
                 }
                 for (region, expected) in [(2 * slot, weights), (2 * slot + 1, scales)] {
                     let mut actual = vec![0; expected.len()];
-                    devices[rank].run(|| library.copy_d2h(&mut actual, owners[rank].layers[0].regions[region].buffer))?;
+                    devices[rank].run(|| library.copy_d2h(&mut actual, owners[rank].layers[0].regions[region].as_ref().unwrap().buffer))?;
                     ensure!(actual == expected, "TP2 paired upload differs: rank {rank} layer {layer} {projection:?} region {region}");
                 }
             }
@@ -775,14 +860,15 @@ mod tests {
         assert_eq!(validate_bf16_package(&primary, &bf16, 64).unwrap(), 128);
         assert_eq!(validate_bf16_package(&primary, &bf16, 4096).unwrap(), 8192);
         assert!(validate_bf16_package(&primary, &bf16, 8193).is_err());
-        for variant in 0..5 {
+        for variant in 0..6 {
             let mut incompatible = bf16.clone();
             match variant {
                 0 => incompatible.wire_input = true,
                 1 => incompatible.slice = 640,
                 2 => incompatible.swiglu_limit = f32::INFINITY,
                 3 => incompatible.tp = 2,
-                _ => incompatible.weights = Fp8MoeWeights::Mxfp4,
+                4 => incompatible.weights = Fp8MoeWeights::Mxfp4,
+                _ => incompatible.activation = cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluPostClampFp32Product,
             }
             assert!(validate_bf16_package(&primary, &incompatible, 64).is_err(), "{incompatible:?}");
         }

@@ -19,14 +19,16 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     if !args.layout && args.vision_replicas != 1 {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
-    let options = PlanOptions {
+    let mut options = PlanOptions {
+        mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
+        mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
         attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(|reason| PlanError::InvalidOption { option: "--attention-placement", reason })?,
         vision: args.vision,
         audio: args.audio,
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks)),
-        spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
+        spark_budget_bytes: args.spark_budget_gib.map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
         coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
             .min(if args.layout || args.coordinator_gpu_budget_gib.is_some() {
                 coordinator_bytes(args.coordinator_gpu_budget_gib)?
@@ -36,8 +38,14 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
+                host_cache_bytes: match args.host_cache_bytes {
+                    crate::shared::prefix::HostBudget::Auto => None,
+                    crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
+                },
+                media_cache_bytes: args.media_cache_bytes,
                 rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib)?; args.rtx],
-                spark_allocation_budget_bytes: Some(budget_bytes("--spark-budget-gib", args.spark_budget_gib)?),
+                spark_allocation_budget_bytes: args.spark_budget_gib
+                    .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
                 qwen_kv: args.kv_format,
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
@@ -92,6 +100,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             })
         }).transpose()?,
     };
+    options.apply_spark_budget();
     options.validate()?;
     Ok(options)
 }
@@ -168,6 +177,49 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
+    if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+        anyhow::ensure!(!(args.files || args.fetch || args.role.is_some()),
+            "EXLR8 file manifests and fetching are not supported");
+        let dense = args.exlr8_dense_from.as_deref().map(|source| -> Result<PathBuf> {
+            if PathBuf::from(source).is_dir() { return Ok(PathBuf::from(source)); }
+            let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
+            resolve_snapshot_at_revision(source, Some(&home), None)?.snapshot_path
+                .with_context(|| format!("no local snapshot for dense source {source}"))
+        }).transpose()?;
+        if args.layout {
+            use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};
+            anyhow::ensure!(args.spark_tp.is_none() && args.spark_ep.is_none(),
+                "EXLR8 requires canonical Spark wire, not explicit ownership topology");
+            let dense = dense.as_deref().context("EXLR8 native layout requires --exlr8-dense-from")?;
+            let mut native_options = options.clone();
+            native_options.placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
+            let native = cuteafd_loader::plan::exlr8::native_plan(&snapshot,
+                args.exlr8_manifest.as_deref().context("EXLR8 native layout requires --exlr8-manifest up1|bit325")?,
+                dense, &native_options, &args.speculator)?;
+            if args.deployment {
+                let deployment = DeploymentOptions { rtx_gpus: args.rtx, spark_tp: None, spark_ep: None,
+                    peers: args.deployment_peers.clone(), speculator: args.speculator.clone(),
+                    admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
+                        memory_reservation: args.memory_reservation.clone(), pool_tokens: args.pool_tokens } };
+                println!("{}", serde_json::to_string_pretty(&DeploymentSpec::from_exlr8(&native, &deployment)?)?);
+            } else if args.json { println!("{}", serde_json::to_string_pretty(&native.report)?); }
+            else { print!("{}", render(&native.report));
+                if let Some(layout) = &native.report.memory_layout { print!("{}", layout.render()); }
+            }
+            anyhow::ensure!(!args.require_ready, "EXLR8 native runtime remains WIP-only pending full quality gates");
+            return Ok(());
+        }
+        let report = cuteafd_loader::plan::exlr8::inspect(&snapshot,
+            args.exlr8_manifest.as_deref().unwrap_or("bit325"), dense.as_deref(),
+            args.spark_ranks.unwrap_or(args.available_sparks), args.rtx,
+            options.spark_budget(), options.coordinator_budget_bytes)?;
+        if args.json { println!("{}", serde_json::to_string_pretty(&report)?); }
+        else { print!("{}", report.render()); }
+        anyhow::ensure!(!args.require_ready, "EXLR8 is unsupported: add the kernels listed in the plan");
+        return Ok(());
+    }
+    anyhow::ensure!(args.exlr8_manifest.is_none() && args.exlr8_dense_from.is_none(),
+        "--exlr8-manifest/--exlr8-dense-from require an EXLR8 checkpoint");
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
     validate_glmf_precision(&args, family)?;
@@ -646,8 +698,30 @@ mod tests {
     use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors,
         write_snapshot};
 
+    #[test]
+    fn exlr8_mounted_cli_reports_fit_and_refuses_serving_modes() {
+        use clap::Parser;
+        let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else { return; };
+        let root = std::path::Path::new(&snapshot);
+        let cli = crate::cli::Cli::try_parse_from([
+            "cuteafd", "plan", root.to_str().unwrap(), "--exlr8-manifest", "up1",
+            "--spark-ranks", "4", "--rtx", "1", "--json",
+        ]).unwrap();
+        let crate::cli::Commands::Plan(plan) = cli.command else { panic!("plan command"); };
+        run_plan(plan).unwrap();
+        let refusal = run_plan(args(root, 6, true)).unwrap_err().to_string();
+        assert!(refusal.contains("EXLR8 is unsupported") && refusal.contains("kernels"));
+        let invalid = PlanArgs { exlr8_manifest: Some("../bad".into()), ..args(root, 6, false) };
+        assert!(run_plan(invalid).unwrap_err().to_string().contains("published name"));
+        let files = PlanArgs { files: true, ..args(root, 6, false) };
+        assert!(run_plan(files).unwrap_err().to_string().contains("planner-only"));
+    }
+
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            exlr8_manifest: None,
+            exlr8_dense_from: None,
+            mapped_scale_preload_gib: 0.0,
             vision_replicas: 1,
             vision: cuteafd_loader::plan::MediaMode::Auto,
             audio: cuteafd_loader::plan::MediaMode::Off,
@@ -658,7 +732,7 @@ mod tests {
             hf_home: None,
             spark_ranks: Some(spark_ranks),
             available_sparks: 6,
-            spark_budget_gib: 100.0,
+            spark_budget_gib: Some(100.0),
             coordinator_weight_budget_gib: 80.0,
             json: true,
             deployment: false, spark_tp: None, spark_ep: None, deployment_peers: vec![],
@@ -696,6 +770,8 @@ mod tests {
             state_slots: None,
             mark_lanes: None,
             prefix_slots: None,
+            host_cache_bytes: crate::shared::prefix::HostBudget::Auto,
+            media_cache_bytes: None,
             prefix_cache_entries: 20,
             prefix_cache_mark_mib: 2048,
             mimo_prefix_draft: false,
@@ -1079,7 +1155,9 @@ mod tests {
             let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
             args.coordinator_gpu_budget_gib = cli.coordinator_gpu_budget_gib;
-            options(&args).unwrap()
+            let mut selected = options(&args).unwrap();
+            selected.layout.as_mut().unwrap().host_memory = Some((128 << 30, 128 << 30));
+            selected
         };
         let expected = parse("--coordinator-gpu-budget-gib", false);
         let snapshot = tempfile::tempdir().unwrap();
@@ -1117,10 +1195,24 @@ mod tests {
     #[test]
     fn spark_encoder_admission_honors_runtime_budget() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
-        request.spark_budget_gib = 82.0;
+        request.spark_budget_gib = Some(82.0);
         let options = options(&request).unwrap();
-        assert_eq!(options.spark_budget_bytes, 82 << 30);
-        assert_eq!(options.layout.unwrap().spark_allocation_budget_bytes, Some(82 << 30));
+        assert_eq!(options.spark_budget_bytes, Some(82 << 30));
+        let layout = options.layout.unwrap();
+        assert_eq!(layout.spark_allocation_budget_bytes, Some(82 << 30));
+        assert_eq!(layout.spark_bytes, 82 << 30);
+    }
+
+    #[test]
+    fn unset_spark_budget_preserves_separate_defaults() {
+        let mut request = args(std::path::Path::new("/not-read"), 4, false);
+        request.spark_budget_gib = None;
+        let options = options(&request).unwrap();
+        assert_eq!(options.spark_budget_bytes, None);
+        assert_eq!(options.spark_budget(), 100 << 30);
+        let layout = options.layout.unwrap();
+        assert_eq!(layout.spark_allocation_budget_bytes, None);
+        assert_eq!(layout.spark_bytes, 108 << 30);
     }
 
     #[test]
@@ -1364,7 +1456,7 @@ mod tests {
         assert!(error.to_string().contains("is not servable by this build"), "{error:#}");
         // Options that describe no deployment fail before the checkpoint is read.
         for (ranks, budget) in [(9, 100.0), (4, f64::NAN), (4, 0.0), (4, -3.0)] {
-            let error = run_plan(PlanArgs { spark_budget_gib: budget, ..args(flash.path(), ranks, false) }).unwrap_err();
+            let error = run_plan(PlanArgs { spark_budget_gib: Some(budget), ..args(flash.path(), ranks, false) }).unwrap_err();
             assert!(matches!(error.downcast_ref::<PlanError>(), Some(PlanError::InvalidOption { .. })),
                 "{ranks} ranks, {budget} GiB: {error:#}");
         }

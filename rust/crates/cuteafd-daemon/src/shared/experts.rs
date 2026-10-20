@@ -5,12 +5,14 @@
 
 pub(crate) mod execution;
 pub(crate) mod exl3;
+pub(crate) mod exlr8;
 pub(crate) mod fp8;
 pub(crate) mod layer;
 pub(crate) mod local;
 pub(crate) mod paired_load;
 pub(crate) mod rtx;
 pub(crate) mod service;
+pub(crate) mod staging;
 
 /// Frozen compatibility set shared by native and EXL3 expert execution.
 /// Launch capacity may vary; every decode variant must match canonical m1 sums.

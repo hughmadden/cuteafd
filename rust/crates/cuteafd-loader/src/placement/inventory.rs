@@ -212,15 +212,13 @@ pub fn loaded_code_family(program_family: &str) -> &str {
 }
 
 /// The measured loaded code of `program_family` with `experts` on coordinator
-/// `rank` of a (`split`) layout: the exact entry, else the family's entry for
-/// any experts on that rank; `None` for a family the table does not measure
-/// (the caller keeps its module formula).
+/// `rank` of a (`split`) layout: exact package, then an explicit `*` entry.
+/// Unmeasured packages retain the manifest formula, never another package's calibration.
 pub fn loaded_code(program_family: &str, experts: &str, split: bool, rank: u8) -> Option<&'static LoadedCode> {
     let family = loaded_code_family(program_family);
     let at = |c: &&LoadedCode| c.family == family && c.split == split && c.rank == rank;
     LOADED_CODE.iter().filter(at).find(|c| c.experts == experts)
         .or_else(|| LOADED_CODE.iter().filter(at).find(|c| c.experts == "*"))
-        .or_else(|| LOADED_CODE.iter().find(at))
 }
 
 impl LoadedCode {
@@ -229,6 +227,36 @@ impl LoadedCode {
     /// (`total - free - tracked`; the CUDA context included).
     pub fn pending(&self, untracked_at_sample: u64, context_bytes: u64) -> u64 {
         self.bytes.saturating_sub(untracked_at_sample.saturating_sub(context_bytes))
+    }
+}
+
+/// Ready code beyond the CUDA context, shared by offline and live admission.
+#[derive(Debug, Clone, Copy)]
+pub struct CodeAllowance {
+    pub bytes: u64,
+    pub basis: Basis,
+    /// Formula paths cannot attribute a large module sample to future BLAS handles.
+    future_library_bytes: u64,
+}
+
+impl CodeAllowance {
+    pub fn pending(self, untracked_at_sample: u64, context_bytes: u64) -> u64 {
+        let resident_code = untracked_at_sample.saturating_sub(context_bytes);
+        self.future_library_bytes + self.bytes.saturating_sub(self.future_library_bytes)
+            .saturating_sub(resident_code)
+    }
+}
+
+/// Exact/explicit-wildcard calibration, otherwise cuBLAS plus selected modules
+/// and peer context. Live admission subtracts bytes already in its sample.
+pub fn loaded_code_allowance(program_family: &str, experts: &str, split: bool, rank: u8,
+    arch: &ArchContext, programs: Option<&ProgramSet>) -> CodeAllowance {
+    match loaded_code(program_family, experts, split, rank) {
+        Some(code) => CodeAllowance { bytes: code.bytes, basis: Basis::Calibrated, future_library_bytes: 0 },
+        None => CodeAllowance { bytes: arch.cublas_bytes
+            + programs.map_or(32 * MIB, ProgramSet::module_bytes)
+            + if split { arch.peer_context_bytes } else { 0 }, basis: Basis::Formula,
+            future_library_bytes: arch.cublas_bytes },
     }
 }
 
@@ -247,6 +275,14 @@ pub struct ProgramSet {
 }
 
 impl ProgramSet {
+    /// Selected runtime program names use the same prefix filter as PROGRAMS.json.
+    pub fn from_names<'a>(families: &[&str], names: impl IntoIterator<Item = &'a str>) -> Self {
+        Self { families: families.iter().map(|f| f.to_string()).collect(),
+            names: names.into_iter().filter(|name| name.split_once('_')
+                .is_some_and(|(prefix, _)| families.contains(&prefix))).map(str::to_string).collect(),
+            scratch: Vec::new() }
+    }
+
     /// Programs of `families` in `manifest` (PROGRAMS.json).
     pub fn from_manifest(manifest: &Value, families: &[&str]) -> Self {
         let keep = |name: &str| name.split_once('_').is_some_and(|(prefix, _)| families.contains(&prefix));
@@ -586,11 +622,66 @@ mod tests {
     }
 
     #[test]
+    fn uncalibrated_packages_use_positive_manifest_formula() {
+        let arch = &ARCH_CONTEXTS[1];
+        let programs = ProgramSet::from_names(&["qwen4"], ["qwen4_decode", "other_decode"]);
+        assert_eq!(programs.names, ["qwen4_decode"]);
+        let allowance = loaded_code_allowance("qwen4", "unmeasured", false, 0, arch, Some(&programs));
+        assert_eq!(allowance.basis, Basis::Formula);
+        assert_eq!(allowance.bytes, arch.cublas_bytes + programs.module_bytes());
+        assert!(allowance.bytes > 0);
+        assert_eq!(allowance.pending(arch.context_bytes, arch.context_bytes), allowance.bytes);
+        assert_eq!(allowance.pending(arch.context_bytes + 100, arch.context_bytes), allowance.bytes - 100);
+        assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), arch.cublas_bytes);
+    }
+
+    #[test]
+    fn loaded_modules_cannot_spend_a_future_library_reservation() {
+        let arch = &ARCH_CONTEXTS[1];
+        let programs = ProgramSet::from_names(&["unmeasured"], ["unmeasured_decode"]);
+        let allowance = loaded_code_allowance("unmeasured", "exl3", true, 0, arch, Some(&programs));
+        // Recorded prefix run: already-loaded modules exceeded the formula, but
+        // the thread-local BLAS and private head handles were still future owners.
+        for (rank, sampled, old_pending, admitted, steady) in [
+            (0, 672_399_360, 29_360_128, 8_129_791_636, 8_166_309_888),
+            (1, 680_787_968, 20_971_520, 7_457_793_680, 7_495_221_248),
+        ] {
+            let pending = allowance.pending(sampled, arch.context_bytes);
+            assert_eq!(pending, arch.cublas_bytes);
+            assert!(admitted + pending - old_pending >= steady, "rank {rank}");
+        }
+        let calibrated = loaded_code_allowance("mimo", "fp8", false, 0, arch, None);
+        assert_eq!(calibrated.pending(u64::MAX, arch.context_bytes), 0);
+    }
+
+    #[test]
+    fn measured_fp8_and_glm_exl3_planner_bytes_do_not_change() {
+        let arch = &ARCH_CONTEXTS[1];
+        let programs = ProgramSet::from_names(&["glm", "glm2"], ["glm_decode", "glm2_decode"]);
+        for (family, package, split, rank, old_bytes) in [
+            ("mimo", "fp8", false, 0, 261_483_520),
+            ("mimo", "fp8", true, 0, 365_259_264),
+            ("mimo", "fp8", true, 1, 165_460_992),
+            ("qwen4", "fp8", false, 0, 1_089_736_388),
+        ] {
+            let allowance = loaded_code_allowance(family, package, split, rank, arch, Some(&programs));
+            assert_eq!(allowance.basis, Basis::Calibrated);
+            assert_eq!(allowance.bytes, old_bytes);
+        }
+        for rank in 0..2 {
+            let allowance = loaded_code_allowance("glm", "exl3", true, rank, arch, Some(&programs));
+            assert_eq!(allowance.basis, Basis::Formula);
+            assert_eq!(arch.context_bytes + allowance.bytes,
+                arch.context_bytes + arch.cublas_bytes + programs.module_bytes() + arch.peer_context_bytes);
+        }
+    }
+
+    #[test]
     fn loaded_code_keys_family_split_rank_and_experts() {
         assert_eq!(loaded_code("qwen4", "fp8", false, 0).unwrap().bytes, 1_089_736_388);
         assert_eq!(loaded_code("qwen4", "exl3", false, 0).unwrap().bytes, 780_221_844);
-        // An unmeasured package falls back to the family's rank entry.
-        assert!(loaded_code("qwen4", "none", false, 0).is_some());
+        // No arbitrary expert package can donate its calibration.
+        assert!(loaded_code("qwen4", "none", false, 0).is_none());
         assert_eq!(loaded_code("dsv4p2", "fp8", true, 1).unwrap().bytes, 803_054_544);
         // An exact package row wins over the family's any-package row, wherever it sits in the table.
         assert_eq!(loaded_code("dsv4p", "exl3", false, 0).unwrap().bytes, 724_349_124);

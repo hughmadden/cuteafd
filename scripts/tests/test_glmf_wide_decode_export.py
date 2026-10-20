@@ -37,10 +37,11 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "kimi_mla", "kimi_residual", "pointwise"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
+    package.kimi_mla.KimiMlaGeometry = lambda **kw: types.SimpleNamespace(**kw)
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
     package.dsv4_mhc.mhc_post_pre_route = lambda rows: "decode" if rows < 96 else "block_m"
     # The real planner's shape at 32 heads: more splits for fewer rows (188 SMs: s32/s11/s4).
@@ -63,6 +64,7 @@ def exporter(monkeypatch):
     ("qwen4", "Qwen/Qwen3.8-Flash-Next", 262144),
     ("qwen35", "Qwen/Qwen3.5-9B", 262144),
     ("qwen38", "Qwen/Qwen3.8-27B", 262144),
+    ("step5", "stepfun-ai/Step-5-Preview", 1048576),
 ])
 def test_checkpoint_extent_table_and_head_splits(exporter, geometry, checkpoint, limit):
     assert exporter.CHECKPOINT_CONTEXTS[geometry] == (checkpoint, limit)
@@ -334,3 +336,106 @@ def test_glmf_w8_state_is_orthogonal_and_canonical(exporter):
         # load covers the whole decode range, so no recipe key selects a second one.
         assert "decode_recipe" not in params
     assert calls["kda_w8_s16t_m4096"][1]["state_rounding"] == "tile"
+
+
+@pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
+def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode_rows, prefill_rows):
+    programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
+    kda = [p for p in programs if p[1] in ("kda", "kda_commit")]
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in kda}
+    assert len(calls) == len(kda) == 1 + len({decode_rows, prefill_rows})
+    for stem, (op, params, call) in calls.items():
+        module, function, args, kwargs = call
+        assert module == "glmf" and args == (GEOMETRY,)
+        assert function == f"compile_glmf_{op}_aot"
+        assert params == kwargs
+        if op == "kda":
+            assert kwargs["output_kind"] == "norm"
+            assert kwargs["decode"] == (kwargs["max_rows"] == decode_rows)
+    # KDA reuses the identical shared-FFN down projection, without a second export.
+    output = [p for p in programs if p[0] == "ffn_down_i6144"]
+    assert len(output) == 1
+    _, op, params, thunk = output[0]
+    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168}
+    assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
+
+
+@pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
+def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_rows, prefill_rows):
+    programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs if op.startswith("mla_") or op == "dense_mla"}
+    assert len(calls) == 2 * (2 * len({decode_rows, prefill_rows}) + 3)
+    for heads in (48, 96):
+        suffix = "" if heads == 48 else "_h96"
+        for rows in {decode_rows, prefill_rows}:
+            for op in ("mla_producer", "mla_output"):
+                actual_op, params, (module, fn, args, kwargs) = calls[f"{op}{suffix}_m{rows}"]
+                assert actual_op == op and module == "kimi_mla"
+                assert fn == f"compile_kimi_{op}_aot"
+                assert vars(args[0]) == {"heads": heads}
+                assert kwargs == {"max_rows": rows}
+                assert params == {"max_rows": rows, "heads": heads}
+        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+            op, params, (module, fn, args, kwargs) = calls[f"dense_mla_{mode}{suffix}_m{rows}"]
+            assert op == "dense_mla" and module == "kimi_mla" and fn == "compile_kimi_dense_mla_aot"
+            assert vars(args[0]) == {"heads": heads}
+            assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
+            assert params == {"mode": mode, "max_rows": rows, "heads": heads}
+
+
+def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
+    programs = exporter.kimi_w8_programs()
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
+    assert len(calls) == len(programs) == 44
+    for stem, (op, params, (module, fn, args, kwargs)) in calls.items():
+        assert args == () and kwargs == params
+        if op == "bf16_projection":
+            assert module == "pointwise" and fn == "compile_bf16_projection_aot"
+            width = int(stem.rsplit("_i", 1)[1])
+            assert params == ({"width": 7168, "outputs": 2 * width} if "gate_up" in stem
+                              else {"width": width, "outputs": 7168})
+            continue
+        assert module == "kimi_residual"
+        if op == "situ":
+            assert fn == "compile_kimi_situ_aot"
+            assert params == {"intermediate": int(stem.removeprefix("situ_i"))}
+        else:
+            assert op == "attn_res_rmsnorm" and fn == "compile_kimi_attn_res_rmsnorm_aot"
+            assert params["hidden"] == 7168
+            assert params["has_mix"] == (params["candidates"] != 1)
+            assert params["append"] == stem.endswith("_append")
+    for candidates in range(2, 10):
+        for mode in ("keep", "add", "replace"):
+            assert f"attn_res_c{candidates}_{mode}" in calls
+    assert {params["intermediate"] for _, op, params, _ in programs if op == "situ"} == {
+        3072, 6144, 16896, 33792}
+
+
+def test_kimi_routes_reuse_shared_kernels_at_hidden_and_latent_widths(exporter):
+    programs = exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)
+    calls = {stem: (op, params, thunk) for stem, op, params, thunk in programs}
+    assert len(calls) == len(programs)
+    for stem, geometry in (("router_scores", {"hidden": 7168, "routed_experts": 896, "top_k": 16}),
+                           ("expert_input_quant", {"hidden": 3584})):
+        op, params, thunk = calls[stem]
+        module, function, args, kwargs = thunk()
+        assert op == stem and params == {} and kwargs == {}
+        assert module == "glmf" and function == f"compile_glmf_{stem}_aot"
+        assert len(args) == 1 and vars(args[0]) == geometry
+    # KDA output already uses this canonical BF16 projection; no duplicate export.
+    op, params, thunk = calls["ffn_down_i6144"]
+    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168}
+    assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
+
+
+def test_kimi_latent_exports_native_norm_and_canonical_projections(exporter):
+    programs = exporter.kimi_latent_programs()
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
+    assert set(calls) == {"rmsnorm_h3584", "rmsnorm_h7168", "latent_down", "latent_up"}
+    for hidden in (3584, 7168):
+        assert calls[f"rmsnorm_h{hidden}"] == ("rmsnorm", {"hidden": hidden},
+            ("kimi_residual", "compile_kimi_rmsnorm_aot", (), {"hidden": hidden}))
+    for direction, width, outputs in (("down", 7168, 3584), ("up", 3584, 7168)):
+        params = dict(width=width, outputs=outputs)
+        assert calls[f"latent_{direction}"] == ("bf16_projection", params,
+            ("pointwise", "compile_bf16_projection_aot", (), params))

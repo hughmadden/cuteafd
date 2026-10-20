@@ -1,5 +1,5 @@
 //! Remote fidelity probes and local paired comparison, without a teacher service.
-use crate::fidelity::{compare, compare_full, Run};
+use crate::fidelity::{compare_full_paired, compare_paired, CrossCheckpoints, Pairing, Run};
 use crate::reference::{Fidelity, Reference};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -32,6 +32,13 @@ pub enum Action {
         seed: u64,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Pair two quants of one reference root (same pinned set, reference and build);
+        /// the checkpoints and a closed list of quant-selection settings may differ.
+        #[arg(long, conflicts_with = "code_ab")]
+        cross_checkpoint: bool,
+        /// Pair two builds of the same checkpoint and server settings (a code A/B).
+        #[arg(long)]
+        code_ab: bool,
     },
     /// Compare candidate A to checkpoint-precision baseline B, paired by position.
     Compare {
@@ -50,6 +57,13 @@ pub enum Action {
         seed: u64,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Pair two quants of one reference root (same pinned set, reference and build);
+        /// the checkpoints and a closed list of quant-selection settings may differ.
+        #[arg(long, conflicts_with = "code_ab")]
+        cross_checkpoint: bool,
+        /// Pair two builds of the same checkpoint and server settings (a code A/B).
+        #[arg(long)]
+        code_ab: bool,
     },
 }
 #[derive(Debug, Clone, clap::Args)]
@@ -353,6 +367,18 @@ fn run_pass(run: &Run) -> bool {
     crate::fidelity::verdict(run).pass
 }
 
+fn pairing(cross_checkpoint: bool, code_ab: bool, hub: &std::path::Path) -> Pairing<'_> {
+    if cross_checkpoint { Pairing::CrossCheckpoint { hub } }
+    else if code_ab { Pairing::CodeChange } else { Pairing::SameCheckpoint }
+}
+
+/// The text report's statement that this verdict pairs two checkpoints, not two precisions.
+fn cross_checkpoint_line(c: &CrossCheckpoints) -> String {
+    format!("Cross-checkpoint comparison (cross_checkpoint: true): candidate {}@{} vs baseline {}@{}, \
+        both resolved to reference root {}; not a same-checkpoint precision verdict.",
+        c.candidate.checkpoint, c.candidate.revision, c.baseline.checkpoint, c.baseline.revision, c.reference_root)
+}
+
 /// Exit 0 pass / 3 gate failure / 1 error is handled at the daemon edge.
 pub fn execute(args: Args) -> Result<bool> {
     match args.action {
@@ -365,19 +391,21 @@ pub fn execute(args: Args) -> Result<bool> {
             }
             Ok(runs.iter().all(run_pass))
         }
-        Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out } => {
+        Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out, cross_checkpoint, code_ab } => {
             let load = |path: PathBuf| -> Result<Run> {
                 Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
             };
-            let comparison = compare_full(&load(a_decode)?, &load(b_decode)?,
-                &load(a_prefill)?, &load(b_prefill)?, bootstrap, seed)?;
+            let hub = crate::fidelity_match::hub();
+            let comparison = compare_full_paired(&load(a_decode)?, &load(b_decode)?,
+                &load(a_prefill)?, &load(b_prefill)?, bootstrap, seed, pairing(cross_checkpoint, code_ab, &hub))?;
             let text = serde_json::to_string_pretty(&comparison)?;
             if let Some(path) = out { std::fs::write(path, &text)?; }
             println!("{text}");
+            if let Some(checkpoints) = &comparison.checkpoints { eprintln!("{}", cross_checkpoint_line(checkpoints)); }
             eprintln!("Both full-tier statistical paths checked; separate agentic replay remains required.");
             Ok(comparison.pass)
         }
-        Action::Compare { a, b, score_path, top1_margin, kl_margin, bootstrap, seed, out } => {
+        Action::Compare { a, b, score_path, top1_margin, kl_margin, bootstrap, seed, out, cross_checkpoint, code_ab } => {
             let load = |path: PathBuf| -> Result<Run> {
                 let value: Value = serde_json::from_reader(std::fs::File::open(path)?)?;
                 let value = if value["schema"] == "cuteafd.fidelity.run/2" { value } else { value[&score_path].clone() };
@@ -386,10 +414,13 @@ pub fn execute(args: Args) -> Result<bool> {
             let a = load(a)?;
             let b = load(b)?;
             let margin = if a.tier == "quick" { 0.01 } else { 0.005 };
-            let comparison = compare(&a, &b, top1_margin.unwrap_or(margin), kl_margin.unwrap_or(margin), bootstrap, seed)?;
+            let hub = crate::fidelity_match::hub();
+            let comparison = compare_paired(&a, &b, top1_margin.unwrap_or(margin), kl_margin.unwrap_or(margin),
+                bootstrap, seed, pairing(cross_checkpoint, code_ab, &hub))?;
             let text = serde_json::to_string_pretty(&comparison)?;
             if let Some(path) = out { std::fs::write(path, &text)?; }
             println!("{text}");
+            if let Some(checkpoints) = &comparison.checkpoints { eprintln!("{}", cross_checkpoint_line(checkpoints)); }
             eprintln!("This is a {}-only gate. Precision defaults require both decode and prefill full-tier results.", a.path_shape);
             Ok(comparison.pass)
         }

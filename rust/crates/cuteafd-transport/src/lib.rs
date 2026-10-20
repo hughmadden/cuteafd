@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use cuteafd_core::{ExpertRequest, ExpertResponse};
 use std::io::ErrorKind;
 use std::time::Duration;
@@ -7,15 +7,19 @@ pub mod bond;
 mod capabilities;
 pub mod fabric;
 pub mod fabric_health;
-pub mod traffic;
 mod sparknest_traffic;
+pub mod traffic;
 
 /// A failed expert wire is terminal for a serving process. Never clear this on
 /// a new request: other lanes may still own queued work from the failed pass.
 pub mod health {
     static FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    pub fn record_failure(reason: impl Into<String>) { let _ = FAILURE.set(reason.into()); }
-    pub fn failure_reason() -> Option<String> { FAILURE.get().cloned() }
+    pub fn record_failure(reason: impl Into<String>) {
+        let _ = FAILURE.set(reason.into());
+    }
+    pub fn failure_reason() -> Option<String> {
+        FAILURE.get().cloned()
+    }
     pub(crate) fn ensure_available() -> anyhow::Result<()> {
         if let Some(reason) = FAILURE.get() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
@@ -24,8 +28,9 @@ pub mod health {
     }
 }
 mod debug_json;
-pub mod protocol_v2;
 pub mod expert;
+pub mod protocol_v2;
+pub mod route_log;
 pub mod worker_selection;
 // Old module path, kept for one release (naming pass).
 pub use expert as v41_expert;
@@ -35,26 +40,21 @@ mod verbs;
 pub use verbs::set_verbs_host_native_library_path;
 
 pub use capabilities::{
-    inproc_capabilities, tcp_capabilities, verbs_host_app_transport_blocker, verbs_host_available,
-    verbs_host_capabilities, verbs_host_preflight, VerbsHostPreflight,
     VERBS_HOST_APP_TRANSPORT_BLOCKER, VERBS_HOST_APP_TRANSPORT_STATUS,
-    VERBS_HOST_PREFLIGHT_ONLY_PROTOCOL,
+    VERBS_HOST_PREFLIGHT_ONLY_PROTOCOL, VerbsHostPreflight, inproc_capabilities, tcp_capabilities,
+    verbs_host_app_transport_blocker, verbs_host_available, verbs_host_capabilities,
+    verbs_host_preflight,
 };
 pub use debug_json::{
-    debug_json_tcp_roundtrip, serve_synthetic_debug_json_tcp, serve_synthetic_tcp, tcp_roundtrip,
     DEBUG_JSON_EXPERT_PROTOCOL_LABEL, DEBUG_JSON_EXPERT_PROTOCOL_VERSION,
-    DEBUG_JSON_FRAME_PROTOCOL,
+    DEBUG_JSON_FRAME_PROTOCOL, debug_json_tcp_roundtrip, serve_synthetic_debug_json_tcp,
+    serve_synthetic_tcp, tcp_roundtrip,
 };
 #[cfg(test)]
-pub(crate) use debug_json::{encode_frame, handle_synthetic_connection, read_frame, FrameKind};
+pub(crate) use debug_json::{FrameKind, encode_frame, handle_synthetic_connection, read_frame};
 pub use protocol_v2::{
-    expert_protocol_v2_compact_id, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2FrameArena,
-    ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestHeader,
-    ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader,
-    ExpertProtocolV2ResponseRef, ExpertProtocolV2ResponseView, ExpertProtocolV2RouteEntry,
-    ExpertProtocolV2RowDescriptor, ExpertProtocolV2Status, ExpertProtocolV2StreamPlan,
-    ExpertProtocolV2StreamRouteGroup, ExpertProtocolV2WireStats, ExpertV2Dtype, ExpertV2SourceKind,
-    EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM, EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP,
+    EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
+    EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP,
     EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
     EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES,
     EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION, EXPERT_PROTOCOL_V2_FLAG_STREAM_DATA,
@@ -62,39 +62,45 @@ pub use protocol_v2::{
     EXPERT_PROTOCOL_V2_FRAME_PROTOCOL, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
     EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
     EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN, EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
+    ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2FrameArena, ExpertProtocolV2FrameBuffer,
+    ExpertProtocolV2Request, ExpertProtocolV2RequestHeader, ExpertProtocolV2RequestView,
+    ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseRef,
+    ExpertProtocolV2ResponseView, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
+    ExpertProtocolV2Status, ExpertProtocolV2StreamPlan, ExpertProtocolV2StreamRouteGroup,
+    ExpertProtocolV2WireStats, ExpertV2Dtype, ExpertV2SourceKind, expert_protocol_v2_compact_id,
 };
 #[cfg(test)]
 pub(crate) use protocol_v2_tcp::handle_protocol_v2_synthetic_connection;
 pub use protocol_v2_tcp::{
+    TcpProtocolV2PendingChunks, TcpProtocolV2PersistentClient,
     serve_protocol_v2_tcp_listener_with_executor, serve_protocol_v2_tcp_with_executor,
     serve_synthetic_protocol_v2_tcp, serve_synthetic_protocol_v2_tcp_listener,
     tcp_protocol_v2_expert_request_roundtrip, tcp_protocol_v2_roundtrip,
     tcp_protocol_v2_roundtrip_arena_response_view, tcp_protocol_v2_roundtrip_response_view,
-    TcpProtocolV2PersistentClient, TcpProtocolV2PendingChunks,
 };
 pub use synthetic::{
-    expert_response_from_protocol_v2_response, protocol_v2_echo_loopback_response,
-    protocol_v2_request_from_expert_request, protocol_v2_route_dependent_synthetic_response,
-    protocol_v2_synthetic_response, synthetic_expert_response, EchoExecutor,
+    EchoExecutor, PROTOCOL_V2_ECHO_EXECUTOR, PROTOCOL_V2_SYNTHETIC_ROUTE_EXECUTOR,
     ProtocolV2ExecutorResponseRef, ProtocolV2ExpertExecutor, ProtocolV2RequestDevicePayload,
-    SyntheticRouteExecutor, PROTOCOL_V2_ECHO_EXECUTOR, PROTOCOL_V2_SYNTHETIC_ROUTE_EXECUTOR,
-    SYNTHETIC_EXPERT_KERNEL,
+    SYNTHETIC_EXPERT_KERNEL, SyntheticRouteExecutor, expert_response_from_protocol_v2_response,
+    protocol_v2_echo_loopback_response, protocol_v2_request_from_expert_request,
+    protocol_v2_route_dependent_synthetic_response, protocol_v2_synthetic_response,
+    synthetic_expert_response,
 };
 pub use verbs::{
-    verbs_host_persistent_ring_bytes, gpu_landing_probe, DeviceLanding, DeviceWriteTarget, FlowProbesOnly, GpuLandingProbe, VerbsHostWriteTarget,
-    VERBS_HOST_WRITE_FLAG_ERROR,
-    LocalVerbsExpertConnection, RingBudget, RingReservation,
-    serve_protocol_v2_verbs_host_with_executor, serve_synthetic_verbs_host,
-    verbs_host_protocol_v2_endpoint_plan, verbs_host_protocol_v2_expert_request_roundtrip,
-    verbs_host_protocol_v2_handshake_contract, verbs_host_protocol_v2_round_trip_plan,
-    verbs_host_protocol_v2_roundtrip, verbs_host_validate_protocol_v2_handshake,
-    VerbsHostMappedRdmaPollStats, VerbsHostMappedRdmaRing, VerbsHostMappedRdmaRingConfig,
-    VerbsHostMappedRdmaSlot, VerbsHostNativeEndpointDescriptor, VerbsHostProtocolV2EndpointPlan,
+    DeviceLanding, DeviceWriteTarget, FlowProbesOnly, GpuLandingProbe, LocalVerbsExpertConnection,
+    RingBudget, RingReservation, VERBS_HOST_WRITE_FLAG_ERROR, VerbsHostMappedRdmaPollStats,
+    VerbsHostMappedRdmaRing, VerbsHostMappedRdmaRingConfig, VerbsHostMappedRdmaSlot,
+    VerbsHostNativeEndpointDescriptor, VerbsHostProtocolV2EndpointPlan,
     VerbsHostProtocolV2HandshakeContract, VerbsHostProtocolV2HandshakeValidation,
     VerbsHostProtocolV2PendingResponse, VerbsHostProtocolV2PersistentClient,
     VerbsHostProtocolV2ResponseChunk, VerbsHostProtocolV2ResponsePayload,
     VerbsHostProtocolV2ResponseStreamStats, VerbsHostProtocolV2RoundTripPlan,
-    VerbsHostRcEndpointDescriptor,
+    VerbsHostRcEndpointDescriptor, VerbsHostWriteTarget, gpu_landing_probe,
+    serve_protocol_v2_verbs_host_with_executor, serve_synthetic_verbs_host,
+    verbs_host_persistent_ring_bytes, verbs_host_protocol_v2_endpoint_plan,
+    verbs_host_protocol_v2_expert_request_roundtrip, verbs_host_protocol_v2_handshake_contract,
+    verbs_host_protocol_v2_round_trip_plan, verbs_host_protocol_v2_roundtrip,
+    verbs_host_validate_protocol_v2_handshake,
 };
 
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -125,7 +131,10 @@ impl Default for TcpTransportConfig {
 /// per-chunk progress and poll paths must never reach `getenv`.
 pub fn protocol_v2_timing_from_env() -> bool {
     match std::env::var("CUTEAFD_PROTOCOL_V2_TCP_TIMING") {
-        Ok(value) => matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => false,
     }
 }

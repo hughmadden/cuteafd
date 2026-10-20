@@ -38,6 +38,14 @@ docker_args=(
   -v "$hf_home:$hf_home:ro"
   -v "$hf_home:/root/.cache/huggingface:ro"
   -e HF_HOME="$hf_home"
+)
+# The host hub is usually a symlink into the shared store; mount its target too,
+# or the link dangles inside the container.
+if [[ -L "$hf_home/hub" ]]; then
+  hub_target="$(readlink -f "$hf_home/hub")"
+  [[ -d "$hub_target" ]] && docker_args+=(-v "$hub_target:$hub_target:ro")
+fi
+docker_args+=(
   -e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
   -e TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
   -e CUTEAFD_MODEL_ID="${CUTEAFD_MODEL_ID:-deepseek-ai/DeepSeek-V4.1-Flash}"
@@ -89,6 +97,20 @@ if [[ -n "${CUTEAFD_DEV_TARGET_DIR:-}" ]]; then
   docker_args+=(--mount "type=bind,src=$CUTEAFD_DEV_TARGET_DIR,dst=/opt/cuteafd-target"
                 -e CARGO_TARGET_DIR=/opt/cuteafd-target)
 fi
+# Sealed WIP artifacts for tests that need a built native library and packages:
+# mounted read-only at the same absolute path, so package paths resolve unchanged.
+if [[ -n "${CUTEAFD_DEV_ARTIFACTS:-}" ]]; then
+  [[ -d "$CUTEAFD_DEV_ARTIFACTS" ]] || { echo "CUTEAFD_DEV_ARTIFACTS is not a directory: $CUTEAFD_DEV_ARTIFACTS" >&2; exit 2; }
+  artifacts="$(cd "$CUTEAFD_DEV_ARTIFACTS" && pwd -P)"
+  docker_args+=(--mount "type=bind,src=$artifacts,dst=$artifacts,readonly"
+                -e CUTEAFD_DEV_ARTIFACTS="$artifacts")
+fi
+# Memory cap for the whole container (e.g. 16g), so a test on a shared Spark's
+# unified memory cannot crowd out the host's services; swap is capped equally.
+if [[ -n "${CUTEAFD_DEV_MEMORY:-}" ]]; then
+  [[ "$CUTEAFD_DEV_MEMORY" =~ ^[0-9]+[kmg]?$ ]] || { echo "CUTEAFD_DEV_MEMORY must be a docker size such as 16g: $CUTEAFD_DEV_MEMORY" >&2; exit 2; }
+  docker_args+=(--memory "$CUTEAFD_DEV_MEMORY" --memory-swap "$CUTEAFD_DEV_MEMORY")
+fi
 source "$repo_root/scripts/build/compiler-cache.sh"
 source "$repo_root/scripts/build/build-caches.sh"
 export CUTEAFD_KACHE="${CUTEAFD_KACHE-}" CUTEAFD_SCCACHE_CUDA="${CUTEAFD_SCCACHE_CUDA-0}"
@@ -107,6 +129,12 @@ elif [[ "$role" != cpu ]]; then
   release_load_config "${CUTEAFD_CONFIG:-$repo_root/cuteafd.config}"
   release_need nvidia-smi
   release_resolve_coordinator_gpu_identity
+  # Under hwlock, the GPU this container gets must be one the caller holds: the
+  # config (not the environment) selects it, so a mismatch is a wrong config.
+  if [[ -n "${CUTEAFD_HW_LOCKS_HELD:-}" && ",$CUTEAFD_HW_LOCKS_HELD," != *",gpu$RELEASE_COORDINATOR_GPU_HOST_INDEX,"* ]]; then
+    echo "coordinator GPU $RELEASE_COORDINATOR_GPU_HOST_INDEX is not among held locks ($CUTEAFD_HW_LOCKS_HELD); set COORDINATOR_GPU in CUTEAFD_CONFIG" >&2
+    exit 2
+  fi
   source "$repo_root/scripts/lib/cdi-gpus.sh"
   cuteafd_cdi_gpu_args "$RELEASE_COORDINATOR_GPU_UUID" || exit 2
   docker_args+=(
@@ -120,8 +148,9 @@ if [[ "$repo_root" != "/workspace/cuteafd" ]]; then
   docker_args+=(-v "$repo_root:$repo_root")
 fi
 # Worktree and submodule gitfiles resolve through the original checkout's metadata.
-git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)"
-if [[ "$git_common_dir" != "$repo_root/.git" ]]; then
+# A staged copy without Git metadata (verified against the lock above) mounts as is.
+if git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    && [[ "$git_common_dir" != "$repo_root/.git" ]]; then
   docker_args+=(-v "$git_common_dir:$git_common_dir:ro")
 fi
 # Relative gitfiles (worktrees, submodules) resolve only from the checkout's real

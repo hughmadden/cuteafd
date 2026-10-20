@@ -2,7 +2,7 @@
 //! not their own ordering of peer pushes, waits or LSE operands.
 use super::context::{combine_order, slot, ContextExchange};
 use super::{hop::HopLink, PeerExchange, DIRECT};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_loader::placement::{FfnMode, Hop, HopPoint, LayerExecutionPlan, LayerMode, Placement};
 use std::ffi::c_void;
 
@@ -14,29 +14,56 @@ pub(crate) fn replicate_terminal(exchange: &PeerExchange<'_>, source: cuteafd_ff
     replicate_terminal_with(exchange, source, destination, bytes)
 }
 
+/// Copy an already-rounded per-layer result without arithmetic. Admission must
+/// validate_routed_replications with actual destination identities first. Queue
+/// the receiver's last read before the next bidirectional head exchange; a flag
+/// wait alone never proves that the destination is reusable. Both buffers and
+/// this exchange belong to the enclosing whole-submission terminal owner.
+pub(crate) fn replicate_result(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    exchange: &PeerExchange<'_>, from: usize, slot: usize,
+    source: cuteafd_ffi::CuteafdDeviceBuffer, destination: cuteafd_ffi::CuteafdDeviceBuffer,
+    bytes: usize) -> Result<()> {
+    ensure!(slot != DIRECT, "layer result requires an admitted publication slot");
+    replicate_with(exchange, from, slot, source, destination, bytes)
+}
+
 trait TerminalProtocol {
     fn device(&self, rank: usize) -> i32;
-    fn publish(&self, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()>;
-    fn land(&self) -> Result<()>;
+    fn validate(&self, slot: usize) -> Result<()>;
+    fn publish(&self, from: usize, slot: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()>;
+    fn land(&self, at: usize, slot: usize) -> Result<()>;
 }
 
 impl TerminalProtocol for PeerExchange<'_> {
     fn device(&self, rank: usize) -> i32 { self.device(rank) }
-    fn publish(&self, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
-        self.push_to(0, DIRECT, source, destination, bytes)
+    fn validate(&self, slot: usize) -> Result<()> {
+        self.require_live()?;
+        if slot != DIRECT { self.recv(0, slot)?; self.recv(1, slot)?; }
+        Ok(())
     }
-    fn land(&self) -> Result<()> { self.wait(1, DIRECT) }
+    fn publish(&self, from: usize, slot: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+        self.push_to(from, slot, source, destination, bytes)
+    }
+    fn land(&self, at: usize, slot: usize) -> Result<()> { self.wait(at, slot) }
 }
 
 fn replicate_terminal_with(exchange: &impl TerminalProtocol, source: cuteafd_ffi::CuteafdDeviceBuffer,
     destination: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
+    replicate_with(exchange, 0, DIRECT, source, destination, bytes)
+}
+
+fn replicate_with(exchange: &impl TerminalProtocol, from: usize, slot: usize,
+    source: cuteafd_ffi::CuteafdDeviceBuffer, destination: cuteafd_ffi::CuteafdDeviceBuffer,
+    bytes: usize) -> Result<()> {
+    ensure!(from < 2, "result copy source rank");
     ensure!(bytes > 0 && bytes <= source.bytes && bytes <= destination.bytes,
-        "terminal residual copy exceeds live source or destination storage");
+        "result copy exceeds live source or destination storage");
     ensure!(!source.ptr.is_null() && !destination.ptr.is_null()
-        && source.device_id == exchange.device(0) && destination.device_id == exchange.device(1)
-        && source.device_id != destination.device_id, "terminal residual copy has invalid rank storage");
-    exchange.publish(source.ptr, destination.ptr, bytes)?;
-    exchange.land()
+        && source.device_id == exchange.device(from) && destination.device_id == exchange.device(1 - from)
+        && source.device_id != destination.device_id, "result copy has invalid rank storage");
+    exchange.validate(slot)?;
+    exchange.publish(from, slot, source.ptr, destination.ptr, bytes)?;
+    exchange.land(1 - from, slot)
 }
 
 #[cfg(test)]
@@ -54,14 +81,20 @@ mod terminal_tests {
 
     impl TerminalProtocol for CopyProtocol {
         fn device(&self, rank: usize) -> i32 { [3, 7][rank] }
-        fn publish(&self, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
-            assert_eq!((source as usize, destination as usize), (1, 2));
+        fn validate(&self, slot: usize) -> Result<()> {
+            ensure!(slot == DIRECT || slot < 8, "invalid result publication slot");
+            Ok(())
+        }
+        fn publish(&self, from: usize, slot: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+            assert!(from < 2 && (slot == DIRECT || slot < 8));
+            assert_eq!((source as usize, destination as usize), (1 + from, 2 - from));
             self.calls.borrow_mut().push("publish");
             ensure!(!self.fail_publish, "injected terminal publication failure");
             self.destination.borrow_mut()[..bytes].copy_from_slice(&self.source[..bytes]);
             Ok(())
         }
-        fn land(&self) -> Result<()> {
+        fn land(&self, at: usize, slot: usize) -> Result<()> {
+            assert!(at < 2 && (slot == DIRECT || slot < 8));
             self.calls.borrow_mut().push("land");
             Ok(())
         }
@@ -84,6 +117,40 @@ mod terminal_tests {
         assert_eq!(&exchange.destination.borrow()[..bytes], exchange.source.as_slice());
         assert_eq!(&exchange.destination.borrow()[bytes..], &[0xa5; 16]);
         assert_eq!(*exchange.calls.borrow(), ["publish", "land"]);
+    }
+
+    #[test]
+    fn routed_result_copy_preserves_native_residual_join_on_both_ranks() {
+        let source: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        for from in 0..2 {
+            let bytes = source.len();
+            let exchange = CopyProtocol { source: source.clone(), destination: RefCell::new(vec![0xa5; bytes + 16]),
+                calls: RefCell::new(Vec::new()), fail_publish: false };
+            let buffers = buffers(bytes);
+            replicate_with(&exchange, from, 4, buffers[from], buffers[1 - from], bytes).unwrap();
+            let joined = |wire: &[u8]| wire.chunks_exact(2).enumerate().map(|(i, bits)| {
+                let routed = f32::from_bits((u16::from_le_bytes(bits.try_into().unwrap()) as u32) << 16);
+                let shared = f32::from_bits(([0x0000u32, 0x8000, 0x3f80, 0xbf80][i % 4]) << 16);
+                let residual = [0.0f32, -0.0, 16777216.0, -0.25][i % 4];
+                // Match the native join's parentheses, not (residual+routed)+shared.
+                (residual + (routed + shared)).to_bits()
+            }).collect::<Vec<_>>();
+            assert_eq!(&exchange.destination.borrow()[..bytes], source.as_slice());
+            assert_eq!(joined(&source), joined(&exchange.destination.borrow()[..bytes]));
+            assert_eq!(&exchange.destination.borrow()[bytes..], &[0xa5; 16]);
+            assert_eq!(*exchange.calls.borrow(), ["publish", "land"]);
+        }
+    }
+
+    #[test]
+    fn routed_result_rejects_rank_slot_and_extent_before_publication() {
+        let exchange = CopyProtocol { source: vec![0; 8], destination: RefCell::new(vec![0; 8]),
+            calls: RefCell::new(Vec::new()), fail_publish: false };
+        let [source, destination] = buffers(8);
+        for (from, slot, bytes) in [(2, 4, 8), (0, 8, 8), (0, 4, 0), (0, 4, 9)] {
+            assert!(replicate_with(&exchange, from, slot, source, destination, bytes).is_err());
+        }
+        assert!(exchange.calls.borrow().is_empty());
     }
 
     #[test]
@@ -197,6 +264,139 @@ fn context_decode_with(exchange: &impl ContextProtocol, rank: usize, context_ind
     let own = kernels.partial(query, rank)?;
     let received = exchange.wait_partial(rank, slot)?;
     kernels.combine(combine_order(rank, own, received))
+}
+
+/// Persistent per-lane publication sequence. Do not reset between steps: an
+/// odd number of head layers flips the starting parity of the next graph.
+#[derive(Debug)]
+pub(crate) struct HeadSequence {
+    lane: usize,
+    ordinal: u64,
+}
+
+impl HeadSequence {
+    pub fn new(lane: usize) -> Result<Self> {
+        ensure!(lane < 2, "head exchange supports one or two lanes");
+        Ok(Self { lane, ordinal: 0 })
+    }
+
+    /// Part of a captured graph's binding key. Both parity variants retain
+    /// their normal graph/workspace owners and are charged by admission.
+    pub fn parity(&self) -> usize { (self.ordinal & 1) as usize }
+
+    fn slot(&self) -> usize { 2 * self.lane + self.parity() }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadPrecision { Bf16, F32 }
+
+pub(crate) struct HeadProjection {
+    pub partial: cuteafd_ffi::CuteafdDeviceBuffer,
+    /// BF16 merge destination; ignored for F32, where the family owns narrowing.
+    pub rounded: Option<cuteafd_ffi::CuteafdDeviceBuffer>,
+}
+
+pub(crate) enum HeadMerge {
+    /// The shared add path has already rounded rank0 + rank1 exactly once.
+    Bf16(cuteafd_ffi::CuteafdDeviceBuffer),
+    /// Both pointers are local, always ordered rank0 then rank1.
+    F32([*const c_void; 2]),
+}
+
+pub(crate) trait HeadKernels {
+    fn project(&mut self, rank: usize) -> Result<HeadProjection>;
+    fn merge(&mut self, rank: usize, values: HeadMerge) -> Result<()>;
+}
+
+trait HeadProtocol {
+    fn require_live(&self) -> Result<()>;
+    fn device(&self, rank: usize) -> i32;
+    fn capacity(&self) -> usize;
+    fn validate_slot(&self, slot: usize) -> Result<()>;
+    fn push(&self, rank: usize, slot: usize, values: *const c_void, bytes: usize) -> Result<()>;
+    fn wait(&self, rank: usize, slot: usize) -> Result<()>;
+    fn recv(&self, rank: usize, slot: usize) -> Result<*mut c_void>;
+    fn add(&self, rank: usize, values: [*const c_void; 2], out: *mut c_void, count: usize) -> Result<()>;
+}
+
+impl HeadProtocol for PeerExchange<'_> {
+    fn require_live(&self) -> Result<()> { self.require_live() }
+    fn device(&self, rank: usize) -> i32 { self.device(rank) }
+    fn capacity(&self) -> usize { self.slot_bytes() }
+    fn validate_slot(&self, slot: usize) -> Result<()> {
+        self.recv(0, slot)?;
+        self.recv(1, slot)?;
+        Ok(())
+    }
+    fn push(&self, rank: usize, slot: usize, values: *const c_void, bytes: usize) -> Result<()> {
+        self.push(rank, slot, values, bytes)
+    }
+    fn wait(&self, rank: usize, slot: usize) -> Result<()> { self.wait(rank, slot) }
+    fn recv(&self, rank: usize, slot: usize) -> Result<*mut c_void> { self.recv(rank, slot) }
+    fn add(&self, rank: usize, values: [*const c_void; 2], out: *mut c_void, count: usize) -> Result<()> {
+        self.add(rank, values[0], values[1], out, count)
+    }
+}
+
+/// Publish both head projections before either wait. Call only inside the
+/// whole-submission guard; it retains all planes and aborts unmatched waits.
+/// F32 families own the native narrowing/residual boundary in `merge`.
+/// Two slots per lane are exclusive to this sequence. The intervening exchange
+/// orders the peer's merge before a slot is reused, including across steps.
+/// All callbacks use the exchange streams; consumers finish reading received
+/// values on that stream before returning. Reset only after both streams drain.
+pub(crate) fn head_partials(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    exchange: &PeerExchange<'_>, sequence: &mut HeadSequence, count: usize, precision: HeadPrecision,
+    kernels: &mut impl HeadKernels) -> Result<()> {
+    head_partials_next_with(exchange, sequence, count, precision, kernels)
+}
+
+fn head_partials_next_with(exchange: &impl HeadProtocol, sequence: &mut HeadSequence,
+    count: usize, precision: HeadPrecision, kernels: &mut impl HeadKernels) -> Result<()> {
+    let next = sequence.ordinal.checked_add(1).context("head publication sequence exhausted")?;
+    head_partials_with(exchange, sequence.slot(), count, precision, kernels)?;
+    sequence.ordinal = next;
+    Ok(())
+}
+
+fn head_partials_with(exchange: &impl HeadProtocol, slot: usize, count: usize,
+    precision: HeadPrecision, kernels: &mut impl HeadKernels) -> Result<()> {
+    let bytes = count.checked_mul(if precision == HeadPrecision::F32 { 4 } else { 2 })
+        .filter(|&bytes| bytes > 0 && bytes <= exchange.capacity())
+        .ok_or_else(|| anyhow::anyhow!("head partial exceeds exchange capacity"))?;
+    ensure!(slot != DIRECT, "head partial requires a receive slot");
+    exchange.validate_slot(slot)?;
+    exchange.require_live()?;
+    let projected = [kernels.project(0)?, kernels.project(1)?];
+    for (rank, projection) in projected.iter().enumerate() {
+        let valid = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes| !buffer.ptr.is_null()
+            && buffer.device_id == exchange.device(rank) && buffer.bytes >= bytes;
+        ensure!(valid(projection.partial, bytes), "head partial storage/device mismatch");
+        if precision == HeadPrecision::Bf16 {
+            let out = projection.rounded.context("BF16 head merge needs rounded output")?;
+            ensure!(valid(out, bytes) && out.ptr != projection.partial.ptr,
+                "BF16 head merge storage/device mismatch");
+        }
+    }
+    for (rank, projection) in projected.iter().enumerate() {
+        exchange.push(rank, slot, projection.partial.ptr, bytes)?;
+    }
+    for (rank, projection) in projected.iter().enumerate() {
+        exchange.wait(rank, slot)?;
+        let received = exchange.recv(rank, slot)?.cast_const();
+        let own = projection.partial.ptr.cast_const();
+        let ordered = if rank == 0 { [own, received] } else { [received, own] };
+        let values = match precision {
+            HeadPrecision::F32 => HeadMerge::F32(ordered),
+            HeadPrecision::Bf16 => {
+                let out = projection.rounded.expect("validated rounded head output");
+                exchange.add(rank, ordered, out.ptr, count)?;
+                HeadMerge::Bf16(out)
+            }
+        };
+        kernels.merge(rank, values)?;
+    }
+    Ok(())
 }
 
 /// Family buffers and kernels. Packing is queued on the source stream;
@@ -360,8 +560,35 @@ fn layer_stack_with(placement: &Placement, exchange: &impl LayerProtocol,
 pub(crate) fn layer_pipeline<K: PipelineKernels>(scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
     plan: &LayerExecutionPlan, peer: &PeerExchange<'_>, hops: &HopLink<'_>,
     order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
-    hops.validate_binding(plan, peer)?;
-    layer_pipeline_with(scope, plan, &LayerExchange { peer, hops }, order, rows, kernels)
+    layer_pipeline_lanes(scope, plan, &[(peer, hops)], order, rows, kernels)
+}
+
+/// Instances bind streams and control words together. One shared instance is
+/// valid for serialized rank streams; independent streams require one per lane.
+pub(crate) fn layer_pipeline_lanes<K: PipelineKernels>(scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    plan: &LayerExecutionPlan, instances: &[(&PeerExchange<'_>, &HopLink<'_>)],
+    order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    let lanes: Vec<_> = (0..kernels.len()).collect();
+    layer_pipeline_selected(scope, plan, instances, &lanes, order, rows, kernels)
+}
+
+/// Submit an active subset without renumbering its admitted transport slots.
+pub(crate) fn layer_pipeline_selected<K: PipelineKernels>(scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    plan: &LayerExecutionPlan, instances: &[(&PeerExchange<'_>, &HopLink<'_>)], lanes: &[usize],
+    order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    validate_pipeline_selection(plan, lanes, rows, kernels.len())?;
+    ensure!(instances.len() == 1 || instances.len() == kernels.len(),
+        "layer pipeline needs one shared exchange or one instance per lane");
+    let exchanges = instances.iter().map(|&(peer, hops)| {
+        hops.validate_binding(plan, peer)?;
+        Ok(LayerExchange { peer, hops })
+    }).collect::<Result<Vec<_>>>()?;
+    for (index, &lane) in lanes.iter().enumerate() {
+        let instance = if instances.len() == 1 { 0 } else { index };
+        instances[instance].1.validate_dispatch(lane, instances.len() == 1 && lanes.len() > 1)?;
+    }
+    let exchanges: Vec<_> = exchanges.iter().collect();
+    layer_pipeline_selected_instances(scope, plan, &exchanges, lanes, order, rows, kernels)
 }
 
 fn pipeline_hops(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, point: HopPoint,
@@ -398,13 +625,43 @@ fn pipeline_attention(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, 
 pub(crate) fn layer_pipeline_with<K: PipelineKernels>(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
     plan: &LayerExecutionPlan, exchange: &impl LayerProtocol,
     order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    layer_pipeline_instances(_scope, plan, &[exchange], order, rows, kernels)
+}
+
+fn pipeline_instance<'e, P>(instances: &[&'e P], lane: usize) -> Result<&'e P> {
+    instances.get(if instances.len() == 1 { 0 } else { lane }).copied()
+        .context("layer pipeline missing lane exchange")
+}
+
+fn layer_pipeline_instances<K: PipelineKernels>(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    plan: &LayerExecutionPlan, exchanges: &[&impl LayerProtocol],
+    order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    let lanes: Vec<_> = (0..kernels.len()).collect();
+    layer_pipeline_selected_instances(_scope, plan, exchanges, &lanes, order, rows, kernels)
+}
+
+fn validate_pipeline_selection(plan: &LayerExecutionPlan, lanes: &[usize], rows: &[usize], count: usize) -> Result<()> {
     cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes,
         usize::try_from(plan.spec().lanes)?)?;
-    ensure!(!kernels.is_empty() && kernels.len() == rows.len()
-        && kernels.len() as u64 <= plan.spec().lanes, "layer pipeline needs one or two admitted lanes");
+    ensure!(!lanes.is_empty() && lanes.len() == count && lanes.len() == rows.len()
+        && lanes.len() as u64 <= plan.spec().lanes, "layer pipeline needs one or two admitted lanes");
+    ensure!(lanes.iter().enumerate().all(|(index, &lane)| (lane as u64) < plan.spec().lanes
+        && !lanes[..index].contains(&lane)), "layer pipeline duplicate or unadmitted lane");
     ensure!(rows.iter().all(|&rows| rows > 0 && rows as u64 <= plan.spec().rows),
         "layer pipeline rows outside admission");
-    exchange.require_live()?;
+    Ok(())
+}
+
+/// Generic protocols retain admitted lane IDs, including single-device instances.
+/// Callers own protocol binding; selection, state owners and hop inventory are
+/// validated by the same pipeline used by peer-backed instances.
+pub(crate) fn layer_pipeline_selected_instances<K: PipelineKernels>(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    plan: &LayerExecutionPlan, exchanges: &[&impl LayerProtocol], lanes: &[usize],
+    order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    validate_pipeline_selection(plan, lanes, rows, kernels.len())?;
+    ensure!(exchanges.len() == 1 || exchanges.len() == kernels.len(),
+        "layer pipeline needs one shared exchange or one instance per lane");
+    for exchange in exchanges { exchange.require_live()?; }
     let count = plan.modes().len();
     for kernel in kernels.iter() {
         for layer in 0..count {
@@ -423,7 +680,8 @@ pub(crate) fn layer_pipeline_with<K: PipelineKernels>(_scope: &crate::shared::ex
         LaneOrder::OrderedChunks => {
             for layer in 0..count {
                 for lane in 0..kernels.len() {
-                    let owner = pipeline_attention(exchange, plan, layer, lane, rows[lane], &mut kernels[lane], &mut consumed[lane])?;
+                    let exchange = pipeline_instance(exchanges, lane)?;
+                    let owner = pipeline_attention(exchange, plan, layer, lanes[lane], rows[lane], &mut kernels[lane], &mut consumed[lane])?;
                     let ticket = kernels[lane].begin_ffn(layer, owner)?;
                     exchange.require_live()?;
                     kernels[lane].finish_ffn(layer, ticket)?;
@@ -438,18 +696,20 @@ pub(crate) fn layer_pipeline_with<K: PipelineKernels>(_scope: &crate::shared::ex
                 let mut pending = Vec::with_capacity(kernels.len());
                 for lane in 0..kernels.len() {
                     let Some(layer) = wave.checked_sub(lane).filter(|&layer| layer < count) else { continue };
-                    let owner = pipeline_attention(exchange, plan, layer, lane, rows[lane], &mut kernels[lane], &mut consumed[lane])?;
+                    let exchange = pipeline_instance(exchanges, lane)?;
+                    let owner = pipeline_attention(exchange, plan, layer, lanes[lane], rows[lane], &mut kernels[lane], &mut consumed[lane])?;
                     pending.push((lane, layer, kernels[lane].begin_ffn(layer, owner)?));
                 }
                 for (lane, layer, ticket) in pending {
-                    exchange.require_live()?;
+                    pipeline_instance(exchanges, lane)?.require_live()?;
                     kernels[lane].finish_ffn(layer, ticket)?;
                 }
             }
         }
     }
     for lane in 0..kernels.len() {
-        pipeline_hops(exchange, plan, HopPoint::Exit, lane, rows[lane], &mut kernels[lane], &mut consumed[lane])?;
+        let exchange = pipeline_instance(exchanges, lane)?;
+        pipeline_hops(exchange, plan, HopPoint::Exit, lanes[lane], rows[lane], &mut kernels[lane], &mut consumed[lane])?;
     }
     validate_hop_inventory(plan, &consumed)
 }
@@ -497,6 +757,265 @@ fn validate_stack(placement: &Placement) -> Result<()> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[derive(Clone, Copy)]
+    enum HeadOp { Publish(usize), Wait(usize), Consume(usize) }
+
+    struct HeadTrace {
+        precision: HeadPrecision,
+        memory: RefCell<[Vec<HeadOp>; 2]>,
+        calls: RefCell<Vec<&'static str>>,
+        schedule: RefCell<super::super::order::Schedule>,
+        owners: RefCell<crate::shared::experts::rtx::pair::TestSubmission<'static>>,
+        fault: Option<(usize, bool)>,
+        inputs: [Vec<u32>; 2],
+        outputs: RefCell<[Vec<u32>; 2]>,
+    }
+    impl HeadTrace {
+        fn new(precision: HeadPrecision) -> Self {
+            Self { precision, memory: RefCell::new([vec![], vec![]]),
+                calls: RefCell::new(vec![]), schedule: RefCell::new(Default::default()),
+                owners: RefCell::new(crate::shared::experts::rtx::pair::TestSubmission::new(None)),
+                fault: None, inputs: [vec![0; 8], vec![0; 8]], outputs: RefCell::new([vec![], vec![]]) }
+        }
+        fn call(&self, name: &'static str) -> Result<()> {
+            self.owners.borrow().require_live()?;
+            let index = self.calls.borrow().len();
+            self.calls.borrow_mut().push(name);
+            if let Some((at, panic)) = self.fault.filter(|&(at, _)| at == index) {
+                if panic { panic!("injected head callback {at}"); }
+                anyhow::bail!("injected head callback {at}");
+            }
+            Ok(())
+        }
+        fn values(&self, ptr: *const c_void) -> &[u32] {
+            match ptr as usize { 1 | 12 => &self.inputs[0], 2 | 11 => &self.inputs[1], _ => panic!("bad head pointer") }
+        }
+        fn sum(&self, rank: usize, values: [*const c_void; 2], precision: HeadPrecision) {
+            assert_eq!(values.map(|p| p as usize), if rank == 0 { [1, 11] } else { [12, 2] });
+            let narrow = |value: f32| {
+                let bits = value.to_bits();
+                if value.is_nan() { (bits >> 16) | 0x40 }
+                else { bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16 }
+            };
+            *self.outputs.borrow_mut().get_mut(rank).unwrap() = self.values(values[0]).iter()
+                .zip(self.values(values[1])).map(|(&a, &b)| {
+                    let f = |v| f32::from_bits(if precision == HeadPrecision::Bf16 { v << 16 } else { v });
+                    let sum = f(a) + f(b);
+                    // Model a family's F32->BF16 boundary and F32 residual join.
+                    let rounded = narrow(sum);
+                    (f32::from_bits(rounded << 16) + 0.25).to_bits()
+                }).collect();
+        }
+        fn run(&self) -> Result<()> {
+            use crate::shared::experts::rtx::pair::{submit_scoped, teardown};
+            submit_scoped(|| self.owners.borrow().require_live(), || teardown(&mut &*self),
+                |_| head_partials_with(self, 0, self.inputs[0].len(), self.precision, &mut &*self))
+        }
+    }
+    impl HeadProtocol for HeadTrace {
+        fn require_live(&self) -> Result<()> { self.call("live") }
+        fn device(&self, rank: usize) -> i32 { rank as i32 }
+        fn capacity(&self) -> usize { 1 << 20 }
+        fn validate_slot(&self, slot: usize) -> Result<()> {
+            ensure!(slot < 4, "invalid head slot");
+            Ok(())
+        }
+        fn push(&self, rank: usize, slot: usize, _: *const c_void, bytes: usize) -> Result<()> {
+            self.call("push")?;
+            assert_eq!(bytes, self.inputs[rank].len() * if self.precision == HeadPrecision::F32 { 4 } else { 2 });
+            self.memory.borrow_mut()[rank].push(HeadOp::Publish(slot));
+            self.schedule.borrow_mut().push(rank, "head", slot, "head push"); Ok(())
+        }
+        fn wait(&self, rank: usize, slot: usize) -> Result<()> {
+            self.call("wait")?;
+            self.memory.borrow_mut()[rank].push(HeadOp::Wait(slot));
+            self.schedule.borrow_mut().wait(rank, "head", slot, "head wait"); Ok(())
+        }
+        fn recv(&self, rank: usize, slot: usize) -> Result<*mut c_void> {
+            self.call("recv")?;
+            // The merge is the last device reader, after the matching wait.
+            self.memory.borrow_mut()[rank].push(HeadOp::Consume(slot));
+            Ok((11 + rank) as *mut c_void)
+        }
+        fn add(&self, rank: usize, values: [*const c_void; 2], out: *mut c_void, count: usize) -> Result<()> {
+            self.call("add")?;
+            assert_eq!((out as usize, count), (21 + rank, self.inputs[rank].len()));
+            self.sum(rank, values, HeadPrecision::Bf16); Ok(())
+        }
+    }
+    impl HeadKernels for &HeadTrace {
+        fn project(&mut self, rank: usize) -> Result<HeadProjection> {
+            self.call("project")?;
+            let buffer = |ptr| cuteafd_ffi::CuteafdDeviceBuffer { ptr: ptr as *mut c_void,
+                bytes: 1 << 20, device_id: rank as i32, flags: 0 };
+            Ok(HeadProjection { partial: buffer(1 + rank), rounded: Some(buffer(21 + rank)) })
+        }
+        fn merge(&mut self, rank: usize, values: HeadMerge) -> Result<()> {
+            self.call("merge")?;
+            match values {
+                HeadMerge::F32(values) => self.sum(rank, values, HeadPrecision::F32),
+                HeadMerge::Bf16(buffer) => assert_eq!(buffer.ptr as usize, 21 + rank),
+            }
+            Ok(())
+        }
+    }
+    impl crate::shared::experts::rtx::pair::SubmissionOwners for &HeadTrace {
+        fn abort_all(&mut self) -> Result<()> { self.owners.borrow_mut().abort_all() }
+        fn drain_ranks(&mut self) -> Result<()> {
+            self.owners.borrow_mut().drain_ranks()?;
+            super::super::order::check_terminal(&self.schedule.borrow(), !self.owners.borrow().live)
+                .map_err(anyhow::Error::msg)
+        }
+        fn quiesce_links(&mut self) -> Result<()> { self.owners.borrow_mut().quiesce_links() }
+        fn drain_copies(&mut self) -> Result<()> { self.owners.borrow_mut().drain_copies() }
+        fn retire_graphs(&mut self) -> Result<()> { self.owners.borrow_mut().retire_graphs() }
+        fn finish(&mut self, drained: bool) { self.owners.borrow_mut().finish(drained); }
+    }
+
+    #[test]
+    fn head_partials_publish_before_wait_and_merge_in_fixed_rank_order() {
+        for precision in [HeadPrecision::Bf16, HeadPrecision::F32] {
+            let mut trace = HeadTrace::new(precision);
+            let patterns = [0, 0x8000, 0x3f80, 0xbf80, 0x7f80, 0xff80, 0x7fc1, 0xffc2];
+            trace.inputs = [patterns.to_vec(), patterns.into_iter().rev().collect()];
+            if precision == HeadPrecision::F32 {
+                for values in &mut trace.inputs { for value in values { *value <<= 16; } }
+            }
+            trace.run().unwrap();
+            let calls = trace.calls.borrow();
+            assert_eq!(&calls[..5], ["live", "project", "project", "push", "push"]);
+            super::super::order::check(&trace.schedule.borrow()).unwrap();
+            assert_eq!(trace.outputs.borrow()[0], trace.outputs.borrow()[1]);
+        }
+    }
+
+    #[test]
+    fn head_partial_faults_and_panics_retire_all_queued_owners() {
+        for precision in [HeadPrecision::Bf16, HeadPrecision::F32] {
+            let healthy = HeadTrace::new(precision);
+            healthy.run().unwrap();
+            for at in 0..healthy.calls.borrow().len() {
+                for panic in [false, true] {
+                    let mut trace = HeadTrace::new(precision);
+                    trace.fault = Some((at, panic));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| trace.run()));
+                    if panic { assert!(result.is_err()); }
+                    else { assert!(result.unwrap().is_err()); }
+                    trace.owners.borrow().verify_retired().unwrap();
+                    assert_eq!(trace.calls.borrow().len(), at + 1);
+                    let schedule = trace.schedule.borrow().streams.clone();
+                    assert!(trace.run().is_err());
+                    assert_eq!(schedule, trace.schedule.borrow().streams);
+                }
+            }
+        }
+    }
+
+    /// Explore every runnable rank interleaving, keeping received payloads live
+    /// until Consume rather than treating Wait as the end of the reader.
+    fn head_storage_safe(streams: &[Vec<HeadOp>; 2]) -> bool {
+        let prefix = streams.each_ref().map(|stream| {
+            let mut counts = vec![[[0usize; 4]; 3]];
+            for &op in stream {
+                let mut next = *counts.last().unwrap();
+                let (kind, slot) = match op {
+                    HeadOp::Publish(slot) => (0, slot),
+                    HeadOp::Wait(slot) => (1, slot),
+                    HeadOp::Consume(slot) => (2, slot),
+                };
+                next[kind][slot] += 1;
+                counts.push(next);
+            }
+            counts
+        });
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = vec![[0usize; 2]];
+        while let Some(at) = todo.pop() {
+            if !seen.insert(at) { continue; }
+            let mut advanced = false;
+            for rank in 0..2 {
+                let Some(&op) = streams[rank].get(at[rank]) else { continue; };
+                let own = prefix[rank][at[rank]];
+                let peer = prefix[1 - rank][at[1 - rank]];
+                match op {
+                    HeadOp::Publish(slot) => {
+                        if peer[2][slot] < own[0][slot] { return false; }
+                    }
+                    HeadOp::Wait(slot) => {
+                        if peer[0][slot] <= own[1][slot] { continue; }
+                    }
+                    HeadOp::Consume(slot) => {
+                        if peer[0][slot] != own[1][slot] { return false; }
+                    }
+                }
+                let mut next = at;
+                next[rank] += 1;
+                todo.push(next);
+                advanced = true;
+            }
+            if !advanced && at != streams.each_ref().map(Vec::len) { return false; }
+        }
+        true
+    }
+
+    #[test]
+    fn head_parity_preserves_consumers_across_odd_passes_and_two_lanes() -> Result<()> {
+        for precision in [HeadPrecision::Bf16, HeadPrecision::F32] {
+            let trace = HeadTrace::new(precision);
+            let mut sequences = [HeadSequence::new(0)?, HeadSequence::new(1)?];
+            for pass in 0..3 {
+                for sequence in &sequences { assert_eq!(sequence.parity(), pass % 2); }
+                // The native schedule has 69 SWA layers with CSA gaps. Ordinal
+                // parity, not physical-layer parity, persists into the next pass.
+                for layer in 0..92 {
+                    if layer % 4 == 3 { continue; }
+                    for sequence in &mut sequences {
+                        head_partials_next_with(&trace, sequence, 8, precision, &mut &trace)?;
+                    }
+                }
+                trace.schedule.borrow_mut().end_request();
+            }
+            super::super::order::check(&trace.schedule.borrow()).unwrap();
+            assert!(head_storage_safe(&trace.memory.borrow()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn head_storage_model_rejects_single_slot_and_padded_odd_passes() -> Result<()> {
+        for slots in [vec![0, 0], vec![0, 1, 0, 0]] {
+            let trace = HeadTrace::new(HeadPrecision::F32);
+            for slot in slots {
+                head_partials_with(&trace, slot, 8, HeadPrecision::F32, &mut &trace)?;
+            }
+            // Matching waits alone pass the old model, but a faster producer
+            // can overwrite a received plane before the peer's queued merge.
+            super::super::order::check(&trace.schedule.borrow()).unwrap();
+            assert!(!head_storage_safe(&trace.memory.borrow()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn head_sequence_rejects_invalid_lane_and_overflow_before_enqueue() -> Result<()> {
+        assert!(HeadSequence::new(2).is_err());
+        let trace = HeadTrace::new(HeadPrecision::F32);
+        let mut sequence = HeadSequence { lane: 0, ordinal: u64::MAX };
+        assert!(head_partials_next_with(&trace, &mut sequence, 8, HeadPrecision::F32, &mut &trace).is_err());
+        assert!(trace.calls.borrow().is_empty());
+        assert_eq!(sequence.ordinal, u64::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn head_partial_invalid_extents_fail_before_projection() {
+        for (slot, count) in [(DIRECT, 1), (4, 1), (0, 0), (0, usize::MAX), (0, 1 << 20)] {
+            let trace = HeadTrace::new(HeadPrecision::F32);
+            assert!(head_partials_with(&trace, slot, count, HeadPrecision::F32, &mut &trace).is_err());
+            assert!(trace.calls.borrow().is_empty());
+        }
+    }
 
     struct Recorder {
         calls: RefCell<Vec<String>>,
@@ -838,6 +1357,124 @@ mod tests {
         fn drain_copies(&mut self) -> Result<()> { self.owners.borrow_mut().drain_copies() }
         fn retire_graphs(&mut self) -> Result<()> { self.owners.borrow_mut().retire_graphs() }
         fn finish(&mut self, drained: bool) { self.owners.borrow_mut().finish(drained); }
+    }
+
+    #[test]
+    fn independent_pipeline_dispatches_entry_hops_and_waits_to_each_lane_instance() {
+        use crate::shared::experts::rtx::pair::submit_scoped;
+        let plan = execution_plan(&[LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
+            LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }], 0, 1);
+        for order in [LaneOrder::Independent, LaneOrder::OrderedChunks] {
+            let traces = [PipelineTrace::new(&plan), PipelineTrace::new(&plan)];
+            let mut kernels: Vec<_> = traces.iter().enumerate()
+                .map(|(lane, shared)| PipelineRecorder { shared, lane }).collect();
+            let exchanges = [&traces[0], &traces[1]];
+            // These CPU protocols own no asynchronous storage; the normal scoped
+            // boundary supplies the same unforgeable pipeline proof as serving.
+            submit_scoped(|| Ok(()), || Ok(()), |scope|
+                layer_pipeline_instances(scope, &plan, &exchanges, order, &[6, 6], &mut kernels)).unwrap();
+            for (lane, trace) in traces.iter().enumerate() {
+                let transfers = trace.transfers.borrow();
+                assert_eq!(transfers.len(), plan.hops().len() * 2);
+                for index in 0..plan.hops().len() {
+                    for pushed in [true, false] {
+                        assert_eq!(transfers.iter().filter(|&&event| event == (lane, index, pushed)).count(), 1);
+                    }
+                }
+                assert!(trace.calls.borrow().iter().all(|&(actual, _, _)| actual == lane));
+                trace.schedule.borrow_mut().end_request();
+                super::super::order::check(&trace.schedule.borrow()).unwrap();
+            }
+            assert!(std::ptr::eq(pipeline_instance(&exchanges, 1).unwrap(), &traces[1]));
+            assert!(std::ptr::eq(pipeline_instance(&exchanges[..1], 1).unwrap(), &traces[0]));
+            assert!(pipeline_instance(&exchanges, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn selected_pipeline_preserves_lane_ids_for_subsets_reordering_and_unequal_rows() {
+        use crate::shared::experts::rtx::pair::submit_scoped;
+        let plan = execution_plan(&[LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
+            LayerMode::HeadSplit, LayerMode::ContextSplit,
+            LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }], 0, 1);
+        for order in [LaneOrder::Independent, LaneOrder::OrderedChunks] {
+            for selected in [&[0][..], &[1][..], &[0, 1][..], &[1, 0][..]] {
+                let traces: Vec<_> = selected.iter().map(|_| PipelineTrace::new(&plan)).collect();
+                let exchanges: Vec<_> = traces.iter().collect();
+                let mut kernels: Vec<_> = traces.iter().zip(selected)
+                    .map(|(shared, &lane)| PipelineRecorder { shared, lane }).collect();
+                let rows: Vec<_> = (1..=selected.len()).collect();
+                submit_scoped(|| Ok(()), || Ok(()), |scope|
+                    layer_pipeline_selected_instances(scope, &plan, &exchanges, selected,
+                        order, &rows, &mut kernels)).unwrap();
+                for (trace, &lane) in traces.iter().zip(selected) {
+                    let transfers = trace.transfers.borrow();
+                    assert_eq!(transfers.len(), plan.hops().len() * 2);
+                    for index in 0..plan.hops().len() {
+                        for pushed in [true, false] {
+                            assert_eq!(transfers.iter().filter(|&&event| event == (lane, index, pushed)).count(), 1);
+                        }
+                    }
+                    assert!(trace.calls.borrow().iter().all(|&(actual, _, _)| actual == lane));
+                    trace.schedule.borrow_mut().end_request();
+                    super::super::order::check(&trace.schedule.borrow()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_single_device_pipeline_never_calls_peer_protocol() {
+        use crate::shared::experts::rtx::pair::submit_scoped;
+        struct Local;
+        impl LayerProtocol for Local {
+            type Ticket = ();
+            fn require_live(&self) -> Result<()> { Ok(()) }
+            fn push_entry(&self, _: usize, _: *const c_void, _: *mut c_void, _: usize) -> Result<()> {
+                panic!("single-device pipeline must not push an entry hop")
+            }
+            fn wait_entry(&self, _: usize) -> Result<()> { panic!("single-device pipeline must not wait for a peer") }
+            fn send(&self, _: usize, _: usize, _: *const c_void, _: usize) -> Result<()> {
+                panic!("single-device pipeline must not send to a peer")
+            }
+            fn land(&self, _: ()) -> Result<*mut c_void> { panic!("single-device pipeline must not land a peer reply") }
+        }
+        let modes = [LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; 3];
+        let plan = execution_plan(&modes, 0, 0);
+        assert!(plan.hops().is_empty());
+        for order in [LaneOrder::Independent, LaneOrder::OrderedChunks] {
+            for selected in [&[0][..], &[1][..], &[1, 0][..]] {
+                let traces: Vec<_> = selected.iter().map(|_| PipelineTrace::new(&plan)).collect();
+                let mut kernels: Vec<_> = traces.iter().zip(selected)
+                    .map(|(shared, &lane)| PipelineRecorder { shared, lane }).collect();
+                let rows = vec![1; selected.len()];
+                submit_scoped(|| Ok(()), || Ok(()), |scope|
+                    layer_pipeline_selected_instances(scope, &plan, &[&Local], selected,
+                        order, &rows, &mut kernels)).unwrap();
+                for (trace, &lane) in traces.iter().zip(selected) {
+                    assert!(trace.transfers.borrow().is_empty());
+                    let expected: Vec<_> = (0..modes.len()).flat_map(|layer|
+                        ["owned", "begin", "finish"].map(|call| (lane, layer, call))).collect();
+                    assert_eq!(*trace.calls.borrow(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_pipeline_rejects_invalid_inventory_before_callbacks() {
+        use crate::shared::experts::rtx::pair::submit_scoped;
+        let plan = execution_plan(&[LayerMode::HeadSplit], 0, 0);
+        for (selected, rows, count) in [(vec![], vec![], 0), (vec![2], vec![1], 1),
+            (vec![0, 0], vec![1, 1], 2), (vec![1], vec![], 1),
+            (vec![1], vec![0], 1), (vec![1], vec![usize::MAX], 1), (vec![1], vec![1], 0)] {
+            let trace = PipelineTrace::new(&plan);
+            let mut kernels: Vec<_> = (0..count).map(|_| PipelineRecorder { shared: &trace, lane: 1 }).collect();
+            assert!(submit_scoped(|| Ok(()), || Ok(()), |scope|
+                layer_pipeline_selected_instances(scope, &plan, &[&trace], &selected,
+                    LaneOrder::Independent, &rows, &mut kernels)).is_err());
+            assert!(trace.callbacks.borrow().is_empty());
+        }
     }
 
     #[test]

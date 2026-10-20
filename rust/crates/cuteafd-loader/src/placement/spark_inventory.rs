@@ -298,11 +298,13 @@ pub struct QualifiedSparkRuntime {
 struct SparkHostOwners {
     exchange: u64,
     row_indices: u64,
+    endpoint_staging: u64,
     retained: Vec<Item>,
 }
 impl SparkHostOwners {
     fn new(assignment: &SparkAssignment, execution: &SparkExecutionInventory) -> Self {
         Self { exchange: assignment.io.host_exchange, row_indices: assignment.io.row_indices,
+            endpoint_staging: assignment.io.endpoint_staging,
             retained: execution.retained.host.clone() }
     }
 }
@@ -385,12 +387,12 @@ impl QualifiedSparkRuntime {
         if !quiet_host || source.trim().is_empty() { return Err(invalid("quiet-host census source required")); }
         let deltas = spark_census_deltas(samples).map_err(|error| invalid(error.to_string()))?;
         let context_before = samples.iter().find(|s| s.phase == "before_context").unwrap();
-        let ready = samples.iter().find(|s| s.phase == "serve_owners_before_endpoint_rings").unwrap();
+        let ready = samples.iter().find(|s| s.phase == "steady_after_first_expert_request").unwrap();
         let context = deltas.context;
         let modules = deltas.modules;
         let (method, witness) = match deltas.witness {
-            CensusDeviceWitness::SystemAvailableCgroup => (SparkRuntimeMethod::IntegratedSystemPhaseDelta,
-                "integrated device: isolated MemAvailable + cgroup headroom; retained ledger/system control within 5%; host-only maps/system within 16 MiB"),
+            CensusDeviceWitness::SystemAvailable => (SparkRuntimeMethod::IntegratedSystemPhaseDelta,
+                "integrated device: isolated MemAvailable (cgroup is an admission limit); retained ledger/system control within 5%; host-only maps/system within 16 MiB"),
             CensusDeviceWitness::CudaMappingPss => (SparkRuntimeMethod::ProcessAttributedPhaseDelta,
                 "discrete device: CUDA mapping PSS + system phase within 16 MiB; retained ledger/maps control within 5%"),
         };
@@ -405,7 +407,7 @@ impl QualifiedSparkRuntime {
                 term("expert_modules", modules, method,
                     &format!("before_expert_modules/after_expert_modules_before_weights: {witness}"))?],
             vec![], vec![term("host_measured_residual", residual, SparkRuntimeMethod::MeasuredResidual,
-                "before_context/serve_owners_before_endpoint_rings: system growth less tracked payload/context/modules; lazy host owners not subtracted")?])
+                "before_context/steady_after_first_expert_request: system growth less tracked payload/context/modules; lazy host owners not subtracted")?])
     }
 
     fn new(assignment: &SparkAssignment, execution: &SparkExecutionInventory,
@@ -504,6 +506,7 @@ pub fn v41_spark_inventory(assignment: &SparkAssignment, execution: &SparkExecut
     // inside its manifest arena. Never add assignment.io.intake a second time.
     retained.host.push(item(Category::Transport, "expert_exchange", assignment.io.host_exchange, Basis::Formula));
     retained.host.push(item(Category::Transport, "expert_row_indices", assignment.io.row_indices, Basis::Formula));
+    retained.host.push(item(Category::Transport, "endpoint_response_prefixes", assignment.io.endpoint_staging, Basis::Formula));
     retained.pinned.push(item(Category::Transport, "mapped_endpoint_rings", assignment.io.mapped_rings, Basis::Formula));
     retained.device.extend(runtime.device.iter().map(|t| t.item.clone()));
     retained.pinned.extend(runtime.pinned.iter().map(|t| t.item.clone()));
@@ -558,9 +561,9 @@ mod tests {
             arch: "sm_121".into(), driver: "test".into() }
     }
     fn assignment() -> SparkAssignment {
-        SparkAssignment { rank: 1, resident_bytes: 1000, slices: vec![cuteafd_core::SparkSlice {
+        SparkAssignment { rank: 1, resident_bytes: 1000, slices: vec![cuteafd_core::SparkSlice { unit_map: None,
             layer: 5, first: 768, width: 768, stored_width: 768, tiers: vec![], projection_counts: vec![] }],
-            io: crate::placement::SparkIoBytes { intake: u64::MAX, host_exchange: 111, row_indices: 222, mapped_rings: 333 } }
+            io: crate::placement::SparkIoBytes { intake: u64::MAX, host_exchange: 111, row_indices: 222, mapped_rings: 333, endpoint_staging: 444 } }
     }
     #[test]
     fn constructors_validate_before_publishing_read_only_proofs() {
@@ -591,19 +594,20 @@ mod tests {
 
     fn census_samples() -> Vec<cuteafd_core::expert_geometry::SparkProcessSample> {
         let phases = ["before_context", "after_context_before_media", "before_expert_modules",
-            "after_expert_modules_before_weights", "after_retained_arenas", "serve_owners_before_endpoint_rings"];
+            "after_expert_modules_before_weights", "after_retained_arenas", "serve_owners_before_endpoint_rings",
+            "steady_after_first_expert_request"];
         phases.into_iter().enumerate().map(|(i, phase)| {
             let mib = 1 << 20;
-            let cuda = [0, 32, 32, 96, 1120, 1120][i] * mib;
+            let cuda = [0, 32, 32, 96, 1120, 1120, 1120][i] * mib;
             cuteafd_core::expert_geometry::SparkProcessSample {
                 phase: phase.into(), pid: 42, monotonic_ns: i as u64 + 1,
-                rss_bytes: cuda, pss_bytes: cuda, private_bytes: 0,
+                rss_bytes: cuda, peak_rss_bytes: Some(cuda), cgroup_memory: vec![], pss_bytes: cuda, private_bytes: 0,
                 tracked_device_bytes: if i >= 4 { 1024 * mib } else { 0 }, tracked_pinned_bytes: 0,
                 device_kind: Some(cuteafd_core::expert_geometry::CensusDeviceKind::Discrete),
                 device_witness: Some(cuteafd_core::expert_geometry::CensusDeviceWitness::CudaMappingPss),
                 cuda_mapping_pss_bytes: cuda, anonymous_pss_bytes: 0, file_pss_bytes: 0,
-                system_available_bytes: 8192 * mib - cuda - if i == 5 { 8 * mib + 333 } else { 0 },
-                system_headroom_bytes: 8192 * mib - cuda - if i == 5 { 8 * mib + 333 } else { 0 },
+                system_available_bytes: 8192 * mib - cuda - if i >= 5 { 8 * mib + 333 } else { 0 },
+                system_headroom_bytes: 8192 * mib - cuda - if i >= 5 { 8 * mib + 333 } else { 0 },
                 system_total_bytes: 16384 * mib, allocatable_bytes: None,
                 raw_cuda_free_bytes: None, method: "synthetic unit-test maps/system".into() }
         }).collect()
@@ -627,7 +631,7 @@ mod tests {
         let mut integrated = census_samples();
         for sample in &mut integrated {
             sample.device_kind = Some(cuteafd_core::expert_geometry::CensusDeviceKind::Integrated);
-            sample.device_witness = Some(cuteafd_core::expert_geometry::CensusDeviceWitness::SystemAvailableCgroup);
+            sample.device_witness = Some(cuteafd_core::expert_geometry::CensusDeviceWitness::SystemAvailable);
             sample.cuda_mapping_pss_bytes = 0;
         }
         let uma = construct(&integrated, hashes.clone(), true).unwrap();
@@ -647,7 +651,7 @@ mod tests {
                 1 => samples[2].monotonic_ns = samples[1].monotonic_ns,
                 2 => samples[1].tracked_device_bytes = 1,
                 3 => samples[3].tracked_pinned_bytes = 1,
-                4 => samples[4].cuda_mapping_pss_bytes = samples[3].cuda_mapping_pss_bytes,
+                4 => samples[6].cuda_mapping_pss_bytes = samples[3].cuda_mapping_pss_bytes,
                 5 => samples[1].cuda_mapping_pss_bytes = 0,
                 6 => samples[3].system_available_bytes -= 32 << 20,
                 7 => samples[1].system_total_bytes = 0,
@@ -669,6 +673,9 @@ mod tests {
         let mut changed = a.clone();
         changed.io.host_exchange += 1;
         changed.io.row_indices -= 1;
+        assert!(v41_spark_inventory(&changed, &e, &r, &sample).is_err());
+        changed = a.clone();
+        changed.io.endpoint_staging += 1;
         assert!(v41_spark_inventory(&changed, &e, &r, &sample).is_err());
         changed = a.clone();
         changed.rank += 1;
@@ -708,7 +715,7 @@ mod tests {
         for (rank, samples) in ranks {
             let deltas = spark_census_deltas(&samples).unwrap();
             let before = samples.iter().find(|s| s.phase == "before_context").unwrap();
-            let ready = samples.iter().find(|s| s.phase == "serve_owners_before_endpoint_rings").unwrap();
+            let ready = samples.iter().find(|s| s.phase == "steady_after_first_expert_request").unwrap();
             let residual = census_residual(before, ready, deltas.context, deltas.modules).unwrap();
             println!("{rank}: host_measured_residual_bytes={residual}");
         }
@@ -723,7 +730,7 @@ mod tests {
         let r = runtime(&e);
         let result = v41_spark_inventory(&assignment(), &e, &r, &runtime_sample()).unwrap();
         assert_eq!(result.load_peak, 1000 + 60 + 100 + 200 + 300);
-        assert_eq!(result.serve_peak, 1000 + 60 + e.retained.total().unwrap() + 111 + 222 + 333);
+        assert_eq!(result.serve_peak, 1000 + 60 + e.retained.total().unwrap() + 111 + 222 + 333 + 444);
         assert!(!result.device.iter().any(|i| i.group == "intake"));
         assert_eq!(result.device.iter().chain(&result.pinned).chain(&result.host).map(|i| i.bytes).sum::<u64>(), result.serve_peak);
     }

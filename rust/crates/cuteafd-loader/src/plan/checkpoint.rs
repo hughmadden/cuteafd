@@ -8,7 +8,25 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
+/// Bounds a metadata read, not tensor data. Kimi K3 EXL3 K2's index names
+/// 991,812 tensors (~100 MiB) and its GPTQModel storage map is ~141 MiB.
+const MAX_JSON_BYTES: u64 = 512 * 1024 * 1024;
+
+pub mod identity;
+
+/// Storage discovery is shared by inventories, catalogs and bootstrap identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointFormat { HfIndexed, HfSingle, Exlr8 }
+
+impl CheckpointFormat {
+    pub fn detect(snapshot: &Path) -> Result<Self> {
+        if super::exlr8::recognizes(snapshot)? { return Ok(Self::Exlr8); }
+        if snapshot.join("model.safetensors.index.json").is_file() { return Ok(Self::HfIndexed); }
+        ensure!(snapshot.join("model.safetensors").is_file(),
+            "checkpoint has no recognized tensor inventory");
+        Ok(Self::HfSingle)
+    }
+}
 
 /// Arithmetic declared by the checkpoint, independent of optional load optimizations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -115,6 +133,9 @@ impl Checkpoint {
 
     fn open_filtered(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool) -> Result<Self> {
         let config = read_json(&snapshot.join("config.json"))?;
+        if CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
+            return super::exlr8::inventory(snapshot, config, needed);
+        }
         let quantize_config = ["quantize_config.json", "quantization_config.json", "hf_quant_config.json"]
             .iter()
             .map(|name| snapshot.join(name))
@@ -254,6 +275,18 @@ impl Checkpoint {
 
     fn declared_numerics(&self, module: &str) -> Result<ModuleNumerics> {
         let module = module.strip_suffix(".weight").unwrap_or(module);
+        // Stacked MoE projections are parameters of the MoE, not child Linear
+        // modules. In particular, a router-module wildcard must not accidentally
+        // match the lexical gate_proj parameter stem. Keep the original stem for
+        // storage/scale validation and projection-target declarations below.
+        let owner = module.rsplit_once('.').and_then(|(parent, parameter)| {
+            (parent.ends_with(".moe") && matches!(parameter, "gate_proj" | "up_proj" | "down_proj"))
+                .then_some(parent)
+        }).unwrap_or(module);
+        self.declared_numerics_for_owner(module, owner)
+    }
+
+    fn declared_numerics_for_owner(&self, module: &str, owner: &str) -> Result<ModuleNumerics> {
         let Some(root) = self.quantization() else { return Ok(ModuleNumerics::CheckpointPrecision) };
         let q = root.get("quantization").unwrap_or(root);
         if root.get("quant_method").and_then(Value::as_str) != Some("modelopt")
@@ -261,7 +294,7 @@ impl Checkpoint {
             return Ok(ModuleNumerics::CheckpointPrecision);
         }
         if ["ignore", "exclude_modules"].iter().any(|key| q.get(key).and_then(Value::as_array).is_some_and(|rules|
-            rules.iter().filter_map(Value::as_str).any(|rule| module_match(rule, module)))) {
+            rules.iter().filter_map(Value::as_str).any(|rule| module_match(rule, owner)))) {
             return Ok(ModuleNumerics::CheckpointPrecision);
         }
         let mut selected = None;
@@ -582,6 +615,20 @@ mod sliced_tests {
             assert!(checkpoint.spark_input_is_bf16(), "{model}");
             let numerics = checkpoint.declared_module_numerics().unwrap();
             assert!(numerics.values().any(|value| *value == ModuleNumerics::W4A4), "{model}");
+            // Compare every indexed weight, not just representative modules:
+            // legacy per-expert exports must keep exactly the same ignore and
+            // quantized sets under module ownership resolution.
+            for module in numerics.keys() {
+                assert_eq!(checkpoint.declared_numerics(module).unwrap(),
+                    checkpoint.declared_numerics_for_owner(module, module).unwrap(),
+                    "changed legacy declaration for {model}/{module}");
+            }
+            let report = super::super::plan(&path, &super::super::PlanOptions {
+                placement: super::super::ExpertPlacement::Sparks { ranks: 6 },
+                layout: Some(Default::default()), ..Default::default()
+            }).unwrap();
+            assert!(report.config_error.is_none(), "{model}: {:?}", report.config_error);
+            eprintln!("{model}: {} numerics entries unchanged; live planner accepted config", numerics.len());
         }
     }
 

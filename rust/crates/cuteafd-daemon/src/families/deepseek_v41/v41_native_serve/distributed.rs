@@ -50,7 +50,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let topology = crate::shared::spark_topology::for_checkpoint(
         topology, args.peers.len(), catalog.exl3().is_some());
     let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
-    crate::shared::spark_topology::require_world(spark_world, &catalog)?;
+    crate::shared::spark_topology::require_world(spark_world, &catalog,
+        &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;
     lib.v41_compact_reducer()?.require_rank_count(spark_world.topology().world_size() as u32)?;
     let map = CachePlacement::encoder_decoder();
     let started = Instant::now();
@@ -398,7 +399,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let token_map = cuteafd_loader::EngramTokenMap::from_file(&args.snapshot.join("tokenizer.json"))?;
     let rows = capacity as usize;
     let pipeline = unsafe { cuteafd_loader::EngramPipeline::new(&catalog, token_map, rows,
-        2 * cuteafd_core::ENGRAM_LAYERS.len(), rows * 64 * 1024)? };
+        2 * cuteafd_core::ENGRAM_LAYERS.len(), rows * 64 * 1024,
+            cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
+    cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());
     let mut requests = if args.tp2_attention {
         Requests::new_replicated(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)?
     } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)? };

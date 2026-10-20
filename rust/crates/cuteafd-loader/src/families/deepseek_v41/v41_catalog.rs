@@ -98,6 +98,7 @@ impl RoutedExpertShape {
 
 #[derive(Debug)]
 pub struct OfficialV41Catalog {
+    format: crate::plan::checkpoint::CheckpointFormat,
     /// The strict V4.1 contract; `None` for other families, which only expose
     /// their routed experts through this catalog.
     config: Option<OfficialV41Config>,
@@ -142,6 +143,12 @@ impl OfficialV41Catalog {
     /// Restrict the coordinator catalog to the selected checkpoint drafter.
     /// Spark workers always select `None`: bundled draft experts are local.
     pub fn select_draft(&mut self, ownership: crate::plan::spec::DraftOwnership) -> Result<()> {
+        if self.format == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
+            ensure!(!ownership.uses_checkpoint(), "EXLR8 MTP drafter not wired; use the default GLM DFlash2 external drafter");
+            self.experts.draft_stages = 0;
+            self.experts.draft_experts = 0;
+            return Ok(());
+        }
         if ownership.uses_checkpoint() { return Ok(()); }
         let checkpoint = crate::plan::Checkpoint::inventory(&self.snapshot)?;
         let family = crate::plan::family::detect(&checkpoint).context("catalog family")?;
@@ -159,6 +166,8 @@ impl OfficialV41Catalog {
         if let Some(tensors) = &mut self.fp8 { tensors.retain_backbone(); }
         Ok(())
     }
+
+    pub fn format(&self) -> crate::plan::checkpoint::CheckpointFormat { self.format }
 
     pub fn exl3(&self) -> Option<&crate::V41Exl3Manifest> {
         self.exl3.as_ref()
@@ -790,7 +799,7 @@ fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String
         );
     }
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog {
+    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         experts: RoutedExpertShape::of_v41(&config),
         config: Some(config),
         snapshot: snapshot.to_path_buf(),
@@ -812,6 +821,20 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     }
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen4_exp") {
         return read_qwen4_expert_catalog(snapshot, &config);
+    }
+    if matches!(config["model_type"].as_str(), Some("step5" | "step5_vl")) {
+        let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
+        let cfg = crate::plan::families::step5::Config::parse(&checkpoint)?;
+        // The final target layer is dense; bundled MTP stages are separately owned.
+        let first_layer = cfg.moe[..cfg.layers].iter().position(|&moe| moe).context("Step-5 has no routed layers")?;
+        let end = cfg.moe[..cfg.layers].iter().rposition(|&moe| moe).unwrap() + 1;
+        ensure!(cfg.moe[first_layer..end].iter().all(|&moe| moe), "Step-5 routed layer set is not contiguous");
+        let shape = RoutedExpertShape { layers: end, first_layer, experts: cfg.experts,
+            topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate, draft_stages: 0, draft_experts: 0 };
+        let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape,
+            &(first_layer..end).collect())?;
+        return Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),
+            tensors: Vec::new(), exl3: None, nvfp4: None, fp8: Some(fp8) });
     }
     if config.get("text_config").is_some() {
         return read_official_v41_catalog(snapshot);
@@ -856,6 +879,17 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         draft_stages: 0,
         draft_experts: 0,
     };
+    if crate::plan::checkpoint::CheckpointFormat::detect(snapshot)? == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
+        ensure!(config["model_type"] == "glm_moe_dsa", "EXLR8 requires GLM DSA");
+        crate::plan::Checkpoint::inventory(snapshot)?;
+        let draft_layers = crate::plan::exlr8::draft_layers(snapshot, config)?;
+        let mut shape = shape;
+        shape.draft_stages = draft_layers.len();
+        shape.draft_experts = if draft_layers.is_empty() { 0 } else { shape.experts };
+        return Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
+            config: None, experts: shape, snapshot: snapshot.into(), tensors: Vec::new(),
+            exl3: None, nvfp4: None, fp8: None });
+    }
     if let Some(catalog) = nvfp4_catalog(snapshot, config, shape)? {
         return Ok(catalog);
     }
@@ -905,7 +939,7 @@ pub fn read_qwen4_mtp_expert_catalog(snapshot: &Path, stages: usize) -> Result<O
     let layers = (cfg.layers..cfg.layers + stages).collect();
     let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape, &layers)?;
     for layer in layers { fp8.for_layer(layer)?; }
-    Ok(OfficialV41Catalog { config: None, experts: shape, snapshot: snapshot.to_path_buf(), tensors: Vec::new(),
+    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(), tensors: Vec::new(),
         exl3: None, nvfp4: None, fp8: Some(fp8) })
 }
 
@@ -985,11 +1019,16 @@ fn nvfp4_catalog(snapshot: &Path, config: &serde_json::Value, shape: RoutedExper
     if !modelopt.experts_nvfp4() {
         return Ok(None);
     }
-    let mut catalog = fp8_catalog(snapshot, shape)?;
+    let catalog = fp8_catalog(snapshot, shape)?;
     let tensors = catalog.fp8().context("NVFP4 catalog")?;
     ensure!(tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4,
         "{} declares NVFP4 routed experts, but layer {} stores {:?}", modelopt.source, shape.first_layer,
         tensors.format());
+    Ok(Some(catalog))
+}
+
+fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41Catalog> {
+    let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read(snapshot, shape)?;
     // The coordinator's tensors (serve-glm reads its weights through the catalog):
     // everything but the backbone's routed experts, which Fp8ExpertTensors serves.
     #[derive(Deserialize)]
@@ -1004,17 +1043,11 @@ fn nvfp4_catalog(snapshot: &Path, config: &serde_json::Value, shape: RoutedExper
         .map(|(shard, metadata)| V41Tensor { shard, metadata, placement: V41TensorPlacement::CoordinatorRtx })
         .collect();
     coordinator.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    catalog.tensors = coordinator;
-    Ok(Some(catalog))
-}
-
-fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41Catalog> {
-    let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read(snapshot, shape)?;
-    Ok(OfficialV41Catalog {
+    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: shape,
         snapshot: snapshot.to_path_buf(),
-        tensors: Vec::new(),
+        tensors: coordinator,
         exl3: None,
         nvfp4: None,
         fp8: Some(fp8),
@@ -1105,7 +1138,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
         v4.n_routed_experts
     );
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog {
+    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: RoutedExpertShape {
             layers: v4.n_layers,
@@ -1210,7 +1243,7 @@ fn deepseek_v4_exl3_catalog(
         manifest.projections.len()
     );
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog {
+    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: manifest.experts,
         snapshot: snapshot.to_path_buf(),
@@ -1349,6 +1382,56 @@ mod tests {
         OfficialV41Config::from_json(include_bytes!("official-v41-config.json"))
             .unwrap()
     }
+    fn assert_glm_coordinator_tensors(catalog: &OfficialV41Catalog) {
+        for name in ["model.embed_tokens.weight", "lm_head.weight", "model.norm.weight"] {
+            let tensor = catalog.tensor(name).unwrap();
+            assert_eq!(tensor.placement, V41TensorPlacement::CoordinatorRtx);
+            assert_eq!(tensor.metadata.dtype, DType::Bf16);
+        }
+    }
+
+    #[test]
+    fn glm_fp8_catalog_keeps_coordinator_tensors_before_and_after_draft_selection() {
+        use crate::plan::testing::{fp8, glm5_config, t, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let mut tensors = vec![
+            t("model.embed_tokens.weight", "BF16", &[64, 6144]),
+            t("lm_head.weight", "BF16", &[64, 6144]),
+            t("model.norm.weight", "BF16", &[6144]),
+            t("model.layers.2.enorm.weight", "BF16", &[6144]),
+        ];
+        for layer in [1, 2] {
+            for (projection, rows, cols) in [("gate_proj", 2048, 6144),
+                ("up_proj", 2048, 6144), ("down_proj", 6144, 2048)] {
+                tensors.extend(fp8(&format!("model.layers.{layer}.mlp.experts.0.{projection}"), rows, cols, None));
+            }
+        }
+        write_snapshot(dir.path(), &glm5_config(), &tensors, None);
+        let mut catalog = read_expert_catalog(dir.path()).unwrap();
+        assert_glm_coordinator_tensors(&catalog);
+        assert!(catalog.tensor("model.layers.1.mlp.experts.0.gate_proj.weight").is_err());
+        assert!(catalog.tensor("model.layers.2.enorm.weight").is_ok());
+        catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
+        assert_glm_coordinator_tensors(&catalog);
+        assert!(catalog.tensor("model.layers.2.enorm.weight").is_err());
+        assert!(catalog.fp8().unwrap().has_layer(1));
+        assert!(!catalog.fp8().unwrap().has_layer(2));
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_GLM_FP8_SNAPSHOT and CUTEAFD_GLM_EXL3_SNAPSHOT"]
+    fn mounted_glm_fp8_and_exl3_keep_coordinator_tensors() {
+        for key in ["CUTEAFD_GLM_FP8_SNAPSHOT", "CUTEAFD_GLM_EXL3_SNAPSHOT"] {
+            let snapshot = std::env::var_os(key).expect(key);
+            let mut catalog = read_expert_catalog(Path::new(&snapshot)).unwrap();
+            assert_eq!(catalog.fp8().is_some(), key == "CUTEAFD_GLM_FP8_SNAPSHOT");
+            assert_eq!(catalog.exl3().is_some(), key == "CUTEAFD_GLM_EXL3_SNAPSHOT");
+            assert_glm_coordinator_tensors(&catalog);
+            catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
+            assert_glm_coordinator_tensors(&catalog);
+        }
+    }
+
     #[test]
     fn checkpoint_contract_keeps_native_types_and_local_draft_experts() {
         let tensors = expected_tensors().unwrap();
@@ -1388,7 +1471,7 @@ mod tests {
             "weight_map": names.iter().map(|name| (*name, "fixture.safetensors")).collect::<BTreeMap<_, _>>()
         }).to_string()).unwrap();
         let shape = RoutedExpertShape::of_v41(&cfg);
-        let mut catalog = OfficialV41Catalog {
+        let mut catalog = OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(cfg), experts: shape, snapshot: dir.path().to_path_buf(),
             tensors: names.iter().map(|name| V41Tensor {
                 shard: "fixture.safetensors".into(), placement: placement(name),
@@ -1457,7 +1540,7 @@ mod tests {
         file.write_all_at(&(0u8..32).collect::<Vec<_>>(), offset)
             .unwrap();
         let name = "layers.0.ffn.experts.0.w2.weight";
-        let mut catalog = OfficialV41Catalog {
+        let mut catalog = OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(official_config()),
             experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,
@@ -1668,7 +1751,7 @@ mod expert_staging_tests {
             offset += spec.bytes;
         }
         tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-        let catalog = OfficialV41Catalog {
+        let catalog = OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(official_config()),
             experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,

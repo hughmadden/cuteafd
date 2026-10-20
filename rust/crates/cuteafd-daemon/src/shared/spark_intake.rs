@@ -16,7 +16,9 @@
 //! - `host`: the original path: payloads are copied into a pinned staging
 //!   buffer and uploaded on the compute stream after the wave.
 //!
-//! `auto` (the default) probes dma-buf landing once at startup (a loopback
+//! `auto` (the default) resolves to `pinned` while #533 is open: landed
+//! partials can reach the reduce before every payload byte is visible. Before
+//! that, and again once landing orders its writes: `auto` probed dma-buf landing once at startup (a loopback
 //! QP pair timing sends into device vs pinned host memory, and pinned host to
 //! device copies) and picks `gpu` when the NIC lands in device memory at
 //! least [`GPU_SHARE_OF_PINNED`] of the pinned path's store-and-forward rate
@@ -126,7 +128,12 @@ impl IntakeChoice {
 pub(crate) fn probe_gpu_landing(library: &NativeLibrary) -> Result<GpuLandingProbe> {
     ensure!(!std::env::var("CUTEAFD_GPU_LANDING_PROBE").is_ok_and(|v| v == "unavailable"),
         "GPU landing probe forced unavailable");
-    cuteafd_transport::gpu_landing_probe(library, None, 64 << 20, 8)
+    let probe = cuteafd_transport::gpu_landing_probe(library, None, 64 << 20, 8)?;
+    let link = landing_pcie_link(library);
+    tracing::info!(cuda_device = probe.cuda_device, gpu_gbps = probe.gpu_gbps,
+        host_gbps = probe.host_gbps, pcie_generation = ?link.as_ref().and_then(|link| link.generation),
+        pcie_width = ?link.as_ref().and_then(|link| link.width), usable = probe.usable(), "GPU landing probe");
+    Ok(probe)
 }
 
 fn device_choice_available(choice: &IntakeChoice) -> bool {
@@ -196,16 +203,22 @@ pub(crate) fn probe_h2d(library: &NativeLibrary) -> Result<f64> {
     timed
 }
 
+/// Exercise the copy engine and PCIe link before timing peer writes.
+fn warm_landing_link(library: &NativeLibrary) -> Result<()> {
+    probe_h2d(library).map(|_| ())
+}
+
 fn resolve_landing_probe(setting: &str, probe: &Result<GpuLandingProbe>, h2d: Option<f64>) -> (IntakeMode, String) {
     match probe {
         Err(error) => (IntakeMode::Pinned, format!("GPU landing probe failed: {error:#}")),
         Ok(p) if !p.usable() => (IntakeMode::Pinned, format!("GPU landing unusable: {}{}",
             p.error.as_deref().unwrap_or(&p.status),
             if p.registered && p.writes_ordering < 100 { " (GPUDirect writes not ordered for kernels)" } else { "" })),
-        Ok(p) if setting == "auto" => match gpu_wins(p, h2d) {
-            (true, rates) => (IntakeMode::Gpu, format!("dma-buf landing verified, {rates}")),
-            (false, rates) => (IntakeMode::Pinned, format!("dma-buf landing verified but slow, {rates}")),
-        },
+        // Landed partials can reach the reduce before every payload byte is visible
+        // (#533: 4 of 20 cold greedy replays diverge, 0 of 20 pinned), so `auto`
+        // stays pinned until the landing path orders its writes; `gpu` still lands.
+        Ok(p) if setting == "auto" => (IntakeMode::Pinned,
+            format!("dma-buf landing verified but held back pending #533, {}", gpu_wins(p, h2d).1)),
         Ok(p) => (IntakeMode::Gpu, format!("dma-buf landing verified, {:.1} GB/s into GPU vs {:.1} GB/s into host",
             p.gpu_gbps, p.host_gbps)),
     }
@@ -248,10 +261,28 @@ pub(crate) fn transport_mode(library: &NativeLibrary, ranks: usize, capacity: us
     Ok(mode)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LandingPcieLink {
+    generation: Option<u32>,
+    width: Option<u32>,
+}
+
+fn landing_pcie_link(library: &NativeLibrary) -> Option<LandingPcieLink> {
+    let bus = library.cuda_device_pci_bus_id(library.cuda_get_device().ok()?)?;
+    let nvml = cuteafd_ffi::nvml::Nvml::open().ok()?;
+    let devices = nvml.devices().ok()?;
+    let device = devices.iter().find(|device| device.identity.pci_bus_id.trim_start_matches('0')
+        .eq_ignore_ascii_case(bus.trim_start_matches('0')))?;
+    let (generation, width) = device.pcie_link();
+    Some(LandingPcieLink { generation, width })
+}
+
 /// `cuteafd fabric`'s view of GPU landing on one CUDA device.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct FabricLanding {
     pub(crate) cuda_device: i32,
+    pub(crate) pcie_before: Option<LandingPcieLink>,
+    pub(crate) pcie_link: Option<LandingPcieLink>,
     pub(crate) probe: Option<GpuLandingProbe>,
     pub(crate) h2d_gbps: Option<f64>,
     pub(crate) error: Option<String>,
@@ -262,7 +293,11 @@ impl FabricLanding {
         match (&self.probe, &self.error) {
             (Some(p), _) if p.usable() => {
                 let (gpu, rates) = gpu_wins(p, self.h2d_gbps);
-                format!("GPU landing (cuda {}, {}): dma-buf ok, loopback {rates}; intake auto: {}",
+                let link = self.pcie_link.as_ref().map(|link| format!("PCIe gen {} x{}",
+                    link.generation.map_or("?".into(), |value| value.to_string()),
+                    link.width.map_or("?".into(), |value| value.to_string())))
+                    .unwrap_or_else(|| "PCIe unknown".into());
+                format!("GPU landing (cuda {}, {}, {link}): dma-buf ok, loopback {rates}; intake auto: {}",
                     self.cuda_device, p.rdma_device, if gpu { "gpu" } else { "pinned" })
             }
             (Some(p), _) => format!("GPU landing (cuda {}): unusable ({}); intake auto: pinned", self.cuda_device,
@@ -276,22 +311,32 @@ impl FabricLanding {
 
 /// Runs the GPU landing probe for `cuteafd fabric` when a native library is
 /// given (or `CUTEAFD_NATIVE_LIB` names one).
-pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32) -> FabricLanding {
-    let path = native_lib.map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("CUTEAFD_NATIVE_LIB").map(std::path::PathBuf::from));
-    let result = (|| -> Result<(GpuLandingProbe, Option<f64>)> {
-        let path = path.context("no native library (pass --native-lib or set CUTEAFD_NATIVE_LIB)")?;
-        // SAFETY: a trusted image library, loaded once for this command.
+pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, warmup: bool, repeats: u32)
+    -> Vec<FabricLanding> {
+    let library = (|| -> Result<NativeLibrary> {
+        let path = native_lib.map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("CUTEAFD_NATIVE_LIB").map(std::path::PathBuf::from))
+            .context("no native library (pass --native-lib or set CUTEAFD_NATIVE_LIB)")?;
+        // SAFETY: a trusted image library, kept loaded across all repeats.
         let library = unsafe { NativeLibrary::load(&path) }?;
         library.cuda_set_device(device)?;
-        let probe = probe_gpu_landing(&library)?;
-        let h2d = probe_h2d(&library).ok();
-        Ok((probe, h2d))
+        Ok(library)
     })();
-    match result {
-        Ok((probe, h2d_gbps)) => FabricLanding { cuda_device: device, probe: Some(probe), h2d_gbps, error: None },
-        Err(error) => FabricLanding { cuda_device: device, probe: None, h2d_gbps: None, error: Some(format!("{error:#}")) },
-    }
+    (0..repeats.clamp(1, 5)).map(|_| {
+        let pcie_before = library.as_ref().ok().and_then(landing_pcie_link);
+        let result = (|| -> Result<(GpuLandingProbe, Option<f64>, Option<LandingPcieLink>)> {
+            let library = library.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            if warmup { warm_landing_link(library)?; }
+            let probe = probe_gpu_landing(library)?;
+            let pcie_link = landing_pcie_link(library);
+            let h2d = probe_h2d(library).ok();
+            Ok((probe, h2d, pcie_link))
+        })();
+        match result {
+            Ok((probe, h2d_gbps, pcie_link)) => FabricLanding { cuda_device: device, pcie_before, pcie_link, probe: Some(probe), h2d_gbps, error: None },
+            Err(error) => FabricLanding { cuda_device: device, pcie_before, pcie_link: None, probe: None, h2d_gbps: None, error: Some(format!("{error:#}")) },
+        }
+    }).collect()
 }
 
 /// One transport's rank planes and the machinery that fills them.
@@ -1197,22 +1242,69 @@ impl Drop for SparkLink<'_> {
     }
 }
 
-/// A prefill lane (transport on its own thread) and the intake its waves
-/// land in (dropped in that order: the lane joins its thread first).
+/// Retains external landing, pinned sources and their loaded library unless
+/// the complete QP/compute/copy retirement handshake has succeeded.
+struct LaneOwners<T>(Option<T>);
+impl<T> LaneOwners<T> {
+    fn release(&mut self) { self.0.take(); }
+}
+impl<T> Drop for LaneOwners<T> {
+    fn drop(&mut self) {
+        if let Some(owners) = self.0.take() {
+            std::mem::forget(owners);
+            tracing::error!("retaining terminal lane intake without complete quiescence and consumer drainage");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_owner_tests {
+    use super::*;
+    struct Owner(std::rc::Rc<Cell<usize>>);
+    impl Drop for Owner { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+
+    #[test]
+    fn unproved_lane_release_retains_intake_and_loaded_library() {
+        let drops = std::rc::Rc::new(Cell::new(0));
+        drop(LaneOwners(Some((Owner(drops.clone()), Owner(drops.clone())))));
+        assert_eq!(drops.get(), 0);
+        let mut released = LaneOwners(Some((Owner(drops.clone()), Owner(drops.clone()))));
+        released.release();
+        drop(released);
+        assert_eq!(drops.get(), 2);
+    }
+}
+
+/// A prefill lane and its external intake. Keep this owner whole: joining a
+/// thread alone is not proof that RDMA writes or queued copies have stopped.
 pub(crate) struct SparkLane<'a> {
     pub(crate) lane: SparkExpertLane,
-    pub(crate) intake: SparkIntake<'a>,
+    pub(crate) intake: std::rc::Rc<SparkIntake<'a>>,
+    terminal: LaneOwners<(std::rc::Rc<SparkIntake<'a>>, Arc<NativeLibrary>)>,
 }
 
 impl<'a> SparkLane<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>, capacity: u32,
+    pub(crate) fn new(library: &'a Arc<NativeLibrary>, world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>, capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
+        library.rdma_rc_endpoint_quiesce_available()?;
         let mode = transport_mode(library, peers.len(), capacity as usize, row_bytes)?;
-        let intake = SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?;
-        // SAFETY: the lane drops (joining its thread) before its intake, and
-        // every submit goes through `submit`, which calls `before_dispatch`.
+        let intake = std::rc::Rc::new(SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?);
+        let terminal = LaneOwners(Some((intake.clone(), library.clone())));
+        // SAFETY: the terminal guard retains the intake and its actual loaded
+        // library until checked QP quiescence and all consumers are drained.
         let lane = unsafe { intake.spawn_lane(world, peers, capacity, config)? };
-        Ok(Self { lane, intake })
+        Ok(Self { lane, intake, terminal })
+    }
+
+    pub(crate) fn terminal_quiesce(&mut self) -> Result<()> { self.lane.terminal_quiesce() }
+
+    /// Called only after the submission's compute streams and intake copies
+    /// drain successfully, never merely because the transport thread joined.
+    pub(crate) fn terminal_release(&mut self) -> Result<()> {
+        self.lane.terminal_release()?;
+        self.intake.terminal_release_payloads()?;
+        self.terminal.release();
+        Ok(())
     }
 
     pub(crate) fn world_size(&self) -> usize {
@@ -1303,6 +1395,7 @@ impl<'a> SparkDeviceLink<'a> {
         let choice = choose_mode(library)?;
         ensure!(device_choice_available(&choice),
             "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
+        library.v41_compact_reducer()?.require_plane_reduction(peers.len() as u32)?;
         let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), if written_responses() { 1 } else { capacity },
             row_bytes)?;
         let mailbox = HostAllocation::new(library, device_mailbox::bytes(capacity, topk, wire_row_bytes))?;
@@ -1483,6 +1576,17 @@ mod tests {
         GpuLandingProbe {
             rdma_device: "mlx5_0".into(), cuda_device: 0, dma_buf: true, gpudirect_rdma: true,
             writes_ordering: 100, registered: true, gpu_gbps, host_gbps: 52.4, status: String::new(), error: None,
+        }
+    }
+
+    #[test]
+    fn fabric_probe_reports_missing_library_for_each_bounded_repeat() {
+        let reports = fabric_probe(Some(std::path::Path::new("/nonexistent-landing-probe-library.so")), 0, true, 3);
+        assert_eq!(reports.len(), 3);
+        for report in reports {
+            assert!(report.probe.is_none());
+            assert!(report.error.is_some());
+            assert!(report.summary().contains("intake auto: pinned"));
         }
     }
 
@@ -1688,7 +1792,7 @@ mod tests {
         measured.host_gbps = 55.0;
         let h2d = Some(55.0);
         assert_eq!(pinned_path_gbps(measured.host_gbps, h2d.unwrap()), 27.5);
-        let (mode, reason) = resolve_landing_probe("auto", &Ok(measured.clone()), h2d);
+        let (mode, reason) = resolve_landing_probe("gpu", &Ok(measured.clone()), h2d);
         assert_eq!(mode, IntakeMode::Gpu);
         let generic = IntakeChoice { setting: "auto".into(), mode, reason,
             probe: Some(measured), h2d_gbps: h2d };
@@ -1711,6 +1815,15 @@ mod tests {
             assert_eq!(device_choice_available(&choice), supported);
             assert_eq!(choice.mode, if supported { IntakeMode::Gpu } else { IntakeMode::Pinned });
         }
+    }
+
+    #[test]
+    fn auto_stays_pinned_while_landing_is_unordered() {
+        // #533: even a probe that would win keeps `auto` on the pinned path.
+        let (mode, reason) = resolve_landing_probe("auto", &Ok(probe(19.6)), Some(57.6));
+        assert_eq!(mode, IntakeMode::Pinned);
+        assert!(reason.contains("#533"));
+        assert_eq!(resolve_landing_probe("gpu", &Ok(probe(19.6)), Some(57.6)).0, IntakeMode::Gpu);
     }
 
     #[test]

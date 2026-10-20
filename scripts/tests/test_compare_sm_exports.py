@@ -61,6 +61,26 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+@pytest.mark.parametrize("group,names", [
+    ("residual", ["attn_res_c1_keep_append", "attn_res_c2_add_append",
+                  "attn_res_c4_add", "attn_res_c5_add",
+                  "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"]),
+    ("latent", ["rmsnorm_h3584", "rmsnorm_h7168", "latent_down", "latent_up"]),
+    ("situ", [f"situ_i{width}" for width in (3072, 6144, 16896, 33792)]),
+])
+def test_kimi_w8_cross_sm_groups(group, names):
+    job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kimi-{group}")
+    assert job == (f"kimi-{group}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(names)])
+
+
+def test_mimop_k32_tp6_uses_production_exact_slice_export():
+    job = next(job for job in compare_sm.jobs("all") if job[0] == "routed-mimop-tp6")
+    assert job == ("routed-mimop-tp6", "package_fp8_moe_aot.py",
+                   ["--geometry", "mimop", "--capacities", compare_sm.CAPACITIES,
+                    "--layouts", "tp6", "--exact-slices"])
+
+
 def test_identical_object_ignores_context_metadata(tmp_path):
     report = compare_sm.compare(*exports(tmp_path))
     assert report["programs"][0]["classification"] == "identical"
@@ -173,6 +193,49 @@ def test_list_includes_dense_qwen_export_groups():
         assert job == (geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
 
 
+@pytest.mark.parametrize("heads,suffix", [(64, ""), (32, "-tp2")])
+@pytest.mark.parametrize("group", ["pointwise", "projections", "attention", "metadata", "region-scores"])
+def test_step5_export_groups_bind_native_geometry(heads, suffix, group):
+    job = next(job for job in compare_sm.jobs("all") if job[0] == f"step5-{group}{suffix}")
+    expected = ["--heads", str(heads)]
+    if group != "pointwise":
+        expected += ["--group", group]
+    assert job == (f"step5-{group}{suffix}", "export_b12x_step5_aot.py", expected)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(monkeypatch, heads):
+    import types
+    module_path = ROOT / "python/tools/aot/export_b12x_step5_aot.py"
+    spec = importlib.util.spec_from_file_location("step5_projection_exports", module_path)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16", float32="f32"))
+    pointwise = SimpleNamespace(compile_bf16_projection_aot=lambda **kwargs: kwargs)
+    monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
+    monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=pointwise))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = {name: build() for name, build in module.builders(heads, "projections").items()}
+    assert len(calls) == 12
+    for name, (width, outputs, dtype) in {
+        "attn_q": (4096, heads * 192, "bf16"),
+        "attn_kv": (4096, heads // 16 * 192, "bf16"),
+        "attn_gate": (4096, heads, "bf16"),
+        "attn_out": (heads * 192, 4096, "bf16"),
+        "attn_out_partial": (heads * 192, 4096, "f32"),
+        "index_q": (4096, heads // 16 * 4 * 256, "bf16"),
+        "index_kz": (4096, 256, "bf16"),
+        "router": (4096, 352, "f32"),
+        "dense_gate_up": (4096, 27648, "bf16"),
+        "dense_down": (13824, 4096, "bf16"),
+        "shared_gate_up": (4096, 3072, "bf16"),
+        "shared_down": (1536, 4096, "bf16"),
+    }.items():
+        assert calls[name] == dict(width=width, outputs=outputs, output_dtype=dtype)
+
+
 def test_catalog_includes_all_geometries_and_fused_suspects():
     jobs = compare_sm.jobs("all")
     names = [name for name, _, _ in jobs]
@@ -203,6 +266,14 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
             assert args[args.index("--geometry") + 1] == family
             assert args[args.index("--role") + 1] == role
             assert args[args.index("--atomic-min-capacity") + 1] == "256"
+
+
+@pytest.mark.parametrize("geometry", ["glmf", "glmf2", "kimik3"])
+@pytest.mark.parametrize("label,stem", [("decode", "kda_m64"), ("prefill", "kda_m4096"), ("commit", "kda_commit")])
+def test_kda_groups_export_only_the_shared_kda_programs(geometry, label, stem):
+    job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kda-{geometry}-{label}")
+    assert job == (f"kda-{geometry}-{label}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", geometry, "--only", stem])
 
 
 def test_hybrid_group_covers_compact_and_grouped_live_rows():
@@ -364,3 +435,70 @@ def test_failed_group_does_not_discard_other_completed_reports(tmp_path, monkeyp
     report = json.loads((tmp_path / "comparison.json").read_text())
     assert [group["group"] for group in report["groups"]] == ["good"]
     assert report["failures"] == [{"group": "bad", "error": "missing pair"}]
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_step5_norms_take_runtime_epsilon_and_keep_final_bf16_boundary(monkeypatch, heads):
+    import types
+    spec = importlib.util.spec_from_file_location("step5_norm_exports",
+        ROOT / "python/tools/aot/export_b12x_step5_aot.py")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16", float32="f32"))
+    pointwise = SimpleNamespace(compile_affine_norm_aot=lambda **kwargs: kwargs)
+    monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
+    monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=pointwise))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = {name: build() for name, build in module.builders(heads, "pointwise").items()
+             if "norm" in name}
+    assert set(calls) == {"hidden_norm", "final_norm", "index_q_norm", "index_k_norm",
+        "swa_q_norm_rope", "swa_k_norm_rope", "csa_q_norm_rope", "csa_k_norm_rope"}
+    assert all("eps" in call and call["eps"] is None for call in calls.values())
+    assert calls["hidden_norm"].get("input_dtype", "f32") == "f32"
+    assert calls["final_norm"] == dict(width=4096, zero_centered=True, eps=None, input_dtype="bf16")
+    for name in ("index_q_norm", "index_k_norm"):
+        assert calls[name]["input_dtype"] == calls[name]["parameter_dtype"] == "bf16"
+    assert calls["index_k_norm"]["subtract_mean"] and calls["index_k_norm"]["bias"]
+    assert calls["index_q_norm"]["zero_centered"]
+    for kind, rotary in (("swa", 192), ("csa", 64)):
+        for name, count in (("q", heads), ("k", heads // 16)):
+            assert calls[f"{kind}_{name}_norm_rope"] == dict(width=192, heads=count,
+                rotary=rotary, zero_centered=True, eps=None, input_dtype="bf16")
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_step5_rope_builders_cover_all_policy_modes_without_recipe_specialization(monkeypatch, heads):
+    import types
+    spec = importlib.util.spec_from_file_location("step5_rope_exports",
+        ROOT / "python/tools/aot/export_b12x_step5_aot.py")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16", float32="f32"))
+    monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
+    monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=SimpleNamespace()))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.rope", SimpleNamespace(
+        compile_rope_tables_aot=lambda **kwargs: kwargs))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    builders = module.builders(heads, "pointwise")
+    calls = {name: build() for name, build in builders.items() if name.startswith("rope_s")}
+    assert calls == {f"rope_s{span}_{'llama3' if scaling else 'plain'}":
+                     dict(rotary_span=span, llama3=scaling)
+                     for span in (32, 64, 192) for scaling in (False, True)}
+def test_source_comparison_requires_same_sm_and_allows_only_source_changes(tmp_path):
+    left, right = exports(tmp_path)
+    with pytest.raises(ValueError, match="same SM count"):
+        compare_sm.compare(left, right, source_comparison=True)
+    context_file = right / "comparison-context.json"
+    context = json.loads(context_file.read_text())
+    context.update(sms=188, sparkinfer_revision="candidate", source_tree_sha256="new-tree",
+                   exporter_sha256="new-exporter", export_sources_sha256={"export.py": "new"})
+    context_file.write_text(json.dumps(context))
+    assert compare_sm.compare(left, right, source_comparison=True)["programs"][0]["object_identical"]
+    context["toolchain"] = {"torch": "other"}
+    context_file.write_text(json.dumps(context))
+    with pytest.raises(ValueError, match="toolchain"):
+        compare_sm.compare(left, right, source_comparison=True)

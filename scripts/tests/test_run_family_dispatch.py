@@ -546,7 +546,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           extra_env: dict[str, str] | None = None,
                           program_manifest: dict | None = None,
                           launcher_source: Path | None = None,
-                          deployment_overrides: dict | None = None) -> subprocess.CompletedProcess[str]:
+                          deployment_overrides: dict | None = None,
+                          probe_fails: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -614,6 +615,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         if tool == "docker":
             stub = (bin_dir / tool).read_text()
             intercept = 'case "$*" in *" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; esac\n'
+            if probe_fails:
+                # A slot binary that predates the family's serve command rejects it.
+                intercept += 'case "$*" in *"/opt/cuteafd-serve-probe"*) exit 2 ;; esac\n'
             stub = stub.replace('case "$*" in', intercept + 'case "$*" in', 1)
             if native_v41:
                 stub += ('case "$*" in container\\ inspect*|inspect\\ *) ' + ('if [[ "$*" == *-wip* ]]; then exit 0; else exit 1; fi' if wip else 'exit 1') + ' ;; image\\ inspect*) echo test-pin ;; esac\n'
@@ -2545,6 +2549,15 @@ def test_qwen_restart_admission_credits_only_its_own_gpu_memory(tmp_path: Path, 
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     assert f"--coordinator-gpu-budget-gib {admitted_gib}" in preflight
+
+
+def test_spark_admission_inherits_release_readiness_bound(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model", "",
+                                  preferred_ranks=1,
+                                  extra_env={"CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS": "2400"})
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=2400" in launch
 
 
 def test_qwen_other_formats_skip_the_local_qualification_preflight(tmp_path: Path) -> None:

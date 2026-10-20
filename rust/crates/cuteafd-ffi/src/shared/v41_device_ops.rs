@@ -4,31 +4,92 @@ use anyhow::{ensure, Result};
 use std::ffi::c_void;
 
 type AddFn = unsafe extern "C" fn(*const u16, *const u16, *mut u16, usize, *mut c_void) -> i32;
-pub struct V41Bf16Add<'a> { _library: &'a NativeLibrary, launch: AddFn }
+pub struct Bf16Add<'a> { _library: &'a NativeLibrary, launch: AddFn }
 impl NativeLibrary {
-    pub fn v41_bf16_add(&self) -> Result<V41Bf16Add<'_>> {
-        Ok(V41Bf16Add { _library: self,
+    pub fn bf16_add(&self) -> Result<Bf16Add<'_>> {
+        Ok(Bf16Add { _library: self,
             launch: unsafe { *self.lib.get(b"cuteafd_add_tp2_shared_async")? } })
     }
 }
-impl V41Bf16Add<'_> {
+impl Bf16Add<'_> {
     /// # Safety
     /// Buffers must be live on the current stream device, with producers ordered
     /// before this operation. No conflicting aliases may access them until done.
     pub unsafe fn launch(&self, a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
         output: CuteafdDeviceBuffer, count: usize, stream: *mut c_void) -> Result<()> {
-        ensure!(count > 0 && count <= 4096*5120, "invalid BF16 addition extent");
-        ensure!(a.device_id == output.device_id && b.device_id == output.device_id,
-            "BF16 addition device mismatch");
-        for buffer in [a,b,output] {
-            ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % 2 == 0 && buffer.bytes >= count*2,
-                "invalid BF16 addition buffer");
-        }
+        validate_add_buffers(a, b, output, count)?;
         let status = unsafe {
             (self.launch)(a.ptr.cast(), b.ptr.cast(), output.ptr.cast(), count, stream)
         };
         ensure!(status == 0, "shared TP2 addition failed with CUDA status {status}");
         Ok(())
+    }
+}
+
+fn validate_add_buffers(a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
+    output: CuteafdDeviceBuffer, count: usize) -> Result<()> {
+    let bytes = count.checked_mul(2).filter(|n| *n > 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid BF16 addition extent"))?;
+    ensure!(output.device_id >= 0 && a.device_id == output.device_id && b.device_id == output.device_id,
+        "BF16 addition device mismatch");
+    for buffer in [a, b, output] {
+        ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % 2 == 0 && buffer.bytes >= bytes
+            && (buffer.ptr as usize).checked_add(bytes).is_some(), "invalid BF16 addition buffer");
+    }
+    let out = output.ptr as usize;
+    for source in [a, b] {
+        let start = source.ptr as usize;
+        let distance = if start <= out { out - start } else { start - out };
+        ensure!(distance >= bytes, "BF16 addition output overlaps input");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod add_tests {
+    use super::*;
+
+    fn buffers(count: usize) -> [CuteafdDeviceBuffer; 3] {
+        std::array::from_fn(|i| CuteafdDeviceBuffer { ptr: (0x1000 + i * count * 2) as *mut c_void,
+            bytes: count * 2, device_id: 0, flags: 0 })
+    }
+
+    #[test]
+    fn shared_add_accepts_real_buffer_extents_without_a_family_width_limit() -> Result<()> {
+        for hidden in [5120, 7168] {
+            for rows in [1, 16, 4096] {
+                let count = rows * hidden;
+                let [a, b, output] = buffers(count);
+                validate_add_buffers(a, b, output, count)?;
+                validate_add_buffers(a, a, output, count)?;
+                assert!(validate_add_buffers(a, b, output, count + 1).is_err());
+                for rank in 0..3 {
+                    let mut short = [a, b, output];
+                    short[rank].bytes -= 1;
+                    assert!(validate_add_buffers(short[0], short[1], short[2], count).is_err());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_add_rejects_overflow_aliases_and_invalid_devices() {
+        let [a, b, output] = buffers(16);
+        for count in [0, usize::MAX / 2 + 1, usize::MAX] {
+            assert!(validate_add_buffers(a, b, output, count).is_err());
+        }
+        let wrapped = CuteafdDeviceBuffer { ptr: (usize::MAX - 1) as *mut c_void, ..a };
+        assert!(validate_add_buffers(wrapped, b, output, 16).is_err());
+        assert!(validate_add_buffers(a, b, a, 16).is_err());
+        let overlap = CuteafdDeviceBuffer { ptr: (a.ptr as usize + 2) as *mut c_void, ..output };
+        assert!(validate_add_buffers(a, b, overlap, 16).is_err());
+        for bad in [CuteafdDeviceBuffer { device_id: -1, ..a },
+            CuteafdDeviceBuffer { device_id: 1, ..a },
+            CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), ..a },
+            CuteafdDeviceBuffer { ptr: 1usize as *mut c_void, ..a }] {
+            assert!(validate_add_buffers(bad, b, output, 16).is_err());
+        }
     }
 }
 

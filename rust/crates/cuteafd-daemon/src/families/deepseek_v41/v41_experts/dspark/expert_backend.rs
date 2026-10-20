@@ -7,7 +7,7 @@ use crate::families::deepseek_v41::v41_experts::{
 };
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{CuteafdDeviceBuffer, V41Bf16Add};
+use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add};
 use std::{ffi::c_void, path::Path, rc::Rc};
 
 pub(super) enum DraftExperts<'w, 'a> {
@@ -66,7 +66,7 @@ pub(super) struct CompressedDraftExperts<'w, 'a> {
     inputs: [DeviceAllocation<'a>; 3],
     shared: DeviceAllocation<'a>,
     output: DeviceAllocation<'a>,
-    add: V41Bf16Add<'a>,
+    add: Bf16Add<'a>,
     owner: &'w DsparkWeights<'a>,
     stage: usize,
     capacity: u32,
@@ -145,7 +145,7 @@ impl<'w, 'a> CompressedDraftExperts<'w, 'a> {
             ],
             shared: DeviceAllocation::new(library, capacity as usize * 10240)?,
             output: DeviceAllocation::new(library, capacity as usize * 10240)?,
-            add: library.v41_bf16_add()?,
+            add: library.bf16_add()?,
             owner,
             stage,
             capacity,

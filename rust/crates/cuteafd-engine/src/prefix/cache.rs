@@ -884,6 +884,32 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         Ok(())
     }
 
+    /// Private append lease: share complete pages and COW the partial tail.
+    /// The caller either replaces its placement and releases the old lease, or
+    /// releases this lease on abort. No committed placement changes here.
+    pub fn fork_step<F: PrefixFamily<M>>(&mut self, family: &F, pages: &[u32],
+        frontier: usize, end: usize) -> Result<Vec<u32>, PrefixError> {
+        if end < frontier || pages.len() < self.pool.pages_for(frontier) {
+            return Err(PrefixError::Family { what: "fork step", source: "invalid append frontier".into() });
+        }
+        let total = self.pool.pages_for(end);
+        self.make_room_for(family, self.pool.fork_need(frontier, total), None)?;
+        let fork = self.pool.fork(pages, frontier, total)?;
+        if let Some(copy) = fork.copy {
+            if let Err(source) = family.copy_rows(copy).and_then(|()| family.drain()) {
+                // Draining also covers a family that failed after enqueueing.
+                if let Err(source) = family.drain() {
+                    self.quarantine.push(Quarantined { _pages: fork.pages, _mark: None });
+                    self.stats.quarantined += 1;
+                    return Err(PrefixError::Family { what: "fork step drain", source });
+                }
+                self.pool.release(&fork.pages);
+                return Err(PrefixError::Family { what: "fork step copy", source });
+            }
+        }
+        Ok(fork.pages)
+    }
+
     /// Poll the host tier's store copies; once per scheduler step.
     pub fn tick(&mut self) {
         if let Some(host) = &mut self.host {

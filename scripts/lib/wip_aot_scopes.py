@@ -17,7 +17,7 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
-                        qwen3_5='QWEN_DENSE')
+                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3')
 
 
 def require_mapping(family):
@@ -58,7 +58,7 @@ def family_scopes(cards, config_reader):
     # coordinator scopes, and a Spark card's TP count is keyed to its own family
     # (FAMILY=COUNT, read by native/cmake/shared/{exl3,fp8_moe}.cmake), so one
     # card's geometry is never exported at another card's TP.
-    scopes, spark_scopes, roles, counts, env = set(), set(), set(), set(), {}
+    scopes, spark_scopes, roles, counts, bf16_input, env = set(), set(), set(), set(), set(), {}
     for card in cards:
         family = card.get('family')
         require_mapping(family)
@@ -80,10 +80,26 @@ def family_scopes(cards, config_reader):
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             if 'exl3' in card['name']:
                 scopes.add(tag + ':exl3-k23')
-        for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4')]:
+        if family == 'kimi_k3':
+            # The max card only: TP6 width 512 EXL3 K2 experts (#273); no local-only layout.
+            tp = int(values.get('SPARK_TP', count))
+            if tp != 6:
+                raise ValueError(f'kimi_k3 has no Spark layout for SPARK_TP={tp} (TP6 only)')
+            env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
+            scopes.add('kimik3:exl3-k23')
+            counts.add('kimik3=6')
+        # EXLR8 checkpoints retain family coordinator programs without expert packages.
+        exlr8 = bool(values.get('EXLR8_MANIFEST'))
+        if exlr8:
+            if family != 'glm5':
+                raise ValueError(f'EXLR8_MANIFEST is supported only for glm5 checkpoints, not {family}')
+            env['CUTEAFD_WIP_EXLR8_AOT'] = 'ON'
+        for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4'), ('step5', 'step5', 'STEP5')]:
             if family == fam:
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
-                if count:
+                if exlr8:
+                    continue
+                if count and fam != 'step5':
                     counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")
                 # Qwen's FP8 package has no Spark TP layout (intermediate 640): request the NVFP4 family,
                 # which CMake expands to nvfp4, nvfp4a4 and, on the coordinator only, the FP8 MTP sibling
@@ -92,6 +108,16 @@ def family_scopes(cards, config_reader):
                 nvfp4 = any('nvfp4' in str(value).lower() for value in
                             (card['name'], checkpoint_id, values.get('EXPERT_FORMAT', '')))
                 scopes.add(tag + (':nvfp4' if tag == 'qwen4' or nvfp4 else ':fp8'))
+                if fam == 'step5':
+                    # Both official quants retain a native BF16 routed layer.
+                    # Format keys keep the min/max card TP layouts independent.
+                    scopes.add('step5:bf16')
+                    # Its golden and serving paths send BF16 rows to the FP8 experts,
+                    # which need the BF16-input sibling package (#516).
+                    if not nvfp4:
+                        bf16_input.add('step5')
+                    if count:
+                        counts.update(f"{scope}={int(values.get('SPARK_TP', count))}" for scope in scopes)
                 if fam == 'glm5_flash' and nvfp4:
                     scopes.add('glmfdense:nvfp4')
                 if 'exl3' in card['name'] or 'tr3' in card['name']:
@@ -106,6 +132,8 @@ def family_scopes(cards, config_reader):
         card_scopes, scopes = scopes, scopes_before | scopes
         if count:
             spark_scopes |= {scope for scope in card_scopes if not scope.startswith('glmfdense:')}
+    if bf16_input:
+        env['CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES'] = ';'.join(sorted(bf16_input))
     env.update(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=';'.join(sorted(scopes)),
                CUTEAFD_WIP_GENERIC_SPARK_COUNTS=';'.join(sorted(counts)),
                CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(spark_scopes)),
