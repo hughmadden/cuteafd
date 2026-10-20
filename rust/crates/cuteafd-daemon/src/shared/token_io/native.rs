@@ -2,8 +2,8 @@
 use crate::shared::experts::exlr8::view;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{Context, Result, ensure};
-use cuteafd_ffi::shared::native_dense::{DenseEmbedding, DenseLinear};
-use cuteafd_ffi::shared::programs::Programs;
+use cuteafd_ffi::native_dense::{DenseEmbedding, DenseLinear};
+use cuteafd_ffi::programs::Programs;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::dense::{
     DenseEncoding, DensePlan, DenseRecord, DenseSlice, ShardSide,
