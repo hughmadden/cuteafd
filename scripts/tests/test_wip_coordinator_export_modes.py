@@ -42,15 +42,17 @@ def test_unknown_mode_is_refused():
     assert result.returncode == 9 and 'must be auto, remote or capped' in result.stdout
 
 
+@pytest.mark.parametrize('setting', ['auto', 'capped'])
 @pytest.mark.parametrize('capped,remote,expected_done,expected_calls', [
     (0, 0, 'remote', ['remote']),
     (0, 75, 'capped', ['remote', 'capped']),
 ])
-def test_dispatch_falls_through_to_remote(tmp_path, capped, remote, expected_done, expected_calls):
+def test_dispatch_queues_only_after_remote_unavailable(tmp_path, setting, capped, remote, expected_done, expected_calls):
     trace = tmp_path / 'trace'
     script = f'''
 release_die() {{ echo "DIE $*"; exit 9; }}
-wip_coordinator_export_modes() {{ printf 'remote capped\\n'; }}
+{_function('wip_coordinator_export_modes')}
+CUTEAFD_WIP_COORDINATOR_EXPORT={setting} CUTEAFD_EXPORT_HOST=other
 wip_remote_export() {{ echo remote >> {trace}; return {remote}; }}
 wip_capped_export() {{ echo capped >> {trace}; return {capped}; }}
 wip_hwlock() {{ echo turn >> {trace}; }}
