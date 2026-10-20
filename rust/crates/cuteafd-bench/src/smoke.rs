@@ -900,6 +900,8 @@ fn write_config(entry: &Entry, repo: &Path, configs: &Path, parallel: bool) -> R
     let mut text = std::fs::read_to_string(&base).with_context(|| format!("{}", base.display()))?;
     text.push_str(&format!("\n# bench smoke entry {}\n", entry.name));
     let mut set = entry.set.clone();
+    // Smoke drives the run through /v1/bench, which the launcher serves only on request.
+    set.insert("ENABLE_BENCH".into(), "on".into());
     if parallel && entry.family.as_deref() != Some("deepseek_v41") {
         // Distinct coordinator containers for launches side by side.
         set.entry("INSTANCE".into()).or_insert_with(|| entry.name.clone());
@@ -1470,5 +1472,6 @@ mod tests {
         assert!(!config.contains_key("BENCH_SIMULATED"));
         assert!(!config.contains_key("BENCH_HARDWARE_CLASS"));
         assert_eq!(config.get("MODEL_ID").map(String::as_str), Some("a/b"));
+        assert_eq!(config.get("ENABLE_BENCH").map(String::as_str), Some("on"));
     }
 }
