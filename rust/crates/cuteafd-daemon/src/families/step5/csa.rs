@@ -194,9 +194,6 @@ pub(super) struct CsaLayer<'a> {
 impl<'a> CsaLayer<'a> {
     pub(super) fn device(&self) -> Device<'a> { self.stream.device }
     pub(super) fn rows(&self) -> usize { self.admission.rows }
-    pub(super) fn new_lane_in(&self, arena: &Arena<'a>) -> Result<Self> {
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None, Some((arena, 0)))
-    }
 
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
         Ok(Admission::new(rows, &[], 0, u64::MAX, &[])?.bytes)

@@ -167,9 +167,6 @@ impl<'a> SwaLayer<'a> {
     pub(super) fn device(&self) -> Device<'a> { self.stream.device }
     pub(super) fn rows(&self) -> usize { self.admission.rows }
     pub(super) fn heads(&self) -> usize { self.immutable.heads }
-    pub(super) fn new_lane_in(&self, arena: &Arena<'a>) -> Result<Self> {
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None, Some((arena, 0)))
-    }
 
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
         Self::workspace_for_heads(rows, 64)

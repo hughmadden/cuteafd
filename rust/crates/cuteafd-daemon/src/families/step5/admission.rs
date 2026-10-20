@@ -228,7 +228,6 @@ mod tests {
                 },
                 rows: 256,
                 sequences: 16,
-                lanes: 2,
                 context,
                 requested_pool: pool,
                 marks: prefix_marks(&<PrefixCli as clap::Parser>::parse_from([

@@ -885,6 +885,8 @@ mod warm_stream_tests {
             ("glm5_flash", include_str!("../families/glm5_flash/mod.rs")),
             ("mimo_v2", include_str!("../families/mimo_v2/mod.rs")),
             ("qwen4", include_str!("../families/qwen4/mod.rs")),
+            ("step5", include_str!("../families/step5/serve.rs")),
+            ("step5 golden", include_str!("../families/step5/golden.rs")),
         ] {
             let transport = source.find(&link).unwrap_or_else(|| panic!("{family}: no Spark transport"));
             let bootstrap = source.find(&open)

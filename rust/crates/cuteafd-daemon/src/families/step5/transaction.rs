@@ -406,20 +406,6 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         result
     }
 
-    pub(super) fn in_submissions<T>(
-        _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
-        steps: &mut [&mut Self],
-        work: impl FnOnce(&mut [&mut Self]) -> Result<T>,
-    ) -> Result<T> {
-        let _modes = steps.iter().map(|step| SubmissionMode::enter(step.submission.clone()))
-            .collect::<Result<Vec<_>>>()?;
-        let result = work(steps);
-        if result.is_err() {
-            for step in steps { step.failed = true; }
-        }
-        result
-    }
-
     pub fn begin(
         ranks: Vec<&'e RefCell<CacheRank<'a>>>,
         staging: Vec<&'e Staging<'a>>,
