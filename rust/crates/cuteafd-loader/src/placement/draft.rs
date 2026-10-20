@@ -92,6 +92,25 @@ impl DrafterDemand {
     }
 }
 
+impl crate::formats::dflash::MlaDraftCacheLayout {
+    /// Both offline and measured admission must consume these exact charges
+    /// before allocating the cache. This is only the cache portion of the
+    /// drafter inventory, not weights, activations or native scratch.
+    pub fn demands(&self, gpu: u8) -> Result<Vec<Demand>, PlacementError> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        let retained = self.cache_bytes.checked_sub(self.margin_bytes)
+            .ok_or(PlacementError::Inventory("MLA draft cache margin exceeds physical cache"))?;
+        Ok(vec![
+            Demand::new(gpu, Category::Drafter, "MLA DFlash retained latent cache",
+                retained, Basis::Formula),
+            Demand::new(gpu, Category::Drafter, "MLA DFlash per-slot private block and page padding",
+                self.margin_bytes, Basis::Formula),
+            Demand::new(gpu, Category::Drafter, "MLA DFlash virtual page tables",
+                self.page_table_bytes, Basis::Formula),
+        ])
+    }
+}
+
 /// Test oracle: the same request with every movable charged as fixed demands
 /// on its first allowed GPU (how families charged drafters before #65).
 #[cfg(test)]
