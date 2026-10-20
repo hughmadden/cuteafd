@@ -196,7 +196,7 @@ PROFILE_EXPERT_INPUT_SAMPLE
 PROFILE_EXPERT_ROUTE_WEIGHTS
 EOF
     [[ "$1" != kimi_k3 ]] || echo RTX_EXPERT_LAYERS
-    [[ "$1" != step5 ]] || echo SPECULATOR_DEPTH
+    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH STEP5_EXECUTION_LANES
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -1923,6 +1923,12 @@ fi
 if ((qualifying)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
+fi
+# STEP5_EXECUTION_LANES: Step-5 native execution lanes (1 or 2; unset keeps
+# serve-step5's default). Each lane is a full private pipeline over shared weights.
+if [[ $family == step5 && -n "$(get STEP5_EXECUTION_LANES)" ]]; then
+  [[ "$(get STEP5_EXECUTION_LANES)" =~ ^[12]$ ]] || release_die "STEP5_EXECUTION_LANES must be 1 or 2"
+  family_args+=(--execution-lanes "$(get STEP5_EXECUTION_LANES)")
 fi
 if [[ $family == kimi_k3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
