@@ -8,6 +8,8 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaWeights, KimiMlaWeights};
 use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, kda, mla,
     w8::{self, ResidualWeightSite}}, formats::mla::MlaOperand, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
 use std::{collections::BTreeMap, os::unix::fs::FileExt};
+use cuteafd_loader::families::kimi_k3::core::CoreInventory;
+use cuteafd_loader::formats::{dense_trellis::{LoadedDenseTrellis, TrellisSide}, exl3_storage::exl3_module};
 
 /// One canonical front end per routed ordinal, independent of attention placement.
 pub(crate) fn routed_owner(cfg: &KimiK3Config, layer: usize) -> Result<usize> {
@@ -133,6 +135,7 @@ impl GlobalWeights<'_> {
 pub(crate) struct LayerLayout {
     operands: BTreeMap<&'static str, usize>,
     pub(crate) attention: AttentionShare,
+    core: BTreeMap<&'static str, CoreWeightLayout>,
 }
 
 impl LayerLayout {
@@ -151,7 +154,7 @@ impl LayerLayout {
         ensure!(intermediate > 0 && intermediate % 2 == 0, "Kimi FFN intermediate does not divide TP2");
         let local = intermediate / 2;
         let sum = |a: usize, b: usize| a.checked_add(b).context("Kimi weight extent overflow");
-        let mut pair = std::array::from_fn(|rank| Self { operands: BTreeMap::new(), attention: shares[rank] });
+        let mut pair = std::array::from_fn(|rank| Self { operands: BTreeMap::new(), attention: shares[rank], core: BTreeMap::new() });
         for (index, rank) in pair.iter_mut().enumerate() {
             for name in ["attention.score", "ffn.score"] { rank.insert(name, &[cfg.hidden, 4])?; }
             for name in ["attention.norm", "ffn.norm"] { rank.insert(name, &[cfg.hidden, 2])?; }
@@ -196,27 +199,104 @@ impl LayerLayout {
         Ok(pair)
     }
 
+    /// The BF16-only layout remains exactly the original fused layout. A mixed
+    /// group stores individual BF16 matrices beside its native K6 projections;
+    /// it never allocates a dequantized shadow of a compressed source tensor.
+    pub(crate) fn pair_with_core(cfg: &KimiK3Config, layer: usize, mode: LayerMode,
+        inventory: &CoreInventory) -> Result<[Self; 2]> {
+        let mut pair = Self::pair(cfg, layer, mode)?;
+        let root = format!("language_model.model.layers.{layer}");
+        let shared = format!("{root}.block_sparse_moe.shared_experts");
+        let attn = format!("{root}.self_attn");
+        let native = |stem: &str| inventory.get_weight(stem).is_some();
+        let ffn_split = !cfg.dense[layer] && ["gate_proj", "up_proj", "down_proj"].iter()
+            .any(|leaf| native(&format!("{shared}.{leaf}")));
+        let attention_split = ["q_proj", "k_proj", "v_proj", "g_proj", "o_proj", "q_a_proj",
+            "q_b_proj", "kv_a_proj_with_mqa"].iter().any(|leaf| native(&format!("{attn}.{leaf}")));
+        let attention_ranks = pair.iter().filter(|layout| layout.attention.present()).count();
+        for (rank, layout) in pair.iter_mut().enumerate() {
+            if ffn_split {
+                layout.operands.remove("ffn.gate_up");
+                layout.operands.remove("ffn.down");
+                let width = cfg.moe_intermediate * cfg.shared_experts;
+                for (name, leaf, shape, side) in [
+                    ("ffn.gate", "gate_proj", [width, cfg.hidden], TrellisSide::Output),
+                    ("ffn.up", "up_proj", [width, cfg.hidden], TrellisSide::Output),
+                    ("ffn.down", "down_proj", [cfg.hidden, width], TrellisSide::Input),
+                ] { layout.projection(name, &format!("{shared}.{leaf}"), shape, side, rank, 2, inventory)?; }
+            }
+            if !attention_split || !layout.attention.present() { continue; }
+            let shard = if attention_ranks == 1 { 0 } else { rank };
+            match cfg.attention[layer] {
+                KimiAttention::Kda => {
+                    layout.operands.remove("kda.input");
+                    layout.operands.remove("kda.output");
+                    layout.insert("kda.fab", &[cfg.kda_head_dim + cfg.kda_heads / 2, cfg.hidden, 2])?;
+                    let width = cfg.kda_heads * cfg.kda_head_dim;
+                    for (name, leaf) in [("kda.q", "q_proj"), ("kda.k", "k_proj"),
+                        ("kda.v", "v_proj"), ("kda.gate", "g_proj")] {
+                        layout.projection(name, &format!("{attn}.{leaf}"), [width, cfg.hidden],
+                            TrellisSide::Output, shard, 2, inventory)?;
+                    }
+                    layout.projection("kda.output", &format!("{attn}.o_proj"), [cfg.hidden, width],
+                        TrellisSide::Input, shard, 2, inventory)?;
+                }
+                KimiAttention::Mla => {
+                    for name in ["mla.qkv_a", "mla.q_b", "mla.gate", "mla.output"] { layout.operands.remove(name); }
+                    for (name, leaf, shape, side, count, index) in [
+                        ("mla.q_a", "q_a_proj", [cfg.q_lora_rank, cfg.hidden], TrellisSide::Output, 1, 0),
+                        ("mla.kv_a", "kv_a_proj_with_mqa", [cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.hidden], TrellisSide::Output, 1, 0),
+                        ("mla.q_b", "q_b_proj", [cfg.heads * (cfg.qk_nope_dim + cfg.qk_rope_dim), cfg.q_lora_rank], TrellisSide::Output, attention_ranks, shard),
+                        ("mla.gate", "g_proj", [cfg.heads * cfg.v_head_dim, cfg.hidden], TrellisSide::Output, attention_ranks, shard),
+                        ("mla.output", "o_proj", [cfg.hidden, cfg.heads * cfg.v_head_dim], TrellisSide::Input, attention_ranks, shard),
+                    ] { layout.projection(name, &format!("{attn}.{leaf}"), shape, side, index, count, inventory)?; }
+                }
+            }
+        }
+        Ok(pair)
+    }
+
+    fn projection(&mut self, name: &'static str, stem: &str, shape: [usize; 2], side: TrellisSide,
+        rank: usize, ranks: usize, inventory: &CoreInventory) -> Result<()> {
+        if let Some(projection) = inventory.get_weight(stem) {
+            ensure!(projection.shape == shape, "Kimi {stem} core inventory differs from layer geometry");
+            let storage = if ranks == 1 { TrellisSide::Output } else { side };
+            self.core.insert(name, CoreWeightLayout::new(projection, storage, rank, ranks)?);
+        } else {
+            let [mut n, mut k] = shape;
+            match side { TrellisSide::Output => n /= ranks, TrellisSide::Input => k /= ranks }
+            self.insert(name, &[n, k, 2])?;
+        }
+        Ok(())
+    }
+
     fn insert(&mut self, name: &'static str, dimensions: &[usize]) -> Result<()> {
         ensure!(self.operands.insert(name, extent(dimensions)?).is_none(), "duplicate Kimi operand {name}");
         Ok(())
     }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
-        self.operands.values().try_fold(0usize, |n, size| n.checked_add(*size)
-            .context("Kimi layer admission extent overflow"))
+        self.operands.values().copied().chain(self.core.values().map(|layout| layout.bytes))
+            .try_fold(0usize, |n, size| n.checked_add(size).context("Kimi layer admission extent overflow"))
     }
 
     pub(super) fn attention_bytes(&self) -> Result<usize> {
         self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
-            .try_fold(0usize, |n, (_, bytes)| n.checked_add(*bytes).context("Kimi attention extent overflow"))
+            .map(|(_, bytes)| *bytes).chain(self.core.iter().filter(|(name, _)|
+                name.starts_with("mla.") || name.starts_with("kda.")).map(|(_, layout)| layout.bytes))
+            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))
     }
 
     fn check(&self, packed: &PackedLayer) -> Result<()> {
-        ensure!(self.attention == packed.attention && self.operands.len() == packed.operands.len(),
+        ensure!(self.attention == packed.attention && self.operands.len() == packed.operands.len()
+            && self.core.len() == packed.core.len(),
             "Kimi packed operand inventory differs from native admission");
         for (name, bytes) in &self.operands {
             ensure!(packed.operands.get(name).is_some_and(|data| data.len() == *bytes),
                 "Kimi packed operand {name} differs from native admission");
+        }
+        for (name, layout) in &self.core {
+            layout.check(packed.core.get(name).context("Kimi packed core operand absent")?)?;
         }
         Ok(())
     }
@@ -232,23 +312,30 @@ fn extent(dimensions: &[usize]) -> Result<usize> {
 pub(crate) struct PackedLayer {
     operands: BTreeMap<&'static str, Vec<u8>>,
     attention: AttentionShare,
+    core: BTreeMap<&'static str, LoadedDenseTrellis>,
 }
 
 impl PackedLayer {
     pub(crate) fn bytes(&self) -> Result<usize> {
-        self.operands.values().try_fold(0usize, |total, bytes|
-            total.checked_add(bytes.len()).context("Kimi packed layer size overflow"))
+        self.operands.values().map(Vec::len).chain(self.core.values().map(|loaded|
+            loaded.shard.payload.len() + loaded.shard.suh.len() + loaded.shard.svh.len()))
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes).context("Kimi packed layer size overflow"))
     }
 
     /// Both ranks are packed together so a source operand is read once, rather
     /// than rereading every tensor separately for each coordinator GPU.
     pub(crate) fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode,
         mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<[Self; 2]> {
-        let layouts = LayerLayout::pair(cfg, layer, mode)?;
+        Self::pair_with_core(cfg, layer, mode, &CoreInventory::default(), &mut read)
+    }
+
+    pub(crate) fn pair_with_core(cfg: &KimiK3Config, layer: usize, mode: LayerMode,
+        inventory: &CoreInventory, mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<[Self; 2]> {
+        let layouts = LayerLayout::pair_with_core(cfg, layer, mode, inventory)?;
         let kind = cfg.attention[layer];
         let shares = layouts.each_ref().map(|layout| layout.attention);
         let mut pair = std::array::from_fn(|rank| Self {
-            operands: BTreeMap::new(), attention: shares[rank] });
+            operands: BTreeMap::new(), attention: shares[rank], core: BTreeMap::new() });
         for (site, score, norm) in [
             (ResidualWeightSite::Attention(layer), "attention.score", "attention.norm"),
             (ResidualWeightSite::Ffn(layer), "ffn.score", "ffn.norm"),
@@ -259,9 +346,19 @@ impl PackedLayer {
                 rank.operands.insert(norm, weights.norm.bytes.clone());
             }
         }
-        for (rank, slice) in pair.iter_mut().zip(w8::pack_ffn(cfg, layer, 2, &mut read)?) {
-            rank.operands.insert("ffn.gate_up", slice.gate_up);
-            rank.operands.insert("ffn.down", slice.down);
+        if layouts[0].operands.contains_key("ffn.gate_up") {
+            for (rank, slice) in pair.iter_mut().zip(w8::pack_ffn(cfg, layer, 2, &mut read)?) {
+                rank.operands.insert("ffn.gate_up", slice.gate_up);
+                rank.operands.insert("ffn.down", slice.down);
+            }
+        } else {
+            let root = format!("language_model.model.layers.{layer}.block_sparse_moe.shared_experts");
+            let width = cfg.moe_intermediate * cfg.shared_experts;
+            for (name, leaf, shape, side) in [
+                ("ffn.gate", "gate_proj", [width, cfg.hidden], TrellisSide::Output),
+                ("ffn.up", "up_proj", [width, cfg.hidden], TrellisSide::Output),
+                ("ffn.down", "down_proj", [cfg.hidden, width], TrellisSide::Input),
+            ] { pack_projection_pair(&layouts, &mut pair, name, &format!("{root}.{leaf}"), shape, side, &[0, 1], &mut read)?; }
         }
         if !cfg.dense[layer] {
             let latent = w8::load_latent(cfg, layer, &mut read)?;
@@ -281,11 +378,33 @@ impl PackedLayer {
                 for (operand, name) in [(KdaOperand::WIn, "kda.input"), (KdaOperand::WFg, "kda.forget"),
                     (KdaOperand::ConvW, "kda.conv"), (KdaOperand::ALog, "kda.a_log"),
                     (KdaOperand::DtBias, "kda.dt_bias"), (KdaOperand::ONorm, "kda.norm"), (KdaOperand::WO, "kda.output")] {
+                    if !layouts[0].operands.contains_key(name) || (operand == KdaOperand::WO && !layouts[0].operands.contains_key("kda.input")) { continue; }
                     let slices = kda::pack(cfg, layer, operand, 2, |name| {
                         let tensor = read(name)?;
                         Ok(KdaTensor { dtype: tensor.info.dtype, shape: tensor.info.shape, bytes: tensor.bytes })
                     })?;
                     for (rank, slice) in pair.iter_mut().zip(slices) { rank.operands.insert(name, slice.bytes); }
+                }
+                if !layouts[0].operands.contains_key("kda.input") {
+                    let root = format!("language_model.model.layers.{layer}.self_attn");
+                    let width = cfg.kda_heads * cfg.kda_head_dim;
+                    let fa = read(&format!("{root}.f_a_proj.weight"))?;
+                    let beta = read(&format!("{root}.b_proj.weight"))?;
+                    check(&fa, DType::Bf16, &[cfg.kda_head_dim, cfg.hidden])?;
+                    check(&beta, DType::Bf16, &[cfg.kda_heads, cfg.hidden])?;
+                    let share = beta.bytes.len() / 2;
+                    for (rank, packed) in pair.iter_mut().enumerate() {
+                        let mut fab = fa.bytes.clone();
+                        fab.extend_from_slice(&beta.bytes[rank * share..(rank + 1) * share]);
+                        packed.operands.insert("kda.fab", fab);
+                    }
+                    for (name, leaf, shape, side) in [
+                        ("kda.q", "q_proj", [width, cfg.hidden], TrellisSide::Output),
+                        ("kda.k", "k_proj", [width, cfg.hidden], TrellisSide::Output),
+                        ("kda.v", "v_proj", [width, cfg.hidden], TrellisSide::Output),
+                        ("kda.gate", "g_proj", [width, cfg.hidden], TrellisSide::Output),
+                        ("kda.output", "o_proj", [cfg.hidden, width], TrellisSide::Input),
+                    ] { pack_projection_pair(&layouts, &mut pair, name, &format!("{root}.{leaf}"), shape, side, &[0, 1], &mut read)?; }
                 }
             }
             KimiAttention::Mla => {
@@ -294,14 +413,71 @@ impl PackedLayer {
                 for (operand, name) in [(MlaOperand::QkvA, "mla.qkv_a"), (MlaOperand::QNorm, "mla.q_norm"),
                     (MlaOperand::KvNorm, "mla.kv_norm"), (MlaOperand::QB, "mla.q_b"), (MlaOperand::Uk, "mla.uk"),
                     (MlaOperand::Uv, "mla.uv"), (MlaOperand::Gate, "mla.gate"), (MlaOperand::Output, "mla.output")] {
+                    if !layouts[owners[0]].operands.contains_key(name)
+                        || ([MlaOperand::QB, MlaOperand::Gate, MlaOperand::Output].contains(&operand)
+                            && !layouts[owners[0]].operands.contains_key("mla.qkv_a")) { continue; }
                     let slices = mla::pack(cfg, layer, operand, owners.len(), &mut read)?;
                     for (&owner, slice) in owners.iter().zip(slices) { pair[owner].operands.insert(name, slice.bytes); }
+                }
+                if !layouts[owners[0]].operands.contains_key("mla.qkv_a") {
+                    let root = format!("language_model.model.layers.{layer}.self_attn");
+                    for (name, leaf, shape, side, replicated) in [
+                        ("mla.q_a", "q_a_proj", [cfg.q_lora_rank, cfg.hidden], TrellisSide::Output, true),
+                        ("mla.kv_a", "kv_a_proj_with_mqa", [cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.hidden], TrellisSide::Output, true),
+                        ("mla.q_b", "q_b_proj", [cfg.heads * (cfg.qk_nope_dim + cfg.qk_rope_dim), cfg.q_lora_rank], TrellisSide::Output, false),
+                        ("mla.gate", "g_proj", [cfg.heads * cfg.v_head_dim, cfg.hidden], TrellisSide::Output, false),
+                        ("mla.output", "o_proj", [cfg.hidden, cfg.heads * cfg.v_head_dim], TrellisSide::Input, false),
+                    ] {
+                        if replicated {
+                            for &owner in &owners {
+                                pack_projection_pair(&layouts, &mut pair, name, &format!("{root}.{leaf}"), shape, side, &[owner], &mut read)?;
+                            }
+                        } else { pack_projection_pair(&layouts, &mut pair, name, &format!("{root}.{leaf}"), shape, side, &owners, &mut read)?; }
+                    }
                 }
             }
         }
         for (layout, packed) in layouts.iter().zip(&pair) { layout.check(packed)?; }
         Ok(pair)
     }
+}
+
+fn pack_projection_pair(layouts: &[LayerLayout; 2], packed: &mut [PackedLayer; 2], name: &'static str,
+    stem: &str, shape: [usize; 2], side: TrellisSide, owners: &[usize],
+    read: &mut impl FnMut(&str) -> Result<LoadedTensor>) -> Result<()> {
+    ensure!(!owners.is_empty() && owners.iter().all(|&rank| rank < 2), "Kimi projection owners");
+    if let Some(layout) = layouts[owners[0]].core.get(name) {
+        let mut tensors = BTreeMap::new();
+        for suffix in ["trellis", "suh", "svh", layout.codebook.marker()] {
+            tensors.insert(format!("{stem}.{suffix}"), read(&format!("{stem}.{suffix}"))?);
+        }
+        for &owner in owners {
+            packed[owner].core.insert(name, layouts[owner].core[name].read(|name|
+                tensors.get(name).cloned().context("Kimi K6 source member absent"))?);
+        }
+    } else {
+        let tensor = read(&format!("{stem}.weight"))?;
+        check(&tensor, DType::Bf16, &shape)?;
+        let [n, k] = shape;
+        let ranks = owners.len();
+        ensure!(!owners.is_empty() && match side { TrellisSide::Output => n % ranks == 0,
+            TrellisSide::Input => k % ranks == 0 }, "Kimi BF16 mixed projection shard geometry");
+        for (rank, &owner) in owners.iter().enumerate() {
+            let bytes = match side {
+                TrellisSide::Output => {
+                    let share = tensor.bytes.len() / ranks;
+                    tensor.bytes[rank * share..(rank + 1) * share].to_vec()
+                }
+                TrellisSide::Input => {
+                    let share = k * 2 / ranks;
+                    tensor.bytes.chunks_exact(k * 2).flat_map(|row|
+                        row[rank * share..(rank + 1) * share].iter().copied()).collect()
+                }
+            };
+            packed[owner].operands.insert(name, bytes);
+        }
+    }
+    Ok(())
 }
 
 fn check(tensor: &LoadedTensor, dtype: DType, shape: &[usize]) -> Result<()> {
@@ -316,11 +492,13 @@ fn check(tensor: &LoadedTensor, dtype: DType, shape: &[usize]) -> Result<()> {
 pub(crate) struct LayerWeights<'a> {
     operands: BTreeMap<&'static str, Allocation<'a>>,
     pub(crate) attention: AttentionShare,
+    core: BTreeMap<&'static str, CoreWeights<'a>>,
 }
 
 impl<'a> LayerWeights<'a> {
     pub(super) fn check_device(&self, device: Device<'_>) -> Result<()> {
-        ensure!(self.operands.values().all(|allocation| allocation.device.id == device.id
+        ensure!(self.operands.values().chain(self.core.values().flat_map(|weights|
+            [&weights.payload, &weights.suh, &weights.svh])).all(|allocation| allocation.device.id == device.id
             && std::ptr::eq(allocation.device.library, device.library)), "Kimi layer weight owner differs from lane device");
         Ok(())
     }
@@ -339,7 +517,9 @@ impl<'a> LayerWeights<'a> {
             device.run(|| device.library.copy_h2d(allocation.buffer, &bytes))?;
             Ok((name, allocation))
         }).collect::<Result<_>>()?;
-        Ok(Self { operands, attention: packed.attention })
+        let core = packed.core.into_iter().map(|(name, loaded)|
+            Ok((name, layout.core[name].upload(device, loaded)?))).collect::<Result<_>>()?;
+        Ok(Self { operands, attention: packed.attention, core })
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
@@ -644,6 +824,7 @@ mod tests {
 
 /// Inert until explicit K6 admission: native bytes remain compressed on device.
 /// The caller selects ownership from the shared layer placement before packing.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CoreWeightLayout {
     pub stem: String, pub side: cuteafd_loader::formats::dense_trellis::TrellisSide,
     pub rank: usize, pub ranks: usize, pub shape: [usize;2], pub bytes: usize,
@@ -667,6 +848,35 @@ impl CoreWeightLayout {
         let bytes=extent(&[n,k,6])?/8+extent(&[n+k,2])?;
         Ok(Self{stem:projection.stem.clone(),side,rank,ranks,shape:[n,k],bytes,codebook:projection.codebook})
     }
+    fn check(&self, loaded: &LoadedDenseTrellis) -> Result<()> {
+        let shard = &loaded.shard;
+        ensure!(loaded.codebook == self.codebook && shard.side == self.side && shard.shape == self.shape
+            && shard.payload.len() == extent(&[self.shape[0], self.shape[1], 6])? / 8
+            && shard.suh.len() == self.shape[1] * 2 && shard.svh.len() == self.shape[0] * 2,
+            "Kimi K6 packed shard differs from admitted operands");
+        Ok(())
+    }
+
+    fn read(&self, mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<LoadedDenseTrellis> {
+        let mut tensors = BTreeMap::new();
+        for suffix in ["trellis", "suh", "svh", self.codebook.marker()] {
+            let tensor = read(&format!("{}.{}", self.stem, suffix))?;
+            tensors.insert(suffix, tensor);
+        }
+        let metadata = tensors.iter().map(|(&suffix, tensor)| (suffix, cuteafd_loader::SafetensorsTensorMetadata {
+            name: tensor.info.name.clone(), dtype: tensor.info.dtype.clone(), shape: tensor.info.shape.clone(),
+            byte_offset: tensor.info.byte_offset, byte_length: tensor.info.byte_length,
+        })).collect::<BTreeMap<_, _>>();
+        let suffixes = tensors.keys().copied().collect::<Vec<_>>();
+        let module = exl3_module(&self.stem, &suffixes, |suffix| metadata.get(suffix))?;
+        let loaded = self.pack(&module, |name| {
+            let suffix = name.strip_prefix(&format!("{}.", self.stem)).context("Kimi K6 source stem")?;
+            tensors.remove(suffix).context("Kimi K6 source member already consumed")
+        })?;
+        self.check(&loaded)?;
+        Ok(loaded)
+    }
+
     pub(crate) fn demand(&self, device: u8) -> Demand {
         Demand::new(device,Category::Weights,format!("Kimi K6 {}",self.stem),self.bytes as u64,Basis::Exact)
     }
@@ -676,10 +886,12 @@ impl CoreWeightLayout {
         ensure!(loaded.codebook==self.codebook && loaded.shard.shape==self.shape
             && loaded.shard.payload.len()+loaded.shard.suh.len()+loaded.shard.svh.len()==self.bytes,
             "Kimi K6 packed shard differs from admitted geometry/bytes");
+        self.check(&loaded)?;
         Ok(loaded)
     }
     pub(crate) fn upload<'a>(&self,device:Device<'a>,loaded:cuteafd_loader::formats::dense_trellis::LoadedDenseTrellis)
         -> Result<CoreWeights<'a>> {
+        self.check(&loaded)?;
         let shard=loaded.shard;
         ensure!(loaded.codebook==self.codebook && shard.side==self.side && shard.shape==self.shape
             && shard.payload.len()+shard.suh.len()+shard.svh.len()==self.bytes,
@@ -705,6 +917,215 @@ mod core_owner_tests {
     use super::*;
     use cuteafd_loader::{families::kimi_k3::core::{CoreProjection,CoreSplit},
         formats::{dense_trellis::TrellisSide,exl3_storage::Exl3Codebook}};
+    fn fixture_config() -> KimiK3Config {
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap();
+        cfg.hidden = 256;
+        cfg.heads = 4;
+        cfg.kda_heads = 16;
+        cfg.kda_head_dim = 128;
+        cfg.q_lora_rank = 128;
+        cfg.kv_lora_rank = 64;
+        cfg.qk_nope_dim = 64;
+        cfg.qk_rope_dim = 64;
+        cfg.v_head_dim = 128;
+        cfg.latent = 128;
+        cfg.experts = 4;
+        cfg.moe_intermediate = 128;
+        cfg.shared_experts = 2;
+        cfg.dense_intermediate = 256;
+        cfg
+    }
+
+    fn inventory(layer: usize, leaves: &[(&str, [usize; 2])]) -> CoreInventory {
+        CoreInventory { projections: leaves.iter().map(|(leaf, shape)| {
+            let stem = format!("language_model.model.layers.{layer}.{leaf}");
+            let projection = CoreProjection { stem: stem.clone(), bits: 6, codebook: Exl3Codebook::Mul1,
+                shape: *shape, stored_outputs: shape[0], split: cuteafd_loader::families::kimi_k3::core::split(&stem).unwrap(),
+                source_bytes: 0 };
+            (stem, projection)
+        }).collect() }
+    }
+
+    #[test]
+    fn mixed_kda_fallback_preserves_fused_attention_and_native_shared_charges() -> Result<()> {
+        let cfg = fixture_config();
+        let core = inventory(1, &[("block_sparse_moe.shared_experts.gate_proj", [256, 256]),
+            ("block_sparse_moe.shared_experts.up_proj", [256, 256]),
+            ("block_sparse_moe.shared_experts.down_proj", [256, 256])]);
+        let original = LayerLayout::pair(&cfg, 1, LayerMode::HeadSplit)?;
+        let mixed = LayerLayout::pair_with_core(&cfg, 1, LayerMode::HeadSplit, &core)?;
+        for rank in 0..2 {
+            assert_eq!(mixed[rank].attention_bytes()?, original[rank].attention_bytes()?);
+            for name in ["kda.input", "kda.output", "kda.forget", "kda.conv", "kda.norm"] {
+                assert_eq!(mixed[rank].operands[name], original[rank].operands[name]);
+            }
+            assert!(!mixed[rank].operands.contains_key("ffn.gate_up"));
+            assert_eq!(mixed[rank].core.len(), 3);
+            let removed = original[rank].operands["ffn.gate_up"] + original[rank].operands["ffn.down"];
+            let native = mixed[rank].core.values().map(|layout| layout.bytes).sum::<usize>();
+            assert_eq!(mixed[rank].bytes()?, original[rank].bytes()? - removed + native);
+            assert_eq!(mixed[rank].core["ffn.down"].side, TrellisSide::Input);
+        }
+        assert_eq!(LayerLayout::pair_with_core(&cfg, 1, LayerMode::HeadSplit, &CoreInventory::default())?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn mla_native_padding_and_ownership_leave_absorbed_kv_b_unchanged() -> Result<()> {
+        use cuteafd_loader::placement::FfnMode;
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let mut core = inventory(3, &[("self_attn.kv_a_proj_with_mqa", [576, 7168]),
+            ("self_attn.o_proj", [7168, 12288])]);
+        core.projections.get_mut("language_model.model.layers.3.self_attn.kv_a_proj_with_mqa").unwrap().stored_outputs = 640;
+        for mode in [LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+            LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] {
+            let baseline = LayerLayout::pair(&cfg, 3, mode)?;
+            let mixed = LayerLayout::pair_with_core(&cfg, 3, mode, &core)?;
+            for rank in 0..2 {
+                if !mixed[rank].attention.present() { assert!(mixed[rank].core.is_empty()); continue; }
+                assert_eq!(mixed[rank].core["mla.kv_a"].shape, [640, 7168]);
+                assert_eq!(mixed[rank].operands["mla.uk"], baseline[rank].operands["mla.uk"]);
+                assert_eq!(mixed[rank].operands["mla.uv"], baseline[rank].operands["mla.uv"]);
+                assert!(!mixed[rank].operands.contains_key("mla.qkv_a"));
+                assert_eq!(mixed[rank].core["mla.output"].side,
+                    if mode == LayerMode::HeadSplit { TrellisSide::Input } else { TrellisSide::Output });
+            }
+        }
+        Ok(())
+    }
+
+    fn mixed_tensor(cfg: &KimiK3Config, inventory: &CoreInventory, name: &str) -> Result<LoadedTensor> {
+        use cuteafd_core::{TensorInfo, TensorRole};
+        let (stem, suffix) = name.rsplit_once('.').context("fixture tensor suffix")?;
+        let (dtype, shape, bytes) = if let Some(projection) = inventory.get_weight(stem) {
+            let [n, k] = [projection.stored_outputs, projection.shape[1]];
+            match suffix {
+                "trellis" => (DType::I16, vec![k / 16, n / 16, 96], vec![0; n * k * 6 / 8]),
+                "suh" => (DType::F16, vec![k], vec![0; k * 2]),
+                "svh" => (DType::F16, vec![n], vec![0; n * 2]),
+                value if value == projection.codebook.marker() =>
+                    (DType::I32, vec![], projection.codebook.multiplier().to_le_bytes().to_vec()),
+                _ => anyhow::bail!("compressed fixture read as BF16: {name}"),
+            }
+        } else {
+            let leaf = name.split("self_attn.").nth(1).unwrap_or("");
+            let d = cfg.kda_heads * cfg.kda_head_dim;
+            let (dtype, shape) = match leaf {
+                "q_proj.weight" | "k_proj.weight" | "v_proj.weight" => (DType::Bf16, vec![d, cfg.hidden]),
+                "f_a_proj.weight" => (DType::Bf16, vec![cfg.kda_head_dim, cfg.hidden]),
+                "f_b_proj.weight" => (DType::Bf16, vec![d, cfg.kda_head_dim]),
+                "b_proj.weight" => (DType::Bf16, vec![cfg.kda_heads, cfg.hidden]),
+                "q_conv1d.weight" | "k_conv1d.weight" | "v_conv1d.weight" => (DType::F32, vec![d, 1, cfg.kda_conv]),
+                "A_log" => (DType::F32, vec![cfg.kda_heads]),
+                "dt_bias" => (DType::F32, vec![d]),
+                "o_norm.weight" => (DType::F32, vec![cfg.kda_head_dim]),
+                "q_a_proj.weight" => (DType::Bf16, vec![cfg.q_lora_rank, cfg.hidden]),
+                "kv_a_proj_with_mqa.weight" => (DType::Bf16, vec![cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.hidden]),
+                "q_a_layernorm.weight" => (DType::Bf16, vec![cfg.q_lora_rank]),
+                "kv_a_layernorm.weight" => (DType::Bf16, vec![cfg.kv_lora_rank]),
+                "q_b_proj.weight" => (DType::Bf16, vec![cfg.heads * (cfg.qk_nope_dim + cfg.qk_rope_dim), cfg.q_lora_rank]),
+                "kv_b_proj.weight" => (DType::Bf16, vec![cfg.heads * (cfg.qk_nope_dim + cfg.v_head_dim), cfg.kv_lora_rank]),
+                "g_proj.weight" => (DType::Bf16, vec![if name.contains("layers.3.") {cfg.heads * cfg.v_head_dim} else {d}, cfg.hidden]),
+                "o_proj.weight" => (DType::Bf16, vec![cfg.hidden, if name.contains("layers.3.") {cfg.heads * cfg.v_head_dim} else {d}]),
+                _ if name.ends_with("routed_expert_down_proj.weight") => (DType::Bf16, vec![cfg.latent, cfg.hidden]),
+                _ if name.ends_with("routed_expert_up_proj.weight") => (DType::Bf16, vec![cfg.hidden, cfg.latent]),
+                _ if name.ends_with("routed_expert_norm.weight") => (DType::Bf16, vec![cfg.latent]),
+                _ if name.ends_with("gate.weight") => (DType::Bf16, vec![cfg.experts, cfg.hidden]),
+                _ if name.ends_with("e_score_correction_bias") => (DType::F32, vec![cfg.experts]),
+                _ if name.ends_with("_res_proj.weight") => (DType::Bf16, vec![1, cfg.hidden]),
+                _ if name.ends_with("gate_proj.weight") || name.ends_with("up_proj.weight") =>
+                    (DType::Bf16, vec![cfg.moe_intermediate * cfg.shared_experts, cfg.hidden]),
+                _ if name.ends_with("down_proj.weight") => (DType::Bf16, vec![cfg.hidden, cfg.moe_intermediate * cfg.shared_experts]),
+                _ => (DType::Bf16, vec![cfg.hidden]),
+            };
+            let bytes = vec![0; shape.iter().product::<usize>() * if dtype == DType::F32 {4} else {2}];
+            (dtype, shape, bytes)
+        };
+        Ok(LoadedTensor { info: TensorInfo { name: name.into(), file: "test".into(), dtype, shape,
+            byte_offset: 0, byte_length: bytes.len() as u64, role: TensorRole::Other, layer_id: None,
+            expert_id: None, is_quantization_metadata: false }, source_path: "test".into(), bytes,
+            elapsed_micros: 0, sha256: String::new() })
+    }
+
+    #[test]
+    fn mixed_layer_pack_matches_each_admitted_operand_without_bf16_shadows() -> Result<()> {
+        use cuteafd_loader::placement::FfnMode;
+        let cfg = fixture_config();
+        for layer in [1, 3] {
+            let mut leaves = vec![("block_sparse_moe.shared_experts.gate_proj", [256, 256]),
+                ("block_sparse_moe.shared_experts.down_proj", [256, 256])];
+            if layer == 1 {
+                leaves.push(("self_attn.q_proj", [2048, 256]));
+            } else {
+                leaves.push(("self_attn.kv_a_proj_with_mqa", [128, 256]));
+                leaves.push(("self_attn.o_proj", [256, 512]));
+            }
+            let core = inventory(layer, &leaves);
+            let modes = if layer == 1 { vec![LayerMode::HeadSplit] } else { vec![LayerMode::HeadSplit,
+                LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] };
+            for mode in modes {
+                let layouts = LayerLayout::pair_with_core(&cfg, layer, mode, &core)?;
+                let packed = PackedLayer::pair_with_core(&cfg, layer, mode, &core, |name| mixed_tensor(&cfg, &core, name))?;
+                for rank in 0..2 {
+                    layouts[rank].check(&packed[rank])?;
+                    assert_eq!(layouts[rank].bytes()?, packed[rank].bytes()?);
+                    assert!(packed[rank].core.contains_key("ffn.gate"));
+                    assert!(packed[rank].operands.contains_key("ffn.up"));
+                    assert!(!packed[rank].operands.contains_key("ffn.gate"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_member_checks_reject_compensating_vector_extent_errors() -> Result<()> {
+        use cuteafd_loader::formats::dense_trellis::{DenseTrellisCheckpoint, LoadedDenseTrellis};
+        let projection = inventory(1, &[("self_attn.q_proj", [256, 256])]);
+        let p = projection.projections.values().next().unwrap();
+        let layout = CoreWeightLayout::new(p, TrellisSide::Output, 0, 2)?;
+        let payload = vec![0; 256 * 256 * 6 / 8];
+        let vector = vec![0; 256 * 2];
+        let source = DenseTrellisCheckpoint { shape: [256, 256], bits: 6, payload: &payload, suh: &vector, svh: &vector };
+        let mut loaded = LoadedDenseTrellis { codebook: p.codebook, shard: source.native_shard(TrellisSide::Output, 0, 2)? };
+        layout.check(&loaded)?;
+        loaded.shard.suh.pop();
+        loaded.shard.svh.push(0);
+        assert_eq!(loaded.shard.payload.len() + loaded.shard.suh.len() + loaded.shard.svh.len(), layout.bytes);
+        assert!(layout.check(&loaded).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_projection_packing_never_reads_a_bf16_shadow() -> Result<()> {
+        use cuteafd_core::{TensorInfo, TensorRole};
+        let cfg = fixture_config();
+        let core = inventory(1, &[("block_sparse_moe.shared_experts.gate_proj", [256, 256])]);
+        let layouts = LayerLayout::pair_with_core(&cfg, 1, LayerMode::HeadSplit, &core)?;
+        let mut packed = std::array::from_fn(|rank| PackedLayer { operands: BTreeMap::new(),
+            core: BTreeMap::new(), attention: layouts[rank].attention });
+        let stem = "language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj";
+        let mut names = Vec::new();
+        pack_projection_pair(&layouts, &mut packed, "ffn.gate", stem, [256, 256], TrellisSide::Output,
+            &[0, 1], &mut |name: &str| {
+                names.push(name.to_owned());
+                let (dtype, shape, bytes) = match name.rsplit_once('.').unwrap().1 {
+                    "trellis" => (DType::I16, vec![16, 16, 96], vec![0; 256 * 256 * 6 / 8]),
+                    "suh" | "svh" => (DType::F16, vec![256], vec![0; 512]),
+                    "mul1" => (DType::I32, vec![], Exl3Codebook::Mul1.multiplier().to_le_bytes().to_vec()),
+                    _ => anyhow::bail!("unexpected BF16 shadow read {name}"),
+                };
+                Ok(LoadedTensor { info: TensorInfo { name: name.into(), file: "test".into(), dtype, shape,
+                    byte_offset: 0, byte_length: bytes.len() as u64, role: TensorRole::Other, layer_id: None,
+                    expert_id: None, is_quantization_metadata: false }, source_path: "test".into(), bytes,
+                    elapsed_micros: 0, sha256: String::new() })
+            })?;
+        assert_eq!(names.len(), 4);
+        assert!(names.iter().all(|name| !name.ends_with(".weight")));
+        for rank in 0..2 { layouts[rank].core["ffn.gate"].check(&packed[rank].core["ffn.gate"])?; }
+        Ok(())
+    }
+
     #[test]
     fn native_owner_charge_matches_planner_and_storage_side() {
         for (split,side) in [(CoreSplit::Output,TrellisSide::Output),(CoreSplit::Input,TrellisSide::Input)] {
