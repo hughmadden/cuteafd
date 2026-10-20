@@ -227,7 +227,7 @@ fn load_weights<'a>(
         );
     }
     let mut remaining = config.device_budget;
-    let weights = super::load_in_rank_order(&layers, config.rank, |_, layer| {
+    let weights = super::load_in_holder_order(&layers, |layer| super::catalog_layer_shards(catalog, layer), |_, layer| {
         let started = std::time::Instant::now();
         let weight = ExpertWeights::load(
             library,
