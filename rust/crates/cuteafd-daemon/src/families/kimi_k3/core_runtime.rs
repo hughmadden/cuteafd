@@ -32,32 +32,44 @@ impl ProjectionLayout {
         let layout=cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout::new(p.input,p.output,rows,p.chunk_columns,p.weight_scratch)?;
         let w=program.workspace();
         ensure!([("rotated",w.rotated),("table",w.pointer_table),("scales",w.block_scales),
-            ("partial",w.partial),("accumulator",w.accumulator)].iter()
-            .all(|(name,bytes)|layout.extents.get(name)==Some(bytes)),"K6 package/planner scratch mismatch");
+            ("accumulator",w.accumulator)].iter()
+            .all(|(name,bytes)|layout.extents.get(name)==Some(bytes))
+            && layout.extents["partial"]==w.partial/rows*rows.min(63),"K6 package/planner scratch mismatch");
         Ok(Self{extents:layout.extents,rows:layout.rows})
     }
     pub(crate) fn demand(&self,device:u8)->Result<Demand> {
         Ok(Demand::new(device,Category::Workspace,"Kimi K6 projection scratch",self.bytes()? as u64,Basis::Exact))
     }
     pub(crate) fn allocate<'a>(&self,device:Device<'a>)->Result<ProjectionScratch<'a>> {
+        let storage=cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout {
+            extents:self.extents.clone(),rows:self.rows }.storage()?;
         let mut owners=BTreeMap::new();
-        for (&name,&bytes) in &self.extents {owners.insert(name,Allocation::new(device,bytes)?);}
-        let table=owners["table"].buffer;
-        let pointer=(owners["rotated"].buffer.ptr as u64).to_le_bytes();
-        device.run(||device.library.copy_h2d(table,&pointer))?;
-        Ok(ProjectionScratch{owners,rows:self.rows})
+        for (&name,&bytes) in &storage.owners {owners.insert(name,Allocation::new(device,bytes)?);}
+        let mut buffers=BTreeMap::new();
+        for (&name,&bytes) in &self.extents {
+            let buffer=if let Some(&offset)=storage.route_offsets.get(name) {
+                crate::shared::prefix::view(owners["route arena"].buffer,offset,bytes)?
+            } else {owners[name].buffer};
+            buffers.insert(name,buffer);
+        }
+        let pointer=(buffers["rotated"].ptr as u64).to_le_bytes();
+        device.run(||device.library.copy_h2d(buffers["table"],&pointer))?;
+        Ok(ProjectionScratch{_owners:owners,buffers,rows:self.rows})
     }
 }
-pub(crate) struct ProjectionScratch<'a> {owners:BTreeMap<&'static str,Allocation<'a>>,rows:usize}
+pub(crate) struct ProjectionScratch<'a> {
+    _owners:BTreeMap<&'static str,Allocation<'a>>,
+    buffers:BTreeMap<&'static str,Buffer>,rows:usize,
+}
 impl ProjectionScratch<'_> {
     fn buffers(&self,input:Buffer,weights:&CoreWeights<'_>)->DenseTrellisBuffers {
-        let get=|name|self.owners[name].buffer;
-        // Decode never touches chunk storage; a valid existing owner is used
+        let get=|name|self.buffers[name];
+        // Decode never touches chunk storage; a valid existing view is used
         // as the unused placeholder instead of a null device pointer.
         DenseTrellisBuffers {input,payload:weights.payload.buffer,suh:weights.suh.buffer,svh:weights.svh.buffer,
             rotated:get("rotated"),pointer_table:get("table"),scales:get("scales"),partial:get("partial"),
-            accumulator:get("accumulator"),chunk_weights:self.owners.get("chunk weights").map_or(get("partial"),|v|v.buffer),
-            chunk_output:self.owners.get("chunk output").map_or(get("partial"),|v|v.buffer)}
+            accumulator:get("accumulator"),chunk_weights:self.buffers.get("chunk weights").copied().unwrap_or(get("partial")),
+            chunk_output:self.buffers.get("chunk output").copied().unwrap_or(get("partial"))}
     }
 }
 pub(crate) struct Projection<'a> {pub program:DenseTrellisDispatch<'a>}
@@ -223,6 +235,39 @@ fn projection_key(shape:[usize;2],side:cuteafd_loader::formats::dense_trellis::T
 mod runtime_layout_tests {
     use super::*;
     #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
+    fn route_views_share_one_owner_and_admission_matches_allocated_bytes()->Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout;
+        let fixture=Fixture::build()?;
+        let library=fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device=Device{library:&library,id:0};
+        for rows in [1,16,63,64,4096] {
+            let planned=ProjectionScratchLayout::new(128,256,rows,128,128*128*2)?;
+            let layout=ProjectionLayout{extents:planned.extents.clone(),rows};
+            let scratch=layout.allocate(device)?;
+            assert_eq!(layout.demand(0)?.bytes as usize,
+                scratch._owners.values().map(|owner|owner.buffer.bytes).sum::<usize>());
+            assert_eq!(layout.bytes()?,planned.bytes()?);
+            let arena=scratch._owners["route arena"].buffer;
+            assert_eq!(scratch.buffers["partial"].ptr,arena.ptr);
+            assert_eq!(scratch.buffers["partial"].bytes,rows.min(63)*256*4);
+            if rows>=64 {
+                let weights=scratch.buffers["chunk weights"];
+                let output=scratch.buffers["chunk output"];
+                assert_eq!(weights.ptr,arena.ptr);
+                assert!((output.ptr as usize)>=weights.ptr as usize+weights.bytes);
+                assert!((output.ptr as usize)+output.bytes<=arena.ptr as usize+arena.bytes);
+            }
+            drop(scratch);
+        }
+        let events=fixture.events()?;
+        assert_eq!(events.matches('D').count(),25);
+        assert_eq!(events.matches('d').count(),25);
+        Ok(())
+    }
+    #[test]
     fn planner_and_runtime_native_core_bytes_agree_on_and_off()->Result<()> {
         use cuteafd_loader::{families::kimi_k3::{config::{KimiK3Config,KimiAttention},core::{self,CoreCharges,CoreInventory}},
             plan::{testing,Checkpoint},placement::{LayerMode,FfnMode}};
@@ -283,7 +328,7 @@ mod runtime_layout_tests {
                         let w=DenseTrellisGeometry{input:*k,output:*n,bits:6,side:*side,rows:live,
                             input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
                         let mut extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
-                            ("scales",w.block_scales),("partial",w.partial),("accumulator",w.accumulator)]);
+                            ("scales",w.block_scales),("partial",w.partial/live*live.min(63)),("accumulator",w.accumulator)]);
                         if live>=64 {
                             let chunk=if k*n*2<=256*1024*1024 {*n}else{128};
                             extents.insert("chunk weights",k*chunk*2);
@@ -316,9 +361,9 @@ mod runtime_layout_tests {
         let mut shared=ProjectionLayout{rows:64,extents:BTreeMap::from([("rotated",256),("partial",4096),
             ("table",8),("accumulator",512)])};
         let other=ProjectionLayout{rows:64,extents:BTreeMap::from([("rotated",512),("partial",2048),
-            ("table",8),("accumulator",1024),("chunk weights",8192)])};
+            ("table",8),("accumulator",1024),("chunk weights",8192),("chunk output",512)])};
         shared.merge(&other)?;
-        assert_eq!(shared.bytes()?,512+4096+8+1024+8192);
+        assert_eq!(shared.bytes()?,512+8+1024+(8192usize+512).max(4096));
         let once=shared.clone();shared.merge(&other)?;assert_eq!(shared,once);
         assert!(shared.merge(&ProjectionLayout{rows:63,..other}).is_err());
         Ok(())

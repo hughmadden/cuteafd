@@ -75,7 +75,13 @@ impl CoreProjection {
     }
 }
 
-/// Serialized native projections share maxima per scratch plane, not their sum.
+/// Physical owners and bounded route-exclusive views for serialized projections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionStorageLayout {
+    pub owners: BTreeMap<&'static str, usize>,
+    pub route_offsets: BTreeMap<&'static str, usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionScratchLayout {
     pub extents: BTreeMap<&'static str, usize>,
@@ -92,7 +98,7 @@ impl ProjectionScratchLayout {
             .context("Kimi K6 scratch overflow");
         let mut extents = BTreeMap::from([
             ("rotated", product(&[rows, k, 2])?), ("table", 8), ("scales", k / 128 * 2),
-            ("partial", product(&[rows, k.div_ceil(1024), n, 4])?),
+            ("partial", product(&[rows.min(63), k.div_ceil(1024), n, 4])?),
             ("accumulator", product(&[rows, n, 4])?),
         ]);
         if rows >= 64 {
@@ -111,8 +117,30 @@ impl ProjectionScratchLayout {
         self.bytes()?;
         Ok(())
     }
+    pub fn storage(&self) -> Result<ProjectionStorageLayout> {
+        let mut owners = self.extents.clone();
+        let partial = owners.remove("partial").context("Kimi K6 native partial absent")?;
+        let weights = owners.remove("chunk weights");
+        let output = owners.remove("chunk output");
+        let mut route_offsets = BTreeMap::from([("partial", 0)]);
+        let wide = match (weights, output) {
+            (Some(weights), Some(output)) => {
+                let offset = weights.checked_add(255).map(|n| n / 256 * 256)
+                    .context("Kimi K6 chunk alignment overflow")?;
+                route_offsets.insert("chunk weights", 0);
+                route_offsets.insert("chunk output", offset);
+                offset.checked_add(output).context("Kimi K6 chunk arena overflow")?
+            }
+            (None, None) => 0,
+            _ => anyhow::bail!("Kimi K6 incomplete chunk scratch"),
+        };
+        // Native M<64 and chunk M>=64 never execute in the same projection.
+        owners.insert("route arena", partial.max(wide));
+        Ok(ProjectionStorageLayout { owners, route_offsets })
+    }
     pub fn bytes(&self) -> Result<usize> {
-        self.extents.values().try_fold(0usize, |a, b| a.checked_add(*b)).context("Kimi K6 scratch sum overflow")
+        self.storage()?.owners.values().try_fold(0usize, |a, b| a.checked_add(*b))
+            .context("Kimi K6 scratch sum overflow")
     }
 }
 
@@ -402,10 +430,37 @@ mod tests {
 mod scratch_admission_tests {
     use super::*;
     #[test]
+    fn route_arena_drops_wide_native_partials_and_keeps_chunk_views_disjoint() -> Result<()> {
+        let mut layout=ProjectionScratchLayout::new(7168,12288,4096,12288,7168*12288*2)?;
+        layout.merge(&ProjectionScratchLayout::new(12288,7168,4096,7168,12288*7168*2)?)?;
+        layout.merge(&ProjectionScratchLayout::new(1536,18432,4096,18432,1536*18432*2)?)?;
+        assert_eq!(layout.extents["partial"],21_676_032);
+        assert_eq!(layout.bytes()?,880_804_040);
+        assert_eq!(2_290_090_184usize-layout.bytes()?,1_409_286_144);
+        let mut head=ProjectionScratchLayout::new(7168,163840,64,16384,7168*16384*2)?;
+        head.rows=4096;
+        layout.merge(&head)?;
+        assert_eq!(layout.extents["partial"],289_013_760);
+        assert_eq!(layout.bytes()?,939_524_296);
+        let storage=layout.storage()?;
+        assert_eq!(storage.route_offsets["partial"],0);
+        assert_eq!(storage.route_offsets["chunk weights"],0);
+        let output=storage.route_offsets["chunk output"];
+        assert_eq!(output%256,0);
+        assert!(output>=layout.extents["chunk weights"]);
+        assert!(output+layout.extents["chunk output"]<=storage.owners["route arena"]);
+        assert!(!storage.owners.contains_key("partial"));
+        assert!(!storage.owners.contains_key("chunk weights"));
+        assert!(!storage.owners.contains_key("chunk output"));
+        assert!(ProjectionScratchLayout {rows:64,extents:BTreeMap::from([
+            ("partial",16),("chunk weights",usize::MAX),("chunk output",16)])}.bytes().is_err());
+        Ok(())
+    }
+    #[test]
     fn row_policy_scratch_uses_native_ceiling_and_adds_chunk_only_at_64() -> Result<()> {
         for rows in [1,8,16,63,64,4096] {
             let layout=ProjectionScratchLayout::new(7168,6144,rows,6144,7168*6144*2)?;
-            assert_eq!(layout.extents["partial"],rows*7*6144*4);
+            assert_eq!(layout.extents["partial"],rows.min(63)*7*6144*4);
             assert_eq!(layout.extents.contains_key("chunk weights"),rows>=64);
             assert_eq!(layout.extents.contains_key("chunk output"),rows>=64);
             assert_eq!(exchange_recv_bytes(rows,true)?,rows*7168*4);
