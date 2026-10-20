@@ -292,6 +292,12 @@ impl InstalledExpertVariant {
 #[serde(rename_all = "snake_case")]
 pub enum ExpertGroupingSelector { Native, Exl3Nearest, Exl3GlmFlashK64, Fp8Nearest }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("installed expert read-byte descriptor missing for rank {rank}; rebuild coordinator and workers together")]
+pub struct MissingWeightReadBytes {
+    pub rank: usize,
+}
+
 /// The exact loaded worker, its resident layers and its immutable launch selector.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -331,7 +337,7 @@ impl InstalledExpertGrouping {
     }
 
     pub fn weight_read_bytes(&self) -> Result<usize> {
-        self.weight_read_bytes.context("installed expert read-byte descriptor missing; rebuild coordinator and workers together")
+        self.weight_read_bytes.ok_or_else(|| MissingWeightReadBytes { rank: self.rank }.into())
     }
 
     pub fn layers(&self) -> &[LayerRange] { self.loaded.ranges() }
