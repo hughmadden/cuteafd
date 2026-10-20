@@ -2,12 +2,13 @@
 //! Owners retain all storage and order cache/tap access on the supplied stream.
 use crate::programs::{Program, ProgramSpec, Programs, Scalar};
 use crate::CuteafdDeviceBuffer as Buffer;
+use cuteafd_core::coordinator_programs::MlaDraftProgramLayout as Layout;
 use std::ffi::c_void;
 use thiserror::Error;
 
-const ROWS: usize = 64;
-const HEADS: usize = 64;
-const PAGE: usize = 64;
+const ROWS: usize = Layout::ROWS;
+const HEADS: usize = Layout::HEADS;
+const PAGE: usize = Layout::PAGE;
 const RECORD: usize = 1152;
 const PRODUCER: &[&str] = &["x", "kv_slots", "positions", "inv_freq", "w_qkv_a", "q_a_norm",
     "kv_a_norm", "w_q_b", "w_uk", "kv_cache", "query", "q_resid", "scratch"];
@@ -59,9 +60,6 @@ pub struct MlaDraft<'a> {
     producer: Program<'a>, attention: Program<'a>, output: Program<'a>,
     layout: Layout,
 }
-
-#[derive(Clone, Copy, Debug)]
-struct Layout { context: usize, splits: usize, scratch: [usize; 3] }
 
 impl<'a> MlaDraft<'a> {
     pub fn load(programs: &'a Programs<'a>, window: MlaDraftWindow) -> Result<Self> {
@@ -137,21 +135,16 @@ fn validate_manifest(specs: [&ProgramSpec; 3], window: MlaDraftWindow) -> Result
     }
     let context = a["max_context"].as_u64().filter(|&n| n > 0 && n <= 1048576)
         .ok_or(MlaDraftError::Invalid("manifest context"))? as usize;
-    let splits = context.div_ceil(PAGE).min(16);
-    let chunks = context.div_ceil(PAGE).div_ceil(splits);
-    let align = |n: usize| n.div_ceil(1024) * 1024;
-    let partial = if splits > 1 { align(ROWS * HEADS * splits * 512 * 2) } else { 0 };
-    let lse = if splits > 1 { align(ROWS * HEADS * splits * 4) } else { 0 };
-    let scratch = [align(ROWS * 2112 * 2) + align(ROWS * HEADS * 192 * 2),
-        partial + lse, align(ROWS * HEADS * 128 * 2)];
-    if [("num_splits", splits), ("chunks_per_split", chunks), ("partial_output_bytes", partial),
-        ("partial_lse_bytes", lse), ("scratch_bytes", scratch[1])]
+    let layout = Layout::new(context).map_err(|_| MlaDraftError::Invalid("manifest context"))?;
+    if [("num_splits", layout.splits), ("chunks_per_split", layout.chunks_per_split),
+        ("partial_output_bytes", layout.partial_output_bytes), ("partial_lse_bytes", layout.partial_lse_bytes),
+        ("scratch_bytes", layout.scratch[1])]
         .iter().any(|&(key, n)| a[key].as_u64() != Some(n as u64))
-        || specs.iter().zip(scratch).any(|(s, bytes)| s.scratch.len() != 1
+        || specs.iter().zip(layout.scratch).any(|(s, bytes)| s.scratch.len() != 1
             || s.scratch.get("scratch").copied() != Some(bytes as u64)) {
         return Err(MlaDraftError::Invalid("manifest traversal/scratch"));
     }
-    Ok(Layout { context, splits, scratch })
+    Ok(layout)
 }
 
 fn producer_requirements(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout) -> Result<Vec<(Buffer, usize)>> {

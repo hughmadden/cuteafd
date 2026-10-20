@@ -216,6 +216,17 @@ impl MlaDflashConfig {
         ((self.mla.nope + self.mla.rope) as f64).sqrt().recip() as f32 * self.rotary.softmax_factor
     }
 
+    /// Admission uses the export's compiled extent, not a live sequence length.
+    /// The loaded FFI binding validates these same capacities against its manifest.
+    pub fn program_layout(&self, compiled_context: usize)
+        -> Result<cuteafd_core::coordinator_programs::MlaDraftProgramLayout> {
+        if compiled_context > self.max_context {
+            return Err(unsupported("MLA draft export context exceeds checkpoint extent"));
+        }
+        cuteafd_core::coordinator_programs::MlaDraftProgramLayout::new(compiled_context)
+            .map_err(|_| unsupported("MLA draft program context outside native extent"))
+    }
+
     /// Exact BF16 source shapes. Embedding and vocabulary head are borrowed
     /// from the target, matching the checkpoint's reference execution.
     pub fn tensor_shapes(&self) -> Vec<(String, Vec<usize>)> {
@@ -397,6 +408,24 @@ mod tests {
         assert!(cfg.cache_bytes(0, 262144).is_err());
         assert!(cfg.cache_bytes(8, 1048577).is_err());
         assert!(cfg.cache_bytes(usize::MAX, 1048576).is_err());
+    }
+
+    #[test]
+    fn admission_program_layout_matches_native_capacity_at_256k_and_1m() {
+        use cuteafd_core::coordinator_programs::MlaDraftProgramLayout;
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        for context in [262144, 1048576] {
+            let layout = cfg.program_layout(context).unwrap();
+            assert_eq!(layout, MlaDraftProgramLayout::new(context).unwrap());
+            assert_eq!(layout.scratch_bytes(), 67_371_008);
+            assert_eq!(layout.scratch[2], 1_048_576);
+        }
+        assert!(cfg.program_layout(0).is_err());
+        assert!(cfg.program_layout(1048577).is_err());
+        let mut shorter = cfg;
+        shorter.max_context = 262144;
+        assert!(shorter.program_layout(262144).is_ok());
+        assert!(shorter.program_layout(1048576).is_err());
     }
 
     #[test]
