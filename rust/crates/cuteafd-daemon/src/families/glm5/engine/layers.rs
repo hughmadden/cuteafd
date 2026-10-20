@@ -100,7 +100,7 @@ impl<'a> GlmEngine<'a> {
         let owners = self.loaded_attention_owners();
         let mut bindings = [Bindings { engine: self, work: [w, w1], tables, lane: 0,
             transport: Transport::Serial(experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime))),
-            owners, on_layer, tap: (rows.saturating_sub(super::super::dflash::TAP_ROWS), rows.min(super::super::dflash::TAP_ROWS), 0) }];
+            owners, on_layer, tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS), rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0) }];
         self.run_layer_pipeline(scope, LaneOrder::Independent, &mut bindings)?;
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
         if self.weights.layers.len() < self.cfg.layers { return Ok(None); }
@@ -123,11 +123,11 @@ impl<'a> GlmEngine<'a> {
         let mut bindings = Vec::new();
         for (lane, ((table, w), transport)) in tables.iter().zip(work).zip(transports.iter_mut()).enumerate() {
             let rows = table[0].positions.len();
-            let start = total.saturating_sub(super::super::dflash::TAP_ROWS).max(first).min(first + rows);
+            let start = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS).max(first).min(first + rows);
             let owners = self.loaded_attention_owners();
             bindings.push(Bindings { engine: self, work: [w, peers.get(lane)?], tables: table, lane,
                 transport: Transport::Lane(transport), owners, on_layer: None,
-                tap: (start - first, first + rows - start, start.saturating_sub(total.saturating_sub(super::super::dflash::TAP_ROWS))) });
+                tap: (start - first, first + rows - start, start.saturating_sub(total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS))) });
             first += rows;
         }
         self.run_layer_pipeline(scope, LaneOrder::OrderedChunks, &mut bindings)?;

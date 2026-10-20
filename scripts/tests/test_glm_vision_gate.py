@@ -220,11 +220,11 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     # GLM full also prepares the shared drafter after admission, before publishing it.
     full = (root / "glm5/mod.rs").read_text().split("pub fn with_engine", 1)[1]
     admitted = full.index("glm::solve_working_set(")
-    loaded = full.index("dflash::GlmDrafter::load(")
+    loaded = full.index("dflash::DflashDrafter::load(")
     prepared = full.index("drafter.prepare_workspace()?")
     pool = full.index("engine::GlmEngine::new(")
     assert admitted < loaded < prepared < pool < full.index("engine.drafter = drafter")
-    drafter = (root / "glm5/dflash.rs").read_text()
+    drafter = (root / "../shared/speculation/dflash.rs").read_text()
     prepare = drafter.split("pub(crate) fn prepare_workspace(", 1)[1].split("pub(crate) fn prime_remote(", 1)[0]
     assert "self.workspace(self.max_sequences)" in prepare
     prime, existing = drafter.split("pub(crate) fn prime_remote(", 1)[1].split("fn workspace(", 1)

@@ -819,7 +819,7 @@ pub(crate) fn features(top: &[f32]) -> [f32; 4] {
     [best - top.get(1).copied().unwrap_or(f32::NEG_INFINITY), 1.0 / total, entropy.max(0.0), 0.0]
 }
 
-impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
+impl crate::shared::speculation::dflash::ReplayDrafter for MimoDrafter<'_> {
     fn block(&self) -> usize {
         self.cfg.block
     }
@@ -828,8 +828,8 @@ impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
         self.max_sequences.min(self.slots)
     }
 
-    fn resident_modes(&self) -> Vec<crate::families::glm5::dflash::ReplayMode> {
-        use crate::families::glm5::dflash::ReplayMode;
+    fn resident_modes(&self) -> Vec<crate::shared::speculation::dflash::ReplayMode> {
+        use crate::shared::speculation::dflash::ReplayMode;
         let name = match self.representation {
             MimoDraftRepresentation::Bf16Only => "BF16",
             MimoDraftRepresentation::Fp8Only => "FP8",

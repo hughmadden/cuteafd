@@ -748,7 +748,7 @@ mod tests {
             fp8_decode: false, mtp_fp8_head: true, attention_plan_rows: None,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128,
             kda_state: crate::families::glm5_flash::engine::KdaState::F32,
-            fp8_head: true, target_head: None, draft_head: crate::families::glm5::DraftHead::Exact,
+            fp8_head: true, target_head: None, draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
             drafter_gib: 0.0,
             local_expert_layers: None,
             rtx_expert_layers: None,
