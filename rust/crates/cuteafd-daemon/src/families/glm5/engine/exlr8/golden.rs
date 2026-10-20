@@ -494,6 +494,8 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
                     Some((&mut *transport, runtime)), None)?;
                 if lane + 1 == LANES {
                     serial = Some(logits.context("serial final logits")?.to_host(engine.library)?);
+                } else {
+                    ensure!(logits.is_none(), "zero-row serial prefill returned logits");
                 }
             }
             let serial_state = snapshot()?;

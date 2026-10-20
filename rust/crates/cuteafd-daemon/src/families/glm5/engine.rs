@@ -972,7 +972,7 @@ impl<'a> GlmEngine<'a> {
             return self.layer_step(scope, w, w1.context("owned attention peer")?, &ranked[0],
                 t, logit_rows, &mut experts, on_layer);
         }
-        if tables.decode && on_layer.is_none() && layers.len() == self.cfg.layers {
+        if tables.decode && logit_rows > 0 && on_layer.is_none() && layers.len() == self.cfg.layers {
             // The first captured segment gathers the rows from the staged ids;
             // the last runs the head and the greedy selection.
             let gather = self.embedding.device_gather();
@@ -1075,7 +1075,7 @@ impl<'a> GlmEngine<'a> {
             crate::shared::console::layer_mark(index);
         }
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
-        if layers.len() < self.cfg.layers {
+        if layers.len() < self.cfg.layers || logit_rows == 0 {
             // SAFETY: the engine owns this stream.
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
