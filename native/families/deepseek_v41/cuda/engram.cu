@@ -8,6 +8,9 @@ constexpr int kEngramDim = 5120;
 constexpr int kEngramCopies = 4;
 constexpr int kEngramThreads = 256;
 constexpr int kEngramItems = kEngramDim / kEngramThreads;
+// fl32(5120 ** -0.5), the reference's `self.dim**-0.5` scalar. Runtime
+// rsqrtf(5120.f) is approximate and returns one ulp lower (0x3c64f92d).
+constexpr float kEngramDotScale = 0x1.c9f25cp-7f;
 
 __device__ float warp_sum(float value) {
   for (int offset = 16; offset; offset >>= 1)
@@ -55,7 +58,7 @@ __global__ void engram_gate_kernel(const uint16_t* x, const uint16_t* kv,
     dot = warp_sum(lane < 8 ? sums[2][lane] : 0);
     if (lane == 0) {
       const float rstd = rsqrtf(xx / kEngramDim + 1e-20f) * rsqrtf(kk / kEngramDim + 1e-20f);
-      dot = __fmul_rn(__fmul_rn(dot, rstd), rsqrtf(float(kEngramDim)));
+      dot = __fmul_rn(__fmul_rn(dot, rstd), kEngramDotScale);
       sums[0][0] = sigmoid_f32(copysignf(sqrtf(fmaxf(fabsf(dot), 1e-6f)), dot));
     }
   }
