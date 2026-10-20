@@ -85,6 +85,8 @@ pub const GLMF_POOL_MARK_RESERVED_UNITS: u64 = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheOptions {
+    /// Selected physical attention layout where a family supports multiple owners.
+    pub attention_placement: Option<crate::placement::AttentionPlacement>,
     pub coordinator_ranks: usize,
     pub native_mtp_layers: usize,
     pub mimo_kv: MimoKvCache,
@@ -103,6 +105,7 @@ pub struct CacheOptions {
 impl Default for CacheOptions {
     fn default() -> Self {
         Self {
+            attention_placement: None,
             coordinator_ranks: 1,
             native_mtp_layers: 0,
             mimo_kv: MimoKvCache::Int8,

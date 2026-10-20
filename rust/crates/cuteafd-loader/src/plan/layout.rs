@@ -1015,6 +1015,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
     report.prefill_rows = admitted_rows;
     let ranks = if id == "deepseek_v41" || options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let selected = CacheOptions { coordinator_ranks: ranks,
+        attention_placement: Some(report.attention_placement),
         native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
         qwen_kv: options.qwen_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
         glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),

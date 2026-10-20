@@ -1,77 +1,10 @@
 use super::*;
-use crate::plan::{self, checkpoint::Checkpoint, format, testing::{self, t, Tensor as FixtureTensor}, *};
+use crate::plan::{self, checkpoint::Checkpoint, format, testing::{self, t, kimi_k3_tensors as tensors, Tensor as FixtureTensor}, *};
 use anyhow::Context;
 use serde_json::Value;
 use crate::families::kimi_k3::validate_expert_inventory;
 
 fn config() -> Value { crate::families::kimi_k3::config::tests::release_config() }
-
-/// The release's tensor headers (sparse payloads). `experts`: routed layers
-/// whose 896 experts are written; the rest are omitted from the shard and the
-/// index alike (a partial snapshot) unless `all`.
-fn tensors(all: bool) -> Vec<FixtureTensor> {
-    let cfg = KimiK3Config::from_hf(&config()).unwrap();
-    let mut out = Vec::new();
-    let p = TEXT;
-    out.push(t(format!("{p}embed_tokens.weight"), "BF16", &[163840, 7168]));
-    out.push(t(format!("{HEAD}weight"), "BF16", &[163840, 7168]));
-    for name in ["norm", "output_attn_res_norm"] { out.push(t(format!("{p}{name}.weight"), "BF16", &[7168])); }
-    out.push(t(format!("{p}output_attn_res_proj.weight"), "BF16", &[1, 7168]));
-    for layer in 0..93 {
-        let b = format!("{p}layers.{layer}");
-        for n in ["input_layernorm", "post_attention_layernorm", "self_attention_res_norm", "mlp_res_norm"] {
-            out.push(t(format!("{b}.{n}.weight"), "BF16", &[7168]));
-        }
-        for n in ["self_attention_res_proj", "mlp_res_proj"] { out.push(t(format!("{b}.{n}.weight"), "BF16", &[1, 7168])); }
-        let a = format!("{b}.self_attn");
-        out.push(t(format!("{a}.g_proj.weight"), "BF16", &[12288, 7168]));
-        out.push(t(format!("{a}.o_proj.weight"), "BF16", &[7168, 12288]));
-        if cfg.attention[layer] == KimiAttention::Kda {
-            for proj in ["q", "k", "v"] {
-                out.push(t(format!("{a}.{proj}_proj.weight"), "BF16", &[12288, 7168]));
-                out.push(t(format!("{a}.{proj}_conv1d.weight"), "F32", &[12288, 1, 4]));
-            }
-            out.push(t(format!("{a}.f_a_proj.weight"), "BF16", &[128, 7168]));
-            out.push(t(format!("{a}.f_b_proj.weight"), "BF16", &[12288, 128]));
-            out.push(t(format!("{a}.b_proj.weight"), "BF16", &[96, 7168]));
-            out.push(t(format!("{a}.A_log"), "F32", &[128]));
-            out.push(t(format!("{a}.dt_bias"), "F32", &[12288]));
-            out.push(t(format!("{a}.o_norm.weight"), "F32", &[128]));
-        } else {
-            out.push(t(format!("{a}.q_a_proj.weight"), "BF16", &[1536, 7168]));
-            out.push(t(format!("{a}.q_a_layernorm.weight"), "BF16", &[1536]));
-            out.push(t(format!("{a}.q_b_proj.weight"), "BF16", &[18432, 1536]));
-            out.push(t(format!("{a}.kv_a_proj_with_mqa.weight"), "BF16", &[576, 7168]));
-            out.push(t(format!("{a}.kv_a_layernorm.weight"), "BF16", &[512]));
-            out.push(t(format!("{a}.kv_b_proj.weight"), "BF16", &[24576, 512]));
-        }
-        if layer == 0 {
-            for (proj, n, k) in [("gate", 33792, 7168), ("up", 33792, 7168), ("down", 7168, 33792)] {
-                out.push(t(format!("{b}.mlp.{proj}_proj.weight"), "BF16", &[n, k]));
-            }
-            continue;
-        }
-        let m = format!("{b}.block_sparse_moe");
-        out.push(t(format!("{m}.gate.weight"), "BF16", &[896, 7168]));
-        out.push(t(format!("{m}.gate.e_score_correction_bias"), "F32", &[896]));
-        out.push(t(format!("{m}.routed_expert_down_proj.weight"), "BF16", &[3584, 7168]));
-        out.push(t(format!("{m}.routed_expert_up_proj.weight"), "BF16", &[7168, 3584]));
-        out.push(t(format!("{m}.routed_expert_norm.weight"), "BF16", &[3584]));
-        for (proj, n, k) in [("gate", 6144, 7168), ("up", 6144, 7168), ("down", 7168, 6144)] {
-            out.push(t(format!("{m}.shared_experts.{proj}_proj.weight"), "BF16", &[n, k]));
-        }
-        if all || layer == 1 {
-            for e in 0..896 {
-                for (w, n, k) in [("w1", 3072, 3584), ("w3", 3072, 3584), ("w2", 3584, 3072)] {
-                    out.extend(testing::exl3(&format!("{m}.experts.{e}.{w}"), n, k, 2));
-                }
-            }
-        }
-    }
-    out.push(t("vision_tower.encoder.blocks.0.wqkv.weight", "BF16", &[1536, 1024]));
-    out.push(t("mm_projector.proj.0.weight", "BF16", &[4096, 4096]));
-    out
-}
 
 /// One shard per layer, as the release (a single 990k-entry header would
 /// exceed the 64 MiB safetensors header bound).
@@ -328,6 +261,8 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     let dir = snapshot(true);
     let mut options = with_layout(6, Some(108 << 30));
     let layout = options.layout.as_mut().unwrap();
+    layout.host_cache_bytes = None;
+    layout.host_memory = Some((128 << 30, 128 << 30));
     layout.concurrency = 8;
     layout.pool_tokens = Some(1_048_576);
     layout.prefix_slots = Some(2);
@@ -403,4 +338,25 @@ fn mounted_release_plan_is_manifest_independent_and_wip_only() -> anyhow::Result
     let deployment = crate::plan::deployment::DeploymentSpec::from_report(&report, &deployment_options);
     assert!(deployment.is_ok(), "{deployment:?}");
     Ok(())
+}
+
+#[test]
+fn cache_geometry_requires_tp2_and_preserves_physical_mla_copies() {
+    use crate::{placement::AttentionPlacement, serving_capacity::{CacheOptions, KvPlacement}};
+    let dir = snapshot(false);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = KIMI_K3.open(&checkpoint).unwrap();
+    assert!(model.cache_geometry(CacheOptions::default()).is_err());
+    for attention in [AttentionPlacement::Layers, AttentionPlacement::Heads] {
+        let cache = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+            attention_placement: Some(attention), ..Default::default() }).unwrap().unwrap();
+        assert_eq!(cache.placement, KvPlacement::PartitionedLayers);
+        assert_eq!(cache.logical_unit_rows, 64);
+        assert_eq!(cache.ranks.len(), 2);
+        assert_eq!(cache.ranks[0].persistent_unit_bytes, 884_736 * if attention == AttentionPlacement::Heads { 2 } else { 1 });
+        assert_eq!(cache.ranks[0], cache.ranks[1]);
+        assert_eq!(cache.ranks[0].retained_mark_bytes, 224_686_080);
+    }
+    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+        attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).is_err());
 }
