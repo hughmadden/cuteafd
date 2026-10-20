@@ -154,6 +154,23 @@ def test_host_cache_and_full_logits_reach_plan_and_serve(quota: str, full: str) 
     assert ("--full-prefill-logits" in serve) == (full == "on")
 
 
+@pytest.mark.parametrize("family", ["deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"])
+@pytest.mark.parametrize("quota", [None, "0", "16GiB"])
+def test_generic_host_default_matches_plan_and_serve(family: str, quota: str | None) -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["family"] == family))
+    entry["set"].pop("HOST_CACHE_BYTES", None)
+    if quota is not None:
+        entry["set"]["HOST_CACHE_BYTES"] = quota
+    result = capture(ROOT, f"host-default-{family}-{quota}", release_entry=entry)
+    plan = result["plans"][0]
+    serve = parse_run(result["containers"][0]["argv"])["command"]
+    expected = quota if quota is not None else "auto"
+    assert plan[plan.index("--host-cache-bytes") + 1] == expected
+    assert serve.count("--host-cache-bytes") == int(expected != "0")
+    if expected != "0":
+        assert serve[serve.index("--host-cache-bytes") + 1] == expected
+
+
 @pytest.mark.parametrize("quota", [None, "0", "2GiB"])
 @pytest.mark.parametrize("vision", ["off", "rtx"])
 def test_effective_media_cache_quota_reaches_plan(quota: str | None, vision: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,7 +203,8 @@ def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> 
     plan = result["plans"][0]
     serve = parse_run(result["containers"][0]["argv"])["command"]
     actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
-    assert actual == ("auto" if enabled == "on" else "0")
+    assert serve.count("--host-cache-bytes") == 1
+    assert actual == "auto"
     assert plan[plan.index("--host-cache-bytes") + 1] == actual
 
 

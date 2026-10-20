@@ -167,8 +167,17 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
             routed.experts as u64, routed.topk as u64, shape.prefill_rows.max(shape.decode_rows))? };
     let gpus = devices.iter().zip(&options.rtx_bytes).map(|(device, &total)|
         (total, Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect();
-    let mark_slots = options.prefix_slots.map_or_else(|| v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
-        shape.native_layers, shape.concurrency, options.mimo_prefix_entries, options.mimo_prefix_mark_bytes), Ok)?;
+    let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
+    let context = shape.manifest.as_ref().and_then(|m| v4::manifest_context(m, id, cfg.n_heads, shape.decode_rows));
+    let attention = report.requested_attention.unwrap_or(if devices.len() == 2 && context.is_some() {
+        crate::placement::AttentionPlacement::Context
+    } else { crate::placement::AttentionPlacement::Heads });
+    let mark_slots = if let Some(slots) = options.prefix_slots { slots }
+        else if options.host_cache_bytes != Some(0) && (devices.len() == 1
+            || attention != crate::placement::AttentionPlacement::Heads) {
+            if options.mimo_prefix_entries == 0 { 0 } else { cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS }
+        } else { v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
+            shape.native_layers, shape.concurrency, options.mimo_prefix_entries, options.mimo_prefix_mark_bytes)? };
     let onboard = match (options.onboard, options.local_expert_layers) {
         (Some(onboard), _) => onboard,
         (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
@@ -194,7 +203,7 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
         exchange_f32: options.exchange_f32,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
         full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(catalog), devices.len()),
-        context: shape.manifest.as_ref().and_then(|m| v4::manifest_context(m, id, cfg.n_heads, shape.decode_rows)),
+        context,
         attention: report.requested_attention };
     let request = v4::request(&inputs)?;
     let reserves = request.inventory.gpus.iter().map(|g| g.headroom_bytes).collect();

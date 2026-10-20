@@ -51,6 +51,7 @@ METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 # Before -> after table: baseline card metrics, then the client sweep's levels
 # (sweep C<n>) and post-load C1, which are separate measurements.
 SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', 'kl', 'top1', 'pool', 'readiness_s')
+FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
 PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'context_load', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort', 'spec_lossless_set'}
@@ -1021,7 +1022,13 @@ def summarize_job(job, exit_code):
         # token hash above is what matches their requests.
         prefill_only = bool(job['entry'].get('prefill_lengths')) and not job['entry'].get('levels') \
             and job['entry'].get('profile') == 'panels:'
-        if not row['requests'] and not prefill_only:
+        # Fidelity panels score fixed windows through the probe endpoint and
+        # decode nothing, so a fidelity-only run has no console rounds either.
+        profile = job['entry'].get('profile') or ''
+        fidelity_only = not job['entry'].get('levels') and profile.startswith('panels:') \
+            and set(filter(None, profile[len('panels:'):].split(','))) <= FIDELITY_PANELS \
+            and job['entry'].get('baseline') is False
+        if not row['requests'] and not (prefill_only or fidelity_only):
             fail(row, 'matched prompts produced no per-request console rounds')
     row['fabric_caveats'] = fabric_assessment(row['fabric'])
     row['ab_verdict'] = 'rerun' if row['fabric_caveats'] else 'eligible'

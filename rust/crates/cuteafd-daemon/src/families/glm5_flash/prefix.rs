@@ -16,8 +16,8 @@
 //! state, 72.8 MiB with a BF16 one. A restore copies the mark back into the new
 //! sequence's own KDA slot and maps its pool pages; nothing else of the state is positional.
 //! `--prefix-marks` picks where marks live:
-//! - `arena` (default): a device arena sized by decoding lanes (2C + 2 marks), the host tier
-//!   holding the rest;
+//! - `arena` (default): two in-flight staging marks with the host tier enabled; without it,
+//!   the legacy lane/entry/budget rule retains positional marks on device;
 //! - `pool`: whole units of the KV pool (49 per mark at FP32 state and token keys), taken at
 //!   capture and evicted like any snapshot's rows. Each rank keeps its part of a mark in its own
 //!   copy of the mark's units, laid out buffer by buffer over the units ([`mark_runs`]), and a
@@ -40,10 +40,11 @@
 //! synchronizes it. Under a head split both GPUs hold identical copies of the paged state (the
 //! replicated MLA projection and indexer write them) and each its own KDA heads' state: page
 //! copies run on each GPU's stream, a mark holds both GPUs' halves (an arena per GPU, or each
-//! GPU's copy of the mark's units), and the host tier is off.
+//! GPU's copy of the mark's units), and the host tier routes each range through its owning GPU.
 use super::engine::{GlmfEngine, GlmfPlacement, IndexCache, KdaState, PagedLayer, KEY_BYTES, KPOOL, PAGE_ROWS,
     RECORD_BYTES, UNIT_PAGES, UNIT_ROWS};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::device::{Allocation, Device};
+use std::rc::Rc;
 use crate::shared::prefix::MarkRule;
 use crate::shared::prefix::view;
 use anyhow::{ensure, Context, Result};
@@ -138,7 +139,7 @@ pub(crate) struct GlmfPrefix<'e, 'a> {
     mark_bytes: usize,
     page_bytes: usize,
     /// Per rank: its part of every mark (its KDA heads' state) and the arena of those parts.
-    arenas: Vec<(usize, Option<DeviceAllocation<'a>>)>,
+    arenas: Vec<(usize, Option<Rc<Allocation<'a>>>)>,
     slots: usize,
     /// Pool units of one mark (`PrefixMarks::Pool`; 0 with an arena).
     mark_units: usize,
@@ -165,9 +166,10 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         let parts: Vec<usize> = (0..engine.ranks())
             .map(|rank| engine.slot_regions_on(rank, 0).iter().map(|r| r.bytes).sum()).collect();
         let mark_bytes = parts.iter().sum();
-        let page_bytes = paged.iter().filter(|(rank, _)| !engine.context_kv() || *rank == 0)
+        let page_bytes = paged.iter().filter(|(rank, _)| !(engine.context_kv() || engine.replicated_kv()) || *rank == 0)
             .map(|(_, layer)| UNIT_ROWS * (RECORD_BYTES + layer.keys.map_or(0, |_| KEY_BYTES)) + POOL_PAGE_BYTES).sum::<usize>()
-            + (0..engine.ranks()).map(|rank| engine.pool_mark_unit(rank, 0).map(|b| b.map_or(0, |b| b.bytes)))
+            + (0..engine.ranks()).filter(|&rank| !(engine.context_kv() || engine.replicated_kv()) || rank == 0)
+                .map(|rank| engine.pool_mark_unit(rank, 0).map(|b| b.map_or(0, |b| b.bytes)))
                 .collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>();
         let (slots, mark_units) = match marks {
             PrefixMarks::Arena => (slots(mark_bytes), 0),
@@ -185,7 +187,10 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         ensure!(mark_units + reserved < engine.pool_pages.max(1), "a pool mark of {mark_units} units and {reserved} \
             reserved do not fit a pool of {} units", engine.pool_pages);
         let arenas = parts.into_iter().enumerate().map(|(rank, part)| -> Result<_> {
-            let arena = if slots > 0 { Some(engine.on(rank, || DeviceAllocation::new(engine.library, slots * part))?) }
+            let arena = if slots > 0 { Some(engine.on(rank, || {
+                let device = Device { library: engine.library, id: engine.library.cuda_get_device()? };
+                Allocation::new(device, slots * part).map(Rc::new)
+            })?) }
                 else { None };
             Ok((part, arena))
         }).collect::<Result<_>>()?;
@@ -220,7 +225,11 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
     /// engine's routing by owning device.
     pub fn buffers(&self) -> Vec<CuteafdDeviceBuffer> {
         self.paged.iter().flat_map(|(_, layer)| std::iter::once(layer.records).chain(layer.keys).chain([layer.pools]))
-            .collect()
+            .chain(self.engine.pool_mark_buffers()).collect()
+    }
+
+    pub fn arena_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        self.arenas.iter().filter_map(|(_, arena)| arena.clone()).collect()
     }
 
     /// Arena marks (none when marks live in pool units).
@@ -472,12 +481,34 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
         self.parity().then_some((page & 1) as u8)
     }
 
-    /// The host tier's ranges: rank 0's (a heads split runs without the host tier), or under
-    /// context the owner's at its local unit.
+    /// Heads store one identical copy; context stores its owner; layers store distinct owners.
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         let (owner, unit) = self.locate(page);
-        self.unit_ranges_on(owner, unit).unwrap_or_default().into_iter()
+        (0..self.engine.ranks()).filter(|&rank| if self.parity() { rank == owner }
+                else { !self.engine.replicated_kv() || rank == 0 })
+            .flat_map(|rank| self.unit_ranges_on(rank, unit).unwrap_or_default())
             .map(|b| DeviceRange { addr: b.ptr as u64, bytes: b.bytes }).collect()
+    }
+
+    fn page_replicas(&self, page: u32) -> Vec<(DeviceRange, DeviceRange)> {
+        if !self.engine.replicated_kv() { return Vec::new(); }
+        let left = self.unit_ranges_on(0, page).expect("admitted page");
+        let right = self.unit_ranges_on(1, page).expect("admitted page replica");
+        replica_ranges(&left, &right)
+    }
+
+    fn copy_replicas(&self, copies: &[(DeviceRange, DeviceRange)]) -> Result<(), BoxError> {
+        self.engine.on(1, || {
+            for &(src, dst) in copies {
+                let template = self.paged.iter().find(|(rank, _)| *rank == 1).context("missing replica owner")?.1.records;
+                let source = CuteafdDeviceBuffer { ptr: src.addr as *mut c_void, bytes: src.bytes,
+                    device_id: self.engine.device, ..template };
+                let target = CuteafdDeviceBuffer { ptr: dst.addr as *mut c_void, bytes: dst.bytes, ..template };
+                // SAFETY: registered page views stay live until the destination stream drains.
+                unsafe { self.engine.library.copy_d2d_async(target, source, src.bytes, self.engine.stream_of(1))?; }
+            }
+            Ok(())
+        }).map_err(Into::into)
     }
 
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
@@ -528,6 +559,15 @@ fn unit_layers(paged: &[(usize, PagedLayer)], rank: usize, unit: u32) -> Result<
 fn unit_ranges(paged: &[(usize, PagedLayer)], rank: usize, unit: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
     Ok(unit_layers(paged, rank, unit)?.into_iter()
         .flat_map(|layer| std::iter::once(layer.records).chain(layer.keys).chain([layer.pools])).collect())
+}
+
+fn replica_ranges(left: &[CuteafdDeviceBuffer], right: &[CuteafdDeviceBuffer]) -> Vec<(DeviceRange, DeviceRange)> {
+    assert_eq!(left.len(), right.len(), "replica segment count");
+    left.iter().zip(right).map(|(src, dst)| {
+        assert_eq!(src.bytes, dst.bytes, "replica segment extent");
+        (DeviceRange { addr: src.ptr as u64, bytes: src.bytes },
+            DeviceRange { addr: dst.ptr as u64, bytes: dst.bytes })
+    }).collect()
 }
 
 /// A device byte range: address, bytes.
@@ -880,6 +920,76 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n
 mod tests {
     use super::super::engine::{Allocator, GlmfPlacement};
 
+    #[test]
+    fn heads_host_round_trip_keeps_one_page_copy_and_both_rank_marks_exact() {
+        use cuteafd_hostcache::{cache::{DevicePage, DeviceSnapshot, HostCache, RestoreOutcome, RestoreTarget},
+            config::Config, copy::{CopyModel, DeviceRange, StubCopyEngine}, pool::Layout,
+            snapshot::{DevicePageId, SnapshotMeta}};
+        use cuteafd_core::prefix::{ReuseRule, SnapshotKind};
+        use cuteafd_ffi::CuteafdDeviceBuffer;
+        let rows = super::UNIT_ROWS;
+        let sizes = [rows * super::RECORD_BYTES, rows * super::KEY_BYTES, super::POOL_PAGE_BYTES];
+        let unit: usize = sizes.iter().sum();
+        let gpu_bytes = unit * 2 + 64;
+        let mut memory = StubCopyEngine::new(CopyModel::default(), gpu_bytes * 2, 1 << 26);
+        let buffer = |gpu: usize, offset: usize, bytes: usize| CuteafdDeviceBuffer {
+            ptr: (gpu * gpu_bytes + offset) as *mut std::ffi::c_void, bytes, device_id: gpu as i32, flags: 0 };
+        let paged = (0..2).map(|rank| (rank, super::PagedLayer {
+            records: buffer(rank, 0, sizes[0] * 2),
+            keys: Some(buffer(rank, sizes[0] * 2, sizes[1] * 2)),
+            pools: buffer(rank, (sizes[0] + sizes[1]) * 2, sizes[2] * 2),
+        })).collect::<Vec<_>>();
+        let left = super::unit_ranges(&paged, 0, 1).unwrap();
+        let right = super::unit_ranges(&paged, 1, 1).unwrap();
+        let replicas = super::replica_ranges(&left, &right);
+        let page = left.iter().map(|b| DeviceRange { addr: b.ptr as u64, bytes: b.bytes }).collect::<Vec<_>>();
+        assert_eq!(page.iter().map(|r| r.bytes).sum::<usize>(), unit);
+        let marks = (0..2).map(|gpu| DeviceRange { addr: (gpu * gpu_bytes + unit * 2) as u64, bytes: 17 })
+            .collect::<Vec<_>>();
+        let layout = Layout { page: unit, tail: 34, draft: 0, scores: 0 };
+        let config = Config { bytes: 1 << 26, chunk_bytes: 1 << 22, min_tokens: 1, ..Default::default() };
+        for (src, dst) in &replicas {
+            memory.write_device(*src, &vec![5; src.bytes]);
+            memory.write_device(*dst, &vec![5; dst.bytes]);
+        }
+        for (gpu, mark) in marks.iter().enumerate() { memory.write_device(*mark, &vec![11 + gpu as u8; mark.bytes]); }
+        let mut host = HostCache::with_rule(config, layout, memory, ReuseRule::EXACT,
+            cuteafd_hostcache::snapshot::EvictionOrder::LeastRecent).unwrap();
+        for (kind, tokens) in [(SnapshotKind::Prompt, vec![1, 2]), (SnapshotKind::Turn, vec![1, 2, 3])] {
+            let mut pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
+            pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 1, generation: 1 }, segments: page.clone() });
+            let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind, end: tokens.len() as u32, tokens: tokens.clone(),
+                has_draft: false }, pages: pages.clone(), tail: marks.clone(), draft: None, scores: vec![] };
+            assert!(matches!(host.store(&snapshot, ()), cuteafd_hostcache::cache::StoreOutcome::Issued(_)));
+            host.engine_mut().advance(100_000_000);
+            let report = host.tick();
+            let key = report.committed[0].1;
+            for (src, dst) in &replicas {
+                host.engine_mut().write_device(*src, &vec![0; src.bytes]);
+                host.engine_mut().write_device(*dst, &vec![0; dst.bytes]);
+            }
+            for mark in &marks { host.engine_mut().write_device(*mark, &vec![0; mark.bytes]); }
+            let target = RestoreTarget { pages, tail: marks.clone(), draft: None, scores: vec![] };
+            assert!(matches!(host.restore(key, &target), RestoreOutcome::Done { .. }));
+            for (src, dst) in &replicas {
+                let bytes = host.engine_mut().read_device(*src);
+                host.engine_mut().write_device(*dst, &bytes);
+                assert_eq!(bytes, vec![5; src.bytes]);
+                assert_eq!(host.engine_mut().read_device(*dst), bytes);
+            }
+            for (gpu, mark) in marks.iter().enumerate() {
+                assert_eq!(host.engine_mut().read_device(*mark), vec![11 + gpu as u8; mark.bytes]);
+                host.engine_mut().write_device(*mark, &vec![0; mark.bytes]);
+            }
+            let before = host.metrics().restore_bytes;
+            assert!(matches!(host.restore_mark(key, marks.clone()), RestoreOutcome::Done { .. }));
+            assert_eq!(host.metrics().restore_bytes - before, 34, "resident KV is not recopied");
+            for (gpu, mark) in marks.iter().enumerate() {
+                assert_eq!(host.engine_mut().read_device(*mark), vec![11 + gpu as u8; mark.bytes]);
+            }
+        }
+    }
+
     /// GLM-5.3-Flash's text config: 34 KDA layers (64 heads of 128) and 11 MLA layers.
     fn glm53_flash() -> cuteafd_loader::families::glm5_flash::GlmNextConfig {
         let types: Vec<&str> = (0..45)
@@ -1023,7 +1133,7 @@ mod tests {
                 // aggregate mark size stays identical to the existing single-rank rule.
                 let budget = 14 * total as u64;
                 let arena = super::ArenaMarks::Rule(crate::shared::prefix::MarkRule {
-                    lanes: 5, entries: 20, budget_bytes: budget });
+                    lanes: 5, entries: 20, budget_bytes: budget, host: false });
                 assert_eq!(arena.slots_placed(&cfg, cfg.layers, index, KdaState::F32, false).unwrap(),
                     arena.slots(total));
                 assert_eq!(arena.slots(total), 14);
@@ -1054,7 +1164,7 @@ mod tests {
         for lanes in 1..=5 {
             for entries in [6, 7, 20, 64] {
                 let arena = super::ArenaMarks::Rule(crate::shared::prefix::MarkRule { lanes, entries,
-                    budget_bytes: budget });
+                    budget_bytes: budget, host: false });
                 let planned = arena.slots_on(&cfg, cfg.layers, served, KdaState::F32).unwrap();
                 assert_eq!((planned, arena.slots(mark)), (14, 14), "{lanes} lanes, {entries} entries");
                 // The count on the cache requested: one short of the arena allocated.
@@ -1089,17 +1199,20 @@ mod tests {
                     for mib in [0, 1000, 1971, 2048, 4096] {
                         for lanes in [1, 4, 5, 8, 16, 64] {
                             for entries in [0, 6, 20] {
-                                let rule = crate::shared::prefix::MarkRule { lanes, entries, budget_bytes: mib << 20 };
-                                let arena = super::ArenaMarks::Rule(rule);
-                                let planned = arena.slots_on(&cfg, cfg.layers, served, state).unwrap();
-                                let allocated = arena.slots(mark);
-                                assert_eq!(planned, allocated, "split {split}, {requested:?}, {state:?}, {mib} MiB, \
-                                    {lanes} lanes, {entries} entries");
-                                for (rank, part) in geometry.ranks.iter().zip(&parts) {
-                                    assert_eq!(planned as u64 * rank.retained_mark_bytes, (allocated * part) as u64);
+                                for host in [false, true] {
+                                    let rule = crate::shared::prefix::MarkRule { lanes, entries, budget_bytes: mib << 20, host };
+                                    let arena = super::ArenaMarks::Rule(rule);
+                                    let planned = arena.slots_on(&cfg, cfg.layers, served, state).unwrap();
+                                    let allocated = arena.slots(mark);
+                                    assert_eq!(planned, allocated, "split {split}, {requested:?}, {state:?}, {mib} MiB, \
+                                        {lanes} lanes, {entries} entries, host {host}");
+                                    for (rank, part) in geometry.ranks.iter().zip(&parts) {
+                                        assert_eq!(planned as u64 * rank.retained_mark_bytes, (allocated * part) as u64);
+                                    }
+                                    if host { assert_eq!(planned, if entries == 0 { 0 } else { 2 }); }
+                                    binding += usize::from(!host && entries > 0 && planned < 2 * entries + 2
+                                        && planned > 2 * lanes + 2);
                                 }
-                                binding += usize::from(entries > 0 && planned < 2 * entries + 2
-                                    && planned > 2 * lanes + 2);
                             }
                         }
                     }
@@ -1122,7 +1235,7 @@ mod tests {
         assert_eq!(PrefixMarks::Pool.with_entries(0), PrefixMarks::Arena);
         assert_eq!(PrefixMarks::Pool.with_entries(1), PrefixMarks::Pool);
         assert_eq!(PrefixMarks::Arena.with_entries(0), PrefixMarks::Arena);
-        let rule = crate::shared::prefix::MarkRule { lanes: 16, entries: 0, budget_bytes: 2 << 30 };
+        let rule = crate::shared::prefix::MarkRule { lanes: 16, entries: 0, budget_bytes: 2 << 30, host: false };
         assert_eq!(super::ArenaMarks::Rule(rule).slots(147_619_840), 0);
     }
 

@@ -91,7 +91,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     ensure!(args.draft.is_none(), "--draft requires --spec-decode for dense qualification");
     let slots = usize::from(args.state_slots);
     let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
-        lanes: slots, entries: 1, budget_bytes: 1 << 30 });
+        lanes: slots, entries: 1, budget_bytes: 1 << 30, host: false });
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
         args.pool_tokens, None, slots, marks)?;
     if args.verify_check {

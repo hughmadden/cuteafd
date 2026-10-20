@@ -16,9 +16,7 @@
 //! - `host`: the original path: payloads are copied into a pinned staging
 //!   buffer and uploaded on the compute stream after the wave.
 //!
-//! `auto` (the default) resolves to `pinned` while #533 is open: landed
-//! partials can reach the reduce before every payload byte is visible. Before
-//! that, and again once landing orders its writes: `auto` probed dma-buf landing once at startup (a loopback
+//! `auto` (the default) probes dma-buf landing once at startup (a loopback
 //! QP pair timing sends into device vs pinned host memory, and pinned host to
 //! device copies) and picks `gpu` when the NIC lands in device memory at
 //! least [`GPU_SHARE_OF_PINNED`] of the pinned path's store-and-forward rate
@@ -214,11 +212,10 @@ fn resolve_landing_probe(setting: &str, probe: &Result<GpuLandingProbe>, h2d: Op
         Ok(p) if !p.usable() => (IntakeMode::Pinned, format!("GPU landing unusable: {}{}",
             p.error.as_deref().unwrap_or(&p.status),
             if p.registered && p.writes_ordering < 100 { " (GPUDirect writes not ordered for kernels)" } else { "" })),
-        // Landed partials can reach the reduce before every payload byte is visible
-        // (#533: 4 of 20 cold greedy replays diverge, 0 of 20 pinned), so `auto`
-        // stays pinned until the landing path orders its writes; `gpu` still lands.
-        Ok(p) if setting == "auto" => (IntakeMode::Pinned,
-            format!("dma-buf landing verified but held back pending #533, {}", gpu_wins(p, h2d).1)),
+        Ok(p) if setting == "auto" => match gpu_wins(p, h2d) {
+            (true, rates) => (IntakeMode::Gpu, format!("dma-buf landing verified, {rates}")),
+            (false, rates) => (IntakeMode::Pinned, format!("dma-buf landing verified but slow, {rates}")),
+        },
         Ok(p) => (IntakeMode::Gpu, format!("dma-buf landing verified, {:.1} GB/s into GPU vs {:.1} GB/s into host",
             p.gpu_gbps, p.host_gbps)),
     }
@@ -1792,7 +1789,7 @@ mod tests {
         measured.host_gbps = 55.0;
         let h2d = Some(55.0);
         assert_eq!(pinned_path_gbps(measured.host_gbps, h2d.unwrap()), 27.5);
-        let (mode, reason) = resolve_landing_probe("gpu", &Ok(measured.clone()), h2d);
+        let (mode, reason) = resolve_landing_probe("auto", &Ok(measured.clone()), h2d);
         assert_eq!(mode, IntakeMode::Gpu);
         let generic = IntakeChoice { setting: "auto".into(), mode, reason,
             probe: Some(measured), h2d_gbps: h2d };
@@ -1815,15 +1812,6 @@ mod tests {
             assert_eq!(device_choice_available(&choice), supported);
             assert_eq!(choice.mode, if supported { IntakeMode::Gpu } else { IntakeMode::Pinned });
         }
-    }
-
-    #[test]
-    fn auto_stays_pinned_while_landing_is_unordered() {
-        // #533: even a probe that would win keeps `auto` on the pinned path.
-        let (mode, reason) = resolve_landing_probe("auto", &Ok(probe(19.6)), Some(57.6));
-        assert_eq!(mode, IntakeMode::Pinned);
-        assert!(reason.contains("#533"));
-        assert_eq!(resolve_landing_probe("gpu", &Ok(probe(19.6)), Some(57.6)).0, IntakeMode::Gpu);
     }
 
     #[test]

@@ -539,10 +539,9 @@ fn speculative_step(
 /// Mark slots of the prefix cache's arena: two per decoding sequence plus two,
 /// raised to the retained entries while they fit the mark budget.
 fn mark_slots(engine: &super::engine::Engine<'_>, args: &PrefixArgs, mark: usize) -> usize {
-    match args.prefix_cache_entries {
-        0 => 0,
-        entries => MarkArena::slots_for(engine.shape.sequences, entries, mark, args.prefix_cache_mark_mib << 20),
-    }
+    let mut rule = args.mark_rule(engine.shape.sequences);
+    rule.host &= engine.ranks() == 1 || engine.context_kv();
+    rule.slots(mark)
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the unit allocator).
@@ -707,6 +706,7 @@ fn schedule(
                 }
             };
             let resume = admitted.resume;
+            job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, "deepseek_v4", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,

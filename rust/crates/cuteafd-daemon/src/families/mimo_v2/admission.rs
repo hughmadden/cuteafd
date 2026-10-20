@@ -134,7 +134,7 @@ mod draft_prefix_tests {
                     let layout = plan(dir.path(), &PlanOptions {
                         layout: Some(LayoutOptions {
                             concurrency: concurrency as u64, mimo_prefix_draft: enabled,
-                            mimo_prefix_mark_bytes: mib << 20, ..Default::default()
+                            mimo_prefix_mark_bytes: mib << 20, host_cache_bytes: Some(0), ..Default::default()
                         }), ..Default::default()
                     }).unwrap().memory_layout.unwrap();
                     let bytes = |name| layout.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes).sum::<u64>();
@@ -633,20 +633,11 @@ pub(super) fn mark_slots(
     concurrency: usize,
     mark_bytes: usize,
 ) -> Result<usize> {
-    let budget = prefix
-        .prefix_cache_mark_mib
-        .checked_mul(1 << 20)
-        .context("MiMo mark budget overflows")?;
-    ensure!(
-        concurrency <= super::engine::DECODE_ROWS,
-        "MiMo mark concurrency exceeds decode capacity"
-    );
-    Ok(cuteafd_engine::prefix::MarkArena::slots_for(
-        concurrency,
-        prefix.prefix_cache_entries,
-        mark_bytes,
-        budget,
-    ))
+    ensure!(concurrency <= super::engine::DECODE_ROWS,
+        "MiMo mark concurrency exceeds decode capacity");
+    (prefix.prefix_cache_mark_mib as u64).checked_mul(1 << 20)
+        .context("prefix mark byte budget overflow")?;
+    Ok(prefix.mark_rule(concurrency).slots(mark_bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
