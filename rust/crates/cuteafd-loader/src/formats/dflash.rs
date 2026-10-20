@@ -33,6 +33,9 @@ pub struct MlaDraftBuffer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftRuntimeLayout {
+    target_hidden: usize,
+    target_vocab: usize,
+    target_taps: Vec<usize>,
     capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
     weights: crate::families::glm5::draft_representation::GlmDraftWeightLayout,
     cache: MlaDraftCacheLayout,
@@ -46,6 +49,9 @@ pub struct MlaDraftRuntimeLayout {
 impl MlaDraftRuntimeLayout {
     pub const TAP_ROWS: usize = 2048;
 
+    pub fn target_hidden(&self) -> usize { self.target_hidden }
+    pub fn target_vocab(&self) -> usize { self.target_vocab }
+    pub fn target_taps(&self) -> &[usize] { &self.target_taps }
     pub fn buffers(&self) -> &[MlaDraftBuffer] { &self.buffers }
     pub fn capacity(&self) -> crate::families::glm5::draft_representation::GlmDraftCapacity { self.capacity }
     pub fn weights(&self) -> crate::families::glm5::draft_representation::GlmDraftWeightLayout { self.weights }
@@ -525,7 +531,8 @@ impl MlaDflashConfig {
             add("fp8_scratch".into(), &[usize::try_from(bytes).map_err(|_| invalid())?])?;
             Some(GlmDraftFp8ScratchLayout { rows: scratch_rows, shapes })
         } else { None };
-        let layout = MlaDraftRuntimeLayout { capacity, weights, cache, program,
+        let layout = MlaDraftRuntimeLayout { target_hidden: h, target_vocab: self.vocab,
+            target_taps: self.taps.clone(), capacity, weights, cache, program,
             fp8_scratch, sm_count, fp8_mode, buffers };
         layout.resident_bytes()?;
         Ok(layout)

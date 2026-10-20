@@ -2,7 +2,9 @@
 //! weights, recurrent state or cache owners allocate. This is not the header
 //! lower bound exposed by `plan` and does not admit Spark workers by itself.
 use super::{device::{IoLayout, TokenIo, Lane, LaneLayout, LocalLane, NativePrograms}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, PackedGlobal, LayerLayout, LayerWeights, PackedLayer}};
-use crate::shared::memory::device::{Device, Stream};
+use crate::shared::memory::device::{Device, DeviceOwner, Stream};
+use crate::shared::speculation::dflash::MlaDraftStorage;
+use cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout;
 use std::rc::{Rc, Weak};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
@@ -49,6 +51,7 @@ pub(crate) struct Inputs<'a> {
     pub pool_bounded: Vec<BoundedDemand>,
     pub rtx: Option<RtxInventory>,
     pub spark_budget: Option<SparkBudgetInventory>,
+    pub draft: Option<MlaDraftRuntimeLayout>,
 }
 
 /// CPU-planned native residency; no backend owner allocates before solve.
@@ -86,6 +89,8 @@ pub(crate) struct Admission<'a> {
     cfg: KimiK3Config,
     rtx: Option<RtxInventory>,
     rtx_loaded: bool,
+    draft: Option<MlaDraftRuntimeLayout>,
+    draft_allocated: bool,
     layouts: Vec<[LayerLayout; 2]>,
     layer_owners: Vec<[Weak<LayerWeights<'a>>; 2]>,
     layer_uploaded: Vec<[bool; 2]>,
@@ -118,6 +123,45 @@ pub(crate) struct LoadedWeights<'a> {
 /// The normal Spark lane consumes these selected layer IDs; selection still
 /// goes through shared `SparkAdmission` before any transport connects.
 impl<'a> Admission<'a> {
+    /// Arena prerequisite only: the typed shared branch must also load admitted
+    /// weights before target residency. No CLI currently supplies this layout.
+    #[allow(dead_code)]
+    pub(crate) fn allocate_draft(&mut self, device: Device<'a>)
+        -> Result<DeviceOwner<'a, MlaDraftStorage<'a>>> {
+        self.allocate_draft_with(device.id, |layout|
+            device.own(|| MlaDraftStorage::allocate(device.library, layout)))
+    }
+
+    fn check_draft(&self, device: i32) -> Result<&MlaDraftRuntimeLayout> {
+        ensure!(device == self.devices[1] && !self.draft_allocated,
+            "Kimi draft allocation differs from admitted rank or was already attempted");
+        ensure!(!self.rtx_loaded && self.global_uploaded == [false; 2]
+            && self.layer_uploaded.iter().all(|pair| *pair == [false; 2])
+            && self.lane_allocated.iter().all(|pair| *pair == [false; 2])
+            && self.io_allocated.iter().all(|pair| *pair == [false; 2])
+            && self.kda_allocated == [false; 2] && self.mla_allocated == [false; 2],
+            "Kimi drafter startup peak requires allocation before target residency");
+        let layout = self.draft.as_ref().context("Kimi drafter was not admitted")?;
+        ensure!(draft::home(&self.placement) == Some(1), "Kimi drafter must stay on target rank 1");
+        let (demand, _) = layout.demands(1)?;
+        for demand in demand.owned {
+            let charges = self.placement.items[1].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
+            ensure!(charges.len() == 1 && charges[0].category == demand.category
+                && charges[0].basis == demand.basis && charges[0].bytes == demand.bytes,
+                "Kimi draft allocation differs from accepted {} charge", demand.group);
+            ensure!(!self.placement.items[0].iter().any(|item| item.group == demand.group),
+                "Kimi draft allocation has an unexecutable remote charge");
+        }
+        Ok(layout)
+    }
+
+    fn allocate_draft_with<T>(&mut self, device: i32,
+        allocate: impl FnOnce(MlaDraftRuntimeLayout) -> Result<T>) -> Result<T> {
+        let layout = self.check_draft(device)?.clone();
+        // A partial native allocation must never become an uncharged retry.
+        self.draft_allocated = true;
+        allocate(layout)
+    }
     pub(crate) fn execution_plan(&self) -> Result<LayerExecutionPlan> {
         Ok(LayerExecutionPlan::new(&self.placement, hop_spec(self.cfg.hidden,
             self.lane_layouts[0][0].rows(), self.lanes as usize))?)
@@ -365,6 +409,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let io_layouts = [IoLayout::new(cfg, 0, inputs.rows)?, IoLayout::new(cfg, 1, inputs.rows)?];
     let rtx = inputs.rtx.take();
     let spark_budget = inputs.spark_budget.take();
+    let draft = inputs.draft.clone();
     let mut request = request(inputs)?;
     if let Some(inventory) = &rtx {
         ensure!(inventory.costs.len() == cfg.layers, "Kimi TP2 expert inventory extent");
@@ -407,7 +452,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let io_allocated = vec![[false; 2]; lane_layouts.len()];
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
-    let admission = Admission { placement, mark_selection, rtx, rtx_loaded: false, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
+    let admission = Admission { placement, mark_selection, rtx, rtx_loaded: false, draft, draft_allocated: false, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
         devices, lanes, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
         mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),
@@ -419,6 +464,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
         admission.check_global(rank, devices[rank])?;
         for lane in 0..lanes as usize { admission.check_io(rank, lane, devices[rank])?; }
     }
+    if admission.draft.is_some() { admission.check_draft(devices[1])?; }
     Ok(admission)
 }
 
@@ -455,10 +501,20 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     let context = i.lane_layouts[0][0].max_context();
     ensure!(i.lane_layouts.iter().flatten().all(|layout| layout.max_context() == context),
         "Kimi lanes must share the compiled context extent");
+    if let Some(layout) = &i.draft {
+        ensure!(layout.capacity().context_slots == i.state_slots
+            && layout.capacity().max_batch_sequences <= i.rows.min(64)
+            && layout.program().context == context
+            && layout.cache().layers.iter().all(|layer| layer.slots() == i.state_slots),
+            "Kimi drafter capacity differs from admitted KDA slots or lane context/rows");
+        ensure!(layout.target_hidden() == cfg.hidden && layout.target_vocab() == cfg.vocab_size
+            && layout.target_taps().iter().all(|&layer| layer < cfg.layers),
+            "Kimi drafter taps, embedding or vocabulary differ from target inventory");
+    }
     let mut fixed = i.fixed;
     // Solver startup phases are transient peaks. Captured executables survive
     // readiness, so retain their validated reserve beside the live KV pool.
-    let (graphs, startup): (Vec<_>, Vec<_>) = i.startup.iter().cloned()
+    let (graphs, mut startup): (Vec<_>, Vec<_>) = i.startup.iter().cloned()
         .partition(|d| d.group == super::graphs::RESERVE);
     for graph in graphs {
         ensure!(!fixed.iter().any(|d| d.gpu == graph.gpu && d.group == graph.group),
@@ -502,6 +558,15 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
             fixed.push(demand);
         }
     }
+    let mut movables = Vec::new();
+    if let Some(layout) = &i.draft {
+        let (demand, peak) = layout.demands(1)?;
+        ensure!(demand.owned.iter().chain(std::iter::once(&peak)).all(|draft|
+            !fixed.iter().chain(&startup).any(|item| item.group == draft.group)),
+            "Kimi drafter charge supplied twice");
+        movables.push(demand.movable(2)?);
+        startup.push(peak);
+    }
     let mut layers = Vec::with_capacity(cfg.layers);
     for layer in 0..cfg.layers {
         let split = LayerLayout::pair(cfg, layer, LayerMode::HeadSplit)?;
@@ -532,7 +597,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
     Ok(PlacementRequest { inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
-        pool, layers, pool_overhead: vec![0; 2], pool_bounded: i.pool_bounded, fixed, startup, movables: vec![],
+        pool, layers, pool_overhead: vec![0; 2], pool_bounded: i.pool_bounded, fixed, startup, movables,
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Layers(0), expert_gpus: 0, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating,
             attention: [(KimiAttention::Mla, AttentionClass::Mla, AttentionPlacement::Layers),
@@ -563,7 +628,98 @@ pub(super) mod tests {
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); 2],
             fixed: (0..2).map(|rank| Demand::new(rank, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
-            startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None }
+            startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None, draft: None }
+    }
+
+    fn draft_layout(slots: usize, sequences: usize, context: usize) -> MlaDraftRuntimeLayout {
+        use cuteafd_loader::{formats::dflash::MlaDflashConfig,
+            families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation}};
+        let config = serde_json::json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
+            "intermediate_size":14336, "num_hidden_layers":5, "num_attention_heads":64,
+            "num_key_value_heads":64, "q_lora_rank":1536, "kv_lora_rank":512,
+            "qk_nope_head_dim":128, "qk_rope_head_dim":64, "v_head_dim":128,
+            "rms_norm_eps":1e-5, "vocab_size":163840, "draft_vocab_size":163840,
+            "max_position_embeddings":1048576, "num_target_layers":93,
+            "layer_types":["sliding_attention","sliding_attention","sliding_attention",
+                "sliding_attention","full_attention"], "sliding_window":4096,
+            "use_sliding_window":true, "is_causal":false, "mla_use_output_gate":false,
+            "attention_bias":false, "hidden_act":"silu", "fc_norm":false,
+            "rope_parameters":{"rope_type":"yarn", "rope_theta":50000.0, "factor":32.0,
+                "original_max_position_embeddings":32768, "beta_fast":32, "beta_slow":1,
+                "mscale":1.0, "mscale_all_dim":1.0},
+            "dflash_config":{"attention_mode":"mla", "block_size":8,
+                "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
+                "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
+        MlaDflashConfig::from_json(&config).unwrap().runtime_layout(GlmDraftRepresentation::Fp8Only,
+            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), context, 188, 2).unwrap()
+    }
+
+    #[test]
+    fn mla_draft_admission_pins_exact_inventory_and_allocates_once_before_target() -> Result<()> {
+        let cfg = cfg();
+        for context in [262144, 1048576] {
+            let mut i = inputs(&cfg);
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, context,
+                super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
+            let layout = draft_layout(i.state_slots, i.state_slots, context);
+            let (demand, peak) = layout.demands(1)?;
+            i.draft = Some(layout.clone());
+            let request = request(i)?;
+            assert_eq!(request.movables, [demand.movable(2)?]);
+            assert!(request.startup.contains(&peak));
+            assert!(!request.fixed.iter().any(|d| d.group == peak.group));
+            let mut i = inputs(&cfg);
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, context,
+                super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
+            i.draft = Some(layout.clone());
+            let mut admitted = admit(i)?;
+            assert!(admitted.check_draft(0).is_err());
+            assert_eq!(admitted.check_draft(1)?, &layout);
+            let allocated = admitted.allocate_draft_with(1, |owned| {
+                assert_eq!(owned, layout);
+                owned.allocate_with(|buffer| Ok((buffer.name.clone(), buffer.bytes)))
+            })?;
+            assert_eq!(allocated.iter().map(|(_, bytes)| *bytes as u64).sum::<u64>(), layout.buffer_bytes()?);
+            assert!(admitted.check_draft(1).is_err());
+        }
+        let mut i = inputs(&cfg);
+        i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1048576));
+        let mut admitted = admit(i)?;
+        assert!(admitted.allocate_draft_with::<()>(1, |_| anyhow::bail!("injected partial allocation")).is_err());
+        assert!(admitted.check_draft(1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mla_draft_rejects_wrong_inventory_duplicate_charge_and_late_allocation() -> Result<()> {
+        let cfg = cfg();
+        for layout in [draft_layout(1, 1, 1048576), draft_layout(2, 2, 262144)] {
+            let mut i = inputs(&cfg); i.draft = Some(layout);
+            assert!(request(i).is_err());
+        }
+        let mut i = inputs(&cfg);
+        i.draft = Some(draft_layout(2, 2, 1048576));
+        i.fixed.push(i.draft.as_ref().unwrap().demands(1)?.0.owned[0].clone());
+        assert!(request(i).is_err());
+        let mut wrong = cfg.clone(); wrong.vocab_size -= 1;
+        let mut i = inputs(&wrong); i.draft = Some(draft_layout(2, 2, 1048576));
+        assert!(request(i).is_err());
+        let mut wrong = cfg.clone(); wrong.layers = 1; wrong.attention.truncate(1); wrong.dense.truncate(1);
+        let mut i = inputs(&wrong); i.draft = Some(draft_layout(2, 2, 1048576));
+        assert!(request(i).is_err());
+        let mut i = inputs(&cfg); i.draft = Some(draft_layout(2, 2, 1048576));
+        let mut admitted = admit(i)?;
+        admitted.global_uploaded[0] = true;
+        assert!(admitted.check_draft(1).is_err());
+        admitted.global_uploaded[0] = false;
+        admitted.placement.movables[0].1 = 0;
+        assert!(admitted.check_draft(1).is_err());
+        admitted.placement.movables[0].1 = 1;
+        let charge = admitted.placement.items[1].iter_mut().find(|item| item.group == "MLA DFlash owned weights").unwrap();
+        charge.bytes -= 1;
+        assert!(admitted.check_draft(1).is_err());
+        assert!(admit(inputs(&cfg))?.check_draft(1).is_err());
+        Ok(())
     }
 
     #[test]

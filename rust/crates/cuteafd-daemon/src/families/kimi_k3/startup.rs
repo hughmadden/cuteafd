@@ -108,7 +108,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
             (0..2).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
-        spark_budget: Some(spark_budget) })?;
+        spark_budget: Some(spark_budget), draft: None })?;
     if let Some(expected) = options.hosted_layers.as_ref() {
         ensure!(admitted.working_set().spark_layers == *expected,
             "Kimi worker layer subset differs from shared placement");

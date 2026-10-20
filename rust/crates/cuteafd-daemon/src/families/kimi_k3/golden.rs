@@ -634,7 +634,7 @@ mod tests {
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows,
                 1048576, native_scratch).unwrap())], fixed,
             startup: (0..2).map(|rank| super::super::graphs::demand(&graph_set.inventory, rank)).collect(),
-            pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()) })?;
+            pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()), draft: None })?;
         let onboard = admitted.placement.onboard_layers;
         assert!(onboard >= spark.minimum_rtx_layers()?);
         assert_eq!(admitted.working_set().rtx_layers, (1..=onboard).collect::<Vec<_>>());
