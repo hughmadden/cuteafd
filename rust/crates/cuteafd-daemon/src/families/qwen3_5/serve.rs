@@ -78,7 +78,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn placement(&self, units: Vec<u32>, slot: i32) -> Placement {
         Placement { units, slot: slot as usize, len: 0, state_len: 0 }
     }
-    fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia, _tokens: &[u32], _resume: usize) {}
+    fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia, _tokens: &[u32], _resume: usize) -> Result<()> { Ok(()) }
     fn history(&self, _placement: &Placement) {}
     fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {

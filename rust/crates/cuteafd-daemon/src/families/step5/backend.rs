@@ -316,7 +316,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         Placement { pages, sequence: slot as u64, committed: 0 }
     }
     fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia,
-        _tokens: &[u32], _resume: usize) { self.state.retire(); }
+        _tokens: &[u32], _resume: usize) -> Result<()> { self.state.retire(); Ok(()) }
     fn history(&self, _placement: &Placement) {}
     fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {

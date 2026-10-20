@@ -82,7 +82,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         Placement { units, slot: slot as usize, len: 0, state_len: 0 }
     }
     fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia,
-        _tokens: &[u32], _resume: usize) {}
+        _tokens: &[u32], _resume: usize) -> Result<()> { Ok(()) }
     fn history(&self, _placement: &Placement) {}
     fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> { self.engine.require_live() }
