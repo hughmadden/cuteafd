@@ -913,7 +913,16 @@ fn checkpoint_identity(revision: Option<&str>, format: cuteafd_loader::formats::
     Ok(())
 }
 
-pub(crate) fn run(args: GoldenArgs) -> Result<()> {
+pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
+    on_engine_thread(move || run(args)).await
+}
+
+async fn on_engine_thread(work: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
+    // Like serving, the golden owns its CUDA state and transport runtime on a blocking worker.
+    tokio::task::spawn_blocking(work).await?
+}
+
+fn run(args: GoldenArgs) -> Result<()> {
     diagnostic_selection(&args)?;
     let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
     if args.dump_layer0.is_none() { selection(args.last_layer, args.peers.len(), &layers, args.nll)?; }
@@ -1130,6 +1139,32 @@ mod tests {
         ].into_iter().chain(flags.iter().copied()))?;
         let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
         Ok(args)
+    }
+
+    #[test]
+    fn golden_engine_thread_drives_its_transport_runtime_outside_async_command() -> Result<()> {
+        for runtime in [
+            tokio::runtime::Builder::new_current_thread().enable_all().build()?,
+            tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?,
+        ] {
+            runtime.block_on(async {
+                let command_thread = std::thread::current().id();
+                on_engine_thread(move || {
+                    assert_ne!(std::thread::current().id(), command_thread);
+                    let transport = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+                    transport.block_on(async {
+                        tokio::task::yield_now().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    });
+                    Ok(())
+                }).await?;
+                let error = on_engine_thread(|| anyhow::bail!("engine completion failed"))
+                    .await.unwrap_err();
+                assert_eq!(error.to_string(), "engine completion failed");
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]

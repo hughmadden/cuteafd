@@ -211,7 +211,7 @@ async fn run() -> Result<()> {
         Commands::GlmfGolden(args) => families::glm5_flash::run_golden(args).await,
         Commands::Qwen4Golden(args) => families::qwen4::run_golden(args).await,
         Commands::Qwen35Golden(args) => families::qwen3_5::run_golden(args).await,
-        Commands::Step5Golden(args) => families::step5::golden::run(args),
+        Commands::Step5Golden(args) => families::step5::golden::run_golden(args).await,
         Commands::ServeStep5(args) => families::step5::serve::run_serve(args).await,
         Commands::ServeQwen35(args) => families::qwen3_5::serve::run_serve(args).await,
         Commands::ServeQwen4(args) => families::qwen4::serve::run_serve(args).await,
