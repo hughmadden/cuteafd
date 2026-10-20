@@ -223,6 +223,17 @@ def test_gate_card_ports_stay_unique() -> None:
         assert len(values) == len(set(values)), key
 
 
+@pytest.mark.parametrize("keys,flag", [("", False), ("NATIVE_K6=off\n", False), ("NATIVE_K6=on\n", True)])
+def test_kimi_native_k6_is_opt_in(tmp_path: Path, keys: str, flag: bool) -> None:
+    serve = _line(_kimi(tmp_path, keys), "cuteafd serve-kimi --snapshot")
+    assert ("--native-k6" in serve.split()) == flag
+
+
+def test_kimi_native_k6_rejects_other_values(tmp_path: Path) -> None:
+    result = _kimi(tmp_path, "NATIVE_K6=yes\n")
+    assert result.returncode != 0 and "NATIVE_K6 must be on or off" in result.stderr
+
+
 # --- Step-5 (#274) ---------------------------------------------------------------
 
 STEP5 = {"model_type": "step5_vl", "vision_config": {"depth": 2},
