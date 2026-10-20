@@ -113,7 +113,7 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                 'physical_sms': props.multi_processor_count, 'device': _pinned_sparkinfer.export_target(props),
                 'projections': [{'name': name, 'n': n, 'k': k, 'weight_block': [32,32],
                                  'groups': 8 if name == 'o_a' else 1,
-                                 'activation_block': 32, 'activation_amax_floor': 0.0 if name == 'o_a' else 1e-4} for name,n,k in projections],
+                                 'activation_block': 32, 'activation_amax_floor': 1e-4} for name,n,k in projections],
                 'sparkinfer_revision': _pinned_sparkinfer.REVISION,
                 'variants': []}
     for name, n, k in projections:
@@ -132,12 +132,13 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                     # Decode and verify share the fast unsplit m16 arithmetic.
                     expected_m = 16
                 all_m = False
-                quant = (compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups)
+                quant = (compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups, amax_floor=1e-4)
                          if groups > 1 else compile_mxfp8_rows_quant_aot(
                              size_k=k, scale_block_size=32, expected_m=expected_m, amax_floor=1e-4))
                 quant.export_to_c(str(output), label + '_quant', 'cuteafd_' + label + '_quant')
                 if groups > 1:
-                    rope_quant = compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups, row_frequencies=True)
+                    rope_quant = compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups,
+                                                              row_frequencies=True, amax_floor=1e-4)
                     rope_quant.export_to_c(str(output), label + '_quant_rope', 'cuteafd_' + label + '_quant_rope')
                 gemm, split_k = compile_dense_gemm_mxfp8_aot(size_m=capacity, size_n=n // groups, size_k=k // groups, num_groups=groups,
                                                   expected_m=expected_m, sfb_k_replicated=False, device=device,
