@@ -3362,3 +3362,23 @@ def test_console_assets_rejects_unknown_value(tmp_path: Path) -> None:
         encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
     assert result.returncode != 0
     assert "CONSOLE_ASSETS must be on or off" in result.stderr
+
+@pytest.mark.parametrize("keys,expected", [
+    ("", None),
+    ("SHARD_HOLDERS=model-00001.safetensors=emu;model-00002.safetensors=kiwi\n",
+     "model-00001.safetensors=emu;model-00002.safetensors=kiwi"),
+])
+def test_shard_holders_reach_spark_workers(tmp_path: Path, keys: str, expected: str | None) -> None:
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
+    result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=off\n" + keys)
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if "expertd-native" in line]
+    assert workers
+    for worker in workers:
+        assert (f"CUTEAFD_SHARD_HOLDERS={expected}" in worker) if expected else ("CUTEAFD_SHARD_HOLDERS" not in worker)
+
+
+def test_shard_holders_rejects_malformed_values(tmp_path: Path) -> None:
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
+    result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=off\nSHARD_HOLDERS=bad value\n")
+    assert result.returncode != 0 and "SHARD_HOLDERS must be shard=host pairs" in result.stderr
