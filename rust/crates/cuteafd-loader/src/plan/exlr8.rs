@@ -81,11 +81,13 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
         _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=6 ranks"),
     };
     ensure!(speculator == "off", "EXLR8 native deployment requires --speculator off");
-    ensure!(matches!(options.attention_placement, None | Some(crate::placement::AttentionPlacement::Context)),
-        "EXLR8 native deployment requires context attention");
     let layout = options.layout.as_ref().context("EXLR8 native deployment requires --layout")?;
-    ensure!(layout.rtx_bytes.len() == 2, "EXLR8 native deployment requires two RTX GPUs");
-    ensure!(layout.prefill_lanes <= 1, "EXLR8 native deployment requires one serial prefill lane");
+    let gpu_count = layout.rtx_bytes.len();
+    ensure!((1..=2).contains(&gpu_count), "EXLR8 native deployment requires 1..=2 RTX GPUs");
+    let attention = if gpu_count == 2 { crate::placement::AttentionPlacement::Context }
+        else { crate::placement::AttentionPlacement::Heads };
+    ensure!(options.attention_placement.is_none_or(|requested| requested == attention),
+        "EXLR8 native deployment with {gpu_count} RTX GPUs requires {attention} attention");
     ensure!(layout.local_expert_layers.is_none_or(|n| n == 0)
         && layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
         "EXLR8 native deployment cannot onboard routed experts");
@@ -99,11 +101,11 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
         "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
     let (_, set_id) = manifest_identity(snapshot, selected)?;
-    let mut shared = vec![0u64; 2];
+    let mut shared = vec![0u64; gpu_count];
     let mut residents = vec![0u64; world];
     for layer in cfg.first_moe_layer..cfg.layers {
         for (rank, resident) in shared.iter_mut().enumerate() {
-            let plan = residency::Residency::plan(snapshot, selected, layer, 2, rank, residency::ExpertSet::Shared)?;
+            let plan = residency::Residency::plan(snapshot, selected, layer, gpu_count, rank, residency::ExpertSet::Shared)?;
             *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
         }
         for (rank, resident) in residents.iter_mut().enumerate() {
@@ -119,7 +121,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, &shared, workspace, world, &programs)?;
     let mut dense_options = options.clone();
     dense_options.layout = None;
-    // This pass classifies dense operands only; native_layout already admitted context TP2.
+    // This pass classifies dense operands only; native_layout already admitted GPU ownership.
     dense_options.attention_placement = None;
     dense_options.draft_ownership = Some(super::spec::DraftOwnership::selected("glm5", "off"));
     let mut report = super::plan(dense, &dense_options)?;
@@ -142,7 +144,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     report.native_serving_admitted = true;
     report.placement_supported = true;
     report.fits = true;
-    report.attention_placement = crate::placement::AttentionPlacement::Context;
+    report.attention_placement = attention;
     report.prefill_rows = Some(if layout.prefill_rows == 0 { 4096 } else { layout.prefill_rows });
     report.experts = Some(super::family::ExpertContract { package: "glm:exlr8".into(), block: 128,
         spark_worlds: vec![world], local: Err("EXLR8 coordinator-local routed experts are unsupported".into()) });
@@ -1130,11 +1132,25 @@ mod tests {
         options.placement = super::super::ExpertPlacement::Sparks { ranks:7 };
         assert!(error(&options,"up1","off").contains("1..=6"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:4 };
-        options.layout.as_mut().unwrap().rtx_bytes.truncate(1);
-        assert!(error(&options,"up1","off").contains("two RTX"));
-        options.layout.as_mut().unwrap().rtx_bytes.push(96 << 30);
-        options.layout.as_mut().unwrap().prefill_lanes = 2;
-        assert!(error(&options,"up1","off").contains("serial"));
+        for gpus in 0..=3 {
+            options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30; gpus];
+            assert_eq!(error(&options,"up1","off").contains("1..=2 RTX"), !(1..=2).contains(&gpus));
+            if !(1..=2).contains(&gpus) { continue; }
+            for attention in [None, Some(crate::placement::AttentionPlacement::Heads),
+                Some(crate::placement::AttentionPlacement::Context), Some(crate::placement::AttentionPlacement::Layers)] {
+                options.attention_placement = attention;
+                let expected = if gpus == 2 { crate::placement::AttentionPlacement::Context }
+                    else { crate::placement::AttentionPlacement::Heads };
+                assert_eq!(error(&options,"up1","off").contains("attention"),
+                    attention.is_some_and(|a| a != expected), "{gpus} GPUs, {attention:?}");
+            }
+            options.attention_placement = None;
+        }
+        options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30; 2];
+        for lanes in 1..=4 {
+            options.layout.as_mut().unwrap().prefill_lanes = lanes;
+            assert!(!error(&options,"up1","off").contains("serial"));
+        }
         options.layout.as_mut().unwrap().prefill_lanes = 1;
         options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(1));
         assert!(error(&options,"up1","off").contains("onboard"));

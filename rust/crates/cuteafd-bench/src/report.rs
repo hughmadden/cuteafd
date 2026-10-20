@@ -447,6 +447,9 @@ pub struct FabricPort {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Configuration {
+    /// Renderer capability; absent preserves requests to older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_thinking_off: Option<bool>,
     #[serde(default)]
     pub snapshot: Option<String>,
     /// Storage formats per tensor group (from `cuteafd plan`).
@@ -465,6 +468,12 @@ pub struct Configuration {
 }
 
 impl Configuration {
+    pub fn supports_thinking_off(&self) -> bool { self.supports_thinking_off != Some(false) }
+
+    pub fn thinking_label(&self) -> &'static str {
+        if self.supports_thinking_off() { "thinking off" } else { "thinking always on (template)" }
+    }
+
     /// Options whose value differs from the default (the chips).
     pub fn non_default(&self) -> impl Iterator<Item = &Setting> {
         self.settings.iter().filter(|s| s.differs())
@@ -551,6 +560,9 @@ pub struct Baseline {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BasicCard {
+    /// Actual request mode; always-thinking templates must not be compared as off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// C1 decode per content type, thinking off.
     pub decode: Vec<ContentRate>,
     /// Code decode sweep, thinking off; aggregate over each batch's decode interval.

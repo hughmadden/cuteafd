@@ -544,16 +544,14 @@ pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64) -> Option
 /// its scratch for `rows` rows.
 pub fn fp8moe_package_scratch(lib: &std::path::Path, family: &str,
     format: crate::formats::fp8_experts::ExpertFormat, rows: u64) -> Option<(String, u64)> {
-    use crate::formats::fp8_experts::ExpertFormat;
-    let a4 = (format == ExpertFormat::Nvfp4).then(|| format!("fp8-{family}-nvfp4a4"));
-    let name = a4.unwrap_or_else(|| format!("fp8-{family}{}", format.package_suffix()));
+    let name = format.package_name(family);
     let manifest: Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json")).ok()?).ok()?;
     Some((name, fp8moe_scratch_bytes(&manifest, "tp1", rows)?))
 }
 
 /// Mandatory native W4A4 dense package; missing exports never select W4A16.
 pub fn dense_package_directory(lib: &std::path::Path, geometry: &str) -> std::path::PathBuf {
-    lib.join("fp8").join(format!("fp8-{geometry}-nvfp4a4")).join("tp1")
+    lib.join("fp8").join(crate::formats::fp8_experts::ExpertFormat::Nvfp4.package_name(geometry)).join("tp1")
 }
 
 pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64) -> Option<u64> {
@@ -583,6 +581,26 @@ pub fn exl3_capacities(rows: u64) -> Vec<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_package_names_and_scratch_share_the_format_contract() {
+        use crate::formats::fp8_experts::ExpertFormat;
+        let dir = tempfile::tempdir().unwrap();
+        for family in ["glm", "glmf", "qwen4", "step5"] {
+            let name = ExpertFormat::Nvfp4.package_name(family);
+            assert_eq!(name, format!("fp8-{family}-nvfp4a4"));
+            let root = dir.path().join("fp8").join(&name);
+            std::fs::create_dir_all(root.join("tp1")).unwrap();
+            std::fs::write(root.join("manifest.json"), json!({"layouts":{"tp1":{
+                "capacities":[{"capacity":16,"scratch_bytes":1024}]}}}).to_string()).unwrap();
+            assert_eq!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 16),
+                Some((name, 1024)));
+            assert_eq!(dense_package_directory(dir.path(), family), root.join("tp1"));
+            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 17).is_none());
+            std::fs::remove_file(root.join("manifest.json")).unwrap();
+            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 1).is_none());
+        }
+    }
 
     #[test]
     fn startup_keys_match_planner_shapes_and_v41_rank_bytes() {

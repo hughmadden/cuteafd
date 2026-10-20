@@ -29,8 +29,11 @@ pub struct Run {
     pub settings: serde_json::Value,
     pub seconds: f64,
     pub score: Fidelity,
+    /// Legacy manifest expectation, retained as provenance; tier bars decide the verdict.
     pub floor_top1: f64,
     pub floor_kl: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<crate::fidelity_precision::Precision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tripwire_expect: Option<crate::reference::TripwireExpect>,
 }
@@ -239,17 +242,22 @@ pub struct Verdict {
 /// Bounds apply to generated rows; context/code rows remain in the report.
 pub fn verdict(run: &Run) -> Verdict {
     let mut generated = Fidelity::from_records(run.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
-    let (top1_min, kl_max) = (run.floor_top1.max(0.90), run.floor_kl.min(0.06));
+    let precision = run.precision.as_ref().ok_or("missing routed-expert precision/tier".to_owned())
+        .and_then(|p| p.validate().map(|()| p).map_err(|e| e.to_string()));
+    let (top1_bar, kl_bar) = precision.as_ref().map(|p| p.tier.bars()).unwrap_or((1.0, 0.0));
+    let (top1_min, kl_max) = (top1_bar, kl_bar);
+    let tier = precision.as_ref().map(|p| p.tier.name()).unwrap_or("unresolved");
     let (confident_top1_min, top3_min) = run.tripwire_expect.as_ref()
         .map_or((0.98, 0.99), |e| (e.confident_top1_min, e.top3_min));
     let mut reasons = Vec::new();
+    if let Err(error) = &precision { reasons.push(error.clone()); }
     if run.score.missing > 0 || run.score.non_finite > 0 { reasons.push("missing or nonfinite rows".into()); }
     if generated.positions == 0 { reasons.push("no generated rows".into()); }
     if !run.floor_top1.is_finite() || !run.floor_kl.is_finite() || !top1_min.is_finite() || !kl_max.is_finite() || !confident_top1_min.is_finite() || !top3_min.is_finite() {
         reasons.push("nonfinite expectation".into());
     }
-    if generated.top1 + 1e-12 < top1_min { reasons.push("generated top-1 below expect/floor".into()); }
-    if !generated.kl.is_finite() || generated.kl > kl_max { reasons.push("generated KL above expect/floor".into()); }
+    if generated.top1 + 1e-12 < top1_min { reasons.push(format!("generated top-1 below {tier} tier bar {top1_bar:.2}")); }
+    if !generated.kl.is_finite() || generated.kl > kl_max { reasons.push(format!("generated KL above {tier} tier bar {kl_bar:.2}")); }
     if generated.confident_top1.is_some_and(|v| v + 1e-12 < confident_top1_min) {
         reasons.push("confident top-1 below calibrated tripwire".into());
     }
@@ -265,7 +273,9 @@ pub fn verdict(run: &Run) -> Verdict {
         }
     }
     generated.records.clear();
-    let label = if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
+    let label = if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference") {
+        Some("reference; common policy floor, not engine calibration".into())
+    } else if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
         Some("reference-only qualified; common policy floor, not engine calibration".into())
     } else {
         (run.tier == crate::fidelity_dataset::STANDARD_TIER).then(||
@@ -277,7 +287,10 @@ pub fn verdict(run: &Run) -> Verdict {
 
 fn absolute(run: &Run) -> bool {
     let score = Fidelity::from_records(run.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
-    score.positions > 0 && score.top1 + 1e-12 >= run.floor_top1.max(0.90) && score.kl <= run.floor_kl.min(0.06)
+    let Some(precision) = &run.precision else { return false; };
+    if precision.validate().is_err() || !run.floor_top1.is_finite() || !run.floor_kl.is_finite() { return false; }
+    let (top1_bar, kl_bar) = precision.tier.bars();
+    score.positions > 0 && score.top1 + 1e-12 >= top1_bar && score.kl <= kl_bar
         && score.groups("window").values().all(|w| w.top1 + 1e-12 >= 0.80)
 }
 
@@ -409,6 +422,7 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
     }
     ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows && a.dataset == b.dataset,
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
+    ensure!(cross || a.precision == b.precision, "same-checkpoint runs use different routed-expert precision/tier");
     let code = code_change;
     ensure!(a.engine == b.engine && (code || a.settings.get("build") == b.settings.get("build"))
         && (cross || a.settings.get("snapshot") == b.settings.get("snapshot")), "runs use different engines, builds or snapshots");
@@ -431,7 +445,8 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
     if a.tier != "quick" {
         let pinned = a.dataset.as_ref().is_some_and(|d| d["revision"].as_str().is_some_and(|r|
             r.len() == 40 && r.bytes().all(|c| c.is_ascii_hexdigit())));
-        ensure!(a.kl_kind == "full-vocabulary" || (pinned && (a.kl_kind == "qualified-top1024-plus-tail"
+        ensure!(a.kl_kind == "full-vocabulary" || (pinned && (matches!(a.kl_kind.as_str(),
+            "qualified-top1024-plus-tail" | "reference-top1024-plus-tail")
             || (code && a.kl_kind == "reference-only-top1024-plus-tail"))),
             "full tier requires full-vocabulary or revision-pinned qualified top1024 KL");
     }
@@ -550,8 +565,69 @@ mod tests {
             set_sha256: "set".into(), reference_sha256: "reference".into(), tier: "full".into(),
             path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None, reference_selection: None, standard_balance: None,
             engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
-            score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None }
+            score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06,
+            precision: Some(crate::fidelity_precision::Precision::new(2.0, "exl3", false, "test").unwrap()), tripwire_expect: None }
     }
+    fn tier_run(bpw: f64, root: bool, top1: f64, kl: f64) -> Run {
+        let mut r = run(1, 10000);
+        r.precision = Some(crate::fidelity_precision::Precision::new(bpw, "test", root, "test").unwrap());
+        r.floor_top1 = 0.91; r.floor_kl = 0.06;
+        for p in &mut r.score.records {
+            p.agree = p.position < (top1 * 10000.0).round() as usize;
+            p.confident = p.agree;
+            // A single nonzero entry makes the mean exactly the requested KL.
+            p.kl = if p.position == 0 { kl * 10000.0 } else { 0.0 };
+        }
+        r
+    }
+
+    #[test]
+    fn every_tier_bar_is_inclusive_and_rejects_the_next_value() {
+        for (bpw, top1, kl) in [(2.0, 0.90, 0.07), (3.0, 0.93, 0.05), (6.0, 0.95, 0.03)] {
+            let at = tier_run(bpw, false, top1, kl);
+            assert!(verdict(&at).pass, "{:?}", verdict(&at).reasons);
+            assert!(absolute(&at));
+            for past in [tier_run(bpw, false, top1 - 0.0001, kl), tier_run(bpw, false, top1, kl + 1e-8)] {
+                assert!(!verdict(&past).pass);
+                assert!(!absolute(&past));
+                assert!(verdict(&past).reasons.iter().any(|s| s.contains("tier bar")));
+            }
+        }
+    }
+
+    #[test]
+    fn published_regressions_use_tier_bars_not_flat_era_manifest_floors() {
+        for (name, bpw, root, top1, kl, pass) in [
+            ("Kimi", 2.0, false, 0.926, 0.0626, true),
+            ("V4 Pro", 2.0, false, 0.920, 0.0605, true),
+            ("V4.1 NVFP4", 4.0, false, 0.936, 0.0655, false),
+            ("GLM Flash", 3.25, false, 0.9525, 0.0389, true),
+            ("V4 Flash", 8.0, true, 0.9658, 0.0123, true),
+        ] {
+            let r = tier_run(bpw, root, top1, kl);
+            assert_eq!(verdict(&r).pass, pass, "{name}: {:?}", verdict(&r).reasons);
+            assert_eq!(absolute(&r), pass, "{name}");
+        }
+        let mut r = tier_run(4.25, false, 0.94, 0.045);
+        r.floor_top1 = 0.99; r.floor_kl = 0.04;
+        assert!(verdict(&r).pass, "legacy manifest values are recorded, not applied");
+        let saved = serde_json::to_value(&r).unwrap();
+        assert_eq!(saved["precision"]["expert_bpw"], 4.25);
+        assert_eq!(saved["precision"]["tier"], "mid");
+        assert_eq!(saved["floor_kl"], 0.04);
+        assert_eq!(serde_json::to_value(verdict(&r)).unwrap()["kl_max"], 0.05);
+    }
+
+    #[test]
+    fn missing_or_inconsistent_saved_precision_fails_closed() {
+        let mut r = tier_run(4.0, false, 1.0, 0.0);
+        r.precision.as_mut().unwrap().tier = crate::fidelity_precision::Tier::Low;
+        assert!(!verdict(&r).pass); assert!(!absolute(&r));
+        r.precision = None;
+        assert!(verdict(&r).reasons.iter().any(|s| s.contains("missing routed-expert")));
+        assert!(!verdict(&r).pass); assert!(!absolute(&r));
+    }
+
     #[test]
     fn standard_shares_full_decode_verdict_and_rejects_prefill() {
         let full = run(8,512);
@@ -620,6 +696,22 @@ mod tests {
     }
 
     #[test]
+    fn reference_scores_use_policy_floors_and_support_paired_comparison() {
+        for tier in ["quick", "full", crate::fidelity_dataset::STANDARD_TIER] {
+            let mut scored = run(8, 512);
+            scored.tier = tier.into();
+            scored.kl_kind = "reference-top1024-plus-tail".into();
+            scored.dataset = Some(serde_json::json!({"qualification":"reference", "revision":"a".repeat(40)}));
+            assert!(verdict(&scored).label.unwrap().contains("common policy floor"));
+            assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).unwrap().pass);
+            if tier != "quick" {
+                scored.dataset.as_mut().unwrap()["revision"] = serde_json::Value::Null;
+                assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn reference_only_scores_are_not_paired_calibration() {
         for tier in ["quick", "full", crate::fidelity_dataset::STANDARD_TIER] {
             let mut scored = run(8, 512);
@@ -629,17 +721,17 @@ mod tests {
             assert!(verdict(&scored).label.unwrap().contains("common policy floor"));
             assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).unwrap_err()
                 .to_string().contains("lack paired engine calibration"));
-            // A code A/B is not refused for calibration (this synthetic set fails later checks).
             assert!(!compare_paired(&scored, &scored, 0.005, 0.005, 100, 1, Pairing::CodeChange)
                 .is_err_and(|e| e.to_string().contains("lack paired engine calibration")));
         }
     }
 
     #[test]
-    fn fixed_mimo_publication_uses_calibrated_bounds() {
+    fn fixed_mimo_publication_uses_strict_tier_and_calibrated_tripwires() {
         let mut fixed = run(8, 512);
         fixed.dataset = Some(serde_json::json!({"repository":crate::fidelity_dataset::REPOSITORY,
             "revision":crate::fidelity_dataset::FLASH_REVISION,"config":crate::fidelity_dataset::FLASH_CONFIG}));
+        fixed.precision = Some(crate::fidelity_precision::Precision::new(8.0, "fp8", true, "test").unwrap());
         fixed.floor_top1 = 0.93;
         fixed.floor_kl = 0.04;
         fixed.tripwire_expect = Some(crate::reference::TripwireExpect {
@@ -647,7 +739,7 @@ mod tests {
         let result = verdict(&fixed);
         assert!(result.pass);
         assert_eq!((result.top1_min,result.kl_max,result.confident_top1_min,result.top3_min),
-            (0.93,0.04,0.96,0.97));
+            (0.95,0.03,0.96,0.97));
         assert!(compare(&fixed, &fixed, 0.005, 0.005, 100, 1).unwrap().pass);
     }
 

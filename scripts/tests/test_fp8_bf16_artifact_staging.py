@@ -109,7 +109,7 @@ def test_cmake_requested_counts_preserve_defaults_and_select_both_input_forms(tm
     assert source.count('${exact_slices} ${requested_layouts}') >= 2
 
 
-def test_step5_nvfp4_has_one_package_not_an_a4_alias(tmp_path):
+def test_step5_nvfp4_keeps_exporter_geometry_and_canonical_a4_package(tmp_path):
     source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     body = source.split("set(CUTEAFD_FP8_MOE_ENTRIES)\n", 1)[1].split(
         "foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)", 1)[0]
@@ -120,6 +120,9 @@ def test_step5_nvfp4_has_one_package_not_an_a4_alias(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "ENTRIES=step5:nvfp4;glm:nvfp4;glm:nvfp4a4" in result.stderr
     assert "step5_nvfp4a4" not in TOOL.read_text()
+    branch = source.split('elseif(entry STREQUAL "step5:nvfp4")', 1)[1].split("elseif(", 1)[0]
+    assert 'set(geometry "step5_nvfp4")' in branch
+    assert '/fp8/fp8-step5-nvfp4a4")' in branch
 
 
 def test_step5_bf16_alone_enables_package_exporter(tmp_path):
@@ -360,7 +363,7 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
         write_package(native / name, input_kind="bf16", role=owner, weights="nvfp4")
     write_package(native / "fp8-step5", input_kind=wire, role=owner)
     write_package(native / "fp8-step5-bf16-weights", input_kind="bf16", role=owner, weights="bf16")
-    write_package(native / "fp8-step5-nvfp4", input_kind="bf16", role=owner, weights="nvfp4")
+    write_package(native / "fp8-step5-nvfp4a4", input_kind="bf16", role=owner, weights="nvfp4")
     if role == "coordinator":
         write_package(native / "fp8-qwen4", input_kind=wire, role=owner)
     write_package(native / "fp8-mimo-bf16", input_kind="bf16", revision=revision)
@@ -386,7 +389,7 @@ def test_step5_stages_native_weights_and_one_nvfp4_package(tmp_path, kind, role)
                            families="step5:fp8;step5:bf16;step5:nvfp4")
     assert result.returncode == 0, result.stderr
     assert {p.name for p in output.iterdir()} == {
-        "fp8-step5", "fp8-step5-bf16-weights", "fp8-step5-nvfp4", "fp8-mimo-bf16"}
+        "fp8-step5", "fp8-step5-bf16-weights", "fp8-step5-nvfp4a4", "fp8-mimo-bf16"}
     package_tool.verify(output / "fp8-step5-bf16-weights", revision=REVISION,
                         role=role, input_kind="bf16")
 

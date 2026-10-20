@@ -118,6 +118,8 @@ pub fn context_buffers(cfg: &GlmNextConfig, extent: u64, rows: u64, lanes: u64,
 
 #[derive(Debug, Clone)]
 pub struct GlmfInputs<'a> {
+    /// True only when the operator left context automatic.
+    pub automatic_context: bool,
     pub attention: GlmfAttention,
     pub cfg: &'a GlmNextConfig,
     pub layers: usize,
@@ -417,7 +419,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         inventory: Inventory { gpus: i.gpus.iter().map(|&(capacity_bytes, baseline)| GpuBudget {
             capacity_bytes, headroom_bytes: i.headroom_bytes, baseline }).collect(), spark_ranks: working.spark_ranks, peer_access: ranks == 2 },
         pool: PoolPolicy::resolve(&i.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), i.max_context,
-            i.requested_pool, geometry.logical_unit_rows, working.spark_ranks == 0),
+            i.requested_pool, geometry.logical_unit_rows, working.spark_ranks == 0).with_automatic_context(i.automatic_context),
         pool_bounded: geometry.ranks.iter().enumerate().filter_map(|(rank, g)| {
             let bytes = g.glmf_pool_mark_backing_unit_bytes(i.pool_marks);
             (bytes > 0).then(|| BoundedDemand { gpu: rank as u8, category: Category::Prefix,
@@ -460,20 +462,9 @@ pub fn expert_costs(catalog: &crate::OfficialV41Catalog, tp2: bool) -> anyhow::R
         tp2, spark_ok: true })).collect()
 }
 
-/// Match the runtime's activation override: only `a16` disables native A4.
-pub fn nvfp4_a4() -> bool {
-    std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() != Ok("a16")
-}
-
 /// Exact compiled package arenas; missing packages fail closed, never become zero scratch.
 pub fn expert_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
     tp: usize) -> anyhow::Result<u64> {
-    expert_workspace_selected(catalog, manifest, rows, tp, nvfp4_a4())
-}
-
-/// Explicit activation selection for deterministic admission and package tests.
-pub fn expert_workspace_selected(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
-    tp: usize, a4: bool) -> anyhow::Result<u64> {
     anyhow::ensure!([1, 2].contains(&tp), "GLM Flash RTX experts need TP1 or TP2");
     anyhow::ensure!((1..=4096).contains(&rows), "GLM Flash expert capacity must be 1..=4096 rows");
     let shape = catalog.routed_experts();
@@ -497,11 +488,11 @@ pub fn expert_workspace_selected(catalog: &crate::OfficialV41Catalog, manifest: 
         return Ok(cache::exl3_workspace_bytes(&manifests, true)? + rows.max(1) * shape.hidden as u64 * if tp == 2 { 4 } else { 2 });
     }
     let fp8 = catalog.fp8().ok_or_else(|| anyhow::anyhow!("GLM Flash fp8moe catalog missing"))?;
-    let a4_name = "fp8-glmf-nvfp4a4";
-    let name = if a4 && fp8.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4
-        && lib.join("fp8").join(a4_name).join(format!("tp{tp}")).is_dir() {
-        a4_name.to_string()
-    } else { format!("fp8-glmf{}", fp8.format().package_suffix()) };
+    let name = fp8.format().package_name("glmf");
+    if fp8.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 {
+        anyhow::ensure!(lib.join("fp8").join(&name).join(format!("tp{tp}")).is_dir(),
+            "missing GLM Flash {name}/tp{tp} package");
+    }
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json"))?)?;
     let scratch = inventory::fp8moe_scratch_bytes(&value, &format!("tp{tp}"), rows)
         .ok_or_else(|| anyhow::anyhow!("missing GLM Flash tp{tp} scratch for {rows} rows"))?;
@@ -628,6 +619,9 @@ pub fn placed_attention(attention: GlmfAttention, placed: &Placement) -> GlmfAtt
 /// closed-form candidate. Graph-geometry shrinking stays local to each candidate.
 pub fn solve_working_set_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
     sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
+    let mut resolved = i.clone();
+    resolved.automatic_context = automatic_context;
+    let i = &resolved;
     request(i)?;
     let mut graph_cache = std::collections::BTreeMap::new();
     if i.spark_ranks == 0 {
@@ -768,7 +762,7 @@ mod tests {
 
     fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
         let context = ArchContext::coordinator(capacity, None).context_bytes;
-        GlmfInputs {
+        GlmfInputs { automatic_context: false,
             attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
                 context_bytes: context + loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap().bytes,
@@ -1488,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn glm5_flash_nvfp4_a4_and_a16_select_matching_package_scratch() {
+    fn glm5_flash_nvfp4_requires_native_a4_package_scratch() {
         use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, nvfp4, write_snapshot};
         let dir = tempfile::tempdir().unwrap();
         let mut config = glm5_flash_config(2);
@@ -1516,11 +1510,18 @@ mod tests {
         };
         package("fp8-glmf-nvfp4", 12345);
         let a4 = package("fp8-glmf-nvfp4a4", 67890);
+        // work/p0 at 2b373eeb29 defaulted A4 on and chose this installed
+        // directory before its obsolete weight-only fallback.
+        let baseline = if a4.join("tp2").is_dir() { a4.clone() }
+            else { dir.path().join("lib/fp8/fp8-glmf-nvfp4") };
+        let selected = dir.path().join("lib/fp8")
+            .join(catalog.fp8().unwrap().format().package_name("glmf"));
+        assert_eq!(selected.join("tp2"), baseline.join("tp2"));
+        assert_eq!(selected, a4);
         let output = 4096 * 4096 * 2;
-        assert_eq!(expert_workspace_selected(&catalog, Some(&manifest), 4096, 2, true).unwrap(), 67890 + output);
-        assert_eq!(expert_workspace_selected(&catalog, Some(&manifest), 4096, 2, false).unwrap(), 12345 + output);
+        assert_eq!(expert_workspace(&catalog, Some(&manifest), 4096, 2).unwrap(), 67890 + output);
         std::fs::remove_dir(a4.join("tp2")).unwrap();
-        assert_eq!(expert_workspace_selected(&catalog, Some(&manifest), 4096, 2, true).unwrap(), 12345 + output);
+        assert!(expert_workspace(&catalog, Some(&manifest), 4096, 2).is_err());
     }
 
     #[test]

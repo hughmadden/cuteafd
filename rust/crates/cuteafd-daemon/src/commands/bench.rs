@@ -158,6 +158,17 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("no placement executor registered for {family}")]
+struct MissingPlacementExecutor {
+    family: String,
+}
+
+fn placement_executor(family: &str) -> std::result::Result<cuteafd_loader::placement::ExecutorModes, MissingPlacementExecutor> {
+    cuteafd_loader::placement::families::executor(family)
+        .ok_or_else(|| MissingPlacementExecutor { family: family.to_owned() })
+}
+
 /// Serve commands and their family ids.
 fn family_of(command: &str) -> Option<&'static str> {
     crate::commands::family::FAMILIES.iter().find(|(_, serve, _)| *serve == command).map(|(id, _, _)| *id)
@@ -230,14 +241,14 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
         .unwrap_or_else(|| "auto".into());
     // Reject an unrunnable placement before loading CUDA or starting workers.
     let mode = attention_mode(family, sub, &requested)?;
-    let executor = cuteafd_loader::placement::families::executor(family).expect("serve family executor");
+    let executor = placement_executor(family)?;
     settings.retain(|setting| setting.name != "attention-placement");
     settings.push(Setting { name: "attention-placement".into(), value: Some(mode.to_string()),
         default: Some(executor.attention_default().to_string()), source: "resolved".into() });
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
     Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: Some(family.to_string()), snapshot, settings }))
+        family: Some(family.to_string()), snapshot, settings, supports_thinking_off: None }))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
@@ -245,7 +256,7 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
 fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
     -> Result<cuteafd_loader::placement::AttentionPlacement> {
     let requested = cuteafd_loader::placement::attention::parse(requested).map_err(anyhow::Error::msg)?;
-    let executor = cuteafd_loader::placement::families::executor(family).expect("serve family executor");
+    let executor = placement_executor(family)?;
     let peer = sub.try_get_one::<u32>("rtx_gpus").ok().flatten().is_some_and(|&gpus| gpus == 2)
         || sub.try_get_one::<i32>("split_device").ok().flatten().is_some();
     Ok(executor.check_attention(requested, if peer { 2 } else { 1 }, peer)?)
@@ -255,6 +266,43 @@ fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    #[test]
+    fn every_serve_family_command_has_a_placement_executor() {
+        let families = crate::commands::family::FAMILIES.iter()
+            .map(|&(family, _, _)| family).collect::<std::collections::BTreeSet<_>>();
+        let executors = cuteafd_loader::placement::families::EXECUTORS.iter()
+            .map(|executor| executor.family).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(families.len(), crate::commands::family::FAMILIES.len(), "duplicate serve family");
+        assert_eq!(executors.len(), cuteafd_loader::placement::families::EXECUTORS.len(), "duplicate executor family");
+        assert_eq!(families, executors, "serve and placement registries must agree");
+    }
+
+    #[test]
+    fn missing_placement_executor_is_a_typed_error() {
+        let error = placement_executor("unregistered").unwrap_err();
+        assert_eq!(error.to_string(), "no placement executor registered for unregistered");
+        let matches = crate::cli::Cli::command().try_get_matches_from([
+            "cuteafd", "serve-glm", "--snapshot", "/s", "--native-lib", "/l",
+        ]).unwrap();
+        let error = attention_mode("unregistered", matches.subcommand().unwrap().1, "auto").unwrap_err();
+        assert!(error.downcast_ref::<MissingPlacementExecutor>().is_some());
+    }
+
+    #[test]
+    fn step5_context_uses_registered_native_attention_placement() {
+        for extra in [vec![], vec!["--split-device", "1"]] {
+            let argv = ["cuteafd", "serve-step5", "--snapshot", "/s", "--native-lib", "/l", "--peers", "127.0.0.1:19000"]
+                .into_iter().chain(extra).collect::<Vec<_>>();
+            let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
+            let context = serve_context(&matches, None).unwrap().expect("Step-5 serve context");
+            assert_eq!(context.family.as_deref(), Some("step5"));
+            let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
+            assert_eq!(placement.value.as_deref(), Some("heads"));
+            assert_eq!(placement.default.as_deref(), Some("heads"));
+            assert!(attention_mode("step5", matches.subcommand().unwrap().1, "context").is_err());
+        }
+    }
 
     #[test]
     fn context_load_arguments_parse_and_validate() {

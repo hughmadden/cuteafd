@@ -143,26 +143,33 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     #[test]
-    fn shared_resolver_matches_c84a1a1e_default_family_quotas() -> Result<()> {
-        // c84a1a1e retained_bytes + automatic_bytes, one coordinator, C16,
+    fn shared_resolver_charges_two_marks_per_conversation() -> Result<()> {
+        // Full-context pages and two marks per conversation, one coordinator, C16,
         // 128 GiB effective RAM, 256 MiB chunks. Default KV representations:
         // V4.1 native+dSpark, MiMo Pro INT8/full + BF16/SWA + warm DFlash,
         // Qwen FP8+MTP+PLE, GLM FP8, V4 Flash native+three dSpark stages.
         // The 4K extent also checks uncapped arithmetic for the large families.
         let fixtures = [
-            ("v41-dspark", 512, 455_680, 2_922_816, 1_048_576, 19_058_917_376, 536_870_912),
-            ("mimo-dflash", 64, 1_843_200, 60_293_128, 1_048_576, 34_359_738_368, 3_758_096_384),
-            ("qwen-mtp", 256, 4_526_080, 115_642_368, 262_144, 34_359_738_368, 4_294_967_296),
-            ("glm", 64, 3_452_160, 0, 1_048_576, 34_359_738_368, 4_831_838_208),
-            ("v4-dspark", 256, 998_208, 27_850_752, 1_048_576, 34_359_738_368, 1_342_177_280),
+            ("v41-dspark", 512, 455_680, 2_922_816, 1_048_576),
+            ("mimo-dflash", 64, 1_843_200, 60_293_128, 1_048_576),
+            ("qwen-mtp", 256, 4_526_080, 115_642_368, 262_144),
+            ("glm", 64, 3_452_160, 0, 1_048_576),
+            ("v4-dspark", 256, 998_208, 27_850_752, 1_048_576),
         ];
         let memory = HostMemory { total: 128 * GIB, available: 128 * GIB };
-        for (family, page_rows, page_bytes, mark_bytes, context, old_default, old_4k) in fixtures {
+        let chunk = 256u64 << 20;
+        for (family, page_rows, page_bytes, mark_bytes, context) in fixtures {
             let layout = FamilyLayout { page_rows, pages: 8192, page_bytes, mark_bytes,
                 draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
                 mark_store: Default::default(), page_owners: Default::default() };
-            for (context, expected) in [(context, old_default), (4096, old_4k)] {
-                assert_eq!(resolve_bytes(layout, None, 16, context, 256 << 20, memory)?, expected, "{family}, {context}");
+            for context in [context, 4096] {
+                let class = |count: u64, bytes: u64| {
+                    count.div_ceil(chunk / bytes) * chunk
+                };
+                let required = class((context as u64).div_ceil(page_rows as u64) * 20, page_bytes as u64)
+                    + class(40, mark_bytes.max(1) as u64);
+                let expected = required.min(32 * GIB);
+                assert_eq!(resolve_bytes(layout, None, 16, context, chunk, memory)?, expected, "{family}, {context}");
             }
         }
         Ok(())
@@ -230,10 +237,10 @@ mod tests {
     fn auto_never_allocates_more_than_full_retention_or_a_fractional_chunk() -> Result<()> {
         let layout = FamilyLayout { page_rows: 64, pages: 100, page_bytes: 512, mark_bytes: 140,
             draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
-        // Six full-context snapshots: twelve pages in six chunks, six marks in one.
-        assert_eq!(retained_bytes(layout, 2, 65, 1024)?, 7 * 1024);
+        // Six conversations: twelve pages in six chunks and twelve marks in two.
+        assert_eq!(retained_bytes(layout, 2, 65, 1024)?, 8 * 1024);
         let memory = HostMemory { total: 32768, available: 32000 };
-        assert_eq!(resolve_bytes(layout, None, 1, 65, 1024, memory)?, 6 * 1024);
+        assert_eq!(resolve_bytes(layout, None, 1, 65, 1024, memory)?, 7 * 1024);
         assert_eq!(resolve_bytes(layout, None, 16, 4096, 1024, memory)?, 8 * 1024);
         assert!(retained_bytes(layout, usize::MAX, usize::MAX, 1024).is_err());
         Ok(())

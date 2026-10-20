@@ -1021,14 +1021,29 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
     // Qwen's dual-owner layout partitions whole layers. Its host snapshot
     // concatenates those owners, so its aggregate is the single-owner geometry.
-    let cache = model.cache_geometry(if id == "qwen4" { CacheOptions { coordinator_ranks: 1, ..selected } }
-        else { selected })?.context("host cache layout unavailable")?;
+    let cache = if id == "glm5_flash" {
+        use crate::placement::AttentionPlacement;
+        let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config)?;
+        let attention = report.attention_placement;
+        let index = match attention {
+            AttentionPlacement::Context => crate::serving_capacity::GlmfIndexCache::Compact,
+            AttentionPlacement::Heads if ranks == 2 => crate::serving_capacity::GlmfIndexCache::Keys,
+            _ => options.glmf_index,
+        };
+        crate::serving_capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks,
+            index, options.glmf_kda_state.bytes(), options.glmf_decode_rows, attention, 0)?
+    } else {
+        model.cache_geometry(if id == "qwen4" { CacheOptions { coordinator_ranks: 1, ..selected } }
+            else { selected })?.context("host cache layout unavailable")?
+    };
     ensure!(!cache.ranks.is_empty(), "host cache has no owners");
     let pages = if cache.placement == KvPlacement::Replicated { &cache.ranks[..1] } else { &cache.ranks[..] };
     let page_bytes = pages.iter().try_fold(0u64, |n, r| n.checked_add(r.persistent_unit_bytes))
         .context("host cache pages overflow")?;
-    // Even replicated pages have distinct per-owner recurrent/window marks.
-    let mut mark_bytes = cache.ranks.iter().try_fold(0u64, |n, r| n.checked_add(r.retained_mark_bytes))
+    // V4 stores the lead's complete mark once, then publishes its backbone prefix
+    // to the peer. Other families retain distinct per-owner positional state.
+    let marks = if id == "deepseek_v4" { &cache.ranks[..1] } else { &cache.ranks[..] };
+    let mut mark_bytes = marks.iter().try_fold(0u64, |n, r| n.checked_add(r.retained_mark_bytes))
         .context("host cache marks overflow")?;
     if id == "deepseek_v41" && shape.native_layers > 0 {
         ensure!(shape.native_layers == 3, "V4.1 dSpark retains all three stages");
@@ -1071,10 +1086,9 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         u64::from(cuteafd_core::coordinator_programs::v41_live_rows(u32::try_from(requested)?)
             .context("invalid V4.1 live prefill rows for host admission")?)
     } else { report.prefill_rows.unwrap_or(options.prefill_rows.max(4096)) };
-    let ranks = report.memory_layout.as_ref().map_or(0, |m| m.devices.iter()
-        .filter(|d| d.kind == DeviceKind::Spark).count());
+    // Native plans keep only coordinator devices in their memory layout.
+    let ranks = report.spark_ranks;
     let lanes = match family {
-        "glm5" if native => 1,
         "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
             glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
         "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
@@ -1172,14 +1186,25 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         let media = options.media_cache_bytes.unwrap_or((8u64 << 30).min(total / 20));
         push(Category::Embedding, "media/embedding-cache", "host quota", media, Basis::Formula);
     }
-    let tier_disabled = options.rtx_bytes.len() > 1 && (family == "glm5_flash"
-        || (matches!(family, "glm5" | "deepseek_v4")
-            && report.attention_placement == crate::placement::AttentionPlacement::Heads));
+    let tier_disabled = options.rtx_bytes.len() > 1 && matches!(family, "glm5" | "deepseek_v4")
+        && report.attention_placement == crate::placement::AttentionPlacement::Heads;
     let family = family.to_owned();
     let cache = if options.mimo_prefix_entries == 0 || tier_disabled || options.host_cache_bytes == Some(0) { 0 } else {
         let resolved = selected_host_geometry(report, options, checkpoint).and_then(|(geometry, context, concurrency)| {
-            geometry.resolve(options.host_cache_bytes, context, concurrency, total, geometry.chunk_bytes())
-                .with_context(|| format!("invalid host snapshot geometry {geometry:?}, context {context}, concurrency {concurrency}"))
+            let chunk = geometry.chunk_bytes();
+            let bytes = geometry.resolve(options.host_cache_bytes, context, concurrency, total, chunk)
+                .with_context(|| format!("invalid host snapshot geometry {geometry:?}, context {context}, concurrency {concurrency}"))?;
+            ensure!(bytes > 0, "host prefix quota resolves to zero; use a positive quota or explicitly disable host retention");
+            let max = geometry.conversations(bytes, context, chunk.min(bytes));
+            let short = geometry.conversations(bytes, 50_000, chunk.min(bytes));
+            if let Some(memory) = &mut report.memory_layout {
+                memory.notes.push(format!("host prefix: {} B per mark; {} conversations at max context, {} at 50K (two marks each)",
+                    geometry.mark_bytes, max, short));
+                if short < concurrency + 4 {
+                    memory.notes.push(format!("WARNING: host prefix 50K capacity {short} is below concurrency+4 ({})", concurrency + 4));
+                }
+            }
+            Ok::<_, anyhow::Error>(bytes)
         });
         match resolved {
             Ok(bytes) => bytes,

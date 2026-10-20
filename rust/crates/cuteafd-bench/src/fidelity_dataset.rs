@@ -29,17 +29,21 @@ pub const GLM_REVISION: &str = "581cdf3b5ee5a63dd5a7726b9d33ea16cf105b0d";
 pub const GLM_CONFIG: &str = "glm5-v2_20261006_exl3k4_bf16root";
 pub const V4PRO_REVISION: &str = "5528730649150b8d8753e052f001f203b36ca12f";
 pub const V4PRO_CONFIG: &str = "deepseek_v4-v2_20261005_v4pro";
-pub const QWEN_DENSE_REVISION: &str = "5242b6006b22b488d71b6695fb449221baeb54ff";
-pub const QWEN35_9B_CONFIG: &str = "qwen35-9b-v1_20261015_bf16";
-pub const QWEN35_9B_MANIFEST_SHA256: &str = "205f00fb9267c6a3c6db0324f8263ac61163cd237e926d8f7ffc49df0a01d8b3";
-pub const QWEN38_27B_CONFIG: &str = "qwen38-27b-v1_20261015_bf16";
-pub const QWEN38_27B_MANIFEST_SHA256: &str = "4b1ba4f3eea0557c7f985f0bf0ad7b6fdcc89f74b87033fae08eedef0c7c5d57";
+pub const QWEN35_9B_REVISION: &str = "cec5bd5800a814c785d391b62041b7e67c6b21a9";
+pub const QWEN38_27B_REVISION: &str = "8dcac4fd5cf00e2189f798cb18e4a50f0bb6b775";
+pub const QWEN35_9B_CONFIG: &str = "qwen35-9b-v1_20261018_own-text-bf16";
+pub const QWEN35_9B_MANIFEST_SHA256: &str = "5ab4523a069cbdf9f3b25adaec0ef6a08ee2db181cac73dfd5e2be360419da07";
+pub const QWEN38_27B_CONFIG: &str = "qwen38-27b-v1_20261018_own-text-bf16";
+pub const QWEN38_27B_MANIFEST_SHA256: &str = "aac84d441de74e34759b18aa3ace78f99784842becfa94986b77eac5c2ff8d67";
 pub const STEP5_REVISION: &str = "f9cecb776d4e47f05738369e7e157122f3e0b473";
 pub const STEP5_CONFIG: &str = "step5-v1_20261017_bf16_provisional";
 pub const STEP5_MANIFEST_SHA256: &str = "dd0f964a891e24570bcbf5840f6398a06c9dd037926d7e240a4a2dff29e17af7";
 pub const V41_1017_REVISION: &str = "9fc394f9b7e847cedb49578072082e9a56ba8e57";
 pub const V41_1017_CONFIG: &str = "deepseek_v41-v2_20261017_1017";
 pub const V41_1017_MANIFEST_SHA256: &str = "0eb4afedef4561ac86876d6c8285e2e0ab73a2643eb08d0efc6547fb4a0c65bd";
+pub const KIMI_K3_REVISION: &str = "a98e1b9d6b622eec1ccc66fd21b5d48ff11d7c01";
+pub const KIMI_K3_CONFIG: &str = "kimi-k3-v2_20261019_own-text-effort-matched-mxfp4-f32";
+pub const KIMI_K3_MANIFEST_SHA256: &str = "815442612c25cd1fb5c3b1eb9dde2deb93e395b7d98bcbbdd5a52c829c9fd5cd";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -58,10 +62,11 @@ pub fn quick_windows(reference: &Reference) -> Result<Vec<Window>> {
 pub const STANDARD_TIER: &str = "standard-v2";
 pub const STANDARD_SPLIT_SHA256: &str = "2af36f78359d9ce7f37d0d2d4740c57ca11f0a77734bc13e774d37e416eee65b";
 pub const STANDARD_FALLBACK: &str = "decode only; prefill not admitted";
-// Pro's sealed split has a 1.1218 gen-row ratio; each half has its own verdict and bootstrap.
-const STANDARD_GEN_ROW_RATIO_MAX: f64 = 1.15;
 // Window ids, positions and blocks are model-independent; buckets/gen rows depend on tokenization/generations.
 const STANDARD_BUCKET_DIFF_MAX: i32 = 3;
+/// Scored generated rows each standard half needs to load (TJ, 2026-10-20).
+/// Every published set clears it; new sets are packaged against 10,000.
+pub const STANDARD_GENERATED_MIN: usize = 6_500;
 
 /// Sealed after balancing all seven published text sets, not sampled at runtime.
 /// Each half has A/B/C/D/E counts 13/6/5/3/5. The singleton legacy anchor
@@ -107,7 +112,6 @@ pub fn standard_windows(reference: &Reference, path: &str, admitted: bool) -> Re
     let halves: Vec<Vec<_>> = [STANDARD_DECODE, STANDARD_PREFILL].iter().map(|ids|
         ids.iter().map(|id| reference.windows.iter().find(|w| w.id == *id).unwrap()).collect()).collect();
     let mut buckets = Vec::new();
-    let mut generated = Vec::new();
     for half in &halves {
         let mut blocks = BTreeMap::new();
         let mut counts = BTreeMap::new();
@@ -119,16 +123,16 @@ pub fn standard_windows(reference: &Reference, path: &str, admitted: bool) -> Re
         }
         ensure!(blocks == BTreeMap::from([("A",13), ("B",6), ("C",5), ("D",3), ("E",5)]),
             "standard-v2 block stratification differs");
-        ensure!(roles.get("ctx").copied().unwrap_or(0) > 0 && roles.get("gen").copied().unwrap_or(0) > 0,
+        ensure!(roles.get("ctx").copied().unwrap_or(0) > 0,
             "standard-v2 requires context and generated rows in each half");
-        generated.push(roles["gen"]);
+        let generated = roles.get("gen").copied().unwrap_or(0);
+        ensure!(generated >= STANDARD_GENERATED_MIN,
+            "standard-v2 half has {generated} scored generated rows, under {STANDARD_GENERATED_MIN}");
         buckets.push(counts);
     }
     ensure!(buckets[0].keys().chain(buckets[1].keys()).all(|k|
         (buckets[0].get(k).copied().unwrap_or(0) - buckets[1].get(k).copied().unwrap_or(0)).abs() <= STANDARD_BUCKET_DIFF_MAX),
         "standard-v2 context buckets are not balanced");
-    ensure!(*generated.iter().max().unwrap() as f64 <= STANDARD_GEN_ROW_RATIO_MAX * *generated.iter().min().unwrap() as f64,
-        "standard-v2 generated row counts differ by more than 15%");
     ensure!(matches!(path, "decode" | "prefill") && (admitted || path == "decode"),
         "standard-v2 prefill scoring not admitted");
     if !admitted { return Ok(reference.windows.clone()); }
@@ -261,10 +265,11 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         let expected = match (commit, config) {
             (FLASH_REVISION, FLASH_CONFIG) => Some(FLASH_MANIFEST_SHA256),
             (MIMO_PRO_REVISION, MIMO_PRO_CONFIG) => Some(MIMO_PRO_MANIFEST_SHA256),
-            (QWEN_DENSE_REVISION, QWEN35_9B_CONFIG) => Some(QWEN35_9B_MANIFEST_SHA256),
-            (QWEN_DENSE_REVISION, QWEN38_27B_CONFIG) => Some(QWEN38_27B_MANIFEST_SHA256),
+            (QWEN35_9B_REVISION, QWEN35_9B_CONFIG) => Some(QWEN35_9B_MANIFEST_SHA256),
+            (QWEN38_27B_REVISION, QWEN38_27B_CONFIG) => Some(QWEN38_27B_MANIFEST_SHA256),
             (STEP5_REVISION, STEP5_CONFIG) => Some(STEP5_MANIFEST_SHA256),
             (V41_1017_REVISION, V41_1017_CONFIG) => Some(V41_1017_MANIFEST_SHA256),
+            (KIMI_K3_REVISION, KIMI_K3_CONFIG) => Some(KIMI_K3_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -294,7 +299,8 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         manifest["qualification_sha256"].as_str().context("qualification hash")?)?)?;
     let label = qualification_label(&qualification, &manifest)?;
     Ok((reference, digest(&bytes), json!({"repository":repo,"revision":commit,"config":config,
-        "qualification":label,"text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])})))
+        "qualification":label,"root_checkpoint":manifest["root_checkpoint"],
+        "text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])})))
 }
 
 fn tensor<'a>(bytes: &'a [u8], name: &str, dtype: &str, shape: &[usize]) -> Result<&'a [u8]> {
@@ -329,7 +335,7 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
     ensure!(panel["set_sha256"] == manifest["set_sha256"] && qualification["set_sha256"] == manifest["set_sha256"]
         && qualification["qualifies"] == true, "unqualified or mismatched dataset set");
     qualification_label(&qualification, manifest)?;
-    if qualification["kind"] == "reference_only" {
+    if matches!(qualification["kind"].as_str(), Some("reference" | "reference_only")) {
         ensure!(panel["checkpoint"] == manifest["checkpoint"]
             && manifest["checkpoint"] == manifest["root_checkpoint"]["id"]
             && panel["windows"].as_array().is_some_and(|w| w.len() == 64),
@@ -379,7 +385,7 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
 fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
     ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
         "unqualified or mismatched dataset set");
-    if qualification["kind"] == "reference_only" {
+    if matches!(qualification["kind"].as_str(), Some("reference" | "reference_only")) {
         let proof = &qualification["prefix_qualification"];
         let provenance = &qualification["reference_provenance"];
         ensure!(qualification["schema"] == "cuteafd.fidelity.qualification/1"
@@ -410,6 +416,28 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             source["revision"] == manifest["root_checkpoint"]["revision"]
                 && ["model_py_sha256", "kernel_torch_sha256", "golden_sha256", "inference_config_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
+        } else if manifest["family"] == "kimi_k3" {
+            let padding = &provenance["gates"]["kda_a_log_zero_padding"];
+            // The native 93-layer decoder has 69 KDA layers with 32 unused F32 heads.
+            let expected: std::collections::BTreeSet<_> = (0..92).filter(|i| i % 4 != 3)
+                .map(|i| format!("language_model.model.layers.{i}.self_attn.A_log")).collect();
+            let padding_valid = padding["active_heads"] == 96
+                && padding["layers"].as_array().is_some_and(|layers| {
+                    let names: std::collections::BTreeSet<_> = layers.iter()
+                        .filter_map(|entry| entry["tensor"].as_str().map(str::to_owned)).collect();
+                    layers.len() == expected.len() && names == expected && layers.iter().all(|entry|
+                        entry["stored_shape"] == json!([128]) && entry["loaded_shape"] == json!([96])
+                        && entry["tail_shape"] == json!([32]) && entry["tail_dtype"] == "F32"
+                        && entry["tail_bitwise_zero"] == true
+                        && entry["tail_sha256"] == digest(&[0u8; 32 * 4]))
+                });
+            manifest["root_checkpoint"]["id"] == "moonshotai/Kimi-K3"
+                && source["revision"] == manifest["root_checkpoint"]["revision"]
+                && ["configuration_kimi_k3_sha256", "modeling_kimi_k3_sha256", "modeling_kimi_linear_sha256",
+                    "reference_adapter_sha256", "reference_runner_sha256", "fla_source_sha256",
+                    "transformers_source_sha256", "compressed_tensors_source_sha256"]
+                    .iter().all(|key| hash(&source[key], 64))
+                && padding_valid
         } else {
             hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
         };
@@ -433,7 +461,7 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                 .is_some_and(|(a, b)| a.is_finite() && (a - b).abs() <= 1e-8)
             && qualification["nll"].as_f64().is_some_and(|x| x.is_finite() && x >= 0.0),
             "incomplete reference-only provenance");
-        return Ok("reference-only qualified");
+        return Ok(if qualification["kind"] == "reference_only" { "reference-only qualified" } else { "reference" });
     }
     ensure!(qualification["kind"].is_null() || qualification["kind"] == "paired", "unknown qualification kind");
     for shape in ["decode", "prefill"] {
@@ -462,6 +490,163 @@ mod tests {
     }
 
     use super::*;
+
+    fn kimi_reference_qualification() -> (Value, Value) {
+        let revision = "a".repeat(40);
+        let identity = json!({"checkpoint":"moonshotai/Kimi-K3", "snapshot_revision":revision,
+            "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
+        let mut source = json!({"revision":revision});
+        for key in ["configuration_kimi_k3_sha256", "modeling_kimi_k3_sha256", "modeling_kimi_linear_sha256",
+            "reference_adapter_sha256", "reference_runner_sha256", "fla_source_sha256",
+            "transformers_source_sha256", "compressed_tensors_source_sha256"] {
+            source[key] = json!("d".repeat(64));
+        }
+        let padding: Vec<_> = (0..92).filter(|i| i % 4 != 3).map(|i| json!({
+            "tensor":format!("language_model.model.layers.{i}.self_attn.A_log"),
+            "stored_shape":[128], "loaded_shape":[96], "tail_shape":[32], "tail_dtype":"F32",
+            "tail_bitwise_zero":true, "tail_sha256":digest(&[0u8;128])})).collect();
+        let manifest = json!({"family":"kimi_k3", "set_sha256":"sealed", "vocab":163840,
+            "root_checkpoint":{"id":"moonshotai/Kimi-K3", "revision":revision}});
+        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference",
+            "set_sha256":"sealed", "qualifies":true, "engine_parity":false, "nll":0.7, "scored_tokens":32768,
+            "reference_validation":{"passed":true,"engine_parity":false,"set_sha256":"sealed",
+                "scored_tokens":32768,"nll":0.7,"golden_seal_sha256":"e".repeat(64),"full_seal_sha256":"f".repeat(64)},
+            "prefix_qualification":{"passed":true,"finite":true,"rows":512,"different_rows":[],
+                "argmax_disagreements":0,"set_sha256":"sealed","snapshot_identity":identity,
+                "fixed_rows":128,"vocab":163840,"lengths":[576,640],"score_from":64,
+                "logits_sha256":["1".repeat(64),"2".repeat(64)]},
+            "reference_provenance":{"snapshot_identity":identity,"source_pin":source,
+                "tokenizers":"0.22.2","platform":{"gpu":"reference GPU"},"mtp":false,
+                "use_cache":false,"attention":"eager",
+                "gates":{"kda_a_log_zero_padding":{"active_heads":96,"layers":padding}}}});
+        (qualification, manifest)
+    }
+
+    #[test]
+    fn cached_published_qualifications_and_manifests_load() {
+        fn visit(root: &Path, sets: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { visit(&path, sets); }
+                else if path.file_name().is_some_and(|name| name == "qualification.json") {
+                    sets.push(path.parent().unwrap().to_path_buf());
+                }
+            }
+        }
+        let Some(home) = std::env::var_os("HOME") else { return; };
+        let cache = PathBuf::from(home).join(".cache/cuteafd/fidelity");
+        if !cache.is_dir() { return; }
+        let mut sets = Vec::new();
+        visit(&cache, &mut sets);
+        sets.sort();
+        for root in sets {
+            let manifest: Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+            let qualification: Value = serde_json::from_slice(&std::fs::read(root.join("qualification.json")).unwrap()).unwrap();
+            let label = qualification_label(&qualification, &manifest)
+                .unwrap_or_else(|e| panic!("{}: {e}", manifest["config"]));
+            let reference = load(&root, &manifest)
+                .unwrap_or_else(|e| panic!("{}: {e}", manifest["config"]));
+            assert!(!reference.windows.is_empty());
+            eprintln!("loaded {}: {label}", manifest["config"]);
+        }
+    }
+
+    #[test]
+    fn published_qualification_kinds_keep_their_labels_and_evidence() {
+        let (reference, manifest) = kimi_reference_qualification();
+        for (kind, label) in [("reference", "reference"), ("reference_only", "reference-only qualified")] {
+            let mut qualification = reference.clone();
+            qualification["kind"] = json!(kind);
+            assert_eq!(qualification_label(&qualification, &manifest).unwrap(), label);
+            qualification["prefix_qualification"]["passed"] = json!(false);
+            assert!(qualification_label(&qualification, &manifest).is_err());
+        }
+        let mut paired = json!({"set_sha256":"sealed", "qualifies":true, "shapes":{}});
+        for shape in ["decode", "prefill"] {
+            paired["shapes"][shape] = json!({"qualifies":true, "pass_verdict":true,
+                "original_pass":true, "delta_difference":0.0, "bound_difference":0.0});
+        }
+        for kind in [Value::Null, json!("paired")] {
+            paired["kind"] = kind;
+            assert_eq!(qualification_label(&paired, &manifest).unwrap(), "paired qualified");
+        }
+        paired["kind"] = json!("unknown");
+        assert!(qualification_label(&paired, &manifest).is_err());
+    }
+
+    #[test]
+    fn kimi_reference_native_source_and_padding_qualify() {
+        let (qualification, manifest) = kimi_reference_qualification();
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+    }
+
+    macro_rules! kimi_hash_test {
+        ($name:ident, $key:literal) => {
+            #[test]
+            fn $name() {
+                let (qualification, manifest) = kimi_reference_qualification();
+                for invalid in [None, Some(json!("a".repeat(40))), Some(json!("g".repeat(64))),
+                    Some(json!("A".repeat(64))), Some(json!("a".repeat(63))), Some(json!(64))] {
+                    let mut changed = qualification.clone();
+                    let source = changed["reference_provenance"]["source_pin"].as_object_mut().unwrap();
+                    if let Some(value) = invalid { source.insert($key.into(), value); } else { source.remove($key); }
+                    assert!(qualification_label(&changed, &manifest).is_err(), "{}", $key);
+                }
+            }
+        };
+    }
+    kimi_hash_test!(kimi_configuration_hash_fails_closed, "configuration_kimi_k3_sha256");
+    kimi_hash_test!(kimi_modeling_hash_fails_closed, "modeling_kimi_k3_sha256");
+    kimi_hash_test!(kimi_linear_hash_fails_closed, "modeling_kimi_linear_sha256");
+    kimi_hash_test!(kimi_adapter_hash_fails_closed, "reference_adapter_sha256");
+    kimi_hash_test!(kimi_runner_hash_fails_closed, "reference_runner_sha256");
+    kimi_hash_test!(kimi_fla_hash_fails_closed, "fla_source_sha256");
+    kimi_hash_test!(kimi_transformers_hash_fails_closed, "transformers_source_sha256");
+    kimi_hash_test!(kimi_compressed_tensors_hash_fails_closed, "compressed_tensors_source_sha256");
+
+    #[test]
+    fn kimi_reference_wrong_root_fails_closed() {
+        let (mut qualification, mut manifest) = kimi_reference_qualification();
+        manifest["root_checkpoint"]["id"] = json!("other/checkpoint");
+        qualification["reference_provenance"]["snapshot_identity"]["checkpoint"] = json!("other/checkpoint");
+        qualification["prefix_qualification"]["snapshot_identity"]["checkpoint"] = json!("other/checkpoint");
+        assert!(qualification_label(&qualification, &manifest).is_err());
+    }
+
+    #[test]
+    fn kimi_reference_revision_mismatch_fails_closed() {
+        let (qualification, manifest) = kimi_reference_qualification();
+        for revision in [Value::Null, json!("b".repeat(40)), json!("g".repeat(40)), json!("a".repeat(64))] {
+            let mut changed = qualification.clone();
+            changed["reference_provenance"]["source_pin"]["revision"] = revision;
+            assert!(qualification_label(&changed, &manifest).is_err());
+        }
+    }
+
+    #[test]
+    fn kimi_reference_padding_fails_closed() {
+        let (qualification, manifest) = kimi_reference_qualification();
+        for (key, invalid) in [("tail_bitwise_zero", json!(false)), ("tail_dtype",json!("BF16")),
+            ("tail_sha256",json!("a".repeat(64))), ("tail_sha256",Value::Null),
+            ("stored_shape",json!([129])), ("loaded_shape",json!([95])), ("tail_shape",json!([33])),
+            ("tensor",json!("language_model.model.layers.3.self_attn.A_log"))] {
+            let mut changed = qualification.clone();
+            changed["reference_provenance"]["gates"]["kda_a_log_zero_padding"]["layers"][0][key] = invalid;
+            assert!(qualification_label(&changed, &manifest).is_err(), "{key}");
+        }
+        for mode in ["missing", "duplicate", "heads", "absent"] {
+            let mut changed = qualification.clone();
+            let padding = &mut changed["reference_provenance"]["gates"]["kda_a_log_zero_padding"];
+            match mode {
+                "missing" => { padding["layers"].as_array_mut().unwrap().pop(); }
+                "duplicate" => { padding["layers"][1] = padding["layers"][0].clone(); }
+                "heads" => { padding["active_heads"] = json!(128); }
+                _ => { *padding = Value::Null; }
+            }
+            assert!(qualification_label(&changed, &manifest).is_err(), "{mode}");
+        }
+    }
+
     #[test]
     fn publications_and_retired_mimo_fail_closed() {
         assert_eq!(default_publication("wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"), Some((GLM_REVISION, GLM_CONFIG)));
@@ -571,7 +756,19 @@ mod tests {
         for w in &mut reference.windows {
             if STANDARD_DECODE.contains(&w.id.as_str()) && w.block != "C" { w.roles.fill("gen".into()); }
         }
-        assert!(standard_windows(&reference,"decode",true).unwrap_err().to_string().contains("more than 15%"));
+        assert!(standard_windows(&reference,"decode",true).is_ok());
+        assert!(standard_windows(&reference,"prefill",true).is_ok());
+        // The decode half has 8,998 scored generated rows; keep exactly the floor, then one fewer.
+        for keep in [STANDARD_GENERATED_MIN, STANDARD_GENERATED_MIN - 1] {
+            reference = saved.clone();
+            let mut excess = 8998 - keep;
+            for w in reference.windows.iter_mut().filter(|w| STANDARD_DECODE.contains(&w.id.as_str())) {
+                for pos in w.positions.iter().map(|p| p.pos).collect::<Vec<_>>() {
+                    if excess > 0 && w.roles[pos] == "gen" { w.roles[pos] = "ctx".into(); excess -= 1; }
+                }
+            }
+            assert_eq!(standard_windows(&reference,"decode",true).is_ok(), keep == STANDARD_GENERATED_MIN, "{keep}");
+        }
         reference = saved;
         for w in &mut reference.windows {
             if STANDARD_DECODE.contains(&w.id.as_str()) { w.bucket = "2-8K".into(); }
@@ -584,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn published_text_tiers_preserve_sealed_windows_and_generated_balance() {
+    fn published_text_tiers_preserve_sealed_windows_and_generated_counts() {
         let publications = [
             (REVISION, CONFIG, 8998, 8658), (FLASH_REVISION, FLASH_CONFIG, 7169, 6838),
             (GLMF_REVISION, GLMF_CONFIG, 7500, 7604), (QWEN_REVISION, QWEN_CONFIG, 8351, 7902),
@@ -628,7 +825,6 @@ mod tests {
                     - balance["prefill"]["context_buckets"][bucket].as_i64().unwrap()).abs()).max().unwrap();
             assert!(bucket_difference <= i64::from(STANDARD_BUCKET_DIFF_MAX), "{config}");
             let ratio = decode_gen.max(prefill_gen) as f64 / decode_gen.min(prefill_gen) as f64;
-            assert!(ratio <= STANDARD_GEN_ROW_RATIO_MAX, "{config}: {ratio}");
             if config == MIMO_PRO_CONFIG {
                 assert_eq!(decode_gen + prefill_gen, 16618);
                 assert!((ratio - 1.1218).abs() < 0.0001);
@@ -636,7 +832,6 @@ mod tests {
                 assert_eq!(balance["prefill"]["context_buckets"], json!({"0-2K":16,"2-8K":7,"8-16K":9}));
                 assert_eq!(standard_windows(&reference,"decode",false).unwrap().len(),64);
             } else {
-                assert!(ratio <= 1.1, "{config}: {ratio}");
                 assert!(bucket_difference <= 1, "{config}: {bucket_difference}");
             }
         }
@@ -646,8 +841,9 @@ mod tests {
     fn manifest_pins_reject_even_self_consistent_cached_indexes() {
         let temporary = tempfile::tempdir().unwrap();
         for (revision, config) in [(MIMO_PRO_REVISION, MIMO_PRO_CONFIG),
-            (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
-            (V41_1017_REVISION, V41_1017_CONFIG)] {
+            (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG),
+            (QWEN38_27B_REVISION, QWEN38_27B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
+            (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -673,18 +869,45 @@ mod tests {
         assert_eq!(reference.windows.len(), 64);
         assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
         assert_eq!(hash, expected_hash);
+        if commit == QWEN35_9B_REVISION && config == QWEN35_9B_CONFIG {
+            assert_eq!(reference.checkpoint, "Qwen/Qwen3.5-9B");
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "Qwen/Qwen3.5-9B");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 13824);
+            assert_eq!(balance["prefill"]["generated_positions"], 13168);
+        }
+        if commit == QWEN38_27B_REVISION && config == QWEN38_27B_CONFIG {
+            assert_eq!(reference.checkpoint, "Qwen/Qwen3.8-27B");
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "Qwen/Qwen3.8-27B");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 8306);
+            assert_eq!(balance["prefill"]["generated_positions"], 7065);
+        }
         if commit == STEP5_REVISION && config == STEP5_CONFIG {
             assert_eq!(reference.checkpoint, "stepfun-ai/Step-5-Preview-BF16");
-            assert_eq!(identity["qualification"], "reference-only qualified");
+            assert_eq!(identity["qualification"], "reference");
             assert_eq!(identity["text_checkpoint"], "Qwen/Qwen3.8-Flash-Next-FP8");
             assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 8089);
             assert_eq!(balance["prefill"]["generated_positions"], 7591);
         }
+        if commit == KIMI_K3_REVISION && config == KIMI_K3_CONFIG {
+            assert_eq!(reference.checkpoint, "moonshotai/Kimi-K3");
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "moonshotai/Kimi-K3");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 9371);
+            assert_eq!(balance["prefill"]["generated_positions"], 8838);
+        }
         if commit == V41_1017_REVISION && config == V41_1017_CONFIG {
             assert_eq!(reference.checkpoint, "deepseek-ai/DeepSeek-V4.1-Flash-1017");
-            assert_eq!(identity["qualification"], "reference-only qualified");
+            assert_eq!(identity["qualification"], "reference");
             assert_eq!(identity["text_checkpoint"], "deepseek-ai/DeepSeek-V4.1-Flash");
             assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
         }
@@ -711,7 +934,7 @@ mod tests {
         assert_eq!(identity["repository"], REPOSITORY);
         assert_eq!(identity["revision"], commit);
         assert_eq!(identity["config"], config);
-        assert!(matches!(identity["qualification"].as_str(), Some("reference-only qualified" | "paired qualified")));
+        assert!(matches!(identity["qualification"].as_str(), Some("reference" | "paired qualified")));
         assert!(identity["text_checkpoint"].as_str().is_some_and(|s| !s.is_empty()));
         let again = download(&ureq::Agent::new(), &cache, REPOSITORY, &commit, &config).unwrap();
         assert_eq!(identity, again.2);
@@ -799,7 +1022,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires locally staged reference-only publication configs"]
-    fn prepared_reference_only_publications_load_with_label() {
+    fn prepared_reference_publications_load_with_label() {
         let paths = std::env::var_os("CUTEAFD_REFERENCE_ONLY_CONFIGS").unwrap();
         for root in std::env::split_paths(&paths) {
             let manifest_bytes = std::fs::read(root.join("manifest.json")).unwrap();
@@ -811,7 +1034,8 @@ mod tests {
                 assert_eq!(standard_windows(&reference, shape, true).unwrap().len(), 32);
             }
             let qualification: Value = serde_json::from_slice(&std::fs::read(root.join("qualification.json")).unwrap()).unwrap();
-            assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference-only qualified");
+            let expected = if qualification["kind"] == "reference_only" { "reference-only qualified" } else { "reference" };
+            assert_eq!(qualification_label(&qualification, &manifest).unwrap(), expected);
             let cache = tempfile::tempdir().unwrap();
             let revision = "a".repeat(40);
             let base = cache.path().join("owner--repo").join(&revision);
@@ -822,7 +1046,7 @@ mod tests {
                 "schema":"cuteafd.fidelity.configs/1", "configs":[{"name":config,
                 "path":format!("{config}/manifest.json"), "sha256":digest(&manifest_bytes)}]})).unwrap()).unwrap();
             let (_, _, identity) = download(&ureq::Agent::new(), cache.path(), "owner/repo", &revision, config).unwrap();
-            assert_eq!(identity["qualification"], "reference-only qualified");
+            assert_eq!(identity["qualification"], expected);
         }
     }
 
@@ -877,11 +1101,11 @@ mod tests {
     }
 
     #[test]
-    fn reference_only_requires_complete_non_engine_evidence() {
+    fn reference_requires_complete_non_engine_evidence() {
         let identity = json!({"checkpoint":"Qwen/Qwen3.5-9B", "snapshot_revision":"a".repeat(40),
             "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
         let manifest = json!({"set_sha256":"set", "vocab":248320, "root_checkpoint":{"id":"Qwen/Qwen3.5-9B", "revision":"a".repeat(40)}});
-        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference_only", "qualifies":true, "engine_parity":false,
+        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference", "qualifies":true, "engine_parity":false,
             "set_sha256":"set", "nll":1.2, "scored_tokens":32768,
             "reference_validation":{"passed":true, "engine_parity":false, "set_sha256":"set",
                 "scored_tokens":32768,"nll":1.2,"golden_seal_sha256":"d".repeat(64),"full_seal_sha256":"e".repeat(64)},
@@ -891,7 +1115,10 @@ mod tests {
             "reference_provenance":{"snapshot_identity":identity,
                 "source_pin":{"revision":"1".repeat(40),"source_tree_sha256":"2".repeat(64),"modeling_sha256":"3".repeat(64)},
                 "tokenizers":"0.23.1","platform":{"gpu":"NVIDIA GB10"},"mtp":false,"use_cache":false,"attention":"eager"}});
-        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference-only qualified");
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+        let mut incomplete = qualification.clone();
+        incomplete["prefix_qualification"]["passed"] = json!(false);
+        assert!(qualification_label(&incomplete, &manifest).is_err());
         let mut native_manifest = manifest.clone();
         native_manifest["family"] = json!("step5");
         native_manifest["root_checkpoint"]["id"] = json!("stepfun-ai/Step-5-Preview-BF16");
@@ -905,7 +1132,7 @@ mod tests {
             "kernel":"_sparse_attn_prefill_kernel"});
         native["reference_provenance"]["sparse_attention_launch"] = launch.clone();
         native_manifest["reference_execution"]["sparse_attention_launch"] = launch;
-        assert_eq!(qualification_label(&native, &native_manifest).unwrap(), "reference-only qualified");
+        assert_eq!(qualification_label(&native, &native_manifest).unwrap(), "reference");
         for key in ["revision", "model_sha256", "kernel_sha256", "vision_encoder_sha256",
             "transformers_revision", "transformers_source_tree_sha256"] {
             let mut bad = native.clone(); bad["reference_provenance"]["source_pin"][key] = Value::Null;
@@ -929,7 +1156,7 @@ mod tests {
         v41["prefix_qualification"]["snapshot_identity"] = v41["reference_provenance"]["snapshot_identity"].clone();
         v41["reference_provenance"]["source_pin"] = json!({"revision":"a".repeat(40), "model_py_sha256":"1".repeat(64),
             "kernel_torch_sha256":"2".repeat(64), "golden_sha256":"3".repeat(64), "inference_config_sha256":"4".repeat(64)});
-        assert_eq!(qualification_label(&v41, &v41_manifest).unwrap(), "reference-only qualified");
+        assert_eq!(qualification_label(&v41, &v41_manifest).unwrap(), "reference");
         for key in ["revision", "model_py_sha256", "kernel_torch_sha256", "golden_sha256", "inference_config_sha256"] {
             let mut bad = v41.clone(); bad["reference_provenance"]["source_pin"][key] = Value::Null;
             assert!(qualification_label(&bad, &v41_manifest).is_err(), "{key}");

@@ -248,20 +248,26 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
     }
 }
 
+fn snapshot_layout(pages: usize, page_bytes: usize, rank_mark_bytes: &[usize], parity: bool) -> FamilyLayout {
+    FamilyLayout {
+        page_rows: SOURCE_PAGE_TOKENS,
+        pages,
+        page_bytes,
+        // Host slabs hold the lead mark only; device arenas still reserve every
+        // rank's part and use their original per-rank strides.
+        mark_bytes: rank_mark_bytes[0],
+        draft_bytes: 0,
+        rule: ReuseRule::EXACT,
+        mark_store: MarkStore::Arena,
+        page_owners: if parity { PageOwners::Parity } else { PageOwners::Uniform },
+    }
+}
+
 impl PrefixFamily for Dsv4Prefix<'_, '_> {
     type Placement = Placement;
 
     fn layout(&self) -> FamilyLayout {
-        FamilyLayout {
-            page_rows: SOURCE_PAGE_TOKENS,
-            pages: self.engine.shape.units,
-            page_bytes: self.page_bytes(),
-            mark_bytes: self.mark_bytes,
-            draft_bytes: 0,
-            rule: ReuseRule::EXACT,
-            mark_store: MarkStore::Arena,
-            page_owners: if self.parity() { PageOwners::Parity } else { PageOwners::Uniform },
-        }
+        snapshot_layout(self.engine.shape.units, self.page_bytes(), &self.rank_mark_bytes, self.parity())
     }
 
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] {
@@ -666,6 +672,55 @@ mod tests {
         // A GPU1 layer order that differs from GPU0's is refused.
         layers.swap(7, 9);
         assert!(Dsv4Prefix::mirror_prefix(&layers).is_err());
+    }
+
+    #[test]
+    fn context_host_quota_matches_planner_and_stores_one_mark_with_peer_replica() {
+        use cuteafd_loader::plan::{self, layout::LayoutOptions, PlanOptions};
+        use cuteafd_loader::placement::AttentionPlacement;
+        use cuteafd_core::prefix::HostCacheGeometry;
+        let buffer = CuteafdDeviceBuffer::default();
+        for stages in [0, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            plan::testing::write_v4_snapshot_with_dspark(dir.path(), stages);
+            let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(dir.path(), stages).unwrap();
+            let layer = |rank: usize, ratio: usize| LayerBuffers { rank, main: buffer,
+                compressed: (ratio > 0).then_some((ratio, buffer)), index: (ratio == 4).then_some(buffer),
+                states: match ratio {
+                    4 => vec![(buffer, 65_536), (buffer, 65_536), (buffer, 16_384), (buffer, 16_384)],
+                    128 => vec![(buffer, 524_288), (buffer, 524_288)], _ => Vec::new(),
+                } };
+            let mut layers: Vec<_> = cfg.compress_ratios.iter().map(|&ratio| layer(0, ratio)).collect();
+            layers.extend((0..stages).map(|_| layer(0, 0)));
+            layers.extend(cfg.compress_ratios.iter().map(|&ratio| layer(1, ratio)));
+            Dsv4Prefix::mirror_prefix(&layers).unwrap();
+            let marks: Vec<_> = (0..2).map(|rank| layers.iter().filter(|l| l.rank == rank)
+                .map(Dsv4Prefix::layer_mark_bytes).sum()).collect();
+            let page_bytes = cfg.compress_ratios.iter().map(|&ratio| match ratio {
+                4 => compressed_page_bytes(4) + INDEX_PAGE_BYTES,
+                128 => compressed_page_bytes(128), _ => 0,
+            }).sum();
+            let runtime = snapshot_layout(32, page_bytes, &marks, true);
+            assert_eq!(runtime.host_layout().tail, marks[0]);
+            assert_eq!(marks[0] - marks[1], stages * WINDOW_MARK_BYTES);
+            let host = HostCacheGeometry { unit_rows: runtime.page_rows as u64,
+                page_bytes: runtime.page_bytes as u64, mark_bytes: runtime.mark_bytes as u64, draft_bytes: 0 };
+            for concurrency in [16, 128] {
+                let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 4096,
+                    pool_tokens: Some(8192), concurrency, native_mtp_layers: stages,
+                    host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+                let report = plan::plan(dir.path(), &PlanOptions { layout: Some(options),
+                    attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).unwrap();
+                let expected = host.resolve(None, 4096, concurrency, 128 << 30, host.chunk_bytes()).unwrap();
+                assert_eq!(report.host_budget_bytes, expected, "stages={stages}, C={concurrency}");
+                let note = format!("host prefix: {} B per mark;", marks[0]);
+                assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.starts_with(&note)),
+                    "{}", plan::render(&report));
+                let required = crate::shared::prefix::budget::retained_bytes(runtime,
+                    concurrency as usize, 4096, host.chunk_bytes()).unwrap();
+                assert_eq!(required.min(32 << 30) / host.chunk_bytes() * host.chunk_bytes(), expected);
+            }
+        }
     }
 
     #[test]

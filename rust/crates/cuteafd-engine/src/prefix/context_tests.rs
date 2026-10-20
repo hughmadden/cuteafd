@@ -519,3 +519,32 @@ fn eviction_keeps_the_halves_balanced_and_every_restore_exact() {
         assert_eq!((cache.pool().free_halves(), cache.arena().in_use()), ([24, 24], 0));
     }
 }
+
+#[test]
+fn host_only_marks_restore_exact_owned_pages_and_replicas_with_two_slots() {
+    let fake = Split::new(96, 4, 2);
+    let mut cache = cache(&fake, 8, 1 << 20);
+    let mut frontiers = Vec::new();
+    for i in 0..4 {
+        let prompt = seq(100 + i * 100, 13);
+        let (_, turn, p) = serve(&mut cache, &fake, 0, &prompt, &seq(1000 + i * 100, 3), 20);
+        cache.release(&fake, &p.pages).unwrap();
+        frontiers.extend([prompt, turn]);
+    }
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    assert_eq!(cache.arena().in_use(), 0);
+    for frontier in frontiers {
+        let mut next = frontier.clone(); next.push(888);
+        let admitted = cache.admit(&fake, &next, 20, false,
+            |pages| Placement { pages, ring: 1, len: 0 }).unwrap();
+        assert_eq!(admitted.resume, frontier.len());
+        assert!(admitted.source.unwrap().host);
+        let mut p = admitted.placement;
+        fake.forward(&mut p, &next).unwrap();
+        cache.release(&fake, &p.pages).unwrap();
+        assert_eq!(cache.arena().in_use(), 0);
+    }
+    assert_eq!((cache.stats().mark_promotions, cache.stats().promotions), (8, 0));
+    assert!(fake.replica_copies.get() >= 8);
+}

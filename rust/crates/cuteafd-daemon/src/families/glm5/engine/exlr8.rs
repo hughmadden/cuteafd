@@ -92,7 +92,7 @@ impl NativePlan {
 }
 
 pub(crate) struct NativeExperts<'a> {
-    execution: Exlr8Execution<'a>,
+    workspace: usize,
     weights: Vec<Exlr8Weights<'a>>,
     first: usize,
 }
@@ -100,7 +100,6 @@ pub(crate) struct NativeExperts<'a> {
 impl<'a> NativeExperts<'a> {
     pub(crate) fn load(
         library: &'a NativeLibrary,
-        programs: &'a Programs<'a>,
         plan: NativePlan,
     ) -> Result<Self> {
         plan.admit_host()?;
@@ -118,11 +117,6 @@ impl<'a> NativeExperts<'a> {
                 .all(|(i, plan)| plan.layer == first + i),
             "EXLR8 shared residency must cover consecutive routed layers"
         );
-        let mut execution =
-            Exlr8Execution::new(library, programs, ROWS, workspace, ExpertSet::Shared)?;
-        library.copy_h2d(execution.ids()?, &vec![0; ROWS * 4])?;
-        library.copy_h2d(execution.route_weights()?, bytes_of(&vec![1.0f32; ROWS]))?;
-        execution.seal_graph_storage()?;
         let weights = plans
             .into_iter()
             .map(|plan| {
@@ -131,10 +125,23 @@ impl<'a> NativeExperts<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            execution,
+            workspace,
             weights,
             first,
         })
+    }
+
+    pub(super) fn execution(
+        &self,
+        library: &'a NativeLibrary,
+        programs: &'a Programs<'a>,
+    ) -> Result<Exlr8Execution<'a>> {
+        let mut execution =
+            Exlr8Execution::new(library, programs, ROWS, self.workspace, ExpertSet::Shared)?;
+        library.copy_h2d(execution.ids()?, &vec![0; ROWS * 4])?;
+        library.copy_h2d(execution.route_weights()?, bytes_of(&vec![1.0f32; ROWS]))?;
+        execution.seal_graph_storage()?;
+        Ok(execution)
     }
 
     pub(crate) fn resident_bytes(&self) -> usize {
@@ -159,6 +166,7 @@ impl<'a> NativeExperts<'a> {
         stream: *mut c_void,
     ) -> Result<()> {
         let weights = self.weights(layer)?;
+        let execution = w.native_shared.as_ref().context("EXLR8 lane shared workspace")?;
         let stride = weights.layout.hidden * 2;
         for first in (0..rows).step_by(ROWS) {
             let count = (rows - first).min(ROWS);
@@ -167,9 +175,9 @@ impl<'a> NativeExperts<'a> {
             // SAFETY: one stream orders copies, K1 and copies out before the next
             // chunk reuses the bounded arena; no host synchronization is needed.
             unsafe {
-                library.copy_d2d_async(self.execution.input()?, input, input.bytes, stream)?;
-                self.execution.run(weights, count, stream)?;
-                library.copy_d2d_async(output, self.execution.output()?, output.bytes, stream)?;
+                library.copy_d2d_async(execution.input()?, input, input.bytes, stream)?;
+                execution.run(weights, count, stream)?;
+                library.copy_d2d_async(output, execution.output()?, output.bytes, stream)?;
             }
         }
         Ok(())

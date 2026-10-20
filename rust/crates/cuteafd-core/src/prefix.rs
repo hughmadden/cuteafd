@@ -27,7 +27,7 @@ pub fn host_cache_required_bytes(context: u64, concurrency: u64,
     let snapshots = concurrency.checked_add(4)?;
     let pages = context.div_ceil(unit_rows).checked_mul(snapshots)?;
     let mut chunks = 0u64;
-    for (count, bytes) in [(pages, page_bytes), (snapshots, mark_bytes), (snapshots, draft_bytes)] {
+    for (count, bytes) in [(pages, page_bytes), (snapshots.checked_mul(2)?, mark_bytes), (snapshots, draft_bytes)] {
         if bytes == 0 { continue; }
         let per = chunk / bytes;
         if per == 0 { return None; }
@@ -61,6 +61,32 @@ impl HostCacheGeometry {
         (256u64 << 20).max(self.page_bytes).max(self.mark_bytes).max(self.draft_bytes)
     }
 
+    /// Whole conversations (shared prompt/turn KV extent, two independent positional marks).
+    pub fn conversations(self, bytes: u64, context: u64, chunk: u64) -> u64 {
+        if context == 0 || chunk == 0 { return 0; }
+        // The same allocator size classes/rounding as admission; binary search avoids overflow.
+        let fits = |n: u64| {
+            let Some(pages) = context.checked_add(self.unit_rows.saturating_sub(1))
+                .and_then(|rows| rows.checked_div(self.unit_rows)).and_then(|pages| pages.checked_mul(n)) else { return false };
+            let Some(marks) = n.checked_mul(2) else { return false };
+            let mut chunks = 0u64;
+            for (count, size) in [(pages, self.page_bytes), (marks, self.mark_bytes.max(1)), (n, self.draft_bytes)] {
+                if size == 0 { continue; }
+                let per = chunk / size;
+                if per == 0 { return false; }
+                let Some(total) = chunks.checked_add(count.div_ceil(per)) else { return false };
+                chunks = total;
+            }
+            chunks.checked_mul(chunk).is_some_and(|needed| needed <= bytes)
+        };
+        let (mut low, mut high) = (0u64, bytes);
+        while low < high {
+            let mid = low + (high - low) / 2 + 1;
+            if fits(mid) { low = mid; } else { high = mid - 1; }
+        }
+        low
+    }
+
     /// Explicit quotas bypass geometry and caps; automatic quotas hold whole chunks.
     pub fn resolve(self, explicit: Option<u64>, context: u64, concurrency: u64,
         host_total: u64, chunk: u64) -> Option<u64> {
@@ -88,7 +114,7 @@ mod host_budget_tests {
     fn shared_resolver_preserves_explicit_overrides_and_whole_chunk_caps() {
         let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 512,
             mark_bytes: 140, draft_bytes: 0 };
-        assert_eq!(geometry.resolve(None, 65, 2, 32768, 1024), Some(7 * 1024));
+        assert_eq!(geometry.resolve(None, 65, 2, 32768, 1024), Some(8 * 1024));
         assert_eq!(geometry.resolve(None, 4096, 16, 32768, 1024), Some(8 * 1024));
         assert_eq!(geometry.resolve(Some(40001), 0, u64::MAX, 1, 0), Some(40001));
         assert_eq!(geometry.resolve(Some(0), 0, 0, 0, 0), Some(0));
@@ -196,6 +222,15 @@ pub fn mark_slots_for(lanes: u64, entries: u64, slot_bytes: u64, budget_bytes: u
     let floor = lanes.max(1).saturating_mul(2).saturating_add(2);
     let wanted = entries.saturating_mul(2).saturating_add(2);
     wanted.min(budget_bytes / slot_bytes.max(1)).max(floor)
+}
+
+/// A fixed staging ring: two asynchronous captures, or a capture and a serialized restore.
+/// Full rings wait for the oldest write; host-off retains the legacy lane/retention rule.
+pub const HOST_MARK_STAGING_SLOTS: u64 = 2;
+
+pub fn mark_slots_with_host(lanes: u64, entries: u64, slot_bytes: u64, budget_bytes: u64, host: bool) -> u64 {
+    if entries == 0 { 0 } else if host { HOST_MARK_STAGING_SLOTS }
+    else { mark_slots_for(lanes, entries, slot_bytes, budget_bytes) }
 }
 
 /// How much computation a retained frontier saves for a query that shares `common` tokens with
@@ -851,5 +886,30 @@ mod tests {
         assert!(!radix.evict_one());
         assert_eq!(dropped.get(), 3);
         assert!(radix.root.children.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    #[test]
+    fn host_working_set_is_constant_and_host_off_is_legacy() {
+        for lanes in [1, 2, 8, 16, 128] {
+            for entries in [0, 1, 20, 128] {
+                assert_eq!(mark_slots_with_host(lanes, entries, 428 << 20, 2 << 30, true),
+                    if entries == 0 { 0 } else { 2 });
+                assert_eq!(mark_slots_with_host(lanes, entries, 428 << 20, 2 << 30, false),
+                    mark_slots_for(lanes, entries, 428 << 20, 2 << 30));
+            }
+        }
+    }
+    #[test]
+    fn host_budget_charges_two_marks_per_conversation_and_capacity_uses_size_classes() {
+        let g = HostCacheGeometry { unit_rows: 64, page_bytes: 512, mark_bytes: 140, draft_bytes: 0 };
+        assert_eq!(host_cache_required_bytes(65, 2, 64, 512, 140, 0, 1024), Some(8 * 1024));
+        assert_eq!(g.conversations(8 * 1024, 65, 1024), 6);
+        assert_eq!(g.conversations(7 * 1024, 65, 1024), 5);
+        assert_eq!(g.conversations(0, 65, 1024), 0);
+        assert_eq!(g.conversations(1024, 0, 1024), 0);
     }
 }

@@ -13,9 +13,9 @@ pub fn messages(text: &str) -> Value {
     json!([{"role": "user", "content": text}])
 }
 
-/// Greedy, thinking off.
-pub fn plain(text: &str, max_tokens: u64) -> Value {
-    json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}})
+/// Greedy, thinking off when the checkpoint renderer supports it.
+pub fn plain(client: &crate::client::Client, text: &str, max_tokens: u64) -> Value {
+    crate::request::thinking_off(&client.configuration, json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}}))
 }
 
 /// The probe a request whose prompt re-renders model output carries: a
@@ -134,6 +134,32 @@ pub fn draft_counters(client: &Client) -> Option<(f64, f64)> {
 /// Verification rounds and tokens emitted by those rounds (not prefill).
 pub fn round_counters(client: &Client) -> Option<(f64, f64)> {
     counter_pair(&client.stats().ok()?, "verification_rounds", "output_tokens")
+}
+
+/// Prefix-cache tier counters (`/v1/stats` `prefix_cache`); absent fields read as zero.
+const PREFIX_TIER_COUNTERS: [&str; 6] =
+    ["device_hits", "host_hits", "mark_promotions", "promotions", "capture_stalls", "capture_stall_ns"];
+
+/// The server's cumulative prefix-cache tier counters, `None` when it publishes none.
+pub fn prefix_tier_counters(client: &Client) -> Option<Value> {
+    let stats = client.stats().ok()?;
+    let cache = stats["prefix_cache"].as_object()?;
+    PREFIX_TIER_COUNTERS.iter().any(|k| cache.contains_key(*k))
+        .then(|| json!(PREFIX_TIER_COUNTERS.iter().map(|k| (k.to_string(), json!(cache.get(*k).and_then(Value::as_u64).unwrap_or(0))))
+            .collect::<serde_json::Map<_, _>>()))
+}
+
+/// Tier counter differences across one measurement.
+pub fn prefix_tier_interval(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
+    let (before, after) = (before?, after?);
+    Some(json!(PREFIX_TIER_COUNTERS.iter().map(|k| (k.to_string(),
+        json!(after[*k].as_u64().unwrap_or(0).saturating_sub(before[*k].as_u64().unwrap_or(0)))))
+        .collect::<serde_json::Map<_, _>>()))
+}
+
+/// Which tier served a request's cached prefix (`usage.prefix_cache_source`: device, host or miss).
+pub fn prefix_source(chat: &Chat) -> Option<String> {
+    chat.usage["prefix_cache_source"].as_str().map(str::to_string)
 }
 
 /// Cumulative mapped-table counters; absence means this family has no mapped tables.

@@ -68,7 +68,7 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
     assert plan[plan.index("--exlr8-manifest") + 1] == manifest
     dense = plan[plan.index("--exlr8-dense-from") + 1]
     assert dense.startswith("/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
-    assert "CUTEAFD_GLM_PREFILL_LANES=1" in plan
+    assert "CUTEAFD_GLM_PREFILL_LANES=3" in plan
     assert len(result["containers"]) == 5
     for run in result["containers"]:
         parsed = parse_run(run["argv"])
@@ -76,17 +76,35 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
         assert command[command.index("--exlr8-manifest") + 1] == manifest
         if "serve-glm" in command:
             assert command[command.index("--exlr8-dense-from") + 1] == dense
-            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "1"
+            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "3"
         else:
             assert "expertd-native" in command
             assert "--exlr8-dense-from" not in command
 
 
+@pytest.mark.parametrize("lanes", ["1", "2", "3", "4"])
+def test_exlr8_launcher_preserves_explicit_prefill_lanes(lanes: str, tmp_path: Path) -> None:
+    source = ROOT / "scripts/launch/run-family.sh"
+    launcher = tmp_path / "run-family.sh"
+    launcher.write_text(source.read_text().replace(
+        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"',
+        f'    CUTEAFD_GLM_PREFILL_LANES={lanes}\n'
+        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"'))
+    result = capture(ROOT, f"exlr8-lanes-{lanes}", release_entry=exlr8_entry(),
+        launcher_source=launcher)
+    assert f"CUTEAFD_GLM_PREFILL_LANES={lanes}" in result["plans"][0]
+    coordinator = parse_run(result["containers"][0]["argv"])
+    assert coordinator["env"]["CUTEAFD_GLM_PREFILL_LANES"] == lanes
+
+
+@pytest.mark.parametrize("gpus,attention", [("1", "auto"), ("1", "heads"), ("2", "auto"), ("2", "context")])
 @pytest.mark.parametrize("ranks", range(1, 7))
-def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int) -> None:
+def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, attention: str) -> None:
     entry = exlr8_entry()
-    entry["set"]["SPARK_COUNT"] = str(ranks)
-    result = capture(ROOT, f"exlr8-world-{ranks}", release_entry=entry)
+    entry["set"].update(SPARK_COUNT=str(ranks), RTX_GPUS=gpus, ATTENTION_PLACEMENT=attention)
+    result = capture(ROOT, f"exlr8-world-{ranks}-{gpus}-{attention}", release_entry=entry)
+    coordinator = parse_run(result["containers"][0]["argv"])["command"]
+    assert ("--split-device" in coordinator) == (gpus == "2")
     assert len(result["containers"]) == ranks + 1
     workers = [parse_run(run["argv"])["command"] for run in result["containers"][1:]]
     for rank, command in enumerate(workers):
@@ -97,7 +115,10 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int) -> None:
 @pytest.mark.parametrize("overrides,reason", [
     ({"EXLR8_MANIFEST": "other"}, "EXLR8_MANIFEST"),
     ({"EXLR8_DENSE_FROM": ""}, "EXLR8_DENSE_FROM"),
-    ({"RTX_GPUS": "1"}, "two RTX"),
+    ({"RTX_GPUS": "0"}, "RTX GPUs"),
+    ({"RTX_GPUS": "3"}, "RTX GPUs"),
+    ({"RTX_GPUS": "1"}, "heads attention"),
+    ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
     ({"SPARK_COUNT": "7"}, "canonical Spark ranks"),
     ({"SPECULATOR": "dflash2"}, "SPECULATOR=off"),
     ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),
@@ -129,6 +150,23 @@ def test_host_cache_and_full_logits_reach_plan_and_serve(quota: str, full: str) 
     assert actual == quota
     assert ("--full-prefill-logits" in plan) == (full == "on")
     assert ("--full-prefill-logits" in serve) == (full == "on")
+
+
+@pytest.mark.parametrize("family", ["deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"])
+@pytest.mark.parametrize("quota", [None, "0", "16GiB"])
+def test_generic_host_default_matches_plan_and_serve(family: str, quota: str | None) -> None:
+    entry = release_entry(next(e for e in ENTRIES if e["family"] == family))
+    entry["set"].pop("HOST_CACHE_BYTES", None)
+    if quota is not None:
+        entry["set"]["HOST_CACHE_BYTES"] = quota
+    result = capture(ROOT, f"host-default-{family}-{quota}", release_entry=entry)
+    plan = result["plans"][0]
+    serve = parse_run(result["containers"][0]["argv"])["command"]
+    expected = quota if quota is not None else "auto"
+    assert plan[plan.index("--host-cache-bytes") + 1] == expected
+    assert serve.count("--host-cache-bytes") == int(expected != "0")
+    if expected != "0":
+        assert serve[serve.index("--host-cache-bytes") + 1] == expected
 
 
 @pytest.mark.parametrize("quota", [None, "0", "2GiB"])
@@ -163,5 +201,6 @@ def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> 
     plan = result["plans"][0]
     serve = parse_run(result["containers"][0]["argv"])["command"]
     actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
-    assert actual == ("auto" if enabled == "on" else "0")
+    assert serve.count("--host-cache-bytes") == 1
+    assert actual == "auto"
     assert plan[plan.index("--host-cache-bytes") + 1] == actual

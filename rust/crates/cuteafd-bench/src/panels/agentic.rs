@@ -246,6 +246,7 @@ impl Panel for Agentic {
             json!({"role": "user", "content": prompt})];
         let mut turns: Vec<Value> = Vec::new();
         let (mut previous_prompt, mut previous_completion) = (0u64, 0u64);
+        let tiers_before = common::prefix_tier_counters(ctx.client);
         let started = std::time::Instant::now();
         for turn in 0..MAX_TURNS {
             ctx.progress.step(turn as f64 / MAX_TURNS as f64, format!("{task} · turn {}", turn + 1));
@@ -259,6 +260,7 @@ impl Panel for Agentic {
             let valid = chat.tool_calls.iter().filter(|c| serde_json::from_str::<Value>(c["function"]["arguments"]
                 .as_str().unwrap_or("")).is_ok()).count();
             turns.push(json!({"turn": turn + 1, "prompt_tokens": t.prompt_tokens, "cached_tokens": t.cached_tokens,
+                "source": common::prefix_source(&chat),
                 "ttft_s": t.ttft_s, "decode_tok_s": t.decode_tok_s(), "completion_tokens": t.completion_tokens,
                 "tool_calls": chat.tool_calls.len(), "invalid_tool_calls": chat.tool_calls.len() - valid,
                 "full_turn_reused": turn > 0 && t.cached_tokens + 1 >= previous_prompt + previous_completion,
@@ -287,11 +289,12 @@ impl Panel for Agentic {
             }
         }
         let success = workspace.passing(tests);
+        let tiers = common::prefix_tier_interval(tiers_before.as_ref(), common::prefix_tier_counters(ctx.client).as_ref());
         let rows = turns.iter().map(|t| vec![t["turn"].clone(), t["prompt_tokens"].clone(), t["cached_tokens"].clone(),
-            json!(t["ttft_s"].as_f64().unwrap_or(0.0) * 1e3), t["decode_tok_s"].clone(), t["tool_calls"].clone(),
-            t["invalid_tool_calls"].clone()]).collect();
-        Ok(json!({"task": task, "success": success, "turns": turns, "seconds": started.elapsed().as_secs_f64(),
-            "table": table(&["turn", "prompt", "cached", "TTFT ms", "tok/s", "tool calls", "invalid"], rows)}))
+            t["source"].clone(), json!(t["ttft_s"].as_f64().unwrap_or(0.0) * 1e3), t["decode_tok_s"].clone(),
+            t["tool_calls"].clone(), t["invalid_tool_calls"].clone()]).collect();
+        Ok(json!({"task": task, "success": success, "turns": turns, "tiers": tiers, "seconds": started.elapsed().as_secs_f64(),
+            "table": table(&["turn", "prompt", "cached", "source", "TTFT ms", "tok/s", "tool calls", "invalid"], rows)}))
     }
 }
 

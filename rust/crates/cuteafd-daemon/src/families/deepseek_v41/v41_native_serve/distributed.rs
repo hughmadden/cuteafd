@@ -276,7 +276,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let dspark_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
         &args.native_lib, exl3_tiers, "dspark");
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
-    let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };
+    let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let dspark_inventory = if args.dspark {
         Some(devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
             &lib, &catalog, capacity, args.concurrency, draft_width, args.tp2_dspark_experts,
@@ -446,7 +446,7 @@ mod tests {
         } else { "What is two plus two? Answer briefly.".into() };
         for text in [arithmetic.as_str(), "Write a Python function that adds two numbers.", arithmetic.as_str()] {
             let (events, output) = mpsc::unbounded_channel();
-            send.blocking_send(NativeRequest { literal_spans: Vec::new(), prompt: format!("<｜begin▁of▁sentence｜><｜User｜>{text}<｜Assistant｜></think>"),
+            send.blocking_send(NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: format!("<｜begin▁of▁sentence｜><｜User｜>{text}<｜Assistant｜></think>"),
                 constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 8, sampling: Default::default(), stop_token_ids: vec![cuteafd_api::openai::DEEPSEEK_EOS_TOKEN_ID], events, usage: None, probe: None })?;
             outputs.push(output);
         }

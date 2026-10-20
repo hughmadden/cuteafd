@@ -36,7 +36,7 @@ const DECODE_TOKENS: u64 = 256;
 /// Distinct code prompts per stream, shared by the sweep and basic card.
 pub(crate) fn code_batch(client: &crate::client::Client, width: usize, tokens: u64)
     -> Vec<Result<common::Timed>> {
-    let bodies = (0..width).map(|_| plain(&format!("[{}] {}", nonce(), CONTENT[0].1), tokens)).collect();
+    let bodies = (0..width).map(|_| plain(client, &format!("[{}] {}", nonce(), CONTENT[0].1), tokens)).collect();
     wave(client, bodies)
 }
 
@@ -69,7 +69,7 @@ impl Panel for DecodeContent {
             let fabric_mark = ctx.client.fabric_mark();
             let table_before = common::mapped_counters(ctx.client);
             let before = common::draft_counters(ctx.client);
-            let chat = ctx.client.chat(plain(&format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
+            let chat = ctx.client.chat(plain(ctx.client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
                 .with_context(|| format!("{content} decode"))?;
             let acceptance = common::acceptance(before, common::draft_counters(ctx.client));
             rows.push(json!({"content": content, "tok_s": chat.timing.decode_tok_s(),
@@ -153,7 +153,7 @@ impl Panel for DraftMix {
         let mut waves = Vec::new();
         for wave_index in 0..2 {
             ctx.progress.step(0.4 * wave_index as f64, format!("C{width} mixed, wave {}", wave_index + 1));
-            let bodies = (0..width).map(|i| plain(&format!("[{}] {}", nonce(), CONTENT[(i + wave_index) % CONTENT.len()].1),
+            let bodies = (0..width).map(|i| plain(ctx.client, &format!("[{}] {}", nonce(), CONTENT[(i + wave_index) % CONTENT.len()].1),
                 MIX_TOKENS)).collect();
             let fabric_mark = ctx.client.fabric_mark();
             let results = wave(ctx.client, bodies);
@@ -175,7 +175,7 @@ impl Panel for DraftMix {
             let fabric_mark = ctx.client.fabric_mark();
             let before = common::round_counters(ctx.client);
             let drafts = common::draft_counters(ctx.client);
-            let chat = ctx.client.chat(plain(&prompt, 1600u64.min(ctx.max_output)), None).context("rewrite decode")?;
+            let chat = ctx.client.chat(plain(ctx.client, &prompt, 1600u64.min(ctx.max_output)), None).context("rewrite decode")?;
             let after = common::round_counters(ctx.client);
             let per_round = before.zip(after).and_then(|((r0, t0), (r1, t1))| (r1 > r0).then(|| (t1 - t0) / (r1 - r0)));
             rewrites.push(json!({"tok_s": chat.timing.decode_tok_s(), "tokens": chat.timing.completion_tokens,
@@ -217,7 +217,7 @@ impl Panel for Prefill {
             let text = sized_prompt(ctx, 1000 + i as u64, target, "Reply with the single word OK.");
             // Cold: a fresh prompt; its ids come back for the cached run.
             let fabric_mark = ctx.client.fabric_mark();
-            let cold = ctx.client.chat(plain(&text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
+            let cold = ctx.client.chat(plain(ctx.client, &text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
             let ids = cold.probe.as_ref().filter(|r| r.engine.is_some()).map(|r| r.prompt_ids.clone());
             let mut point = json!({"target": target, "prompt_tokens": cold.timing.prompt_tokens,
                 "cold_ttft_s": cold.timing.ttft_s, "cold_tok_s": cold.timing.prefill_tok_s(),
@@ -225,10 +225,10 @@ impl Panel for Prefill {
             if let Some(ids) = ids.filter(|ids| ids.len() > 512) {
                 // Cached: retain all but the last 256 tokens, then send the whole prompt.
                 let cut = ids.len() - 256;
-                ctx.client.chat(plain("prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids[..cut].to_vec()),
+                ctx.client.chat(plain(ctx.client, "prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids[..cut].to_vec()),
                     ..ProbeSpec::default() }))?;
                 let fabric_mark = ctx.client.fabric_mark();
-                let cached = ctx.client.chat(plain("prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids.clone()),
+                let cached = ctx.client.chat(plain(ctx.client, "prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids.clone()),
                     ..ProbeSpec::default() }))?;
                 point["cached_fabric"] = json!(ctx.client.fabric_since(fabric_mark, &format!("prefill/{target}/cached"), true));
                 point["cached_tokens"] = json!(cached.timing.cached_tokens);
@@ -274,7 +274,7 @@ impl Panel for Retained {
             let text = if context == 0 { format!("[{}] {question}", nonce()) }
                 else { sized_prompt(ctx, 2000 + i as u64, context, &question) };
             let fabric_mark = ctx.client.fabric_mark();
-            let chat = ctx.client.chat(plain(&text, 160), None)?;
+            let chat = ctx.client.chat(plain(ctx.client, &text, 160), None)?;
             points.push(json!({"context": context, "prompt_tokens": chat.timing.prompt_tokens,
                 "decode_tok_s": chat.timing.decode_tok_s(), "ttft_s": chat.timing.ttft_s,
                 "tokens": chat.timing.completion_tokens,
@@ -301,11 +301,12 @@ impl Panel for PrefixCache {
         let mut history = vec![json!({"role": "system", "content": format!("[{}] You are a concise assistant. \
             Reference notes follow.\n\n{}", nonce(), filler(4242, 700))})];
         let mut turns = Vec::new();
+        let tiers_before = common::prefix_tier_counters(ctx.client);
         for turn in 1..=6 {
             ctx.progress.step((turn - 1) as f64 / 6.0, format!("turn {turn}"));
             history.push(json!({"role": "user", "content": format!("Question {turn}: {} Answer in three sentences.",
                 filler(turn as u64 * 77, 120))}));
-            let body = json!({"messages": history, "max_tokens": 64, "temperature": 0, "thinking": {"type": "disabled"}});
+            let body = super::context_load::body(&ctx.info.configuration, json!(history), 64);
             // From turn 2 the history carries the model's own answers, so the
             // prompt is model-determined and differs between arms by design.
             let derived = turn > 1;
@@ -320,13 +321,17 @@ impl Panel for PrefixCache {
             let supported = cold.probe.as_ref().is_some_and(|r| r.engine.is_some());
             turns.push(json!({"turn": turn, "prompt_tokens": chat.timing.prompt_tokens,
                 "cached_tokens": chat.timing.cached_tokens, "ttft_s": chat.timing.ttft_s,
+                "source": common::prefix_source(&chat),
                 "cold_ttft_s": supported.then_some(cold.timing.ttft_s), "fabric": fabric,
                 "cold_fabric": ctx.client.fabric_since(fabric_mark, &format!("prefix_cache/{turn}/cold"), true)}));
             history.push(json!({"role": "assistant", "content": chat.content}));
             ctx.progress.partial(json!({"turns": turns}));
         }
+        let tiers = common::prefix_tier_interval(tiers_before.as_ref(), common::prefix_tier_counters(ctx.client).as_ref());
         let rows = turns.iter().map(|t| vec![t["turn"].clone(), t["prompt_tokens"].clone(), t["cached_tokens"].clone(),
-            json!(t["ttft_s"].as_f64().unwrap_or(0.0) * 1e3), json!(t["cold_ttft_s"].as_f64().map(|v| v * 1e3))]).collect();
-        Ok(json!({"turns": turns, "table": table(&["turn", "prompt", "cached", "TTFT ms", "cold TTFT ms"], rows)}))
+            t["source"].clone(), json!(t["ttft_s"].as_f64().unwrap_or(0.0) * 1e3),
+            json!(t["cold_ttft_s"].as_f64().map(|v| v * 1e3))]).collect();
+        Ok(json!({"turns": turns, "tiers": tiers,
+            "table": table(&["turn", "prompt", "cached", "source", "TTFT ms", "cold TTFT ms"], rows)}))
     }
 }

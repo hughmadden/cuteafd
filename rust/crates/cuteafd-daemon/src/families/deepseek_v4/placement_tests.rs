@@ -77,7 +77,7 @@ fn planned(shared: &Shared, case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>
     let report = shared.input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(case.sparks),
         layout: Some(LayoutOptions { rtx_bytes: (0..case.rtx).map(|g| if g == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget }).collect(), context_tokens: case.context,
             // Retained measured fixtures and the direct EngineArgs default are C8.
-            concurrency: 8, workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, exchange_f32: case.exchange_f32,
+            concurrency: 8, host_cache_bytes: Some(0), workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, exchange_f32: case.exchange_f32,
             native_mtp_layers: if case.dspark { 3 } else { 0 }, headroom_bytes: 0, ..Default::default() }),
         attention_placement: case.attention, ..Default::default() }).unwrap();
     let hints = report.hints.iter().map(|h| h.what.clone()).collect();
@@ -147,8 +147,7 @@ fn runtime_with_upload_check(shared: &Shared, case: &Case<'_>, layout: &MemoryLa
         }).collect::<anyhow::Result<Vec<_>>>()?;
         let after = admission::Inputs { gpus: measured, loaded_modes: Some(&modes), ..inputs };
         let mut request = admission::request(&cli.engine, &after)?;
-        request.pool.requested = Some(placement.pool_tokens);
-        request.pool.floor = placement.pool_tokens;
+        request.pool.pin_selected(placement.pool_tokens);
         request.onboard = Onboard::Layers(placement.onboard_layers);
         let checked = cuteafd_loader::placement::solve_frozen(&request, &placement)?;
         assert_eq!(checked, placement, "pre-upload/frozen measured admission differs");

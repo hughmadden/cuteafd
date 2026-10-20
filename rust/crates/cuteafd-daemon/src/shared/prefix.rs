@@ -21,9 +21,8 @@ pub(crate) struct PrefixArgs {
     /// Device snapshots per bank; the host tier is limited only by --host-cache-bytes.
     #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = 20)]
     pub prefix_cache_entries: usize,
-    /// Device memory for retained positional marks (SWA rows, MTP hidden rows, recurrent
-    /// state), MiB; the arena holds two marks per entry pair while they fit, and never fewer
-    /// than two per decoding sequence plus two.
+    /// Device mark budget in MiB. With host retention, two staging marks are reserved;
+    /// host-off retains the legacy entry/budget count with two per decoding sequence plus two.
     #[arg(long, env = "CUTEAFD_PREFIX_CACHE_MARK_MIB", default_value_t = 2048)]
     pub prefix_cache_mark_mib: usize,
     /// Shortest prompt or turn worth a snapshot.
@@ -74,6 +73,7 @@ pub struct MarkRule {
     pub entries: usize,
     /// `--prefix-cache-mark-mib`, in bytes.
     pub budget_bytes: u64,
+    pub host: bool,
 }
 
 impl MarkRule {
@@ -82,8 +82,8 @@ impl MarkRule {
     /// ([`cuteafd_core::prefix::mark_slots_for`]). The budget holds whole marks, so the count
     /// depends on the exact mark bytes: size both sides from the same mark.
     pub fn slots(self, mark_bytes: usize) -> usize {
-        cuteafd_core::prefix::mark_slots_for(self.lanes as u64, self.entries as u64, mark_bytes as u64,
-            self.budget_bytes) as usize
+        cuteafd_core::prefix::mark_slots_with_host(self.lanes as u64, self.entries as u64, mark_bytes as u64,
+            self.budget_bytes, self.host) as usize
     }
 }
 
@@ -98,7 +98,7 @@ impl PrefixArgs {
     /// The device mark arena's knobs for `lanes` decoding sequences.
     pub fn mark_rule(&self, lanes: usize) -> MarkRule {
         MarkRule { lanes, entries: self.prefix_cache_entries,
-            budget_bytes: (self.prefix_cache_mark_mib as u64).saturating_mul(1 << 20) }
+            budget_bytes: (self.prefix_cache_mark_mib as u64).saturating_mul(1 << 20), host: self.host_cache_bytes.enabled() }
     }
 
     pub fn points(&self) -> PointPolicy {
@@ -145,9 +145,8 @@ impl PrefixArgs {
                 bytes
             }
         };
-        if bytes == 0 {
-            return Ok(None);
-        }
+        anyhow::ensure!(bytes > 0,
+            "host prefix quota resolves to zero; provide a positive quota or disable it explicitly for device retention");
         budget::admit(bytes, self.scoring_host_bytes, self.host_cache_headroom_bytes)?;
         let config = cuteafd_hostcache::config::Config {
             bytes,
@@ -158,6 +157,17 @@ impl PrefixArgs {
             ..Default::default()
         };
         config.validate()?;
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
+            page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
+            draft_bytes: layout.draft_bytes as u64 };
+        let conversations_max_context = geometry.conversations(bytes, max_context as u64, config.chunk_bytes);
+        let conversations_50k = geometry.conversations(bytes, 50_000, config.chunk_bytes);
+        tracing::info!(mark_bytes = layout.mark_bytes, host_bytes = bytes, conversations_max_context,
+            conversations_50k, "retained-prefix conversation capacity (two marks per conversation)");
+        if conversations_50k < concurrency as u64 + 4 {
+            tracing::warn!(conversations_50k, desired = concurrency + 4,
+                "host prefix quota holds fewer 50K conversations than concurrency plus four");
+        }
         Ok(Some(config))
     }
 

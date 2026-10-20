@@ -22,6 +22,7 @@ pub fn report(failed: bool) -> Report {
     let setting = |name: &str, value: &str, default: Option<&str>, source: &str| Setting { name: name.into(),
         value: Some(value.into()), default: default.map(str::to_string), source: source.into() };
     let configuration = Configuration {
+        supports_thinking_off: None,
         snapshot: Some("/mnt/sparknest/hf-home/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa".into()),
         quant: vec![QuantGroup { group: "attention".into(), formats: vec!["fp8_block".into()] },
             QuantGroup { group: "routed expert".into(), formats: vec!["mxfp4".into()] },
@@ -62,7 +63,7 @@ pub fn report(failed: bool) -> Report {
     quality.settle();
     let baseline = Baseline {
         fingerprint: "3f9a2c41d07be5a1".into(), run_id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
-        card: BasicCard { decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
+        card: BasicCard { thinking: None, decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
             concurrency: [(1, 187.3, 187.3), (4, 640.0, 158.0), (8, 960.0, 118.0), (16, 1280.0, 78.0)]
                 .into_iter().map(|(width, aggregate_tok_s, per_stream_median_tok_s)| ConcurrentRate {
                     width, aggregate_tok_s, per_stream_median_tok_s, decode_s: 319.0 / per_stream_median_tok_s,
@@ -318,7 +319,8 @@ pub fn full_report() -> Report {
         tier: "standard".into(), path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(),
         verify_rows: None, reference_selection: None, standard_balance: None, dataset: Some(json!({"config": "synthetic-long-config-for-responsive-layout",
             "revision": "a".repeat(40)})), engine: "synthetic".into(), settings: json!({}), seconds: 346.0,
-        score: fidelity_score, floor_top1: 0.985, floor_kl: 0.06, tripwire_expect: None };
+        score: fidelity_score, floor_top1: 0.985, floor_kl: 0.06,
+        precision: Some(crate::fidelity_precision::Precision::new(3.25, "exl3", false, "synthetic").unwrap()), tripwire_expect: None };
     let full_score = fidelity_run.score.clone();
     fidelity_run.score = crate::reference::Fidelity::from_records(full_score.records.iter().filter(|p| p.window[1..].parse::<usize>().unwrap() < 32).cloned().collect());
     fidelity_run.tier = crate::fidelity_dataset::STANDARD_TIER.into();

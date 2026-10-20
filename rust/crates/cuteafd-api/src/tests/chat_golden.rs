@@ -99,6 +99,8 @@ fn normalize(text: &str) -> String {
 fn scrub(value: &mut Value) {
     match value {
         Value::Object(map) => {
+            // The additive tier telemetry is gated separately; all legacy bytes stay fixed.
+            if let Some(source) = map.remove("prefix_cache_source") { assert_eq!(source, "device"); }
             for (key, field) in map.iter_mut() {
                 match key.as_str() {
                     "id" if field.is_string() => *field = json!("<id>"),
@@ -118,6 +120,7 @@ async fn run(profile: &ModelProfile, body: &Value) -> String {
     let witness = seen.clone();
     let worker = tokio::spawn(async move {
         if let Some(job) = rx.recv().await {
+            job.prefix_cache_source.set(4, false);
             *witness.lock().unwrap() = describe(&job);
             for chunk in chunks() { let _ = job.events.send(Ok(chunk)); }
         }

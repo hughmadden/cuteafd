@@ -210,6 +210,8 @@ struct Workspace<'a> {
     route_weights: Dev<'a>,
     wire: Dev<'a>,
     shared: Dev<'a>,
+    /// Decode and each prefill lane own an arena; weights remain shared per GPU.
+    native_shared: Option<crate::shared::experts::exlr8::Exlr8Execution<'a>>,
     payload: Option<Dev<'a>>,
     router_host: RefCell<HostAllocation<'a>>,
     /// The step's token ids (U32, gathered from the device embedding table).
@@ -663,6 +665,8 @@ impl<'a> GlmEngine<'a> {
             route_weights: self.alloc(if lead || self.tp2.is_some() { t * self.cfg.topk * 4 } else { 256 })?,
             wire: self.alloc(if lead || self.tp2.is_some() { t * (h + h / 32) } else { 256 })?,
             shared: self.alloc(t * h * 2)?,
+            native_shared: self.native_experts.get(rank)
+                .map(|native| native.execution(self.library, self.programs)).transpose()?,
             payload: self.tp2.as_ref().map(|tp2| self.alloc(tp2.combine.payload_bytes(t, h))).transpose()?,
             router_host: RefCell::new(HostAllocation::new(self.library, lead_only(t * (self.cfg.topk * 8 + if self.spark_bf16 { h * 2 } else { h + h / 32 })))?),
             ids: self.alloc(t * 4)?,
@@ -968,7 +972,7 @@ impl<'a> GlmEngine<'a> {
             return self.layer_step(scope, w, w1.context("owned attention peer")?, &ranked[0],
                 t, logit_rows, &mut experts, on_layer);
         }
-        if tables.decode && on_layer.is_none() && layers.len() == self.cfg.layers {
+        if tables.decode && logit_rows > 0 && on_layer.is_none() && layers.len() == self.cfg.layers {
             // The first captured segment gathers the rows from the staged ids;
             // the last runs the head and the greedy selection.
             let gather = self.embedding.device_gather();
@@ -1071,7 +1075,7 @@ impl<'a> GlmEngine<'a> {
             crate::shared::console::layer_mark(index);
         }
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
-        if layers.len() < self.cfg.layers {
+        if layers.len() < self.cfg.layers || logit_rows == 0 {
             // SAFETY: the engine owns this stream.
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
@@ -1617,7 +1621,6 @@ impl<'a> GlmEngine<'a> {
     /// its rank partials gathered into the lane's intake, all off this
     /// thread; [`Self::lane_land`] waits for it.
     fn lane_send(&self, w: &Workspace<'_>, index: usize, t: usize, lane: &mut SparkLane<'_>) -> Result<()> {
-        ensure!(self.native_experts.is_empty(), "EXLR8 currently requires serial prefill");
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let ranks = lane.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");

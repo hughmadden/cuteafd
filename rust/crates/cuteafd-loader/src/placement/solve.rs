@@ -6,6 +6,7 @@ use cuteafd_core::memory_layout::{Basis, Category, Item};
 /// Places `request`. Pure arithmetic over the request: the planner and the
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
+    request.pool.validate_explicit()?;
     validate_attention(request)?;
     let mut best = solve_once(request, &[], None);
     if request.attention_placement.is_some() || request.inventory.gpus.len() != 2 || !request.inventory.peer_access
@@ -102,6 +103,7 @@ fn validate_attention(request: &PlacementRequest) -> Result<(), PlacementError> 
 /// Re-admit loaded owner modes without running the owner chooser again.
 /// Shape, executable-mode and hop checks still run, as do all memory gates.
 pub fn solve_frozen(request: &PlacementRequest, placement: &Placement) -> Result<Placement, PlacementError> {
+    request.pool.validate_explicit()?;
     validate_attention(request)?;
     let mut kinds = Vec::new();
     for &(kind, mode) in &placement.attention_by_kind {

@@ -90,8 +90,16 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     let mut cache_cfg = inputs.cfg.clone();
     cache_cfg.n_mtp_layers = inputs.cache_stages;
     let (prefill, decode) = (inputs.prefill_rows as u64, inputs.decode_rows as u64);
+    let context = v4::manifest_context(inputs.manifest, inputs.family, inputs.cfg.n_heads, decode);
+    let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?;
+    let resolved = attention.unwrap_or(if gpus == 2 && context.is_some() {
+        cuteafd_loader::placement::AttentionPlacement::Context
+    } else { cuteafd_loader::placement::AttentionPlacement::Heads });
+    let host_marks = inputs.prefix.is_some_and(|p| p.host_cache_bytes.enabled())
+        && (gpus == 1 || resolved != cuteafd_loader::placement::AttentionPlacement::Heads);
     let mark_slots = match inputs.prefix.map_or(0, |p| p.prefix_cache_entries) {
         0 => 0,
+        _ if host_marks => cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS,
         entries => v4::mark_slots(&cache_cfg, gpus, prefill, inputs.cache_stages, args.max_sequences as u64,
             entries as u64, (inputs.prefix.map_or(0, |p| p.prefix_cache_mark_mib) as u64) << 20)?,
     };
@@ -127,7 +135,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         }
     } else { (Vec::new(), [0; 2]) };
     let spark_ranks = if args.skip_routed_experts { 0 } else { args.peers.split(',').filter(|p| !p.is_empty()).count() };
-    let request = v4::request(&v4::V4Inputs { cfg: &cache_cfg, weights, cache_stages: inputs.cache_stages,
+    let request = v4::request(&v4::V4Inputs { automatic_context: args.max_context == 0, cfg: &cache_cfg, weights, cache_stages: inputs.cache_stages,
         gpus: baselines, headroom_floor: 0, spark_ranks,
         sequences: args.max_sequences as u64, prefill_rows: prefill, decode_rows: decode,
         max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
@@ -136,7 +144,6 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
         full_prefill_logits: 0, code_bytes: v4::code_bytes(inputs.cfg.dim, v4::code_experts(inputs.catalog), gpus),
-        context: v4::manifest_context(inputs.manifest, inputs.family, inputs.cfg.n_heads, decode),
-        attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)? })?;
+        context, attention })?;
     Ok(request)
 }

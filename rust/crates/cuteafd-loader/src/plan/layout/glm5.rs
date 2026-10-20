@@ -315,37 +315,43 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     Ok(glm::solve_working_set(&inputs, serial_workspace, report.requested_attention)?)
 }
 
-/// Native EXLR8 uses the ordinary GLM solver, with ordinary per-GPU TP2 shared ownership.
+/// Native EXLR8 uses the ordinary GLM solver and coordinator shared ownership.
 pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
     workspace: u64, spark_ranks: usize, manifest: &serde_json::Value) -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
-    anyhow::ensure!(options.rtx_bytes.len() == 2 && shared_bytes.len() == 2, "EXLR8 requires two RTX shared owners");
+    let gpu_count = options.rtx_bytes.len();
+    anyhow::ensure!((1..=2).contains(&gpu_count) && shared_bytes.len() == gpu_count,
+        "EXLR8 requires 1..=2 RTX shared owners matching coordinator GPUs");
+    let split = gpu_count == 2;
+    let attention = if split { crate::placement::AttentionPlacement::Context }
+        else { crate::placement::AttentionPlacement::Heads };
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
     let requested_pool = options.pool_tokens.filter(|&n| n > 0)
-        .unwrap_or(cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
+        .unwrap_or_else(|| cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS.max(context));
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, None, options.glm5_attention_plan_rows)?;
     let mut manifest = manifest.clone();
     cuteafd_core::coordinator_programs::select_attention_plans(&mut manifest, plan,
         |name| cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: "glm", split_family: Some("glm2") }.contains(name))?;
-    let scratch = glm::manifest_scratch(&cfg, true, &manifest)?;
-    let context_programs = glm::manifest_context(&manifest,
+    let scratch = glm::manifest_scratch(&cfg, split, &manifest)?;
+    let context_programs = if split { Some(glm::manifest_context(&manifest,
         options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
             "sm_120", options.rtx_bytes[0]).sms) as usize, &plan)
-        .ok_or_else(|| anyhow::anyhow!("EXLR8 requires GLM context programs in PROGRAMS.json"))?;
-    let resident = resident_owned(checkpoint, 2, cfg.layers, None)?;
+        .ok_or_else(|| anyhow::anyhow!("EXLR8 requires GLM context programs in PROGRAMS.json"))?) }
+        else { None };
+    let resident = resident_owned(checkpoint, gpu_count, cfg.layers, None)?;
     let mut devices = Vec::new();
     for (rank, groups) in resident.into_iter().enumerate() {
         let mut items: Vec<_> = groups.into_iter().filter(|(group, _, _)| group != "shared_expert")
             .map(|(group, format, bytes)| Item::new(if group == "embedding" { Category::Embedding }
                 else { Category::Weights }, group, format, bytes, Basis::Exact)).collect();
         items.push(Item::new(Category::Weights, "shared_expert", "exlr8", shared_bytes[rank], Basis::Exact));
-        let mut programs = program_families("glm", true);
+        let mut programs = program_families("glm", split);
         programs.push("exlr8".into());
-        let mut runtime = runtime_item(Some(&manifest), &programs, "glm:exlr8", true,
+        let mut runtime = runtime_item(Some(&manifest), &programs, "glm:exlr8", split,
             rank, options.rtx_bytes[rank]);
         runtime.group = "EXLR8 context+modules".into();
         items.push(runtime);
@@ -356,13 +362,14 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,
-        native_workspace: workspace, skip_routed_experts: false, prefill_rows: rows, prefill_lanes: 1,
+        native_workspace: workspace, skip_routed_experts: false, prefill_rows: rows,
+        prefill_lanes: glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
+            else { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 }),
         max_context: context, automatic_context: false, scratch: Some(scratch), drafter_bytes: 0,
         drafter_staging: 0, pending_code: Vec::new(), experts: Vec::new(), expert_workspace: 0,
         tp2_workspace: [0; 2], requested_pool: Some(requested_pool), onboard: Onboard::Layers(0),
-        full_prefill_logits: options.full_prefill_logits, context: Some(context_programs) };
-    let (placement, _) = glm::solve_working_set(&inputs, [0; 2],
-        Some(crate::placement::AttentionPlacement::Context))?;
+        full_prefill_logits: options.full_prefill_logits, context: context_programs };
+    let (placement, _) = glm::solve_working_set(&inputs, [0; 2], Some(attention))?;
     anyhow::ensure!(placement.pool_tokens >= requested_pool,
         "EXLR8 requested KV pool {requested_pool} was reduced to {}", placement.pool_tokens);
     for (device, items) in devices.iter_mut().zip(&placement.items) {
@@ -370,7 +377,7 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         device.kv_tokens = placement.pool_tokens;
     }
     Ok((MemoryLayout { devices, pool_tokens: placement.pool_tokens, waste: vec![],
-        notes: vec![format!("EXLR8 serial native TP2 shared owners; context {context}; {}", placement.summary())] }, placement))
+        notes: vec![format!("EXLR8 native {gpu_count} shared owners; {attention} attention; context {context}; {}", placement.summary())] }, placement))
 }
 
 /// The planner's packed owners, excluding a host-mapped embedding when selected.
@@ -386,6 +393,59 @@ pub fn device_bytes(checkpoint: &Checkpoint, ranks: usize, layers: usize, host_e
 mod tests {
     use super::*;
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
+
+    #[test]
+    fn native_automatic_pool_covers_context_without_relaxing_explicit_pools() {
+        use crate::placement::{families::glm5 as glm, PlacementError};
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        for (cap, mode) in [("m64", "decode"), ("m4096", "prefill")] {
+            names.extend([format!("glm_index_producer_{cap}"), format!("glm_index_topk_{mode}_{cap}")]);
+            for (prefix, moe, dense) in [("glm", 2048, 12288), ("glm2", 1024, 6144)] {
+                names.extend([format!("{prefix}_producer_{cap}"), format!("{prefix}_sparse_mla_{mode}_{cap}"),
+                    format!("{prefix}_o_{cap}"), format!("{prefix}_ffn_i{moe}_{cap}"),
+                    format!("{prefix}_ffn_i{dense}_{cap}")]);
+            }
+        }
+        names.extend(["glm_sparse_mla_partial_h0_s2_m64".into(), "glm_sparse_mla_partial_h32_s2_m64".into()]);
+        let manifest = json!({"programs": names.into_iter().map(|name|
+            json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})).collect::<Vec<_>>()});
+        let default = cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS;
+        for gpus in 1..=2 {
+            // Whole execution must not depend on any context-split or glm2 exports.
+            let mut manifest = manifest.clone();
+            if gpus == 1 {
+                manifest["programs"].as_array_mut().unwrap().retain(|p|
+                    !p["name"].as_str().unwrap().starts_with("glm2_")
+                    && !glm::CONTEXT_PROGRAMS.contains(&p["name"].as_str().unwrap()));
+            }
+            for context in [1 << 20, default + 128] {
+                for pool_tokens in [None, Some(0)] {
+                    let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                        context_tokens: context, pool_tokens, ..Default::default() };
+                    let (memory, placement) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).unwrap();
+                    assert_eq!(memory.devices.len(), gpus);
+                    assert_eq!(memory.pool_tokens, default.max(context));
+                    assert_eq!(placement.pool_tokens, default.max(context));
+                    assert_eq!(placement.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Context }
+                        else { crate::placement::AttentionPlacement::Heads });
+                }
+            }
+            let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                context_tokens: default + 128, pool_tokens: Some(default), ..Default::default() };
+            let error = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).unwrap_err();
+            assert_eq!(error.downcast_ref::<PlacementError>(), Some(&PlacementError::RequestedBelowContext {
+                requested: default, floor: default + 128,
+            }));
+            let options = LayoutOptions { rtx_bytes: vec![1 << 30; gpus],
+                context_tokens: 1 << 20, pool_tokens: Some(1 << 20), ..Default::default() };
+            assert!(native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).is_err());
+            assert!(native_layout(&checkpoint, &options, &[], 256, 4, &manifest).is_err());
+        }
+    }
 
     #[test]
     fn resident_headers_follow_rank_ownership_and_absorbed_kv_packing() {

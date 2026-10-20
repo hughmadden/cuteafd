@@ -1629,10 +1629,13 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   [[ "$family" == glm5 ]] || release_die "EXLR8 is supported only for glm5"
   [[ "$exlr8_manifest" == up1 || "$exlr8_manifest" == bit325 ]] || release_die "EXLR8_MANIFEST must be up1 or bit325"
   [[ -n "$exlr8_dense" ]] || release_die "EXLR8_DENSE_FROM must name the compatible official GLM-5.3 FP8 snapshot"
-  [[ "$(get RTX_GPUS 1)" == 2 && "$ranks" -ge 1 && "$ranks" -le 6 ]] || release_die "EXLR8 requires two RTX GPUs and 1..6 canonical Spark ranks"
+  exlr8_gpu_count="$(get RTX_GPUS 1)"
+  [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 6 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..6 canonical Spark ranks"
   [[ "$(get SPECULATOR off)" == off ]] || release_die "EXLR8 requires SPECULATOR=off"
   [[ "$(get RTX_EXPERT_LAYERS 0)" == 0 ]] || release_die "EXLR8 cannot onboard routed experts"
-  [[ "$attention_placement" == auto || "$attention_placement" == context ]] || release_die "EXLR8 requires context attention"
+  exlr8_attention=heads
+  [[ "$exlr8_gpu_count" != 2 ]] || exlr8_attention=context
+  [[ "$attention_placement" == auto || "$attention_placement" == "$exlr8_attention" ]] || release_die "EXLR8 requires $exlr8_attention attention for $exlr8_gpu_count RTX GPUs"
   if [[ -d "$exlr8_dense" ]]; then
     exlr8_dense="$(readlink -f "$exlr8_dense")"
     release_validate_path_setting EXLR8_DENSE_FROM "$exlr8_dense"
@@ -1824,12 +1827,12 @@ if [[ "$drafts" != adaptive ]]; then
 fi
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
-# snapshots the device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by
+# retention (auto by default, e.g. 64GiB explicitly; 0 = off). POOL_TOKENS: paged KV tokens shared by
 # live sequences and retained snapshots.
 case $family in
   mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
-    [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
+    [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
 if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
@@ -1842,7 +1845,6 @@ if [[ $family == mimo_v2 ]]; then
   [[ "$(get MIMO_SNAPSHOT_WAIT off)" != on ]] || family_args+=(--mimo-snapshot-wait)
   if [[ "$(get MIMO_HOST_CACHE off)" == on ]]; then
     family_args+=(--mimo-host-cache)
-    [[ -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
   fi
   [[ -z "$(get MIMO_PREFILL_CHUNK_S)" ]] || family_args+=(--prefill-chunk-s "$(get MIMO_PREFILL_CHUNK_S)")
   # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
@@ -1915,19 +1917,17 @@ if [[ $family =~ ^(glm5|qwen4|qwen3_5|deepseek_v4)$ ]]; then
 fi
 # Kimi K3 and Step-5: unset or auto POOL_TOKENS leaves the KV pool to the serve
 # command's own automatic admission (no --pool-tokens). Kimi's RTX_EXPERT_LAYERS
-# is the fixed count of routed layers onboarded to the RTX pair (unset:
-# serve-kimi's default).
+# is auto (default: the planner picks the RTX-onboarded routed layers and marks)
+# or a fixed count, which admission must then fit.
 if ((qualifying)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
 fi
 if [[ $family == kimi_k3 ]]; then
-  local_layers="$(get RTX_EXPERT_LAYERS)"
-  if [[ -n "$local_layers" ]]; then
-    [[ "$local_layers" =~ ^[0-9]+$ ]] ||
-      release_die "Kimi K3 RTX_EXPERT_LAYERS is a fixed routed-layer count (N, N% or all), not $local_layers"
-    family_args+=(--rtx-expert-layers "$local_layers")
-  fi
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "Kimi K3 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
+  family_args+=(--rtx-expert-layers "$local_layers")
 fi
 # DECODE_SHARE: the share of the time running requests keep while prompts
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
@@ -2307,19 +2307,16 @@ if [[ $family == glm5_flash ]]; then
     *) echo "GLM5_FLASH_EXL3_SCHEDULE must be default or gb10" >&2; exit 2 ;;
   esac
   # GLM5_FLASH_PREFIX_MARKS: where prefix-cache snapshots keep their KDA state marks: unset or
-  # arena (the engine default: a 2C + 2 device arena beside the KV pool) or pool (units of the
-  # KV pool itself, evicted like any snapshot's rows, unit 0 reserved; no arena to reserve). Pool
-  # marks turn the pinned host tier on (HOST_CACHE_BYTES=auto) unless HOST_CACHE_BYTES is set (0
-  # keeps it off): snapshots the pool evicts move to RAM instead of being lost.
+  # arena (two staging marks with host retention, legacy counts with host off) or pool (units
+  # of the KV pool itself, unit 0 reserved; no separate arena). Both use the shared host default.
   prefix_marks="$(get GLM5_FLASH_PREFIX_MARKS)"
   case "$prefix_marks" in
     "") ;;
     arena|pool) family_args+=(--prefix-marks "$prefix_marks") ;;
     *) echo "GLM5_FLASH_PREFIX_MARKS must be arena or pool" >&2; exit 2 ;;
   esac
-  [[ "$prefix_marks" != pool || -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
   # PREFIX_CACHE_MARK_MIB: the device budget of the prefix mark arena, MiB (unset: serve-glmf's
-  # 2048), as for MiMo; the arena still holds at least two marks per sequence plus two.
+  # 2048), as for MiMo; the host-off legacy arena retains its per-sequence floor.
   [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   # GLM5_FLASH_REPLAY_RECORDS: auto shares when eligible; own keeps their
   # own 321 MB, 642 MB with GLM5_FLASH_DECODE_ROWS=128) or shared (the prefill lanes' scratch, which
@@ -2401,10 +2398,6 @@ case "$family" in
   deepseek_v4) ;;
   glm5)
     selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"
-    if [[ -n "$exlr8_manifest" ]]; then
-      [[ -z "${CUTEAFD_GLM_PREFILL_LANES:-}" || "$CUTEAFD_GLM_PREFILL_LANES" == 1 ]] || release_die "EXLR8 requires one serial prefill lane"
-      selected_lanes=1
-    fi
     [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
     if [[ "$ranks" == 0 ]]; then
       selected_lanes=1

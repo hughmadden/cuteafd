@@ -88,7 +88,7 @@ pub struct Source {
     pub session: Option<String>,
     pub kind: SnapshotKind,
     pub frontier: usize,
-    /// Promoted from the host tier by this admission.
+    /// Restored pages or positional state from the host tier by this admission.
     pub host: bool,
     /// A partial match: the positional state restarts empty at `resume`, which lies the rule's
     /// replay window before the aligned common prefix (approximate; exact frontiers are exact).
@@ -130,6 +130,12 @@ pub struct PrefixStats {
     pub partial_hits: u64,
     pub hit_tokens: u64,
     pub promotions: u64,
+    pub device_hits: u64,
+    pub host_hits: u64,
+    /// Host mark copies without copying already-resident KV pages.
+    pub mark_promotions: u64,
+    pub capture_stalls: u64,
+    pub capture_stall_ns: u64,
     pub restore_failures: u64,
     /// Hits dropped because the pool could not hold the fork.
     pub fork_no_room: u64,
@@ -204,6 +210,7 @@ pub struct PrefixCache<E: CopyEngine, M = ()> {
     retained: Retention<EntryId>,
     entries: BTreeMap<EntryId, Entry<M>>,
     pending: Vec<PendingCapture<M>>,
+    completed_captures: Vec<CaptureTicket>,
     quarantine: Vec<Quarantined>,
     pool: RefPagePool,
     arena: MarkArena,
@@ -245,6 +252,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             retained: Retention::with_rule(config.entries, layout.rule),
             entries: BTreeMap::new(),
             pending: Vec::new(),
+            completed_captures: Vec::new(),
             quarantine: Vec::new(),
             pool: match layout.page_owners {
                 PageOwners::Uniform => RefPagePool::with_reserved(layout.pages, layout.page_rows, layout.mark_store.reserved()),
@@ -282,9 +290,9 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// most the configured store pace while the oldest store copy is overdue
     /// ([`HostCache::prefill_hold`]). A no-op without a host tier.
     pub fn prefill_hold(&mut self) -> anyhow::Result<()> {
+        self.tick();
         match &mut self.host {
             Some(host) => {
-                host.tick();
                 host.prefill_hold()
             }
             None => Ok(()),
@@ -336,6 +344,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             return Err(MediaError::Spans.into());
         }
         self.restored_session = None;
+        self.tick();
         let total = self.pool.pages_for(capacity.max(tokens.len()));
         if self.enabled() && !tokens.is_empty() {
             self.stats.lookups += 1;
@@ -512,10 +521,22 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let entry = self.entries.get(&hit.id).expect("the hit is kept while making room");
         let fork = self.pool.fork(&entry.pages, source_end, total)?;
         let exact = plan.exact();
-        let (mark, meta) = if exact { (entry.mark.clone(), Some(entry.meta.clone())) } else { (None, None) };
+        let (mut mark, meta) = if exact { (entry.mark.clone(), Some(entry.meta.clone())) } else { (None, None) };
+        let host_mark = if exact && self.layout.mark_bytes > 0 && mark.is_none() { entry.host_mark } else { None };
         let after = (resume == tokens.len()).then(|| entry.after.clone());
         let session = entry.session.clone();
         let pages = fork.pages.clone();
+        let temporary = host_mark.is_some();
+        if let Some(key) = host_mark {
+            mark = match self.restore_mark(family, key, hit.id) {
+                Ok(mark) => mark,
+                Err(error) => { self.release(family, &pages)?; return Err(error); }
+            };
+            if mark.is_none() {
+                self.release(family, &pages)?;
+                return Ok(None);
+            }
+        }
         let mut placement = build(fork.pages);
         self.dirty = true;
         let restored = self.check_owners(family, &pages).map_err(|e| ("owners", e))
@@ -536,8 +557,18 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 tracing::error!(target: "cuteafd::prefix", %error, "discarding a failed restore");
             }
             self.release(family, &pages)?;
+            if temporary { self.give_back(family, mark)?; }
             return Err(PrefixError::Family { what, source });
         }
+        if self.host.is_some() && mark.is_some() { self.drain(family)?; }
+        if temporary { self.give_back(family, mark)?; }
+        if promoted {
+            let mark = self.entries.get_mut(&hit.id).and_then(|e| e.mark.take());
+            self.give_back(family, mark)?;
+        }
+        let host_hit = promoted || temporary;
+        self.stats.host_hits += u64::from(host_hit);
+        self.stats.device_hits += u64::from(!host_hit);
         self.stats.hits += 1;
         self.stats.hit_tokens += resume as u64;
         self.stats.exact_hits += u64::from(after.is_some());
@@ -547,7 +578,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             placement,
             resume,
             after,
-            source: Some(Source { session, kind: hit.kind, frontier: hit.frontier, host: promoted, partial: !exact, plan }),
+            source: Some(Source { session, kind: hit.kind, frontier: hit.frontier, host: host_hit, partial: !exact, plan }),
         }))
     }
 
@@ -645,6 +676,10 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// Publish a queued capture whose copies landed: `Ok(true)` once it is retained (or was
     /// dropped because its bank no longer wants it), `Ok(false)` while copies are in flight.
     pub fn poll_capture<F: PrefixFamily<M>>(&mut self, family: &F, ticket: CaptureTicket) -> Result<bool, PrefixError> {
+        if let Some(index) = self.completed_captures.iter().position(|&t| t == ticket) {
+            self.completed_captures.swap_remove(index);
+            return Ok(true);
+        }
         let Some(index) = self.pending.iter().position(|p| p.ticket == ticket) else {
             return Err(PrefixError::Layout("no pending capture with this ticket"));
         };
@@ -658,7 +693,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if !ready {
             return Ok(false);
         }
-        let PendingCapture { kind, entry, .. } = self.pending.swap_remove(index);
+        let PendingCapture { kind, entry, .. } = self.pending.remove(index);
         // Another capture may have filled the bank or replaced this frontier meanwhile.
         if let Some(old) = self.retained.bank_mut(kind).remove_exact(&entry.tokens) {
             self.evict(family, old)?;
@@ -670,8 +705,9 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// Abandon a queued capture: its storage returns to the cache once the family proved its
     /// copies drained, and is quarantined (never handed out again) otherwise.
     pub fn abort_capture<F: PrefixFamily<M>>(&mut self, family: &F, ticket: CaptureTicket) -> Result<(), PrefixError> {
+        self.completed_captures.retain(|&done| done != ticket);
         let Some(index) = self.pending.iter().position(|p| p.ticket == ticket) else { return Ok(()) };
-        let PendingCapture { entry, .. } = self.pending.swap_remove(index);
+        let PendingCapture { entry, .. } = self.pending.remove(index);
         self.stats.captures_aborted += 1;
         match family.abort_capture(ticket) {
             Ok(()) => {
@@ -725,11 +761,12 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.stats.capture_skips += 1;
             return Ok(None);
         }
+        self.reap_marks(family)?;
         let slot = if self.arena_marks() {
             loop {
                 match self.arena.take() {
                     Ok(slot) => break Some(slot),
-                    Err(_) => match self.victim(None) {
+                    Err(_) => match self.mark_victim() {
                         Some(id) => self.evict(family, id)?,
                         None => {
                             self.stats.capture_skips += 1;
@@ -765,7 +802,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             after.logits = None;
         }
         let entry = Entry { session: self.capture_session.clone(), tokens: tokens.to_vec(),
-            media: snapshot_media(len, media), kind, pages: fork.pages, mark, after, meta, last_use: 0, ticket: None };
+            media: snapshot_media(len, media), kind, pages: fork.pages, mark, after, meta, last_use: 0, ticket: None, host_mark: None };
         Ok(Some(Prepared { entry, copy: fork.copy }))
     }
 
@@ -910,11 +947,128 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         Ok(fork.pages)
     }
 
-    /// Poll the host tier's store copies; once per scheduler step.
+    /// Poll the host stream and release staging marks only after their last reader completes.
     pub fn tick(&mut self) {
         if let Some(host) = &mut self.host {
-            host.tick();
+            let report = host.tick();
+            for entry in self.entries.values_mut() {
+                let Some(ticket) = entry.ticket else { continue };
+                if report.completed.contains(&ticket) {
+                    entry.ticket = None;
+                    let key = report.committed.iter().find_map(|&(done, key)|
+                        (done == ticket && host.payload(key).is_some()).then_some(key));
+                    if let Some(key) = key.filter(|_| entry.mark.is_some()) {
+                        entry.host_mark = Some(key);
+                        match entry.mark.take() {
+                            Some(Mark::Slot(slot)) => self.arena.give_back(slot),
+                            Some(Mark::Pages(pages)) => { self.pool.release(&pages); }
+                            None => {}
+                        }
+                    }
+                } else if report.failed.contains(&ticket) { entry.ticket = None; }
+            }
         }
+    }
+
+    fn mark_victim(&self) -> Option<EntryId> {
+        victim(self.entries.iter().filter(|(_, e)| e.mark.is_some()).map(|(&id, e)| (id, e.kind, e.last_use)))
+    }
+
+    fn staging_full(&self) -> bool {
+        if self.arena_marks() { return self.arena.free() == 0; }
+        self.layout.mark_bytes > 0 && self.entries.values().filter(|e| e.mark.is_some()).count()
+            + self.pending.len() >= cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS as usize
+    }
+
+    /// Only a full staging ring waits. Complete the oldest write without dropping its KV.
+    fn reap_marks<F: PrefixFamily<M>>(&mut self, family: &F) -> Result<(), PrefixError> {
+        self.tick();
+        if self.host.is_none() || !self.staging_full() { return Ok(()); }
+        let start = std::time::Instant::now();
+        let mut waited = false;
+        while self.staging_full() {
+            if let Some(id) = self.entries.iter().filter(|(_, e)| e.mark.is_some() && e.ticket.is_some())
+                .min_by_key(|(_, e)| e.ticket.unwrap().0).map(|(&id, _)| id) {
+                waited = true;
+                let ticket = self.entries[&id].ticket;
+                let host = self.host.as_mut().expect("host enabled");
+                let (decision, key) = host.before_device_evict_with_key(ticket);
+                match decision {
+                    EvictDecision::Clean | EvictDecision::WaitedClean { .. } => {
+                        let entry = self.entries.get_mut(&id).unwrap();
+                        entry.ticket = None;
+                        if let Some(key) = key {
+                            entry.host_mark = Some(key);
+                            let mark = entry.mark.take();
+                            self.give_back(family, mark)?;
+                        }
+                    }
+                    EvictDecision::DroppedUncached => { self.entries.get_mut(&id).unwrap().ticket = None; }
+                    EvictDecision::Held => return Err(PrefixError::Host("staging write did not drain".into())),
+                }
+            } else if !self.pending.is_empty() {
+                waited = true;
+                let ticket = self.pending[0].ticket;
+                family.wait_capture(ticket).map_err(|source| PrefixError::Family { what: "capture wait", source })?;
+                let PendingCapture { kind, entry, .. } = self.pending.remove(0);
+                if let Some(old) = self.retained.bank_mut(kind).remove_exact(&entry.tokens) { self.evict(family, old)?; }
+                self.publish(family, kind, entry)?;
+                self.completed_captures.push(ticket);
+            } else {
+                // Uncacheable/failed host writes retain their mark only until staging pressure.
+                let Some(id) = self.mark_victim() else { break };
+                self.evict(family, id)?;
+            }
+        }
+        if waited {
+            self.stats.capture_stalls += 1;
+            self.stats.capture_stall_ns += start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        }
+        Ok(())
+    }
+
+    fn restore_mark<F: PrefixFamily<M>>(&mut self, family: &F, key: cuteafd_hostcache::snapshot::Key, keep: EntryId)
+        -> Result<Option<Mark>, PrefixError> {
+        if !self.host.as_ref().is_some_and(|h| h.payload(key).is_some()) { return Ok(None); }
+        self.reap_marks(family)?;
+        let mark = if self.arena_marks() {
+            while self.arena.free() == 0 {
+                let Some(id) = self.mark_victim() else { return Ok(None) };
+                self.evict(family, id)?;
+            }
+            Some(Mark::Slot(self.arena.take().expect("free slot")))
+        } else {
+            let need = self.pool.need_for(0..self.layout.mark_store.pages());
+            if !self.make_room_for(family, need, Some(keep))? { return Ok(None); }
+            self.take_mark_pages()?
+        };
+        let tail = match Self::mark_segments(family, mark.as_ref()) {
+            Ok(tail) => tail,
+            Err(error) => { self.give_back(family, mark)?; return Err(error); }
+        };
+        let result = self.host.as_mut().expect("host enabled").restore_mark(key, tail);
+        if !matches!(result, RestoreOutcome::Done { .. }) {
+            if let Err(error) = self.host.as_mut().unwrap().engine_mut().release_barrier(Stream::Restore) {
+                self.quarantine.push(Quarantined { _pages: Vec::new(), _mark: mark });
+                self.stats.quarantined += 1;
+                return Err(PrefixError::Host(format!("mark restore barrier: {error:#}")));
+            }
+            self.give_back(family, mark)?;
+            self.stats.restore_failures += 1;
+            return Ok(None);
+        }
+        if let Some(Mark::Slot(slot)) = &mark {
+            let replicas = family.mark_replicas(*slot);
+            if !replicas.is_empty() {
+                self.dirty = true;
+                if let Err(source) = family.copy_replicas(&replicas) {
+                    self.give_back(family, mark)?;
+                    return Err(PrefixError::Family { what: "mark replicas", source });
+                }
+            }
+        }
+        self.stats.mark_promotions += 1;
+        Ok(mark)
     }
 
     pub fn stats(&self) -> PrefixStats {
@@ -1129,11 +1283,12 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if !self.make_room_for(family, fresh, None)? {
             return Ok(None);
         }
+        self.reap_marks(family)?;
         let slot = if self.arena_marks() {
             loop {
                 match self.arena.take() {
                     Ok(slot) => break Some(slot),
-                    Err(_) => match self.victim(None) {
+                    Err(_) => match self.mark_victim() {
                         Some(id) => self.evict(family, id)?,
                         None => return Ok(None),
                     },
@@ -1193,8 +1348,11 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 // On barrier failure keep the pool refs/mark allocated and the
                 // host snapshot pinned, instead of handing live targets back.
                 let host = self.host.as_mut().expect("checked");
-                host.engine_mut().release_barrier(Stream::Restore)
-                    .map_err(|error| PrefixError::Host(format!("host restore release barrier: {error:#}")))?;
+                if let Err(error) = host.engine_mut().release_barrier(Stream::Restore) {
+                    self.quarantine.push(Quarantined { _pages: pages, _mark: mark });
+                    self.stats.quarantined += 1;
+                    return Err(PrefixError::Host(format!("host restore release barrier: {error:#}")));
+                }
                 tracing::warn!(target: "cuteafd::prefix", tokens = len, "host restore abandoned; prefilling");
                 self.stats.restore_failures += 1;
                 self.release(family, &pages)?;
@@ -1221,7 +1379,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let id = self.next_id;
         self.next_id += 1;
         self.entries.insert(id, Entry { session, tokens: snapshot_tokens.clone(), media: saved_media, kind: hit.kind, pages, mark, after,
-            meta, last_use: self.clock, ticket: None });
+            meta, last_use: self.clock, ticket: None, host_mark: Some(hit.key) });
         if let Some(evicted) = self.retained.bank_mut(hit.kind).insert(&snapshot_tokens, id) {
             self.evict(family, evicted)?;
         }

@@ -162,7 +162,7 @@ pub(super) fn admit_startup(
     let mut startup = vec![owners::vocabulary_load_phase(&weights, &target,
         VocabularyHead::plan(catalog)? as u64)?];
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
-    let slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * u64::from(args.prefix_cache_entries) + 2 };
+    let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
         2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, slots)?;
     let draft = if args.dspark {
@@ -174,8 +174,8 @@ pub(super) fn admit_startup(
                 lib, catalog, capacity, args.concurrency,
                 if args.dspark_draft_limit > 5 { 7 } else { 5 }, Some(&directory))?;
         startup.extend(target_owners.draft_load_phases(&draft)?);
-        draft.marks = resident::prefix_bytes(u64::from(args.prefix_cache_entries), true, 1)[0]
-            - resident::prefix_bytes(u64::from(args.prefix_cache_entries), false, 1)[0];
+        draft.marks = resident::prefix_arena_bytes(slots, true, 1)[0]
+            - resident::prefix_arena_bytes(slots, false, 1)[0];
         Some(draft)
     } else { None };
     if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
@@ -397,8 +397,8 @@ pub(super) fn resolve_with_owners(
             groups > tails && groups <= 131072,
             "explicit KV byte pool is outside physical/admission limits"
         );
-        pool.requested = Some((groups - tails) * 512);
-        pool.floor = (groups - tails) * 512;
+        pool = PoolPolicy::resolve(&cards, args.max_context_tokens as u64,
+            Some((groups - tails) * 512), 512, args.peers.is_empty());
     }
     if pool.requested.is_none() {
         pool.floor = pool.floor.max(
@@ -857,6 +857,35 @@ mod admission_tests {
                 81 << 30, Basis::Exact)];
             assert!(resolve_with_owners(&args, &memory, vec![], 0, &vec![0; ranks], 0,
                 &[], &peak, Some(&draft)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_byte_pool_must_cover_fixed_context_after_snapshot_tails() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"
+        )))?;
+        let mut args = args(dir.path());
+        args.max_context_tokens = 131_072;
+        args.rtx_expert_layers = LocalLayers::Count(0);
+        let tails = args.concurrency as usize + 2 * args.prefix_cache_entries as usize;
+        let memory = [(80usize << 30, 96usize << 30)];
+        for tokens in [32_768, 131_072] {
+            args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(
+                (tokens / 512 + tails) * 5 * 256 * 356));
+            let result = resolve(&args, &memory, vec![], 0, &[0], 0, None);
+            if tokens < args.max_context_tokens as usize {
+                let error = result.err().context("small explicit byte pool was admitted")?;
+                assert_eq!(error.downcast_ref::<PlacementError>(), Some(&PlacementError::RequestedBelowContext {
+                    requested: tokens as u64, floor: args.max_context_tokens as u64,
+                }));
+                assert!(error.to_string().contains("KV_POOL_SIZE"));
+            } else {
+                assert_eq!(result?.placement.pool_tokens, tokens as u64);
+            }
         }
         Ok(())
     }

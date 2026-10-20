@@ -43,9 +43,29 @@ pub(super) fn snapshot(kind: &str) -> tempfile::TempDir {
     dir
 }
 
+fn native_manifest(dir: &std::path::Path) -> std::path::PathBuf {
+    let ops = ["hidden_norm", "final_norm", "residual_bf16", "residual_f32", "swa_attention",
+        "csa_attention", "region_compress", "region_scores", "region_selection", "region_commit",
+        "sliding_commit", "attn_q", "attn_kv", "attn_gate", "attn_out", "router",
+        "dense_gate_up", "dense_down", "shared_gate_up", "shared_down"];
+    let programs = ["step5", "step52"].iter().flat_map(|prefix| ops.iter().map(move |op|
+        serde_json::json!({"name": format!("{prefix}_{op}"), "capacity_rows": 4096}))).collect::<Vec<_>>();
+    let path = dir.join("PROGRAMS.json");
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"programs": programs,
+        "capacities": {"max_context": 1048576}})).unwrap()).unwrap();
+    path
+}
+
 fn report(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>) -> PlanReport {
+    report_context(dir, gpus, gib, ranks, pool, 0)
+}
+
+fn report_context(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>, context: u64) -> PlanReport {
+    let manifest = native_manifest(dir);
     plan::plan(dir, &PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool, ..Default::default() }),
+        draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool, context_tokens: context,
+            workspace_manifest: Some(manifest), ..Default::default() }),
         ..Default::default() }).unwrap()
 }
 
@@ -374,41 +394,36 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
     assert!(result.unclassified.is_empty(),"{:?}",result.unclassified);
     assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
     assert!(result.components.iter().all(|c| c.status != Status::Ready));
-    assert!(result.hints.iter().any(|hint|hint.how.contains("CSA-8")));
-    assert!(result.hints.iter().any(|hint|hint.how.contains("BF16-tail")));
+    assert!(result.hints.iter().any(|hint|hint.what.contains("unqualified")));
     assert_eq!(result.min_spark_ranks,Some(6));
 }
 
 #[test]
 fn card_memory_conclusions_and_request_vs_pool_extent() {
     let dir = snapshot("fp8");
-    for gpus in [1,2] {
-        let r = report(dir.path(),gpus,96,6,Some(262_144));
-        assert!(r.config_error.is_none(),"{:?}",r.config_error);
-        assert!(!r.executable());
-        let memory = r.memory_layout.unwrap();
-        assert_eq!(memory.pool_tokens,262_144,"{:?}",r.hints);
-        assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+    let r = report_context(dir.path(), 2, 96, 6, Some(262_144), 262_144);
+    assert!(r.wip_launchable(), "{:?}", r.hints);
+    assert!(!r.executable());
+    assert!(r.native_serving_admitted);
+    assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
+    assert!(r.memory_layout.as_ref().unwrap().devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+    let r = report(dir.path(), 2, 96, 6, Some(262_144));
+    assert!(!r.wip_launchable());
+    assert!(r.hints.iter().any(|h| h.what.contains("compiled/max-context floor of 1048576")), "{:?}", r.hints);
+    for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
+        let r = report(dir.path(), gpus, gib, ranks, None);
+        assert!(!r.wip_launchable() && !r.native_serving_admitted);
+        assert!(r.hints.iter().any(|h| h.what.contains("unqualified")), "{:?}", r.hints);
     }
-    let r = report(dir.path(),1,96,6,Some(1<<20));
-    assert!(r.hints.iter().any(|h| h.what.contains("coordinator BF16 pool lower bound refused")),"{:?}",r.hints);
-    let r = report(dir.path(),2,96,6,Some(1<<20));
-    assert_eq!(r.memory_layout.unwrap().pool_tokens,1<<20);
-    let r = report(dir.path(),1,32,6,None);
-    assert!(r.hints.iter().any(|h| h.what.contains("5090 refused")));
-    let r = report(dir.path(),1,96,4,None);
-    assert!(r.hints.iter().any(|h| h.what.contains("TP4 refused")));
-    let r = report(dir.path(),2,96,0,None);
-    assert!(r.hints.iter().any(|h| h.what.contains("no 0-Spark")));
-    let r = report(dir.path(),1,96,6,Some(32_768));
-    assert!(r.hints.iter().any(|h| h.what.contains("below 256K")));
-    let r = report(dir.path(),1,96,6,None);
+    let r = report(dir.path(), 2, 96, 6, Some(32_768));
+    assert!(!r.wip_launchable());
+    assert!(r.hints.iter().any(|h| h.what.contains("at least 256K")));
+    let r = report(dir.path(), 2, 96, 6, None);
     let memory = r.memory_layout.unwrap();
-    assert!(memory.pool_tokens >= 262_144 && memory.pool_tokens < 1<<20);
-    assert!(memory.notes.iter().any(|n| n.contains("71392 bytes/token")));
-    assert!(memory.notes.iter().any(|n| n.contains("36064 bytes/token")));
-    assert!(memory.notes.iter().any(|n| n.contains("Maximum request 1048576")));
-    assert!(memory.notes.iter().any(|n| n.contains("14155776 bytes per admitted sequence")));
+    assert!(memory.pool_tokens >= 262_144);
+    assert!(memory.notes.iter().any(|n| n.contains("zero graphs")));
+    assert!(memory.notes.iter().any(|n| n.contains("compiled extent 1048576")));
+
 }
 
 #[test]
@@ -427,12 +442,12 @@ fn nvfp4_stacked_scales_and_bf16_root_are_named_not_executed() {
     }
     let result = report(dir.path(),1,96,4,Some(262_144));
     assert!(result.config_error.is_none(),"{:?}",result.config_error);
-    assert_eq!(result.min_spark_ranks,Some(4));
-    assert_eq!(result.memory_layout.unwrap().pool_tokens,262_144);
+    assert!(!result.wip_launchable() && !result.native_serving_admitted);
+    assert!(result.hints.iter().any(|h| h.what.contains("NVFP4/BF16")));
     let dir = snapshot("bf16");
     let r = report(dir.path(),2,96,6,None);
     assert!(r.config_error.is_none(),"{:?}",r.config_error);
-    assert!(r.hints.iter().any(|h| h.what.contains("TP6 refused")));
+    assert!(r.hints.iter().any(|h| h.what.contains("NVFP4/BF16")));
 }
 
 #[test]
@@ -533,8 +548,9 @@ fn unknown_tensor_and_context_ownership_fail_closed() {
         attention_placement:Some(crate::placement::AttentionPlacement::Context),
         layout:Some(layout::LayoutOptions { rtx_bytes:vec![96<<30;2], ..Default::default() }),
         ..Default::default() }).unwrap();
-    assert!(!r.placement_supported);
-    assert!(r.hints.iter().any(|h|h.what.contains("context/layer ownership")));
+    assert!(!r.wip_launchable() && !r.native_serving_admitted);
+    assert!(r.config_error.as_deref().is_some_and(|e| e.contains("context")));
+    assert!(r.hints.iter().any(|h|h.what.contains("executor not implemented")));
 }
 
 #[test]
@@ -644,9 +660,9 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
     for kind in ["fp8", "nvfp4", "bf16"] {
         let dir = snapshot(kind);
         let cp = Checkpoint::open(dir.path()).unwrap();
-        if kind == "fp8" {
+        if kind != "bf16" {
             for world in [4, 6] {
-                assert_eq!(checkpoint_spark_recipe(&cp, world, &[3]).unwrap(), spark_recipe("step5:fp8", 1536, world).unwrap());
+                assert_eq!(checkpoint_spark_recipe(&cp, world, &[3]).unwrap(), spark_recipe(&format!("step5:{kind}"), 1536, world).unwrap());
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..88).collect::<Vec<_>>()).is_ok());
             }
             for world in [1, 2, 3, 5, 7, 8] {
@@ -662,7 +678,7 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
                 assert_eq!(checkpoint_spark_recipe(&cp, world, &layers).unwrap(),
                     spark_recipe("step5:bf16", 1536, world).unwrap());
             }
-            if kind == "fp8" {
+            if kind != "bf16" {
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).is_ok());
             } else {
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).is_err());
@@ -671,11 +687,10 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
                 assert!(checkpoint_spark_recipe(&cp, world, &layers).is_err());
             }
         }
-        let r = report(dir.path(), 2, 96, 6, Some(262_144));
-        assert!(!r.executable() && !r.wip_launchable() && !r.native_serving_admitted);
-        for component in ["dense_ffn", "attention", "routed_expert"] {
-            assert!(r.hints.iter().any(|hint| hint.what.contains(component)), "{component}: {:?}", r.hints);
-        }
+        let r = report(dir.path(), 2, 96, 6, None);
+        assert!(!r.executable());
+        assert_eq!(r.wip_launchable(), kind == "fp8", "{:?}", r.hints);
+        assert_eq!(r.native_serving_admitted, kind == "fp8");
     }
 }
 
@@ -719,5 +734,44 @@ fn routed_admission_rechecks_operand_shape_scale_and_role() {
             assert!(model.accepts(&role, &stem, &mut wrong).is_err());
         }
         assert!(model.accepts(&TensorRole::layer(Component::RoutedExpert, 3), &stem, &mut operand.clone()).is_err());
+    }
+}
+
+#[test]
+fn nvfp4_routed_admission_rechecks_packing_scales_and_role() {
+    let dir = snapshot("nvfp4");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let model = Model::open(&cp).unwrap();
+    let groups = format::group_by_stem(&cp.tensors);
+    for projection in ["gate", "up", "down"] {
+        let stem = format!("model.layers.3.moe.{projection}_proj");
+        let operand = format::detect(&groups[&stem]).unwrap();
+        let role = TensorRole::layer(Component::RoutedExpert, 3);
+        assert!(model.accepts(&role, &stem, &mut operand.clone()).is_ok());
+        assert_eq!(model.experts(&operand).unwrap().package, "step5:nvfp4");
+        for mutation in 0..14 {
+            let mut wrong = operand.clone();
+            match mutation {
+                0 => wrong.logical[0] -= 1,
+                1 => wrong.logical[2] -= 1,
+                2 => wrong.stored[0] -= 1,
+                3 => wrong.encoding = format::Encoding::Int { bits: 8 },
+                4 => wrong.scale = None,
+                5 => wrong.scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+                6 => wrong.scale.as_mut().unwrap().cols = 32,
+                7 => wrong.scale.as_mut().unwrap().rows = format::RowTiling::Uniform { rows: 2 },
+                8 => wrong.global_scale = None,
+                9 => wrong.global_scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+                10 => wrong.input_scale = None,
+                11 => wrong.input_scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+                12 => wrong.companions.push("bias".into()),
+                _ => { wrong.logical.pop(); }
+            }
+            assert!(model.accepts(&role, &stem, &mut wrong).is_err(), "{projection}: mutation {mutation}");
+        }
+        for role in [TensorRole::layer(Component::RoutedExpert, 4),
+            TensorRole::layer(Component::RoutedExpert, 88), TensorRole::layer(Component::DenseFfn, 3)] {
+            assert!(model.accepts(&role, &stem, &mut operand.clone()).is_err());
+        }
     }
 }

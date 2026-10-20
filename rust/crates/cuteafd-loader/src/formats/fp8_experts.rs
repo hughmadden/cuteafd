@@ -75,13 +75,16 @@ pub enum ExpertFormat {
 }
 
 impl ExpertFormat {
-    /// The package directory suffix and label (`fp8-glmf`, `fp8-mimop`,
-    /// `fp8-glmf-nvfp4`): FP8 and MXFP4 checkpoints have distinct
-    /// geometries, NVFP4 releases share theirs with the FP8 ones.
-    pub fn package_suffix(self) -> &'static str {
+    /// Canonical native arithmetic package. NVFP4 always quantizes activations
+    /// with the checkpoint's calibrated K16 scales (W4A4), at every row count.
+    pub fn package_name(self, geometry: &str) -> String {
+        format!("fp8-{geometry}{}", self.package_suffix())
+    }
+
+    fn package_suffix(self) -> &'static str {
         match self {
             Self::Fp8Block128 | Self::Mxfp4 => "",
-            Self::Nvfp4 => "-nvfp4",
+            Self::Nvfp4 => "-nvfp4a4",
             Self::Bf16 => "-bf16-weights",
         }
     }
@@ -137,6 +140,42 @@ pub struct Fp8ExpertTensors {
     activations: Vec<cuteafd_core::FfnActivation>,
     slice_layer: usize,
     coordinator: bool,
+}
+
+/// Parallel readers in the projection-at-a-time native expert loader.
+pub const FP8_LOAD_READERS: usize = 16;
+
+/// Host owners of one projection load. The synchronous H2D owner retains its
+/// largest upload until all layers finish; reader buffers drain before upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fp8ProjectionLoad {
+    pub weights: usize,
+    pub scales: usize,
+    pub readers: usize,
+    pub reader_staging: usize,
+    pub reader_auxiliary: usize,
+    pub gate_inputs: usize,
+}
+
+impl Fp8ProjectionLoad {
+    pub fn pinned_upload(&self) -> usize { self.weights.max(self.scales) }
+
+    pub fn host_bytes(&self) -> Result<usize> {
+        self.reader_staging.checked_add(self.reader_auxiliary)
+            .and_then(|bytes| bytes.checked_mul(self.readers))
+            .and_then(|bytes| bytes.checked_add(self.weights))
+            .and_then(|bytes| bytes.checked_add(self.scales))
+            .and_then(|bytes| bytes.checked_add(self.gate_inputs))
+            .context("FP8 projection host load overflow")
+    }
+}
+
+/// Layer maxima for sequential projections, including retained upload staging.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Fp8LayerLoad {
+    pub resident: usize,
+    pub host: usize,
+    pub pinned: usize,
 }
 
 /// How a package lays a TP rank's intermediate slice out.
@@ -559,6 +598,60 @@ impl Fp8ExpertTensors {
         Ok(experts * self.slice_bytes_with(projection, tp, rank, slicing)?.1 + alphas)
     }
 
+    /// Allocation recipe used by the native projection loader and its admission.
+    pub fn projection_load(&self, layer: usize, projection: Fp8Projection, tp: usize,
+        rank: usize, slicing: Slicing) -> Result<Fp8ProjectionLoad> {
+        let experts = self.shape.experts;
+        ensure!(experts > 0, "FP8 projection load needs experts");
+        let (weights, _) = self.slice_bytes_with(projection, tp, rank, slicing)?;
+        let weights = weights.checked_mul(experts).context("FP8 projection weights overflow")?;
+        let scales = self.scale_region_bytes_with(projection, tp, rank, slicing)?;
+        let readers = experts.div_ceil(experts.div_ceil(FP8_LOAD_READERS));
+        let mut reader_staging = 0;
+        let mut reader_auxiliary = 0;
+        for expert in 0..experts {
+            let name = self.name(layer, expert, projection);
+            let weight = self.located(&name)?;
+            if projection == Fp8Projection::Down && self.format != ExpertFormat::Bf16 {
+                reader_staging = reader_staging.max(usize::try_from(weight.bytes)?);
+            }
+            if self.format.packed_fp4() {
+                let scale = self.located(&format!("{name}_scale"))?;
+                if projection == Fp8Projection::Down {
+                    reader_staging = reader_staging.max(usize::try_from(scale.bytes)?);
+                }
+            } else if self.format == ExpertFormat::Fp8Block128 {
+                let scale = self.located(&format!("{name}_scale_inv"))?;
+                let (rows, cols) = self.dims(projection);
+                let widened = rows.div_ceil(128).checked_mul(cols.div_ceil(128))
+                    .and_then(|n| n.checked_mul(4)).context("FP8 scale grid overflow")?;
+                // BF16 raw scales and their widened FP32 grid coexist briefly.
+                reader_auxiliary = reader_auxiliary.max(usize::try_from(scale.bytes)?
+                    .checked_add(widened).context("FP8 reader grid overflow")?);
+            }
+        }
+        let gate_inputs = if self.format == ExpertFormat::Nvfp4 {
+            experts.checked_mul(4).context("NVFP4 gate input scales overflow")?
+        } else { 0 };
+        Ok(Fp8ProjectionLoad { weights, scales, readers, reader_staging,
+            reader_auxiliary, gate_inputs })
+    }
+
+    /// Sequential native load owners, excluding the final resident device bytes.
+    pub fn layer_load(&self, layer: usize, tp: usize, rank: usize,
+        slicing: Slicing) -> Result<Fp8LayerLoad> {
+        let mut load = Fp8LayerLoad::default();
+        for projection in Fp8Projection::ALL {
+            let plan = self.projection_load(layer, projection, tp, rank, slicing)?;
+            load.resident = load.resident.checked_add(plan.weights)
+                .and_then(|bytes| bytes.checked_add(plan.scales))
+                .context("FP8 layer resident overflow")?;
+            load.host = load.host.max(plan.host_bytes()?);
+            load.pinned = load.pinned.max(plan.pinned_upload());
+        }
+        Ok(load)
+    }
+
     /// One expert's stored weight and scale read extent for an installed rank.
     pub fn weight_read_bytes_with(&self, tp: usize, rank: usize, slicing: Slicing) -> Result<usize> {
         let experts = self.shape.experts;
@@ -879,6 +972,16 @@ impl Fp8ExpertTensors {
 mod tests {
     use super::*;
 
+    #[test]
+    fn package_names_follow_native_math_not_family() {
+        for geometry in ["glm", "glmf", "qwen4", "step5", "future"] {
+            assert_eq!(ExpertFormat::Nvfp4.package_name(geometry), format!("fp8-{geometry}-nvfp4a4"));
+            assert_eq!(ExpertFormat::Fp8Block128.package_name(geometry), format!("fp8-{geometry}"));
+            assert_eq!(ExpertFormat::Mxfp4.package_name(geometry), format!("fp8-{geometry}"));
+            assert_eq!(ExpertFormat::Bf16.package_name(geometry), format!("fp8-{geometry}-bf16-weights"));
+        }
+    }
+
     fn catalog(format: ExpertFormat, intermediate: usize) -> Fp8ExpertTensors {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
             draft_stages: 0, draft_experts: 0 };
@@ -921,6 +1024,71 @@ mod tests {
         assert!(tensors.homogeneous_layers(&[]).is_err());
         assert!(tensors.homogeneous_layers(&[4, 3]).is_err());
         assert!(tensors.homogeneous_layers(&[3, 3]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_projection_load_owners_follow_format_and_direct_bf16_slices() -> Result<()> {
+        for format in [ExpertFormat::Bf16, ExpertFormat::Fp8Block128,
+            ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
+            let mut tensors = catalog(format, 1536);
+            tensors.shape.hidden = 4096;
+            tensors.shape.experts = 352;
+            for projection in Fp8Projection::ALL {
+                let (rows, cols) = tensors.dims(projection);
+                let full = tensors.projection_bytes(projection);
+                for expert in 0..352 {
+                    let name = tensors.name(3, expert, projection);
+                    Arc::make_mut(&mut tensors.tensors).insert(name.clone(), Located {
+                        shard: "headers-only.safetensors".into(), offset: 0, bytes: full.0 as u64,
+                        dtype: if format == ExpertFormat::Bf16 { DType::Bf16 } else { DType::U8 },
+                        shape: vec![rows, cols],
+                    });
+                    if format != ExpertFormat::Bf16 {
+                        let suffix = if format.packed_fp4() { "_scale" } else { "_scale_inv" };
+                        // Include the BF16 -> FP32 grid owner's overlapping lifetime.
+                        let raw = if format == ExpertFormat::Fp8Block128 { full.1 / 2 }
+                            else { full.1 - if format == ExpertFormat::Nvfp4 { 8 } else { 0 } };
+                        Arc::make_mut(&mut tensors.tensors).insert(format!("{name}{suffix}"), Located {
+                            shard: "headers-only.safetensors".into(), offset: 0, bytes: raw as u64,
+                            dtype: if format == ExpertFormat::Fp8Block128 { DType::Bf16 } else { DType::U8 },
+                            shape: vec![],
+                        });
+                    }
+                }
+            }
+            for tp in [1, 4, 6] {
+                for rank in 0..tp {
+                    for slicing in [Slicing::Padded, Slicing::Blocks(128)] {
+                        let load = tensors.layer_load(3, tp, rank, slicing)?;
+                        assert_eq!(load.resident,
+                            tensors.weight_read_bytes_with(tp, rank, slicing)? * 352);
+                        for projection in Fp8Projection::ALL {
+                            let plan = tensors.projection_load(3, projection, tp, rank, slicing)?;
+                            let (weights, _) = tensors.slice_bytes_with(projection, tp, rank, slicing)?;
+                            assert_eq!(plan.weights, weights * 352);
+                            assert_eq!(plan.scales, tensors.scale_region_bytes_with(projection, tp, rank, slicing)?);
+                            assert_eq!(plan.readers, 16);
+                            assert_eq!(plan.reader_staging, if projection == Fp8Projection::Down
+                                && format != ExpertFormat::Bf16 { tensors.projection_bytes(projection).0 } else { 0 });
+                            assert!(load.host >= plan.host_bytes()?);
+                            assert!(load.pinned >= plan.pinned_upload());
+                            if format == ExpertFormat::Bf16 {
+                                assert_eq!(plan.reader_auxiliary, 0);
+                                assert_eq!(plan.host_bytes()?, plan.weights);
+                                assert_eq!(plan.pinned_upload(), plan.weights);
+                            }
+                        }
+                        if format == ExpertFormat::Bf16 && tp == 6 {
+                            assert_eq!(load.pinned, 738_197_504);
+                            assert_eq!(load.host, load.pinned);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(Fp8ProjectionLoad { weights: usize::MAX, scales: 1, readers: 1,
+            reader_staging: 0, reader_auxiliary: 0, gate_inputs: 0 }.host_bytes().is_err());
         Ok(())
     }
 

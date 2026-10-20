@@ -89,6 +89,8 @@ pub enum StoreOutcome {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TickReport {
     pub completed: Vec<StoreTicket>,
+    /// Exact resident identities committed by the completed tickets.
+    pub committed: Vec<(StoreTicket, Key)>,
     pub failed: Vec<StoreTicket>,
 }
 
@@ -262,10 +264,16 @@ impl<'a> RestorePlan<'a> {
         target: &'a RestoreTarget,
         layout: &Layout,
     ) -> Option<Self> {
+        Self::build_parts(snapshots, snapshot, target, layout, false)
+    }
+
+    fn build_parts(snapshots: &Snapshots, snapshot: &HostSnapshot, target: &'a RestoreTarget,
+        layout: &Layout, mark_only: bool) -> Option<Self> {
         let mut pages = Vec::new();
         let mut shared = Vec::new();
         let mut bytes = 0u64;
         for (compressor, list) in snapshot.pages.iter().enumerate() {
+            if mark_only { continue; }
             let targets = target.pages.get(compressor)?;
             if targets.len() != list.len() {
                 return None;
@@ -286,7 +294,7 @@ impl<'a> RestorePlan<'a> {
             return None;
         }
         bytes += tail_total as u64;
-        let draft = match (snapshot.draft, target.draft.as_deref()) {
+        let draft = match (if mark_only { None } else { snapshot.draft }, target.draft.as_deref()) {
             (None, None) | (None, Some([])) => None,
             (Some(slab), Some(segments)) => {
                 let total = segment_bytes(segments);
@@ -298,7 +306,7 @@ impl<'a> RestorePlan<'a> {
             }
             _ => return None,
         };
-        let scores = match (snapshot.scores, target.scores.as_slice()) {
+        let scores = match (if mark_only { None } else { snapshot.scores }, target.scores.as_slice()) {
             (None, []) => None,
             (Some(slab), segments) => {
                 let total = segment_bytes(segments);
@@ -439,7 +447,9 @@ impl<E: CopyEngine, P> HostCache<E, P> {
                 Ok(true) => {
                     let pending = self.pending.remove(index);
                     let ticket = pending.ticket;
-                    self.commit_pending(pending, now);
+                    if let Some(key) = self.commit_pending(pending, now) {
+                        report.committed.push((ticket, key));
+                    }
                     report.completed.push(ticket);
                 }
                 Ok(false) => break,
@@ -462,14 +472,20 @@ impl<E: CopyEngine, P> HostCache<E, P> {
     /// recorded at store time, whose ranges are still valid because the snapshot is still
     /// alive); without a ticket, `Clean`.
     pub fn before_device_evict(&mut self, ticket: Option<StoreTicket>) -> EvictDecision {
-        let decision = self.decide_evict(ticket);
+        self.before_device_evict_with_key(ticket).0
+    }
+
+    /// Finish a pending write and return its exact resident identity, if committed.
+    pub fn before_device_evict_with_key(&mut self, ticket: Option<StoreTicket>) -> (EvictDecision, Option<Key>) {
+        let mut key = None;
+        let decision = self.decide_evict(ticket, &mut key);
         self.refresh_gauges();
-        decision
+        (decision, key)
     }
 
     /// The body of [`before_device_evict`](Self::before_device_evict), so the gauges are
     /// refreshed on every exit.
-    fn decide_evict(&mut self, ticket: Option<StoreTicket>) -> EvictDecision {
+    fn decide_evict(&mut self, ticket: Option<StoreTicket>, key: &mut Option<Key>) -> EvictDecision {
         if !self.enabled() {
             return EvictDecision::Clean;
         }
@@ -532,7 +548,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         if completed {
             let pending = self.pending.remove(index);
             let now = self.engine.now_ns();
-            self.commit_pending(pending, now);
+            *key = self.commit_pending(pending, now);
             EvictDecision::WaitedClean { ns }
         } else {
             // The bounded wait expired; correctness still requires completion
@@ -648,6 +664,16 @@ impl<E: CopyEngine, P> HostCache<E, P> {
     /// the copies may still land later, so the engine must not reuse `target` until it has
     /// synchronized the restore stream itself; the host snapshot stays resident either way.
     pub fn restore(&mut self, key: Key, target: &RestoreTarget) -> RestoreOutcome {
+        self.restore_parts(key, target, false)
+    }
+
+    /// Copy only positional state when immutable KV pages are still device resident.
+    pub fn restore_mark(&mut self, key: Key, tail: Vec<DeviceRange>) -> RestoreOutcome {
+        let target = RestoreTarget { pages: Default::default(), tail, draft: None, scores: Vec::new() };
+        self.restore_parts(key, &target, true)
+    }
+
+    fn restore_parts(&mut self, key: Key, target: &RestoreTarget, mark_only: bool) -> RestoreOutcome {
         if !self.enabled() {
             return RestoreOutcome::Failed;
         }
@@ -658,7 +684,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
             let Some(snapshot) = snapshots.get(key) else {
                 return RestoreOutcome::Failed;
             };
-            match RestorePlan::build(snapshots, snapshot, target, &self.layout) {
+            match RestorePlan::build_parts(snapshots, snapshot, target, &self.layout, mark_only) {
                 Some(plan) => plan,
                 None => {
                     self.metrics.get_mut().restore_failures += 1;
@@ -843,7 +869,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
     /// reserved its slabs. Invariant: the payload is resident exactly while its snapshot is. Records the
     /// store-latency histogram entry exactly once, here, wherever the completion was observed
     /// (`tick` or the evict path's bounded wait).
-    fn commit_pending(&mut self, pending: PendingStore<P>, now: u64) {
+    fn commit_pending(&mut self, pending: PendingStore<P>, now: u64) -> Option<Key> {
         let PendingStore { kind, payload, .. } = pending;
         let PendingKind::Issued {
             plan,
@@ -852,14 +878,14 @@ impl<E: CopyEngine, P> HostCache<E, P> {
             ..
         } = kind
         else {
-            return;
+            return None;
         };
         let copied = plan.copies.len() as u64;
         let total: u64 = plan.pages.iter().map(|list| list.len() as u64).sum();
         let before = self.snapshots.as_ref().map_or(0, Snapshots::len);
         let key = match self.snapshots.as_mut() {
             Some(snapshots) => snapshots.commit_store(plan, now),
-            None => return,
+            None => return None,
         };
         let after = self.snapshots.as_ref().map_or(0, Snapshots::len);
         let replaced = before + 1 - after;
@@ -881,6 +907,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         metrics.pages_shared += total - copied;
         metrics.store_bytes += bytes;
         self.metrics.record_store(now.saturating_sub(issued_ns));
+        Some(key)
     }
 
     /// Release a pending store's plan, if it still holds one.
