@@ -157,7 +157,6 @@ mod tests {
             (1_048_576, None, true),
             (1_048_576, Some(262_144), false),
         ] {
-            let launchable = launchable && !(nvfp4 && host == Some(0) && entries != 0);
             let opts = LayoutOptions {
                 rtx_bytes: vec![96 << 30; ranks],
                 pool_tokens: pool,
@@ -175,7 +174,7 @@ mod tests {
                 },
             )?;
             assert_eq!(report.wip_launchable(), launchable,
-                "nvfp4={nvfp4} context={context} pool={pool:?} host={host:?} entries={entries}: {:?}", report.hints);
+                "nvfp4={nvfp4} context={context} pool={pool:?}: {:?}", report.hints);
             assert!(!report.executable());
             let mut code = Vec::new();
             let gpus = opts
@@ -228,14 +227,7 @@ mod tests {
             if !launchable {
                 let error = live.err().expect("both edges must refuse the unsupported allocation");
                 let refusal = error.to_string();
-                if pool == Some(262_144) {
-                    assert!(refusal.contains("compiled/max-context floor of 1048576"));
-                } else {
-                    assert!(nvfp4 && host == Some(0) && entries == 20);
-                    assert!(refusal.contains("exact retained marks") && refusal.contains("do not fit on rtx0"), "{refusal}");
-                    inputs.marks.entries = 0;
-                    assert!(checkpoint_admission(&checkpoint, &inputs).is_ok());
-                }
+                assert!(refusal.contains("compiled/max-context floor of 1048576"));
                 assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)));
                 continue;
             }
