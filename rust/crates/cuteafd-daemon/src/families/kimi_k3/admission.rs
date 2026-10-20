@@ -33,6 +33,7 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// page tables; global weights, token IO and state banks add their own demands.
 pub(crate) struct Inputs<'a> {
     pub cfg: &'a KimiK3Config,
+    pub core: cuteafd_loader::families::kimi_k3::core::CoreInventory,
     pub gpus: [GpuBudget; 2],
     pub devices: [i32; 2],
     pub peer_access: bool,
@@ -84,6 +85,7 @@ pub(crate) struct Admission<'a> {
     pub placement: Placement,
     pub mark_selection: MarkSelection,
     cfg: KimiK3Config,
+    core: cuteafd_loader::families::kimi_k3::core::CoreInventory,
     rtx: Option<RtxInventory>,
     rtx_loaded: bool,
     layouts: Vec<[LayerLayout; 2]>,
@@ -194,7 +196,7 @@ impl<'a> Admission<'a> {
         }
         let mut layers = Vec::new();
         for layer in 0..self.cfg.layers {
-            let packed = PackedLayer::pair(&self.cfg, layer, self.placement.layers[layer].mode,
+            let packed = PackedLayer::pair_with_core(&self.cfg, layer, self.placement.layers[layer].mode, &self.core,
                 |name| super::weights::read_tensor(checkpoint, name))?;
             let [zero, one] = packed;
             layers.push([self.upload(devices[0], 0, layer, zero)?, self.upload(devices[1], 1, layer, one)?]);
@@ -353,6 +355,8 @@ impl<'a> Admission<'a> {
 
 pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let cfg = inputs.cfg;
+    inputs.core.validate_runtime_groups(cfg)?;
+    let core = inputs.core.clone();
     let devices = inputs.devices;
     let lanes = inputs.lanes as u64;
     let lane_layouts = inputs.lane_layouts.clone();
@@ -391,7 +395,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     tracing::info!(selection = %mark_selection.summary(), "Kimi retained mark admission");
     EXECUTOR.check(&placement)?;
     let layouts = placement.layers.iter().enumerate().map(|(layer, assignment)|
-        LayerLayout::pair(cfg, layer, assignment.mode)).collect::<Result<Vec<_>>>()?;
+        LayerLayout::pair_with_core(cfg, layer, assignment.mode, &core)).collect::<Result<Vec<_>>>()?;
     for rank in 0..2 {
         let native = layouts.iter().try_fold(0u64, |sum, pair| sum.checked_add(pair[rank].bytes()? as u64)
             .context("Kimi admitted native weight sum overflow"))?;
@@ -407,7 +411,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let io_allocated = vec![[false; 2]; lane_layouts.len()];
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
-    let admission = Admission { placement, mark_selection, rtx, rtx_loaded: false, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
+    let admission = Admission { placement, mark_selection, rtx, rtx_loaded: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
         devices, lanes, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
         mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),
@@ -504,7 +508,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     }
     let mut layers = Vec::with_capacity(cfg.layers);
     for layer in 0..cfg.layers {
-        let split = LayerLayout::pair(cfg, layer, LayerMode::HeadSplit)?;
+        let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, &i.core)?;
         let mut split_attention = [0; 2];
         // Whole describes attention residency, not the split FFN's residency.
         // Keep these always-resident native operands on both ranks, as GLM's
@@ -516,7 +520,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
                 (split[rank].bytes()? - attention) as u64, Basis::Exact));
         }
         let mla = cfg.attention[layer] == KimiAttention::Mla;
-        let whole = if mla { LayerLayout::pair(cfg, layer, MODES[1])?[0].attention_bytes()? as u64 } else { 0 };
+        let whole = if mla { LayerLayout::pair_with_core(cfg, layer, MODES[1], &i.core)?[0].attention_bytes()? as u64 } else { 0 };
         let unit = if mla { (MLA_PAGE_ROWS * MLA_RECORD_BYTES) as u64 } else { 0 };
         layers.push(LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
             weights: ModeBytes { whole, split: split_attention },
@@ -556,7 +560,7 @@ pub(super) mod tests {
     }
 
     pub(in crate::families::kimi_k3) fn inputs(cfg: &KimiK3Config) -> Inputs<'_> {
-        Inputs { cfg, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
+        Inputs { cfg, core: Default::default(), gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2], devices: [0, 1], peer_access: true, spark_ranks: 6,
             attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::new(
@@ -732,6 +736,63 @@ pub(super) mod tests {
         assert!(working.rtx_layers.is_empty());
         assert_eq!(working.spark_layers, cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect::<Vec<_>>());
         assert_eq!(working.spark_ranks, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_k6_weights_match_shared_admission_in_owned_and_split_modes() -> Result<()> {
+        use cuteafd_loader::{families::kimi_k3::core::{CoreInventory,CoreProjection,split},
+            formats::exl3_storage::Exl3Codebook};
+        let cfg=cfg();
+        let mut core=CoreInventory::default();
+        for (layer,leaf,shape,stored_outputs) in [
+            (0,"self_attn.q_proj",[12288,7168],12288),
+            (0,"self_attn.k_proj",[12288,7168],12288),
+            (0,"self_attn.v_proj",[12288,7168],12288),
+            (0,"self_attn.g_proj",[12288,7168],12288),
+            (0,"self_attn.o_proj",[7168,12288],7168),
+            (1,"self_attn.q_a_proj",[1536,7168],1536),
+            (1,"self_attn.q_b_proj",[18432,1536],18432),
+            (1,"self_attn.g_proj",[12288,7168],12288),
+            (1,"self_attn.kv_a_proj_with_mqa",[576,7168],640),
+            (1,"self_attn.o_proj",[7168,12288],7168),
+            (2,"block_sparse_moe.shared_experts.gate_proj",[6144,7168],6144),
+            (2,"block_sparse_moe.shared_experts.up_proj",[6144,7168],6144),
+            (2,"block_sparse_moe.shared_experts.down_proj",[7168,6144],7168)] {
+            let stem=format!("language_model.model.layers.{layer}.{leaf}");
+            core.projections.insert(stem.clone(),CoreProjection{split:split(&stem).unwrap(),stem,
+                bits:6,codebook:Exl3Codebook::Mul1,shape,stored_outputs,source_bytes:0});
+        }
+        for attention in [None,Some(AttentionPlacement::Heads)] {
+            let mut i=inputs(&cfg);i.core=core.clone();i.attention=attention;
+            let mixed=admit(i)?;
+            let mut i=inputs(&cfg);i.attention=attention;
+            let original=admit(i)?;
+            let mut freed=[0;2];
+            for (layer,assignment) in mixed.placement.layers.iter().enumerate() {
+                let expected=LayerLayout::pair_with_core(&cfg,layer,assignment.mode,&core)?;
+                let baseline=LayerLayout::pair(&cfg,layer,assignment.mode)?;
+                for rank in 0..2 {
+                    assert_eq!(mixed.layouts[layer][rank],expected[rank]);
+                    freed[rank]+=baseline[rank].bytes()? - expected[rank].bytes()?;
+                }
+            }
+            for rank in 0..2 {
+                let charge=|a:&Admission<'_>|a.placement.items[rank].iter().filter(|item|
+                    item.category==Category::Weights && (item.group=="layers" || item.group.starts_with("Kimi layer ")))
+                    .map(|item|item.bytes).sum::<u64>();
+                let baseline_same_placement=mixed.placement.layers.iter().enumerate().map(|(layer,assignment)|
+                    LayerLayout::pair(&cfg,layer,assignment.mode).unwrap()[rank].bytes().unwrap() as u64).sum::<u64>();
+                assert_eq!(baseline_same_placement-charge(&mixed),freed[rank] as u64);
+                assert!(freed[rank]>0);
+                if attention.is_some() {assert_eq!(charge(&original)-charge(&mixed),freed[rank] as u64);}
+            }
+            // BF16 KDA fallback is selected by the inventory, with no mode flag.
+            for rank in 0..2 {
+                assert_eq!(mixed.layouts[2][rank].attention_bytes()?,
+                    LayerLayout::pair(&cfg,2,LayerMode::HeadSplit)?[rank].attention_bytes()?);
+            }
+        }
         Ok(())
     }
 

@@ -103,7 +103,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
-    let admitted = admission::admit(admission::Inputs { cfg, gpus, devices: [options.devices[0], options.devices[1]],
+    let admitted = admission::admit(admission::Inputs { cfg, core: Default::default(), gpus, devices: [options.devices[0], options.devices[1]],
         peer_access: true, spark_ranks: 6, attention: None, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|

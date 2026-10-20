@@ -17,6 +17,12 @@ mod tests;
 pub struct KimiK3;
 pub static KIMI_K3: KimiK3 = KimiK3;
 
+/// The same validated header inventory used by planning, for native startup.
+/// This does not grant serving admission or convert any core weight format.
+pub fn core_inventory(checkpoint: &Checkpoint) -> Result<crate::families::kimi_k3::core::CoreInventory> {
+    Ok(Model::open(checkpoint)?.core)
+}
+
 const TEXT: &str = "language_model.model.";
 const HEAD: &str = "language_model.lm_head.";
 const GIB: u64 = 1 << 30;

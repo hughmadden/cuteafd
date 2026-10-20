@@ -256,6 +256,8 @@ impl LayerLayout {
         Ok(pair)
     }
 
+    pub(crate) fn core_layouts(&self) -> impl Iterator<Item=&CoreWeightLayout> { self.core.values() }
+
     fn projection(&mut self, name: &'static str, stem: &str, shape: [usize; 2], side: TrellisSide,
         rank: usize, ranks: usize, inventory: &CoreInventory) -> Result<()> {
         if let Some(projection) = inventory.get_weight(stem) {
@@ -525,6 +527,11 @@ impl<'a> LayerWeights<'a> {
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
         Ok(self.operands.get(name).with_context(|| format!("Kimi layer has no resident operand {name}"))?.buffer)
     }
+
+    pub(crate) fn core(&self,name:&str)->Result<&CoreWeights<'a>> {
+        self.core.get(name).with_context(||format!("Kimi layer has no resident K6 projection {name}"))
+    }
+    pub(crate) fn is_core(&self,name:&str)->bool { self.core.contains_key(name) }
 
     pub(crate) fn kda(&self) -> Result<KimiKdaWeights> {
         ensure!(self.attention == AttentionShare::Split, "Kimi KDA weights are not TP2 split");

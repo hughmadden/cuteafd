@@ -626,7 +626,7 @@ mod tests {
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots)?;
-        let admitted = admission::admit(admission::Inputs { cfg: &cfg, gpus: [GpuBudget {
+        let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(), gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,

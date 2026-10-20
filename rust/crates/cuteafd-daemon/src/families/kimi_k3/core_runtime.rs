@@ -13,6 +13,7 @@ use std::ffi::c_void;
 
 /// All mutable projection storage is private to a serialized execution lane.
 /// Weight storage is separate and may be shared by lanes on the same device.
+#[derive(Debug,Clone,PartialEq,Eq)]
 pub(crate) struct ProjectionLayout { extents:BTreeMap<&'static str,usize>, rows:usize }
 impl ProjectionLayout {
     pub(crate) fn new(program:&DenseTrellisDispatch<'_>,rows:usize)->Result<Self> {
@@ -26,6 +27,13 @@ impl ProjectionLayout {
             extents.insert("chunk output",multiply(rows,multiply(p.chunk_columns,4)?)?);
         }
         Ok(Self{extents,rows})
+    }
+    fn merge(&mut self,other:&Self)->Result<()> {
+        ensure!(self.rows==other.rows,"K6 scratch row capacities differ");
+        for (&name,&bytes) in &other.extents {
+            self.extents.entry(name).and_modify(|value|*value=(*value).max(bytes)).or_insert(bytes);
+        }
+        self.bytes()?;Ok(())
     }
     pub(crate) fn bytes(&self)->Result<usize> {
         self.extents.values().try_fold(0usize,|sum,&v|sum.checked_add(v).ok_or_else(||anyhow::anyhow!("K6 scratch sum overflow")))
@@ -59,6 +67,11 @@ impl<'a> Projection<'a> {
     pub(crate) fn load(programs:&'a Programs<'a>,shape:&str,book:&str,rows:usize,output:TrellisDType)->Result<Self> {
         let policy=DenseTrellisPolicy::from_package(programs,shape,book)?;
         Ok(Self{program:DenseTrellisDispatch::load(programs,policy,rows,output)?})
+    }
+    pub(crate) fn load_geometry(programs:&'a Programs<'a>,input:usize,output:usize,side:usize,book:&str,
+        rows:usize,dtype:TrellisDType)->Result<Self> {
+        let policy=DenseTrellisPolicy::from_package_geometry(programs,input,output,side,book)?;
+        Ok(Self{program:DenseTrellisDispatch::load(programs,policy,rows,dtype)?})
     }
     pub(crate) fn core(&self,rows:usize,input:Buffer,weights:&CoreWeights<'_>,scratch:&ProjectionScratch<'_>,
         stream:*mut c_void)->Result<Buffer> {
@@ -126,4 +139,85 @@ pub(crate) fn ffn_projected(gate:Projected<'_,'_>,up:Projected<'_,'_>,down:Proje
     copy.interleave_bf16(gate_up,gate_output,up_output,rows,width,stream)?;
     situ.launch(rows,gate_up,activated,stream)?;
     down.projection.core(rows,activated,down.weights,down.scratch,stream)
+}
+
+/// Resolve both possible MLA ownership geometries before placement samples CUDA.
+/// Serialized projections reuse one lane-private scratch set, never one set per
+/// layer. Their BF16 outputs remain distinct until the downstream core consumes them.
+pub(crate) struct CorePrograms<'a> {
+    projections:BTreeMap<(usize,usize,usize,String),Projection<'a>>,
+    pub layout:ProjectionLayout,
+    pub kda:[KimiKdaCore<'a>;2],
+    pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
+    pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,pub add:F32Add<'a>,
+}
+impl<'a> CorePrograms<'a> {
+    pub(crate) fn load(programs:&'a Programs<'a>,cfg:&cuteafd_loader::families::kimi_k3::config::KimiK3Config,
+        inventory:&cuteafd_loader::families::kimi_k3::core::CoreInventory,rows:usize)->Result<Option<Self>> {
+        use cuteafd_loader::placement::{LayerMode,FfnMode};
+        inventory.validate_runtime_groups(cfg)?;
+        if inventory.projections.is_empty() {return Ok(None);}
+        let mut projections=BTreeMap::new();
+        let mut layout:Option<ProjectionLayout>=None;
+        for layer in 0..cfg.layers {
+            let modes=if cfg.attention[layer]==cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla {
+                vec![LayerMode::HeadSplit,LayerMode::Whole{gpu:0,ffn:FfnMode::Split}]
+            } else {vec![LayerMode::HeadSplit]};
+            for mode in modes {
+                for rank in super::weights::LayerLayout::pair_with_core(cfg,layer,mode,inventory)? {
+                    for weight in rank.core_layouts() {
+                        let key=projection_key(weight.shape,weight.side,weight.codebook);
+                        if projections.contains_key(&key) {continue;}
+                        let projection=Projection::load_geometry(programs,key.0,key.1,key.2,&key.3,rows,TrellisDType::Bf16)?;
+                        let required=ProjectionLayout::new(&projection.program,rows)?;
+                        if let Some(layout)=&mut layout {layout.merge(&required)?;} else {layout=Some(required);}
+                        projections.insert(key,projection);
+                    }
+                }
+            }
+        }
+        let Some(layout)=layout else {anyhow::bail!("Kimi K6 inventory has no bound layer projections");};
+        let kda=[KimiKdaCore::load(programs,"kda_core_h48_m64",64,true)?,
+            KimiKdaCore::load(programs,"kda_core_h48_m4096",4096,false)?];
+        let mut mla=BTreeMap::new();
+        for heads in [48,96] {for stride in [576,640] {for capacity in [64,4096] {
+            let names=[format!("mla_rank_norm_h{heads}_kv{stride}_m{capacity}"),
+                format!("mla_query_h{heads}_m{capacity}"),format!("mla_gate_output_h{heads}_m{capacity}")];
+            mla.insert((heads,stride,capacity),KimiMlaSplit::load(programs,
+                [&names[0],&names[1],&names[2]],heads,capacity,stride)?);
+        }}}
+        Ok(Some(Self{projections,layout,kda,mla,situ:KimiSitu::load(programs,3072)?,
+            copy:programs.library().v41_peer_copy()?,add:programs.library().f32_add()?}))
+    }
+    pub(crate) fn projection(&self,weights:&CoreWeights<'_>)->Result<&Projection<'a>> {
+        self.projections.get(&projection_key(weights.shape,weights.side,weights.codebook))
+            .ok_or_else(||anyhow::anyhow!("Kimi K6 weight geometry not resolved before admission"))
+    }
+    pub(crate) fn projected<'b>(&'b self,weights:&'b CoreWeights<'a>,scratch:&'b ProjectionScratch<'a>)->Result<Projected<'a,'b>> {
+        Ok(Projected{projection:self.projection(weights)?,weights,scratch})
+    }
+}
+fn projection_key(shape:[usize;2],side:cuteafd_loader::formats::dense_trellis::TrellisSide,
+    book:cuteafd_loader::formats::exl3_storage::Exl3Codebook)->(usize,usize,usize,String) {
+    (shape[1],shape[0],match side {cuteafd_loader::formats::dense_trellis::TrellisSide::Output=>1,
+        cuteafd_loader::formats::dense_trellis::TrellisSide::Input=>2},
+        match book {cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg=>"mcg",
+            cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mul1=>"mul1"}.into())
+}
+
+#[cfg(test)]
+mod runtime_layout_tests {
+    use super::*;
+    #[test]
+    fn serialized_projections_charge_memberwise_high_water_not_per_layer_sum()->Result<()> {
+        let mut shared=ProjectionLayout{rows:64,extents:BTreeMap::from([("rotated",256),("partial",4096),
+            ("table",8),("accumulator",512)])};
+        let other=ProjectionLayout{rows:64,extents:BTreeMap::from([("rotated",512),("partial",2048),
+            ("table",8),("accumulator",1024),("chunk weights",8192)])};
+        shared.merge(&other)?;
+        assert_eq!(shared.bytes()?,512+4096+8+1024+8192);
+        let once=shared.clone();shared.merge(&other)?;assert_eq!(shared,once);
+        assert!(shared.merge(&ProjectionLayout{rows:63,..other}).is_err());
+        Ok(())
+    }
 }

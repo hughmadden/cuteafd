@@ -113,6 +113,35 @@ impl CoreInventory {
         Ok(inventory)
     }
 
+    /// The current projected engine admits complete operator groups only. The
+    /// quantizer's KDA fallback keeps all five projections BF16, preserving the
+    /// original fused path; partial groups require independently exported BF16
+    /// partner projections and are deliberately not admitted.
+    pub fn validate_runtime_groups(&self,cfg:&KimiK3Config)->Result<()> {
+        for layer in 0..cfg.layers {
+            let root=format!("language_model.model.layers.{layer}");
+            let attention:&[&str]=match cfg.attention[layer] {
+                super::config::KimiAttention::Kda=>&["q_proj","k_proj","v_proj","g_proj","o_proj"],
+                super::config::KimiAttention::Mla=>&["q_a_proj","kv_a_proj_with_mqa","q_b_proj","g_proj","o_proj"],
+            };
+            self.complete_group("attention",attention.iter().map(|leaf|format!("{root}.self_attn.{leaf}")))?;
+            if !cfg.dense[layer] {
+                self.complete_group("shared FFN",["gate_proj","up_proj","down_proj"].iter()
+                    .map(|leaf|format!("{root}.block_sparse_moe.shared_experts.{leaf}")))?;
+                self.complete_group("latent",["routed_expert_down_proj","routed_expert_up_proj"].iter()
+                    .map(|leaf|format!("{root}.block_sparse_moe.{leaf}")))?;
+            }
+        }
+        Ok(())
+    }
+    fn complete_group(&self,group:&str,stems:impl IntoIterator<Item=String>)->Result<()> {
+        let (native,bf16):(Vec<_>,Vec<_>)=stems.into_iter().partition(|stem|self.get_weight(stem).is_some());
+        ensure!(native.is_empty() || bf16.is_empty(),
+            "Kimi {group} mixes per-tensor K6/BF16 storage; only whole-group fallback is supported; K6: {}; BF16: {}",
+            native.join(", "),bf16.join(", "));
+        Ok(())
+    }
+
     pub fn get_weight(&self, weight: &str) -> Option<&CoreProjection> {
         self.projections.get(weight.strip_suffix(".weight").unwrap_or(weight))
     }
@@ -133,6 +162,36 @@ mod tests {
         for stem in ["language_model.model.embed_tokens", "language_model.model.norm", "vision_tower.proj", "mm_projector.proj"] {
             assert_eq!(split(stem), None);
         }
+    }
+
+    #[test]
+    fn runtime_groups_allow_bf16_kda_fallback_but_name_partial_groups() -> Result<()> {
+        let cfg=KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config())?;
+        let mut core=CoreInventory::default();
+        core.validate_runtime_groups(&cfg)?;
+        let mut add=|leaf:&str| {
+            let stem=format!("language_model.model.layers.1.{leaf}");
+            core.projections.insert(stem.clone(),CoreProjection {stem:stem.clone(),bits:6,
+                codebook:crate::formats::exl3_storage::Exl3Codebook::Mcg,shape:[128,128],stored_outputs:128,
+                split:split(&stem).unwrap(),source_bytes:0});
+        };
+        for leaf in ["gate_proj","up_proj","down_proj"] {add(&format!("block_sparse_moe.shared_experts.{leaf}"));}
+        // No KDA projections selected: the unchanged fused BF16 attention is valid.
+        core.validate_runtime_groups(&cfg)?;
+        for (layer,leaves) in [(1,vec!["self_attn.q_proj"]),
+            (3,vec!["self_attn.q_a_proj"]),
+            (2,vec!["block_sparse_moe.shared_experts.gate_proj"]),
+            (2,vec!["block_sparse_moe.routed_expert_down_proj"])] {
+            let mut partial=core.clone();
+            let stem=format!("language_model.model.layers.{layer}.{}",leaves[0]);
+            partial.projections.insert(stem.clone(),CoreProjection {stem:stem.clone(),bits:6,
+                codebook:crate::formats::exl3_storage::Exl3Codebook::Mcg,shape:[128,128],stored_outputs:128,
+                split:split(&stem).unwrap(),source_bytes:0});
+            let error=partial.validate_runtime_groups(&cfg).unwrap_err().to_string();
+            assert!(error.contains("only whole-group fallback") && error.contains(&stem)
+                && error.contains("BF16:"),"{error}");
+        }
+        Ok(())
     }
 
     #[test]
