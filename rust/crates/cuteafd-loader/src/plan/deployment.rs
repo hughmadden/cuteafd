@@ -102,7 +102,8 @@ impl<'a> DeploymentSpec<'a> {
 
     pub fn from_exlr8(native: &'a super::exlr8::NativePlan, options: &'a DeploymentOptions) -> Result<Self> {
         ensure!((1..=2).contains(&options.rtx_gpus) && options.spark_tp.is_none() && options.spark_ep.is_none()
-            && options.speculator == "off", "EXLR8 deployment requires one or two RTX GPUs, canonical Spark wire and no speculator");
+            && matches!(options.speculator.as_str(), "off" | "dflash2"),
+            "EXLR8 deployment requires one or two RTX GPUs, canonical Spark wire and off or dflash2 speculation");
         Self::build(&native.report, options, Some(native))
     }
 
@@ -261,6 +262,8 @@ mod tests {
             assert_eq!(value["rtx_gpus"], gpus);
         }
         options.rtx_gpus = 1;
+        options.speculator = "dflash2".into();
+        assert!(DeploymentSpec::from_exlr8(&native, &options).is_ok());
         options.spark_tp = Some(4);
         options.spark_ep = Some(1);
         assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());

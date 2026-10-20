@@ -60,6 +60,36 @@ def exlr8_entry(manifest: str = "up1", **overrides: str) -> dict:
     return entry
 
 
+@pytest.mark.parametrize("speculator", ["dflash2", "off", "unset"])
+def test_exlr8_uses_glm_drafter_default_and_explicit_opt_out(speculator: str, tmp_path: Path) -> None:
+    entry = exlr8_entry()
+    launcher = None
+    if speculator == "unset":
+        launcher = tmp_path / "run-family.sh"
+        source = ROOT / "scripts/launch/run-family.sh"
+        # The release fixture has explicit settings; remove both before resolution.
+        launcher.write_text(source.read_text().replace(
+            'exlr8_manifest="$(get EXLR8_MANIFEST)"',
+            'unset \'cfg[SPECULATOR]\' \'cfg[SPECULATOR_MODEL_ID]\'\n'
+            'exlr8_manifest="$(get EXLR8_MANIFEST)"'))
+    else:
+        entry["set"]["SPECULATOR"] = speculator
+    result = capture(ROOT, f"exlr8-{speculator}", release_entry=entry, launcher_source=launcher)
+    plan = result["plans"][0]
+    selected = "off" if speculator == "off" else "dflash2"
+    assert plan[plan.index("--speculator") + 1] == selected
+    for run in result["containers"]:
+        command = parse_run(run["argv"])["command"]
+        if "serve-glm" in command:
+            assert ("--draft" in command) == (selected == "dflash2")
+            if selected == "dflash2":
+                assert "models--incoai--GLM-5.3-DFlash2/snapshots/" in command[command.index("--draft") + 1]
+            assert "--exlr8-dense-from" in command
+        else:
+            assert "expertd-native" in command
+            assert "--draft" not in command
+
+
 @pytest.mark.parametrize("manifest", ["up1", "bit325"])
 def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: str) -> None:
     result = capture(ROOT, f"exlr8-{manifest}", release_entry=exlr8_entry(manifest))
@@ -120,7 +150,7 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
     ({"RTX_GPUS": "1"}, "heads attention"),
     ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
     ({"SPARK_COUNT": "7"}, "canonical Spark ranks"),
-    ({"SPECULATOR": "dflash2"}, "SPECULATOR=off"),
+    ({"SPECULATOR": "mtp"}, "SPECULATOR=off or dflash2"),
     ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),
     ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),
 ])

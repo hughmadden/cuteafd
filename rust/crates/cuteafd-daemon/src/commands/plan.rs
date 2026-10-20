@@ -189,6 +189,8 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             anyhow::ensure!(args.spark_tp.is_none() && args.spark_ep.is_none(),
                 "EXLR8 requires canonical Spark wire, not explicit ownership topology");
             let dense = dense.as_deref().context("EXLR8 native layout requires --exlr8-dense-from")?;
+            let cfg = launch_config(args.config.as_deref())?;
+            resolve_speculator(&mut args, &snapshot, "glm5", &cfg)?;
             let mut native_options = options.clone();
             native_options.placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
             let native = cuteafd_loader::plan::exlr8::native_plan(&snapshot,
@@ -695,6 +697,42 @@ mod tests {
     use super::*;
     use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors,
         write_snapshot};
+
+    #[test]
+    fn exlr8_native_cli_resolves_default_config_and_opt_out_before_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let experts = dir.path().join("experts");
+        std::fs::create_dir(&experts).unwrap();
+        let header = br#"{"__metadata__":{"format":"exlr8-v2"}}"#;
+        let mut index = (header.len() as u64).to_le_bytes().to_vec();
+        index.extend_from_slice(header);
+        std::fs::write(experts.join("exlr8-layer-3.index.safetensors"), index).unwrap();
+        let config = dir.path().join("launch.config");
+        for (selected, configured, no_speculator, include_speculator, expected) in [
+            ("auto", None, false, false, "EXLR8 requires GPU embedding"),
+            ("off", None, false, false, "EXLR8 requires GPU embedding"),
+            ("auto", Some("off"), false, false, "EXLR8 requires GPU embedding"),
+            ("auto", Some("mtp"), false, false, "SPECULATOR=mtp does not apply to glm5"),
+            ("dflash2", Some("mtp"), false, false, "EXLR8 requires GPU embedding"),
+            ("auto", Some("mtp"), true, false, "EXLR8 requires GPU embedding"),
+            ("auto", None, true, true, "--no-speculator conflicts with --include-speculator"),
+        ] {
+            let mut request = args(dir.path(), 4, false);
+            request.exlr8_manifest = Some("up1".into());
+            request.exlr8_dense_from = Some(dir.path().display().to_string());
+            // Stop before checkpoint payload validation after speculator admission succeeds.
+            request.embedding_placement = Some(crate::shared::token_io::EmbedPlacement::Host);
+            request.speculator = selected.into();
+            request.no_speculator = no_speculator;
+            request.include_speculator = include_speculator;
+            if let Some(value) = configured {
+                std::fs::write(&config, format!("SPECULATOR={value}\n")).unwrap();
+                request.config = Some(config.clone());
+            }
+            let error = run_plan(request).unwrap_err().to_string();
+            assert!(error.contains(expected), "{selected}/{configured:?}/{no_speculator}: {error}");
+        }
+    }
 
     #[test]
     fn exlr8_mounted_cli_reports_fit_and_refuses_serving_modes() {

@@ -253,7 +253,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         return Err(PlacementError::Inventory("GLM rank/lane/step/context geometry"));
     }
     if inputs.native_experts && (inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
-        || !inputs.experts.is_empty() || inputs.drafter_bytes != 0 || inputs.scratch.is_none()
+        || !inputs.experts.is_empty() || inputs.scratch.is_none()
         || inputs.native_workspace == 0) {
         return Err(PlacementError::Inventory("EXLR8 requires measured workspaces, real Spark experts and 1..=6 ranks"));
     }
@@ -933,6 +933,16 @@ mod tests {
             let endpoints = 1 + if lanes > 1 { lanes } else { 0 };
             assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"),
                 endpoints * 4 * 4096 * h * 2);
+        }
+        for gpus in 1..=2 {
+            let mut drafting = native.clone();
+            drafting.gpus = vec![drafting.gpus[0]; gpus];
+            drafting.drafter_bytes = 3 * GIB;
+            drafting.drafter_staging = GIB;
+            let request = request(&drafting).unwrap();
+            assert_eq!(request.movables.len(), 1);
+            assert_eq!(request.startup.len(), 1);
+            assert_eq!(request.startup[0].bytes, 4 * GIB);
         }
         let mut invalid = native.clone(); invalid.native_workspace = u64::MAX;
         assert!(matches!(request(&invalid), Err(PlacementError::Overflow(_))));

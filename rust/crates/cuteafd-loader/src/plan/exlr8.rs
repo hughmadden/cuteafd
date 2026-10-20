@@ -80,8 +80,10 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
         ExpertPlacement::Sparks { ranks } if (1..=6).contains(&ranks) => ranks,
         _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=6 ranks"),
     };
-    ensure!(speculator == "off", "EXLR8 native deployment requires --speculator off");
-    let layout = options.layout.as_ref().context("EXLR8 native deployment requires --layout")?;
+    ensure!(matches!(speculator, "off" | "dflash2"), "EXLR8 native deployment supports off or dflash2 speculation");
+    let mut resolved_layout = options.layout.clone().context("EXLR8 native deployment requires --layout")?;
+    resolved_layout.glm5_drafter_disabled = speculator == "off";
+    let layout = &resolved_layout;
     let gpu_count = layout.rtx_bytes.len();
     ensure!((1..=2).contains(&gpu_count), "EXLR8 native deployment requires 1..=2 RTX GPUs");
     let attention = if gpu_count == 2 { crate::placement::AttentionPlacement::Context }
@@ -91,7 +93,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     ensure!(layout.local_expert_layers.is_none_or(|n| n == 0)
         && layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
         "EXLR8 native deployment cannot onboard routed experts");
-    ensure!(!layout.host_embedding && layout.drafter_bytes == 0, "EXLR8 requires GPU embedding and no drafter");
+    ensure!(!layout.host_embedding, "EXLR8 requires GPU embedding");
     validate_dense_source(snapshot, dense)?;
     let checkpoint = super::Checkpoint::coordinator(dense, false, false)?;
     ensure!(checkpoint.config["quantization_config"]["quant_method"] == "fp8"
@@ -1126,7 +1128,8 @@ mod tests {
             .err().unwrap().to_string();
         assert!(!error(&options,"up1","off").contains("rotation"));
         assert!(error(&options,"other","off").contains("manifest"));
-        assert!(error(&options,"up1","dflash2").contains("speculator off"));
+        assert!(!error(&options,"up1","dflash2").contains("speculation"));
+        assert!(error(&options,"up1","mtp").contains("off or dflash2"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:6 };
         assert!(!error(&options,"up1","off").contains("canonical Sparks"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:7 };
