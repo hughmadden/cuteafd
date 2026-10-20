@@ -311,6 +311,10 @@ mod runtime_layout_tests {
             for heads in [48,96] {
                 let suffix=if heads==48 {""}else{"_h96"};
                 program(format!("kimik3_mla_producer{suffix}_m{capacity}"),4096);
+                program(format!("kimik3_mla_output{suffix}_m{capacity}"),4096);
+                for mode in if capacity == 64 { &["decode", "verify"][..] } else { &["extend"][..] } {
+                    program(format!("kimik3_dense_mla_{mode}{suffix}_m{capacity}"),4096);
+                }
                 for stride in [576,640] {program(format!("mla_rank_norm_h{heads}_kv{stride}_m{capacity}"),2048);}
             }
         }
@@ -345,7 +349,12 @@ mod runtime_layout_tests {
                 assert_eq!(charged.stages,expected_stages);
                 let sum=charged.demands()?.iter().filter(|d|d.gpu==0).map(|d|d.bytes).sum::<u64>();
                 assert_eq!(sum,runtime.as_ref().map_or(Ok(0),|p|p.bytes())? as u64
-                    +expected_stages.values().sum::<usize>() as u64+charged.receive as u64);
+                    +charged.stage_bytes as u64+charged.receive as u64);
+                if on {
+                    let base = cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(&cfg, rows,
+                        1_048_576, cuteafd_loader::families::kimi_k3::allocation::NativeScratch::from_manifest(&manifest)?)?;
+                    assert_eq!(charged.stage_bytes, base.clone().with_core_stages(expected_stages)?.bytes()? - base.bytes()?);
+                }
             }
         }
         // A duplicate exact geometry is ambiguous, never selected by table order.

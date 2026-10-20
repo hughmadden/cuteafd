@@ -202,22 +202,29 @@ pub fn exchange_recv_bytes(rows: usize, f32: bool) -> Result<usize> {
 pub struct CoreCharges {
     pub projection: Option<ProjectionScratchLayout>,
     pub stages: BTreeMap<&'static str,usize>,
+    pub stage_bytes: usize,
     pub receive: usize,
 }
 impl CoreCharges {
     pub fn from_package(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
         manifest: &serde_json::Value) -> Result<Self> {
+        let stages = if core.projections.is_empty() { BTreeMap::new() } else { package_lane_extents(manifest,rows)? };
+        let stage_bytes = if stages.is_empty() { 0 } else {
+            let base = super::allocation::NativeLaneLayout::new(cfg, rows, super::COMPILED_CONTEXT,
+                super::allocation::NativeScratch::from_manifest(manifest)?)?;
+            base.clone().with_core_stages(stages.clone())?.bytes()?.checked_sub(base.bytes()?)
+                .context("Kimi core stage charge underflow")?
+        };
         Ok(Self {
             projection: projection_scratch(cfg,core,rows,&manifest["families"]["kimi_k6_dense"] )?,
-            stages: if core.projections.is_empty() {BTreeMap::new()}else{package_lane_extents(manifest,rows)?},
+            stages, stage_bytes,
             receive: exchange_recv_bytes(rows,needs_f32_partials(cfg,core))?,
         })
     }
     pub fn demands(&self) -> Result<Vec<crate::placement::Demand>> {
         use cuteafd_core::memory_layout::{Basis,Category};
         let projection=self.projection.as_ref().map_or(Ok(0),|layout|layout.bytes())?;
-        let stages=self.stages.values().try_fold(0usize,|sum,bytes|sum.checked_add(*bytes))
-            .context("K6 stage scratch overflow")?;
+        let stages=self.stage_bytes;
         Ok((0..2).flat_map(|gpu|[
             crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 projection scratch",projection as u64,Basis::Exact),
             crate::placement::Demand::new(gpu,Category::Workspace,"Kimi K6 split-stage operands",stages as u64,Basis::Exact),

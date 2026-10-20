@@ -178,7 +178,7 @@ impl<'a> NativePrograms<'a> {
             let mla=core.mla.values().map(|p|p.scratch_bytes()).max().unwrap_or(0);
             let stages = cuteafd_loader::families::kimi_k3::core::lane_extents(rows,
                 layout.operands["KDA scratch"],layout.operands["MLA producer scratch"],kda,mla)?;
-            layout.operands.extend(stages);
+            layout.base = layout.base.with_core_stages(stages)?;
             layout.bytes()?;
         }
         Ok(layout)
@@ -1594,6 +1594,154 @@ mod tests {
         assert!(!operators.contains("Stream::new"));
         assert!(!operators.contains("peer.stream"));
         assert!(operators.contains("self.lane.stream.raw"));
+        Ok(())
+    }
+
+    #[test]
+    fn core_stage_arena_preserves_bf16_offsets_and_full_prefill_capacity() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::{allocation::CORE_MEET_PLANES, core::lane_extents};
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        // Installed-package peaks; the split KDA recurrence is larger than fused.
+        let scratch = NativeScratch { kda: 629_464_064,
+            mla: [168_296_448, 101_056_512, 201_326_592] };
+        for rows in [1, 4, 16, 63, 64, 4096] {
+            for larger in [false, true] {
+                let split = if larger { 630_905_856 } else { scratch.kda };
+                let stages = lane_extents(rows, scratch.kda, scratch.mla[0], split, 0)?;
+                let base = LaneLayout::new(&cfg, rows, 1_048_576, scratch)?;
+                let shared = base.base.clone().with_core_stages(stages.clone())?;
+                for (&name, &offset) in &base.arena_offsets {
+                    assert_eq!(shared.arena_offsets[name], offset, "BF16 offset {name}");
+                }
+                assert_eq!(shared.rows, rows);
+                for name in CORE_MEET_PLANES {
+                    assert!(!shared.arena_offsets.contains_key(name));
+                    assert_eq!(shared.operands[name], rows * 7168 * 4);
+                }
+                for phase in shared.core_phases() {
+                    for (i, &a) in phase.iter().enumerate() {
+                        let start = shared.arena_offsets[a];
+                        assert_eq!(start % ARENA_ALIGNMENT, 0);
+                        assert!(start + shared.operands[a] <= shared.arena_bytes);
+                        for &b in &phase[..i] {
+                            assert!(start + shared.operands[a] <= shared.arena_offsets[b]
+                                || shared.arena_offsets[b] + shared.operands[b] <= start,
+                                "live overlap {a} / {b}");
+                        }
+                    }
+                }
+                if rows == 4096 && larger {
+                    assert_eq!(base.arena_bytes, 1_340_473_344);
+                    assert_eq!(shared.arena_bytes, base.arena_bytes);
+                    let old = stages.values().sum::<usize>();
+                    let added = shared.bytes()? - base.bytes()?;
+                    assert_eq!(old, 1_554_701_312);
+                    assert_eq!(added, 352_321_536);
+                    assert_eq!(old - added, 1_202_379_776);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn captured_core_phases_require_lane_order_and_fenced_peer_meets() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::{allocation::CORE_MEET_PLANES, core::lane_extents};
+        struct Schedule<'a> {
+            layout: &'a cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout,
+            clocks: [[usize; 2]; 2],
+            uses: Vec<(&'static str, [usize; 2])>,
+        }
+        impl Schedule<'_> {
+            fn overlap(&self, a: &str, b: &str) -> bool {
+                match (self.layout.arena_offsets.get(a), self.layout.arena_offsets.get(b)) {
+                    (Some(&a0), Some(&b0)) => a0 < b0 + self.layout.operands[b]
+                        && b0 < a0 + self.layout.operands[a],
+                    (None, None) => a == b,
+                    _ => false,
+                }
+            }
+            fn kernel(&mut self, stream: usize, operands: &[&'static str]) -> Result<()> {
+                self.clocks[stream][stream] += 1;
+                let clock = self.clocks[stream];
+                for &(prior, finished) in &self.uses {
+                    let ordered = finished.iter().zip(clock).all(|(&a, b)| a <= b);
+                    for &next in operands {
+                        ensure!(ordered || !self.overlap(prior, next),
+                            "unfenced captured reuse {prior} -> {next}");
+                    }
+                }
+                self.uses.extend(operands.iter().map(|&name| (name, clock)));
+                Ok(())
+            }
+            fn wait(&mut self, stream: usize, event: [usize; 2]) {
+                for (clock, finished) in self.clocks[stream].iter_mut().zip(event) {
+                    *clock = (*clock).max(finished);
+                }
+            }
+            fn meet(&mut self, partial: &'static str) -> Result<()> {
+                // Protocol::producers joins the exact lane before peer.push;
+                // Protocol::consumer joins reduction before the next lane node.
+                self.kernel(0, &[partial])?;
+                self.wait(1, self.clocks[0]);
+                self.kernel(1, &[partial, "K6 reduced"])?;
+                self.wait(0, self.clocks[1]);
+                Ok(())
+            }
+        }
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        for rows in [1, 4, 16, 64, 4096] {
+            let scratch = NativeScratch { kda: 629_464_064,
+                mla: [168_296_448, 101_056_512, 201_326_592] };
+            let layout = LaneLayout::new(&cfg, rows, 1_048_576, scratch)?.base.with_core_stages(
+                lane_extents(rows, scratch.kda, scratch.mla[0], 630_905_856, 0)?)?;
+            let phases = layout.core_phases();
+            let make = || Schedule { layout: &layout, clocks: [[0; 2]; 2], uses: Vec::new() };
+            let mut captured = make();
+            for layer in 0..cfg.layers {
+                // Mixed checkpoints retain fused BF16 captures between K6 ones.
+                if layer % 2 == 0 {
+                    let phase = usize::from(cfg.attention[layer]
+                        == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla);
+                    captured.kernel(0, SCRATCH_PHASES[phase])?;
+                } else {
+                    let range = if cfg.attention[layer]
+                        == cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda { 0..3 } else { 3..7 };
+                    for phase in &phases[range] { captured.kernel(0, phase)?; }
+                    captured.meet("K6 attention partial")?;
+                }
+                for phase in &phases[7..] { captured.kernel(0, phase)?; }
+                captured.meet("K6 FFN partial")?;
+            }
+            for phase in &phases {
+                let mut missing_producer = make();
+                missing_producer.kernel(0, phase)?;
+                assert!(missing_producer.kernel(1, phase).is_err());
+                missing_producer.wait(1, missing_producer.clocks[0]);
+                missing_producer.kernel(1, phase)?;
+                // An exchange-stream reader extends the phase lifetime until
+                // its consumer event is joined, not merely host-enqueued.
+                assert!(missing_producer.kernel(0, phase).is_err());
+                missing_producer.wait(0, missing_producer.clocks[1]);
+                missing_producer.kernel(0, phase)?;
+            }
+            let mut parallel = make();
+            parallel.kernel(1, &CORE_MEET_PLANES)?;
+            for phase in &phases { parallel.kernel(0, phase)?; }
+        }
+        // The captured helper functions propagate the caller's lane stream;
+        // exchange reduction touches only the retained, non-arena meet planes.
+        let source = include_str!("core_runtime.rs").split("#[cfg(test)]").next().unwrap();
+        let projected = source.split("pub(crate) fn kda_projected").nth(1).unwrap()
+            .split("pub(crate) struct CorePrograms").next().unwrap();
+        assert!(!projected.contains("Stream::new") && !projected.contains("peer.stream"));
+        assert!(projected.contains("core.launch(weights,batch,stream)"));
+        assert!(projected.contains("situ.launch(rows,gate_up,activated,stream)"));
+        let layers = include_str!("layers.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(layers.contains("cuda_stream_wait_event"));
+        let bindings = include_str!("layers.rs").split("fn meet_core").nth(1).unwrap()
+            .split("fn transfer").next().unwrap();
+        assert!(bindings.contains("self.protocol.consumer(self.lane,rank)?"));
         Ok(())
     }
 

@@ -44,6 +44,22 @@ pub const SCRATCH_PHASES: [&[&str]; 3] = [
         "MLA producer scratch", "MLA attention scratch", "MLA output scratch"],
     &["gate-up", "activated"],
 ];
+/// Live operands at consecutive rank-local kernel boundaries. Projection scratch
+/// is a separate owner; all these phases execute on the captured lane stream.
+pub const CORE_PHASES: &[&[&str]] = &[
+    &["K6 q", "K6 k", "K6 v", "K6 gate"],
+    &["K6 q", "K6 k", "K6 v", "K6 gate", "K6 normalized", "K6 KDA scratch"],
+    &["K6 normalized"],
+    &["K6 q_a", "K6 kv_a", "MLA q residual", "K6 MLA scratch"],
+    &["K6 q_b", "MLA q residual", "MLA query"],
+    &["MLA query", "MLA attention", "MLA LSE", "MLA attention scratch"],
+    &["MLA attention", "K6 gate", "K6 normalized"],
+    &["K6 FFN gate", "K6 FFN up"],
+    &["K6 FFN gate", "K6 FFN up", "gate-up"],
+    &["gate-up", "activated"],
+    &["activated"],
+];
+pub const CORE_MEET_PLANES: [&str; 3] = ["K6 attention partial", "K6 FFN partial", "K6 reduced"];
 pub const ARENA_ALIGNMENT: usize = 1024;
 
 impl NativeLaneLayout {
@@ -106,6 +122,56 @@ impl NativeLaneLayout {
         let layout = Self { rows, max_context, operands, arena_offsets, arena_bytes };
         layout.bytes()?;
         Ok(layout)
+    }
+
+    /// Preserve every BF16 offset. Place transient K6 operands into holes whose
+    /// previous reader has completed on the same lane stream. Peer meet outputs
+    /// remain separate allocations because the exchange stream reads them.
+    pub fn with_core_stages(mut self, stages: BTreeMap<&'static str, usize>) -> Result<Self> {
+        let mut transient = stages.iter().filter(|(name, _)| !CORE_MEET_PLANES.contains(name))
+            .map(|(&name, &bytes)| (name, bytes)).collect::<Vec<_>>();
+        transient.sort_by_key(|&(name, bytes)| (std::cmp::Reverse(bytes), name));
+        ensure!(stages.keys().all(|name| !self.operands.contains_key(name)), "duplicate Kimi core arena operand");
+        self.operands.extend(stages);
+        let phases = self.core_phases();
+        for (name, bytes) in transient {
+            let conflicts = phases.iter().map(Vec::as_slice).chain(SCRATCH_PHASES)
+                .filter(|phase| phase.contains(&name)).flat_map(|phase| phase.iter().copied())
+                .filter(|other| *other != name && self.arena_offsets.contains_key(other))
+                .collect::<std::collections::BTreeSet<_>>();
+            ensure!(CORE_PHASES.iter().any(|phase| phase.contains(&name)), "Kimi stage lacks a live phase: {name}");
+            let mut candidates = vec![0];
+            for other in &conflicts {
+                candidates.push(self.arena_offsets[other].checked_add(self.operands[other])
+                    .context("Kimi core arena candidate overflow")?);
+            }
+            candidates.sort_unstable();
+            let mut selected = None;
+            for start in candidates {
+                let start = start.checked_add(ARENA_ALIGNMENT - 1)
+                    .map(|n| n / ARENA_ALIGNMENT * ARENA_ALIGNMENT).context("Kimi core arena alignment overflow")?;
+                let end = start.checked_add(bytes).context("Kimi core arena extent overflow")?;
+                if conflicts.iter().all(|other| end <= self.arena_offsets[other]
+                    || start >= self.arena_offsets[other] + self.operands[other]) {
+                    selected = Some((start, end)); break;
+                }
+            }
+            let (start, end) = selected.context("Kimi core arena placement absent")?;
+            self.arena_offsets.insert(name, start);
+            self.arena_bytes = self.arena_bytes.max(end);
+        }
+        self.bytes()?;
+        Ok(self)
+    }
+
+    /// Resolve optional larger split scratch to the fused scratch fallback used
+    /// by the runtime. Every listed operand is live through that kernel boundary.
+    pub fn core_phases(&self) -> Vec<Vec<&'static str>> {
+        CORE_PHASES.iter().map(|phase| phase.iter().map(|&name| match name {
+            "K6 KDA scratch" if !self.operands.contains_key(name) => "KDA scratch",
+            "K6 MLA scratch" if !self.operands.contains_key(name) => "MLA producer scratch",
+            _ => name,
+        }).collect()).collect()
     }
 
     pub fn bytes(&self) -> Result<usize> {
