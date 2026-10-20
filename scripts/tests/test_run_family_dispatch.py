@@ -426,9 +426,10 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     shared = (family.parent.parent / "shared/speculation/dflash.rs").read_text()
     update = shared.split("    pub(crate) fn update_with(", 1)[1].split("    fn put(", 1)[0]
     assert update.index("self.put(&self.context_positions") < update.index("ready()?")
-    assert update.index("self.put(&self.context_slots") < update.index("ready()?") < update.index("self.linear(")
+    assert "let DraftContext::Gqa(context) = &self.context" in update
+    assert update.index("self.put(&context.slots") < update.index("ready()?") < update.index("self.linear(")
     draft = shared.split("    fn draft_from(", 1)[1].split("let (s, l)", 1)[0]
-    assert "let attention = w.attention.gqa()?;" in draft
+    assert "if let AttentionWorkspace::Gqa(attention) = &w.attention" in draft
     for metadata in ("w.positions", "attention.tables", "w.anchors"):
         assert draft.index(f"self.put(&{metadata}") < draft.index("input(&ids, w.h.buffer")
     transport = remote.split("    pub fn update(", 1)[1].split("    pub fn put_taps(", 1)[0]

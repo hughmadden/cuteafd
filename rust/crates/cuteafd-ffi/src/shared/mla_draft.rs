@@ -74,6 +74,15 @@ impl<'a> MlaDraft<'a> {
     pub fn max_context(&self) -> usize { self.layout.context }
     pub fn splits(&self) -> usize { self.layout.splits }
 
+    /// Preflight an entire multi-layer/chunk operation before its first cache write.
+    pub fn check_produce(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
+        validate_producer(w, b, self.layout)
+    }
+
+    pub fn check_launch(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
+        validate_batch(w, b, self.layout)
+    }
+
     /// Context-only projection uses the same producer, without attention or
     /// output. The owner chunks taps to at most 64 rows and joins their producer.
     pub fn produce(&self, w: MlaDraftWeights, b: MlaDraftBatch, stream: *mut c_void) -> Result<()> {

@@ -3,7 +3,7 @@
 //! lower bound exposed by `plan` and does not admit Spark workers by itself.
 use super::{device::{IoLayout, TokenIo, Lane, LaneLayout, LocalLane, NativePrograms}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, PackedGlobal, LayerLayout, LayerWeights, PackedLayer}};
 use crate::shared::memory::device::{Device, DeviceOwner, Stream};
-use crate::shared::speculation::dflash::MlaDraftStorage;
+use crate::shared::speculation::dflash::DflashDrafter;
 use cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout;
 use std::rc::{Rc, Weak};
 use anyhow::{ensure, Context, Result};
@@ -123,13 +123,18 @@ pub(crate) struct LoadedWeights<'a> {
 /// The normal Spark lane consumes these selected layer IDs; selection still
 /// goes through shared `SparkAdmission` before any transport connects.
 impl<'a> Admission<'a> {
-    /// Arena prerequisite only: the typed shared branch must also load admitted
-    /// weights before target residency. No CLI currently supplies this layout.
-    #[allow(dead_code)]
-    pub(crate) fn allocate_draft(&mut self, device: Device<'a>)
-        -> Result<DeviceOwner<'a, MlaDraftStorage<'a>>> {
-        self.allocate_draft_with(device.id, |layout|
-            device.own(|| MlaDraftStorage::allocate(device.library, layout)))
+    /// Construct the final shared owner once, inside its admitted device scope.
+    /// Failed construction frees partial storage and never retries allocation.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn allocate_draft(&mut self, device: Device<'a>,
+        programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &std::path::Path,
+        file: Vec<u8>, stream: *mut std::ffi::c_void,
+        representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation,
+        scales: crate::shared::fp8_linear::Fp8Scales, rows: crate::shared::fp8_linear::Fp8Rows)
+        -> Result<DeviceOwner<'a, DflashDrafter<'a>>> {
+        self.allocate_draft_with(device.id, |layout| device.own(||
+            DflashDrafter::load_mla(device.library, programs, snapshot, file, stream, layout,
+                representation, scales, rows)))
     }
 
     fn check_draft(&self, device: i32) -> Result<&MlaDraftRuntimeLayout> {
