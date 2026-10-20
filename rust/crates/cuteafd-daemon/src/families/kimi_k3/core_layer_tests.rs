@@ -22,12 +22,26 @@ fn read(path:&Path,name:&str)->Result<LoadedTensor> {
         role:TensorRole::Other,layer_id:None,expert_id:None,is_quantization_metadata:false},source_path:path.into(),bytes,
         elapsed_micros:0,sha256:String::new()})
 }
+// Called only after errors() validates finite, nonempty vectors with nonzero reference.
+fn error_bias(actual:&[f64],reference:&[f64])->(Option<f64>,f64) {
+    let mut dot=0.;let mut error_squared=0.;let mut reference_squared=0.;
+    let mut signed=0.;let mut absolute_reference=0.;
+    for (&actual,&reference) in actual.iter().zip(reference) {
+        let error=actual-reference;
+        dot+=error*reference;error_squared+=error*error;reference_squared+=reference*reference;
+        signed+=error;absolute_reference+=reference.abs();
+    }
+    let cosine=if error_squared==0. {None}else{Some(dot/(error_squared*reference_squared).sqrt())};
+    (cosine,signed/absolute_reference)
+}
 struct Source {root:PathBuf,book:String,failures:std::cell::RefCell<Vec<String>>}
 impl Source {
     fn report(&self,label:&str,actual:&[f64],reference:&[f64])->Result<()> {
         let (relative,peak)=errors(actual,reference)?;
         let max_abs=actual.iter().zip(reference).map(|(a,b)|(a-b).abs()).fold(0.,f64::max);
-        let result=format!("book={} {label} rel_l2={relative} max_abs={max_abs} max_abs_over_peak={peak}",self.book);
+        let (cosine,signed)=error_bias(actual,reference);
+        let cosine=cosine.map_or_else(||"undefined".to_string(),|value|value.to_string());
+        let result=format!("book={} {label} rel_l2={relative} max_abs={max_abs} max_abs_over_peak={peak} error_ref_cosine={cosine} mean_signed_over_mean_abs_ref={signed}",self.book);
         eprintln!("K6 full-layer {result}");
         if relative>=0.004 || peak>=0.01 {self.failures.borrow_mut().push(result);}
         Ok(())
@@ -351,6 +365,19 @@ fn bf16_order_control_changes_only_product_sequence() {
     let dot=|a:&[u8],b:&[u8]|a.chunks_exact(2).zip(b.chunks_exact(2))
         .map(|(a,b)|u64::from(u16::from_le_bytes([a[0],a[1]]))*u64::from(u16::from_le_bytes([b[0],b[1]]))).sum::<u64>();
     assert_eq!(dot(&x,&w),dot(&reversed_x,&reversed_w));
+}
+
+#[test]
+fn error_bias_distinguishes_aligned_cancelled_and_zero_error() {
+    let aligned=error_bias(&[2.,4.],&[1.,2.]);
+    assert!((aligned.0.unwrap()-1.).abs()<1e-12);
+    assert_eq!(aligned.1,1.);
+    let cancelled=error_bias(&[2.,0.],&[1.,1.]);
+    assert_eq!(cancelled,(Some(0.),0.));
+    let negative=error_bias(&[0.,0.],&[1.,2.]);
+    assert!((negative.0.unwrap()+1.).abs()<1e-12);
+    assert_eq!(negative.1,-1.);
+    assert_eq!(error_bias(&[1.,2.],&[1.,2.]),(None,0.));
 }
 
 #[test]
