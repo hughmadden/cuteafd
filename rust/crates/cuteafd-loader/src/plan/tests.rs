@@ -3322,6 +3322,17 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
         assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency.max(8)
             + rank.speculative_replay_bytes);
     }
+    // At the default 2M pool cap the released arena becomes reported free headroom.
+    let mut capped = layout(96 << 30, 16);
+    capped.layout.as_mut().unwrap().pool_tokens = Some(2_097_152);
+    let legacy = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
+    capped.layout.as_mut().unwrap().host_cache_bytes = None;
+    let staged = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
+    let released = (34 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
+    assert_eq!((legacy.pool_tokens, staged.pool_tokens), (2_097_152, 2_097_152));
+    assert_eq!(marks(&legacy) - marks(&staged), released);
+    assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(), released as i64);
+    assert_eq!(released, 4_723_834_880);
     // An explicit arena (0: none) is taken as given.
     let mut none = layout(96 << 30, 16);
     none.layout.as_mut().unwrap().prefix_slots = Some(0);

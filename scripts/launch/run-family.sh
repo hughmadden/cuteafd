@@ -1829,12 +1829,12 @@ if [[ "$drafts" != adaptive ]]; then
 fi
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
-# snapshots the device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by
+# retention (auto by default, e.g. 64GiB explicitly; 0 = off). POOL_TOKENS: paged KV tokens shared by
 # live sequences and retained snapshots.
 case $family in
   mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
-    [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
+    [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
 if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
@@ -1847,7 +1847,6 @@ if [[ $family == mimo_v2 ]]; then
   [[ "$(get MIMO_SNAPSHOT_WAIT off)" != on ]] || family_args+=(--mimo-snapshot-wait)
   if [[ "$(get MIMO_HOST_CACHE off)" == on ]]; then
     family_args+=(--mimo-host-cache)
-    [[ -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
   fi
   [[ -z "$(get MIMO_PREFILL_CHUNK_S)" ]] || family_args+=(--prefill-chunk-s "$(get MIMO_PREFILL_CHUNK_S)")
   # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
@@ -2312,19 +2311,16 @@ if [[ $family == glm5_flash ]]; then
     *) echo "GLM5_FLASH_EXL3_SCHEDULE must be default or gb10" >&2; exit 2 ;;
   esac
   # GLM5_FLASH_PREFIX_MARKS: where prefix-cache snapshots keep their KDA state marks: unset or
-  # arena (the engine default: a 2C + 2 device arena beside the KV pool) or pool (units of the
-  # KV pool itself, evicted like any snapshot's rows, unit 0 reserved; no arena to reserve). Pool
-  # marks turn the pinned host tier on (HOST_CACHE_BYTES=auto) unless HOST_CACHE_BYTES is set (0
-  # keeps it off): snapshots the pool evicts move to RAM instead of being lost.
+  # arena (two staging marks with host retention, legacy counts with host off) or pool (units
+  # of the KV pool itself, unit 0 reserved; no separate arena). Both use the shared host default.
   prefix_marks="$(get GLM5_FLASH_PREFIX_MARKS)"
   case "$prefix_marks" in
     "") ;;
     arena|pool) family_args+=(--prefix-marks "$prefix_marks") ;;
     *) echo "GLM5_FLASH_PREFIX_MARKS must be arena or pool" >&2; exit 2 ;;
   esac
-  [[ "$prefix_marks" != pool || -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
   # PREFIX_CACHE_MARK_MIB: the device budget of the prefix mark arena, MiB (unset: serve-glmf's
-  # 2048), as for MiMo; the arena still holds at least two marks per sequence plus two.
+  # 2048), as for MiMo; the host-off legacy arena retains its per-sequence floor.
   [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   # GLM5_FLASH_REPLAY_RECORDS: auto shares when eligible; own keeps their
   # own 321 MB, 642 MB with GLM5_FLASH_DECODE_ROWS=128) or shared (the prefill lanes' scratch, which
