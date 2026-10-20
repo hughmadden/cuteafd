@@ -1045,7 +1045,7 @@ mod draft_tests {
     fn installed_reports(bytes: Option<[usize; 2]>, conservative: bool) -> Vec<InstalledExpertGrouping> {
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [6144, 256, 8, 2048, 78],
-            "world": 2, "topology": [2, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 2, "topology": [2, 1], "ownership_wire": false,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &(3..78).collect::<Vec<_>>()).unwrap();
         (0..2).map(|rank| {
