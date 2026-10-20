@@ -76,6 +76,131 @@ mod load_order_tests {
         Ok(())
     }
 
+    fn exlr8_fixture(root: &std::path::Path, layers: &[usize]) -> Result<()> {
+        use serde_json::json;
+        use std::io::Write;
+        fn write(path: &std::path::Path, metadata: serde_json::Value,
+            tensors: Vec<(String, &'static str, Vec<usize>, Vec<u8>)>) -> Result<Vec<usize>> {
+            let mut header = serde_json::Map::from_iter([("__metadata__".into(), metadata)]);
+            let mut offsets = vec![];
+            let mut end = 0;
+            for (name, dtype, shape, bytes) in &tensors {
+                offsets.push(end);
+                header.insert(name.clone(), json!({"dtype":dtype,"shape":shape,
+                    "data_offsets":[end,end+bytes.len()]}));
+                end += bytes.len();
+            }
+            let header = serde_json::to_vec(&header)?;
+            let mut file = std::fs::File::create(path)?;
+            file.write_all(&(header.len() as u64).to_le_bytes())?;
+            file.write_all(&header)?;
+            for (_, _, _, bytes) in tensors { file.write_all(&bytes)?; }
+            Ok(offsets.into_iter().map(|offset| offset + 8 + header.len()).collect())
+        }
+        std::fs::create_dir(root.join("experts"))?;
+        std::fs::create_dir(root.join("manifests"))?;
+        std::fs::write(root.join("config.json"), json!({
+            "architectures":["GlmMoeDsaForCausalLM"],"hidden_size":128,
+            "moe_intermediate_size":384,"n_routed_experts":2,
+            "num_hidden_layers":layers.iter().max().unwrap()+1,"first_k_dense_replace":3
+        }).to_string())?;
+        let mut choices = serde_json::Map::new();
+        for &layer in layers {
+            choices.insert(layer.to_string(), json!({"gate":[[2,3,4],[4,2,3]],
+                "up":[[4,3,2],[2,3,4]],"down":[3,4],
+                "shared":{"gate":[3,4,3],"up":[4,3,4],"down":4}}));
+            let mut index = vec![("signs.in".into(), "I8", vec![128], vec![1;128]),
+                ("signs.out".into(), "I8", vec![128], vec![255;128])];
+            // Independent XXH64 constants for payload + channel + block bytes.
+            for (k, checksum) in [(2,0x39d89079a9c254bcu64), (3,0x6c2ec4eafd85e1ed),
+                (4,0xfe1b9862dc9faa1f)] {
+                let bytes = 128*16*k;
+                let offsets = write(&root.join(format!("experts/exlr8-layer-{layer:03}.k{k}.safetensors")),
+                    json!({"layer":layer.to_string(),"k":k.to_string(),"gate_up_order":"grouped",
+                        "down_order":"item128","pad_halves":"false"}),
+                    ["gate","up","down"].into_iter().map(|projection|
+                        (format!("trellis.{projection}"),"U8",vec![6*bytes],vec![k as u8;6*bytes])).collect())?;
+                let mut ranges = vec![];
+                for e in 0..2 { for &base in &offsets { for u in 0..3 {
+                    ranges.extend_from_slice(&((base+(e*3+u)*bytes) as u64).to_le_bytes());
+                    ranges.extend_from_slice(&(bytes as u64).to_le_bytes());
+                }}}
+                index.push((format!("k{k}.index"),"I64",vec![2,3,3,2],ranges));
+                index.push((format!("k{k}.checksum"),"U64",vec![2,3,3],checksum.to_le_bytes().repeat(18)));
+                for (projection,channel,block) in [("gate","svh","su_block"),
+                    ("up","svh","su_block"),("down","suh","sv_block")] {
+                    index.push((format!("k{k}.{projection}.{channel}"),"F16",vec![2,384],vec![1;1536]));
+                    index.push((format!("k{k}.{projection}.{block}"),"F16",vec![2,1],vec![k as u8;4]));
+                }
+            }
+            write(&root.join(format!("experts/exlr8-layer-{layer:03}.index.safetensors")),
+                json!({"layer":layer.to_string(),"gate_up_order":"grouped","down_order":"item128",
+                    "widths":"2,3,4","shared_widths":"3,4"}),index)?;
+        }
+        std::fs::write(root.join("manifests/exlr8-manifest-mixed.json"), json!({
+            "format":"exlr8-v2-manifest","name":"mixed","version":"test","set_id":"b".repeat(64),
+            "layers":choices}).to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_exlr8_native_bytes_budgets_and_failure_are_exact() -> Result<()> {
+        use crate::shared::experts::exlr8::Exlr8Weights;
+        use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
+        fn read(plan: Residency) -> Result<(usize, Vec<u8>, [usize;5])> {
+            let budget = Exlr8Weights::plan(&plan)?;
+            let mut arena = vec![0;plan.resident_bytes];
+            let mut put = |offset: usize, bytes: &[u8]| { arena[offset..offset+bytes.len()].copy_from_slice(bytes); };
+            for (offset, bytes) in plan.signs_offsets.iter().zip(&plan.signs) { put(*offset,bytes); }
+            let (pointers,bits) = plan.descriptors(0x10000)?;
+            put(plan.pointers_offset,&pointers.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>());
+            put(plan.bits_offset,&bits.into_iter().flat_map(i32::to_le_bytes).collect::<Vec<_>>());
+            let (counts,mapping,_) = plan.compact_descriptors()?;
+            for (offset, values) in plan.compact_offsets.into_iter().zip([counts,mapping]) {
+                put(offset,&values.into_iter().flat_map(i32::to_le_bytes).collect::<Vec<_>>());
+            }
+            for unit in &plan.loads {
+                let mut staging = vec![0;unit.staging_bytes()];
+                unit.read_verified(&mut staging)?;
+                let mut at = 0;
+                for (source,destination) in unit.source.iter().zip(unit.destination) {
+                    put(destination,&staging[at..at+source.bytes]); at += source.bytes;
+                }
+            }
+            Ok((plan.layer,arena,[budget.resident_bytes,budget.device_staging_bytes,
+                budget.pinned_host_bytes,budget.read_scratch_bytes,plan.host_bytes()]))
+        }
+        let layers = [3,8,13,21,34,55,89,144];
+        let root = tempfile::tempdir()?;
+        exlr8_fixture(root.path(),&layers)?;
+        for rank in 0..6 {
+            let plans = || layers.iter().map(|&layer| Residency::plan(root.path(),"mixed",layer,6,rank,
+                ExpertSet::Routed).map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>();
+            let sequential = plans()?.into_iter().map(read).collect::<Result<Vec<_>>>()?;
+            let mut owned: Vec<_> = plans()?.into_iter().map(Some).collect();
+            let shuffled = load_in_rank_order(&layers,rank,|index,layer| {
+                let plan = owned[index].take().unwrap(); assert_eq!(plan.layer,layer); read(plan)
+            })?;
+            assert_eq!(shuffled,sequential,"EXLR8 rank {rank}");
+            assert!(owned.iter().all(Option::is_none));
+            let mut visits = 0;
+            assert!(load_in_rank_order(&layers,rank,|_,layer| {
+                visits += 1;
+                if visits == 3 { anyhow::bail!("injected publication failure"); }
+                read(Residency::plan(root.path(),"mixed",layer,6,rank,ExpertSet::Routed)?)
+            }).is_err());
+            assert_eq!(visits,3);
+        }
+        let plans = layers.iter().map(|&layer| Residency::plan(root.path(),"mixed",layer,6,0,
+            ExpertSet::Routed).map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>()?;
+        let source = &plans[0].loads[0].source[0];
+        OpenOptions::new().write(true).open(&source.path)?.write_all_at(&[0],source.offset)?;
+        let mut owned: Vec<_> = plans.into_iter().map(Some).collect();
+        assert!(load_in_rank_order(&layers,0,|index,_| read(owned[index].take().unwrap()))
+            .unwrap_err().to_string().contains("checksum mismatch"));
+        Ok(())
+    }
+
     // Distinct finite payloads expose layer/rank/offset mix-ups that zero-filled
     // fixture files would hide. MCG and ModelOpt scalars retain valid values.
     fn fill_payloads(root: &std::path::Path) -> Result<()> {
