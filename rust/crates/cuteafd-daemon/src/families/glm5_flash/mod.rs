@@ -1728,7 +1728,7 @@ impl Opened {
                 Some(crate::shared::draft::remote::Prepared::new(&self.library,
                     crate::shared::peer_split::RankDevice { device: args.device, stream },
                     crate::shared::peer_split::RankDevice { device, stream: peer_stream },
-                    remote_dflash::IDENTITY)?)
+                    0, remote_dflash::IDENTITY)?)
             },
             _ => None,
         };

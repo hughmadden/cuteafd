@@ -226,9 +226,16 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert admitted < loaded < prepared < pool < full.index("engine.drafter = drafter")
     drafter = (root / "../shared/speculation/dflash.rs").read_text()
     prepare = drafter.split("pub(crate) fn prepare_workspace(", 1)[1].split("pub(crate) fn prime_remote(", 1)[0]
-    assert "self.workspace(self.max_sequences)" in prepare
+    assert "self.prime_remote()" in prepare
     prime, existing = drafter.split("pub(crate) fn prime_remote(", 1)[1].split("fn workspace(", 1)
-    assert "self.prepare_workspace()?" in prime
+    assert "self.workspace(self.max_sequences)" in prime
+    assert "if self.startup_primed.get() { return Ok(()); }" in prime
+    assert "self.prime_metadata()?" in prime
+    assert "self.reset_context(0, 0)?" in prime
+    assert "self.reset_context(slot, TAP_ROWS)?" in prime
+    assert "self.discard_context(slot)?" in prime
+    assert prime.index("self.prime_metadata()?") < prime.index("self.update(") < prime.index("self.draft_device_with(")
+    assert prime.index("self.discard_context(slot)?") < prime.index("self.startup_primed.set(true)")
     assert "prepare_workspace()" not in existing
     assert "prepare_workspace()" not in drafter.split("pub(crate) fn prepare_workspace(", 1)[0]
     assert 'if let Some(dspark::Drafter::RemoteDflash(draft))' in opening

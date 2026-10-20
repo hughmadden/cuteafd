@@ -426,10 +426,12 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     shared = (family.parent.parent / "shared/speculation/dflash.rs").read_text()
     update = shared.split("    pub(crate) fn update_with(", 1)[1].split("    fn put(", 1)[0]
     assert update.index("self.put(&self.context_positions") < update.index("ready()?")
-    assert update.index("self.put(&self.context_slots") < update.index("ready()?") < update.index("self.linear(")
+    assert "let DraftContext::Gqa(context) = &self.context" in update
+    assert update.index("self.put(&context.slots") < update.index("ready()?") < update.index("self.linear(")
     draft = shared.split("    fn draft_from(", 1)[1].split("let (s, l)", 1)[0]
-    for metadata in ("positions", "tables", "anchors"):
-        assert draft.index(f"self.put(&w.{metadata}") < draft.index("input(&ids, w.h.buffer")
+    assert "if let AttentionWorkspace::Gqa(attention) = &w.attention" in draft
+    for metadata in ("w.positions", "attention.tables", "w.anchors"):
+        assert draft.index(f"self.put(&{metadata}") < draft.index("input(&ids, w.h.buffer")
     transport = remote.split("    pub fn update(", 1)[1].split("    pub fn put_taps(", 1)[0]
     assert "self.synchronize()?" not in transport
     assert "cuda_stream_synchronize" not in transport
@@ -469,6 +471,15 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert "0..TAP_ROWS" in isolated and "1..=self.max_sequences" in isolated
     assert "self.draft_device_with(" in isolated
     assert isolated.index("self.draft_device_with(") < isolated.index("for ring in")
+    assert "DraftAttention::Gqa(layer)" in isolated and "self.discard_context(slot)?" in isolated
+    assert "buffers.push(&layer.page_table)" in isolated
+    assert "&attention.lengths, &attention.query_offsets" in isolated
+    head_trip = bridge.split("    pub fn round_trip_head(", 1)[1].split("\n}\n", 1)[0]
+    assert "head_route(self.head_rank," in head_trip
+    route = bridge.split("fn head_route(", 1)[1].split("impl<'a> Prepared", 1)[0]
+    assert route.index("if rank == 1 { return head(true); }") < route.index("send_hidden()?")
+    assert "head(hidden, logits, self.stream.raw)" in head_trip
+    assert "head(target_hidden.cast_const(), target_logits.cast_mut(), self.exchange.stream(0))" in head_trip
     startup = (family / "mod.rs").read_text().split("    pub fn with_engine<", 1)[1]
     assert startup.index("draft.prime(&engine.embedding, engine.draft_head())?") < startup.index("let result = with_startup_graphs(")
 
