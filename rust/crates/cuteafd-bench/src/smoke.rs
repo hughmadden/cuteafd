@@ -119,6 +119,9 @@ pub struct Entry {
     /// Cold prefill at these prompt lengths, in the same sweep (`[8192]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_lengths: Option<Vec<u64>>,
+    /// Output tokens per sweep decode request (default `crate::sweep::TOKENS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_tokens: Option<u64>,
     /// `false` runs explicit panels without the server's baseline (basic card
     /// + quick quality); default true. Needs a server build that honours it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,6 +259,7 @@ impl Entry {
             post_load_c1: self.post_load_c1.or(defaults.post_load_c1),
             post_load_repeat: self.post_load_repeat.or(defaults.post_load_repeat),
             prefill_lengths: self.prefill_lengths.clone().or_else(|| defaults.prefill_lengths.clone()),
+            sweep_tokens: self.sweep_tokens.or(defaults.sweep_tokens),
             baseline: self.baseline.or(defaults.baseline),
             window: self.window.clone().or_else(|| defaults.window.clone()),
             lossless_set: self.lossless_set.clone().or_else(|| defaults.lossless_set.clone()),
@@ -1069,7 +1073,8 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 })
             });
             let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
-                entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true), open);
+                entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true),
+                entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open);
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;
