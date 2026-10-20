@@ -226,9 +226,8 @@ fn load_weights<'a>(
             "explicit Spark replicas admission"
         );
     }
-    let mut weights = Vec::with_capacity(layers.len());
     let mut remaining = config.device_budget;
-    for &layer in &layers {
+    let weights = super::load_in_rank_order(&layers, config.rank, |_, layer| {
         let started = std::time::Instant::now();
         let weight = ExpertWeights::load(
             library,
@@ -246,8 +245,8 @@ fn load_weights<'a>(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "native expert layer loaded"
         );
-        weights.push(weight);
-    }
+        Ok(weight)
+    })?;
     log_spark_memory_if_enabled(library, config, "weights resident", None, None);
     Ok((backend::Weights::Full(weights), remaining))
 }
