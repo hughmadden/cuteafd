@@ -643,59 +643,76 @@ pub(super) mod tests {
         let context = 1_048_576;
         let capacity = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         let spark_bytes = 115_964_116_992;
-        let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2], prefill_rows: rows as u64,
-                concurrency: 16, state_slots: Some(16), prefix_slots: Some(1),
-                context_tokens: context as u64, host_cache_bytes: Some(0),
-                workspace_manifest: Some(manifest_path.clone()), onboard: Some(Onboard::Auto),
-                spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }), ..Default::default() };
-        let report = plan::plan(snapshot.path(), &options)?;
-        ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
-        let memory = report.memory_layout.context("installed Kimi planner ledger")?;
-        let catalog = cuteafd_loader::read_expert_catalog(snapshot.path())?;
-        let package = allocation::expert_package(&manifest_path)?;
-        let mut rtx = plan_rtx(&cfg, &catalog, package, rows, 92)?;
-        rtx.layers = Onboard::Auto;
-        let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (1..93).collect(),
-            spark_ranks: 6, prefill_lanes: 1 };
-        let rings = cuteafd_loader::plan::layout::spark_ring_geometry(1);
-        let spark = SparkBudgetInventory::exl3(&catalog, &working,
-            &[cuteafd_core::SparkEndpoint { capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
-            cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
-                slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
-            cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
-        let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
-        let arch = ArchContext::for_device("sm_120", capacity);
-        let mut i = inputs(&cfg);
-        i.rows = rows; i.lanes = 1; i.state_slots = 16; i.prefix_marks = 1;
-        i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, context,
-            allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
-        i.fixed = super::super::startup::exchange_demands(rows, false, false)?;
-        i.startup = (0..2).map(|rank| super::super::graphs::demand(
-            &super::super::graphs::owned_inventory(&cfg, 1, rows, 16).unwrap().inventory, rank)).collect();
-        for rank in 0..2 {
-            let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
-                "kimik3", "exl3", true, rank as u8, arch, Some(&programs));
-            // Model an identical post-module sample: context + resident code are
-            // already allocated, while BLAS and private head handles are future.
-            let resident = code.bytes - arch.cublas_bytes;
-            i.gpus[rank] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
-                baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
-            i.fixed.push(super::super::startup::code_demand(rank,
-                code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1)?);
+        for (slots, prefix_slots, host_cache_bytes, entries) in [
+            (16, Some(1), Some(0), 20),
+            (8, None, None, 20),
+            (16, None, Some(8 << 30), 20),
+        ] {
+            let rule = crate::shared::prefix::MarkRule { lanes: slots as usize, entries,
+                budget_bytes: 512 << 20, host: host_cache_bytes != Some(0) };
+            let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
+            let marks = prefix_slots.unwrap_or_else(|| rule.slots(usize::try_from(mark_bytes).unwrap()) as u64);
+            assert_eq!(marks, if entries == 0 { 0 } else if rule.host { 2 } else { 1 });
+            let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+                layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2], prefill_rows: rows as u64,
+                    concurrency: slots, state_slots: Some(slots), prefix_slots,
+                    mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
+                    context_tokens: context as u64, host_cache_bytes,
+                    workspace_manifest: Some(manifest_path.clone()), onboard: Some(Onboard::Auto),
+                    spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }), ..Default::default() };
+            let report = plan::plan(snapshot.path(), &options)?;
+            ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
+            let memory = report.memory_layout.context("installed Kimi planner ledger")?;
+            let catalog = cuteafd_loader::read_expert_catalog(snapshot.path())?;
+            let package = allocation::expert_package(&manifest_path)?;
+            let mut rtx = plan_rtx(&cfg, &catalog, package, rows, 92)?;
+            rtx.layers = Onboard::Auto;
+            let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (1..93).collect(),
+                spark_ranks: 6, prefill_lanes: 1 };
+            let rings = cuteafd_loader::plan::layout::spark_ring_geometry(1);
+            let spark = SparkBudgetInventory::exl3(&catalog, &working,
+                &[cuteafd_core::SparkEndpoint { capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+                cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
+                    slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
+                cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+            let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
+            let arch = ArchContext::for_device("sm_120", capacity);
+            let mut i = inputs(&cfg);
+            i.rows = rows; i.lanes = 1; i.state_slots = slots as usize; i.prefix_marks = marks as usize;
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, context,
+                allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
+            i.fixed = super::super::startup::exchange_demands(rows, false, false)?;
+            i.startup = (0..2).map(|rank| super::super::graphs::demand(
+                &super::super::graphs::owned_inventory(&cfg, 1, rows, slots as usize).unwrap().inventory, rank)).collect();
+            for rank in 0..2 {
+                let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
+                    "kimik3", "exl3", true, rank as u8, arch, Some(&programs));
+                // Model an identical post-module sample: context + resident code are
+                // already allocated, while BLAS and private head handles are future.
+                let resident = code.bytes - arch.cublas_bytes;
+                i.gpus[rank] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
+                    baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
+                i.fixed.push(super::super::startup::code_demand(rank,
+                    code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1)?);
+            }
+            i.rtx = Some(rtx); i.spark_budget = Some(spark);
+            let admitted = admit(i)?;
+            assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
+            assert_eq!(admitted.mark_selection.slots, marks);
+            for rank in 0..2 {
+                let planned = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx && d.index == rank as u32)
+                    .context("planned RTX rank")?;
+                let planned_marks = planned.items.iter().filter(|item| item.category == Category::Prefix)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(planned_marks, mark_bytes as u64 / 2 * marks,
+                    "rank {rank}, concurrency {slots}: planner must charge runtime staging marks");
+                let non_pool = planned.items.iter().filter(|item| item.group != "records").map(|item| item.bytes).sum::<u64>();
+                let remaining = capacity - arch.context_bytes - non_pool;
+                assert_eq!(remaining, admitted.placement.pool_limits.0[rank].available_bytes,
+                    "rank {rank}: installed planner and runtime must leave identical KV room");
+            }
+            assert!(admitted.placement.pool_tokens >= context as u64);
         }
-        i.rtx = Some(rtx); i.spark_budget = Some(spark);
-        let admitted = admit(i)?;
-        assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
-        for rank in 0..2 {
-            let planned = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx && d.index == rank as u32)
-                .context("planned RTX rank")?;
-            let non_pool = planned.items.iter().filter(|item| item.group != "records").map(|item| item.bytes).sum::<u64>();
-            let remaining = capacity - arch.context_bytes - non_pool;
-            assert_eq!(remaining, admitted.placement.pool_limits.0[rank].available_bytes,
-                "rank {rank}: installed planner and runtime must leave identical KV room");
-        }
-        assert!(admitted.placement.pool_tokens >= context as u64);
         Ok(())
     }
 
