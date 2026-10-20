@@ -1,5 +1,5 @@
 use super::*;
-use crate::plan::{self, checkpoint::Checkpoint, format, testing::{self, t, kimi_k3_tensors as tensors, Tensor as FixtureTensor}, *};
+use crate::plan::{self, checkpoint::Checkpoint, format, testing::{self, t, kimi_k3_tensors as tensors}, *};
 use anyhow::Context;
 use serde_json::Value;
 use crate::families::kimi_k3::validate_expert_inventory;
@@ -10,19 +10,7 @@ fn config() -> Value { crate::families::kimi_k3::config::tests::release_config()
 /// exceed the 64 MiB safetensors header bound).
 fn snapshot(all: bool) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let tensors = tensors(all);
-    let shard = |name: &str| indexed(name.strip_prefix(TEXT).unwrap_or(""), "layers.").map_or(0, |(l, _)| l + 1);
-    let mut shards: BTreeMap<usize, Vec<FixtureTensor>> = BTreeMap::new();
-    for tensor in tensors { shards.entry(shard(&tensor.0)).or_default().push(tensor); }
-    let mut weight_map = serde_json::Map::new();
-    for (index, members) in &shards {
-        let file = format!("model-{index:05}.safetensors");
-        testing::write_safetensors(&dir.path().join(&file), members);
-        for (name, ..) in members { weight_map.insert(name.clone(), Value::String(file.clone())); }
-    }
-    std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config()).unwrap()).unwrap();
-    std::fs::write(dir.path().join("model.safetensors.index.json"),
-        serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap()).unwrap();
+    testing::write_kimi_snapshot(dir.path(), all);
     dir
 }
 
@@ -272,7 +260,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     let memory = report.memory_layout.as_ref().unwrap();
     assert_eq!(memory.pool_tokens, 1_048_576);
     assert!(memory.notes.iter().any(|note| note.contains("API max context: 262144")
-        && note.contains("compiled max context: 1048576")), "{:?}", memory.notes);
+        && note.contains("compiled max context: 262144")), "{:?}", memory.notes);
     assert!(memory.notes.iter().any(|note| note.contains("selected RTX expert layers:")
         && note.contains("retained marks:")), "{:?}", memory.notes);
     assert!(memory.notes.iter().any(|note| note.contains("estimated runtime/workspace reserve")));

@@ -16,7 +16,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission targets 2M tokens on the reference coordinator pair.
     #[arg(long)] pub pool_tokens: Option<u64>,
-    /// API request ceiling only; native allocation keeps the compiled 1M extent.
+    /// Native allocation extent and API ceiling, up to the compiled 1M capacity.
     #[arg(long, default_value_t = COMPILED_CONTEXT)] pub max_context: usize,
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
     /// Complete per-rank allocation ceiling, estimated until the first worker census.
@@ -89,7 +89,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 devices: [worker_args.device, worker_args.split_device], native_lib: &worker_args.native_lib,
                 peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
                 spark_budget_gib: worker_args.spark_budget_gib,
-                rows: 4096, slots, marks, max_context: COMPILED_CONTEXT,
+                rows: 4096, slots, marks, max_context: worker_args.max_context,
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None,
             })?;
