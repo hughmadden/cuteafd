@@ -1249,7 +1249,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         if opened.weight_formats.draft == MimoDraftRepresentation::Bf16Only {
             println!("DFlash replay: immutable BF16-only storage; one BF16 arithmetic arm, no FP8 comparison");
         }
-        let (tokens, greedy) = crate::families::glm5::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
+        let (tokens, greedy) = crate::shared::speculation::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
         let hidden = opened.cfg.hidden;
         let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
             .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
@@ -1263,7 +1263,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
             }
             Ok(taps)
         };
-        return crate::families::glm5::dflash::replay(drafter, &tokens, &greedy, &taps,
+        return crate::shared::speculation::dflash::replay(drafter, &tokens, &greedy, &taps,
             &|t| engine.embedding.host_rows(t), engine.weights.head.bf16_ptr()?, start);
     }
     if let Some(dir) = &args.mtp_oracle {

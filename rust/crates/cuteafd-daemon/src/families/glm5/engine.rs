@@ -316,7 +316,7 @@ pub(crate) struct GlmEngine<'a> {
     graphs_warming: Cell<bool>,
     graph_misses: Cell<u64>,
     /// The DFlash2 drafter; every step taps its target layers.
-    pub drafter: Option<super::dflash::GlmDrafter<'a>>,
+    pub drafter: Option<crate::shared::speculation::dflash::DflashDrafter<'a>>,
     pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
@@ -1062,7 +1062,7 @@ impl<'a> GlmEngine<'a> {
                     &[rows, Scalar::I32(1)])?;
             }
             if let Some(drafter) = &self.drafter {
-                let n = t.min(super::dflash::TAP_ROWS);
+                let n = t.min(crate::shared::speculation::dflash::TAP_ROWS);
                 drafter.tap(index, w.h.buffer.ptr, t - n, n)?;
             }
             if let Some(on_layer) = on_layer.as_mut() {
@@ -1754,7 +1754,7 @@ impl<'a> GlmEngine<'a> {
         };
         // The drafter taps the chunk's last TAP_ROWS rows: each lane's part of
         // that window, at its offset among the tap rows.
-        let window = total - total.min(super::dflash::TAP_ROWS);
+        let window = total - total.min(crate::shared::speculation::dflash::TAP_ROWS);
         let attention = |(index, lane): (usize, usize)| -> Result<()> {
             // Local pairs wait for rank1's result. Queue only this unit's
             // peer front, never a future lane's unmatched attention wait.

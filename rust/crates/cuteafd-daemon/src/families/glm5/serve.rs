@@ -14,7 +14,7 @@
 //! finish (`Turn`), a prefill whose client left is parked at its last chunk;
 //! a decode whose client left is not retained. `prompt_cache_hit_tokens`
 //! reports the restored rows; `/v1/stats` carries the cache's counters.
-use super::dflash::{ContextRow, DraftSeq, TAP_ROWS};
+use crate::shared::speculation::dflash::{ContextRow, DraftSeq, TAP_ROWS};
 use crate::shared::draft_policy::DraftHistory;
 use crate::shared::draft::evidence::{Censor, DraftSource};
 use super::engine::{GlmEngine, GlmPlacement, DECODE_ROWS};
@@ -350,7 +350,7 @@ impl Trace {
 
     #[allow(clippy::too_many_arguments)]
     fn cycle(&mut self, id: u64, position: usize, rows: usize, committed: usize, planned: usize, copy: bool,
-        draft: Option<&super::dflash::Draft>, verify_ms: f64) -> Result<()> {
+        draft: Option<&crate::shared::speculation::dflash::Draft>, verify_ms: f64) -> Result<()> {
         let line = serde_json::json!({"kind": "cycle", "id": id, "position": position, "rows": rows,
             "committed": committed, "planned": planned, "copy": copy, "verify_ms": verify_ms,
             "draft": draft.map(|d| &d.tokens), "features": draft.map(|d| &d.features)});
@@ -776,7 +776,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             resource::choose_block(&mut shared.policy, &requests, width, eligible.len(), DECODE_ROWS, false)?
         };
         let timer = Instant::now();
-        let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
+        let drafted: Vec<Option<crate::shared::speculation::dflash::Draft>> = match drafter {
             Some(drafter) if run_draft => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
                     .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0).map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
@@ -785,7 +785,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     .collect();
                 drafted_requests = seqs.len();
                 let drafts = round_clock.draft(|| drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    super::dflash::TargetHead::Bf16(&engine.weights.head)));
+                    crate::shared::speculation::dflash::TargetHead::Bf16(&engine.weights.head)));
                 drafted_width = drafter.cfg.drafts();
 
                 let mut out = vec![None; active.len()];

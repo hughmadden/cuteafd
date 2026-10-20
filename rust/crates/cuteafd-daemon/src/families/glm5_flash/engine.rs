@@ -47,7 +47,7 @@ use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use super::head::GlmfHead;
 use crate::shared::target_head::TargetHead as TargetHeadRoute;
-use crate::families::glm5::dflash::TargetHead;
+use crate::shared::speculation::dflash::TargetHead;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
@@ -3379,7 +3379,7 @@ impl<'a> GlmfEngine<'a> {
         packing::Limits { rows: self.prefill_rows,
             chunk_rows: single_pass_rows(self.pipelined(), self.prefill_lane_count, self.prefill_rows),
             table_pages: self.table_pages, table_pool_pages: self.table_pool_pages,
-            taps: self.drafter.as_ref().map(|_| crate::families::glm5::dflash::TAP_ROWS),
+            taps: self.drafter.as_ref().map(|_| crate::shared::speculation::dflash::TAP_ROWS),
             dense_context: self.cfg.dense_context(), max_context: self.max_context }
     }
 
@@ -3976,7 +3976,7 @@ impl<'a> GlmfEngine<'a> {
             }
             if let Some(drafter) = &self.drafter {
                 if tables.segments.is_empty() {
-                    let n = t.min(crate::families::glm5::dflash::TAP_ROWS);
+                    let n = t.min(crate::shared::speculation::dflash::TAP_ROWS);
                     drafter.tap_streams(index, w.streams[cur].buffer.ptr, HC, t - n, n)?;
                 } else {
                     // Each packed sequence's last rows, as its own pass taps them, at its tap rows.
@@ -5134,7 +5134,7 @@ impl<'a> GlmfEngine<'a> {
         };
         // The drafter taps the chunk's last TAP_ROWS rows: lane `lane`'s part of
         // that window, at its offset in the tap rows.
-        let tap_rows = total.min(crate::families::glm5::dflash::TAP_ROWS);
+        let tap_rows = total.min(crate::shared::speculation::dflash::TAP_ROWS);
         let lane_first: Vec<usize> = lanes.iter().scan(0, |first, (t, _)| {
             let here = *first;
             *first += t.kv_slots.len();
