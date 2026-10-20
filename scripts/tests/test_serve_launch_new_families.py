@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from test_run_family_dispatch import _family_launch_result
+from test_run_family_dispatch import _family_launch_result, _snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("wip_cards_new_families", ROOT / "scripts/bench/wip-cards.py")
@@ -64,7 +64,7 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     # the planner picks the onboarded layers; it takes no speculator or media options.
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     for absent in ("--max-context", "--pool-tokens", "--vision", "--audio",
-                   "--draft", "--mtp", "--dspark", "--local-experts"):
+                   "--draft", "--draft-fp8", "--mtp", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == 6
@@ -75,6 +75,7 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     assert "--world 6" in workers[0] and "--vision off --audio off" in plan
     assert _flag(plan, "--spark-ranks") == "6" and _flag(plan, "--rtx") == "2"
     assert _flag(plan, "--speculator") == "off" and "--require-ready" not in plan.split()
+    assert "--drafter-snapshot" not in plan.split() and "--draft-fp8" not in plan.split()
     # The slot's binary is asked for serve-kimi before anything is planned.
     lines = result.stderr.splitlines()
     probe = next(i for i, line in enumerate(lines) if "dst=/opt/cuteafd-serve-probe" in line)
@@ -92,6 +93,25 @@ def test_kimi_forwards_typed_keys_when_set(tmp_path: Path) -> None:
     assert _flag(serve, "--max-sequences") == "8"
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path: Path, enabled: bool) -> None:
+    model, revision = "lightseekorg/kimi-k3-dflash2", "e77935fb4804e17eb55085bffd045eae1d779769"
+    _snapshot(tmp_path / "hf", model, {}, revision=revision)
+    result = _kimi(tmp_path, f"SPECULATOR={'dflash2' if enabled else 'off'}\n"
+                            f"SPECULATOR_MODEL_ID={model}\nSPECULATOR_MODEL_REVISION={revision}\n"
+                            + ("SPECULATOR_DRAFTS=7\n" if enabled else ""))
+    serve, plan = _line(result, "cuteafd serve-kimi --snapshot"), _line(result, "cuteafd plan")
+    assert _flag(plan, "--speculator") == ("dflash2" if enabled else "off")
+    if enabled:
+        snapshot = f"/hf/hub/models--{model.replace('/', '--')}/snapshots/{revision}"
+        assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
+        assert _flag(serve, "--draft-fp8") == _flag(plan, "--draft-fp8") == "true"
+        assert _flag(serve, "--draft-fixed") == "7"
+    else:
+        assert all(flag not in serve.split() for flag in ("--draft", "--draft-fp8", "--draft-fixed"))
+        assert all(flag not in plan.split() for flag in ("--drafter-snapshot", "--draft-fp8"))
+
+
 def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> None:
     result = _kimi(tmp_path, "SPARK_DEVICE_BUDGET_BYTES=107374182400\n")
     assert _flag(_line(result, "cuteafd plan"), "--spark-budget-gib") == "100.0"
@@ -99,7 +119,7 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("keys,diagnostic", [
-    ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 does not apply to kimi_k3"),
+    ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 needs SPECULATOR_MODEL_ID"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to kimi_k3"),
     ("ATTENTION_PLACEMENT=heads\n", "kimi_k3 supports only ATTENTION_PLACEMENT=auto"),
     ("ATTENTION_PLACEMENT=context\n", "kimi_k3 supports only ATTENTION_PLACEMENT=auto"),
@@ -114,7 +134,6 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
     ("RTX_EXPERT_LAYERS=max\n", "auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=94\n", "RTX_EXPERT_LAYERS must be"),
     ("KV_CACHE=bf16\n", "unused configuration key: KV_CACHE"),
-    ("SPECULATOR_MODEL_ID=x/y\n", "unused configuration key: SPECULATOR_MODEL_ID"),
     ("L2_PREFETCH=auto\n", "unused configuration key: L2_PREFETCH"),
 ])
 def test_kimi_refuses_unsupported_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:
@@ -263,7 +282,7 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert ((_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")) == (gpus == 2)
     for absent in ("--max-context", "--pool-tokens", "--rtx-expert-layers", "--vision", "--audio",
-                   "--draft", "--mtp", "--dspark", "--local-experts"):
+                   "--draft", "--draft-fp8", "--mtp", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == sparks and f"--world {sparks}" in workers[0]
@@ -285,6 +304,9 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "Step-5 has no local-expert layout"),
     ("EMBEDDING=host\n", "step5 serves GPU token embeddings only"),
     ("RTX_EXPERT_LAYERS=4\n", "unused configuration key: RTX_EXPERT_LAYERS"),
+    ("SPECULATOR_MODEL_ID=x/y\n", "unused configuration key: SPECULATOR_MODEL_ID"),
+    ("SPECULATOR_MODEL_REVISION=abc\n", "unused configuration key: SPECULATOR_MODEL_REVISION"),
+    ("SPECULATOR_DRAFTS=adaptive\n", "unused configuration key: SPECULATOR_DRAFTS"),
     ("KV_CACHE=bf16\n", "unused configuration key: KV_CACHE"),
 ])
 def test_step5_refuses_unsupported_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:

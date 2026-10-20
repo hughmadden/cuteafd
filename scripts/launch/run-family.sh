@@ -195,7 +195,7 @@ PROFILE_NSYS_GPU_METRICS
 PROFILE_EXPERT_INPUT_SAMPLE
 PROFILE_EXPERT_ROUTE_WEIGHTS
 EOF
-    [[ "$1" != kimi_k3 ]] || printf '%s\n' RTX_EXPERT_LAYERS NATIVE_K6
+    [[ "$1" != kimi_k3 ]] || printf '%s\n' RTX_EXPERT_LAYERS NATIVE_K6 SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS
     [[ "$1" != step5 ]] || echo SPECULATOR_DEPTH
     _spark_slot_keys HOST LANE_A
     return
@@ -1727,7 +1727,7 @@ if [[ -z "$speculator" ]]; then
 fi
 case "$family:$speculator" in
   qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
-  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|step5:mtp|deepseek_v4:dspark) ;;
+  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
@@ -1807,6 +1807,7 @@ case "$speculator" in
       draft_snapshot="$(snapshot_of "$drafter" "$(get SPECULATOR_MODEL_REVISION)")" ||
         { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
+      [[ "$family" != kimi_k3 ]] || draft_args+=(--draft-fp8 true)
     elif [[ $family == mimo_v2 ]]; then
       draft_args=(--draft "$snapshot")
     else
@@ -2460,6 +2461,9 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t=map(float,sys.argv[1:3]);b=float(sys.argv[3]) if sys.argv[3] else t/1024;print(max(0,min(f/1024,b-(t-f)/1024)))' "$free_mib" "$total_mib" "$coordinator_budget")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
+    plan_draft_args+=(--drafter-snapshot "$draft_snapshot" --draft-fp8 true)
+  fi
   # Read the effective serve argv, including family modes that enable auto.
   plan_host_cache=0
   for ((i=0; i<${#family_args[@]}; i++)); do
