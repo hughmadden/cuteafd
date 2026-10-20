@@ -26,6 +26,46 @@ impl Bf16Add<'_> {
     }
 }
 
+type F32AddFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32, usize, *mut c_void) -> i32;
+pub struct F32Add<'a> { _library: &'a NativeLibrary, launch: F32AddFn }
+impl NativeLibrary {
+    pub fn f32_add(&self) -> Result<F32Add<'_>> {
+        // SAFETY: the symbol has the native header's F32 residual-add signature.
+        Ok(F32Add { _library: self,
+            launch: unsafe { *self.lib.get(b"cuteafd_cuda_residual_add_f32_async")? } })
+    }
+}
+impl F32Add<'_> {
+    /// # Safety
+    /// All operands are live on the current stream device and ordered after
+    /// their producers. The caller retains storage through completion/replay.
+    pub unsafe fn launch(&self, a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
+        output: CuteafdDeviceBuffer, count: usize, stream: *mut c_void) -> Result<()> {
+        validate_f32_add_buffers(a,b,output,count)?;
+        // SAFETY: validated F32 extents/devices; caller owns stream/lifetimes.
+        let status = unsafe { (self.launch)(a.ptr.cast(),b.ptr.cast(),output.ptr.cast(),count,stream) };
+        ensure!(status == 0, "shared F32 addition failed with CUDA status {status}");
+        Ok(())
+    }
+}
+fn validate_f32_add_buffers(a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
+    output: CuteafdDeviceBuffer, count: usize) -> Result<()> {
+    let bytes=count.checked_mul(4).filter(|&n|n>0).ok_or_else(||anyhow::anyhow!("invalid F32 addition extent"))?;
+    ensure!(count.div_ceil(256) <= i32::MAX as usize, "F32 addition grid exceeds native int32");
+    ensure!(output.device_id>=0 && a.device_id==output.device_id && b.device_id==output.device_id,
+        "F32 addition device mismatch");
+    for buffer in [a,b,output] {
+        ensure!(!buffer.ptr.is_null() && buffer.ptr as usize%4==0 && buffer.bytes>=bytes
+            && buffer.flags==0 && (buffer.ptr as usize).checked_add(bytes).is_some(), "invalid F32 addition buffer");
+    }
+    let out=output.ptr as usize;
+    for source in [a,b] {
+        let start=source.ptr as usize;
+        ensure!(out.abs_diff(start)>=bytes,"F32 addition output overlaps input");
+    }
+    Ok(())
+}
+
 fn validate_add_buffers(a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
     output: CuteafdDeviceBuffer, count: usize) -> Result<()> {
     let bytes = count.checked_mul(2).filter(|n| *n > 0)
@@ -71,6 +111,20 @@ mod add_tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn f32_tp_add_preserves_full_width_extents_and_rejects_aliases() {
+        let [mut a,mut b,mut out]=buffers(7168);
+        a.bytes*=2; b.bytes*=2; out.bytes*=2;
+        a.ptr=0x10000usize as *mut c_void;
+        b.ptr=0x20000usize as *mut c_void;
+        out.ptr=0x30000usize as *mut c_void;
+        validate_f32_add_buffers(a,b,out,7168).unwrap();
+        assert!(validate_f32_add_buffers(a,b,out,7169).is_err());
+        assert!(validate_f32_add_buffers(a,b,a,7168).is_err());
+        assert!(validate_f32_add_buffers(a,b,out,usize::MAX).is_err());
+        assert!(validate_f32_add_buffers(a,CuteafdDeviceBuffer{device_id:1,..b},out,7168).is_err());
     }
 
     #[test]

@@ -413,7 +413,9 @@ fn core_header_validation_rejects_wrong_bits_keep_list_and_duplicate_bf16() {
             "missing-scale" => changed.tensors.retain(|t| t.meta.name != format!("{stem}.svh")),
             "shape" => trellis.meta.shape[0] -= 1,
             "codebook" => {
-                changed.tensors.iter_mut().find(|t| t.meta.name == format!("{stem}.mcg")).unwrap().meta.name = format!("{stem}.mul1");
+                let mut marker = changed.tensors.iter().find(|t| t.meta.name == format!("{stem}.mcg")).unwrap().clone();
+                marker.meta.name = format!("{stem}.mul1");
+                changed.tensors.push(marker);
             }
             _ => unreachable!(),
         }

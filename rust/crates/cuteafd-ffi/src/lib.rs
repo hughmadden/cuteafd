@@ -1,12 +1,14 @@
 mod families;
 mod shared;
-pub use shared::{audio, exlr8, fp8_moe, mla_draft, peer_exchange, programs, vision};
+pub use shared::{audio, dense_trellis, exlr8, fp8_moe, mla_draft, peer_exchange, programs, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
     KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit,
     KimiRouter, KimiRoutes, KimiExpertInput, MLA_PAGE_ROWS, MLA_RECORD_BYTES};
+pub use families::kimi_k3_split::{KimiSplitError, KimiMlaSplit, KimiMlaRankBatch,
+    KimiKdaCore, KimiKdaCoreWeights, KimiKdaCoreBatch};
 pub use shared::vocab_head::{VOCAB_HEAD_ROWS_MAX, VOCAB_HEAD_ROWS_PASS};
-pub use shared::v41_device_ops::{Bf16Add, V41PeerCopy};
+pub use shared::v41_device_ops::{Bf16Add, F32Add, V41PeerCopy};
 pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;
 pub use families::deepseek_v41::v41_index_topk::V41IndexTopK;
 pub use families::deepseek_v41::v41_sparse_attention::{V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow};

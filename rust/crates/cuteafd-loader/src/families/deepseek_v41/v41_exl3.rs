@@ -678,6 +678,8 @@ fn build_deepseek_v4_manifest(
                         module.input_features,
                         module.output_features
                     );
+                    ensure!(module.codebook == crate::formats::exl3_storage::Exl3Codebook::Mcg,
+                        "projection {name}: routed expert kernels require MCG, found {}", module.codebook.marker());
                     ensure!(
                         (2..=5).contains(&module.bits),
                         "projection {name} is K{}; the expert kernels run K2..K5",
@@ -1160,6 +1162,17 @@ mod tests {
             assert!(read_publication(&config, &[("quantize_config.json", &manifest)], shape, &incomplete, &[]).is_err());
         }
         Ok(())
+    }
+
+    #[test]
+    fn routed_mul1_is_rejected_after_shared_header_derivation() {
+        let (config, _, shape, mut headers) = deepseek_v4_publication();
+        let marker = headers.iter_mut().find(|tensor| tensor.name.ends_with(".mcg")).unwrap();
+        let stem = marker.name.strip_suffix(".mcg").unwrap().to_owned();
+        marker.name = format!("{stem}.mul1");
+        let error = read_publication(&config, &[], shape, &headers, &[]).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains(&stem) && text.contains("routed expert kernels require MCG"), "{text}");
     }
 
     #[test]

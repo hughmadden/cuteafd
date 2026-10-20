@@ -19,3 +19,5 @@ pub(crate) mod state;
 pub(crate) mod weights;
 #[cfg(test)]
 pub(crate) mod reference;
+#[cfg(test)]
+mod core_native_tests;

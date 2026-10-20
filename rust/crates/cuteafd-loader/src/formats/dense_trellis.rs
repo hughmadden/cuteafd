@@ -10,8 +10,8 @@ pub enum DenseTrellisError {
     Extent(&'static str),
 }
 
-/// Native units follow the side sharded by tensor parallelism. Both layouts
-/// contain identical 16x16 checkpoint tiles, without changing any packed bits.
+/// Payload storage order (not necessarily the ownership axis for whole tensors).
+/// Both layouts contain identical 16x16 tiles without changing packed bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrellisSide { Output, Input }
 
@@ -96,6 +96,40 @@ impl DenseTrellisCheckpoint<'_> {
     }
 }
 
+/// Owned native bytes, read through the checkpoint's ordinary tensor reader.
+/// Codebook markers are validated on the host and never uploaded to the GPU.
+#[derive(Debug)]
+pub struct LoadedDenseTrellis {
+    pub codebook: super::exl3_storage::Exl3Codebook,
+    pub shard: NativeTrellisShard,
+}
+
+pub fn load_native_shard(stem: &str, module: &super::exl3_storage::Exl3Module,
+    side: TrellisSide, rank: usize, ranks: usize,
+    mut read: impl FnMut(&str) -> anyhow::Result<crate::LoadedTensor>) -> anyhow::Result<LoadedDenseTrellis> {
+    use anyhow::{ensure, Context};
+    let mut load = |suffix: &str| -> anyhow::Result<Vec<u8>> {
+        let name = format!("{stem}.{suffix}");
+        let expected = module.tensors.get(suffix).with_context(||format!("{name}: missing validated header"))?;
+        let tensor = read(&name)?;
+        ensure!(tensor.info.name == name && tensor.info.dtype == expected.dtype && tensor.info.shape == expected.shape,
+            "{name}: loaded tensor differs from validated checkpoint headers");
+        ensure!(tensor.info.byte_length == tensor.bytes.len() as u64,
+            "{name}: loaded byte extent differs from checkpoint header");
+        Ok(tensor.bytes)
+    };
+    let marker = load(module.codebook.marker())?;
+    ensure!(marker.as_slice() == module.codebook.multiplier().to_le_bytes(),
+        "{stem}: unsupported {} marker payload", module.codebook.marker());
+    let payload = load("trellis")?;
+    let suh = load("suh")?;
+    let svh = load("svh")?;
+    let checkpoint = DenseTrellisCheckpoint { shape: [module.output_features,module.input_features],
+        bits: module.bits, payload: &payload, suh: &suh, svh: &svh };
+    let shard = checkpoint.native_shard(side,rank,ranks)?;
+    Ok(LoadedDenseTrellis { codebook: module.codebook, shard })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +175,37 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn loads_both_codebooks_and_checks_payload_markers_before_packing() {
+        use super::super::exl3_storage::{Exl3Codebook, Exl3StoredTensor, Exl3Module};
+        use cuteafd_core::{DType, TensorInfo, TensorRole};
+        use std::collections::BTreeMap;
+        for codebook in [Exl3Codebook::Mcg, Exl3Codebook::Mul1] {
+            let module = Exl3Module { codebook, bits:6, input_features:128, output_features:256,
+                tensors:BTreeMap::from([
+                    ("trellis".into(),Exl3StoredTensor{dtype:DType::I16,shape:vec![8,16,96]}),
+                    ("suh".into(),Exl3StoredTensor{dtype:DType::F16,shape:vec![128]}),
+                    ("svh".into(),Exl3StoredTensor{dtype:DType::F16,shape:vec![256]}),
+                    (codebook.marker().into(),Exl3StoredTensor{dtype:DType::I32,shape:vec![]})]) };
+            let read = |name: &str, corrupt: bool| -> anyhow::Result<crate::LoadedTensor> {
+                let suffix=name.strip_prefix("fixture.").unwrap();
+                let meta=&module.tensors[suffix];
+                let mut bytes=if suffix==codebook.marker() {codebook.multiplier().to_le_bytes().to_vec()}
+                    else {vec![0;meta.shape.iter().product::<usize>()*2]};
+                if corrupt && suffix==codebook.marker() {bytes[0]^=1;}
+                Ok(crate::LoadedTensor {info:TensorInfo{name:name.into(),file:"fixture".into(),
+                    dtype:meta.dtype.clone(),shape:meta.shape.clone(),byte_offset:0,byte_length:bytes.len()as u64,
+                    role:TensorRole::Other,layer_id:None,expert_id:None,is_quantization_metadata:false},
+                    source_path:Default::default(),bytes,elapsed_micros:0,sha256:String::new()})
+            };
+            let loaded=load_native_shard("fixture",&module,TrellisSide::Output,1,2,|n|read(n,false)).unwrap();
+            assert_eq!(loaded.codebook,codebook);
+            assert_eq!(loaded.shard.shape,[128,128]);
+            let error=load_native_shard("fixture",&module,TrellisSide::Output,0,1,|n|read(n,true)).unwrap_err();
+            assert!(error.to_string().contains("marker payload"));
         }
     }
 

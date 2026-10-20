@@ -7,6 +7,7 @@ pub mod programs;
 pub mod native_dense;
 pub mod mla_draft;
 pub mod exlr8;
+pub mod dense_trellis;
 pub(crate) mod l2_prefetch;
 pub mod peer_exchange;
 pub(crate) mod v41_device_ops;

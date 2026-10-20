@@ -33,6 +33,7 @@ pub fn split(stem: &str) -> Option<CoreSplit> {
 pub struct CoreProjection {
     pub stem: String,
     pub bits: usize,
+    pub codebook: crate::formats::exl3_storage::Exl3Codebook,
     /// Logical checkpoint shape [N,K], before any explicit output padding.
     pub shape: [usize; 2],
     pub stored_outputs: usize,
@@ -81,8 +82,7 @@ pub struct CoreInventory {
 
 impl CoreInventory {
     /// Expected logical shapes come from the family geometry, not a side file.
-    /// MCG/unpacked H128 is the initial contract; MUL1 remains fail-closed until
-    /// the pinned shared ABI and the format decoder support it.
+    /// Both native MCG and MUL1 keep their own unpacked H128 vectors.
     pub fn from_checkpoint(cfg: &KimiK3Config, checkpoint: &Checkpoint,
         expected: &BTreeMap<String, Vec<usize>>) -> Result<Self> {
         let mut inventory = Self::default();
@@ -106,7 +106,7 @@ impl CoreInventory {
                 module.output_features, module.input_features);
             ensure!(!checkpoint.contains_tensor(&format!("{stem}.weight")),
                 "{stem}: checkpoint contains both BF16 and K6 storage");
-            inventory.projections.insert(stem.clone(), CoreProjection { stem, bits: module.bits,
+            inventory.projections.insert(stem.clone(), CoreProjection { stem, bits: module.bits, codebook: module.codebook,
                 shape: [shape[0], shape[1]], stored_outputs: module.output_features, split,
                 source_bytes: members.values().map(|t| t.meta.byte_length).sum() });
         }
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn tp_bytes_include_the_replicated_opposite_rotation() {
         for split in [CoreSplit::Output, CoreSplit::Input, CoreSplit::Whole] {
-            let p = CoreProjection { stem: "test".into(), bits: 6, shape: [12288,7168], stored_outputs: 12288,
+            let p = CoreProjection { stem: "test".into(), bits: 6, codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg, shape: [12288,7168], stored_outputs: 12288,
                 split, source_bytes: 66099204 };
             let (s, r) = p.residency();
             assert_eq!(p.resident_bytes(2).unwrap(), s / 2 + r);
