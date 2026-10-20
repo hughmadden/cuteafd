@@ -15,6 +15,7 @@ use nest_push::{
 };
 
 pub use nest_push::{client::JoinArgs, plan, proto, slot};
+pub mod builder;
 
 pub const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HOSTS_XATTR: &str = "user.sparknest.hosts";
@@ -122,7 +123,7 @@ impl PushGroup {
         self.coordinator.patterns(patterns)
     }
 
-    /// Entries must be batched below `proto::MAX_MSG` by the plan builder.
+    /// The shared client batches entries below the socket message limit.
     pub fn entries(&self, entries: Vec<Entry>) -> io::Result<()> {
         self.coordinator.entries(entries)
     }
