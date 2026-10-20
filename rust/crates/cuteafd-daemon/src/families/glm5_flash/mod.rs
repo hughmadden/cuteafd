@@ -1824,7 +1824,7 @@ impl Opened {
             kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8),
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "GLM 5.3 Flash coordinator weights resident (one copy each)");
+            "GLM 5.3 Flash coordinator weights validated after Spark admission (one copy each; elapsed includes wait)");
         let moe = (0..layers).any(|l| !self.cfg.dense[l]);
         let reserved_units = if args.prefix_marks == prefix::PrefixMarks::Pool {
             cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };

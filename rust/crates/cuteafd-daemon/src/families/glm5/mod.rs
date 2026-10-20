@@ -642,7 +642,8 @@ impl Opened {
         ensure!(actual_weights == reserved_weights,
             "GLM loaded coordinator owners {actual_weights:?} differ from header reservation {reserved_weights:?}");
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
-            resident_bytes = ?actual_weights, "GLM coordinator weights match pre-weight reservation");
+            resident_bytes = ?actual_weights,
+            "GLM coordinator weights validated against pre-weight reservation after Spark admission (elapsed includes wait)");
         let context_kv = placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context;
         ensure!(!context_kv || peer_stream.is_some(), "context attention needs the head split's second GPU");
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
