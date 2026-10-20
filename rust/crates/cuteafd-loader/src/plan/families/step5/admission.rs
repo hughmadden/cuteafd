@@ -739,6 +739,25 @@ mod tests {
     }
 
     #[test]
+    fn device_only_retention_fit_refusal_names_host_and_context_remedies() -> Result<()> {
+        let mut inputs = inputs(1);
+        inputs.context = EXTENT;
+        inputs.requested_pool = None;
+        inputs.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 50 << 30 };
+        let refusal = run(&inputs).err().expect("device marks exceed the available budget").to_string();
+        for message in ["device-only prefix retention with HOST_CACHE_BYTES=0",
+            "request context 1048576", "--host-cache-bytes auto", "MAX_CONTEXT_TOKENS", "262144"] {
+            assert!(refusal.contains(message), "{refusal}");
+        }
+        inputs.marks.host = true;
+        run(&inputs)?;
+        inputs.marks.host = false;
+        inputs.context = FLOOR;
+        run(&inputs)?;
+        Ok(())
+    }
+
+    #[test]
     fn admission_checks_capacity_before_any_native_allocation() -> Result<()> {
         let mut inputs = inputs(1);
         let admission = run(&inputs)?;

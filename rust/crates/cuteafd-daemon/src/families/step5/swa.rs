@@ -1,4 +1,5 @@
 //! Layer-selected SWA projections and transaction-owned cache reads.
+use super::scratch::{self, Arena, Plane};
 use super::{
     ffn::{DenseFfn, DensePlan},
     rope::TargetTables,
@@ -157,12 +158,18 @@ pub(super) struct SwaLayer<'a> {
     // This stream drains before every composed owner, including the FFN.
     stream: Stream<'a>,
     ffn: Option<DenseFfn<'a>>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
     admission: Admission,
     immutable: std::rc::Rc<SwaWeights<'a>>,
 }
 
 impl<'a> SwaLayer<'a> {
+    pub(super) fn device(&self) -> Device<'a> { self.stream.device }
+    pub(super) fn rows(&self) -> usize { self.admission.rows }
+    pub(super) fn heads(&self) -> usize { self.immutable.heads }
+    pub(super) fn new_lane_in(&self, arena: &Arena<'a>) -> Result<Self> {
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None, Some((arena, 0)))
+    }
 
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
         Self::workspace_for_heads(rows, 64)
@@ -183,7 +190,7 @@ impl<'a> SwaLayer<'a> {
         reservations: &[u64],
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None)
     }
 
     pub fn for_execution(
@@ -196,12 +203,13 @@ impl<'a> SwaLayer<'a> {
         available: u64,
         reservations: &[u64],
         rank: usize,
+        arena: &Arena<'a>,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
     ) -> Result<Self> {
         let heads = ownership.layer(layer, rank)?.query_heads;
         ensure!(heads > 0, "Step-5 SWA is not owned by rank {rank}");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
-            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false)
+            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false, Some((arena, 0)))
     }
 
     fn load_layout(
@@ -216,6 +224,7 @@ impl<'a> SwaLayer<'a> {
         layout: RankWeightLayout,
         heads: usize,
         include_dense: bool,
+        arena: Option<(&Arena<'a>, usize)>,
     ) -> Result<Self> {
         let name = |full: &str| if heads == 32 { full.replacen("step5_", "step52_", 1) }
             else { full.to_owned() };
@@ -394,38 +403,39 @@ impl<'a> SwaLayer<'a> {
             .map(|w| load_operand(device, checkpoint, &layout, w))
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { rope, layer: layer_id, weights,
-            programs: resolved, epsilon: contract.norms.input, heads }), ffn)
+            programs: resolved, epsilon: contract.norms.input, heads }), ffn, arena)
     }
 
     /// Fresh metadata and attention/FFN planes, with no checkpoint or program reload.
     pub(super) fn new_lane(&self) -> Result<Self> {
         let ffn = self.ffn.as_ref().map(DenseFfn::new_lane).transpose()?;
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn)
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn, None)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
-        immutable: std::rc::Rc<SwaWeights<'a>>, ffn: Option<DenseFfn<'a>>) -> Result<Self> {
-        let planes = admission.planes.iter().map(|&n| Allocation::new(device, n))
-            .collect::<Result<Vec<_>>>()?;
+        immutable: std::rc::Rc<SwaWeights<'a>>, ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
+        let planes = scratch::planes(device, &admission.planes, arena)?;
         let stream = Stream::new(device)?;
         let rows = admission.rows;
         let owner = Self { stream, ffn, planes, admission, immutable };
-        for (plane, bytes) in [
-            (
-                POSITIONS,
-                (0..rows as i64)
-                    .flat_map(i64::to_le_bytes)
-                    .collect::<Vec<_>>(),
-            ),
-            (REQUESTS, vec![0; rows * 4]),
-            (
-                TABLE,
-                (0..owner.admission.pages as i32)
-                    .flat_map(i32::to_le_bytes)
-                    .collect(),
-            ),
-        ] {
-            device.run(|| device.library.copy_h2d(owner.planes[plane].buffer, &bytes))?;
+        if arena.is_none() {
+            for (plane, bytes) in [
+                (
+                    POSITIONS,
+                    (0..rows as i64)
+                        .flat_map(i64::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                ),
+                (REQUESTS, vec![0; rows * 4]),
+                (
+                    TABLE,
+                    (0..owner.admission.pages as i32)
+                        .flat_map(i32::to_le_bytes)
+                        .collect(),
+                ),
+            ] {
+                device.run(|| device.library.copy_h2d(owner.planes[plane].buffer, &bytes))?;
+            }
         }
         Ok(owner)
     }
