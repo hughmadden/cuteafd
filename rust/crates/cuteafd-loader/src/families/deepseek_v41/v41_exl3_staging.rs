@@ -54,9 +54,9 @@ impl V41Exl3TensorSlice {
 /// gathers columns of each packed K row; down trellis gathers whole K rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V41Exl3TensorGather {
-    rows: usize,
-    source_row_bytes: usize,
-    columns: Vec<std::ops::Range<usize>>,
+    pub(crate) rows: usize,
+    pub(crate) source_row_bytes: usize,
+    pub(crate) columns: Vec<std::ops::Range<usize>>,
     selected_row_bytes: usize,
 }
 

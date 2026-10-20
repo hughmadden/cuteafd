@@ -2214,7 +2214,7 @@ checksum = "63fa2238e662d3d3c1a71168b3278f23422cf9bf76f6943ee6b1c2581d74eb5c"
 [[package]]
 name = "nest-push"
 version = "0.5.5"
-source = "git+https://github.com/tpurtell/sparknest?rev=8d1df4e1c0376a7e8267c7710d226fc7c32843b3#8d1df4e1c0376a7e8267c7710d226fc7c32843b3"
+source = "git+https://github.com/tpurtell/sparknest?rev=e9d60a1b011efd81af4523f59382cae3eacd8926#e9d60a1b011efd81af4523f59382cae3eacd8926"
 dependencies = [
  "libc",
  "nix",
