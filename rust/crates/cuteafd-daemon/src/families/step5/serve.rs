@@ -3,7 +3,7 @@ use super::{admission::{self, RuntimeInputs}, backend::{Inputs, Step5Backend}, c
     execution::Execution, transaction::Staging};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::Device,
     placement::{spark_rings, SparkAdmission}, prefix::PrefixArgs, qwen::scheduler::{self, Backend},
-    spark_intake::SparkLane, token_io::{EmbedPlacement, EmbedSource, TokenEmbedding, TokenIoArgs}};
+    spark_intake::SparkLink, token_io::{EmbedPlacement, EmbedSource, TokenEmbedding, TokenIoArgs}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
 use cuteafd_ffi::NativeLibrary;
@@ -32,9 +32,6 @@ pub(crate) struct ServeArgs {
     max_context: u64,
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
     prefill_rows: u32,
-    /// Native execution lanes, independent of scheduler sequence slots.
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
-    execution_lanes: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
     #[arg(long, default_value_t = 32768)]
@@ -146,7 +143,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let mut inputs = RuntimeInputs { inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: args.prefill_rows as usize,
-        sequences: usize::from(args.max_sequences), lanes: usize::from(args.execution_lanes), context: args.max_context,
+        sequences: usize::from(args.max_sequences), context: args.max_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
         peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![] };
@@ -166,14 +163,14 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let config = TcpTransportConfig::default();
     SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
         rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: args.peers.len(),
-        prefill_lanes: inputs.lanes as u64 }, args.peers.len(), None,
+        prefill_lanes: 1 }, args.peers.len(), None,
         ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, compiled,
             spark_rings(config.max_frame_bytes)?, clients)?)?.select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
         let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.rows)?;
-        let native = native.check(inputs.lanes, u64::MAX, &[])?;
+        let native = native.check( u64::MAX, &[])?;
         let total = admission.placement.items[rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
             .context("Step-5 solved allocation overflow")?;
         total.checked_sub(native).context("Step-5 native allocation missing from solved ledger")
@@ -182,30 +179,30 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         admission.cache.clone(), rank, inputs.sequences as u64, admission.marks as u64,
         admission.placement.pool_tokens / 64, admission.reservations[rank].total)?)))
         .collect::<Result<Vec<_>>>()?;
-    let stages = (0..inputs.lanes).map(|_| devices.iter().enumerate().map(|(rank, &device)| {
+    let stages = devices.iter().enumerate().map(|(rank, &device)| {
         let cache = caches[rank].borrow();
         Staging::new_for_sequences(device, &programs, &cache,
             Staging::bytes_for_sequences(&admission.cache, rank, inputs.sequences)?, inputs.sequences)
-    }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
-    let lane_inputs = (0..inputs.lanes).map(|_| Inputs::allocate(devices[0], inputs.rows, Inputs::bytes(inputs.rows)?))
-        .collect::<Result<Vec<_>>>()?;
+    }).collect::<Result<Vec<_>>>()?;
+    let target_input = Inputs::allocate(devices[0], inputs.rows, Inputs::bytes(inputs.rows)?)?;
     let world = SparkWorld::canonical(args.peers.len())?;
-    let wave_ranks = admission.ownership.routed_wave_ranks()?;
-    let transports = (0..inputs.lanes).map(|_| devices.iter().enumerate().map(|(rank, device)| {
-        if wave_ranks.contains(&rank) { device.own(|| SparkLane::new(&library, world,
-            args.peers.clone(), args.prefill_rows, config.clone(), 4096 * 2)).map(Some) } else { Ok(None) }
-    }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+    let transport = devices[0].own(|| {
+        let mut link = SparkLink::new(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2)?;
+        link.enable_terminal_ownership(library.clone())?;
+        link.bootstrap(&super::execution::bootstrap_request(inputs.rows, 1)?)?;
+        Ok(link)
+    })?;
     let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight")
         .context("Step-5 embedding header missing")?;
     let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
     library.cuda_set_device(args.device)?;
     let (embedding, execution) = TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, ||
-        Execution::load_lanes_count(&programs, &checkpoint, admission.ownership,
-            caches.iter().collect(), stages.iter().map(|rank| rank.iter().collect()).collect(), inputs.rows,
-            available, reserves, transports, 92, 1))?;
-    let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, lane_inputs.iter().collect())?;
+        Execution::load_count(&programs, &checkpoint, admission.ownership,
+            caches.iter().collect(), stages.iter().collect(), inputs.rows,
+            available, reserves, Some(transport), 92, 1))?;
+    let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?;
     library.cuda_set_device(args.device)?;
-    tracing::info!(rows=inputs.rows, sequences=inputs.sequences, lanes=inputs.lanes,
+    tracing::info!(rows=inputs.rows, sequences=inputs.sequences,
         context=backend.geometry().max_context, pool_tokens=admission.placement.pool_tokens,
         "Step-5 admitted eager target; native MTP disabled");
     scheduler::schedule(&backend, &args.snapshot, receive, stats, inputs.sequences, scheduler::Drafts::None,
@@ -276,7 +273,7 @@ mod tests {
     fn target_serving_defaults_and_invalid_owners() -> Result<()> {
         let mut args = args();
         args.validate()?;
-        assert_eq!((args.execution_lanes, args.max_context, args.max_sequences), (2, 1_048_576, 16));
+        assert_eq!((args.max_context, args.max_sequences), (1_048_576, 16));
         args.split_device = Some(args.device);
         assert!(args.validate().is_err());
         args.split_device = Some(1);

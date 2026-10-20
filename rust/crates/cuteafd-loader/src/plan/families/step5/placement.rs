@@ -43,7 +43,7 @@ pub(super) fn layout(
             && report
                 .requested_attention
                 .is_none_or(|a| a == AttentionPlacement::Heads),
-        Unqualified("context or non-native attention ownership")
+        Unqualified("two-GPU execution requires head-split SWA with alternating whole-owned CSA; all-whole SWA has no routed reply reuse proof")
     );
     ensure!(
         !opts.host_embedding
@@ -64,11 +64,7 @@ pub(super) fn layout(
     } else {
         opts.prefill_rows
     })?;
-    let lanes = usize::try_from(if opts.prefill_lanes == 0 {
-        2
-    } else {
-        opts.prefill_lanes
-    })?;
+
     let sequences = usize::try_from(if opts.concurrency == 0 {
         16
     } else {
@@ -177,7 +173,6 @@ pub(super) fn layout(
         inventory,
         rows,
         sequences,
-        lanes,
         context,
         requested_pool: opts.pool_tokens,
         marks: MarkRule {
@@ -206,7 +201,7 @@ pub(super) fn layout(
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: admitted.placement.pool_tokens,
         waste: vec![], notes: vec!["WIP target-only eager Step-5: exact native allocation owners; zero graphs; no MTP or media".into(),
             "Offline CUDA/code baseline is estimated; serving must re-admit against pre-weight live samples and native export ABIs".into(),
-            format!("{}; {lanes} lanes, {sequences} sequences, request context {}, compiled extent {}",
+            format!("{}; {sequences} sequences, request context {}, compiled extent {}",
                 if coordinators == 2 { "SWA head split, alternating whole-owned CSA" } else { "Single-device SWA and CSA ownership" },
                 admitted.cache.context, model.cfg.max_context)] };
     for rank in 0..coordinators {
@@ -240,7 +235,7 @@ pub(super) fn layout(
         rtx_layers: vec![],
         spark_layers: (3..91).collect(),
         spark_ranks,
-        prefill_lanes: lanes as u64,
+        prefill_lanes: 1,
     };
     let endpoints = (0..admitted.ownership.routed_endpoints()?)
         .map(|_| cuteafd_core::SparkEndpoint {
