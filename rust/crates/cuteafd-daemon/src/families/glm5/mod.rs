@@ -610,20 +610,22 @@ impl Opened {
         let selected_peers = if working.spark.spark_ranks > 0 { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
-        if let Some(peers) = args.peers.as_deref() {
+        let admission = if let Some(peers) = args.peers.as_deref() {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-            crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
+            Some(crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
                 peers.len(), None, spark_model(prefill_lanes, spark_bf16, native)?,
-                args.exlr8_manifest.as_deref())?.select(&peers)?;
-        }
+                args.exlr8_manifest.as_deref())?.start(&peers)?)
+        } else { None };
         let started = Instant::now();
         let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
-        let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, owners.as_deref(), native) })?;
+        let (embedding, (model, mut shares)) = crate::shared::placement::load_while_admitting(admission, || {
+            crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+                args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, owners.as_deref(), native) })
+        })?;
         let native_owners = native_plans.into_iter().zip(&devices).map(|(plan, &device)| {
             self.library.cuda_set_device(device)?;
             engine::exlr8::NativeExperts::load(&self.library, plan)
@@ -640,7 +642,8 @@ impl Opened {
         ensure!(actual_weights == reserved_weights,
             "GLM loaded coordinator owners {actual_weights:?} differ from header reservation {reserved_weights:?}");
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
-            resident_bytes = ?actual_weights, "GLM coordinator weights match pre-weight reservation");
+            resident_bytes = ?actual_weights,
+            "GLM coordinator weights validated against pre-weight reservation after Spark admission (elapsed includes wait)");
         let context_kv = placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context;
         ensure!(!context_kv || peer_stream.is_some(), "context attention needs the head split's second GPU");
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());

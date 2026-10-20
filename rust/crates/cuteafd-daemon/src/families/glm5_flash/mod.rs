@@ -1757,7 +1757,7 @@ impl Opened {
             ensure!(rtx_layers == working.rtx_layers,
                 "GLM Flash runtime RTX selection disagrees with admitted working set");
         }
-        if args.peers.is_some() {
+        let admission = if args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }
@@ -1773,9 +1773,9 @@ impl Opened {
                 endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress }; args.prefill_lanes],
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
-            crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
-                &working, peers.len(), None, model)?.select(&peers)?;
-        }
+            Some(crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
+                &working, peers.len(), None, model)?.start(&peers)?)
+        } else { None };
         let execution = cuteafd_loader::placement::LayerExecutionPlan::new(&placement,
             cuteafd_loader::placement::HopSpec {
                 storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,
@@ -1787,11 +1787,13 @@ impl Opened {
                     else { cuteafd_loader::placement::TerminalHome::AttentionOwner },
             })?;
         let source = self.embed_source()?;
-        let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
-            args.token_io.embed_placement, || {
-                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                loader.model(&self.cfg, &execution)
-            })?;
+        let (embedding, (model, mut shares)) = crate::shared::placement::load_while_admitting(admission, || {
+            crate::shared::token_io::TokenEmbedding::load(&self.library, source,
+                args.token_io.embed_placement, || {
+                    let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                    loader.model(&self.cfg, &execution)
+                })
+        })?;
         probe("target-weights")?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
@@ -1822,7 +1824,7 @@ impl Opened {
             kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8),
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "GLM 5.3 Flash coordinator weights resident (one copy each)");
+            "GLM 5.3 Flash coordinator weights validated after Spark admission (one copy each; elapsed includes wait)");
         let moe = (0..layers).any(|l| !self.cfg.dense[l]);
         let reserved_units = if args.prefix_marks == prefix::PrefixMarks::Pool {
             cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };
