@@ -294,13 +294,21 @@ def test_step5_refuses_unsupported_configuration(tmp_path: Path, keys: str, diag
     assert "docker run -d" not in result.stderr and "Traceback" not in result.stderr
 
 
-@pytest.mark.parametrize("keys,depth", [("SPECULATOR=mtp\n", "1"), ("SPECULATOR=mtp\nSPECULATOR_DEPTH=3\n", "3")])
+@pytest.mark.parametrize("keys,depth", [
+    ("SPECULATOR=mtp\n", "3"),
+    *[(f"SPECULATOR=mtp\nSPECULATOR_DEPTH={depth}\n", str(depth)) for depth in (1, 2, 3)],
+    ("SPECULATOR=off\n", "0"),
+])
 def test_step5_native_mtp_is_opt_in(tmp_path: Path, keys: str, depth: str) -> None:
     result = _step5(tmp_path, "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6) + keys)
     serve = _line(result, "cuteafd serve-step5 --snapshot")
-    assert _flag(serve, "--mtp") == depth
+    assert _flag(serve, "--mtp") == (depth if depth != "0" else None)
+    assert _flag(_line(result, "cuteafd plan"), "--native-mtp-layers") == depth
     for absent in ("--draft", "--dspark"):
         assert absent not in serve.split(), absent
+    other = _family_launch_result(tmp_path / "other", {"model_type": "deepseek_v4"},
+                                  "test/dsv4", "SPECULATOR=dspark\n")
+    assert _flag(_line(other, "cuteafd plan"), "--native-mtp-layers") is None
 
 
 def test_step5_refuses_release_images_and_slots_without_serve_step5(tmp_path: Path) -> None:
