@@ -19,6 +19,25 @@ pub fn write_kimi_tokenizer(snapshot: &Path) {
     }}).to_string()).unwrap();
 }
 
+/// Real Kimi geometry with one sparse shard per layer, below the header limit.
+pub fn write_kimi_snapshot(dir: &Path, all: bool) {
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in kimi_k3_tensors(all) {
+        let shard = tensor.0.split(".layers.").nth(1)
+            .and_then(|tail| tail.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("model-{index:05}.safetensors");
+        write_safetensors(&dir.join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    fs::write(dir.join("config.json"), kimi_k3_config().to_string()).unwrap();
+    fs::write(dir.join("model.safetensors.index.json"), json!({"weight_map":weight_map}).to_string()).unwrap();
+}
+
 /// (name, safetensors dtype, shape).
 pub type Tensor = (String, &'static str, Vec<usize>);
 

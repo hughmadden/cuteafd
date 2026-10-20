@@ -331,7 +331,7 @@ mod tests {
         use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
         use cuteafd_hostcache::{config::Config, copy::Stream as CopyStream};
 
-        for heads in [false, true] {
+        for (heads, context) in [(false, 262_144), (true, 1_048_576)] {
             let fixture = Fixture::build()?;
             let library = fixture.load()?;
             fixture.immediate_copies(&library)?;
@@ -341,6 +341,13 @@ mod tests {
             cfg.dense.truncate(3);
             let mut inputs = super::super::admission::tests::inputs(&cfg);
             inputs.attention = heads.then_some(AttentionPlacement::Heads);
+            for layouts in &mut inputs.lane_layouts {
+                for layout in layouts {
+                    *layout = super::super::device::LaneLayout::new(
+                        &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?, inputs.rows, context,
+                        super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
+                }
+            }
             let mut placement = super::super::admission::admit(inputs)?.placement;
             placement.pool_tokens = 512;
             let bank = |rank| -> Result<_> {
@@ -352,7 +359,7 @@ mod tests {
             };
             let (k0, m0) = bank(0)?;
             let (k1, m1) = bank(1)?;
-            let family = KimiPrefix::new(&cfg, 512, [k0, k1], [m0, m1])?;
+            let family = KimiPrefix::new(&cfg, context, [k0, k1], [m0, m1])?;
             let boxed = |error: BoxError| anyhow::anyhow!("Kimi host fixture: {error}");
             let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
                 let mut bytes = vec![0; buffer.bytes];

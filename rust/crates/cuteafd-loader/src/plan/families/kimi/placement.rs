@@ -7,7 +7,7 @@ use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
-const FLOOR: u64 = crate::families::kimi_k3::COMPILED_CONTEXT as u64;
+const COMPILED_CAPACITY: u64 = crate::families::kimi_k3::COMPILED_CONTEXT as u64;
 const PAGE: u64 = 64;
 const MODES: &[LayerMode] = &[LayerMode::HeadSplit,
     LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
@@ -33,11 +33,11 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     };
     report.bytes_by_owner.clear();
     report.attention_placement = report.requested_attention.unwrap_or(AttentionPlacement::Layers);
-    let api_context = if opts.context_tokens == 0 { FLOOR } else { opts.context_tokens };
-    memory.notes.push(format!("Kimi API max context: {api_context} tokens; compiled max context: {FLOOR} tokens (allocation floor unchanged)"));
-    if api_context > FLOOR {
-        refusal(report, format!("Kimi API context {api_context} exceeds compiled context {FLOOR}"),
-            "Lower --context-tokens; Kimi's native allocation extent remains fixed at 1M.");
+    let context = if opts.context_tokens == 0 { COMPILED_CAPACITY } else { opts.context_tokens };
+    memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {context} tokens (native capacity {COMPILED_CAPACITY} tokens)"));
+    if context > COMPILED_CAPACITY {
+        refusal(report, format!("Kimi context {context} exceeds compiled capacity {COMPILED_CAPACITY}"),
+            "Lower --context-tokens to at most 1M; the pool must cover the selected context extent.");
         return memory;
     }
     if report.requested_attention == Some(AttentionPlacement::Context) {
@@ -148,9 +148,9 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             headroom_bytes: opts.headroom_bytes, baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }).collect(),
             spark_ranks: ranks, peer_access: true },
         attention_placement: report.requested_attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
-        pool: PoolPolicy { compiled_context: FLOOR,
-            requested: requested_pool, target: opts.target_pool_tokens.max(FLOOR), floor: FLOOR,
-            ceiling: opts.target_pool_tokens.max(requested_pool.unwrap_or(0)).max(FLOOR), unit_rows: PAGE },
+        pool: PoolPolicy { compiled_context: context,
+            requested: requested_pool, target: opts.target_pool_tokens.max(context), floor: context,
+            ceiling: opts.target_pool_tokens.max(requested_pool.unwrap_or(0)).max(context), unit_rows: PAGE },
         layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
         expert_workspace: 0, tp2_workspace: [0; 2], onboard, expert_gpus: 2, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating, expert_ownership: ExpertOwnership::Contiguous,

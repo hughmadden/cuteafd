@@ -628,6 +628,71 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn planner_equals_runtime_context_extent_at_256k_and_1m() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
+        let snapshot = tempfile::tempdir()?;
+        testing::write_kimi_snapshot(snapshot.path(), true);
+        let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
+        let mut lane_bytes = Vec::new();
+        let mut cache_bytes = Vec::new();
+        for context in [262_144, 1_048_576] {
+            let text = context.to_string();
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-kimi", "--snapshot", "/fixture",
+                "--native-lib", "/fixture.so", "--max-context", &text, "--pool-tokens", &text])?;
+            let crate::cli::Commands::ServeKimi(args) = cli.command else { panic!("Kimi command") };
+            let mut i = inputs(&cfg);
+            i.requested_pool = args.pool_tokens;
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, args.max_context,
+                super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
+            lane_bytes.push(i.lane_layouts[0][0].bytes()?);
+            let mut under = request(i)?;
+            assert_eq!(under.pool.compiled_context, context);
+            assert_eq!(under.pool.floor, context);
+            under.pool.requested = Some(context - 64);
+            assert_eq!(solve(&under), Err(PlacementError::RequestedBelowContext {
+                requested: context - 64, floor: context,
+            }));
+            let mut i = inputs(&cfg);
+            i.requested_pool = Some(context);
+            for layouts in &mut i.lane_layouts {
+                for layout in layouts {
+                    *layout = LaneLayout::new(&cfg, i.rows, context as usize,
+                        super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
+                }
+            }
+            let admitted = admit(i)?;
+            let mut options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+                layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                    context_tokens: context, pool_tokens: Some(context), prefix_slots: Some(2),
+                    host_cache_bytes: Some(0), onboard: Some(Onboard::Layers(5)), ..Default::default() }),
+                ..Default::default() };
+            let report = plan::plan(snapshot.path(), &options)?;
+            ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
+            let memory = report.memory_layout.context("Kimi planned layout")?;
+            assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
+            assert_eq!(memory.pool_tokens, context);
+            let mut total = 0;
+            for rank in 0..2 {
+                let mla = super::super::mla::CacheLayout::new(&cfg, &admitted.placement, rank)?;
+                total += mla.bytes();
+                let planned = memory.devices.iter().find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx
+                    && d.index == rank as u32).context("planned RTX")?;
+                let kv = |items: &[cuteafd_core::memory_layout::Item]| items.iter()
+                    .filter(|item| item.category == Category::Kv).map(|item| item.bytes).sum::<u64>();
+                assert_eq!(kv(&planned.items), kv(&admitted.placement.items[rank]), "rank {rank}, context {context}");
+            }
+            cache_bytes.push(total);
+            options.layout.as_mut().unwrap().pool_tokens = Some(context - 64);
+            let refused = plan::plan(snapshot.path(), &options)?;
+            assert!(!refused.fits, "planner must not shrink the explicit context floor");
+        }
+        assert_eq!(lane_bytes[1] - lane_bytes[0], 3 << 20);
+        assert_eq!(cache_bytes[1] - cache_bytes[0], 24 * (1_048_576 - 262_144) * MLA_RECORD_BYTES);
+        Ok(())
+    }
+
+    #[test]
     fn diagnostic_prefix_admits_only_selected_layers_and_uses_shared_plan() -> Result<()> {
         let full = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for layers in [1, 2, 4, 5, 12, 92, 93] {
