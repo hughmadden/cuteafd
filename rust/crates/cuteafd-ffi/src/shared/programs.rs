@@ -211,7 +211,9 @@ impl<'a> Programs<'a> {
                 }
                 self.card_specs.insert(name.to_string(), specs);
             }
-            if name.starts_with("exlr8_dense_") {
+            if name.starts_with("glm_stage_") || name.starts_with("glm2_stage_") {
+                super::glm_stage::validate_entry(spec, entry)?;
+            } else if name.starts_with("exlr8_dense_") {
                 super::native_dense::validate_entry(spec, entry)?;
             } else if name.starts_with("exlr8_") {
                 super::exlr8::validate_entry(spec, entry)?;

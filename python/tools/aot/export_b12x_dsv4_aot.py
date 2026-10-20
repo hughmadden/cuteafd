@@ -148,6 +148,31 @@ def head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int
     return [item for item in programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 
+def glm_stage_programs(g, decode_rows: int, prefill_rows: int):
+    """Dormant primitive boundaries; the official fused GLM table stays unchanged."""
+    from functools import partial
+    from b12x.integration.cuteafd.glm_attention import compile_glm_attention_stage_aot
+
+    out = []
+    for rows in (decode_rows, prefill_rows):
+        mode = "decode" if rows == decode_rows else "prefill"
+        for stage in ("rank_pack", "query_rope", "index_post", "absorb", "values"):
+            modes = (None, mode) if stage in ("absorb", "values") else (None,)
+            for weights in modes:
+                params = dict(stage=stage, max_rows=rows, fp8_only=weights)
+                suffix = "_bf16" if weights is None and stage in ("absorb", "values") else ""
+                out.append((f"{stage}{suffix}_m{rows}", "attention_stage", params,
+                            partial(compile_glm_attention_stage_aot, g, **params)))
+        if g.heads == 32:
+            for stage in ("query_rope", "absorb"):
+                params = dict(stage=stage, max_rows=rows, query_row=2 * g.heads * g.latent_dim)
+                if stage == "absorb":
+                    params["fp8_only"] = mode
+                out.append((f"{stage}_context_m{rows}", "attention_stage", params,
+                            partial(compile_glm_attention_stage_aot, g, **params)))
+    return out
+
+
 def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """GLM 5.x programs, same (stem suffix, op, params, thunk) shape as ``programs``."""
     from b12x.integration.cuteafd import glm_attention as attn
@@ -740,7 +765,8 @@ def main() -> None:
                              "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
                              "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
                              "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
-                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands)")
+                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), "
+                             "glm_stage/glm2_stage (dormant full/TP2 GLM primitive boundaries)")
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
@@ -769,9 +795,9 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -797,6 +823,11 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
+        if name in ("glm_stage", "glm2_stage"):
+            g = GLM53 if name == "glm_stage" else dataclasses.replace(GLM53, name="glm53_tp2", heads=32)
+            manifest["families"][name] = dataclasses.asdict(g)
+            work += [(name, *item) for item in glm_stage_programs(g, args.decode_rows, args.prefill_rows)]
+            continue
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
             manifest["families"][name] = {"abi_version": 1}

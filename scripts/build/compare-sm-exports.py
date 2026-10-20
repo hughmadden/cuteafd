@@ -157,6 +157,8 @@ def jobs(scope):
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
+        ("glm-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm_stage"]),
+        ("glm2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm2_stage"]),
         ("exlr8-dense-trellis", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "trellis_q_b,trellis_o,trellis_gate_up,trellis_down"]),
