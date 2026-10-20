@@ -1132,8 +1132,10 @@ mod tests {
         options.layout.as_mut().unwrap().rtx_bytes.truncate(1);
         assert!(error(&options,"up1","off").contains("two RTX"));
         options.layout.as_mut().unwrap().rtx_bytes.push(96 << 30);
-        options.layout.as_mut().unwrap().prefill_lanes = 2;
-        assert!(error(&options,"up1","off").contains("serial"));
+        for lanes in 1..=4 {
+            options.layout.as_mut().unwrap().prefill_lanes = lanes;
+            assert!(!error(&options,"up1","off").contains("serial"));
+        }
         options.layout.as_mut().unwrap().prefill_lanes = 1;
         options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(1));
         assert!(error(&options,"up1","off").contains("onboard"));
