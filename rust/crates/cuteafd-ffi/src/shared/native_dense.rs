@@ -59,7 +59,7 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
             return Err(invalid(format!(
                 "unsupported native dense program {}",
                 spec.name
-            )))
+            )));
         }
     };
     let g = &spec.geometry;
@@ -358,6 +358,86 @@ impl<'a> DenseLinear<'a> {
     }
 }
 
+/// Row-FP8 vocabulary gather. `ids` contains arbitrary vocabulary IDs, not row offsets.
+/// This deliberately does not replace the indexed/copy/fallback BF16 gather ABI.
+pub struct DenseEmbedding<'a> {
+    program: Program<'a>,
+    geometry: DenseGeometry,
+    cta_limit: i32,
+}
+
+impl<'a> DenseEmbedding<'a> {
+    pub fn bind(programs: &'a Programs<'a>, name: &str) -> Result<Self> {
+        let geometry = validate_spec(programs.spec(name).map_err(|e| invalid(e.to_string()))?)?;
+        if geometry.encoding != Encoding::Embedding {
+            return Err(invalid("native embedding requires the row-FP8 gather ABI"));
+        }
+        let cta_limit = programs
+            .library()
+            .sm_count()
+            .map_err(|e| invalid(e.to_string()))?
+            .checked_mul(4)
+            .filter(|&n| n > 0)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| invalid("invalid runtime SM count"))?;
+        let program = programs
+            .program(name, geometry.pointers())
+            .map_err(|e| invalid(e.to_string()))?;
+        Ok(Self {
+            program,
+            geometry,
+            cta_limit,
+        })
+    }
+
+    pub fn geometry(&self) -> DenseGeometry {
+        self.geometry
+    }
+
+    /// # Safety
+    /// IDs are I32[rows], payload U8[vocabulary,hidden], scales F32[vocabulary],
+    /// and output BF16[rows,hidden] on the bound device. All storage survives
+    /// stream completion. Out-of-vocabulary IDs produce zero rows.
+    pub unsafe fn launch(
+        &self,
+        ids: *mut c_void,
+        payload: *mut c_void,
+        scales: *mut c_void,
+        output: *mut c_void,
+        rows: u32,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        validate_embedding_launch(self.geometry, ids, payload, scales, output, rows)?;
+        // SAFETY: the caller retains correctly sized device operands through completion.
+        unsafe {
+            self.program.launch(
+                &[ids, payload, scales, output],
+                &[Scalar::I32(rows as i32), Scalar::I32(self.cta_limit)],
+                stream,
+            )
+        }
+        .map_err(|e| invalid(e.to_string()))
+    }
+}
+
+fn validate_embedding_launch(
+    g: DenseGeometry,
+    ids: *mut c_void,
+    payload: *mut c_void,
+    scales: *mut c_void,
+    output: *mut c_void,
+    rows: u32,
+) -> Result<()> {
+    if g.encoding != Encoding::Embedding
+        || rows == 0
+        || rows > g.max_rows
+        || [ids, payload, scales, output].iter().any(|p| p.is_null())
+    {
+        return Err(invalid("native embedding launch storage or row capacity"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,9 +561,37 @@ mod tests {
             {"name":"payload","dtype":"uint8","shape":"[154880,6144]","role":"in"},
             {"name":"scales","dtype":"float32","shape":"[154880]","role":"in"},
             {"name":"output","dtype":"bfloat16","shape":"[rows,6144]","role":"out"}]);
-        assert_eq!(
-            validate_entry(&spec, &entry).unwrap().encoding,
-            Encoding::Embedding
-        );
+        let geometry = validate_entry(&spec, &entry).unwrap();
+        assert_eq!(geometry.encoding, Encoding::Embedding);
+        let pointer = std::ptr::NonNull::<u32>::dangling().as_ptr().cast();
+        for rows in [1, 4, 4096] {
+            validate_embedding_launch(geometry, pointer, pointer, pointer, pointer, rows).unwrap();
+        }
+        for rows in [0, 4097, u32::MAX] {
+            assert!(
+                validate_embedding_launch(geometry, pointer, pointer, pointer, pointer, rows)
+                    .is_err()
+            );
+        }
+        for missing in 0..4 {
+            let mut pointers = [pointer; 4];
+            pointers[missing] = std::ptr::null_mut();
+            assert!(
+                validate_embedding_launch(
+                    geometry,
+                    pointers[0],
+                    pointers[1],
+                    pointers[2],
+                    pointers[3],
+                    1
+                )
+                .is_err()
+            );
+        }
+        for (field, value) in [("dtype", "uint8"), ("shape", "[rows,1]"), ("role", "out")] {
+            let mut bad = entry.clone();
+            bad["pointers"][0][field] = json!(value);
+            assert!(validate_entry(&spec, &bad).is_err());
+        }
     }
 }
