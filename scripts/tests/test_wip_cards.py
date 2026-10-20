@@ -486,6 +486,17 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
     assert prefill['prompt_token_hashes'] == ['73b4ebf8f4958775'] and prefill['follow_up_prompts'] == 1
     decode = cards.summarize_job(job(dict(name='d', profile='panels:', levels=[1, 16], set={}, sparks=[])), 0)
     assert decode['status'] == 'failed' and 'per-request console rounds' in decode['error']
+    # Fidelity-only runs (no baseline) score through the probe endpoint and decode nothing either.
+    def with_report(entry):
+        made = job(entry)
+        report = Path(made['state']) / 'reports' / entry['name'] / 'report.json'
+        report.write_text(json.dumps({'panels': [{'id': 'fidelity', 'status': 'pass'}]}))
+        return made
+    fidelity = cards.summarize_job(with_report(dict(name='f', profile='panels:fidelity', baseline=False, set={}, sparks=[])), 0)
+    assert 'per-request console rounds' not in (fidelity.get('error') or ''), fidelity.get('error')
+    # A fidelity panel beside the baseline still decodes, so it keeps the check.
+    mixed = cards.summarize_job(with_report(dict(name='m', profile='panels:fidelity', set={}, sparks=[])), 0)
+    assert 'per-request console rounds' in (mixed.get('error') or '')
 
 
 def _coordinator_log(deterministic, follow_up_tokens):
