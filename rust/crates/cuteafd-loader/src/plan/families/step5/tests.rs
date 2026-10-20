@@ -164,6 +164,35 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
         assert_eq!(charged(&admitted, 0) - charged(&baseline, 0),
             weights + workspace + active_delta as u64 + marks_delta as u64);
         assert_eq!(charged(&admitted, 1), charged(&baseline, 1));
+        let planned = plan::plan(&checkpoint_path, &PlanOptions {
+            placement: ExpertPlacement::from_spark_ranks(6),
+            draft_ownership: Some(if depth == 0 { spec::DraftOwnership::None }
+                else { spec::DraftOwnership::NativeMtp }),
+            layout: Some(layout::LayoutOptions {
+                rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool,
+                context_tokens: inputs.context, concurrency: inputs.sequences as u64,
+                prefill_rows: inputs.rows as u64, headroom_bytes: 1 << 30,
+                native_mtp_layers: depth, workspace_manifest: Some(manifest_path.clone()),
+                mimo_prefix_entries: inputs.marks.entries as u64,
+                mimo_prefix_mark_bytes: inputs.marks.budget_bytes,
+                ..Default::default()
+            }), ..Default::default()
+        })?;
+        let memory = planned.memory_layout.as_ref().expect("depth-aware Step-5 layout");
+        assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
+        for rank in 0..2 {
+            let device = &memory.devices[rank];
+            for category in [cuteafd_core::memory_layout::Category::Weights,
+                cuteafd_core::memory_layout::Category::Kv,
+                cuteafd_core::memory_layout::Category::Prefix,
+                cuteafd_core::memory_layout::Category::Workspace] {
+                let expected = admitted.placement.items[rank].iter()
+                    .filter(|item| item.category == category).map(|item| item.bytes).sum::<u64>();
+                let actual = device.items.iter().filter(|item| item.category == category)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(actual, expected, "depth {depth}, rank {rank}, {category:?}");
+            }
+        }
         let by_category = (0..2).map(|rank| {
             let mut categories = std::collections::BTreeMap::new();
             for item in &admitted.placement.items[rank] {

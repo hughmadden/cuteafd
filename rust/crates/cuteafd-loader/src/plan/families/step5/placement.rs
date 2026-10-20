@@ -47,7 +47,6 @@ pub(super) fn layout(
     );
     ensure!(
         !opts.host_embedding
-            && opts.native_mtp_layers == 0
             && opts.drafter_bytes == 0
             && report.vision == MediaMode::Off
             && report.audio == MediaMode::Off,
@@ -185,7 +184,7 @@ pub(super) fn layout(
         pending_code: code,
         startup: vec![],
     };
-    let admitted = admission::admit(input.checkpoint(), &inputs)?;
+    let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
     report.prefill_rows = Some(rows as u64);
     report.attention_placement = admitted.placement.attention_placement;
     report.bytes_by_owner.clear();
@@ -199,7 +198,7 @@ pub(super) fn layout(
             .sum(),
     );
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: admitted.placement.pool_tokens,
-        waste: vec![], notes: vec!["WIP target-only eager Step-5: exact native allocation owners; zero graphs; no MTP or media".into(),
+        waste: vec![], notes: vec![format!("WIP eager Step-5: exact native allocation owners; zero graphs; {} native MTP stages; no media", opts.native_mtp_layers),
             "Offline CUDA/code baseline is estimated; serving must re-admit against pre-weight live samples and native export ABIs".into(),
             format!("{}; {sequences} sequences, request context {}, compiled extent {}",
                 if coordinators == 2 { "SWA head split, alternating whole-owned CSA" } else { "Single-device SWA and CSA ownership" },
