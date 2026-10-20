@@ -794,7 +794,7 @@ impl Checkpoint {
         let t = self.tensors.get(name).with_context(|| format!("DFlash2 checkpoint has no {name}"))?;
         Ok(cuteafd_loader::LoadedTensor {
             info: cuteafd_core::TensorInfo { name: name.into(), file: "model.safetensors".into(),
-                dtype: t.dtype, shape: t.shape.clone(), byte_offset: t.byte_offset, byte_length: t.byte_length,
+                dtype: t.dtype.clone(), shape: t.shape.clone(), byte_offset: t.byte_offset, byte_length: t.byte_length,
                 role: cuteafd_core::TensorRole::Other, layer_id: None, expert_id: None,
                 is_quantization_metadata: false },
             source_path: "model.safetensors".into(), bytes: self.bytes(name, &t.shape)?.to_vec(),
