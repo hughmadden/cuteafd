@@ -66,6 +66,8 @@ fn k6_checkpoint_load_forward_matches_dequant() -> Result<()> {
     };
     let stream=device.run(||library.cuda_stream_create())?;
     let result=(|| -> Result<()> {
+        let mut numerical_failures=Vec::new();
+        let mut cases=0;
         for (stem,module) in &modules {
             ensure!(module.bits==6 && module.input_features==128 && module.output_features==256,"fixture geometry");
             let book=match module.codebook {Exl3Codebook::Mcg=>"mcg",Exl3Codebook::Mul1=>"mul1"};
@@ -124,9 +126,14 @@ fn k6_checkpoint_load_forward_matches_dequant() -> Result<()> {
                 let actual=bytes.chunks_exact(4).map(|b|f32::from_le_bytes(b.try_into().unwrap())as f64).collect::<Vec<_>>();
                 let (rel,peak)=errors(&actual,&reference)?;
                 eprintln!("K6 {stem} side={side_id} rows=8 rel_l2={rel} max_abs_over_peak={peak}");
-                ensure!(rel<0.004 && peak<0.01,"K6 native forward exceeds F64 bar");
+                cases+=1;
+                if rel>=0.004 || peak>=0.01 {
+                    numerical_failures.push(format!("{stem} side={side_id} rel_l2={rel} max_abs_over_peak={peak}"));
+                }
             }
         }
+        ensure!(cases==44,"expected 22 fixtures on both native layouts");
+        ensure!(numerical_failures.is_empty(),"K6 native forward exceeds F64 bar: {}",numerical_failures.join("; "));
         Ok(())
     })();
     if library.is_quarantined_after_failed_drain() {
