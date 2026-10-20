@@ -422,7 +422,7 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
         engine: crate::families::glm5::EngineArgs,
     }
     const LANES: usize = 3;
-    let context = total.next_multiple_of(PAGE_ROWS);
+    let context = total.next_multiple_of(2 * PAGE_ROWS);
     let mut shape = Vec::new();
     let mut start = 0;
     while start < total {
