@@ -147,20 +147,19 @@ impl V41Exl3Residency {
 }
 
 impl V41Exl3Manifest {
-    /// Plan true owned-byte storage without admitting the unqualified kernel.
+    /// Plan whole-unit balanced owned-byte storage.
     /// Divisible geometry returns the legacy plan verbatim, including descriptors.
-    pub fn residency_with_placement(&self, layer: V41Exl3Layer, world: usize, rank: usize,
-        placement: cuteafd_core::tp_units::TpPlacement) -> Result<V41Exl3Residency> {
-        use cuteafd_core::tp_units::{RankUnits, TpPlacement};
+    pub fn balanced_residency(&self, layer: V41Exl3Layer, world: usize, rank: usize) -> Result<V41Exl3Residency> {
+        use cuteafd_core::tp_units::RankUnits;
         let mut plan = self.residency(layer, world, rank)?;
-        if placement == TpPlacement::RoundRobin || self.experts.intermediate / 128 % world == 0 {
+        if self.experts.intermediate / 128 % world == 0 {
             return Ok(plan);
         }
         ensure!(self.decoder_tiers.len() == 2, "compact EXL3 requires a qualified two-tier export");
         let V41Exl3Layer::Backbone(index) = layer else {
             anyhow::bail!("compact EXL3 draft placement is not qualified");
         };
-        let map = RankUnits::new(placement.rule(128, self.experts.intermediate / 128, world),
+        let map = RankUnits::new(cuteafd_core::tp_units::balanced_rule(128, self.experts.intermediate / 128, world),
             plan.experts, self.experts.intermediate, 128, index, world, rank)?;
         let widths: Vec<_> = map.experts.iter().map(|units| units.len() * 128).collect();
         ensure!(widths.iter().all(|&width| width > 0), "compact EXL3 empty expert slice");
@@ -411,11 +410,11 @@ mod tests {
 
     #[test]
     fn compact_owned_payloads_match_offsets_and_even_layouts_are_unchanged() -> Result<()> {
-        use cuteafd_core::tp_units::TpPlacement;
         for (hidden, intermediate, experts, tiers) in [
             (5120, 2304, 384, [3, 4]), (6144, 2048, 256, [4, 5]),
+            (2560, 640, 512, [4, 5]),
         ] {
-            for world in [2, 3, 4, 6] {
+            for world in [2, 3, 4, 6].into_iter().filter(|&world| world <= intermediate / 128) {
                 let manifest = fixture_geometry(&tiers, hidden, intermediate, experts);
                 let units = intermediate / 128;
                 let mut total_weights = 0;
@@ -423,8 +422,8 @@ mod tests {
                 let mut allocated_bytes = Vec::new();
                 for rank in 0..world {
                     let old = manifest.residency(V41Exl3Layer::Backbone(0), world, rank)?;
-                    let plan = manifest.residency_with_placement(V41Exl3Layer::Backbone(0), world,
-                        rank, TpPlacement::Balanced)?;
+                    let plan = manifest.balanced_residency(V41Exl3Layer::Backbone(0), world,
+                        rank)?;
                     if units % world == 0 {
                         assert_eq!(serde_json::to_value(&plan)?, serde_json::to_value(&old)?);
                         assert!(plan.unit_map.is_none());

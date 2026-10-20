@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn gathered_h128_units_preserve_source_bytes_and_reconstruct_every_projection() -> Result<()> {
-        use cuteafd_core::tp_units::{RankUnits, TpPlacement};
+        use cuteafd_core::tp_units::RankUnits;
         let dir = tempfile::tempdir()?;
         let file = File::options().create_new(true).read(true).write(true).open(dir.path().join("gather"))?;
         let offset = (1u64 << 31) + 64;
@@ -379,7 +379,7 @@ mod tests {
                                 file.write_all_at(&source, offset)?;
                                 let mut rebuilt = vec![0; source.len()];
                                 for rank in 0..world {
-                                    let rule = TpPlacement::Balanced.rule(128, intermediate / 128, world);
+                                    let rule = cuteafd_core::tp_units::balanced_rule(128, intermediate / 128, world);
                                     let map = RankUnits::new(rule, 4, intermediate, 128, layer, world, rank)?;
                                     let gather = tensor_gather(&projection, suffix, &map, 3)?;
                                     let mut got = vec![0xa5; gather.bytes()];

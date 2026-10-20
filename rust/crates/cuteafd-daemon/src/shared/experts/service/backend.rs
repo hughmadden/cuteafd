@@ -528,10 +528,9 @@ pub(super) fn load_exl3<'a>(
         .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let plans = layers.iter().map(|&layer| {
-            Exl3Weights::plan_with_placement(
+            Exl3Weights::plan(
                 catalog,
                 config.exl3_selection(layer)?,
-                config.placement,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -561,12 +560,11 @@ pub(super) fn load_exl3<'a>(
     for (index, plan) in plans.iter().enumerate() {
         let layer = layers[index];
         let started = std::time::Instant::now();
-        let weight = Exl3Weights::load_with_placement(
+        let weight = Exl3Weights::load(
             library,
             catalog,
             config.exl3_selection(layer)?,
             remaining,
-            config.placement,
         )?;
         remaining = remaining
             .checked_sub(plan.resident_bytes)

@@ -12,7 +12,7 @@ expert e in layer L to a rank of an N-rank Spark world. Units per expert:
 U = intermediate / unit. Rules (all checkpoint-independent closed forms
 except `fitted`):
 
-  contiguous     today's exact slices: rank r owns one contiguous run of whole
+  contiguous     offline contiguous reference: rank r owns one contiguous run of whole
                  units, the first U mod N ranks one extra (TP6 of 16: 3,3,3,3,2,2
                  for every expert of every layer). With unit=32 (MXFP4 K32
                  scale groups, MiMo) this is 352,352,352,352,320,320.

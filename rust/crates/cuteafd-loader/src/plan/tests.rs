@@ -1035,7 +1035,7 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     let catalog = crate::read_expert_catalog(dir.path()).unwrap();
     let tensors = catalog.fp8().unwrap();
     assert_eq!(tensors.format(), crate::formats::fp8_experts::ExpertFormat::Nvfp4);
-    assert_eq!(tensors.rank_range(3, 2).unwrap(), (1376, 672));
+    assert_eq!(tensors.rank_range(3, 2).unwrap(), (688, 688));
     let report_tp5 = plan(dir.path(), &quant_options(5)).unwrap();
     assert!(report_tp5.executable(), "{}", render(&report_tp5));
     assert_eq!(component(&report_tp5, Component::RoutedExpert).status, Status::Ready, "{}", render(&report_tp5));
@@ -2497,9 +2497,12 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(layout.pool_tokens % 64, 0);
     assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
-    // 2048 over six ranks: exact whole-block slices (384 x 4, 256 x 2), no padding.
+    // Layer 1 rotates native K32 ownership: rank 0 has 320 columns, rank 4 has 352.
     let experts = |i: usize| layout.devices[2 + i].by_category()[&Category::Experts];
-    assert_eq!(experts(0) * 2, experts(4) * 3);
+    // Both widths store 12 down-scale bytes per hidden row, rather than 10/11.
+    let down_scale_padding = |groups: u64| 384 * 6144 * (12 - groups);
+    assert_eq!((experts(0) - down_scale_padding(10)) * 11,
+        (experts(4) - down_scale_padding(11)) * 10);
     assert!(!layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
 }
 

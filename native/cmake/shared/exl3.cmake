@@ -13,11 +13,9 @@ else()
   message(FATAL_ERROR "EXL3 AOT requires a single native SM120 or SM121 target")
 endif()
 set(CUTEAFD_V41_EXL3_CAPACITIES "1;16;80;256;1024;4096" CACHE STRING "EXL3 batch capacities to package")
-# V7 ships two decoder families side by side: the uniform K=2 raw
-# publication family (resident tiers [2,3]) and the staged K3.25 family
-# ([3,4]). Each family lands in its own sibling package directory
-# (exl3-k23, exl3-k34) and the daemon selects by checkpoint tiers.
-set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4" CACHE STRING "EXL3 decoder tier families to package; one comma-joined tier list per family")
+# Decoder families land in sibling packages (exl3-k23, exl3-k34, exl3-k45);
+# the daemon selects the family from checkpoint tiers.
+set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4;4,5" CACHE STRING "EXL3 decoder tier families to package; one comma-joined tier list per family")
 set(CUTEAFD_V41_EXL3_BITS "" CACHE STRING "Single EXL3 decoder tier family override (replaces CUTEAFD_V41_EXL3_BIT_FAMILIES)")
 set(CUTEAFD_V41_EXL3_TILES "" CACHE STRING "Per-profile EXL3 tile overrides for a controlled A/B (for example tp3-width768=all:128,128,128,128, or tp3-width768=16:64,256,64,256)")
 if(CUTEAFD_V41_EXL3_BITS)

@@ -25,7 +25,7 @@ pub(super) struct Fp8Group {
 
 impl Fp8Group {
     fn plan(catalog: &OfficialV41Catalog, config: &NativeExpertServiceConfig) -> Result<Vec<Self>> {
-        use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Slicing};
+        use cuteafd_loader::formats::fp8_experts::ExpertFormat;
         let tensors = catalog.fp8().context("native expert groups require checkpoint tensors")?;
         ensure!(config.spark_world()?.wire() == cuteafd_transport::expert::SparkWire::Canonical,
             "native expert packages require canonical Spark wire");
@@ -47,10 +47,6 @@ impl Fp8Group {
                 cuteafd_loader::plan::experts::spark_recipe(&format!("{family}:{format}"),
                     tensors.shape().intermediate, config.world)?.rank_for_layer(config.rank, layer), slicing,
                 tensors.rank_width(config.world, config.rank, slicing)?)?;
-            if config.world == 5 {
-                ensure!(slicing == Slicing::Blocks(128) || tensors.shape().intermediate % (128 * config.world) == 0,
-                    "Spark TP5 requires whole-H128 rank-width packages");
-            }
             let metadata = fp8::package_metadata(&directory, &tensors, &layers, config.world, config.rank, slicing)?;
             let capacity = config.capacity as usize;
             let mut scratch = metadata.scratch_for(capacity)?.max(256);

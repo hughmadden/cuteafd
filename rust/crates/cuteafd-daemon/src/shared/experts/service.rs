@@ -68,7 +68,6 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         world: args.world as usize,
         model_admission: None,
         selected_layers: None,
-        placement: cuteafd_core::tp_units::TpPlacement::active()?,
         capacity: 0,
         device_budget: args.device_budget_bytes,
         max_frame_bytes: 0,
@@ -100,7 +99,6 @@ pub(crate) struct NativeExpertServiceConfig {
     pub world: usize,
     model_admission: Option<cuteafd_transport::worker_selection::ModelAdmission>,
     selected_layers: Option<Vec<usize>>,
-    placement: cuteafd_core::tp_units::TpPlacement,
     pub capacity: u32,
     pub device_budget: usize,
     pub max_frame_bytes: usize,
@@ -547,7 +545,6 @@ mod tests {
                     depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
             }),
             selected_layers: None,
-            placement: cuteafd_core::tp_units::TpPlacement::RoundRobin,
             capacity: 16,
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,
@@ -670,6 +667,16 @@ mod tests {
                         }
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn spark_exl3_uses_compressed_shards_for_every_registered_world() {
+        for world in [1, 2, 3, 4, 6] {
+            for rank in 0..world {
+                assert_eq!(config(world, rank, None).exl3_selection(7).unwrap(),
+                    ExpertLayer::BackboneExl3Tp { layer: 7, rank, world });
             }
         }
     }
@@ -1173,13 +1180,10 @@ impl NativeExpertServiceConfig {
                 "compact EXL3 ownership wire requires TP3EP1");
         }
         let topology = world.topology();
-        // TP4 and TP2 preserve their existing storage selectors; compact TP3
-        // uses compressed shards rather than the native replicated role.
-        if topology.tp() == 3 {
-            return Ok(ExpertLayer::BackboneExl3Tp { layer,
-                rank: topology.tp_rank(self.rank)? as usize, world: 3 });
-        }
-        self.selection(layer)
+        // Spark EXL3 always uses the compressed-shard variant. Coordinator
+        // BackboneTp2 keeps its separate legacy layout and arithmetic.
+        Ok(ExpertLayer::BackboneExl3Tp { layer,
+            rank: topology.tp_rank(self.rank)? as usize, world: topology.tp() as usize })
     }
 
     fn native_group(&self) -> Result<Option<u8>> {
@@ -1198,7 +1202,7 @@ impl NativeExpertServiceConfig {
         let layer = *self.resident_layers(catalog.routed_experts().layers)?.first()
             .context("EXL3 package selection requires a resident layer")?;
         let plan = crate::shared::experts::exl3::planned_residency(catalog,
-            self.exl3_selection(layer)?, self.placement)?;
+            self.exl3_selection(layer)?)?;
         Ok(self.exl3_directory_for(&plan.tiers, &plan.aot_layout()))
     }
 
@@ -1206,7 +1210,7 @@ impl NativeExpertServiceConfig {
         let geometry = catalog.routed_experts().geometry()?;
         for layer in self.resident_layers(catalog.routed_experts().layers)? {
             let plan = crate::shared::experts::exl3::planned_residency(catalog,
-                self.exl3_selection(layer)?, self.placement)?;
+                self.exl3_selection(layer)?)?;
             crate::shared::experts::exl3::worker::Exl3Worker::validate_planned_residency(
                 directory, self.capacity, self.exl3_schedule, &plan, geometry)?;
         }
