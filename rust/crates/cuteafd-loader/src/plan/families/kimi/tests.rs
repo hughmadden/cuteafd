@@ -387,6 +387,57 @@ fn core_k6_headers_charge_native_bytes_but_do_not_claim_runtime_support() {
 }
 
 #[test]
+fn core_index_only_native_inventory_reads_headers_and_preserves_runtime_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_kimi_core_snapshot(dir.path(), false);
+    let checkpoint = Checkpoint::inventory(dir.path()).unwrap();
+    assert!(checkpoint.tensors.is_empty());
+    let model = Model::open(&checkpoint).unwrap();
+    assert_eq!(model.core.projections.len(), 926);
+    assert!(!model.native_serving_admission());
+    assert_eq!(model.core.projections.values().map(|p| p.source_bytes).sum::<u64>(), 40_323_110_520);
+    model.core.validate_runtime_groups(&model.cfg).unwrap();
+    let names = files::required_tensors(&checkpoint,
+        files::ReadRole::Coordinator { local_experts: false, speculator: false }).unwrap();
+    assert!(names.contains("language_model.lm_head.trellis"));
+    assert!(!names.contains("language_model.lm_head.weight"));
+    // Already-loaded core headers must not reopen a shard on the readiness path.
+    let loaded = Checkpoint::open(dir.path()).unwrap();
+    for shard in loaded.weight_map.values().collect::<std::collections::BTreeSet<_>>() {
+        std::fs::remove_file(dir.path().join(shard)).unwrap();
+    }
+    assert_eq!(Model::open(&loaded).unwrap().core.projections.len(), 926);
+}
+
+#[test]
+fn core_index_only_mixed_inventory_keeps_bf16_kda_and_opens_spark_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mixed = Vec::new();
+    for tensor in tensors(false) {
+        let native = tensor.0.starts_with("language_model.model.layers.1.block_sparse_moe.shared_experts.")
+            || tensor.0.starts_with("language_model.model.layers.1.block_sparse_moe.routed_expert_")
+                && !tensor.0.contains("routed_expert_norm");
+        if native {
+            let stem = tensor.0.strip_suffix(".weight").unwrap();
+            mixed.extend(testing::exl3(stem, tensor.2[0], tensor.2[1], 6));
+        } else { mixed.push(tensor); }
+    }
+    testing::write_snapshot(dir.path(), &config(), &mixed, None);
+    let checkpoint = Checkpoint::inventory(dir.path()).unwrap();
+    assert!(checkpoint.tensors.is_empty());
+    let model = Model::open(&checkpoint).unwrap();
+    assert_eq!(model.core.projections.len(), 5);
+    model.core.validate_runtime_groups(&model.cfg).unwrap();
+    assert!(model.core.get_weight("language_model.model.layers.1.self_attn.q_proj.weight").is_none());
+    let role = files::ReadRole::Spark { rank: 0, world: 6 };
+    let spark = files::open_role(dir.path(), role).unwrap();
+    assert!(spark.tensors.iter().all(|tensor| tensor.meta.name.contains(".experts.")));
+    assert!(!spark.tensors.is_empty());
+    // Spark-only headers still discover core formats from the authoritative index.
+    assert_eq!(Model::open(&spark).unwrap().core.projections.len(), 5);
+}
+
+#[test]
 fn core_header_validation_rejects_wrong_bits_keep_list_and_duplicate_bf16() {
     let dir = tempfile::tempdir().unwrap();
     testing::write_kimi_core_snapshot(dir.path(), false);

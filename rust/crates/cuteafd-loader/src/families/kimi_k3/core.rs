@@ -86,10 +86,32 @@ impl CoreInventory {
     pub fn from_checkpoint(cfg: &KimiK3Config, checkpoint: &Checkpoint,
         expected: &BTreeMap<String, Vec<usize>>) -> Result<Self> {
         let mut inventory = Self::default();
-        let selected = checkpoint.tensors.iter().filter(|t| {
-            !t.meta.name.contains(".experts.") && (t.meta.name.starts_with("language_model.model.")
-                || t.meta.name.starts_with("language_model.lm_head."))
-        }).cloned().collect::<Vec<_>>();
+        let is_core = |name: &str| !name.contains(".experts.")
+            && (name.starts_with("language_model.model.") || name.starts_with("language_model.lm_head."));
+        let mut selected = checkpoint.tensors.iter().filter(|t| is_core(&t.meta.name))
+            .cloned().collect::<Vec<_>>();
+        // Role selection starts from an index-only inventory. Read each missing
+        // core shard's bounded header once; never read weight payloads or use a side map.
+        let loaded = selected.iter().map(|t| format::split_stem(&t.meta.name).0)
+            .collect::<std::collections::BTreeSet<_>>();
+        let missing = checkpoint.weight_map.keys().filter(|name| is_core(name))
+            .filter_map(|name| name.strip_suffix(".trellis"))
+            .filter(|stem| !loaded.contains(stem)).collect::<std::collections::BTreeSet<_>>();
+        let mut shards = BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+        for (name, shard) in &checkpoint.weight_map {
+            if missing.contains(format::split_stem(name).0) {
+                shards.entry(shard).or_default().insert(name);
+            }
+        }
+        for (shard, mut names) in shards {
+            for meta in crate::read_safetensors_metadata(&checkpoint.snapshot.join(shard))? {
+                if names.remove(meta.name.as_str()) {
+                    selected.push(crate::plan::checkpoint::CheckpointTensor { shard: shard.into(), meta });
+                }
+            }
+            ensure!(names.is_empty(), "Kimi core shard {shard} lacks indexed tensors: {}",
+                names.into_iter().collect::<Vec<_>>().join(", "));
+        }
         for (stem, members) in format::group_by_stem(&selected) {
             if !members.contains_key("trellis") { continue; }
             let split = split(&stem).with_context(|| format!("{stem}: Kimi BF16/native keep-list forbids core quantization"))?;
