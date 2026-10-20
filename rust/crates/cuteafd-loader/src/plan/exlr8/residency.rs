@@ -615,7 +615,7 @@ fn ensure_inner(plan: &Residency, address: u64) -> anyhow::Result<(Vec<u64>, Vec
 
 // XXH64, seed zero, canonical little-endian arithmetic from the published
 // algorithm. Keeping it here avoids depending on an optional native library.
-fn xxhash64(data: &[u8]) -> u64 {
+pub(super) fn xxhash64(data: &[u8]) -> u64 {
     const P1: u64 = 11400714785074694791;
     const P2: u64 = 14029467366897019727;
     const P3: u64 = 1609587929392839161;
