@@ -152,7 +152,8 @@ pub enum Slicing {
 
 /// Use unequal whole-H128 slices only when every rank's width is packaged.
 /// An incomplete Spark tree or CUTEAFD_FP8_EXACT_SLICES=0 selects the legacy
-/// padded layout. The worker validates its width against the planner recipe
+/// padded layout, except exact-even H128 splits need no width-specific package.
+/// The worker validates its width against the planner recipe
 /// before allocation; the coordinator package tree never defines Spark slicing.
 pub fn exact_layout_directory(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize,
     rank: usize) -> (PathBuf, Slicing) {
@@ -162,8 +163,9 @@ pub fn exact_layout_directory(directory: &Path, tensors: &Fp8ExpertTensors, tp: 
 
 fn exact_layout_directory_with(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize,
     rank: usize, enabled: bool) -> (PathBuf, Slicing) {
-    let padded = (directory.to_path_buf(), Slicing::Padded);
-    if !enabled || tp < 2 || rank >= tp { return padded; }
+    if tp == 0 || rank >= tp { return (directory.to_path_buf(), Slicing::Padded); }
+    let padded = (directory.to_path_buf(), tensors.slicing_for_directory(directory, tp));
+    if !enabled || tp < 2 { return padded; }
     let (Some(package), Some(layout)) = (directory.parent(), directory.file_name().and_then(|name| name.to_str()))
         else { return padded; };
     let exact = tensors.exact_slicing(tp);
@@ -363,6 +365,11 @@ impl Fp8ExpertTensors {
     pub fn slicing_for_directory(&self, directory: &Path, tp: usize) -> Slicing {
         if directory.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains("-w")) {
             self.exact_slicing(tp)
+        } else if tp > 0 && self.shape.intermediate > 0 && self.shape.intermediate % 128 == 0
+            && self.shape.intermediate / 128 % tp == 0 {
+            // Exact-even packages omit the width suffix, but still use the
+            // planner's H128 ownership units, not the format's scale groups.
+            Slicing::Blocks(128)
         } else { Slicing::Padded }
     }
 
@@ -1369,6 +1376,83 @@ mod tests {
     }
 
     #[test]
+    fn packaged_world_directory_slicing_matches_coordinator_fingerprints() -> Result<()> {
+        use crate::plan::experts::spark_recipe_with_placement;
+        use cuteafd_core::tp_units::{RankUnits, TpPlacement};
+        for (package, format) in [
+            ("mimo:fp8", ExpertFormat::Fp8Block128),
+            ("mimof:fp8", ExpertFormat::Mxfp4), ("mimop:fp8", ExpertFormat::Mxfp4),
+            ("glm:fp8", ExpertFormat::Fp8Block128), ("glmf:fp8", ExpertFormat::Fp8Block128),
+            ("qwen4:fp8", ExpertFormat::Fp8Block128), ("step5:fp8", ExpertFormat::Fp8Block128),
+            ("step5:bf16", ExpertFormat::Bf16),
+            ("glm:nvfp4", ExpertFormat::Nvfp4), ("glm:nvfp4a4", ExpertFormat::Nvfp4),
+            ("glmf:nvfp4", ExpertFormat::Nvfp4), ("glmf:nvfp4a4", ExpertFormat::Nvfp4),
+            ("qwen4:nvfp4", ExpertFormat::Nvfp4), ("qwen4:nvfp4a4", ExpertFormat::Nvfp4),
+        ] {
+            for intermediate in [640, 1536, 2048, 2304, 3072] {
+                for placement in [TpPlacement::RoundRobin, TpPlacement::Balanced] {
+                    let mut tensors = catalog(format, intermediate);
+                    tensors.placement = placement;
+                    for world in 1..=6 {
+                        let Ok(recipe) = spark_recipe_with_placement(package, intermediate, world, placement) else { continue };
+                        let root = tempfile::tempdir()?;
+                        let directory = root.path().join(format!("tp{world}"));
+                        std::fs::create_dir(&directory)?;
+                        for layout in &recipe.required_layouts {
+                            std::fs::create_dir_all(root.path().join(layout))?;
+                        }
+                        for layer in [0, 1, 40, 77] {
+                            tensors.slice_layer = layer;
+                            for rank in 0..world {
+                                let (selected, slicing) = exact_layout_directory_with(&directory, &tensors, world, rank, true);
+                                let worker_slicing = tensors.slicing_for_directory(&selected, world);
+                                let context = format!("{package} i{intermediate} tp{world} {placement:?} L{layer} r{rank}");
+                                assert_eq!(slicing, worker_slicing, "{context}");
+                                assert_eq!(worker_slicing, recipe.slicing, "{context}");
+                                let unit = match recipe.slicing { Slicing::Blocks(g) => g, Slicing::Padded => tensors.block() };
+                                let coordinator = RankUnits::new(recipe.rule, tensors.shape.experts,
+                                    intermediate, unit, layer, world, rank)?;
+                                let worker = tensors.unit_map(world, rank, worker_slicing)?;
+                                assert_eq!(coordinator.fingerprint(), worker.fingerprint(), "{context}");
+                                assert_eq!(tensors.rank_width(world, rank, worker_slicing)?,
+                                    recipe.widths[recipe.rank_for_layer(rank, layer)], "{context}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_even_directory_keeps_source_ranges_and_stored_bytes() -> Result<()> {
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4, ExpertFormat::Bf16] {
+            let tensors = catalog(format, 2048);
+            for tp in [2, 4] {
+                let directory = PathBuf::from(format!("tp{tp}"));
+                let slicing = tensors.slicing_for_directory(&directory, tp);
+                assert_eq!(slicing, Slicing::Blocks(128));
+                for rank in 0..tp {
+                    assert_eq!(tensors.rank_range_with(tp, rank, slicing)?, tensors.rank_range(tp, rank)?);
+                    assert_eq!(tensors.rank_width(tp, rank, slicing)?, tensors.rank_width(tp, rank, Slicing::Padded)?);
+                    for projection in Fp8Projection::ALL {
+                        assert_eq!(tensors.projection_slices(projection, tp, rank, slicing)?,
+                            tensors.projection_slices(projection, tp, rank, Slicing::Padded)?);
+                        assert_eq!(tensors.slice_bytes_with(projection, tp, rank, slicing)?,
+                            tensors.slice_bytes_with(projection, tp, rank, Slicing::Padded)?);
+                    }
+                }
+                assert_eq!(exact_layout_directory_with(&directory, &tensors, tp, 0, false),
+                    (directory, slicing));
+            }
+            assert_eq!(tensors.slicing_for_directory(Path::new("tp6"), 6), Slicing::Padded);
+            assert_eq!(tensors.slicing_for_directory(Path::new("tp0"), 0), Slicing::Padded);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn package_selection_requires_every_rank_width_and_honors_opt_out() {
         for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
             let tensors = catalog(format, 2048);
@@ -1393,7 +1477,7 @@ mod tests {
             assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, 6, true),
                 (padded.clone(), Slicing::Padded));
             assert_eq!(exact_layout_directory_with(&padded, &tensors, 1, 0, true),
-                (padded, Slicing::Padded));
+                (padded, Slicing::Blocks(128)));
         }
     }
 
