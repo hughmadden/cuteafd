@@ -329,19 +329,46 @@ struct DraftLayer<'a> {
     attn_base: Dev<'a>,
     mlp_conv: DraftWeight<'a>,
     mlp_base: Dev<'a>,
+    attention: DraftAttention<'a>,
+    gate_up: DraftWeight<'a>,
+    down: DraftWeight<'a>,
+}
+
+#[allow(dead_code)]
+enum DraftAttention<'a> {
+    Gqa(GqaAttention<'a>),
+    Mla(MlaAttention<'a>),
+}
+
+impl<'a> DraftAttention<'a> {
+    fn gqa(&self) -> Result<&GqaAttention<'a>> {
+        match self {
+            Self::Gqa(attention) => Ok(attention),
+            Self::Mla(_) => anyhow::bail!("MLA draft context/forward binding is not installed"),
+        }
+    }
+}
+
+struct GqaAttention<'a> {
     /// q | k | v rows; the context update reads the k | v rows.
     qkv: DraftWeight<'a>,
     q_norm: Dev<'a>,
     k_norm: Dev<'a>,
     o: DraftWeight<'a>,
-    gate_up: DraftWeight<'a>,
-    down: DraftWeight<'a>,
     k_ring: Dev<'a>,
     v_ring: Dev<'a>,
 }
 
-/// Admitted native MLA arenas. The common executor will borrow these by name;
-/// this storage has no independent forward/head path and owns no target weights.
+#[allow(dead_code)]
+struct MlaAttention<'a> {
+    program: cuteafd_ffi::mla_draft::MlaDraft<'a>,
+    qkv_a: Dev<'a>, q_norm: Dev<'a>, kv_norm: Dev<'a>,
+    q_b: Dev<'a>, uk: Dev<'a>, uv: Dev<'a>, output: Dev<'a>,
+    cache: Dev<'a>, page_table: Dev<'a>,
+}
+
+/// Admitted native MLA arenas, consumed into the common executor's owners.
+/// This storage has no independent forward/head path and owns no target weights.
 #[allow(dead_code)]
 pub(crate) struct MlaDraftStorage<'a> {
     layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
@@ -385,6 +412,41 @@ impl<'a> MlaDraftStorage<'a> {
             .with_context(|| format!("MLA draft unknown admitted buffer {name}"))?;
         Ok(self.buffers[index].buffer)
     }
+
+    fn into_owners(self) -> Result<AdmittedBuffers<Dev<'a>>> {
+        for (recipe, owner) in self.layout.buffers().iter().zip(&self.buffers) {
+            ensure!(owner.buffer.bytes == recipe.bytes, "MLA draft {} extent differs from admission", recipe.name);
+        }
+        AdmittedBuffers::new(self.layout.buffers(), self.buffers)
+    }
+}
+
+/// Move, never alias or reallocate, each named admitted owner exactly once.
+#[allow(dead_code)]
+struct AdmittedBuffers<T> {
+    owners: HashMap<String, T>,
+}
+
+#[allow(dead_code)]
+impl<T> AdmittedBuffers<T> {
+    fn new(recipes: &[cuteafd_loader::formats::dflash::MlaDraftBuffer], owners: Vec<T>) -> Result<Self> {
+        ensure!(recipes.len() == owners.len(), "MLA draft owner count differs from admission");
+        let mut named = HashMap::with_capacity(owners.len());
+        for (recipe, owner) in recipes.iter().zip(owners) {
+            ensure!(!named.contains_key(&recipe.name), "MLA draft duplicate admitted owner {}", recipe.name);
+            named.insert(recipe.name.clone(), owner);
+        }
+        Ok(Self { owners: named })
+    }
+
+    fn take(&mut self, name: &str) -> Result<T> {
+        self.owners.remove(name).with_context(|| format!("MLA draft owner {name} missing or already consumed"))
+    }
+
+    fn finish(self) -> Result<()> {
+        ensure!(self.owners.is_empty(), "MLA draft admitted owners were not consumed: {:?}", self.owners.keys());
+        Ok(())
+    }
 }
 
 /// Buffers of one draft step for up to `sequences` sequences.
@@ -394,11 +456,7 @@ struct Workspace<'a> {
     n: Dev<'a>,
     conv: Dev<'a>,
     dynamic: Dev<'a>,
-    qkv: Dev<'a>,
-    q: Dev<'a>,
-    k: Dev<'a>,
-    v: Dev<'a>,
-    attn: Dev<'a>,
+    attention: AttentionWorkspace<'a>,
     delta: Dev<'a>,
     gate_up: Dev<'a>,
     act: Dev<'a>,
@@ -412,11 +470,36 @@ struct Workspace<'a> {
     tokens: Dev<'a>,
     features: Dev<'a>,
     positions: Dev<'a>,
-    tables: Dev<'a>,
-    attention_workspace: Dev<'a>,
     topk_workspace: Dev<'a>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
+}
+
+#[allow(dead_code)]
+enum AttentionWorkspace<'a> {
+    Gqa(GqaWorkspace<'a>),
+    Mla(MlaWorkspace<'a>),
+}
+
+impl<'a> AttentionWorkspace<'a> {
+    fn gqa(&self) -> Result<&GqaWorkspace<'a>> {
+        match self {
+            Self::Gqa(workspace) => Ok(workspace),
+            Self::Mla(_) => anyhow::bail!("MLA draft context/forward binding is not installed"),
+        }
+    }
+}
+
+struct GqaWorkspace<'a> {
+    qkv: Dev<'a>, q: Dev<'a>, k: Dev<'a>, v: Dev<'a>, attn: Dev<'a>,
+    tables: Dev<'a>, scratch: Dev<'a>,
+}
+
+#[allow(dead_code)]
+struct MlaWorkspace<'a> {
+    query: Dev<'a>, q_residual: Dev<'a>, attention: Dev<'a>, lse: Dev<'a>,
+    scratch: Dev<'a>, lengths: Dev<'a>, query_offsets: Dev<'a>,
+    slots: Dev<'a>, positions: Dev<'a>, inverse_frequencies: Dev<'a>,
 }
 
 /// One sequence to draft for: its ring slot, the token at `position` whose
@@ -753,17 +836,19 @@ impl<'a> DflashDrafter<'a> {
                 mlp_conv: matrix(tensor(&format!("{p}.mlp_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
                     cfg.conv_width(), h)?,
                 mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-                qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
-                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h)?,
-                q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
-                k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-                o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?,
-                    h, cfg.heads * cfg.head_dim)?,
+                attention: DraftAttention::Gqa(GqaAttention {
+                    qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
+                        (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h)?,
+                    q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
+                    k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
+                    o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?,
+                        h, cfg.heads * cfg.head_dim)?,
+                    k_ring: zeroed(slots * RING * kv * 2)?,
+                    v_ring: zeroed(slots * RING * kv * 2)?,
+                }),
                 gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
                     (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
                 down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter)?,
-                k_ring: zeroed(slots * RING * kv * 2)?,
-                v_ring: zeroed(slots * RING * kv * 2)?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
@@ -898,24 +983,39 @@ impl<'a> DflashDrafter<'a> {
             ranges.push((format!("drafter/{name}"), buffer.buffer));
         }
         for (layer, buffers) in self.layers.iter().enumerate() {
-            ranges.push((format!("drafter/layer{layer}/k_ring"), buffers.k_ring.buffer));
-            ranges.push((format!("drafter/layer{layer}/v_ring"), buffers.v_ring.buffer));
+            match &buffers.attention {
+                DraftAttention::Gqa(a) => {
+                    ranges.push((format!("drafter/layer{layer}/k_ring"), a.k_ring.buffer));
+                    ranges.push((format!("drafter/layer{layer}/v_ring"), a.v_ring.buffer));
+                }
+                DraftAttention::Mla(a) => {
+                    ranges.push((format!("drafter/layer{layer}/cache"), a.cache.buffer));
+                    ranges.push((format!("drafter/layer{layer}/page_table"), a.page_table.buffer));
+                }
+            }
         }
         if let Some(buffer) = &self.fp8_workspace {
             ranges.push(("drafter/fp8_workspace".into(), buffer.buffer));
         }
         if let Some(w) = self.workspace.borrow().as_ref() {
             for (name, buffer) in [("h", &w.h), ("n", &w.n), ("conv", &w.conv),
-                ("dynamic", &w.dynamic), ("qkv", &w.qkv), ("q", &w.q), ("k", &w.k),
-                ("v", &w.v), ("attn", &w.attn), ("delta", &w.delta), ("gate_up", &w.gate_up),
+                ("dynamic", &w.dynamic), ("delta", &w.delta), ("gate_up", &w.gate_up),
                 ("act", &w.act), ("logits", &w.logits), ("unary", &w.unary),
                 ("candidates", &w.candidates), ("projected", &w.projected), ("anchors", &w.anchors),
                 ("ids", &w.ids), ("tokens", &w.tokens), ("features", &w.features),
-                ("positions", &w.positions), ("tables", &w.tables),
-                ("attention_workspace", &w.attention_workspace), ("topk_workspace", &w.topk_workspace),
+                ("positions", &w.positions), ("topk_workspace", &w.topk_workspace),
                 ("head_workspace", &w._head_workspace)] {
                 ranges.push((format!("drafter/step/{name}"), buffer.buffer));
             }
+            let attention = match &w.attention {
+                AttentionWorkspace::Gqa(a) => vec![("qkv", &a.qkv), ("q", &a.q), ("k", &a.k),
+                    ("v", &a.v), ("attn", &a.attn), ("tables", &a.tables), ("attention_workspace", &a.scratch)],
+                AttentionWorkspace::Mla(a) => vec![("query", &a.query), ("q_residual", &a.q_residual),
+                    ("attention", &a.attention), ("lse", &a.lse), ("native_scratch", &a.scratch),
+                    ("lengths", &a.lengths), ("query_offsets", &a.query_offsets),
+                    ("native_slots", &a.slots), ("native_positions", &a.positions)],
+            };
+            ranges.extend(attention.into_iter().map(|(name, buffer)| (format!("drafter/step/{name}"), buffer.buffer)));
         }
         ranges
     }
@@ -954,6 +1054,7 @@ impl<'a> DflashDrafter<'a> {
             self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
                 self.fused_norm.buffer.ptr, n, h, self.cfg.eps, s)?;
             for layer in &self.layers {
+                let layer = layer.attention.gqa()?;
                 let q_rows = self.cfg.heads * self.cfg.head_dim;
                 self.linear(self.fused_norm.buffer.ptr, &layer.qkv, q_rows,
                     self.context_kv.buffer.ptr, n, h, 2 * kv)?;
@@ -1009,6 +1110,7 @@ impl<'a> DflashDrafter<'a> {
             self.draft_device_with(&sequences, &input, TargetHead::Launch(Box::new(head)))?;
         }
         for layer in &self.layers {
+            let layer = layer.attention.gqa()?;
             for ring in [&layer.k_ring, &layer.v_ring] {
                 self.library.cuda_zero_bytes(ring.buffer, ring.buffer.bytes)?;
             }
@@ -1033,11 +1135,15 @@ impl<'a> DflashDrafter<'a> {
             n: alloc(rows * c.hidden * 2)?,
             conv: alloc(rows * c.hidden * 2)?,
             dynamic: alloc(rows * c.conv_width() * 2)?,
-            qkv: alloc(rows * c.qkv_width() * 2)?,
-            q: alloc(rows * c.heads * c.head_dim * 2)?,
-            k: alloc(rows * c.kv_width() * 2)?,
-            v: alloc(rows * c.kv_width() * 2)?,
-            attn: alloc(rows * c.heads * c.head_dim * 2)?,
+            attention: AttentionWorkspace::Gqa(GqaWorkspace {
+                qkv: alloc(rows * c.qkv_width() * 2)?,
+                q: alloc(rows * c.heads * c.head_dim * 2)?,
+                k: alloc(rows * c.kv_width() * 2)?,
+                v: alloc(rows * c.kv_width() * 2)?,
+                attn: alloc(rows * c.heads * c.head_dim * 2)?,
+                tables: alloc(3 * sequences * 4)?,
+                scratch: attention_workspace,
+            }),
             delta: alloc(rows * c.hidden * 2)?,
             gate_up: alloc(rows * 2 * c.intermediate * 2)?,
             act: alloc(rows * c.intermediate * 2)?,
@@ -1050,8 +1156,6 @@ impl<'a> DflashDrafter<'a> {
             tokens: alloc(drafted * 4)?,
             features: alloc(drafted * 16)?,
             positions: alloc(rows * 8)?,
-            tables: alloc(3 * sequences * 4)?,
-            attention_workspace,
             topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
@@ -1121,6 +1225,8 @@ impl<'a> DflashDrafter<'a> {
             *slot = Some(self.workspace(self.max_sequences)?);
         }
         let w = slot.as_ref().context("draft workspace")?;
+        let attention = w.attention.gqa()?;
+        for layer in &self.layers { layer.attention.gqa()?; }
         let mut positions = Vec::with_capacity(rows);
         let mut tables = vec![0i32; 3 * s_count];
         for (i, seq) in sequences.iter().enumerate() {
@@ -1134,7 +1240,7 @@ impl<'a> DflashDrafter<'a> {
         // A future graph path must read changing lengths on-device instead.
         let max_keys = tables[s_count..2 * s_count].iter().copied().max().unwrap() as usize + block;
         self.put(&w.positions, bytes_of(&positions))?;
-        self.put(&w.tables, bytes_of(&tables))?;
+        self.put(&attention.tables, bytes_of(&tables))?;
         let anchors: Vec<u32> = sequences.iter().map(|s| s.anchor).collect();
         self.put(&w.anchors, bytes_of(&anchors))?;
         match input {
@@ -1171,16 +1277,17 @@ impl<'a> DflashDrafter<'a> {
                     rows, h, c.conv_width())?;
                 l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr, w.conv.buffer.ptr,
                     rows, block, h, group, s)?;
-                self.linear(w.conv.buffer.ptr, &layer.qkv, 0, w.qkv.buffer.ptr, rows, h,
+                let a = layer.attention.gqa()?;
+                self.linear(w.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, h,
                     c.qkv_width())?;
-                l.glm_dflash_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
-                    w.positions.buffer.ptr, std::ptr::null(), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
+                l.glm_dflash_qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
+                    w.positions.buffer.ptr, std::ptr::null(), attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr, rows,
                     c.heads, c.kv_heads, c.theta, eps, s)?;
-                l.glm_dflash_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
-                    layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
-                    w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
+                l.glm_dflash_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr, a.k_ring.buffer.ptr,
+                    a.v_ring.buffer.ptr, attention.tables.buffer.ptr, at(&attention.tables, s_count * 4), at(&attention.tables, 2 * s_count * 4),
+                    attention.attn.buffer.ptr, attention.scratch.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
                     max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), s)?;
-                self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
+                self.linear(attention.attn.buffer.ptr, &a.o, 0, w.delta.buffer.ptr, rows,
                     attention_width, h)?;
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr,
                     w.h.buffer.ptr, layer.post_norm.buffer.ptr, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
@@ -1569,6 +1676,37 @@ mod checkpoint_header_tests {
         assert!(checkpoint.bytes("fc.weight", &[4, 1]).is_err());
         checkpoint.tensors.get_mut("fc.weight").unwrap().byte_length = 6;
         assert!(checkpoint.bytes("fc.weight", &[2, 2]).is_err());
+    }
+
+    #[test]
+    fn admitted_buffers_move_once_and_drop_partial_failures_without_retry() {
+        use cuteafd_loader::formats::dflash::MlaDraftBuffer;
+        use std::rc::Rc;
+        struct Owner(Rc<Cell<usize>>);
+        impl Drop for Owner { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let dropped = Rc::new(Cell::new(0));
+        let recipes = [MlaDraftBuffer { name: "h".into(), bytes: 256 },
+            MlaDraftBuffer { name: "native_scratch".into(), bytes: 1024 }];
+        let make = || Owner(dropped.clone());
+        let mut buffers = AdmittedBuffers::new(&recipes, vec![make(), make()]).unwrap();
+        let common = buffers.take("h").unwrap();
+        assert!(buffers.take("h").is_err());
+        let typed = buffers.take("native_scratch").unwrap();
+        buffers.finish().unwrap();
+        assert_eq!(dropped.get(), 0);
+        drop((common, typed));
+        assert_eq!(dropped.get(), 2);
+        let mut buffers = AdmittedBuffers::new(&recipes, vec![make(), make()]).unwrap();
+        let common = buffers.take("h").unwrap();
+        assert!(buffers.finish().is_err());
+        assert_eq!(dropped.get(), 3);
+        drop(common);
+        assert_eq!(dropped.get(), 4);
+        assert!(AdmittedBuffers::new(&recipes, vec![make()]).is_err());
+        assert_eq!(dropped.get(), 5);
+        let duplicates = [recipes[0].clone(), recipes[0].clone()];
+        assert!(AdmittedBuffers::new(&duplicates, vec![make(), make()]).is_err());
+        assert_eq!(dropped.get(), 7);
     }
 
     #[test]
