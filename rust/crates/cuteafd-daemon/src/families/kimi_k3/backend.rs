@@ -99,7 +99,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         self.engine.step_device(sequences, pool, rows, true).map(Some)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+        _kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(!speculative, "Kimi speculative state commit is not qualified; use no drafter");
         let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         self.engine.step_device(sequences, pool, rows, false).map(Some)
