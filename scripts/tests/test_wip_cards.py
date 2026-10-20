@@ -1246,7 +1246,7 @@ def test_preflight_only_and_grant_hook(tmp_path, monkeypatch, capsys):
     gate = ROOT / 'scripts/bench/kits/gate'
     state = tmp_path / 'state'
     argv = ['--kit', str(gate), '--cards', 'qwen38-exl3-min', '--matrix', '--arm', 'c=x:s', '--state', str(state), '--preflight-only']
-    rc, launched = _run_main(monkeypatch, argv, slot=_fake_slot(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4']))
+    rc, launched = _run_main(monkeypatch, argv, slot=_fake_slot(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4a4']))
     assert rc == 0 and launched == []
     job = json.loads((state / 'qwen38-exl3-min-c-r1' / 'job.json').read_text())
     hook = job['entry']['prelaunch']['argv']
@@ -1255,7 +1255,7 @@ def test_preflight_only_and_grant_hook(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--preflight-job', hook[-1]])
     assert cards.main() == 0
     monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot='s', seal_sha256='other', artifact_manifest_sha256='art',
-                                                                         contents=dict(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4'], audio=True))))
+                                                                         contents=dict(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4a4'], audio=True))))
     with pytest.raises(ValueError, match='sealed artifacts changed since enqueue'):
         cards.main()
 

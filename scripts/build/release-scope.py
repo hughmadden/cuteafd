@@ -339,6 +339,8 @@ def check_inventory(root, role, wanted, symbols=None):
                     check_package(root, f'exl3/exl3-{family}-{kind[5:]}', layouts, role, verified)
                 elif kind in ('fp8', 'nvfp4', 'nvfp4a4') or item == 'step5:bf16':
                     suffix = '-bf16-weights' if item == 'step5:bf16' else '' if kind == 'fp8' else '-' + kind
+                    if item == 'step5:nvfp4':
+                        suffix = '-nvfp4a4'
                     layouts = [f'tp{entry["spark_tp"]}'] if role == 'expert' else ['tp1']
                     if role == 'coordinator' and entry['dual'] and family != 'glmfdense':
                         layouts.append('tp2')

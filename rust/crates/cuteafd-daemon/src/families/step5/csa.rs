@@ -77,43 +77,8 @@ impl Admission {
             "CSA staged row capacity must be 1..=8192"
         );
         let pages = rows.div_ceil(64);
-        let regions = rows.div_ceil(8);
         // Scores and top-k scratch are bounded by query tiles, never prefill length.
-        let planes = [
-            rows * H * 4,
-            rows * H * 2,
-            rows * Q * 2,
-            rows * KV * 2,
-            pages * 64 * KV * 2,
-            rows * Q * 2,
-            pages * 64 * KV * 2,
-            rows * 64 * 2,
-            rows * Q * 2,
-            rows * Q * 2,
-            rows * H * 2,
-            rows * H * 4,
-            rows * 8,
-            rows * 4,
-            pages * 4,
-            rows * H * 2,
-            rows * 256 * 2,
-            rows * 256 * 2,
-            rows * H * 2,
-            rows * 256 * 2,
-            rows * 16 * 4,
-            rows * 16 * 2,
-            regions * 4,
-            regions * 4,
-            CAPACITY * 256,
-            regions * 256 * 4,
-            TILE * 4 * CAPACITY * 4,
-            TILE * SELECT * 4,
-            TILE * 4 * CAPACITY * 4,
-            TILE * 4 * 4,
-            TILE * 4 * 512 * 4,
-            TILE * 4 * 512 * 4,
-        ]
-        .map(|n| n.max(256));
+        let planes = cuteafd_loader::plan::families::step5::native::csa_planes(rows)?;
         let bytes = planes
             .iter()
             .map(|&n| n as u64)
@@ -226,6 +191,7 @@ pub(super) struct CsaLayer<'a> {
     immutable: std::rc::Rc<CsaWeights<'a>>,
 }
 impl<'a> CsaLayer<'a> {
+
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
         Ok(Admission::new(rows, &[], 0, u64::MAX, &[])?.bytes)
     }
@@ -661,7 +627,7 @@ impl<'a> CsaLayer<'a> {
         }
         self.finish_dense_on(query_start, rows - query_start, &self.stream)
     }
-    fn project_on(
+    pub(super) fn project_on(
         &self,
         rows: usize,
         positions: CuteafdDeviceBuffer,
@@ -749,18 +715,12 @@ impl<'a> CsaLayer<'a> {
             &self.planes[VALUE],
             Some((&self.planes[IK], &self.planes[IZ])),
         )?;
-        step.attend(rank, self.immutable.layer, &*self, |layer, read| {
-            let rows = read.inputs.rows;
-            let stream = read.inputs.stream;
-            layer.read_attention_on(read)?;
-            layer.finish_dense_on(0, rows, stream)
-        })
+        step.attend(rank, self.immutable.layer, &*self, |layer, read| layer.read_attention_on(read))?;
+        step.compose(rank, &*self, |layer, input| layer.finish_dense_on(0, input.rows, input.stream))
     }
 
     pub fn enqueue_attention_step<'e, E: cuteafd_hostcache::copy::CopyEngine>(
-        &'e self,
-        step: &mut Step<'e, 'a, E>,
-        rank: usize,
+        &'e self, step: &mut Step<'e, 'a, E>, rank: usize,
     ) -> Result<()> {
         ensure!(self.ffn.is_none(), "shared CSA pipeline must own its FFN separately");
         step.project(rank, self.immutable.layer, self, |layer, input| {
@@ -777,10 +737,7 @@ impl<'a> CsaLayer<'a> {
             input.heads == 64
                 && input.stream.device.id == self.stream.device.id
                 && std::ptr::eq(input.stream.device.library, self.stream.device.library)
-                && input
-                    .base
-                    .checked_add(input.rows)
-                    .is_some_and(|end| end <= self.immutable.rope.tables.plan.extent as usize),
+                && input.extent <= self.immutable.rope.tables.plan.extent as usize,
             "CSA owner device/head/rotary extent mismatch"
         );
         Ok(())
@@ -798,8 +755,11 @@ impl<'a> CsaLayer<'a> {
         let summary = read
             .summaries
             .context("CSA full-head read requires owned summaries")?;
-        for start in (0..read.inputs.rows).step_by(TILE) {
-            let count = (read.inputs.rows - start).min(TILE);
+        ensure!(read.start.checked_add(read.inputs.rows).is_some_and(|end| end <= self.admission.rows),
+            "CSA sequence row extent");
+        for local in (0..read.inputs.rows).step_by(TILE) {
+            let start = read.start + local;
+            let count = (read.inputs.rows - local).min(TILE);
             self.score_select_on(
                 start,
                 count,

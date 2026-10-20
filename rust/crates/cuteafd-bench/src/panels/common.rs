@@ -13,9 +13,9 @@ pub fn messages(text: &str) -> Value {
     json!([{"role": "user", "content": text}])
 }
 
-/// Greedy, thinking off.
-pub fn plain(text: &str, max_tokens: u64) -> Value {
-    json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}})
+/// Greedy, thinking off when the checkpoint renderer supports it.
+pub fn plain(client: &crate::client::Client, text: &str, max_tokens: u64) -> Value {
+    crate::request::thinking_off(&client.configuration, json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}}))
 }
 
 /// The probe a request whose prompt re-renders model output carries: a

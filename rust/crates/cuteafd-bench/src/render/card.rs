@@ -34,6 +34,7 @@ pub fn card_svg(report: &Report) -> String {
         sub.push(format!("experts {}", quant.join(" ")));
     }
     sub.push(format!("speculator {}", c.speculator_label()));
+    if !c.supports_thinking_off() { sub.insert(0, c.thinking_label().into()); }
     doc.text(pad, 182.0, Font::new(15.0, t.ink2), &fit(&sub.join(" · "), 15.0, WIDTH - 2.0 * pad));
     let dim = if t.scary { 0.55 } else { 1.0 };
     let warn = if t.scary { "⚠" } else { "" };
@@ -60,7 +61,7 @@ pub fn card_svg(report: &Report) -> String {
         doc.text(pad, 330.0, Font::new(18.0, t.ink2), &fit(reason, 18.0, WIDTH - 2.0 * pad));
         doc.text(pad, 386.0, Font::new(15.0, t.muted), "Planner-only qualification; no performance measured");
     } else {
-        huge(&mut doc, pad, "C1 CODE DECODE", &rate(code), "thinking off · one request", t.series[0]);
+        huge(&mut doc, pad, "C1 CODE DECODE", &rate(code), &format!("{} · one request", c.thinking_label()), t.series[0]);
         bodies::decode_scaling(&mut doc, &t, r, pad + column_width + gap, 246.0, column_width - 60.0, 1.0);
         let prefill_x = pad + 2.0 * (column_width + gap);
         match prefill {

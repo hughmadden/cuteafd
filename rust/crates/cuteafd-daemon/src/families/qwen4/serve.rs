@@ -370,7 +370,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         self.engine.verify_device(sequences, speculative)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
-        _pool: &cuteafd_engine::prefix::RefPagePool)
+        _kind: scheduler::UngraphedKind, _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.verify_device_ungraphed(sequences, speculative)
     }

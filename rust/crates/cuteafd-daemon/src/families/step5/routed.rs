@@ -52,23 +52,7 @@ impl Admission {
             (1..=4096).contains(&rows),
             "Step-5 routed rows must be 1..=4096"
         );
-        let planes = [
-            (H, 4),
-            (H, 2),
-            (E, 4),
-            (E, 4),
-            (K, 4),
-            (K, 4),
-            (2 * I, 2),
-            (I, 2),
-            (H, 2),
-            (H, 2),
-            (H, 4),
-            (H, 4),
-            (H, 4),
-            (H, 4),
-        ]
-        .map(|(width, element)| (rows * width * element).max(256));
+        let planes = cuteafd_loader::plan::families::step5::native::routed_planes(rows)?;
         let bytes = planes
             .iter()
             .map(|&n| n as u64)
@@ -280,6 +264,7 @@ pub(super) struct RoutedFfn<'a> {
     immutable: std::rc::Rc<RoutedWeights<'a>>,
 }
 impl<'a> RoutedFfn<'a> {
+
     pub fn load(
         device: Device<'a>,
         programs: &'a Programs<'a>,

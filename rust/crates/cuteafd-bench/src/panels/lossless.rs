@@ -266,12 +266,12 @@ pub fn judge(id: &str, on: &ProbeRecord, off: &ProbeRecord) -> Verdict {
 }
 
 /// The probe pair as kept evidence: ids, row hashes and top two per row.
-fn evidence(case: &Case, on: &ProbeRecord, off: &ProbeRecord) -> Value {
+pub(crate) fn evidence(configuration: &crate::report::Configuration, case: &Case, on: &ProbeRecord, off: &ProbeRecord) -> Value {
     let record = |r: &ProbeRecord| json!({"engine": r.engine, "cold": r.cold, "no_speculation": r.no_speculation,
         "generated": r.generated, "rows": r.rows.iter().map(|row| json!({"position": row.position, "hash": row.hash,
             "top": row.top})).collect::<Vec<_>>()});
-    json!({"nonce": case.nonce, "text": case.text(), "max_tokens": TOKENS, "thinking": "disabled", "temperature": 0,
-        "prompt_ids": off.prompt_ids, "on": record(on), "off": record(off)})
+    crate::request::thinking_off(configuration, json!({"nonce": case.nonce, "text": case.text(), "max_tokens": TOKENS, "thinking": "disabled", "temperature": 0,
+        "prompt_ids": off.prompt_ids, "on": record(on), "off": record(off)}))
 }
 
 /// The pass record from the verdicts (`k/N`, a gate status and a table).
@@ -368,11 +368,11 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
             }
             spec
         };
-        let on = ctx.client.chat(plain(&text, TOKENS), Some(arm(false)))
+        let on = ctx.client.chat(plain(ctx.client, &text, TOKENS), Some(arm(false)))
             .with_context(|| format!("{} drafts on", case.id))?;
         let on = probe_of(&on)?.clone();
         anyhow::ensure!(honoured(&on), "this engine does not run benchmark probes");
-        let off = ctx.client.chat(plain(&text, TOKENS), Some(arm(true)))
+        let off = ctx.client.chat(plain(ctx.client, &text, TOKENS), Some(arm(true)))
             .with_context(|| format!("{} drafts off", case.id))?;
         let off = probe_of(&off)?.clone();
         let mut verdict = judge(&case.id, &on, &off);
@@ -391,7 +391,7 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
                 "cases": dumped});
             std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
         }
-        kept.insert(case.id.clone(), evidence(case, &on, &off));
+        kept.insert(case.id.clone(), evidence(&ctx.info.configuration, case, &on, &off));
         verdicts.push(verdict);
         ctx.progress.partial(aggregate(set, &speculator, &verdicts, serde_json::Map::new()));
     }
@@ -608,7 +608,7 @@ mod tests {
         let on = record(&[1, 2], &["x", "q"], false);
         let off = record(&[1, 2], &["x", "y"], true);
         let mut kept = serde_json::Map::new();
-        kept.insert("glmf-v19-base".into(), evidence(&s.cases[0], &on, &off));
+        kept.insert("glmf-v19-base".into(), evidence(&crate::report::Configuration::default(), &s.cases[0], &on, &off));
         let value = aggregate(&s, "dflash", &[judge("glmf-v19-base", &on, &off)], kept);
         let keys = |v: &Value| { let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect(); k.sort(); k };
         assert_eq!(keys(&value), ["evidence", "gate", "passed", "rows", "set", "speculator", "summary", "table", "total"]);

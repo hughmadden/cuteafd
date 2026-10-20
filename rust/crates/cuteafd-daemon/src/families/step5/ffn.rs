@@ -30,26 +30,9 @@ impl Admission {
             rows > 0 && rows <= 4096,
             "Step-5 dense row capacity must be 1..=4096"
         );
-        let shapes = [
-            (HIDDEN, 4),
-            (HIDDEN, 2),
-            (2 * DENSE, 2),
-            (DENSE, 2),
-            (HIDDEN, 2),
-            (HIDDEN, 4),
-        ];
-        let mut planes = [0; 6];
-        let mut bytes = 0u64;
-        for (plane, (width, elem)) in planes.iter_mut().zip(shapes) {
-            *plane = rows
-                .checked_mul(width)
-                .and_then(|n| n.checked_mul(elem))
-                .context("dense workspace overflow")?
-                .max(256);
-            bytes = bytes
-                .checked_add(*plane as u64)
-                .context("dense workspace overflow")?;
-        }
+        let planes = cuteafd_loader::plan::families::step5::native::dense_planes(rows)?;
+        let mut bytes = planes.iter().try_fold(0u64, |n, &v| n.checked_add(v as u64))
+            .context("dense workspace overflow")?;
         for weight in weights {
             bytes = bytes
                 .checked_add(weight.allocation_bytes)
@@ -245,6 +228,7 @@ impl DensePlan {
 }
 
 impl<'a> DenseFfn<'a> {
+
     pub fn load(
         device: Device<'a>,
         programs: &'a Programs<'a>,

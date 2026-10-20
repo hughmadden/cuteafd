@@ -327,7 +327,7 @@ def test_step5_example_configs(tmp_path: Path, name, model, revision, gpus, spar
 
 @pytest.mark.parametrize("name,gpus,sparks,package", [
     ("step5-fp8-max", [0, 1], ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"], "fp8/fp8-step5"),
-    ("step5-nvfp4-min", [1], ["ostrich", "dodo", "emu", "kiwi"], "fp8/fp8-step5-nvfp4"),
+    ("step5-nvfp4-min", [1], ["ostrich", "dodo", "emu", "kiwi"], "fp8/fp8-step5-nvfp4a4"),
 ])
 def test_step5_gate_cards_list_and_generate_wip_launches(tmp_path: Path, name, gpus, sparks, package) -> None:
     card = cards.load_cards(ROOT / "scripts/bench/kits/gate", [name])[0]

@@ -5,38 +5,7 @@ use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::serving_capacity::step5::{ByteSpan, Step5CacheLayout};
 use std::{cell::{Cell, RefCell}, rc::{Rc, Weak}};
 
-/// Checked cache-only reservations. Weights, code, workspace and transport must
-/// be subtracted before supplying the available bytes to `CacheRank::new`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Reservation {
-    active: usize,
-    marks: usize,
-    pages: usize,
-    total: usize,
-}
-
-impl Reservation {
-    fn new(layout: &Step5CacheLayout, rank: usize, sequences: u64, slots: u64,
-        pages: u64, available: usize) -> Result<Self> {
-        ensure!(sequences > 0 && pages > 0, "empty Step-5 cache capacity");
-        let state = layout.ranks.get(rank).context("Step-5 cache rank")?;
-        let geometry = layout.geometry.ranks.get(rank).context("Step-5 cache geometry rank")?;
-        let declared = state.regions.iter().try_fold(0u64, |sum, region|
-            sum.checked_add(region.page_bytes.checked_mul(2)?))
-            .context("Step-5 CSA page geometry overflow")?;
-        ensure!(geometry.persistent_unit_bytes == declared, "Step-5 inconsistent CSA page geometry");
-        let bytes = |unit: u64, count: u64| -> Result<usize> {
-            Ok(usize::try_from(unit.checked_mul(count).context("Step-5 cache allocation overflow")?)?)
-        };
-        let active = bytes(state.bytes, sequences)?;
-        let marks = bytes(state.bytes, slots)?;
-        let pages = bytes(geometry.persistent_unit_bytes, pages)?;
-        let total = active.checked_add(marks).and_then(|n| n.checked_add(pages))
-            .context("Step-5 cache total overflow")?;
-        ensure!(total <= available, "Step-5 cache needs {total} bytes, admitted only {available}");
-        Ok(Self { active, marks, pages, total })
-    }
-}
+pub(super) use cuteafd_loader::plan::families::step5::admission::Reservation;
 
 /// Maintenance owns its stream; transactions use registered lane streams.
 /// Boundary operations join every live lane before copying shared state.
@@ -44,8 +13,8 @@ pub(super) struct CacheRank<'a> {
     pub stream: Stream<'a>,
     lane_streams: RefCell<Vec<Weak<Stream<'a>>>>,
     active: Allocation<'a>,
-    marks: Option<Allocation<'a>>,
-    pages: Option<Allocation<'a>>,
+    marks: Option<Rc<Allocation<'a>>>,
+    pages: Option<Rc<Allocation<'a>>>,
     page_count: u64,
     layout: Step5CacheLayout,
     rank: usize,
@@ -75,9 +44,9 @@ impl<'a> CacheRank<'a> {
         // Allocate all storage before enqueueing initialization: failed allocation
         // cannot release an earlier plane still being initialized asynchronously.
         let active = Allocation::new(device, reservation.active)?;
-        let marks = if reservation.marks > 0 { Some(Allocation::new(device, reservation.marks)?) } else { None };
+        let marks = if reservation.marks > 0 { Some(Rc::new(Allocation::new(device, reservation.marks)?)) } else { None };
         let page_count = pages;
-        let pages = if reservation.pages > 0 { Some(Allocation::new(device, reservation.pages)?) } else { None };
+        let pages = if reservation.pages > 0 { Some(Rc::new(Allocation::new(device, reservation.pages)?)) } else { None };
         let owner = Self { stream, lane_streams: RefCell::new(Vec::new()), active, marks, pages, page_count, layout, rank, sequences, slots,
             marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
         let mut guard = owner.stream.cancellation_guard("Step-5 cache initialization");
@@ -105,10 +74,39 @@ impl<'a> CacheRank<'a> {
     }
 
     pub fn drain(&self) -> Result<()> {
-        for stream in self.lane_streams.borrow().iter().filter_map(Weak::upgrade) {
-            stream.drain()?;
+        super::execution::collect_lane_results(self.lane_streams.borrow().iter()
+            .filter_map(Weak::upgrade).map(|stream| stream.drain())
+            .chain(std::iter::once_with(|| self.stream.drain())))
+    }
+
+    pub(super) fn validate_reset(&self, sequence: u64) -> Result<()> {
+        self.check_idle(sequence)
+    }
+
+    /// Old KV and summaries remain masked by the zero frontier. Only canonical
+    /// lengths and both pending banks must be initialized before slot reuse.
+    pub(super) fn reset_sequence(&self, sequence: u64) -> Result<()> {
+        self.validate_reset(sequence)?;
+        self.drain()?;
+        let state = &self.layout.ranks[self.rank];
+        let spans = [state.length, state.next_length].into_iter()
+            .chain(state.mtp_lengths.iter().copied())
+            .chain(state.regions.iter().flat_map(|region| [region.pending_key,
+                region.pending_z, region.next_key, region.next_z]));
+        let mut guard = self.stream.cancellation_guard("Step-5 cold sequence reset");
+        for span in spans {
+            let target = self.request_component(span, sequence)?;
+            self.stream.device.run(|| {
+                // SAFETY: an idle private sequence owns these nonpaged banks;
+                // the guard drains errors before any state can be reused.
+                unsafe { self.stream.device.library.cuda_zero_bytes_async(
+                    target, target.bytes, self.stream.raw) }
+            })?;
         }
-        self.stream.drain()
+        self.stream.drain()?;
+        self.pending_bank[sequence as usize].set(false);
+        guard.complete = true;
+        Ok(())
     }
 
     pub fn bytes(&self) -> usize { self.reservation.total }
@@ -117,6 +115,10 @@ impl<'a> CacheRank<'a> {
         self.pages.as_ref().map_or(CuteafdDeviceBuffer {
             ptr: std::ptr::null_mut(), bytes: 0, ..self.active.buffer
         }, |pages| pages.buffer)
+    }
+    /// Complete registered snapshot inventory, not just one slot or page view.
+    pub(super) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        self.marks.iter().chain(self.pages.iter()).cloned().collect()
     }
     pub fn layout(&self) -> &Step5CacheLayout { &self.layout }
     pub fn rank(&self) -> usize { self.rank }
@@ -276,8 +278,23 @@ impl<'a> CacheRank<'a> {
         self.restore_copies(copies)
     }
 
-    /// Shared prefix metadata identifies host-restored marks; local capture
-    /// bookkeeping cannot identify a slot that the host tier just overwrote.
+    /// Validate canonical bytes, not arena-local capture bookkeeping, before
+    /// any rank installs a host-promoted snapshot into active state.
+    pub fn validate_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
+        self.check_idle(sequence)?;
+        self.snapshot_copies(sequence, slot, frontier)?;
+        self.drain()?;
+        let mark = self.mark_view(u32::try_from(slot)?)?;
+        let length = self.layout.ranks[self.rank].length;
+        ensure!(length.bytes == 8, "Step-5 canonical mark length width");
+        let source = view(mark, length)?;
+        let mut encoded = [0; 8];
+        self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut encoded, source))?;
+        validate_mark_length(encoded, frontier)
+    }
+
+    /// Caller validates every rank with validate_retained before installing any
+    /// rank. The shared family retains the arena slot across both phases.
     pub fn restore_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
         self.check_idle(sequence)?;
         self.drain()?;
@@ -313,6 +330,12 @@ impl<'a> CacheRank<'a> {
     }
 }
 
+fn validate_mark_length(encoded: [u8; 8], frontier: u64) -> Result<()> {
+    ensure!(u64::from_le_bytes(encoded) == frontier,
+        "Step-5 canonical mark length differs from retained frontier");
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -334,6 +357,47 @@ pub(super) mod tests {
             activation: Vec::new(), shared_activation: Vec::new(),
         };
         Step5CacheLayout::new(&config, ranks, context, mtp, step).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
+    fn native_cold_slot_reset_clears_both_banks_without_touching_other_slots() -> Result<()> {
+        // SAFETY: the selected library implements the native CUDA ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let layout = layout_for(65, 1, 3, 64);
+        let cache = CacheRank::new(device, layout.clone(), 0, 2, 1, 2, usize::MAX)?;
+        let initial = vec![0xa5; cache.active.buffer.bytes];
+        device.run(|| library.copy_h2d(cache.active.buffer, &initial))?;
+        cache.publish_bank(1);
+        cache.reset_sequence(1)?;
+        let mut actual = vec![0; initial.len()];
+        device.run(|| library.copy_d2h(&mut actual, cache.active.buffer))?;
+        let mut expected = initial;
+        let state = &layout.ranks[0];
+        for span in [state.length, state.next_length].into_iter()
+            .chain(state.mtp_lengths.iter().copied())
+            .chain(state.regions.iter().flat_map(|region| [region.pending_key,
+                region.pending_z, region.next_key, region.next_z])) {
+            let offset = usize::try_from(span.offset * 2 + span.bytes)?;
+            expected[offset..offset + usize::try_from(span.bytes)?].fill(0);
+        }
+        assert_eq!(actual, expected);
+        assert!(!cache.pending_bank[1].get());
+        cache.busy[1].set(true);
+        assert!(cache.reset_sequence(1).is_err());
+        cache.busy[1].set(false);
+        assert!(cache.reset_sequence(2).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_mark_length_requires_exact_encoded_frontier() {
+        for frontier in [0u64, 1, 63, 64, 65, 1 << 20, u64::MAX] {
+            validate_mark_length(frontier.to_le_bytes(), frontier).unwrap();
+            assert!(validate_mark_length(frontier.wrapping_add(1).to_le_bytes(), frontier).is_err());
+            assert!(validate_mark_length(frontier.wrapping_sub(1).to_le_bytes(), frontier).is_err());
+        }
     }
 
     #[test]

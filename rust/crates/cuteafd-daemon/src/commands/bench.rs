@@ -248,7 +248,7 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
     Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: Some(family.to_string()), snapshot, settings }))
+        family: Some(family.to_string()), snapshot, settings, supports_thinking_off: None }))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
@@ -287,6 +287,21 @@ mod tests {
         ]).unwrap();
         let error = attention_mode("unregistered", matches.subcommand().unwrap().1, "auto").unwrap_err();
         assert!(error.downcast_ref::<MissingPlacementExecutor>().is_some());
+    }
+
+    #[test]
+    fn step5_context_uses_registered_native_attention_placement() {
+        for extra in [vec![], vec!["--split-device", "1"]] {
+            let argv = ["cuteafd", "serve-step5", "--snapshot", "/s", "--native-lib", "/l", "--peers", "127.0.0.1:19000"]
+                .into_iter().chain(extra).collect::<Vec<_>>();
+            let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
+            let context = serve_context(&matches, None).unwrap().expect("Step-5 serve context");
+            assert_eq!(context.family.as_deref(), Some("step5"));
+            let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
+            assert_eq!(placement.value.as_deref(), Some("heads"));
+            assert_eq!(placement.default.as_deref(), Some("heads"));
+            assert!(attention_mode("step5", matches.subcommand().unwrap().1, "context").is_err());
+        }
     }
 
     #[test]

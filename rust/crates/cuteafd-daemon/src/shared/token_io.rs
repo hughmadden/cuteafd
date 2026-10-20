@@ -143,6 +143,11 @@ impl<'a> TokenEmbedding<'a> {
         if self.table.is_host() { EmbedPlacement::Host } else { EmbedPlacement::Gpu }
     }
 
+    /// CUDA owner of the resident table or mapped alias.
+    pub(crate) fn owner(&self) -> crate::shared::memory::device::Device<'a> {
+        crate::shared::memory::device::Device { library: self.library, id: self.table.buffer().device_id }
+    }
+
     pub(crate) fn device_bytes(&self) -> usize { self.table.device_bytes() }
 
     pub fn device_gather(&self) -> bool { true }

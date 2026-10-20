@@ -1,0 +1,239 @@
+//! Native export validation and measured-inventory edge of shared Step-5 admission.
+use super::execution::Execution;
+pub(super) use admission::RuntimeInputs;
+use anyhow::{ensure, Result};
+use cuteafd_ffi::programs::Programs;
+use cuteafd_loader::plan::{checkpoint::Checkpoint, families::step5::admission};
+
+pub(super) fn admit<'a>(
+    programs: &'a Programs<'a>,
+    checkpoint: &'a Checkpoint,
+    inputs: &RuntimeInputs,
+) -> Result<admission::Admission> {
+    let admitted = checkpoint_admission(checkpoint, inputs)?;
+    let ownership = &admitted.ownership;
+    for rank in 0..ownership.ranks() {
+        let native =
+            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.rows)?;
+        let shared = cuteafd_loader::plan::families::step5::native::rank_admission(
+            checkpoint,
+            ownership,
+            rank,
+            inputs.rows,
+        )?;
+        ensure!(
+            native.immutable == shared.immutable && native.workspace == shared.workspace,
+            "Step-5 native allocation owners differ from shared admission"
+        );
+    }
+    Ok(admitted)
+}
+
+fn measured(inputs: &RuntimeInputs) -> Result<()> {
+    ensure!(
+        inputs.inventory.gpus.iter().all(|g| matches!(
+            g.baseline,
+            cuteafd_loader::placement::Baseline::Measured { .. }
+        )),
+        "Step-5 runtime requires a pre-weight measured baseline"
+    );
+    Ok(())
+}
+
+fn checkpoint_admission(
+    checkpoint: &Checkpoint,
+    inputs: &RuntimeInputs,
+) -> Result<admission::Admission> {
+    measured(inputs)?;
+    admission::admit(checkpoint, inputs)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_loader::{
+        placement::*,
+        plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions},
+    };
+
+    #[test]
+    fn public_max_card_planner_equals_measured_daemon_before_allocation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-loader/src/plan/families/step5/fixtures/official-fp8.json"
+        )))?;
+        let tensors = source["tensors"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| {
+                let dtype = match value[0].as_str().unwrap() {
+                    "BF16" => "BF16",
+                    "F32" => "F32",
+                    "F8_E4M3" => "F8_E4M3",
+                    _ => panic!("fixture dtype"),
+                };
+                testing::t(
+                    name,
+                    dtype,
+                    &value[1]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|n| n.as_u64().unwrap() as usize)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        testing::write_snapshot(dir.path(), &source["config"], &tensors, None);
+        // Export metadata only: no fabricated executor, library or CUDA pointers.
+        let ops = [
+            "hidden_norm",
+            "final_norm",
+            "residual_bf16",
+            "residual_f32",
+            "swa_attention",
+            "csa_attention",
+            "region_compress",
+            "region_scores",
+            "region_selection",
+            "region_commit",
+            "sliding_commit",
+            "attn_q",
+            "attn_kv",
+            "attn_gate",
+            "attn_out",
+            "router",
+            "dense_gate_up",
+            "dense_down",
+            "shared_gate_up",
+            "shared_down",
+        ];
+        let entries = ["step5", "step52"]
+            .iter()
+            .flat_map(|prefix| {
+                ops.iter().map(move |op|
+            serde_json::json!({"name": format!("{prefix}_{op}"), "capacity_rows": 4096}))
+            })
+            .collect::<Vec<_>>();
+        let manifest =
+            serde_json::json!({"capacities": {"max_context": 1048576}, "programs": entries});
+        let path = dir.path().join("PROGRAMS.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
+        let checkpoint = Checkpoint::coordinator(dir.path(), false, false)?;
+        for (context, pool, launchable) in [
+            (262_144, Some(262_144), true),
+            (1_048_576, None, true),
+            (1_048_576, Some(262_144), false),
+        ] {
+            let opts = LayoutOptions {
+                rtx_bytes: vec![96 << 30; 2],
+                pool_tokens: pool,
+                context_tokens: context,
+                workspace_manifest: Some(path.clone()),
+                ..Default::default()
+            };
+            let report = plan::plan(
+                dir.path(),
+                &PlanOptions {
+                    placement: ExpertPlacement::Sparks { ranks: 6 },
+                    draft_ownership: Some(plan::spec::DraftOwnership::None),
+                    layout: Some(opts.clone()),
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(report.wip_launchable(), launchable, "{:?}", report.hints);
+            assert!(!report.executable());
+            let mut code = Vec::new();
+            let gpus = opts
+                .rtx_bytes
+                .iter()
+                .enumerate()
+                .map(|(rank, &capacity_bytes)| {
+                    let arch = ArchContext::coordinator(capacity_bytes, None);
+                    code.push(
+                        inventory::loaded_code_allowance(
+                            "step5",
+                            "step5:fp8",
+                            true,
+                            rank as u8,
+                            &arch,
+                            Some(&programs),
+                        )
+                        .bytes,
+                    );
+                    GpuBudget {
+                        capacity_bytes,
+                        headroom_bytes: opts.headroom_bytes,
+                        baseline: Baseline::Measured {
+                            free_bytes: capacity_bytes - arch.context_bytes,
+                        },
+                    }
+                })
+                .collect();
+            let mut inputs = RuntimeInputs {
+                inventory: Inventory {
+                    gpus,
+                    spark_ranks: 6,
+                    peer_access: true,
+                },
+                rows: 256,
+                sequences: 16,
+                lanes: 2,
+                context,
+                requested_pool: pool,
+                marks: admission::MarkRule {
+                    lanes: 16,
+                    entries: opts.mimo_prefix_entries as usize,
+                    budget_bytes: opts.mimo_prefix_mark_bytes,
+                },
+                peer_diagnostics: false,
+                pending_code: code,
+                startup: vec![],
+            };
+            let live = checkpoint_admission(&checkpoint, &inputs);
+            if !launchable {
+                let error = live.err().expect("explicit pool below requested context");
+                let refusal = error.to_string();
+                assert!(refusal.contains("compiled/max-context floor of 1048576"));
+                assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)));
+                continue;
+            }
+            let live = live?;
+            assert_eq!(report.solver_placement.as_ref(), Some(&live.placement));
+            assert!(live.cache.context >= 262_144 && live.cache.context <= 1_048_576);
+            for (rank, reservation) in live.reservations.iter().enumerate() {
+                assert_eq!(reservation.active as u64, live.cache.ranks[rank].bytes * 16);
+                assert_eq!(
+                    reservation.marks as u64,
+                    live.cache.ranks[rank].bytes * live.marks as u64
+                );
+            }
+            inputs.inventory.gpus[0].baseline = Baseline::Planned {
+                context_bytes: 0,
+                loaded_bytes: 0,
+            };
+            let error = checkpoint_admission(&checkpoint, &inputs)
+                .err()
+                .expect("live requires measured baseline");
+            assert!(error.to_string().contains("measured baseline"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_native_allocation_constants_match_ffi_owners() -> Result<()> {
+        assert_eq!(
+            std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>(),
+            48
+        );
+        for rows in [1, 64, 256, 4096] {
+            assert_eq!(
+                cuteafd_loader::plan::families::step5::native::head_planes(rows)?[3],
+                cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE
+            );
+        }
+        Ok(())
+    }
+}

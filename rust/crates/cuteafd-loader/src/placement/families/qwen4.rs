@@ -157,7 +157,7 @@ pub fn dual_packages(catalog: &crate::OfficialV41Catalog, native_lib: &std::path
         Ok([0, 1].map(|rank| root.join(format!("rtx-tp2-rank{rank}"))))
     } else {
         let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs native expert headers"))?;
-        let root = root.join("fp8").join(format!("fp8-qwen4{}", if tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 { "-nvfp4a4" } else { tensors.format().package_suffix() }));
+        let root = root.join("fp8").join(tensors.format().package_name("qwen4"));
         let rank = |rank| -> anyhow::Result<_> {
             Ok(root.join(format!("tp2-w{}", tensors.rank_width(2, rank,
                 crate::formats::fp8_experts::Slicing::Blocks(128))?)))
@@ -198,7 +198,7 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
             let scales = tensors.scale_region_bytes_with(projection, 1, 0, Slicing::Padded)?;
             Ok::<_, anyhow::Error>(total + weights as u64 * shape.experts as u64 + scales as u64)
         })?;
-        let root = root.join("fp8").join(format!("fp8-qwen4{}", if tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 { "-nvfp4a4" } else { tensors.format().package_suffix() }));
+        let root = root.join("fp8").join(tensors.format().package_name("qwen4"));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
         let info = &manifest["layouts"]["tp1"];
         let weights = match tensors.format() {
