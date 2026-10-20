@@ -4,13 +4,13 @@ use super::device::LocalLane;
 use crate::shared::{
     experts::staging::RouteStaging,
     memory::{HostAllocation, device::{Event, Stream}},
-    spark_intake::SparkLane,
+    spark_intake::SparkLink,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{ExpertGeometry, memory_layout::{Basis, Category}};
 use cuteafd_ffi::KimiExpertInput;
 use cuteafd_loader::placement::{Demand, Placement};
-use cuteafd_transport::{expert::SparkWorld, ExpertProtocolV2Request,
+use cuteafd_transport::{expert::{SparkWorld, SparkExpertWave}, ExpertProtocolV2Request,
     ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
     TcpTransportConfig};
 use cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
@@ -32,11 +32,12 @@ pub(crate) fn demand(rows: usize, lane: usize) -> Result<Demand> {
 pub(crate) struct Ticket { layer: usize, rows: usize, sequence: u64 }
 
 /// Engine-retained wave owner; tickets never own the transport or copy sources.
-/// Drop completes copies before releasing pinned storage, and the ordinary lane
-/// joins its transport thread before the intake's planes are released.
+/// The main engine thread owns the transport. Drop completes copies before
+/// releasing pinned storage; terminal QP ownership retains unproved sources.
 pub(crate) struct RoutedLane<'a> {
     stream: Rc<Stream<'a>>,
-    link: Option<SparkLane<'a>>,
+    link: Option<SparkLink<'a>>,
+    runtime: tokio::runtime::Runtime,
     library_owner: Arc<cuteafd_ffi::NativeLibrary>,
     terminal: bool,
     staging: HostAllocation<'a>,
@@ -44,6 +45,7 @@ pub(crate) struct RoutedLane<'a> {
     capacity: usize,
     sequence: u64,
     pending: Option<Ticket>,
+    wave: Option<SparkExpertWave>,
 }
 
 impl Drop for RoutedLane<'_> {
@@ -72,19 +74,35 @@ impl<'a> RoutedLane<'a> {
         let stream = local.stream().clone();
         let layout = RouteStaging::new(local.rows(), TOPK, KimiExpertInput::ROW_BYTES)?;
         let library = library_owner.as_ref();
-        let (link, staging, ready) = stream.device.run(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let (mut link, staging, ready) = stream.device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(RANKS as u32)?;
-            Ok((SparkLane::new(library_owner, world, peers, local.rows() as u32, config, LATENT * 2)?,
-                HostAllocation::new(library, layout.bytes)?, Event::new(stream.device)?))
+            let mut link = SparkLink::new(library, world, &peers, local.rows() as u32, config, LATENT * 2)?;
+            link.enable_terminal_ownership(Arc::clone(library_owner))?;
+            Ok((link, HostAllocation::new(library, layout.bytes)?, Event::new(stream.device)?))
         })?;
         ensure!(link.world_size() == RANKS, "Kimi Spark transport world differs from admission");
-        Ok(Self { stream, link: Some(link), library_owner: Arc::clone(library_owner),
-            terminal: false, staging, ready, capacity: local.rows(), sequence: 0, pending: None })
+        if let Some(layer) = placement.layers.iter().position(|assignment|
+            assignment.experts == cuteafd_loader::placement::ExpertHome::Spark) {
+            stream.device.run(|| link.bootstrap(&bootstrap_request(layer, local.rows())?))?;
+            ensure!(link.transport.installed_grouping()?.len() == RANKS,
+                "Kimi bootstrap requires installed grouping from all six ranks");
+        }
+        Ok(Self { stream, link: Some(link), runtime, library_owner: Arc::clone(library_owner),
+            terminal: false, staging, ready, capacity: local.rows(), sequence: 0, pending: None, wave: None })
+    }
+
+    pub(crate) fn installed_grouping(&self)
+        -> Result<Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
+        self.link.as_ref().context("Kimi Spark link retired")?.transport.installed_grouping()
     }
 
     /// Checked QP quiescence precedes copy drainage and owner release.
     pub(crate) fn quiesce_links(&mut self) -> Result<()> {
-        if let Some(link) = &mut self.link { link.terminal_quiesce()?; }
+        self.stream.device.run(|| {
+            if let Some(link) = &mut self.link { link.terminal_quiesce()?; }
+            Ok(())
+        })?;
         self.terminal = true;
         Ok(())
     }
@@ -105,6 +123,7 @@ impl<'a> RoutedLane<'a> {
             Ok(())
         })?;
         self.pending = None;
+        self.wave = None;
         Ok(())
     }
 
@@ -122,7 +141,7 @@ impl<'a> RoutedLane<'a> {
         kind: ExpertV2SourceKind, routes: cuteafd_ffi::KimiRoutes,
         wire: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<Ticket> {
         self.check(local, rows)?;
-        ensure!(self.pending.is_none(), "Kimi routed lane already has an outstanding wave");
+        ensure!(self.pending.is_none() && self.wave.is_none(), "Kimi main link already has an outstanding wave");
         let sequence = self.sequence.checked_add(1).context("Kimi Spark request sequence overflow")?;
         let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
         self.stream.device.run(|| {
@@ -141,11 +160,11 @@ impl<'a> RoutedLane<'a> {
         })?;
         let request = request(layer, rows, sequence, kind, &layout, self.staging.bytes())?;
         let ticket = Ticket { layer, rows, sequence };
-        // Retain the terminal wave identity before handing work to the lane.
+        // Retain the terminal identity before dispatch can partially post work.
         self.pending = Some(ticket);
         self.sequence = sequence;
         let link = self.link.as_mut().context("Kimi Spark lane retired")?;
-        self.stream.device.run(|| link.submit(rows, Box::new(move || Ok(request))))?;
+        self.wave = Some(self.stream.device.run(|| link.dispatch(&request))?);
         Ok(ticket)
     }
 
@@ -155,10 +174,14 @@ impl<'a> RoutedLane<'a> {
         self.check(local, ticket.rows)?;
         ensure!(self.pending == Some(ticket), "Kimi Spark completion differs from retained wave");
         let output = local.buffer("expert combined")?;
+        let wave = self.wave.take().context("Kimi Spark completion has no dispatched wave")?;
         let link = self.link.as_mut().context("Kimi Spark lane retired")?;
         self.stream.device.run(|| {
-            link.wait(ticket.rows, Duration::from_secs(120), self.stream.raw)?;
-            // SAFETY: wait orders all six live intake planes before this exact
+            self.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(120), link.receive(wave, ticket.rows, self.stream.raw))
+                    .await.context("Kimi main-link receive timed out")?
+            })?;
+            // SAFETY: receive orders all six live intake planes before this exact
             // lane stream; output is a disjoint admitted latent allocation.
             unsafe { self.stream.device.library.v41_compact_reducer()?.reduce_planes(
                 link.intake.pointers(), RANKS as u32, std::ptr::null(),
@@ -168,6 +191,15 @@ impl<'a> RoutedLane<'a> {
         self.pending = None;
         Ok(())
     }
+}
+
+/// Control bootstrap sizes rings for the widest real request; these rows
+/// are never dispatched to the expert kernels.
+fn bootstrap_request(layer: usize, rows: usize) -> Result<ExpertProtocolV2Request> {
+    ensure!((1..93).contains(&layer) && (1..=4096).contains(&rows), "Kimi bootstrap geometry");
+    let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
+    let staged = vec![0; layout.bytes];
+    request(layer, rows, 1, ExpertV2SourceKind::Prefill, &layout, &staged)
 }
 
 fn request(layer: usize, rows: usize, sequence: u64, kind: ExpertV2SourceKind,
@@ -193,13 +225,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routed_owner_keeps_shared_lane_and_exact_library_until_terminal_release() {
+    fn routed_owner_keeps_main_link_and_exact_library_until_terminal_release() {
         let source = include_str!("spark.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(source.contains("link: Option<SparkLane<'a>>"));
+        assert!(source.contains("link: Option<SparkLink<'a>>"));
         assert!(source.contains("library_owner: Arc<cuteafd_ffi::NativeLibrary>"));
         assert!(source.contains("std::ptr::eq(library_owner.as_ref(), local.stream().device.library)"));
         assert!(source.contains("Arc::clone(library_owner)"));
-        assert!(!source.contains("let SparkLane {"));
+        assert!(!source.contains("SparkLane"));
+        assert!(!source.contains("submit_lane"));
+        assert!(source.contains("link.dispatch(&request)"));
+        assert!(source.contains("link.receive(wave, ticket.rows, self.stream.raw)"));
+        assert!(source.find("link.enable_terminal_ownership").unwrap() < source.find("link.bootstrap").unwrap());
+        assert!(source.find("link.bootstrap").unwrap() < source.find("link.transport.installed_grouping()").unwrap());
         let release = source.split("pub(crate) fn release_payloads").nth(1).unwrap()
             .split("fn check").next().unwrap();
         assert!(release.find("self.drain_copies()?").unwrap() < release.find("link.terminal_release()?").unwrap());
@@ -207,6 +244,23 @@ mod tests {
         assert!(release.contains("self.stream.device.run(||"));
         assert!(source.contains("link.terminal_quiesce()?"));
         assert!(!source.contains("not failure-safe"));
+    }
+
+    #[test]
+    fn widest_bootstrap_matches_real_request_storage_without_consuming_a_wave() -> Result<()> {
+        for rows in [1, 64, 4096] {
+            let request = bootstrap_request(6, rows)?;
+            assert_eq!(request.header.layer_id, 6);
+            assert_eq!(request.header.row_count as usize, rows);
+            assert_eq!(request.rows.len(), rows);
+            assert_eq!(request.routes.len(), rows * TOPK);
+            assert_eq!(request.hidden_payload.len(), rows * KimiExpertInput::ROW_BYTES);
+            assert!(request.routes.iter().all(|route| route.expert_id == 0 && route.gate_weight == 0.));
+        }
+        assert!(bootstrap_request(0, 4096).is_err());
+        assert!(bootstrap_request(1, 0).is_err());
+        assert!(bootstrap_request(1, 4097).is_err());
+        Ok(())
     }
 
     #[test]
