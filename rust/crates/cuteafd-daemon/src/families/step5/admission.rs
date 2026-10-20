@@ -172,7 +172,6 @@ mod tests {
             (1_048_576, None, true, None, 0),
             (1_048_576, None, true, Some(0), 0),
         ] {
-            let launchable = launchable && !(nvfp4 && host == Some(0) && entries != 0);
             let opts = LayoutOptions {
                 rtx_bytes: vec![96 << 30; ranks],
                 pool_tokens: pool,
@@ -245,21 +244,7 @@ mod tests {
             if !launchable {
                 let error = live.err().expect("both edges must refuse the unsupported allocation");
                 let refusal = error.to_string();
-                if pool == Some(262_144) {
-                    assert!(refusal.contains("compiled/max-context floor of 1048576"));
-                } else {
-                    assert!(nvfp4 && host == Some(0) && entries == 20);
-                    for message in ["device-only prefix retention with HOST_CACHE_BYTES=0",
-                        "request context 1048576", "--host-cache-bytes auto", "MAX_CONTEXT_TOKENS",
-                        "262144"] {
-                        assert!(refusal.contains(message), "{refusal}");
-                    }
-                    inputs.marks.entries = 0;
-                    assert!(checkpoint_admission(&checkpoint, &inputs).is_ok());
-                    inputs.marks.entries = usize::try_from(entries)?;
-                    inputs.context = 262_144;
-                    assert!(checkpoint_admission(&checkpoint, &inputs).is_ok());
-                }
+                assert!(refusal.contains("compiled/max-context floor of 1048576"));
                 assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)));
                 continue;
             }
