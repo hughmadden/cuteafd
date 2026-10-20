@@ -54,8 +54,11 @@ fn k6_checkpoint_load_forward_matches_dequant() -> Result<()> {
     ensure!(modules.len()==22,"expected eleven slices for both codebooks");
     // SAFETY: this is the native library selected by the existing golden runner.
     let library=unsafe{NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)?};
+    // SAFETY: test-only shim links the fixture objects and the runner's base
+    // library; production allocation/device symbols remain in the base handle.
+    let fixture_library=unsafe{NativeLibrary::load(std::env::var("CUTEAFD_K6_FIXTURE_LIB")?)?};
     let device=Device{library:&library,id:std::env::var("CUTEAFD_CACHE_TEST_DEVICE").unwrap_or_else(|_|"0".into()).parse()?};
-    let programs=device.run(||library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?)))?;
+    let programs=device.run(||fixture_library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?)))?;
     let upload=|bytes: &[u8]| -> Result<Allocation<'_>> {
         let allocation=Allocation::new(device,bytes.len().max(16))?;
         device.run(||library.copy_h2d(allocation.buffer,bytes))?;
@@ -112,7 +115,8 @@ fn k6_checkpoint_load_forward_matches_dequant() -> Result<()> {
                 let drained=device.run(||unsafe{library.cuda_stream_synchronize(stream)});
                 if let Err(error)=drained {
                     library.quarantine_module_after_failed_drain();
-                    return Err(error.context("native fixture drain failed; allocation owners quarantined"));
+                    fixture_library.quarantine_module_after_failed_drain();
+                    return Err(error.context("native fixture drain failed; allocation owners and both modules quarantined"));
                 }
                 launched?;
                 let mut bytes=vec![0;8*256*4];
