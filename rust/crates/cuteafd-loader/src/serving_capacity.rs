@@ -11,13 +11,15 @@ use thiserror::Error;
 
 mod deepseek;
 pub mod step5;
+mod spark_intake;
+pub use spark_intake::spark_intake_bytes;
 mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
 pub mod glm_graphs;
 pub mod glmf_graphs;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes,
-    glmf_spark_intake_bytes, glmf_step_scratch,
+    glmf_step_scratch,
     glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram,
     GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
     GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};

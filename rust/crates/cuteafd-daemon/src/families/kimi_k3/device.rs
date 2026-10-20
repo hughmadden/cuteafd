@@ -7,7 +7,7 @@ use cuteafd_ffi::{programs::Programs, Bf16Add, KimiExpertInput, KimiFfn, KimiFfn
     KimiKda, KimiKdaCommit, KimiLatent, KimiMlaMode, KimiPrefixMode, KimiResidual,
     KimiResidualBatch, KimiResidualSite, KimiRmsNorm, KimiRouter};
 use crate::shared::{memory::device::{Allocation, Device, DeviceOwner, Stream}, prefix::view};
-use cuteafd_ffi::{CuteafdDeviceBuffer, programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE}};
+use cuteafd_ffi::{CuteafdDeviceBuffer, programs::VocabularyHead};
 use std::rc::Rc;
 use super::weights::GlobalWeights;
 use cuteafd_core::memory_layout::{Basis, Category};
@@ -120,29 +120,7 @@ pub(crate) struct MlaPrograms<'a> {
 
 /// Reusable native temporary storage for one serialized layer lane. These are
 /// validated manifest requirements, not estimated total-engine allowances.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeScratch {
-    pub kda: usize,
-    pub mla: [usize; 3],
-}
-
-impl NativeScratch {
-    fn combine(kda: [usize; 2], mla: impl IntoIterator<Item = [usize; 3]>) -> Result<Self> {
-        let mut scratch = Self { kda: *kda.iter().max().unwrap(), mla: [0; 3] };
-        for requirements in mla {
-            for (current, required) in scratch.mla.iter_mut().zip(requirements) {
-                *current = (*current).max(required);
-            }
-        }
-        scratch.bytes()?;
-        Ok(scratch)
-    }
-
-    pub(crate) fn bytes(&self) -> Result<usize> {
-        self.mla.iter().try_fold(self.kda, |sum, bytes| sum.checked_add(*bytes)
-            .ok_or_else(|| anyhow::anyhow!("Kimi native scratch extent overflow")))
-    }
-}
+pub(crate) use cuteafd_loader::families::kimi_k3::allocation::NativeScratch;
 
 impl<'a> NativePrograms<'a> {
     pub(crate) fn load(device: Device<'a>, cfg: &KimiK3Config,
@@ -198,8 +176,9 @@ impl<'a> NativePrograms<'a> {
             // producers; admission retains the larger exact requirement.
             let kda=core.kda.iter().map(|p|p.scratch_bytes()).max().unwrap_or(0);
             let mla=core.mla.values().map(|p|p.scratch_bytes()).max().unwrap_or(0);
-            layout.operands.extend(cuteafd_loader::families::kimi_k3::core::lane_extents(rows,
-                layout.operands["KDA scratch"],layout.operands["MLA producer scratch"],kda,mla)?);
+            let stages = cuteafd_loader::families::kimi_k3::core::lane_extents(rows,
+                layout.operands["KDA scratch"],layout.operands["MLA producer scratch"],kda,mla)?;
+            layout.operands.extend(stages);
             layout.bytes()?;
         }
         Ok(layout)
@@ -211,84 +190,23 @@ impl<'a> NativePrograms<'a> {
 /// owners; these bytes must not be used as a total-engine allowance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LaneLayout {
-    rows: usize,
-    max_context: usize,
-    operands: BTreeMap<&'static str, usize>,
-    arena_offsets: BTreeMap<&'static str, usize>,
-    arena_bytes: usize,
-    core:Option<super::core_runtime::ProjectionLayout>,
+    base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout,
+    core: Option<super::core_runtime::ProjectionLayout>,
 }
 
-// Each native call keeps its internal operands disjoint. Only different phases
-// alias, exclusively on the lane's exact compute stream, including graph replay.
-const SCRATCH_PHASES: [&[&str]; 3] = [
-    &["KDA normalized", "KDA scratch"],
-    &["MLA query", "MLA q residual", "MLA attention", "MLA LSE",
-        "MLA producer scratch", "MLA attention scratch", "MLA output scratch"],
-    &["gate-up", "activated"],
-];
-const ARENA_ALIGNMENT: usize = 1024;
+impl std::ops::Deref for LaneLayout {
+    type Target = cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout;
+    fn deref(&self) -> &Self::Target { &self.base }
+}
+impl std::ops::DerefMut for LaneLayout {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.base }
+}
 
 impl LaneLayout {
     pub(crate) fn new(cfg: &KimiK3Config, rows: usize, max_context: usize,
         scratch: NativeScratch) -> Result<Self> {
-        cfg.release_geometry()?;
-        ensure!((1..=4096).contains(&rows) && (1..=1_048_576).contains(&max_context),
-            "Kimi lane row/context capacity");
-        let mut operands = BTreeMap::new();
-        let mut plane = |name, shape: &[usize]| -> Result<()> {
-            let bytes = shape.iter().try_fold(1usize, |n, size| n.checked_mul(*size)
-                .ok_or_else(|| anyhow::anyhow!("Kimi lane {name} extent overflow")))?;
-            ensure!(operands.insert(name, bytes.max(16)).is_none(), "duplicate Kimi lane operand");
-            Ok(())
-        };
-        let hidden = [rows, cfg.hidden, 2];
-        plane("residual arena", &[9, rows, cfg.hidden, 2])?;
-        for name in ["delta", "normalized", "attention output", "ffn output", "shared output", "routed output", "combined output"] {
-            plane(name, &hidden)?;
-        }
-        let intermediate = (cfg.dense_intermediate / 2).max(cfg.moe_intermediate * cfg.shared_experts / 2);
-        plane("gate-up", &[rows, 2, intermediate, 2])?;
-        plane("activated", &[rows, intermediate, 2])?;
-        for name in ["latent input", "expert combined", "latent normalized"] {
-            plane(name, &[rows, cfg.latent, 2])?;
-        }
-        plane("router logits", &[rows, cfg.experts, 4])?;
-        for name in ["route ids", "route weights"] { plane(name, &[rows, cfg.topk, 4])?; }
-        plane("expert wire", &[rows, KimiExpertInput::ROW_BYTES])?;
-        plane("KDA normalized", &[rows, 48, 128, 2])?;
-        for name in ["KDA slots", "KDA first"] { plane(name, &[rows, 4])?; }
-        plane("MLA slots", &[rows, 8])?;
-        plane("MLA query", &[rows, cfg.heads, 576, 2])?;
-        plane("MLA q residual", &[rows, cfg.q_lora_rank, 2])?;
-        plane("MLA attention", &[rows, cfg.heads, 512, 2])?;
-        plane("MLA LSE", &[rows, cfg.heads, 4])?;
-        // Decode/verify permits one request per row, at most the 64-row
-        // specialization. Wide prefill is one sequence. Cache pages live outside.
-        let requests = rows.min(64);
-        plane("MLA page table", &[requests, max_context.div_ceil(64), 4])?;
-        plane("MLA lengths", &[requests, 4])?;
-        plane("MLA query offsets", &[requests + 1, 4])?;
-        plane("KDA scratch", &[scratch.kda])?;
-        for (name, bytes) in ["MLA producer scratch", "MLA attention scratch", "MLA output scratch"]
-            .into_iter().zip(scratch.mla) { plane(name, &[bytes])?; }
-        let mut arena_offsets = BTreeMap::new();
-        let mut arena_bytes = 0;
-        for phase in SCRATCH_PHASES {
-            let mut end = 0usize;
-            for &name in phase {
-                let offset = end.checked_add(ARENA_ALIGNMENT - 1)
-                    .map(|n| n / ARENA_ALIGNMENT * ARENA_ALIGNMENT)
-                    .ok_or_else(|| anyhow::anyhow!("Kimi phase alignment overflow"))?;
-                ensure!(arena_offsets.insert(name, offset).is_none(), "duplicate Kimi arena operand");
-                end = offset.checked_add(operands[name])
-                    .ok_or_else(|| anyhow::anyhow!("Kimi phase extent overflow"))?;
-            }
-            arena_bytes = arena_bytes.max(end);
-        }
-        let layout = Self { rows, max_context, operands, arena_offsets, arena_bytes,core:None };
-        layout.bytes()?;
-        Ok(layout)
+        Ok(Self { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(
+            cfg, rows, max_context, scratch)?, core: None })
     }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
@@ -975,8 +893,8 @@ impl IoLayout {
     }
 
     fn extents(&self) -> [usize; 3] {
-        if self.rank == 0 { [self.rows * 4, 0, 0] }
-        else { [0, self.rows.min(64) * self.vocab * 4, if self.core_head {0}else{VOCABULARY_HEAD_WORKSPACE}] }
+        cuteafd_loader::families::kimi_k3::allocation::io_extents(
+            self.vocab, self.rank, self.rows, self.core_head)
     }
 
     pub(crate) fn demand(&self, lane: usize) -> Result<Demand> {
@@ -1141,6 +1059,8 @@ impl Ops for Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
+    use cuteafd_loader::families::kimi_k3::allocation::{SCRATCH_PHASES, ARENA_ALIGNMENT};
 
     fn i32_metadata(bytes: &[u8]) -> Vec<i32> {
         bytes.chunks_exact(4).map(|value| i32::from_le_bytes(value.try_into().unwrap())).collect()
@@ -1321,8 +1241,9 @@ mod tests {
         let lane = Lane { stream: stream.clone(),
             operands: BTreeMap::from([("delta", Allocation::new(device, 16)?)]),
             arena: Some(Allocation::new(device, 32)?),
-            layout: LaneLayout { rows: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
-                arena_offsets: BTreeMap::new(), arena_bytes: 32,core:None },core:None };
+            layout: LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout {
+                rows: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
+                arena_offsets: BTreeMap::new(), arena_bytes: 32 }, core:None },core:None };
         assert!(!fixture.events()?.contains('d'));
         drop(lane);
         let events = fixture.events()?;

@@ -7,7 +7,7 @@ use crate::shared::{
     spark_intake::SparkLane,
 };
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{ExpertGeometry, memory_layout::{Basis, Category}};
+use cuteafd_core::ExpertGeometry;
 use cuteafd_ffi::KimiExpertInput;
 use cuteafd_loader::placement::{Demand, Placement};
 use cuteafd_transport::{expert::SparkWorld, ExpertProtocolV2Request,
@@ -24,8 +24,7 @@ const TOPK: usize = 16;
 /// Pinned route storage is host memory; all device planes precede admission.
 pub(crate) fn demand(rows: usize, lane: usize) -> Result<Demand> {
     ensure!((1..=4096).contains(&rows), "Kimi Spark row capacity");
-    Ok(Demand::new(1, Category::Workspace, format!("Kimi Spark lane {lane} latent intake"),
-        (RANKS * rows * LATENT * 2) as u64, Basis::Exact))
+    Ok(cuteafd_loader::families::kimi_k3::allocation::spark_demand(rows, lane))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

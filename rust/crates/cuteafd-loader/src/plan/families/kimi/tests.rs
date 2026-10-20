@@ -22,46 +22,7 @@ fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
 }
 
 fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBuf {
-    use serde_json::json;
-    let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
-        "/../../../third_party/sparkinfer.lock.json"))).unwrap();
-    let revision = lock["revision"].as_str().unwrap();
-    let mut programs = Vec::new();
-    for (name, geometry) in [
-        ("kimik3_router_scores", json!({"hidden":7168,"experts":896,"top_k":16})),
-        ("kimik3_expert_input_quant", json!({"hidden":3584})),
-        ("kimik3_latent_down", json!({"width":7168,"outputs":3584})),
-        ("kimik3_latent_up", json!({"width":3584,"outputs":7168})),
-        ("kimik3_rmsnorm_h3584", json!({"hidden":3584})),
-    ] {
-        if !spark { programs.push(json!({"name":name,"geometry":geometry,"object_sha256":"b".repeat(64)})); }
-    }
-    std::fs::create_dir_all(root.join("share")).unwrap();
-    let path = root.join("share/PROGRAMS.json");
-    std::fs::write(&path, json!({"schema":1,"sparkinfer_revision":revision,"programs":programs}).to_string()).unwrap();
-    let package = root.join("lib/exl3/exl3-kimik3-k23");
-    let layouts = if spark { (0..6).map(|r| (format!("tp6-rank{r}"), 512)).collect::<Vec<_>>() }
-        else { vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)] };
-    let mut variants = Vec::new();
-    for (layout, intermediate) in layouts {
-        for capacity in [1, 80, 256, 1024, 4096] {
-            let directory = format!("{layout}/m{capacity}");
-            let meta = json!({"directory":directory,"capacity":capacity,"intermediate":intermediate,
-                "experts":896,"top_k":16,"bits":[2,3],"output_dtype":if spark {"bf16"} else {"fp32"},
-                "hidden":3584,"activation":"situ","descriptor_bits":10,"sparkinfer_revision":revision});
-            let target = package.join(&directory);
-            std::fs::create_dir_all(target.join("routes")).unwrap();
-            std::fs::write(target.join("v41_exl3.json"), meta.to_string()).unwrap();
-            for file in ["libcuteafd_exl3.so", "routes/libv41_exl3_routes.so", "trellis_lut.bin"] {
-                std::fs::write(target.join(file), []).unwrap();
-            }
-            variants.push(meta);
-        }
-    }
-    std::fs::write(package.join("manifest.json"), json!({"schema":"cuteafd.exl3-package.v1",
-        "geometry":"kimik3","role":if spark {"spark"} else {"coordinator"},
-        "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
-    path
+    testing::write_kimi_installed_inventory(root, spark)
 }
 
 #[test]

@@ -4,8 +4,10 @@ use super::{admission, device::NativePrograms, engine::Engine};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::{Device, Stream},
     peer_split::{hop::HopLink, PeerExchange, RankDevice}};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{ExpertGeometry, memory_layout::{Basis, Category}};
-use cuteafd_loader::{families::kimi_k3::config::KimiK3Config, placement::{Demand, GpuBudget, HOP_SLOTS}};
+use cuteafd_core::ExpertGeometry;
+#[cfg(test)]
+use cuteafd_core::memory_layout::Basis;
+use cuteafd_loader::{families::kimi_k3::config::KimiK3Config, placement::{Demand, GpuBudget}};
 use std::{net::SocketAddr, path::Path, rc::Rc, sync::Arc};
 const HIDDEN: usize = 7168;
 
@@ -156,14 +158,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
 }
 
 pub(super) fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -> Result<Demand> {
-    ensure!(rank < 2 && (1..=2).contains(&lanes), "Kimi code allowance rank/lane geometry");
-    // Shared allowance covers one thread-local handle per rank. Each head-rank
-    // lane owns an additional private handle beside its explicitly charged workspace.
-    let heads = if rank == 1 { lanes as u64 } else { 0 };
-    let bytes = heads.checked_mul(cublas_bytes).and_then(|extra| pending.checked_add(extra))
-        .context("Kimi future code/handle allowance overflow")?;
-    Ok(Demand::new(rank as u8, Category::Workspace, "Kimi future loaded code and private head handles",
-        bytes, Basis::Formula))
+    cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, cublas_bytes, lanes)
 }
 
 fn validate_core(cfg:&KimiK3Config,core:&cuteafd_loader::families::kimi_k3::core::CoreInventory,
@@ -176,12 +171,9 @@ fn validate_core(cfg:&KimiK3Config,core:&cuteafd_loader::families::kimi_k3::core
 use cuteafd_loader::families::kimi_k3::core::{needs_f32_partials,exchange_recv_bytes};
 
 pub(super) fn exchange_demands(rows: usize, diagnostics: bool,f32_partials:bool) -> Result<Vec<Demand>> {
-    let recv=exchange_recv_bytes(rows,f32_partials)?;
     let progress = if diagnostics { (2 * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256) } else { 0 };
-    // Hop receive planes are charged by the shared solver; only controls are fixed.
-    let bytes = recv + 256 + 256 + (((HOP_SLOTS + 1) * 16) as usize).max(256) + progress;
-    Ok((0..2).map(|rank| Demand::new(rank, Category::Workspace, "Kimi peer/abort/hop controls",
-        bytes as u64, Basis::Exact)).collect())
+    (0..2).map(|rank| cuteafd_loader::families::kimi_k3::allocation::exchange_demand(
+        rows, rank, f32_partials, progress)).collect()
 }
 
 #[cfg(test)]

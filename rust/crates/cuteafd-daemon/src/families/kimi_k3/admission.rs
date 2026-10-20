@@ -62,13 +62,10 @@ pub(crate) struct RtxInventory {
 
 pub(crate) fn plan_rtx(cfg: &KimiK3Config, catalog: &cuteafd_loader::OfficialV41Catalog,
     package: std::path::PathBuf, rows: usize, layers: usize) -> Result<RtxInventory> {
-    use crate::shared::experts::{exl3::Exl3Weights, layer::ExpertLayer,
-        rtx::{exl3::Exl3Tp2, RtxSelectionPolicy}};
+    use crate::shared::experts::{exl3::Exl3Weights, layer::ExpertLayer};
     ensure!(layers > 0 && layers <= cfg.dense.iter().filter(|dense| !**dense).count(),
         "Kimi TP2 expert count outside routed inventory");
-    let workspace = Exl3Tp2::workspace_bytes_for_selection(&package, cfg.latent, rows,
-        cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3),
-        RtxSelectionPolicy::FirstCapacity)?;
+    let workspace = usize::try_from(cuteafd_loader::families::kimi_k3::allocation::expert_workspace(&package, rows)?)?;
     let costs = cfg.dense.iter().enumerate().map(|(layer, dense)| {
         if *dense { return Ok([Bytes2::default(); 2]); }
         let mut costs = [Bytes2::default(); 2];
@@ -628,6 +625,77 @@ pub(super) mod tests {
         i.lane_layouts[1][1] = LaneLayout::new(&full, i.rows, 524_288,
             super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
         assert!(request(i).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn installed_max_planner_and_runtime_remaining_kv_match_per_gpu() -> Result<()> {
+        use cuteafd_loader::{families::kimi_k3::allocation, plan::{self, layout::LayoutOptions,
+            testing, ExpertPlacement, PlanOptions}};
+        use cuteafd_core::memory_layout::DeviceKind;
+        let snapshot = tempfile::tempdir()?;
+        testing::write_kimi_snapshot(snapshot.path(), true);
+        let package_root = tempfile::tempdir()?;
+        let manifest_path = testing::write_kimi_installed_inventory(package_root.path(), false);
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
+        let rows = 4096;
+        let context = 1_048_576;
+        let capacity = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
+        let spark_bytes = 115_964_116_992;
+        let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+            layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2], prefill_rows: rows as u64,
+                concurrency: 16, state_slots: Some(16), prefix_slots: Some(1),
+                context_tokens: context as u64, host_cache_bytes: Some(0),
+                workspace_manifest: Some(manifest_path.clone()), onboard: Some(Onboard::Auto),
+                spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }), ..Default::default() };
+        let report = plan::plan(snapshot.path(), &options)?;
+        ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
+        let memory = report.memory_layout.context("installed Kimi planner ledger")?;
+        let catalog = cuteafd_loader::read_expert_catalog(snapshot.path())?;
+        let package = allocation::expert_package(&manifest_path)?;
+        let mut rtx = plan_rtx(&cfg, &catalog, package, rows, 92)?;
+        rtx.layers = Onboard::Auto;
+        let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (1..93).collect(),
+            spark_ranks: 6, prefill_lanes: 1 };
+        let rings = cuteafd_loader::plan::layout::spark_ring_geometry(1);
+        let spark = SparkBudgetInventory::exl3(&catalog, &working,
+            &[cuteafd_core::SparkEndpoint { capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+            cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
+                slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
+            cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+        let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
+        let arch = ArchContext::for_device("sm_120", capacity);
+        let mut i = inputs(&cfg);
+        i.rows = rows; i.lanes = 1; i.state_slots = 16; i.prefix_marks = 1;
+        i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, context,
+            allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
+        i.fixed = super::super::startup::exchange_demands(rows, false, false)?;
+        i.startup = (0..2).map(|rank| super::super::graphs::demand(
+            &super::super::graphs::owned_inventory(&cfg, 1, rows, 16).unwrap().inventory, rank)).collect();
+        for rank in 0..2 {
+            let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
+                "kimik3", "exl3", true, rank as u8, arch, Some(&programs));
+            // Model an identical post-module sample: context + resident code are
+            // already allocated, while BLAS and private head handles are future.
+            let resident = code.bytes - arch.cublas_bytes;
+            i.gpus[rank] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
+                baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
+            i.fixed.push(super::super::startup::code_demand(rank,
+                code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1)?);
+        }
+        i.rtx = Some(rtx); i.spark_budget = Some(spark);
+        let admitted = admit(i)?;
+        assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
+        for rank in 0..2 {
+            let planned = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx && d.index == rank as u32)
+                .context("planned RTX rank")?;
+            let non_pool = planned.items.iter().filter(|item| item.group != "records").map(|item| item.bytes).sum::<u64>();
+            let remaining = capacity - arch.context_bytes - non_pool;
+            assert_eq!(remaining, admitted.placement.pool_limits.0[rank].available_bytes,
+                "rank {rank}: installed planner and runtime must leave identical KV room");
+        }
+        assert!(admitted.placement.pool_tokens >= context as u64);
         Ok(())
     }
 

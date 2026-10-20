@@ -1,10 +1,12 @@
 //! Kimi K3 (`kimi_k3` wrapping `text_config.model_type=kimi_linear`) checkpoint readers.
+pub mod allocation;
 pub mod config;
 pub mod core;
 pub mod kda;
 pub mod mla;
 pub mod reference;
 pub mod w8;
+pub mod weight_layout;
 
 pub const COMPILED_CONTEXT: usize = 1_048_576;
 pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
