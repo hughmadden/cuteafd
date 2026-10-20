@@ -252,6 +252,20 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_load_failure_closes_pending_worker_connections() -> Result<()> {
+        let (pending, listeners) = pending_fixture()?;
+        assert!(load_while_admitting::<()>(Some(pending), || anyhow::bail!("load failed")).is_err());
+        for (rank, listener) in listeners.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept()?;
+            cuteafd_transport::worker_selection::receive_worker_selection(
+                &stream, rank, Duration::from_secs(5))?;
+            let mut byte = [0];
+            assert_eq!(std::io::Read::read(&mut stream, &mut byte)?, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn coordinator_only_load_needs_no_worker_admission() -> Result<()> {
         assert_eq!(load_while_admitting(None, || Ok(42))?, 42);
         assert!(load_while_admitting::<()>(None, || anyhow::bail!("load failed")).is_err());
