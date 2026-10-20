@@ -238,6 +238,33 @@ fn context_slices(rows: &[ContextRow]) -> Result<Vec<Vec<ContextRow>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_hosted_tail(dense: &[bool], csv: &str) -> Result<(usize, Vec<usize>)> {
+        let hosted = csv.split(',').map(str::parse)
+            .collect::<std::result::Result<Vec<usize>, _>>()?;
+        let routed = dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer))
+            .collect::<Vec<_>>();
+        let local = routed.len().checked_sub(hosted.len())
+            .context("native proof worker list exceeds the routed layer count")?;
+        ensure!(routed[local..] == hosted,
+            "native proof workers must host an exact routed-layer suffix");
+        Ok((local, hosted))
+    }
+
+    #[test]
+    fn native_placement_derives_local_prefix_from_exact_worker_tail() -> Result<()> {
+        let mut dense = vec![false; 93];
+        dense[0] = true;
+        let csv = (6..93).map(|layer| layer.to_string()).collect::<Vec<_>>().join(",");
+        assert_eq!(native_hosted_tail(&dense, &csv)?, (5, (6..93).collect()));
+        assert_eq!(native_hosted_tail(&[true, false, true, false, false], "3,4")?, (1, vec![3, 4]));
+        for invalid in ["", "5,7,8", "91,91,92", "92,91", "0,91,92", "91,93", "91,92,"] {
+            assert!(native_hosted_tail(&dense, invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert!(native_hosted_tail(&[true, false], "0,1").is_err());
+        Ok(())
+    }
+
     #[test]
     fn wide_prefill_keeps_every_tap_in_two_common_slices() -> Result<()> {
         let rows = (0..TARGET_TAP_ROWS).map(|tap_row| ContextRow {
@@ -292,6 +319,8 @@ mod tests {
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
         cfg.release_geometry()?;
+        let (local_layers, hosted_layers) = native_hosted_tail(&cfg.dense,
+            &env("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
         cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
             .map_err(|_| anyhow::anyhow!("native MLA proof requires an isolated test process"))?;
         startup::preflight(&manifest, &native)?;
@@ -300,11 +329,10 @@ mod tests {
         let programs = library.programs()?.with_manifest(&manifest)?;
         let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
             devices: [0, 1], native_lib: &native, peers,
-            rtx_expert_layers: cuteafd_loader::placement::Onboard::Auto, spark_budget_gib: None,
+            rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(local_layers), spark_budget_gib: None,
             rows: TARGET_TAP_ROWS, slots: 1, marks: 1, max_context: 1_048_576,
             pool_tokens: Some(1_048_576), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
-            hosted_layers: Some(env("CUTEAFD_GOLDEN_EXPERT_LAYERS")?.split(',')
-                .filter(|s| !s.is_empty()).map(str::parse).collect::<std::result::Result<Vec<usize>, _>>()?),
+            hosted_layers: Some(hosted_layers),
             draft: Some(Options { snapshot: drafter, fp8: true }),
         })?;
         let engine = &loaded.engine;
