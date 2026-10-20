@@ -584,10 +584,9 @@ pub(super) fn load_exl3<'a>(
     let scratch = plans.iter().map(|p| p.read_scratch_bytes).max().unwrap_or(0);
     let peak = spark_admission_budget(config, resident, staging, pinned, scratch, workspace)?;
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
-    let mut weights = Vec::with_capacity(plans.len());
     let mut remaining = config.device_budget;
-    for (index, plan) in plans.iter().enumerate() {
-        let layer = layers[index];
+    let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, layer| {
+        let plan = &plans[index];
         let started = std::time::Instant::now();
         let weight = Exl3Weights::load(
             library,
@@ -605,8 +604,8 @@ pub(super) fn load_exl3<'a>(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "compressed EXL3 expert layer loaded"
         );
-        weights.push(weight);
-    }
+        Ok(weight)
+    })?;
     Ok((Weights::Exl3(Rc::new(weights)), remaining))
 }
 

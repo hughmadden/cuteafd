@@ -3362,3 +3362,12 @@ def test_console_assets_rejects_unknown_value(tmp_path: Path) -> None:
         encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
     assert result.returncode != 0
     assert "CONSOLE_ASSETS must be on or off" in result.stderr
+
+
+def test_worker_env_survives_the_remote_worker_shell(tmp_path: Path) -> None:
+    # Shared worker env reaches the ssh remote command as shell-quoted words.
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
+    result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=off\n")
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if "expertd-native" in line]
+    assert workers and all("CUTEAFD_THERMAL=" in worker for worker in workers)

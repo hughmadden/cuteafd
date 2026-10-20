@@ -36,8 +36,7 @@ impl ExecutionOwnership {
             "Step-5 execution entry/head rank");
         ensure!(execution.spec().row_bytes == 4096 * 4 && execution.spec().rows <= 4096,
             "Step-5 residual hop geometry");
-        crate::placement::validate_layer_pipeline_lanes(execution.spec().lanes,
-            usize::try_from(execution.spec().lanes)?)?;
+        ensure!(execution.spec().lanes == 1, "Step-5 has one main execution lane");
         for (layer, mode) in execution.modes().iter().enumerate() {
             match mode {
                 LayerMode::Whole { gpu, ffn: FfnMode::Owner } =>
@@ -50,24 +49,22 @@ impl ExecutionOwnership {
             }
         }
         let owners = Self { ranks, execution, full: cfg.full.clone(), moe: cfg.moe.clone() };
-        for lane in 0..owners.execution.spec().lanes as usize {
-            owners.execution.validate_routed_replications(&owners.routed_replications(lane)?)?;
-        }
+        owners.execution.validate_routed_replications(&owners.routed_replications()?)?;
         Ok(owners)
     }
 
-    /// Publication flags 0..4 belong exclusively to head partials. Routed
-    /// copies use 4..8, with one full native receive allocation per layer/lane.
-    /// The ordinal counts actual routed copies, not physical layer parity.
-    pub fn routed_replications(&self, lane: usize) -> Result<Vec<Option<RoutedReplication>>> {
-        ensure!(lane < self.execution.spec().lanes as usize, "Step-5 routed lane outside admission");
-        let mut ordinal = 0;
+    /// Routed replies use the entry GPU intake and existing peer publication.
+    /// Head exchanges between layers order reuse of the reply receive planes.
+    pub fn routed_replications(&self) -> Result<Vec<Option<RoutedReplication>>> {
+        let entry = self.execution.spec().entry_gpu;
         Ok(self.execution.modes().iter().enumerate().map(|(layer, mode)| {
-            if *mode != LayerMode::HeadSplit || !self.moe[layer] { return None; }
-            let copy = RoutedReplication { source: 0, slot: 4 + 2 * lane + ordinal % 2,
-                storage: 1 + lane * self.execution.modes().len() + layer };
-            ordinal += 1;
-            Some(copy)
+            if !self.moe[layer] || self.ranks == 1 { return None; }
+            let slot = match mode {
+                LayerMode::HeadSplit => 4,
+                LayerMode::Whole { gpu, .. } if *gpu != entry => 5,
+                _ => return None,
+            };
+            Some(RoutedReplication { source: entry, slot, storage: 1 + layer })
         }).collect())
     }
 
@@ -81,24 +78,8 @@ impl ExecutionOwnership {
         Ok(())
     }
 
-    /// Every persistent lane connects once for each routed-wave owning rank.
-    pub fn routed_endpoints(&self) -> Result<usize> {
-        self.routed_wave_ranks()?.len().checked_mul(usize::try_from(self.execution.spec().lanes)?)
-            .ok_or_else(|| anyhow::anyhow!("Step-5 routed endpoint count overflow"))
-    }
-
-    /// Owning ranks within a lane, not the total number of persistent transports.
-    pub fn routed_wave_ranks(&self) -> Result<Vec<usize>> {
-        let mut ranks = Vec::new();
-        for rank in 0..self.ranks {
-            let mut owns = false;
-            for layer in 0..self.execution.modes().len() {
-                owns |= self.layer(layer, rank)?.routed_wave;
-            }
-            if owns { ranks.push(rank); }
-        }
-        Ok(ranks)
-    }
+    /// The engine owns one Spark-world transport, with intake on its entry GPU.
+    pub fn routed_endpoints(&self) -> Result<usize> { Ok(1) }
 
     pub fn layer(&self, layer: usize, rank: usize) -> Result<LayerRank> {
         ensure!(rank < self.ranks, "Step-5 execution rank");

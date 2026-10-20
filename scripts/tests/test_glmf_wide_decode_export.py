@@ -436,6 +436,49 @@ def test_kimi_routes_reuse_shared_kernels_at_hidden_and_latent_widths(exporter):
     assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
 
 
+@pytest.mark.parametrize("heads,count", [(64, 14), (32, 18)])
+def test_glm_dormant_stage_catalog(exporter, heads, count):
+    geometry = types.SimpleNamespace(heads=heads, latent_dim=576)
+    entries = exporter.glm_stage_programs(geometry, 64, 4096)
+    assert len(entries) == count
+    assert len({name for name, _, _, _ in entries}) == count
+    for name, op, params, thunk in entries:
+        assert op == "attention_stage"
+        rows = params["max_rows"]
+        assert rows in (64, 4096) and name.endswith(f"_m{rows}")
+        assert thunk() == ("glm_attention", "compile_glm_attention_stage_aot", (geometry,), params)
+        stage = params["stage"]
+        if "_context_" in name:
+            assert heads == 32 and stage in ("query_rope", "absorb")
+            assert params["query_row"] == 36864
+        else:
+            assert "query_row" not in params
+        if stage in ("absorb", "values") and "_bf16_" not in name:
+            assert params["fp8_only"] == ("decode" if rows == 64 else "prefill")
+        else:
+            assert params.get("fp8_only") is None
+    for rows in (64, 4096):
+        names = {name for name, _, _, _ in entries if name.endswith(f"_m{rows}")}
+        expected = {f"{stage}_m{rows}" for stage in (
+            "rank_pack", "query_rope", "index_post", "absorb", "values",
+            "absorb_bf16", "values_bf16")}
+        if heads == 32:
+            expected |= {f"{stage}_context_m{rows}" for stage in ("query_rope", "absorb")}
+        assert names == expected
+
+
+def test_glm_official_catalog_stays_fused(exporter):
+    geometry = types.SimpleNamespace(moe_inter=2048, dense_inter=12288)
+    entries = exporter.glm_programs(geometry, 64, 4096, 1048576)
+    names = {name for name, _, _, _ in entries}
+    assert len(names) == len(entries) == 27
+    for rows in (64, 4096):
+        for stem in ("producer", "index_producer", "o"):
+            assert f"{stem}_m{rows}" in names
+            assert f"{stem}_bf16_m{rows}" in names
+    assert not any(op == "attention_stage" for _, op, _, _ in entries)
+
+
 def test_kimi_latent_exports_native_norm_and_canonical_projections(exporter):
     programs = exporter.kimi_latent_programs()
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}

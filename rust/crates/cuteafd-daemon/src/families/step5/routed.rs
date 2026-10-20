@@ -268,9 +268,6 @@ impl<'a> RoutedFfn<'a> {
     pub(super) fn workspace_bytes(&self) -> u64 {
         cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
     }
-    pub(super) fn new_lane_in(&self, arena: &Arena<'a>, offset: usize) -> Result<Self> {
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), Some((arena, offset)))
-    }
 
 
     pub fn load(
