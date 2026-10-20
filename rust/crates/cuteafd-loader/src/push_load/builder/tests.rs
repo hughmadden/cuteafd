@@ -205,6 +205,17 @@ pub(super) fn snapshot(variable: &str) -> Option<PathBuf> {
     std::env::var_os(variable).map(PathBuf::from)
 }
 
+pub(super) fn real_pattern_headroom(plan: &CheckedPlan, label: &str) {
+    let (id, pattern) = plan.plan.patterns.iter().enumerate()
+        .max_by_key(|(_, p)| nest_push::proto::encode(*p).len()).unwrap();
+    let bytes = nest_push::proto::encode(pattern).len();
+    let indices = pattern.dims.iter().filter_map(|d| match &d.steps {
+        Steps::Indices(v) => Some(v.len()), _ => None,
+    }).max().unwrap_or(0);
+    assert!(bytes < 100 * 1024, "{label}: real pattern {id} needs {bytes} bytes; approaching socket ceiling");
+    eprintln!("real pattern headroom {label}: pattern {id}, {indices} indices, {bytes} encoded bytes");
+}
+
 #[test]
 fn real_exl3_tp4_tp6_bytes_match_existing_gathers() {
     let Some(snapshot) = snapshot("CUTEAFD_PUSH_EXL3") else {
@@ -279,6 +290,20 @@ fn real_exl3_tp4_tp6_bytes_match_existing_gathers() {
                 .unwrap();
         }
         let resident_plan = resident_builder.finish().unwrap();
+        real_pattern_headroom(&resident_plan, "EXL3 serving residency");
+        for (rank, residency) in resident.iter().enumerate() {
+            let expected = cuteafd_core::tp_units::RankUnits::new(
+                cuteafd_core::tp_units::balanced_rule(128, shape.intermediate / 128, world),
+                shape.experts, shape.intermediate, 128, layer, world, rank).unwrap();
+            if let Some(actual) = &residency.unit_map { assert_eq!(actual, &expected); }
+        }
+        let entry = resident_plan.plan.entries.iter().max_by_key(|e|
+            nest_push::proto::encode(&resident_plan.plan.patterns[e.pattern as usize]).len()).unwrap();
+        let tensor = catalog.tensors().iter().find(|t|
+            t.shard == resident_plan.plan.files[entry.file as usize]
+            && entry.src_base >= t.metadata.byte_offset
+            && entry.src_base < t.metadata.byte_offset + t.metadata.byte_length).unwrap();
+        eprintln!("EXL3 TP{world} largest serving pattern tensor {}", tensor.metadata.name);
         eprintln!(
             "EXL3 TP{world} full layer: {} checked entries, {} patterns",
             resident_plan.plan.entries.len(),
@@ -291,6 +316,7 @@ fn real_exl3_tp4_tp6_bytes_match_existing_gathers() {
                 .unwrap();
         }
         let plan = builder.finish().unwrap();
+            real_pattern_headroom(&plan, "native checkpoint");
         assert_eq!(plan.plan.entries.len(), jobs.len());
         let landed = land(&plan, &snapshot);
         for (units, name, target, gather) in jobs {
@@ -389,6 +415,7 @@ fn real_fp8_nvfp4_tp4_tp6_bytes_match_existing_windows() {
                             .unwrap();
                     }
                     let plan = builder.finish().unwrap();
+            real_pattern_headroom(&plan, "native checkpoint");
                     let mut landed = land(&plan, &snapshot);
                     let name = tensors.name(layer, 0, projection);
                     let scale_name = format!(
@@ -488,6 +515,7 @@ fn real_exlr8_tp4_tp6_plan_counts_and_verified_unit_bytes() {
                 )
                 .unwrap();
             let plan = builder.finish().unwrap();
+            real_pattern_headroom(&plan, "native checkpoint");
             eprintln!(
                 "EXLR8 TP{world} rank {rank} layer 3: {} entries, {} patterns",
                 plan.plan.entries.len(),

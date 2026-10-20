@@ -1,4 +1,4 @@
-use super::tests::{land, snapshot};
+use super::tests::{land, snapshot, real_pattern_headroom};
 use super::*;
 
 #[test]
@@ -40,6 +40,7 @@ fn real_v41_native_tp4_tp6_and_coordinator_tp2_match_staging() {
                 .unwrap();
         }
         let plan = builder.finish().unwrap();
+        real_pattern_headroom(&plan, "V4.1 native / coordinator");
         let landed = land(&plan, &snapshot);
         for (rank, staging) in staging.iter().enumerate() {
             let mut expected = vec![0; staging.staging_bytes()];
@@ -83,6 +84,7 @@ fn real_v41_native_tp4_tp6_and_coordinator_tp2_match_staging() {
                 .unwrap();
         }
         let plan = builder.finish().unwrap();
+        real_pattern_headroom(&plan, "V4.1 native / coordinator");
         for (rank, landed) in land(&plan, &snapshot).iter().enumerate() {
             let mut expected = vec![0; landed.len()];
             let mut scratch = vec![0; source.bytes as usize / tensor.metadata.shape[0]];
@@ -108,7 +110,9 @@ fn real_v41_native_tp4_tp6_and_coordinator_tp2_match_staging() {
             },
         )
         .unwrap();
-    let landed = land(&builder.finish().unwrap(), &snapshot).remove(0);
+    let plan = builder.finish().unwrap();
+    real_pattern_headroom(&plan, "coordinator whole");
+    let landed = land(&plan, &snapshot).remove(0);
     let mut expected = vec![0; source.bytes as usize];
     catalog.read_projection_once(name, &mut expected).unwrap();
     assert_eq!(landed, expected);
@@ -156,6 +160,7 @@ fn real_v41_nvfp4_tp4_tp6_match_staging() {
                 .unwrap();
         }
         let plan = builder.finish().unwrap();
+        real_pattern_headroom(&plan, "V4.1 native / coordinator");
         for (s, landed) in staging.iter().zip(land(&plan, &snapshot)) {
             let mut expected = vec![0; s.staging_bytes()];
             let mut scratch = vec![0; s.minimum_read_scratch_bytes()];
