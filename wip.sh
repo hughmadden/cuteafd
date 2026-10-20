@@ -1140,10 +1140,8 @@ native_store_has() {
 wip_seed_lock() {
   case "$1" in rhea|moa|kakapo) printf '%s\n' "$1" ;; *) printf 'sparks\n' ;; esac
 }
-# Auto never queues on a raptor GPU: capped admission probes the GPU locks
-# without blocking (a held lock falls through to the next mode), then remote
-# retries are bounded. It may run while the Spark leg holds its seed lease:
-# a non-blocking probe can never wait on a lock, so it cannot deadlock.
+# Try a configured remote exporter first, then queue one capped local turn.
+# Dispatch runs only after the Spark lease and Cargo build slot are released.
 wip_coordinator_export_modes() {
   case "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" in
     auto) [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote ' ; printf 'capped\n' ;;
