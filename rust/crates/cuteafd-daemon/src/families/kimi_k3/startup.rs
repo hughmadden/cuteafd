@@ -53,8 +53,8 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     // Resolve native modules before the measured baseline, while retaining their handles.
     let _draft_modules = options.draft.as_ref().map(|_| devices[1].run(|| {
         use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
-        Ok([MlaDraft::load(programs, MlaDraftWindow::Full)?,
-            MlaDraft::load(programs, MlaDraftWindow::Sliding4096)?])
+        Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full)?,
+            MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096)?])
     })).transpose()?;
     let rows = options.rows;
     let spark_budget_gib = options.spark_budget_gib.unwrap_or(

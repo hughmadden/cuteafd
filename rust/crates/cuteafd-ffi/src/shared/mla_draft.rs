@@ -62,10 +62,10 @@ pub struct MlaDraft<'a> {
 }
 
 impl<'a> MlaDraft<'a> {
-    pub fn load(programs: &'a Programs<'a>, window: MlaDraftWindow) -> Result<Self> {
-        let producer = programs.program("mla_draft_producer_m64", PRODUCER)?;
-        let attention = programs.program(&format!("mla_draft_attention_{}_m64", window.suffix()), ATTENTION)?;
-        let output = programs.program("mla_draft_output_m64", OUTPUT)?;
+    pub fn load(programs: &'a Programs<'a>, program_namespace: &str, window: MlaDraftWindow) -> Result<Self> {
+        let producer = programs.program(&format!("{program_namespace}_mla_draft_producer_m64"), PRODUCER)?;
+        let attention = programs.program(&format!("{program_namespace}_mla_draft_attention_{}_m64", window.suffix()), ATTENTION)?;
+        let output = programs.program(&format!("{program_namespace}_mla_draft_output_m64"), OUTPUT)?;
         let layout = validate_manifest([producer.spec(), attention.spec(), output.spec()], window)?;
         Ok(Self { producer, attention, output, layout })
     }

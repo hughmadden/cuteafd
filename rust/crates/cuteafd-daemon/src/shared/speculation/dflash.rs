@@ -1036,7 +1036,7 @@ impl<'a> DflashDrafter<'a> {
     /// Programs and headers are checked before the exact arenas are allocated.
     #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) fn load_mla(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
-        snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
+        program_namespace: &str, snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
@@ -1052,7 +1052,7 @@ impl<'a> DflashDrafter<'a> {
             .into_iter().map(|t| (t.name.clone(), t)).collect() };
         for (name, shape) in native.tensor_shapes() { checkpoint.bytes(&name, &shape)?; }
         let programs = native.windows.iter().map(|window| -> Result<_> {
-            let program = MlaDraft::load(programs, if window.is_some() { MlaDraftWindow::Sliding4096 }
+            let program = MlaDraft::load(programs, program_namespace, if window.is_some() { MlaDraftWindow::Sliding4096 }
                 else { MlaDraftWindow::Full })?;
             ensure!(program.max_context() >= layout.program().context
                 && program.splits() == layout.program().splits

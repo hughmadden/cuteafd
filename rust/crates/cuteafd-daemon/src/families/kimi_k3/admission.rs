@@ -133,7 +133,7 @@ impl<'a> Admission<'a> {
         scales: crate::shared::fp8_linear::Fp8Scales, rows: crate::shared::fp8_linear::Fp8Rows)
         -> Result<DeviceOwner<'a, DflashDrafter<'a>>> {
         self.allocate_draft_with(device.id, |layout| device.own(||
-            DflashDrafter::load_mla(device.library, programs, snapshot, file, stream, layout,
+            DflashDrafter::load_mla(device.library, programs, "kimik3", snapshot, file, stream, layout,
                 representation, scales, rows)))
     }
 

@@ -385,6 +385,51 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
             assert params == {"mode": mode, "max_rows": rows, "heads": heads}
 
 
+@pytest.mark.parametrize("namespace", ["kimik3"])
+def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, namespace):
+    ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/mla_draft.rs").read_text()
+    load = ffi.split("pub fn load(", 1)[1].split("pub fn scratch_bytes", 1)[0]
+    requested = re.findall(r'programs\.program\(&format!\("([^"]+)"', load)
+    assert len(requested) == 3
+    catalog = {f"{namespace}_{stem}" for stem, *_ in
+               exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)}
+    for window in ("full", "w4096"):
+        names = {name.replace("{program_namespace}", namespace).replace("{}", window)
+                 for name in requested}
+        assert names <= catalog, sorted(names - catalog)
+        assert all(name.startswith(namespace + "_") for name in names)
+    daemon = ROOT / "rust/crates/cuteafd-daemon/src"
+    startup = (daemon / "families/kimi_k3/startup.rs").read_text()
+    admission = (daemon / "families/kimi_k3/admission.rs").read_text()
+    shared = (daemon / "shared/speculation/dflash.rs").read_text()
+    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Full)' in startup
+    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Sliding4096)' in startup
+    assert f'DflashDrafter::load_mla(device.library, programs, "{namespace}",' in admission
+    assert "MlaDraft::load(programs, program_namespace," in shared
+
+
+@pytest.mark.parametrize("family", ["glm5", "glm5_flash"])
+def test_shared_gqa_drafter_requested_symbols_exist_in_native_catalog(family):
+    # GQA uses the common native C ABI, not the family-prefixed AOT table.
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/speculation/dflash.rs").read_text()
+    requested = set(re.findall(r"\.((?:glm_dflash_)[a-z0-9_]+)\(", shared))
+    assert requested
+    ffi = (ROOT / "rust/crates/cuteafd-ffi/src/families/glm5/glm_dflash.rs").read_text()
+    symbols = dict(re.findall(r'pub (?:unsafe )?fn (glm_dflash_\w+)\b.*?self\.lib\.get::<F>\(b"([^"]+)"',
+                              ffi, re.S))
+    assert requested <= symbols.keys(), sorted(requested - symbols.keys())
+    native = ROOT / "native"
+    source = "families/glm5/cuda/glm_dflash.cu"
+    catalog = set(re.findall(r'extern "C" \w+ (cuteafd_glm_dflash_\w+)\(',
+                             (native / source).read_text()))
+    assert {symbols[name] for name in requested} <= catalog
+    cmake = (native / "CMakeLists.txt").read_text()
+    common_sources = cmake.split("list(APPEND CUTEAFD_NATIVE_SOURCES\n", 1)[1].split(")", 1)[0]
+    assert source in common_sources
+    adapter = ROOT / f"rust/crates/cuteafd-daemon/src/families/{family}"
+    assert any("DflashDrafter" in path.read_text() for path in adapter.glob("*.rs"))
+
+
 def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
     programs = exporter.kimi_w8_programs()
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
