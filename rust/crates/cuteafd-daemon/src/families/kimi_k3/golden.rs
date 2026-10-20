@@ -43,6 +43,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long)] check_headers: bool,
     /// Routed layers split across both coordinator GPUs (rtx-tp2).
     #[arg(long, default_value_t = 0)] rtx_expert_layers: usize,
+    /// Complete per-rank allocation ceiling; still an offline estimate.
+    #[arg(long)] spark_budget_gib: Option<f64>,
     /// Informational F32 comparison only; direct gate/up is the speed-first default.
     #[arg(long, env = "CUTEAFD_KIMI_COMPENSATED_FFN")]
     compensated_ffn: bool,
@@ -299,7 +301,8 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let super::startup::Loaded { engine, admission_free, admitted_bytes } = super::startup::load(
         &library, &programs, checkpoint, full, cfg, super::startup::Options {
             devices: [args.device, args.split_device], native_lib: args.native_lib.as_deref().context("--native-lib required")?,
-            peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
+            peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
+            spark_budget_gib: args.spark_budget_gib,
             rows, slots: 1, marks: 1, max_context: 1_048_576, pool_tokens: Some(1_048_576), graphs: false,
             ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
         })?;
@@ -574,10 +577,15 @@ mod tests {
     fn mounted_whole_expert_coordinator_demand() -> Result<()> {
         let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("snapshot")?);
         let artifacts = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_COORDINATOR_ARTIFACTS").context("artifacts")?);
-        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)
+            .with_context(|| format!("read coordinator checkpoint {}", snapshot.display()))?;
         let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
-        let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
-        let manifest: Value = serde_json::from_slice(&std::fs::read(artifacts.join("PROGRAMS.json"))?)?;
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot)
+            .with_context(|| format!("read expert catalog {}", snapshot.display()))?;
+        let path = artifacts.join("PROGRAMS.json");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(&path)
+            .with_context(|| format!("read coordinator programs {}", path.display()))?)
+            .with_context(|| format!("parse coordinator programs {}", path.display()))?;
         let programs = manifest["programs"].as_array().context("programs")?;
         let scratch = |prefix: &str| -> Result<usize> {
             programs.iter().filter(|p| p["name"].as_str().is_some_and(|name| name.starts_with(prefix)))
@@ -600,25 +608,54 @@ mod tests {
         // No CUDA baseline is claimed: conservatively reserve context plus a
         // separate 2 GiB module allowance in this CPU-only forecast.
         let reserve = arch.context_bytes + (2u64 << 30);
-        let onboard = 5;
-        let rtx = admission::plan_rtx(&cfg, &catalog,
-            artifacts.join("exl3").join(crate::shared::experts::exl3::package_name("kimik3",
-                catalog.exl3().context("EXL3 manifest")?.decoder_tiers())).join("rtx-tp2"), rows, onboard)?;
+        let slots = 8;
+        let mark_bytes = super::super::state::KdaLayout::new(&cfg, slots, 1, 1)?.mark_bytes() * 2;
+        let marks = crate::shared::prefix::MarkRule { lanes: slots, entries: 20,
+            budget_bytes: 2 << 30 }.slots(mark_bytes);
+        let package = artifacts.join("exl3").join(crate::shared::experts::exl3::package_name("kimik3",
+            catalog.exl3().context("EXL3 manifest")?.decoder_tiers())).join("rtx-tp2");
+        let mut rtx = admission::plan_rtx(&cfg, &catalog, package.clone(), rows, 92)
+            .with_context(|| format!("read TP2 expert inventory {}", package.display()))?;
+        rtx.layers = cuteafd_loader::placement::Onboard::Auto;
         let workspace = rtx.workspace;
+        let working = cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![],
+            spark_layers: (1..93).collect(), spark_ranks: 6, prefill_lanes: 1 };
+        let spark = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
+            &[cuteafd_core::SparkEndpoint { capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+            crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
+            cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
+            cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+        let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots)?;
         let admitted = admission::admit(admission::Inputs { cfg: &cfg, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
-            requested_pool: Some(1_048_576), state_slots: 1, prefix_marks: 1, rows, lanes: 1,
+            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows,
-                1048576, native_scratch).unwrap())], fixed, startup: vec![], pool_bounded: vec![], rtx: Some(rtx) })?;
-        assert_eq!(admitted.working_set().rtx_layers, [1, 2, 3, 4, 5]);
-        assert_eq!(admitted.working_set().spark_layers, (6..93).collect::<Vec<_>>());
+                1048576, native_scratch).unwrap())], fixed,
+            startup: (0..2).map(|rank| super::super::graphs::demand(&graph_set.inventory, rank)).collect(),
+            pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()) })?;
+        let onboard = admitted.placement.onboard_layers;
+        assert!(onboard >= spark.minimum_rtx_layers()?);
+        assert_eq!(admitted.working_set().rtx_layers, (1..=onboard).collect::<Vec<_>>());
+        assert_eq!(admitted.working_set().spark_layers, (onboard + 1..93).collect::<Vec<_>>());
+        let page_bytes = cfg.mla_layers() as u64 * 64 * cuteafd_ffi::MLA_RECORD_BYTES as u64;
+        let host = cuteafd_core::prefix::HostCacheGeometry { unit_rows: 64, page_bytes,
+            mark_bytes: mark_bytes as u64, draft_bytes: 0 };
+        let chunk = host.chunk_bytes();
+        let required = cuteafd_core::prefix::host_cache_required_bytes(1 << 20, slots as u64,
+            64, page_bytes, mark_bytes as u64, 0, chunk).context("host required quota")?;
+        let host_bytes = host.resolve(None, 1 << 20, slots as u64, 128 << 30, chunk).context("host quota")?;
+        eprintln!("Kimi CPU host forecast concurrency={slots} context=1048576 mark_bytes={mark_bytes} page_bytes={page_bytes} chunk={chunk} required={required} resolved={host_bytes} marks={} legacy_marks={marks}", admitted.mark_selection.slots);
+        for rank in 0..6 {
+            eprintln!("Kimi CPU Spark forecast rank={rank} retained={} budget={} reserve={} estimated_until_W9_census=true",
+                spark.rank_bytes(rank, onboard)?, spark.budget, cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES);
+        }
         for rank in 0..2 {
             let items = &admitted.placement.items[rank];
             let total = items.iter().map(|i| i.bytes).sum::<u64>();
-            eprintln!("Kimi CPU coordinator forecast rank={rank} rows={rows} onboard={onboard} module_context_reserve={reserve} expert_workspace={workspace} admitted={total} expert_arena={} pool={}",
-                admitted.placement.expert_ranges[rank].peak_bytes, admitted.placement.pool_tokens);
+            eprintln!("Kimi CPU coordinator forecast rank={rank} rows={rows} onboard={onboard} module_context_reserve={reserve} expert_workspace={workspace} admitted={total} expert_arena={} pool={} margin={}",
+                admitted.placement.tp2.as_ref().context("TP2 arena forecast")?.peak_bytes[rank], admitted.placement.pool_tokens, (96u64 << 30) - total - reserve - (2u64 << 30));
             for item in items { eprintln!("Kimi CPU coordinator rank={rank} category={:?} group={} bytes={}",
                 item.category, item.group, item.bytes); }
             assert!(total + reserve + (2u64 << 30) < 96u64 << 30);

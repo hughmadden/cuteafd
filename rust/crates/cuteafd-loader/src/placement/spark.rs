@@ -248,6 +248,80 @@ impl SparkAssignment {
     }
 }
 
+/// Offline Spark ceiling: exact header arenas and endpoint allocations plus an
+/// explicitly estimated worker reserve. Feeds the existing pool-first solver's
+/// mandatory prefix; it does not choose RTX owners or allocate worker storage.
+#[derive(Debug, Clone)]
+pub struct SparkBudgetInventory {
+    pub layers: Vec<usize>,
+    pub resident: Vec<Vec<u64>>,
+    pub overhead: Vec<u64>,
+    pub budget: u64,
+}
+
+impl SparkBudgetInventory {
+    pub fn exl3(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
+        endpoints: &[cuteafd_core::SparkEndpoint], rings: cuteafd_core::SparkRings,
+        budget: u64, estimated_reserve: u64) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let mut resident = Vec::new();
+        let mut overhead = Vec::new();
+        for rank in 0..working.spark_ranks {
+            let mut costs = Vec::new();
+            for &layer in &working.spark_layers {
+                let one = SparkWorkingSet { spark_layers: vec![layer], ..working.clone() };
+                costs.push(SparkAssignment::from_catalog(catalog, &one, rank,
+                    SparkResidentLayout::Exl3 { world: working.spark_ranks, rank }, endpoints, rings)?.resident_bytes);
+            }
+            let io = working.rank_endpoints_io(rank, catalog.routed_experts().geometry()?, endpoints, rings)?;
+            let bytes = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings,
+                io.endpoint_staging, estimated_reserve].into_iter().try_fold(0u64, |sum, bytes|
+                    sum.checked_add(bytes).context("Spark estimated overhead overflow"))?;
+            resident.push(costs);
+            overhead.push(bytes);
+        }
+        Ok(Self { layers: working.spark_layers.clone(), resident, overhead, budget })
+    }
+
+    pub fn rank_bytes(&self, rank: usize, onboard: usize) -> anyhow::Result<u64> {
+        use anyhow::{ensure, Context};
+        ensure!(onboard <= self.layers.len() && self.resident.len() == self.overhead.len()
+            && self.resident.iter().all(|costs| costs.len() == self.layers.len()), "Spark budget inventory extent");
+        let costs = self.resident.get(rank).context("Spark budget rank outside inventory")?;
+        // An empty selected set allocates no worker storage or endpoint rings.
+        if onboard == self.layers.len() { return Ok(0); }
+        costs[onboard..].iter().try_fold(self.overhead[rank], |sum, bytes|
+            sum.checked_add(*bytes).context("Spark estimated retained bytes overflow"))
+    }
+
+    pub fn minimum_rtx_layers(&self) -> anyhow::Result<usize> {
+        anyhow::ensure!(self.budget > 0 && !self.resident.is_empty(), "Spark budget must be positive with selected ranks");
+        for count in 0..=self.layers.len() {
+            let fits = (0..self.resident.len()).map(|rank| self.rank_bytes(rank, count))
+                .collect::<anyhow::Result<Vec<_>>>()?.into_iter().all(|bytes| bytes <= self.budget);
+            if fits { return Ok(count); }
+        }
+        unreachable!("empty Spark working set has zero bytes")
+    }
+
+    pub fn constrain(&self, request: &mut super::PlacementRequest) -> anyhow::Result<()> {
+        let layers = request.layers.iter().enumerate().filter_map(|(layer, demand)|
+            demand.experts.is_some().then_some(layer)).collect::<Vec<_>>();
+        anyhow::ensure!(layers == self.layers, "Spark budget routed inventory differs from coordinator");
+        let minimum = self.minimum_rtx_layers()?;
+        if let super::Onboard::Layers(count) = request.onboard {
+            anyhow::ensure!(count <= layers.len(), "explicit --rtx-expert-layers {count} exceeds {} routed layers", layers.len());
+        }
+        if let Some(count) = request.onboard.layers(layers.len()) {
+            anyhow::ensure!(count >= minimum,
+                "explicit --rtx-expert-layers {count} is below {minimum} required by estimated --spark-budget-gib ({budget} bytes including reserve and I/O)",
+                budget = self.budget);
+        }
+        request.minimum_expert_layers = request.minimum_expert_layers.max(minimum);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SparkRingGeometry {
     pub max_frame_bytes: usize,

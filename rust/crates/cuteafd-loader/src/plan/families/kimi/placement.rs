@@ -7,16 +7,15 @@ use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
-const MIB: u64 = 1 << 20;
-const FLOOR: u64 = 262_144;
+const FLOOR: u64 = crate::families::kimi_k3::COMPILED_CONTEXT as u64;
 const PAGE: u64 = 64;
 const MODES: &[LayerMode] = &[LayerMode::HeadSplit,
     LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
 /// Spark EXL3 workspace across the capacity set, estimated until the Kimi
 /// package manifest records it (Gemini review of #273: ~430 MiB at m4096).
-const SPARK_EXL3_WORKSPACE: u64 = 512 * MIB;
+const SPARK_EXL3_WORKSPACE: u64 = crate::families::kimi_k3::SPARK_ESTIMATED_WORKSPACE_BYTES;
 /// Prefill lanes the Spark transport serves (one QP endpoint each).
-const LANES: u64 = 2;
+const LANES: u64 = 1;
 
 pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
@@ -34,6 +33,13 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     };
     report.bytes_by_owner.clear();
     report.attention_placement = report.requested_attention.unwrap_or(AttentionPlacement::Layers);
+    let api_context = if opts.context_tokens == 0 { FLOOR } else { opts.context_tokens };
+    memory.notes.push(format!("Kimi API max context: {api_context} tokens; compiled max context: {FLOOR} tokens (allocation floor unchanged)"));
+    if api_context > FLOOR {
+        refusal(report, format!("Kimi API context {api_context} exceeds compiled context {FLOOR}"),
+            "Lower --context-tokens; Kimi's native allocation extent remains fixed at 1M.");
+        return memory;
+    }
     if report.requested_attention == Some(AttentionPlacement::Context) {
         refusal(report, "Kimi K3 context attention placement has no owned-page query exchange/LSE-combine ABI".into(),
             "Use layers (owned MLA with split KDA/FFNs) or explicitly select heads; context requires a new native ABI.");
@@ -69,7 +75,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let mla_weights: u64 = model.mla.iter().map(|r| r.split + r.replicated).sum();
     report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + residency.split + residency.replicated + mla_weights);
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
-    let slots = opts.concurrency.max(1) + 2;
+    let slots = opts.concurrency.max(1);
     let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / 2;
     let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2;
     let legacy_marks = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
@@ -89,14 +95,41 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     for gpu in 0..2u8 {
         fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", residency.split / 2, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Weights, "text weights replicated (KDA low-rank A, routers, latent proj, norms)",
-            residency.replicated, Basis::Exact));
+            residency.replicated - model.frontends[1 - gpu as usize], Basis::Exact));
         fixed.push(Demand::new(gpu, if gpu == 0 { Category::Embedding } else { Category::Weights },
             if gpu == 0 { "token embedding" } else { "lm head" }, if gpu == 0 { embedding } else { head }, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Kv, format!("KDA FP32 state + BF16 conv, {slots} slots, 48 heads"), state, Basis::Formula));
     }
+    let inventory = (|| -> anyhow::Result<_> {
+        let catalog = crate::read_expert_catalog(&model.snapshot)?;
+        let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
+            .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: ranks, prefill_lanes: LANES };
+        let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
+        let endpoints = [cuteafd_core::SparkEndpoint { capacity: opts.spark_capacity_rows as u32,
+            ingress: cuteafd_core::SparkIngress::Fp8K32 }];
+        let budget = opts.spark_allocation_budget_bytes.unwrap_or(super::SPARK_BUDGET_BYTES);
+        let spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
+            cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
+                slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget,
+            crate::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+        let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi TP2 requires EXL3 headers"))?;
+        let mut costs = vec![[Bytes2::default(); 2]; cfg.layers];
+        for &layer in &working.spark_layers {
+            for rank in 0..2 {
+                costs[layer][rank].resident = manifest.residency(crate::V41Exl3Layer::Backbone(layer), 2, rank)?
+                    .device_arena_layout()?.1 as u64;
+            }
+        }
+        Ok((spark, costs))
+    })();
+    let (spark_budget, costs) = match inventory {
+        Ok(value) => value,
+        Err(error) => {
+            refusal(report, format!("Kimi header inventory refused: {error:#}"), "Provide complete native EXL3 headers.");
+            return memory;
+        }
+    };
     let record = (cfg.mla_record_values() * 2) as u64 * PAGE;
-    let cost = ExpertCost { whole: Bytes2 { resident: layer_bytes, staging: 0 },
-        half: [Bytes2 { resident: layer_bytes / 2, staging: 0 }; 2], tp2: false, spark_ok: true };
     let layers = (0..cfg.layers).map(|layer| {
         let mla = cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla;
         LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
@@ -105,34 +138,40 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             kv_unit: KvDemand { unit_bytes_whole: if mla { record } else { 0 }, unit_bytes_split: if mla { [record; 2] } else { [0; 2] },
                 unit_bytes_context: None },
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
-            experts: (!cfg.dense[layer]).then_some(cost), modes: if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } }
+            experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
+                half: costs[layer], tp2: true, spark_ok: true }), modes: if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } }
     }).collect();
-    // Routed experts stay on the Sparks unless the operator onboards layers
-    // (--rtx-expert-layers N|auto|max): rtx-tp1, a whole layer on one GPU.
-    let onboard = opts.onboard.unwrap_or(Onboard::Layers(0));
-    let request = PlacementRequest {
+    // Reuse pool-first TP2 onboarding, constrained by the Spark suffix budget.
+    let onboard = opts.onboard.unwrap_or(Onboard::Auto);
+    let mut request = PlacementRequest {
         inventory: Inventory { gpus: opts.rtx_bytes.iter().map(|bytes| GpuBudget { capacity_bytes: *bytes,
             headroom_bytes: opts.headroom_bytes, baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }).collect(),
             spark_ranks: ranks, peer_access: true },
         attention_placement: report.requested_attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
-        pool: PoolPolicy { compiled_context: opts.context_tokens,
+        pool: PoolPolicy { compiled_context: FLOOR,
             requested: requested_pool, target: opts.target_pool_tokens.max(FLOOR), floor: FLOOR,
             ceiling: opts.target_pool_tokens.max(requested_pool.unwrap_or(0)).max(FLOOR), unit_rows: PAGE },
         layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
         expert_workspace: 0, tp2_workspace: [0; 2], onboard, expert_gpus: 2, minimum_expert_layers: 0,
-        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating,
+        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating, expert_ownership: ExpertOwnership::Contiguous,
             attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, AttentionPlacement::Heads)],
             ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: 0, lanes: 0,
             entry_gpu: 0, head_gpu: 1, terminal: TerminalHome::Replicated },
         executor: ExecutorModes { family: "kimi_k3 metadata only", modes: MODES, hops: true, attention: AttentionPlacement::Layers },
     };
+    if let Err(error) = spark_budget.constrain(&mut request) {
+        refusal(report, format!("Kimi joint admission refused: {error:#}"),
+            "Use automatic RTX expert selection or increase the explicit estimated Spark budget.");
+        return memory;
+    }
     let selected = if legacy_marks == 0 {
         solve(&request).map(|placed| (placed, MarkSelection { legacy_slots: 0, slots: 0, reduction_reason: None }))
     } else { solve_with_marks(&request, legacy_marks, 1, &mark_demands) };
     let onboarded = match selected {
         Ok((placed, selection)) => {
             memory.notes.push(selection.summary());
+            memory.notes.push(format!("Kimi selected RTX expert layers: {}; retained marks: {}", placed.onboard_layers, selection.slots));
             memory.pool_tokens = placed.pool_tokens;
             report.attention_placement = placed.attention_placement;
             for gpu in 0..2 {
@@ -154,21 +193,20 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             memory.notes.push(format!("MLA latent {} B/token over {} layers; {} placement, KDA and FFNs split TP2; \
                 pool {} tokens with {} routed layers on RTX ({:.2} GiB each)", cfg.mla_record_values() * 2 * cfg.mla_layers(),
                 cfg.mla_layers(), placed.attention_placement, placed.pool_tokens, placed.onboard_layers, layer_bytes as f64 / GIB as f64));
-            placed.onboard_layers as u64
+            placed.onboard_layers
         }
         Err(error) => {
             refusal(report, format!("Kimi K3 coordinator lower bound refused: {error}"),
                 "Coordinator text weights are 105.7 GiB BF16; free KV room by placement, not a smaller pool floor.");
-            0
+            return memory;
         }
     };
     // Sparks: resident slices of the routed layers left on them, plus the
     // shared runtime residual, latent-width (3584) I/O and EXL3 workspace.
-    let resident = rank_layer(ranks as u64) * (routed_layers - onboarded);
-    let working = SparkWorkingSet { rtx_layers: Vec::new(), spark_layers: vec![0], spark_ranks: ranks, prefill_lanes: LANES };
+    let working = SparkWorkingSet { rtx_layers: Vec::new(), spark_layers: spark_budget.layers[onboarded..].to_vec(), spark_ranks: ranks, prefill_lanes: LANES };
     let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
-    let budget = opts.spark_allocation_budget_bytes.unwrap_or(super::SPARK_BUDGET_BYTES);
     for rank in 0..ranks {
+        let resident = spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
         let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (TP6 width 512, replicated 3584 rotations)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
@@ -179,14 +217,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         device.items.push(Item::new(Category::Workspace, "EXL3 expert workspace", "kimik3:exl3-k23", SPARK_EXL3_WORKSPACE, Basis::Estimated));
         memory.devices.push(device);
     }
-    if resident > budget {
-        refusal(report, format!("Kimi K3 TP{ranks} routed experts need {:.2} GiB/rank, {:.2} GiB over the {:.2} GiB Spark budget",
-            resident as f64 / GIB as f64, (resident - budget) as f64 / GIB as f64, budget as f64 / GIB as f64),
-            "Kimi K3's family budget is 108 GiB/rank; onboard routed layers to the RTX cards (--rtx-expert-layers N) \
-             or raise --spark-budget-gib from a measured census.");
-    }
-    memory.notes.push(format!("Spark rank: {:.2} GiB routed weights ({} of {} layers) + runtime residual, FP8 K32 latent I/O \
-        and EXL3 workspace; each RTX-onboarded layer frees {:.2} GiB per rank", resident as f64 / GIB as f64,
-        routed_layers - onboarded, routed_layers, rank_layer(ranks as u64) as f64 / GIB as f64));
+    memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas and endpoint I/O plus {} B estimated runtime/workspace reserve; census pending",
+        spark_budget.budget, crate::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES));
     memory
 }

@@ -21,16 +21,11 @@ const TEXT: &str = "language_model.model.";
 const HEAD: &str = "language_model.lm_head.";
 const GIB: u64 = 1 << 30;
 
-/// Routed-expert weights per Spark rank for Kimi K3 without `--spark-budget-gib`.
-///
-/// TP6 EXL3 K2 needs 107.54 GiB per rank (92 layers x 896 experts: each rank
-/// holds 1/6 of the trellis, the 3072-wide rotation slice, and full copies of
-/// the 3584-wide input/output rotations). 108 GiB is that plus 0.46 GiB margin,
-/// equal to the planner's usable GB10 bytes (121.7 GiB physical minus ~13 GiB
-/// host OS and storage daemon). Rank runtime and I/O stay separate charges on
-/// the device layout. The shared 100 GiB default would put ~8 routed layers
-/// (55 GiB) on the coordinators and leave no room for the 256K KV floor.
-pub const SPARK_BUDGET_BYTES: u64 = 108 * GIB;
+/// Complete per-rank allocation ceiling without `--spark-budget-gib`.
+/// Exact TP6 header arenas and endpoint I/O plus an estimated runtime/workspace
+/// reserve constrain RTX onboarding alongside marks and the fixed 1M pool floor.
+/// The default remains estimated until the first full worker load/steady census.
+pub const SPARK_BUDGET_BYTES: u64 = crate::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES;
 
 /// The EXL3 expert package Kimi K3 uses: H3584/E896/K16/I3072, uniform K2 in
 /// the K2/K3 tier set, TP6 width 512.
@@ -44,6 +39,7 @@ struct Tensor {
 
 pub(super) struct Model {
     cfg: KimiK3Config,
+    snapshot: std::path::PathBuf,
     spec: ModelSpec,
     tensors: BTreeMap<String, Tensor>,
     /// Header byte counts by component.
@@ -54,6 +50,8 @@ pub(super) struct Model {
     expert_formats: Vec<String>,
     /// Coordinator text bytes by TP2 residency (embedding, head and MLA excluded).
     coordinator: Residency,
+    /// One canonical latent/router frontend, alternating by routed ordinal.
+    frontends: [u64; 2],
     /// MLA operands by layer, held whole on the owner or head-split explicitly.
     mla: Vec<Residency>,
 }
@@ -142,8 +140,8 @@ impl Model {
         }
         let spec = spec(&cfg, checkpoint);
         let mla = vec![Residency::default(); cfg.layers];
-        let mut model = Self { cfg, spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
-            coordinator: Residency::default(), mla };
+        let mut model = Self { cfg, snapshot: checkpoint.snapshot.clone(), spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
+            coordinator: Residency::default(), frontends: [0; 2], mla };
         let mut headers = BTreeMap::new();
         for tensor in &checkpoint.tensors { headers.insert(tensor.meta.name.as_str(), &tensor.meta); }
         for (name, expected) in &model.tensors {
@@ -160,6 +158,10 @@ impl Model {
                 *model.bytes.entry(role.component).or_default() += tensor.meta.byte_length;
                 if let Some((layer, rest)) = text(&tensor.meta.name).and_then(|r| indexed(r, "layers."))
                     .filter(|_| role.component != Component::RoutedExpert) {
+                    if matches!(role.component, Component::LatentProjection | Component::Router) {
+                        let ordinal = model.cfg.dense[..layer].iter().filter(|dense| !**dense).count();
+                        model.frontends[ordinal % 2] += tensor.meta.byte_length;
+                    }
                     let residency = if role.component == Component::Attention && model.cfg.attention[layer] == KimiAttention::Mla {
                         &mut model.mla[layer]
                     } else { &mut model.coordinator };

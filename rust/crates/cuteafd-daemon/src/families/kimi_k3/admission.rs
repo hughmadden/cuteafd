@@ -48,6 +48,7 @@ pub(crate) struct Inputs<'a> {
     pub startup: Vec<Demand>,
     pub pool_bounded: Vec<BoundedDemand>,
     pub rtx: Option<RtxInventory>,
+    pub spark_budget: Option<SparkBudgetInventory>,
 }
 
 /// CPU-planned native residency; no backend owner allocates before solve.
@@ -55,7 +56,7 @@ pub(crate) struct RtxInventory {
     pub package: std::path::PathBuf,
     pub costs: Vec<[Bytes2; 2]>,
     pub workspace: usize,
-    pub layers: usize,
+    pub layers: Onboard,
 }
 
 pub(crate) fn plan_rtx(cfg: &KimiK3Config, catalog: &cuteafd_loader::OfficialV41Catalog,
@@ -76,7 +77,7 @@ pub(crate) fn plan_rtx(cfg: &KimiK3Config, catalog: &cuteafd_loader::OfficialV41
         }
         Ok(costs)
     }).collect::<Result<Vec<_>>>()?;
-    Ok(RtxInventory { package, costs, workspace, layers })
+    Ok(RtxInventory { package, costs, workspace, layers: Onboard::Layers(layers) })
 }
 
 pub(crate) struct Admission<'a> {
@@ -363,19 +364,29 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let global_layouts = GlobalLayout::pair(cfg)?;
     let io_layouts = [IoLayout::new(cfg, 0, inputs.rows)?, IoLayout::new(cfg, 1, inputs.rows)?];
     let rtx = inputs.rtx.take();
+    let spark_budget = inputs.spark_budget.take();
     let mut request = request(inputs)?;
     if let Some(inventory) = &rtx {
-        ensure!(inventory.costs.len() == cfg.layers && inventory.layers > 0, "Kimi TP2 expert inventory extent");
+        ensure!(inventory.costs.len() == cfg.layers, "Kimi TP2 expert inventory extent");
         for (layer, cost) in request.layers.iter_mut().zip(&inventory.costs) {
             if let Some(experts) = &mut layer.experts { experts.half = *cost; experts.tp2 = true; }
         }
         let workspace = (inventory.workspace as u64).checked_mul(lanes).context("Kimi TP2 workspace overflow")?;
         request.tp2_workspace = [workspace; 2];
-        request.onboard = Onboard::Layers(inventory.layers);
+        request.onboard = inventory.layers;
         request.expert_gpus = 2;
         request.policy.expert_ownership = ExpertOwnership::Contiguous;
     }
+    if let Some(budget) = &spark_budget { budget.constrain(&mut request)?; }
     let (placement, mark_selection) = solve_with_marks(&request, legacy_marks as u64, 1, &mark_demands)?;
+    if let Some(budget) = &spark_budget {
+        for rank in 0..budget.resident.len() {
+            let bytes = budget.rank_bytes(rank, placement.onboard_layers)?;
+            ensure!(bytes <= budget.budget, "Kimi selected Spark working set exceeds estimated budget");
+            tracing::info!(rank, retained_bytes = bytes, budget_bytes = budget.budget,
+                reserve = "estimated; pending load/steady census", "Kimi Spark budget selection");
+        }
+    }
     let kda_layout = KdaLayout::new(cfg, state_slots, usize::try_from(mark_selection.slots)?, lanes as usize)?;
     tracing::info!(selection = %mark_selection.summary(), "Kimi retained mark admission");
     EXECUTOR.check(&placement)?;
@@ -552,7 +563,7 @@ pub(super) mod tests {
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); 2],
             fixed: (0..2).map(|rank| Demand::new(rank, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
-            startup: vec![], pool_bounded: vec![], rtx: None }
+            startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None }
     }
 
     #[test]
@@ -560,7 +571,7 @@ pub(super) mod tests {
         let cfg = cfg();
         let mut i = inputs(&cfg);
         i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![[Bytes2 {
-            resident: 1024 * 1024, staging: 4096 }; 2]; cfg.layers], workspace: 8192, layers: 3 });
+            resident: 1024 * 1024, staging: 4096 }; 2]; cfg.layers], workspace: 8192, layers: Onboard::Layers(3) });
         let admitted = admit(i)?;
         let local = admitted.working_set();
         assert_eq!(local.rtx_layers, [1, 2, 3]);
@@ -569,6 +580,26 @@ pub(super) mod tests {
         for rank in 0..2 {
             assert_eq!(admitted.placement.tp2.as_ref().unwrap().peak_bytes[rank], 3 * 1024 * 1024 + 2 * 8192 + 4096);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_tp2_admission_uses_complete_spark_budget_and_numeric_override_is_strict() -> Result<()> {
+        let cfg = cfg();
+        let make = |selection| {
+            let mut i = inputs(&cfg);
+            i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![[Bytes2 {
+                resident: 1024 * 1024, staging: 4096 }; 2]; cfg.layers], workspace: 8192, layers: selection });
+            i.spark_budget = Some(SparkBudgetInventory { layers: vec![1, 2, 3, 4],
+                resident: vec![vec![100; 4]; 6], overhead: vec![50; 6], budget: 250 });
+            i
+        };
+        let admitted = admit(make(Onboard::Auto))?;
+        assert!(admitted.placement.onboard_layers >= 2);
+        assert!(admitted.placement.pool_tokens >= 1 << 20);
+        assert!(admitted.mark_selection.slots > 0);
+        let error = admit(make(Onboard::Layers(1))).err().context("strict override must refuse")?.to_string();
+        assert!(error.contains("explicit --rtx-expert-layers 1") && error.contains("--spark-budget-gib"));
         Ok(())
     }
 

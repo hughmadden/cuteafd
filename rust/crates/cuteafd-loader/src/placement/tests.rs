@@ -1552,6 +1552,43 @@ fn compulsory_prefix_reserves_exact_costs_before_an_automatic_pool() {
 }
 
 #[test]
+fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
+    let mut req = request(2, 8 * GIB, 4, 6, Onboard::Auto);
+    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 1 << 20, Some(1 << 20), 64, false);
+    req.pool_overhead = vec![128 * 1024; 2]; // 2 GiB per GPU at the fixed 1M extent.
+    for layer in &mut req.layers {
+        let cost = layer.experts.as_mut().unwrap();
+        cost.tp2 = true;
+        cost.half = [Bytes2 { resident: GIB, staging: GIB / 4 }; 2];
+    }
+    req.tp2_workspace = [GIB / 4; 2];
+    let marks = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+        "exact marks", GIB, cuteafd_core::memory_layout::Basis::Exact)).collect::<Vec<_>>();
+    req.fixed = marks.iter().cloned().map(|mut demand| { demand.bytes *= 4; demand }).collect();
+    let budget = SparkBudgetInventory { layers: vec![0, 1, 2, 3],
+        resident: vec![vec![GIB; 4], vec![GIB, GIB, 2 * GIB, GIB]],
+        overhead: vec![GIB; 2], budget: 4 * GIB };
+    assert_eq!(budget.minimum_rtx_layers().unwrap(), 2); // The asymmetric rank is binding.
+    budget.constrain(&mut req).unwrap();
+    assert_eq!(req.minimum_expert_layers, 2);
+    let (placed, marks) = solve_with_marks(&req, 4, 1, &marks).unwrap();
+    assert_eq!(placed.onboard_layers, 2);
+    assert_eq!(placed.pool_tokens, 1 << 20);
+    assert_eq!(marks.slots, 3);
+    assert!(placed.layers[..2].iter().all(|layer| layer.experts == ExpertHome::RtxTp2));
+    req.onboard = Onboard::Layers(1);
+    let error = budget.constrain(&mut req).unwrap_err().to_string();
+    assert!(error.contains("--rtx-expert-layers 1") && error.contains("--spark-budget-gib"));
+    req.onboard = Onboard::Layers(2);
+    budget.constrain(&mut req).unwrap();
+    let all = SparkBudgetInventory { budget: 1, ..budget.clone() };
+    assert_eq!(all.minimum_rtx_layers().unwrap(), 4);
+    assert_eq!(all.rank_bytes(0, 4).unwrap(), 0);
+    let invalid = SparkBudgetInventory { budget: 0, ..budget };
+    assert!(invalid.minimum_rtx_layers().is_err());
+}
+
+#[test]
 fn compulsory_prefix_fails_when_even_the_weights_do_not_fit() {
     let mut req = request(1, GIB, 2, 4, Onboard::Auto);
     req.minimum_expert_layers = 1;

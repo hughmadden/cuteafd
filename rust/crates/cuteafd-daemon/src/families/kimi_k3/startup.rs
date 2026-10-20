@@ -13,7 +13,8 @@ pub(crate) struct Options<'a> {
     pub devices: [i32; 2],
     pub native_lib: &'a Path,
     pub peers: Vec<SocketAddr>,
-    pub rtx_expert_layers: usize,
+    pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
+    pub spark_budget_gib: Option<f64>,
     pub rows: usize,
     pub slots: usize,
     pub marks: usize,
@@ -47,12 +48,28 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     let [zero, one] = native;
     let native = [zero?, one?];
     let rows = options.rows;
-    let rtx = if options.rtx_expert_layers == 0 { None } else {
-        let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+    let spark_budget_gib = options.spark_budget_gib.unwrap_or(
+        cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES as f64 / (1u64 << 30) as f64);
+    ensure!(spark_budget_gib.is_finite() && spark_budget_gib > 0.0
+        && spark_budget_gib < u64::MAX as f64 / (1u64 << 30) as f64,
+        "Kimi --spark-budget-gib must be finite, positive and representable");
+    let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+    let routed = cfg.dense.iter().filter(|dense| !**dense).count();
+    let model = crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?;
+    let working = cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![],
+        spark_layers: cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(),
+        spark_ranks: 6, prefill_lanes: 1 };
+    let spark_budget = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
+        &[cuteafd_core::SparkEndpoint { capacity: u32::try_from(rows)?, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+        model, (spark_budget_gib * (1u64 << 30) as f64) as u64,
+        cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+    let rtx = if options.rtx_expert_layers.layers(routed) == Some(0) { None } else {
         let tiers = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?.decoder_tiers();
         let package = crate::shared::experts::exl3::aot_layout_directory(
             options.native_lib, tiers, "rtx-tp2");
-        Some(admission::plan_rtx(cfg, &catalog, package, rows, options.rtx_expert_layers)?)
+        let mut inventory = admission::plan_rtx(cfg, &catalog, package, rows, routed)?;
+        inventory.layers = options.rtx_expert_layers;
+        Some(inventory)
     };
     let expert_modules = if let Some(inventory) = &rtx {
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
@@ -90,7 +107,8 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         peer_access: true, spark_ranks: 6, attention: None, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
-            (0..2).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx })?;
+            (0..2).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
+        spark_budget: Some(spark_budget) })?;
     if let Some(expected) = options.hosted_layers.as_ref() {
         ensure!(admitted.working_set().spark_layers == *expected,
             "Kimi worker layer subset differs from shared placement");
@@ -100,7 +118,10 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         tracing::info!(executables = set.keys.len(), bytes0 = set.inventory.bytes(0),
             bytes1 = set.inventory.bytes(1), reserve = "estimated", "Kimi startup graph inventory");
     }
-    tracing::info!(placement = %admitted.placement.summary(), marks = %admitted.mark_selection.summary(), "Kimi admitted TP2 expert ownership");
+    tracing::info!(placement = %admitted.placement.summary(), rtx_expert_layers = admitted.placement.onboard_layers,
+        prefix_marks = admitted.mark_selection.slots, marks = %admitted.mark_selection.summary(),
+        spark_budget_gib, reserve = "estimated until W9 census",
+        "Kimi admitted TP2 expert ownership");
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())
