@@ -194,6 +194,66 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn fp8_nvfp4_mxfp4_header_fixture_views_match_mount_layout() -> Result<()> {
+        use cuteafd_loader::plan::testing::{fp8, mxfp4, nvfp4, write_snapshot};
+        for format in 0..3 {
+            let dir = tempfile::tempdir()?;
+            let mut headers = Vec::new();
+            for expert in 0..2 {
+                for (stem, rows, columns) in [
+                    ("gate_proj", 768, 256),
+                    ("up_proj", 768, 256),
+                    ("down_proj", 256, 768),
+                ] {
+                    let name = format!("model.layers.0.mlp.experts.{expert}.{stem}");
+                    headers.extend(match format {
+                        0 => fp8(&name, rows, columns, None),
+                        1 => nvfp4(&name, rows, columns),
+                        _ => mxfp4(&name, rows, columns),
+                    });
+                }
+            }
+            write_snapshot(dir.path(), &serde_json::json!({}), &headers, None);
+            let shape = cuteafd_loader::RoutedExpertShape {
+                layers: 1,
+                first_layer: 0,
+                experts: 2,
+                topk: 1,
+                hidden: 256,
+                intermediate: 768,
+                draft_stages: 0,
+                draft_experts: 0,
+            };
+            let tensors = Fp8ExpertTensors::read_layers(dir.path(), shape, &[0].into())?;
+            for world in [4, 6] {
+                for rank in 0..world {
+                    let slicing = tensors.exact_slicing(world);
+                    let layout = RegionLayout::fp8(&tensors, world, rank, slicing)?;
+                    let addresses = layout.addresses(0x10000000)?;
+                    let mut offset = 0;
+                    for (index, projection) in Fp8Projection::ALL.into_iter().enumerate() {
+                        let (weight, _) =
+                            tensors.slice_bytes_with(projection, world, rank, slicing)?;
+                        for (slot, bytes) in [
+                            (2 * index, weight * shape.experts),
+                            (
+                                2 * index + 1,
+                                tensors
+                                    .scale_region_bytes_with(projection, world, rank, slicing)?,
+                            ),
+                        ] {
+                            offset = (offset + 255) & !255;
+                            assert_eq!(layout.regions[slot], (offset, bytes));
+                            assert_eq!(addresses[slot], 0x10000000 + offset as u64);
+                            offset += bytes;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
     fn real_fp8_family_views_preserve_mount_region_order_and_sizes() -> Result<()> {
         for variable in [
             "CUTEAFD_PUSH_FP8_TP6",

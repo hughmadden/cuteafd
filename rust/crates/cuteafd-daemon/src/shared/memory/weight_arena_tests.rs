@@ -23,8 +23,8 @@ impl<'a> FileWalk<'a> {
         }
         Self { walks, heads }
     }
-    // Checkpoint tensors occupy disjoint source extents. A run is consumed in
-    // source order; adjacent destination runs combine before touching the tree.
+    // Merge all entry cursors by file offset, including replicated rotations.
+    // Adjacent destination runs combine before touching the coverage tree.
     fn batch(&mut self, coverage: &mut Coverage) -> Result<bool> {
         let mut remaining = 4 * 1024 * 1024u64;
         let mut pending: Option<(u64, u64)> = None;
@@ -107,47 +107,53 @@ fn full_exl3_plan(variable: &str) -> Result<()> {
     Ok(())
 }
 
-fn simulate(plan: &cuteafd_loader::push_load::builder::CheckedPlan, rank: usize, label: &str) -> Result<usize> {
-        let expected = ExpectedCoverage::from_plan(plan, rank as u32)?;
-        let mut peak = 0;
-        let mut files: BTreeMap<u32, Vec<&Entry>> = BTreeMap::new();
-        for entry in &plan.plan.entries {
-            files.entry(entry.file).or_default().push(entry);
+fn simulate(
+    plan: &cuteafd_loader::push_load::builder::CheckedPlan,
+    rank: usize,
+    label: &str,
+) -> Result<usize> {
+    let expected = ExpectedCoverage::from_plan(plan, rank as u32)?;
+    let mut peak = 0;
+    let mut files: BTreeMap<u32, Vec<&Entry>> = BTreeMap::new();
+    for entry in &plan.plan.entries {
+        files.entry(entry.file).or_default().push(entry);
+    }
+    for sources in [6, 8] {
+        let mut queues = (0..sources).map(|_| VecDeque::new()).collect::<Vec<_>>();
+        for (&file, entries) in &files {
+            queues[file as usize % sources]
+                .push_back(FileWalk::new(entries.clone(), &plan.plan.patterns));
         }
-        for sources in [6, 8] {
-            let mut queues = (0..sources).map(|_| VecDeque::new()).collect::<Vec<_>>();
-            for (&file, entries) in &files {
-                queues[file as usize % sources]
-                    .push_back(FileWalk::new(entries.clone(), &plan.plan.patterns));
-            }
-            let mut coverage = Coverage::default();
-            while queues.iter().any(|q| !q.is_empty()) {
-                for queue in &mut queues {
-                    if let Some(file) = queue.front_mut() {
-                        if !file.batch(&mut coverage)? {
-                            queue.pop_front();
-                        }
+        let mut coverage = Coverage::default();
+        while queues.iter().any(|q| !q.is_empty()) {
+            for queue in &mut queues {
+                if let Some(file) = queue.front_mut() {
+                    if !file.batch(&mut coverage)? {
+                        queue.pop_front();
                     }
                 }
             }
-            assert_eq!(coverage.intervals, expected.0.intervals);
-            assert_eq!(coverage.bytes, expected.0.bytes);
-            let before = coverage.bytes;
-            let mut replay = FileWalk::new(
-                files.first_key_value().unwrap().1.clone(),
-                &plan.plan.patterns,
-            );
-            while replay.batch(&mut coverage)? {}
-            assert_eq!(coverage.bytes, before);
-            peak = peak.max(coverage.peak);
-            eprintln!("{label} TP6 rank{rank}, {sources} sources + file replay: peak {} intervals, conservative tree bound {} bytes", coverage.peak, coverage.peak*128);
         }
+        assert_eq!(coverage.intervals, expected.0.intervals);
+        assert_eq!(coverage.bytes, expected.0.bytes);
+        let before = coverage.bytes;
+        let mut replay = FileWalk::new(
+            files.first_key_value().unwrap().1.clone(),
+            &plan.plan.patterns,
+        );
+        while replay.batch(&mut coverage)? {}
+        assert_eq!(coverage.bytes, before);
+        peak = peak.max(coverage.peak);
+        eprintln!("{label} TP6 rank{rank}, {sources} sources + file replay: peak {} intervals, conservative tree bound {} bytes", coverage.peak, coverage.peak*128);
+    }
     Ok(peak)
 }
 
 #[test]
 fn real_v41_full_plan_interleaved_sources_and_file_replay() -> Result<()> {
-    let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_V41") else { return Ok(()) };
+    let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_V41") else {
+        return Ok(());
+    };
     let snapshot = std::path::PathBuf::from(snapshot);
     let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
     let shape = catalog.routed_experts();
@@ -158,12 +164,28 @@ fn real_v41_full_plan_interleaved_sources_and_file_replay() -> Result<()> {
         let mut cursor = 0u64;
         for layer in shape.first_layer..shape.layers {
             for expert in 0..shape.experts {
-                let staging = catalog.expert_staging(cuteafd_loader::V41ExpertSelection::BackboneTp {
-                    layer, expert, world: 6, rank,
-                })?;
-                builder.v41_regions(&catalog, staging.tensor_names(), staging.tensor_ranges(), 6, rank as u32,
-                    Destination { rank: rank as u32, offset: cursor, bytes: staging.staging_bytes() as u64 })?;
-                cursor = cursor.checked_add(staging.staging_bytes() as u64).context("V4.1 arena overflow")?;
+                let staging =
+                    catalog.expert_staging(cuteafd_loader::V41ExpertSelection::BackboneTp {
+                        layer,
+                        expert,
+                        world: 6,
+                        rank,
+                    })?;
+                builder.v41_regions(
+                    &catalog,
+                    staging.tensor_names(),
+                    staging.tensor_ranges(),
+                    6,
+                    rank as u32,
+                    Destination {
+                        rank: rank as u32,
+                        offset: cursor,
+                        bytes: staging.staging_bytes() as u64,
+                    },
+                )?;
+                cursor = cursor
+                    .checked_add(staging.staging_bytes() as u64)
+                    .context("V4.1 arena overflow")?;
             }
         }
         let mut plan = builder.finish()?;

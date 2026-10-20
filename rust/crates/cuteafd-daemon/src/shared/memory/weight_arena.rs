@@ -130,7 +130,9 @@ impl ExpectedCoverage {
                     Steps::Count(n) => u64::from(*n),
                     Steps::Indices(v) => v.len() as u64,
                 };
-                if count == 1 { continue; }
+                if count == 1 {
+                    continue;
+                }
                 if sparse.is_empty() && dim.dst_stride == span {
                     span = span
                         .checked_mul(count)
@@ -473,6 +475,52 @@ mod tests {
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
+    #[test]
+    fn expected_footprint_excludes_padding_and_merges_dense_axes() -> Result<()> {
+        use cuteafd_loader::push_load::{
+            builder::CheckedPlan,
+            plan::{Dim, Entry, Pattern, Plan, Steps},
+        };
+        let plan = Plan {
+            files: vec!["weights".into()],
+            patterns: vec![Pattern {
+                run: 4,
+                dims: vec![
+                    Dim {
+                        steps: Steps::Count(2),
+                        src_stride: 64,
+                        dst_stride: 16,
+                    },
+                    Dim {
+                        steps: Steps::Indices(vec![0, 3]),
+                        src_stride: 4,
+                        dst_stride: 4,
+                    },
+                ],
+            }],
+            entries: vec![Entry {
+                file: 0,
+                pattern: 0,
+                rank: 0,
+                src_base: 0,
+                dst_base: 0,
+            }],
+        };
+        let totals = plan.check(&[128], &[32])?;
+        let checked = CheckedPlan {
+            plan,
+            file_sizes: vec![128],
+            arenas: vec![32],
+            totals,
+        };
+        let expected = ExpectedCoverage::from_plan(&checked, 0)?;
+        assert_eq!(expected.0.intervals, [(0, 8), (16, 24)].into());
+        assert!(expected.contains(4, 4));
+        assert!(!expected.contains(4, 8));
+        assert!(!expected.contains(8, 4));
+        assert!(ExpectedCoverage::from_plan(&checked, 2).is_err());
+        Ok(())
+    }
     #[test]
     fn replay_merges_partial_overlaps_and_cap_fails_closed() -> Result<()> {
         let mut coverage = Coverage::default();
