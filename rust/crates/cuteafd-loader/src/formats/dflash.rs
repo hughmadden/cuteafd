@@ -747,6 +747,12 @@ mod tests {
                 for mode in [Bf16Only, Fp8Only] {
                     let capacity = GlmDraftCapacity::new(8, 8, 8).unwrap();
                     let layout = cfg.runtime_layout(mode, capacity, context, sms, 2).unwrap();
+                    let bridge = crate::families::kimi_k3::draft_bridge_demands(&layout).unwrap();
+                    assert_eq!(bridge.len(), 5);
+                    assert_eq!(bridge.iter().find(|d| d.group == "DFlash bridge taps").unwrap().bytes,
+                        (4096 * 5 * 7168 * 2) as u64);
+                    assert!(bridge.iter().filter(|d| d.group != "DFlash bridge exchange").all(|d| d.gpu == 0));
+                    assert!(!bridge.iter().any(|d| d.group.contains("head scratch") || d.group.contains("logits")));
                     let allocated = layout.allocate_with(|b| Ok::<_, ()>((b.name.clone(), b.bytes))).unwrap();
                     let bytes = |name: &str| allocated.iter().find(|(n, _)| n == name).unwrap().1;
                     assert_eq!(bytes("query"), 64 * 64 * 576 * 2);

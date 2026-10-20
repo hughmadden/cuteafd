@@ -98,6 +98,9 @@ pub struct LayoutOptions {
     pub glm5_drafter_disabled: bool,
     pub glm5_draft_bf16: bool,
     pub glm5_attention_plan_rows: Option<usize>,
+    /// Kimi MLA DFlash is opt-in and charged from its native checkpoint headers.
+    pub kimi_drafter_snapshot: Option<std::path::PathBuf>,
+    pub kimi_draft_fp8: bool,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
     /// Concurrent sequences (state slots = concurrency + 2).
@@ -194,6 +197,8 @@ impl Default for LayoutOptions {
             glm5_drafter_disabled: false,
             glm5_draft_bf16: false,
             glm5_attention_plan_rows: None,
+            kimi_drafter_snapshot: None,
+            kimi_draft_fp8: false,
             headroom_bytes: 2 * GIB,
             concurrency: 0,
             state_slots: None,

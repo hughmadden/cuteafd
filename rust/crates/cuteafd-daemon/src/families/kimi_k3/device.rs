@@ -290,7 +290,12 @@ impl LaneLayout {
     }
 
     pub(super) fn allocate<'a>(&self, device: Device<'a>) -> Result<Lane<'a>> {
-        let stream = Stream::new(device)?;
+        self.allocate_on(device, Rc::new(Stream::new(device)?))
+    }
+
+    pub(super) fn allocate_on<'a>(&self, device: Device<'a>, stream: Rc<Stream<'a>>) -> Result<Lane<'a>> {
+        ensure!(stream.device.id == device.id && std::ptr::eq(stream.device.library, device.library),
+            "Kimi admitted lane stream differs from device");
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi lane");
         let arena = Allocation::new(device, self.arena_bytes)?;
         let operands = self.operands.iter().filter(|(name, _)| !self.arena_offsets.contains_key(*name))
@@ -300,7 +305,7 @@ impl LaneLayout {
                     "Kimi allocated lane operand {name} differs from admitted extent/device");
                 Ok((*name, allocation))
             }).collect::<Result<BTreeMap<_, _>>>()?;
-        let lane = Lane { stream: std::rc::Rc::new(stream), operands, arena: Some(arena), layout: self.clone() };
+        let lane = Lane { stream, operands, arena: Some(arena), layout: self.clone() };
         lane.prime_attention()?;
         Ok(lane)
     }

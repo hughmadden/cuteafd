@@ -13,6 +13,31 @@ pub const SPARK_ESTIMATED_WORKSPACE_BYTES: u64 = 512 << 20;
 pub const SPARK_ESTIMATED_RESERVE_BYTES: u64 =
     cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + SPARK_ESTIMATED_WORKSPACE_BYTES;
 
+/// Target waves remain wide while the common MLA drafter consumes 2048-row slices.
+pub const DRAFT_TARGET_TAP_ROWS: usize = 4096;
+
+pub fn draft_bridge_demands(layout: &crate::formats::dflash::MlaDraftRuntimeLayout)
+    -> anyhow::Result<Vec<crate::placement::Demand>> {
+    use anyhow::Context;
+    let mut demands = crate::placement::draft::remote_dflash_bridge_demands(
+        layout.target_hidden() as u64, layout.target_vocab() as u64,
+        layout.target_taps().len() as u64, layout.capacity().block_rows as u64, 1)?.demands;
+    let taps = demands.iter_mut().find(|d| d.group == "DFlash bridge taps")
+        .context("Kimi bridge tap inventory missing")?;
+    taps.bytes = (DRAFT_TARGET_TAP_ROWS * layout.target_taps().len() * layout.target_hidden() * 2) as u64;
+    Ok(demands)
+}
+
+/// The shared probe retains one GPU0 route arena; its pinned mirror is host memory.
+pub fn draft_probe_demand(layers: usize, topk: usize, rows: usize) -> anyhow::Result<crate::placement::Demand> {
+    use anyhow::Context;
+    use crate::placement::Demand;
+    use cuteafd_core::memory_layout::{Basis, Category};
+    let bytes = layers.checked_mul(topk).and_then(|n| n.checked_mul(rows))
+        .and_then(|n| n.checked_mul(4)).context("Kimi draft probe extent overflow")?;
+    Ok(Demand::new(0, Category::Workspace, "draft policy route arena", bytes.max(256) as u64, Basis::Formula))
+}
+
 /// Validate sealed role artifacts at runtime, never during checkpoint planning.
 pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path) -> anyhow::Result<()> {
     use crate::plan::checkpoint::read_json;

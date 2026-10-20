@@ -273,6 +273,9 @@ pub(crate) struct PlanArgs {
     /// Separately configured drafter checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) drafter_snapshot: Option<PathBuf>,
+    /// Charge native MLA DFlash FP8 residency instead of BF16.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub(crate) draft_fp8: bool,
     /// Separately configured vision checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) vision_snapshot: Option<PathBuf>,

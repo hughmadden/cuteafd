@@ -121,6 +121,10 @@ impl GlobalWeights<'_> {
         Ok(())
     }
 
+    pub(crate) fn borrowed_buffer(&self, name: &str) -> Result<&CuteafdDeviceBuffer> {
+        Ok(&self.operands.get(name).with_context(|| format!("Kimi global operand {name} absent on this rank"))?.buffer)
+    }
+
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
         Ok(self.operands.get(name).with_context(|| format!("Kimi global operand {name} absent on this rank"))?.buffer)
     }

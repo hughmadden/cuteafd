@@ -16,6 +16,9 @@ struct Lanes<'a> {
 }
 
 pub(crate) struct Engine<'a> {
+    draft: Option<super::draft::NativeDraft<'a>>,
+    draft_probe: RefCell<Option<crate::shared::memory::device::DeviceOwner<'a,
+        crate::shared::draft::probe::RoundProbe<'a>>>>,
     execution: Execution<'a>,
     lanes: RefCell<Lanes<'a>>,
     prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
@@ -96,6 +99,8 @@ impl<'a> Engine<'a> {
     /// exchange owners. Worker reconciliation precedes ordinary lane connection.
     pub(crate) fn load_admitted(library: &'a std::sync::Arc<cuteafd_ffi::NativeLibrary>,
         exchange_streams: [Rc<Stream<'a>>; 2],
+        lane_streams: [Rc<Stream<'a>>; 2],
+        mut draft: Option<super::draft::NativeDraft<'a>>,
         mut admission: super::admission::Admission<'a>,
         checkpoint: &cuteafd_loader::plan::Checkpoint,
         programs: [std::rc::Rc<super::device::NativePrograms<'a>>; 2],
@@ -128,8 +133,8 @@ impl<'a> Engine<'a> {
         let weights = admission.load_weights(devices, checkpoint)?;
         let lanes = usize::try_from(plan.spec().lanes)?;
         let mut allocated = (0..lanes).map(|lane| Ok([
-            admission.allocate_lane(devices[0], 0, lane)?,
-            admission.allocate_lane(devices[1], 1, lane)?,
+            admission.allocate_lane_on(devices[0], 0, lane, lane_streams[0].clone())?,
+            admission.allocate_lane_on(devices[1], 1, lane, lane_streams[1].clone())?,
         ])).collect::<Result<Vec<_>>>()?;
         let kda = [admission.allocate_kda(devices[0], 0)?, admission.allocate_kda(devices[1], 1)?];
         let mla = [admission.allocate_mla(devices[0], 0)?, admission.allocate_mla(devices[1], 1)?];
@@ -149,14 +154,22 @@ impl<'a> Engine<'a> {
             check_expert_owners(&admission.placement.layers,
                 std::array::from_fn(|rank| pair[rank].as_ref().map_or(&[][..], |e| e.layers())))?;
         }
+        // Admission charged this arena before allocation; retain its exact device owner.
+        let draft_probe = draft.as_ref().map(|_| devices[0].own(||
+            crate::shared::draft::probe::RoundProbe::new(devices[0].library,
+                local[0][0].config().dense.clone(), local[0][0].config().topk, 64))).transpose()?;
         // Weak admission registries must not outlive these strong startup owners
         // until every persistent local binding has acquired the same operands.
+        if let Some(draft) = draft.as_mut() { draft.bind_target(weights.global.clone())?; }
         drop((weights, kda, mla));
         pending.wait()?;
         let world = SparkWorld::canonical(6)?;
         let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
-        Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts)
+        let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts)?;
+        engine.draft = draft;
+        *engine.draft_probe.borrow_mut() = draft_probe;
+        Ok(engine)
     }
 
     /// Bind only exact owners already allocated through Admission. No device
@@ -178,7 +191,7 @@ impl<'a> Engine<'a> {
         }
         let streams = local.iter().map(|pair| pair.each_ref().map(|local| local.stream().clone())).collect();
         let execution = Execution::new(plan, &peer, &hops, exchange_streams.clone(), streams)?;
-        Ok(Self { execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+        Ok(Self { draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
             hops, peer, exchange_streams })
     }
@@ -204,6 +217,56 @@ impl<'a> Engine<'a> {
             full_prefill_logits: false })
     }
 
+    pub(crate) fn arm_draft_probe(&self) -> Result<()> {
+        self.require_live()?;
+        ensure!(self.draft_probe.borrow().is_some(), "Kimi draft policy probe was not admitted");
+        Ok(())
+    }
+    pub(crate) fn probe_begin(&self, rows: usize) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
+    }
+    pub(crate) fn probe_end(&self) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.end(); }
+    }
+    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
+        &[Option<f64>]) -> T) -> Option<T> {
+        let mut probe = self.draft_probe.borrow_mut();
+        let probe = probe.as_mut()?;
+        let device = probe.device;
+        device.run(|| Ok(probe.finish().map(|(routes, times)| observe(routes, &times))))
+            .unwrap_or_else(|error| { tracing::debug!(%error, "Kimi draft probe read failed"); None })
+    }
+
+    pub(crate) fn native_draft(&self) -> Option<&super::draft::NativeDraft<'a>> { self.draft.as_ref() }
+
+    pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)
+        -> Result<cuteafd_core::PolicyGeometry> {
+        use crate::shared::{draft::resource::{self, LayerHome}, experts::rtx::RtxExpertLayer};
+        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+        let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi draft needs EXL3 headers"))?;
+        let lanes = self.lanes.try_borrow()?;
+        let cfg = lanes.local[0][0].config();
+        let reports = lanes.routed[0].installed_grouping()?;
+        let local = &lanes.experts[0];
+        let homes = cfg.dense.iter().enumerate().map(|(layer, dense)| {
+            if *dense { return Ok(LayerHome::Dense); }
+            let resident = local[0].as_ref().is_some_and(|rank| rank.layers().contains(&layer));
+            ensure!(resident == local[1].as_ref().is_some_and(|rank| rank.layers().contains(&layer)),
+                "Kimi TP2 draft policy layer homes disagree");
+            let bytes = resource::exl3_slice_bytes(manifest, layer, if resident { 2 } else { 6 })?;
+            Ok(if resident { LayerHome::Local { slice_bytes: bytes } }
+                else { LayerHome::Remote { slice_bytes: bytes } })
+        }).collect::<Result<Vec<_>>>()?;
+        resource::geometry_with_grouping(&homes, cfg.experts, cfg.topk, 64, width, 0, |layer, rows| {
+            if matches!(homes[layer], LayerHome::Local { .. }) {
+                let group = local[0].as_ref().unwrap().group_rows(rows)?;
+                ensure!(local[1].as_ref().unwrap().group_rows(rows)? == group,
+                    "Kimi TP2 draft policy grouping disagrees");
+                Ok(group)
+            } else { resource::worker_group_rows_for_input(&reports, layer, rows, false) }
+        })
+    }
+
     pub(crate) fn library(&self) -> &'a cuteafd_ffi::NativeLibrary {
         self.exchange_streams[0].device.library
     }
@@ -214,6 +277,7 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn require_live(&self) -> Result<()> {
         self.peer.require_live()?;
+        if let Some(draft) = &self.draft { draft.require_live()?; }
         if let Some(startup) = self.startup_captures.get() {
             super::graphs::check_captures(startup, cuteafd_ffi::graph_captures())?;
         }
@@ -271,6 +335,7 @@ impl<'a> Engine<'a> {
         for (placement, tokens) in sequences.iter() {
             family.check_append(placement, tokens.len())?;
         }
+        if let Some(draft) = &self.draft { draft.prepare_target()?; }
         let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
             lanes.local[0][1].config().release_geometry()?;
@@ -284,7 +349,7 @@ impl<'a> Engine<'a> {
             for binding in &mut local[0] { binding.enable_replay(graphed); }
             let result = self.execution.run(scope, &self.peer, &self.hops,
                 &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
-                super::layers::Output::Normalized);
+                super::layers::Output::Normalized, self.draft.as_ref(), Some(&self.draft_probe));
             for binding in &mut local[0] { binding.enable_replay(true); }
             let normalized = result?[0];
             let input = crate::shared::prefix::view(normalized,
@@ -357,6 +422,7 @@ impl<'a> Engine<'a> {
         if self.peer.terminal_state() == TerminalState::Drained { return Ok(()); }
         let lanes = self.lanes.try_borrow_mut()?;
         let lanes = RefCell::new(lanes);
+        if let Some(draft) = &self.draft { draft.abort()?; }
         let result = teardown(&mut Teardown {
             abort: || self.peer.publish_abort(),
             ranks: || {
@@ -381,13 +447,17 @@ impl<'a> Engine<'a> {
             },
             copies: || {
                 for routed in &lanes.borrow().routed { routed.drain_copies()?; }
+                if let Some(draft) = &self.draft { draft.drain()?; }
                 Ok(())
             },
             graphs: || {
                 for routed in &mut lanes.borrow_mut().routed { routed.release_payloads()?; }
                 Ok(())
             },
-            finish: |drained| self.peer.finish_terminal(drained),
+            finish: |drained| {
+                self.peer.finish_terminal(drained);
+                if let Some(draft) = &self.draft { draft.finish_terminal(drained); }
+            },
         });
         crate::shared::decode_graph::fatal_drain(result, "Kimi submission shutdown");
         Ok(())
@@ -407,7 +477,7 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, experts, .. } = &mut *lanes;
             let outputs = self.execution.run(scope, &self.peer, &self.hops,
                 &mut local[..1], &mut routed[..1], &mut experts[..1], &[tokens.len()], false,
-                super::layers::Output::Residual)?;
+                super::layers::Output::Residual, None, None)?;
             let stream = local[0][1].stream();
             stream.device.run(|| {
                 // SAFETY: this uncaptured diagnostic retains every operand until
@@ -462,7 +532,7 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, io, experts } = &mut *lanes;
             let normalized = self.execution.run(scope, &self.peer, &self.hops,
                 &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
-                super::layers::Output::Normalized)?;
+                super::layers::Output::Normalized, None, None)?;
             for (lane, normalized) in normalized.into_iter().enumerate() {
                 let stream = local[lane][1].stream();
                 for first in (0..rows[lane]).step_by(64) {

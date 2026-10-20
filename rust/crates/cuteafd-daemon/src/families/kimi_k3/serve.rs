@@ -26,6 +26,12 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long)] pub model_id: Option<String>,
+    /// Opt in to a checkpoint-native MLA DFlash2 drafter.
+    #[arg(long)] pub draft: Option<PathBuf>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub draft_fp8: bool,
+    /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
+    #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
+    pub draft_fixed: Option<u8>,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -85,13 +91,15 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             // SAFETY: every native owner drops on this worker before the library.
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;
+            let draft = worker_args.draft.as_ref().map(|snapshot| super::draft::Options {
+                snapshot: snapshot.clone(), fp8: worker_args.draft_fp8 });
             let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
                 devices: [worker_args.device, worker_args.split_device], native_lib: &worker_args.native_lib,
                 peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
                 spark_budget_gib: worker_args.spark_budget_gib,
                 rows: 4096, slots, marks, max_context: worker_args.max_context,
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
-                ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None,
+                ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft,
             })?;
             crate::shared::memory_report::release_load_staging(&library);
             let backend = KimiBackend::new(&loaded.engine)?;
@@ -99,7 +107,12 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             // consumes logits on the terminal rank's exact producing stream.
             library.cuda_set_device(worker_args.split_device)?;
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats, slots,
-                scheduler::Drafts::None, eos, worker_args.decode_share, &worker_args.prefix,
+                match loaded.engine.native_draft() {
+                    Some(draft) => scheduler::Drafts::Neural {
+                        depth: worker_args.draft_fixed.map_or(draft.drafts(), usize::from),
+                        fixed: worker_args.draft_fixed.is_some() },
+                    None => scheduler::Drafts::None,
+                }, eos, worker_args.decode_share, &worker_args.prefix,
                 worker_args.token_io.token_select, &mut super::super::qwen3_5::serve::text_media(), None, || {
                     loaded.engine.require_live()?;
                     crate::shared::inventory::RuntimeInventory::measure(&library,
@@ -150,6 +163,26 @@ mod tests {
         let cli = crate::cli::Cli::try_parse_from(argv)?;
         let crate::cli::Commands::ServeKimi(args) = cli.command else { panic!("Kimi command") };
         Ok(args)
+    }
+
+    #[test]
+    fn native_draft_is_opt_in_with_explicit_precision_and_bounded_fixed_depth() -> Result<()> {
+        let defaults = args(&[])?;
+        assert!(defaults.draft.is_none());
+        assert!(!defaults.draft_fp8);
+        assert!(defaults.draft_fixed.is_none());
+        for fp8 in ["false", "true"] {
+            let selected = args(&["--draft", "/drafter", "--draft-fp8", fp8, "--draft-fixed", "7"])?;
+            assert_eq!(selected.draft.as_deref(), Some(std::path::Path::new("/drafter")));
+            assert_eq!(selected.draft_fp8, fp8 == "true");
+            assert_eq!(selected.draft_fixed, Some(7));
+        }
+        assert!(args(&["--draft-fp8"]).is_err());
+        assert!(args(&["--draft-fixed", "1"]).is_err());
+        for depth in ["0", "8"] {
+            assert!(args(&["--draft", "/drafter", "--draft-fixed", depth]).is_err());
+        }
+        Ok(())
     }
 
     #[test]

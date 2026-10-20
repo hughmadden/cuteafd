@@ -342,6 +342,15 @@ impl<'a> Admission<'a> {
         Ok(allocated)
     }
 
+    pub(crate) fn allocate_lane_on(&mut self, device: Device<'a>, rank: usize, lane: usize,
+        stream: Rc<Stream<'a>>) -> Result<Lane<'a>> {
+        let layout = self.check_lane(rank, lane, device.id)?;
+        let allocated = layout.allocate_on(device, stream)?;
+        self.lane_readers[lane][rank] = Rc::downgrade(&allocated.stream);
+        self.lane_allocated[lane][rank] = true;
+        Ok(allocated)
+    }
+
     pub(crate) fn allocate_kda(&mut self, device: Device<'a>, rank: usize) -> Result<Rc<KdaBank<'a>>> {
         self.check_kda(rank, device.id)?;
         let readers = self.lane_readers.iter().map(|pair| pair[rank].upgrade()

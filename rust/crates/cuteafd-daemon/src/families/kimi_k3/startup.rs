@@ -23,6 +23,7 @@ pub(crate) struct Options<'a> {
     pub graphs: bool,
     pub ffn_mode: cuteafd_ffi::KimiFfnMode,
     pub hosted_layers: Option<Vec<usize>>,
+    pub draft: Option<super::draft::Options>,
 }
 
 pub(crate) struct Loaded<'a> {
@@ -47,6 +48,14 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     let native = devices.map(|device| NativePrograms::load(device, full, programs, options.ffn_mode).map(Rc::new));
     let [zero, one] = native;
     let native = [zero?, one?];
+    let draft_layout = options.draft.as_ref().map(|draft| devices[1].run(||
+        draft.layout(options.slots, options.max_context, library.sm_count()?))).transpose()?;
+    // Resolve native modules before the measured baseline, while retaining their handles.
+    let _draft_modules = options.draft.as_ref().map(|_| devices[1].run(|| {
+        use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
+        Ok([MlaDraft::load(programs, MlaDraftWindow::Full)?,
+            MlaDraft::load(programs, MlaDraftWindow::Sliding4096)?])
+    })).transpose()?;
     let rows = options.rows;
     let spark_budget_gib = options.spark_budget_gib.unwrap_or(
         cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES as f64 / (1u64 << 30) as f64);
@@ -91,6 +100,10 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         native[1].lane_layout(full, rows, options.max_context)?]];
     let graph_set = options.graphs.then(|| super::graphs::owned_inventory(cfg, 1, rows, options.slots)).transpose()?;
     let mut fixed = exchange_demands(rows, diagnostics)?;
+    if let Some(layout) = &draft_layout {
+        fixed.extend(super::draft::bridge_demands(layout)?);
+        fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
+    }
     let selected = cuteafd_loader::placement::ProgramSet::from_names(&["kimik3"], programs.names());
     for (rank, sample) in inventory.gpus.iter().enumerate() {
         let pending = crate::shared::inventory::pending_code(library, sample.device, rank, true,
@@ -103,12 +116,12 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
-    let admitted = admission::admit(admission::Inputs { cfg, gpus, devices: [options.devices[0], options.devices[1]],
+    let mut admitted = admission::admit(admission::Inputs { cfg, gpus, devices: [options.devices[0], options.devices[1]],
         peer_access: true, spark_ranks: 6, attention: None, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
             (0..2).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
-        spark_budget: Some(spark_budget), draft: None })?;
+        spark_budget: Some(spark_budget), draft: draft_layout.clone() })?;
     if let Some(expected) = options.hosted_layers.as_ref() {
         ensure!(admitted.working_set().spark_layers == *expected,
             "Kimi worker layer subset differs from shared placement");
@@ -132,7 +145,10 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec()))?;
     hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
         peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
-    let engine = Engine::load_admitted(library, streams, admitted, checkpoint, native, peer, hops,
+    let lane_streams = [Rc::new(Stream::new(devices[0])?), Rc::new(Stream::new(devices[1])?)];
+    let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
+        super::draft::NativeDraft::load(&mut admitted, programs, options, lane_streams.clone(), layout)).transpose()?;
+    let engine = Engine::load_admitted(library, streams, lane_streams, draft, admitted, checkpoint, native, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig::default(), 4096, expert_modules)?;
     if let Some(set) = graph_set {
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;

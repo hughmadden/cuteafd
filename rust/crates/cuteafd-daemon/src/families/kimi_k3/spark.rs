@@ -139,7 +139,8 @@ impl<'a> RoutedLane<'a> {
     /// event so the host can parse ordinary protocol rows while the FFN runs.
     pub(crate) fn begin(&mut self, local: &mut LocalLane<'a>, layer: usize, rows: usize,
         kind: ExpertV2SourceKind, routes: cuteafd_ffi::KimiRoutes,
-        wire: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<Ticket> {
+        wire: cuteafd_ffi::CuteafdDeviceBuffer,
+        probe: Option<&mut crate::shared::draft::probe::RoundProbe<'a>>) -> Result<Ticket> {
         self.check(local, rows)?;
         ensure!(self.pending.is_none() && self.wave.is_none(), "Kimi main link already has an outstanding wave");
         let sequence = self.sequence.checked_add(1).context("Kimi Spark request sequence overflow")?;
@@ -158,6 +159,7 @@ impl<'a> RoutedLane<'a> {
             // pinned staging remains exclusively owned until this fence.
             unsafe { self.stream.device.library.cuda_event_synchronize(self.ready.raw) }
         })?;
+        if let Some(probe) = probe { probe.staged(layer, &self.staging.bytes()[..layout.route_bytes]); }
         let request = request(layer, rows, sequence, kind, &layout, self.staging.bytes())?;
         let ticket = Ticket { layer, rows, sequence };
         // Retain the terminal identity before dispatch can partially post work.

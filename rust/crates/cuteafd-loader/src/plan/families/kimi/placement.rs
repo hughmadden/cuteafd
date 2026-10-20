@@ -129,6 +129,31 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             return memory;
         }
     };
+    let draft = opts.kimi_drafter_snapshot.as_ref().map(|snapshot| -> anyhow::Result<_> {
+        use crate::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
+            formats::dflash::MlaDflashConfig};
+        let draft = MlaDflashConfig::read(snapshot)?;
+        anyhow::ensure!(draft.mla.hidden == cfg.hidden && draft.vocab == cfg.vocab_size
+            && draft.taps.iter().all(|&layer| layer < cfg.layers), "Kimi drafter target geometry differs from checkpoint");
+        let slots = usize::try_from(slots)?;
+        let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
+            else { GlmDraftRepresentation::Bf16Only };
+        let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
+            usize::try_from(context)?, opts.physical_sms.unwrap_or(188) as usize, 0)?;
+        fixed.extend(crate::families::kimi_k3::draft_bridge_demands(&layout)?);
+        fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
+        let (demand, peak) = layout.demands(1)?;
+        Ok((demand.movable(2)?, peak))
+    }).transpose();
+    let (movables, startup) = match draft {
+        Ok(Some((movable, peak))) => (vec![movable], vec![peak]),
+        Ok(None) => (Vec::new(), Vec::new()),
+        Err(error) => {
+            refusal(report, format!("Kimi native MLA draft inventory refused: {error:#}"),
+                "Provide a supported MLA DFlash2 checkpoint and matching native representation.");
+            return memory;
+        }
+    };
     let record = (cfg.mla_record_values() * 2) as u64 * PAGE;
     let layers = (0..cfg.layers).map(|layer| {
         let mla = cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla;
@@ -151,7 +176,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         pool: PoolPolicy { compiled_context: context,
             requested: requested_pool, target: opts.target_pool_tokens.max(context), floor: context,
             ceiling: opts.target_pool_tokens.max(requested_pool.unwrap_or(0)).max(context), unit_rows: PAGE },
-        layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
+        layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup, movables,
         expert_workspace: 0, tp2_workspace: [0; 2], onboard, expert_gpus: 2, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating, expert_ownership: ExpertOwnership::Contiguous,
             attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, AttentionPlacement::Heads)],

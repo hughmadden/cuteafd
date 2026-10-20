@@ -313,7 +313,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
             peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
             spark_budget_gib: args.spark_budget_gib,
             rows, slots: 1, marks: 1, max_context: 1_048_576, pool_tokens: Some(1_048_576), graphs: false,
-            ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
+            draft: None, ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
         })?;
     use cuteafd_engine::prefix::PrefixFamily;
     let pages = engine.prefix_family()?.layout().pages;

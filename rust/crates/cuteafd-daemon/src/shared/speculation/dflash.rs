@@ -669,6 +669,8 @@ pub(crate) type InputLaunch<'h> = dyn Fn(&[u32], CuteafdDeviceBuffer, *mut c_voi
 pub(crate) enum TargetHead<'h> {
     /// The target's checkpoint BF16 `[vocab, hidden]`.
     Bf16(&'h Dev<'h>),
+    /// A scoped borrow from a device-aware target owner, retained through the draft drain.
+    Bf16Buffer(&'h CuteafdDeviceBuffer),
     /// A target-owned launcher over another representation (GLM 5.3 Flash's
     /// FP8-only head in 16-row spans); the drafter's head workspace is unused.
     Launch(HeadLaunch<'h>),
@@ -694,6 +696,14 @@ enum DraftInput<'r, 'e> {
     Table(&'r TokenEmbedding<'e>),
     /// A device-ordered gather/transport bridge owned by the target.
     Launch(&'r InputLaunch<'r>),
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MlaReadback {
+    pub frontier: (usize, usize),
+    pub layers: Vec<Vec<u8>>,
+    pub taps: Vec<u8>,
 }
 
 pub(crate) struct DflashDrafter<'a> {
@@ -1314,6 +1324,39 @@ impl<'a> DflashDrafter<'a> {
         Ok(())
     }
 
+    /// Read only reachable committed records and explicitly initialized tap rows.
+    #[cfg(test)]
+    pub(crate) fn mla_readback(&self, slot: usize, tap_rows: usize) -> Result<MlaReadback> {
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("MLA readback needs MLA context"); };
+        ensure!(tap_rows <= TAP_ROWS, "MLA readback tap extent");
+        let frontier @ (origin, end) = context.state.borrow().frontier(slot)?;
+        // SAFETY: test-only readback retains all operands and their producing stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        let cache = context.layout.cache();
+        let record_bytes = (context.cfg.mla.kv_rank + context.cfg.mla.rope) * 2;
+        let mut layers = Vec::new();
+        for (index, layer) in self.layers.iter().enumerate() {
+            let DraftAttention::Mla(attention) = &layer.attention else { anyhow::bail!("mixed MLA layers"); };
+            let bound = cache.layers[index].bind(slot, origin)?;
+            let start = context.cfg.windows[index].map_or(origin, |window| origin.max(end.saturating_sub(window)));
+            let mut bytes = Vec::with_capacity((end - start) * record_bytes);
+            for position in start..end {
+                let view = crate::shared::prefix::view(attention.cache.buffer,
+                    bound.row(position)? * record_bytes, record_bytes)?;
+                let mut row = vec![0; record_bytes];
+                self.library.copy_d2h(&mut row, view)?;
+                bytes.extend(row);
+            }
+            layers.push(bytes);
+        }
+        let count = tap_rows * self.cfg.taps.len() * self.cfg.hidden * 2;
+        let mut taps = vec![0; count];
+        if count > 0 {
+            self.library.copy_d2h(&mut taps, crate::shared::prefix::view(self.taps.buffer, 0, count)?)?;
+        }
+        Ok(MlaReadback { frontier, layers, taps })
+    }
+
     pub(crate) fn reset_context(&self, slot: usize, origin: usize) -> Result<()> {
         ensure!(slot < self.slots, "DFlash reset outside admitted slots");
         if let DraftContext::Mla(context) = &self.context { context.state.borrow_mut().reset(slot, origin)?; }
@@ -1545,18 +1588,22 @@ impl<'a> DflashDrafter<'a> {
 
     fn head_call<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadCall<'h>> {
         Ok(match head {
-            TargetHead::Bf16(owner) => HeadCall::Bf16(self.borrowed_head(owner)?),
+            TargetHead::Bf16(owner) => HeadCall::Bf16(self.borrowed_head(owner.buffer)?),
+            TargetHead::Bf16Buffer(buffer) => {
+                ensure!(buffer.device_id == self.library.cuda_get_device()?, "draft head borrow on wrong device");
+                HeadCall::Bf16(self.borrowed_head(**buffer)?)
+            }
             TargetHead::Launch(launch) => HeadCall::Launch(launch),
         })
     }
 
-    fn borrowed_head(&self, owner: &Dev<'_>) -> Result<*const c_void> {
+    fn borrowed_head(&self, owner: CuteafdDeviceBuffer) -> Result<*const c_void> {
         let bytes = self.cfg.vocab.checked_mul(self.cfg.hidden).and_then(|n| n.checked_mul(2))
             .context("DFlash borrowed BF16 head byte count overflow")?;
-        ensure!(!owner.buffer.ptr.is_null() && owner.buffer.bytes == bytes,
+        ensure!(!owner.ptr.is_null() && owner.bytes == bytes,
             "DFlash requires the target-owned BF16 head [{}, {}] ({bytes} bytes); compact target-head \
              consumer is unsupported, no private head copy will be allocated", self.cfg.vocab, self.cfg.hidden);
-        Ok(owner.buffer.ptr)
+        Ok(owner.ptr)
     }
 
     fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>,

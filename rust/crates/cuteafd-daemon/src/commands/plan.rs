@@ -94,6 +94,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glm5_drafter_disabled: args.no_speculator || args.speculator == "off",
                 glm5_drafter_snapshot: args.drafter_snapshot.clone(),
                 glm5_draft_bf16: args.glm5_draft_bf16,
+                kimi_drafter_snapshot: None,
+                kimi_draft_fp8: args.draft_fp8,
                 glm5_attention_plan_rows: args.attention_plan_rows,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
@@ -230,6 +232,11 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
+        if family == "kimi_k3" && args.speculator != "off" {
+            anyhow::ensure!(args.speculator == "dflash2" && args.drafter_snapshot.is_some(),
+                "Kimi MLA speculation requires --speculator dflash2 --drafter-snapshot SNAPSHOT");
+            layout.kimi_drafter_snapshot = args.drafter_snapshot.clone();
+        }
         let config = std::fs::File::open(snapshot.join("config.json")).ok()
             .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
         let v41 = config.as_ref().is_some_and(|value| {
@@ -409,11 +416,11 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
         args.speculator = "off".into();
     } else if (args.include_speculator || args.drafter_snapshot.is_some()) && args.speculator == "off" {
-        args.speculator = default.into();
+        args.speculator = if family == "kimi_k3" && args.drafter_snapshot.is_some() { "dflash2".into() } else { default.into() };
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "mtp")
         | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
         _ => false,
@@ -776,7 +783,7 @@ mod tests {
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             config: None, speculator: "auto".into(), no_speculator: false,
-            drafter_snapshot: None, vision_snapshot: None, audio_snapshot: None,
+            drafter_snapshot: None, draft_fp8: false, vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
             rtx: 2,
