@@ -55,6 +55,27 @@ pub struct MlaDraftCacheView {
     pub pages: Vec<i32>,
 }
 
+/// One block uses absolute positions and the slot's immutable cold-resume origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlaDraftCacheRequest {
+    pub slot: usize,
+    pub position: usize,
+    pub valid_from: usize,
+}
+
+/// Checked host metadata for one native m64 launch. Sequence order is preserved
+/// across chunks; positions drive RoPE while slots address origin-relative rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlaDraftCacheBatch {
+    pub first_sequence: usize,
+    pub positions: Vec<i64>,
+    pub slots: Vec<i64>,
+    pub page_table: Vec<i32>,
+    pub page_table_width: usize,
+    pub lengths: Vec<i32>,
+    pub query_offsets: Vec<i32>,
+}
+
 /// A cold continuation binds one immutable storage origin to one slot. Rebind
 /// after slot reuse or prefix restore; never move the origin of retained rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +95,44 @@ impl MlaDraftCacheLayer {
             return Err(unsupported("MLA draft origin outside admitted slot/context"));
         }
         Ok(MlaDraftCacheSlot { layer: self.clone(), slot, valid_from })
+    }
+
+    /// Build every chunk before staging any of them, so a bad later sequence
+    /// cannot follow a partially enqueued draft. One slot appears at most once.
+    pub fn block_batches(&self, requests: &[MlaDraftCacheRequest]) -> Result<Vec<MlaDraftCacheBatch>> {
+        use cuteafd_core::coordinator_programs::MlaDraftProgramLayout;
+        let per_batch = MlaDraftProgramLayout::ROWS / self.block.max(1);
+        if requests.is_empty() || self.block == 0 || per_batch == 0 || requests.len() > self.slots {
+            return Err(unsupported("MLA draft batch outside admitted rows/slots"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let views = requests.iter().map(|request| {
+            if !seen.insert(request.slot) { return Err(unsupported("MLA draft repeats a slot in one batch")); }
+            let bound = self.bind(request.slot, request.valid_from)?;
+            let view = bound.block_view(request.position, self.block)?;
+            let rows = (request.position..request.position + self.block)
+                .map(|position| Ok((position as i64, i64::try_from(bound.row(position)?)
+                    .map_err(|_| unsupported("MLA draft physical row exceeds I64"))?)))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((view, rows))
+        }).collect::<Result<Vec<_>>>()?;
+        views.chunks(per_batch).enumerate().map(|(chunk, views)| {
+            let width = views.iter().map(|(view, _)| view.pages.len()).max().unwrap_or(0);
+            let mut batch = MlaDraftCacheBatch { first_sequence: chunk * per_batch,
+                positions: Vec::with_capacity(views.len() * self.block),
+                slots: Vec::with_capacity(views.len() * self.block),
+                page_table: Vec::with_capacity(views.len() * width), page_table_width: width,
+                lengths: Vec::with_capacity(views.len()), query_offsets: vec![0] };
+            for (view, rows) in views {
+                for &(position, slot) in rows { batch.positions.push(position); batch.slots.push(slot); }
+                batch.page_table.extend_from_slice(&view.pages);
+                batch.page_table.resize(batch.lengths.len() * width + width, 0);
+                batch.lengths.push(i32::try_from(view.cache_seqlen)
+                    .map_err(|_| unsupported("MLA draft cache length exceeds I32"))?);
+                batch.query_offsets.push(batch.positions.len() as i32);
+            }
+            Ok(batch)
+        }).collect()
     }
 }
 
@@ -607,6 +666,72 @@ mod tests {
                 assert_eq!(bound.row(origin + 1).unwrap(), capacity + 1);
             }
         }
+    }
+
+    #[test]
+    fn native_block_batches_chunk_concurrency_without_changing_positions_or_cache_rows() {
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        let layout = cfg.cache_layout(16, 262144).unwrap();
+        for layer in [&layout.layers[0], &layout.layers[4]] {
+            for origin in 0..64 {
+                let requests = (0..16).map(|slot| MlaDraftCacheRequest { slot,
+                    valid_from: origin + slot * 17, position: origin + slot * 17 + slot * 4097 })
+                    .collect::<Vec<_>>();
+                let batches = layer.block_batches(&requests).unwrap();
+                assert_eq!(batches.len(), 2);
+                for batch in batches {
+                    assert_eq!(batch.positions.len(), 64);
+                    assert_eq!(batch.slots.len(), 64);
+                    assert_eq!(batch.query_offsets, [0,8,16,24,32,40,48,56,64]);
+                    assert_eq!(batch.lengths.len(), 8);
+                    assert_eq!(batch.page_table.len(), 8 * batch.page_table_width);
+                    for local in 0..8 {
+                        let request = requests[batch.first_sequence + local];
+                        let bound = layer.bind(request.slot, request.valid_from).unwrap();
+                        let view = bound.block_view(request.position, cfg.block).unwrap();
+                        assert_eq!(batch.lengths[local] as usize, view.cache_seqlen);
+                        let pages = &batch.page_table[local * batch.page_table_width..][..batch.page_table_width];
+                        assert_eq!(&pages[..view.pages.len()], view.pages);
+                        assert!(pages[view.pages.len()..].iter().all(|&page| page == 0));
+                        for row in 0..cfg.block {
+                            let index = local * cfg.block + row;
+                            let absolute = request.position + row;
+                            assert_eq!(batch.positions[index] as usize, absolute);
+                            assert_eq!(batch.slots[index] as usize, bound.row(absolute).unwrap());
+                            let relative = absolute - view.base_position;
+                            assert_eq!(pages[relative / 64] as usize * 64 + relative % 64,
+                                batch.slots[index] as usize);
+                        }
+                    }
+                }
+                let partial = layer.block_batches(&requests[..9]).unwrap();
+                assert_eq!(partial[1].first_sequence, 8);
+                assert_eq!(partial[1].query_offsets, [0,8]);
+                assert_eq!(partial[1].positions.len(), 8);
+            }
+        }
+    }
+
+    #[test]
+    fn native_block_batches_reject_bad_later_chunks_before_returning_metadata() {
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        let layer = &cfg.cache_layout(16, 262144).unwrap().layers[0];
+        let requests = (0..16).map(|slot| MlaDraftCacheRequest { slot, position: 4096, valid_from: 17 })
+            .collect::<Vec<_>>();
+        for defect in 0..5 {
+            let mut bad = requests.clone();
+            match defect {
+                0 => bad[15].slot = 0,
+                1 => bad[15].slot = 16,
+                2 => bad[15].valid_from = 4097,
+                3 => bad[15].position = 262144 - cfg.block + 1,
+                _ => bad[15].position = usize::MAX,
+            }
+            assert!(layer.block_batches(&bad).is_err());
+        }
+        assert!(layer.block_batches(&[]).is_err());
+        let mut too_many = requests.clone(); too_many.push(requests[0]);
+        assert!(layer.block_batches(&too_many).is_err());
     }
 
     #[test]
