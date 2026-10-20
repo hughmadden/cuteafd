@@ -435,3 +435,22 @@ def test_coordinator_retry_discovers_sealed_seed_slot_after_dry_run():
     probe = text.split('# A coordinator-only retry repairs', 1)[1].split('# Probe only after', 1)[0]
     assert text.index('# A coordinator-only retry repairs') > text.index('if ((dry_run)); then')
     assert 'docker inspect' in probe and 'FINGERPRINT' in probe and 'wip_spark_leg=1' in probe
+
+
+@pytest.mark.parametrize('running', ['true', 'false'])
+def test_distribution_stops_only_seed_it_restarted(tmp_path, running):
+    text = (ROOT / 'wip.sh').read_text()
+    helper = 'wip_distribute_sealed_expert() (' + text.split('wip_distribute_sealed_expert() (', 1)[1].split('\n)\n', 1)[0] + '\n)\n'
+    trace = tmp_path / 'trace'
+    setup = f"""set -euo pipefail
+wip_spark_leg=1 seed_host=fixture spark_container=owned
+ssh() {{ echo "$*" >> '{trace}'; [[ $* != *inspect* ]] || echo {running}; }}
+wip_check_expert_readiness() {{ :; }}
+distribute_expert_slot() {{ echo distribute >> '{trace}'; }}
+"""
+    result = subprocess.run(['bash', '-c', setup + helper + '\nwip_distribute_sealed_expert'], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    calls = trace.read_text()
+    assert 'distribute' in calls
+    assert ('docker stop' in calls) == (running == 'false')
+    assert ('docker start' in calls) == (running == 'false')

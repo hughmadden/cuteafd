@@ -1618,8 +1618,12 @@ fi
 # tar/file operations; stop the seed again even when transfer fails.
 wip_distribute_sealed_expert() (
   ((wip_spark_leg)) || return 0
-  ssh -o BatchMode=yes "$seed_host" "docker start '$spark_container' >/dev/null"
-  trap 'ssh -o BatchMode=yes "$seed_host" "docker stop -t 10 \"$spark_container\" >/dev/null"' EXIT
+  local running
+  running="$(ssh -o BatchMode=yes "$seed_host" "docker inspect -f '{{.State.Running}}' '$spark_container'")"
+  if [[ "$running" != true ]]; then
+    ssh -o BatchMode=yes "$seed_host" "docker start '$spark_container' >/dev/null"
+    trap 'ssh -o BatchMode=yes "$seed_host" "docker stop -t 10 \"$spark_container\" >/dev/null"' EXIT
+  fi
   wip_check_expert_readiness
   distribute_expert_slot
 )
