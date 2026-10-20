@@ -1,8 +1,8 @@
 //! One device-driven bridge for a drafter that lives on the other GPU from
 //! its target (#65, #106). Families bind it to their drafter: the target rank
-//! (0) keeps its single head, embedding and tap producer; the draft rank (1)
-//! owns the drafter, a dedicated stream and an ordering event. Context, input
-//! rows, hidden rows and logits move GPU to GPU over one abortable
+//! (0) keeps its embedding and tap producer; the draft rank (1) owns the drafter,
+//! a dedicated stream and an ordering event. The single target head may live on
+//! either rank. Context, input rows and remote-head operands use one abortable
 //! [`PeerExchange`]; the host only enqueues.
 //!
 //! **Ordering invariant (#94).** A resident peer wait on the draft GPU must not
@@ -35,11 +35,27 @@ pub(crate) struct Prepared<'a> {
     pub stream: Stream<'a>,
     target_peer: RankDevice,
     target_ready: Event<'a>,
+    head_rank: usize,
+}
+
+fn check_head_rank(rank: usize) -> Result<()> {
+    ensure!(rank < 2, "remote draft head rank must be 0 or 1");
+    Ok(())
+}
+
+fn head_route(rank: usize, send_hidden: impl FnOnce() -> Result<()>,
+    head: impl FnOnce(bool) -> Result<()>, send_logits: impl FnOnce() -> Result<()>) -> Result<()> {
+    check_head_rank(rank)?;
+    if rank == 1 { return head(true); }
+    send_hidden()?;
+    head(false)?;
+    send_logits()
 }
 
 impl<'a> Prepared<'a> {
     pub fn new(library: &'a NativeLibrary, target: RankDevice, target_peer: RankDevice,
-        identity: &'static str) -> Result<Self> {
+        head_rank: usize, identity: &'static str) -> Result<Self> {
+        check_head_rank(head_rank)?;
         ensure!(target.device != target_peer.device && !target_peer.stream.is_null(),
             "remote draft requires the peer target producer stream");
         let device = Device { library, id: target_peer.device };
@@ -48,7 +64,7 @@ impl<'a> Prepared<'a> {
         let exchange = PeerExchange::new_abortable(library,
             [target, RankDevice { device: target_peer.device, stream: stream.raw }], SLOTS, 0)?;
         exchange.trace_identity(identity);
-        Ok(Self { exchange, stream, target_peer, target_ready })
+        Ok(Self { exchange, stream, target_peer, target_ready, head_rank })
     }
 
     /// Sampled before admission but charged only for the selected remote candidate.
@@ -62,16 +78,20 @@ pub(crate) struct RemoteBridge<'a> {
     // The exchange and event drop before the stream they borrow.
     pub stream: Stream<'a>,
     update_pending: Cell<bool>,
+    head_rank: usize,
 }
 
 impl<'a> RemoteBridge<'a> {
     pub fn new(prepared: Prepared<'a>) -> Self {
         Self { exchange: prepared.exchange, target_peer: prepared.target_peer,
-            target_ready: prepared.target_ready, stream: prepared.stream, update_pending: Cell::new(false) }
+            target_ready: prepared.target_ready, stream: prepared.stream, update_pending: Cell::new(false),
+            head_rank: prepared.head_rank }
     }
 
     pub fn library(&self) -> &'a NativeLibrary { self.stream.device.library }
     pub fn target_device(&self) -> i32 { self.exchange.device(0) }
+    pub fn head_rank(&self) -> usize { self.head_rank }
+    pub fn head_device(&self) -> i32 { self.exchange.device(self.head_rank) }
 
     pub fn require_live(&self) -> Result<()> { self.exchange.require_live() }
 
@@ -165,15 +185,26 @@ impl<'a> RemoteBridge<'a> {
         self.exchange.wait(1, INPUT)
     }
 
-    /// Drafter hidden rows to the target head, then the target's logits back.
+    /// Borrow the head on its owning rank. A draft-local head consumes the
+    /// common executor's rows/logits directly; rank 0 retains its existing trip.
     pub fn round_trip_head(&self, hidden: *const std::ffi::c_void, target_hidden: *mut std::ffi::c_void,
-        hidden_bytes: usize, head: impl FnOnce() -> Result<()>, target_logits: *const std::ffi::c_void,
-        logits: *mut std::ffi::c_void, logits_bytes: usize) -> Result<()> {
-        self.exchange.push_to(1, HIDDEN, hidden, target_hidden, hidden_bytes)?;
-        self.exchange.wait(0, HIDDEN)?;
-        head()?;
-        self.exchange.push_to(0, LOGITS, target_logits, logits, logits_bytes)?;
-        self.exchange.wait(1, LOGITS)
+        hidden_bytes: usize,
+        head: impl FnOnce(*const std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> Result<()>,
+        target_logits: *const std::ffi::c_void, logits: *mut std::ffi::c_void, logits_bytes: usize) -> Result<()> {
+        head_route(self.head_rank,
+            || {
+                self.exchange.push_to(1, HIDDEN, hidden, target_hidden, hidden_bytes)?;
+                self.exchange.wait(0, HIDDEN)
+            },
+            |local| if local {
+                self.exchange.on(1, || head(hidden, logits, self.stream.raw))
+            } else {
+                head(target_hidden.cast_const(), target_logits.cast_mut(), self.exchange.stream(0))
+            },
+            || {
+                self.exchange.push_to(0, LOGITS, target_logits, logits, logits_bytes)?;
+                self.exchange.wait(1, LOGITS)
+            })
     }
 }
 
@@ -189,13 +220,55 @@ mod tests {
         schedule.push(1, "draft", CONTEXT, "context readers finished");
     }
 
-    fn draft(schedule: &mut Schedule) {
+    fn draft_on(schedule: &mut Schedule, head_rank: usize) {
+        check_head_rank(head_rank).unwrap();
         schedule.push(0, "draft", INPUT, "target input gathered");
         schedule.wait(1, "draft", INPUT, "draft input arrived");
-        schedule.push(1, "draft", HIDDEN, "draft hidden normalized");
-        schedule.wait(0, "draft", HIDDEN, "target head input arrived");
-        schedule.push(0, "draft", LOGITS, "target head finished");
-        schedule.wait(1, "draft", LOGITS, "draft selector logits arrived");
+        if head_rank == 0 {
+            schedule.push(1, "draft", HIDDEN, "draft hidden normalized");
+            schedule.wait(0, "draft", HIDDEN, "target head input arrived");
+            schedule.push(0, "draft", LOGITS, "target head finished");
+            schedule.wait(1, "draft", LOGITS, "draft selector logits arrived");
+        }
+    }
+
+    fn draft(schedule: &mut Schedule) { draft_on(schedule, 0); }
+
+    #[test]
+    fn either_head_owner_preserves_input_context_order_without_extra_waits() {
+        for head_rank in 0..2 {
+            for rounds in [1, 2, 8, 32] {
+                let mut schedule = Schedule::default();
+                for round in 0..rounds {
+                    update(&mut schedule, round > 0);
+                    draft_on(&mut schedule, head_rank);
+                }
+                schedule.wait(0, "draft", CONTEXT, "request boundary context readers");
+                schedule.end_request();
+                assert_eq!(order::check(&schedule), Ok(()));
+            }
+        }
+        assert!(check_head_rank(2).is_err());
+        assert!(check_head_rank(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn head_routing_executes_only_owning_rank_and_stops_on_failure() -> Result<()> {
+        for rank in 0..2 {
+            let calls = std::cell::RefCell::new(Vec::new());
+            head_route(rank, || { calls.borrow_mut().push("hidden"); Ok(()) },
+                |local| { calls.borrow_mut().push(if local { "head1" } else { "head0" }); Ok(()) },
+                || { calls.borrow_mut().push("logits"); Ok(()) })?;
+            assert_eq!(*calls.borrow(), if rank == 0 { vec!["hidden", "head0", "logits"] } else { vec!["head1"] });
+            calls.borrow_mut().clear();
+            assert!(head_route(rank, || { calls.borrow_mut().push("hidden"); Ok(()) },
+                |_| { calls.borrow_mut().push("failed head"); anyhow::bail!("selection failed") },
+                || { calls.borrow_mut().push("logits"); Ok(()) }).is_err());
+            assert!(!calls.borrow().contains(&"logits"));
+        }
+        assert!(head_route(2, || panic!("invalid rank sent hidden"),
+            |_| panic!("invalid rank ran head"), || panic!("invalid rank sent logits")).is_err());
+        Ok(())
     }
 
     #[test]

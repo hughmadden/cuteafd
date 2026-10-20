@@ -24,17 +24,29 @@ pub enum DsparkRope {
         rope_theta: f64,
         factor: f64,
         original_max_position_embeddings: usize,
+        #[serde(default = "default_beta_fast")]
         beta_fast: f64,
+        #[serde(default = "default_beta_slow")]
         beta_slow: f64,
+        #[serde(default)]
+        mscale: Option<f64>,
+        #[serde(default)]
+        mscale_all_dim: Option<f64>,
     },
 }
+
+fn default_beta_fast() -> f64 { 32.0 }
+fn default_beta_slow() -> f64 { 1.0 }
 
 /// Immutable draft-only rotary inputs. The legacy 64-wide default route
 /// computes its frequencies in the kernel instead of consuming this table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DsparkRotaryPlan {
     pub inv_freq: Vec<f32>,
+    /// Magnitude applied to rotary query/key coordinates.
     pub attention_factor: f32,
+    /// Additional MLA softmax multiplier, separate from rotary magnitude.
+    pub softmax_factor: f32,
 }
 
 impl DsparkRope {
@@ -53,6 +65,8 @@ impl DsparkRope {
                 original_max_position_embeddings,
                 beta_fast,
                 beta_slow,
+                mscale,
+                mscale_all_dim,
             } => {
                 if !factor.is_finite()
                     || factor < 1.0
@@ -61,6 +75,8 @@ impl DsparkRope {
                     || !beta_slow.is_finite()
                     || beta_fast <= beta_slow
                     || beta_slow <= 0.0
+                    || [mscale, mscale_all_dim].into_iter().flatten()
+                        .any(|scale| !scale.is_finite() || scale < 0.0)
                 {
                     return Err(Unsupported("invalid YaRN rotary parameters".into()));
                 }
@@ -80,8 +96,17 @@ impl DsparkRope {
                 "rotary theta must be finite and greater than one in FP32".into(),
             ));
         }
-        let attention_factor =
-            yarn.map_or(1.0, |(factor, _, _, _)| (1.0 + 0.1 * factor.ln()) as f32);
+        let (attention_factor, softmax_factor) = match *self {
+            Self::Yarn { factor, mscale, mscale_all_dim, .. } => {
+                let magnitude = |scale: f64| if factor <= 1.0 { 1.0 }
+                    else { 1.0 + 0.1 * scale * factor.ln() };
+                // MLA separates the rotary-coordinate magnitude from the
+                // all-dimension query scale. GQA without these fields keeps HF YaRN.
+                let all = magnitude(mscale_all_dim.unwrap_or(0.0));
+                ((magnitude(mscale.unwrap_or(1.0)) / all) as f32, (all * all) as f32)
+            }
+            Self::Default { .. } => (1.0, 1.0),
+        };
         let correction = yarn.map(|(_, original, fast, slow)| {
             let dimension = |rotations: f64| {
                 head_dim as f64 * (original as f64 / (rotations * 2.0 * std::f64::consts::PI)).ln()
@@ -110,7 +135,8 @@ impl DsparkRope {
                 }
             })
             .collect::<Vec<_>>();
-        if !attention_factor.is_finite() || inv_freq.iter().any(|x| !x.is_finite() || *x <= 0.0) {
+        if !attention_factor.is_finite() || !softmax_factor.is_finite()
+            || inv_freq.iter().any(|x| !x.is_finite() || *x <= 0.0) {
             return Err(Unsupported(
                 "rotary plan is not representable in FP32".into(),
             ));
@@ -118,6 +144,7 @@ impl DsparkRope {
         Ok(DsparkRotaryPlan {
             inv_freq,
             attention_factor,
+            softmax_factor,
         })
     }
 }
@@ -263,27 +290,8 @@ impl BlockDsparkConfig {
                 ))
             }
         };
-        match t.rope_parameters {
-            DsparkRope::Default { rope_theta } if rope_theta.is_finite() && rope_theta > 1.0 => (),
-            DsparkRope::Yarn {
-                rope_theta,
-                factor,
-                original_max_position_embeddings,
-                beta_fast,
-                beta_slow,
-            } if rope_theta.is_finite()
-                && rope_theta > 1.0
-                && factor.is_finite()
-                && factor >= 1.0
-                && original_max_position_embeddings > 0
-                && beta_fast.is_finite()
-                && beta_slow.is_finite()
-                && beta_fast > beta_slow
-                && beta_slow > 0.0 =>
-            {
-                ()
-            }
-            _ => return Err(Unsupported("invalid RoPE parameters".into())),
+        if t.rope_parameters.plan(t.head_dim)?.softmax_factor != 1.0 {
+            return Err(Unsupported("GQA dSpark has no all-dimension YaRN softmax scale".into()));
         }
         if let Some(target_layers) = raw["num_target_layers"].as_u64() {
             if taps.iter().any(|&l| l as u64 >= target_layers) {
@@ -476,6 +484,37 @@ mod tests {
         }
         assert_eq!(plan, c.rope.plan(c.head_dim).unwrap());
         assert!(plan.inv_freq.windows(2).all(|p| p[0] > p[1]));
+    }
+
+    #[test]
+    fn mla_yarn_separates_rotary_magnitude_and_softmax_scale() {
+        let raw = json!({"rope_type":"yarn", "rope_theta":50000.0,
+            "factor":32.0, "original_max_position_embeddings":32768,
+            "mscale":1.0, "mscale_all_dim":1.0});
+        let rope: DsparkRope = serde_json::from_value(raw.clone()).unwrap();
+        let plan = rope.plan(64).unwrap();
+        assert_eq!(plan.attention_factor, 1.0);
+        assert_eq!(plan.softmax_factor, (1.0 + 0.1 * 32.0f64.ln()).powi(2) as f32);
+        let mut explicit = raw.clone();
+        explicit["beta_fast"] = json!(32.0);
+        explicit["beta_slow"] = json!(1.0);
+        assert_eq!(plan, serde_json::from_value::<DsparkRope>(explicit).unwrap().plan(64).unwrap());
+        let mut scaled = raw.clone();
+        scaled["mscale"] = json!(0.5);
+        let scaled = serde_json::from_value::<DsparkRope>(scaled).unwrap().plan(64).unwrap();
+        assert_eq!(scaled.inv_freq, plan.inv_freq);
+        assert_eq!(scaled.softmax_factor, plan.softmax_factor);
+        assert_eq!(scaled.attention_factor,
+            ((1.0 + 0.05 * 32.0f64.ln()) / (1.0 + 0.1 * 32.0f64.ln())) as f32);
+        for field in ["mscale", "mscale_all_dim"] {
+            let mut invalid = raw.clone();
+            invalid[field] = json!(-1.0);
+            assert!(serde_json::from_value::<DsparkRope>(invalid).unwrap().plan(64).is_err());
+        }
+        let mut unit = raw;
+        unit["factor"] = json!(1.0);
+        let unit = serde_json::from_value::<DsparkRope>(unit).unwrap().plan(64).unwrap();
+        assert_eq!((unit.attention_factor, unit.softmax_factor), (1.0, 1.0));
     }
 
     #[test]
