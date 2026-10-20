@@ -137,10 +137,126 @@ impl PendingSparkAdmission {
     }
 }
 
+/// Placement and reservations are final; only worker validation is pending.
+/// Keep loaded owners local until validation succeeds, before any serving pool or link.
+pub(crate) fn load_while_admitting<T>(pending: Option<PendingSparkAdmission>,
+    load: impl FnOnce() -> Result<T>) -> Result<T> {
+    let started = std::time::Instant::now();
+    tracing::info!(spark_pending = pending.is_some(), "loading admitted coordinator target weights");
+    let loaded = load()?;
+    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+        "coordinator target weights loaded; awaiting Spark admission");
+    if let Some(pending) = pending { pending.wait()?; }
+    Ok(loaded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cuteafd_core::{RuntimeSample, SparkEndpoint, SparkIngress, SparkRuntimeInventory};
+
+    struct LoadedOwners(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for LoadedOwners {
+        fn drop(&mut self) { self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+    }
+
+    fn pending_fixture() -> Result<(PendingSparkAdmission, Vec<std::net::TcpListener>)> {
+        let plan = idle_plan()?;
+        let listeners = (0..2).map(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let peers = listeners.iter().map(|listener| listener.local_addr())
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let timeout = Duration::from_secs(5);
+        let pending = cuteafd_transport::worker_selection::start_model_admission(
+            &peers, &plan.selection, timeout)?;
+        Ok((PendingSparkAdmission { plan, pending, timeout }, listeners))
+    }
+
+    #[test]
+    fn coordinator_load_overlaps_slow_admission_and_returns_only_after_reconciliation() -> Result<()> {
+        let (pending, listeners) = pending_fixture()?;
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut workers = Vec::new();
+        for (rank, listener) in listeners.into_iter().enumerate() {
+            let (release, hold) = std::sync::mpsc::channel();
+            releases.push(release);
+            workers.push(std::thread::spawn(move || -> Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                let selection = cuteafd_transport::worker_selection::receive_worker_selection(
+                    &stream, rank, Duration::from_secs(5))?;
+                hold.recv_timeout(Duration::from_secs(5))?;
+                cuteafd_transport::worker_selection::acknowledge_model_admission(
+                    &mut stream, rank, &selection, Some(&idle_report(rank as u32)))
+            }));
+        }
+        let owned_drops = drops.clone();
+        let coordinator = std::thread::spawn(move || {
+            let result = load_while_admitting(Some(pending), || {
+                loaded_tx.send(())?;
+                Ok(LoadedOwners(owned_drops))
+            });
+            done_tx.send(result).unwrap();
+        });
+        loaded_rx.recv_timeout(Duration::from_secs(5))?;
+        assert!(matches!(done_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for release in releases { release.send(())?; }
+        let owners = done_rx.recv_timeout(Duration::from_secs(5))??;
+        for worker in workers { worker.join().unwrap()?; }
+        coordinator.join().unwrap();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(owners);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_failure_after_load_drops_coordinator_owners_without_publishing() -> Result<()> {
+        for reject in [false, true] {
+            let (pending, listeners) = pending_fixture()?;
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut releases = Vec::new();
+            let workers = listeners.into_iter().enumerate().map(|(rank, listener)| {
+                let (release, hold) = std::sync::mpsc::channel();
+                releases.push(release);
+                std::thread::spawn(move || -> Result<()> {
+                    let (mut stream, _) = listener.accept()?;
+                    let selection = cuteafd_transport::worker_selection::receive_worker_selection(
+                        &stream, rank, Duration::from_secs(5))?;
+                    hold.recv_timeout(Duration::from_secs(5))?;
+                    if reject {
+                        cuteafd_transport::worker_selection::reject_worker_selection(
+                            &mut stream, &anyhow::anyhow!("fixture Spark load failed"))
+                    } else {
+                        let mut report = idle_report(rank as u32);
+                        report.resident_bytes = 1;
+                        cuteafd_transport::worker_selection::acknowledge_model_admission(
+                            &mut stream, rank, &selection, Some(&report))
+                    }
+                })
+            }).collect::<Vec<_>>();
+            let result = load_while_admitting(Some(pending), || {
+                let owners = LoadedOwners(drops.clone());
+                for release in releases { release.send(())?; }
+                Ok(owners)
+            });
+            assert!(result.is_err());
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+            for worker in workers { worker.join().unwrap()?; }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_only_load_needs_no_worker_admission() -> Result<()> {
+        assert_eq!(load_while_admitting(None, || Ok(42))?, 42);
+        assert!(load_while_admitting::<()>(None, || anyhow::bail!("load failed")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn admission_timeout_uses_launch_bound_and_rejects_invalid_values() -> Result<()> {

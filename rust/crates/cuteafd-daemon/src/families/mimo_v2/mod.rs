@@ -856,7 +856,7 @@ impl Opened {
         let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
         let args = &resolved;
-        if args.peers.is_some() {
+        let admission = if args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker admission needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
@@ -873,10 +873,10 @@ impl Opened {
                     usize::try_from(preflight.working_set.prefill_lanes)?],
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
-            crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
+            Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
                 &preflight.working_set, peers.len(), None, model)?
-                .select(&peers)?;
-        }
+                .start(&peers)?)
+        } else { None };
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
@@ -900,8 +900,10 @@ impl Opened {
             output_formats: &self.weight_formats.output,
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
-        let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
+        let (embedding, (model, mut shares)) = crate::shared::placement::load_while_admitting(admission, || {
+            crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+                args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })
+        })?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let available = self.checkpoint.tensor_names()

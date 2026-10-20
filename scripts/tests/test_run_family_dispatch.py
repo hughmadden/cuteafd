@@ -484,13 +484,29 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert startup.index("draft.prime(&engine.embedding, engine.draft_head())?") < startup.index("let result = with_startup_graphs(")
 
 
-def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() -> None:
+def test_shared_startup_load_overlaps_admission_before_serving_allocation() -> None:
+    for family, engine in [("glm5", "GlmEngine"), ("glm5_flash", "GlmfEngine"), ("mimo_v2", "MimoEngine")]:
+        source = (ROOT / f"rust/crates/cuteafd-daemon/src/families/{family}/mod.rs").read_text()
+        start = source.index("let admission = if")
+        body = source[start:]
+        assert body.index(".start(&peers)?") < body.index("load_while_admitting(admission,")
+        assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
+        assert body.index("TokenEmbedding::load(") < body.index(f"engine::{engine}::new(")
+        assert ".select(&peers)?" not in body
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/placement.rs").read_text()
+    helper = shared.split("pub(crate) fn load_while_admitting", 1)[1].split("#[cfg(test)]", 1)[0]
+    assert helper.index("let loaded = load()?") < helper.index("pending.wait()?") < helper.index("Ok(loaded)")
+
+
+def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> None:
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
     body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]
     assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("SparkAdmission::plan(")
     assert body.index("SparkAdmission::plan(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
-    assert "model)?.select(&peers)?" in body
+    assert "model)?.start(&peers)?)" in body
+    assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
+    assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body
     assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
     assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
