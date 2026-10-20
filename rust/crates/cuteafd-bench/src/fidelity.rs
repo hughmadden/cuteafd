@@ -265,8 +265,8 @@ pub fn verdict(run: &Run) -> Verdict {
         }
     }
     generated.records.clear();
-    let label = if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
-        Some("reference-only qualified; common policy floor, not engine calibration".into())
+    let label = if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference") {
+        Some("reference; common policy floor, not engine calibration".into())
     } else {
         (run.tier == crate::fidelity_dataset::STANDARD_TIER).then(||
             run.dataset.as_ref().and_then(|d| d["standard_subset"]["mode"].as_str())
@@ -433,7 +433,8 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
     if a.tier != "quick" {
         let pinned = a.dataset.as_ref().is_some_and(|d| d["revision"].as_str().is_some_and(|r|
             r.len() == 40 && r.bytes().all(|c| c.is_ascii_hexdigit())));
-        ensure!(a.kl_kind == "full-vocabulary" || (pinned && (a.kl_kind == "qualified-top1024-plus-tail"
+        ensure!(a.kl_kind == "full-vocabulary" || (pinned && (matches!(a.kl_kind.as_str(),
+            "qualified-top1024-plus-tail" | "reference-top1024-plus-tail")
             || (code && a.kl_kind == "reference-only-top1024-plus-tail"))),
             "full tier requires full-vocabulary or revision-pinned qualified top1024 KL");
     }
@@ -622,18 +623,18 @@ mod tests {
     }
 
     #[test]
-    fn reference_only_scores_are_not_paired_calibration() {
+    fn reference_scores_use_policy_floors_and_support_paired_comparison() {
         for tier in ["quick", "full", crate::fidelity_dataset::STANDARD_TIER] {
             let mut scored = run(8, 512);
             scored.tier = tier.into();
-            scored.kl_kind = "reference-only-top1024-plus-tail".into();
-            scored.dataset = Some(serde_json::json!({"qualification":"reference-only qualified"}));
+            scored.kl_kind = "reference-top1024-plus-tail".into();
+            scored.dataset = Some(serde_json::json!({"qualification":"reference", "revision":"a".repeat(40)}));
             assert!(verdict(&scored).label.unwrap().contains("common policy floor"));
-            assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).unwrap_err()
-                .to_string().contains("lack paired engine calibration"));
-            // A code A/B is not refused for calibration (this synthetic set fails later checks).
-            assert!(!compare_paired(&scored, &scored, 0.005, 0.005, 100, 1, Pairing::CodeChange)
-                .is_err_and(|e| e.to_string().contains("lack paired engine calibration")));
+            assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).unwrap().pass);
+            if tier != "quick" {
+                scored.dataset.as_mut().unwrap()["revision"] = serde_json::Value::Null;
+                assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).is_err());
+            }
         }
     }
 
