@@ -452,8 +452,8 @@ mod tests {
         use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
         let root = tempfile::tempdir()?;
         let (tensors, _) = qwen4_exl3(1, 4);
-        let tensors: Vec<_> = tensors.into_iter().filter(|tensor| !tensor.name.contains(".experts.")
-            || tensor.name.contains(".experts.0.")).collect();
+        let tensors: Vec<_> = tensors.into_iter().filter(|tensor| !tensor.0.contains(".experts.")
+            || tensor.0.contains(".experts.0.")).collect();
         let mut config = qwen4_config(1);
         config["text_config"]["num_experts"] = serde_json::json!(1);
         config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
