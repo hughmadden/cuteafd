@@ -541,8 +541,9 @@ fn unknown_tensor_and_context_ownership_fail_closed() {
         attention_placement:Some(crate::placement::AttentionPlacement::Context),
         layout:Some(layout::LayoutOptions { rtx_bytes:vec![96<<30;2], ..Default::default() }),
         ..Default::default() }).unwrap();
-    assert!(!r.placement_supported);
-    assert!(r.hints.iter().any(|h|h.what.contains("non-native attention ownership")));
+    assert!(!r.wip_launchable() && !r.native_serving_admitted);
+    assert!(r.config_error.as_deref().is_some_and(|e| e.contains("context")));
+    assert!(r.hints.iter().any(|h|h.what.contains("executor not implemented")));
 }
 
 #[test]

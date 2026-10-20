@@ -290,6 +290,21 @@ mod tests {
     }
 
     #[test]
+    fn step5_context_uses_registered_native_attention_placement() {
+        for extra in [vec![], vec!["--split-device", "1"]] {
+            let argv = ["cuteafd", "serve-step5", "--snapshot", "/s", "--native-lib", "/l", "--peers", "127.0.0.1:19000"]
+                .into_iter().chain(extra).collect::<Vec<_>>();
+            let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
+            let context = serve_context(&matches, None).unwrap().expect("Step-5 serve context");
+            assert_eq!(context.family.as_deref(), Some("step5"));
+            let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
+            assert_eq!(placement.value.as_deref(), Some("heads"));
+            assert_eq!(placement.default.as_deref(), Some("heads"));
+            assert!(attention_mode("step5", matches.subcommand().unwrap().1, "context").is_err());
+        }
+    }
+
+    #[test]
     fn context_load_arguments_parse_and_validate() {
         let args = |lengths: &str, levels: &str| crate::cli::Cli::command().try_get_matches_from([
             "cuteafd", "bench", "--panels", "context_load", "--context-lengths", lengths, "--context-levels", levels]);

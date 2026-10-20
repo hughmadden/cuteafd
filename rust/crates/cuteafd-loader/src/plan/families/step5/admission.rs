@@ -152,12 +152,7 @@ const WHOLE1: LayerMode = LayerMode::Whole {
     gpu: 1,
     ffn: FfnMode::Owner,
 };
-const EXECUTOR: ExecutorModes = ExecutorModes {
-    family: "step5",
-    modes: &[WHOLE0, WHOLE1, LayerMode::HeadSplit],
-    hops: true,
-    attention: AttentionPlacement::Heads,
-};
+const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 
 /// All demands are future to the pre-weight inventory. Startup phases are
 /// absolute additional peaks above that same sample, not steady-state deltas.
