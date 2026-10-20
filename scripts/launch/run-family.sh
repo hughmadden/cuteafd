@@ -2794,7 +2794,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   ((${#RELEASE_PROFILE_ARGS[@]} == 0)) || worker_profile=" $(printf '%q ' "${RELEASE_PROFILE_ARGS[@]}")"
   [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && release_require_writable_state $(printf '%q' "$(get PROFILE_DIR)") && "
   ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no \"\${CUTEAFD_CDI_ARGS[@]}\" --network host \
-    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info ${shared_worker_env_args[*]}$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
+    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info $(printf '%q ' "${shared_worker_env_args[@]}")$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/hf/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --device-budget-bytes $budget $spark_worker_args \
