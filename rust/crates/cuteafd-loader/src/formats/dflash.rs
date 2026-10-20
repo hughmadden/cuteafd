@@ -260,11 +260,44 @@ impl MlaDflashConfig {
     }
 
     pub fn bf16_weight_bytes(&self) -> Result<u64> {
-        self.tensor_shapes().iter().try_fold(0u64, |total, (_, shape)| {
-            let bytes = shape.iter().try_fold(2u64, |n, &d| n.checked_mul(d as u64))
-                .ok_or_else(|| unsupported("MLA draft weight byte overflow"))?;
-            total.checked_add(bytes).ok_or_else(|| unsupported("MLA draft weight total overflow"))
-        })
+        self.weight_layout(crate::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only)?
+            .resident_bytes().map_err(|_| unsupported("MLA draft weight total overflow"))
+    }
+
+    /// The native MLA projections remain BF16 in both arms. Only the shared
+    /// FC, selector projection, convolution projections and MLP matrices use
+    /// the optional FP8 representation; embeddings and the head remain borrowed.
+    pub fn weight_layout(&self,
+        mode: crate::families::glm5::draft_representation::GlmDraftRepresentation)
+        -> Result<crate::families::glm5::draft_representation::GlmDraftWeightLayout> {
+        use crate::families::glm5::draft_representation::{GlmDraftRepresentation, GlmDraftWeightLayout};
+        let overflow = || unsupported("MLA draft weight admission overflow");
+        let mut layout = GlmDraftWeightLayout { bf16_values: 0, fp8_values: 0, fp8_scales: 0,
+            bf16_auxiliary: 0, bf16_codebooks: 0, max_load_staging: 0 };
+        for (name, shape) in self.tensor_shapes() {
+            let values = shape.iter().try_fold(1u64, |n, &d| n.checked_mul(d as u64))
+                .ok_or_else(overflow)?;
+            let bytes = values.checked_mul(2).ok_or_else(overflow)?;
+            let codebook = name.ends_with("_codebook");
+            let matrix = name == "fc.weight" || name == "candidate_selector.hidden_projection.weight"
+                || name.contains(".kernel_projection.") || name.contains(".mlp.");
+            let fp8 = matrix && mode == GlmDraftRepresentation::Fp8Only;
+            let destination = if fp8 {
+                if shape.len() != 2 || shape[0] % 16 != 0 || shape[1] % 128 != 0 {
+                    return Err(unsupported("MLA draft FP8 GEMMs require N multiples of 16 and K multiples of 128"));
+                }
+                layout.fp8_scales = layout.fp8_scales.checked_add(values / 128 * 4)
+                    .ok_or_else(overflow)?;
+                layout.max_load_staging = layout.max_load_staging.max(bytes);
+                &mut layout.fp8_values
+            } else if codebook { &mut layout.bf16_codebooks }
+            else if shape.len() == 1 || name.ends_with(".base_kernel") { &mut layout.bf16_auxiliary }
+            else { &mut layout.bf16_values };
+            *destination = destination.checked_add(if fp8 { values } else { bytes })
+                .ok_or_else(overflow)?;
+        }
+        layout.loading_peak_bytes().map_err(|_| overflow())?;
+        Ok(layout)
     }
 
     /// Cache admission shared by planner and runtime. Full layers admit the
@@ -364,6 +397,33 @@ mod tests {
         assert!(cfg.cache_bytes(0, 262144).is_err());
         assert!(cfg.cache_bytes(8, 1048577).is_err());
         assert!(cfg.cache_bytes(usize::MAX, 1048576).is_err());
+    }
+
+    #[test]
+    fn precision_inventory_keeps_native_mla_and_codebooks_bf16_without_dual_copies() {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation::{Bf16Only, Fp8Only};
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        let bf16 = cfg.weight_layout(Bf16Only).unwrap();
+        let fp8 = cfg.weight_layout(Fp8Only).unwrap();
+        assert_eq!(bf16.resident_bytes().unwrap(), 5_036_945_408);
+        assert_eq!((bf16.fp8_values, bf16.fp8_scales, bf16.max_load_staging), (0, 0, 0));
+        assert_eq!(bf16.bf16_codebooks, 2 * cfg.vocab as u64 * cfg.selector_rank as u64 * 2);
+        assert_eq!(fp8.bf16_codebooks, bf16.bf16_codebooks);
+        assert_eq!(fp8.bf16_auxiliary, bf16.bf16_auxiliary);
+        let native_mla = cfg.tensor_shapes().iter().filter(|(name, shape)|
+            name.contains(".self_attn.") && shape.len() == 2)
+            .map(|(_, shape)| shape.iter().product::<usize>() as u64 * 2).sum::<u64>();
+        assert_eq!(fp8.bf16_values, native_mla);
+        assert_eq!(bf16.bf16_values - fp8.bf16_values, 2 * fp8.fp8_values);
+        assert_eq!(fp8.fp8_scales, fp8.fp8_values / 128 * 4);
+        assert_eq!(fp8.max_load_staging, 2 * 7168 * 5 * 7168);
+        assert_eq!(fp8.loading_peak_bytes().unwrap(), fp8.resident_bytes().unwrap() + fp8.max_load_staging);
+        assert!(fp8.resident_bytes().unwrap() < bf16.resident_bytes().unwrap());
+        assert!(fp8.loading_peak_bytes().unwrap() < bf16.resident_bytes().unwrap());
+        let mut unsupported = cfg;
+        unsupported.intermediate += 1;
+        assert!(unsupported.weight_layout(Fp8Only).is_err());
+        assert!(unsupported.weight_layout(Bf16Only).is_ok());
     }
 
     #[test]
