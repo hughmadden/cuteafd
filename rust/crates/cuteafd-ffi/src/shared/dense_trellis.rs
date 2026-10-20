@@ -323,9 +323,22 @@ impl DenseTrellisPolicy {
         Self::from_metadata(programs.family_metadata("kimi_k6_dense")?,shape,codebook)
     }
     fn from_metadata(family:&serde_json::Value,shape:&str,codebook:&str)->Result<Self> {
+        Self::select_metadata(family, |p| p["shape"].as_str()==Some(shape) && p["codebook"].as_str()==Some(codebook))
+    }
+    /// Projection labels do not affect arithmetic. In particular, MLA TP2 g/o
+    /// share the KDA TP2 geometries; select exactly one policy, never the first.
+    pub fn from_package_geometry(programs:&Programs<'_>,input:usize,output:usize,side:usize,codebook:&str)->Result<Self> {
+        Self::from_geometry_metadata(programs.family_metadata("kimi_k6_dense")?,input,output,side,codebook)
+    }
+    fn from_geometry_metadata(family:&serde_json::Value,input:usize,output:usize,side:usize,codebook:&str)->Result<Self> {
+        Self::select_metadata(family, |p| p["input_features"].as_u64()==Some(input as u64)
+            && p["output_features"].as_u64()==Some(output as u64)
+            && p["sharded_side"].as_u64()==Some(side as u64) && p["codebook"].as_str()==Some(codebook))
+    }
+    fn select_metadata(family:&serde_json::Value,select:impl Fn(&serde_json::Value)->bool)->Result<Self> {
         if family["abi_version"].as_u64()!=Some(1) { return Err(DenseTrellisError::Invalid("row-policy ABI")); }
         let entries=family["row_policies"].as_array().ok_or(DenseTrellisError::Invalid("row-policy list"))?;
-        let mut matches=entries.iter().filter(|p|p["shape"].as_str()==Some(shape)&&p["codebook"].as_str()==Some(codebook));
+        let mut matches=entries.iter().filter(|p|select(p));
         let selected=matches.next().ok_or(DenseTrellisError::Invalid("missing row policy"))?;
         if matches.next().is_some() { return Err(DenseTrellisError::Invalid("duplicate row policy")); }
         let mut policy=Self::parse(selected)?;
@@ -440,6 +453,39 @@ mod policy_tests {
         assert!(DenseTrellisPolicy::from_metadata(&family,"test","mul1").is_err());
         family["row_policies"].as_array_mut().unwrap().push(policy());
         assert!(DenseTrellisPolicy::from_metadata(&family,"test","mcg").is_err());
+    }
+    #[test]
+    fn mla_tp2_gate_output_reuse_exact_kda_geometry_and_reject_ambiguity() {
+        let make=|shape:&str,k:usize,n:usize,side:usize,book:&str| {
+            let mut p=policy();
+            for (key,value) in [("shape",serde_json::json!(shape)),("input_features",serde_json::json!(k)),
+                ("output_features",serde_json::json!(n)),("sharded_side",serde_json::json!(side)),
+                ("codebook",serde_json::json!(book)),("weight_scratch_bytes",serde_json::json!(128*k*2)),
+                ("native_program",serde_json::json!(format!("trellis_{shape}_{book}")))] {p[key]=value;}
+            p
+        };
+        let mut entries=Vec::new();
+        for book in ["mcg","mul1"] {
+            for (shape,k,n,side) in [("kda_qkvg_tp2",7168,6144,1),("kda_o_tp2",6144,7168,2),
+                ("mla_g_owned",7168,12288,1),("mla_o_owned",12288,7168,1)] {
+                entries.push(make(shape,k,n,side,book));
+            }
+        }
+        let mut family=serde_json::json!({"abi_version":1,"row_policies":entries});
+        for book in ["mcg","mul1"] {
+            for (k,n,side,name) in [(7168,6144,1,"kda_qkvg_tp2"),(6144,7168,2,"kda_o_tp2")] {
+                let resolved=DenseTrellisPolicy::from_geometry_metadata(&family,k,n,side,book).unwrap();
+                assert_eq!(resolved.shape,name);
+                assert_eq!(resolved.native,format!("kimi_k6_dense_trellis_{name}_{book}"));
+            }
+        }
+        assert!(DenseTrellisPolicy::from_geometry_metadata(&family,6144,7168,1,"mcg").is_err());
+        assert!(DenseTrellisPolicy::from_geometry_metadata(&family,7168,6144,1,"f16").is_err());
+        family["row_policies"].as_array_mut().unwrap().push(make("mla_g_tp2",7168,6144,1,"mcg"));
+        assert!(matches!(DenseTrellisPolicy::from_geometry_metadata(&family,7168,6144,1,"mcg"),
+            Err(DenseTrellisError::Invalid("duplicate row policy"))));
+        family["abi_version"]=serde_json::json!(2);
+        assert!(DenseTrellisPolicy::from_geometry_metadata(&family,6144,7168,2,"mul1").is_err());
     }
     #[test]
     fn package_policy_owns_exact_64_row_boundary_and_scratch() {
