@@ -256,7 +256,7 @@ mod tests {
                     }
                     inputs.marks.entries = 0;
                     assert!(checkpoint_admission(&checkpoint, &inputs).is_ok());
-                    inputs.marks.entries = entries;
+                    inputs.marks.entries = usize::try_from(entries)?;
                     inputs.context = 262_144;
                     assert!(checkpoint_admission(&checkpoint, &inputs).is_ok());
                 }
