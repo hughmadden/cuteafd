@@ -2404,10 +2404,6 @@ case "$family" in
   deepseek_v4) ;;
   glm5)
     selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"
-    if [[ -n "$exlr8_manifest" ]]; then
-      [[ -z "${CUTEAFD_GLM_PREFILL_LANES:-}" || "$CUTEAFD_GLM_PREFILL_LANES" == 1 ]] || release_die "EXLR8 requires one serial prefill lane"
-      selected_lanes=1
-    fi
     [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
     if [[ "$ranks" == 0 ]]; then
       selected_lanes=1

@@ -70,7 +70,7 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
     assert plan[plan.index("--exlr8-manifest") + 1] == manifest
     dense = plan[plan.index("--exlr8-dense-from") + 1]
     assert dense.startswith("/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
-    assert "CUTEAFD_GLM_PREFILL_LANES=1" in plan
+    assert "CUTEAFD_GLM_PREFILL_LANES=3" in plan
     assert len(result["containers"]) == 5
     for run in result["containers"]:
         parsed = parse_run(run["argv"])
@@ -78,10 +78,25 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
         assert command[command.index("--exlr8-manifest") + 1] == manifest
         if "serve-glm" in command:
             assert command[command.index("--exlr8-dense-from") + 1] == dense
-            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "1"
+            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "3"
         else:
             assert "expertd-native" in command
             assert "--exlr8-dense-from" not in command
+
+
+@pytest.mark.parametrize("lanes", ["1", "2", "3", "4"])
+def test_exlr8_launcher_preserves_explicit_prefill_lanes(lanes: str, tmp_path: Path) -> None:
+    source = ROOT / "scripts/launch/run-family.sh"
+    launcher = tmp_path / "run-family.sh"
+    launcher.write_text(source.read_text().replace(
+        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"',
+        f'    CUTEAFD_GLM_PREFILL_LANES={lanes}\n'
+        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"'))
+    result = capture(ROOT, f"exlr8-lanes-{lanes}", release_entry=exlr8_entry(),
+        launcher_source=launcher)
+    assert f"CUTEAFD_GLM_PREFILL_LANES={lanes}" in result["plans"][0]
+    coordinator = parse_run(result["containers"][0]["argv"])
+    assert coordinator["env"]["CUTEAFD_GLM_PREFILL_LANES"] == lanes
 
 
 @pytest.mark.parametrize("ranks", range(1, 7))
