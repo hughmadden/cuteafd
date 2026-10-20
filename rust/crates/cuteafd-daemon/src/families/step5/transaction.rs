@@ -100,35 +100,7 @@ impl<'a> Staging<'a> {
         rank: usize,
         sequences: usize,
     ) -> Result<usize> {
-        let layers = layout
-            .ranks
-            .get(rank)
-            .context("Step-5 staging rank")?
-            .regions
-            .len();
-        let step = usize::try_from(layout.ring.step)?;
-        let rows = retained_wave_rows(step, sequences)?;
-        let regions = (step + 7) / 8;
-        let metadata = regions
-            .checked_mul(4)
-            .context("Step-5 region metadata overflow")?
-            .max(256);
-        let scratch = regions
-            .checked_mul(256 * 4)
-            .context("Step-5 region scratch overflow")?
-            .max(256);
-        let table = usize::try_from(layout.context.div_ceil(64))?
-            .checked_mul(4)
-            .context("Step-5 attention table overflow")?
-            .max(256);
-        rows.checked_mul(256 * 2 * 2)
-            .and_then(|n| n.checked_mul(layers))
-            .and_then(|n| n.checked_add(if layers == 0 { 0 } else { metadata.checked_mul(2)? }))
-            .and_then(|n| n.checked_add(if layers == 0 { 0 } else { scratch }))
-            .and_then(|n| n.checked_add(step.checked_mul(8)?.max(256)))
-            .and_then(|n| n.checked_add(step.checked_mul(4)?.max(256)))
-            .and_then(|n| n.checked_add(table.checked_mul(sequences.checked_add(1)?)?))
-            .context("Step-5 staging bytes overflow")
+        cuteafd_loader::plan::families::step5::admission::staging_bytes(layout, rank, sequences)
     }
 
     pub fn new(

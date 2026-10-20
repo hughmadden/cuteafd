@@ -143,7 +143,7 @@ pub(super) struct Inputs<'a> {
 impl<'a> Inputs<'a> {
     pub(super) fn bytes(rows: usize) -> Result<u64> {
         ensure!((1..=4096).contains(&rows), "Step-5 input row capacity");
-        Ok((rows * (4 + H * 6)) as u64)
+        cuteafd_loader::plan::families::step5::admission::input_bytes(rows)
     }
 
     pub(super) fn allocate(device: Device<'a>, rows: usize, available: u64) -> Result<Self> {

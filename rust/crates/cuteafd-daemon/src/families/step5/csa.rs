@@ -77,43 +77,8 @@ impl Admission {
             "CSA staged row capacity must be 1..=8192"
         );
         let pages = rows.div_ceil(64);
-        let regions = rows.div_ceil(8);
         // Scores and top-k scratch are bounded by query tiles, never prefill length.
-        let planes = [
-            rows * H * 4,
-            rows * H * 2,
-            rows * Q * 2,
-            rows * KV * 2,
-            pages * 64 * KV * 2,
-            rows * Q * 2,
-            pages * 64 * KV * 2,
-            rows * 64 * 2,
-            rows * Q * 2,
-            rows * Q * 2,
-            rows * H * 2,
-            rows * H * 4,
-            rows * 8,
-            rows * 4,
-            pages * 4,
-            rows * H * 2,
-            rows * 256 * 2,
-            rows * 256 * 2,
-            rows * H * 2,
-            rows * 256 * 2,
-            rows * 16 * 4,
-            rows * 16 * 2,
-            regions * 4,
-            regions * 4,
-            CAPACITY * 256,
-            regions * 256 * 4,
-            TILE * 4 * CAPACITY * 4,
-            TILE * SELECT * 4,
-            TILE * 4 * CAPACITY * 4,
-            TILE * 4 * 4,
-            TILE * 4 * 512 * 4,
-            TILE * 4 * 512 * 4,
-        ]
-        .map(|n| n.max(256));
+        let planes = cuteafd_loader::plan::families::step5::native::csa_planes(rows)?;
         let bytes = planes
             .iter()
             .map(|&n| n as u64)

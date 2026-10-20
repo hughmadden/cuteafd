@@ -5,6 +5,8 @@ use cuteafd_core::{DType, FfnActivation};
 use crate::plan::{checkpoint::Checkpoint, family::*, format::QuantOperand, names::indexed, spec::*};
 
 mod placement;
+pub mod admission;
+pub mod native;
 pub mod coordinator;
 pub mod ownership;
 #[cfg(test)]
@@ -317,7 +319,7 @@ impl Model {
                 "CSA compresses index keys only: one E4M3 proxy256 summary per eight tokens, original GQA K/V retained; provider-group top-512 regions".into(),
                 "FP32 residual and zero-centered norms; post-SiLU clamp + FP32 product, one BF16 round, for routed/shared/dense FFNs".into(),
                 "ssmax_s [64] FP32 is retained and validated, unused by released kernels; ordinary attention scale 1/sqrt(192)".into(),
-                "Header-only memory lower bounds; no executable kernels, runtime workspace/prefix/graph admission or serving-fit claim".into(),
+                "Target-only eager native admission on the WIP FP8 max card; no release, MTP or media qualification".into(),
             ] };
         let mut spec = spec;
         if complete {
@@ -364,21 +366,27 @@ impl Family for Step5 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
-        let exports = match component {
-            Component::RoutedExpert => "shared stacked FP8 block128 / NVFP4 W4A4 expert-axis reader and native BF16-tail backend; step5 H4096 E352 K8 I1536 TP6(256)/TP4(384) exports; post-SiLU clamp/FP32 product",
-            Component::Attention => "BF16 GQA192 projections, Q/K norms, sigmoid head gate, SWA512 + verify slack, provider-group sparse paged GQA192 prefill/decode/verify exports",
-            Component::Indexer | Component::Compressor => "CSA-8 summarize/commit/rollback, index norm/RoPE/E4M3 rounding, signed weighted-ReLU scores and deterministic provider top-512 region expansion exports",
-            Component::DenseFfn | Component::SharedExpert => "shared BF16 FFN exports with post-SiLU clamp and FP32 product (not existing pre-SiLU clamp kernels)",
-            Component::Vision => "official perception encoder QuickGELU/LayerScale, two downsamplers, BF16 projector and crop/token ordering exports",
-            Component::Speculator => "three BF16 SWA/dense MTP stage exports and independent heads; shared draft policy and exact rollback/prefix adapter",
-            _ => "FP32 residual/zero-centered norm and FP32 sigmoid router with selection-only bias and factor3 primitives",
-        };
-        Some(Hint { what: format!("Step-5 {} kernels/exports missing", component.label()), how: format!("Add {exports}; gate SM120 + SM121 and exact state before enabling runtime.") })
+        match component {
+            Component::Vision => Some(Hint { what: "Step-5 bundled vision is not qualified".into(),
+                how: "Use text-only serving; qualify the official bundled encoder before enabling media.".into() }),
+            Component::Speculator => Some(Hint { what: "Step-5 native MTP remains deferred".into(),
+                how: "Use target-only NoDraft; layers 92..94 are not serving owners.".into() }),
+            _ => None,
+        }
     }
+    fn optional(&self, component: Component) -> bool {
+        matches!(component, Component::Vision | Component::Speculator)
+    }
+    fn expert_catalog(&self) -> bool { true }
+
 }
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
+    fn native_serving_admission(&self) -> bool { true }
+    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
+        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
+    }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         let layout = crate::serving_capacity::step5::Step5CacheLayout::new(
@@ -420,8 +428,27 @@ impl FamilyModel for Model {
                 return Ok(());
             }
         }
-        let hint = STEP5.component_hint(role.component).expect("every component has a hint");
-        Err(format!("{stem}: {}: {}", hint.what, hint.how))
+        if !matches!(role.component, Component::RoutedExpert | Component::Vision | Component::Speculator) {
+            if let Some(tensor) = self.tensors.get(stem).or_else(|| self.tensors.get(&format!("{stem}.weight"))) {
+                let encoding = match tensor.dtype {
+                    DType::Bf16 => Some(crate::plan::format::Encoding::Bf16),
+                    DType::F32 => Some(crate::plan::format::Encoding::F32),
+                    _ => None,
+                };
+                // The index key norm groups its validated FP32 bias with the weight.
+                let companions = operand.companions.is_empty()
+                    || (operand.companions == ["bias"]
+                        && stem.ends_with(".self_attn.sparse_indexer_k_norm")
+                        && self.tensors.get(&format!("{stem}.bias")).is_some_and(|bias|
+                            bias.role == *role && bias.dtype == DType::F32 && bias.shape == tensor.shape));
+                if tensor.role == *role && tensor.shape == operand.logical && tensor.shape == operand.stored
+                    && encoding == Some(operand.encoding) && operand.scale.is_none()
+                    && operand.global_scale.is_none() && operand.input_scale.is_none() && companions {
+                    return Ok(());
+                }
+            }
+        }
+        Err(format!("{stem}: Step-5 {:?} operand is outside the validated target-only native contract", role.component))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let package = if operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
@@ -440,9 +467,9 @@ impl FamilyModel for Model {
             local: Err("Step-5 coordinator-local routed experts are not qualified".into()),
         })
     }
-    fn placement(&self, _input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
+    fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
-        Some(Ok(placement::layout(self, report, options, requested)))
+        Some(placement::layout(self, input, report, options, requested))
     }
 }

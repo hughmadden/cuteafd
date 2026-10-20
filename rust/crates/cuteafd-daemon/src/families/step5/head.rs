@@ -7,7 +7,7 @@ use crate::shared::{
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{
-    programs::{Program, Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE},
+    programs::{Program, Programs, Scalar, VocabularyHead},
     CuteafdDeviceBuffer,
 };
 use cuteafd_loader::plan::{
@@ -31,7 +31,7 @@ pub(super) struct HeadPlan {
 impl HeadPlan {
     fn plane_bytes(rows: usize) -> Result<[usize; 4]> {
         ensure!((1..=4096).contains(&rows), "Step-5 head row capacity must be 1..4096");
-        Ok([rows * H * 2, rows * H * 2, rows * V * 4, VOCABULARY_HEAD_WORKSPACE])
+        cuteafd_loader::plan::families::step5::native::head_planes(rows)
     }
 
     pub fn prepare(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize) -> Result<Self> {

@@ -5,38 +5,7 @@ use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::serving_capacity::step5::{ByteSpan, Step5CacheLayout};
 use std::{cell::{Cell, RefCell}, rc::{Rc, Weak}};
 
-/// Checked cache-only reservations. Weights, code, workspace and transport must
-/// be subtracted before supplying the available bytes to `CacheRank::new`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Reservation {
-    pub(super) active: usize,
-    pub(super) marks: usize,
-    pub(super) pages: usize,
-    pub(super) total: usize,
-}
-
-impl Reservation {
-    pub(super) fn new(layout: &Step5CacheLayout, rank: usize, sequences: u64, slots: u64,
-        pages: u64, available: usize) -> Result<Self> {
-        ensure!(sequences > 0 && pages > 0, "empty Step-5 cache capacity");
-        let state = layout.ranks.get(rank).context("Step-5 cache rank")?;
-        let geometry = layout.geometry.ranks.get(rank).context("Step-5 cache geometry rank")?;
-        let declared = state.regions.iter().try_fold(0u64, |sum, region|
-            sum.checked_add(region.page_bytes.checked_mul(2)?))
-            .context("Step-5 CSA page geometry overflow")?;
-        ensure!(geometry.persistent_unit_bytes == declared, "Step-5 inconsistent CSA page geometry");
-        let bytes = |unit: u64, count: u64| -> Result<usize> {
-            Ok(usize::try_from(unit.checked_mul(count).context("Step-5 cache allocation overflow")?)?)
-        };
-        let active = bytes(state.bytes, sequences)?;
-        let marks = bytes(state.bytes, slots)?;
-        let pages = bytes(geometry.persistent_unit_bytes, pages)?;
-        let total = active.checked_add(marks).and_then(|n| n.checked_add(pages))
-            .context("Step-5 cache total overflow")?;
-        ensure!(total <= available, "Step-5 cache needs {total} bytes, admitted only {available}");
-        Ok(Self { active, marks, pages, total })
-    }
-}
+pub(super) use cuteafd_loader::plan::families::step5::admission::Reservation;
 
 /// Maintenance owns its stream; transactions use registered lane streams.
 /// Boundary operations join every live lane before copying shared state.

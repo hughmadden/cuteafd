@@ -66,32 +66,12 @@ impl Admission {
         reservations: &[u64],
     ) -> Result<Self> {
         ensure!(matches!(heads, 32 | 64), "SWA native query head count");
-        let q = heads * 192;
-        let kv = heads / 16 * 192;
         ensure!(
             (1..=4096).contains(&rows),
             "SWA row capacity must be 1..=4096"
         );
         let pages = rows.div_ceil(64);
-        let planes = [
-            rows * H * 4,
-            rows * H * 2,
-            rows * q * 2,
-            rows * kv * 2,
-            pages * 64 * kv * 2,
-            rows * q * 2,
-            pages * 64 * kv * 2,
-            rows * heads * 2,
-            rows * q * 2,
-            rows * q * 2,
-            rows * H * if heads == 32 { 4 } else { 2 },
-            rows * 8,
-            rows * 4,
-            pages * 4,
-            rows * 512 * 4,
-            rows * H * 4,
-        ]
-        .map(|n| n.max(256));
+        let planes = cuteafd_loader::plan::families::step5::native::swa_planes(rows, heads)?;
         let bytes = planes
             .iter()
             .map(|&n| n as u64)
@@ -237,8 +217,6 @@ impl<'a> SwaLayer<'a> {
         heads: usize,
         include_dense: bool,
     ) -> Result<Self> {
-        let q = heads * 192;
-        let kv = heads / 16 * 192;
         let name = |full: &str| if heads == 32 { full.replacen("step5_", "step52_", 1) }
             else { full.to_owned() };
         let output = if heads == 32 { "step52_attn_out_partial" } else { "step5_attn_out" };
@@ -289,6 +267,8 @@ impl<'a> SwaLayer<'a> {
                     .context("SWA operand missing")
             })
             .collect::<Result<Vec<_>>>()?;
+        let q = heads * 192;
+        let kv = heads / 16 * 192;
         for (weight, (dtype, shape)) in weights.iter().zip([
             (DType::F32, vec![H]),
             (DType::Bf16, vec![q, H]),
