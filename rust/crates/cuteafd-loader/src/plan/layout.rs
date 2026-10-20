@@ -1086,10 +1086,9 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         u64::from(cuteafd_core::coordinator_programs::v41_live_rows(u32::try_from(requested)?)
             .context("invalid V4.1 live prefill rows for host admission")?)
     } else { report.prefill_rows.unwrap_or(options.prefill_rows.max(4096)) };
-    let ranks = report.memory_layout.as_ref().map_or(0, |m| m.devices.iter()
-        .filter(|d| d.kind == DeviceKind::Spark).count());
+    // Native plans keep only coordinator devices in their memory layout.
+    let ranks = report.spark_ranks;
     let lanes = match family {
-        "glm5" if native => 1,
         "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
             glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
         "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
