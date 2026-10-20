@@ -11,12 +11,17 @@ use cuteafd_loader::{
 pub(crate) struct RegionLayout {
     regions: Vec<(usize, usize)>,
     bytes: usize,
+    padding: usize,
 }
 impl RegionLayout {
     fn packed(sizes: impl IntoIterator<Item = usize>) -> Result<Self> {
         let mut cursor = 0usize;
+        let mut admitted = 0usize;
         let mut regions = Vec::new();
         for size in sizes {
+            admitted = admitted
+                .checked_add(size)
+                .ok_or_else(|| anyhow::anyhow!("resident plane admission overflow"))?;
             cursor = cursor
                 .checked_add(255)
                 .ok_or_else(|| anyhow::anyhow!("plane alignment overflow"))?
@@ -26,9 +31,15 @@ impl RegionLayout {
                 .checked_add(size)
                 .ok_or_else(|| anyhow::anyhow!("plane extent overflow"))?;
         }
+        let padding = cursor - admitted;
+        ensure!(
+            padding <= 1024 * 1024,
+            "push plane padding exceeds 1 MiB per layer"
+        );
         Ok(Self {
             regions,
             bytes: cursor,
+            padding,
         })
     }
     pub fn exl3(residency: &V41Exl3Residency) -> Result<Self> {
@@ -39,6 +50,7 @@ impl RegionLayout {
                 .zip(residency.buffers.iter().map(|b| b.bytes.max(16)))
                 .collect(),
             bytes,
+            padding: 0, // Already included in the mount loader's EXL3 admission.
         })
     }
     pub fn fp8(
@@ -82,8 +94,12 @@ impl RegionLayout {
         }
         Self::packed(sizes)
     }
+    /// Push resident admission includes every byte of inter-plane alignment.
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+    pub fn padding_bytes(&self) -> usize {
+        self.padding
     }
     pub fn regions<'s>(&self, owner: &'s WeightView<'s>) -> Result<Vec<Option<WeightView<'s>>>> {
         ensure!(
@@ -143,6 +159,32 @@ pub(crate) fn exlr8_push_integrity() -> Exlr8Integrity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn push_admission_includes_real_plane_padding_and_allocation() -> Result<()> {
+        use super::super::{
+            device::{Allocation, Device},
+            weight_arena::ArenaLayout,
+        };
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let planes = RegionLayout::packed([3, 4, 5])?;
+        assert_eq!(planes.padding_bytes(), 505);
+        assert_eq!(planes.bytes(), 517);
+        let layout = ArenaLayout::new([planes.bytes()], planes.bytes())?;
+        assert_eq!(layout.bytes(), planes.bytes());
+        assert!(ArenaLayout::new([planes.bytes()], planes.bytes() - 1).is_err());
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let allocation = Allocation::new(
+            Device {
+                library: &library,
+                id: 0,
+            },
+            layout.bytes(),
+        )?;
+        assert_eq!(allocation.buffer.bytes, 517);
+        assert!(RegionLayout::packed(std::iter::repeat_n(1, 5000)).is_err());
+        Ok(())
+    }
     #[test]
     fn real_exl3_and_exlr8_descriptors_match_mount_at_same_base() -> Result<()> {
         if let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_EXL3") {
@@ -289,10 +331,17 @@ mod tests {
             };
             let tensors =
                 Fp8ExpertTensors::read_layers(snapshot, shape, &[shape.first_layer].into())?;
+            let mut max_padding = 0;
             for world in [4, 6] {
                 for rank in 0..world {
                     let slicing = tensors.exact_slicing(world);
                     let layout = RegionLayout::fp8(&tensors, world, rank, slicing)?;
+                    max_padding = max_padding.max(layout.padding_bytes());
+                    assert_eq!(
+                        layout.bytes(),
+                        layout.regions.iter().map(|(_, bytes)| bytes).sum::<usize>()
+                            + layout.padding_bytes()
+                    );
                     for (index, projection) in Fp8Projection::ALL.into_iter().enumerate() {
                         let (weight, _) =
                             tensors.slice_bytes_with(projection, world, rank, slicing)?;
@@ -304,6 +353,7 @@ mod tests {
                     }
                 }
             }
+            eprintln!("{variable} TP4/TP6 max added push padding per layer: {max_padding} bytes");
         }
         Ok(())
     }
