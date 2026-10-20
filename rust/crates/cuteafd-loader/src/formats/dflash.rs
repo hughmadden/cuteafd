@@ -159,6 +159,89 @@ pub struct MlaDraftCacheSlot {
     valid_from: usize,
 }
 
+/// Logical liveness of the retained MLA records. Prefix restores are cold:
+/// rebinding excludes every byte from the previous occupant without clearing KV.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlaDraftCacheState {
+    layout: MlaDraftCacheLayout,
+    slots: Vec<Option<MlaDraftFrontier>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MlaDraftFrontier {
+    origin: usize,
+    end: usize,
+}
+
+impl MlaDraftCacheState {
+    pub fn new(layout: MlaDraftCacheLayout) -> Result<Self> {
+        let first = layout.layers.first().ok_or_else(|| unsupported("MLA draft has no cache layers"))?;
+        if layout.layers.iter().any(|layer| layer.slots != first.slots || layer.context != first.context) {
+            return Err(unsupported("MLA draft cache layers disagree on slots/context"));
+        }
+        let slots = vec![None; first.slots];
+        Ok(Self { layout, slots })
+    }
+
+    /// Both a prefix restore and a newly cold-started drafter use this operation.
+    /// Validate every layer before replacing the old slot binding.
+    pub fn reset(&mut self, slot: usize, origin: usize) -> Result<()> {
+        for layer in &self.layout.layers { layer.bind(slot, origin)?; }
+        self.slots[slot] = Some(MlaDraftFrontier { origin, end: origin });
+        Ok(())
+    }
+
+    pub fn discard(&mut self, slot: usize) -> Result<()> {
+        *self.slots.get_mut(slot).ok_or_else(|| unsupported("MLA draft discard outside slots"))? = None;
+        Ok(())
+    }
+
+    pub fn frontier(&self, slot: usize) -> Result<(usize, usize)> {
+        let state = self.slots.get(slot).and_then(Option::as_ref)
+            .ok_or_else(|| unsupported("MLA draft slot is not bound"))?;
+        Ok((state.origin, state.end))
+    }
+
+    /// Validate the entire append before any producer writes; publishing the
+    /// frontier is separate and happens only after the ordered context update.
+    pub fn context_rows(&self, layer: usize, slot: usize, start: usize, rows: usize) -> Result<Vec<i64>> {
+        self.check_append(slot, start, rows)?;
+        let (origin, _) = self.frontier(slot)?;
+        let finish = start + rows;
+        let layer = self.layout.layers.get(layer).ok_or_else(|| unsupported("MLA draft unknown cache layer"))?;
+        let bound = layer.bind(slot, origin)?;
+        (start..finish).map(|position| i64::try_from(bound.row(position)?)
+            .map_err(|_| unsupported("MLA draft physical row exceeds I64"))).collect()
+    }
+
+    fn check_append(&self, slot: usize, start: usize, rows: usize) -> Result<()> {
+        let (_, end) = self.frontier(slot)?;
+        let finish = start.checked_add(rows).ok_or_else(|| unsupported("MLA draft context overflow"))?;
+        if start != end || rows == 0 || finish > self.layout.layers[0].context {
+            return Err(unsupported("MLA draft context append differs from committed frontier"));
+        }
+        Ok(())
+    }
+
+    pub fn commit_context(&mut self, slot: usize, start: usize, rows: usize) -> Result<()> {
+        self.check_append(slot, start, rows)?;
+        self.slots[slot].as_mut().unwrap().end = start + rows;
+        Ok(())
+    }
+
+    /// A proposed block cannot move a slot's storage origin or skip committed
+    /// context. Rejected blocks leave this logical state unchanged.
+    pub fn block_batches(&self, layer: usize, requests: &[MlaDraftCacheRequest]) -> Result<Vec<MlaDraftCacheBatch>> {
+        for request in requests {
+            if self.frontier(request.slot)? != (request.valid_from, request.position) {
+                return Err(unsupported("MLA draft request differs from bound origin/frontier"));
+            }
+        }
+        self.layout.layers.get(layer).ok_or_else(|| unsupported("MLA draft unknown cache layer"))?
+            .block_batches(requests)
+    }
+}
+
 impl MlaDraftCacheLayer {
     pub fn rows_per_slot(&self) -> usize { self.rows_per_slot }
     pub fn table_width(&self) -> usize { self.table_width }
@@ -918,6 +1001,104 @@ mod tests {
                 let replacement = layer.bind(1, origin + 1).unwrap();
                 assert_eq!(replacement.row(origin + 1).unwrap(), capacity);
                 assert_eq!(bound.row(origin + 1).unwrap(), capacity + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn restored_slot_matches_clean_cold_start_origin_rows_and_reachable_state() {
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        for context in [262144, 1048576] {
+            let layout = cfg.cache_layout(3, context).unwrap();
+            for origin in (0..64).chain([4095, 4096, 4097, context - 16]) {
+                let mut restored = MlaDraftCacheState::new(layout.clone()).unwrap();
+                restored.reset(1, 0).unwrap();
+                restored.commit_context(1, 0, 128).unwrap();
+                restored.reset(2, 17).unwrap();
+                restored.commit_context(2, 17, 19).unwrap();
+                // Previous occupant has both committed and rejected proposal rows.
+                // Unwritten backing bytes stay poisoned rather than being cleared.
+                let mut reused = std::collections::BTreeMap::new();
+                for (index, layer) in layout.layers.iter().enumerate() {
+                    let old = layer.bind(1, 0).unwrap();
+                    for position in 0..136 {
+                        reused.insert((index, old.row(position).unwrap()), usize::MAX);
+                    }
+                }
+                restored.discard(1).unwrap();
+                assert!(restored.frontier(1).is_err());
+                restored.reset(1, origin).unwrap();
+                let mut clean = MlaDraftCacheState::new(layout.clone()).unwrap();
+                clean.reset(1, origin).unwrap();
+                assert_eq!(restored.frontier(1).unwrap(), (origin, origin));
+                assert_eq!(restored.slots[1], clean.slots[1]);
+                assert_eq!(restored.frontier(2).unwrap(), (17, 36));
+                let cold_request = MlaDraftCacheRequest { slot: 1, position: origin, valid_from: origin };
+                for index in 0..layout.layers.len() {
+                    let batches = restored.block_batches(index, &[cold_request]).unwrap();
+                    assert_eq!(batches, clean.block_batches(index, &[cold_request]).unwrap());
+                    assert_eq!(batches[0].lengths, [cfg.block as i32]);
+                    assert_eq!(batches[0].positions, (origin..origin + cfg.block).map(|p| p as i64).collect::<Vec<_>>());
+                    let view = layout.layers[index].bind(1, origin).unwrap().block_view(origin, cfg.block).unwrap();
+                    assert_eq!(view.base_position, origin);
+                    // Every cold attention-visible record is produced before
+                    // use; old poisoned rows outside this span are unreachable.
+                    let mut cold_reused = reused.clone();
+                    let mut cold_fresh = std::collections::BTreeMap::new();
+                    for (&row, &position) in batches[0].slots.iter().zip(&batches[0].positions) {
+                        cold_reused.insert((index, row as usize), position as usize);
+                        cold_fresh.insert((index, row as usize), position as usize);
+                    }
+                    for offset in 0..view.cache_seqlen {
+                        let physical = view.pages[offset / 64] as usize * 64 + offset % 64;
+                        assert_eq!(cold_reused.get(&(index, physical)), cold_fresh.get(&(index, physical)));
+                        assert_eq!(cold_fresh.get(&(index, physical)), Some(&(origin + offset)));
+                    }
+                }
+                let mut fresh = std::collections::BTreeMap::new();
+                let committed = (context - origin - cfg.block).min(4201);
+                for (index, layer) in layout.layers.iter().enumerate() {
+                    if committed > 0 {
+                        let rows = restored.context_rows(index, 1, origin, committed).unwrap();
+                        assert_eq!(rows, clean.context_rows(index, 1, origin, committed).unwrap());
+                        for (offset, row) in rows.into_iter().enumerate() {
+                            reused.insert((index, row as usize), origin + offset);
+                            fresh.insert((index, row as usize), origin + offset);
+                        }
+                    }
+                    let bound = layer.bind(1, origin).unwrap();
+                    if origin > 0 { assert!(bound.row(origin - 1).is_err()); }
+                }
+                if committed > 0 {
+                    restored.commit_context(1, origin, committed).unwrap();
+                    clean.commit_context(1, origin, committed).unwrap();
+                }
+                let anchor = origin + committed;
+                let request = MlaDraftCacheRequest { slot: 1, position: anchor, valid_from: origin };
+                for (index, layer) in layout.layers.iter().enumerate() {
+                    let batches = restored.block_batches(index, &[request]).unwrap();
+                    assert_eq!(batches, clean.block_batches(index, &[request]).unwrap());
+                    let before = restored.clone();
+                    // Native production writes the whole block before attention.
+                    for (&row, &position) in batches[0].slots.iter().zip(&batches[0].positions) {
+                        reused.insert((index, row as usize), position as usize);
+                        fresh.insert((index, row as usize), position as usize);
+                    }
+                    let view = layer.bind(1, origin).unwrap().block_view(anchor, cfg.block).unwrap();
+                    for position in view.base_position..anchor + cfg.block {
+                        let offset = position - view.base_position;
+                        let physical = view.pages[offset / 64] as usize * 64 + offset % 64;
+                        assert_eq!(reused.get(&(index, physical)), fresh.get(&(index, physical)));
+                        assert_eq!(fresh.get(&(index, physical)), Some(&position));
+                    }
+                    assert_eq!(restored, before, "rejected proposal cannot publish a frontier");
+                }
+                let before = restored.clone();
+                assert!(restored.reset(1, context).is_err());
+                assert_eq!(restored, before, "bad rebind must preserve the live slot");
+                let wrong = MlaDraftCacheRequest { valid_from: origin + 1, ..request };
+                assert!(restored.block_batches(0, &[wrong]).is_err());
+                assert!(restored.context_rows(0, 1, anchor + 1, 1).is_err());
             }
         }
     }
