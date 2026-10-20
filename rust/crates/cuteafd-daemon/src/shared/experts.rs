@@ -18,8 +18,8 @@ mod tp_gate;
 #[cfg(test)]
 mod tp_reference;
 
-#[cfg(test)]
-/// Original randomized experimental arm, retained for byte-identity tests.
+/// Shuffle checkpoint traffic independently per rank, but retain the caller's
+/// layer-indexed residency. Admission must finish before invoking this loader.
 fn load_in_rank_order<T>(layers: &[usize], rank: usize,
     mut load: impl FnMut(usize, usize) -> anyhow::Result<T>) -> anyhow::Result<Vec<T>> {
     let mut order: Vec<_> = (0..layers.len()).collect();
@@ -44,75 +44,6 @@ fn load_in_rank_order<T>(layers: &[usize], rank: usize,
     Ok(weights.into_iter().map(|weight| weight.expect("every layer loaded once")).collect())
 }
 
-type LayerShards = std::collections::BTreeMap<String, u64>;
-
-fn shard_holders(value: &str) -> Option<std::collections::BTreeMap<String, String>> {
-    let mut holders = std::collections::BTreeMap::new();
-    for entry in value.split(';') {
-        let (shard, holder) = entry.split_once('=')?;
-        if shard.is_empty() || holder.is_empty() || shard.contains('/')
-            || holder.contains('=') || entry.chars().any(char::is_whitespace)
-            || holders.insert(shard.into(), holder.into()).is_some() { return None; }
-    }
-    (!holders.is_empty()).then_some(holders)
-}
-
-fn holder_order(layers: &[usize], shards: &[LayerShards],
-    holders: &std::collections::BTreeMap<String, String>, rank: usize) -> Option<Vec<usize>> {
-    use std::collections::{BTreeMap, VecDeque};
-    if layers.len() != shards.len() { return None; }
-    let mut files: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for (index, sources) in shards.iter().enumerate() {
-        // A boundary layer can straddle files. Keep its bank/fence lifetime
-        // intact and assign it to the dominant payload file (lexical tie-break).
-        if sources.is_empty() || sources.keys().any(|file| !holders.contains_key(file)) { return None; }
-        let file = sources.iter().max_by(|(a, x), (b, y)| x.cmp(y).then_with(|| b.cmp(a)))?.0;
-        files.entry(file).or_default().push(index);
-    }
-    let mut hosts: BTreeMap<&str, VecDeque<Vec<usize>>> = BTreeMap::new();
-    for (file, indices) in files { hosts.entry(holders.get(file)?.as_str()).or_default().push_back(indices); }
-    let mut hosts: Vec<_> = hosts.into_values().collect();
-    if !hosts.is_empty() {
-        // Offset the holder cycle, not the layer list: ranks start on distinct
-        // sources even when files contain different numbers of layers.
-        let offset = rank % hosts.len();
-        hosts.rotate_left(offset);
-    }
-    let mut order = Vec::with_capacity(layers.len());
-    while order.len() < layers.len() {
-        for groups in &mut hosts {
-            if let Some(indices) = groups.pop_front() { order.extend(indices); }
-        }
-    }
-    Some(order)
-}
-
-/// Placement is optional; without a complete map retain plain layer order.
-/// Admission must finish before invoking this loader. Results retain caller slots.
-fn load_in_holder_order<T>(layers: &[usize], rank: usize, mut shards: impl FnMut(usize) -> LayerShards,
-    mut load: impl FnMut(usize, usize) -> anyhow::Result<T>) -> anyhow::Result<Vec<T>> {
-    let order = std::env::var("CUTEAFD_SHARD_HOLDERS").ok().and_then(|value| shard_holders(&value))
-        .and_then(|holders| holder_order(layers, &layers.iter().map(|&layer| shards(layer)).collect::<Vec<_>>(), &holders, rank));
-    tracing::info!(holder_rotated = order.is_some(), rank, layer_count = layers.len(), "expert checkpoint load order");
-    load_in_order(layers, order.unwrap_or_else(|| (0..layers.len()).collect()), &mut load)
-}
-
-fn load_in_order<T>(layers: &[usize], order: Vec<usize>,
-    mut load: impl FnMut(usize, usize) -> anyhow::Result<T>) -> anyhow::Result<Vec<T>> {
-    let mut weights: Vec<_> = (0..layers.len()).map(|_| None).collect();
-    for index in order { weights[index] = Some(load(index, layers[index])?); }
-    Ok(weights.into_iter().map(|weight| weight.expect("every layer loaded once")).collect())
-}
-
-fn catalog_layer_shards(catalog: &cuteafd_loader::OfficialV41Catalog, layer: usize) -> LayerShards {
-    let marker = format!(".layers.{layer}.mlp.experts.");
-    let mut shards = LayerShards::new();
-    for tensor in catalog.tensors().iter().filter(|tensor| tensor.metadata.name.contains(&marker)) {
-        *shards.entry(tensor.shard.clone()).or_default() += tensor.metadata.byte_length;
-    }
-    shards
-}
-
 #[cfg(test)]
 mod load_order_tests {
     use super::load_in_rank_order;
@@ -120,53 +51,6 @@ mod load_order_tests {
     use std::{collections::BTreeSet, fs::OpenOptions, os::unix::fs::FileExt};
     use cuteafd_loader::{formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection, Slicing},
         plan::testing as fixture, RoutedExpertShape};
-
-    #[test]
-    fn holder_file_groups_round_robin_and_preserve_slots() -> Result<()> {
-        use super::{holder_order, shard_holders, load_in_order, LayerShards};
-        let holders = shard_holders("a=host1;b=host1;c=host2;d=host2;e=host3") .unwrap();
-        let layers = [3, 8, 13, 21, 34, 55, 89];
-        let sources: Vec<LayerShards> = ["a", "a", "b", "c", "d", "e", "e"].into_iter()
-            .map(|file| [(file.to_string(), 10)].into_iter().collect()).collect();
-        let expected = [0, 1, 3, 5, 6, 2, 4];
-        assert_eq!(holder_order(&layers, &sources, &holders, 0).unwrap(), expected);
-        for rank in 0..6 {
-            let loaded = load_in_order(&layers, holder_order(&layers, &sources, &holders, rank).unwrap(), |_, layer| Ok(layer))?;
-            assert_eq!(loaded, layers);
-        }
-        let mut split = sources.clone();
-        split[0].insert("c".into(), 11);
-        assert_eq!(holder_order(&layers, &split, &holders, 0).unwrap(), [1, 0, 3, 5, 6, 2, 4]);
-        split[0].insert("missing".into(), 1);
-        assert!(holder_order(&layers, &split, &holders, 0).is_none());
-        assert!(holder_order(&layers, &sources, &shard_holders("a=host1").unwrap(), 0).is_none());
-        assert_eq!(holder_order(&[], &[], &holders, usize::MAX).unwrap(), Vec::<usize>::new());
-        for value in ["", "a=", "=h", "a=h;a=h", "a=h;", "a/b=h", "a=h=h", "a= h"] {
-            assert!(shard_holders(value).is_none(), "{value}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn holder_rotation_starts_ranks_on_distinct_holders() -> Result<()> {
-        use super::{holder_order, load_in_order, LayerShards};
-        let layers = [3, 8, 13, 21, 34, 55, 89, 144];
-        let holders = (0..6).map(|i| (format!("file{i}"), format!("host{i}"))).collect();
-        let sources: Vec<LayerShards> = [0, 0, 1, 2, 3, 4, 5, 5].into_iter()
-            .map(|i| [(format!("file{i}"), 10)].into_iter().collect()).collect();
-        let mut starts = BTreeSet::new();
-        for rank in 0..6 {
-            let order = holder_order(&layers, &sources, &holders, rank).unwrap();
-            let first = sources[order[0]].keys().next().unwrap();
-            assert!(starts.insert(holders[first].clone()));
-            assert_eq!(holders[first], format!("host{rank}"));
-            assert_eq!(holder_order(&layers, &sources, &holders, rank + 6).unwrap(), order);
-            assert_eq!(order.iter().copied().collect::<BTreeSet<_>>(), (0..layers.len()).collect());
-            assert_eq!(load_in_order(&layers, order, |_, layer| Ok(layer))?, layers);
-        }
-        assert_eq!(starts.len(), 6);
-        Ok(())
-    }
 
     #[test]
     fn rank_permutations_are_reproducible_and_preserve_sparse_layer_slots() -> Result<()> {
@@ -255,11 +139,6 @@ mod load_order_tests {
                 let sequential = layers.iter().map(|&layer| load(layer)).collect::<Result<Vec<_>>>()?;
                 let shuffled = load_in_rank_order(&layers, rank, |_, layer| load(layer))?;
                 assert_eq!(sequential, shuffled, "{format:?} rank {rank}");
-                let holders = super::shard_holders("one=host1;two=host2").unwrap();
-                let sources = ["one", "two", "one"].map(|file| [(file.into(), 1)].into_iter().collect());
-                let order = super::holder_order(&layers, &sources, &holders, rank).unwrap();
-                let interleaved = super::load_in_order(&layers, order, |_, layer| load(layer))?;
-                assert_eq!(sequential, interleaved, "holder {format:?} rank {rank}");
                 let totals = |weights: &[(Vec<u8>, [usize; 3])]| weights.iter().fold([0; 3], |a, (_, b)|
                     [a[0] + b[0], a[1].max(b[1]), a[2].max(b[2])]);
                 assert_eq!(totals(&sequential), totals(&shuffled));
@@ -315,11 +194,6 @@ mod load_order_tests {
             let sequential = layers.iter().map(|&layer| load(layer)).collect::<Result<Vec<_>>>()?;
             let shuffled = load_in_rank_order(&layers, rank, |_, layer| load(layer))?;
             assert_eq!(sequential, shuffled, "EXL3 rank {rank}");
-            let holders = super::shard_holders("one=host1;two=host2").unwrap();
-            let sources = ["one", "two", "one"].map(|file| [(file.into(), 1)].into_iter().collect());
-            let order = super::holder_order(&layers, &sources, &holders, rank).unwrap();
-            let interleaved = super::load_in_order(&layers, order, |_, layer| load(layer))?;
-            assert_eq!(sequential, interleaved, "holder EXL3 rank {rank}");
         }
         Ok(())
     }

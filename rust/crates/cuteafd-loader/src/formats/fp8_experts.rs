@@ -378,17 +378,6 @@ impl Fp8ExpertTensors {
         &self.shape
     }
 
-    /// Validated source-file payload totals for placement-aware layer ordering.
-    pub fn layer_shards(&self, layer: usize) -> BTreeMap<String, u64> {
-        let name = self.name(layer, 0, Fp8Projection::Gate);
-        let prefix = name.split_once(".mlp.experts.").unwrap().0.to_string() + ".mlp.experts.";
-        let mut shards = BTreeMap::new();
-        for (_, tensor) in self.tensors.iter().filter(|(name, _)| name.starts_with(&prefix)) {
-            *shards.entry(tensor.shard.clone()).or_default() += tensor.bytes;
-        }
-        shards
-    }
-
     /// Family-declared arithmetic, when it differs from the process geometry's legacy default.
     pub fn activation(&self, layer: usize) -> Option<cuteafd_core::FfnActivation> {
         self.activations.get(layer).copied()

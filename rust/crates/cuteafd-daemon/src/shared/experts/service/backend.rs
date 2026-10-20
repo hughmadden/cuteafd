@@ -585,8 +585,7 @@ pub(super) fn load_exl3<'a>(
     let peak = spark_admission_budget(config, resident, staging, pinned, scratch, workspace)?;
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
     let mut remaining = config.device_budget;
-    let weights = crate::shared::experts::load_in_holder_order(&layers, config.rank,
-        |layer| crate::shared::experts::catalog_layer_shards(catalog, layer), |index, layer| {
+    let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, layer| {
         let plan = &plans[index];
         let started = std::time::Instant::now();
         let weight = Exl3Weights::load(
