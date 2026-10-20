@@ -211,7 +211,9 @@ impl<'a> Programs<'a> {
                 }
                 self.card_specs.insert(name.to_string(), specs);
             }
-            if name.starts_with("exlr8_") {
+            if name.starts_with("exlr8_dense_") {
+                super::native_dense::validate_entry(spec, entry)?;
+            } else if name.starts_with("exlr8_") {
                 super::exlr8::validate_entry(spec, entry)?;
                 let expected: &[(&str, &str)] = match name {
                     "exlr8_a16_grouped" => &[("rows", "int32"), ("cta_limit", "int32"), ("unit_limit", "int32")],
