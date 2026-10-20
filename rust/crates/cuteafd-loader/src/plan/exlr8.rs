@@ -85,7 +85,6 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
         "EXLR8 native deployment requires context attention");
     let layout = options.layout.as_ref().context("EXLR8 native deployment requires --layout")?;
     ensure!(layout.rtx_bytes.len() == 2, "EXLR8 native deployment requires two RTX GPUs");
-    ensure!(layout.prefill_lanes <= 1, "EXLR8 native deployment requires one serial prefill lane");
     ensure!(layout.local_expert_layers.is_none_or(|n| n == 0)
         && layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
         "EXLR8 native deployment cannot onboard routed experts");
