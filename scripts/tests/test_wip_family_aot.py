@@ -316,3 +316,26 @@ def test_non_kimi_scope_does_not_enable_kimi_programs(tmp_path):
     output = dry_run(tmp_path, path)
     assert 'CUTEAFD_WIP_KIMIK3_AOT' not in output
     assert scopes['CUTEAFD_WIP_GLM_AOT'] == 'ON'
+
+
+def test_kimik6_aot_is_explicit_and_reaches_coordinator_build(tmp_path):
+    path = config_file(tmp_path, 'kimi_k3', 'Kimi-K3-EXL3-K2', 6)
+    _, scopes = aot.config_scopes(aot.read_config(path))
+    assert 'CUTEAFD_WIP_KIMIK6_AOT' not in scopes
+    output = dry_run(tmp_path, path, {'CUTEAFD_WIP_KIMIK6_AOT': 'ON'})
+    assert 'CUTEAFD_WIP_KIMIK3_AOT=ON' in output
+    wip = (ROOT / 'wip.sh').read_text()
+    assert '-e "CUTEAFD_WIP_KIMIK6_AOT=${CUTEAFD_WIP_KIMIK6_AOT:-OFF}"' in wip
+    assert 'KIMIK3_AOT KIMIK6_AOT COORDINATOR_EXPERT_FAMILIES' in wip
+    assert '"$key" != KIMIK6_AOT' in wip
+    build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    assert '-DCUTEAFD_ENABLE_KIMIK6_AOT=' in build
+    assert '${CUTEAFD_WIP_KIMIK6_AOT:-OFF}' in build
+    assert "CUTEAFD_WIP_KIMIK[36]_AOT=OFF" in build
+    cmake = (ROOT / 'native/CMakeLists.txt').read_text()
+    assert 'option(CUTEAFD_ENABLE_KIMIK6_AOT "Build experimental Kimi K6 dense and split programs" OFF)' in cmake
+    table = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
+    assert 'if(CUTEAFD_ENABLE_KIMIK6_AOT)' in table
+    assert 'kimi_k6_dense,kimi_split' in table
+    for exporter in ['export_b12x_kimi_k6_dense_aot.py', 'export_b12x_kimi_split_aot.py']:
+        assert exporter in table
