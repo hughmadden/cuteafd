@@ -395,3 +395,127 @@ fn native_layer3_same_quant() -> Result<()> {
         result.and(drained.map_err(Into::into))
     })
 }
+
+/// Keep projection and attention row shapes identical: the serial arm finishes
+/// each chunk, while the pipeline schedules the same three chunks layer-major.
+#[test]
+#[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
+fn native_prefill_lanes_byte_exact() -> Result<()> {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Args {
+        #[command(flatten)]
+        engine: crate::families::glm5::EngineArgs,
+    }
+    const CHUNK: usize = 1024;
+    const LANES: usize = 3;
+    let args = Args::try_parse_from([
+        "exlr8-lanes".into(),
+        "--snapshot".into(),
+        std::env::var_os("CUTEAFD_GOLDEN_SNAPSHOT").context("native snapshot")?,
+        "--native-lib".into(),
+        std::env::var_os("CUTEAFD_NATIVE_LIB").context("native library")?,
+        "--manifest".into(),
+        std::env::var_os("CUTEAFD_PROGRAM_MANIFEST").context("program manifest")?,
+        "--exlr8-manifest".into(), "up1".into(),
+        "--exlr8-dense-from".into(),
+        std::env::var_os("CUTEAFD_EXLR8_DENSE_SNAPSHOT").context("dense snapshot")?,
+        "--device".into(), "0".into(),
+        "--split-device".into(), "1".into(),
+        "--attention-placement".into(), "context".into(),
+        "--max-context".into(), "4096".into(),
+        "--pool-tokens".into(), "4096".into(),
+        "--prefill-rows".into(), CHUNK.to_string().into(),
+        "--rtx-expert-layers".into(), "0".into(),
+        "--l2-prefetch".into(), "off".into(),
+        "--peers".into(),
+        std::env::var_os("CUTEAFD_GOLDEN_PEERS").context("real worker peers")?,
+    ])?.engine;
+    let opened = crate::families::glm5::open(&args)?;
+    opened.with_engine(&args, |engine, transport, runtime| {
+        ensure!(engine.prefill_lanes == LANES && engine.lanes.borrow().len() == LANES,
+            "lane exactness gate requires exactly three admitted prefill lanes");
+        ensure!(engine.native_experts.len() == 2, "lane gate requires native shared owners");
+        let transport = transport.context("lane gate needs real workers")?;
+        let mut allocator = PageAllocator::new(engine);
+        let placement = allocator.admit(CHUNK * LANES)?;
+        let tokens: Vec<u32> = (0..CHUNK * LANES)
+            .map(|i| (17 + i * 7919) as u32 % engine.cfg.vocab_size as u32).collect();
+        let tables = (0..LANES).map(|lane|
+            engine.prefill_tables(&placement, lane * CHUNK, CHUNK)).collect::<Result<Vec<_>>>()?;
+        let chunks: Vec<_> = tokens.chunks_exact(CHUNK).collect();
+        let caches = |rank| -> Result<(&Vec<Dev<'_>>, &Vec<Option<Dev<'_>>>)> {
+            if rank == 0 { Ok((&engine.kv, &engine.index)) }
+            else { let peer = engine.peer()?; Ok((&peer.kv, &peer.index)) }
+        };
+        let drain = || -> Result<()> {
+            for rank in 0..engine.ranks() {
+                // SAFETY: both engines' streams and all test operands remain live.
+                engine.on(rank, || unsafe {
+                    engine.library.cuda_stream_synchronize(engine.stream_of(rank))
+                })?;
+            }
+            Ok(())
+        };
+        let clear = || -> Result<()> {
+            drain()?;
+            for rank in 0..engine.ranks() {
+                let (kv, index) = caches(rank)?;
+                engine.on(rank, || {
+                    for buffer in kv.iter().chain(index.iter().flatten()) {
+                        engine.library.cuda_zero_bytes(buffer.buffer, buffer.buffer.bytes)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        };
+        let snapshot = || -> Result<Vec<Vec<Vec<u8>>>> {
+            drain()?;
+            (0..engine.ranks()).map(|rank| {
+                let (kv, index) = caches(rank)?;
+                engine.on(rank, || kv.iter().zip(index).map(|(kv, index)| {
+                    let mut bytes = vec![0; kv.buffer.bytes];
+                    engine.library.copy_d2h(&mut bytes, kv.buffer)?;
+                    if let Some(index) = index {
+                        let first = bytes.len();
+                        bytes.resize(first + index.buffer.bytes, 0);
+                        engine.library.copy_d2h(&mut bytes[first..], index.buffer)?;
+                    }
+                    Ok(bytes)
+                }).collect::<Result<Vec<_>>>())
+            }).collect()
+        };
+        let result = (|| {
+            clear()?;
+            let mut serial = None;
+            for (lane, (tables, tokens)) in tables.iter().zip(&chunks).enumerate() {
+                let logits = engine.step(tables, tokens, usize::from(lane + 1 == LANES),
+                    Some((&mut *transport, runtime)), None)?;
+                if lane + 1 == LANES {
+                    serial = Some(logits.context("serial final logits")?.to_host(engine.library)?);
+                }
+            }
+            let serial_state = snapshot()?;
+            clear()?;
+            let pipelined = engine.host_logits(engine.step_lanes(&tables, &chunks, 1)?)?
+                .context("pipelined final logits")?;
+            let pipelined_state = snapshot()?;
+            for (rank, (serial, pipelined)) in serial_state.iter().zip(&pipelined_state).enumerate() {
+                for (layer, (serial, pipelined)) in serial.iter().zip(pipelined).enumerate() {
+                    ensure!(serial == pipelined, "KV/index bytes differ at rank {rank} layer {layer}");
+                }
+            }
+            let serial = serial.context("serial logits")?;
+            ensure!(serial.len() == pipelined.len() && serial.iter().zip(&pipelined)
+                .all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits()),
+                "fixed-chunk prefill final logits differ");
+            eprintln!("EXLR8 lanes exact: chunks={LANES} rows_per_chunk={CHUNK} ranks={} layers={} logits={}",
+                engine.ranks(), engine.weights.layers.len(), serial.len());
+            Ok(())
+        })();
+        let drained = drain();
+        allocator.release(placement);
+        result.and(drained)
+    })
+}
