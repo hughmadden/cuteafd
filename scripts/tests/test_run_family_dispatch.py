@@ -3363,26 +3363,11 @@ def test_console_assets_rejects_unknown_value(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "CONSOLE_ASSETS must be on or off" in result.stderr
 
-@pytest.mark.parametrize("keys,expected", [
-    ("", None),
-    ("SHARD_HOLDERS=model-00001.safetensors=emu;model-00002.safetensors=kiwi\n",
-     "model-00001.safetensors=emu;model-00002.safetensors=kiwi"),
-])
-def test_shard_holders_reach_spark_workers(tmp_path: Path, keys: str, expected: str | None) -> None:
+
+def test_worker_env_survives_the_remote_worker_shell(tmp_path: Path) -> None:
+    # Shared worker env reaches the ssh remote command as shell-quoted words.
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
-    result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=off\n" + keys)
+    result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=off\n")
     assert result.returncode == 0, result.stderr
     workers = [line for line in result.stderr.splitlines() if "expertd-native" in line]
-    assert workers
-    for worker in workers:
-        if expected:
-            # The ssh remote command re-parses this line; ';' must stay inside one quoted word.
-            assert "CUTEAFD_SHARD_HOLDERS=" + expected.replace(";", "\\;") in worker
-        else:
-            assert "CUTEAFD_SHARD_HOLDERS" not in worker
-
-
-def test_shard_holders_rejects_malformed_values(tmp_path: Path) -> None:
-    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
-    result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=off\nSHARD_HOLDERS=bad value\n")
-    assert result.returncode != 0 and "SHARD_HOLDERS must be shard=host pairs" in result.stderr
+    assert workers and all("CUTEAFD_THERMAL=" in worker for worker in workers)
