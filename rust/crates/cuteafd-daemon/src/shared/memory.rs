@@ -22,6 +22,12 @@ pub(crate) mod chain;
 
 #[path = "memory/budget.rs"]
 pub(crate) mod budget;
+#[path = "memory/weight_arena.rs"]
+pub(crate) mod weight_arena;
+#[path = "memory/weight_validation.rs"]
+pub(crate) mod weight_validation;
+#[path = "memory/weight_views.rs"]
+pub(crate) mod weight_views;
 
 pub(crate) struct DeviceAllocation<'a> {
     pub(crate) library: &'a NativeLibrary,
