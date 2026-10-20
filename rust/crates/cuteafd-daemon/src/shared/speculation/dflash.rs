@@ -340,6 +340,53 @@ struct DraftLayer<'a> {
     v_ring: Dev<'a>,
 }
 
+/// Admitted native MLA arenas. The common executor will borrow these by name;
+/// this storage has no independent forward/head path and owns no target weights.
+#[allow(dead_code)]
+pub(crate) struct MlaDraftStorage<'a> {
+    layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+    buffers: Vec<Dev<'a>>,
+}
+
+#[allow(dead_code)]
+impl<'a> MlaDraftStorage<'a> {
+    /// The caller must first admit `layout.demands(target_gpu)` and validate the
+    /// native programs. All native size queries finish before the first allocation.
+    pub(crate) fn allocate(library: &'a NativeLibrary,
+        layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout) -> Result<Self> {
+        ensure!(library.sm_count()? == layout.sm_count(), "MLA draft layout belongs to another SM count");
+        let expected = |name: &str| -> Result<usize> {
+            layout.buffers().iter().find(|b| b.name == name).map(|b| b.bytes)
+                .with_context(|| format!("MLA draft missing admitted {name}"))
+        };
+        ensure!(expected("head_workspace")? == VOCABULARY_HEAD_WORKSPACE,
+            "MLA draft vocabulary workspace disagrees with admission");
+        let drafted = layout.capacity().block_rows - layout.capacity().max_batch_sequences;
+        ensure!(library.glm_dflash_topk_workspace(drafted)?.max(256) == expected("topk_workspace")?,
+            "MLA draft top-k workspace disagrees with admission");
+        if let Some(scratch) = layout.fp8_scratch() {
+            let mut bytes = 256;
+            for shape in &scratch.shapes {
+                let (k, n) = (usize::try_from(shape.k)?, usize::try_from(shape.n)?);
+                for mode in 0..=layout.fp8_mode() {
+                    let queried = if mode == 0 { library.fp8_w8a16_workspace(scratch.rows, k, n)? }
+                        else { library.fp8_linear_workspace(scratch.rows, k, n, i32::from(mode))? };
+                    bytes = bytes.max(queried);
+                }
+            }
+            ensure!(bytes == expected("fp8_scratch")?, "MLA draft FP8 workspace disagrees with admission");
+        }
+        let buffers = layout.allocate_with(|b| DeviceAllocation::named(library, b.bytes, "drafter/mla"))?;
+        Ok(Self { layout, buffers })
+    }
+
+    pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
+        let index = self.layout.buffers().iter().position(|b| b.name == name)
+            .with_context(|| format!("MLA draft unknown admitted buffer {name}"))?;
+        Ok(self.buffers[index].buffer)
+    }
+}
+
 /// Buffers of one draft step for up to `sequences` sequences.
 struct Workspace<'a> {
     sequences: usize,
