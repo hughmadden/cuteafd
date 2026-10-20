@@ -169,7 +169,7 @@ EOF
     return
   fi
   # Kimi K3 and Step-5 (WIP slots only): the shared serve contract and Spark
-  # workers, with no speculator, media or family modes yet.
+  # workers, no media or family modes yet; Step-5 takes an opt-in MTP depth.
   if [[ "$1" == kimi_k3 || "$1" == step5 ]]; then
     cat <<'EOF'
 ATTENTION_PLACEMENT
@@ -196,6 +196,7 @@ PROFILE_EXPERT_INPUT_SAMPLE
 PROFILE_EXPERT_ROUTE_WEIGHTS
 EOF
     [[ "$1" != kimi_k3 ]] || echo RTX_EXPERT_LAYERS
+    [[ "$1" != step5 ]] || echo SPECULATOR_DEPTH
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -225,7 +226,6 @@ TARGET_HEAD
 SPARK_INTAKE
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
-TP_PLACEMENT
 ATTENTION_PLAN_ROWS
 PROFILE
 PROFILE_DIR
@@ -380,7 +380,6 @@ ENABLE_BENCH
 EXPERT_FORMAT
 EXPERT_PORT
 FP8_EXPERT_PREFILL
-TP_PLACEMENT
 GATEWAY
 HOST_CACHE_BYTES
 HOST_ISA
@@ -438,8 +437,6 @@ WIP_ROOT
 EOF
   _spark_slot_keys HOST LANE_A LANE_B
 }
-tp_placement="$(get TP_PLACEMENT round-robin)"
-case "$tp_placement" in round-robin|balanced) ;; *) release_die "TP_PLACEMENT must be round-robin or balanced" ;; esac
 vision="$(get VISION auto)"
 audio="$(get AUDIO auto)"
 vision_replicas="$(get VISION_REPLICAS 1)"
@@ -561,12 +558,11 @@ fi
 shared_env_args=(-e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
-  -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}"
-  -e "CUTEAFD_TP_PLACEMENT=$tp_placement")
+  -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi
-shared_worker_env_args=(-e "CUTEAFD_TP_PLACEMENT=$tp_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
+shared_worker_env_args=(-e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
 }
 shared_bench_nonce_args() {
 bench_nonce_env_args=()
@@ -1497,8 +1493,8 @@ case "$family" in
 esac
 # Kimi K3 (#273) and Step-5 (#274) are under qualification: WIP slots only,
 # automatic attention placement, text only (their bundled vision towers are not
-# in scope), GPU token embeddings and no speculator (Kimi ships no MTP head;
-# neither family's drafter is wired into serving).
+# in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5's native
+# MTP is opt-in (SPECULATOR=mtp) while it qualifies, never a default.
 qualifying=0
 [[ "$family" != kimi_k3 && "$family" != step5 ]] || qualifying=1
 if ((qualifying)); then
@@ -1636,7 +1632,7 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   [[ -n "$exlr8_dense" ]] || release_die "EXLR8_DENSE_FROM must name the compatible official GLM-5.3 FP8 snapshot"
   exlr8_gpu_count="$(get RTX_GPUS 1)"
   [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 6 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..6 canonical Spark ranks"
-  [[ "$(get SPECULATOR off)" == off ]] || release_die "EXLR8 requires SPECULATOR=off"
+  [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
   [[ "$(get RTX_EXPERT_LAYERS 0)" == 0 ]] || release_die "EXLR8 cannot onboard routed experts"
   exlr8_attention=heads
   [[ "$exlr8_gpu_count" != 2 ]] || exlr8_attention=context
@@ -1656,7 +1652,6 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   fi
   exlr8_plan_args=(--exlr8-manifest "$exlr8_manifest" --exlr8-dense-from "$exlr8_dense")
   spark_worker_args+=" --exlr8-manifest $exlr8_manifest"
-  cfg[SPECULATOR]=off
   cfg[RTX_EXPERT_LAYERS]=0
 fi
 # SPECULATOR picks the drafter. Unset, each family takes the speculator its
@@ -1668,7 +1663,7 @@ fi
 #            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2);
 #            MiMo V2.6 Flash/Pro: the snapshot's own dflash/ drafter unless
 #            SPECULATOR_MODEL_ID names one (Pro needs SPARK_COUNT=6)
-#   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
+#   mtp      MiMo V2 Flash, Qwen 3.8, Step-5 (opt-in): the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (qualified local Qwen default 3; otherwise 1)
 #   dspark   DeepSeek V4 (its own drafter); GLM 5.3 Flash: the dSpark
 #            checkpoint SPECULATOR_MODEL_ID (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview)
@@ -1732,7 +1727,7 @@ if [[ -z "$speculator" ]]; then
 fi
 case "$family:$speculator" in
   qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
-  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
+  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|step5:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
@@ -2553,7 +2548,7 @@ audio_encoder_hash=""
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
   # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "CUTEAFD_TP_PLACEMENT=$tp_placement" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" "${exlr8_mounts[@]}" \
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" "${exlr8_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"

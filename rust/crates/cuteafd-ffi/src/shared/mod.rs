@@ -5,6 +5,7 @@ pub(crate) mod fp8_gemv;
 pub mod fp8_moe;
 pub mod programs;
 pub mod mla_draft;
+pub mod native_dense;
 pub mod exlr8;
 pub(crate) mod l2_prefetch;
 pub mod peer_exchange;

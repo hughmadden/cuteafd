@@ -54,7 +54,14 @@ def test_reject_malformed_geometry(module, k, n, kwargs):
         geometry(module)(k, n, **kwargs)
 
 
-@pytest.mark.parametrize("kwargs", [{"bits": 1}, {"bits": 5}, {"codebook": "bogus"},
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+def test_trellis_supported_bit_widths(bits):
+    g = geometry("trellis_linear")(128, 128, bits=bits)
+    assert g["bits"] == bits
+    assert g["codebook"] == "e4m3" and g["abi_version"] == 1
+
+
+@pytest.mark.parametrize("kwargs", [{"bits": 1}, {"bits": 7}, {"codebook": "bogus"},
                                       {"rotation_count": 0}, {"rotation_count": True}])
 def test_trellis_reject_unsupported_format(kwargs):
     with pytest.raises(ValueError):

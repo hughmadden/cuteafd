@@ -159,14 +159,10 @@ def shared_wip(arms, mappings, builds, parallel):
         if 'wip_instance' in arms[name]:
             raise ValueError('duplicate --arm-wip mapping')
         arms[name]['wip_instance'] = instance
-    slots = {}
-    for arm in arms.values():
-        if 'release' in arm:
-            continue
-        instance = arm.get('wip_instance', arm['instance'])
-        if instance in slots and slots[instance] != arm['slot']:
-            raise ValueError('shared WIP instance requires identical slots')
-        slots[instance] = arm['slot']
+    # Arms of one WIP instance may name different sealed slots (e.g. a base and a
+    # candidate source built in the same instance): launches stage per slot and
+    # serving instance (release_wip_serving_layout), and --arm-wip runs one arm
+    # at a time, so slots never swap files under each other.
 
 
 def load_cards(kit, names):
@@ -1576,6 +1572,38 @@ def resolve_builds(items):
     return builds
 
 
+def owner_marker_script(root, task, instance, slot, revision):
+    # A direct WIP retry may predate the cards owner marker. Adopt only a single
+    # slot whose seals, identity and frozen source all match this build task.
+    return """import hashlib,json,pathlib
+p=pathlib.Path.home()/'.cache/cuteafd/builds'/ROOT_NAME
+assert not p.is_symlink(), 'refusing root symlink'
+p.mkdir(parents=True,exist_ok=True)
+m=p/'.wip-card-owner.json'
+owner=OWNER
+if m.exists():
+    assert json.loads(m.read_text())==owner, 'foreign WIP owner'
+elif any(p.iterdir()):
+    slots=p/'slots'
+    assert slots.is_dir() and {d.name for d in slots.iterdir()}=={SLOT}, 'unowned slot set'
+    roles=list((slots/SLOT).iterdir())
+    assert roles, 'no sealed roles'
+    for d in roles:
+        assert d.name in ('coordinator','spark-expert') and not d.is_symlink(), 'invalid role'
+        raw=(d/'META.json').read_bytes()
+        assert hashlib.sha256(raw).hexdigest()==(d/'FINGERPRINT').read_text().strip(), 'META seal mismatch'
+        meta=json.loads(raw)
+        assert (meta['slot'],meta['role'],meta['wip_instance'])==(SLOT,d.name,INSTANCE), 'slot identity mismatch'
+        for relative,key in [('SOURCE_SHA256SUMS','source_manifest_sha256'),('workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS','artifact_manifest_sha256')]:
+            assert hashlib.sha256((d/relative).read_bytes()).hexdigest()==meta[key], 'manifest seal mismatch'
+        revision_path=d/'workspace/.cuteafd-source-revision'
+        revision_bytes=revision_path.read_bytes()
+        assert revision_bytes.decode().strip()==REVISION, 'source revision mismatch'
+        assert hashlib.sha256(revision_bytes).hexdigest()+'  ./.cuteafd-source-revision' in (d/'SOURCE_SHA256SUMS').read_text().splitlines(), 'unsealed source revision'
+m.write_text(json.dumps(owner))
+""".replace('ROOT_NAME', repr(Path(root).name)).replace('OWNER', repr(dict(task=task, instance=instance))).replace('SLOT', repr(slot)).replace('INSTANCE', repr(instance)).replace('REVISION', repr(revision))
+
+
 def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
     scopes = build_scopes(cards)
     for name, revision in builds.items():
@@ -1676,7 +1704,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                         subprocess.run([sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
                                         '--wait', str(seed_wait), '--', 'true'], check=True, timeout=seed_wait + 60)
                     for host in (('raptor', *HOSTS, *([seed] if seed not in HOSTS else [])) if build_role == 'both' else ('raptor',)):
-                        marker = 'import pathlib,json; p=pathlib.Path.home()/".cache/cuteafd/builds"/' + repr(root.name) + '; p.mkdir(parents=True,exist_ok=True); m=p/".wip-card-owner.json"; owner=' + repr(dict(task=task, instance=arm['instance'])) + '; assert not m.exists() or json.loads(m.read_text())==owner; assert m.exists() or not any(p.iterdir()); m.write_text(json.dumps(owner))'
+                        marker = owner_marker_script(root, task, arm['instance'], arm['slot'], revision)
                         mark = ['python3', '-c', marker]
                         run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
                     env = {**os.environ, **scopes, 'WIP_INSTANCE': arm['instance'], 'WIP_ROOT': str(root)}

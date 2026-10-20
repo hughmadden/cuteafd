@@ -32,6 +32,7 @@ use std::{cell::RefCell, net::SocketAddr, os::unix::fs::FileExt, path::PathBuf};
 
 const H: usize = 4096;
 const FP8_REVISION: &str = "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc";
+const NVFP4_REVISION: &str = "bc246cc2848e17b37f377eda8fd825c5b3018d1f";
 const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
@@ -63,6 +64,9 @@ pub(crate) struct GoldenArgs {
     /// Explicit cold diagnostic lane count; not a serving/default qualification.
     #[arg(long, default_value_t = 1)]
     diagnostic_lanes: usize,
+    /// Poison reusable target scratch between layers; logits must remain byte-exact.
+    #[arg(long, requires = "split_device")]
+    poison_scratch: bool,
     /// Validate source, reference and routed-layer selection without CUDA.
     #[arg(long)]
     check_headers: bool,
@@ -445,8 +449,10 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: u
         && clients % prefill_lanes == 0, "Step-5 persistent lane endpoint inventory");
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
+    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let format = catalog.fp8().context("Step-5 golden requires native expert headers")?.format();
     let metadata: Value = serde_json::from_slice(&std::fs::read(
-        packages.join("fp8/fp8-step5/manifest.json"),
+        packages.join("fp8").join(format.package_name("step5")).join("manifest.json"),
     )?)?;
     let layout = &metadata["layouts"][format!("tp{}", args.peers.len())];
     ensure!(
@@ -471,7 +477,6 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize], clients: u
         compiled >= rows as u64 && compiled <= 4096,
         "FP8 package row capacity"
     );
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     let config = TcpTransportConfig::default();
     SparkAdmission::plan(
         &args.snapshot,
@@ -880,6 +885,10 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let execution = Execution::load_lanes_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
         stages.iter().map(|stage| vec![&stage[0], &stage[1]]).collect(), rows,
         available.to_vec(), reservations.to_vec(), transports.into_iter().map(Vec::from).collect(), 92, 17)?;
+    if args.poison_scratch { execution.poison_scratch_between_layers(); }
+    let retained_layers = reference.hidden.iter().map(|(layer, _)| *layer).chain(args.dump_layers.iter().copied())
+        .collect::<Vec<_>>();
+    execution.retain_diagnostic_outputs(&retained_layers)?;
     let embeddings = embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?;
     let inputs = (0..lane_count).map(|_| {
         let input = Allocation::new(devices[0], rows * H * 4)?;
@@ -899,13 +908,11 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     for lane in 0..lane_count {
         let head = execution.lane_head(lane)?;
         for (layer, expected) in &reference.hidden {
-            let (device, output) = execution.lane_output(lane, *layer)?;
-            let bytes = read_buffer(device, output)?;
-            let actual = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+            let actual = execution.diagnostic_output(lane, *layer)?;
             let (cosine, relative_l2) = hidden_metrics(&actual, expected)?;
             println!("Step-5 shared hidden rows={rows} lane={lane} layer={layer} cosine={cosine:.9} relative_l2={relative_l2:.9}");
         }
-        let (_, output) = execution.lane_output(lane, 91)?;
+        let (_, output) = execution.lane_terminal_output(lane)?;
         ensure!(output.device_id == devices[head_rank].id, "Step-5 shared final head owner");
         let actual = head.logits(output)?;
         if let Some(first) = &first_logits {
@@ -921,9 +928,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         }
         save_diagnostics(&lane_args, &reference.tokens, &reference.positions, cfg.vocab,
             &actual, normalized.as_deref(), |layer| {
-                let (device, output) = execution.lane_output(lane, layer)?;
-                Ok(read_buffer(device, output)?.chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+                execution.diagnostic_output(lane, layer)
             })?;
         if let Some(expected) = &reference.final_norm {
             let (cosine, relative_l2) = hidden_metrics(normalized.as_deref().context("final norm inspection")?, &expected)?;
@@ -944,14 +949,26 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     Ok(())
 }
 
+fn checkpoint_identity(revision: Option<&str>, format: cuteafd_loader::formats::fp8_experts::ExpertFormat,
+    fp8_diagnostic: bool) -> Result<()> {
+    use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+    ensure!(matches!((revision, format),
+        (Some(FP8_REVISION), ExpertFormat::Fp8Block128)
+        | (Some(NVFP4_REVISION), ExpertFormat::Nvfp4)),
+        "Step-5 golden requires matching pinned native FP8 or NVFP4 revision and expert headers");
+    ensure!(!fp8_diagnostic || format == ExpertFormat::Fp8Block128,
+        "native-FP8 diagnostic reference cannot qualify an NVFP4 checkpoint; use the BF16 root");
+    Ok(())
+}
+
 pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     diagnostic_selection(&args)?;
     let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
     if args.dump_layer0.is_none() { selection(args.last_layer, args.peers.len(), &layers, args.nll)?; }
-    ensure!(
-        args.snapshot.file_name().and_then(|s| s.to_str()) == Some(FP8_REVISION),
-        "Step-5 golden requires pinned native FP8 revision"
-    );
+    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let format = catalog.fp8().context("Step-5 golden requires native expert headers")?.format();
+    checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), format,
+        args.fp8_diagnostic_reference)?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
     let reference = reference(&args, cfg.vocab)?;
@@ -988,7 +1005,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
         0,
         false,
         "step5",
-        "fp8",
+        &format.package_name("step5"),
         &selected,
     )?;
     let (free, _) = library.cuda_memory_info()?;
@@ -1463,7 +1480,7 @@ mod tests {
             prefill: Some(1),
             device: 0,
             split_device: None,
-            diagnostic_lanes: 1,
+            diagnostic_lanes: 1, poison_scratch: false,
             check_headers: true,
             nll: false,
             prefix_state: false,
@@ -1516,7 +1533,7 @@ mod tests {
         std::fs::write(folder.join("logits.bin"), &logits)?;
         let mut args = GoldenArgs { snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
-            peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None, diagnostic_lanes: 1, check_headers: true, nll: true, prefix_state: false,
+            peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None, diagnostic_lanes: 1, poison_scratch: false, check_headers: true, nll: true, prefix_state: false,
             fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false,
             save_logits: None, dump_residuals: None, dump_layers: vec![], dump_layer0: None };
         let full = reference(&args, 3)?;
@@ -1559,6 +1576,25 @@ mod tests {
         bad[..4].copy_from_slice(&f32::NAN.to_le_bytes());
         std::fs::write(folder.join("logits.bin"), bad)?;
         assert!(reference(&args, 3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn golden_checkpoint_revision_and_native_format_must_agree() -> Result<()> {
+        use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+        checkpoint_identity(Some(FP8_REVISION), ExpertFormat::Fp8Block128, false)?;
+        checkpoint_identity(Some(FP8_REVISION), ExpertFormat::Fp8Block128, true)?;
+        checkpoint_identity(Some(NVFP4_REVISION), ExpertFormat::Nvfp4, false)?;
+        for (revision, format, diagnostic) in [
+            (Some(FP8_REVISION), ExpertFormat::Nvfp4, false),
+            (Some(NVFP4_REVISION), ExpertFormat::Fp8Block128, false),
+            (Some(NVFP4_REVISION), ExpertFormat::Nvfp4, true),
+            (Some(BF16_REVISION), ExpertFormat::Bf16, false),
+            (Some("unpinned"), ExpertFormat::Nvfp4, false),
+            (None, ExpertFormat::Fp8Block128, false),
+        ] {
+            assert!(checkpoint_identity(revision, format, diagnostic).is_err());
+        }
         Ok(())
     }
 

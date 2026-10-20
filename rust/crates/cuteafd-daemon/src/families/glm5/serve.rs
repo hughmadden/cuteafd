@@ -426,6 +426,23 @@ fn draft_seed() -> cuteafd_core::PolicySeed {
         cold_drafts: 5, warm_rounds: 24, warm_error: 0.08 }
 }
 
+fn draft_homes(layers: impl IntoIterator<Item = (bool, bool, usize)>,
+    exl3: Option<&cuteafd_loader::V41Exl3Manifest>,
+    read_bytes: impl Fn(usize) -> Result<usize>) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
+    use crate::shared::draft::resource::{self, LayerHome};
+    layers.into_iter().enumerate().map(|(layer, (dense, local, tp))| {
+        if dense { return Ok(LayerHome::Dense); }
+        ensure!(tp > 0, "GLM layer {layer} has no installed expert ranks");
+        // EXL3 workers retain manifest pricing; every other backend attests its
+        // actual installed weight/scale extent, including native EXLR8.
+        let slice_bytes = match exl3 {
+            Some(manifest) => resource::exl3_slice_bytes(manifest, layer, tp)?,
+            None => read_bytes(layer)? as f64,
+        };
+        Ok(if local { LayerHome::Local { slice_bytes } } else { LayerHome::Remote { slice_bytes } })
+    }).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
@@ -446,19 +463,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             transport.as_ref().context("GLM installed Spark transport missing")?.transport.installed_grouping()?
         } else { Vec::new() };
         let catalog = cuteafd_loader::read_expert_catalog(&opened.snapshot)?;
-        let homes = engine.weights.layers.iter().enumerate().map(|(layer, weights)| {
-            if weights.dense { return Ok(resource::LayerHome::Dense); }
+        let homes = draft_homes(engine.weights.layers.iter().enumerate().map(|(layer, weights)| {
             let local = tp2.as_ref().is_some_and(|layers| layers.contains(&layer));
-            let tp = if local { 2 } else { remote.len() };
-            ensure!(tp > 0, "GLM layer {layer} has no installed expert ranks");
-            let slice_bytes = match (catalog.fp8(), catalog.exl3()) {
-                (Some(_), _) => engine.draft_weight_read_bytes(layer, &remote)? as f64,
-                (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
-                _ => anyhow::bail!("GLM routed expert format cannot be priced"),
-            };
-            Ok(if local { resource::LayerHome::Local { slice_bytes } }
-                else { resource::LayerHome::Remote { slice_bytes } })
-        }).collect::<Result<Vec<_>>>()?;
+            (weights.dense, local, if local { 2 } else { remote.len() })
+        }), catalog.exl3(), |layer| engine.draft_weight_read_bytes(layer, &remote))?;
         let geometry = resource::geometry_with_grouping(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS,
             d.cfg.drafts(), resource::COPY_EXTENSION, |layer, rows| engine.draft_group_rows(layer, rows, &remote))?;
         engine.arm_draft_probe()?;
@@ -1030,6 +1038,73 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
 #[cfg(test)]
 mod draft_tests {
     use super::*;
+    use crate::shared::draft::{resource, runtime::SharedPolicy};
+    use cuteafd_transport::worker_selection::{ExpertGroupingSelector, ExpertTrafficContract,
+        InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
+
+    fn installed_reports(bytes: Option<[usize; 2]>, conservative: bool) -> Vec<InstalledExpertGrouping> {
+        let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
+            "checkpoint": "0".repeat(64), "geometry": [6144, 256, 8, 2048, 78],
+            "world": 2, "topology": [2, 1], "ownership_wire": false,
+        })).unwrap();
+        let loaded = WorkerSelection::new(identity, &(3..78).collect::<Vec<_>>()).unwrap();
+        (0..2).map(|rank| {
+            let contract = if conservative { ExpertTrafficContract::ConservativeRouteUpperBound }
+                else { ExpertTrafficContract::ExactGrouping };
+            let variant = InstalledExpertVariant::from_piecewise_queries(256, contract,
+                |_| Ok(if conservative { 1 } else { 48 })).unwrap();
+            let report = InstalledExpertGrouping::new(loaded.clone(), rank, 128,
+                ExpertGroupingSelector::Fp8Nearest, vec![variant]).unwrap();
+            bytes.map_or(report.clone(), |bytes| report.with_weight_read_bytes(bytes[rank]).unwrap())
+        }).collect()
+    }
+
+    #[test]
+    fn exlr8_dflash2_scheduler_constructs_from_installed_native_read_bytes() {
+        let reports = installed_reports(Some([6_144_024, 9_216_024]), true);
+        let homes = draft_homes((0..78).map(|layer| (layer < 3, false, reports.len())), None,
+            |layer| resource::worker_weight_read_bytes(&reports, layer)).unwrap();
+        let geometry = resource::geometry_with_grouping(&homes, 256, 8, DECODE_ROWS, 7,
+            resource::COPY_EXTENSION, |layer, rows| resource::worker_group_rows(&reports, layer, rows)).unwrap();
+        let scheduler = SharedPolicy::with_geometry(geometry,
+            resource::Prior::Selector(crate::shared::draft_confidence::SelectorFit::default()), draft_seed()).unwrap();
+        assert_eq!(scheduler.policy.geometry().widths, [7]);
+        assert_eq!(scheduler.policy.geometry().layers.len(), 78);
+        assert!(scheduler.policy.geometry().layers[..3].iter().all(|layer| layer.class.is_none()));
+        for layer in &scheduler.policy.geometry().layers[3..] {
+            assert_eq!(layer.slice_bytes.to_bits(), 9_216_024f64.to_bits());
+            assert_eq!(layer.group_rows, 1);
+        }
+    }
+
+    #[test]
+    fn installed_fp8_mxfp4_nvfp4_prices_remain_bit_identical() {
+        for (format, bytes) in [("fp8", [12_288_024, 9_216_024]),
+            ("mxfp4", [6_291_456, 4_194_304]), ("nvfp4", [7_077_900, 4_718_600])] {
+            let reports = installed_reports(Some(bytes), false);
+            let homes = draft_homes((0..78).map(|layer| (layer < 3, layer == 3, 2)), None,
+                |layer| resource::worker_weight_read_bytes(&reports, layer)).unwrap();
+            let previous = (0..78).map(|layer| if layer < 3 { resource::LayerHome::Dense }
+                else if layer == 3 { resource::LayerHome::Local { slice_bytes: bytes[0] as f64 } }
+                else { resource::LayerHome::Remote { slice_bytes: bytes[0] as f64 } }).collect::<Vec<_>>();
+            assert_eq!(homes, previous, "{format}");
+            let geometry = |homes: &[_]| resource::geometry_with_grouping(homes, 256, 8, DECODE_ROWS, 7,
+                resource::COPY_EXTENSION, |layer, rows| resource::worker_group_rows(&reports, layer, rows)).unwrap();
+            assert_eq!(geometry(&homes), geometry(&previous), "{format}");
+        }
+    }
+
+    #[test]
+    fn missing_installed_read_bytes_is_typed_without_format_fallback() {
+        let reports = installed_reports(None, true);
+        let error = draft_homes((0..78).map(|layer| (layer < 3, false, 2)), None,
+            |layer| resource::worker_weight_read_bytes(&reports, layer)).unwrap_err();
+        assert_eq!(error.downcast_ref::<cuteafd_transport::worker_selection::MissingWeightReadBytes>(),
+            Some(&cuteafd_transport::worker_selection::MissingWeightReadBytes { rank: 0 }));
+        let error = resource::worker_weight_read_bytes(&[], 3).unwrap_err();
+        assert_eq!(error.downcast_ref::<resource::MissingWorkerReadBytes>(),
+            Some(&resource::MissingWorkerReadBytes { layer: 3 }));
+    }
 
     #[test]
     fn glm53_seed_uses_its_own_weak_drafter_prices() {

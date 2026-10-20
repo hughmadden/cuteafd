@@ -32,8 +32,6 @@ def test_deployment_preserves_release_container_commands(entry: dict) -> None:
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
         before, after = parse_run(old["argv"]), parse_run(new["argv"])
-        # MiMo Pro configs select balanced TP placement (#521); every other card stays round-robin.
-        before["env"]["CUTEAFD_TP_PLACEMENT"] = "balanced" if "mimo-v26-pro" in entry["config"] else "round-robin"
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
@@ -60,6 +58,36 @@ def exlr8_entry(manifest: str = "up1", **overrides: str) -> dict:
         ATTENTION_PLACEMENT="context", EXLR8_MANIFEST=manifest,
         EXLR8_DENSE_FROM="deepseek-ai/DeepSeek-V4.1-Flash", **overrides)
     return entry
+
+
+@pytest.mark.parametrize("speculator", ["dflash2", "off", "unset"])
+def test_exlr8_uses_glm_drafter_default_and_explicit_opt_out(speculator: str, tmp_path: Path) -> None:
+    entry = exlr8_entry()
+    launcher = None
+    if speculator == "unset":
+        launcher = tmp_path / "run-family.sh"
+        source = ROOT / "scripts/launch/run-family.sh"
+        # The release fixture has explicit settings; remove both before resolution.
+        launcher.write_text(source.read_text().replace(
+            'exlr8_manifest="$(get EXLR8_MANIFEST)"',
+            'unset \'cfg[SPECULATOR]\' \'cfg[SPECULATOR_MODEL_ID]\'\n'
+            'exlr8_manifest="$(get EXLR8_MANIFEST)"'))
+    else:
+        entry["set"]["SPECULATOR"] = speculator
+    result = capture(ROOT, f"exlr8-{speculator}", release_entry=entry, launcher_source=launcher)
+    plan = result["plans"][0]
+    selected = "off" if speculator == "off" else "dflash2"
+    assert plan[plan.index("--speculator") + 1] == selected
+    for run in result["containers"]:
+        command = parse_run(run["argv"])["command"]
+        if "serve-glm" in command:
+            assert ("--draft" in command) == (selected == "dflash2")
+            if selected == "dflash2":
+                assert "models--incoai--GLM-5.3-DFlash2/snapshots/" in command[command.index("--draft") + 1]
+            assert "--exlr8-dense-from" in command
+        else:
+            assert "expertd-native" in command
+            assert "--draft" not in command
 
 
 @pytest.mark.parametrize("manifest", ["up1", "bit325"])
@@ -122,7 +150,7 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
     ({"RTX_GPUS": "1"}, "heads attention"),
     ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
     ({"SPARK_COUNT": "7"}, "canonical Spark ranks"),
-    ({"SPECULATOR": "dflash2"}, "SPECULATOR=off"),
+    ({"SPECULATOR": "mtp"}, "SPECULATOR=off or dflash2"),
     ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),
     ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),
 ])
@@ -206,21 +234,3 @@ def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> 
     assert serve.count("--host-cache-bytes") == 1
     assert actual == "auto"
     assert plan[plan.index("--host-cache-bytes") + 1] == actual
-
-
-@pytest.mark.parametrize("policy", ["round-robin", "balanced"])
-def test_tp_placement_reaches_planner_coordinator_and_workers(policy: str) -> None:
-    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo-pro-max"))
-    entry["set"]["TP_PLACEMENT"] = policy
-    result = capture(ROOT, f"tp-placement-{policy}", release_entry=entry)
-    assert f"CUTEAFD_TP_PLACEMENT={policy}" in result["plans"][0]
-    assert len(result["containers"]) == 7
-    for container in result["containers"]:
-        assert parse_run(container["argv"])["env"]["CUTEAFD_TP_PLACEMENT"] == policy
-
-
-def test_tp_placement_rejects_unknown_policy_before_launch() -> None:
-    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo-pro-max"))
-    entry["set"]["TP_PLACEMENT"] = "fitted"
-    with pytest.raises(RuntimeError, match="TP_PLACEMENT"):
-        capture(ROOT, "tp-placement-invalid", release_entry=entry)

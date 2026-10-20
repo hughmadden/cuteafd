@@ -39,6 +39,24 @@ def test_dense_trellis_catalog_has_native_full_shapes(monkeypatch):
         assert thunk() == params
 
 
+def test_dense_tp2_catalog_halves_only_the_owned_axis(monkeypatch):
+    entries = {name: (op, params, thunk)
+               for name, op, params, thunk in catalog(monkeypatch)}
+    assert len(entries) == 18
+    for name in ("trellis_q_b", "trellis_o", "trellis_gate_up", "trellis_down",
+                 "int4_q_b", "int4_o"):
+        op, full, _ = entries[name]
+        half_op, half, thunk = entries[name + "_tp2"]
+        axis = "output_features" if full["sharded_side"] == 1 else "input_features"
+        expected = dict(full, **{axis: full[axis] // 2})
+        assert half_op == op
+        assert half == expected
+        assert half["max_rows"] == 4096
+        assert thunk() == half
+    assert not any(name.endswith("_tp2") and name.startswith(("mxfp8", "fp8_row"))
+                   for name in entries)
+
+
 def test_dense_has_opt_in_sm_comparison_group(monkeypatch):
     spec = importlib.util.spec_from_file_location("sm_exports", ROOT / "scripts/build/compare-sm-exports.py")
     module = importlib.util.module_from_spec(spec)

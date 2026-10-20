@@ -98,6 +98,18 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             assert_eq!(layout.geometry.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>(),
                 diagnostic.geometry.ranks[0].persistent_unit_bytes);
             let weights: Vec<_> = (0..ranks).map(|rank| RankWeightLayout::for_execution(&cp, rank, &owners).unwrap()).collect();
+            for rank in 0..ranks {
+                let rows = owners.execution().spec().rows as usize;
+                let layer_bytes = (0..cfg.layers).filter_map(|layer| {
+                    let local = owners.layer(layer, rank).unwrap();
+                    (local.query_heads > 0).then(|| native::layer_workspace(
+                        rows, cfg.full[layer], local.query_heads, cfg.moe[layer]).unwrap())
+                }).collect::<Vec<_>>();
+                let head_bytes = if rank == usize::from(head) { native::plane_bytes(&native::head_planes(rows).unwrap()).unwrap() } else { 0 };
+                let expected = layer_bytes.iter().copied().max().unwrap_or(0).max(head_bytes);
+                assert_eq!(native::rank_admission(&cp, &owners, rank, rows).unwrap().workspace, expected);
+                if layer_bytes.len() > 1 { assert!(expected < layer_bytes.iter().sum::<u64>() + head_bytes); }
+            }
             for (layer, &mode) in modes.iter().enumerate() {
                 let mut attention = Vec::new();
                 let mut ffns = Vec::new();
@@ -427,7 +439,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
 }
 
 #[test]
-fn nvfp4_stacked_scales_and_bf16_root_are_named_not_executed() {
+fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
     let dir = snapshot("nvfp4");
     let cp = Checkpoint::open(dir.path()).unwrap();
     let model = Model::open(&cp).unwrap();
@@ -440,14 +452,39 @@ fn nvfp4_stacked_scales_and_bf16_root_are_named_not_executed() {
             assert_eq!(operand.scale.unwrap().grid,vec![352,1536,256]);
         }
     }
-    let result = report(dir.path(),1,96,4,Some(262_144));
-    assert!(result.config_error.is_none(),"{:?}",result.config_error);
-    assert!(!result.wip_launchable() && !result.native_serving_admitted);
-    assert!(result.hints.iter().any(|h| h.what.contains("NVFP4/BF16")));
+    for (context, pool) in [(262_144, Some(262_144)), (1_048_576, None)] {
+        let result = report_context(dir.path(), 1, 96, 4, pool, context);
+        assert!(result.config_error.is_none(), "{:?}", result.config_error);
+        assert!(result.wip_launchable() && result.native_serving_admitted, "{:?}", result.hints);
+        assert!(!result.executable());
+        assert_eq!(result.min_spark_ranks, Some(4));
+        let memory = result.memory_layout.unwrap();
+        assert_eq!(memory.devices.len(), 5);
+        if let Some(tokens) = pool {
+            assert_eq!(memory.pool_tokens, tokens);
+        } else {
+            assert!((262_144..=context).contains(&memory.pool_tokens));
+        }
+        assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+        let endpoint = cuteafd_core::SparkEndpoint { capacity: 256, ingress: cuteafd_core::SparkIngress::Bf16 };
+        let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
+            depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        let lane_rings = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::STEP5, rings).unwrap();
+        for device in &memory.devices[1..] {
+            assert!(device.items.iter().any(|item| item.format == "W4A4"));
+            let mapped = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
+            assert_eq!(mapped.bytes, 2 * lane_rings as u64, "one endpoint per execution lane");
+        }
+    }
+    for (gpus, gib, ranks) in [(2, 96, 4), (1, 32, 4), (1, 96, 6), (1, 96, 0)] {
+        let result = report(dir.path(), gpus, gib, ranks, None);
+        assert!(!result.wip_launchable() && !result.native_serving_admitted);
+        assert!(result.hints.iter().any(|h| h.what.contains("unqualified")), "{:?}", result.hints);
+    }
     let dir = snapshot("bf16");
     let r = report(dir.path(),2,96,6,None);
     assert!(r.config_error.is_none(),"{:?}",r.config_error);
-    assert!(r.hints.iter().any(|h| h.what.contains("NVFP4/BF16")));
+    assert!(r.hints.iter().any(|h| h.what.contains("BF16 target format")));
 }
 
 #[test]
@@ -573,6 +610,47 @@ fn routed_catalog_preserves_native_formats_activation_and_target_bounds() {
             assert_eq!(tail.activation(layer), Some(FfnActivation::SiluPostClampFp32Product { limit: 7.0 }));
         }
         catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
+    }
+}
+
+#[test]
+fn mixed_native_assignment_matches_each_worker_groups_exact_units() {
+    use crate::formats::fp8_experts::Slicing;
+    use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
+    use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+    let endpoints = [SparkEndpoint { capacity: 64, ingress: SparkIngress::Bf16 }];
+    let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+    for kind in ["fp8", "nvfp4", "bf16"] {
+        let dir = snapshot(kind);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let tensors = catalog.fp8().unwrap();
+        for world in [4, 6] {
+            let working = SparkWorkingSet { spark_layers: vec![3, 88, 89, 90],
+                spark_ranks: world, prefill_lanes: 1, ..Default::default() };
+            // Exercise either exact unit chosen from a mixed checkpoint's headers.
+            for block in [16, 128] {
+                for rank in 0..world {
+                    let assignment = SparkAssignment::from_catalog(&catalog, &working, rank,
+                        SparkResidentLayout::Fp8 { world, rank, slicing: Slicing::Blocks(block) },
+                        &endpoints, rings).unwrap();
+                    let mut resident = 0u64;
+                    for slice in &assignment.slices {
+                        let view = tensors.for_layer(slice.layer as usize).unwrap();
+                        let slicing = view.slicing_for_directory(std::path::Path::new(&format!("tp{world}")), world);
+                        assert_eq!(slicing, Slicing::Blocks(view.block()));
+                        let map = view.unit_map(world, rank, slicing).unwrap();
+                        assert_eq!(slice.unit_map, Some(map.fingerprint()),
+                            "{kind} TP{world} rank{rank} layer{} inputK{block}", slice.layer);
+                        let (first, width) = view.rank_range_with(world, rank, slicing).unwrap();
+                        assert_eq!((slice.first as usize, slice.width as usize, slice.stored_width as usize),
+                            (first, width, view.rank_width(world, rank, slicing).unwrap()));
+                        resident += (view.weight_read_bytes_with(world, rank, slicing).unwrap()
+                            * view.shape().experts) as u64;
+                    }
+                    assert_eq!(assignment.resident_bytes, resident);
+                }
+            }
+        }
     }
 }
 

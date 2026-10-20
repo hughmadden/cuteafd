@@ -11,14 +11,16 @@ pub struct MarkRule {
     pub lanes: usize,
     pub entries: usize,
     pub budget_bytes: u64,
+    pub host: bool,
 }
 impl MarkRule {
     pub fn slots(self, bytes: usize) -> usize {
-        cuteafd_core::prefix::mark_slots_for(
+        cuteafd_core::prefix::mark_slots_with_host(
             self.lanes as u64,
             self.entries as u64,
             bytes as u64,
             self.budget_bytes,
+            self.host,
         ) as usize
     }
 }
@@ -520,11 +522,26 @@ pub fn admit_with(
                 hops: inputs.hops(),
                 executor: EXECUTOR,
             };
-            let placement = solve(&request)?;
-            ensure!(
-                placement.pool_tokens >= FLOOR,
-                "Step-5 aggregate pool is below the 256K agentic floor"
-            );
+            let retention_guidance = |error: anyhow::Error| {
+                if !inputs.marks.host && marks > 0 {
+                    anyhow::anyhow!("{error}; Step-5 device-only prefix retention with HOST_CACHE_BYTES=0 does not fit at request context {context}; enable --host-cache-bytes auto (HOST_CACHE_BYTES=auto), or lower --max-context/--context-tokens (MAX_CONTEXT_TOKENS), for example to 262144")
+                } else {
+                    error
+                }
+            };
+            let placement = solve(&request).map_err(|error| {
+                if matches!(&error, PlacementError::Mandatory { .. }
+                    | PlacementError::PoolDoesNotFit { .. } | PlacementError::BelowFloor { .. }) {
+                    retention_guidance(error.into())
+                } else {
+                    error.into()
+                }
+            })?;
+            if placement.pool_tokens < FLOOR {
+                return Err(retention_guidance(anyhow::anyhow!(
+                    "Step-5 aggregate pool is below the 256K agentic floor"
+                )));
+            }
             EXECUTOR.check(&placement)?;
             ensure!(
                 placement.layers.iter().map(|l| l.mode).eq(ownership
@@ -628,6 +645,7 @@ mod tests {
                 lanes: 16,
                 entries: 16,
                 budget_bytes: 0,
+                host: false,
             },
             peer_diagnostics: false,
             pending_code: vec![1 << 20; ranks],
@@ -693,6 +711,49 @@ mod tests {
                 assert_eq!(admission.ownership.execution().mode(7)?, WHOLE1);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn host_retention_reserves_only_shared_staging_marks() -> Result<()> {
+        for ranks in [1, 2] {
+            let mut inputs = inputs(ranks);
+            inputs.context = EXTENT;
+            inputs.requested_pool = None;
+            inputs.marks.host = true;
+            for entries in [0, 20, 200] {
+                inputs.marks.entries = entries;
+                for budget in [0, 2 << 30, 32 << 30] {
+                    inputs.marks.budget_bytes = budget;
+                    let admitted = run(&inputs)?;
+                    let slots = if entries == 0 { 0 } else { 2 };
+                    assert_eq!(admitted.marks, slots);
+                    for rank in 0..ranks {
+                        assert_eq!(admitted.reservations[rank].marks as u64,
+                            admitted.cache.ranks[rank].bytes * slots as u64);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn device_only_retention_fit_refusal_names_host_and_context_remedies() -> Result<()> {
+        let mut inputs = inputs(1);
+        inputs.context = EXTENT;
+        inputs.requested_pool = None;
+        inputs.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 50 << 30 };
+        let refusal = run(&inputs).err().expect("device marks exceed the available budget").to_string();
+        for message in ["device-only prefix retention with HOST_CACHE_BYTES=0",
+            "request context 1048576", "--host-cache-bytes auto", "MAX_CONTEXT_TOKENS", "262144"] {
+            assert!(refusal.contains(message), "{refusal}");
+        }
+        inputs.marks.host = true;
+        run(&inputs)?;
+        inputs.marks.host = false;
+        inputs.context = FLOOR;
+        run(&inputs)?;
         Ok(())
     }
 

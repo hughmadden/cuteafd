@@ -11,7 +11,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 #[derive(Debug, thiserror::Error)]
-#[error("Step-5 layout is unqualified: {0}; use WIP target-only FP8 on 2 RTX PRO 6000 + 6 Sparks")]
+#[error("Step-5 layout is unqualified: {0}; use WIP target-only FP8 on 2 RTX PRO 6000 + 6 Sparks or NVFP4 on 1 RTX PRO 6000 + 4 Sparks")]
 struct Unqualified(&'static str);
 
 pub(super) fn layout(
@@ -25,15 +25,16 @@ pub(super) fn layout(
         model.complete,
         "Step-5 admission requires complete safetensors headers; missing safetensors headers"
     );
-    report.min_spark_ranks = Some(6);
+    let nvfp4 = model.formats.iter().any(|f| f == "nvfp4-g16-w4a4");
+    let (coordinators, spark_ranks) = if nvfp4 { (1, 4) } else { (2, 6) };
+    report.min_spark_ranks = Some(spark_ranks);
     ensure!(
-        model.formats.iter().any(|f| f == "fp8-block128")
-            && !model.formats.iter().any(|f| f == "nvfp4-g16-w4a4"),
-        Unqualified("NVFP4/BF16 target format")
+        nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
+        Unqualified("BF16 target format")
     );
     ensure!(
-        opts.rtx_bytes.len() == 2
-            && requested.spark_ranks() == 6
+        opts.rtx_bytes.len() == coordinators
+            && requested.spark_ranks() == spark_ranks
             && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
         Unqualified("coordinator/Spark count or 5090")
     );
@@ -98,11 +99,12 @@ pub(super) fn layout(
         manifest["capacities"]["max_context"] == model.cfg.max_context,
         "Step-5 exports require the checkpoint's 1M compiled extent"
     );
-    let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
+    let prefixes: &[&str] = if coordinators == 2 { &["step5", "step52"] } else { &["step5"] };
+    let programs = ProgramSet::from_manifest(&manifest, prefixes);
     let entries = manifest["programs"]
         .as_array()
         .context("Step-5 program manifest lacks entries")?;
-    for prefix in ["step5", "step52"] {
+    for prefix in prefixes {
         for op in [
             "hidden_norm",
             "final_norm",
@@ -138,6 +140,9 @@ pub(super) fn layout(
             );
         }
     }
+    let catalog = input.expert_catalog()?;
+    let format = catalog.fp8().context("Step-5 requires native expert headers")?.format();
+    let package = format.package_name("step5");
     let mut code = Vec::new();
     let inventory = Inventory {
         gpus: opts
@@ -148,8 +153,8 @@ pub(super) fn layout(
                 let arch = ArchContext::coordinator(capacity_bytes, None);
                 let allowance = inventory::loaded_code_allowance(
                     "step5",
-                    "step5:fp8",
-                    true,
+                    &package,
+                    coordinators == 2,
                     rank as u8,
                     &arch,
                     Some(&programs),
@@ -165,8 +170,8 @@ pub(super) fn layout(
                 }
             })
             .collect(),
-        spark_ranks: 6,
-        peer_access: true,
+        spark_ranks,
+        peer_access: coordinators == 2,
     };
     let inputs = RuntimeInputs {
         inventory,
@@ -179,6 +184,7 @@ pub(super) fn layout(
             lanes: sequences,
             entries: usize::try_from(opts.mimo_prefix_entries)?,
             budget_bytes: opts.mimo_prefix_mark_bytes,
+            host: opts.host_cache_bytes != Some(0),
         },
         peer_diagnostics: false,
         pending_code: code,
@@ -200,9 +206,10 @@ pub(super) fn layout(
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: admitted.placement.pool_tokens,
         waste: vec![], notes: vec!["WIP target-only eager Step-5: exact native allocation owners; zero graphs; no MTP or media".into(),
             "Offline CUDA/code baseline is estimated; serving must re-admit against pre-weight live samples and native export ABIs".into(),
-            format!("SWA head split, alternating whole-owned CSA; {lanes} lanes, {sequences} sequences, request context {}, compiled extent {}",
+            format!("{}; {lanes} lanes, {sequences} sequences, request context {}, compiled extent {}",
+                if coordinators == 2 { "SWA head split, alternating whole-owned CSA" } else { "Single-device SWA and CSA ownership" },
                 admitted.cache.context, model.cfg.max_context)] };
-    for rank in 0..2 {
+    for rank in 0..coordinators {
         let mut items = admitted.placement.items[rank].clone();
         items.push(Item::new(
             Category::Runtime,
@@ -232,10 +239,10 @@ pub(super) fn layout(
     let working = SparkWorkingSet {
         rtx_layers: vec![],
         spark_layers: (3..91).collect(),
-        spark_ranks: 6,
+        spark_ranks,
         prefill_lanes: lanes as u64,
     };
-    let endpoints = (0..lanes * admitted.ownership.routed_endpoints()?)
+    let endpoints = (0..admitted.ownership.routed_endpoints()?)
         .map(|_| cuteafd_core::SparkEndpoint {
             capacity: u32::try_from(rows).unwrap_or(u32::MAX),
             ingress: cuteafd_core::SparkIngress::Bf16,
@@ -247,19 +254,18 @@ pub(super) fn layout(
         slot_bytes: 8 << 20,
         alignment: 4096,
     };
-    let catalog = input.expert_catalog()?;
     let recipe = crate::plan::experts::checkpoint_spark_recipe(
         input.checkpoint(),
-        6,
+        spark_ranks,
         &working.spark_layers,
     )?;
-    for rank in 0..6 {
+    for rank in 0..spark_ranks {
         let assignment = SparkAssignment::from_catalog(
             &catalog,
             &working,
             rank,
             SparkResidentLayout::Fp8 {
-                world: 6,
+                world: spark_ranks,
                 rank,
                 slicing: recipe.slicing,
             },
@@ -271,7 +277,7 @@ pub(super) fn layout(
                 <= opts
                     .spark_allocation_budget_bytes
                     .unwrap_or(opts.spark_bytes),
-            "Step-5 FP8 TP6 Spark rank {rank} weights exceed allocation budget"
+            "Step-5 {package} TP{spark_ranks} Spark rank {rank} weights exceed allocation budget"
         );
         *report
             .bytes_by_owner
@@ -286,8 +292,8 @@ pub(super) fn layout(
             items: vec![
                 Item::new(
                     Category::Experts,
-                    "native FP8 TP6 and BF16 tails",
-                    "W8A16",
+                    if nvfp4 { "native NVFP4 TP4 and BF16 tails" } else { "native FP8 TP6 and BF16 tails" },
+                    if nvfp4 { "W4A4" } else { "W8A16" },
                     assignment.resident_bytes,
                     Basis::Exact,
                 ),
