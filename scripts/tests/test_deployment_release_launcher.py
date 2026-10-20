@@ -99,11 +99,14 @@ def test_exlr8_launcher_preserves_explicit_prefill_lanes(lanes: str, tmp_path: P
     assert coordinator["env"]["CUTEAFD_GLM_PREFILL_LANES"] == lanes
 
 
+@pytest.mark.parametrize("gpus,attention", [("1", "auto"), ("1", "heads"), ("2", "auto"), ("2", "context")])
 @pytest.mark.parametrize("ranks", range(1, 7))
-def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int) -> None:
+def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, attention: str) -> None:
     entry = exlr8_entry()
-    entry["set"]["SPARK_COUNT"] = str(ranks)
-    result = capture(ROOT, f"exlr8-world-{ranks}", release_entry=entry)
+    entry["set"].update(SPARK_COUNT=str(ranks), RTX_GPUS=gpus, ATTENTION_PLACEMENT=attention)
+    result = capture(ROOT, f"exlr8-world-{ranks}-{gpus}-{attention}", release_entry=entry)
+    coordinator = parse_run(result["containers"][0]["argv"])["command"]
+    assert ("--split-device" in coordinator) == (gpus == "2")
     assert len(result["containers"]) == ranks + 1
     workers = [parse_run(run["argv"])["command"] for run in result["containers"][1:]]
     for rank, command in enumerate(workers):
@@ -114,7 +117,10 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int) -> None:
 @pytest.mark.parametrize("overrides,reason", [
     ({"EXLR8_MANIFEST": "other"}, "EXLR8_MANIFEST"),
     ({"EXLR8_DENSE_FROM": ""}, "EXLR8_DENSE_FROM"),
-    ({"RTX_GPUS": "1"}, "two RTX"),
+    ({"RTX_GPUS": "0"}, "RTX GPUs"),
+    ({"RTX_GPUS": "3"}, "RTX GPUs"),
+    ({"RTX_GPUS": "1"}, "heads attention"),
+    ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
     ({"SPARK_COUNT": "7"}, "canonical Spark ranks"),
     ({"SPECULATOR": "dflash2"}, "SPECULATOR=off"),
     ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),

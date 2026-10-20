@@ -40,6 +40,44 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
 }
 
 #[test]
+fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
+    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+    use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, MemoryLayout, ItemLifetime};
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&sparks(6)).unwrap();
+    assert_eq!(report.spark_ranks, 6);
+    report.prefill_rows = Some(4096);
+    report.prefill_lanes = Some(3);
+    report.memory_layout = Some(MemoryLayout { devices: vec![DeviceLayout {
+        kind: DeviceKind::Rtx, index: 0, capacity_bytes: 96 << 30, items: vec![], kv_tokens: 0,
+    }], pool_tokens: 0, waste: vec![], notes: vec![] });
+    let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        host_cache_bytes: Some(0), ..Default::default() };
+    let spec = report.spec.as_ref().unwrap();
+    let moe = spec.moe.as_ref().unwrap();
+    let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
+        topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
+    let endpoint = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32 };
+    let (request, response) = endpoint.wire_bytes(geometry).unwrap();
+    let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+        depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+    let expected = endpoint.ring_bytes(geometry, rings).unwrap() as u64 * 4 * 6;
+    layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
+    let host = report.host_ledger.as_ref().unwrap();
+    let registered = host.items.iter().find(|i| i.group == "transport/rdma-rings").unwrap();
+    assert_eq!(registered.bytes, expected);
+    assert_eq!(registered.lifetime, ItemLifetime::PostReadyReserve);
+    let intake = host.items.iter().find(|i| i.group == "spark-intake").unwrap();
+    assert_eq!(intake.bytes, 4096 * geometry.hidden as u64 * 4 * 4 * 6);
+    assert_eq!(host.shortfall_bytes, 0);
+    report.spark_ranks = 0;
+    layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
+    assert!(!report.host_ledger.as_ref().unwrap().items.iter()
+        .any(|i| matches!(i.group.as_str(), "transport/rdma-rings" | "spark-intake")));
+}
+
+#[test]
 fn real_layout_charges_host_and_names_unsupported_snapshot_geometry() {
     let mut config = mimo_flash_config();
     config.as_object_mut().unwrap().remove("max_position_embeddings");
