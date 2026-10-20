@@ -1,24 +1,13 @@
 //! Checkpoint-native MLA DFlash2 geometry shared by admission and loading.
-use super::block_dspark::{DsparkConfigError, DsparkRope, DsparkRotaryPlan};
+use super::{block_dspark::{DsparkConfigError, DsparkRope, DsparkRotaryPlan}, mla::MlaGeometry};
 use serde::Deserialize;
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, DsparkConfigError>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MlaDraftGeometry {
-    pub hidden: usize,
-    pub heads: usize,
-    pub q_rank: usize,
-    pub kv_rank: usize,
-    pub nope: usize,
-    pub rope: usize,
-    pub value: usize,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct MlaDflashConfig {
-    pub mla: MlaDraftGeometry,
+    pub mla: MlaGeometry,
     pub intermediate: usize,
     pub eps: f64,
     pub block: usize,
@@ -160,10 +149,10 @@ impl MlaDflashConfig {
             || raw.attention_bias || raw.hidden_act != "silu" || raw.fc_norm {
             return Err(unsupported("MLA DFlash2 requires noncausal, ungated, bias-free SiLU and fc_norm=false"));
         }
-        let mla = MlaDraftGeometry { hidden: raw.hidden_size, heads: raw.num_attention_heads,
+        let mla = MlaGeometry { hidden: raw.hidden_size, heads: raw.num_attention_heads,
             q_rank: raw.q_lora_rank, kv_rank: raw.kv_lora_rank, nope: raw.qk_nope_head_dim,
             rope: raw.qk_rope_head_dim, value: raw.v_head_dim };
-        if mla != (MlaDraftGeometry { hidden: 7168, heads: 64, q_rank: 1536,
+        if mla != (MlaGeometry { hidden: 7168, heads: 64, q_rank: 1536,
             kv_rank: 512, nope: 128, rope: 64, value: 128 })
             || raw.num_key_value_heads != mla.heads || raw.rms_norm_eps != 1e-5 {
             return Err(unsupported("MLA draft exports require H7168, 64 heads, Q1536/KV512, NoPE128/RoPE64/V128, eps=1e-5"));

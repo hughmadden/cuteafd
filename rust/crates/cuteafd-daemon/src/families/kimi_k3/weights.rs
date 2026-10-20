@@ -5,8 +5,8 @@ use crate::shared::{memory::device::{Allocation, Device}, placement::layers::Att
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{DType, memory_layout::{Basis, Category}};
 use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaWeights, KimiMlaWeights};
-use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, kda, mla::{self, MlaOperand},
-    w8::{self, ResidualWeightSite}}, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
+use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, kda, mla,
+    w8::{self, ResidualWeightSite}}, formats::mla::MlaOperand, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
 use std::{collections::BTreeMap, os::unix::fs::FileExt};
 
 /// One canonical front end per routed ordinal, independent of attention placement.
