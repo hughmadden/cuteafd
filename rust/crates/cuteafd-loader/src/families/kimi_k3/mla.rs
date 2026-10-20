@@ -15,7 +15,7 @@ pub fn pack(cfg: &KimiK3Config, layer: usize, operand: MlaOperand, ranks: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuteafd_core::{TensorInfo, TensorRole};
+    use cuteafd_core::{DType, TensorInfo, TensorRole};
 
     fn cfg() -> KimiK3Config {
         let mut cfg = KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap();
