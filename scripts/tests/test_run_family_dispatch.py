@@ -3375,7 +3375,11 @@ def test_shard_holders_reach_spark_workers(tmp_path: Path, keys: str, expected: 
     workers = [line for line in result.stderr.splitlines() if "expertd-native" in line]
     assert workers
     for worker in workers:
-        assert (f"CUTEAFD_SHARD_HOLDERS={expected}" in worker) if expected else ("CUTEAFD_SHARD_HOLDERS" not in worker)
+        if expected:
+            # The ssh remote command re-parses this line; ';' must stay inside one quoted word.
+            assert "CUTEAFD_SHARD_HOLDERS=" + expected.replace(";", "\\;") in worker
+        else:
+            assert "CUTEAFD_SHARD_HOLDERS" not in worker
 
 
 def test_shard_holders_rejects_malformed_values(tmp_path: Path) -> None:
