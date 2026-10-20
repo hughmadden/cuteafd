@@ -132,10 +132,11 @@ def jobs(scope):
     result.append(("routed-mimop-tp6", "package_fp8_moe_aot.py",
                    ["--geometry", "mimop", "--capacities", CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"]))
-    for mode in ("legacy", "compact"):
-        result.append((f"exl3-glm-{mode}", "package_exl3_aot.py",
-                       ["--geometry", "glm", "--capacities", "1,16", "--bits", "4,5",
-                        "--compact-glm", *(["--compact-weights"] if mode == "compact" else [])]))
+    for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4"),
+                           ("dsv4f", "2,3"), ("v41", "2,3"), ("v41", "3,4"), ("v41", "4,5")):
+        result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
+                       ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits,
+                        "--compact-companions"]))
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
@@ -241,16 +242,27 @@ def _export_exl3(extra, output):
     capacities = (package.package_capacities(geometry, requested) if hasattr(package, "package_capacities")
                   else sorted({int(item) for item in requested.split(",")}))
     bits = tuple(int(item) for item in extra[extra.index("--bits") + 1].split(",")) if "--bits" in extra else (3, 4)
-    if "--compact-glm" in extra:
-        if geometry != "glm" or bits != (4, 5) or capacities != [1, 16]:
-            raise ValueError("compact GLM gate requires GLM K4/K5 rows 1/16")
-        for width, tile in ((384, (64, 128, 64, 128)), (256, (64, 256, 64, 256))):
+    if "--compact-companions" in extra:
+        if len(bits) != 2:
+            raise ValueError("compact companions require two-tier Spark exports")
+        profiles = package.compact_profiles(geometry, package.build_profiles("spark", geometry))
+        for profile, width, experts, topk, dtype, _ in profiles:
             for rows in capacities:
-                options = dict(hidden=6144, compile_only=True, tile=tile, swiglu_limit=None)
-                if "--compact-weights" in extra:
-                    options["compact_weights"] = True
-                export(output / f"width{width}" / f"m{rows}", width, 256, rows,
-                       bits, "auto", 8, "bf16", **options)
+                options = dict(compile_only=True, tile=(64, 128, 64, 128), compact_weights=True)
+                if geometry != "v41":
+                    options["hidden"] = package.GEOMETRIES[geometry][0]
+                if package.activation(geometry) != "silu":
+                    options["activation"] = package.activation(geometry)
+                block = package.route_block(geometry, rows)
+                if block != 8:
+                    options["route_block"] = block
+                if len(bits) == 2 and package.token_major_rotation(geometry, rows):
+                    options["token_major_rotation"] = True
+                limit = package.swiglu_limit(geometry)
+                if limit != 10.0:
+                    options["swiglu_limit"] = limit
+                export(output / profile / f"m{rows}", width, experts, rows,
+                       bits, "auto", topk, dtype, **options)
         return
     for profile, width, experts, topk, dtype, _ in package.profiles_for_role("coordinator", geometry):
         for rows in capacities:
