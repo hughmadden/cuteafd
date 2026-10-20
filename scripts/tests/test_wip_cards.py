@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -1828,3 +1829,15 @@ def test_summary_row_records_the_launcher(tmp_path):
     job = dict(card='c', arm='a', repeat=1, simulated=True, state=str(tmp_path), launcher=dict(repo='/r', commit='abc'),
                entry=dict(name='c', set={}))
     assert cards.summarize_job(job, 1)['launcher'] == dict(repo='/r', commit='abc')
+
+
+def test_every_required_smoke_field_is_advertised_by_the_dry_run():
+    # binary_supports looks for FIELD= in the smoke dry-run line; a field wip-cards can
+    # require but smoke.rs never prints would refuse every binary, however new.
+    source = (ROOT / 'scripts/bench/wip-cards.py').read_text()
+    block = source[source.index("    fields = ['fabric']"):source.index('    for job in {j[\'launcher\'][\'repo\']')]
+    required = {name for name in re.findall(r"\['([a-z_0-9]+)'\]", block) if name not in ('entry', 'launcher', 'repo')}
+    dry_run = (ROOT / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
+    line = next(text for text in dry_run.splitlines() if 'api_key_file={}' in text)
+    advertised = set(re.findall(r'([a-z_0-9]+)=\{', line))
+    assert required <= advertised, sorted(required - advertised)
