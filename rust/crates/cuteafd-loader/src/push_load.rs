@@ -9,12 +9,12 @@
 use std::{io, path::Path, time::Duration};
 
 use nest_push::{
-    client::{Coordinator, JoinArgs, Rank},
+    client::{Coordinator, Rank},
     plan::{Entry, Pattern},
     proto::{Event, Forecast, RankSpec, SOCKET},
 };
 
-pub use nest_push::{plan, proto, slot};
+pub use nest_push::{client::JoinArgs, plan, proto, slot};
 
 pub const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HOSTS_XATTR: &str = "user.sparknest.hosts";

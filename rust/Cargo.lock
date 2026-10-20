@@ -2092,6 +2092,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5449c8c750f1a07ea702bbd212bd999fceece9b3d1508b17023b3e174583124b"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2205,12 +2214,26 @@ checksum = "63fa2238e662d3d3c1a71168b3278f23422cf9bf76f6943ee6b1c2581d74eb5c"
 [[package]]
 name = "nest-push"
 version = "0.5.5"
-source = "git+https://github.com/tpurtell/sparknest?rev=9048eb446d1b4849939228b5fc054d38be8b98d1#9048eb446d1b4849939228b5fc054d38be8b98d1"
+source = "git+https://github.com/tpurtell/sparknest?rev=8d1df4e1c0376a7e8267c7710d226fc7c32843b3#8d1df4e1c0376a7e8267c7710d226fc7c32843b3"
 dependencies = [
  "libc",
+ "nix",
  "postcard",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
 ]
 
 [[package]]

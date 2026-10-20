@@ -393,6 +393,29 @@ fn join_start_and_stream_idle_deadlines_fall_back() {
 }
 
 #[test]
+fn full_socket_backlog_cannot_hang_model_loading() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("full.sock");
+    let listener = Socket::new(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+    listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+    listener.listen(0).unwrap();
+    // Linux admits backlog + 1 connections. Leave the first unaccepted.
+    let _occupant = Conn::connect(path.to_str().unwrap()).unwrap();
+    let client = PushClient {
+        socket: path.to_str().unwrap().into(),
+        timeout: Duration::from_millis(50),
+    };
+    assert_fallback(&client, |client| {
+        let error = match client.create(vec![], vec![]) {
+            Ok(_) => panic!("full listener backlog connected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Err(error)
+    });
+}
+
+#[test]
 fn eof_refusal_failure_and_wrong_phase_events_are_errors() {
     for response in [
         None,
