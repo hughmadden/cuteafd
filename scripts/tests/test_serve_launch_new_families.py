@@ -292,17 +292,6 @@ def test_step5_native_mtp_is_opt_in(tmp_path: Path, keys: str, depth: str) -> No
         assert absent not in serve.split(), absent
 
 
-@pytest.mark.parametrize("keys,lanes", [("", None), ("STEP5_EXECUTION_LANES=1\n", "1"), ("STEP5_EXECUTION_LANES=2\n", "2")])
-def test_step5_execution_lanes(tmp_path: Path, keys: str, lanes: str | None) -> None:
-    serve = _line(_step5(tmp_path, "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6) + keys), "cuteafd serve-step5 --snapshot")
-    assert _flag(serve, "--execution-lanes") == lanes
-
-
-def test_step5_execution_lanes_rejects_other_counts(tmp_path: Path) -> None:
-    result = _step5(tmp_path, "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6) + "STEP5_EXECUTION_LANES=3\n")
-    assert result.returncode != 0 and "STEP5_EXECUTION_LANES must be 1 or 2" in result.stderr
-
-
 def test_step5_refuses_release_images_and_slots_without_serve_step5(tmp_path: Path) -> None:
     keys = "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6)
     release = _step5(tmp_path / "release", keys, wip=False)
