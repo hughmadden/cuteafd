@@ -641,3 +641,86 @@ mod tests {
         Ok(())
     }
 }
+
+/// Inert until explicit K6 admission: native bytes remain compressed on device.
+/// The caller selects ownership from the shared layer placement before packing.
+pub(crate) struct CoreWeightLayout {
+    pub stem: String, pub side: cuteafd_loader::formats::dense_trellis::TrellisSide,
+    pub rank: usize, pub ranks: usize, pub shape: [usize;2], pub bytes: usize,
+    pub codebook: cuteafd_loader::formats::exl3_storage::Exl3Codebook,
+}
+impl CoreWeightLayout {
+    pub(crate) fn new(projection: &cuteafd_loader::families::kimi_k3::core::CoreProjection,
+        side: cuteafd_loader::formats::dense_trellis::TrellisSide, rank: usize, ranks: usize) -> Result<Self> {
+        ensure!(matches!(ranks,1|2) && rank<ranks,"Kimi core native rank geometry");
+        let [_,k]=projection.shape;
+        let n=projection.stored_outputs;
+        ensure!(match side {
+            cuteafd_loader::formats::dense_trellis::TrellisSide::Output=>n%ranks==0,
+            cuteafd_loader::formats::dense_trellis::TrellisSide::Input=>k%ranks==0,
+        },"Kimi core dimension does not divide ranks");
+        let (n,k)=match side {
+            cuteafd_loader::formats::dense_trellis::TrellisSide::Output=>(n/ranks,k),
+            cuteafd_loader::formats::dense_trellis::TrellisSide::Input=>(n,k/ranks),
+        };
+        ensure!(projection.bits==6 && n>0 && k>0 && n%128==0 && k%128==0,"Kimi K6 local H128 geometry");
+        let bytes=extent(&[n,k,6])?/8+extent(&[n+k,2])?;
+        Ok(Self{stem:projection.stem.clone(),side,rank,ranks,shape:[n,k],bytes,codebook:projection.codebook})
+    }
+    pub(crate) fn demand(&self, device: u8) -> Demand {
+        Demand::new(device,Category::Weights,format!("Kimi K6 {}",self.stem),self.bytes as u64,Basis::Exact)
+    }
+    pub(crate) fn pack(&self,module:&cuteafd_loader::formats::exl3_storage::Exl3Module,
+        read:impl FnMut(&str)->Result<LoadedTensor>) -> Result<cuteafd_loader::formats::dense_trellis::LoadedDenseTrellis> {
+        let loaded=cuteafd_loader::formats::dense_trellis::load_native_shard(&self.stem,module,self.side,self.rank,self.ranks,read)?;
+        ensure!(loaded.codebook==self.codebook && loaded.shard.shape==self.shape
+            && loaded.shard.payload.len()+loaded.shard.suh.len()+loaded.shard.svh.len()==self.bytes,
+            "Kimi K6 packed shard differs from admitted geometry/bytes");
+        Ok(loaded)
+    }
+    pub(crate) fn upload<'a>(&self,device:Device<'a>,loaded:cuteafd_loader::formats::dense_trellis::LoadedDenseTrellis)
+        -> Result<CoreWeights<'a>> {
+        let shard=loaded.shard;
+        ensure!(loaded.codebook==self.codebook && shard.side==self.side && shard.shape==self.shape
+            && shard.payload.len()+shard.suh.len()+shard.svh.len()==self.bytes,
+            "Kimi K6 upload differs from admitted shard");
+        let upload=|bytes:&[u8]|->Result<Allocation<'a>> {
+            let _scope=cuteafd_ffi::memory_ledger::scope("weights/Kimi K6 core");
+            let owner=Allocation::new(device,bytes.len())?;
+            device.run(||device.library.copy_h2d(owner.buffer,bytes))?;
+            Ok(owner)
+        };
+        Ok(CoreWeights{payload:upload(&shard.payload)?,suh:upload(&shard.suh)?,svh:upload(&shard.svh)?,
+            shape:self.shape,side:self.side,codebook:self.codebook})
+    }
+}
+pub(crate) struct CoreWeights<'a> {
+    pub payload:Allocation<'a>, pub suh:Allocation<'a>, pub svh:Allocation<'a>,
+    pub shape:[usize;2], pub side:cuteafd_loader::formats::dense_trellis::TrellisSide,
+    pub codebook:cuteafd_loader::formats::exl3_storage::Exl3Codebook,
+}
+
+#[cfg(test)]
+mod core_owner_tests {
+    use super::*;
+    use cuteafd_loader::{families::kimi_k3::core::{CoreProjection,CoreSplit},
+        formats::{dense_trellis::TrellisSide,exl3_storage::Exl3Codebook}};
+    #[test]
+    fn native_owner_charge_matches_planner_and_storage_side() {
+        for (split,side) in [(CoreSplit::Output,TrellisSide::Output),(CoreSplit::Input,TrellisSide::Input)] {
+            let p=CoreProjection{stem:"projection".into(),bits:6,codebook:Exl3Codebook::Mul1,
+                shape:[12288,7168],stored_outputs:12288,split,source_bytes:0};
+            for rank in 0..2 {
+                let layout=CoreWeightLayout::new(&p,side,rank,2).unwrap();
+                assert_eq!(layout.bytes as u64,p.resident_bytes(2).unwrap());
+                assert_eq!(layout.shape,if side==TrellisSide::Output {[6144,7168]}else{[12288,3584]});
+            }
+            assert!(CoreWeightLayout::new(&p,side,2,2).is_err());
+            assert!(CoreWeightLayout::new(&p,side,0,3).is_err());
+        }
+        let p=CoreProjection{stem:"kv_a".into(),bits:6,codebook:Exl3Codebook::Mcg,
+            shape:[576,7168],stored_outputs:640,split:CoreSplit::Whole,source_bytes:0};
+        let layout=CoreWeightLayout::new(&p,TrellisSide::Output,0,1).unwrap();
+        assert_eq!(layout.shape,[640,7168]);assert_eq!(layout.bytes as u64,p.resident_bytes(1).unwrap());
+    }
+}

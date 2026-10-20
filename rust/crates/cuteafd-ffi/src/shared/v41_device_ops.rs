@@ -1,6 +1,6 @@
 //! Pre-resolved operations used by asynchronous dual-device chains.
 use crate::{CuteafdDeviceBuffer, NativeLibrary};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::ffi::c_void;
 
 type AddFn = unsafe extern "C" fn(*const u16, *const u16, *mut u16, usize, *mut c_void) -> i32;
@@ -160,6 +160,36 @@ impl NativeLibrary {
     }
 }
 impl V41PeerCopy<'_> {
+    /// Interleave independent BF16 gate/up planes on one serialized stream.
+    /// The caller retains allocation owners until the stream drains.
+    pub fn interleave_bf16(&self, destination:CuteafdDeviceBuffer,gate:CuteafdDeviceBuffer,
+        up:CuteafdDeviceBuffer,rows:usize,width:usize,stream:*mut c_void)->Result<()> {
+        ensure!((1..=4096).contains(&rows) && width>0,"invalid gate/up interleave shape");
+        let row_bytes=width.checked_mul(2).context("gate/up row overflow")?;
+        let plane_bytes=rows.checked_mul(row_bytes).context("gate/up plane overflow")?;
+        let total=plane_bytes.checked_mul(2).context("gate/up destination overflow")?;
+        let pitch=row_bytes.checked_mul(2).context("gate/up pitch overflow")?;
+        let mut ranges=[(0,0);3];
+        for (i,(buffer,bytes)) in [(destination,total),(gate,plane_bytes),(up,plane_bytes)].into_iter().enumerate() {
+            ensure!(buffer.device_id>=0 && buffer.device_id==destination.device_id && buffer.flags==0
+                && !buffer.ptr.is_null() && (buffer.ptr as usize)%2==0 && buffer.bytes>=bytes,
+                "gate/up interleave device/extent/alignment");
+            let start=buffer.ptr as usize;
+            let end=start.checked_add(bytes).context("gate/up interleave pointer overflow")?;
+            ranges[i]=(start,end);
+        }
+        ensure!(ranges.iter().enumerate().all(|(i,&(start,end))|ranges[..i].iter()
+            .all(|&(other_start,other_end)|end<=other_start || other_end<=start)),"gate/up planes overlap");
+        let second=CuteafdDeviceBuffer {ptr:destination.ptr.wrapping_byte_add(row_bytes),
+            bytes:destination.bytes-row_bytes,..destination};
+        // SAFETY: disjoint local extents, device, pitches and pointer arithmetic
+        // are checked above; the serialized caller retains all stream owners.
+        unsafe {
+            self.launch_rows(destination,gate,row_bytes,rows,pitch,row_bytes,stream)?;
+            self.launch_rows(second,up,row_bytes,rows,pitch,row_bytes,stream)?;
+        }
+        Ok(())
+    }
     /// # Safety
     /// Destination is on the current stream device; source peer access is enabled.
     /// Producers precede this stream, buffers are disjoint and live through
