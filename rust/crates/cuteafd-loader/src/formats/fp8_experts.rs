@@ -246,7 +246,8 @@ impl Fp8ExpertTensors {
 
     pub(crate) fn finish_reads(&self) { self.reader.clear(); }
 
-    pub(crate) fn push_source(&self, name: &str) -> Result<(crate::push_load::builder::Source, DType)> {
+    /// Header-derived source range and dtype; performs no payload reads.
+    pub fn push_source(&self, name: &str) -> Result<(crate::push_load::builder::Source, DType)> {
         let tensor = self.located(name)?;
         Ok((crate::push_load::builder::Source {
             path: self.snapshot.join(&tensor.shard),

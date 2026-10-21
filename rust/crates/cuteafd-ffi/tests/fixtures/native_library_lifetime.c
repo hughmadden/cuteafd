@@ -96,8 +96,7 @@ void fixture_configure_pack(int pack, int drain) {
 void fixture_configure_drain_after(int after) { drain_after = after; }
 
 int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
-    out->ptr = malloc(bytes);
-    if (!out->ptr) return 1;
+    if (posix_memalign(&out->ptr, 256, bytes)) return 1;
     out->bytes = bytes;
     out->device_id = current_device;
     out->flags = 1;

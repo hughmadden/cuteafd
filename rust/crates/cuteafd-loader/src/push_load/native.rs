@@ -14,25 +14,49 @@ pub struct NativePlanes {
     pub bytes: usize,
 }
 impl NativePlanes {
-    pub fn new(hidden: usize, intermediate: usize, kernel_intermediate: usize,
-        experts: usize, nvfp4: bool) -> Result<Self> {
-        ensure!(hidden > 0 && hidden % 256 == 0 && intermediate > 0
-            && intermediate % 32 == 0 && kernel_intermediate >= intermediate
-            && kernel_intermediate % if nvfp4 { 64 } else { 128 } == 0 && kernel_intermediate <= 8192
-            && experts > 0, "invalid native push geometry");
+    pub fn new(
+        hidden: usize,
+        intermediate: usize,
+        kernel_intermediate: usize,
+        experts: usize,
+        nvfp4: bool,
+    ) -> Result<Self> {
+        ensure!(
+            hidden > 0
+                && hidden % 256 == 0
+                && intermediate > 0
+                && intermediate % 32 == 0
+                && kernel_intermediate >= intermediate
+                && kernel_intermediate % (if nvfp4 { 64 } else { 128 }) == 0
+                && (nvfp4 || kernel_intermediate == intermediate.div_ceil(128) * 128)
+                && kernel_intermediate <= 8192
+                && experts > 0,
+            "invalid native push geometry"
+        );
         let sizes = crate::placement::families::deepseek_v41::resident_planes(
-            hidden as u64, kernel_intermediate as u64, nvfp4)?;
+            hidden as u64,
+            kernel_intermediate as u64,
+            nvfp4,
+        )?;
         let mut cursor = 0usize;
         let mut reserve = |size: usize| -> Result<(usize, usize)> {
-            cursor = cursor.checked_add(255).context("native plane alignment overflow")? & !255;
+            cursor = cursor
+                .checked_add(255)
+                .context("native plane alignment overflow")?
+                & !255;
             let start = cursor;
-            cursor = cursor.checked_add(size).context("native plane extent overflow")?;
+            cursor = cursor
+                .checked_add(size)
+                .context("native plane extent overflow")?;
             Ok((start, size))
         };
         let mut planes = [(0, 0); 4];
         for (plane, size) in planes.iter_mut().zip(sizes) {
-            *plane = reserve(usize::try_from(size)?.checked_mul(experts)
-                .context("native expert plane overflow")?)?;
+            *plane = reserve(
+                usize::try_from(size)?
+                    .checked_mul(experts)
+                    .context("native expert plane overflow")?,
+            )?;
         }
         let mut vectors = [(0, 0); 4];
         if nvfp4 {
@@ -40,8 +64,16 @@ impl NativePlanes {
                 *vector = reserve(experts.checked_mul(4).context("native scalar overflow")?)?;
             }
         }
-        Ok(Self { hidden, intermediate, kernel_intermediate, experts, nvfp4,
-            planes, vectors, bytes: cursor })
+        Ok(Self {
+            hidden,
+            intermediate,
+            kernel_intermediate,
+            experts,
+            nvfp4,
+            planes,
+            vectors,
+            bytes: cursor,
+        })
     }
     pub fn expert_plane(&self, plane: usize, expert: usize) -> Result<(usize, usize)> {
         ensure!(expert < self.experts, "native expert outside plane");
@@ -52,10 +84,21 @@ impl NativePlanes {
     /// One scratch allocation is reused for every plane on this rank. Weights
     /// already have their final layout for NVFP4; only its scale planes move.
     pub fn scratch_bytes(&self) -> usize {
-        self.planes.iter().enumerate().filter(|(i, _)| !self.nvfp4 || i % 2 == 1)
-            .map(|(_, (_, bytes))| bytes / self.experts).max().unwrap_or(0)
+        self.planes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.nvfp4 || i % 2 == 1)
+            .map(|(_, (_, bytes))| bytes / self.experts)
+            .max()
+            .unwrap_or(0)
     }
-    pub fn scalar_bytes(&self) -> usize { if self.nvfp4 { self.experts * 24 } else { 0 } }
+    pub fn scalar_bytes(&self) -> usize {
+        if self.nvfp4 {
+            self.experts * 24
+        } else {
+            0
+        }
+    }
 }
 
 #[cfg(test)]

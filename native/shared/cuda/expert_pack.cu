@@ -1,6 +1,7 @@
 #include "cuteafd_experts.h"
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <algorithm>
 #include "expert_pack_layout.h"
 
 namespace {
@@ -66,18 +67,27 @@ extern "C" int32_t cuteafd_pack_expert_plane_async(
       reinterpret_cast<uintptr_t>(source) % 4 ||
       reinterpret_cast<uintptr_t>(destination) % 16 ||
       overlaps(source, required, destination, sizes[plane])) return cudaErrorInvalidValue;
+  int device, sms;
+  auto status = cudaGetDevice(&device);
+  if (status != cudaSuccess) return status;
+  status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  if (status != cudaSuccess) return status;
+  if (sms <= 0) return cudaErrorInvalidDevice;
+  const uint64_t count = sizes[plane] / (scales ? 1 : 4);
+  const unsigned blocks = static_cast<unsigned>(
+      std::min<uint64_t>((count + 255) / 256, uint64_t(sms) * 4));
   auto s = static_cast<cudaStream_t>(stream);
   if (gated && !scales)
-    pack<false, false><<<256, 256, 0, s>>>(source, nullptr, destination,
+    pack<false, false><<<blocks, 256, 0, s>>>(source, nullptr, destination,
         2 * padded, hidden, 0, sizes[plane] / 4);
   else if (gated)
-    pack<false, true><<<256, 256, 0, s>>>(source, nullptr, destination,
+    pack<false, true><<<blocks, 256, 0, s>>>(source, nullptr, destination,
         2 * padded, hidden, 0, sizes[plane]);
   else if (!scales)
-    pack<false, false><<<256, 256, 0, s>>>(source, nullptr, destination,
+    pack<false, false><<<blocks, 256, 0, s>>>(source, nullptr, destination,
         hidden, intermediate, 0, sizes[plane] / 4);
   else
-    pack<false, true><<<256, 256, 0, s>>>(source, nullptr, destination,
+    pack<false, true><<<blocks, 256, 0, s>>>(source, nullptr, destination,
         hidden, intermediate, 0, sizes[plane]);
   return cudaGetLastError();
 }
