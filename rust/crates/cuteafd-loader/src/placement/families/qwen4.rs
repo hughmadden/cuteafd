@@ -631,7 +631,9 @@ mod tests {
             layer.kv_unit = ModeBytes::replicated((1 << 30) / 4096).into();
             layer.extra = extra;
         }
-        for (entry, cut, owner) in [(0, 2, 0), (4 << 30, 1, 1)] {
+        // Charge enough entry pressure to move the capacity-maximizing cut,
+        // rather than balancing only the bytes of the requested 2M pool.
+        for (entry, cut, owner) in [(0, 2, 0), (64 << 30, 1, 1)] {
             req.fixed = vec![Demand::new(0, Category::Weights, "entry", entry, Basis::Exact)];
             let placement = solve(&req).unwrap();
             assert_eq!(placement.pool_tokens, 2 << 20);

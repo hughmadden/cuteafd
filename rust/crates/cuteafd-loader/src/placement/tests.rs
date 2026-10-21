@@ -700,8 +700,8 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         let mut max_req = req.clone();
         max_req.onboard = Onboard::Layers(0);
         let max_pool = solve(&max_req).unwrap().pool_tokens;
-        assert!((max_pool as f64 / 1e6 - if nvfp4 { 2.22 } else { 2.54 }).abs() < 0.005);
         eprintln!("K0 GLM layers max_pool={max_pool}");
+        assert_eq!(max_pool, if nvfp4 { 2_471_424 } else { 2_808_000 });
         let records = layers.items.iter().map(|items| items.iter().find(|i| i.group == "records").unwrap().bytes / (2 << 20)).collect::<Vec<_>>();
         let k = layers.layers.iter().position(|l| l.mode == S0).unwrap();
         eprintln!("K0 GLM layers switch={k} hops={}", layers.hops.len());
@@ -709,8 +709,9 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         assert!(layers.layers[k..].iter().all(|l| l.mode == S0));
         eprintln!("K0 GLM layers records={records:?}");
         let used = layers.items.iter().map(|items| items.iter().map(|i| i.bytes).sum::<u64>() as f64 / GIB as f64).collect::<Vec<_>>();
-        let expected = if nvfp4 { [89.7, 76.4] } else { [81.6, 68.3] };
-        for gpu in 0..2 { assert!((used[gpu] - expected[gpu]).abs() < 0.07, "NVFP4={nvfp4} layers GPU{gpu}: {}", used[gpu]); }
+        eprintln!("K0 GLM layers used={used:?}");
+        let expected = if nvfp4 { [84.32, 81.77] } else { [76.23, 73.68] };
+        for gpu in 0..2 { assert!((used[gpu] - expected[gpu]).abs() < 0.01); }
     }
 }
 
@@ -1190,7 +1191,7 @@ fn conditional_movable_selected_device_scratch_and_planned_measured_agree() {
 }
 
 fn owner_balance_request() -> PlacementRequest {
-    let mut req = request(2, 96 * GIB, 4, 4, Onboard::Auto);
+    let mut req = request(2, 16 * GIB, 4, 4, Onboard::Auto);
     req.executor = CONTEXT;
     req.attention_placement = Some(AttentionPlacement::Layers);
     req.pool_overhead = vec![0; 2];
@@ -1211,7 +1212,7 @@ fn owner_cut(req: &PlacementRequest) -> usize {
 #[test]
 fn nonempty_layer_ranges_keep_both_owners_under_extreme_entry_skew() {
     let mut req = owner_balance_request();
-    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 16 * GIB, Basis::Exact));
+    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 12 * GIB, Basis::Exact));
     assert_eq!(owner_cut(&req), 0);
     req.policy.ownership = LayerOwnership::NonemptyRanges;
     assert_eq!(owner_cut(&req), 1);
@@ -1230,15 +1231,15 @@ fn layer_extra_rows_follow_the_cutover_and_reduce_available_pool() {
     assert_eq!(owner_cut(&req), 2);
     assert!(first.items[0].iter().any(|i| i.category == Category::Tables && i.group == "side table" && i.bytes == GIB));
     assert!(!first.items[1].iter().any(|i| i.group == "side table"));
-    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 4 * GIB, Basis::Exact));
+    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 8 * GIB, Basis::Exact));
     let moved = solve(&req).unwrap();
     assert_eq!(owner_cut(&req), 1);
     assert!(moved.items[1].iter().any(|i| i.group == "side table" && i.bytes == GIB));
     assert!(!moved.items[0].iter().any(|i| i.group == "side table"));
     req.layers[1].extra[0].bytes = 8 * GIB;
     req.fixed.clear();
-    // A large side table participates in the primary owner balance, not just
-    // the final charge: k2 has 12/4 GiB, better than k1's 2/14 or k0's 0/16.
+    // The side table reduces physical KV capacity on its selected owner;
+    // spreading the remaining records over two layers per GPU wins.
     assert_eq!(owner_cut(&req), 2);
     req.layers[0].extra = std::mem::take(&mut req.layers[1].extra);
     assert_eq!(owner_cut(&req), 1);
@@ -1261,23 +1262,23 @@ fn layer_extra_rows_follow_the_cutover_and_reduce_available_pool() {
 }
 
 #[test]
-fn layer_switch_balances_owner_only_head_mtp_and_layer_weights() {
+fn layer_switch_balances_complete_fixed_costs_independent_of_group_names() {
     let mut req = owner_balance_request();
     assert_eq!(owner_cut(&req), 2);
-    req.fixed.push(Demand::new(0, Category::Weights, "Qwen head", 3 * GIB, Basis::Exact));
+    req.fixed.push(Demand::new(0, Category::Weights, "Qwen head", 7 * GIB, Basis::Exact));
     req.fixed.push(Demand::new(0, Category::Drafter, "Qwen MTP", GIB, Basis::Exact));
     assert_eq!(owner_cut(&req), 1);
-    // Same names on both ranks are paired, even when the byte totals differ.
+    // Diagnostic names and zero-byte paired rows cannot hide real costs.
     req.fixed.push(Demand::new(1, Category::Weights, "Qwen head", 0, Basis::Exact));
     req.fixed.push(Demand::new(1, Category::Drafter, "Qwen MTP", 0, Basis::Exact));
-    assert_eq!(owner_cut(&req), 2);
-    // Category is part of the key: an unrelated workspace cannot pair a head.
+    assert_eq!(owner_cut(&req), 1);
+    // An unrelated workspace cannot change the accounting either.
     req.fixed.retain(|d| d.gpu == 0 || d.category != Category::Weights);
     req.fixed.push(Demand::new(1, Category::Workspace, "Qwen head", 0, Basis::Exact));
     assert_eq!(owner_cut(&req), 1);
     req.fixed.clear();
     req.layers[0].weights.whole = 8 * GIB;
-    // k1 holds 10/6 GiB, better than k0's 0/16 GiB or k2's 12/4 GiB.
+    // Isolate the heavy first layer to maximize the tighter GPU's capacity.
     assert_eq!(owner_cut(&req), 1);
 }
 
@@ -1289,7 +1290,8 @@ fn layer_switch_balances_mandatory_unequal_tp2_not_optional_residency() {
             half: [Bytes2 { resident: 3 * GIB, staging: 0 }, Bytes2 { resident: 2 * GIB, staging: 0 }],
             tp2: true, spark_ok: true });
     }
-    // 384/256 resident ratio must not become mandatory under Auto with Sparks.
+    req.pool.target = 128 << 20;
+    // No optional expert fits after this large automatic pool.
     assert_eq!(owner_cut(&req), 2);
     req.onboard = Onboard::Layers(4);
     assert_eq!(owner_cut(&req), 1);
@@ -1299,14 +1301,15 @@ fn layer_switch_balances_mandatory_unequal_tp2_not_optional_residency() {
     req.inventory.spark_ranks = 0;
     assert_eq!(owner_cut(&req), 1);
     // An unequal mandatory workspace participates in the same primary score.
-    req.tp2_workspace = [0, 8 * GIB];
+    req.inventory.gpus.iter_mut().for_each(|g| g.baseline = Baseline::Measured { free_bytes: 32 * GIB });
+    req.tp2_workspace = [0, 16 * GIB];
     assert_eq!(owner_cut(&req), 3);
 }
 
 #[test]
 fn qwen_refuses_shared_solver_empty_owner_chain() {
     let mut req = owner_balance_request();
-    req.fixed.push(Demand::new(1, Category::Workspace, "owner1 fixed", 8 * GIB, Basis::Exact));
+    req.fixed.push(Demand::new(1, Category::Workspace, "owner1 fixed", 16 * GIB, Basis::Exact));
     assert_eq!(owner_cut(&req), 4);
     let p = solve(&req).unwrap();
     let owners = p.layers.iter().map(|layer| match layer.mode {
@@ -1605,4 +1608,126 @@ fn alternating_owner_function_preserves_noncontiguous_colocate_groups() {
             [first, 0, 1 - first, first, first]);
     }
     assert!(attention::alternating_owners([], 2).is_err());
+}
+
+#[test]
+fn owner_candidates_admit_pinned_and_conditional_draft_costs_before_pool() {
+    let mut req = owner_balance_request();
+    // Make KV capacity, not the target ceiling, decide the winning boundary.
+    req.pool.target = 128 << 20;
+    req.pool.ceiling = 128 << 20;
+    req.movables.push(Movable {
+        id: MovableId::Drafter, allowed: vec![1], expert_arena: false,
+        parts: vec![Bytes2 { resident: 8 * GIB, staging: 0 }], conditional: vec![],
+    });
+    let pinned = solve(&req).unwrap();
+    assert_eq!(owner_cut(&req), 3);
+    req.movables[0].parts.clear();
+    req.movables[0].conditional = vec![MovableDemands { placement_gpu: 1,
+        demands: vec![Demand::new(1, Category::Drafter, "predictor stages", 8 * GIB, Basis::Exact)] }];
+    let conditional = solve(&req).unwrap();
+    assert_eq!(conditional.layers, pinned.layers);
+    assert_eq!(conditional.pool_tokens, pinned.pool_tokens);
+    assert_eq!(conditional.pool_limits, pinned.pool_limits);
+    // Admission of loaded modes uses exactly the costs that selected them.
+    let frozen = solve_frozen(&req, &conditional).unwrap();
+    assert_eq!(frozen.items, conditional.items);
+    assert_eq!(frozen.pool_limits, conditional.pool_limits);
+    assert_eq!(frozen.movables, conditional.movables);
+    req.movables[0].allowed = vec![0];
+    req.movables[0].conditional[0].placement_gpu = 0;
+    req.movables[0].conditional[0].demands[0].gpu = 0;
+    assert_eq!(owner_cut(&req), 1);
+}
+
+#[test]
+fn owner_candidates_find_fit_that_balanced_boundary_refuses() {
+    let mut req = owner_balance_request();
+    req.inventory.gpus.iter_mut().for_each(|g| g.baseline = Baseline::Measured { free_bytes: 16 * GIB });
+    req.policy.ownership = LayerOwnership::NonemptyRanges;
+    req.pool.requested = Some(2 << 20);
+    req.pool.floor = 2 << 20;
+    req.movables.push(Movable { id: MovableId::Drafter, allowed: vec![0], expert_arena: false,
+        parts: vec![Bytes2 { resident: 13 * GIB, staging: 0 }], conditional: vec![] });
+    let solved = solve(&req).unwrap();
+    assert_eq!(owner_cut(&req), 1);
+    let mut balanced = solved.clone();
+    balanced.layers[1].mode = S0;
+    assert!(solve_frozen(&req, &balanced).is_err());
+}
+
+#[test]
+fn shared_owner_boundaries_keep_colocation_and_skip_duplicate_split_stretches() {
+    use attention::owner_boundaries;
+    let groups = [(false, None), (true, Some(7)), (true, Some(7)),
+        (false, None), (true, None), (false, None)];
+    assert_eq!(owner_boundaries(&groups, false), [0, 3, 5]);
+    assert_eq!(owner_boundaries(&groups, true), [3]);
+    assert_eq!(owner_boundaries(&[], false), [0]);
+    assert!(owner_boundaries(&[], true).is_empty());
+}
+
+#[test]
+fn owner_specific_inventory_callback_matches_frozen_admission() {
+    let req = owner_balance_request();
+    let groups = req.layers.iter().map(|_| (true, None)).collect::<Vec<_>>();
+    let (placed, inventory) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0, req.onboard,
+        |owners| -> Result<_, PlacementError> {
+            let mut candidate = req.clone();
+            // Header/native inventory may depend on the owners; its payload must
+            // come from the winning candidate, not a prior alternating layout.
+            for (layer, &owner) in candidate.layers.iter_mut().zip(owners) {
+                layer.modes = vec![if owner == 0 { S0 } else { S1 }];
+            }
+            candidate.fixed.push(Demand::new(1, Category::Drafter, "native predictor", 8 * GIB, Basis::Exact));
+            let placed = solve(&candidate)?;
+            Ok((placed, candidate))
+        }).unwrap();
+    assert_eq!(placed.layers.iter().filter(|l| l.mode == S0).count(), 3);
+    let checked = solve_frozen(&inventory, &placed).unwrap();
+    assert_eq!(checked, placed);
+    assert_eq!(group_bytes(&placed, 1, "native predictor"), 8 * GIB);
+
+    let mut attempted = 0;
+    let (valid, ()) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0, req.onboard,
+        |_| -> Result<_, PlacementError> {
+            attempted += 1;
+            if attempted == 1 { Err(PlacementError::Overflow("refused boundary")) }
+            else { Ok((placed.clone(), ())) }
+        }).unwrap();
+    assert_eq!(attempted, 5);
+    assert_eq!(valid, placed);
+    let mut smaller = placed.clone();
+    smaller.onboard_layers = placed.onboard_layers + 1;
+    smaller.pool_tokens /= 2;
+    assert!(attention::owner_score(Onboard::Auto, &placed) > attention::owner_score(Onboard::Auto, &smaller));
+    let experts_first = Onboard::ExpertsFirst { pool_floor: 1 };
+    assert!(attention::owner_score(experts_first, &smaller) > attention::owner_score(experts_first, &placed));
+
+    let refused: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 0, Onboard::Auto, |_| Err(PlacementError::Overflow("candidate")));
+    assert_eq!(refused, Err(PlacementError::Overflow("candidate")));
+    let invalid: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 2, Onboard::Auto, |_| unreachable!());
+    assert!(matches!(invalid, Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn owner_search_matches_exhaustive_frozen_pool_with_bounded_draft_storage() {
+    let mut req = owner_balance_request();
+    req.pool.target = 128 << 20;
+    req.pool.ceiling = 128 << 20;
+    req.pool_bounded.push(BoundedDemand { gpu: 1, category: Category::Drafter,
+        group: "paged draft KV".into(), bytes_per_unit: UNIT / 3,
+        offset_units: 1, cap_units: 32_768, basis: Basis::Formula });
+    let accepted = solve(&req).unwrap();
+    let best = (0..=req.layers.len()).filter_map(|boundary| {
+        let mut frozen = accepted.clone();
+        for (index, layer) in frozen.layers.iter_mut().enumerate() {
+            layer.mode = if index < boundary { S0 } else { S1 };
+        }
+        solve_frozen(&req, &frozen).ok()
+    }).map(|p| attention::owner_score(req.onboard, &p)).max().unwrap();
+    assert_eq!(attention::owner_score(req.onboard, &accepted), best);
+    assert_eq!(solve_frozen(&req, &accepted).unwrap(), accepted);
 }
