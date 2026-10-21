@@ -65,6 +65,37 @@ impl MlaDraftRuntimeLayout {
     pub fn sm_count(&self) -> usize { self.sm_count }
     pub fn fp8_mode(&self) -> u8 { self.fp8_mode }
 
+    /// Rebind only the aggregate full-context pool; every native shape and bounded
+    /// ring remains identical to the checked checkpoint-derived layout.
+    pub fn with_pool_tokens(&self, target_tokens: usize) -> Result<Self> {
+        let pages = target_tokens.div_ceil(64);
+        if target_tokens == 0 || pages > i32::MAX as usize {
+            return Err(unsupported("draft pool token budget outside native page limits"));
+        }
+        let bytes = pages.checked_mul(64).and_then(|n| n.checked_mul(self.paged_cache.record_bytes))
+            .ok_or_else(|| unsupported("draft pool byte overflow"))?;
+        let mut next = self.clone();
+        next.paged_cache.target_tokens = target_tokens;
+        next.paged_cache.pages = pages;
+        next.paged_cache.full_bytes = (bytes as u64).checked_mul(next.paged_cache.full_layers as u64)
+            .ok_or_else(|| unsupported("draft pool layer total overflow"))?;
+        for (index, layer) in next.cache.layers.iter().enumerate() {
+            if layer.window().is_none() {
+                next.paged_cache.layer_bytes[index] = bytes;
+                let name = format!("layer.{index}.cache");
+                next.buffers.iter_mut().find(|buffer| buffer.name == name)
+                    .ok_or_else(|| unsupported("draft pool allocation recipe missing layer"))?.bytes = bytes.max(256);
+            }
+        }
+        next.resident_bytes()?;
+        Ok(next)
+    }
+
+    pub fn window_mark_bytes(&self) -> Result<usize> {
+        usize::try_from(self.paged_cache.window_bytes / self.capacity.context_slots as u64)
+            .map_err(|_| unsupported("draft window mark overflow"))
+    }
+
     pub fn buffer_bytes(&self) -> Result<u64> {
         self.buffers.iter().try_fold(0u64, |sum, b| sum.checked_add(b.bytes as u64)
             .ok_or_else(|| unsupported("MLA draft buffer total overflow")))
@@ -965,6 +996,24 @@ mod tests {
         assert_eq!(cfg.paged_cache_layout(8, tokens, 65).unwrap().full_bytes, 128 * 1152);
         assert!(cfg.paged_cache_layout(8, tokens, 0).is_err());
         assert!(cfg.paged_cache_layout(8, tokens, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn aggregate_pool_resize_preserves_native_layout_and_bounded_window_marks() {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        let capacity = GlmDraftCapacity::new(8, 8, cfg.block).unwrap();
+        for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+            let initial = cfg.runtime_layout(representation, capacity, 1 << 20, 8 << 20, 188, 0).unwrap();
+            for tokens in [65, 262144, 1048576] {
+                let resized = initial.with_pool_tokens(tokens).unwrap();
+                let native = cfg.runtime_layout(representation, capacity, 1 << 20, tokens, 188, 0).unwrap();
+                assert_eq!(resized, native);
+                assert_eq!(resized.window_mark_bytes().unwrap(), 4 * 4160 * 1152);
+            }
+            assert!(initial.with_pool_tokens(0).is_err());
+            assert!(initial.with_pool_tokens(usize::MAX).is_err());
+        }
     }
 
     #[test]

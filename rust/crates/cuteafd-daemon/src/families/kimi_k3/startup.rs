@@ -122,6 +122,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
             (0..2).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
         spark_budget: Some(spark_budget), draft: draft_layout.clone() })?;
+    let graph_set = admitted.graph_set.take();
     if let Some(expected) = options.hosted_layers.as_ref() {
         ensure!(admitted.working_set().spark_layers == *expected,
             "Kimi worker layer subset differs from shared placement");
@@ -146,6 +147,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
         peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
     let lane_streams = [Rc::new(Stream::new(devices[0])?), Rc::new(Stream::new(devices[1])?)];
+    let draft_layout = admitted.draft_layout().cloned();
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
         super::draft::NativeDraft::load(&mut admitted, programs, options, lane_streams.clone(), layout)).transpose()?;
     let engine = Engine::load_admitted(library, streams, lane_streams, draft, admitted, checkpoint, native, peer, hops,

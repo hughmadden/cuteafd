@@ -48,6 +48,9 @@ pub(crate) struct NativeDraft<'a> {
     producer: RefCell<crate::shared::memory::device::Event<'a>>,
     consumed: RefCell<crate::shared::memory::device::Event<'a>>,
     context_pending: Cell<bool>,
+    window_marks: Rc<Allocation<'a>>,
+    window_bytes: usize,
+    marks: usize,
 }
 
 impl<'a> NativeDraft<'a> {
@@ -66,7 +69,10 @@ impl<'a> NativeDraft<'a> {
             let demand = demands.iter().find(|d| d.group == name).context("Kimi draft bridge inventory missing")?;
             Allocation::new(device, usize::try_from(demand.bytes)?)
         };
-        Ok(Self { owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+        let marks = usize::try_from(admission.mark_selection.slots)?;
+        let window_bytes = layout.window_mark_bytes()?;
+        let window_marks = admission.allocate_draft_marks(streams[1].device)?;
+        Ok(Self { window_marks, window_bytes, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge: RemoteBridge::new(prepared), producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[1].device)?),
@@ -191,6 +197,26 @@ impl<'a> NativeDraft<'a> {
         self.owners.draft.device.run(|| self.owners.draft.mla_readback(slot, tap_rows))
     }
 
+    pub(crate) fn device(&self) -> crate::shared::memory::device::Device<'a> { self.owners.draft.device }
+    pub(crate) fn common(&self) -> &DflashDrafter<'a> { &self.owners.draft }
+    pub(crate) fn frontier(&self, slot: usize) -> Result<(usize, usize)> { self.common().mla_frontier(slot) }
+    pub(crate) fn mark_owner(&self) -> Rc<Allocation<'a>> { self.window_marks.clone() }
+    pub(crate) fn mark_segments(&self, mark: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
+        ensure!(mark < self.marks, "Kimi draft window mark outside admission");
+        let windows = self.common().mla_window_segments(0)?;
+        let mut offset = mark * self.window_bytes;
+        windows.into_iter().map(|window| {
+            let view = crate::shared::prefix::view(self.window_marks.buffer, offset, window.bytes)?;
+            offset += window.bytes;
+            Ok(view)
+        }).collect()
+    }
+    pub(crate) fn move_mark(&self, mark: usize, slot: usize, capture: bool) -> Result<()> {
+        let marks = self.mark_segments(mark)?;
+        self.drain()?;
+        self.owners.draft.device.run(|| self.common().copy_mla_windows(slot, &marks, capture))
+    }
+
     pub(crate) fn max_batch_sequences(&self) -> usize { self.owners.draft.max_batch_sequences() }
     pub(crate) fn drafts(&self) -> usize { self.owners.draft.cfg.drafts() }
     pub(crate) fn require_live(&self) -> Result<()> { self.bridge.require_live() }
@@ -214,6 +240,10 @@ impl<'a> NativeDraft<'a> {
             draft.draft_device_with(sequences, &input, TargetHead::Bf16Buffer(head))
         }))
     }
+}
+
+impl crate::shared::prefix::cuda_copy::SnapshotOwner for NativeDraft<'_> {
+    fn snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>> { self.common().mla_snapshot_buffers() }
 }
 
 impl Drop for NativeDraft<'_> {
@@ -382,7 +412,8 @@ mod tests {
         let mut pool = RefPagePool::new(layout.pages, layout.page_rows);
         let draft = engine.native_draft().context("native proof drafter absent")?;
         let prefix_error = |error: cuteafd_engine::prefix::BoxError| anyhow::anyhow!("{error}");
-        let tokens = (0..67).map(|i| 1000 + (i * 37 % 4096) as u32).collect::<Vec<_>>();
+        // Cross the 4096-row sliding ring and retain a partial full-cache page.
+        let tokens = (0..4163).map(|i| 1000 + (i * 37 % 4096) as u32).collect::<Vec<_>>();
         let suffix = [2201, 2202, 2203];
         let extent = (tokens.len() + suffix.len() + 16).div_ceil(layout.page_rows);
         let allocate = |pool: &mut RefPagePool| -> Result<Placement> {
@@ -393,41 +424,56 @@ mod tests {
                 &tokens, resume)
         };
         let prefill = |placement: &mut Placement, seq: &mut DraftState, start, ids: &[u32], pool: &RefPagePool| -> Result<u32> {
-            let logits = backend.prefill_device(placement, ids, 1, pool)?.context("native prefill logits absent")?;
-            let values = engine.library().cuda_set_device(1).and_then(|_| logits.to_host(engine.library()))?;
-            let next = values.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).unwrap().0 as u32;
-            backend.prefill_draft(placement, start, ids, Some(next), seq)?;
-            Ok(next)
+            let mut next = None;
+            for (index, chunk) in ids.chunks(TARGET_TAP_ROWS).enumerate() {
+                let logits = backend.prefill_device(placement, chunk, 1, pool)?.context("native prefill logits absent")?;
+                let values = engine.library().cuda_set_device(1).and_then(|_| logits.to_host(engine.library()))?;
+                next = Some(values.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).unwrap().0 as u32);
+                backend.prefill_draft(placement, start + index * TARGET_TAP_ROWS, chunk, next, seq)?;
+            }
+            next.context("native proof empty prefill")
         };
         // Retain real MLA pages and an exact KDA mark. The saved last page is never appended to.
         let mut saved = allocate(&mut pool)?;
         family.bind(&mut saved).map_err(prefix_error)?;
+        family.admit_draft_pages(&mut saved, extent * layout.page_rows).map_err(prefix_error)?;
         bind(&mut saved, 0)?;
         let mut seq = DraftState::default();
         prefill(&mut saved, &mut seq, 0, &tokens, &pool)?;
         family.capture(MarkSlot(0), &saved, tokens.len()).map_err(prefix_error)?;
+        let attachment = family.capture_draft_pages(&saved, tokens.len()).map_err(prefix_error)?
+            .context("native warm proof did not capture draft pages")?;
+        assert_eq!(family.capture_meta(&saved, tokens.len()).map_err(prefix_error)?.draft, Some((0, tokens.len())));
         family.drain().map_err(prefix_error)?;
         family.discard(&mut saved).map_err(prefix_error)?;
         let mut states = Vec::new();
         let mut proposals = Vec::new();
         let mut verifies = Vec::new();
         let mut common_verify = Vec::new();
-        for arm in 0..3 {
+        let mut warm_states = Vec::new();
+        for arm in 0..4 {
             let mut placement = allocate(&mut pool)?;
             family.bind(&mut placement).map_err(prefix_error)?;
             let mut seq = DraftState::default();
-            if arm == 0 {
+            if arm == 0 || arm == 3 {
                 for (index, (&from, &to)) in saved.units.iter().zip(&placement.units).enumerate() {
                     let rows = tokens.len().saturating_sub(index * layout.page_rows).min(layout.page_rows);
                     if rows > 0 { family.copy_rows(TailCopy { from, to, rows, owner: None }).map_err(prefix_error)?; }
                 }
                 family.restore(Some(MarkSlot(0)), &mut placement, tokens.len()).map_err(prefix_error)?;
+                family.restore_draft_pages((arm == 3).then_some(&attachment), &mut placement, tokens.len())
+                    .map_err(prefix_error)?;
+                family.admit_draft_pages(&mut placement, extent * layout.page_rows).map_err(prefix_error)?;
                 bind(&mut placement, tokens.len())?;
+                backend.restore_draft(&placement, tokens.len(), &tokens, &mut seq)?;
             } else {
+                family.admit_draft_pages(&mut placement, extent * layout.page_rows).map_err(prefix_error)?;
                 bind(&mut placement, 0)?;
                 prefill(&mut placement, &mut seq, 0, &tokens, &pool)?;
                 if arm == 1 {
-                    // The serving cache-hit contract is cold(P), not rebuilt history from 0.
+                    // Missing/revoked draft pages must erase the warm binding to cold(P).
+                    family.restore_draft_pages(None, &mut placement, tokens.len()).map_err(prefix_error)?;
+                    family.admit_draft_pages(&mut placement, extent * layout.page_rows).map_err(prefix_error)?;
                     bind(&mut placement, tokens.len())?;
                     seq = DraftState::default();
                 }
@@ -439,6 +485,7 @@ mod tests {
             }
             let anchor = prefill(&mut placement, &mut seq, tokens.len(), &suffix, &pool)?;
             if arm < 2 { states.push(draft.readback(0, suffix.len())?); }
+            else { warm_states.push(draft.readback(0, suffix.len())?); }
             let proposed = backend.draft(&mut [scheduler::DraftSeq {
                 placement: &placement, seq: &mut seq, depth: 7 }], &mut scheduler::DraftTiming::default())?.remove(0);
             assert_eq!(proposed.len(), 7);
@@ -459,6 +506,7 @@ mod tests {
                 start, history: (), rows: &common_verify, first_row: 0,
                 kept: Some((1, common_verify[1])), finished: false, neural: true }], true)?;
             if arm < 2 { states.push(draft.readback(0, 1)?); }
+            else { warm_states.push(draft.readback(0, 1)?); }
             backend.cancel(&placement)?;
             family.drain().map_err(prefix_error)?;
             family.discard(&mut placement).map_err(prefix_error)?;
@@ -469,6 +517,11 @@ mod tests {
         assert_eq!(proposals[0], proposals[1], "first seven draft tokens after cold(P)");
         assert_eq!(verifies[0], verifies[1], "restored versus fresh cold(P) target verification bits");
         assert_eq!(verifies[0], verifies[2], "both cold arms versus fresh no-snapshot target verification bits");
+        assert_eq!(warm_states[0], warm_states[2], "warm restored/scratch suffix cache and tap bytes");
+        assert_eq!(warm_states[1], warm_states[3], "warm restored/scratch accepted-only cache and tap bytes");
+        assert_eq!(proposals[2], proposals[3], "warm restored/scratch proposals");
+        assert_eq!(verifies[2], verifies[3], "warm restored/scratch target logits");
+        family.release_draft_pages(&attachment).map_err(prefix_error)?;
         pool.release(&saved.units);
         Ok(())
     }

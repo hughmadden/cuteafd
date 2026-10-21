@@ -40,7 +40,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     type History = ();
     type Coordinates = ();
     type Encoder = crate::shared::qwen::Encoder;
-    type Meta = ();
+    type Meta = super::prefix::SnapshotMeta;
     type Prefix = KimiPrefix<'a>;
 
     fn geometry(&self) -> scheduler::Geometry {
@@ -52,18 +52,18 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn message_starts(&self) -> &[&str] { &["<|open|>"] }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.engine.library() }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
-    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
+    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Self::Meta>)> {
         ensure!(args.prefix_partial == Toggle::Off, "Kimi restores exact KDA/MLA snapshots only");
         let args = args.with_scoring(self.geometry.decode_rows, self.geometry.prefill_rows, self.geometry.vocab_size)?;
         let family = self.engine.prefix_family()?;
         let layout = family.layout();
         let host = args.host_config(layout, self.geometry.max_context, lanes)?.map(|config|
-            CudaCopyEngine::registered_owned(self.library(), family.snapshot_owners()).map(|copy| (config, copy)))
+            CudaCopyEngine::registered_retained(self.library(), family.snapshot_owners(), family.snapshot_retained()).map(|copy| (config, copy)))
             .transpose()?;
         let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
-        let cache = PrefixCache::new(layout, config, host)?;
+        let cache = PrefixCache::new_with_draft_pages(layout, config, host, family.draft_page_bytes())?;
         cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
             "BF16 owned MLA + exact TP2 KDA", host_bytes);
         Ok((family, cache))
@@ -89,12 +89,26 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn bind_request(&self, placement: &mut Placement, _coordinates: (), _media: RequestMedia,
         _tokens: &[u32], resume: usize) -> Result<()> {
         if let Some(draft) = self.engine.native_draft() {
-            draft.reset(placement.slot, resume)?;
-            self.origins.borrow_mut()[placement.slot] = resume;
+            let (origin, end) = draft.frontier(placement.slot)?;
+            ensure!(end == resume, "Kimi draft binding differs from prefix admission");
+            self.origins.borrow_mut()[placement.slot] = origin;
         }
         Ok(())
     }
     fn history(&self, _placement: &Placement) {}
+    fn restore_draft(&self, placement: &Placement, frontier: usize, _tokens: &[u32], seq: &mut DraftState) -> Result<()> {
+        let draft = self.engine.native_draft().ok_or_else(|| anyhow::anyhow!("Kimi drafter was not admitted"))?;
+        let (origin, end) = draft.frontier(placement.slot)?;
+        ensure!(end == frontier, "Kimi draft restored frontier differs from target");
+        seq.ready = end > origin;
+        seq.valid_from = origin;
+        Ok(())
+    }
+    fn needs_snapshot_filter(&self, neural: bool) -> bool { neural }
+    fn snapshot_compatible(&self, saved: &Self::Meta, frontier: usize, neural: bool) -> bool {
+        !neural || saved.draft == Some((0, frontier))
+    }
+
     fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> { self.engine.require_live() }
     fn log_table_stats(&self, _phase: &str) {}
@@ -175,15 +189,17 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
             let drafter = self.engine.native_draft().ok_or_else(|| anyhow::anyhow!("Kimi drafter was not admitted"))?;
             let mut context = Vec::new();
             for sequence in verified.iter_mut() {
-                if sequence.finished { continue; }
                 let Some((keep, after)) = sequence.neural_kept() else { continue; };
                 ensure!(keep > 0 && keep <= sequence.rows.len()
                     && sequence.placement.state_len == sequence.start + keep,
                     "Kimi draft accept differs from exact committed target state");
                 if !sequence.seq.ready {
-                    // Whole-prompt hits start cold at P, never read the previous occupant.
-                    drafter.reset(sequence.placement.slot, sequence.start)?;
-                    sequence.seq.valid_from = sequence.start;
+                    // Admission already bound cold(P) and reserved this request's growth.
+                    // Do not reset again: that would release its upfront live credits.
+                    let (origin, end) = drafter.frontier(sequence.placement.slot)?;
+                    ensure!(origin == sequence.start && end == sequence.start,
+                        "Kimi cold draft continuation differs from admitted frontier");
+                    sequence.seq.valid_from = origin;
                 }
                 context.extend((0..keep).map(|offset| crate::shared::speculation::dflash::ContextRow {
                     tap_row: sequence.first_row + offset, slot: sequence.placement.slot,

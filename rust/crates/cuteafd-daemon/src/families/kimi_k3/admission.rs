@@ -13,6 +13,7 @@ use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, p
 
 const EXECUTOR: ExecutorModes = families::KIMI_K3;
 const MODES: &[LayerMode] = EXECUTOR.modes;
+const DRAFT_MARKS: &str = "Kimi exact draft windows";
 
 /// Diagnostic inventories retain checkpoint numerics and select only a prefix.
 pub(super) fn prefix(cfg: &KimiK3Config, layers: usize) -> Result<KimiK3Config> {
@@ -86,11 +87,13 @@ pub(crate) fn plan_rtx(cfg: &KimiK3Config, catalog: &cuteafd_loader::OfficialV41
 pub(crate) struct Admission<'a> {
     pub placement: Placement,
     pub mark_selection: MarkSelection,
+    pub graph_set: Option<cuteafd_loader::placement::inventory::StartupGraphs<super::graphs::Key>>,
     cfg: KimiK3Config,
     rtx: Option<RtxInventory>,
     rtx_loaded: bool,
     draft: Option<MlaDraftRuntimeLayout>,
     draft_allocated: bool,
+    draft_marks_allocated: bool,
     layouts: Vec<[LayerLayout; 2]>,
     layer_owners: Vec<[Weak<LayerWeights<'a>>; 2]>,
     layer_uploaded: Vec<[bool; 2]>,
@@ -167,6 +170,18 @@ impl<'a> Admission<'a> {
         self.draft_allocated = true;
         allocate(layout)
     }
+    pub(crate) fn allocate_draft_marks(&mut self, device: Device<'a>) -> Result<Rc<crate::shared::memory::device::Allocation<'a>>> {
+        ensure!(device.id == self.devices[1] && !self.draft_marks_allocated, "Kimi draft mark allocation owner");
+        let layout = self.draft.as_ref().context("Kimi draft marks without admitted draft")?;
+        let bytes = layout.window_mark_bytes()?.checked_mul(usize::try_from(self.mark_selection.slots)?)
+            .context("Kimi draft mark arena overflow")?;
+        ensure!(self.placement.items[1].iter().filter(|item| item.group == DRAFT_MARKS)
+            .map(|item| item.bytes).collect::<Vec<_>>() == vec![bytes as u64], "Kimi draft mark charge differs from arena");
+        self.draft_marks_allocated = true;
+        Ok(Rc::new(crate::shared::memory::device::Allocation::new(device, bytes.max(256))?))
+    }
+    pub(crate) fn draft_layout(&self) -> Option<&MlaDraftRuntimeLayout> { self.draft.as_ref() }
+
     pub(crate) fn execution_plan(&self) -> Result<LayerExecutionPlan> {
         Ok(LayerExecutionPlan::new(&self.placement, hop_spec(self.cfg.hidden,
             self.lane_layouts[0][0].rows(), self.lanes as usize))?)
@@ -417,14 +432,26 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let state_slots = inputs.state_slots;
     let legacy_marks = inputs.prefix_marks;
     let one_mark = KdaLayout::new(cfg, state_slots, 1, inputs.lanes)?;
-    let mark_demands = (0..2).map(|rank| one_mark.demands(rank).map(|demands| demands[2].clone()))
+    let mut mark_demands = (0..2).map(|rank| one_mark.demands(rank).map(|demands| demands[2].clone()))
         .collect::<Result<Vec<_>>>()?;
     let global_layouts = GlobalLayout::pair(cfg)?;
     let io_layouts = [IoLayout::new(cfg, 0, inputs.rows)?, IoLayout::new(cfg, 1, inputs.rows)?];
     let rtx = inputs.rtx.take();
     let spark_budget = inputs.spark_budget.take();
     let draft = inputs.draft.clone();
+    let graph_reserve = inputs.startup.iter().any(|d| d.group == super::graphs::RESERVE);
+    let graph_rows = inputs.rows;
+    let graph_slots = inputs.state_slots;
     let mut request = request(inputs)?;
+    if let Some(layout) = &draft {
+        let demand = Demand::new(1, Category::Prefix, DRAFT_MARKS, layout.window_mark_bytes()? as u64, Basis::Exact);
+        if demand.bytes > 0 {
+            let mut total = demand.clone();
+            total.bytes = total.bytes.checked_mul(legacy_marks as u64).context("Kimi draft window marks overflow")?;
+            request.fixed.push(total);
+            mark_demands.push(demand);
+        }
+    }
     if let Some(inventory) = &rtx {
         ensure!(inventory.costs.len() == cfg.layers, "Kimi TP2 expert inventory extent");
         for (layer, cost) in request.layers.iter_mut().zip(&inventory.costs) {
@@ -437,7 +464,42 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
         request.policy.expert_ownership = ExpertOwnership::Contiguous;
     }
     if let Some(budget) = &spark_budget { budget.constrain(&mut request)?; }
-    let (placement, mark_selection) = solve_with_marks(&request, legacy_marks as u64, 1, &mark_demands)?;
+    let groups = request.layers.iter().map(|layer|
+        (layer.kind == AttentionClass::Mla && request.attention_placement != Some(AttentionPlacement::Heads), layer.colocate))
+        .collect::<Vec<_>>();
+    let (placement, (mark_selection, graph_set, draft)) = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, request.layers_first_gpu, request.onboard, |owners| -> Result<_> {
+            let mut candidate = request.clone();
+            for (layer, (&owner, &(selected, _))) in candidate.layers.iter_mut().zip(owners.iter().zip(&groups)) {
+                if selected { layer.modes = vec![LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }]; }
+            }
+            let graphs = graph_reserve.then(|| super::graphs::inventory(cfg, lanes as usize, graph_rows,
+                graph_slots, |rank, layer| !groups[layer].0 || usize::from(owners[layer]) == rank)).transpose()?;
+            candidate.fixed.retain(|d| d.group != super::graphs::RESERVE);
+            if let Some(graphs) = &graphs {
+                candidate.fixed.extend((0..2).map(|rank| super::graphs::demand(&graphs.inventory, rank)));
+            }
+            let (placed, marks, layout) = if let Some(layout) = &draft {
+                let initial = candidate.pool.requested.unwrap_or(candidate.pool.target);
+                settle_pool((initial, ()), |tokens, _| -> Result<_> {
+                    let mut trial = candidate.clone();
+                    let layout = layout.with_pool_tokens(usize::try_from(tokens)?)?;
+                    let (demand, peak) = layout.demands(1)?;
+                    trial.movables = vec![demand.movable(2)?];
+                    trial.startup.retain(|d| d.group != peak.group);
+                    trial.startup.push(peak);
+                    trial.pool.target = trial.pool.target.min(tokens);
+                    trial.pool.ceiling = trial.pool.ceiling.min(tokens);
+                    let (placed, marks) = solve_with_marks(&trial, legacy_marks as u64, 1, &mark_demands)?;
+                    Ok((placed.pool_tokens, (), (placed, marks, Some(layout))))
+                })?
+            } else {
+                let (placed, marks) = solve_with_marks(&candidate, legacy_marks as u64, 1, &mark_demands)?;
+                (placed, marks, None)
+            };
+            if let Some(graphs) = &graphs { super::graphs::check_placement(cfg, &placed, &graphs.keys)?; }
+            Ok((placed, (marks, graphs, layout)))
+        })?;
     if let Some(budget) = &spark_budget {
         for rank in 0..budget.resident.len() {
             let bytes = budget.rank_bytes(rank, placement.onboard_layers)?;
@@ -466,7 +528,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let io_allocated = vec![[false; 2]; lane_layouts.len()];
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
-    let admission = Admission { placement, mark_selection, rtx, rtx_loaded: false, draft, draft_allocated: false, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
+    let admission = Admission { placement, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
         devices, lanes, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
         mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),
@@ -613,7 +675,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         attention_placement: i.attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool, layers, pool_overhead: vec![0; 2], pool_bounded: i.pool_bounded, fixed, startup, movables,
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Layers(0), expert_gpus: 0, minimum_expert_layers: 0,
-        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating,
+        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Ranges,
             attention: [(KimiAttention::Mla, AttentionClass::Mla, AttentionPlacement::Layers),
                 (KimiAttention::Kda, AttentionClass::Kda, AttentionPlacement::Heads)].into_iter()
                 .filter(|(kind, _, _)| cfg.attention.contains(kind))
@@ -689,6 +751,7 @@ pub(super) mod tests {
             i.draft = Some(layout.clone());
             let mut admitted = admit(i)?;
             assert!(admitted.check_draft(0).is_err());
+            let layout = layout.with_pool_tokens(usize::try_from(admitted.placement.pool_tokens)?)?;
             assert_eq!(admitted.check_draft(1)?, &layout);
             let allocated = admitted.allocate_draft_with(1, |owned| {
                 assert_eq!(owned, layout);
@@ -702,6 +765,33 @@ pub(super) mod tests {
         let mut admitted = admit(i)?;
         assert!(admitted.allocate_draft_with::<()>(1, |_| anyhow::bail!("injected partial allocation")).is_err());
         assert!(admitted.check_draft(1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_candidates_keep_matching_graphs_and_shared_draft_pool() -> Result<()> {
+        let cfg = cfg();
+        let mut i = inputs(&cfg);
+        let seed = super::super::graphs::owned_inventory(&cfg, i.lanes, i.rows, i.state_slots)?;
+        i.startup = (0..2).map(|rank| super::super::graphs::demand(&seed.inventory, rank)).collect();
+        i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1048576));
+        let admitted = admit(i)?;
+        let layout = admitted.draft_layout().unwrap();
+        assert_eq!(layout.paged_cache().target_tokens as u64, admitted.placement.pool_tokens);
+        assert_eq!(layout.paged_cache().full_bytes,
+            admitted.placement.pool_tokens.div_ceil(64) * 64 * layout.paged_cache().record_bytes as u64);
+        let set = admitted.graph_set.as_ref().context("winning owner graphs missing")?;
+        super::super::graphs::check_placement(&cfg, &admitted.placement, &set.keys)?;
+        for rank in 0..2 {
+            let charge = admitted.placement.items[rank].iter().find(|item| item.group == super::super::graphs::RESERVE).unwrap();
+            assert_eq!(charge.bytes, set.inventory.bytes(rank));
+        }
+        let marks = admitted.placement.items[1].iter().find(|item| item.group == DRAFT_MARKS).unwrap();
+        assert_eq!(marks.bytes, layout.window_mark_bytes()? as u64 * admitted.mark_selection.slots);
+        let owners = admitted.placement.layers.iter().filter_map(|layer| match layer.mode {
+            LayerMode::Whole { gpu, .. } => Some(gpu), _ => None,
+        }).collect::<Vec<_>>();
+        assert!(owners.windows(2).filter(|pair| pair[0] != pair[1]).count() <= 1);
         Ok(())
     }
 

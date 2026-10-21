@@ -1524,6 +1524,38 @@ impl<'a> DflashDrafter<'a> {
         Ok(())
     }
 
+    pub(crate) fn mla_frontier(&self, slot: usize) -> Result<(usize, usize)> {
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        Ok(context.state.borrow().rings.frontier(slot)?)
+    }
+
+    pub(crate) fn mla_snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>> {
+        let DraftContext::Mla(_) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        self.layers.iter().map(|layer| {
+            let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
+            Ok(layer.cache.buffer)
+        }).collect()
+    }
+
+    pub(crate) fn mla_draft_page_bytes(&self) -> usize {
+        let DraftContext::Mla(context) = &self.context else { return 0 };
+        let layout = context.layout.paged_cache();
+        layout.page_rows * layout.record_bytes * layout.full_layers
+    }
+
+    pub(crate) fn copy_mla_windows(&self, slot: usize, marks: &[CuteafdDeviceBuffer], capture: bool) -> Result<()> {
+        let windows = self.mla_window_segments(slot)?;
+        ensure!(windows.len() == marks.len(), "MLA window mark layer count");
+        for (window, mark) in windows.into_iter().zip(marks) {
+            ensure!(window.bytes == mark.bytes, "MLA window mark byte count");
+            let live = CuteafdDeviceBuffer { ptr: window.addr as *mut c_void, bytes: window.bytes, ..*mark };
+            let (dst, src) = if capture { (*mark, live) } else { (live, *mark) };
+            // SAFETY: family retains both window and mark owners until its drafter drain.
+            unsafe { self.library.copy_d2d_async(dst, src, src.bytes, self.stream)?; }
+        }
+        Ok(())
+    }
+
     /// Typed full-context attachment. The caller's existing positional mark must also
     /// retain `mla_window_segments(slot)`; a pages-only attachment is not a warm snapshot.
     pub(crate) fn capture_mla_pages(&self, slot: usize, frontier: usize, write_frontier: usize)

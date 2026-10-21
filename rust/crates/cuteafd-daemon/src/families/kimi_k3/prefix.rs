@@ -24,6 +24,11 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotMeta {
+    pub draft: Option<(usize, usize)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Frontier { units: Vec<u32>, len: usize }
 
@@ -37,6 +42,7 @@ struct Inner<'a> {
     layout: FamilyLayout,
     joins: [RefCell<Joins<'a>>; 2],
     live: RefCell<Vec<Option<Frontier>>>,
+    draft: Option<Rc<super::draft::NativeDraft<'a>>>,
 }
 
 impl Drop for Inner<'_> {
@@ -86,14 +92,28 @@ impl<'a> KimiPrefix<'a> {
             mark_bytes, draft_bytes: 0,
             rule: PREFIX_REUSE, mark_store: MarkStore::Arena, page_owners: Default::default() };
         let live = RefCell::new(vec![None; kda[0].slots()]);
-        Ok(Self(Rc::new(Inner { kda, mla, cfg: cfg.clone(), context, layout, joins, live })))
+        Ok(Self(Rc::new(Inner { kda, mla, cfg: cfg.clone(), context, layout, joins, live, draft: None })))
+    }
+
+    pub(crate) fn with_draft(mut self, draft: Option<Rc<super::draft::NativeDraft<'a>>>) -> Result<Self> {
+        let inner = Rc::get_mut(&mut self.0).context("Kimi prefix drafter must bind before publication")?;
+        if let Some(draft) = &draft {
+            let bytes = draft.mark_segments(0)?.iter().map(|buffer| buffer.bytes).sum::<usize>();
+            inner.layout.mark_bytes = inner.layout.mark_bytes.checked_add(bytes).context("Kimi complete mark overflow")?;
+        }
+        inner.draft = draft;
+        Ok(self)
+    }
+    pub(crate) fn snapshot_retained(&self) -> Vec<Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>> {
+        self.0.draft.iter().cloned().map(|draft| draft as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>).collect()
     }
 
     pub(crate) fn slots(&self) -> usize { self.0.kda[0].marks() }
 
     pub(crate) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
         self.0.mla.iter().flat_map(|bank| bank.owners())
-            .chain(self.0.kda.iter().map(|bank| bank.mark_owner())).collect()
+            .chain(self.0.kda.iter().map(|bank| bank.mark_owner()))
+            .chain(self.0.draft.iter().map(|draft| draft.mark_owner())).collect()
     }
 
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
@@ -193,12 +213,65 @@ impl<'a> KimiPrefix<'a> {
                 Ok(())
             })?;
         }
+        if let Some(draft) = &self.0.draft { draft.move_mark(mark.0 as usize, slot, capture)?; }
         Ok(())
     }
 }
 
-impl PrefixFamily for KimiPrefix<'_> {
+impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     type Placement = Placement;
+    fn draft_page_bytes(&self) -> usize { self.0.draft.as_ref().map_or(0, |draft| draft.common().mla_draft_page_bytes()) }
+    fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
+        if let Some(draft) = &self.0.draft {
+            let _scope = draft.device().enter()?;
+            draft.common().admit_mla_pages(placement.slot, capacity)?;
+        }
+        Ok(())
+    }
+    fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
+        self.0.draft.as_ref().is_some_and(|draft| draft.common().mla_pages_valid(attachment))
+    }
+    fn draft_pages_revocable(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
+        self.0.draft.as_ref().is_some_and(|draft| draft.common().mla_pages_revocable(attachment))
+    }
+    fn retain_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> {
+        let draft = self.0.draft.as_ref().context("Kimi draft attachment without executor")?;
+        Ok(draft.common().retain_mla_pages(attachment)?)
+    }
+    fn capture_draft_pages(&self, placement: &Placement, len: usize)
+        -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError> {
+        let Some(draft) = &self.0.draft else { return Ok(None) };
+        if draft.frontier(placement.slot)? != (0, len) { return Ok(None); }
+        let _scope = draft.device().enter()?;
+        draft.common().capture_mla_pages(placement.slot, len, len).map(Some)
+    }
+    fn release_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> {
+        let draft = self.0.draft.as_ref().context("Kimi draft attachment without executor")?;
+        let _scope = draft.device().enter()?;
+        Ok(draft.common().release_mla_pages(attachment)?)
+    }
+    fn promote_draft_pages(&self, saved: &cuteafd_engine::prefix::DraftPageAttachment)
+        -> Result<cuteafd_engine::prefix::DraftPageAttachment, BoxError> {
+        self.0.draft.as_ref().context("Kimi draft attachment without executor")?.common().promote_mla_pages(saved)
+    }
+    fn draft_page_segments(&self, page: cuteafd_engine::prefix::DraftPageId) -> Vec<DeviceRange> {
+        self.0.draft.as_ref().and_then(|draft| draft.common().mla_page_segments(page).ok()).unwrap_or_default()
+    }
+    fn restore_draft_pages(&self, attachment: Option<&cuteafd_engine::prefix::DraftPageAttachment>,
+        placement: &mut Placement, frontier: usize) -> Result<(), BoxError> {
+        let Some(draft) = &self.0.draft else { return Ok(()) };
+        if let Some(attachment) = attachment {
+            if attachment.origin != 0 || attachment.frontier != frontier { return Err("Kimi noncanonical draft snapshot".into()); }
+            draft.drain()?;
+            let _scope = draft.device().enter()?;
+            draft.common().restore_mla_pages(placement.slot, attachment, frontier)
+        } else { Ok(draft.reset(placement.slot, frontier)?) }
+    }
+    fn capture_meta(&self, placement: &Placement, len: usize) -> Result<SnapshotMeta, BoxError> {
+        let draft = self.0.draft.as_ref().map(|draft| draft.frontier(placement.slot)).transpose()?;
+        Ok(SnapshotMeta { draft: draft.filter(|frontier| *frontier == (0, len)) })
+    }
+
     fn record_format(&self) -> &'static str { "kimi_k3_bf16_mla_tp2_kda_f32_v1" }
     fn layout(&self) -> FamilyLayout { self.0.layout }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
@@ -221,6 +294,7 @@ impl PrefixFamily for KimiPrefix<'_> {
                 Ok(())
             })?;
         }
+        if let Some(draft) = &self.0.draft { draft.reset(placement.slot, 0)?; }
         self.0.live.borrow_mut()[placement.slot] = Some(Frontier { units: placement.units.clone(), len: 0 });
         placement.len = 0;
         placement.state_len = 0;
@@ -228,6 +302,7 @@ impl PrefixFamily for KimiPrefix<'_> {
     }
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
         if placement.slot >= self.0.kda[0].slots() { return Err("Kimi prefix discard slot".into()); }
+        if let Some(draft) = &self.0.draft { draft.discard(placement.slot)?; }
         self.0.live.borrow_mut()[placement.slot] = None;
         placement.len = 0;
         placement.state_len = 0;
@@ -272,6 +347,7 @@ impl PrefixFamily for KimiPrefix<'_> {
         Ok(())
     }
     fn drain(&self) -> Result<(), BoxError> {
+        if let Some(draft) = &self.0.draft { draft.drain()?; }
         for rank in 0..2 {
             self.ordered(rank, |_| Ok(()))?;
             self.0.kda[rank].stream.drain()?;
@@ -282,7 +358,9 @@ impl PrefixFamily for KimiPrefix<'_> {
         (0..2).flat_map(|rank| self.page_buffers(rank, page, MLA_PAGE_ROWS).unwrap_or_default()).map(range).collect()
     }
     fn mark_segments(&self, mark: MarkSlot) -> Vec<DeviceRange> {
-        (0..2).flat_map(|rank| self.mark_buffers(rank, mark).unwrap_or_default()).map(range).collect()
+        (0..2).flat_map(|rank| self.mark_buffers(rank, mark).unwrap_or_default())
+            .chain(self.0.draft.iter().flat_map(|draft| draft.mark_segments(mark.0 as usize).unwrap_or_default()))
+            .map(range).collect()
     }
 }
 
@@ -391,7 +469,7 @@ mod tests {
                 }
                 Ok(result)
             };
-            let make_cache = || -> Result<PrefixCache<CudaCopyEngine<'_>>> {
+            let make_cache = || -> Result<PrefixCache<CudaCopyEngine<'_>, SnapshotMeta>> {
                 let layout = family.layout();
                 let chunk = layout.mark_bytes.max(layout.page_bytes) as u64;
                 let copy = CudaCopyEngine::registered_owned(&library, family.snapshot_owners())?;
@@ -399,7 +477,7 @@ mod tests {
                     keep_logits: true, min_tokens: 1 }, Some((Config { bytes: chunk * 6, chunk_bytes: chunk,
                         min_tokens: 1, ..Default::default() }, copy)))?)
             };
-            let finish_store = |cache: &mut PrefixCache<CudaCopyEngine<'_>>| -> Result<()> {
+            let finish_store = |cache: &mut PrefixCache<CudaCopyEngine<'_>, SnapshotMeta>| -> Result<()> {
                 cache.host_engine_mut().context("host tier missing")?.synchronize(CopyStream::Store)?;
                 cache.tick();
                 Ok(())

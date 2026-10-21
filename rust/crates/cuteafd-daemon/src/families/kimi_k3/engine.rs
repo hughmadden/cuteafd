@@ -16,7 +16,7 @@ struct Lanes<'a> {
 }
 
 pub(crate) struct Engine<'a> {
-    draft: Option<super::draft::NativeDraft<'a>>,
+    draft: Option<Rc<super::draft::NativeDraft<'a>>>,
     draft_probe: RefCell<Option<crate::shared::memory::device::DeviceOwner<'a,
         crate::shared::draft::probe::RoundProbe<'a>>>>,
     execution: Execution<'a>,
@@ -167,7 +167,7 @@ impl<'a> Engine<'a> {
         let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts)?;
-        engine.draft = draft;
+        engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;
         Ok(engine)
     }
@@ -202,7 +202,7 @@ impl<'a> Engine<'a> {
         let lanes = self.lanes.try_borrow()?;
         let [(kda0, mla0), (kda1, mla1)] = lanes.local[0].each_ref().map(|lane| lane.prefix_banks());
         let family = super::prefix::KimiPrefix::new(lanes.local[0][0].config(), lanes.local[0][0].max_context(),
-            [kda0, kda1], [mla0, mla1])?;
+            [kda0, kda1], [mla0, mla1])?.with_draft(self.draft.clone())?;
         *prefix = Some(family.clone());
         Ok(family)
     }
@@ -237,7 +237,7 @@ impl<'a> Engine<'a> {
             .unwrap_or_else(|error| { tracing::debug!(%error, "Kimi draft probe read failed"); None })
     }
 
-    pub(crate) fn native_draft(&self) -> Option<&super::draft::NativeDraft<'a>> { self.draft.as_ref() }
+    pub(crate) fn native_draft(&self) -> Option<&super::draft::NativeDraft<'a>> { self.draft.as_deref() }
 
     pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)
         -> Result<cuteafd_core::PolicyGeometry> {
@@ -351,11 +351,11 @@ impl<'a> Engine<'a> {
             let result = if !speculative && sequences.len() == 1 && windows.len() > 1 {
                 self.execution.run_subwaves(scope, &self.peer, &self.hops, &mut local[0],
                     &mut routed[0], &mut experts[0], &windows, &metadata[0], pool,
-                    self.draft.as_ref()).map(|output| vec![output])
+                    self.draft.as_deref()).map(|output| vec![output])
             } else {
                 self.execution.run(scope, &self.peer, &self.hops,
                     &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
-                    super::layers::Output::Normalized, self.draft.as_ref(), Some(&self.draft_probe))
+                    super::layers::Output::Normalized, self.draft.as_deref(), Some(&self.draft_probe))
             };
             for binding in &mut local[0] { binding.enable_replay(true); }
             let normalized = result?[0];

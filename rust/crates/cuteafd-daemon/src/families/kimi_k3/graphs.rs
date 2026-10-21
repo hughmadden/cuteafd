@@ -151,8 +151,11 @@ mod tests {
     #[test]
     fn owned_keys_match_shared_admission_and_reject_wrong_residency() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let admitted = super::super::admission::admit(super::super::admission::tests::inputs(&cfg))?;
-        let inventory = owned_inventory(&cfg, 1, 4096, 4)?;
+        let mut inputs = super::super::admission::tests::inputs(&cfg);
+        let provisional = owned_inventory(&cfg, inputs.lanes, inputs.rows, inputs.state_slots)?;
+        inputs.startup.extend((0..2).map(|rank| demand(&provisional.inventory, rank)));
+        let admitted = super::super::admission::admit(inputs)?;
+        let inventory = admitted.graph_set.as_ref().expect("winning owner graph inventory");
         check_placement(&cfg, &admitted.placement, &inventory.keys)?;
         let mut wrong = inventory.keys.clone();
         let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
@@ -160,7 +163,7 @@ mod tests {
             Op::Attention { layer: captured, .. } if captured == layer)).unwrap();
         key.rank = 1 - key.rank;
         assert!(check_placement(&cfg, &admitted.placement, &wrong).is_err());
-        let missing = inventory.keys.into_iter().filter(|key| !matches!(key.op,
+        let missing = inventory.keys.iter().copied().filter(|key| !matches!(key.op,
             Op::Attention { layer: captured, .. } if captured == layer)).collect::<Vec<_>>();
         assert!(check_placement(&cfg, &admitted.placement, &missing).is_err());
         Ok(())
