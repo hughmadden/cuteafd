@@ -199,6 +199,7 @@ pub(crate) struct DeliveredArena<'a> {
     allocation: Allocation<'a>,
     layout: ArenaLayout,
     validation: Vec<u8>,
+    expected: ExpectedCoverage,
 }
 
 pub(crate) struct ReadyArena<'a> {
@@ -322,11 +323,34 @@ impl<'a> LoadingArena<'a> {
             allocation: self.allocation,
             layout: self.layout,
             validation: self.validation,
+            expected: self.expected,
         })
     }
 }
 
 impl<'a> DeliveredArena<'a> {
+    pub fn device(&self) -> Device<'a> { self.allocation.device }
+    pub fn buffer(&self, range: Range<usize>) -> Result<CuteafdDeviceBuffer> {
+        slice(self.allocation.buffer, range)
+    }
+    /// Only omitted bytes are generated. Delivered source bytes are never
+    /// replaced by zero padding, including replayed or sparse tensor images.
+    pub fn zero_padding(&self) -> Result<()> {
+        self.device().run(|| {
+            let mut cursor = 0usize;
+            for (&start, &end) in &self.expected.0.intervals {
+                let start = usize::try_from(start)?.min(self.layout.bytes);
+                if cursor < start {
+                    self.device().library.cuda_zero_bytes(self.buffer(cursor..start)?, start - cursor)?;
+                }
+                cursor = usize::try_from(end)?.min(self.layout.bytes);
+            }
+            if cursor < self.layout.bytes {
+                self.device().library.cuda_zero_bytes(self.buffer(cursor..self.layout.bytes)?, self.layout.bytes - cursor)?;
+            }
+            Ok(())
+        })
+    }
     pub fn validation(&self) -> &[u8] {
         &self.validation
     }

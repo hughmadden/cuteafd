@@ -557,6 +557,75 @@ impl Builder {
         Ok(())
     }
 
+    /// Native planes occupy their final rank regions. Gate/up land as
+    /// [up;gate], independently padded; no post-Done fusion copy is needed.
+    /// Six NVFP4 scalars per expert go to the admitted host-only tail.
+    pub fn v41_resident(
+        &mut self,
+        catalog: &crate::OfficialV41Catalog,
+        names: &[String],
+        layout: &super::native::NativePlanes,
+        expert: usize,
+        world: u32,
+        rank: u32,
+        destination: Destination,
+        scalars: Option<Destination>,
+    ) -> Result<()> {
+        if world == 0 || rank >= world || expert >= layout.experts
+            || destination.bytes < layout.bytes as u64
+            || names.len() != if layout.nvfp4 { 12 } else { 6 } {
+            return Err(invalid("invalid native resident image"));
+        }
+        for (slot, name) in names.iter().take(6).enumerate() {
+            let down = name.contains(".w2.");
+            let gate = name.contains(".w1.");
+            if !down && !gate && !name.contains(".w3.") {
+                return Err(invalid("native projection name is not W1/W3/W2"));
+            }
+            let scale = slot >= 3;
+            let plane = usize::from(down) * 2 + usize::from(scale);
+            let divisor = if scale { if layout.nvfp4 { 16 } else { 32 } } else { 2 };
+            let source = Self::v41_source(catalog, name)?;
+            let expected = mul(mul(layout.hidden as u64, layout.intermediate as u64)?, world as u64)? / divisor;
+            if source.bytes != expected {
+                return Err(invalid("native source geometry differs from resident plan"));
+            }
+            let (offset, bytes) = layout.expert_plane(plane, expert)?;
+            let half = if gate { layout.kernel_intermediate * layout.hidden / divisor as usize } else { 0 };
+            let source_pitch = if down { layout.intermediate * world as usize / divisor as usize }
+                else { layout.hidden / divisor as usize };
+            let width = if down { layout.intermediate / divisor as usize } else { source_pitch };
+            let source_offset = if down { rank as usize * width }
+                else { rank as usize * layout.intermediate * source_pitch };
+            let destination_pitch = if down && layout.nvfp4 {
+                layout.kernel_intermediate / divisor as usize
+            } else { width };
+            self.rows(&source, source_offset as u64,
+                u32::try_from(if down { layout.hidden } else { layout.intermediate })
+                    .map_err(|_| invalid("native rows exceed u32"))?,
+                u32::try_from(width).map_err(|_| invalid("native row exceeds u32"))?,
+                source_pitch as u64, destination_pitch as u64,
+                Destination { offset: add(destination.offset, (offset + half) as u64)?,
+                    bytes: (bytes - half) as u64, ..destination })?;
+        }
+        if layout.nvfp4 {
+            let scalars = scalars.ok_or_else(|| invalid("NVFP4 host scalar image absent"))?;
+            if scalars.rank != destination.rank || scalars.bytes < layout.scalar_bytes() as u64 {
+                return Err(invalid("NVFP4 host scalar image too small"));
+            }
+            for (slot, name) in names.iter().skip(6).enumerate() {
+                let source = Self::v41_source(catalog, name)?;
+                if source.bytes != 4 || catalog.tensor(name)?.metadata.dtype != cuteafd_core::DType::F32 {
+                    return Err(invalid("NVFP4 scalar must be F32"));
+                }
+                self.contiguous(&source, 0, 4, Destination {
+                    offset: add(scalars.offset, (expert * 24 + slot * 4) as u64)?,
+                    bytes: 4, ..scalars })?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn fp8_matrix(
         &mut self,
         source: &Source,

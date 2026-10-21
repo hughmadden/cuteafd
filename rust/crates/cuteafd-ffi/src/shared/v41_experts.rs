@@ -593,6 +593,21 @@ impl NativeLibrary {
         })
     }
 
+    /// Pack one fused raw plane out of place, using the mount packer's kernel.
+    /// # Safety
+    /// Both buffers must be live on the current device through stream completion.
+    /// FC1 halves must already contain their independently padded [up;gate] rows.
+    pub unsafe fn v41_pack_plane_async(&self, source: crate::CuteafdDeviceBuffer,
+        destination: crate::CuteafdDeviceBuffer, intermediate: u32, plane: u32,
+        stream: *mut c_void) -> Result<()> {
+        type PlaneFn = unsafe extern "C" fn(*const u8, u64, *mut u8, u64, u32, u32, *mut c_void) -> i32;
+        let pack = unsafe { self.lib.get::<PlaneFn>(b"cuteafd_pack_expert_plane_async")? };
+        let status = unsafe { pack(source.ptr.cast(), source.bytes as u64,
+            destination.ptr.cast(), destination.bytes as u64, intermediate, plane, stream) };
+        ensure!(status == 0, "V4.1 plane packing failed with CUDA status {status}");
+        Ok(())
+    }
+
     pub fn v41_expert_packer(&self, intermediate: u32) -> Result<V41ExpertPacker<'_>> {
         ensure!(
             v41_pack_intermediate_supported(intermediate),
