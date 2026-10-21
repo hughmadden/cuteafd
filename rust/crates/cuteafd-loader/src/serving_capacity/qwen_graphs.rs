@@ -201,6 +201,7 @@ pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, own
     add(&mut ranks[0].persistent_unit_bytes, all.persistent_unit_bytes - previous.persistent_unit_bytes)?;
     add(&mut ranks[0].active_state_per_sequence_bytes,
         all.active_state_per_sequence_bytes - previous.active_state_per_sequence_bytes)?;
+    add(&mut ranks[0].retained_mark_bytes, all.retained_mark_bytes - previous.retained_mark_bytes)?;
     ranks[0].pool_metadata_unit_bytes = all.pool_metadata_unit_bytes;
     ranks[0].fixed_state_bytes = all.fixed_state_bytes;
     ranks[1].fixed_state_bytes = 3 * QWEN_DECODE_ROWS as u64 * 4;

@@ -184,7 +184,7 @@ struct PendingCapture<M> {
 /// A capture whose storage was taken and whose copies are the caller's to enqueue.
 struct Prepared<M> {
     entry: Entry<M>,
-    copy: Option<super::pages::TailCopy>,
+    copies: Vec<super::pages::TailCopy>,
 }
 
 /// What [`PrefixCache::queue_capture`] did.
@@ -337,7 +337,16 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// a family whose restore rebuilds token-derived state ([`RestoreContext`]).
     #[allow(clippy::too_many_arguments)]
     pub fn admit_native<F: PrefixFamily<M, Placement = P>, P>(&mut self, family: &F, tokens: &[u32],
-        native: &[u32], media: &[MediaSpan], capacity: usize, sampled: bool, mut build: impl FnMut(Vec<u32>) -> P)
+        native: &[u32], media: &[MediaSpan], capacity: usize, sampled: bool, build: impl FnMut(Vec<u32>) -> P)
+        -> Result<Admitted<P>, PrefixError> {
+        self.admit_native_compatible(family, tokens, native, media, capacity, sampled, None, build)
+    }
+
+    /// Request-local state requirements are checked before either tier restores bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_native_compatible<F: PrefixFamily<M, Placement = P>, P>(&mut self, family: &F,
+        tokens: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize, sampled: bool,
+        compatible: Option<&dyn Fn(&M, usize) -> bool>, mut build: impl FnMut(Vec<u32>) -> P)
         -> Result<Admitted<P>, PrefixError> {
         crate::media::keys::validate_spans(media)?;
         if media.last().is_some_and(|s| s.checked_end().unwrap() > tokens.len()) || native.len() != tokens.len() {
@@ -349,12 +358,25 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if self.enabled() && !tokens.is_empty() {
             self.stats.lookups += 1;
             let mut promoted = false;
-            let mut hit = self.lookup_media(tokens, media, sampled);
-            if hit.is_none() {
-                hit = self.promote(family, tokens, media, sampled)?;
-                promoted = hit.is_some();
+            let mut hit = if let Some(compatible) = compatible {
+                self.device_compatible_hit(tokens, media, sampled, compatible)
+            } else { self.lookup_media(tokens, media, sampled) };
+            let host_deeper = compatible.is_some_and(|compatible| self.host_compatible_hit(tokens, media,
+                sampled, compatible).is_some_and(|(_, resume)| resume > hit.as_ref().map_or(0, |h| h.resume)));
+            if hit.is_none() || host_deeper {
+                let restored = self.promote(family, tokens, media, sampled, compatible)?;
+                promoted = restored.is_some();
+                // Promotion can evict the previous device candidate before
+                // failing admission. Re-select rather than keeping a stale id.
+                hit = if let Some(compatible) = compatible {
+                    self.device_compatible_hit(tokens, media, sampled, compatible)
+                } else { restored };
             }
             if let Some(hit) = hit {
+                if compatible.is_some() {
+                    self.clock += 1;
+                    if let Some(entry) = self.entries.get_mut(&hit.id) { entry.last_use = self.clock; }
+                }
                 let context = RestoreContext { native_tokens: native, media };
                 match self.restore_hit(family, &hit, tokens, &context, total, promoted, &mut build) {
                     Ok(Some(admitted)) => return Ok(admitted),
@@ -442,6 +464,38 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         device.max(host)
     }
 
+    /// A compatible ancestor may be shallower than an incompatible token match.
+    pub fn peek_media_compatible(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        compatible: &dyn Fn(&M, usize) -> bool) -> usize {
+        if !self.enabled() { return 0; }
+        let device = self.device_compatible_hit(tokens, media, sampled, compatible).map_or(0, |h| h.resume);
+        let host = self.host_compatible_hit(tokens, media, sampled, compatible).map_or(0, |h| h.1);
+        device.max(host)
+    }
+
+    fn device_compatible_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        compatible: &dyn Fn(&M, usize) -> bool) -> Option<Hit> {
+        self.entries.iter().filter_map(|(&id, entry)| {
+            let (resume, common, _) = media_resume(self.layout.rule, tokens, media, &entry.tokens,
+                &entry.media, &entry.after, sampled);
+            (resume > 0 && compatible(&entry.meta, entry.len())).then_some((
+                (resume, entry.kind == SnapshotKind::Turn, entry.last_use),
+                Hit { id, kind: entry.kind, resume, common, frontier: entry.len() }))
+        }).max_by_key(|(rank, _)| *rank).map(|(_, hit)| hit)
+    }
+
+    fn host_compatible_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        compatible: &dyn Fn(&M, usize) -> bool) -> Option<(cuteafd_hostcache::snapshot::Hit, usize)> {
+        self.host.as_ref()?.resident_payloads().filter_map(|(meta, key, payload)| {
+            let (resume, common, _) = media_resume(self.layout.rule, tokens, media, &meta.tokens,
+                &payload.media, &payload.after, sampled);
+            (resume > 0 && compatible(&payload.family, meta.tokens.len())).then_some((
+                (resume, meta.kind == SnapshotKind::Turn, key),
+                (cuteafd_hostcache::snapshot::Hit { key, kind: meta.kind, common,
+                    frontier: meta.tokens.len() }, resume)))
+        }).max_by_key(|(rank, _)| *rank).map(|(_, hit)| hit)
+    }
+
     fn device_media_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> (Option<Hit>, u64) {
         let mut best = None;
         let mut rank = (0, false, 0);
@@ -514,18 +568,19 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if resume == 0 {
             return Ok(None);
         }
-        let need = self.pool.fork_need(source_end, total);
+        let writable = family.write_frontier(source_end);
+        let need = self.pool.fork_need_writable(source_end, total, writable);
         if !self.make_room_for(family, need, Some(hit.id))? {
             return Ok(None);
         }
         let entry = self.entries.get(&hit.id).expect("the hit is kept while making room");
-        let fork = self.pool.fork(&entry.pages, source_end, total)?;
+        let (fork_pages, copies) = self.pool.fork_writable(&entry.pages, source_end, total, writable)?;
         let exact = plan.exact();
         let (mut mark, meta) = if exact { (entry.mark.clone(), Some(entry.meta.clone())) } else { (None, None) };
         let host_mark = if exact && self.layout.mark_bytes > 0 && mark.is_none() { entry.host_mark } else { None };
         let after = (resume == tokens.len()).then(|| entry.after.clone());
         let session = entry.session.clone();
-        let pages = fork.pages.clone();
+        let pages = fork_pages.clone();
         let temporary = host_mark.is_some();
         if let Some(key) = host_mark {
             mark = match self.restore_mark(family, key, hit.id) {
@@ -537,17 +592,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 return Ok(None);
             }
         }
-        let mut placement = build(fork.pages);
+        let mut placement = build(fork_pages);
         self.dirty = true;
         let restored = self.check_owners(family, &pages).map_err(|e| ("owners", e))
             .and_then(|()| family.bind(&mut placement).map_err(|e| ("bind", e)))
-            .and_then(|()| match fork.copy {
-                Some(copy) => {
-                    self.stats.cow_copies += 1;
-                    family.copy_rows(copy).map_err(|e| ("copy", e))
-                }
-                None => Ok(()),
-            })
+            .and_then(|()| copies.into_iter().try_for_each(|copy| {
+                self.stats.cow_copies += 1;
+                family.copy_rows(copy).map_err(|e| ("copy", e))
+            }))
             .and_then(|()| family.restore_with(mark.as_ref(), meta.as_ref(), &mut placement, &plan, context)
                 .map_err(|e| ("restore", e)));
         if let Err((what, source)) = restored {
@@ -598,12 +650,9 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let Some(prepared) = self.prepare_capture(family, kind, tokens, media, placement, after)? else {
             return Ok(false);
         };
-        let Prepared { entry, copy } = prepared;
+        let Prepared { entry, copies } = prepared;
         let len = entry.len();
-        let captured = match copy {
-            Some(copy) => family.copy_rows(copy),
-            None => Ok(()),
-        }
+        let captured = copies.into_iter().try_for_each(|copy| family.copy_rows(copy))
         .and_then(|()| match &entry.mark {
             Some(Mark::Pages(pages)) => family.capture_pages(pages, placement, len),
             Some(Mark::Slot(slot)) => family.capture(*slot, placement, len),
@@ -629,11 +678,16 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             return self.capture_media(family, kind, tokens, media, placement, after)
                 .map(|done| if done { Captured::Done } else { Captured::Skipped });
         }
-        let Some(Prepared { entry, copy }) = self.prepare_capture(family, kind, tokens, media, placement, after)? else {
+        let Some(Prepared { entry, copies }) = self.prepare_capture(family, kind, tokens, media, placement, after)? else {
             return Ok(Captured::Skipped);
         };
         let Some(Mark::Slot(slot)) = entry.mark else { unreachable!("arena marks take a slot") };
-        match family.queue_capture(slot, placement, entry.len(), copy) {
+        // Existing queued families accept one tail. Multiple writable retained units use
+        // their ordinary ordered capture stream without changing the asynchronous contract.
+        let queued = if copies.len() <= 1 {
+            family.queue_capture(slot, placement, entry.len(), copies.first().copied())
+        } else { Ok(None) };
+        match queued {
             Ok(Some(ticket)) => {
                 self.pending.push(PendingCapture { ticket, kind, entry });
                 self.stats.captures_queued += 1;
@@ -642,10 +696,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             Ok(None) => {
                 // The family captures synchronously: do it now on its own stream.
                 let len = entry.len();
-                let captured = match copy {
-                    Some(copy) => family.copy_rows(copy),
-                    None => Ok(()),
-                }.and_then(|()| family.capture(slot, placement, len));
+                let captured = copies.into_iter().try_for_each(|copy| family.copy_rows(copy)).and_then(|()| family.capture(slot, placement, len));
                 if let Err(source) = captured {
                     self.release(family, &entry.pages)?;
                     self.give_back(family, entry.mark)?;
@@ -781,7 +832,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let total = self.pool.pages_for(len);
         // The rows a fork copies and, for pool-page marks, the mark's own pages.
         let mark_pages = self.pool.need_for(0..self.layout.mark_store.pages());
-        if !self.make_room_for(family, self.pool.fork_need(len, total) + mark_pages, None)? {
+        let writable = family.write_frontier(len);
+        if !self.make_room_for(family, self.pool.fork_need_writable(len, total, writable) + mark_pages, None)? {
             self.give_back(family, slot.map(Mark::Slot))?;
             self.stats.capture_skips += 1;
             return Ok(None);
@@ -790,7 +842,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             Some(slot) => Some(Mark::Slot(slot)),
             None => self.take_mark_pages()?,
         };
-        let fork = match self.pool.fork(family.pages(placement), len, total) {
+        let (fork_pages, copies) = match self.pool.fork_writable(family.pages(placement), len, total, writable) {
             Ok(fork) => fork,
             Err(error) => {
                 self.give_back(family, mark)?;
@@ -802,8 +854,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             after.logits = None;
         }
         let entry = Entry { session: self.capture_session.clone(), tokens: tokens.to_vec(),
-            media: snapshot_media(len, media), kind, pages: fork.pages, mark, after, meta, last_use: 0, ticket: None, host_mark: None };
-        Ok(Some(Prepared { entry, copy: fork.copy }))
+            media: snapshot_media(len, media), kind, pages: fork_pages, mark, after, meta, last_use: 0, ticket: None, host_mark: None };
+        Ok(Some(Prepared { entry, copies }))
     }
 
     /// Retain a captured snapshot whose copies were enqueued (synchronous families) or landed.
@@ -930,21 +982,22 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             return Err(PrefixError::Family { what: "fork step", source: "invalid append frontier".into() });
         }
         let total = self.pool.pages_for(end);
-        self.make_room_for(family, self.pool.fork_need(frontier, total), None)?;
-        let fork = self.pool.fork(pages, frontier, total)?;
-        if let Some(copy) = fork.copy {
-            if let Err(source) = family.copy_rows(copy).and_then(|()| family.drain()) {
+        let writable = family.write_frontier(frontier);
+        self.make_room_for(family, self.pool.fork_need_writable(frontier, total, writable), None)?;
+        let (fork_pages, copies) = self.pool.fork_writable(pages, frontier, total, writable)?;
+        if !copies.is_empty() {
+            if let Err(source) = copies.into_iter().try_for_each(|copy| family.copy_rows(copy)).and_then(|()| family.drain()) {
                 // Draining also covers a family that failed after enqueueing.
                 if let Err(source) = family.drain() {
-                    self.quarantine.push(Quarantined { _pages: fork.pages, _mark: None });
+                    self.quarantine.push(Quarantined { _pages: fork_pages, _mark: None });
                     self.stats.quarantined += 1;
                     return Err(PrefixError::Family { what: "fork step drain", source });
                 }
-                self.pool.release(&fork.pages);
+                self.pool.release(&fork_pages);
                 return Err(PrefixError::Family { what: "fork step copy", source });
             }
         }
-        Ok(fork.pages)
+        Ok(fork_pages)
     }
 
     /// Poll the host stream and release staging marks only after their last reader completes.
@@ -1195,10 +1248,13 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.give_back(family, entry.mark)
     }
 
-    /// Host identities of an entry's pages: full pages by content (hash chain over their tokens),
-    /// the partial tail by device allocation.
-    fn identities(&self, tokens: &[u32], media: &[MediaSpan], pages: &[u32]) -> Vec<DevicePageId> {
-        let chain = page_chain_media(tokens, media, self.layout.page_rows);
+    /// Token-only page identities are safe only when all paged state follows the target
+    /// frontier. Predictor-inclusive pages can differ for the same tokens (a no-spec writer),
+    /// so use allocation identities rather than deduplicating their canonical state.
+    fn identities<F: PrefixFamily<M>>(&self, family: &F, tokens: &[u32], media: &[MediaSpan], pages: &[u32]) -> Vec<DevicePageId> {
+        let chain = if family.write_frontier(tokens.len()) == tokens.len() {
+            page_chain_media(tokens, media, self.layout.page_rows)
+        } else { Vec::new() };
         pages
             .iter()
             .enumerate()
@@ -1217,7 +1273,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.drain(family)?;
         let entry = self.entries.get(&id).expect("stored entry is retained");
         self.check_owners(family, &entry.pages).map_err(|source| PrefixError::Family { what: "page owners", source })?;
-        let ids = self.identities(&entry.tokens, &entry.media, &entry.pages);
+        let ids = self.identities(family, &entry.tokens, &entry.media, &entry.pages);
         let mut pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
         pages[0] = entry.pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
         let snapshot = DeviceSnapshot {
@@ -1243,8 +1299,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
 
     /// On a device miss: rebuild the best host snapshot on the device so the device path finds
     /// it. Anything short of a completed restore is a miss.
-    fn promote<F: PrefixFamily<M>>(&mut self, family: &F, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> Result<Option<Hit>, PrefixError> {
-        let selected = if media.is_empty() {
+    fn promote<F: PrefixFamily<M>>(&mut self, family: &F, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        compatible: Option<&dyn Fn(&M, usize) -> bool>) -> Result<Option<Hit>, PrefixError> {
+        let selected = if let Some(compatible) = compatible {
+            let selected = self.host_compatible_hit(tokens, media, sampled, compatible);
+            let key = selected.as_ref().map(|(hit, _)| hit.key);
+            if !self.host.as_mut().is_some_and(|host| host.lookup_verified(key)) { return Ok(None); }
+            selected.map(|(hit, _)| hit)
+        } else if media.is_empty() {
             self.host.as_mut().and_then(|host| host.lookup(tokens))
         } else {
             let (selected, collisions) = self.host_media_hit(tokens, media, sampled);
@@ -1315,7 +1377,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.give_back(family, mark)?;
             return Ok(None);
         }
-        let ids = self.identities(&snapshot_tokens, &saved_media, &pages);
+        let ids = self.identities(family, &snapshot_tokens, &saved_media, &pages);
         let mut target_pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
         target_pages[0] = pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
         let tail = match Self::mark_segments(family, mark.as_ref()) {
@@ -1384,7 +1446,9 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.evict(family, evicted)?;
         }
         self.stats.promotions += 1;
-        Ok(self.lookup_media(tokens, media, sampled))
+        Ok(if let Some(compatible) = compatible {
+            self.device_compatible_hit(tokens, media, sampled, compatible)
+        } else { self.lookup_media(tokens, media, sampled) })
     }
 }
 

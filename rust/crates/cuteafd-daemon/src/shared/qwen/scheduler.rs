@@ -51,6 +51,7 @@ pub(crate) trait Placement: Clone {
 pub(crate) trait DraftState: Default {
     fn pending_rows(&self) -> usize;
     fn close(&mut self, token: u32);
+    fn restored(&mut self, _frontier: usize) {}
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -74,6 +75,17 @@ pub(crate) struct Verified<'p, P, D, H> {
     pub first_row: usize,
     pub kept: Option<(usize, u32)>,
     pub finished: bool,
+    pub neural: bool,
+}
+
+impl<P, D, H> Verified<'_, P, D, H> {
+    pub(crate) fn neural_kept(&self) -> Option<(usize, u32)> {
+        self.kept.filter(|_| self.neural)
+    }
+}
+
+fn effective_neural(configured: bool, probe: &probe::ProbeRef) -> bool {
+    configured && !probe::no_speculation(probe)
 }
 
 /// The scheduler owns admission, batching, token selection and publication.
@@ -101,6 +113,13 @@ pub(crate) trait Backend<'a> {
     fn bind_request(&self, placement: &mut Self::Placement, coordinates: Self::Coordinates,
         media: RequestMedia, tokens: &[u32], resume: usize) -> Result<()>;
     fn history(&self, placement: &Self::Placement) -> Self::History;
+    fn restore_draft(&self, _placement: &Self::Placement, frontier: usize, _tokens: &[u32],
+        draft: &mut Self::Draft) -> Result<()> {
+        draft.restored(frontier);
+        Ok(())
+    }
+    fn needs_snapshot_filter(&self, _neural: bool) -> bool { false }
+    fn snapshot_compatible(&self, _saved: &Self::Meta, _frontier: usize, _neural: bool) -> bool { true }
     fn prefetch(&self, tokens: &[u32], next: &[u32]);
     fn require_live(&self) -> Result<()>;
     fn log_table_stats(&self, phase: &str);
@@ -123,7 +142,7 @@ pub(crate) trait Backend<'a> {
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming)
         -> Result<Vec<Vec<u32>>>;
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
-        speculative: bool, draft: bool) -> Result<()>;
+        speculative: bool) -> Result<()>;
     /// Drop any unaccepted replay owned by this request before its storage is released.
     fn cancel(&self, _placement: &Self::Placement) -> Result<()> { Ok(()) }
     fn probe_begin(&self, rows: usize);
@@ -677,7 +696,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                             continue;
                         }
                         let resume = if probe::cold(&prompt.job.probe) { 0 }
-                            else { cache.peek_media(prompt.keys.tokens(), prompt.keys.spans(), true) };
+                            else if engine.needs_snapshot_filter(effective_neural(neural, &prompt.job.probe)) {
+                                cache.peek_media_compatible(prompt.keys.tokens(), prompt.keys.spans(), true,
+                                    &|saved, frontier| engine.snapshot_compatible(saved, frontier, true))
+                            } else { cache.peek_media(prompt.keys.tokens(), prompt.keys.spans(), true) };
                         let waiter = MediaWaiter::new(prompt, request_media, jobs, resume)?;
                         if let Err((_, error)) = media.enqueue(waiter) {
                             let _ = events.send(Err(media_failure(error)));
@@ -720,8 +742,13 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             // room for the rows a verify may write past the last kept one.
             let build = |units| engine.placement(units, slot);
             let extent = (capacity + geometry.decode_rows).min(geometry.max_context);
+            let request_neural = effective_neural(neural, &ready.job().job.probe);
+            let compatible = |saved: &B::Meta, frontier| engine.snapshot_compatible(saved, frontier, request_neural);
             let admission = if cold { cache.admit_cold(&family, ready.job().tokens.len(), extent, build) }
-                else { cache.admit_media(&family, ready.job().keys.tokens(), ready.job().keys.spans(), extent, true, build) };
+                else if engine.needs_snapshot_filter(request_neural) {
+                    cache.admit_native_compatible(&family, ready.job().keys.tokens(), ready.job().tokens.as_slice(),
+                        ready.job().keys.spans(), extent, true, Some(&compatible), build)
+                } else { cache.admit_media(&family, ready.job().keys.tokens(), ready.job().keys.spans(), extent, true, build) };
             let admitted = match admission {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -749,7 +776,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             admissions += 1;
             let mut placement = admitted.placement;
             // Native ids and this request's grids rebuild positions on EVERY restore.
-            let bound = engine.bind_request(&mut placement, rope, request_media, &tokens, resume);
+            let mut seq = B::Draft::default();
+            let bound = engine.bind_request(&mut placement, rope, request_media, &tokens, resume)
+                .and_then(|()| if request_neural { engine.restore_draft(&placement, resume, &tokens, &mut seq) }
+                    else { Ok(()) });
             if !bound_before_ready(bound, || {
                 release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
             }, &job.events) { continue; }
@@ -804,7 +834,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 engine.prefetch(&tokens[..resume], &tokens[resume..end]);
             }
             prefills.push(Prefill { job, constraint, tokens, keys, done: resume, resume, plan, chunks: 0, cancelled: false,
-                placement, capacity, seq: B::Draft::default(), logits, first: None, prompt_row: None,
+                placement, capacity, seq, logits, first: None, prompt_row: None,
                 started: Instant::now(), busy: 0.0, phases: [0.0; 2], id: admissions, ticket });
         }
         if prefills.due(!active.is_empty()) {
@@ -855,7 +885,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         let selected = selector.select(&logits, &batch)?;
                         p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
                     }
-                    if neural && !probe::no_speculation(&p.job.probe) {
+                    if effective_neural(neural, &p.job.probe) {
                         engine.prefill_draft(&p.placement, start, chunk, p.tokens.get(end).copied(),
                             &mut p.seq)?;
                     }
@@ -948,7 +978,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         ticket: p.ticket,
                     };
                     request.next = first;
-                    request.draft.close(request.next);
+                    if effective_neural(neural, &request.job.probe) {
+                        request.draft.close(request.next);
+                    }
                     Ok(request)
                 })();
                 match admitted {
@@ -1183,10 +1215,11 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         for ((((request, rows), (&start, history)), kept), &finished) in active.iter_mut().zip(&sequences)
             .zip(starts.iter().zip(histories)).zip(&kept).zip(&finished) {
             verified.push(Verified { placement: &mut request.placement, seq: &mut request.draft, start, history,
-                rows, first_row, kept: *kept, finished });
+                rows, first_row, kept: *kept, finished,
+                neural: effective_neural(neural, &request.job.probe) });
             first_row += rows.len();
         }
-        let accepted = engine.accept(&mut verified, spec, neural);
+        let accepted = engine.accept(&mut verified, spec);
         drop(verified);
         if let Err(error) = accepted {
             for request in &active { engine.cancel(&request.placement)?; }
@@ -1539,5 +1572,33 @@ mod media_failure_tests {
     fn encoder_failure_does_not_expose_internal_error() {
         assert!(matches!(super::media_failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
             cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
+    }
+}
+
+#[cfg(test)]
+mod request_neural_tests {
+    use super::*;
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+
+    #[test]
+    fn mixed_wave_keeps_target_acceptance_but_never_advances_probe_predictors() {
+        let probe = Some(Probe::new(ProbeSpec { no_speculation: true, ..ProbeSpec::default() }));
+        for configured in [false, true] {
+            let mut placements = [0usize; 3];
+            let mut states = [0usize; 3];
+            let rows = [11, 13];
+            let probes = [None, probe.clone(), None];
+            let mut wave: Vec<_> = placements.iter_mut().zip(&mut states).zip(&probes)
+                .map(|((placement, seq), probe)| Verified { placement, seq, start: 255,
+                    history: (), rows: &rows, first_row: 0, kept: Some((2, 17)), finished: false,
+                    neural: effective_neural(configured, probe) }).collect();
+            for v in &mut wave {
+                *v.placement = v.start + v.kept.unwrap().0;
+                if let Some((kept, _)) = v.neural_kept() { *v.seq += kept; }
+            }
+            drop(wave);
+            assert_eq!(placements, [257; 3]);
+            assert_eq!(states, if configured { [2, 0, 2] } else { [0; 3] });
+        }
     }
 }

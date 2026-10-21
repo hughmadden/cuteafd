@@ -329,9 +329,9 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     fn draft(&self, _sequences: &mut [scheduler::DraftSeq<'_, Placement, NoDraft>],
         _timing: &mut scheduler::DraftTiming) -> Result<Vec<Vec<u32>>> { anyhow::bail!("Step-5 MTP is not yet qualified") }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, NoDraft, ()>],
-        speculative: bool, draft: bool) -> Result<()> {
+        speculative: bool) -> Result<()> {
         let pending = self.state.take_pending();
-        ensure!(!draft, "Step-5 MTP is not yet qualified");
+        ensure!(!verified.iter().any(|row| row.neural), "Step-5 MTP is not yet qualified");
         if let Some(step) = pending {
             let mut accepted = Vec::with_capacity(verified.len());
             for sequence in verified {
@@ -380,7 +380,7 @@ mod tests {
             placement.committed = 9;
             let mut draft = NoDraft;
             let mut actual = scheduler::Verified { placement: &mut placement, seq: &mut draft,
-                start: 7, history: (), rows: &tokens, first_row: 0, kept: Some((2, 17)), finished: false };
+                start: 7, history: (), rows: &tokens, first_row: 0, kept: Some((2, 17)), finished: false, neural: false };
             match fault {
                 1 => actual.placement.sequence = 1,
                 2 => actual.placement.pages[0] = 4,
@@ -404,7 +404,7 @@ mod tests {
             placement.committed = committed;
             let mut draft = NoDraft;
             let result = wave.accept(&[scheduler::Verified { placement: &mut placement, seq: &mut draft,
-                start: 7, history: (), rows: &[11, 13], first_row: 0, kept: None, finished: true }]);
+                start: 7, history: (), rows: &[11, 13], first_row: 0, kept: None, finished: true, neural: false }]);
             assert_eq!(result.is_ok(), (7..=9).contains(&committed));
             assert!(wave.accept(&[]).is_err());
             *wave.0.borrow_mut() = Some(ImmediateWave::record(&[(&mut placement, &[17])]));
