@@ -507,7 +507,7 @@ mod tests {
         use crate::shared::{experts::{exl3::Exl3Weights, layer::ExpertLayer}, memory::push_exl3};
         use cuteafd_transport::worker_selection::push::Offer;
         let root = tempfile::tempdir()?;
-        cuteafd_loader::plan::testing::write_kimi_snapshot(root.path(), false);
+        cuteafd_loader::plan::testing::write_kimi_snapshot(root.path(), true);
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
             ..Default::default() };
@@ -541,7 +541,10 @@ mod tests {
             ("gate_proj", 2048, 6144), ("up_proj", 2048, 6144), ("down_proj", 6144, 2048),
         ].into_iter().flat_map(move |(projection, n, k)|
             exl3(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4))).collect::<Vec<_>>();
-        write_snapshot(glm.path(), &glm5_config(), &tensors, None);
+        let mut config = glm5_config();
+        config["quantization_config"] = serde_json::json!({"quant_method": "exl3", "bits": 4.0,
+            "checkpoint_format": "exl3", "format": "exl3"});
+        write_snapshot(glm.path(), &config, &tensors, None);
         let catalog = cuteafd_loader::read_expert_catalog(glm.path())?;
         let budget = Exl3Weights::plan(&catalog, ExpertLayer::BackboneExl3Tp { layer: 1, rank: 0, world: 6 })?;
         assert_eq!(budget.pinned_host_bytes, 114_499_584);
