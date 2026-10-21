@@ -58,24 +58,26 @@ pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_s
     let capacity_error = |error: &PlacementError| matches!(error,
         PlacementError::PoolDoesNotFit { .. } | PlacementError::StartupPeak { .. }
         | PlacementError::Mandatory { .. } | PlacementError::ExpertLayers { .. }
-        | PlacementError::BelowFloor { .. } | PlacementError::SparkFree { .. });
-    let reason = match trial(legacy_slots) {
+        | PlacementError::BelowFloor { .. } | PlacementError::SparkFree { .. }
+        | PlacementError::OwnerCandidates { .. });
+    let mut final_error = match trial(legacy_slots) {
         Ok(placement) => return Ok((placement, MarkSelection { legacy_slots, slots: legacy_slots, reduction_reason: None })),
-        Err(error) if capacity_error(&error) => error.to_string(),
+        Err(error) if capacity_error(&error) => error,
         Err(error) => return Err(error),
     };
-    let mut final_reason = reason.clone();
+    let reason = final_error.to_string();
     // Descend rather than assume the discrete owner/onboard chooser is monotone.
     for slots in (minimum_slots..legacy_slots).rev() {
         match trial(slots) {
             Ok(placement) => return Ok((placement, MarkSelection { legacy_slots, slots, reduction_reason: Some(reason) })),
-            Err(error) if capacity_error(&error) => final_reason = error.to_string(),
+            Err(error) if capacity_error(&error) => final_error = error,
             Err(error) => return Err(error),
         }
     }
     Err(PlacementError::PrefixMarks { minimum: minimum_slots,
         reason: format!("tried {} complete-mark counts ({} down to {}); final attempt with {} marks: {}",
-            legacy_slots - minimum_slots + 1, legacy_slots, minimum_slots, minimum_slots, final_reason) })
+            legacy_slots - minimum_slots + 1, legacy_slots, minimum_slots, minimum_slots, final_error),
+        source: Box::new(final_error) })
 }
 
 /// Places `request`. Pure arithmetic over the request: the planner and the
@@ -732,7 +734,9 @@ fn conditional_movable(request: &PlacementRequest, movable: &Movable, available:
         let fit = if context { fit / 2 * 2 } else { fit };
         let required = request.pool.requested.map_or(request.pool.floor, |n| n.max(request.pool.floor))
             .div_ceil(request.pool.unit_rows);
-        if fit < required {
+        // A fixed expert prefix is admitted next. Let that stage produce the
+        // complete-cost pool refusal instead of reporting this pre-expert ceiling.
+        if fit < required && !(movable.allowed.len() == 1 && matches!(request.onboard, Onboard::Layers(_))) {
             let limits = pool_limits(request, available, &trial_used, &trial_arenas, unit_bytes);
             refusal.get_or_insert_with(|| match request.pool.requested {
                 Some(requested) => PlacementError::PoolDoesNotFit { requested,

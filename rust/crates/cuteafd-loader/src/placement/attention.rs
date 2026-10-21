@@ -64,12 +64,35 @@ pub fn owner_score(onboard: Onboard, placed: &Placement) -> (u64, u64, u64) {
     }
 }
 
+/// Typed pool evidence survives mark-selection and contextual error wrappers.
+pub trait OwnerAdmissionError {
+    fn placement_error(&self) -> Option<&PlacementError>;
+}
+
+impl OwnerAdmissionError for PlacementError {
+    fn placement_error(&self) -> Option<&PlacementError> { Some(self) }
+}
+
+impl OwnerAdmissionError for anyhow::Error {
+    fn placement_error(&self) -> Option<&PlacementError> { self.downcast_ref() }
+}
+
+fn attainable_pool(error: &PlacementError) -> Option<u64> {
+    match error {
+        PlacementError::PoolDoesNotFit { fit, .. } => Some(*fit),
+        PlacementError::BelowFloor { pool, .. } => Some(*pool),
+        PlacementError::PrefixMarks { source, .. } | PlacementError::OwnerCandidates { source, .. } => attainable_pool(source),
+        _ => None,
+    }
+}
+
 /// Evaluate owner-specific costs before choosing a boundary. The callback builds
 /// native/cache/graph inventory for these owners and runs ordinary admission with
 /// those modes pinned; its payload carries the matching inventory to the caller.
 /// Equal scores retain the first legal candidate. An unsupported candidate does
-/// not mask another valid placement; if all fail, return the first admission error.
-pub fn solve_owners<T, E: From<PlacementError>>(groups: &[(bool, Option<u16>)],
+/// not mask another valid placement. If all fail, report the greatest attainable
+/// pool and its selected-layer owner split; without pool evidence keep the first error.
+pub fn solve_owners<T, E: From<PlacementError> + OwnerAdmissionError>(groups: &[(bool, Option<u16>)],
     ownership: LayerOwnership, first: u8, onboard: Onboard,
     mut admit: impl FnMut(&[u8]) -> Result<(Placement, T), E>) -> Result<(Placement, T), E> {
     if first > 1 { return Err(PlacementError::Inventory("layers first GPU must be 0 or 1").into()); }
@@ -78,6 +101,7 @@ pub fn solve_owners<T, E: From<PlacementError>>(groups: &[(bool, Option<u16>)],
     }
     let mut best = None;
     let mut refusal = None;
+    let mut best_refusal: Option<(u64, usize, usize, PlacementError)> = None;
     for boundary in owner_boundaries(groups, ownership == LayerOwnership::NonemptyRanges) {
         let owners = (0..groups.len()).map(|i| if i < boundary { first } else { 1 - first }).collect::<Vec<_>>();
         match admit(&owners) {
@@ -85,11 +109,26 @@ pub fn solve_owners<T, E: From<PlacementError>>(groups: &[(bool, Option<u16>)],
                 let score = owner_score(onboard, &candidate.0);
                 if best.as_ref().is_none_or(|(old, _)| score > *old) { best = Some((score, candidate)); }
             }
-            Err(error) => { if refusal.is_none() { refusal = Some(error); } }
+            Err(error) => {
+                if let Some(source) = error.placement_error() {
+                    if let Some(fit) = attainable_pool(source) {
+                        if best_refusal.as_ref().is_none_or(|old| fit > old.0) {
+                            let rank0 = groups.iter().zip(&owners).filter(|(group, owner)| group.0 && **owner == 0).count();
+                            let rank1 = groups.iter().filter(|group| group.0).count() - rank0;
+                            best_refusal = Some((fit, rank0, rank1, source.clone()));
+                        }
+                    }
+                }
+                if refusal.is_none() { refusal = Some(error); }
+            }
         }
     }
-    best.map(|(_, candidate)| candidate).ok_or_else(|| refusal.unwrap_or_else(||
-        PlacementError::Inventory("no legal layer ownership boundary").into()))
+    best.map(|(_, candidate)| candidate).ok_or_else(|| {
+        if let Some((fit, rank0, rank1, source)) = best_refusal {
+            return PlacementError::OwnerCandidates { fit, rank0, rank1, source: Box::new(source) }.into();
+        }
+        refusal.unwrap_or_else(|| PlacementError::Inventory("no legal layer ownership boundary").into())
+    })
 }
 
 /// Pure alternating ownership of selected colocate groups, independent of

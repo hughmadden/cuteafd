@@ -688,6 +688,138 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
 pub(super) mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "CPU-only receipt replay; requires CUTEAFD_KIMI_MODEL, CUTEAFD_KIMI_DRAFT and CUTEAFD_KIMI_EXL3_PACKAGE"]
+    fn recorded_runtime_owner_capacity() -> Result<()> {
+        use super::super::{device::NativeScratch, startup, graphs};
+        use std::path::PathBuf;
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+            .map_err(|_| anyhow::anyhow!("run receipt replay in an isolated process"))?;
+        let path = |key| std::env::var_os(key).map(PathBuf::from).context(key);
+        let cfg = KimiK3Config::read(&path("CUTEAFD_KIMI_MODEL")?)?;
+        let catalog = cuteafd_loader::read_expert_catalog(&path("CUTEAFD_KIMI_MODEL")?)?;
+        let package = path("CUTEAFD_KIMI_EXL3_PACKAGE")?;
+        let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
+            .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: 6, prefill_lanes: 1 };
+        let spark = SparkBudgetInventory::exl3(&catalog, &working,
+            &[cuteafd_core::SparkEndpoint { capacity: 4096, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+            crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
+            cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
+            cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+        println!("spark minimum_onboard={} max_four_expert_bytes={}", spark.minimum_rtx_layers()?,
+            (0..6).map(|rank| spark.rank_bytes(rank, 4)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap());
+        let context = std::env::var("CUTEAFD_KIMI_REPLAY_CONTEXT").ok().map(|v| v.parse::<usize>()).transpose()?.unwrap_or(1 << 20);
+        let draft = super::super::draft::Options { snapshot: path("CUTEAFD_KIMI_DRAFT")?, fp8: true }.layout(8, context, 188)?;
+        // Sealed program manifests and the failed card's post-module CUDA samples.
+        // These are CPU arithmetic inputs, not a new hardware measurement.
+        let scratch = NativeScratch { kda: 629_464_064, mla: [168_296_448, 101_056_512, 201_326_592] };
+        let free = [101_298_995_200, 101_287_460_864];
+        let total = [101_973_491_712, 101_970_345_984];
+        for enabled in [false, true] {
+            let make_inputs = || -> Result<Inputs<'_>> {
+                let mut i = inputs(&cfg);
+                i.gpus = std::array::from_fn(|rank| GpuBudget { capacity_bytes: total[rank],
+                    headroom_bytes: 2 << 30, baseline: Baseline::Measured { free_bytes: free[rank] } });
+                i.state_slots = 8; i.prefix_marks = 1; i.lanes = 1; i.requested_pool = Some(1 << 20);
+                i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, 4096, context, scratch).unwrap())];
+                i.fixed = startup::exchange_demands(4096, false)?;
+                for rank in 0..2 { i.fixed.push(startup::code_demand(rank, 71_303_168, 71_303_168, 1)?); }
+                if enabled {
+                    i.fixed.extend(super::super::draft::bridge_demands(&draft)?);
+                    i.fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
+                    i.draft = Some(draft.with_pool_tokens(1 << 20)?);
+                }
+                Ok(i)
+            };
+            let mut automatic = make_inputs()?;
+            automatic.requested_pool = None; automatic.prefix_marks = 2;
+            automatic.spark_budget = Some(spark.clone());
+            automatic.rtx = Some(plan_rtx(&cfg, &catalog, package.clone(), 4096, 5)?);
+            let graphs = graphs::owned_inventory(&cfg, 1, 4096, 8)?;
+            automatic.startup = (0..2).map(|rank| graphs::demand(&graphs.inventory, rank)).collect();
+            match admit(automatic) {
+                Ok(admitted) => println!("automatic context={context} draft={enabled} pool={} owners={}/{} marks={}",
+                    admitted.placement.pool_tokens,
+                    admitted.placement.layers.iter().filter(|l| matches!(l.mode, LayerMode::Whole { gpu: 0, .. })).count(),
+                    admitted.placement.layers.iter().filter(|l| matches!(l.mode, LayerMode::Whole { gpu: 1, .. })).count(),
+                    admitted.mark_selection.slots),
+                Err(error) => println!("automatic context={context} draft={enabled} refusal={error}"),
+            }
+            let rtx = plan_rtx(&cfg, &catalog, package.clone(), 4096, 5)?;
+            let mut req = request(make_inputs()?)?;
+            if enabled { req.fixed.push(Demand::new(1, Category::Prefix, DRAFT_MARKS,
+                draft.window_mark_bytes()? as u64, Basis::Exact)); }
+            for (layer, cost) in req.layers.iter_mut().zip(&rtx.costs) {
+                if let Some(experts) = &mut layer.experts { experts.half = *cost; experts.tp2 = true; }
+            }
+            req.tp2_workspace = [rtx.workspace as u64; 2]; req.onboard = rtx.layers; req.expert_gpus = 2;
+            req.policy.expert_ownership = ExpertOwnership::Contiguous;
+            let groups = req.layers.iter().map(|l| (l.kind == AttentionClass::Mla, l.colocate)).collect::<Vec<_>>();
+            for (scenario, onboard, pool_cap, drop_windows, drop_workspace) in if enabled {
+                vec![("normal", 5, None, false, false), ("four_experts", 4, None, false, false),
+                    ("half_draft_pool", 5, Some(524_288), false, false),
+                    ("minimal_draft_pool", 5, Some(64), false, false),
+                    ("no_window_marks", 5, None, true, false),
+                    ("no_draft_workspace", 5, None, false, true)]
+            } else { vec![("normal", 5, None, false, false)] } {
+                for boundary in attention::owner_boundaries(&groups, false) {
+                    let mut candidate = req.clone();
+                    candidate.onboard = Onboard::Layers(onboard);
+                    if drop_windows { candidate.fixed.retain(|d| d.group != DRAFT_MARKS); }
+                    for (index, layer) in candidate.layers.iter_mut().enumerate() {
+                        if groups[index].0 { layer.modes = vec![LayerMode::Whole { gpu: u8::from(index >= boundary), ffn: FfnMode::Split }]; }
+                    }
+                    let set = graphs::inventory(&cfg, 1, 4096, 8,
+                        |rank, layer| !groups[layer].0 || usize::from(layer >= boundary) == rank)?;
+                    candidate.fixed.extend((0..2).map(|rank| graphs::demand(&set.inventory, rank)));
+                    let rank0 = groups[..boundary].iter().filter(|g| g.0).count();
+                    let strict = solve(&candidate);
+                    if enabled && rank0 == 0 && scenario == "normal" && context == 1 << 20 {
+                        let Err(PlacementError::PoolDoesNotFit { limits, .. }) = &strict else { panic!("{strict:?}") };
+                        // The old early refusal was pre-expert. Restore its exact bytes
+                        // to verify the recorded 937,792-token hardware receipt.
+                        let peak = rtx.workspace as u64 + rtx.costs.iter().filter(|pair| pair[1].resident > 0)
+                            .take(5).map(|pair| pair[1].resident).sum::<u64>()
+                            + rtx.costs.iter().filter(|pair| pair[1].resident > 0).take(5)
+                                .map(|pair| pair[1].staging).max().unwrap_or(0);
+                        assert_eq!(limits.0[1].available_bytes + peak, 25_928_157_276);
+                        assert_eq!((limits.0[1].available_bytes + peak) / 1_769_472 * 64, 937_792);
+                    }
+                    println!("strict scenario={scenario} draft={enabled} owners={rank0}/{} result={}", 24-rank0,
+                        strict.as_ref().map(|p| p.pool_tokens.to_string()).unwrap_or_else(|e| e.to_string()));
+                    // Find physical capacity with the selected compiled lane extents kept.
+                    // Relax only the diagnostic pool floor, never production admission.
+                    let mut low = 0; let mut high = (2 << 20) / 64;
+                    let mut best = None;
+                    while low < high {
+                        let units = (low + high + 1) / 2;
+                        let tokens = units * 64;
+                        let mut trial = candidate.clone();
+                        trial.pool.compiled_context = 0;
+                        trial.pool.requested = Some(tokens); trial.pool.floor = tokens;
+                        trial.pool.target = tokens; trial.pool.ceiling = tokens;
+                        if enabled {
+                            let layout = draft.with_pool_tokens(pool_cap.map_or(tokens as usize, |cap| cap.min(tokens as usize)))?;
+                            let (mut demand, peak) = layout.demands(1)?;
+                            if drop_workspace { demand.owned.retain(|d| d.group == "MLA DFlash owned weights"
+                                || d.group.starts_with("MLA DFlash layer.")); }
+                            trial.movables = vec![demand.movable(2)?]; trial.startup = vec![peak];
+                        }
+                        match solve(&trial) {
+                            Ok(placed) => { low = units; best = Some(placed); }
+                            Err(_) => high = units - 1,
+                        }
+                    }
+                    println!("capacity scenario={scenario} draft={enabled} owners={rank0}/{} tokens={}", 24-rank0, low*64);
+                    if let Some(placed) = best {
+                        println!("items scenario={scenario} draft={enabled} owners={rank0}/{} {}", 24-rank0, serde_json::to_string(&placed.items)?);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn cfg() -> KimiK3Config {
         let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap();
         cfg.layers = 5;

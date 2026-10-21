@@ -625,7 +625,9 @@ pub enum PlacementError {
     #[error("placement inventory is invalid: {0}")]
     Inventory(&'static str),
     #[error("placement cannot retain the minimum {minimum} complete exact-restore marks after fixed floors: {reason}")]
-    PrefixMarks { minimum: u64, reason: String },
+    PrefixMarks { minimum: u64, reason: String, #[source] source: Box<PlacementError> },
+    #[error("no legal attention owner candidate fits; best attainable KV pool is {fit} tokens with selected-layer owners rtx0={rank0}, rtx1={rank1}: {source}")]
+    OwnerCandidates { fit: u64, rank0: usize, rank1: usize, #[source] source: Box<PlacementError> },
     #[error("explicit KV pool of {requested} tokens does not fit beside admitted demands (fits {fit}); {limits}")]
     PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
     #[error("{family} drafter was placed on rtx{gpu}, where this build has no executor for it")]
