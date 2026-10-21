@@ -307,9 +307,21 @@ release_gpu_device_args() {
   cuteafd_cdi_gpu_args "$1" || return 1
   printf '%s\n' "${CUTEAFD_CDI_ARGS[@]}"
 }
-# release_host_has_rdma HOST: HOST has at least one RDMA device (RoCE fabric).
+# LAN-only build seeds: GB10 hosts that compile, export and seal Spark slots but
+# never serve. They sit off the RoCE fabric (10 GbE), so bulk transfers to them go
+# over their LAN address and their sealed slots reach the Sparks through sparknest.
+# Keep in sync with scripts/build/build-resource.py LAN_SEEDS, scripts/hw/hwlock.py
+# ORDER and scripts/bench/wip-cards.py SEED_HOSTS (a script test checks).
+release_lan_seed_hosts=(kakapo cassowary)
+release_is_lan_seed() {
+  [[ " ${release_lan_seed_hosts[*]} " == *" $1 "* ]]
+}
+# release_host_has_rdma HOST: HOST is on the RoCE fabric: at least one RDMA port
+# is ACTIVE. A LAN-only build seed never counts, even with its adapters present
+# (cassowary's are down) or a private seed-to-seed link up.
 release_host_has_rdma() {
-  release_ssh "$1" 'ls /sys/class/infiniband 2>/dev/null | grep -q .'
+  ! release_is_lan_seed "$1" || return 1
+  release_ssh "$1" 'grep -qsx "4: ACTIVE" /sys/class/infiniband/*/ports/*/state'
 }
 # release_bulk_ssh HOST ADDR ARGS...: one bulk ssh leg (ADDR may be empty).
 release_bulk_ssh() {

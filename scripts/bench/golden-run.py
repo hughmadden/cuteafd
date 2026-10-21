@@ -48,7 +48,7 @@ CUTEAFD_GOLDEN_EXPERT_LAYERS (expanded --expert-layers) and CUTEAFD_GOLDEN_SPARK
 (the workers' package manifest.json files, identical on every host, read-only under
 /opt/cuteafd/spark). A golden subcommand must take them as `--peers {peers}`. Workers are
 removed (logs kept) after every run, on failure, timeout and SIGTERM/SIGINT too, before
-the locks are released. oliver (reserved) and kakapo (build seed) are refused.
+the locks are released. oliver (reserved) and the LAN-only build seeds are refused.
 
 Hardware: the locks (sparks for dodo/emu, gpu0, gpu1, rhea, moa, in that order) are
 taken once through the fair queue (scripts/hw/hwlock.py) and every arm and repeat runs
@@ -118,6 +118,7 @@ HUB = '/hf/hub'
 REFUSED_HOSTS = {
     'oliver': 'reserved for the Kimi F32 golden',
     'kakapo': 'build seed for the fidelity goldens, not a serving rank',
+    'cassowary': 'LAN-only build seed, not a serving rank',
     'raptor': 'the coordinator, not a Spark rank',
 }
 # Which hardware lock covers a Spark (scripts/hw/hwlock.py order; as `cuteafd bench smoke`).

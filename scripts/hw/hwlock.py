@@ -9,8 +9,9 @@ dead process and is removed. A request takes its locks only when no older live
 ticket wants any of the same locks, so a job waiting for both GPUs is not
 overtaken by later single-GPU jobs, while jobs on disjoint locks still run side
 by side. The locks themselves are the usual flock files, taken in the canonical
-order (sparks, gpu0, gpu1, rhea, moa, kakapo), so callers that still use plain flock
-stay excluded (they are just not queued fairly). Exit 75 when the wait expires.
+order (sparks, gpu0, gpu1, rhea, moa, kakapo, cassowary, kakapo-export,
+cassowary-export), so callers that still use plain flock stay excluded (they are
+just not queued fairly). Exit 75 when the wait expires.
 
 Default: the locks are held while CMD runs, and CUTEAFD_HW_LOCKS_HELD names
 them so a `cuteafd bench smoke` child skips taking them again. --gate is for a
@@ -37,9 +38,12 @@ import sys
 import time
 from pathlib import Path
 
-# kakapo is the out-of-pool build seed (10 GbE, never serves): last, so a
-# serving job's locks are always taken before a seed lease's.
-ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo')
+# kakapo and cassowary are the LAN-only build seeds (10 GbE, never serve): after
+# every serving lock, so a serving job's locks are always taken before a seed
+# lease's. Each seed's GPU-export turn (SEED-export) comes last: a build takes it
+# while its counting lease on that seed is live (scripts/build/build-resource.py).
+LAN_SEEDS = ('kakapo', 'cassowary')
+ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', *LAN_SEEDS, *(f'{seed}-export' for seed in LAN_SEEDS))
 LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
 POLL_S = 2.0
 GATE_SEQ = [0]  # this process's ticket while it holds a turn (exported in --gate mode)
@@ -148,6 +152,10 @@ class PreflightFailed(Exception):
     pass
 
 
+class Cancelled(Exception):
+    """The waiter's `cancelled` callback asked it to stop waiting."""
+
+
 def check_preflight(command, timeout):
     if not command:
         return
@@ -175,9 +183,10 @@ def check_preflight(command, timeout):
 
 @contextlib.contextmanager
 def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str = '',
-         preflight_timeout: float = 300, preflight_at_grant_only: bool = False):
+         preflight_timeout: float = 300, preflight_at_grant_only: bool = False, cancelled=None):
     """Hold `names` (canonical order) for the body; FIFO against other tickets.
-    With `gate`, release the flocks at our turn and keep the ticket instead."""
+    With `gate`, release the flocks at our turn and keep the ticket instead.
+    `cancelled()`, polled while waiting, raises Cancelled when true."""
     locks = canonical(names)
     # A check on state the queue itself changes (free memory on shared hosts) is
     # meaningful only once our turn comes; such checks run at grant alone.
@@ -190,6 +199,8 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
         held = None
         deadline = time.monotonic() + wait
         while (held := _try_flocks(locks)) is None:
+            if cancelled is not None and cancelled():
+                raise Cancelled(f'stopped waiting for {",".join(locks)}')
             if time.monotonic() >= deadline:
                 raise TimeoutError(f'no flocks for {",".join(locks)} after {wait:.0f} s inside a gate')
             time.sleep(POLL_S)
@@ -209,6 +220,8 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
                 held = _try_flocks(locks)
                 if held is not None:
                     break
+            if cancelled is not None and cancelled():
+                raise Cancelled(f'stopped waiting for {",".join(locks)}')
             if time.monotonic() >= deadline:
                 raise TimeoutError(f'no turn for {",".join(locks)} after {wait:.0f} s')
             if not announced:

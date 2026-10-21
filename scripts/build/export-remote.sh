@@ -28,8 +28,10 @@ host="$1" staging="$2" key="$3" env_file="$4" image="$5" layers="$6"
 # under the key raptor's own build expects.
 [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "export-remote: bad native key" >&2; exit 2; }
 NO_TURN=75
+# HOST's own ssh configuration (user, identity agent) applies; the address only
+# replaces its route, and the host key is still checked under HOST's name.
 fqdn="${CUTEAFD_EXPORT_HOST_ADDR:-$host}"
-ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o "HostKeyAlias=$host" "$fqdn")
+ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o "HostName=$fqdn" -o "HostKeyAlias=$host" "$host")
 run_id="$$-$(date +%s%N)"
 area="/mnt/sparknest/build-cache/export/$key-$run_id"
 archive="/mnt/sparknest/build-cache/wip-native/x86_64/coordinator-120/$key.tar.zst"
