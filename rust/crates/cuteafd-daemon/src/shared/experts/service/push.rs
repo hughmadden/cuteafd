@@ -45,7 +45,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
 
 // Push and mount are alternative loaders. Charge the actual push transient,
 // not the mount loader's pinned staging, against the unified host/device pool.
-fn admit_peak(resident: usize, validation: usize, validation_budget: usize,
+pub(super) fn admit_peak(resident: usize, validation: usize, validation_budget: usize,
     headroom: usize, available: usize) -> Result<usize> {
     ensure!(validation <= validation_budget, "push validation exceeds admitted read scratch");
     let peak = DEFAULT_SLOTS.checked_mul(DEFAULT_SLOT_BYTES)
