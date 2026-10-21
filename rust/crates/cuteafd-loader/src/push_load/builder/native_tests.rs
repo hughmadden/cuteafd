@@ -59,6 +59,138 @@ fn real_native_resident_planes_match_mount_staging_after_plan_fusion() {
     }
 }
 
+// Independent inverse map from the six-source mount packer. The plane path
+// below uses the forward tile map over the fused, independently padded halves.
+fn mount_packed(raw: &[u8], ranges: &[std::ops::Range<usize>], plane: usize,
+    layout: &super::super::native::NativePlanes) -> Vec<u8> {
+    let scales = plane % 2 == 1;
+    let element = if scales { 1 } else { 4 };
+    let divisor = if scales { 32 } else { 8 };
+    let k = if plane < 2 { layout.hidden } else { layout.intermediate };
+    let n = if plane < 2 { layout.intermediate } else { layout.hidden };
+    let mut output = vec![0; layout.planes[plane].1];
+    for (index, destination) in output.chunks_exact_mut(element).enumerate() {
+        let tile_elements = if scales { 1024 } else { 4096 };
+        let tile = index / tile_elements;
+        let local = index % tile_elements;
+        let nt = tile / k.div_ceil(128);
+        let kt = tile % k.div_ceil(128);
+        let (mut row, col) = if scales { (nt * 256 + local / 4, kt * 4 + local % 4) }
+            else { (nt * 256 + ((local >> 7) & 7) * 32 + (local & 3) * 8
+                + (((local >> 2) & 31) >> 2), kt * 16 + (local >> 10) * 4 + ((local >> 2) & 3)) };
+        let mut slot = if plane < 2 { 1 } else { 2 };
+        if plane < 2 && row >= layout.kernel_intermediate { row -= layout.kernel_intermediate; slot = 0; }
+        if scales { slot += 3; }
+        if row < n && col < k / divisor {
+            let start = ranges[slot].start + (row * (k / divisor) + col) * element;
+            destination.copy_from_slice(&raw[start..start + element]);
+        }
+    }
+    output
+}
+
+fn plane_packed(raw: &[u8], plane: usize,
+    layout: &super::super::native::NativePlanes) -> Vec<u8> {
+    let scales = plane % 2 == 1;
+    let element = if scales { 1 } else { 4 };
+    let divisor = if scales { 32 } else { 8 };
+    let rows = if plane < 2 { 2 * layout.kernel_intermediate } else { layout.hidden };
+    let k = if plane < 2 { layout.hidden } else { layout.intermediate };
+    let cols = k / divisor;
+    let mut output = vec![0; raw.len()];
+    for row in 0..rows { for col in 0..cols {
+        let tile = row / 256 * k.div_ceil(128) + col / (128 / divisor);
+        let r = row % 256;
+        let c = col % (128 / divisor);
+        let lane = if scales { r * 4 + c } else {
+            (r % 32) / 8 + ((r % 8 * 4 + c % 4) << 2) + ((r / 32) << 7) + ((c / 4) << 10)
+        };
+        let target = (tile * if scales { 1024 } else { 4096 } + lane) * element;
+        let source = (row * cols + col) * element;
+        output[target..target + element].copy_from_slice(&raw[source..source + element]);
+    }}
+    output
+}
+
+fn fused_mount(raw: &[u8], ranges: &[std::ops::Range<usize>],
+    layout: &super::super::native::NativePlanes) -> Vec<u8> {
+    let mut expected = vec![0; layout.bytes];
+    for slot in 0..6 {
+        let down = slot % 3 == 2;
+        let gate = slot % 3 == 0;
+        let divisor = if slot >= 3 { 32 } else { 2 };
+        let plane = usize::from(down) * 2 + usize::from(slot >= 3);
+        let (offset, _) = layout.expert_plane(plane, 0).unwrap();
+        let half = if gate { layout.kernel_intermediate * layout.hidden / divisor } else { 0 };
+        expected[offset + half..offset + half + ranges[slot].len()].copy_from_slice(&raw[ranges[slot].clone()]);
+    }
+    expected
+}
+
+#[test]
+fn padded_native_mount_and_plane_pack_maps_are_byte_exact() {
+    let layout = super::super::native::NativePlanes::new(5120, 576, 640, 1, false).unwrap();
+    let mut raw = Vec::new();
+    let mut ranges = Vec::new();
+    for slot in 0..6 {
+        let start = raw.len();
+        let bytes = 5120 * 576 / if slot >= 3 { 32 } else { 2 };
+        raw.extend((0..bytes).map(|i| ((i * 37 + slot * 53) % 255 + 1) as u8));
+        ranges.push(start..raw.len());
+    }
+    let fused = fused_mount(&raw, &ranges, &layout);
+    for plane in 0..4 {
+        let (offset, bytes) = layout.expert_plane(plane, 0).unwrap();
+        let mount = mount_packed(&raw, &ranges, plane, &layout);
+        let pushed = plane_packed(&fused[offset..offset + bytes], plane, &layout);
+        assert_eq!(mount, pushed, "padded plane {plane}");
+        assert!(mount.iter().any(|&b| b == 0), "padding not exercised");
+        assert!(mount.iter().any(|&b| b != 0), "source not exercised");
+    }
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn live_native_tp4_sample_packed_planes_match_mount() {
+    let root = snapshot("CUTEAFD_PUSH_V41").expect("explicit live checkpoint required");
+    let catalog = crate::read_official_v41_catalog(&root).unwrap();
+    assert!(catalog.nvfp4().is_none());
+    let layout = super::super::native::NativePlanes::new(5120, 576, 640, 1, false).unwrap();
+    let mut seed = 57320261025u64;
+    let mut checked = 0;
+    for layer in 19..40 {
+        let mut experts = vec![0, 1, 191, 382, 383];
+        while experts.len() < 8 {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            let expert = seed as usize % 384;
+            if !experts.contains(&expert) { experts.push(expert); }
+        }
+        for rank in 0..4 { for &expert in &experts {
+            let selection = crate::V41ExpertSelection::BackboneTp { layer, expert, world: 4, rank };
+            let staging = catalog.expert_staging(selection).unwrap();
+            let mut raw = vec![0; staging.staging_bytes()];
+            staging.read_into(&mut raw, &mut vec![0; staging.minimum_read_scratch_bytes()]).unwrap();
+            let mut builder = Builder::new(&root, vec![layout.bytes as u64]);
+            builder.v41_resident(&catalog, staging.tensor_names(), &layout, 0, 4, rank as u32,
+                Destination { rank: 0, offset: 0, bytes: layout.bytes as u64 }, None).unwrap();
+            let landed = land(&builder.finish().unwrap(), &root).remove(0);
+            assert_eq!(landed, fused_mount(&raw, staging.tensor_ranges(), &layout),
+                "source image layer{layer} rank{rank} expert{expert}");
+            for plane in 0..4 {
+                let (offset, bytes) = layout.expert_plane(plane, 0).unwrap();
+                assert_eq!(mount_packed(&raw, staging.tensor_ranges(), plane, &layout),
+                    plane_packed(&landed[offset..offset + bytes], plane, &layout),
+                    "packed layer{layer} rank{rank} expert{expert} plane{plane}");
+            }
+            checked += 1;
+        }
+        eprintln!("live MXFP4 layer={layer} rank={rank}: experts={experts:?}, four packed planes byte exact");
+        }
+    }
+    assert_eq!(checked, 4 * 21 * 8);
+    eprintln!("live MXFP4 sampled packed byte identity: {checked} experts, {} bytes, no launch vectors in MXFP4", checked * layout.bytes);
+}
+
 #[test]
 fn real_v41_native_tp4_tp6_and_coordinator_tp2_match_staging() {
     let Some(snapshot) = snapshot("CUTEAFD_PUSH_V41") else {
