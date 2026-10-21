@@ -22,6 +22,8 @@ pub(crate) mod chain;
 
 #[path = "memory/budget.rs"]
 pub(crate) mod budget;
+#[path = "memory/load_timing.rs"]
+pub(crate) mod load_timing;
 #[path = "memory/weight_arena.rs"]
 pub(crate) mod weight_arena;
 #[path = "memory/weight_validation.rs"]

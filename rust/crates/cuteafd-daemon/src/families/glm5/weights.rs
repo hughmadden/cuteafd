@@ -116,15 +116,15 @@ impl<'a> GlmLoader<'a> {
         cuteafd_ffi::memory_ledger::tensor(name);
         let tensor = self.catalog.tensor(name)?;
         let mut bytes = vec![0u8; tensor.metadata.byte_length as usize];
-        std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?
-            .read_exact_at(&mut bytes, tensor.metadata.byte_offset)
+        crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?
+            .read_exact_at(&mut bytes, tensor.metadata.byte_offset))
             .with_context(|| format!("reading {name}"))?;
         Ok((bytes, tensor.metadata.dtype.clone(), tensor.metadata.shape.clone()))
     }
 
     fn upload(&self, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
         let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
-        self.library.copy_h2d(allocation.buffer, bytes)?;
+        crate::shared::memory::load_timing::upload(bytes.len(), || self.library.copy_h2d(allocation.buffer, bytes))?;
         Ok(allocation)
     }
 
@@ -147,7 +147,7 @@ impl<'a> GlmLoader<'a> {
                 ..out.buffer
             };
             match dtype {
-                DType::Bf16 => self.library.copy_h2d(dest, bytes)?,
+                DType::Bf16 => crate::shared::memory::load_timing::upload(bytes.len(), || self.library.copy_h2d(dest, bytes))?,
                 DType::F8E4M3 => {
                     let (scale, scale_dtype, _) = self.raw(&format!("{}_scale_inv", name))?;
                     ensure!(scale_dtype == DType::F32, "{name}: block scales must be FP32");
@@ -174,8 +174,8 @@ impl<'a> GlmLoader<'a> {
         let tensor = self.catalog.tensor(name)?;
         let length = tensor.metadata.byte_length as usize;
         ensure!(at + length <= out.len(), "{name}: {length} bytes past the operand buffer");
-        std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?
-            .read_exact_at(&mut out[at..at + length], tensor.metadata.byte_offset)
+        crate::shared::memory::load_timing::read(length, || std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?
+            .read_exact_at(&mut out[at..at + length], tensor.metadata.byte_offset))
             .with_context(|| format!("reading {name}"))?;
         Ok((length, tensor.metadata.dtype.clone(), tensor.metadata.shape.clone()))
     }
@@ -483,10 +483,10 @@ impl<'a> GlmLoader<'a> {
                         let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
                             // SAFETY: offset + bytes lie inside the rank's buffer (sized above).
                             ptr: unsafe { buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..buffer };
-                        self.library.copy_h2d(at(dv.buffer, row_at / ranks * cols, share * cols),
-                            &values[rank * share * cols..(rank + 1) * share * cols])?;
+                        crate::shared::memory::load_timing::upload(share * cols, || self.library.copy_h2d(at(dv.buffer, row_at / ranks * cols, share * cols),
+                            &values[rank * share * cols..(rank + 1) * share * cols]))?;
                         let grid_part = f32_bytes(&grid[rank * share / 128 * kb..(rank + 1) * share / 128 * kb]);
-                        self.library.copy_h2d(at(dg.buffer, grid_at / ranks * 4, grid_part.len()), &grid_part)
+                        crate::shared::memory::load_timing::upload(grid_part.len(), || self.library.copy_h2d(at(dg.buffer, grid_at / ranks * 4, grid_part.len()), &grid_part))
                     })?;
                 }
                 row_at += rows;
@@ -751,6 +751,7 @@ impl<'a> GlmLoader<'a> {
         -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
         ensure!(owners.is_none_or(|o| o.len() == layers && self.ranks() == 2 && o.iter().all(|&r| r < 2)),
             "whole attention needs one owner per layer and two ranks");
+        let split = crate::shared::memory::load_timing::Split::start();
         let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())?;
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
@@ -765,6 +766,7 @@ impl<'a> GlmLoader<'a> {
             head: self.one("lm_head.weight")?,
         };
         crate::shared::memory::staging::release_staging();
+        split.log("glm5 dense");
         Ok((weights, shares.collect()))
     }
 }
