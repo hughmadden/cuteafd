@@ -31,7 +31,7 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
         let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream, fp8_source: None,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true, kda_nvfp4: None,
             fp8_scales: rule, device: 0, peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
-            quantizer: Default::default() };
+            dense: Default::default() };
         let dense = (0..cfg.layers).find(|&l| cfg.dense[l]).context("no dense layer")?;
         for layer in [kda, mla, dense] {
             for (rank, share) in loader.layer_shares(&cfg, layer, LayerMode::HeadSplit)?.iter().enumerate() {

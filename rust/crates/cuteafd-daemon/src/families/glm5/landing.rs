@@ -3,7 +3,7 @@
 //! same byte range of each of its rows) at fixed offsets. The mount fills
 //! them by reading; a push plan targets the same offsets. Combination and
 //! transform steps stay in the loader.
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::OfficialV41Catalog;
 use std::ops::Range;
