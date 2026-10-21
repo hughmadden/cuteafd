@@ -103,7 +103,7 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
     serve, plan = _line(result, "cuteafd serve-kimi --snapshot"), _line(result, "cuteafd plan")
     assert _flag(plan, "--speculator") == ("dflash2" if enabled else "off")
     if enabled:
-        snapshot = f"/hf/hub/models--{model.replace('/', '--')}/snapshots/{revision}"
+        snapshot = str(tmp_path / f"hf/hub/models--{model.replace('/', '--')}/snapshots/{revision}")
         assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
         assert _flag(serve, "--draft-fp8") == _flag(plan, "--draft-fp8") == "true"
         assert _flag(serve, "--draft-fixed") == "7"
