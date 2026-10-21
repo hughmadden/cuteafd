@@ -389,6 +389,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn only_done_initialized_arena_publishes_stable_nonowning_views() -> Result<()> {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
@@ -422,6 +423,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn host_validation_tail_is_admitted_routed_and_checked_only_after_done() -> Result<()> {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
@@ -452,6 +454,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn incomplete_delivery_or_failed_initialization_never_publishes() -> Result<()> {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;

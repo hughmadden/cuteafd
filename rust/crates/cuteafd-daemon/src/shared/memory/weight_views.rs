@@ -160,6 +160,7 @@ pub(crate) fn exlr8_push_integrity() -> Exlr8Integrity {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn push_admission_includes_real_plane_padding_and_allocation() -> Result<()> {
         use super::super::{
             device::{Allocation, Device},
