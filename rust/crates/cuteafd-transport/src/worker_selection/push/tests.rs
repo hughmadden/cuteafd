@@ -207,3 +207,56 @@ fn disconnected_rank_aborts_other_control_reads() -> Result<()> {
     assert!(job.join().unwrap().is_err());
     Ok(())
 }
+
+#[test]
+fn delayed_begin_uses_coordinator_admission_bound_not_selection_timeout() -> Result<()> {
+    let (mut coordinator, mut worker) = pair()?;
+    let selection = super::super::tests::admission_selection().with_push_weights();
+    let digest = selection.digest()?;
+    super::super::write(&mut coordinator, &super::super::Start {
+        message: "worker_selection_start".into(), rank: 0, selection,
+        digest, admission_timeout_ms: 2000,
+    })?;
+    let received = super::super::receive_worker_selection(&worker, 0, Duration::from_millis(20))?;
+    assert!(received.push_weights());
+    assert_eq!(worker.read_timeout()?, Some(Duration::from_secs(2)));
+    assert_eq!(worker.write_timeout()?, Some(Duration::from_secs(2)));
+    let job = thread::spawn(move || offer(&mut worker, Some(rank_offer(0))));
+    assert!(matches!(read::<Frame>(&coordinator)?, Frame::Offer { .. }));
+    thread::sleep(Duration::from_millis(150));
+    write(&mut coordinator, &Frame::Begin { credentials: None })?;
+    assert!(job.join().unwrap()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn begin_wait_is_bounded_by_coordinator_admission_timeout() -> Result<()> {
+    let (mut coordinator, mut worker) = pair()?;
+    let selection = super::super::tests::admission_selection().with_push_weights();
+    let digest = selection.digest()?;
+    super::super::write(&mut coordinator, &super::super::Start {
+        message: "worker_selection_start".into(), rank: 0, selection,
+        digest, admission_timeout_ms: 30,
+    })?;
+    super::super::receive_worker_selection(&worker, 0, Duration::from_secs(1))?;
+    let started = std::time::Instant::now();
+    let job = thread::spawn(move || offer(&mut worker, Some(rank_offer(0))));
+    assert!(matches!(read::<Frame>(&coordinator)?, Frame::Offer { .. }));
+    assert!(job.join().unwrap().is_err());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    Ok(())
+}
+
+#[test]
+fn zero_admission_timeout_is_rejected_before_push() -> Result<()> {
+    let (mut coordinator, worker) = pair()?;
+    let selection = super::super::tests::admission_selection().with_push_weights();
+    let digest = selection.digest()?;
+    super::super::write(&mut coordinator, &super::super::Start {
+        message: "worker_selection_start".into(), rank: 0, selection,
+        digest, admission_timeout_ms: 0,
+    })?;
+    assert!(super::super::receive_worker_selection(&worker, 0, Duration::from_secs(1))
+        .unwrap_err().to_string().contains("invalid coordinator admission timeout"));
+    Ok(())
+}
