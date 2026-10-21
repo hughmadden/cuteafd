@@ -22,13 +22,18 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
         if group == "region-scores":
             return {"region_scores": lambda: a.compile_region_scores_aot(
                 groups=groups, capacity=summary_capacity)}
-        return {
+        result = {
             "region_compress": a.compile_region_compress_aot,
             "region_scores": lambda: a.compile_region_scores_aot(groups=groups, capacity=summary_capacity),
-            "swa_attention": lambda: a.compile_selected_gqa_aot(
-                query_heads=heads, kv_heads=groups, selection_width=512, selection_groups=1),
-            "csa_attention": lambda: a.compile_selected_gqa_aot(query_heads=heads, kv_heads=groups),
         }
+        for kv_format in ("bf16", "fp8"):
+            suffix = "_fp8" if kv_format == "fp8" else ""
+            result[f"swa_attention{suffix}"] = lambda kv_format=kv_format: a.compile_selected_gqa_aot(
+                query_heads=heads, kv_heads=groups, selection_width=512, selection_groups=1,
+                kv_format=kv_format)
+            result[f"csa_attention{suffix}"] = lambda kv_format=kv_format: a.compile_selected_gqa_aot(
+                query_heads=heads, kv_heads=groups, kv_format=kv_format)
+        return result
     if group == "metadata":
         from b12x.integration.cuteafd import cache_transactions as c, region_selection as s
         return {
@@ -62,6 +67,7 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
                 p.compile_bf16_projection_aot(width=width, outputs=outputs, output_dtype=dtype))
                 for name, (width, outputs, dtype) in shapes.items()}
     result = {
+        "pack_fp8_kv_plane": lambda: p.compile_pack_fp8_kv_plane_aot(kv_heads=groups, head_dim=192),
         "residual_bf16": lambda: p.compile_residual_add_aot(width=4096),
         "residual_f32": lambda: p.compile_residual_add_aot(width=4096, delta_dtype=torch.float32),
         "hidden_norm": lambda: p.compile_affine_norm_aot(width=4096, zero_centered=True, eps=None),

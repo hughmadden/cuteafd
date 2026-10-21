@@ -37,6 +37,9 @@ const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GoldenArgs {
+    /// Same immutable target KV storage as serving.
+    #[arg(long, default_value = "fp8")]
+    kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long)]
     snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
@@ -153,7 +156,7 @@ fn save_diagnostics(
         std::fs::write(dir.join("positions.bin"), (0..tokens.len() as u32)
             .flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
         std::fs::write(meta, serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": "cuteafd.step5.residuals/1", "window": args.window,
+            "schema": "cuteafd.step5.residuals/1", "window": args.window, "kv_cache": args.kv_cache,
             "rows": tokens.len(), "width": H, "dtype": "F32", "byte_order": "little",
             "positions": "positions.bin", "position_dtype": "U32", "tokens": "tokens.bin",
             "layers": args.dump_layers, "layer_pattern": "layerNN.bin",
@@ -594,9 +597,10 @@ fn committed_step<'a>(
 fn check_prefix_state<'a>(
     device: Device<'a>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
     checkpoint: &Checkpoint, cfg: &Config, tokens: &[u32], chain: &mut TargetChain<'a>,
+    kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     input: &Allocation<'a>, link: &SparkDeviceLink<'a>, waves: usize, available: usize,
 ) -> Result<()> {
-    let shape = Step5CacheLayout::new(cfg, 1, tokens.len() as u64, 0, tokens.len() as u64)?;
+    let shape = Step5CacheLayout::new(cfg, 1, tokens.len() as u64, 0, tokens.len() as u64, kv_format)?;
     prefix_state_bytes(&shape, tokens.len())?;
     let pages = tokens.len().div_ceil(64) * 4 + 4;
     for frontier in PREFIX_FRONTIERS {
@@ -710,7 +714,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     if let Some(peer) = args.split_device {
         let devices = [args.device, peer].map(|id| Device { library: &library, id });
         let ownership = split_ownership(cfg, rows)?;
-        let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64)?;
+        let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, args.kv_cache)?;
         let mut available = [0; 2];
         let mut reservations = [0; 2];
         let mut cache_bytes = [0; 2];
@@ -748,7 +752,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     } else {
         let device = Device { library: &library, id: args.device };
         let available = library.cuda_memory_info()?.0 as u64;
-        let layout = Step5CacheLayout::new(cfg, 1, rows as u64, 0, rows as u64)?;
+        let layout = Step5CacheLayout::new(cfg, 1, rows as u64, 0, rows as u64, args.kv_cache)?;
         let cache_bytes = layout.ranks[0].bytes + layout.geometry.ranks[0].persistent_unit_bytes * pages;
         let staging_bytes = Staging::bytes(&layout, 0)? as u64;
         let reserved = cache_bytes + staging_bytes + (rows * H * 4) as u64 + (4u64 << 30);
@@ -759,7 +763,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let family = Step5Prefix::new(vec![&cache])?;
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
         let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
-        let mut chain = TargetChain::load(device, &programs, checkpoint, 1, rows, available, &[reserved])?;
+        let mut chain = TargetChain::load(device, &programs, checkpoint, 1, rows, available, &[reserved], args.kv_cache)?;
         let input = Allocation::new(device, rows * H * 4)?;
         library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?)?;
         let mut step = Step::begin(vec![&cache], vec![&staging], &pool, &mut placement, rows)?;
@@ -795,7 +799,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         "Step-5 shared golden requires distinct devices and complete cold target");
     let rows = reference.tokens.len();
     let ownership = split_ownership(cfg, rows)?;
-    let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64)?;
+    let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, args.kv_cache)?;
     if args.check_headers { println!("Step-5 shared headers/reference validated: rows={rows} ranks=2; no CUDA or numerical qualification"); return Ok(()); }
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 golden requires an isolated process"))?;
@@ -940,7 +944,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let rows = tokens.len();
     ensure!(!args.prefix_state || (args.nll && args.last_layer == 91),
         "Step-5 prefix state check requires the complete target");
-    let layout = Step5CacheLayout::new(&cfg, 1, rows as u64, 0, rows as u64)?;
+    let layout = Step5CacheLayout::new(&cfg, 1, rows as u64, 0, rows as u64, args.kv_cache)?;
     if args.check_headers {
         println!("Step-5 headers/reference validated: rows={rows} layers=0..{} TP{}; no CUDA or numerical qualification", args.last_layer, args.peers.len());
         return Ok(());
@@ -1051,8 +1055,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         args.last_layer + 1,
         rows,
         available,
-        &[head_bytes, cache_bytes, staging_bytes, input_bytes, reserve],
-    )?;
+        &[head_bytes, cache_bytes, staging_bytes, input_bytes, reserve], args.kv_cache)?;
     let head = head_plan.map(|plan| TargetHeadOwner::load(device, &programs, &checkpoint, plan,
         available, &[chain_bytes, cache_bytes, staging_bytes, input_bytes, reserve])).transpose()?;
     let input = Allocation::new(device, rows * H * 4)?;
@@ -1066,7 +1069,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     );
     if args.prefix_state {
         return check_prefix_state(device, &programs, &checkpoint, &cfg, &tokens,
-            &mut chain, &input, &link, layers.len(), remaining);
+            &mut chain, args.kv_cache, &input, &link, layers.len(), remaining);
     }
     link.arm()?;
     link.expect(layers.len() as u64);
@@ -1229,46 +1232,50 @@ mod tests {
 
     #[test]
     fn diagnostic_files_preserve_full_rows_bits_positions_and_head_input() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0,91"])?;
-        let logits_dir = root.path().join("logits");
-        let residual_dir = root.path().join("residuals");
-        args.save_logits = Some(logits_dir.clone());
-        args.dump_residuals = Some(residual_dir.clone());
-        let tokens = [2u32, 0, 1];
-        let positions = [1, 2];
-        let logits = [-0.0f32, 1., -2., 3., 4., 5., 6., 7., 8.];
-        let norm = vec![0.5f32; tokens.len() * H];
-        let mut requested = vec![];
-        save_diagnostics(&args, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
-            requested.push(layer);
-            Ok(vec![layer as f32; tokens.len() * H])
-        })?;
-        assert_eq!(requested, [0, 91]);
-        assert_eq!(std::fs::read(logits_dir.join("tokens.bin"))?,
-            tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>());
-        assert_eq!(std::fs::read(logits_dir.join("logits.bin"))?,
-            logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
-        assert_eq!(std::fs::read(residual_dir.join("positions.bin"))?,
-            [0u32, 1, 2].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>());
-        for (file, value) in [("layer00.bin", 0f32), ("layer91.bin", 91.), ("final_norm.bin", 0.5)] {
-            assert_eq!(std::fs::read(residual_dir.join(file))?,
-                vec![value; tokens.len() * H].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        for format in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+            let root = tempfile::tempdir()?;
+            let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0,91"])?;
+            args.kv_cache = format;
+            let logits_dir = root.path().join("logits");
+            let residual_dir = root.path().join("residuals");
+            args.save_logits = Some(logits_dir.clone());
+            args.dump_residuals = Some(residual_dir.clone());
+            let tokens = [2u32, 0, 1];
+            let positions = [1, 2];
+            let logits = [-0.0f32, 1., -2., 3., 4., 5., 6., 7., 8.];
+            let norm = vec![0.5f32; tokens.len() * H];
+            let mut requested = vec![];
+            save_diagnostics(&args, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
+                requested.push(layer);
+                Ok(vec![layer as f32; tokens.len() * H])
+            })?;
+            assert_eq!(requested, [0, 91]);
+            assert_eq!(std::fs::read(logits_dir.join("tokens.bin"))?,
+                tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>());
+            assert_eq!(std::fs::read(logits_dir.join("logits.bin"))?,
+                logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+            assert_eq!(std::fs::read(residual_dir.join("positions.bin"))?,
+                [0u32, 1, 2].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>());
+            for (file, value) in [("layer00.bin", 0f32), ("layer91.bin", 91.), ("final_norm.bin", 0.5)] {
+                assert_eq!(std::fs::read(residual_dir.join(file))?,
+                    vec![value; tokens.len() * H].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+            }
+            let meta: Value = serde_json::from_slice(&std::fs::read(residual_dir.join("meta.json"))?)?;
+            assert_eq!(meta, serde_json::json!({
+                "schema":"cuteafd.step5.residuals/1", "window":"code-1", "kv_cache":format.to_string(), "rows":3, "width":H,
+                "dtype":"F32", "byte_order":"little", "positions":"positions.bin", "position_dtype":"U32",
+                "tokens":"tokens.bin", "layers":[0,91], "layer_pattern":"layerNN.bin",
+                "final_norm":"final_norm.bin", "final_norm_source_dtype":"BF16",
+                "scored_target_positions":[1,2], "logits_row_target_offset":1, "complete":true
+            }));
+            let scored = select_scored_rows(&logits, &positions, 3)?;
+            assert_eq!(scored, logits[..6]);
+            // Outputs survive the numerical rejection that follows writing in the shared path.
+            assert!(shared_diagnostic_verdict(0.02, 0., 0.01, 0.1).is_err());
+            assert!(logits_dir.join("logits.bin").is_file());
+            assert!(residual_dir.join("meta.json").is_file());
         }
-        let meta: Value = serde_json::from_slice(&std::fs::read(residual_dir.join("meta.json"))?)?;
-        assert_eq!(meta, serde_json::json!({
-            "schema":"cuteafd.step5.residuals/1", "window":"code-1", "rows":3, "width":H,
-            "dtype":"F32", "byte_order":"little", "positions":"positions.bin", "position_dtype":"U32",
-            "tokens":"tokens.bin", "layers":[0,91], "layer_pattern":"layerNN.bin",
-            "final_norm":"final_norm.bin", "final_norm_source_dtype":"BF16",
-            "scored_target_positions":[1,2], "logits_row_target_offset":1, "complete":true
-        }));
-        let scored = select_scored_rows(&logits, &positions, 3)?;
-        assert_eq!(scored, logits[..6]);
-        // Outputs survive the numerical rejection that follows writing in the shared path.
-        assert!(shared_diagnostic_verdict(0.02, 0., 0.01, 0.1).is_err());
-        assert!(logits_dir.join("logits.bin").is_file());
-        assert!(residual_dir.join("meta.json").is_file());
         Ok(())
     }
 
@@ -1436,6 +1443,7 @@ mod tests {
             .collect::<Vec<_>>();
         std::fs::write(folder.join("layer87.bin"), &bytes)?;
         let mut args = GoldenArgs {
+            kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             snapshot: root.path().into(),
             native_lib: None,
             manifest: PathBuf::new(),
@@ -1497,7 +1505,8 @@ mod tests {
         let logits = [0f32, 5., 0., 0., 0., 5.].into_iter()
             .flat_map(f32::to_le_bytes).collect::<Vec<_>>();
         std::fs::write(folder.join("logits.bin"), &logits)?;
-        let mut args = GoldenArgs { snapshot: root.path().into(), native_lib: None,
+        let mut args = GoldenArgs {
+            kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
             peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None,  poison_scratch: false, check_headers: true, nll: true, prefix_state: false,
             fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false,

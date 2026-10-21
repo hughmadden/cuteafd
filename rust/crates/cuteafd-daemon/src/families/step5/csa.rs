@@ -9,6 +9,7 @@ use super::{
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
+use cuteafd_loader::families::qwen4::Qwen4KvCache;
 use cuteafd_ffi::{
     programs::{Program, Programs, Scalar},
     CuteafdDeviceBuffer,
@@ -175,6 +176,7 @@ const DEFS: [(&str, &[&str], &[u8]); 17] = [
 ];
 
 struct CsaWeights<'a> {
+    kv_format: Qwen4KvCache,
     rope: std::rc::Rc<TargetTables<'a>>,
     layer: usize,
     weights: Vec<Allocation<'a>>,
@@ -208,9 +210,10 @@ impl<'a> CsaLayer<'a> {
         rope: Option<std::rc::Rc<TargetTables<'a>>>,
         available: u64,
         reservations: &[u64],
+        kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None, kv_format)
     }
 
     pub fn for_execution(
@@ -225,12 +228,13 @@ impl<'a> CsaLayer<'a> {
         rank: usize,
         arena: &Arena<'a>,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+        kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         let local = ownership.layer(layer, rank)?;
         ensure!(local.query_heads == 64 && local.kv_heads == 4,
             "Step-5 CSA needs a whole native attention owner");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
-            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, false, Some((arena, 0)))
+            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, false, Some((arena, 0)), kv_format)
     }
 
     fn load_layout(
@@ -245,6 +249,7 @@ impl<'a> CsaLayer<'a> {
         layout: RankWeightLayout,
         include_dense: bool,
         arena: Option<(&Arena<'a>, usize)>,
+        kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layer = contract
@@ -342,8 +347,11 @@ impl<'a> CsaLayer<'a> {
             available,
             reservations,
         )?;
+        let selected_name = |name: &str| if name == "step5_csa_attention" && kv_format == Qwen4KvCache::Fp8 {
+            "step5_csa_attention_fp8".to_owned()
+        } else { name.to_owned() };
         for (name, pointers, scalars) in DEFS {
-            let s = programs.spec(name)?;
+            let s = programs.spec(&selected_name(name))?;
             ensure!(
                 s.pointers == pointers
                     && s.scalar_kinds == scalars
@@ -442,7 +450,11 @@ impl<'a> CsaLayer<'a> {
             g["topk"] == 512 && g["region_tokens"] == 8,
             "CSA selection geometry"
         );
-        let g = &programs.spec("step5_csa_attention")?.geometry;
+        let g = &programs.spec(&selected_name("step5_csa_attention"))?.geometry;
+        let stride = match kv_format {
+            Qwen4KvCache::Bf16 => 768,
+            Qwen4KvCache::Fp8 => kv_format.plane_record_bytes(4, 192),
+        };
         ensure!(
             g["query_heads"] == 64
                 && g["kv_heads"] == 4
@@ -450,8 +462,10 @@ impl<'a> CsaLayer<'a> {
                 && g["selection_width"] == 4104
                 && g["selection_groups"] == 4
                 && g["head_dim"] == 192
-                && g["key_strides"] == serde_json::json!([49152, 768, 192])
-                && g["value_strides"] == serde_json::json!([49152, 768, 192]),
+                && g["kv_format"] == kv_format.to_string()
+                && g["record_bytes"] == kv_format.plane_record_bytes(4, 192)
+                && g["key_strides"] == serde_json::json!([64 * stride, stride, 192])
+                && g["value_strides"] == serde_json::json!([64 * stride, stride, 192]),
             "CSA selected attention geometry"
         );
         let g = &programs.spec("step5_head_gate")?.geometry;
@@ -465,7 +479,7 @@ impl<'a> CsaLayer<'a> {
         );
         let resolved = DEFS
             .iter()
-            .map(|(name, pointers, _)| device.run(|| programs.program(name, pointers)))
+            .map(|(name, pointers, _)| device.run(|| programs.program(&selected_name(name), pointers)))
             .collect::<Result<Vec<_>>>()?;
         let residual = device
             .run(|| programs.program("step5_residual_bf16", &["residual", "delta", "out"]))?;
@@ -487,7 +501,7 @@ impl<'a> CsaLayer<'a> {
             .into_iter()
             .map(|w| load_operand(device, checkpoint, &layout, w))
             .collect::<Result<Vec<_>>>()?;
-        Self::workspace(device, admission, std::rc::Rc::new(CsaWeights { rope, layer: layer_id, weights,
+        Self::workspace(device, admission, std::rc::Rc::new(CsaWeights { kv_format, rope, layer: layer_id, weights,
             programs: resolved, residual, epsilon: contract.norms.input }), ffn, arena)
     }
 
@@ -741,6 +755,7 @@ impl<'a> CsaLayer<'a> {
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
         ensure!(
             input.heads == 64
+                && input.kv_format == self.immutable.kv_format
                 && input.stream.device.id == self.stream.device.id
                 && std::ptr::eq(input.stream.device.library, self.stream.device.library)
                 && input.extent <= self.immutable.rope.tables.plan.extent as usize,
@@ -932,6 +947,7 @@ impl<'a> CsaLayer<'a> {
         )
     }
     fn attend(&self, start: usize, rows: usize) -> Result<()> {
+        ensure!(self.immutable.kv_format == Qwen4KvCache::Bf16, "CSA raw projection diagnostic requires BF16 reader");
         self.attend_on(
             start,
             rows,
@@ -1226,8 +1242,7 @@ mod tests {
             total,
             None,
             u64::MAX,
-            &[],
-        )?;
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         let residual = fixture(&root, &manifest, "r513_residual")?;
         device.run(|| library.copy_h2d(chain.input(), &residual))?;
         chain.enqueue(total, 0)?;
@@ -1365,8 +1380,7 @@ mod tests {
             1,
             Some(std::rc::Rc::clone(&chain.immutable.rope)),
             u64::MAX,
-            &[],
-        )?;
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         ensure!(
             std::rc::Rc::ptr_eq(&other.immutable.rope, &chain.immutable.rope) && other.immutable.layer == 7,
             "CSA shared layer binding"
@@ -1413,8 +1427,7 @@ mod tests {
             rows,
             None,
             u64::MAX,
-            &[],
-        )?;
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         ensure!(chain.has_dense_ffn(), "planned sparse+dense owner");
         assert!(CsaLayer::load(
             device,
@@ -1424,8 +1437,7 @@ mod tests {
             rows,
             None,
             chain.admission.bytes - 1,
-            &[]
-        )
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)
         .is_err());
         let load = |name: &str| fixture(&root, &manifest, &format!("r{rows}_{name}"));
         upload(&chain, X, 0, &load("residual")?)?;
@@ -1508,7 +1520,7 @@ mod tests {
             "CSA snapshot revision"
         );
         let mut chain =
-            CsaLayer::load(device, &programs, &checkpoint, 3, 4105, None, u64::MAX, &[])?;
+            CsaLayer::load(device, &programs, &checkpoint, 3, 4105, None, u64::MAX, &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         ensure!(
             manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.immutable.epsilon),
             "CSA epsilon"
@@ -1521,8 +1533,7 @@ mod tests {
             4105,
             None,
             chain.admission.bytes - 1,
-            &[]
-        )
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)
         .is_err());
         assert!(chain.enqueue(4106, 0).is_err());
         assert!(chain.score_select(0, TILE + 1).is_err());

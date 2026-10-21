@@ -9,6 +9,7 @@ use super::{
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
+use cuteafd_loader::families::qwen4::Qwen4KvCache;
 use cuteafd_ffi::{
     programs::{Program, Programs, Scalar},
     CuteafdDeviceBuffer,
@@ -146,6 +147,7 @@ const DEFS: [(&str, &[&str], &[u8]); 12] = [
 ];
 
 struct SwaWeights<'a> {
+    kv_format: Qwen4KvCache,
     rope: std::rc::Rc<TargetTables<'a>>,
     attention_rope: std::rc::Rc<crate::shared::rope::Table<'a>>,
     layer: usize,
@@ -187,9 +189,10 @@ impl<'a> SwaLayer<'a> {
         rope: Option<std::rc::Rc<TargetTables<'a>>>,
         available: u64,
         reservations: &[u64],
+        kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None, kv_format)
     }
 
     pub fn for_execution(
@@ -204,22 +207,23 @@ impl<'a> SwaLayer<'a> {
         rank: usize,
         arena: &Arena<'a>,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+        kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         let heads = ownership.layer(layer, rank)?.query_heads;
         ensure!(heads > 0, "Step-5 SWA is not owned by rank {rank}");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
-            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false, Some((arena, 0)))
+            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false, Some((arena, 0)), kv_format)
     }
 
     pub(super) fn for_mtp_stage(
         device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         stage: usize, rows: usize, rope: std::rc::Rc<TargetTables<'a>>,
-        available: u64, reservations: &[u64], arena: &Arena<'a>,
+        available: u64, reservations: &[u64], arena: &Arena<'a>, kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
         let cfg = Config::parse(checkpoint)?;
         Self::load_layout(device, programs, checkpoint, cfg.layers + stage, rows,
-            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)))
+            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format)
     }
 
     fn load_layout(
@@ -235,9 +239,15 @@ impl<'a> SwaLayer<'a> {
         heads: usize,
         include_dense: bool,
         arena: Option<(&Arena<'a>, usize)>,
+        kv_format: Qwen4KvCache,
     ) -> Result<Self> {
-        let name = |full: &str| if heads == 32 { full.replacen("step5_", "step52_", 1) }
-            else { full.to_owned() };
+        let name = |full: &str| {
+            let name = if heads == 32 { full.replacen("step5_", "step52_", 1) }
+                else { full.to_owned() };
+            if full == "step5_swa_attention" && kv_format == Qwen4KvCache::Fp8 {
+                format!("{name}_fp8")
+            } else { name }
+        };
         let output = if heads == 32 { "step52_attn_out_partial" } else { "step5_attn_out" };
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let cfg = Config::parse(checkpoint)?;
@@ -371,6 +381,10 @@ impl<'a> SwaLayer<'a> {
             );
         }
         let g = &programs.spec(&name("step5_swa_attention"))?.geometry;
+        let stride = match kv_format {
+            Qwen4KvCache::Bf16 => kv,
+            Qwen4KvCache::Fp8 => kv_format.plane_record_bytes(heads / 16, 192),
+        };
         ensure!(
             g["query_heads"] == heads
                 && g["kv_heads"] == heads / 16
@@ -378,8 +392,10 @@ impl<'a> SwaLayer<'a> {
                 && g["selection_width"] == 512
                 && g["selection_groups"] == 1
                 && g["head_dim"] == 192
-                && g["key_strides"] == serde_json::json!([64 * kv, kv, 192])
-                && g["value_strides"] == serde_json::json!([64 * kv, kv, 192]),
+                && g["kv_format"] == kv_format.to_string()
+                && g["record_bytes"] == kv_format.plane_record_bytes(heads / 16, 192)
+                && g["key_strides"] == serde_json::json!([64 * stride, stride, 192])
+                && g["value_strides"] == serde_json::json!([64 * stride, stride, 192]),
             "SWA attention geometry"
         );
         ensure!(
@@ -420,7 +436,7 @@ impl<'a> SwaLayer<'a> {
             .map(|w| load_operand(device, checkpoint, &layout, w))
             .collect::<Result<Vec<_>>>()?;
         let attention_rope = rope.tables.get(layer.rope)?;
-        Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { rope, attention_rope,
+        Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { kv_format, rope, attention_rope,
             layer: layer_id, extent: contract.rope_tables.extent as usize, weights,
             programs: resolved, epsilon: cfg.norm_eps, heads }), ffn, arena)
     }
@@ -698,6 +714,7 @@ impl<'a> SwaLayer<'a> {
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
         ensure!(
             input.heads == self.immutable.heads
+                && input.kv_format == self.immutable.kv_format
                 && input.stream.device.id == self.stream.device.id
                 && std::ptr::eq(input.stream.device.library, self.stream.device.library)
                 && input.extent <= self.immutable.extent,
@@ -748,6 +765,7 @@ impl<'a> SwaLayer<'a> {
     }
 
     fn attend(&self, rows: usize) -> Result<()> {
+        ensure!(self.immutable.kv_format == Qwen4KvCache::Bf16, "SWA raw projection diagnostic requires BF16 reader");
         self.attend_on(
             0,
             rows,
@@ -970,8 +988,7 @@ mod tests {
             513,
             None,
             u64::MAX,
-            &[],
-        )?;
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         ensure!(
             manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.immutable.epsilon),
             "SWA epsilon mismatch"
@@ -984,8 +1001,7 @@ mod tests {
             513,
             None,
             chain.admission.bytes - 1,
-            &[]
-        )
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)
         .is_err());
         assert!(chain.enqueue(514).is_err());
         let boundaries = [
@@ -1260,8 +1276,7 @@ mod tests {
             total,
             None,
             u64::MAX,
-            &[],
-        )?;
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         let source = fixture(&root, &manifest, "r513_residual")?;
         let residual: Vec<u8> = source.iter().copied().cycle().take(total * H * 4).collect();
         device.run(|| library.copy_h2d(chain.input(), &residual))?;
@@ -1399,8 +1414,7 @@ mod tests {
             1,
             Some(std::rc::Rc::clone(&chain.immutable.rope)),
             u64::MAX,
-            &[],
-        )?;
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         ensure!(
             std::rc::Rc::ptr_eq(&routed.immutable.rope, &chain.immutable.rope) && routed.ffn.is_none(),
             "SWA shared layer binding"

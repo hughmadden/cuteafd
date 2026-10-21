@@ -47,7 +47,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 spark_allocation_budget_bytes: args.spark_budget_gib
                     .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
-                qwen_kv: args.kv_format,
+                qwen_kv: args.kv_format.unwrap_or_default(),
+                step5_kv: args.kv_format.unwrap_or_default(),
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
                     fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
                 qwen_attention_plan_rows: args.attention_plan_rows,
@@ -751,6 +752,17 @@ mod tests {
         assert!(run_plan(invalid).unwrap_err().to_string().contains("published name"));
         let files = PlanArgs { files: true, ..args(root, 6, false) };
         assert!(run_plan(files).unwrap_err().to_string().contains("planner-only"));
+    }
+
+    #[test]
+    fn step5_plan_defaults_to_fp8_and_preserves_explicit_bf16() {
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        let mut args = args(std::path::Path::new("/model"), 6, false);
+        assert_eq!(options(&args).unwrap().layout.unwrap().step5_kv, Qwen4KvCache::Fp8);
+        for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+            args.kv_format = Some(format);
+            assert_eq!(options(&args).unwrap().layout.unwrap().step5_kv, format);
+        }
     }
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {

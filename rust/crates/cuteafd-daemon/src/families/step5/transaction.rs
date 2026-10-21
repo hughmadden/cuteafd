@@ -1,6 +1,6 @@
 //! Append-only target steps: mutable proposal rows never overlap the old frontier.
 use super::{
-    scratch::BufferOwner,
+    scratch::{BufferOwner, CompactKv},
     cache::CacheRank,
     prefix::{Frontier, Placement, Step5Prefix},
 };
@@ -43,6 +43,7 @@ pub(super) struct Staging<'a> {
     pub stream: Rc<Stream<'a>>,
     raw: Vec<(Allocation<'a>, Allocation<'a>)>,
     sparse: Option<RegionScratch<'a>>,
+    compact: Option<CompactKv<'a>>,
     rows: usize,
     regions: usize,
     bytes: usize,
@@ -64,6 +65,7 @@ pub(super) struct StepInputs<'s, 'a> {
     pub base: usize,
     pub extent: usize,
     pub heads: usize,
+    pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
 }
 
 /// Borrowed only inside the transaction callback, after this layer was staged.
@@ -160,12 +162,21 @@ impl<'a> Staging<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
         let table_width = usize::try_from(cache.layout().context.div_ceil(64))?;
+        let sizes = cache.layout().target_pack_planes(cache.rank())?;
+        let compact = if sizes[0] == 0 { None } else {
+            let state = &cache.layout().ranks[cache.rank()];
+            let heads = state.sliding.iter().filter(|s| !s.mtp).map(|s| s.query_heads)
+                .chain(state.regions.iter().map(|s| s.query_heads)).collect::<BTreeSet<_>>()
+                .into_iter().collect::<Vec<_>>();
+            Some(CompactKv::new(device, programs, rows, &heads, sizes, None)?)
+        };
         let stream = Rc::new(Stream::new(device)?);
         cache.register_lane(&stream)?;
         let owner = Self {
             stream,
             raw,
             sparse,
+            compact,
             positions: Allocation::new(device, (rows * 8).max(256))?,
             requests: Allocation::new(device, (rows * 4).max(256))?,
             ring_table: Allocation::new(device, (table_width * 4).max(256))?,
@@ -567,6 +578,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 base: self.base,
                 extent: self.extent,
                 heads: cache.layout().query_heads(rank, layer)?,
+                kv_format: cache.layout().kv_format,
             },
         );
         if result.is_ok() {
@@ -597,6 +609,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             base: self.base,
             extent: self.extent,
             heads: 64 / self.ranks.len(),
+            kv_format: cache.layout().kv_format,
         });
         if result.is_ok() {
             self.failed = false;
@@ -645,6 +658,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 stream: &stage.stream, positions: stage.positions.buffer, requests: stage.requests.buffer,
                 rows: sequence.rows, base: sequence.base, extent: sequence.base + sequence.rows,
                 heads: cache.layout().query_heads(rank, layer)?,
+                kv_format: cache.layout().kv_format,
             }, start: sequence.start, key, value, summaries, table, table_width: stage.table_width, pages })?;
         }
         self.attended[rank].insert(layer);
@@ -680,6 +694,14 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let stage = self.staging[rank];
         let mut guard = stage.stream.cancellation_guard("Step-5 staged layer");
         guard.complete = self.submission.get();
+        let heads = cache.layout().query_heads(rank, layer)?;
+        let source_bytes = self.rows * (heads / 16) * 192 * 2;
+        for source in [key, value] { self.validate_source(&cache, source, source_bytes)?; }
+        // Projections remain BF16; only the selected compact outputs use the
+        // retained cache's byte stride. The pair is reused in lane-stream order.
+        let [key, value] = if let Some(compact) = &stage.compact {
+            compact.enqueue(&stage.stream, [key, value], self.rows, heads)?
+        } else { [key, value] };
         for sequence in &self.sequences {
             let kv_row = cache.layout().ranks[rank].sliding.iter().find(|r| r.layer == layer && !r.mtp)
                 .map(|ring| ring.key.bytes as usize / cache.layout().ring.rows as usize)
@@ -1262,6 +1284,25 @@ pub(super) mod tests {
                 step.stage(0, layer, key, value, (layer % 4 == 3).then_some((ik, iz)))?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_staging_is_one_pair_per_lane_not_per_layer_or_sequence() -> Result<()> {
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        for ranks in [1, 2] { for rows in [1, 64, 513, 4096] {
+            let bf16 = super::super::cache::tests::layout_with_format(8192, ranks, 3, rows, Qwen4KvCache::Bf16);
+            let fp8 = super::super::cache::tests::layout_with_format(8192, ranks, 3, rows, Qwen4KvCache::Fp8);
+            for rank in 0..ranks {
+                let expected = rows as usize * Qwen4KvCache::Fp8.plane_record_bytes(4 / ranks, 192);
+                assert_eq!(bf16.target_pack_planes(rank)?, [0; 2]);
+                assert_eq!(fp8.target_pack_planes(rank)?, [expected; 2]);
+                for sequences in [1, 4, 16] {
+                    assert_eq!(Staging::bytes_for_sequences(&fp8, rank, sequences)?
+                        - Staging::bytes_for_sequences(&bf16, rank, sequences)?, 2 * expected);
+                }
+            }
+        }}
         Ok(())
     }
 

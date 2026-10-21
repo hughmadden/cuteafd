@@ -4,7 +4,7 @@ use super::{
     ownership::ExecutionOwnership,
     Config,
 };
-use crate::plan::checkpoint::Checkpoint;
+use crate::{families::qwen4::Qwen4KvCache, plan::checkpoint::Checkpoint};
 use anyhow::{ensure, Context, Result};
 const H: usize = 4096;
 const Q: usize = 64 * 192;
@@ -134,10 +134,10 @@ pub fn mtp_metadata_planes(rows: usize) -> Result<[usize; 5]> {
 
 /// One sequential predictor scratch recipe, shared with the target arena.
 /// Only greedy token/status words survive across stages within a draft chain.
-pub fn mtp_forecast_workspace(rows: usize, depth: usize) -> Result<u64> {
+pub fn mtp_forecast_workspace(rows: usize, depth: usize, kv_format: Qwen4KvCache) -> Result<u64> {
     ensure!(depth <= 3, "Step-5 predictor depth must be 0..=3");
     if depth == 0 { return Ok(0); }
-    mtp_scratch_core(rows)?.checked_add((depth * 256) as u64)
+    mtp_scratch_core(rows, kv_format)?.checked_add((depth * 256) as u64)
         .context("Step-5 MTP workspace overflow")
 }
 
@@ -155,9 +155,21 @@ pub fn mtp_metadata_offset(rows: usize) -> Result<u64> {
         .context("Step-5 predictor input offset overflow")
 }
 
-pub fn mtp_scratch_core(rows: usize) -> Result<u64> {
-    Ok(mtp_metadata_offset(rows)?.checked_add(plane_bytes(&mtp_metadata_planes(rows)?[..4])?)
-        .context("Step-5 predictor metadata offset overflow")?
+pub fn mtp_compact_offset(rows: usize) -> Result<u64> {
+    mtp_metadata_offset(rows)?.checked_add(plane_bytes(&mtp_metadata_planes(rows)?[..4])?)
+        .context("Step-5 predictor metadata offset overflow")
+}
+
+pub fn mtp_compact_planes(rows: usize, kv_format: Qwen4KvCache) -> Result<[usize; 2]> {
+    ensure!((1..=4096).contains(&rows), "Step-5 predictor compact rows");
+    Ok([if kv_format == Qwen4KvCache::Fp8 {
+        rows * kv_format.plane_record_bytes(4, 192)
+    } else { 0 }; 2])
+}
+
+pub fn mtp_scratch_core(rows: usize, kv_format: Qwen4KvCache) -> Result<u64> {
+    Ok(mtp_compact_offset(rows)?.checked_add(plane_bytes(&mtp_compact_planes(rows, kv_format)?)?)
+        .context("Step-5 predictor compact staging overflow")?
         .max(plane_bytes(&head_planes(rows)?)?))
 }
 
