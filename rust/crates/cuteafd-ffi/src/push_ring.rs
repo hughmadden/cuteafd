@@ -99,8 +99,15 @@ impl<'a> RegisteredRing<'a> {
     pub fn slot_bytes(&self) -> usize {
         self.slot_bytes
     }
-    /// The caller holds the server's Filled credit until all references/copies end.
-    pub fn slot(&self, index: u32, len: u32) -> Result<&[u8]> {
+    pub fn belongs_to(&self, library: &NativeLibrary, device: i32) -> bool {
+        std::ptr::eq(self.library, library) && self.device == device
+    }
+    /// Read a slot whose Filled credit the caller owns.
+    ///
+    /// # Safety
+    /// The producer must not write this slot until all references and queued
+    /// copies end. The caller must retain its credit until then.
+    pub unsafe fn slot(&self, index: u32, len: u32) -> Result<&[u8]> {
         ensure!(
             (index as usize) < self.slots && len as usize == self.slot_bytes,
             "invalid Filled slot extent"
@@ -141,15 +148,15 @@ impl Drop for RegisteredRing<'_> {
         }
         if self.registered {
             let result = (|| -> Result<()> {
+                type Unregister = unsafe extern "C" fn(*mut c_void) -> i32;
+                // Resolve before changing devices, including the missing-symbol path.
+                // SAFETY: the library exposes this native ABI signature.
+                let unregister: Symbol<Unregister> =
+                    unsafe { self.library.lib.get(b"cuteafd_unregister_host_mapping")? };
                 let previous = self.library.cuda_get_device()?;
                 self.library.cuda_set_device(self.device)?;
-                type Unregister = unsafe extern "C" fn(*mut c_void) -> i32;
                 // SAFETY: all queued copies must have drained before the ring is dropped.
-                let status = unsafe {
-                    let unregister: Symbol<Unregister> =
-                        self.library.lib.get(b"cuteafd_unregister_host_mapping")?;
-                    unregister(self.ptr)
-                };
+                let status = unsafe { unregister(self.ptr) };
                 let result = self
                     .library
                     .status_to_result("cuteafd_unregister_host_mapping", status);
@@ -165,5 +172,49 @@ impl Drop for RegisteredRing<'_> {
         unsafe {
             libc::munmap(self.ptr, self.bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_library_lifetime_fixture::Fixture;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn mapping_seals_bounds_and_device_restoration() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        for (slots, bytes) in [
+            (0, 4096),
+            (4097, 4096),
+            (1, 4095),
+            (1, 8193),
+            (1, 2 * DEFAULT_SLOT_BYTES),
+        ] {
+            assert!(RegisteredRing::new(&library, slots, bytes).is_err());
+        }
+        library.cuda_set_device(1)?;
+        let ring = RegisteredRing::new(&library, 2, 4096)?;
+        assert!(ring.belongs_to(&library, 1));
+        assert!(!ring.belongs_to(&library, 0));
+        // SAFETY: valid descriptor, querying its immutable resize seals.
+        let seals = unsafe { libc::fcntl(ring.fd().as_raw_fd(), libc::F_GET_SEALS) };
+        assert_eq!(
+            seals & (libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL),
+            libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL
+        );
+        // SAFETY: no producer has this fd; both slots remain exclusively owned here.
+        unsafe {
+            assert_eq!(ring.slot(0, 4096)?.len(), 4096);
+            assert!(ring.slot(2, 4096).is_err());
+            assert!(ring.slot(0, 4095).is_err());
+        }
+        assert!(ring.payload(0, 4095, 2).is_err());
+        library.cuda_set_device(0)?;
+        drop(ring);
+        assert_eq!(library.cuda_get_device()?, 0);
+        assert_eq!(fixture.events()?, "Gg");
+        Ok(())
     }
 }

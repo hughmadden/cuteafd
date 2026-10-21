@@ -109,6 +109,11 @@ pub(crate) fn consume<'a>(
         window > 0 && window <= ring.slots(),
         "invalid push copy window"
     );
+    ensure!(
+        ring.belongs_to(device.library, device.id),
+        "push ring device mismatch"
+    );
+    ensure!(arena.belongs_to(device), "push arena device mismatch");
     let mut copies = Copies::new(device)?;
     let mut done = false;
     while !done {
@@ -135,7 +140,9 @@ pub(crate) fn consume<'a>(
                     copies.occupied.insert(index),
                     "push reused an unreleased slot"
                 );
-                let data = ring.slot(index, len)?;
+                // SAFETY: Filled transfers the credit, duplicate credits are rejected,
+                // and Release follows the slot's completed event (including teardown).
+                let data = unsafe { ring.slot(index, len)? };
                 let parsed = slot::parse(data, arena.logical_bytes() as u64)?;
                 while copies.events.len() <= index as usize {
                     copies

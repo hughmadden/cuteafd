@@ -106,6 +106,16 @@ impl Fixture {
         Ok(library)
     }
 
+    pub fn quiet_events(&self, library: &NativeLibrary, quiet: bool) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_quiet_events")?;
+            configure(i32::from(quiet));
+        }
+        Ok(())
+    }
+
     pub fn resident(&self) -> Result<bool> {
         Ok(fs::read_to_string("/proc/self/maps")?
             .lines()

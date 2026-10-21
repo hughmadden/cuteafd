@@ -46,36 +46,123 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
         id: 0,
     };
     let dir = tempfile::tempdir()?;
-    let path = dir.path().join("weights");
-    // Real builder methods, with two disjoint native source tensors and a host-only scalar.
-    let source_bytes = bytes + 4;
-    let mut source = (0..source_bytes)
-        .map(|i| (i % 251) as u8)
-        .collect::<Vec<_>>();
-    source[bytes..].copy_from_slice(&0xcbac1fedu32.to_le_bytes());
-    std::fs::write(&path, &source)?;
-    let mut builder = Builder::new(dir.path(), vec![source_bytes as u64]);
-    for (offset, count) in [(0, bytes / 2), (bytes / 2, bytes - bytes / 2), (bytes, 4)] {
-        builder.contiguous(
-            &Source {
-                path: path.clone(),
-                offset: offset as u64,
-                bytes: count as u64,
-            },
-            0,
-            count as u64,
-            Destination {
-                rank: 0,
-                offset: offset as u64,
-                bytes: count as u64,
-            },
-        )?;
+    use cuteafd_loader::{
+        formats::fp8_experts::{Fp8ExpertTensors, Fp8Projection, Slicing},
+        plan::testing::{fp8, t, write_snapshot},
+        RoutedExpertShape,
+    };
+    use std::os::unix::fs::FileExt;
+    // Header-backed TP4 down-column plan: source rows are pitched, destination
+    // rows are packed. Compare with the existing mount loader, not Pattern::runs.
+    let hidden = bytes / 1024;
+    let mut headers = Vec::new();
+    for (projection, n, k) in [
+        ("gate", 4096, hidden),
+        ("up", 4096, hidden),
+        ("down", hidden, 4096),
+    ] {
+        headers.extend(fp8(
+            &format!("model.layers.0.mlp.experts.0.{projection}_proj"),
+            n,
+            k,
+            None,
+        ));
     }
+    headers.push(t("validation.mcg", "I32", &[]));
+    write_snapshot(
+        dir.path(),
+        &serde_json::json!({"model_type": "fixture"}),
+        &headers,
+        None,
+    );
+    let path = dir.path().join("model-00001-of-00001.safetensors");
+    let metadata = cuteafd_loader::read_safetensors_metadata(&path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    for tensor in &metadata {
+        let data = (0..tensor.byte_length)
+            .map(|i| ((i + tensor.byte_offset) % 251) as u8)
+            .collect::<Vec<_>>();
+        file.write_all_at(&data, tensor.byte_offset)?;
+    }
+    let tail = metadata
+        .iter()
+        .find(|t| t.name == "validation.mcg")
+        .unwrap();
+    file.write_all_at(&0xcbac1fedu32.to_le_bytes(), tail.byte_offset)?;
+    let tensors = Fp8ExpertTensors::read_layers(
+        dir.path(),
+        RoutedExpertShape {
+            layers: 1,
+            first_layer: 0,
+            experts: 1,
+            topk: 1,
+            hidden,
+            intermediate: 4096,
+            draft_stages: 0,
+            draft_experts: 0,
+        },
+        &[0].into(),
+    )?;
+    let projection = Fp8Projection::Down;
+    let (weights, scales) = tensors.slice_bytes_with(projection, 4, 1, Slicing::Padded)?;
+    assert_eq!(weights, bytes);
+    let device_bytes = weights + scales;
+    let mut expected = vec![0; device_bytes];
+    let (w, s) = expected.split_at_mut(weights);
+    tensors.read_slice_with(
+        0,
+        0,
+        projection,
+        4,
+        1,
+        Slicing::Padded,
+        w,
+        s,
+        &mut Vec::new(),
+    )?;
+    let mut builder = Builder::new(dir.path(), vec![(device_bytes + 4) as u64]);
+    builder.fp8_projection(
+        &tensors,
+        0,
+        0,
+        projection,
+        4,
+        1,
+        Slicing::Padded,
+        Destination {
+            rank: 0,
+            offset: 0,
+            bytes: weights as u64,
+        },
+        Destination {
+            rank: 0,
+            offset: weights as u64,
+            bytes: scales as u64,
+        },
+    )?;
+    builder.contiguous(
+        &Source {
+            path: path.clone(),
+            offset: tail.byte_offset,
+            bytes: 4,
+        },
+        0,
+        4,
+        Destination {
+            rank: 0,
+            offset: device_bytes as u64,
+            bytes: 4,
+        },
+    )?;
+    let source = std::fs::read(&path)?;
     let plan = builder.finish()?;
     let footprint = ExpectedCoverage::from_plan(&plan, 0)?;
     let arena = LoadingArena::new(
         device,
-        ArenaLayout::new([bytes], bytes)?.with_validation(4, 4)?,
+        ArenaLayout::new([device_bytes], device_bytes)?.with_validation(4, 4)?,
         footprint,
     )?;
     let ring = RegisteredRing::new(&library, 8, 1024 * 1024)?;
@@ -84,6 +171,7 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
     client.set_timeout(Some(Duration::from_secs(10)))?;
     server.set_timeout(Some(Duration::from_secs(10)))?;
     let released = AtomicUsize::new(0);
+    let (prefilled, ready) = std::sync::mpsc::channel();
     let started = Instant::now();
     let result = std::thread::scope(|scope| -> Result<_> {
         let released = &released;
@@ -138,9 +226,6 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
                     server.send_event(&Event::Done)?;
                     return Ok(());
                 }
-                if matches!(mode, Mode::DrainFailed) {
-                    // Still enqueue a slot before the configured CUDA failure.
-                }
                 let mut sent = 0;
                 let mut inflight = std::collections::BTreeSet::new();
                 while sent < slots_data.len() || !inflight.is_empty() {
@@ -164,6 +249,13 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
                         })?;
                         inflight.insert(index);
                         sent += 1;
+                        if matches!(mode, Mode::Good) && sent == slots_data.len() {
+                            // Real Done may arrive while copies and credits remain queued.
+                            server.send_event(&Event::Done)?;
+                        }
+                        if matches!(mode, Mode::Good) && sent == slots_data.len().min(slots) {
+                            prefilled.send(())?;
+                        }
                         if matches!(mode, Mode::Failed) {
                             server.send_event(&Event::Failed {
                                 reason: "injected".into(),
@@ -202,7 +294,9 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
                         );
                     }
                 }
-                server.send_event(&Event::Done)?;
+                if !matches!(mode, Mode::Good) {
+                    server.send_event(&Event::Done)?;
+                }
                 Ok(())
             })();
             // SAFETY: server stops writes and has no views after run.
@@ -214,6 +308,9 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
         if matches!(mode, Mode::DrainFailed) {
             fixture.configure_pack(&library, 0, 1)?;
         }
+        if matches!(mode, Mode::Good) {
+            ready.recv_timeout(Duration::from_secs(10))?;
+        }
         let value = consume(device, arena, ring, SocketRank(client), window);
         let server_result = task.join().expect("fake server panicked");
         if matches!(mode, Mode::Good) {
@@ -222,11 +319,9 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
             assert_eq!(delivered.validation(), &0xcbac1fedu32.to_le_bytes());
             let buffer = delivered.region(0)?;
             // SAFETY: CPU fake DSO device storage is host malloc, delivery has drained.
-            let actual = unsafe { std::slice::from_raw_parts(buffer.ptr.cast::<u8>(), bytes) };
-            assert!(actual
-                .iter()
-                .enumerate()
-                .all(|(i, b)| *b == (i % 251) as u8));
+            let actual =
+                unsafe { std::slice::from_raw_parts(buffer.ptr.cast::<u8>(), device_bytes) };
+            assert_eq!(actual, expected);
             drop(delivered);
         } else {
             ensure!(value.is_err(), "partial or invalid load published");
@@ -239,6 +334,13 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
         assert!(library.is_quarantined_after_failed_drain());
         assert!(!events.contains('g') && !events.contains('d'));
     } else {
+        if matches!(mode, Mode::Good) && window == 8 {
+            let queued_before_first_wait = events.split('S').next().unwrap().matches('R').count();
+            assert!(
+                queued_before_first_wait > 1,
+                "pipeline never queued multiple slot events"
+            );
+        }
         assert!(events.rfind('S').unwrap() < events.rfind('g').unwrap());
         assert!(events.rfind('S').unwrap() < events.rfind('d').unwrap());
     }
@@ -269,6 +371,137 @@ fn failures_drain_without_partial_publication() -> Result<()> {
         Mode::DrainFailed,
     ] {
         exercise(8, mode, 256 * 1024)?;
+    }
+    Ok(())
+}
+
+// Explicit CPU throughput experiment, not a CUDA or RDMA performance gate.
+#[test]
+#[ignore = "bounded CPU fake throughput experiment"]
+fn socket_fake_copy_out_throughput() -> Result<()> {
+    for window in [1, 8] {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        let device = Device {
+            library: &library,
+            id: 0,
+        };
+        let bytes = 32 * 1024 * 1024;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("payload");
+        std::fs::File::create(&path)?.set_len(bytes as u64)?;
+        let mut builder = Builder::new(dir.path(), vec![bytes as u64]);
+        builder.contiguous(
+            &Source {
+                path,
+                offset: 0,
+                bytes: bytes as u64,
+            },
+            0,
+            bytes as u64,
+            Destination {
+                rank: 0,
+                offset: 0,
+                bytes: bytes as u64,
+            },
+        )?;
+        let plan = builder.finish()?;
+        let arena = LoadingArena::new(
+            device,
+            ArenaLayout::new([bytes], bytes)?,
+            ExpectedCoverage::from_plan(&plan, 0)?,
+        )?;
+        let ring = RegisteredRing::new(&library, 128, 1024 * 1024)?;
+        let fd = ring.fd().as_raw_fd();
+        let (client, server) = Conn::pair()?;
+        client.set_timeout(Some(Duration::from_secs(30)))?;
+        server.set_timeout(Some(Duration::from_secs(30)))?;
+        let payload = vec![0x5a; bytes];
+        let mut templates = Vec::new();
+        let mut offset = 0;
+        while offset < bytes {
+            let mut packer = slot::Packer::new(vec![0; 1024 * 1024]);
+            let count = packer.push(offset as u64, &payload[offset..]);
+            ensure!(count > 0, "benchmark slot cannot fit payload");
+            templates.push(packer.finish().0);
+            offset += count;
+        }
+        let measurement = std::thread::scope(|scope| -> Result<_> {
+            let task = scope.spawn(move || -> Result<_> {
+                let extent = 128 * 1024 * 1024;
+                // SAFETY: ring owns fd until the producer has disconnected.
+                let mapped = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        extent,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        fd,
+                        0,
+                    )
+                };
+                ensure!(mapped != libc::MAP_FAILED, "benchmark mapping failed");
+                let run = (|| -> Result<_> {
+                    let mut elapsed = 0.0;
+                    for pass in 0..17 {
+                        let start = Instant::now();
+                        let mut sent = 0;
+                        let mut inflight = std::collections::BTreeSet::new();
+                        while sent < templates.len() || !inflight.is_empty() {
+                            while sent < templates.len() && inflight.len() < 8 {
+                                let index = (0..8).find(|i| !inflight.contains(i)).unwrap();
+                                // SAFETY: producer owns this free credit, extent is checked.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        templates[sent].as_ptr(),
+                                        mapped.cast::<u8>().add(index * 1024 * 1024),
+                                        1024 * 1024,
+                                    );
+                                }
+                                server.send_event(&Event::Filled {
+                                    slot: index as u32,
+                                    len: 1024 * 1024,
+                                })?;
+                                inflight.insert(index);
+                                sent += 1;
+                            }
+                            let Some((Request::Release { slot }, _)) = server.next_request()?
+                            else {
+                                anyhow::bail!("benchmark missing Release");
+                            };
+                            ensure!(
+                                inflight.remove(&(slot as usize)),
+                                "benchmark duplicate Release"
+                            );
+                        }
+                        // First complete arena pass faults in mappings and fake device pages.
+                        if pass > 0 {
+                            elapsed += start.elapsed().as_secs_f64();
+                        }
+                    }
+                    server.send_event(&Event::Done)?;
+                    Ok(elapsed)
+                })();
+                // SAFETY: no producer views or writes survive the run.
+                unsafe {
+                    libc::munmap(mapped, extent);
+                }
+                run
+            });
+            let delivered = consume(device, arena, ring, SocketRank(client), window)?;
+            let elapsed = task.join().expect("benchmark server panicked")?;
+            let region = delivered.region(0)?;
+            // SAFETY: fake device storage is malloc and all events have drained.
+            let actual = unsafe { std::slice::from_raw_parts(region.ptr.cast::<u8>(), bytes) };
+            assert_eq!(actual, payload);
+            Ok(elapsed)
+        })?;
+        let transferred = bytes * 16;
+        eprintln!(
+            "CPU_FAKE window={window} bytes={transferred} seconds={measurement:.6} GB/s={:.3}",
+            transferred as f64 / measurement / 1e9
+        );
     }
     Ok(())
 }

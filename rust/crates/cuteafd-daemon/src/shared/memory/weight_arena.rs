@@ -251,6 +251,10 @@ impl<'a> LoadingArena<'a> {
         })
     }
 
+    pub fn belongs_to(&self, device: Device<'_>) -> bool {
+        self.allocation.device.id == device.id
+            && std::ptr::eq(self.allocation.device.library, device.library)
+    }
     pub fn device_bytes(&self) -> usize { self.layout.bytes() }
     pub fn logical_bytes(&self) -> usize { self.layout.logical_bytes() }
     pub fn check_fragment(&self, offset: u64, bytes: u64) -> Result<()> {

@@ -7,6 +7,8 @@
 
 struct host_buffer { void *ptr; size_t bytes; uint64_t flags; };
 static char *event_path;
+static int quiet_events;
+void fixture_quiet_events(int quiet) { quiet_events = quiet; }
 static int pack_status, drain_status, drain_calls, drain_after, current_device;
 static size_t memory_total[8], memory_used[8], graph_bytes;
 
@@ -40,6 +42,7 @@ int cuteafd_cuda_memory_info(size_t *free_bytes, size_t *total) {
 }
 
 static void event(char value) {
+    if (quiet_events) return;
     FILE *file = fopen(event_path, "a");
     if (!file || fputc(value, file) == EOF || fclose(file)) abort();
 }
@@ -200,7 +203,7 @@ int cuteafd_cuda_event_record(void *handle, void *stream) {
     if (upload->count) return 1;
     upload->copies = malloc(pending_count * sizeof(struct upload));
     if (pending_count && !upload->copies) return 1;
-    memcpy(upload->copies, pending_uploads, pending_count * sizeof(struct upload));
+    if (pending_count) memcpy(upload->copies, pending_uploads, pending_count * sizeof(struct upload));
     upload->count = pending_count;
     pending_count = 0;
     event('R');
