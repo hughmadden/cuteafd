@@ -335,13 +335,16 @@ fn cache_geometry_requires_tp2_and_preserves_physical_mla_copies() {
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let model = KIMI_K3.open(&checkpoint).unwrap();
     assert!(model.cache_geometry(CacheOptions::default()).is_err());
-    for attention in [AttentionPlacement::Layers, AttentionPlacement::Heads] {
-        let cache = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+    for (attention, format) in [AttentionPlacement::Layers, AttentionPlacement::Heads].into_iter()
+        .flat_map(|attention| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
+            .map(|format| (attention, format))) {
+        let cache = model.cache_geometry(CacheOptions { coordinator_ranks: 2, mla_kv: format,
             attention_placement: Some(attention), ..Default::default() }).unwrap().unwrap();
         assert_eq!(cache.placement, KvPlacement::PartitionedLayers);
         assert_eq!(cache.logical_unit_rows, 64);
         assert_eq!(cache.ranks.len(), 2);
-        assert_eq!(cache.ranks[0].persistent_unit_bytes, 884_736 * if attention == AttentionPlacement::Heads { 2 } else { 1 });
+        assert_eq!(cache.ranks[0].persistent_unit_bytes,
+            (12 * 64 * format.record_bytes()) as u64 * if attention == AttentionPlacement::Heads { 2 } else { 1 });
         assert_eq!(cache.ranks[0], cache.ranks[1]);
         assert_eq!(cache.ranks[0].retained_mark_bytes, 224_686_080);
     }
