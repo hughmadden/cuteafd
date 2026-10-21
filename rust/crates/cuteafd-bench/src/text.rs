@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn seeds_rotate_kinds_and_offsets() {
-        for seed in 0..9 {
+        for seed in 0u64..9 {
             let bank = &banks()[(seed % 3) as usize];
             let text = corpus(seed, 256);
             assert!(bank.text.contains(&text), "seed {seed}");
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn length_targeting_uses_reference_token_chunks() {
-        for seed in 0..9 {
+        for seed in 0u64..9 {
             let bank = &banks()[(seed % 3) as usize];
             let chunks = bank.offsets.len() - 1;
             let offset = (seed / 3).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
