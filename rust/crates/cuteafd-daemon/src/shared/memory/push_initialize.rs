@@ -506,6 +506,7 @@ pub(crate) fn exlr8(
     tracing::info!(layer = residency.layer, rank = residency.rank, checked_bytes,
         checksum_seconds = started.elapsed().as_secs_f64(),
         "EXLR8 push post-Done checksums verified");
+    drop(scratch);
     let (pointers, bits) = residency.descriptors(owner.ptr as u64)?;
     ensure!(
         residency.resident_bytes <= owner.bytes,
