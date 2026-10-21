@@ -638,8 +638,8 @@ impl Opened {
                     let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
                         &local.package, self.cfg.hidden, max_rows)?;
                     let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
-                    crate::shared::experts::rtx::push::CoordinatorTp2Push::prepare(&self.snapshot, &self.catalog,
-                        &range.clone().collect::<Vec<_>>(), budgets)
+                    crate::shared::experts::rtx::push::CoordinatorPush::prepare(&self.snapshot, Some(&self.catalog), 2,
+                        Some((&range.clone().collect::<Vec<_>>(), budgets.to_vec())))
                 })().map_err(|error| tracing::info!(%error, "coordinator TP2 push unavailable; mount")).ok(),
                 _ => None,
             };
@@ -687,15 +687,17 @@ impl Opened {
                 let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
                 let planned = planning.model(&self.cfg, layers, owners.as_deref(), native).and_then(|model| {
                     let (records, deferred) = sink.take();
-                    let dense = push::plan_ranks(dense_catalog, &self.snapshot, &records, devices, sparks)?;
+                    let (plans, destinations) = push::plan_ranks(dense_catalog, &self.snapshot, &records, devices, sparks)?;
+                    let dense: (Vec<_>, Vec<_>) = (plans.into(), destinations.into());
                     Ok((model, records, deferred, dense))
                 });
                 let (planned, dense) = match planned {
                     Ok((model, records, deferred, dense)) => (Some((model, records, deferred)), Ok(dense)),
                     Err(error) => (None, Err(error)),
                 };
-                let (pushed, ()) = push.receive_with(devices, &self.catalog, sparks, Some(dense), || ());
-                let pushed = pushed?;
+                let (pushed, ()) = push.receive_with(devices.to_vec(), Some(&self.catalog), sparks, Some(dense), || ());
+                let pushed = pushed?.map(|ranks| <[_; 2]>::try_from(ranks)
+                    .map_err(|_| anyhow::anyhow!("two coordinator GPUs"))).transpose()?;
                 let Some((model, records, deferred)) = planned else {
                     // Planning allocated nothing that survives; the mount loads as usual.
                     return Ok((loader.model(&self.cfg, layers, owners.as_deref(), native)?, None));

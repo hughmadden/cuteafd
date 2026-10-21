@@ -69,17 +69,15 @@ pub(crate) struct DenseRank<D> {
     pub base: u64,
 }
 
-/// One coordinator GPU's half of a push group, received on its own thread with
-/// its own ring, under the same control protocol as a Spark rank (a loopback
-/// stream to the group driver). `Ok(None)` means the whole group fell back:
-/// every arena reference is dropped before the drained acknowledgment.
+/// One coordinator GPU's TP2 halves alone (the TP2-only group replay).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn receive_tp2<'a>(
     device: crate::shared::memory::device::Device<'a>, catalog: &OfficialV41Catalog, plan: Tp2ExpertPlan,
     checked: &CheckedPlan, rank: usize, client: &cuteafd_loader::push_load::PushClient,
     stream: &mut std::net::TcpStream, credentials: (u64, u64), slots: usize, slot_bytes: usize,
 ) -> Result<Option<Vec<crate::shared::experts::exl3::Exl3Weights<'a>>>> {
-    receive_rank::<NoDense>(device, catalog, plan, checked, None, rank, client, stream, credentials, slots, slot_bytes)
+    receive_rank::<NoDense>(device, Some((catalog, plan, checked)), None, rank, client, stream, credentials,
+        slots, slot_bytes)
 }
 
 /// No dense operands on this rank (families whose dense weights load by mount).
@@ -98,12 +96,17 @@ impl PushDestination for NoDense {
     fn done(self) -> Result<()> { Ok(()) }
 }
 
-/// `checked_tp2` covers the TP2 entries alone, from offset 0 (the arena's own
-/// footprint); `dense` lands in `[0, dense.base)` of the same rank.
+/// One coordinator GPU's rank of a push group, received on its own thread and
+/// ring under the same control protocol as a Spark rank (a loopback stream to
+/// the group driver): its TP2 halves (`tp2`: their entries alone from offset
+/// 0, the arena's own footprint) and/or its dense operands (`dense`, in
+/// `[0, dense.base)` of the rank). `Ok(None)`: the whole group fell back; every
+/// arena reference is dropped before the drained acknowledgment. With no TP2,
+/// a committed rank returns no expert weights.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
-    device: crate::shared::memory::device::Device<'a>, catalog: &OfficialV41Catalog, plan: Tp2ExpertPlan,
-    checked_tp2: &CheckedPlan, dense: Option<DenseRank<D>>, rank: usize,
+    device: crate::shared::memory::device::Device<'a>,
+    tp2: Option<(&OfficialV41Catalog, Tp2ExpertPlan, &CheckedPlan)>, dense: Option<DenseRank<D>>, rank: usize,
     client: &cuteafd_loader::push_load::PushClient, stream: &mut std::net::TcpStream, credentials: (u64, u64),
     slots: usize, slot_bytes: usize,
 ) -> Result<Option<Vec<crate::shared::experts::exl3::Exl3Weights<'a>>>> {
@@ -111,12 +114,16 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     use cuteafd_ffi::push_ring::RegisteredRing;
     use cuteafd_transport::worker_selection::push;
     use std::os::fd::AsRawFd;
+    ensure!(tp2.is_some() || dense.is_some(), "coordinator rank receives nothing");
     let library = device.library;
     let (group, token) = credentials;
-    tracing::info!(group, rank, device = device.id, dense = dense.is_some(), "coordinator push rank joining load group");
+    tracing::info!(group, rank, device = device.id, tp2 = tp2.is_some(), dense = dense.is_some(),
+        "coordinator push rank joining load group");
     let joined = device.run(|| -> Result<_> {
-        let expected = ExpectedCoverage::from_plan(checked_tp2, u32::try_from(rank)?)?;
-        let arena = LoadingArena::new(device, plan.layout.clone(), expected)?;
+        let arena = tp2.as_ref().map(|(_, plan, checked)| -> Result<_> {
+            let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank)?)?;
+            LoadingArena::new(device, plan.layout.clone(), expected)
+        }).transpose()?;
         let ring = RegisteredRing::new(library, slots, slot_bytes)?;
         let joined = client.join(cuteafd_loader::push_load::JoinArgs { group, token,
             rank: u32::try_from(rank)?, ring_fd: ring.fd().as_raw_fd(),
@@ -126,11 +133,17 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     if let Err(error) = &joined { tracing::info!(group, rank, %error, "coordinator push rank join failed"); }
     push::joined(stream, joined.is_ok()).context("coordinator push joined frame")?;
     let candidate = joined.and_then(|(arena, ring, joined)| {
-        let delivered = match dense {
-            Some(DenseRank { destination, base }) =>
-                push_consumer::consume(device, Combined::new(destination, base, arena)?, ring, joined, slots)?,
-            None => push_consumer::consume(device, arena, ring, joined, slots)?,
+        let delivered = match (arena, dense) {
+            (Some(arena), Some(DenseRank { destination, base })) =>
+                Some(push_consumer::consume(device, Combined::new(destination, base, arena)?, ring, joined, slots)?),
+            (Some(arena), None) => Some(push_consumer::consume(device, arena, ring, joined, slots)?),
+            (None, Some(DenseRank { destination, .. })) => {
+                push_consumer::consume(device, destination, ring, joined, slots)?;
+                None
+            }
+            (None, None) => unreachable!("checked above"),
         };
+        let Some(((catalog, plan, _), delivered)) = tp2.zip(delivered) else { return Ok(Vec::new()) };
         let initialize = plan.residencies.iter().enumerate().map(|(region, residency)|
             push_initialize::Layer::Exl3 { region, residency }).collect::<Vec<_>>();
         let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, Some(&plan.validation), 0)?);
@@ -162,15 +175,14 @@ pub(crate) struct DensePlan {
     pub append: Box<dyn Fn(&mut cuteafd_loader::push_load::builder::Builder, &OfficialV41Catalog, u32) -> Result<()> + Send>,
 }
 
-type DenseSlot = std::sync::Arc<std::sync::Mutex<Option<[DensePlan; 2]>>>;
+type DenseSlot = std::sync::Arc<std::sync::Mutex<Option<Vec<DensePlan>>>>;
 
-/// The coordinator side of one Spark push group for the two coordinator GPUs:
-/// their admitted TP2 expert halves and, when the family lands them, their
-/// dense operands. Per-GPU plans, the in-process loopback streams, and the
-/// entries the group driver appends after the Spark ranks.
-pub(crate) struct CoordinatorTp2Push {
-    plans: [Tp2ExpertPlan; 2],
-    streams: [std::net::TcpStream; 2],
+/// The coordinator side of one Spark push group: one rank per coordinator GPU
+/// (one or two), each carrying its admitted TP2 expert halves and/or the
+/// family's dense operands. Per-GPU TP2 plans, the in-process loopback
+/// streams, and the entries the group driver appends after the Spark ranks.
+pub(crate) struct CoordinatorPush {
+    gpus: Vec<(Option<Tp2ExpertPlan>, std::net::TcpStream)>,
     host: String,
     snapshot: std::path::PathBuf,
     dense: DenseSlot,
@@ -179,69 +191,82 @@ pub(crate) struct CoordinatorTp2Push {
 /// Group rank of coordinator GPU `gpu` after `sparks` Spark ranks.
 fn group_rank(sparks: usize, gpu: usize) -> usize { sparks + gpu }
 
-impl CoordinatorTp2Push {
-    /// Metadata only: plans and loopback pairs, before any allocation.
-    /// `budgets` are the admitted per-GPU TP2 arenas (resident bytes only).
-    pub(crate) fn prepare(snapshot: &std::path::Path, catalog: &OfficialV41Catalog, layers: &[usize],
-        budgets: [usize; 2]) -> Result<(Self, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
+impl CoordinatorPush {
+    /// Metadata only, before any allocation: `gpus` coordinator ranks, with each
+    /// GPU's admitted TP2 halves when `tp2` is (layers, per-GPU resident budgets).
+    pub(crate) fn prepare(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
+        tp2: Option<(&[usize], Vec<usize>)>)
+        -> Result<(Self, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
+        ensure!((1..=2).contains(&gpus), "one or two coordinator GPUs");
         let (_, host) = cuteafd_loader::push_load::namespace(snapshot)?;
-        let plans = [Tp2ExpertPlan::new(catalog, layers, 0, budgets[0])?, Tp2ExpertPlan::new(catalog, layers, 1, budgets[1])?];
-        let mut driver = Vec::new();
-        let mut ranks = Vec::new();
-        for _ in 0..2 {
+        let plans = match &tp2 {
+            Some((layers, budgets)) => {
+                ensure!(gpus == 2 && budgets.len() == 2, "coordinator TP2 needs two GPUs");
+                let catalog = catalog.context("coordinator TP2 push needs the expert catalog")?;
+                (0..2).map(|gpu| Tp2ExpertPlan::new(catalog, layers, gpu, budgets[gpu]).map(Some)).collect::<Result<Vec<_>>>()?
+            }
+            None => (0..gpus).map(|_| None).collect(),
+        };
+        let (mut driver, mut ranks) = (Vec::new(), Vec::new());
+        for _ in 0..gpus {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             let rank = std::net::TcpStream::connect(listener.local_addr()?)?;
             let (accepted, _) = listener.accept()?;
             driver.push(accepted);
             ranks.push(rank);
         }
-        let [first, second]: [std::net::TcpStream; 2] = ranks.try_into().map_err(|_| anyhow::anyhow!("two loopback ranks"))?;
         let dense: DenseSlot = Default::default();
         // TP2 entries are re-derived from headers; dense entries (set before the
         // offers are sent) carry no device state either.
-        let (append_layers, arenas, append_dense) = (layers.to_vec(), budgets, dense.clone());
+        let append_tp2 = tp2.map(|(layers, budgets)| (layers.to_vec(), budgets));
+        let append_dense = dense.clone();
         let append = Box::new(move |builder: &mut cuteafd_loader::push_load::builder::Builder,
             catalog: &OfficialV41Catalog, offers: &[cuteafd_transport::worker_selection::push::Offer]| -> Result<()> {
-            ensure!(offers.len() == 2, "coordinator push needs two GPU offers");
+            ensure!(offers.len() == gpus, "coordinator push offer count differs");
             let dense = append_dense.lock().map_err(|_| anyhow::anyhow!("coordinator dense plan poisoned"))?;
             for (gpu, offer) in offers.iter().enumerate() {
-                let plan = Tp2ExpertPlan::new(catalog, &append_layers, gpu, arenas[gpu])?;
                 let rank = u32::try_from(offer.rank)?;
                 let base = match dense.as_ref() {
                     Some(dense) => { (dense[gpu].append)(builder, catalog, rank)?; dense[gpu].base }
                     None => 0,
                 };
-                ensure!(offer.placement.is_empty() && offer.arena_bytes == base + plan.layout.logical_bytes() as u64,
+                let tp2_bytes = match &append_tp2 {
+                    Some((layers, budgets)) => {
+                        let plan = Tp2ExpertPlan::new(catalog, layers, gpu, budgets[gpu])?;
+                        plan.append_at(builder, catalog, rank, base)?;
+                        plan.layout.logical_bytes() as u64
+                    }
+                    None => 0,
+                };
+                ensure!(offer.placement.is_empty() && offer.arena_bytes == base + tp2_bytes,
                     "coordinator push offer differs from its admitted arenas");
-                plan.append_at(builder, catalog, rank, base)?;
             }
             Ok(())
         });
-        let ranks = crate::shared::memory::push_exl3::CoordinatorRanks { ranks: 2, append };
-        Ok((Self { plans, streams: [first, second], host, snapshot: snapshot.to_path_buf(), dense }, driver, ranks))
+        let ranks_spec = crate::shared::memory::push_exl3::CoordinatorRanks { ranks: gpus, append };
+        Ok((Self { gpus: plans.into_iter().zip(ranks).collect(), host, snapshot: snapshot.to_path_buf(), dense },
+            driver, ranks_spec))
     }
 
-    /// Receives both GPUs' TP2 halves (each on its own thread) while `beside`
-    /// runs on this thread. `Ok(None)`: the whole group fell back.
-    pub(crate) fn receive<'a, U>(self, devices: [crate::shared::memory::device::Device<'a>; 2],
-        catalog: &OfficialV41Catalog, sparks: usize, beside: impl FnOnce() -> U)
-        -> (Result<Option<[Vec<crate::shared::experts::exl3::Exl3Weights<'a>>; 2]>>, U) {
-        self.receive_with::<NoDense, U>(devices, catalog, sparks, None, beside)
-    }
-
-    /// As `receive`, with each GPU's dense operands landing in the same rank:
-    /// `dense` is each GPU's plan (published to the group driver before the
-    /// offers) and destination (unaliased descriptors of operand allocations the
-    /// caller keeps alive and unread until this returns and the group commits).
-    /// A dense planning error makes every coordinator GPU offer mount, so the
-    /// whole group (Sparks and TP2 halves too) loads through the mount.
+    /// Receives every coordinator GPU (two: each on its own thread) while
+    /// `beside` runs on this thread. `dense`: each GPU's plan (published to the
+    /// group driver before the offers) and destination (unaliased descriptors of
+    /// operand allocations the caller keeps alive and unread until this returns
+    /// and the group commits). `Ok(None)`: the whole group fell back. A dense
+    /// planning error makes every coordinator GPU offer mount, so the whole
+    /// group (Sparks and TP2 halves too) loads through the mount.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn receive_with<'a, D: PushDestination<Delivered = ()>, U>(self,
-        devices: [crate::shared::memory::device::Device<'a>; 2], catalog: &OfficialV41Catalog, sparks: usize,
-        dense: Option<Result<([DensePlan; 2], [D; 2])>>, beside: impl FnOnce() -> U)
-        -> (Result<Option<[Vec<crate::shared::experts::exl3::Exl3Weights<'a>>; 2]>>, U) {
+        devices: Vec<crate::shared::memory::device::Device<'a>>, catalog: Option<&OfficialV41Catalog>, sparks: usize,
+        dense: Option<Result<(Vec<DensePlan>, Vec<D>)>>, beside: impl FnOnce() -> U)
+        -> (Result<Option<Vec<Vec<crate::shared::experts::exl3::Exl3Weights<'a>>>>>, U) {
         use cuteafd_ffi::push_ring::{DEFAULT_SLOTS, DEFAULT_SLOT_BYTES};
-        let Self { plans, streams, host, snapshot, dense: slot } = self;
-        let world = sparks + 2;
+        let Self { gpus, host, snapshot, dense: slot } = self;
+        if devices.len() != gpus.len() || dense.as_ref().is_some_and(|d| d.as_ref()
+            .is_ok_and(|(p, d)| p.len() != gpus.len() || d.len() != gpus.len())) {
+            return (Err(anyhow::anyhow!("coordinator push GPUs differ from their plans")), beside());
+        }
+        let world = sparks + gpus.len();
         let declined = match &dense {
             Some(Err(error)) => {
                 tracing::info!(%error, "coordinator dense push planning failed; whole group uses mount");
@@ -249,55 +274,68 @@ impl CoordinatorTp2Push {
             }
             _ => false,
         };
-        let (bases, destinations) = match dense.and_then(Result::ok) {
+        let (bases, destinations): (Vec<u64>, Vec<Option<D>>) = match dense.and_then(Result::ok) {
             Some((plans, destinations)) => {
-                let bases = [plans[0].base, plans[1].base];
+                let bases = plans.iter().map(|p| p.base).collect();
                 match slot.lock() {
                     Ok(mut slot) => *slot = Some(plans),
                     Err(_) => return (Err(anyhow::anyhow!("coordinator dense plan poisoned")), beside()),
                 }
-                let [left, right] = destinations;
-                (bases, [Some(left), Some(right)])
+                (bases, destinations.into_iter().map(Some).collect())
             }
-            None => ([0, 0], [None, None]),
+            None => (vec![0; gpus.len()], (0..gpus.len()).map(|_| None).collect()),
         };
-        let [first, second] = plans;
-        let [first_stream, second_stream] = streams;
-        let [first_dense, second_dense] = destinations;
-        let inputs = [(first, first_stream, first_dense), (second, second_stream, second_dense)];
         let client = cuteafd_loader::push_load::PushClient::default();
         let (snapshot, host) = (&snapshot, &host);
-        // SAFETY: each GPU's input (its plan, stream and dense destination) is used
-        // by that GPU's thread only; the dense descriptors refer to allocations the
-        // caller keeps alive and unread until this returns. Each GPU result is a
-        // freshly committed, drained rank arena and its views, unaliased (every Rc
-        // clone stays inside that GPU's Vec); a fallback returns None after
-        // dropping and draining its arena.
-        let (pair, value) = unsafe { cuteafd_ffi::synchronized_load::load_pair_with(inputs,
-            |gpu, (plan, mut stream, dense): (Tp2ExpertPlan, std::net::TcpStream, Option<D>)| {
+        let receive = |gpu: usize, (tp2, mut stream, dense): (Option<Tp2ExpertPlan>, std::net::TcpStream, Option<D>)| {
             let rank = group_rank(sparks, gpu);
             let base = bases[gpu];
             let planned = (|| -> Result<_> {
                 ensure!(!declined, "coordinator dense operands were not planned");
+                let Some(plan) = &tp2 else { return Ok(None) };
+                let catalog = catalog.context("coordinator TP2 push needs the expert catalog")?;
                 let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
                 let checked = plan.checked(catalog, &root, world, rank)?;
                 ensure!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
                     "coordinator push source is not a SparkNest shard");
-                Ok(checked)
+                Ok(Some(checked))
             })();
             if let Err(error) = &planned { tracing::info!(gpu, %error, "coordinator push unavailable; offering mount"); }
+            let tp2_bytes = tp2.as_ref().map_or(0, |p| p.layout.logical_bytes() as u64);
             let offer = planned.as_ref().ok().map(|_| cuteafd_transport::worker_selection::push::Offer {
-                rank, host: host.clone(), arena_bytes: base + plan.layout.logical_bytes() as u64, placement: Vec::new() });
+                rank, host: host.clone(), arena_bytes: base + tp2_bytes, placement: Vec::new() });
             let credentials = cuteafd_transport::worker_selection::push::offer(&mut stream, offer)?;
             let Some(credentials) = credentials else { return Ok(None) };
-            receive_rank(devices[gpu], catalog, plan, &planned?,
-                dense.map(|destination| DenseRank { destination, base }), rank, &client, &mut stream, credentials,
-                DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)
-        }, beside) };
-        let pushed = pair.and_then(|[left, right]| match (left, right) {
-            (Some(left), Some(right)) => Ok(Some([left, right])),
-            (None, None) => Ok(None),
-            _ => anyhow::bail!("coordinator push GPUs disagree on the group commit"),
+            let checked = planned?;
+            let tp2 = match (tp2, checked.as_ref()) {
+                (Some(plan), Some(checked)) => Some((catalog.context("expert catalog")?, plan, checked)),
+                _ => None,
+            };
+            receive_rank(devices[gpu], tp2, dense.map(|destination| DenseRank { destination, base }), rank,
+                &client, &mut stream, credentials, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)
+        };
+        let inputs: Vec<_> = gpus.into_iter().zip(destinations).map(|((tp2, stream), dense)| (tp2, stream, dense)).collect();
+        let (results, value) = if inputs.len() == 2 {
+            let [first, second]: [_; 2] = match inputs.try_into() { Ok(pair) => pair, Err(_) => unreachable!() };
+            // SAFETY: each GPU's input (its plan, stream and dense destination) is used by
+            // that GPU's thread only; the dense descriptors refer to allocations the caller
+            // keeps alive and unread until this returns. Each GPU result is a freshly
+            // committed, drained rank arena and its views, unaliased (every Rc clone stays
+            // inside that GPU's Vec); a fallback returns None after dropping its arena.
+            let (pair, value) = unsafe { cuteafd_ffi::synchronized_load::load_pair_with([first, second], receive, beside) };
+            (pair.map(Vec::from), value)
+        } else {
+            let mut inputs = inputs;
+            let result = inputs.pop().context("one coordinator GPU").and_then(|input| receive(0, input)).map(|r| vec![r]);
+            (result, beside())
+        };
+        let pushed = results.and_then(|results| {
+            let committed = results.iter().filter(|r| r.is_some()).count();
+            match committed {
+                0 => Ok(None),
+                n if n == results.len() => Ok(Some(results.into_iter().map(|r| r.unwrap_or_default()).collect())),
+                _ => anyhow::bail!("coordinator push GPUs disagree on the group commit"),
+            }
         });
         (pushed, value)
     }

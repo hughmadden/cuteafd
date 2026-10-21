@@ -1799,7 +1799,8 @@ impl Opened {
                     let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
                         &tp2_package(manifest), self.cfg.hidden, args.expert_rows())?;
                     let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
-                    crate::shared::experts::rtx::push::CoordinatorTp2Push::prepare(source, catalog, &tp2_layers, budgets)
+                    crate::shared::experts::rtx::push::CoordinatorPush::prepare(source, Some(catalog), 2,
+                        Some((&tp2_layers, budgets.to_vec())))
                 })().map_err(|error| tracing::info!(%error, "coordinator TP2 push unavailable; mount")).ok(),
                 _ => None,
             };
@@ -1849,8 +1850,11 @@ impl Opened {
             let (pushed, loaded) = match coordinator_push.take() {
                 Some((push, sparks)) => {
                     let catalog = self.experts.as_ref().context("TP2 expert catalog")?;
-                    let (pushed, loaded) = push.receive(tp2_devices()?, catalog, sparks, dense);
-                    (pushed?, loaded?)
+                    let (pushed, loaded) = push.receive_with::<crate::shared::experts::rtx::push::NoDense, _>(
+                        tp2_devices()?.to_vec(), Some(catalog), sparks, None, dense);
+                    let pushed = pushed?.map(|ranks| <[_; 2]>::try_from(ranks)
+                        .map_err(|_| anyhow::anyhow!("two coordinator GPUs"))).transpose()?;
+                    (pushed, loaded?)
                 }
                 None => (None, dense()?),
             };

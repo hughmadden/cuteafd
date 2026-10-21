@@ -285,7 +285,7 @@ fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
     let dense = HostDense { image: vec![0; cursor as usize], planned: planned.clone(), delivered: delivered.clone(), device: 0 };
     let client = PushClient::at(socket, Duration::from_secs(10))?;
     let device = Device { library: &library, id: 0 };
-    let weights = receive_rank(device, &catalog, plan, &checked_tp2, Some(DenseRank { destination: dense, base }),
+    let weights = receive_rank(device, Some((&catalog, plan, &checked_tp2)), Some(DenseRank { destination: dense, base }),
         rank, &client, &mut worker, (7, 11), 8, DEFAULT_SLOT_BYTES)?;
     server.join().map_err(|_| anyhow::anyhow!("fake SparkNest panicked"))??;
     let weights = weights.context("combined push fell back")?;
@@ -357,7 +357,8 @@ fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
         assert!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.path().join(f))),
             "without the dense error the TP2 halves would be offered");
     }
-    let (push, coordinator_streams, _) = CoordinatorTp2Push::prepare(root.path(), &catalog, &[0, 1], [usize::MAX; 2])?;
+    let (push, coordinator_streams, _) = CoordinatorPush::prepare(root.path(), Some(&catalog), 2,
+        Some((&[0, 1], vec![usize::MAX; 2])))?;
     // One Spark rank offering push, then the two coordinator ranks, in group order.
     let (mut spark_driver, mut spark) = control_pair()?;
     let spark_thread = std::thread::spawn(move || cuteafd_transport::worker_selection::push::offer(&mut spark,
@@ -375,8 +376,8 @@ fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
         Ok(prepared)
     });
     let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
-    let dense: Option<Result<([DensePlan; 2], [NoDense; 2])>> = Some(Err(anyhow::anyhow!("injected dense planning error")));
-    let (pushed, ()) = push.receive_with(devices, &catalog, sparks, dense, || ());
+    let dense: Option<Result<(Vec<DensePlan>, Vec<NoDense>)>> = Some(Err(anyhow::anyhow!("injected dense planning error")));
+    let (pushed, ()) = push.receive_with(devices.to_vec(), Some(&catalog), sparks, dense, || ());
     assert!(pushed?.is_none(), "a declined dense plan must fall back to mount");
     assert!(!driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??, "the group driver must not prepare a group");
     assert_eq!(spark_thread.join().map_err(|_| anyhow::anyhow!("spark panicked"))??, None,
