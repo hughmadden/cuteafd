@@ -336,7 +336,7 @@ impl<'a> DeliveredArena<'a> {
     /// Only omitted bytes are generated. Delivered source bytes are never
     /// replaced by zero padding, including replayed or sparse tensor images.
     pub fn zero_padding(&self) -> Result<()> {
-        self.device().run(|| {
+        let result = self.device().run(|| {
             let queued = (|| {
                 // Fold adjacent equal-width/equal-pitch gaps in constant host
                 // memory. A padded plane then needs one enqueue, not one per row.
@@ -374,10 +374,12 @@ impl<'a> DeliveredArena<'a> {
             // A failed enqueue can still leave earlier zero fills in flight.
             // SAFETY: the current device owns the default stream and arena.
             let drained = unsafe { self.device().library.cuda_stream_synchronize(std::ptr::null_mut()) };
-            if drained.is_err() { self.device().library.quarantine_module_after_failed_drain(); }
             drained?;
-            queued
-        })
+            Ok(queued)
+        });
+        // Device binding/restoration can fail outside the drain closure too.
+        if result.is_err() { self.device().library.quarantine_module_after_failed_drain(); }
+        result?
     }
     pub fn validation(&self) -> &[u8] {
         &self.validation

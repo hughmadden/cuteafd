@@ -170,6 +170,35 @@ fn padded_rows_coalesce_and_failed_zero_drains_before_free() -> Result<()> {
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn device_binding_failures_quarantine_every_post_done_drain() -> Result<()> {
+    for operation in 0..3 {
+        for id in 0..2 {
+            let fixture = Fixture::build()?;
+            let library = fixture.load()?;
+            let device = Device { library: &library, id };
+            let mut arena = Some(delivered(device, &[7; 4], 8)?);
+            let transforms = Transforms::new(device, 256, 256)?;
+            let completed = if operation == 2 { if id == 0 { 1 } else { 2 } } else { 0 };
+            fixture.configure_bind_after(&library, completed)?;
+            let result = match operation {
+                0 => arena.as_ref().unwrap().zero_padding(),
+                1 => transforms.synchronize(),
+                _ => initialize(arena.take().unwrap(), &[], None, 0).map(drop),
+            };
+            assert!(result.is_err());
+            assert!(library.is_quarantined_after_failed_drain());
+            // A later successful bind must not free storage with unproved completion.
+            fixture.configure_bind_after(&library, -1)?;
+            drop(transforms);
+            drop(arena);
+            assert!(!fixture.events()?.contains('d'));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn exl3_semantics_reject_nonfinite_and_upload_exact_descriptors() -> Result<()> {
     use cuteafd_loader::{V41Exl3Layer, V41Exl3Load, V41Exl3ResidentBuffer};
     let fixture = Fixture::build()?;

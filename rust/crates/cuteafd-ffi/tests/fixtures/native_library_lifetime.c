@@ -11,6 +11,8 @@ static char *event_path;
 static int quiet_events;
 void fixture_quiet_events(int quiet) { quiet_events = quiet; }
 static int pack_status, drain_status, drain_calls, drain_after, current_device;
+static int bind_after = -1, bind_calls;
+void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;
 
 void fixture_configure_memory(int device, size_t total, size_t used, size_t graph) {
@@ -258,7 +260,11 @@ int cuteafd_cuda_stream_destroy(void *stream) {
     return 0;
 }
 
-int cuteafd_cuda_set_device(int device) { current_device = device; return 0; }
+int cuteafd_cuda_set_device(int device) {
+    if (bind_after >= 0 && bind_calls++ >= bind_after) return 1;
+    current_device = device;
+    return 0;
+}
 
 int cuteafd_copy_h2d(struct device_buffer dst, const void *source, size_t bytes) {
     if (bytes > dst.bytes) return 1;

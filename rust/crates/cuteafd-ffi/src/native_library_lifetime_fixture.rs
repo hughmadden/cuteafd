@@ -165,6 +165,16 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn configure_bind_after(&self, library: &NativeLibrary, completed: i32) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_configure_bind_after")?;
+            configure(completed);
+        }
+        Ok(())
+    }
+
     pub fn drain(&self, library: &NativeLibrary) -> Result<()> {
         // SAFETY: the fixture's stream synchronizer accepts a null stream and
         // performs no CUDA work. Only use with this fixture's NativeLibrary.

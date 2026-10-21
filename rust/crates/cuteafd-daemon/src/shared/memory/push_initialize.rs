@@ -171,10 +171,9 @@ pub(crate) fn initialize<'a>(
         // Prove default-stream completion before discarding their borrowed arena.
         let drain = arena.device().run(|| {
             // SAFETY: the default stream belongs to the arena's current device.
-            let drain = unsafe { arena.device().library.cuda_stream_synchronize(std::ptr::null_mut()) };
-            if drain.is_err() { arena.device().library.quarantine_module_after_failed_drain(); }
-            drain
+            unsafe { arena.device().library.cuda_stream_synchronize(std::ptr::null_mut()) }
         });
+        if drain.is_err() { arena.device().library.quarantine_module_after_failed_drain(); }
         drain?;
         result
     })
@@ -202,14 +201,15 @@ impl<'a> Transforms<'a> {
         })
     }
     fn synchronize(&self) -> Result<()> {
-        self.device.run(|| {
+        let result = self.device.run(|| {
             // SAFETY: this owner retains its stream and every queued buffer.
-            let result = unsafe { self.device.library.cuda_stream_synchronize(self.stream) };
-            if result.is_err() {
-                self.device.library.quarantine_module_after_failed_drain();
-            }
-            result
-        })
+            unsafe { self.device.library.cuda_stream_synchronize(self.stream) }
+        });
+        // Failure to bind the device also leaves completion unproved.
+        if result.is_err() {
+            self.device.library.quarantine_module_after_failed_drain();
+        }
+        result
     }
     pub fn native(
         &self,
