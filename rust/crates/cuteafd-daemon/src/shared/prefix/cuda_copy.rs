@@ -386,7 +386,7 @@ mod cuda_tests {
             })?;
             let half = |buffer: CuteafdDeviceBuffer, offset| DeviceRange {
                 addr: buffer.ptr as u64 + offset, bytes: 2048 };
-            let mut pages: [Vec<DevicePage>; COMPRESSORS] = Default::default();
+            let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
             pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 0, generation: round as u32 },
                 segments: vec![half(buffers[0], 0), half(buffers[1], 0)] });
             let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind: cuteafd_hostcache::SnapshotKind::Prompt,
@@ -514,7 +514,7 @@ mod cuda_tests {
                 for (allocation, bytes) in allocations.iter().zip(&expected) {
                     allocation.device.run(|| lib.copy_h2d(allocation.buffer, bytes))?;
                 }
-                let mut pages: [Vec<DevicePage>; COMPRESSORS] = Default::default();
+                let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
                 pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 0, generation: round },
                     segments: vec![range(buffers[0]), range(buffers[2])] });
                 let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind: cuteafd_hostcache::SnapshotKind::Prompt,

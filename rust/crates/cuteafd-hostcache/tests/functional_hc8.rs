@@ -77,8 +77,8 @@ impl Ranges {
 /// them), one tail. Non-overlapping consecutive ranges from `ranges`.
 fn engine_snapshot(tokens: usize, ranges: &mut Ranges) -> DeviceSnapshot {
     let pages_per_compressor = tokens * KV_BYTES_PER_TOKEN / (PAGE_BYTES * COMPRESSORS);
-    let mut lists: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
-    for (compressor, list) in lists.iter_mut().enumerate() {
+    let mut lists: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
+    for (compressor, list) in lists.iter_mut().take(COMPRESSORS).enumerate() {
         for index in 0..pages_per_compressor {
             list.push(DevicePage {
                 id: DevicePageId {
@@ -444,8 +444,8 @@ proptest! {
         let mut cache = default_cache(8 * CHUNK as u64, StoreMode::OnRetain);
         let layout = layout();
         let mut device = Device::new(common_hc_5::DEVICE_BYTES);
-        let mut lists: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
-        for (compressor, list) in lists.iter_mut().enumerate() {
+        let mut lists: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
+        for (compressor, list) in lists.iter_mut().take(COMPRESSORS).enumerate() {
             for index in 0..pages {
                 let segments = 1 + rng.below(4) as usize;
                 let mut ranges = Vec::with_capacity(segments);

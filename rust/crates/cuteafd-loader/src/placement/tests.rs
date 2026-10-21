@@ -1668,6 +1668,34 @@ fn shared_owner_boundaries_keep_colocation_and_skip_duplicate_split_stretches() 
 }
 
 #[test]
+fn owner_solver_charges_pooled_draft_inventory_without_slot_context_replication() {
+    let req = owner_balance_request();
+    let tokens = 1usize << 20;
+    let full = tokens * 1152;
+    let windows = 4 * 8 * 4160 * 1152;
+    let cache = crate::formats::dflash::DraftCacheLayout { target_tokens: tokens,
+        page_rows: 64, pages: tokens / 64, record_bytes: 1152, full_layers: 1,
+        window_bytes: windows as u64, full_bytes: full as u64,
+        page_table_bytes: 532736, layer_bytes: vec![windows / 4; 4].into_iter()
+            .chain(std::iter::once(full)).collect() };
+    let groups = req.layers.iter().map(|_| (true, None)).collect::<Vec<_>>();
+    let (placed, inventory) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0, req.onboard,
+        |owners| -> Result<_, PlacementError> {
+            let mut candidate = req.clone();
+            for (layer, &owner) in candidate.layers.iter_mut().zip(owners) {
+                layer.modes = vec![if owner == 0 { S0 } else { S1 }];
+            }
+            candidate.movables.push(draft::DrafterDemand::itemized(cache.demands(1).unwrap(), 1).movable(2)?);
+            Ok((solve(&candidate)?, candidate))
+        }).unwrap();
+    assert_eq!(solve_frozen(&inventory, &placed).unwrap(), placed);
+    assert_eq!(group_bytes(&placed, 1, "draft shared full-context KV pool"), full as u64);
+    assert_eq!(group_bytes(&placed, 1, "draft bounded window rings"), windows as u64);
+    assert_eq!(group_bytes(&placed, 1, "draft page tables"), cache.page_table_bytes);
+    assert_eq!(group_bytes(&placed, 0, "draft shared full-context KV pool"), 0);
+}
+
+#[test]
 fn owner_specific_inventory_callback_matches_frozen_admission() {
     let req = owner_balance_request();
     let groups = req.layers.iter().map(|_| (true, None)).collect::<Vec<_>>();

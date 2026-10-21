@@ -225,6 +225,55 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     type Placement;
 
     fn layout(&self) -> FamilyLayout;
+    /// Full-context draft pages use their own host slab class, under the same quota.
+    fn draft_page_bytes(&self) -> usize { 0 }
+    /// Reserve live growth and private proposal/tail credit before request publication.
+    fn admit_draft_pages(&self, placement: &mut Self::Placement, capacity: usize) -> Result<(), BoxError> {
+        let _ = (placement, capacity);
+        Ok(())
+    }
+    /// A retired retained attachment may be reclaimed by the drafter's live admission.
+    fn draft_pages_valid(&self, attachment: &super::DraftPageAttachment) -> bool {
+        let _ = attachment;
+        true
+    }
+    /// Restore leases and pending copy events must prevent draft-only LRU eviction too.
+    fn draft_pages_revocable(&self, attachment: &super::DraftPageAttachment) -> bool {
+        let _ = attachment;
+        false
+    }
+    fn retain_draft_pages(&self, attachment: &super::DraftPageAttachment) -> Result<(), BoxError> {
+        let _ = attachment;
+        Ok(())
+    }
+    /// Capture returns owned immutable page references. Any tail copies are ordered
+    /// before publication together with the target snapshot's copies.
+    fn capture_draft_pages(&self, placement: &Self::Placement, len: usize)
+        -> Result<Option<super::DraftPageAttachment>, BoxError> {
+        let _ = (placement, len);
+        Ok(None)
+    }
+    fn release_draft_pages(&self, attachment: &super::DraftPageAttachment) -> Result<(), BoxError> {
+        let _ = attachment;
+        Err("family has no draft page release binding".into())
+    }
+    fn restore_draft_pages(&self, attachment: Option<&super::DraftPageAttachment>,
+        placement: &mut Self::Placement, frontier: usize) -> Result<(), BoxError> {
+        let _ = (placement, frontier);
+        if attachment.is_some() { return Err("family has no draft page restore binding".into()); }
+        Ok(())
+    }
+    /// Reserve destination pages for a host promotion. The returned references
+    /// stay unpublished until target and draft DMA have both completed.
+    fn promote_draft_pages(&self, saved: &super::DraftPageAttachment)
+        -> Result<super::DraftPageAttachment, BoxError> {
+        let _ = saved;
+        Err("family has no draft page restore binding".into())
+    }
+    fn draft_page_segments(&self, page: super::DraftPageId) -> Vec<DeviceRange> {
+        let _ = page;
+        Vec::new()
+    }
     /// Record schema carried by host snapshots; formats cannot share restored bytes.
     fn record_format(&self) -> &'static str {
         "opaque_v1"

@@ -39,6 +39,7 @@ pub struct MlaDraftRuntimeLayout {
     capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
     weights: crate::families::glm5::draft_representation::GlmDraftWeightLayout,
     cache: MlaDraftCacheLayout,
+    paged_cache: DraftCacheLayout,
     program: cuteafd_core::coordinator_programs::MlaDraftProgramLayout,
     fp8_scratch: Option<crate::families::glm5::draft_representation::GlmDraftFp8ScratchLayout>,
     sm_count: usize,
@@ -56,6 +57,7 @@ impl MlaDraftRuntimeLayout {
     pub fn capacity(&self) -> crate::families::glm5::draft_representation::GlmDraftCapacity { self.capacity }
     pub fn weights(&self) -> crate::families::glm5::draft_representation::GlmDraftWeightLayout { self.weights }
     pub fn cache(&self) -> &MlaDraftCacheLayout { &self.cache }
+    pub fn paged_cache(&self) -> &DraftCacheLayout { &self.paged_cache }
     pub fn program(&self) -> cuteafd_core::coordinator_programs::MlaDraftProgramLayout { self.program }
     pub fn fp8_scratch(&self) -> Option<&crate::families::glm5::draft_representation::GlmDraftFp8ScratchLayout> {
         self.fp8_scratch.as_ref()
@@ -81,7 +83,7 @@ impl MlaDraftRuntimeLayout {
         self.buffers.iter().map(&mut allocate).collect()
     }
 
-    /// SM-local scratch and every per-slot cache are mandatory on the target's
+    /// SM-local scratch, bounded rings and the shared full-layer pool stay on the target's
     /// home. Packing is a separate startup peak, never a second resident copy.
     pub fn demands(&self, gpu: u8) -> Result<(crate::placement::draft::DrafterDemand, crate::placement::Demand)> {
         use crate::placement::{draft::DrafterDemand, Demand};
@@ -118,6 +120,41 @@ pub struct MlaDraftCacheLayout {
     pub page_table_bytes: u64,
     /// Physical padding and private block rows above retained-record capacity.
     pub margin_bytes: u64,
+}
+
+/// Immutable full-layer pool and bounded-window inventory. The target's aggregate
+/// token budget is independent of both request count and checkpoint context extent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftCacheLayout {
+    pub target_tokens: usize,
+    pub page_rows: usize,
+    pub pages: usize,
+    pub record_bytes: usize,
+    pub full_layers: usize,
+    pub window_bytes: u64,
+    pub full_bytes: u64,
+    pub page_table_bytes: u64,
+    pub layer_bytes: Vec<usize>,
+}
+
+impl DraftCacheLayout {
+    pub fn cache_bytes(&self) -> Result<u64> {
+        self.full_bytes.checked_add(self.window_bytes)
+            .ok_or_else(|| unsupported("draft pool total overflow"))
+    }
+
+    /// Owner balancing moves the same inventory runtime allocates, not a per-slot
+    /// estimate. The one chosen owner holds every full-layer segment of a page ID.
+    pub fn demands(&self, gpu: u8) -> Result<Vec<crate::placement::Demand>> {
+        use crate::placement::Demand;
+        use cuteafd_core::memory_layout::{Basis, Category};
+        Ok(vec![Demand::new(gpu, Category::Drafter, "draft shared full-context KV pool",
+                self.full_bytes, Basis::Formula),
+            Demand::new(gpu, Category::Drafter, "draft bounded window rings",
+                self.window_bytes, Basis::Formula),
+            Demand::new(gpu, Category::Drafter, "draft page tables",
+                self.page_table_bytes, Basis::Formula)])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +228,16 @@ impl MlaDraftCacheState {
         Ok(())
     }
 
+    /// Bind exact saved metadata after the owner has restored every retained ring row.
+    pub fn restore_frontier(&mut self, slot: usize, origin: usize, end: usize) -> Result<()> {
+        if end < origin || end > self.layout.layers[0].context {
+            return Err(unsupported("MLA draft saved frontier outside context"));
+        }
+        self.reset(slot, origin)?;
+        self.slots[slot] = Some(MlaDraftFrontier { origin, end });
+        Ok(())
+    }
+
     pub fn discard(&mut self, slot: usize) -> Result<()> {
         *self.slots.get_mut(slot).ok_or_else(|| unsupported("MLA draft discard outside slots"))? = None;
         Ok(())
@@ -246,6 +293,9 @@ impl MlaDraftCacheLayer {
     pub fn rows_per_slot(&self) -> usize { self.rows_per_slot }
     pub fn table_width(&self) -> usize { self.table_width }
     pub fn slots(&self) -> usize { self.slots }
+    pub fn window(&self) -> Option<usize> { self.window }
+    pub fn context(&self) -> usize { self.context }
+    pub fn block(&self) -> usize { self.block }
 
     pub fn bind(&self, slot: usize, valid_from: usize) -> Result<MlaDraftCacheSlot> {
         if slot >= self.slots || valid_from >= self.context {
@@ -529,11 +579,12 @@ impl MlaDflashConfig {
 
     /// One checked inventory for the shared executor's common buffers and the
     /// native MLA branch. Native work is chunked, not replicated per layer or
-    /// scheduler sequence; only the retained cache scales with admitted slots.
+    /// scheduler sequence. Only bounded rings and page tables scale with slots;
+    /// full-context records scale with the target's aggregate token budget.
     pub fn runtime_layout(&self,
         mode: crate::families::glm5::draft_representation::GlmDraftRepresentation,
         capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
-        compiled_context: usize, sm_count: usize, fp8_mode: u8) -> Result<MlaDraftRuntimeLayout> {
+        compiled_context: usize, target_pool_tokens: usize, sm_count: usize, fp8_mode: u8) -> Result<MlaDraftRuntimeLayout> {
         use crate::families::glm5::draft_representation::{draft_fp8_scratch_bytes,
             GlmDraftCapacity, GlmDraftFp8ScratchLayout, GlmDraftLinearShape, GlmDraftRepresentation};
         use cuteafd_core::coordinator_programs::MlaDraftProgramLayout;
@@ -552,6 +603,7 @@ impl MlaDflashConfig {
         }
         let program = self.program_layout(compiled_context)?;
         let cache = self.cache_layout(capacity.context_slots, compiled_context)?;
+        let paged_cache = self.paged_cache_layout(capacity.context_slots, compiled_context, target_pool_tokens)?;
         let mut weights = self.weight_layout(mode)?;
         let fp8 = mode == GlmDraftRepresentation::Fp8Only;
         let (h, inter, rows, seq) = (self.mla.hidden, self.intermediate,
@@ -567,7 +619,7 @@ impl MlaDflashConfig {
             Ok(())
         };
         for (index, layer) in cache.layers.iter().enumerate() {
-            add(format!("layer.{index}.cache"), &[layer.rows_per_slot, layer.slots, 1152])?;
+            add(format!("layer.{index}.cache"), &[paged_cache.layer_bytes[index]])?;
             add(format!("layer.{index}.page_table"), &[layer.table_width, layer.slots, 4])?;
         }
         // Absolute RoPE inputs and origin-relative cache destinations are I64.
@@ -615,9 +667,44 @@ impl MlaDflashConfig {
             Some(GlmDraftFp8ScratchLayout { rows: scratch_rows, shapes })
         } else { None };
         let layout = MlaDraftRuntimeLayout { target_hidden: h, target_vocab: self.vocab,
-            target_taps: self.taps.clone(), capacity, weights, cache, program,
+            target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch, sm_count, fp8_mode, buffers };
         layout.resident_bytes()?;
+        Ok(layout)
+    }
+
+    /// Full-context pages come from the target's aggregate token budget. Window
+    /// rings retain their existing per-request append slack and table geometry.
+    pub fn paged_cache_layout(&self, slots: usize, context: usize, target_tokens: usize)
+        -> Result<DraftCacheLayout> {
+        let source = self.cache_layout(slots, context)?;
+        let pages = target_tokens.div_ceil(64);
+        if target_tokens == 0 || pages > i32::MAX as usize {
+            return Err(unsupported("draft pool token budget outside native page limits"));
+        }
+        let overflow = || unsupported("draft paged layout overflow");
+        let record_bytes = self.mla.kv_rank.checked_add(self.mla.rope)
+            .and_then(|n| n.checked_mul(2)).ok_or_else(overflow)?;
+        let full_layer = pages.checked_mul(64).and_then(|n| n.checked_mul(record_bytes))
+            .ok_or_else(overflow)?;
+        let (mut window_bytes, mut full_bytes, mut full_layers) = (0u64, 0u64, 0usize);
+        let mut layer_bytes = Vec::with_capacity(source.layers.len());
+        for layer in &source.layers {
+            let bytes = if layer.window.is_none() {
+                full_layers += 1;
+                full_bytes = full_bytes.checked_add(full_layer as u64).ok_or_else(overflow)?;
+                full_layer
+            } else {
+                let bytes = layer.rows_per_slot.checked_mul(slots)
+                    .and_then(|n| n.checked_mul(record_bytes)).ok_or_else(overflow)?;
+                window_bytes = window_bytes.checked_add(bytes as u64).ok_or_else(overflow)?;
+                bytes
+            };
+            layer_bytes.push(bytes);
+        }
+        let layout = DraftCacheLayout { target_tokens, page_rows: 64, pages, record_bytes,
+            full_layers, window_bytes, full_bytes, page_table_bytes: source.page_table_bytes, layer_bytes };
+        layout.cache_bytes()?;
         Ok(layout)
     }
 
@@ -746,7 +833,7 @@ mod tests {
             for sms in [170, 188] {
                 for mode in [Bf16Only, Fp8Only] {
                     let capacity = GlmDraftCapacity::new(8, 8, 8).unwrap();
-                    let layout = cfg.runtime_layout(mode, capacity, context, sms, 2).unwrap();
+                    let layout = cfg.runtime_layout(mode, capacity, context, context, sms, 2).unwrap();
                     let allocated = layout.allocate_with(|b| Ok::<_, ()>((b.name.clone(), b.bytes))).unwrap();
                     let bytes = |name: &str| allocated.iter().find(|(n, _)| n == name).unwrap().1;
                     assert_eq!(bytes("query"), 64 * 64 * 576 * 2);
@@ -756,7 +843,7 @@ mod tests {
                     assert_eq!(bytes("taps"), 2048 * 5 * 7168 * 2);
                     assert_eq!(bytes("logits"), 64 * 163840 * 4);
                     assert_eq!(bytes("layer.0.cache"), 8 * 4160 * 1152);
-                    assert_eq!(bytes("layer.4.cache"), 8 * context * 1152);
+                    assert_eq!(bytes("layer.4.cache"), context * 1152);
                     assert_eq!(bytes("layer.4.page_table"), 8 * context / 64 * 4);
                     assert_eq!(bytes("topk_workspace"), 56 * 64 * 16 * 8);
                     assert_eq!(allocated.iter().map(|(_, b)| *b as u64).sum::<u64>(), layout.buffer_bytes().unwrap());
@@ -771,7 +858,7 @@ mod tests {
                     assert_eq!(layout.fp8_scratch.is_some(), mode == Fp8Only);
                     let cache_sum = allocated.iter().filter(|(n, _)| n.ends_with(".cache"))
                         .map(|(_, n)| *n as u64).sum::<u64>();
-                    assert_eq!(cache_sum, layout.cache.cache_bytes);
+                    assert_eq!(cache_sum, layout.paged_cache.cache_bytes().unwrap());
                 }
             }
         }
@@ -782,14 +869,14 @@ mod tests {
         use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::Fp8Only};
         let cfg = MlaDflashConfig::from_json(&config()).unwrap();
         let make = |slots, sequences, sms| cfg.runtime_layout(Fp8Only,
-            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), 262144, sms, 2).unwrap();
+            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), 262144, 262144, sms, 2).unwrap();
         let eight = make(8, 8, 188);
         let sixteen = make(16, 16, 188);
         let bytes = |l: &MlaDraftRuntimeLayout, name| l.buffers().iter().find(|b| b.name == name).unwrap().bytes;
-        for name in ["query", "q_residual", "attention", "lse", "native_scratch"] {
+        for name in ["query", "q_residual", "attention", "lse", "native_scratch", "layer.4.cache"] {
             assert_eq!(bytes(&eight, name), bytes(&sixteen, name));
         }
-        for name in ["h", "gate_up", "logits", "layer.0.cache", "layer.4.cache", "layer.4.page_table"] {
+        for name in ["h", "gate_up", "logits", "layer.0.cache", "layer.4.page_table"] {
             assert_eq!(2 * bytes(&eight, name), bytes(&sixteen, name));
         }
         assert_eq!(sixteen.capacity.max_batch_sequences, 16);
@@ -812,16 +899,16 @@ mod tests {
         let capacity = GlmDraftCapacity::new(8, 8, 8).unwrap();
         let mut bad = capacity;
         bad.block_rows += 1;
-        assert!(cfg.runtime_layout(Bf16Only, bad, 262144, 188, 0).is_err());
+        assert!(cfg.runtime_layout(Bf16Only, bad, 262144, 262144, 188, 0).is_err());
         for (context, sms, mode) in [(0,188,0), (1048577,188,0), (262144,0,0), (262144,4097,0), (262144,188,3)] {
-            assert!(cfg.runtime_layout(Fp8Only, capacity, context, sms, mode).is_err());
+            assert!(cfg.runtime_layout(Fp8Only, capacity, context, 262144, sms, mode).is_err());
         }
         cfg.intermediate = 32768;
-        let layout = cfg.runtime_layout(Fp8Only, capacity, 262144, 188, 2).unwrap();
+        let layout = cfg.runtime_layout(Fp8Only, capacity, 262144, 262144, 188, 2).unwrap();
         assert_eq!(layout.weights.max_load_staging, 2 * 2 * 32768 * 7168);
         assert!(layout.fp8_scratch.as_ref().unwrap().shapes.iter().any(|s| s.n == 65536 && s.k == 7168));
         cfg.mla.hidden = usize::MAX;
-        assert!(cfg.runtime_layout(Bf16Only, capacity, 262144, 188, 0).is_err());
+        assert!(cfg.runtime_layout(Bf16Only, capacity, 262144, 262144, 188, 0).is_err());
     }
 
     #[test]
@@ -849,6 +936,28 @@ mod tests {
         unsupported.intermediate += 1;
         assert!(unsupported.weight_layout(Fp8Only).is_err());
         assert!(unsupported.weight_layout(Bf16Only).is_ok());
+    }
+
+    #[test]
+    fn pooled_full_layers_charge_target_tokens_not_slots_times_context() {
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        let tokens = 1 << 20;
+        for slots in [1, 8, 20] {
+            let layout = cfg.paged_cache_layout(slots, tokens, tokens).unwrap();
+            assert_eq!(layout.pages, tokens / 64);
+            assert_eq!(layout.full_layers, 1);
+            assert_eq!(layout.full_bytes, tokens as u64 * 1152);
+            assert_eq!(layout.window_bytes, 4 * slots as u64 * 4160 * 1152);
+            assert_eq!(layout.layer_bytes.iter().sum::<usize>() as u64, layout.cache_bytes().unwrap());
+            assert_eq!(layout.demands(1).unwrap().iter().map(|d| d.bytes).sum::<u64>(),
+                layout.cache_bytes().unwrap() + layout.page_table_bytes);
+        }
+        let layout = cfg.paged_cache_layout(8, tokens, tokens).unwrap();
+        assert_eq!(layout.cache_bytes().unwrap(), 1_361_313_792);
+        assert_eq!(cfg.paged_cache_layout(8, 262144, tokens).unwrap().full_bytes, layout.full_bytes);
+        assert_eq!(cfg.paged_cache_layout(8, tokens, 65).unwrap().full_bytes, 128 * 1152);
+        assert!(cfg.paged_cache_layout(8, tokens, 0).is_err());
+        assert!(cfg.paged_cache_layout(8, tokens, usize::MAX).is_err());
     }
 
     #[test]

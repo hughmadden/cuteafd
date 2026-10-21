@@ -946,7 +946,7 @@ mod tests {
         assert_eq!(page.iter().map(|r| r.bytes).sum::<usize>(), unit);
         let marks = (0..2).map(|gpu| DeviceRange { addr: (gpu * gpu_bytes + unit * 2) as u64, bytes: 17 })
             .collect::<Vec<_>>();
-        let layout = Layout { page: unit, tail: 34, draft: 0, scores: 0 };
+        let layout = Layout { page: unit, tail: 34, draft: 0, scores: 0 , draft_page: 0};
         let config = Config { bytes: 1 << 26, chunk_bytes: 1 << 22, min_tokens: 1, ..Default::default() };
         for (src, dst) in &replicas {
             memory.write_device(*src, &vec![5; src.bytes]);
@@ -956,7 +956,7 @@ mod tests {
         let mut host = HostCache::with_rule(config, layout, memory, ReuseRule::EXACT,
             cuteafd_hostcache::snapshot::EvictionOrder::LeastRecent).unwrap();
         for (kind, tokens) in [(SnapshotKind::Prompt, vec![1, 2]), (SnapshotKind::Turn, vec![1, 2, 3])] {
-            let mut pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
+            let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
             pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 1, generation: 1 }, segments: page.clone() });
             let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind, end: tokens.len() as u32, tokens: tokens.clone(),
                 has_draft: false }, pages: pages.clone(), tail: marks.clone(), draft: None, scores: vec![] };

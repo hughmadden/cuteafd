@@ -122,6 +122,12 @@ struct Fake {
     pooled: bool,
     /// Leading pool pages never handed out (a pooled fake reserves page 0, the stand-in).
     reserved: usize,
+    draft: RefCell<Option<DraftFixture>>,
+}
+
+struct DraftFixture {
+    pool: DraftPagePool,
+    bindings: Vec<Option<DraftBinding>>,
 }
 
 impl Fake {
@@ -129,7 +135,7 @@ impl Fake {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
         Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
-            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0 }
+            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
     /// out, past the reserved page 0.
@@ -145,6 +151,19 @@ impl Fake {
             mark_bytes: if self.markless { 0 } else { WINDOW * ROW }, draft_bytes: 0, rule: self.rule,
             mark_store: if self.pooled { MarkStore::Pool { pages: MARK_PAGES, reserved: self.reserved } }
                 else { MarkStore::Arena }, page_owners: Default::default() }
+    }
+    fn draft_range(&self, page: u32) -> DeviceRange {
+        DeviceRange { addr: ((self.pages * ROWS + self.rings * RING + self.slots * WINDOW) * ROW
+            + page as usize * DRAFT_PAGE_ROWS * ROW) as u64, bytes: DRAFT_PAGE_ROWS * ROW }
+    }
+    fn draft_copies(&self, copies: Vec<TailCopy>) {
+        for copy in copies {
+            let mut from = self.draft_range(copy.from);
+            let mut to = self.draft_range(copy.to);
+            from.bytes = copy.rows * ROW;
+            to.bytes = from.bytes;
+            self.queue.borrow_mut().push(Op::Copy(from, to));
+        }
     }
     /// Row `i` of the mark held in pool `pages`.
     fn mark_row(&self, pages: &[u32], i: usize) -> DeviceRange {
@@ -217,6 +236,80 @@ impl PrefixFamily for Fake {
     fn layout(&self) -> FamilyLayout {
         Fake::layout(self)
     }
+    fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if let Some(draft) = self.draft.borrow_mut().as_mut() {
+            if let Some(binding) = draft.bindings[placement.ring].take() { draft.pool.release(binding)?; }
+        }
+        Ok(())
+    }
+    fn draft_page_bytes(&self) -> usize {
+        if self.draft.borrow().is_some() { DRAFT_PAGE_ROWS * ROW } else { 0 }
+    }
+    fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
+        let mut draft = self.draft.borrow_mut();
+        let Some(draft) = draft.as_mut() else { return Ok(()) };
+        let binding = match draft.bindings[placement.ring] {
+            Some(binding) => binding,
+            None => {
+                let binding = draft.pool.bind(placement.ring, placement.len)?;
+                draft.bindings[placement.ring] = Some(binding);
+                binding
+            }
+        };
+        draft.pool.admit(binding, capacity, 8)?;
+        Ok(())
+    }
+    fn draft_pages_valid(&self, attachment: &DraftPageAttachment) -> bool {
+        self.draft.borrow().as_ref().is_some_and(|d| d.pool.check_attachment(attachment).is_ok())
+    }
+    fn draft_pages_revocable(&self, attachment: &DraftPageAttachment) -> bool {
+        self.draft.borrow().as_ref().is_some_and(|d| d.pool.snapshot_revocable(attachment.snapshot))
+    }
+    fn retain_draft_pages(&self, attachment: &DraftPageAttachment) -> Result<(), BoxError> {
+        self.draft.borrow_mut().as_mut().ok_or("missing draft pool")?.pool.retain_snapshot(attachment.snapshot)?;
+        Ok(())
+    }
+    fn capture_draft_pages(&self, placement: &Placement, len: usize) -> Result<Option<DraftPageAttachment>, BoxError> {
+        let mut draft = self.draft.borrow_mut();
+        let Some(draft) = draft.as_mut() else { return Ok(None) };
+        let binding = draft.bindings[placement.ring].ok_or("missing draft binding")?;
+        assert_eq!(draft.pool.frontier(binding)?.1, len);
+        let (snapshot, copies) = draft.pool.capture_writable(binding, self.write_frontier(len))?;
+        self.draft_copies(copies);
+        Ok(Some(draft.pool.attachment(snapshot)?))
+    }
+    fn release_draft_pages(&self, attachment: &DraftPageAttachment) -> Result<(), BoxError> {
+        let mut draft = self.draft.borrow_mut();
+        let draft = draft.as_mut().ok_or("missing draft pool")?;
+        draft.pool.check_attachment(attachment)?;
+        draft.pool.release_snapshot(attachment.snapshot)?;
+        Ok(())
+    }
+    fn restore_draft_pages(&self, attachment: Option<&DraftPageAttachment>, placement: &mut Placement,
+        frontier: usize) -> Result<(), BoxError> {
+        let mut draft = self.draft.borrow_mut();
+        let Some(draft) = draft.as_mut() else { return Ok(()) };
+        if let Some(old) = draft.bindings[placement.ring].take() { draft.pool.release(old)?; }
+        let binding = if let Some(attachment) = attachment {
+            draft.pool.check_attachment(attachment)?;
+            draft.pool.pin_snapshot(attachment.snapshot)?;
+            let (binding, copies) = match draft.pool.restore_writable(placement.ring, attachment.snapshot,
+                frontier, self.write_frontier(frontier)) {
+                Ok(restored) => restored,
+                Err(error) => { draft.pool.unpin_snapshot(attachment.snapshot)?; return Err(error.into()); }
+            };
+            self.draft_copies(copies);
+            self.flush();
+            draft.pool.unpin_snapshot(attachment.snapshot)?;
+            binding
+        } else { draft.pool.bind(placement.ring, frontier)? };
+        draft.bindings[placement.ring] = Some(binding);
+        Ok(())
+    }
+    fn promote_draft_pages(&self, saved: &DraftPageAttachment) -> Result<DraftPageAttachment, BoxError> {
+        Ok(self.draft.borrow_mut().as_mut().ok_or("missing draft pool")?.pool.promote(saved)?)
+    }
+    fn draft_page_segments(&self, page: DraftPageId) -> Vec<DeviceRange> { vec![self.draft_range(page.index)] }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] {
         &placement.pages
     }
@@ -628,6 +721,138 @@ fn host_tier_restores_evicted_snapshots_exactly_and_shares_identical_prefixes() 
     longer.push(7);
     fake.forward(&mut p, &longer).unwrap();
     cache.release(&fake, &p.pages).unwrap();
+}
+
+#[test]
+fn draft_pressure_evicts_only_retention_and_guarantees_live_proposal_credit() {
+    let fake = Fake::new(256, 3, 16);
+    let draft_tokens = 12 * 64;
+    let bytes = fake.draft_range(0).addr as usize + draft_tokens * ROW;
+    *fake.mem.borrow_mut() = StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26);
+    *fake.draft.borrow_mut() = Some(DraftFixture {
+        pool: DraftPagePool::new(draft_tokens, 3, 4096, 23).unwrap(), bindings: vec![None; 3],
+    });
+    let mut cache: PrefixCache<Shared> = PrefixCache::new_with_draft_pages(fake.layout(),
+        config(16, 16), None, fake.draft_page_bytes()).unwrap();
+    for n in 0..10 {
+        let tokens = seq(100 + n, 64);
+        let mut p = cache.admit_cold(&fake, 64, 64,
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = fake.forward(&mut p, &tokens).unwrap();
+        {
+            let mut draft = fake.draft.borrow_mut();
+            let draft = draft.as_mut().unwrap();
+            let binding = draft.bindings[0].unwrap();
+            let producer = draft.pool.reserve(binding, 0, 64).unwrap();
+            draft.pool.commit(producer, 64).unwrap();
+        }
+        cache.capture(&fake, SnapshotKind::Turn, &tokens, &p, After::from_logits(&logits, true)).unwrap();
+        fake.discard(&mut p).unwrap();
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    assert_eq!(cache.stats().entries_turn, 10);
+    let before = fake.draft.borrow().as_ref().unwrap().pool.free();
+    assert!(before <= 3);
+    let mut live = Vec::new();
+    for slot in 0..3 {
+        live.push(cache.admit_cold(&fake, 65, 65,
+            |pages| Placement { pages, ring: slot, len: 0, ring_from: 0 }).unwrap().placement);
+    }
+    // Every old draft attachment was revoked, but all target snapshots survive.
+    assert_eq!(cache.stats().entries_turn, 10);
+    {
+        let mut draft = fake.draft.borrow_mut();
+        let draft = draft.as_mut().unwrap();
+        for slot in 0..3 {
+            let binding = draft.bindings[slot].unwrap();
+            let rows = draft.pool.reserve(binding, 0, 65).unwrap();
+            draft.pool.commit(rows, 65).unwrap();
+            let proposal = draft.pool.reserve(binding, 65, 8).unwrap();
+            draft.pool.commit(proposal, 0).unwrap();
+        }
+    }
+    for p in &mut live { fake.discard(p).unwrap(); cache.release(&fake, &p.pages).unwrap(); }
+    // Draft-only revocation never turns a valid target hit into a miss. Its drafter
+    // binds cold at P, with no historical page from a previous slot occupant.
+    let prompt = seq(100, 64);
+    let mut hit = cache.admit(&fake, &prompt, 0, false,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(hit.resume, 64);
+    let binding = fake.draft.borrow().as_ref().unwrap().bindings[0].unwrap();
+    assert_eq!(fake.draft.borrow().as_ref().unwrap().pool.frontier(binding).unwrap(), (64, 64));
+    fake.discard(&mut hit.placement).unwrap();
+    cache.release(&fake, &hit.placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(fake.draft.borrow().as_ref().unwrap().pool.free(), 12);
+}
+
+#[test]
+fn typed_draft_pages_follow_target_device_and_host_restores_exactly() {
+    for frontier in [63usize, 64, 65] {
+        let mut fake = Fake::new(80, 4, 8);
+        fake.writable_lag = 1;
+        let draft_tokens = 2048;
+        let device_bytes = fake.draft_range(0).addr as usize + draft_tokens * ROW;
+        *fake.mem.borrow_mut() = StubCopyEngine::new(CopyModel::default(), device_bytes, 1 << 26);
+        *fake.draft.borrow_mut() = Some(DraftFixture {
+            pool: DraftPagePool::new(draft_tokens, 4, 4096, 23).unwrap(), bindings: vec![None; 4],
+        });
+        let host = HostConfig { bytes: 1 << 20, chunk_bytes: 1 << 16, min_tokens: 1, ..HostConfig::default() };
+        let mut cache = PrefixCache::new_with_draft_pages(fake.layout(), config(8, 8),
+            Some((host, Shared(fake.mem.clone()))), fake.draft_page_bytes()).unwrap();
+        let tokens = seq(100, frontier);
+        let mut p = cache.admit_cold(&fake, frontier, 0,
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = fake.forward(&mut p, &tokens).unwrap();
+        {
+            let mut state = fake.draft.borrow_mut();
+            let state = state.as_mut().unwrap();
+            let binding = state.bindings[0].unwrap();
+            let reservation = state.pool.reserve(binding, 0, frontier).unwrap();
+            for (position, physical) in state.pool.destinations(reservation).unwrap().into_iter().enumerate() {
+                let range = DeviceRange { addr: fake.draft_range(0).addr + physical as u64 * ROW as u64, bytes: ROW };
+                fake.mem.borrow_mut().write_device(range, &(position as u64 + 1).to_le_bytes());
+            }
+            state.pool.commit(reservation, frontier).unwrap();
+            state.bindings[0] = Some(binding);
+        }
+        cache.capture(&fake, SnapshotKind::Turn, &tokens, &p, After::from_logits(&logits, true)).unwrap();
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        assert_eq!(cache.stats().host.unwrap().stores_completed, 1);
+        cache.release(&fake, &p.pages).unwrap();
+        // First the device attachment, then the same snapshot after device eviction.
+        for host_hit in [false, true] {
+            if host_hit { cache.clear(&fake).unwrap(); }
+            let admitted = cache.admit(&fake, &tokens, 0, false,
+                |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+            assert_eq!(admitted.resume, frontier);
+            fake.forward(&mut { admitted.placement.clone() }, &tokens).unwrap();
+            fake.drain().unwrap();
+            let mut state = fake.draft.borrow_mut();
+            let state = state.as_mut().unwrap();
+            let binding = state.bindings[1].unwrap();
+            assert_eq!(state.pool.frontier(binding).unwrap(), (0, frontier));
+            let proposal = state.pool.reserve(binding, frontier, 1).unwrap();
+            let pages = state.pool.page_table(proposal).unwrap();
+            for position in 0..frontier {
+                let row = pages[position / 64] as u64 * 64 + (position % 64) as u64;
+                let range = DeviceRange { addr: fake.draft_range(0).addr + row * ROW as u64, bytes: ROW };
+                assert_eq!(fake.mem.borrow().read_device(range), (position as u64 + 1).to_le_bytes());
+            }
+            state.pool.commit(proposal, 0).unwrap();
+            state.pool.release(binding).unwrap();
+            state.bindings[1] = None;
+            cache.release(&fake, &admitted.placement.pages).unwrap();
+        }
+        assert_eq!(cache.stats().promotions, 1);
+        cache.clear(&fake).unwrap();
+        let mut state = fake.draft.borrow_mut();
+        let state = state.as_mut().unwrap();
+        state.pool.release(state.bindings[0].take().unwrap()).unwrap();
+        assert_eq!(state.pool.free(), state.pool.capacity());
+        assert!(cache.stats().host.unwrap().bytes_used <= 1 << 20);
+    }
 }
 
 #[test]

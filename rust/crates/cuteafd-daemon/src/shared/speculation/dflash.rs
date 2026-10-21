@@ -472,10 +472,115 @@ enum DraftContext<'a> {
 
 struct GqaContext<'a> { kv: Dev<'a>, slots: Dev<'a> }
 
+// Keep exhaustion downcastable across the family adapter's boxed error boundary.
+fn box_draft_page_error(error: anyhow::Error) -> cuteafd_engine::prefix::BoxError {
+    match error.downcast::<cuteafd_engine::prefix::DraftPageError>() {
+        Ok(error) => Box::new(error),
+        Err(error) => error.into(),
+    }
+}
+
+struct MlaPagedState {
+    rings: cuteafd_loader::formats::dflash::MlaDraftCacheState,
+    pool: cuteafd_engine::prefix::DraftPagePool,
+    bindings: Vec<Option<cuteafd_engine::prefix::DraftBinding>>,
+}
+
+impl MlaPagedState {
+    fn new(layout: &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout) -> Result<Self> {
+        use std::hash::{Hash, Hasher};
+        let mut identity = std::collections::hash_map::DefaultHasher::new();
+        (layout.program().context, layout.target_hidden(), layout.target_vocab(), layout.target_taps(),
+            layout.paged_cache().target_tokens, layout.paged_cache().record_bytes).hash(&mut identity);
+        for layer in &layout.cache().layers { layer.window().hash(&mut identity); }
+        Ok(Self { rings: cuteafd_loader::formats::dflash::MlaDraftCacheState::new(layout.cache().clone())?,
+            pool: cuteafd_engine::prefix::DraftPagePool::new(layout.paged_cache().target_tokens,
+                layout.capacity().context_slots, layout.program().context, identity.finish())?,
+            bindings: vec![None; layout.capacity().context_slots] })
+    }
+
+    fn reset(&mut self, slot: usize, origin: usize) -> Result<()> {
+        // Validate the ring geometry before dropping the previous request's ownership.
+        let mut rings = self.rings.clone();
+        rings.reset(slot, origin)?;
+        self.discard(slot)?;
+        self.bindings[slot] = Some(self.pool.bind(slot, origin)?);
+        self.rings = rings;
+        Ok(())
+    }
+
+    fn discard(&mut self, slot: usize) -> Result<()> {
+        let binding = self.bindings.get_mut(slot).context("MLA draft slot outside capacity")?.take();
+        if let Some(binding) = binding { self.pool.release(binding)?; }
+        self.rings.discard(slot)?;
+        Ok(())
+    }
+
+    fn block_batches(&self, layer: usize,
+        requests: &[cuteafd_loader::formats::dflash::MlaDraftCacheRequest],
+        reservations: &[cuteafd_engine::prefix::DraftReservation],
+        full: bool) -> Result<Vec<cuteafd_loader::formats::dflash::MlaDraftCacheBatch>> {
+        let mut batches = self.rings.block_batches(layer, requests)?;
+        if !full { return Ok(batches); }
+        for batch in &mut batches {
+            batch.slots.clear();
+            batch.page_table.clear();
+            for index in batch.first_sequence..batch.first_sequence + batch.lengths.len() {
+                batch.slots.extend(self.pool.destinations(reservations[index])?);
+                let pages = self.pool.page_table(reservations[index])?;
+                ensure!(pages.len() <= batch.page_table_width, "MLA draft pooled table exceeds context view");
+                batch.page_table.extend_from_slice(&pages);
+                batch.page_table.resize(batch.page_table.len() + batch.page_table_width - pages.len(), 0);
+            }
+        }
+        Ok(batches)
+    }
+
+    fn reserve(&mut self, slot: usize, start: usize, rows: usize)
+        -> Result<cuteafd_engine::prefix::DraftReservation> {
+        let binding = self.bindings.get(slot).copied().flatten().context("MLA draft unbound slot")?;
+        Ok(self.pool.reserve(binding, start, rows)?)
+    }
+}
+
+/// A failed enqueue cannot recycle any destinations until the owned stream retires.
+struct MlaPageLease<'c, 'a> {
+    context: &'c MlaContext<'a>,
+    library: &'a NativeLibrary,
+    stream: *mut c_void,
+    reservations: Vec<cuteafd_engine::prefix::DraftReservation>,
+}
+
+impl MlaPageLease<'_, '_> {
+    fn commit(mut self) -> Result<()> {
+        let mut state = self.context.state.borrow_mut();
+        while let Some(&reservation) = self.reservations.last() {
+            state.pool.commit(reservation, reservation.end() - reservation.start())?;
+            self.reservations.pop();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MlaPageLease<'_, '_> {
+    fn drop(&mut self) {
+        if self.reservations.is_empty() { return; }
+        // SAFETY: this lease retains its destinations on the drafter's live owned stream.
+        if unsafe { self.library.cuda_stream_synchronize(self.stream) }.is_err() {
+            // Failed retirement deliberately retains ownership: never reuse live storage.
+            return;
+        }
+        let mut state = self.context.state.borrow_mut();
+        for reservation in self.reservations.drain(..) {
+            let _ = state.pool.commit(reservation, 0);
+        }
+    }
+}
+
 struct MlaContext<'a> {
     cfg: cuteafd_loader::formats::dflash::MlaDflashConfig,
     layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
-    state: RefCell<cuteafd_loader::formats::dflash::MlaDraftCacheState>,
+    state: RefCell<MlaPagedState>,
     slots: Dev<'a>,
 }
 
@@ -614,6 +719,35 @@ struct MlaContextUpdate {
 }
 
 impl MlaContextUpdate {
+    fn checked_paged(state: &mut MlaPagedState,
+        layout: &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout, rows: &[ContextRow])
+        -> Result<(Self, Vec<cuteafd_engine::prefix::DraftReservation>)> {
+        let mut plan = Self::checked(&state.rings, layout.cache().layers.len(), rows)?;
+        let mut reservations = Vec::new();
+        let result = (|| -> Result<()> {
+            let mut grouped = std::collections::BTreeMap::<usize, Vec<&ContextRow>>::new();
+            for row in rows { grouped.entry(row.slot).or_default().push(row); }
+            for (slot, mut group) in grouped {
+                group.sort_unstable_by_key(|r| r.position);
+                let reservation = state.reserve(slot, group[0].position, group.len())?;
+                reservations.push(reservation);
+                let physical = state.pool.destinations(reservation)?;
+                for (layer, destinations) in plan.slots.iter_mut().enumerate() {
+                    if layout.cache().layers[layer].window().is_some() { continue; }
+                    for (row, &physical) in group.iter().zip(&physical) {
+                        destinations[row.tap_row - plan.first] = physical;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for reservation in reservations { state.pool.commit(reservation, 0)?; }
+            return Err(error);
+        }
+        Ok((plan, reservations))
+    }
+
     fn checked(state: &cuteafd_loader::formats::dflash::MlaDraftCacheState,
         layers: usize, rows: &[ContextRow]) -> Result<Self> {
         ensure!(!rows.is_empty(), "MLA draft empty context update");
@@ -1031,11 +1165,11 @@ impl<'a> DflashDrafter<'a> {
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
         use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
-        use cuteafd_loader::formats::{dflash::{MlaDflashConfig, MlaDraftCacheState}, mla::{self, MlaOperand}};
+        use cuteafd_loader::formats::{dflash::MlaDflashConfig, mla::{self, MlaOperand}};
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let native = MlaDflashConfig::read(snapshot)?;
         ensure!(native.runtime_layout(representation, layout.capacity(), layout.program().context,
-            library.sm_count()?, fp8_rows.code() as u8)? == layout,
+            layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8)? == layout,
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
         let checkpoint = Checkpoint { data: file, tensors: read_safetensors_metadata(&snapshot.join("model.safetensors"))?
@@ -1111,7 +1245,7 @@ impl<'a> DflashDrafter<'a> {
             successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?, layers,
             taps: owners.take("taps")?, fused: owners.take("fused")?, fused_norm: owners.take("fused_norm")?,
             context_positions: owners.take("context_positions")?,
-            context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaDraftCacheState::new(layout.cache().clone())?),
+            context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
                 layout, slots: owners.take("context_slots")? }),
             mask_row: Vec::new(), workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
@@ -1316,18 +1450,171 @@ impl<'a> DflashDrafter<'a> {
 
     pub(crate) fn reset_context(&self, slot: usize, origin: usize) -> Result<()> {
         ensure!(slot < self.slots, "DFlash reset outside admitted slots");
-        if let DraftContext::Mla(context) = &self.context { context.state.borrow_mut().reset(slot, origin)?; }
+        if let DraftContext::Mla(context) = &self.context {
+            // SAFETY: rebind retires the old request before its pooled destinations are released.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            context.state.borrow_mut().reset(slot, origin)?;
+        }
         Ok(())
     }
 
     pub(crate) fn discard_context(&self, slot: usize) -> Result<()> {
         ensure!(slot < self.slots, "DFlash discard outside admitted slots");
-        if let DraftContext::Mla(context) = &self.context { context.state.borrow_mut().discard(slot)?; }
+        if let DraftContext::Mla(context) = &self.context {
+            // SAFETY: cancellation cannot recycle pages still addressed by queued work.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            context.state.borrow_mut().discard(slot)?;
+        }
+        Ok(())
+    }
+
+    /// Typed full-context attachment. The caller's existing positional mark must also
+    /// retain `mla_window_segments(slot)`; a pages-only attachment is not a warm snapshot.
+    pub(crate) fn capture_mla_pages(&self, slot: usize, frontier: usize, write_frontier: usize)
+        -> std::result::Result<cuteafd_engine::prefix::DraftPageAttachment, cuteafd_engine::prefix::BoxError> {
+        (|| -> Result<cuteafd_engine::prefix::DraftPageAttachment> {
+            let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+            // SAFETY: the owned stream retires producers before snapshotting their canonical rows.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            let mut state = context.state.borrow_mut();
+            let binding = state.bindings.get(slot).copied().flatten().context("unbound MLA draft slot")?;
+            ensure!(state.pool.frontier(binding)?.1 == frontier, "MLA snapshot differs from committed frontier");
+            let (snapshot, copies) = state.pool.capture_writable(binding, write_frontier)?;
+            let attachment = state.pool.attachment(snapshot)?;
+            drop(state);
+            if let Err(error) = self.copy_mla_pages(&copies) {
+                // A failed copy may have queued work. Do not release its destinations unless drained.
+                // SAFETY: all copies use this drafter's owned stream.
+                if unsafe { self.library.cuda_stream_synchronize(self.stream) }.is_ok() {
+                    context.state.borrow_mut().pool.release_snapshot(snapshot)?;
+                }
+                return Err(error);
+            }
+            Ok(attachment)
+        })().map_err(box_draft_page_error)
+    }
+
+    pub(crate) fn release_mla_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<()> {
+            let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        // SAFETY: the family also retires its host-copy stream before calling this hook.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        let mut state = context.state.borrow_mut();
+        state.pool.check_attachment(attachment)?;
+        Ok(state.pool.release_snapshot(attachment.snapshot)?)
+    }
+
+    pub(crate) fn mla_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
+        let DraftContext::Mla(context) = &self.context else { return false };
+        context.state.borrow().pool.check_attachment(attachment).is_ok()
+    }
+
+    pub(crate) fn mla_pages_revocable(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
+        let DraftContext::Mla(context) = &self.context else { return false };
+        context.state.borrow().pool.snapshot_revocable(attachment.snapshot)
+    }
+
+    pub(crate) fn retain_mla_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<()> {
+            let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        let mut state = context.state.borrow_mut();
+        state.pool.check_attachment(attachment)?;
+        Ok(state.pool.retain_snapshot(attachment.snapshot)?)
+    }
+
+    pub(crate) fn admit_mla_pages(&self, slot: usize, capacity: usize) -> std::result::Result<(), cuteafd_engine::prefix::BoxError> {
+        (|| -> Result<()> {
+            let DraftContext::Mla(context) = &self.context else { return Ok(()) };
+            let mut state = context.state.borrow_mut();
+            let binding = state.bindings.get(slot).copied().flatten().context("unbound MLA draft slot")?;
+            Ok(state.pool.admit(binding, capacity, self.cfg.block)?)
+        })().map_err(box_draft_page_error)
+    }
+
+    pub(crate) fn promote_mla_pages(&self, saved: &cuteafd_engine::prefix::DraftPageAttachment)
+        -> std::result::Result<cuteafd_engine::prefix::DraftPageAttachment, cuteafd_engine::prefix::BoxError> {
+        (|| -> Result<cuteafd_engine::prefix::DraftPageAttachment> {
+            let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+            Ok(context.state.borrow_mut().pool.promote(saved)?)
+        })().map_err(box_draft_page_error)
+    }
+
+    /// Caller restores window segments from its positional mark before publishing the binding.
+    pub(crate) fn restore_mla_pages(&self, slot: usize,
+        attachment: &cuteafd_engine::prefix::DraftPageAttachment, write_frontier: usize) -> std::result::Result<(), cuteafd_engine::prefix::BoxError> {
+        (|| -> Result<()> {
+            let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+            // SAFETY: retire the previous request before replacing its ownership.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            let mut state = context.state.borrow_mut();
+            state.pool.check_attachment(attachment)?;
+            let mut rings = state.rings.clone();
+            rings.restore_frontier(slot, attachment.origin, attachment.frontier)?;
+            state.discard(slot)?;
+            state.pool.pin_snapshot(attachment.snapshot)?;
+            let (binding, copies) = match state.pool.restore_writable(slot, attachment.snapshot,
+                attachment.frontier, write_frontier) {
+                Ok(restored) => restored,
+                Err(error) => { state.pool.unpin_snapshot(attachment.snapshot)?; return Err(error.into()); }
+            };
+            state.bindings[slot] = Some(binding);
+            drop(state);
+            let copied = self.copy_mla_pages(&copies);
+            // SAFETY: retain the source pin and live destinations until every restore copy retires.
+            // A failed drain deliberately leaves the pin/ownership quarantined in the pool.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            context.state.borrow_mut().pool.unpin_snapshot(attachment.snapshot)?;
+            copied?;
+            context.state.borrow_mut().rings = rings;
+            Ok(())
+        })().map_err(box_draft_page_error)
+    }
+
+    pub(crate) fn mla_page_segments(&self, page: cuteafd_engine::prefix::DraftPageId)
+        -> Result<Vec<cuteafd_hostcache::copy::DeviceRange>> {
+            let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        let page_bytes = context.layout.paged_cache().page_rows * context.layout.paged_cache().record_bytes;
+        ensure!((page.index as usize) < context.layout.paged_cache().pages, "MLA draft page outside pool");
+        self.layers.iter().zip(&context.layout.cache().layers).filter(|(_, layout)| layout.window().is_none())
+            .map(|(layer, _)| {
+                let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
+                let buffer = draft_view(layer.cache.buffer, page.index as usize * page_bytes, page_bytes)?;
+                Ok(cuteafd_hostcache::copy::DeviceRange { addr: buffer.ptr as u64, bytes: buffer.bytes })
+            }).collect()
+    }
+
+    pub(crate) fn mla_window_segments(&self, slot: usize)
+        -> Result<Vec<cuteafd_hostcache::copy::DeviceRange>> {
+            let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        ensure!(slot < self.slots, "MLA draft window slot outside capacity");
+        self.layers.iter().zip(&context.layout.cache().layers).filter(|(_, layout)| layout.window().is_some())
+            .map(|(layer, layout)| {
+                let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
+                let bytes = layout.rows_per_slot() * context.layout.paged_cache().record_bytes;
+                let buffer = draft_view(layer.cache.buffer, slot * bytes, bytes)?;
+                Ok(cuteafd_hostcache::copy::DeviceRange { addr: buffer.ptr as u64, bytes: buffer.bytes })
+            }).collect()
+    }
+
+    fn copy_mla_pages(&self, copies: &[cuteafd_engine::prefix::TailCopy]) -> Result<()> {
+            let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        let bytes_per_row = context.layout.paged_cache().record_bytes;
+        let page_bytes = context.layout.paged_cache().page_rows * bytes_per_row;
+        for copy in copies {
+            for (layer, layout) in self.layers.iter().zip(&context.layout.cache().layers) {
+                if layout.window().is_some() { continue; }
+                let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
+                let bytes = copy.rows * bytes_per_row;
+                let from = draft_view(layer.cache.buffer, copy.from as usize * page_bytes, bytes)?;
+                let to = draft_view(layer.cache.buffer, copy.to as usize * page_bytes, bytes)?;
+                // SAFETY: allocator owns both checked ranges until the family's retirement barrier.
+                unsafe { self.library.copy_d2d_async(to, from, bytes, self.stream)?; }
+            }
+        }
         Ok(())
     }
 
     fn update_mla(&self, context: &MlaContext<'_>, rows: &[ContextRow], ready: impl FnOnce() -> Result<()>) -> Result<()> {
-        let plan = MlaContextUpdate::checked(&context.state.borrow(), self.layers.len(), rows)?;
+        let (plan, reservations) = MlaContextUpdate::checked_paged(&mut context.state.borrow_mut(), &context.layout, rows)?;
+        let lease = MlaPageLease { context, library: self.library, stream: self.stream, reservations };
         let workspace = self.workspace.borrow();
         let w = workspace.as_ref().context("MLA draft requires admitted workspace")?;
         let AttentionWorkspace::Mla(attention) = &w.attention else { anyhow::bail!("MLA draft workspace mismatch") };
@@ -1369,7 +1656,8 @@ impl<'a> DflashDrafter<'a> {
             for batch in chunks { layer.program.produce(layer.weights(), batch, self.stream)?; }
         }
         self.timing.end(span, self.stream)?;
-        *context.state.borrow_mut() = plan.next;
+        lease.commit()?;
+        context.state.borrow_mut().rings = plan.next;
         Ok(())
     }
 
@@ -1579,6 +1867,23 @@ impl<'a> DflashDrafter<'a> {
             *slot = Some(self.workspace(self.max_sequences)?);
         }
         let w = slot.as_ref().context("draft workspace")?;
+        let mut mla_lease = match &self.context {
+            DraftContext::Gqa(_) => None,
+            DraftContext::Mla(context) => Some(MlaPageLease { context, library: self.library,
+                stream: self.stream, reservations: Vec::new() }),
+        };
+        if let Some(lease) = &mut mla_lease {
+            let mut state = lease.context.state.borrow_mut();
+            // Validate every frontier before reserving or enqueueing any sequence.
+            let mut seen = std::collections::BTreeSet::new();
+            for seq in sequences {
+                ensure!(seen.insert(seq.slot) && state.rings.frontier(seq.slot)? == (seq.valid_from, seq.position),
+                    "MLA draft request differs from bound origin/frontier");
+            }
+            for seq in sequences {
+                lease.reservations.push(state.reserve(seq.slot, seq.position, block)?);
+            }
+        }
         let mla_batches = match (&self.context, &w.attention) {
             (DraftContext::Gqa(_), AttentionWorkspace::Gqa(_)) => {
                 for layer in &self.layers { layer.attention.gqa()?; }
@@ -1591,7 +1896,9 @@ impl<'a> DflashDrafter<'a> {
                 let mut all = Vec::with_capacity(self.layers.len());
                 for (index, layer) in self.layers.iter().enumerate() {
                     let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
-                    let chunks = state.block_batches(index, &requests)?;
+                    let chunks = state.block_batches(index, &requests,
+                        &mla_lease.as_ref().expect("MLA lease").reservations,
+                        context.layout.cache().layers[index].window().is_none())?;
                     for chunk in &chunks {
                         let chunk_rows = chunk.positions.len();
                         let offset = chunk.first_sequence * block * h * 2;
@@ -1725,6 +2032,13 @@ impl<'a> DflashDrafter<'a> {
                 w.features.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
             self.timing.end(select_span, s)?;
             l.cuda_stream_synchronize(s)?;
+        }
+        if let Some(mut lease) = mla_lease.take() {
+            let mut state = lease.context.state.borrow_mut();
+            while let Some(&reservation) = lease.reservations.last() {
+                state.pool.commit(reservation, 0)?;
+                lease.reservations.pop();
+            }
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
@@ -1977,6 +2291,16 @@ pub(crate) fn golden_sequence(dir: &Path, vocab: usize) -> Result<(Vec<u32>, Vec
 mod checkpoint_header_tests {
     use super::*;
 
+    #[test]
+    fn native_pool_exhaustion_survives_context_and_the_boxed_family_boundary() {
+        use cuteafd_engine::prefix::{DraftPageError, PoolExhausted};
+        let pages = PoolExhausted { needed: 4, free: 2, capacity: 8 };
+        let native = anyhow::Error::new(DraftPageError::Exhausted(pages)).context("MLA reservation");
+        let boxed = box_draft_page_error(native);
+        assert!(matches!(boxed.downcast_ref::<DraftPageError>(),
+            Some(DraftPageError::Exhausted(actual)) if *actual == pages));
+    }
+
     struct HeaderSnapshot(std::path::PathBuf);
     impl Drop for HeaderSnapshot {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
@@ -2109,8 +2433,8 @@ mod checkpoint_header_tests {
         assert_eq!(dropped.get(), 7);
     }
 
-    fn mla_cache_state() -> cuteafd_loader::formats::dflash::MlaDraftCacheState {
-        use cuteafd_loader::formats::{dflash::{MlaDflashConfig, MlaDraftCacheState},
+    fn mla_config() -> cuteafd_loader::formats::dflash::MlaDflashConfig {
+        use cuteafd_loader::formats::{dflash::MlaDflashConfig,
             mla::MlaGeometry, block_dspark::DsparkRotaryPlan};
         let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 7168, heads: 64,
             q_rank: 1536, kv_rank: 512, nope: 128, rope: 64, value: 128 },
@@ -2118,7 +2442,77 @@ mod checkpoint_header_tests {
             selector_top_k: 16, taps: vec![19, 37, 66, 78, 90], vocab: 163840,
             mask_token: 163592, max_context: 1048576, windows: vec![Some(4096), None],
             rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. } };
-        MlaDraftCacheState::new(cfg.cache_layout(2, 262144).unwrap()).unwrap()
+        cfg
+    }
+
+    fn mla_cache_state() -> cuteafd_loader::formats::dflash::MlaDraftCacheState {
+        cuteafd_loader::formats::dflash::MlaDraftCacheState::new(
+            mla_config().cache_layout(2, 262144).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn mla_pooled_producers_and_proposals_share_only_the_admitted_budget() {
+        use cuteafd_loader::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
+            formats::dflash::MlaDraftCacheRequest};
+        let layout = mla_config().runtime_layout(GlmDraftRepresentation::Fp8Only,
+            GlmDraftCapacity::new(2, 2, 8).unwrap(), 262144, 128, 188, 2).unwrap();
+        let mut state = MlaPagedState::new(&layout).unwrap();
+        assert_eq!(state.pool.capacity(), 2);
+        state.reset(0, 513).unwrap();
+        state.reset(1, 17000).unwrap();
+        let rows = (0..64).flat_map(|i| [
+            ContextRow { tap_row: 2 * i, slot: 0, position: 513 + i },
+            ContextRow { tap_row: 2 * i + 1, slot: 1, position: 17000 + i },
+        ]).collect::<Vec<_>>();
+        let (plan, reservations) = MlaContextUpdate::checked_paged(&mut state, &layout, &rows).unwrap();
+        assert_eq!(state.pool.free(), 0);
+        let full: std::collections::BTreeSet<_> = plan.slots[1].iter().copied().collect();
+        assert_eq!(full.len(), 128);
+        assert!(full.iter().all(|&row| (0..128).contains(&row)));
+        assert_eq!(plan.slots[0][1], state.rings.context_rows(0, 1, 17000, 1).unwrap()[0]);
+        for reservation in reservations { state.pool.commit(reservation, 64).unwrap(); }
+        state.rings = plan.next;
+        // Exhaustion is transactional, including the ring frontier and existing destinations.
+        assert!(state.reserve(0, 577, 8).is_err());
+        assert_eq!(state.rings.frontier(0).unwrap(), (513, 577));
+        state.discard(1).unwrap();
+        let proposal = state.reserve(0, 577, 8).unwrap();
+        let request = [MlaDraftCacheRequest { slot: 0, position: 577, valid_from: 513 }];
+        let batches = state.block_batches(1, &request, &[proposal], true).unwrap();
+        assert_eq!(batches[0].slots, state.pool.destinations(proposal).unwrap());
+        assert_eq!(&batches[0].page_table[..2], state.pool.page_table(proposal).unwrap());
+        state.pool.commit(proposal, 0).unwrap();
+        assert_eq!(state.pool.free(), 1);
+        // Rebinding is a zero-page cold(P), even after fragmented/interleaved ownership.
+        state.reset(0, 100001).unwrap();
+        assert_eq!(state.pool.free(), state.pool.capacity());
+        assert_eq!(state.rings.frontier(0).unwrap(), (100001, 100001));
+        let (_, reservations) = MlaContextUpdate::checked_paged(&mut state, &layout,
+            &[ContextRow { tap_row: 0, slot: 0, position: 100001 }]).unwrap();
+        assert_eq!(state.pool.destinations(reservations[0]).unwrap()[0] % 64, 0);
+        state.pool.commit(reservations[0], 0).unwrap();
+        state.discard(0).unwrap();
+        assert_eq!(state.pool.free(), state.pool.capacity());
+    }
+
+    #[test]
+    fn glm_gqa_cold_restore_excludes_old_ring_rows_until_canonical_producers_replace_them() {
+        for frontier in [63usize, 64, 65, 2047, 2048, 2049, 4097] {
+            let mut reused = vec![u64::MAX; 2 * RING];
+            let mut cold = vec![0u64; 2 * RING];
+            let slot = 1;
+            for count in 0..=RING + 1 {
+                let position = frontier + count;
+                let length = position.saturating_sub(frontier).min(RING);
+                for p in position - length..position {
+                    assert_eq!(reused[slot * RING + p % RING], cold[slot * RING + p % RING]);
+                }
+                let at = slot * RING + position % RING;
+                reused[at] = position as u64 + 1;
+                cold[at] = position as u64 + 1;
+                assert!(reused[..RING].iter().all(|&row| row == u64::MAX));
+            }
+        }
     }
 
     #[test]
