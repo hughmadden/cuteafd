@@ -633,7 +633,7 @@ impl Opened {
             // The coordinator GPUs' EXL3 TP2 halves join the Spark push group as
             // two more ranks; planning failure leaves them on the mount.
             let ranks = match (&tp2_range, local.as_ref().map(|l| &l.format)) {
-                (Some(range), Some(glm::GlmLocalFormat::Exl3)) if admission.pushes() => (|| -> Result<_> {
+                (Some(range), Some(glm::GlmLocalFormat::Exl3)) if admission.coordinator_pushes() => (|| -> Result<_> {
                     let local = local.as_ref().context("TP2 local inventory")?;
                     let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
                         &local.package, self.cfg.hidden, max_rows)?;

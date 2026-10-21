@@ -106,6 +106,22 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
         let head = (gpus == 2).then(|| loader.fp8(&["lm_head.weight".to_string()],
             crate::families::glm5_flash::fp8::Layout::Row128)).transpose()?;
         let (records, steps) = load.sink.as_ref().context("push sink")?.take();
+        // Every kind of staged step (quantize, widen, absorb, A_log) fits one
+        // uniform staging buffer exactly or below.
+        use crate::shared::experts::rtx::dense::{Job, STEP_BYTES};
+        let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
+        for step in &steps {
+            assert!(step.bytes() <= STEP_BYTES, "a step stages {} bytes", step.bytes());
+            for job in &step.jobs {
+                let kind = match job { Job::Upload { .. } => "upload", Job::Widen { .. } => "widen",
+                    Job::Quant { .. } => "quant", Job::Absorb { .. } => "absorb", Job::ALog { .. } => "a_log" };
+                let largest = kinds.entry(kind).or_default();
+                *largest = (*largest).max(step.bytes());
+            }
+        }
+        for kind in ["widen", "quant", "absorb", "a_log"] {
+            assert!(kinds.contains_key(kind), "no {kind} step exercised");
+        }
         let mut peak_steps = 0;
         for gpu in 0..gpus as i32 {
             let layout = RankLayout::new(records.clone(), steps.clone(), gpu)?;

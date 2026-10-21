@@ -199,8 +199,8 @@ impl DenseSink {
         Ok(())
     }
     pub fn step(&self, step: Step) -> Result<()> {
-        ensure!(step.bytes() > 0 && step.bytes() <= STEP_BYTES.max(step.rects.iter().map(Rect::bytes).max().unwrap_or(0)),
-            "step stages too many bytes");
+        ensure!(step.bytes() > 0 && step.bytes() <= STEP_BYTES,
+            "a step stages {} bytes, beyond the {STEP_BYTES}-byte staging buffer", step.bytes());
         self.steps.borrow_mut().push(step);
         Ok(())
     }
@@ -234,6 +234,7 @@ impl<'a> Mount<'a> {
     /// Stages and runs `step` on the current device (`stream`).
     pub fn step(&mut self, step: &Step, stream: *mut c_void) -> Result<()> {
         let bytes = step.bytes();
+        ensure!(bytes > 0 && bytes <= STEP_BYTES, "a step stages {bytes} bytes, beyond the {STEP_BYTES}-byte bound");
         if self.staging.as_ref().is_none_or(|s| s.buffer.bytes < bytes) {
             drop(self.staging.take());
             self.staging = Some(HostAllocation::named(self.library, bytes.max(1 << 20), "staging/coordinator-dense")?);
@@ -422,12 +423,12 @@ impl PushDestination for DenseArena<'_> {
         let (index, at) = self.step(offset, length)?;
         let need = self.layout.steps[index].1.bytes();
         if !self.open.contains_key(&index) {
-            // Uniform buffers (a step's own size only past the bound), so returned
-            // staging always fits the next step.
+            // Uniform buffers (every step is within the bound, checked when
+            // recorded), so returned staging always fits the next step.
             let staging = match self.pool.iter().position(|s| s.buffer.bytes >= need) {
                 Some(found) => self.pool.swap_remove(found),
                 None => {
-                    let bytes = need.max(STEP_BYTES);
+                    let bytes = STEP_BYTES;
                     self.held += bytes as u64;
                     self.peak_held = self.peak_held.max(self.held);
                     HostAllocation::named(self.device.library, bytes, "staging/coordinator-dense")?

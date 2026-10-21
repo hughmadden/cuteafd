@@ -23,6 +23,8 @@ pub(crate) struct SparkAdmission {
     assignments: Vec<SparkAssignment>,
     push_snapshot: Option<std::path::PathBuf>,
     push_manifest: Option<String>,
+    /// The Spark push group's format takes coordinator-GPU ranks (EXL3).
+    coordinator_ranks: bool,
 }
 
 impl SparkAdmission {
@@ -102,7 +104,9 @@ impl SparkAdmission {
             Some(snapshot.to_path_buf())
         } else { None };
         let selection = if push_snapshot.is_some() { selection.with_push_weights() } else { selection };
-        Ok(Self { selection, assignments, push_snapshot, push_manifest: manifest.map(str::to_owned) })
+        let coordinator_ranks = push_snapshot.is_some() && manifest.is_none()
+            && catalog.is_some_and(|c| c.exl3().is_some());
+        Ok(Self { selection, assignments, push_snapshot, push_manifest: manifest.map(str::to_owned), coordinator_ranks })
     }
 
     fn reconcile(&self, reports: &[ModelAdmissionResponse]) -> Result<()> {
@@ -117,14 +121,23 @@ impl SparkAdmission {
         self.start_with(peers, None)
     }
 
-    /// Whether this admission opens a push group (EXL3 Spark experts on SparkNest).
+    /// Whether this admission opens a push group (Spark experts on SparkNest).
     pub(crate) fn pushes(&self) -> bool { self.push_snapshot.is_some() }
+
+    /// Whether coordinator GPUs may join this admission's push group as ranks:
+    /// only a group whose Spark format plans them (EXL3). Otherwise the Spark
+    /// ranks push alone and the coordinator loads its weights by mount.
+    pub(crate) fn coordinator_pushes(&self) -> bool { self.coordinator_ranks }
 
     /// `coordinator`: in-process coordinator-GPU ranks joining the Spark push
     /// group (loopback streams in rank order, and their plan entries).
     pub(crate) fn start_with(self, peers: &[SocketAddr],
         coordinator: Option<(Vec<std::net::TcpStream>, super::memory::push_exl3::CoordinatorRanks)>)
         -> Result<PendingSparkAdmission> {
+        // Never let coordinator ranks decline a group whose format cannot take them
+        // (checked before any worker is contacted).
+        ensure!(coordinator.is_none() || self.coordinator_ranks,
+            "coordinator push ranks offered to a Spark group whose format does not take them");
         let value = std::env::var(ADMISSION_TIMEOUT_ENV).ok();
         let timeout = admission_timeout(value.as_deref())?;
         let pending = cuteafd_transport::worker_selection::start_model_admission(
@@ -147,15 +160,12 @@ impl SparkAdmission {
                     tracing::info!(elapsed_ms = started.elapsed().as_millis(),
                         "Spark push admission catalog opened");
                     if let Some(manifest) = manifest.as_deref() {
-                        anyhow::ensure!(ranks.is_none(), "coordinator push ranks join EXL3 groups only");
                         super::memory::push_exlr8::prepare(&snapshot, manifest, &layers, &assignments, offers)
                     } else if catalog.exl3().is_some() {
                         super::memory::push_exl3::prepare(&snapshot, &catalog, &layers, &assignments, offers, ranks.as_ref())
                     } else if catalog.fp8().is_some() {
-                        anyhow::ensure!(ranks.is_none(), "coordinator push ranks join EXL3 groups only");
                         super::memory::push_fp8::prepare(&snapshot, &catalog, &assignments, offers)
                     } else {
-                        anyhow::ensure!(ranks.is_none(), "coordinator push ranks join EXL3 groups only");
                         super::memory::push_native::prepare(&snapshot, &catalog, &assignments, offers)
                     }
                 })?;
@@ -514,6 +524,94 @@ mod tests {
             assert_eq!(assignment.io.mapped_rings, fixture_model().ring_bytes(geometry)? as u64);
         }
         check_reports(&plan)
+    }
+
+    /// Marks `root` a SparkNest namespace with every file a hosted shard, so a
+    /// populated Spark admission opens a push group.
+    fn mark_namespace(root: &Path) -> Result<()> {
+        let mark = |path: &Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
+            let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+            // SAFETY: both strings are NUL-terminated and live across the call; the
+            // value pointer and length describe one live buffer.
+            let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+            ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+            Ok(())
+        };
+        mark(root, c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+        for entry in std::fs::read_dir(root)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"[]")?; }
+        }
+        Ok(())
+    }
+
+    /// Coordinator GPUs join only groups whose Spark format plans coordinator
+    /// ranks (EXL3). FP8, native and EXLR8 Spark groups push without them: the
+    /// coordinator loads by mount and cannot make the group decline.
+    #[test]
+    fn coordinator_ranks_join_only_spark_formats_that_take_them() -> Result<()> {
+        use cuteafd_loader::plan::testing::{fp8, mimo_flash_config, qwen4_config, qwen4_exl3, write_snapshot,
+            write_v41_snapshot};
+        let check = |root: &Path, working: SparkWorkingSet, world: usize, geometry: Option<ExpertGeometry>,
+            manifest: Option<&str>, exl3: bool| -> Result<()> {
+            let mut catalog = cuteafd_loader::read_expert_catalog(root)?;
+            if manifest.is_some() { catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?; }
+            let geometry = match geometry { Some(g) => g, None => catalog.routed_experts().geometry()? };
+            let mut model = fixture_model();
+            if manifest.is_some() { model.endpoints.iter_mut().for_each(|e| e.ingress = SparkIngress::Fp8K32); }
+            let plan = SparkAdmission::plan_manifest(root, geometry, Some(&catalog), &working, world, None, model,
+                manifest)?;
+            assert!(plan.pushes(), "{root:?}: the Spark ranks push");
+            assert_eq!(plan.coordinator_pushes(), exl3, "{root:?}: coordinator ranks only for EXL3");
+            if !exl3 {
+                // Offered anyway, the ranks are refused before any worker is contacted.
+                let ranks = crate::shared::memory::push_exl3::CoordinatorRanks { ranks: 1,
+                    append: Box::new(|_, _, _| Ok(())) };
+                let unused = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let error = plan.start_with(&[unused.local_addr()?], Some((Vec::new(), ranks))).err()
+                    .context("coordinator ranks must be refused")?;
+                assert!(error.to_string().contains("does not take them"), "{error:#}");
+                unused.set_nonblocking(true)?;
+                assert!(unused.accept().is_err(), "no worker was contacted");
+            }
+            Ok(())
+        };
+        // EXL3: coordinator ranks join.
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(3, 4);
+        write_snapshot(root.path(), &qwen4_config(3), &tensors, None);
+        mark_namespace(root.path())?;
+        check(root.path(), SparkWorkingSet { spark_layers: vec![0, 2], spark_ranks: 3, prefill_lanes: 1,
+            ..Default::default() }, 3, None, None, true)?;
+        // FP8.
+        let root = tempfile::tempdir()?;
+        let mut tensors = Vec::new();
+        for expert in 0..256 {
+            for (name, rows, cols) in [("gate", 2048, 4096), ("up", 2048, 4096), ("down", 4096, 2048)] {
+                tensors.extend(fp8(&format!("model.layers.1.mlp.experts.{expert}.{name}_proj"), rows, cols, None));
+            }
+        }
+        write_snapshot(root.path(), &mimo_flash_config(), &tensors, None);
+        mark_namespace(root.path())?;
+        check(root.path(), SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
+            ..Default::default() }, 6, None, None, false)?;
+        // Native (V4.1 MXFP4).
+        let root = tempfile::tempdir()?;
+        write_v41_snapshot(root.path());
+        mark_namespace(root.path())?;
+        check(root.path(), SparkWorkingSet { spark_layers: vec![17, 39], spark_ranks: 4, prefill_lanes: 2,
+            ..Default::default() }, 4, Some(ExpertGeometry::DEEPSEEK_V41), None, false)?;
+        // EXLR8 (installed snapshot, read-only: its own namespace marks).
+        if let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") {
+            let snapshot = Path::new(&snapshot);
+            let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+            let first = catalog.routed_experts().first_layer;
+            if cuteafd_loader::push_load::namespace(snapshot).is_ok() {
+                check(snapshot, SparkWorkingSet { spark_layers: vec![first], spark_ranks: 4, prefill_lanes: 1,
+                    ..Default::default() }, 4, None, Some("up1"), false)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]

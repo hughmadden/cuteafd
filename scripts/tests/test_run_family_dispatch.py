@@ -521,7 +521,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
     assert "&working, peers.len(), None, model)?;" in body and "admission.start_with(&peers, ranks)?" in body
     # Coordinator GPUs (dense operands, TP2 halves) join the Spark push group only when it pushes.
-    assert "if admission.pushes() && dense_pushable(&args, self.fp8_checkpoint.is_some())" in body
+    assert "if admission.coordinator_pushes() && dense_pushable(&args, self.fp8_checkpoint.is_some())" in body
     assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
     assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body

@@ -1805,7 +1805,7 @@ impl Opened {
             // on the GPU) and, with TP2 layers, its EXL3 expert halves. Planning
             // failure leaves the coordinator on the mount.
             let gpus = 1 + usize::from(peer_stream.is_some());
-            let ranks = if admission.pushes() && dense_pushable(&args, self.fp8_checkpoint.is_some()) {
+            let ranks = if admission.coordinator_pushes() && dense_pushable(&args, self.fp8_checkpoint.is_some()) {
                 (|| -> Result<_> {
                     let tp2 = match self.experts.as_ref().and_then(|c| c.exl3().map(|m| (c, m))) {
                         Some((_, manifest)) if !tp2_layers.is_empty() => {
