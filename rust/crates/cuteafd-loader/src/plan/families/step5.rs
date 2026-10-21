@@ -319,7 +319,7 @@ impl Model {
                 "CSA compresses index keys only: one E4M3 proxy256 summary per eight tokens, original GQA K/V retained; provider-group top-512 regions".into(),
                 "FP32 residual and zero-centered norms; post-SiLU clamp + FP32 product, one BF16 round, for routed/shared/dense FFNs".into(),
                 "ssmax_s [64] FP32 is retained and validated, unused by released kernels; ordinary attention scale 1/sqrt(192)".into(),
-                "Eager native admission on qualified WIP cards; native MTP is opt-in, with exact predictor header contracts; no release or media qualification".into(),
+                "Eager native admission on qualified WIP cards; native MTP defaults to depth 3, with exact predictor header contracts; no release or media qualification".into(),
             ] };
         let mut spec = spec;
         if complete {

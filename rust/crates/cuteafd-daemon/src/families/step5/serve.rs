@@ -1,4 +1,4 @@
-//! Eager native target and opt-in MTP over the shared scheduler.
+//! Eager native target and default-on MTP over the shared scheduler.
 use super::{admission::{self, RuntimeInputs}, backend::{Inputs, Step5Backend}, cache::CacheRank,
     execution::Execution, transaction::Staging};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::Device,
@@ -32,8 +32,8 @@ pub(crate) struct ServeArgs {
     max_context: u64,
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
     prefill_rows: u32,
-    /// Native predictor depth. Opt-in until live lossless and speed qualification.
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
+    /// Native predictor depth; 0 disables speculation.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
@@ -550,7 +550,13 @@ mod tests {
     fn target_serving_defaults_and_invalid_owners() -> Result<()> {
         let mut args = args();
         args.validate()?;
-        assert_eq!((args.max_context, args.max_sequences), (1_048_576, 16));
+        assert_eq!((args.max_context, args.max_sequences, args.mtp), (1_048_576, 16, 3));
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4",
+            "--mtp", "0"])?;
+        let crate::cli::Commands::ServeStep5(off) = cli.command else { panic!("Step-5 dispatch") };
+        off.validate()?;
+        assert_eq!(off.mtp, 0);
         args.split_device = Some(args.device);
         assert!(args.validate().is_err());
         args.split_device = Some(1);

@@ -1493,8 +1493,8 @@ case "$family" in
 esac
 # Kimi K3 (#273) and Step-5 (#274) are under qualification: WIP slots only,
 # automatic attention placement, text only (their bundled vision towers are not
-# in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5's native
-# MTP is opt-in (SPECULATOR=mtp) while it qualifies, never a default.
+# in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5 defaults
+# to native MTP depth 3 (SPECULATOR=off disables it).
 qualifying=0
 [[ "$family" != kimi_k3 && "$family" != step5 ]] || qualifying=1
 if ((qualifying)); then
@@ -1717,6 +1717,10 @@ if [[ -z "$speculator" ]]; then
     speculator=dspark
     echo "note: DeepSeek V4 drafts with its bundled dSpark; SPECULATOR=off disables it" >&2
   fi
+  if [[ $speculator == off && $family == step5 ]]; then
+    speculator=mtp
+    echo "note: Step-5 drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
+  fi
   # Only the resident local paths are qualified (EXL3, and NVFP4 with its FP8
   # MTP package). Spark workers serve backbone layers, not mtp.layers.0; other
   # expert formats keep their opt-in status. SPECULATOR=off disables the default.
@@ -1799,6 +1803,8 @@ if [[ $family == mimo_v2 ]]; then
   done
 fi
 case "$speculator" in
+  off)
+    [[ "$family" != step5 ]] || family_args+=(--mtp 0) ;;
   dflash2|dspark)
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"

@@ -217,8 +217,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
         assert_eq!(charged(&admitted, 1), charged(&baseline, 1));
         let planned = plan::plan(&checkpoint_path, &PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(6),
-            draft_ownership: Some(if depth == 0 { spec::DraftOwnership::None }
-                else { spec::DraftOwnership::NativeMtp }),
+            draft_ownership: if depth == 0 { Some(spec::DraftOwnership::None) } else { None },
             layout: Some(layout::LayoutOptions {
                 rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool,
                 context_tokens: inputs.context, concurrency: inputs.sequences as u64,
