@@ -675,7 +675,7 @@ mod tests {
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected plan"); };
             assert_eq!(args.kv_format.map(|format| match format {
                 cuteafd_core::MlaCacheFormat::Bf16 => Qwen4KvCache::Bf16,
-                cuteafd_core::MlaCacheFormat::Fp8 => Qwen4KvCache::Fp8 }).unwrap_or_default(), expected);
+                cuteafd_core::MlaCacheFormat::Fp8 => Qwen4KvCache::Fp8 }), expected);
         }
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--kv-cache", "int8"])).is_err());
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--kv-format", "bf16"])).is_err());

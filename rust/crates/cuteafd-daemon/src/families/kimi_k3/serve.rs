@@ -195,7 +195,7 @@ mod tests {
         defaults.validate()?;
         assert_eq!(defaults.max_context, 524_288);
         assert_eq!(defaults.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
-        assert_eq!(cuteafd_loader::plan::LayoutOptions::default().mla_kv, defaults.kv_cache);
+        assert_eq!(cuteafd_loader::plan::layout::LayoutOptions::default().mla_kv, defaults.kv_cache);
         assert_eq!(args(&["--peers", peers, "--kv-cache", "bf16"])?.kv_cache, cuteafd_core::MlaCacheFormat::Bf16);
         assert_eq!(args(&["--peers", peers, "--kv-cache", "fp8"])?.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
         assert!(args(&["--peers", peers, "--kv-cache", "int8"]).is_err());
