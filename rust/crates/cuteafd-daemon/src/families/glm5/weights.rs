@@ -780,3 +780,7 @@ pub(crate) fn bf16_programs() -> bool {
     static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *NATIVE.get_or_init(|| std::env::var("CUTEAFD_GLM_BF16").is_ok_and(|v| v == "native"))
 }
+
+#[cfg(test)]
+#[path = "weights_tests.rs"]
+mod operand_tests;
