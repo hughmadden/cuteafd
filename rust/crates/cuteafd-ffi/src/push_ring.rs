@@ -182,6 +182,7 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn mapping_seals_bounds_and_device_restoration() -> Result<()> {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;

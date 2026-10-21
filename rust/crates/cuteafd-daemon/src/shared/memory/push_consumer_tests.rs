@@ -354,6 +354,7 @@ fn fixture_events(fixture: &Fixture) -> Result<String> {
 }
 
 #[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn socket_fake_replays_checked_plan_into_registered_ring() -> Result<()> {
     for window in [1, 8] {
         exercise(window, Mode::Good, 2 * 1024 * 1024)?;
@@ -361,6 +362,7 @@ fn socket_fake_replays_checked_plan_into_registered_ring() -> Result<()> {
     Ok(())
 }
 #[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn failures_drain_without_partial_publication() -> Result<()> {
     for mode in [
         Mode::Missing,
@@ -377,7 +379,7 @@ fn failures_drain_without_partial_publication() -> Result<()> {
 
 // Explicit CPU throughput experiment, not a CUDA or RDMA performance gate.
 #[test]
-#[ignore = "bounded CPU fake throughput experiment"]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn socket_fake_copy_out_throughput() -> Result<()> {
     for window in [1, 8] {
         let fixture = Fixture::build()?;
