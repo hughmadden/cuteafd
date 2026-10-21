@@ -2,7 +2,7 @@
 //! This is cache storage, not serving admission: executable workspace, graph,
 //! transport and weight owners must contribute their actual reservations too.
 use super::{CacheGeometryError, FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
-use crate::plan::families::step5::Config;
+use crate::{families::qwen4::Qwen4KvCache, plan::families::step5::Config};
 
 pub const PAGE_ROWS: u64 = 64;
 pub const REGION_ROWS: u64 = 8;
@@ -67,6 +67,7 @@ pub struct Step5CacheLayout {
     pub ranks: Vec<RankState>,
     pub geometry: FamilyCacheGeometry,
     pub context: u64,
+    pub kv_format: Qwen4KvCache,
     pub mtp_hidden_rows: u64,
     pub ring: cuteafd_core::prefix::AppendRing,
     window: u64,
@@ -99,22 +100,22 @@ impl RankState {
 }
 
 impl Step5CacheLayout {
-    /// BF16 K/V, BF16 pending K/Z, E4M3-byte dense summaries. MTP is owned by
-    /// rank 0 with all heads; target K/V is head-split. No 256-row MiMo limits.
-    pub fn new(cfg: &Config, ranks: usize, context: u64, mtp: usize, max_step: u64) -> Result<Self, CacheGeometryError> {
-        Self::build(cfg, ranks, context, mtp, max_step, None)
+    /// Selected K/V, BF16 pending K/Z, E4M3 dense summaries; recurrence stays F32.
+    pub fn new(cfg: &Config, ranks: usize, context: u64, mtp: usize, max_step: u64,
+        kv_format: Qwen4KvCache) -> Result<Self, CacheGeometryError> {
+        Self::build(cfg, ranks, context, mtp, max_step, kv_format, None)
     }
 
     /// The serving candidate uses the same validated ownership as its weights.
     /// This storage contract alone does not admit execution or serving.
     pub fn for_execution(cfg: &Config, ownership: &crate::plan::families::step5::ownership::ExecutionOwnership,
-        context: u64, mtp: usize, max_step: u64) -> Result<Self, CacheGeometryError> {
+        context: u64, mtp: usize, max_step: u64, kv_format: Qwen4KvCache) -> Result<Self, CacheGeometryError> {
         ownership.validate_config(cfg).map_err(|_| invalid("ownership/checkpoint geometry"))?;
-        Self::build(cfg, ownership.ranks(), context, mtp, max_step, Some(ownership))
+        Self::build(cfg, ownership.ranks(), context, mtp, max_step, kv_format, Some(ownership))
     }
 
     fn build(cfg: &Config, ranks: usize, context: u64, mtp: usize, max_step: u64,
-        ownership: Option<&crate::plan::families::step5::ownership::ExecutionOwnership>) -> Result<Self, CacheGeometryError> {
+        kv_format: Qwen4KvCache, ownership: Option<&crate::plan::families::step5::ownership::ExecutionOwnership>) -> Result<Self, CacheGeometryError> {
         if ![1, 2].contains(&ranks) || cfg.groups % ranks != 0 || cfg.heads % ranks != 0
             || (cfg.window, cfg.groups, cfg.dim, cfg.hidden) != (512, 4, 192, 4096)
             || cfg.full.len() != cfg.layers + cfg.mtp || cfg.layers != 92
@@ -157,7 +158,7 @@ impl Step5CacheLayout {
                     (local.query_heads, local.kv_heads)
                 } else { (cfg.heads / ranks, cfg.groups / ranks) };
                 if heads == 0 { continue; }
-                let record = mul(&[groups as u64, cfg.dim as u64, 2])?;
+                let record = kv_format.plane_record_bytes(groups, cfg.dim) as u64;
                 if cfg.full[layer] {
                     let plane = mul(&[PAGE_ROWS, record])?;
                     page_bytes = page_bytes.checked_add(mul(&[plane, 2])?)
@@ -178,7 +179,7 @@ impl Step5CacheLayout {
             if rank == mtp_owner && mtp > 0 {
                 for stage in 0..mtp {
                     state.ring(cfg.layers + stage, true, cfg.heads,
-                        mul(&[ring.rows, cfg.groups as u64, cfg.dim as u64, 2])?)?;
+                        mul(&[ring.rows, kv_format.plane_record_bytes(cfg.groups, cfg.dim) as u64])?)?;
                     let length = state.reserve(8)?;
                     state.mtp_lengths.push(length);
                     let hidden = state.reserve(mul(&[mtp_hidden_rows, cfg.hidden as u64, 4])?)?;
@@ -204,7 +205,7 @@ impl Step5CacheLayout {
                     else { KvPlacement::PartitionedHeads },
                 ranks: costs,
             },
-            context, mtp_hidden_rows, ring, window,
+            context, kv_format, mtp_hidden_rows, ring, window,
         })
     }
 

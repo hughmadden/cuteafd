@@ -274,7 +274,7 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
         let dir = snapshot(quant);
         let cp = Checkpoint::open(dir.path()).unwrap();
         let cfg = Config::parse(&cp).unwrap();
-        let diagnostic = Step5CacheLayout::new(&cfg, 1, 1024, 0, 64).unwrap();
+        let diagnostic = Step5CacheLayout::new(&cfg, 1, 1024, 0, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         // Exercise unequal owner counts, a rank with no CSA, and owned SWA.
         for (ranks, policy) in [(1, 0), (2, 0), (2, 1), (2, 2)] {
             let modes: Vec<_> = (0..cfg.layers).map(|l| {
@@ -292,7 +292,7 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             let head = if ranks == 1 { 0 } else { 1 };
             let owners = ExecutionOwnership::new(&cfg, ranks, ownership::plan(&modes, 0, head)).unwrap();
             assert_eq!(owners.routed_endpoints().unwrap(), 1);
-            let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64).unwrap();
+            let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
             assert_eq!(layout.geometry.placement, if ranks == 1 { KvPlacement::SingleDevice }
                 else { KvPlacement::PartitionedLayers });
             assert_eq!(layout.geometry.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>(),
@@ -379,7 +379,7 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
                     assert_eq!(layout.csa_tail_bytes(rank, frontier % 64).unwrap(), cost.persistent_unit_bytes / 64 * (frontier % 64));
                 }
             }
-            let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64).unwrap();
+            let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
             for (rank, state) in mtp.ranks.iter().enumerate() {
                 assert_eq!(state.mtp_hidden.is_some(), rank == head as usize);
                 assert_eq!(state.mtp_stage_hidden.len(), if rank == head as usize { 3 } else { 0 });
@@ -414,7 +414,7 @@ fn execution_ownership_refuses_unbound_modes_and_checkpoint_changes() {
     let mut changed = cfg.clone();
     changed.full[3] = false;
     assert!(owners.validate_config(&changed).is_err());
-    assert!(crate::serving_capacity::step5::Step5CacheLayout::for_execution(&changed, &owners, 1024, 0, 64).is_err());
+    assert!(crate::serving_capacity::step5::Step5CacheLayout::for_execution(&changed, &owners, 1024, 0, 64, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
 }
 
 #[test]
@@ -478,8 +478,9 @@ fn predictor_histories_are_private_charged_and_snapshotted_without_append_slack(
     let dir = snapshot("fp8");
     let cp = Checkpoint::open(dir.path()).unwrap();
     let cfg = Config::parse(&cp).unwrap();
+    for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
     for depth in 0..=3 {
-        let layout = Step5CacheLayout::new(&cfg, 2, 1 << 20, depth, 256).unwrap();
+        let layout = Step5CacheLayout::new(&cfg, 2, 1 << 20, depth, 256, kv_format).unwrap();
         let state = &layout.ranks[0];
         assert_eq!(state.mtp_stage_hidden.len(), depth);
         assert!(layout.ranks[1].mtp_stage_hidden.is_empty());
@@ -520,6 +521,7 @@ fn predictor_histories_are_private_charged_and_snapshotted_without_append_slack(
             assert!((base..base + 256).all(|p| !old.contains(&(p % layout.mtp_hidden_rows))));
         }
     }
+    }
 }
 
 #[test]
@@ -528,7 +530,8 @@ fn predictor_marks_validate_independent_frontiers_and_ignore_rejected_rows() {
     let dir = snapshot("fp8");
     let cp = Checkpoint::open(dir.path()).unwrap();
     let cfg = Config::parse(&cp).unwrap();
-    let layout = Step5CacheLayout::new(&cfg, 1, 1024, 3, 64).unwrap();
+    for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
+    let layout = Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, kv_format).unwrap();
     let state = &layout.ranks[0];
     for stages in [[600, 0, 0], [600, 598, 0], [600, 598, 597]] {
         let copies = layout.snapshot_copies(0, 603, &stages, 1, 0, 1, 0).unwrap();
@@ -561,6 +564,7 @@ fn predictor_marks_validate_independent_frontiers_and_ignore_rejected_rows() {
     for invalid in [vec![], vec![600], vec![603, 0, 0], vec![600, 601, 0], vec![600, 598, 599]] {
         assert!(layout.snapshot_spans(0, 603, &invalid).is_err());
     }
+    }
 }
 
 #[test]
@@ -569,12 +573,24 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
     let dir = snapshot("fp8");
     let cp = Checkpoint::open(dir.path()).unwrap();
     let cfg = Model::open(&cp).unwrap().cfg;
+    for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
     for ranks in [1, 2] {
-        let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3, 64).unwrap();
+        let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3, 64, kv_format).unwrap();
         assert_eq!(layout.mtp_hidden_rows, 640);
         assert_eq!(layout.ranks[0].mtp_stage_hidden.len(), 3);
         assert!(layout.ranks[0].mtp_stage_hidden.iter().all(|span| span.bytes == 640 * 4096 * 4));
         assert_eq!(layout.window(), 512);
+        assert_eq!(layout.kv_format, kv_format);
+        for state in &layout.ranks {
+            for ring in &state.sliding {
+                let groups = if ring.mtp { 4 } else { 4 / ranks };
+                let row = kv_format.plane_record_bytes(groups, 192) as u64;
+                assert_eq!(ring.key.bytes, layout.ring.rows * row);
+                assert_eq!(ring.value.bytes, layout.ring.rows * row);
+            }
+            assert!(state.regions.iter().all(|r|
+                r.page_bytes == PAGE_ROWS * kv_format.plane_record_bytes(4 / ranks, 192) as u64));
+        }
         assert_eq!(layout.capture_reach(), 0);
         assert_eq!(layout.geometry.logical_unit_rows, PAGE_ROWS);
         let summaries: u64 = layout.ranks[0].regions.iter().map(|r| r.summaries.unwrap().bytes).sum();
@@ -649,9 +665,10 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         assert!(layout.snapshot_copies(0, 0, &[0; 3], 3, 0, 4, 4).is_err());
         assert!(layout.snapshot_copies(0, 0, &[0; 3], u64::MAX, 0, 4, 0).is_err());
     }
-    assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0, 64).is_err());
-    assert!(Step5CacheLayout::new(&cfg, 1, 0, 0, 64).is_err());
-    assert!(Step5CacheLayout::new(&cfg, 1, 1024, 4, 64).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0, 64, kv_format).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 0, 0, 64, kv_format).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 1024, 4, 64, kv_format).is_err());
+    }
 }
 
 #[test]

@@ -19,6 +19,14 @@ pub enum Qwen4KvCache {
 }
 
 impl Qwen4KvCache {
+    /// Separate K or V plane with inline head descales; align vector loads.
+    pub const fn plane_record_bytes(self, kv_heads: usize, head_dim: usize) -> usize {
+        match self {
+            Self::Bf16 => kv_heads * head_dim * 2,
+            Self::Fp8 => (kv_heads * (head_dim + 4) + 15) / 16 * 16,
+        }
+    }
+
     pub const fn record_bytes(self, kv_heads: usize, head_dim: usize) -> usize {
         match self {
             Self::Bf16 => 2 * kv_heads * head_dim * 2,
@@ -38,6 +46,22 @@ impl std::str::FromStr for Qwen4KvCache {
             "bf16" => Ok(Self::Bf16),
             "fp8" => Ok(Self::Fp8),
             _ => Err(QwenKvFormatError(value.into())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod kv_record_tests {
+    use super::Qwen4KvCache;
+
+    #[test]
+    fn planar_records_keep_inline_scales_and_vector_alignment() {
+        for (heads, dim, fp8_bytes) in [(2, 192, 400), (4, 192, 784), (2, 256, 528)] {
+            assert_eq!(Qwen4KvCache::Bf16.plane_record_bytes(heads, dim), heads * dim * 2);
+            assert_eq!(Qwen4KvCache::Fp8.plane_record_bytes(heads, dim), fp8_bytes);
+            assert_eq!(fp8_bytes % 16, 0);
+            assert!(fp8_bytes >= heads * (dim + 4));
+            assert!(fp8_bytes < heads * (dim + 4) + 16);
         }
     }
 }

@@ -409,7 +409,7 @@ pub(super) mod tests {
             rope_scaling: None, scale_full: false, scale_sliding: false,
             activation: Vec::new(), shared_activation: Vec::new(),
         };
-        Step5CacheLayout::new(&config, ranks, context, mtp, step).unwrap()
+        Step5CacheLayout::new(&config, ranks, context, mtp, step, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16).unwrap()
     }
 
     #[test]

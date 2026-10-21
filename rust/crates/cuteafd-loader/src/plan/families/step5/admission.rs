@@ -377,7 +377,7 @@ fn admit_depth_with(
         (initial, inputs.context.min(initial)),
         |tokens, &context| {
             let cache =
-                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.rows as u64)?;
+                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.rows as u64, crate::families::qwen4::Qwen4KvCache::Bf16)?;
             let mark_bytes = usize::try_from(checked_sum(cache.ranks.iter().map(|r| r.bytes))?)?;
             let marks = inputs.marks.slots(mark_bytes);
             let mut fixed = Vec::new();
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(admission.cache.context, admission.placement.pool_tokens);
         assert_eq!(config().max_context, EXTENT);
         let initial =
-            Step5CacheLayout::for_execution(&config(), &admission.ownership, EXTENT, 0, 64)?;
+            Step5CacheLayout::for_execution(&config(), &admission.ownership, EXTENT, 0, 64, crate::families::qwen4::Qwen4KvCache::Bf16)?;
         assert!(initial.ranks[0].bytes > admission.cache.ranks[0].bytes);
         Ok(())
     }

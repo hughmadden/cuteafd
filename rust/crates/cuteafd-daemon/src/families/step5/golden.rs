@@ -596,7 +596,7 @@ fn check_prefix_state<'a>(
     checkpoint: &Checkpoint, cfg: &Config, tokens: &[u32], chain: &mut TargetChain<'a>,
     input: &Allocation<'a>, link: &SparkDeviceLink<'a>, waves: usize, available: usize,
 ) -> Result<()> {
-    let shape = Step5CacheLayout::new(cfg, 1, tokens.len() as u64, 0, tokens.len() as u64)?;
+    let shape = Step5CacheLayout::new(cfg, 1, tokens.len() as u64, 0, tokens.len() as u64, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     prefix_state_bytes(&shape, tokens.len())?;
     let pages = tokens.len().div_ceil(64) * 4 + 4;
     for frontier in PREFIX_FRONTIERS {
@@ -710,7 +710,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     if let Some(peer) = args.split_device {
         let devices = [args.device, peer].map(|id| Device { library: &library, id });
         let ownership = split_ownership(cfg, rows)?;
-        let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64)?;
+        let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         let mut available = [0; 2];
         let mut reservations = [0; 2];
         let mut cache_bytes = [0; 2];
@@ -748,7 +748,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     } else {
         let device = Device { library: &library, id: args.device };
         let available = library.cuda_memory_info()?.0 as u64;
-        let layout = Step5CacheLayout::new(cfg, 1, rows as u64, 0, rows as u64)?;
+        let layout = Step5CacheLayout::new(cfg, 1, rows as u64, 0, rows as u64, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         let cache_bytes = layout.ranks[0].bytes + layout.geometry.ranks[0].persistent_unit_bytes * pages;
         let staging_bytes = Staging::bytes(&layout, 0)? as u64;
         let reserved = cache_bytes + staging_bytes + (rows * H * 4) as u64 + (4u64 << 30);
@@ -795,7 +795,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         "Step-5 shared golden requires distinct devices and complete cold target");
     let rows = reference.tokens.len();
     let ownership = split_ownership(cfg, rows)?;
-    let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64)?;
+    let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     if args.check_headers { println!("Step-5 shared headers/reference validated: rows={rows} ranks=2; no CUDA or numerical qualification"); return Ok(()); }
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 golden requires an isolated process"))?;
@@ -940,7 +940,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let rows = tokens.len();
     ensure!(!args.prefix_state || (args.nll && args.last_layer == 91),
         "Step-5 prefix state check requires the complete target");
-    let layout = Step5CacheLayout::new(&cfg, 1, rows as u64, 0, rows as u64)?;
+    let layout = Step5CacheLayout::new(&cfg, 1, rows as u64, 0, rows as u64, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     if args.check_headers {
         println!("Step-5 headers/reference validated: rows={rows} layers=0..{} TP{}; no CUDA or numerical qualification", args.last_layer, args.peers.len());
         return Ok(());

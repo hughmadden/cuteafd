@@ -707,7 +707,7 @@ mod tests {
         ensure!(checkpoint.snapshot.file_name().and_then(|s| s.to_str()) == manifest["snapshot"].as_str(),
             "MTP fixture checkpoint identity");
         let cfg = Config::parse(&checkpoint)?;
-        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64)?;
+        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
         let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
         let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);
