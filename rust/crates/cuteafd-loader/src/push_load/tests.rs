@@ -348,6 +348,58 @@ fn done_progress_rank_release_and_group_cancel_use_shared_protocol() {
 }
 
 #[test]
+fn rank_nonblocking_poll_preserves_events_failures_and_eof() {
+    let (step, commands) = mpsc::channel();
+    let (sent, ready) = mpsc::channel();
+    let server = Server::new(move |conn| {
+        assert!(matches!(request(&conn), Request::Join { .. }));
+        event(&conn, Event::Joined);
+        commands.recv_timeout(Duration::from_secs(2)).unwrap();
+        event(&conn, Event::Filled { slot: 0, len: 4096 });
+        sent.send(()).unwrap();
+        commands.recv_timeout(Duration::from_secs(2)).unwrap();
+        event(
+            &conn,
+            Event::Failed {
+                reason: "injected".into(),
+                missing: vec![],
+            },
+        );
+        sent.send(()).unwrap();
+        commands.recv_timeout(Duration::from_secs(2)).unwrap();
+    });
+    let ring = tempfile::tempfile().unwrap();
+    let rank = server
+        .client
+        .join(JoinArgs {
+            group: 7,
+            token: 11,
+            rank: 0,
+            ring_fd: ring.as_raw_fd(),
+            slots: 1,
+            slot_bytes: 4096,
+        })
+        .unwrap();
+    assert!(matches!(rank.try_next().unwrap(), Poll::Empty));
+    step.send(()).unwrap();
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(
+        rank.try_next().unwrap(),
+        Poll::Ready(Event::Filled { slot: 0, len: 4096 })
+    ));
+    step.send(()).unwrap();
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(rank
+        .try_next()
+        .unwrap_err()
+        .to_string()
+        .contains("injected"));
+    step.send(()).unwrap();
+    server.finish();
+    assert!(matches!(rank.try_next().unwrap(), Poll::Closed));
+}
+
+#[test]
 fn join_start_and_stream_idle_deadlines_fall_back() {
     for phase in ["join", "start", "next"] {
         let (unblock, blocked) = mpsc::channel();

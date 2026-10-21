@@ -665,7 +665,7 @@ pub(super) mod tests {
                 "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
                 "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
         MlaDflashConfig::from_json(&config).unwrap().runtime_layout(GlmDraftRepresentation::Fp8Only,
-            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), context, 188, 2).unwrap()
+            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), context, slots * context, 188, 2).unwrap()
     }
 
     #[test]

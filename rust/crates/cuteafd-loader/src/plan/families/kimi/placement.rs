@@ -3,6 +3,7 @@
 //! onboarding and retained marks. Not runtime admission: coordinator workspaces,
 //! graphs and the EXL3 workspace of the final export set come with the engine.
 use super::Model;
+use anyhow::Context;
 use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
@@ -139,7 +140,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
             else { GlmDraftRepresentation::Bf16Only };
         let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
-            usize::try_from(context)?, opts.physical_sms.unwrap_or(188) as usize, 0)?;
+            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0)?;
         fixed.extend(crate::families::kimi_k3::draft_bridge_demands(&layout)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         let (demand, peak) = layout.demands(1)?;

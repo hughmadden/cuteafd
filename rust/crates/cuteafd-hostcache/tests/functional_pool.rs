@@ -145,14 +145,15 @@ fn constructor_failure_releases_partial() {
 
 #[test]
 fn release_all_returns_every_chunk() {
-    let (mut pool, mut mem) = pool(4 * CHUNK as u64);
+    let chunks = Class::ALL.len() as u64 + 1;
+    let (mut pool, mut mem) = pool(chunks * CHUNK as u64);
     // Carve one chunk per class so release_all must walk carved and uncarved chunks alike.
     for class in Class::ALL {
         pool.take(class).expect("take");
     }
-    assert_eq!(mem.live_chunks(), 4);
+    assert_eq!(mem.live_chunks(), chunks as usize);
     pool.release_all(&mut mem).expect("release_all");
-    assert_eq!(mem.releases(), 4);
+    assert_eq!(mem.releases(), chunks as usize);
     assert_eq!(mem.live_chunks(), 0);
     assert_eq!(mem.live_bytes(), 0);
 }
@@ -212,7 +213,7 @@ fn occupancy_tracks_use() {
 
 #[test]
 fn bytes_used_exact_mixed() {
-    let (mut pool, _mem) = pool(4 * CHUNK as u64);
+    let (mut pool, _mem) = pool(Class::ALL.len() as u64 * CHUNK as u64);
     let mut held = Vec::new();
     let mut expected = 0u64;
     for class in Class::ALL {
@@ -244,7 +245,7 @@ fn new_rejects_oversized_class() {
         page: CHUNK + 1,
         tail: 1,
         draft: 1,
-        scores: 1,
+        scores: 1, draft_page: 0
     };
     assert!(SlabPool::new(CHUNK as u64, CHUNK, bad, &mut mem).is_err());
     assert_eq!(mem.allocations(), 0);
@@ -262,7 +263,7 @@ fn zero_size_class_is_disabled() {
         page: 4096,
         tail: 8192,
         draft: 2048,
-        scores: 0,
+        scores: 0, draft_page: 0
     };
     let mut mem = FakePinned::new(usize::MAX);
     let mut pool = SlabPool::new(2 * CHUNK as u64, CHUNK, disabled, &mut mem).expect("pool");

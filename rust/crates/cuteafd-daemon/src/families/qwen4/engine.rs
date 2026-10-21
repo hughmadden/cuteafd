@@ -276,6 +276,9 @@ pub(crate) struct Qwen4Placement {
     /// plain verify; a speculative verify leaves it until the kept rows are committed and the
     /// placement rewound ([`Qwen4Engine::rewind`]).
     pub state_len: usize,
+    /// Contiguous canonical MTP rows; proposals and pending hidden rows do not count.
+    pub mtp_frontier: std::cell::Cell<usize>,
+    pub mtp_snapshot_pending: std::cell::Cell<bool>,
     pub history: NgramHistory,
     /// Request metadata from native ids/span grids, recomputed on prefix restore.
     /// Never radix keys; rotary coordinates never change logical cache rows.
@@ -289,7 +292,7 @@ impl Qwen4Placement {
         let pages = units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i))
             .collect();
         let pool_pages = units.iter().map(|&u| u as i32).collect();
-        Self { units, pages, pool_pages, slot, len: 0, state_len: 0, history, rope: Default::default(), media: None }
+        Self { units, pages, pool_pages, slot, len: 0, state_len: 0, mtp_frontier: Default::default(), mtp_snapshot_pending: Default::default(), history, rope: Default::default(), media: None }
     }
 
     pub fn record(&self, position: usize) -> Result<i64> {
@@ -1629,6 +1632,7 @@ impl<'a> Qwen4Engine<'a> {
             owners.extend([&bank.conv, &bank.state].into_iter().filter_map(|p| p.as_ref().cloned()));
         }
         owners.extend(self.ple_state.as_ref().cloned());
+        owners.extend(self.mtp_pending.as_ref().cloned());
         owners
     }
 
@@ -1719,6 +1723,29 @@ impl<'a> Qwen4Engine<'a> {
             regions.push(Self::region(ple, slot * per, per));
         }
         regions
+    }
+
+    pub(crate) fn snapshot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
+        let mut regions = self.slot_regions(slot);
+        if let Some(pending) = &self.mtp_pending {
+            let row = HC * self.cfg.hidden * 2;
+            regions.push(Self::region(pending, slot * MTP_PENDING_ROWS * row, row));
+        }
+        regions
+    }
+
+    pub(crate) fn mtp_keep_last_pending(&self, slot: i32, last: usize) -> Result<()> {
+        let pending = self.mtp_pending.as_ref().context("MTP stash absent")?;
+        let slot = usize::try_from(slot)?;
+        ensure!(slot < self.slots && last < MTP_PENDING_ROWS, "invalid MTP snapshot pending row");
+        if last > 0 {
+            let row = HC * self.cfg.hidden * 2;
+            let dst = Self::region(pending, slot * MTP_PENDING_ROWS * row, row);
+            let src = Self::region(pending, (slot * MTP_PENDING_ROWS + last) * row, row);
+            // SAFETY: disjoint rows in retained stash storage, ordered after canonical forwards.
+            unsafe { self.library.copy_d2d_async(dst, src, row, self.execution_stream())?; }
+        }
+        Ok(())
     }
 
     fn persistent_state_buffers(&self) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {

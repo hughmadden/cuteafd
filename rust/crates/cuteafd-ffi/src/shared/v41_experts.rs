@@ -593,6 +593,37 @@ impl NativeLibrary {
         })
     }
 
+    /// Generate equal-pitch omitted row tails without touching source bytes.
+    /// # Safety
+    /// The destination is on the current device and stays live through completion.
+    pub unsafe fn zero_pitched_async(&self, destination: CuteafdDeviceBuffer,
+        pitch: usize, width: usize, rows: usize, stream: *mut c_void) -> Result<()> {
+        ensure!(width > 0 && rows > 0 && pitch >= width
+            && (rows - 1).checked_mul(pitch).and_then(|n| n.checked_add(width))
+                .is_some_and(|n| n <= destination.bytes), "zero pitch exceeds destination");
+        type F = unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, *mut c_void) -> i32;
+        let zero = unsafe { self.lib.get::<F>(b"cuteafd_zero_pitched_async")? };
+        let status = unsafe { zero(destination.ptr, destination.bytes as u64,
+            pitch as u64, width as u64, rows as u64, stream) };
+        ensure!(status == 0, "pitched zero failed with CUDA status {status}");
+        Ok(())
+    }
+
+    /// Pack one fused raw plane out of place, using the mount packer's kernel.
+    /// # Safety
+    /// Both buffers must be live on the current device through stream completion.
+    /// FC1 halves must already contain their independently padded [up;gate] rows.
+    pub unsafe fn v41_pack_plane_async(&self, source: crate::CuteafdDeviceBuffer,
+        destination: crate::CuteafdDeviceBuffer, intermediate: u32, plane: u32,
+        stream: *mut c_void) -> Result<()> {
+        type PlaneFn = unsafe extern "C" fn(*const u8, u64, *mut u8, u64, u32, u32, *mut c_void) -> i32;
+        let pack = unsafe { self.lib.get::<PlaneFn>(b"cuteafd_pack_expert_plane_async")? };
+        let status = unsafe { pack(source.ptr.cast(), source.bytes as u64,
+            destination.ptr.cast(), destination.bytes as u64, intermediate, plane, stream) };
+        ensure!(status == 0, "V4.1 plane packing failed with CUDA status {status}");
+        Ok(())
+    }
+
     pub fn v41_expert_packer(&self, intermediate: u32) -> Result<V41ExpertPacker<'_>> {
         ensure!(
             v41_pack_intermediate_supported(intermediate),

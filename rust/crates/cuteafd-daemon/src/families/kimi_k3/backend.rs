@@ -161,7 +161,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         timing.seconds += started.elapsed().as_secs_f64();
         Ok(output)
     }
-    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool, draft: bool)
+    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool)
         -> Result<()> {
         if speculative {
             self.engine.accept_provisional(verified)?;
@@ -171,12 +171,12 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
                     "Kimi non-speculative state did not commit all input rows");
             }
         }
-        if draft {
+        if verified.iter().any(|sequence| sequence.neural) {
             let drafter = self.engine.native_draft().ok_or_else(|| anyhow::anyhow!("Kimi drafter was not admitted"))?;
             let mut context = Vec::new();
             for sequence in verified.iter_mut() {
-                if sequence.finished || sequence.kept.is_none() { continue; }
-                let (keep, after) = sequence.kept.unwrap();
+                if sequence.finished { continue; }
+                let Some((keep, after)) = sequence.neural_kept() else { continue; };
                 ensure!(keep > 0 && keep <= sequence.rows.len()
                     && sequence.placement.state_len == sequence.start + keep,
                     "Kimi draft accept differs from exact committed target state");

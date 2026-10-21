@@ -515,6 +515,7 @@ mod tests {
         for heads in [false, true] {
             let fixture = Fixture::build()?;
             let library = fixture.load()?;
+            fixture.immediate_copies(&library)?;
             let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
             cfg.layers = 3;
             cfg.attention = vec![KimiAttention::Kda, KimiAttention::Mla, KimiAttention::Mla];
