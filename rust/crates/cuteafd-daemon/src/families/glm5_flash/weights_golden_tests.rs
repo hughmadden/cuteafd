@@ -62,3 +62,69 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
     }
     Ok(())
 }
+
+/// The same operands pushed, Pow2 rule: the loader records its class-2
+/// operands and class-3 steps, each GPU's plan (one coordinator rank per GPU,
+/// two GPUs with a head split and one GPU whole) replays through a ring into
+/// its dense arena (steps staged through the host path and transformed on
+/// completion), and every operand matches the mount golden.
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_GLMF, an allocated CPU build slot and explicit NVMe fixture directory"]
+fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{testing, RankLayout};
+    let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_GLMF").map(std::path::PathBuf::from) else { return Ok(()) };
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 256 << 30)?; }
+    let checkpoint = Checkpoint::coordinator(&snapshot, false, false)?;
+    let cfg = GlmNextConfig::read(&snapshot)?;
+    let kda = (0..cfg.layers).find(|&l| cfg.attention[l] == GlmNextAttention::Kda).context("no KDA layer")?;
+    let mla = (0..cfg.layers).find(|&l| cfg.attention[l] == GlmNextAttention::Mla && !cfg.dense[l]).context("no MLA layer")?;
+    let dense = (0..cfg.layers).find(|&l| cfg.dense[l]).context("no dense layer")?;
+    let stream = std::ptr::null_mut();
+    let rule = crate::shared::fp8_linear::Fp8Scales::Pow2;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/glm5_flash/weights_golden.json");
+    let golden: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let sparks = 2;
+    for gpus in [2usize, 1] {
+        let load = std::rc::Rc::new(DenseLoad::push());
+        let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream, fp8_source: None,
+            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true,
+            kda_nvfp4: None, fp8_scales: rule, device: 0,
+            peers: if gpus == 2 { vec![crate::shared::peer_split::RankDevice { device: 1, stream }] } else { Vec::new() },
+            dense: load.clone() };
+        let mut operands = Vec::new();
+        for layer in [kda, mla, dense] {
+            if gpus == 2 {
+                for (rank, share) in loader.layer_shares(&cfg, layer, LayerMode::HeadSplit)?.into_iter().enumerate() {
+                    operands.push((format!("{rule:?}.layer{layer}.rank{rank}"), share));
+                }
+            } else {
+                operands.push((format!("{rule:?}.single.layer{layer}"), loader.layer(&cfg, layer)?));
+            }
+        }
+        let head = (gpus == 2).then(|| loader.fp8(&["lm_head.weight".to_string()],
+            crate::families::glm5_flash::fp8::Layout::Row128)).transpose()?;
+        let (records, steps) = load.sink.as_ref().context("push sink")?.take();
+        let mut peak_steps = 0;
+        for gpu in 0..gpus as i32 {
+            let layout = RankLayout::new(records.clone(), steps.clone(), gpu)?;
+            peak_steps = peak_steps.max(layout.steps.iter().map(|(_, s)| s.bytes()).max().unwrap_or(0));
+            testing::replay(crate::shared::memory::device::Device { library: &library, id: gpu }, layout, &snapshot,
+                sparks + gpus, sparks + gpu as usize)?;
+        }
+        assert!(peak_steps <= crate::shared::experts::rtx::dense::STEP_BYTES, "a staged step exceeds its bound");
+        for (prefix, share) in &operands {
+            for (name, allocation) in &share.operands {
+                let key = format!("{prefix}.{name}");
+                assert_eq!(&digest(&library, allocation.buffer)?, golden.get(&key).context("golden key")?,
+                    "pushed {key} differs from the mount golden");
+            }
+        }
+        if let Some((values, scales)) = head {
+            assert_eq!(&digest(&library, values.buffer)?, &golden[&format!("{rule:?}.head.values")]);
+            assert_eq!(&digest(&library, scales.buffer)?, &golden[&format!("{rule:?}.head.scales")]);
+        }
+    }
+    Ok(())
+}
