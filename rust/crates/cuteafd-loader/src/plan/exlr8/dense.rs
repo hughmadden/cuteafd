@@ -1,5 +1,5 @@
 //! Dormant native coordinator layouts. No serving path selects these yet.
-use super::{Header, files, number, residency::xxhash64};
+use super::{Header, files, number};
 use anyhow::{Context, ensure};
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -88,14 +88,13 @@ pub struct DenseRecord {
     pub rotation: Option<String>,
     pub hessian_solved: bool,
     pub components: Vec<DenseComponent>,
-    pub checksums: Vec<u64>,
+    pub native_blocks: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct DenseUnit {
     pub block: usize,
     pub source: Vec<DenseRange>,
-    pub checksum: u64,
 }
 
 impl DenseUnit {
@@ -103,8 +102,8 @@ impl DenseUnit {
         sum(self.source.iter().map(|r| r.bytes)).map_err(Into::into)
     }
 
-    /// Verify before publishing any component of this block to a device owner.
-    pub fn read_verified(&self, staging: &mut [u8]) -> Result<()> {
+    /// Read complete native blocks through checked source extents.
+    pub fn read(&self, staging: &mut [u8]) -> Result<()> {
         (|| -> anyhow::Result<()> {
             ensure!(
                 staging.len() == sum(self.source.iter().map(|r| r.bytes))?,
@@ -115,11 +114,6 @@ impl DenseUnit {
                 source.read(&mut staging[at..at + source.bytes])?;
                 at += source.bytes;
             }
-            ensure!(
-                xxhash64(staging) == self.checksum,
-                "dense checksum mismatch at block {}",
-                self.block
-            );
             Ok(())
         })()
         .map_err(Into::into)
@@ -143,7 +137,7 @@ pub struct DensePlan {
     pub tensors: Vec<DenseSlice>,
     /// Sum of separately 256-byte-aligned component allocations.
     pub resident_bytes: usize,
-    /// One verification unit, including replicated trellis scale vectors.
+    /// One staging unit, including replicated trellis scale vectors.
     pub read_staging_bytes: usize,
 }
 
@@ -207,7 +201,7 @@ fn component(
     })
 }
 
-/// Read headers and tiny record/checksum tables only. The official checkpoint is not an input.
+/// Read headers and tiny record tables only. The official checkpoint is not an input.
 impl DenseRecord {
     pub fn inventory(snapshot: &Path) -> Result<Vec<Self>> {
         Self::inventory_inner(snapshot).map_err(Into::into)
@@ -425,11 +419,6 @@ impl DenseRecord {
                     "U64",
                     &[extent.div_ceil(128)],
                 )?;
-                let checksums = header
-                    .read(&path, &checksum)?
-                    .chunks_exact(8)
-                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-                    .collect();
                 claimed.extend([name.clone(), checksum]);
                 let tensor = logical(stem, true);
                 ensure!(
@@ -446,7 +435,7 @@ impl DenseRecord {
                     rotation: (rotation_id > 0).then(|| rotations[rotation_id - 1].into()),
                     hessian_solved: solved == 1,
                     components,
-                    checksums,
+                    native_blocks: extent.div_ceil(128),
                 });
             }
             for (name, meta) in entries {
@@ -480,7 +469,7 @@ impl DenseRecord {
                     rotation: None,
                     hessian_solved: false,
                     components: vec![component(&header, &path, name, "plain", dtype, &shape)?],
-                    checksums: vec![],
+                    native_blocks: 0,
                 });
             }
         }
@@ -556,11 +545,11 @@ impl DenseRecord {
             );
             ensure!(
                 first % 128 == 0 && (channels % 128 == 0 || first + channels == extent),
-                "dense slice must contain complete checksum blocks"
+                "dense slice must contain complete native blocks"
             );
             ensure!(
-                self.checksums.len() == extent.div_ceil(128),
-                "dense checksum count differs from channel extent"
+                self.native_blocks == extent.div_ceil(128),
+                "dense native block count differs from channel extent"
             );
             let components = self.ranges(first, channels)?;
             let units = (first..first + channels)
@@ -568,7 +557,7 @@ impl DenseRecord {
                 .map(|at| {
                     let count = (first + channels - at).min(128);
                     let mut ranges = self.ranges(at, count)?;
-                    // Trellis checksums put the sharded vector before the other vector.
+                    // Keep the native component order used by streaming loaders.
                     if matches!(self.encoding, DenseEncoding::Trellis { .. })
                         && self.side != ShardSide::Input
                     {
@@ -577,7 +566,6 @@ impl DenseRecord {
                     Ok(DenseUnit {
                         block: at / 128,
                         source: ranges.into_iter().map(|c| c.source).collect(),
-                        checksum: self.checksums[at / 128],
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -595,7 +583,7 @@ impl DenseRecord {
 }
 
 impl DensePlan {
-    /// Streaming owns one verification buffer; retained/pinned host storage is caller-owned.
+    /// Streaming owns one staging buffer; retained/pinned host storage is caller-owned.
     pub fn admit_host(&self, available: usize, reserved: usize) -> Result<usize> {
         (|| -> anyhow::Result<_> {
             let total = sum([self.read_staging_bytes, reserved])?;
@@ -644,11 +632,11 @@ impl DensePlan {
                 };
                 if split {
                     ensure!(
-                        count % record.channels_per_shard == 0,
+                        count % record.native_blocks == 0,
                         "dense TP cuts a checkpoint shard unit"
                     );
                 }
-                let slice = if record.checksums.is_empty() {
+                let slice = if record.native_blocks == 0 {
                     DenseSlice {
                         tensor: record.tensor.clone(),
                         first_channel: 0,
@@ -756,20 +744,7 @@ mod tests {
         let payload = (0..16384).map(|i| (i % 251) as u8).collect::<Vec<_>>();
         let suh = vec![17u8; 512];
         let svh = vec![23u8; 256];
-        let mut checksums = Vec::new();
-        if side == 2 {
-            for at in 0..2 {
-                let mut bytes = payload[at * 8192..(at + 1) * 8192].to_vec();
-                bytes.extend_from_slice(&suh[at * 256..(at + 1) * 256]);
-                bytes.extend_from_slice(&svh);
-                checksums.extend_from_slice(&xxhash64(&bytes).to_le_bytes());
-            }
-        } else {
-            let mut bytes = payload.clone();
-            bytes.extend_from_slice(&svh);
-            bytes.extend_from_slice(&suh);
-            checksums.extend_from_slice(&xxhash64(&bytes).to_le_bytes());
-        }
+        let checksums = vec![0; if side == 2 { 16 } else { 8 }];
         write(
             root,
             [1, 128, 256, 4, side, unit, rotation, 1],
@@ -799,7 +774,7 @@ mod tests {
     #[test]
     fn typed_trellis_inventory_and_input_tp_verify_native_bytes() {
         let root = tempfile::tempdir().unwrap();
-        let path = trellis(root.path(), 2, 128, 0);
+        trellis(root.path(), 2, 128, 0);
         let records = DenseRecord::inventory(root.path()).unwrap();
         assert_eq!(records[0].encoding, DenseEncoding::Trellis { bits: 4 });
         assert_eq!(records[0].rotation_id, 0);
@@ -810,9 +785,9 @@ mod tests {
             assert_eq!(plan.resident_bytes, 8192 + 256 + 256);
             assert_eq!(plan.read_staging_bytes, 8192 + 256 + 256);
             let unit = &plan.tensors[0].units[0];
-            unit.read_verified(&mut vec![0; unit.staging_bytes().unwrap()])
+            unit.read(&mut vec![0; unit.staging_bytes().unwrap()])
                 .unwrap();
-            assert!(unit.read_verified(&mut []).is_err());
+            assert!(unit.read(&mut []).is_err());
             assert_eq!(
                 plan.admit(plan.resident_bytes + 512, 1, 2, 0).unwrap(),
                 plan.resident_bytes + 512
@@ -821,27 +796,37 @@ mod tests {
             assert!(plan.admit(usize::MAX, usize::MAX, 2, 0).is_err());
             assert!(plan.admit(usize::MAX, 0, 0, 0).is_err());
         }
-        let unit = DensePlan::for_rank(&records, 1, 0).unwrap().tensors[0].units[0].clone();
-        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-        f.seek(SeekFrom::Start(unit.source[0].offset)).unwrap();
-        f.write_all(&[255]).unwrap();
-        assert!(
-            unit.read_verified(&mut vec![0; unit.staging_bytes().unwrap()])
-                .unwrap_err()
-                .to_string()
-                .contains("checksum mismatch")
-        );
+        let plan = DensePlan::for_rank(&records, 1, 0).unwrap();
+        let unit = &plan.tensors[0].units[0];
+        let source = &unit.source[0];
+        std::fs::OpenOptions::new().write(true).open(&source.path).unwrap()
+            .set_len(source.offset + source.bytes as u64 - 1).unwrap();
+        assert!(unit.read(&mut vec![0; unit.staging_bytes().unwrap()]).is_err());
     }
 
     #[test]
-    fn output_trellis_checksum_order_and_shared_rotation_are_preserved() {
+    fn replicated_native_records_keep_block_streaming() {
+        let root = tempfile::tempdir().unwrap();
+        trellis(root.path(), 0, 0, 0);
+        let records = DenseRecord::inventory(root.path()).unwrap();
+        assert_eq!(records[0].channels_per_shard, 0);
+        assert_eq!(records[0].native_blocks, 1);
+        for rank in 0..2 {
+            let plan = DensePlan::for_rank(&records, 2, rank).unwrap();
+            let unit = &plan.tensors[0].units[0];
+            unit.read(&mut vec![0; unit.staging_bytes().unwrap()]).unwrap();
+        }
+    }
+
+    #[test]
+    fn output_trellis_component_order_and_shared_rotation_are_preserved() {
         let root = tempfile::tempdir().unwrap();
         trellis(root.path(), 1, 128, 3);
         let records = DenseRecord::inventory(root.path()).unwrap();
         assert_eq!(records[0].rotation.as_deref(), Some("mlp_in"));
         let p = DensePlan::for_rank(&records, 1, 0).unwrap();
         let unit = &p.tensors[0].units[0];
-        unit.read_verified(&mut vec![0; unit.staging_bytes().unwrap()])
+        unit.read(&mut vec![0; unit.staging_bytes().unwrap()])
             .unwrap();
         assert!(DensePlan::for_rank(&records, 2, 0).is_err());
     }
@@ -889,16 +874,11 @@ mod tests {
     }
 
     #[test]
-    fn side2_int4_checksum_and_slice_are_unit_major() {
+    fn side2_int4_blocks_and_slice_are_unit_major() {
         let root = tempfile::tempdir().unwrap();
         let data = vec![0x89; 128 * 256 / 2];
         let scales = vec![0x3c; 128 * 256 / 32 * 2];
-        let mut hashes = Vec::new();
-        for i in 0..2 {
-            let mut bytes = data[i * 8192..(i + 1) * 8192].to_vec();
-            bytes.extend_from_slice(&scales[i * 1024..(i + 1) * 1024]);
-            hashes.extend_from_slice(&xxhash64(&bytes).to_le_bytes());
-        }
+        let hashes = vec![0; 16];
         write(
             root.path(),
             [2, 128, 256, 0, 2, 128, 0, 1],
@@ -914,7 +894,7 @@ mod tests {
             let u = &p.tensors[0].units[0];
             assert_eq!(u.source[0].bytes, 8192);
             assert_eq!(u.source[1].bytes, 1024);
-            u.read_verified(&mut vec![0; u.staging_bytes().unwrap()])
+            u.read(&mut vec![0; u.staging_bytes().unwrap()])
                 .unwrap();
         }
     }
@@ -934,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_norms_have_no_synthetic_checksum_or_tp_slice() {
+    fn plain_norms_have_no_native_blocks_or_tp_slice() {
         let root = tempfile::tempdir().unwrap();
         let path = trellis(root.path(), 2, 128, 0);
         rewrite_header(&path, |h| {
@@ -956,7 +936,7 @@ mod tests {
             .iter()
             .find(|r| r.tensor.ends_with("input_layernorm.weight"))
             .unwrap();
-        assert!(norm.checksums.is_empty());
+        assert_eq!(norm.native_blocks, 0);
         for rank in 0..2 {
             let p = DensePlan::for_rank(&records, 2, rank).unwrap();
             let norm = p
@@ -1023,20 +1003,7 @@ mod tests {
                 6 => vec![("bf16", "BF16", vec![n, k], vec![1; n * k * 2])],
                 _ => vec![("fp32", "F32", vec![n, k], vec![1; n * k * 4])],
             };
-            let mut hashes = Vec::new();
-            for first in (0..n).step_by(128) {
-                let count = (n - first).min(128);
-                let mut bytes = Vec::new();
-                for (suffix, _, _, data) in &parts {
-                    if code == 4 && *suffix == "scale" {
-                        bytes.extend_from_slice(&data[first / 128 * 4..first / 128 * 4 + 4]);
-                    } else {
-                        let stride = data.len() / n;
-                        bytes.extend_from_slice(&data[first * stride..(first + count) * stride]);
-                    }
-                }
-                hashes.extend_from_slice(&xxhash64(&bytes).to_le_bytes());
-            }
+            let hashes = vec![0; n.div_ceil(128) * 8];
             let mut parts = parts;
             parts.push(("checksum", "U64", vec![n.div_ceil(128)], hashes));
             write(
@@ -1047,7 +1014,7 @@ mod tests {
             let records = DenseRecord::inventory(root.path()).unwrap();
             let p = DensePlan::for_rank(&records, 1, 0).unwrap();
             for unit in &p.tensors[0].units {
-                unit.read_verified(&mut vec![0; unit.staging_bytes().unwrap()])
+                unit.read(&mut vec![0; unit.staging_bytes().unwrap()])
                     .unwrap();
             }
             assert_eq!(p.tensors[0].components[0].shape[0], n);
@@ -1058,7 +1025,7 @@ mod tests {
                     assert_eq!(p.tensors[0].components[1].shape, [128, 4]);
                 }
             } else {
-                // TP cannot cut a checksum block, even if it divides the declared shard unit.
+                // TP cannot cut a native block, even if it divides the declared shard unit.
                 assert!(DensePlan::for_rank(&records, 2, 0).is_err());
             }
         }

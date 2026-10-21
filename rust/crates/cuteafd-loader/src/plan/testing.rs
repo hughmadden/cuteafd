@@ -1,6 +1,8 @@
 //! Checkpoint fixtures for planner tests (this crate's and the daemon's CLI
 //! tests): headers with the real geometry of each family over sparse,
 //! all-zero payloads, so a fixture costs no disk.
+pub mod exlr8;
+
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
