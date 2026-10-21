@@ -520,8 +520,8 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert body.index("SparkAdmission::plan(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
     assert "&working, peers.len(), None, model)?;" in body and "admission.start_with(&peers, ranks)?" in body
-    # Coordinator TP2 halves join the Spark push group only when it pushes.
-    assert "if !tp2_layers.is_empty() && admission.pushes()" in body
+    # Coordinator GPUs (dense operands, TP2 halves) join the Spark push group only when it pushes.
+    assert "if admission.pushes() && dense_pushable(&args, self.fp8_checkpoint.is_some())" in body
     assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
     assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body
@@ -535,7 +535,9 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     # Admitted TP2 expert weights land inside the Spark admission window;
     # execution binds after the engine exists and before step workspaces.
     window = body.split("load_while_admitting(admission,", 1)[1].split("probe(\"target-weights\")", 1)[0]
-    assert "tp2_weights(pushed)?" in window and "push.receive(" in window
+    assert "tp2_weights(pushed)?" in window and "push.receive_with(devices, catalog, sparks, Some(dense)" in window
+    # A planning failure declines the group; a group fallback fills the same records through the mount.
+    assert "Err(error) => (None, Err(error))" in window and "dense::fill_by_mount(" in window
     assert body.index("engine::GlmfEngine::new(") < body.index("tp2.execution()?") < body.index("engine.install_tp2(ranks)?")
     assert body.index("engine.install_tp2(ranks)?") < body.index("engine.install_workspaces(workspaces)?")
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
