@@ -14,7 +14,7 @@ use nest_push::{
     proto::{Event, Forecast, RankSpec, SOCKET},
 };
 
-pub use nest_push::{client::JoinArgs, plan, proto, slot};
+pub use nest_push::{client::{JoinArgs, Poll, Conn, Listener}, plan, proto, slot};
 pub mod builder;
 
 pub const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -145,6 +145,18 @@ pub struct PushRank {
 }
 
 impl PushRank {
+    pub fn try_next(&self) -> io::Result<Poll> {
+        match self.rank.try_next()? {
+            Poll::Ready(event) => {
+                let event = checked_event(Some(event))?;
+                match event {
+                    event @ (Event::Filled { .. } | Event::Progress { .. } | Event::Done) => Ok(Poll::Ready(event)),
+                    other => Err(unexpected(other)),
+                }
+            }
+            other => Ok(other),
+        }
+    }
     pub fn next(&self) -> io::Result<Event> {
         match checked_event(self.rank.next()?)? {
             event @ (Event::Filled { .. } | Event::Progress { .. } | Event::Done) => Ok(event),
