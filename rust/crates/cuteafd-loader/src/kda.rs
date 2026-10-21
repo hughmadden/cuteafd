@@ -68,9 +68,6 @@ pub fn narrow_a_log(raw: &[u8], heads: usize) -> Result<Vec<f32>, KdaError> {
     Ok(live)
 }
 
-#[derive(Clone, Copy)]
-enum Split { Rows, Cols, Replicate }
-
 impl KdaGeometry {
     pub fn validate(&self, ranks: usize) -> Result<(), KdaError> {
         if self.hidden == 0 || self.hidden % 128 != 0 || self.head_dim != 128 || self.conv_kernel != 4
@@ -98,19 +95,20 @@ impl KdaGeometry {
         }
     }
 
-    /// Read each tensor role once, preserving BF16/F32 bytes and head order.
-    /// Only the operand being packed is materialized, not a second whole layer.
-    /// Input projections split rows, o_proj splits columns, low-rank inputs
-    /// and the per-head norm replicate. Conv and dt_bias become F32; o_norm
-    /// retains the geometry's native dtype. A_log arrives padded and raw.
-    pub fn pack(&self, operand: KdaOperand, ranks: usize,
-        mut read: impl FnMut(KdaRole) -> Result<KdaTensor, KdaError>) -> Result<Vec<KdaTensor>, KdaError>
+    /// Where each rank's operand elements come from, from checkpoint headers
+    /// alone (`meta` gives a role's dtype and shape): per rank, in operand order,
+    /// one window per role. Input projections split rows, o_proj splits columns,
+    /// low-rank inputs and the per-head norm replicate. Conv and dt_bias become
+    /// F32 (from BF16 or F32 sources); o_norm retains the geometry's native
+    /// dtype. A_log keeps its active heads, after `narrow_a_log` checks the
+    /// padding of the whole raw vector. [`Self::pack`] executes this plan.
+    pub fn plan(&self, operand: KdaOperand, ranks: usize,
+        mut meta: impl FnMut(KdaRole) -> Result<(DType, Vec<usize>), KdaError>) -> Result<KdaPlan, KdaError>
     {
         self.validate(ranks)?;
         use KdaOperand as Op;
         use KdaRole as R;
         let full = self.output_gate == KdaOutputGate::FullRank;
-        let roles = self.roles(operand);
         let d = self.heads * self.head_dim;
         let local_d = d / ranks;
         let dtype = match operand {
@@ -118,59 +116,51 @@ impl KdaGeometry {
             Op::ONorm => self.o_norm_dtype.clone(),
             _ => DType::Bf16,
         };
-        let mut out = vec![KdaTensor { dtype: dtype.clone(), shape: Vec::new(), bytes: Vec::new() }; ranks];
-        for role in roles {
-            let mut tensor = read(role)?;
-            let element: usize = match tensor.dtype { DType::Bf16 => 2, DType::F32 => 4,
-                _ => return Err(tensor_error(role, format!("unsupported dtype {:?}", tensor.dtype))) };
+        let mut pieces = vec![Vec::new(); ranks];
+        let mut at = vec![0usize; ranks];
+        for role in self.roles(operand) {
+            let (source, mut shape) = meta(role)?;
+            if !matches!(source, DType::Bf16 | DType::F32) {
+                return Err(tensor_error(role, format!("unsupported dtype {source:?}")));
+            }
             let expected = match role {
                 R::Q | R::K | R::V | R::G => vec![d, self.hidden],
                 R::Fa | R::Ga => vec![self.head_dim, self.hidden],
                 R::Fb | R::Gb => vec![d, self.head_dim],
                 R::Beta => vec![self.heads, self.hidden],
                 R::ConvQ | R::ConvK | R::ConvV => {
-                    if tensor.shape == [d, 1, self.conv_kernel] { tensor.shape = vec![d, self.conv_kernel]; }
+                    if shape == [d, 1, self.conv_kernel] { shape = vec![d, self.conv_kernel]; }
                     vec![d, self.conv_kernel]
                 },
-                R::ALog => tensor.shape.clone(),
+                R::ALog => shape.clone(),
                 R::DtBias => vec![d], R::ONorm => vec![self.head_dim], R::O => vec![self.hidden, d],
             };
-            let size = tensor.shape.iter().try_fold(element, |n, dim| n.checked_mul(*dim));
-            if tensor.shape != expected || size != Some(tensor.bytes.len()) {
-                return Err(tensor_error(role, format!("expected {expected:?}, found {:?} ({} bytes)", tensor.shape, tensor.bytes.len())));
+            if shape != expected {
+                return Err(tensor_error(role, format!("expected {expected:?}, found {shape:?}")));
             }
+            let mut rows = shape[0];
+            let cols = shape.get(1).copied().unwrap_or(1);
             if role == R::ALog {
-                if tensor.dtype != DType::F32 || tensor.shape.len() != 1 {
+                if source != DType::F32 || shape.len() != 1 {
                     return Err(tensor_error(role, "A_log must be a raw F32 vector"));
                 }
-                tensor.bytes = narrow_a_log(&tensor.bytes, self.heads)?.into_iter().flat_map(f32::to_le_bytes).collect();
-                tensor.shape = vec![self.heads];
-            }
-            if tensor.dtype != dtype {
-                if dtype == DType::F32 && tensor.dtype == DType::Bf16 && operand != Op::ONorm {
-                    tensor.bytes = tensor.bytes.chunks_exact(2).flat_map(|b|
-                        (u32::from(u16::from_le_bytes([b[0], b[1]])) << 16).to_le_bytes()).collect();
-                } else {
-                    return Err(tensor_error(role, format!("expected {dtype:?}, found {:?}", tensor.dtype)));
+                if rows < self.heads {
+                    return Err(tensor_error(role, "expected F32 bytes with at least one entry per active head"));
                 }
+                rows = self.heads;
             }
-            let element = if dtype == DType::F32 { 4 } else { 2 };
-            let split = match role { R::Fa | R::Ga | R::ONorm => Split::Replicate, R::O => Split::Cols, _ => Split::Rows };
-            for (rank, dest) in out.iter_mut().enumerate() {
-                match split {
-                    Split::Replicate => dest.bytes.extend_from_slice(&tensor.bytes),
-                    Split::Rows => {
-                        let share = tensor.bytes.len() / ranks;
-                        dest.bytes.extend_from_slice(&tensor.bytes[rank * share..(rank + 1) * share]);
-                    },
-                    Split::Cols => {
-                        let row_bytes = d * element;
-                        let share = row_bytes / ranks;
-                        for row in tensor.bytes.chunks_exact(row_bytes) {
-                            dest.bytes.extend_from_slice(&row[rank * share..(rank + 1) * share]);
-                        }
-                    },
-                }
+            if source != dtype && !(dtype == DType::F32 && source == DType::Bf16 && operand != Op::ONorm) {
+                return Err(tensor_error(role, format!("expected {dtype:?}, found {source:?}")));
+            }
+            for rank in 0..ranks {
+                let (window_rows, window) = match role {
+                    R::Fa | R::Ga | R::ONorm => (0..rows, 0..cols),
+                    R::O => (0..rows, rank * cols / ranks..(rank + 1) * cols / ranks),
+                    _ => (rank * rows / ranks..(rank + 1) * rows / ranks, 0..cols),
+                };
+                let piece = KdaPiece { role, source: source.clone(), rows: window_rows, cols, window, at: at[rank] };
+                at[rank] += piece.elements();
+                pieces[rank].push(piece);
             }
         }
         let shape = match operand {
@@ -180,9 +170,92 @@ impl KdaGeometry {
             Op::ALog => vec![self.heads / ranks], Op::DtBias => vec![local_d],
             Op::ONorm => vec![self.head_dim], Op::WO => vec![self.hidden, local_d],
         };
-        for tensor in &mut out { tensor.shape = shape.clone(); }
+        Ok(KdaPlan { dtype, shape, ranks: pieces, a_log: (operand == Op::ALog).then_some(self.heads) })
+    }
+
+    /// Read each tensor role once and execute [`Self::plan`], preserving
+    /// BF16/F32 bytes and head order. Only the operand being packed is
+    /// materialized, not a second whole layer.
+    pub fn pack(&self, operand: KdaOperand, ranks: usize,
+        mut read: impl FnMut(KdaRole) -> Result<KdaTensor, KdaError>) -> Result<Vec<KdaTensor>, KdaError>
+    {
+        let mut tensors: Vec<(KdaRole, KdaTensor)> = Vec::new();
+        let plan = self.plan(operand, ranks, |role| {
+            let tensor = read(role)?;
+            let element: usize = match tensor.dtype { DType::Bf16 => 2, DType::F32 => 4,
+                _ => return Err(tensor_error(role, format!("unsupported dtype {:?}", tensor.dtype))) };
+            let size = tensor.shape.iter().try_fold(element, |n, dim| n.checked_mul(*dim));
+            if size != Some(tensor.bytes.len()) {
+                return Err(tensor_error(role, format!("{:?} does not hold {} bytes", tensor.shape, tensor.bytes.len())));
+            }
+            let meta = (tensor.dtype.clone(), tensor.shape.clone());
+            tensors.push((role, tensor));
+            Ok(meta)
+        })?;
+        if let Some(heads) = plan.a_log {
+            let (_, tensor) = tensors.first().ok_or_else(|| tensor_error(KdaRole::ALog, "A_log was not read"))?;
+            narrow_a_log(&tensor.bytes, heads)?;
+        }
+        let element = if plan.dtype == DType::F32 { 4 } else { 2 };
+        let mut out = Vec::with_capacity(ranks);
+        for pieces in &plan.ranks {
+            let elements = pieces.iter().map(KdaPiece::elements).sum::<usize>();
+            let mut bytes = vec![0u8; elements * element];
+            for piece in pieces {
+                let (_, tensor) = tensors.iter().find(|(role, _)| *role == piece.role)
+                    .ok_or_else(|| tensor_error(piece.role, "role was not read"))?;
+                piece.copy(&tensor.bytes, &mut bytes, element);
+            }
+            out.push(KdaTensor { dtype: plan.dtype.clone(), shape: plan.shape.clone(), bytes });
+        }
         Ok(out)
     }
+}
+
+/// One role's window of a rank's KDA operand: rows `rows` and element columns
+/// `window` of the source viewed as `[rows, cols]` (1-D tensors are `[n, 1]`,
+/// conv weights `[d, kernel]`), packed row-major at element `at`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KdaPiece {
+    pub role: KdaRole,
+    pub source: DType,
+    pub rows: std::ops::Range<usize>,
+    pub cols: usize,
+    pub window: std::ops::Range<usize>,
+    pub at: usize,
+}
+
+impl KdaPiece {
+    pub fn elements(&self) -> usize { self.rows.len() * self.window.len() }
+
+    /// Copies this window of `source` into `out` (operand elements of
+    /// `element` bytes), widening BF16 to F32 exactly when they differ.
+    fn copy(&self, source: &[u8], out: &mut [u8], element: usize) {
+        let from = if self.source == DType::F32 { 4 } else { 2 };
+        let mut at = self.at;
+        for row in self.rows.clone() {
+            for col in self.window.clone() {
+                let i = (row * self.cols + col) * from;
+                let dst = &mut out[at * element..(at + 1) * element];
+                if from == element {
+                    dst.copy_from_slice(&source[i..i + from]);
+                } else {
+                    dst.copy_from_slice(&(u32::from(u16::from_le_bytes([source[i], source[i + 1]])) << 16).to_le_bytes());
+                }
+                at += 1;
+            }
+        }
+    }
+}
+
+/// A KDA operand from checkpoint headers: its element type and shape, each
+/// rank's windows, and (A_log) the active heads whose padding must be checked.
+#[derive(Clone, Debug)]
+pub struct KdaPlan {
+    pub dtype: DType,
+    pub shape: Vec<usize>,
+    pub ranks: Vec<Vec<KdaPiece>>,
+    pub a_log: Option<usize>,
 }
 
 #[cfg(test)]

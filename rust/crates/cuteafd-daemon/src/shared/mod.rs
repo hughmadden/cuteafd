@@ -10,6 +10,7 @@ pub(crate) mod draft_policy;
 pub(crate) mod draft_confidence;
 pub(crate) mod experts;
 pub(crate) mod fp8_linear;
+pub(crate) mod fp8_load_quant;
 pub(crate) mod golden_scores;
 pub(crate) mod inventory;
 pub(crate) mod l2_prefetch;

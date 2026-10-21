@@ -3,7 +3,7 @@
 //! same byte range of each of its rows) at fixed offsets. The mount fills
 //! them by reading; a push plan targets the same offsets. Combination and
 //! transform steps stay in the loader.
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::OfficialV41Catalog;
 use std::ops::Range;
@@ -48,33 +48,37 @@ pub(crate) fn native_fp8_block(catalog: &OfficialV41Catalog, name: &str) -> Resu
         && scale.metadata.shape == [meta.shape[0].div_ceil(128), meta.shape[1].div_ceil(128)])
 }
 
+impl Land {
+    /// The shared coordinator rectangle and its operand offset.
+    pub fn rect(&self, catalog: &OfficialV41Catalog) -> Result<(crate::shared::experts::rtx::dense::Rect, usize)> {
+        let tensor = catalog.tensor(&self.tensor)?;
+        let (rows, row_bytes) = geometry(catalog, &self.tensor)?;
+        ensure!(self.rows.end <= rows && self.cols.end <= row_bytes && !self.rows.is_empty() && !self.cols.is_empty(),
+            "{}: landing outside the tensor", self.tensor);
+        Ok((crate::shared::experts::rtx::dense::Rect { name: self.tensor.clone(),
+            path: catalog.snapshot().join(&tensor.shard), base: tensor.metadata.byte_offset, row_bytes,
+            rows: self.rows.clone(), cols: self.cols.clone() }, self.offset))
+    }
+}
+
+/// The shared class-2 operand of `lands` in `buffer` on `device`.
+pub(crate) fn operand(catalog: &OfficialV41Catalog, device: i32, buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+    lands: &[Land], bytes: usize) -> Result<crate::shared::experts::rtx::dense::Operand> {
+    ensure!(lands.iter().all(|l| l.offset.checked_add(l.bytes()).is_some_and(|end| end <= bytes)) && bytes <= buffer.bytes,
+        "landing outside its operand");
+    Ok(crate::shared::experts::rtx::dense::Operand { device, buffer, bytes,
+        lands: lands.iter().map(|land| land.rect(catalog)).collect::<Result<_>>()? })
+}
+
 /// The operand's host image of `lands` read from the checkpoint (the mount
-/// path); unspecified gaps stay zero. One positioned read per row range.
+/// path); unspecified gaps stay zero.
 pub(crate) fn read(catalog: &OfficialV41Catalog, lands: &[Land], bytes: usize) -> Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
     let mut out = vec![0u8; bytes];
+    let mut rows = None;
     for land in lands {
-        let tensor = catalog.tensor(&land.tensor)?;
-        let (rows, row_bytes) = geometry(catalog, &land.tensor)?;
-        ensure!(land.rows.end <= rows && land.cols.end <= row_bytes && !land.rows.is_empty() && !land.cols.is_empty(),
-            "{}: landing outside the tensor", land.tensor);
-        ensure!(land.offset.checked_add(land.bytes()).is_some_and(|end| end <= bytes),
-            "{}: landing outside the operand", land.tensor);
-        let file = std::fs::File::open(catalog.snapshot().join(&tensor.shard))?;
-        let start = tensor.metadata.byte_offset + (land.rows.start * row_bytes) as u64;
-        if land.cols.len() == row_bytes {
-            crate::shared::memory::load_timing::read(land.bytes(), ||
-                file.read_exact_at(&mut out[land.offset..land.offset + land.bytes()], start))
-                .with_context(|| format!("reading {}", land.tensor))?;
-        } else {
-            let mut source = vec![0u8; land.rows.len() * row_bytes];
-            crate::shared::memory::load_timing::read(source.len(), || file.read_exact_at(&mut source, start))
-                .with_context(|| format!("reading {}", land.tensor))?;
-            for (row, chunk) in source.chunks_exact(row_bytes).enumerate() {
-                let at = land.offset + row * land.width();
-                out[at..at + land.width()].copy_from_slice(&chunk[land.cols.clone()]);
-            }
-        }
+        let (rect, at) = land.rect(catalog)?;
+        ensure!(at.checked_add(rect.bytes()).is_some_and(|end| end <= bytes), "{}: landing outside the operand", land.tensor);
+        rect.read_cached(&mut out[at..at + rect.bytes()], &mut rows)?;
     }
     Ok(out)
 }
@@ -115,4 +119,51 @@ pub(crate) fn col_share(catalog: &OfficialV41Catalog, name: &str, ranks: usize, 
     let land = Land { tensor: name.into(), rows: 0..rows, cols: rank * width..(rank + 1) * width, offset: 0 };
     let bytes = land.bytes();
     Ok((land, bytes))
+}
+
+/// A K-major widening of a landed grid, run once its grid is delivered.
+#[derive(Clone, Copy)]
+pub(crate) struct Kmajor {
+    pub device: i32,
+    pub grid: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub kmajor: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub rows: usize,
+    pub kb: usize,
+}
+
+impl Kmajor {
+    /// On the current device (`device`), drained before return.
+    pub fn run(&self, library: &cuteafd_ffi::NativeLibrary, stream: *mut std::ffi::c_void) -> Result<()> {
+        ensure!(self.grid.bytes >= self.rows.div_ceil(128) * self.kb * 4 && self.kmajor.bytes >= self.rows * self.kb * 4,
+            "K-major widening exceeds its operands");
+        // SAFETY: both buffers are live operand allocations on the current device
+        // sized as checked above; the stream drains before return.
+        unsafe {
+            library.fp8_grid_kmajor(self.grid.ptr, self.kmajor.ptr, self.rows, self.kb, stream)?;
+            library.cuda_stream_synchronize(stream)
+        }
+    }
+}
+
+/// Push-mode loader output: the class-2 operands to fill (shared records)
+/// and the transforms that read them after commit, in loader order.
+#[derive(Default)]
+pub(crate) struct PushSink {
+    pub dense: crate::shared::experts::rtx::dense::DenseSink,
+    deferred: std::cell::RefCell<Vec<Kmajor>>,
+}
+
+impl PushSink {
+    pub fn record(&self, catalog: &OfficialV41Catalog, device: i32, buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+        lands: &[Land], bytes: usize) -> Result<()> {
+        self.dense.operand(operand(catalog, device, buffer, lands, bytes)?)
+    }
+    pub fn defer(&self, job: Kmajor) -> Result<()> {
+        self.deferred.borrow_mut().push(job);
+        Ok(())
+    }
+    /// The recorded operands and deferred transforms (leaves the sink empty).
+    pub fn take(&self) -> (Vec<crate::shared::experts::rtx::dense::Operand>, Vec<Kmajor>) {
+        (self.dense.take().0, self.deferred.take())
+    }
 }
