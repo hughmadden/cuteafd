@@ -222,7 +222,9 @@ def test_v41_worker_puts_the_spark_wrapper_between_image_and_command():
     source = (ROOT / 'scripts/launch/run-family.sh').read_text()
     invocation, remote = source.split('echo "== starting native Spark experts =="', 1)[1].split("<<'REMOTE' &", 1)
     remote = remote.split('\nREMOTE', 1)[0]
-    assert 'spark_profile_wrapper_for "$host" "$i" "$SPARK_COUNT"' in invocation
+    assert 'release_profile_spark_wrapper "${PROFILE_SPARK:-}" "${PROFILE_SPARK_RANKS:-}" "${PROFILE_DIR:-}" "$host" "$i" "$SPARK_COUNT"' in invocation
+    # Unprofiled workers keep the exact pre-existing argv (no wrapper sentinel).
+    assert 'if ((${#RELEASE_PROFILE_WRAPPER[@]})); then' in invocation
     positional = ['image', 'name', '0', '107374182400', '19441', 'snapshot', 'fingerprint', '4',
                   '0', '', '', '', '', '', 'info', '__none__']
     tail = ['--profile-args', '-e', 'CUTEAFD_PROFILE_HOST=emu', *GRACEFUL, '--profile-wrapper', '/bin/bash', '-c', 'script', 'x', 'ncu', '--set', 'full']

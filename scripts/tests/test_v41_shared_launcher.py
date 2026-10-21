@@ -276,3 +276,46 @@ def test_v41_fp8_head_key_rejects_bad_values_and_env_conflicts(tmp_root, monkeyp
     known = subprocess.run(["bash", "-c", "source scripts/lib/release-common.sh; release_known_key V41_FP8_HEAD"],
                            cwd=ROOT)
     assert known.returncode == 0
+
+
+def test_profile_spark_wraps_the_selected_v41_worker_and_ncu_skip_reaches_the_coordinator(tmp_root, monkeypatch) -> None:
+    """PROFILE_SPARK wraps only the ranks in PROFILE_SPARK_RANKS on V4.1 too; the
+    other workers keep their exact command, and PROFILE_NCU_SKIP reaches the
+    coordinator's ncu as --launch-skip."""
+    import v41_launch_capture as capture_module
+
+    prof = tmp_root / "prof"
+    extra = (f"PROFILE=ncu\nPROFILE_NCU_KERNEL=gemm\nPROFILE_NCU_SKIP=500\nPROFILE_DIR={prof}\n"
+             "PROFILE_SPARK=ncu\nPROFILE_SPARK_RANKS=1\nPROFILE_SPARK_NCU_KERNEL=grouped\nPROFILE_SPARK_NCU_SKIP=700\n")
+    original = capture_module.example_config
+
+    def with_keys(name, directory):
+        config = original(name, directory)
+        config.write_text(config.read_text() + extra)
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_keys)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    coordinator = parse_run(result["containers"][0]["argv"])
+    assert "--launch-skip" in coordinator["command"]
+    assert coordinator["command"][coordinator["command"].index("--launch-skip") + 1] == "500"
+    workers = result["containers"][1:]
+    assert len(workers) >= 2
+    ranks = []
+    for container in workers:
+        run = parse_run(container["argv"])
+        assert run["env"]["CUTEAFD_PROFILE_DIR"] == str(prof)
+        # Workers are captured in completion order; the rank is the worker's own flag.
+        rank = int(run["command"][run["command"].index("--rank") + 1])
+        ranks.append(rank)
+        if rank == 1:
+            assert "--label cuteafd.graceful-stop=1" in run["options"]
+            assert run["command"][:2] == ["/bin/bash", "-c"]
+            tail = run["command"][run["command"].index("ncu"):]
+            joined = " ".join(tail)
+            assert "--kernel-name regex:grouped --launch-skip 700 --launch-count 20 --set full" in joined
+            assert f"--export {prof}/ncu-{container['host']}-rank1 --force-overwrite cuteafd expertd-native" in joined
+        else:
+            assert not any("graceful-stop" in option for option in run["options"])
+            assert run["command"][:2] == ["cuteafd", "expertd-native"]
+    assert sorted(ranks) == list(range(len(workers)))

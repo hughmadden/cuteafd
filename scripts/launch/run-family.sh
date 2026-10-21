@@ -1405,10 +1405,13 @@ for i in "${!hosts[@]}"; do
   # PROFILE switches (absent unless set), the shared worker environment and a
   # PROFILE_SPARK rank's stop options; its profiler argv follows --profile-wrapper.
   release_profile_docker_args "${PROFILE:-}" "${PROFILE_DIR:-}" "$host" "${PROFILE_SPARK:-}"
-  spark_profile_wrapper_for "$host" "$i" "$SPARK_COUNT"
-  remote_args+=(--profile-args ${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"} "${shared_worker_env_args[@]}"
-    ${spark_profile_wrapper_args[@]+"${spark_profile_wrapper_args[@]}"}
-    --profile-wrapper ${spark_profile_wrapper[@]+"${spark_profile_wrapper[@]}"})
+  remote_args+=(--profile-args ${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"} "${shared_worker_env_args[@]}")
+  release_profile_spark_wrapper "${PROFILE_SPARK:-}" "${PROFILE_SPARK_RANKS:-}" "${PROFILE_DIR:-}" "$host" "$i" "$SPARK_COUNT" \
+    "${PROFILE_SPARK_NCU_KERNEL:-}" "${PROFILE_SPARK_NCU_COUNT:-}" "${PROFILE_SPARK_NCU_SET:-}" \
+    "${PROFILE_SPARK_NCU_SKIP:-}" "${PROFILE_SPARK_NSYS_GPU_METRICS:-}"
+  if ((${#RELEASE_PROFILE_WRAPPER[@]})); then
+    remote_args+=("${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}" --profile-wrapper "${RELEASE_PROFILE_WRAPPER[@]}")
+  fi
   release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args; bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 image="$1"; name="$2"; rank="$3"; budget="$4"; port="$5"; snapshot_rel="$6"; fingerprint="$7"; world="$8"
