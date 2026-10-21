@@ -8,6 +8,7 @@ use crate::shared::{experts::{rtx::pair::{self, SubmissionScope}, staging::Route
         HeadKernels, HeadMerge, HeadPrecision, HeadProjection, HeadSequence,
         LaneOrder, LayerKernels, LayerProtocol, PipelineKernels}, hop::{HopLink, HopTicket}, TerminalState}, spark_intake::SparkLink};
 use anyhow::{ensure, Context, Result};
+use cuteafd_loader::families::qwen4::Qwen4KvCache;
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_hostcache::copy::CopyEngine;
 use cuteafd_loader::{placement::{Hop, HopPoint, LayerMode}, plan::{checkpoint::Checkpoint,
@@ -76,7 +77,7 @@ struct NativeOwners<'a> {
 impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize,
-        count: usize, available: &[u64], reservations: &[u64], depth: usize) -> Result<Self> {
+        count: usize, available: &[u64], reservations: &[u64], depth: usize, kv_format: Qwen4KvCache) -> Result<Self> {
         validate_rank_inventory(ownership.ranks(), &[devices.len(), available.len(), reservations.len()])?;
         ensure!(matches!(count, 1 | 92), "Step-5 native layer inventory");
         let head_rank = ownership.execution().spec().head_gpu as usize;
@@ -89,7 +90,7 @@ impl<'a> NativeOwners<'a> {
             if rank == head_rank {
                 if let Some(head) = &head_plan { *plan = plan.with_head(head)?; }
                 plan.workspace = plan.workspace.max(
-                    cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth)?);
+                    cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?);
             }
         }
         admit_native(&admission, available, reservations, || {
@@ -106,10 +107,10 @@ impl<'a> NativeOwners<'a> {
                     if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
                     let attention = if contract.layers[layer].sliding.is_some() {
                         Attention::Sliding(SwaLayer::for_execution(device, programs, checkpoint, layer,
-                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership)?)
+                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format)?)
                     } else {
                         Attention::Sparse(CsaLayer::for_execution(device, programs, checkpoint, layer,
-                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership)?)
+                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format)?)
                     };
                     let offset = usize::try_from(match &attention {
                         Attention::Sliding(_) => cuteafd_loader::plan::families::step5::native::plane_bytes(
@@ -296,9 +297,11 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
         validate_rank_inventory(ownership.ranks(), &[caches.len(), stages.len(), available.len(), reservations.len()])?;
         ensure!(transport.is_some() == (count == 92), "Step-5 main Spark transport inventory");
+        let kv_format = caches[0].borrow().layout().kv_format;
         for rank in 0..ownership.ranks() {
             ensure!(rows as u64 <= ownership.execution().spec().rows, "Step-5 live rows exceed execution plan");
             let cache = caches[rank].borrow();
+            ensure!(cache.layout().kv_format == kv_format, "Step-5 rank cache formats differ");
             ensure!(cache.rank() == rank && cache.layout().ranks.len() == ownership.ranks(), "Step-5 cache rank inventory");
             stages[rank].validate_cache(&cache)?;
         }
@@ -308,7 +311,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                 && devices[..rank].iter().all(|other| other.id != device.id)), "Step-5 rank devices/library differ");
         let depth = caches[ownership.execution().spec().head_gpu as usize].borrow()
             .layout().ranks[ownership.execution().spec().head_gpu as usize].mtp_lengths.len();
-        let native = NativeOwners::load(programs, checkpoint, &ownership, &devices, rows, count, &available, &reservations, depth)?;
+        let native = NativeOwners::load(programs, checkpoint, &ownership, &devices, rows, count, &available, &reservations, depth, kv_format)?;
         let main = MainExecution::bind(checkpoint, ownership, native, caches, stages, rows, transport, count, placement_version)?;
         Ok(Self { main, startup_captures: cuteafd_ffi::graph_captures() })
     }

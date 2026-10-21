@@ -1,5 +1,5 @@
 //! Stable per-rank scratch views; each layer retires before the next reuses them.
-use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::rc::Rc;
@@ -52,6 +52,62 @@ impl<'a> Arena<'a> {
     }
 }
 
+/// Shared writer, with private target-lane or arena-backed predictor planes.
+/// Reuse is safe only in stream order, after copies into retained cache storage.
+pub(super) struct CompactKv<'a> {
+    planes: Vec<Plane<'a>>,
+    writers: Vec<(usize, cuteafd_ffi::programs::Program<'a>)>,
+    device: Device<'a>,
+    rows: usize,
+}
+impl<'a> CompactKv<'a> {
+    pub(super) fn new(device: Device<'a>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        rows: usize, heads: &[usize], sizes: [usize; 2], arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        ensure!(rows > 0 && !heads.is_empty(), "Step-5 compact producer capacity");
+        let writers = heads.iter().copied().map(|heads| {
+            ensure!(matches!(heads, 32 | 64), "Step-5 compact producer heads");
+            let groups = heads / 16;
+            let name = if heads == 32 { "step52_pack_fp8_kv_plane" } else { "step5_pack_fp8_kv_plane" };
+            let spec = programs.spec(name)?;
+            let record = Qwen4KvCache::Fp8.plane_record_bytes(groups, 192);
+            ensure!(sizes.iter().all(|&n| rows.checked_mul(record).is_some_and(|bytes| bytes <= n))
+                && spec.pointers == ["x", "out"] && spec.scalar_kinds == b"i"
+                && spec.capacity_rows as usize >= rows && spec.scratch.is_empty()
+                && spec.geometry["kv_heads"] == groups && spec.geometry["head_dim"] == 192
+                && spec.geometry["kv_format"] == "fp8" && spec.geometry["record_bytes"] == record
+                && spec.geometry["scale_offset"] == groups * 192,
+                "{name}: compact producer ABI/geometry/capacity");
+            Ok((heads, device.run(|| programs.program(name, &["x", "out"]))?))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self { planes: planes(device, &sizes, arena)?, writers, device, rows })
+    }
+
+    pub(super) fn enqueue(&self, stream: &Stream<'a>, sources: [CuteafdDeviceBuffer; 2],
+        rows: usize, heads: usize) -> Result<[CuteafdDeviceBuffer; 2]> {
+        use cuteafd_ffi::programs::Scalar;
+        let (_, writer) = self.writers.iter().find(|(count, _)| *count == heads)
+            .context("Step-5 compact producer head geometry")?;
+        ensure!((1..=self.rows).contains(&rows) && stream.device.id == self.device.id
+            && std::ptr::eq(stream.device.library, self.device.library),
+            "Step-5 compact producer stream/capacity");
+        let bytes = rows * (heads / 16) * 192 * 2;
+        ensure!(sources.iter().all(|source| !source.ptr.is_null()
+            && source.device_id == self.device.id && source.bytes >= bytes),
+            "Step-5 compact producer BF16 source extent/device");
+        self.device.run(|| {
+            for (source, target) in sources.iter().zip(&self.planes) {
+                // SAFETY: validated BF16 projections and compact planes are borrowed
+                // through the caller's cancellation guard and stream drain.
+                unsafe { writer.launch(&[source.ptr, target.buffer.ptr],
+                    &[Scalar::I32(rows as i32)], stream.raw)?; }
+            }
+            Ok(())
+        })?;
+        Ok([self.planes[0].buffer, self.planes[1].buffer])
+    }
+}
+
 fn view_layout(capacity: usize, sizes: &[usize], offset: usize) -> Result<Vec<(usize, usize)>> {
     ensure!(offset % 16 == 0, "Step-5 scratch view alignment");
     let mut next = offset;
@@ -73,13 +129,16 @@ mod tests {
     fn predictor_arena_spans_preserve_live_inputs_output_and_selected_tokens() -> Result<()> {
         let disjoint = |a: (usize, usize), b: (usize, usize)|
             a.0 + a.1 <= b.0 || b.0 + b.1 <= a.0;
-        for rows in [1, 3, 16, 63, 64, 65, 256, 640, 1025, 4095, 4096] {
-            let predictor = usize::try_from(native::mtp_forecast_workspace(rows, 3)?)?;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        for (rows, kv_format) in [1, 3, 16, 63, 64, 65, 256, 640, 1025, 4095, 4096]
+            .into_iter().flat_map(|rows| [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8]
+                .into_iter().map(move |format| (rows, format))) {
+            let predictor = usize::try_from(native::mtp_forecast_workspace(rows, 3, kv_format)?)?;
             let attention_sizes = native::swa_planes(rows, 64)?;
             let attention_bytes = usize::try_from(native::plane_bytes(&attention_sizes)?)?;
             let input_offset = usize::try_from(native::mtp_input_offset(rows)?)?;
             let metadata_offset = usize::try_from(native::mtp_metadata_offset(rows)?)?;
-            let core = usize::try_from(native::mtp_scratch_core(rows)?)?;
+            let core = usize::try_from(native::mtp_scratch_core(rows, kv_format)?)?;
             let attention = view_layout(predictor, &attention_sizes, 0)?;
             let dense = view_layout(predictor, &native::dense_planes(rows)?, attention_bytes)?;
             let inputs = view_layout(predictor, &native::mtp_input_planes(rows)?, input_offset)?;
@@ -90,8 +149,12 @@ mod tests {
                 core + stage * 256).map(|views| views[0])).collect::<Result<Vec<_>>>()?;
             assert_eq!(input_offset, attention_bytes
                 + usize::try_from(native::plane_bytes(&native::dense_planes(rows)?)?)?);
+            let compact = if kv_format == Qwen4KvCache::Fp8 {
+                view_layout(predictor, &native::mtp_compact_planes(rows, kv_format)?,
+                    usize::try_from(native::mtp_compact_offset(rows)?)?)?
+            } else { Vec::new() };
             let live_core = attention.iter().chain(&dense).chain(&inputs).chain(&metadata)
-                .copied().collect::<Vec<_>>();
+                .chain(&compact).copied().collect::<Vec<_>>();
             for (i, &a) in live_core.iter().enumerate() {
                 assert!(a.0 + a.1 <= core);
                 assert!(live_core[i + 1..].iter().all(|&b| disjoint(a, b)));

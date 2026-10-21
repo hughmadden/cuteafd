@@ -140,6 +140,7 @@ pub struct LayoutOptions {
     pub native_mtp_layers: usize,
     /// Qwen full-attention record format; index keys remain BF16.
     pub qwen_kv: crate::families::qwen4::Qwen4KvCache,
+    pub step5_kv: crate::families::qwen4::Qwen4KvCache,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
@@ -218,6 +219,7 @@ impl Default for LayoutOptions {
             context_tokens: 0,
             native_mtp_layers: 3,
             qwen_kv: Default::default(),
+            step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,
@@ -1022,7 +1024,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
     let selected = CacheOptions { coordinator_ranks: ranks,
         attention_placement: Some(report.attention_placement),
         native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
-        qwen_kv: options.qwen_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
+        qwen_kv: options.qwen_kv, step5_kv: options.step5_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
         glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
         glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
     // Qwen's dual-owner layout partitions whole layers. Its host snapshot

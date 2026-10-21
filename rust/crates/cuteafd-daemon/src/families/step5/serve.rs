@@ -28,6 +28,9 @@ pub(crate) struct ServeArgs {
     peers: Vec<SocketAddr>,
     #[arg(long)]
     pool_tokens: Option<u64>,
+    /// Immutable target and native predictor KV storage.
+    #[arg(long, default_value = "fp8")]
+    kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long, default_value_t = 1_048_576)]
     max_context: u64,
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
@@ -145,7 +148,7 @@ fn with_backend<T>(args: &ServeArgs,
         &library, id, rank, ids.len() == 2, "step5", &format.package_name("step5"), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
-    let mut inputs = RuntimeInputs { inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
+    let mut inputs = RuntimeInputs { kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: args.prefill_rows as usize,
         sequences: usize::from(args.max_sequences), context: args.max_context,
@@ -178,7 +181,7 @@ fn with_backend<T>(args: &ServeArgs,
         let mut native = native;
         if rank == usize::from(admission.ownership.execution().spec().head_gpu) {
             native.workspace = native.workspace.max(
-                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(args.mtp))?);
+                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(args.mtp), inputs.kv_format)?);
         }
         let native = native.check(u64::MAX, &[])?;
         let total = admission.placement.items[rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
@@ -334,6 +337,8 @@ mod tests {
         use cuteafd_loader::{placement::{self, Baseline}, plan::{self, layout::LayoutOptions}};
         let mut args = args();
         args.snapshot = std::env::var("CUTEAFD_STEP5_SNAPSHOT")?.into();
+        args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
+            .unwrap_or_else(|_| "bf16".into()).parse()?;
         args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
         args.split_device = Some(1);
@@ -363,6 +368,7 @@ mod tests {
         let arch = placement::inventory::ArchContext::coordinator(capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
         let mut inputs = RuntimeInputs {
+                kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
                 headroom_bytes: LayoutOptions::default().headroom_bytes }; 2], spark_ranks: 6, peer_access: true },
@@ -395,7 +401,7 @@ mod tests {
                     &admitted.ownership, rank, inputs.rows)?;
                 if rank == head_rank {
                     native.workspace = native.workspace.max(
-                        plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(depth))?);
+                        plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(depth), inputs.kv_format)?);
                 }
                 let native = native.check(u64::MAX, &[])?;
                 let total = admitted.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
@@ -417,7 +423,7 @@ mod tests {
             let planned = plan::plan(&args.snapshot, &plan::PlanOptions {
                 placement: plan::ExpertPlacement::from_spark_ranks(6),
                 draft_ownership: Some(DraftOwnership::NativeMtp),
-                layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2],
+                layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2], step5_kv: args.kv_cache,
                     native_mtp_layers: usize::from(depth), workspace_manifest: Some(args.manifest.clone()),
                     ..Default::default() }), ..Default::default()
             })?;
@@ -436,6 +442,8 @@ mod tests {
         use cuteafd_engine::prefix::{After, PrefixFamily, SnapshotKind};
         use super::super::prefix::Placement;
         let mut args = live_mtp_args();
+        args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
+            .unwrap_or_else(|_| "bf16".into()).parse()?;
         args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
         args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
@@ -551,6 +559,16 @@ mod tests {
         let mut args = args();
         args.validate()?;
         assert_eq!((args.max_context, args.max_sequences, args.mtp), (1_048_576, 16, 3));
+        assert_eq!(args.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
+        assert_eq!(cuteafd_loader::plan::layout::LayoutOptions::default().step5_kv, args.kv_cache);
+        for format in ["bf16", "fp8"] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+                "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4",
+                "--kv-cache", format])?;
+            let crate::cli::Commands::ServeStep5(explicit) = cli.command else { panic!("Step-5 dispatch") };
+            explicit.validate()?;
+            assert_eq!(explicit.kv_cache.to_string(), format);
+        }
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4",
             "--mtp", "0"])?;

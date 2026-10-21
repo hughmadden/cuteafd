@@ -209,7 +209,7 @@ PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' RTX_EXPERT_LAYERS NATIVE_K6 SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS
-    [[ "$1" != step5 ]] || echo SPECULATOR_DEPTH
+    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -1639,6 +1639,8 @@ if [[ "$family" == kimi_k3 ]]; then
     release_die "Kimi K3 serves its routed experts on exactly six Spark ranks (TP6), not $ranks; set SPARK_COUNT=6"
 fi
 if [[ "$family" == step5 ]]; then
+  step5_kv_cache="$(get KV_CACHE fp8)"
+  case "$step5_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   [[ "$backend" != local && "$ranks" != 0 ]] ||
     release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (FP8: 6, NVFP4: 4 or 6)"
 fi
@@ -2004,6 +2006,9 @@ fi
 # command's own automatic admission (no --pool-tokens). Kimi's RTX_EXPERT_LAYERS
 # is auto (default: the planner picks the RTX-onboarded routed layers and marks)
 # or a fixed count, which admission must then fit.
+if [[ "$family" == step5 ]]; then
+  family_args+=(--kv-cache "$step5_kv_cache")
+fi
 if ((qualifying)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
@@ -2628,7 +2633,7 @@ audio_encoder_hash=""
   if [[ "$family" == step5 ]]; then
     plan_mtp_depth=0
     [[ "$speculator" != mtp ]] || plan_mtp_depth="$(get SPECULATOR_DEPTH "$mtp_depth")"
-    plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth")
+    plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth" --kv-cache "$step5_kv_cache")
   fi
   for pair in 'CONCURRENCY:--concurrency' 'PREFIX_CACHE_ENTRIES:--prefix-cache-entries' \
     'MAX_CONTEXT_TOKENS:--context-tokens' 'PREFILL_BATCH_TOKENS:--prefill-rows' \
