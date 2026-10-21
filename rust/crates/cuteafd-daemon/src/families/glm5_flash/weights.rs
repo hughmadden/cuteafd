@@ -205,7 +205,9 @@ fn kda_output_geometry(hidden: usize, width: usize, shape: &[usize], ranks: usiz
     Ok((axis, rows, cols))
 }
 
-/// Quantize one KDA slice using the whole weight's per-row rule, with `[kb,n]` scales.
+/// Quantize one KDA slice using the whole weight's per-row rule, with `[kb,n]` scales
+/// (the host reference the GPU load quantization reproduces).
+#[cfg(test)]
 fn quantize_kda_part(bytes: &[u8], rows: usize, cols: usize, layout: super::fp8::Layout,
     rule: crate::shared::fp8_linear::Fp8Scales) -> (Vec<u8>, Vec<u8>) {
     let (values, scales) = super::fp8::quantize(bytes, rows, cols, layout, rule);
