@@ -152,8 +152,10 @@ pub(crate) struct Frontier {
 
 impl Frontier {
     pub fn supports_predictors(&self, frontier: usize) -> bool {
-        self.target == frontier && (self.predictors.as_slice() == [frontier]
-            || (frontier > 0 && self.pending && self.predictors.as_slice() == [frontier - 1]))
+        // Row P-1 consumes token(P), which is outside the retained prefix.
+        // Only the unconsumed hidden row is valid for arbitrary continuations.
+        self.target == frontier && frontier > 0 && self.pending
+            && self.predictors.as_slice() == [frontier - 1]
     }
 }
 
@@ -637,7 +639,7 @@ mod frontier_tests {
             assert!(!mark.supports_predictors(target + 1));
             mark.predictors[0] = target;
             mark.pending = false;
-            assert!(mark.supports_predictors(target));
+            assert!(!mark.supports_predictors(target), "known-next-token state is not prefix-independent");
         }
     }
 }
