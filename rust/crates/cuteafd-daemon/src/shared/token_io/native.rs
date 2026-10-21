@@ -309,6 +309,7 @@ mod tests {
             rotation_id: 0,
             rotation: None,
             hessian_solved: false,
+            native_blocks: n.div_ceil(128),
             components: vec![
                 DenseComponent {
                     suffix: "fp8".into(),
@@ -416,6 +417,7 @@ mod tests {
             let mut item = record(root.path(), "small-fixture");
             item.tensor = name.into();
             item.shape = vec![N, K];
+            item.native_blocks = N / 128;
             item.components[0].shape = vec![N, K];
             item.components[0].source = DenseRange {
                 path: path.clone(),
@@ -525,7 +527,7 @@ mod tests {
                 2 => bad[0].side = ShardSide::Input,
                 3 => bad[0].components[1].dtype = "F16".into(),
                 4 => bad[0].components[0].source.bytes -= 1,
-                5 => bad[0].channels_per_shard = 0,
+                5 => bad[0].native_blocks -= 1,
                 _ => bad[0].components.swap(0, 1),
             }
             assert!(

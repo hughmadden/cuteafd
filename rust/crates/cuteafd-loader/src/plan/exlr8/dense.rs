@@ -88,6 +88,7 @@ pub struct DenseRecord {
     pub rotation: Option<String>,
     pub hessian_solved: bool,
     pub components: Vec<DenseComponent>,
+    pub native_blocks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +435,7 @@ impl DenseRecord {
                     rotation: (rotation_id > 0).then(|| rotations[rotation_id - 1].into()),
                     hessian_solved: solved == 1,
                     components,
+                    native_blocks: extent.div_ceil(128),
                 });
             }
             for (name, meta) in entries {
@@ -467,6 +469,7 @@ impl DenseRecord {
                     rotation: None,
                     hessian_solved: false,
                     components: vec![component(&header, &path, name, "plain", dtype, &shape)?],
+                    native_blocks: 0,
                 });
             }
         }
@@ -545,8 +548,8 @@ impl DenseRecord {
                 "dense slice must contain complete native blocks"
             );
             ensure!(
-                self.channels_per_shard > 0,
-                "dense native slice requires a checkpoint shard unit"
+                self.native_blocks == extent.div_ceil(128),
+                "dense native block count differs from channel extent"
             );
             let components = self.ranges(first, channels)?;
             let units = (first..first + channels)
@@ -629,11 +632,11 @@ impl DensePlan {
                 };
                 if split {
                     ensure!(
-                        count % record.channels_per_shard == 0,
+                        count % record.native_blocks == 0,
                         "dense TP cuts a checkpoint shard unit"
                     );
                 }
-                let slice = if record.channels_per_shard == 0 {
+                let slice = if record.native_blocks == 0 {
                     DenseSlice {
                         tensor: record.tensor.clone(),
                         first_channel: 0,
@@ -802,6 +805,20 @@ mod tests {
     }
 
     #[test]
+    fn replicated_native_records_keep_block_streaming() {
+        let root = tempfile::tempdir().unwrap();
+        trellis(root.path(), 0, 0, 0);
+        let records = DenseRecord::inventory(root.path()).unwrap();
+        assert_eq!(records[0].channels_per_shard, 0);
+        assert_eq!(records[0].native_blocks, 1);
+        for rank in 0..2 {
+            let plan = DensePlan::for_rank(&records, 2, rank).unwrap();
+            let unit = &plan.tensors[0].units[0];
+            unit.read(&mut vec![0; unit.staging_bytes().unwrap()]).unwrap();
+        }
+    }
+
+    #[test]
     fn output_trellis_component_order_and_shared_rotation_are_preserved() {
         let root = tempfile::tempdir().unwrap();
         trellis(root.path(), 1, 128, 3);
@@ -919,7 +936,7 @@ mod tests {
             .iter()
             .find(|r| r.tensor.ends_with("input_layernorm.weight"))
             .unwrap();
-        assert_eq!(norm.channels_per_shard, 0);
+        assert_eq!(norm.native_blocks, 0);
         for rank in 0..2 {
             let p = DensePlan::for_rank(&records, 2, rank).unwrap();
             let norm = p
