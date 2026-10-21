@@ -384,3 +384,143 @@ fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
         "the Spark rank receives the whole-group mount decision");
     Ok(())
 }
+
+/// A model of SparkNest's push credit flow (crates/nest-data/src/push.rs,
+/// `grant`/`flush` as of 615cc7a), NOT a cuteafd guarantee: it documents why
+/// two coordinator rings on one rank host can deadlock under that policy, and
+/// is the regression check for a fixed policy once SparkNest changes.
+///
+/// - Each rank host has one incast budget (in slots) shared by all its ranks;
+///   a fill frees one unit; `grant(rank)` runs at join and on that rank's own
+///   releases only, handing free ring slots to its sources round robin while
+///   the host budget allows (at least one grant if the host has none out).
+/// - Each source streams its slots in plan order (rank of each slot fixed by
+///   the plan) and blocks in `flush` until it holds a credit for that rank.
+/// - The engine releases each filled slot at once.
+mod sparknest_credit_model {
+    use std::collections::VecDeque;
+
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum Policy {
+        /// SparkNest today: freed budget is offered to the releasing rank only.
+        ReleasingRank,
+        /// Not enough: every rank on the host is offered freed budget, round
+        /// robin (budget still parks at sources blocked on the other rank).
+        AllRanks,
+        /// A fix: every (source, rank) the plan pairs keeps at least one credit
+        /// outside the shared budget, so no source blocks for want of a grant.
+        SourceFloor,
+    }
+
+    /// Returns true when every slot was delivered, false on a stall (no source
+    /// can make progress and no grant can be issued).
+    pub fn run(policy: Policy, host_of: &[usize], ring: usize, budget: usize,
+        streams: &[Vec<usize>]) -> bool {
+        let ranks = host_of.len();
+        let hosts = host_of.iter().max().map_or(0, |h| h + 1);
+        let sources = streams.len();
+        let mut free = vec![ring; ranks];
+        let mut out = vec![0usize; hosts];
+        let mut next = vec![0usize; ranks];
+        // credits[source][rank]
+        let mut credits = vec![vec![0usize; ranks]; sources];
+        let mut cursor = vec![0usize; sources];
+        let owing: Vec<Vec<usize>> = (0..ranks).map(|r| (0..sources)
+            .filter(|&s| streams[s].contains(&r)).collect()).collect();
+        let grant = |r: usize, free: &mut Vec<usize>, out: &mut Vec<usize>, next: &mut Vec<usize>,
+            credits: &mut Vec<Vec<usize>>| {
+            let h = host_of[r];
+            if owing[r].is_empty() { return; }
+            while free[r] > 0 && (out[h] < budget || out[h] == 0) {
+                let s = owing[r][next[r] % owing[r].len()];
+                next[r] += 1;
+                free[r] -= 1;
+                out[h] += 1;
+                credits[s][r] += 1;
+            }
+        };
+        // The floor: one credit per (source, rank) pair, outside the budget.
+        let floor = |free: &mut Vec<usize>, credits: &mut Vec<Vec<usize>>| {
+            for r in 0..ranks {
+                for &s in &owing[r] {
+                    if credits[s][r] == 0 && free[r] > 0 { free[r] -= 1; credits[s][r] += 1; }
+                }
+            }
+        };
+        let mut floored = vec![vec![false; ranks]; sources];
+        if policy == Policy::SourceFloor {
+            floor(&mut free, &mut credits);
+            for r in 0..ranks { for &s in &owing[r] { floored[s][r] = credits[s][r] > 0; } }
+        }
+        for r in 0..ranks { grant(r, &mut free, &mut out, &mut next, &mut credits); }
+        let mut released: VecDeque<usize> = VecDeque::new();
+        loop {
+            let mut progressed = false;
+            for s in 0..sources {
+                while let Some(&r) = streams[s].get(cursor[s]) {
+                    if credits[s][r] == 0 { break; }
+                    credits[s][r] -= 1;
+                    cursor[s] += 1;
+                    if floored[s][r] { floored[s][r] = false; } else { out[host_of[r]] -= 1; } // filled: its budget is free
+                    released.push_back(r); // the engine releases at once
+                    progressed = true;
+                }
+            }
+            while let Some(r) = released.pop_front() {
+                free[r] += 1;
+                match policy {
+                    Policy::ReleasingRank => grant(r, &mut free, &mut out, &mut next, &mut credits),
+                    Policy::SourceFloor => {
+                        // Refill the floor first (its credit is outside the budget), then the budget.
+                        for &s in &owing[r] {
+                            if credits[s][r] == 0 && free[r] > 0 && cursor[s] < streams[s].len() {
+                                free[r] -= 1; credits[s][r] += 1; floored[s][r] = true;
+                            }
+                        }
+                        let h = host_of[r];
+                        for q in (0..ranks).filter(|&q| host_of[q] == h) {
+                            grant(q, &mut free, &mut out, &mut next, &mut credits);
+                        }
+                    }
+                    Policy::AllRanks => {
+                        let h = host_of[r];
+                        let mut order: Vec<usize> = (0..ranks).filter(|&q| host_of[q] == h).collect();
+                        let at = order.iter().position(|&q| q == r).unwrap_or(0);
+                        order.rotate_left(at);
+                        for q in order { grant(q, &mut free, &mut out, &mut next, &mut credits); }
+                    }
+                }
+            }
+            if cursor.iter().zip(streams).all(|(c, s)| *c == s.len()) { return true; }
+            if !progressed { return false; }
+        }
+    }
+
+    /// Plan-order streams: each source's files interleave both ranks' slots
+    /// (a dense tensor's row shares for GPU0 then GPU1, file after file).
+    pub fn interleaved(sources: usize, slots: usize, ranks: &[usize], ahead: usize) -> Vec<Vec<usize>> {
+        (0..sources).map(|s| {
+            let mut v = Vec::new();
+            for block in 0..slots / ahead {
+                for &r in ranks { v.extend(std::iter::repeat_n(r, ahead + (block + s) % 3)); }
+            }
+            v
+        }).collect()
+    }
+}
+
+#[test]
+fn sparknest_model_two_ranks_on_one_host_stall_under_the_shared_budget() {
+    use sparknest_credit_model::{interleaved, run, Policy};
+    // Six sources streaming slots for two coordinator ranks on one host
+    // (ring 128 slots, incast budget 64 slots).
+    let streams = interleaved(6, 400, &[0, 1], 20);
+    assert!(!run(Policy::ReleasingRank, &[0, 0], 128, 64, &streams),
+        "SparkNest's releasing-rank grants are expected to stall two rings on one host");
+    assert!(!run(Policy::AllRanks, &[0, 0], 128, 64, &streams),
+        "sharing freed budget alone still parks credits at blocked sources");
+    assert!(run(Policy::SourceFloor, &[0, 0], 128, 64, &streams),
+        "a per-(source, rank) credit floor outside the shared budget must complete");
+    // One rank per host (the Spark-only groups) completes under today's policy.
+    assert!(run(Policy::ReleasingRank, &[0, 1], 128, 64, &streams));
+}
