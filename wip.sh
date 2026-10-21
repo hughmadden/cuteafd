@@ -23,13 +23,17 @@ Usage: ./wip.sh [--slot NAME] [--role coordinator|expert|both]
 Synchronizes the current checkout into persistent development containers and
 incrementally builds a named WIP slot. The coordinator container builds and
 runs coordinator slots. A seed host builds Spark slots, which are copied to
-every configured Spark's persistent WIP container. --seed HOST (or
-WIP_SEED_HOST) names the seed; it need not be a configured Spark (a build-only
-seed such as kakapo is never one), and the config's SPARK_*_HOST list stays the
-serving Sparks that receive the slot. Unset, WIP_BUILD_SEED defaults to kakapo.
-WIP_SEED_ADDR optionally gives a seed without RDMA its bulk-transfer address
-(default: its LANE_A when it is a configured Spark, else its directly attached
-LAN address).
+every configured Spark's persistent WIP container. --seed HOST names the seed
+and is a placement request; it need not be a configured Spark (a LAN-only build
+seed, kakapo or cassowary, is never one), and the config's SPARK_*_HOST list
+stays the serving Sparks that receive the slot. An automatic seed
+(WIP_SEED_HOST, else WIP_BUILD_SEED, default kakapo) that is a LAN-only seed
+becomes the less-loaded of the LAN-only seeds, else rhea or moa when they are
+all unreachable or full. Builds on one LAN-only seed share its CPU slots but
+take its GPU export one at a time (hwlock SEED-export); native-cache hits take
+no turn. WIP_SEED_ADDR optionally gives a seed without RDMA its bulk-transfer
+address (default: its LANE_A when it is a configured Spark, else its directly
+attached LAN address).
 The default builds the shared release Spark role set alongside historical TP4,
 independent of the serving topology. CUTEAFD_WIP_SPARK_TP_ROLES selects an
 explicit subset (empty keeps only TP4).
@@ -173,7 +177,7 @@ mapfile -t wip_hosts < <(release_spark_values HOST)
 [[ "${#wip_hosts[@]}" == "$SPARK_COUNT" ]] ||
   release_die "SPARK_COUNT=$SPARK_COUNT does not match ${#wip_hosts[@]} configured Spark hosts"
 # The seed builds the Spark slot; the configured Sparks (wip_hosts) serve it.
-# A seed outside them (kakapo) is a build host only: it gets the build
+# A seed outside them (a LAN-only seed) is a build host only: it gets the build
 # container, never a serving one, and is never a distribution target. Every
 # host that holds this instance's Spark WIP container is wip_container_hosts.
 seed_host="${seed_option:-${WIP_BUILD_SEED:-${wip_hosts[0]:-}}}"
@@ -223,15 +227,18 @@ if [[ "$role" == coordinator && -z "$from_slot" ]] && ((${#wip_hosts[@]})) &&
 fi
 
 # Probe only after dry-run exits; a dry-run performs no network operations.
-if [[ "$seed_host" == kakapo && "$role" != coordinator ]] && ((seed_explicit == 0)) &&
-   ! timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=5 kakapo true; then
-  for host in rhea moa; do
-    if timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" true; then
-      seed_host="$host"
-      unset WIP_SEED_ADDR
-      break
-    fi
-  done
+# An automatic LAN-only seed starts on the less-loaded reachable LAN seed (held
+# build slots), else a reachable rhea/moa; the lease re-balances at grant time.
+if release_is_lan_seed "$seed_host" && [[ "$role" != coordinator ]] && ((seed_explicit == 0)); then
+  wip_picked_seed="$(timeout 120 python3 "$repo_root/scripts/build/build-resource.py" --pick --balance \
+    --host "$seed_host" --fallback "${CUTEAFD_WIP_SEED_FALLBACK:-rhea,moa}" --lease-dir /nonexistent)" ||
+    wip_picked_seed="$seed_host"
+  if [[ "$wip_picked_seed" != "$seed_host" ]]; then
+    echo "WIP seed: automatic $seed_host -> $wip_picked_seed (least loaded or reachable)"
+    seed_host="$wip_picked_seed"
+    # The address belonged to the seed we left; the transport check re-resolves it.
+    unset WIP_SEED_ADDR
+  fi
   wip_target_hosts=()
   wip_seed_serves=0
   for host in "${wip_hosts[@]}"; do
@@ -260,10 +267,13 @@ wip_build_resource_acquire() {
   wip_build_resource_dir="$(mktemp -d "${TMPDIR:-/tmp}/wip-build-resource.XXXXXXXX")"
   mkfifo "$wip_build_resource_dir/release"
   resource_args=(--host "$seed_host" --lock-host "$(wip_seed_lock "$seed_host")" --owner "$BASHPID" --container "$spark_container" --lease-dir "$wip_build_resource_dir" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}")
-  if [[ "$seed_host" != kakapo ]]; then resource_args+=(--slots 1)
+  if ! release_is_lan_seed "$seed_host"; then resource_args+=(--slots 1)
   elif [[ -n "${CUTEAFD_SEED_BUILD_SLOTS:-}" ]]; then resource_args+=(--slots "$CUTEAFD_SEED_BUILD_SLOTS"); fi
-  # Explicit --seed is a placement request; automatic/environment seeds may fall back.
-  [[ "$seed_host" != kakapo ]] || ((seed_explicit)) || resource_args+=(--fallback "${CUTEAFD_WIP_SEED_FALLBACK:-rhea,moa}")
+  # Explicit --seed is a placement request; automatic/environment seeds balance
+  # across the LAN-only seeds and may fall back.
+  if release_is_lan_seed "$seed_host" && ((seed_explicit == 0)); then
+    resource_args+=(--balance --fallback "${CUTEAFD_WIP_SEED_FALLBACK:-rhea,moa}")
+  fi
   python3 "$repo_root/scripts/build/build-resource.py" "${resource_args[@]}" &
   wip_build_resource_pid=$!
   trap wip_build_resource_release EXIT
@@ -273,7 +283,7 @@ wip_build_resource_acquire() {
   done
   local original_seed="$seed_host"
   seed_host="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host"])' "$wip_build_resource_dir/granted")"
-  [[ "$seed_host" == kakapo ]] || unset WIP_SEED_ADDR
+  [[ "$seed_host" == "$original_seed" ]] || unset WIP_SEED_ADDR
   wip_seed_serves=0
   wip_target_hosts=()
   for host in "${wip_hosts[@]}"; do
@@ -286,6 +296,11 @@ wip_build_resource_acquire() {
   if [[ "$seed_host" != "$original_seed" ]]; then
     wip_seed_rdma=1
     wip_seed_addr=""
+    if release_is_lan_seed "$seed_host"; then
+      wip_seed_rdma=0
+      wip_seed_addr="$(python3 "$repo_root/scripts/build/seed-transfer.py" lan-addr "$seed_host")" ||
+        release_die "WIP seed $seed_host has no reachable LAN address"
+    fi
     ensure_seed_image
     ensure_remote_container "$seed_host"
   fi
@@ -434,7 +449,7 @@ CANCEL
 }
 release_configure_ssh_transport
 # The seed's transport. A seed on the RoCE fabric streams directly (rdmasync,
-# rdmapipe). A seed without RDMA (a 10 GbE build seed such as kakapo) moves bulk
+# rdmapipe). A seed without RDMA (a 10 GbE LAN-only build seed) moves bulk
 # data over WIP_SEED_ADDR (default: its LANE_A when it is a configured Spark,
 # else its directly attached LAN address from scripts/build/seed-transfer.py;
 # not a slower name route) with release_bulk_ssh, compresses what
@@ -1059,7 +1074,7 @@ fi
 }
 
 # A cluster tier for Spark native entries on sparknest, so every seed (and a
-# fresh one such as kakapo) reuses an export any seed already built: one sealed
+# fresh LAN-only seed) reuses an export any seed already built: one sealed
 # zstd tar per key at build-cache/wip-native/<arch>/<scope>/<key>.tar.zst,
 # imported into the host store before the host-to-instance import and published
 # after the host publish. The newest CUTEAFD_WIP_NEST_NATIVE_KEEP (8) per scope
@@ -1135,10 +1150,10 @@ native_store_has() {
   fi
 }
 
-# The seed Spark's lock: rhea, moa and the out-of-pool build seed kakapo have
-# their own; a pool Spark is under sparks.
+# The seed Spark's lock: rhea, moa and the LAN-only build seeds have their own;
+# a pool Spark is under sparks.
 wip_seed_lock() {
-  case "$1" in rhea|moa|kakapo) printf '%s\n' "$1" ;; *) printf 'sparks\n' ;; esac
+  case "$1" in rhea|moa) printf '%s\n' "$1" ;; *) release_is_lan_seed "$1" && printf '%s\n' "$1" || printf 'sparks\n' ;; esac
 }
 # Try a configured remote exporter first, then queue one capped local turn.
 # Dispatch runs only after the Spark lease and Cargo build slot are released.
@@ -1355,6 +1370,22 @@ build_coordinator() {
     "$COORDINATOR_DOCKER_DEV" "$image_id"
 }
 
+# wip_seed_export_turn: this build's exclusive GPU-export turn on the seed, held
+# by the lease process (scripts/build/build-resource.py) so its teardown stops
+# the build container before releasing it. A LAN-only seed queues fairly on
+# hwlock SEED-export; rhea and moa leases are exclusive already.
+wip_seed_export_turn() {
+  local dir="$wip_build_resource_dir" started=$SECONDS
+  : >"$dir/export-request"
+  echo "WIP Spark export: waiting for the GPU export turn on $seed_host"
+  until [[ -e "$dir/export-granted" ]]; do
+    [[ ! -e "$dir/export-failed" ]] || release_die "no GPU export turn on $seed_host: $(<"$dir/export-failed")"
+    kill -0 "$wip_build_resource_pid" 2>/dev/null || release_die "the $seed_host build lease ended before the export turn"
+    sleep 1
+  done
+  echo "WIP Spark export: GPU export turn on $seed_host after $((SECONDS - started))s"
+}
+
 build_expert() (
   echo "== incrementally building Spark expert slot $slot on $seed_host =="
   sync_seed_source
@@ -1385,17 +1416,30 @@ build_expert() (
   seed_root="$(ssh -o BatchMode=yes "$seed_host" "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/wip\"}}{{.Source}}{{end}}{{end}}' '$spark_container'")"
   native_store_nest "$seed_host" aarch64 "$seed_root" expert import
   native_store_sync "$seed_host" "$seed_root" aarch64 expert import
+  local restore_command="${build_command/docker exec /docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 } native"
   if [[ "${wip_export_locks:-off}" != on ]]; then
     timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native"
   elif native_store_has "$seed_host" "$seed_root" expert; then
-    echo "WIP Spark export: native cache hit, no lock turn"
-    timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "${build_command/docker exec /docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 } native" ||
+    echo "WIP Spark export: native cache hit, no export turn"
+    timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$restore_command" ||
       release_die "Spark WIP native restore on $seed_host failed"
   else
-    # The leg's lease already holds the seed's lock: the export runs inside it.
-    echo "WIP Spark export: inside the ${CUTEAFD_WIP_SEED_LEASE:-seed} lease"
-    timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native" ||
-      release_die "Spark WIP export on $seed_host failed"
+    # The seed's CPU lease admits other builds; its GPU export is one at a time.
+    wip_seed_export_turn
+    # A build that held a turn before us may have published this very key.
+    native_store_nest "$seed_host" aarch64 "$seed_root" expert import
+    native_store_sync "$seed_host" "$seed_root" aarch64 expert import
+    if native_store_has "$seed_host" "$seed_root" expert; then
+      echo "WIP Spark export: native cache hit after the export turn"
+      timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$restore_command" ||
+        release_die "Spark WIP native restore on $seed_host failed"
+    else
+      timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native" ||
+        release_die "Spark WIP export on $seed_host failed"
+    fi
+    # Publish to the host store (hardlinks) before the next export on this seed.
+    native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
+    : >"$wip_build_resource_dir/export-done"
   fi
   native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
   native_store_nest "$seed_host" aarch64 "$seed_root" expert publish
