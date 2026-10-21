@@ -1033,3 +1033,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "weights_golden_tests.rs"]
+mod golden_tests;
