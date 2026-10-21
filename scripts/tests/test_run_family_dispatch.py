@@ -80,6 +80,20 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --wip s1 --restart\n"
 
 
+def test_public_launcher_resolves_family_from_selected_namespace(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    namespace = tmp_path / "namespace"
+    model = "local/flash"
+    _snapshot(namespace / "hf-home", model, GLMF_TWO_LAYER)
+    config = repo / "selected.config"
+    config.write_text(f"MODEL_ID={model}\n")
+    result = subprocess.run(["bash", str(repo / "run.sh"), "--config", str(config)],
+        env={**os.environ, "HF_HOME": str(tmp_path / "missing"), "CUTEAFD_NAMESPACE_ROOT": str(namespace)},
+        capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert "--family glm5_flash" in result.stdout
+
+
 def test_deepseek_v41_goes_to_run_family_like_every_family(tmp_path: Path) -> None:
     """run.sh is the same thin dispatcher for DeepSeek V4.1 (#82)."""
     repo, hf = _repo(tmp_path), tmp_path / "hf"
@@ -790,8 +804,8 @@ def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen)
         for part in ("bin", "lib", "share"):
             assert f"wip-run/plan-test/slot-test/serve-default/{part}:/opt/cuteafd/{part}:ro" in preflight
         assert "--entrypoint /opt/cuteafd/share/release-entrypoint.sh" in preflight
-        # Draft snapshots resolve under HF_HOME; the hub is mounted at /hf/hub.
-        assert "HF_HOME=/hf" in preflight and ":/hf/hub:ro" in preflight
+        # Draft snapshots resolve under HF_HOME inside the full namespace mount.
+        assert "HF_HOME=/mnt/sparknest/hf-home" in preflight and "/mnt/sparknest:/mnt/sparknest:ro" in preflight
 
 
 @pytest.mark.parametrize("budget,total,embedding", [("", 32768, "host"), ("31.8", 98304, "host"), ("", 98304, "gpu")])
@@ -2019,7 +2033,7 @@ def test_glm_vision_template_override_is_explicit_and_coordinator_only(tmp_path,
     expected = source
     if source_kind == "hub_snapshot":
         source = str(tmp_path / "hf/hub/models--test--model/snapshots/abc")
-        expected = "/hf/hub/models--test--model/snapshots/abc"
+        expected = source
     elif source_kind == "external_snapshot":
         source = str(tmp_path / "vendor")
         Path(source).mkdir()
@@ -2032,7 +2046,9 @@ def test_glm_vision_template_override_is_explicit_and_coordinator_only(tmp_path,
     if source_kind == "external_snapshot":
         assert f"-v {source}:{source}:ro" in launch
     worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
-    assert "--chat-template-from" not in worker and source not in worker
+    assert "--chat-template-from" not in worker
+    if source_kind != "hub_snapshot":
+        assert source not in worker
 
 
 def test_text_only_glm_ignores_template_override(tmp_path):
@@ -2371,14 +2387,14 @@ def test_glm_flash_drafts_with_its_default_speculator(tmp_path: Path) -> None:
         text = _family_launch_lines(tmp_path / sub, config, model, keys + extra)
         return text, [l for l in text.splitlines() if "cuteafd serve-glmf" in l]
 
-    snap = lambda name: f"--draft /hf/hub/models--{name.replace('/', '--')}/snapshots/abc"
+    snap = lambda sub, name: f"--draft {tmp_path}/{sub}/hf/hub/models--{name.replace('/', '--')}/snapshots/abc"
     text, lines = launch("a", "")
-    assert lines and snap(default) in lines[0], text
+    assert lines and snap("a", default) in lines[0], text
     assert "drafts with dflash2" in text
     text, lines = launch("b", "SPECULATOR=off\n")
     assert lines and "--draft" not in lines[0], text
     text, lines = launch("c", f"SPECULATOR=dspark\nSPECULATOR_MODEL_ID={dspark}\n")
-    assert lines and snap(dspark) in lines[0], text
+    assert lines and snap("c", dspark) in lines[0], text
     text, lines = launch("d", "", ())
     assert lines and "--draft" not in lines[0] and "hf download " + default in text, text
 
@@ -2462,7 +2478,7 @@ def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, ke
         assert "--draft" not in launch
         assert ("--mtp 1" in launch) == (expected == "mtp")
     else:
-        assert "--draft /hf/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch
+        assert f"--draft {tmp_path}/hf/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch
         if expected == "checkpoint":
             assert "--draft-representation checkpoint" in launch and "--draft-fp8" not in launch
         else:
@@ -3243,7 +3259,7 @@ def test_generic_family_checkpoint_context_default_and_override(tmp_path, family
 def test_pre_108_wip_seal_serves_with_hub_under_hf_home(tmp_path):
     """#111: binaries sealed before #108 resolve drafter snapshots under HF_HOME (falling
     back to a root-only default otherwise). Every planner and serving container the
-    launcher starts sets HF_HOME=/hf with the hub at /hf/hub, so such a seal plans and
+    launcher starts sets HF_HOME to the namespace HF home, so such a seal plans and
     serves instead of being reported unsupported. Measured on wip-glmf65final:final1
     (9968af44, no #108 ancestry): its `cuteafd plan` refused Spark count 2 without
     HF_HOME and fit with HF_HOME=/hf."""
@@ -3257,12 +3273,12 @@ def test_pre_108_wip_seal_serves_with_hub_under_hf_home(tmp_path):
     coordinator = [line for line in lines if "serve-glmf --snapshot" in line]
     assert plans and coordinator
     for line in plans + coordinator:
-        assert "HF_HOME=/hf" in line and ":/hf/hub:ro" in line, line
+        assert "HF_HOME=/mnt/sparknest/hf-home" in line and "/mnt/sparknest:/mnt/sparknest:ro" in line, line
         assert "/root/" not in line, line
-    # The default drafter is passed as a /hf/hub snapshot the old binary resolves too.
-    assert "--draft /hf/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/" in coordinator[0]
+    # The default drafter is passed as the same resolved host snapshot path.
+    assert f"--draft {tmp_path}/hf/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/" in coordinator[0]
     worker = result.stderr.split("release_serving_docker_args ()", 1)[1]
-    assert "HF_HOME=/hf" in worker and ":/hf/hub:ro" in worker
+    assert "HF_HOME=/mnt/sparknest/hf-home" in worker and "/mnt/sparknest:/mnt/sparknest:ro" in worker
 
 
 @pytest.mark.parametrize("wip", [False, True])
@@ -3429,3 +3445,21 @@ def test_qwen_external_occupancy_is_nvml_used_subtracted_from_cuda_capacity(tmp_
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line).split()
     used = (97887 - 12000 - (84000 if restart else 0)) * 2**20
     assert float(plan[plan.index("--coordinator-gpu-budget-gib") + 1]) == (total - used) / 2**30
+
+
+def test_namespace_root_and_push_endpoint_reach_both_serving_roles(tmp_path):
+    root = tmp_path / "namespace"
+    hf = root / "hf-home"
+    model = "zai-org/GLM-5.3-Flash"
+    _snapshot(hf, model, GLMF_TWO_LAYER)
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, model,
+        "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+        extra_env={"CUTEAFD_NAMESPACE_ROOT": str(root), "CUTEAFD_PUSH_SOCKET": "@isolated-push"})
+    assert result.returncode == 0, result.stderr
+    for line in result.stderr.splitlines():
+        if "docker run" in line and ("cuteafd plan" in line or "serve-glmf --snapshot" in line):
+            assert f"{root}:{root}:ro" in line
+            assert f"HF_HOME={hf}" in line
+            assert f"{hf}/hub/models--zai-org--GLM-5.3-Flash/snapshots/abc" in line
+    assert result.stderr.count("CUTEAFD_PUSH_SOCKET=@isolated-push") >= 2
+    assert f"--snapshot '{hf}/hub/models--zai-org--GLM-5.3-Flash/snapshots/abc'" in result.stderr

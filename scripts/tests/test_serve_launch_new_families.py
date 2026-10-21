@@ -54,7 +54,7 @@ def _flag(line: str, flag: str) -> str | None:
 def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> None:
     result = _kimi(tmp_path)
     serve = _line(result, "cuteafd serve-kimi --snapshot")
-    assert "/hf/hub/models--wrldsuksgo2mars--Kimi-K3-EXL3-K2/snapshots/abc" in serve
+    assert str(tmp_path / "hf/hub/models--wrldsuksgo2mars--Kimi-K3-EXL3-K2/snapshots/abc") in serve
     assert _flag(serve, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(6))
     assert (_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")
     assert _flag(serve, "--max-sequences") == "16"

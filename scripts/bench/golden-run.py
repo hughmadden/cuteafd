@@ -13,8 +13,8 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
 Each arm runs its slot's `cuteafd`, `libcuteafd_native.so`, `PROGRAMS.json` and expert
 packages, mounted read-only as /opt/cuteafd/{bin,lib,share} in the slot's own dev image
 (META base_image_id), with CDI `--device nvidia.com/gpu=N`, `--ipc host`, memlock
-unlimited, the host uid (release_serving_docker_args), the hub read-only at /hf/hub
-(HF_HOME=/hf) and /mnt/sparknest read-only. What runs:
+unlimited, the host uid (release_serving_docker_args), the full namespace read-only at /mnt/sparknest
+(HF_HOME=/mnt/sparknest/hf-home). What runs:
 
 - default: the family's golden subcommand (`glm-golden ARGS`, ...). The slot supplies
   --native-lib and --manifest; ARGS may not override them.
@@ -28,7 +28,7 @@ Both raw modes run in the slot's sealed source tree, mounted read-only at
 PYTHONDONTWRITEBYTECODE=1), with CUTEAFD_NATIVE_LIB and CUTEAFD_PROGRAM_MANIFEST set.
 
 Placeholders in ARGS and in --env/--arm-env values: {snapshot} (the checkpoint's
-container path), {hub} (/hf/hub), {out} (the run's writable output directory, e.g.
+container path), {hub} (the resolved host hub path), {out} (the run's writable output directory, e.g.
 `--save-logits {out}/logits`), {fixtures}, {peers} and {expert_layers}. Other existing
 absolute host paths in ARGS are mounted read-only at the same path. --fixtures DIR is
 mounted at its own path (read-only; --fixtures-writable for a fixture-generation run,
@@ -113,7 +113,11 @@ POWER_SAMPLE_S = 5.0
 SOURCE = '/workspace/cuteafd'
 TEST_DIR = '/opt/cuteafd/test'
 SPARK_PACKAGES = '/opt/cuteafd/spark'
-HUB = '/hf/hub'
+def namespace_root():
+    return str(Path(os.environ.get('CUTEAFD_NAMESPACE_ROOT', '/mnt/sparknest')).expanduser().resolve())
+
+
+HUB = '/mnt/sparknest/hf-home/hub'
 # Real experts. Hosts refused outright, with the reason (lift a refusal here once cleared).
 REFUSED_HOSTS = {
     'oliver': 'reserved for the Kimi F32 golden',
@@ -256,7 +260,7 @@ def substitute(args, snapshot, out=OUT, **values):
 
 
 def placeholder_values(state):
-    return dict(fixtures=state.get('fixtures'), peers=state['sparks']['peers_csv'] if state.get('sparks') else None,
+    return dict(hub=str(state['hub']), fixtures=state.get('fixtures'), peers=state['sparks']['peers_csv'] if state.get('sparks') else None,
                 expert_layers=','.join(map(str, state['sparks']['layers'])) if state.get('sparks')
                 and state['sparks']['layers'] else None)
 
@@ -401,7 +405,7 @@ def check_spark(host, arm, state, coordinator, at_grant=True):
     in the fair queue may legitimately hold it."""
     root = coordinator.get('wip_root') or '-'
     snap = state['snapshot_container']
-    snap_rel = snap[len(HUB) + 1:] if snap.startswith(HUB + '/') else '-'
+    snap_rel = '-'
     names = json.dumps([worker_name(state['task'], arm, r) for r in range(len(state['sparks']['hosts']))])
     argv = ['python3', '-c', REMOTE_CHECK, root, coordinator['slot'], coordinator['instance'], '-',
             str(state['sparks']['port']) if at_grant else '-', names, snap_rel, snap if snap_rel == '-' else '-']
@@ -442,11 +446,13 @@ def worker_command(state, arm, rank, record):
         mounts.append((art / kind, f'{SLOT_LIB}/{kind}'))
     mounts += [(art, SLOT_SHARE), (root / 'workspace/docker/release-entrypoint.sh', ENTRYPOINT),
                (root / 'workspace/third_party/sparkinfer', '/source/third_party/sparkinfer'),
-               (record['hub'], HUB)]
-    if not record['snapshot'].startswith(record['hub'] + '/'):
-        mounts.append(('/mnt/sparknest', '/mnt/sparknest'))
-    snapshot = HUB + record['snapshot'][len(record['hub']):] if record['snapshot'].startswith(record['hub'] + '/') \
-        else record['snapshot']
+               (namespace_root(), namespace_root())]
+    snapshot = record['snapshot']
+    hub = Path(record['hub'])
+    if not hub.is_relative_to(namespace_root()):
+        mounts.append((hub, hub))
+    if not Path(snapshot).is_relative_to(namespace_root()) and not Path(snapshot).is_relative_to(hub):
+        mounts.append((snapshot, snapshot))
     cmd = ['docker', 'run', '-d', '--name', worker_name(state['task'], arm, rank), '--restart', 'no',
            '--label', f"{WORKER_LABEL}={state['task']}/{arm}", '--device', 'nvidia.com/gpu=all', '--network', 'host',
            '--ipc', 'host', '--ulimit', 'memlock=-1:-1', '--device=/dev/infiniband', *record['serving_args']]
@@ -458,7 +464,8 @@ def worker_command(state, arm, rank, record):
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
            # As the coordinator gets it: workers resolve installed programs and packages from it.
            'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json',
-           'RUST_LOG': 'info', **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env'],
+           'RUST_LOG': 'info', 'HF_HOME': namespace_root() + '/hf-home',
+           **{k: os.environ[k] for k in ('CUTEAFD_PUSH_SOCKET',) if os.environ.get(k)}, **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env'],
            **sparks.get('arm_env', {}).get(arm, {})}
     for key, value in env.items():
         cmd += ['-e', f'{key}={value}']
@@ -551,7 +558,8 @@ def stop_workers(state, arm, out_dir):
 # --------------------------------------------------------------------------- checkpoint
 
 def hub_root():
-    return Path(os.environ.get('CUTEAFD_HF_HUB', Path.home() / '.cache/huggingface/hub')).resolve()
+    default = Path(namespace_root()) / 'hf-home/hub' if os.environ.get('CUTEAFD_NAMESPACE_ROOT') else Path.home() / '.cache/huggingface/hub'
+    return Path(os.environ.get('CUTEAFD_HF_HUB', default)).resolve()
 
 
 def resolve_model(model, hub=None):
@@ -572,9 +580,7 @@ def resolve_model(model, hub=None):
     path = path.resolve()
     if not (path / 'config.json').is_file():
         raise ValueError(f'{path} has no config.json')
-    if path.is_relative_to(hub):
-        return path, '/hf/hub/' + str(path.relative_to(hub)), []
-    if path.is_relative_to('/mnt/sparknest'):
+    if path.is_relative_to(namespace_root()):
         return path, str(path), []
     return path, str(path), [str(path)]
 
@@ -747,9 +753,7 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
     mounts += [(str(art), SLOT_SHARE),
                (str(root / 'workspace/docker/release-entrypoint.sh'), ENTRYPOINT),
                (str(root / 'workspace/third_party/sparkinfer'), '/source/third_party/sparkinfer'),
-               (str(state['hub']), '/hf/hub')]
-    if Path('/mnt/sparknest').is_dir():
-        mounts.append(('/mnt/sparknest', '/mnt/sparknest'))
+               (namespace_root(), namespace_root())]
     mounts += [(p, p) for p in state['extra_mounts']]
     if mode != 'golden':
         mounts.append((str(root / 'workspace'), SOURCE))
@@ -776,7 +780,10 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
     # environment as well as from --manifest.
     env = {'PATH': f'{SLOT_BIN}:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
-           'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json', 'RUST_LOG': 'info'}
+           'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json', 'RUST_LOG': 'info',
+           'HF_HOME': namespace_root() + '/hf-home'}
+    if os.environ.get('CUTEAFD_PUSH_SOCKET'):
+        env['CUTEAFD_PUSH_SOCKET'] = os.environ['CUTEAFD_PUSH_SOCKET']
     if mode != 'golden':
         env.update(PYTHONPATH=f'/source/third_party/sparkinfer:{SOURCE}/python/reference',
                    PYTHONDONTWRITEBYTECODE='1')
@@ -1161,7 +1168,9 @@ def build_state(args, arms):
             raise ValueError(f'--native-test {args.native_test} is not an executable file (an absolute path)')
         native_test, native_digest = str(test.resolve()), sha256_file(test)
     fixtures = resolve_fixtures(args, task_root)
-    covered = [hub, Path('/mnt/sparknest'), snapshot] + ([Path(fixtures)] if fixtures else [])
+    if not hub.is_relative_to(namespace_root()):
+        extra = [str(hub)] + [path for path in extra if not Path(path).is_relative_to(hub)]
+    covered = [hub, Path(namespace_root()), snapshot] + ([Path(fixtures)] if fixtures else [])
     state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus),
                  snapshot=str(snapshot), snapshot_container=container_path, hub=str(hub), timeout=args.timeout,
                  golden=golden, extra_mounts=extra + path_mounts(golden, covered + [Path(p) for p in extra]),
