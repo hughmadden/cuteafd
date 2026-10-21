@@ -385,111 +385,81 @@ fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
     Ok(())
 }
 
-/// A model of SparkNest's push credit flow (crates/nest-data/src/push.rs,
-/// `grant`/`flush` as of 615cc7a), NOT a cuteafd guarantee: it documents why
-/// two coordinator rings on one rank host can deadlock under that policy, and
-/// is the regression check for a fixed policy once SparkNest changes.
+/// A model of SparkNest's push credit flow (crates/nest-data/src/push.rs
+/// `grant`/`flush`: today's policy as of 0.6.2, and the per-(source, rank)
+/// floor of 1d3be3b), NOT a cuteafd guarantee: it documents why coordinator
+/// ranks stalled the K4 and Flash push groups and checks the floor's fix.
 ///
-/// - Each rank host has one incast budget (in slots) shared by all its ranks;
-///   a fill frees one unit; `grant(rank)` runs at join and on that rank's own
-///   releases only, handing free ring slots to its sources round robin while
-///   the host budget allows (at least one grant if the host has none out).
-/// - Each source streams its slots in plan order (rank of each slot fixed by
-///   the plan) and blocks in `flush` until it holds a credit for that rank.
-/// - The engine releases each filled slot at once.
+/// - Each rank host has one incast budget (in slots) shared by its ranks; a
+///   fill frees one unit; `grant(rank)` runs at join and on that rank's own
+///   releases only, handing free ring slots round robin to EVERY source owing
+///   the rank (needed yet or not) while the budget allows (at least one grant
+///   if the host has none out).
+/// - With the floor, `grant(rank)` first tops each owing source up to one held
+///   grant of that rank, outside the budget, then runs the budget's round robin.
+/// - Each source streams its slots in plan order and blocks in `flush` until it
+///   holds a credit for that slot's rank. The engine releases each fill at once.
 mod sparknest_credit_model {
     use std::collections::VecDeque;
 
     #[derive(Clone, Copy, PartialEq)]
     pub enum Policy {
-        /// SparkNest today: freed budget is offered to the releasing rank only.
-        ReleasingRank,
-        /// Not enough: every rank on the host is offered freed budget, round
-        /// robin (budget still parks at sources blocked on the other rank).
-        AllRanks,
-        /// A fix: every (source, rank) the plan pairs keeps at least one credit
-        /// outside the shared budget, so no source blocks for want of a grant.
+        /// SparkNest 0.6.2: one budget per host, no floor.
+        Budget,
+        /// SparkNest 1d3be3b: each owing source held at one grant outside the budget.
         SourceFloor,
     }
 
     /// Returns true when every slot was delivered, false on a stall (no source
     /// can make progress and no grant can be issued).
-    pub fn run(policy: Policy, host_of: &[usize], ring: usize, budget: usize,
-        streams: &[Vec<usize>]) -> bool {
+    pub fn run(policy: Policy, host_of: &[usize], ring: usize, budget: usize, streams: &[Vec<usize>]) -> bool {
         let ranks = host_of.len();
         let hosts = host_of.iter().max().map_or(0, |h| h + 1);
         let sources = streams.len();
         let mut free = vec![ring; ranks];
         let mut out = vec![0usize; hosts];
         let mut next = vec![0usize; ranks];
-        // credits[source][rank]
-        let mut credits = vec![vec![0usize; ranks]; sources];
+        // credits[source][rank] = (budgeted, floor) grants held.
+        let mut credits = vec![vec![(0usize, 0usize); ranks]; sources];
         let mut cursor = vec![0usize; sources];
         let owing: Vec<Vec<usize>> = (0..ranks).map(|r| (0..sources)
             .filter(|&s| streams[s].contains(&r)).collect()).collect();
         let grant = |r: usize, free: &mut Vec<usize>, out: &mut Vec<usize>, next: &mut Vec<usize>,
-            credits: &mut Vec<Vec<usize>>| {
-            let h = host_of[r];
+            credits: &mut Vec<Vec<(usize, usize)>>| {
             if owing[r].is_empty() { return; }
-            while free[r] > 0 && (out[h] < budget || out[h] == 0) {
+            if policy == Policy::SourceFloor {
+                for &s in &owing[r] {
+                    let held = credits[s][r].0 + credits[s][r].1;
+                    if held == 0 && free[r] > 0 { free[r] -= 1; credits[s][r].1 += 1; }
+                }
+            }
+            let h = host_of[r];
+            while free[r] > 0 && (out[h] < budget || (out[h] == 0 && policy == Policy::Budget)) {
                 let s = owing[r][next[r] % owing[r].len()];
                 next[r] += 1;
                 free[r] -= 1;
                 out[h] += 1;
-                credits[s][r] += 1;
+                credits[s][r].0 += 1;
             }
         };
-        // The floor: one credit per (source, rank) pair, outside the budget.
-        let floor = |free: &mut Vec<usize>, credits: &mut Vec<Vec<usize>>| {
-            for r in 0..ranks {
-                for &s in &owing[r] {
-                    if credits[s][r] == 0 && free[r] > 0 { free[r] -= 1; credits[s][r] += 1; }
-                }
-            }
-        };
-        let mut floored = vec![vec![false; ranks]; sources];
-        if policy == Policy::SourceFloor {
-            floor(&mut free, &mut credits);
-            for r in 0..ranks { for &s in &owing[r] { floored[s][r] = credits[s][r] > 0; } }
-        }
         for r in 0..ranks { grant(r, &mut free, &mut out, &mut next, &mut credits); }
         let mut released: VecDeque<usize> = VecDeque::new();
         loop {
             let mut progressed = false;
             for s in 0..sources {
                 while let Some(&r) = streams[s].get(cursor[s]) {
-                    if credits[s][r] == 0 { break; }
-                    credits[s][r] -= 1;
+                    let held = &mut credits[s][r];
+                    if held.1 > 0 { held.1 -= 1; }
+                    else if held.0 > 0 { held.0 -= 1; out[host_of[r]] -= 1; } // a budgeted fill frees budget
+                    else { break; }
                     cursor[s] += 1;
-                    if floored[s][r] { floored[s][r] = false; } else { out[host_of[r]] -= 1; } // filled: its budget is free
-                    released.push_back(r); // the engine releases at once
+                    released.push_back(r);
                     progressed = true;
                 }
             }
             while let Some(r) = released.pop_front() {
                 free[r] += 1;
-                match policy {
-                    Policy::ReleasingRank => grant(r, &mut free, &mut out, &mut next, &mut credits),
-                    Policy::SourceFloor => {
-                        // Refill the floor first (its credit is outside the budget), then the budget.
-                        for &s in &owing[r] {
-                            if credits[s][r] == 0 && free[r] > 0 && cursor[s] < streams[s].len() {
-                                free[r] -= 1; credits[s][r] += 1; floored[s][r] = true;
-                            }
-                        }
-                        let h = host_of[r];
-                        for q in (0..ranks).filter(|&q| host_of[q] == h) {
-                            grant(q, &mut free, &mut out, &mut next, &mut credits);
-                        }
-                    }
-                    Policy::AllRanks => {
-                        let h = host_of[r];
-                        let mut order: Vec<usize> = (0..ranks).filter(|&q| host_of[q] == h).collect();
-                        let at = order.iter().position(|&q| q == r).unwrap_or(0);
-                        order.rotate_left(at);
-                        for q in order { grant(q, &mut free, &mut out, &mut next, &mut credits); }
-                    }
-                }
+                grant(r, &mut free, &mut out, &mut next, &mut credits);
             }
             if cursor.iter().zip(streams).all(|(c, s)| *c == s.len()) { return true; }
             if !progressed { return false; }
@@ -512,41 +482,36 @@ mod sparknest_credit_model {
 #[test]
 fn sparknest_model_two_ranks_on_one_host_stall_under_the_shared_budget() {
     use sparknest_credit_model::{interleaved, run, Policy};
-    // Six sources streaming slots for two coordinator ranks on one host
-    // (ring 128 slots, incast budget 64 slots).
+    // Group ...667's shape: six sources streaming slots for two coordinator
+    // ranks on one host (ring 128 slots, incast budget 64 slots).
     let streams = interleaved(6, 400, &[0, 1], 20);
-    assert!(!run(Policy::ReleasingRank, &[0, 0], 128, 64, &streams),
-        "SparkNest's releasing-rank grants are expected to stall two rings on one host");
-    assert!(!run(Policy::AllRanks, &[0, 0], 128, 64, &streams),
-        "sharing freed budget alone still parks credits at blocked sources");
+    assert!(!run(Policy::Budget, &[0, 0], 128, 64, &streams),
+        "one shared budget is expected to stall two rings on one host");
     assert!(run(Policy::SourceFloor, &[0, 0], 128, 64, &streams),
-        "a per-(source, rank) credit floor outside the shared budget must complete");
-    // One rank per host (the Spark-only groups) completes under today's policy.
-    assert!(run(Policy::ReleasingRank, &[0, 1], 128, 64, &streams));
+        "the per-(source, rank) floor outside the budget must complete");
 }
 
-/// The 1-RTX GLM Flash pair's shape: one coordinator rank on its own host,
-/// its dense tensors spread over every source and interleaved with two Spark
-/// ranks' expert files in each source's plan order. Group ...669 stalled in
-/// production in this shape, but this simple model does NOT reproduce that
-/// stall under today's policy (one rank per host completes here), so the real
-/// cause involves behaviour the model omits; only the floor's completion is
-/// pinned here.
+/// The 1-RTX GLM Flash pair's shape (group ...669): one coordinator rank on its
+/// own host beside two Spark ranks. One source (kiwi there) is in a long
+/// stretch of coordinator tensors while the other five stream experts. Grants
+/// go round robin to every source owing a rank, needed yet or not, so each
+/// Spark rank's budget parks at the coordinator-busy source and the
+/// coordinator's at the expert-busy ones: a stall under today's policy (as
+/// SparkNest's grants_parked_at_busy_sources_do_not_deadlock_one_rank_per_host
+/// reproduces at 1d3be3b); the per-(source, rank) floor (1d3be3b) completes.
 #[test]
 fn sparknest_model_one_coordinator_rank_beside_spark_ranks() {
     use sparknest_credit_model::{run, Policy};
-    // Six sources; ranks 0 and 1 are Sparks (heavy), rank 2 the coordinator
-    // (a short run of dense rows between each Spark tensor's runs).
+    // Ranks 0 and 1 are Sparks, rank 2 the coordinator; source 3 holds a long
+    // run of coordinator tensors before its expert files, the rest the reverse.
     let streams: Vec<Vec<usize>> = (0..6).map(|s| {
-        let mut v = Vec::new();
-        for block in 0..40 {
-            v.extend(std::iter::repeat_n(0, 24 + (block + s) % 5));
-            v.extend(std::iter::repeat_n(2, 1 + (block + 2 * s) % 3));
-            v.extend(std::iter::repeat_n(1, 24 + (block + 3 * s) % 5));
-        }
-        v
+        let experts: Vec<usize> = (0..400).map(|i| i % 2).collect();
+        let dense = vec![2; 300];
+        if s == 3 { [dense, experts].concat() } else { [experts, dense].concat() }
     }).collect();
     let hosts = [0, 1, 2];
+    assert!(!run(Policy::Budget, &hosts, 128, 64, &streams),
+        "grants parked at busy sources are expected to stall under today's policy");
     assert!(run(Policy::SourceFloor, &hosts, 128, 64, &streams),
         "a per-(source, rank) credit floor outside the shared budget must complete");
 }
