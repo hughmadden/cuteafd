@@ -7,6 +7,7 @@ mod routes;
 mod exlr8;
 mod push;
 mod push_fp8;
+mod push_native;
 mod push_exlr8;
 
 use crate::shared::experts::execution::HostExpertExchange;
@@ -231,6 +232,11 @@ fn load_weights<'a>(
             device_budget_bytes = config.device_budget,
             "explicit Spark replicas admission"
         );
+    }
+    if let Some(stream) = push {
+        if let Some(weights) = push_native::load(library, catalog, config, resident, stream)? {
+            return Ok((backend::Weights::Full(weights), config.device_budget - resident));
+        }
     }
     let mut remaining = config.device_budget;
     let weights = super::load_in_rank_order(&layers, config.rank, |_, layer| {

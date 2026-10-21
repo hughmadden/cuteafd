@@ -94,8 +94,8 @@ impl SparkAdmission {
                     .with_context(|| format!("Spark admission rank {rank} checkpoint assignment"))
             }).collect::<Result<Vec<_>>>()?
         };
-        let push_snapshot = if catalog.is_some_and(|c| c.exl3().is_some() || c.fp8().is_some()
-            || (manifest.is_some() && c.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8))
+        let push_snapshot = if catalog.is_some_and(|c|
+            c.format() != cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || manifest.is_some())
             && !working.spark_layers.is_empty() && assignments.iter().all(|a| a.resident_bytes > 0)
             && topology.is_none_or(|t| t.tp() as usize == world)
             && cuteafd_loader::push_load::namespace(snapshot).is_ok() {
@@ -135,8 +135,10 @@ impl SparkAdmission {
                         super::memory::push_exlr8::prepare(&snapshot, manifest, &layers, &assignments, offers)
                     } else if catalog.exl3().is_some() {
                         super::memory::push_exl3::prepare(&snapshot, &catalog, &layers, &assignments, offers)
-                    } else {
+                    } else if catalog.fp8().is_some() {
                         super::memory::push_fp8::prepare(&snapshot, &catalog, &assignments, offers)
+                    } else {
+                        super::memory::push_native::prepare(&snapshot, &catalog, &assignments, offers)
                     }
                 })?;
                 pending.wait()
