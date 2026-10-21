@@ -528,7 +528,13 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert "rtx_layers == working.rtx_layers" in body
     assert "admitted_tp2_range" not in source and "spark_range" not in body
     assert "&local_layers, Some(budget)" in body and "&spark_layers, None" in body
-    assert "tensors, &package, tp2_layers, args.expert_rows(), budgets" in body
+    assert "Fp8MoeTp2::load_pair(devices, tensors, &package, tp2_layers.clone(),\n                    args.expert_rows(), budgets)" in body
+    # Admitted TP2 expert weights land inside the Spark admission window;
+    # execution binds after the engine exists and before step workspaces.
+    window = body.split("load_while_admitting(admission,", 1)[1].split("probe(\"target-weights\")", 1)[0]
+    assert "tp2_weights()?" in window
+    assert body.index("engine::GlmfEngine::new(") < body.index("tp2.execution()?") < body.index("engine.install_tp2(ranks)?")
+    assert body.index("engine.install_tp2(ranks)?") < body.index("engine.install_workspaces(workspaces)?")
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
     assert "solve_attention_working_set_with_graphs(" in admission
     assert "let local_workspace = workspaces(false, lanes);" in admission

@@ -214,8 +214,8 @@ impl<'a> GlmfLoader<'a> {
     fn raw(&self, name: &str) -> Result<(Vec<u8>, DType, Vec<usize>)> {
         let tensor = self.tensor(name)?;
         let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
-        std::fs::File::open(self.checkpoint.snapshot.join(&tensor.shard))?
-            .read_exact_at(&mut bytes, tensor.meta.byte_offset)
+        crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(self.checkpoint.snapshot.join(&tensor.shard))?
+            .read_exact_at(&mut bytes, tensor.meta.byte_offset))
             .with_context(|| format!("reading {name}"))?;
         Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
     }
@@ -269,7 +269,7 @@ impl<'a> GlmfLoader<'a> {
 
     fn upload(&self, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
         let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
-        self.library.copy_h2d(allocation.buffer, bytes)?;
+        crate::shared::memory::load_timing::upload(bytes.len(), || self.library.copy_h2d(allocation.buffer, bytes))?;
         Ok(allocation)
     }
 
@@ -290,7 +290,7 @@ impl<'a> GlmfLoader<'a> {
                 ..out.buffer
             };
             match dtype {
-                DType::Bf16 => self.library.copy_h2d(dest(0, shape[0]), bytes)?,
+                DType::Bf16 => crate::shared::memory::load_timing::upload(bytes.len(), || self.library.copy_h2d(dest(0, shape[0]), bytes))?,
                 DType::F8E4M3 => {
                     let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
                     ensure!(scale_dtype == DType::F32, "{name}: block scales must be FP32");
@@ -350,16 +350,16 @@ impl<'a> GlmfLoader<'a> {
                 ensure!(shape[1] == tensors[0].meta.shape[1] && (i + 1 == names.len() || shape[0] % 128 == 0),
                     "{names:?}: FP8 rows must share columns and fill whole 128-row blocks but the last");
                 let length = tensor.meta.byte_length as usize;
-                std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
-                    .read_exact_at(&mut values[at..at + length], tensor.meta.byte_offset)
+                crate::shared::memory::load_timing::read(length, || std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
+                    .read_exact_at(&mut values[at..at + length], tensor.meta.byte_offset))
                     .with_context(|| format!("reading {name}"))?;
                 at += length;
                 let scale = find(&format!("{name}_scale_inv"))?;
                 ensure!(scale.meta.dtype == DType::F32 && scale.meta.shape == [shape[0] / 128, shape[1].div_ceil(128)],
                     "{name}: expected FP32 128x128 block scales, found {:?} {:?}", scale.meta.dtype, scale.meta.shape);
                 let mut bytes = vec![0u8; scale.meta.byte_length as usize];
-                std::fs::File::open(checkpoint.snapshot.join(&scale.shard))?
-                    .read_exact_at(&mut bytes, scale.meta.byte_offset)?;
+                crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(checkpoint.snapshot.join(&scale.shard))?
+                    .read_exact_at(&mut bytes, scale.meta.byte_offset))?;
                 grid.extend_from_slice(&bytes);
             }
             Ok(Some((self.upload(values)?, self.upload(&grid)?)))
@@ -387,8 +387,8 @@ impl<'a> GlmfLoader<'a> {
                         .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
                     let tensor = &checkpoint.tensors[at];
                     let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
-                    std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
-                        .read_exact_at(&mut bytes, tensor.meta.byte_offset)?;
+                    crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
+                        .read_exact_at(&mut bytes, tensor.meta.byte_offset))?;
                     Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
                 }
                 None => self.raw(name),
@@ -674,8 +674,8 @@ impl<'a> GlmfLoader<'a> {
                 .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
             let tensor = &checkpoint.tensors[at];
             let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
-            std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
-                .read_exact_at(&mut bytes, tensor.meta.byte_offset).with_context(|| format!("reading {name}"))?;
+            crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
+                .read_exact_at(&mut bytes, tensor.meta.byte_offset)).with_context(|| format!("reading {name}"))?;
             Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
         };
         let (values, dtype, shape) = read(name)?;
@@ -870,6 +870,7 @@ impl<'a> GlmfLoader<'a> {
     #[allow(clippy::type_complexity)]
     pub fn model(&self, cfg: &GlmNextConfig, plan: &LayerExecutionPlan) -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
         validate_kda_output_shard(self.ranks(), self.kda_fp8, self.kda_output_shard)?;
+        let split = crate::shared::memory::load_timing::Split::start();
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         ensure!(plan.modes().len() <= cfg.layers, "attention plan exceeds checkpoint layers");
         for (layer, &mode) in plan.modes().iter().enumerate() {
@@ -889,6 +890,7 @@ impl<'a> GlmfLoader<'a> {
             },
         };
         crate::shared::memory::staging::release_staging();
+        split.log("glm5_flash dense");
         Ok((weights, shares.collect()))
     }
 }

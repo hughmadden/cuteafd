@@ -622,9 +622,33 @@ impl Opened {
         let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
-        let (embedding, (model, mut shares)) = crate::shared::placement::load_while_admitting(admission, || {
-            crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-                args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, owners.as_deref(), native) })
+        let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
+        let max_rows = args.prefill_rows.max(engine::DECODE_ROWS);
+        // The admitted TP2 expert halves are charged before the serving pool;
+        // their bytes land inside the Spark admission window. Execution
+        // (modules, workspaces, routes) binds after the engine exists.
+        let tp2_weights = |range: std::ops::Range<usize>| -> Result<crate::shared::experts::rtx::Tp2Weights<'_>> {
+            let local = local.as_ref().context("TP2 placement without local package inventory")?;
+            let devices = [crate::shared::memory::device::Device { library: &self.library, id: args.device },
+                crate::shared::memory::device::Device { library: &self.library, id: split_device.context("TP2 peer")? }];
+            let budgets = placement.tp2.context("TP2 budget")?.peak_bytes;
+            let budgets = [usize::try_from(budgets[0])?, usize::try_from(budgets[1])?];
+            Ok(match local.format {
+                glm::GlmLocalFormat::Exl3 => crate::shared::experts::rtx::Tp2Weights::Exl3(
+                    crate::shared::experts::rtx::exl3::Exl3Tp2::load_pair_weights(devices, &self.catalog,
+                        cuteafd_core::expert_geometry(), [&local.package; 2], range.collect(), max_rows, budgets,
+                        crate::shared::experts::rtx::RtxSelectionPolicy::CanonicalDecode)?),
+                glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::Tp2Weights::Fp8(
+                    crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::load_pair(devices,
+                        self.catalog.fp8().context("NVFP4 tensors")?, &local.package,
+                        range.collect(), max_rows, budgets)?),
+            })
+        };
+        let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
+            let loaded = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+                args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, owners.as_deref(), native) })?;
+            let tp2 = tp2_range.clone().map(&tp2_weights).transpose()?;
+            Ok((loaded.0, (loaded.1, tp2)))
         })?;
         let native_owners = native_plans.into_iter().zip(&devices).map(|(plan, &device)| {
             self.library.cuda_set_device(device)?;
@@ -679,7 +703,6 @@ impl Opened {
         engine.spark_bf16 = spark_bf16;
         engine.full_prefill_logits = args.full_prefill_logits;
         engine.attention_plan = attention_plan;
-        let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
         if tp2_range.is_some() && exchange_f32 {
             engine.set_tp2_exchange(crate::shared::experts::rtx::ExchangeDtype::F32);
         }
@@ -689,21 +712,9 @@ impl Opened {
             engine.attach_peer(device, stream, peer_layers)?;
         }
         if owners.is_some() { engine.bind_layer_execution(&placement)?; }
-        if let Some(range) = tp2_range {
+        if let Some(tp2) = tp2 {
             let local = local.as_ref().context("TP2 placement without local package inventory")?;
-            let devices = [crate::shared::memory::device::Device { library: &self.library, id: args.device },
-                crate::shared::memory::device::Device { library: &self.library, id: split_device.context("TP2 peer")? }];
-            let budgets = placement.tp2.context("TP2 budget")?.peak_bytes;
-            let budgets = [usize::try_from(budgets[0])?, usize::try_from(budgets[1])?];
-            let max_rows = args.prefill_rows.max(engine::DECODE_ROWS);
-            use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxExpertLayer};
-            let ranks: [Box<dyn RtxExpertLayer + '_>; 2] = match local.format {
-                glm::GlmLocalFormat::Exl3 => Exl3Tp2::load_pair(devices, &self.catalog, &local.package,
-                    range.collect(), max_rows, budgets)?.map(|r| Box::new(r) as Box<dyn RtxExpertLayer>),
-                glm::GlmLocalFormat::Nvfp4 { .. } => Fp8MoeTp2::load_pair(devices,
-                    self.catalog.fp8().context("NVFP4 tensors")?, &local.package,
-                    range.collect(), max_rows, budgets)?.map(|r| Box::new(r) as Box<dyn RtxExpertLayer>),
-            };
+            let ranks = tp2.execution()?;
             for rank in &ranks { ensure!(rank.workspace_bytes() as u64 == local.backend_workspace,
                 "GLM loaded TP2 workspace differs from admission"); }
             engine.install_tp2(ranks)?;
