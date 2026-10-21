@@ -44,7 +44,7 @@ def test_mtp_shared_arena_target_history_and_logits_retire_before_prefill_draft(
     ordered(chunk, "engine.prefill_device(", "if end == p.tokens.len() {",
             "p.prompt_row = Some(logits.row_host(", "probe::device_rows(",
             "selector.select(&logits, &batch)?", "p.first = Some(take(",
-            "if neural && !probe::no_speculation(", "engine.prefill_draft(")
+            "if effective_neural(neural, &p.job.probe) {", "engine.prefill_draft(")
 
 
 def test_mtp_semantics_provenance_is_complete_and_fail_closed(tmp_path):

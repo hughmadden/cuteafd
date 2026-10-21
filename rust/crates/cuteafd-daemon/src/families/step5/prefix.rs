@@ -341,42 +341,72 @@ mod tests {
         // SAFETY: the selected library implements the native CUDA ABI.
         let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = cache_test_device(&library)?;
-        let shape = super::super::cache::tests::layout_for(66, 2, 0, 64);
-        let ranks = (0..2).map(|rank| CacheRank::new(device, shape.clone(), rank, 1, 1, 2, usize::MAX)
-            .map(RefCell::new)).collect::<Result<Vec<_>>>()?;
-        let family = Step5Prefix::new(ranks.iter().collect())?;
-        for (rank, owner) in ranks.iter().enumerate() {
-            let mark = owner.borrow().mark_view(0)?;
-            let mut bytes = vec![0; mark.bytes];
-            let at = shape.ranks[rank].length.offset as usize;
-            bytes[at..at + 8].copy_from_slice(&(65u64 - rank as u64).to_le_bytes());
-            device.run(|| library.copy_h2d(mark, &bytes))?;
-        }
         let plan = RestorePlan { snapshot_end: 65, target_end: 66,
             lag: cuteafd_engine::prefix::LaggedState { source_end: 65, replay_start: 65 },
             fidelity: cuteafd_engine::prefix::RestoreFidelity::Exact };
         let tokens: Vec<u32> = (0..66).collect();
         let context = RestoreContext { native_tokens: &tokens, media: &[] };
-        let mut destination = Placement { pages: vec![0, 1], sequence: 0, committed: 0 };
-        assert!(family.restore_with(Some(&Mark::Slot(MarkSlot(0))), Some(&Frontier::at(65)),
-            &mut destination, &plan, &context).is_err());
-        assert_eq!(destination.committed, 0);
-        for owner in &ranks {
-            let mut bytes = [0; 8];
-            device.run(|| library.copy_d2h(&mut bytes, owner.borrow().length(0, false)?))?;
-            assert_eq!(u64::from_le_bytes(bytes), 0, "earlier rank must not be restored before validation completes");
-        }
-        let mark = ranks[1].borrow().mark_view(0)?;
-        let length = cuteafd_ffi::CuteafdDeviceBuffer { ptr: mark.ptr
-            .wrapping_byte_add(shape.ranks[1].length.offset as usize), bytes: 8, ..mark };
-        device.run(|| library.copy_h2d(length, &65u64.to_le_bytes()))?;
-        family.restore_with(Some(&Mark::Slot(MarkSlot(0))), Some(&Frontier::at(65)),
-            &mut destination, &plan, &context)?;
-        assert_eq!(destination.committed, 65);
-        for owner in &ranks {
-            let mut bytes = [0; 8];
-            device.run(|| library.copy_d2h(&mut bytes, owner.borrow().length(0, false)?))?;
-            assert_eq!(u64::from_le_bytes(bytes), 65);
+        for depth in 0..=3 {
+            let shape = super::super::cache::tests::layout_for(66, 2, depth, 64);
+            let ranks = (0..2).map(|rank| CacheRank::new(device, shape.clone(), rank, 1, 1, 2, usize::MAX)
+                .map(RefCell::new)).collect::<Result<Vec<_>>>()?;
+            let family = Step5Prefix::new(ranks.iter().collect())?;
+            let mut saved = Frontier::at(65);
+            saved.predictor_frontiers = (0..depth).map(|stage| 64 - stage as u64).collect();
+            let mut counters = Vec::new();
+            let mut stage = 0;
+            for (rank, owner) in ranks.iter().enumerate() {
+                let mark = owner.borrow().mark_view(0)?;
+                let mut bytes = vec![0; mark.bytes];
+                let state = &shape.ranks[rank];
+                for (span, value) in std::iter::once((state.length, 65)).chain(
+                    state.mtp_lengths.iter().copied().map(|span| {
+                        let value = saved.predictor_frontiers[stage];
+                        stage += 1;
+                        (span, value)
+                    })) {
+                    let at = span.offset as usize;
+                    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+                    counters.push((rank, span, value));
+                }
+                device.run(|| library.copy_h2d(mark, &bytes))?;
+            }
+            assert_eq!(stage, depth);
+            let pristine = || -> Result<Vec<Vec<u8>>, BoxError> {
+                counters.iter().map(|&(rank, span, _)| {
+                    let mut bytes = vec![0; span.bytes as usize];
+                    device.run(|| library.copy_d2h(&mut bytes, ranks[rank].borrow().request_component(span, 0)?))?;
+                    Ok(bytes)
+                }).collect()
+            };
+            let before = pristine()?;
+            let mut destination = Placement { pages: vec![0, 1], sequence: 0, committed: 0 };
+            // Corrupt both target ranks and every predictor stage independently.
+            for &(rank, span, value) in &counters {
+                let mark = ranks[rank].borrow().mark_view(0)?;
+                let encoded = cuteafd_ffi::CuteafdDeviceBuffer { ptr: mark.ptr
+                    .wrapping_byte_add(span.offset as usize), bytes: 8, ..mark };
+                device.run(|| library.copy_h2d(encoded, &(value - 1).to_le_bytes()))?;
+                assert!(family.restore_with(Some(&Mark::Slot(MarkSlot(0))), Some(&saved),
+                    &mut destination, &plan, &context).is_err());
+                assert_eq!(destination.committed, 0);
+                assert_eq!(pristine()?, before, "no rank may publish before every retained counter validates");
+                device.run(|| library.copy_h2d(encoded, &value.to_le_bytes()))?;
+            }
+            for stage in 0..depth {
+                let mut wrong = saved.clone();
+                wrong.predictor_frontiers[stage] -= 1;
+                assert!(family.restore_with(Some(&Mark::Slot(MarkSlot(0))), Some(&wrong),
+                    &mut destination, &plan, &context).is_err());
+                assert_eq!(pristine()?, before);
+            }
+            family.restore_with(Some(&Mark::Slot(MarkSlot(0))), Some(&saved),
+                &mut destination, &plan, &context)?;
+            assert_eq!(destination.committed, 65);
+            for ((_, _, value), bytes) in counters.iter().zip(pristine()?) {
+                assert_eq!(bytes, value.to_le_bytes());
+            }
+            println!("Step-5 retained counter validation depth={depth} all_ranks_before_write=true");
         }
         Ok(())
     }
@@ -443,6 +473,7 @@ mod tests {
         for &span in &shape.ranks[0].mtp_lengths {
             device.run(|| library.copy_h2d(owner.borrow().request_component(span, 0)?, &0u64.to_le_bytes()))?;
         }
+        let captured = family.capture_meta(&source, 65)?;
         assert!(shared.capture(&family, SnapshotKind::Prompt, &tokens, &source, After::default())?);
         // Simulate host-tier promotion into a different arena slot: its bytes
         // and entry metadata are valid, but no local capture ever used slot 1.
@@ -464,11 +495,11 @@ mod tests {
         let encoded = cuteafd_ffi::CuteafdDeviceBuffer { ptr: owner.borrow().mark_view(1)?.ptr
             .wrapping_byte_add(length.offset as usize), bytes: 8, ..mark };
         device.run(|| library.copy_h2d(encoded, &64u64.to_le_bytes()))?;
-        assert!(family.restore_with(Some(&Mark::Slot(MarkSlot(1))), Some(&Frontier::at(65)),
+        assert!(family.restore_with(Some(&Mark::Slot(MarkSlot(1))), Some(&captured),
             &mut promoted, &plan, &context).is_err());
         assert_eq!(promoted.committed, 0);
         device.run(|| library.copy_h2d(encoded, &65u64.to_le_bytes()))?;
-        family.restore_with(Some(&Mark::Slot(MarkSlot(1))), Some(&Frontier::at(65)),
+        family.restore_with(Some(&Mark::Slot(MarkSlot(1))), Some(&captured),
             &mut promoted, &plan, &context)?;
         // Only the source's partial page is mutable; the full page remains shared.
         for plane in owner.borrow().page_views(tail)? { set(plane, 0x49)?; }
