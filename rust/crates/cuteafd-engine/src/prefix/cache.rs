@@ -337,7 +337,16 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// a family whose restore rebuilds token-derived state ([`RestoreContext`]).
     #[allow(clippy::too_many_arguments)]
     pub fn admit_native<F: PrefixFamily<M, Placement = P>, P>(&mut self, family: &F, tokens: &[u32],
-        native: &[u32], media: &[MediaSpan], capacity: usize, sampled: bool, mut build: impl FnMut(Vec<u32>) -> P)
+        native: &[u32], media: &[MediaSpan], capacity: usize, sampled: bool, build: impl FnMut(Vec<u32>) -> P)
+        -> Result<Admitted<P>, PrefixError> {
+        self.admit_native_compatible(family, tokens, native, media, capacity, sampled, None, build)
+    }
+
+    /// Request-local state requirements are checked before either tier restores bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_native_compatible<F: PrefixFamily<M, Placement = P>, P>(&mut self, family: &F,
+        tokens: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize, sampled: bool,
+        compatible: Option<&dyn Fn(&M, usize) -> bool>, mut build: impl FnMut(Vec<u32>) -> P)
         -> Result<Admitted<P>, PrefixError> {
         crate::media::keys::validate_spans(media)?;
         if media.last().is_some_and(|s| s.checked_end().unwrap() > tokens.len()) || native.len() != tokens.len() {
@@ -349,12 +358,25 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if self.enabled() && !tokens.is_empty() {
             self.stats.lookups += 1;
             let mut promoted = false;
-            let mut hit = self.lookup_media(tokens, media, sampled);
-            if hit.is_none() {
-                hit = self.promote(family, tokens, media, sampled)?;
-                promoted = hit.is_some();
+            let mut hit = if let Some(compatible) = compatible {
+                self.device_compatible_hit(tokens, media, sampled, compatible)
+            } else { self.lookup_media(tokens, media, sampled) };
+            let host_deeper = compatible.is_some_and(|compatible| self.host_compatible_hit(tokens, media,
+                sampled, compatible).is_some_and(|(_, resume)| resume > hit.as_ref().map_or(0, |h| h.resume)));
+            if hit.is_none() || host_deeper {
+                let restored = self.promote(family, tokens, media, sampled, compatible)?;
+                promoted = restored.is_some();
+                // Promotion can evict the previous device candidate before
+                // failing admission. Re-select rather than keeping a stale id.
+                hit = if let Some(compatible) = compatible {
+                    self.device_compatible_hit(tokens, media, sampled, compatible)
+                } else { restored };
             }
             if let Some(hit) = hit {
+                if compatible.is_some() {
+                    self.clock += 1;
+                    if let Some(entry) = self.entries.get_mut(&hit.id) { entry.last_use = self.clock; }
+                }
                 let context = RestoreContext { native_tokens: native, media };
                 match self.restore_hit(family, &hit, tokens, &context, total, promoted, &mut build) {
                     Ok(Some(admitted)) => return Ok(admitted),
@@ -440,6 +462,38 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             } else { self.host_media_hit(tokens, media, sampled).0.map(|h| h.1) }
         }).unwrap_or(0);
         device.max(host)
+    }
+
+    /// A compatible ancestor may be shallower than an incompatible token match.
+    pub fn peek_media_compatible(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        compatible: &dyn Fn(&M, usize) -> bool) -> usize {
+        if !self.enabled() { return 0; }
+        let device = self.device_compatible_hit(tokens, media, sampled, compatible).map_or(0, |h| h.resume);
+        let host = self.host_compatible_hit(tokens, media, sampled, compatible).map_or(0, |h| h.1);
+        device.max(host)
+    }
+
+    fn device_compatible_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        compatible: &dyn Fn(&M, usize) -> bool) -> Option<Hit> {
+        self.entries.iter().filter_map(|(&id, entry)| {
+            let (resume, common, _) = media_resume(self.layout.rule, tokens, media, &entry.tokens,
+                &entry.media, &entry.after, sampled);
+            (resume > 0 && compatible(&entry.meta, entry.len())).then_some((
+                (resume, entry.kind == SnapshotKind::Turn, entry.last_use),
+                Hit { id, kind: entry.kind, resume, common, frontier: entry.len() }))
+        }).max_by_key(|(rank, _)| *rank).map(|(_, hit)| hit)
+    }
+
+    fn host_compatible_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        compatible: &dyn Fn(&M, usize) -> bool) -> Option<(cuteafd_hostcache::snapshot::Hit, usize)> {
+        self.host.as_ref()?.resident_payloads().filter_map(|(meta, key, payload)| {
+            let (resume, common, _) = media_resume(self.layout.rule, tokens, media, &meta.tokens,
+                &payload.media, &payload.after, sampled);
+            (resume > 0 && compatible(&payload.family, meta.tokens.len())).then_some((
+                (resume, meta.kind == SnapshotKind::Turn, key),
+                (cuteafd_hostcache::snapshot::Hit { key, kind: meta.kind, common,
+                    frontier: meta.tokens.len() }, resume)))
+        }).max_by_key(|(rank, _)| *rank).map(|(_, hit)| hit)
     }
 
     fn device_media_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> (Option<Hit>, u64) {
@@ -1243,8 +1297,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
 
     /// On a device miss: rebuild the best host snapshot on the device so the device path finds
     /// it. Anything short of a completed restore is a miss.
-    fn promote<F: PrefixFamily<M>>(&mut self, family: &F, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> Result<Option<Hit>, PrefixError> {
-        let selected = if media.is_empty() {
+    fn promote<F: PrefixFamily<M>>(&mut self, family: &F, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        compatible: Option<&dyn Fn(&M, usize) -> bool>) -> Result<Option<Hit>, PrefixError> {
+        let selected = if let Some(compatible) = compatible {
+            let selected = self.host_compatible_hit(tokens, media, sampled, compatible);
+            let key = selected.as_ref().map(|(hit, _)| hit.key);
+            if !self.host.as_mut().is_some_and(|host| host.lookup_verified(key)) { return Ok(None); }
+            selected.map(|(hit, _)| hit)
+        } else if media.is_empty() {
             self.host.as_mut().and_then(|host| host.lookup(tokens))
         } else {
             let (selected, collisions) = self.host_media_hit(tokens, media, sampled);
@@ -1384,7 +1444,9 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.evict(family, evicted)?;
         }
         self.stats.promotions += 1;
-        Ok(self.lookup_media(tokens, media, sampled))
+        Ok(if let Some(compatible) = compatible {
+            self.device_compatible_hit(tokens, media, sampled, compatible)
+        } else { self.lookup_media(tokens, media, sampled) })
     }
 }
 

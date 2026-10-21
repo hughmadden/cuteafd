@@ -712,6 +712,79 @@ fn family_metadata_survives_host_promotion_and_tail_cow() {
     assert_eq!(cache.stats().promotions, 2);
     cache.clear(&family).unwrap();
     assert_eq!(cache.pool().free(), 64);
+
+    // A target-only turn must not hide a shorter predictor-complete prompt.
+    // Repeat selection on device, then with both entries resident only on host.
+    let short = seq(3000, 13);
+    let mut long = short.clone();
+    long.extend(seq(4000, 8));
+    for (tokens, generation, kind) in [(&short, 200, SnapshotKind::Prompt), (&long, 0, SnapshotKind::Turn)] {
+        family.generation.set(generation);
+        let mut source = cache.admit_cold(&family, tokens.len(), tokens.len(),
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = family.fake.forward(&mut source, tokens).unwrap();
+        assert!(cache.capture(&family, kind, tokens, &source, After::from_logits(&logits, true)).unwrap());
+        family.fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        cache.release(&family, &source.pages).unwrap();
+    }
+    let mut next = long.clone();
+    next.push(5000);
+    let complete = |meta: &Metadata, frontier| meta.generation == 200 && meta.len == frontier;
+    for host_only in [false, true] {
+        if host_only { cache.clear(&family).unwrap(); }
+        assert_eq!(cache.peek_media(&next, &[], false), long.len());
+        assert_eq!(cache.peek_media_compatible(&next, &[], false, &complete), short.len());
+        let hit = cache.admit_native_compatible(&family, &next, &next, &[], next.len(), false,
+            Some(&complete), |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(hit.resume, short.len());
+        if host_only { assert!(hit.source.unwrap().host); }
+        let mut restored = hit.placement;
+        let restored_logits = family.fake.forward(&mut restored, &next).unwrap();
+        let mut cold = cache.admit_cold(&family, next.len(), next.len(),
+            |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap().placement;
+        assert_eq!(restored_logits, family.fake.forward(&mut cold, &next).unwrap());
+        for row in next.len().saturating_sub(WINDOW)..next.len() {
+            let mem = family.fake.mem.borrow();
+            assert_eq!(mem.read_device(family.fake.ring_row(restored.ring, row)),
+                mem.read_device(family.fake.ring_row(cold.ring, row)));
+        }
+        cache.release(&family, &cold.pages).unwrap();
+        cache.release(&family, &restored.pages).unwrap();
+    }
+    let hit = cache.admit_native_compatible(&family, &next, &next, &[], next.len(), false,
+        Some(&complete), |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    let mut restored = hit.placement;
+    let restored_logits = family.fake.forward(&mut restored, &next).unwrap();
+    // A drafting continuation publishes a complete turn, then hits it on
+    // the next turn rather than falling back to its original prompt.
+    family.generation.set(200);
+    assert!(cache.capture(&family, SnapshotKind::Turn, &next, &restored,
+        After::from_logits(&restored_logits, true)).unwrap());
+    cache.release(&family, &restored.pages).unwrap();
+    let mut turn = next.clone();
+    turn.push(5001);
+    let hit = cache.admit_native_compatible(&family, &turn, &turn, &[], turn.len(), false,
+        Some(&complete), |pages| Placement { pages, ring: 3, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(hit.resume, next.len());
+    let mut continued = hit.placement;
+    let logits = family.fake.forward(&mut continued, &turn).unwrap();
+    let mut cold = cache.admit_cold(&family, turn.len(), turn.len(),
+        |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap().placement;
+    assert_eq!(logits, family.fake.forward(&mut cold, &turn).unwrap());
+    for row in turn.len().saturating_sub(WINDOW)..turn.len() {
+        let mem = family.fake.mem.borrow();
+        assert_eq!(mem.read_device(family.fake.ring_row(continued.ring, row)),
+            mem.read_device(family.fake.ring_row(cold.ring, row)));
+    }
+    cache.release(&family, &cold.pages).unwrap();
+    cache.release(&family, &continued.pages).unwrap();
+    let reject = |_: &Metadata, _: usize| false;
+    let hit = cache.admit_native_compatible(&family, &next, &next, &[], next.len(), false,
+        Some(&reject), |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(hit.resume, 0);
+    cache.release(&family, &hit.placement.pages).unwrap();
+    cache.clear(&family).unwrap();
 }
 
 #[test]

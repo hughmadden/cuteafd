@@ -2122,6 +2122,35 @@ mod checkpoint_header_tests {
     }
 
     #[test]
+    fn glm_dflash_cache_hit_cold_origin_is_request_local_and_exact() {
+        for frontier in [1usize, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1492] {
+            let mut restored = mla_cache_state();
+            let mut fresh = mla_cache_state();
+            restored.reset(0, 0).unwrap();
+            let old: Vec<_> = (0..4).map(|i| ContextRow { tap_row: i, slot: 0, position: i }).collect();
+            restored = MlaContextUpdate::checked(&restored, 2, &old).unwrap().next;
+            restored.reset(0, frontier).unwrap();
+            fresh.reset(0, frontier).unwrap();
+            // Interleaved no-spec work has its own slot and never alters the
+            // drafting request's cold origin or its context address mapping.
+            restored.reset(1, 0).unwrap();
+            let probe: Vec<_> = (0..3).map(|i| ContextRow { tap_row: i, slot: 1, position: i }).collect();
+            restored = MlaContextUpdate::checked(&restored, 2, &probe).unwrap().next;
+            for offset in 0..3 {
+                let rows = [ContextRow { tap_row: 2, slot: 0, position: frontier + offset }];
+                let hit = MlaContextUpdate::checked(&restored, 2, &rows).unwrap();
+                let cold = MlaContextUpdate::checked(&fresh, 2, &rows).unwrap();
+                assert_eq!(hit.positions, cold.positions);
+                assert_eq!(hit.slots, cold.slots);
+                assert_eq!(hit.next.frontier(0).unwrap(), cold.next.frontier(0).unwrap());
+                assert_eq!(hit.next.frontier(1).unwrap(), (0, 3));
+                restored = hit.next;
+                fresh = cold.next;
+            }
+        }
+    }
+
+    #[test]
     fn mla_context_preflight_preserves_holes_origins_and_all_slot_frontiers() {
         let mut state = mla_cache_state();
         state.reset(0, 4093).unwrap();

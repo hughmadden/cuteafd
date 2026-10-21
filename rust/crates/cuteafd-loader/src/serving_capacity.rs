@@ -708,7 +708,7 @@ pub fn qwen_cache_geometry(
             )?,
             pool_metadata_unit_bytes: 4,
             active_state_per_sequence_bytes: sum("Qwen active state", &[mark, mtp_pending])?,
-            retained_mark_bytes: mark,
+            retained_mark_bytes: sum("Qwen retained MTP hidden row", &[mark, if mtp { hc_width * 2 } else { 0 }])?,
             speculative_replay_bytes: sum(
                 "Qwen replay storage",
                 &[
@@ -1129,7 +1129,7 @@ mod tests {
         );
         assert_eq!(
             mtp.ranks[0].retained_mark_bytes,
-            plain.ranks[0].retained_mark_bytes
+            plain.ranks[0].retained_mark_bytes + cfg.hc_width() as u64 * 2
         );
     }
 
