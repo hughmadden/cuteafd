@@ -760,9 +760,9 @@ impl<'a> GlmfLoader<'a> {
         Ok(self.kda_tensors(cfg, prefix, operand, ranks, true)?.into_iter().map(|tensor| tensor.bytes).collect())
     }
 
-    fn kda_tensors(&self, cfg: &GlmNextConfig, prefix: &str, operand: KdaOperand, ranks: usize, widen: bool)
+    fn kda_tensors(&self, cfg: &GlmNextConfig, prefix: &str, operand: KdaOperand, ranks: usize, _widen: bool)
         -> Result<Vec<KdaTensor>> {
-        Ok(Self::kda_geometry(cfg).pack_with(operand, ranks, widen, |role| {
+        Ok(Self::kda_geometry(cfg).pack(operand, ranks, |role| {
             let name = Self::kda_name(prefix, role);
             let (bytes, dtype, shape) = self.raw(&name).map_err(|error| KdaError::Source(error.to_string()))?;
             Ok(KdaTensor { dtype, shape, bytes })

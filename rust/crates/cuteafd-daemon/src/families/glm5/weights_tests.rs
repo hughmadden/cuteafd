@@ -182,14 +182,15 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
     let (records, deferred) = sink.take();
     let (sparks, world) = (6usize, 8usize);
     for gpu in 0..2 {
+        use crate::shared::experts::rtx::dense::{DenseArena, RankLayout};
         let device = crate::shared::memory::device::Device { library: &library, id: gpu };
-        let layout = crate::families::glm5::push::RankLayout::new(&records, gpu)?;
-        let checked = layout.checked(&catalog, root.path(), world, sparks + gpu as usize)?;
+        let layout = RankLayout::new(records.clone(), Vec::new(), gpu)?;
+        let checked = layout.checked(root.path(), world, sparks + gpu as usize)?;
         let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, (sparks + gpu as usize) as u32)?;
         device.run(|| -> Result<()> {
             let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES)?;
             let fake = FakeRank::new(&checked, root.path(), (sparks + gpu as usize) as u32, &ring)?;
-            let arena = crate::families::glm5::push::OperandArena::new(device, layout, expected)?;
+            let arena = DenseArena::new(device, layout, expected)?;
             crate::shared::memory::push_consumer::consume(device, arena, ring, fake, 8)
         })?;
     }

@@ -20,6 +20,8 @@ use anyhow::Result;
 use std::ffi::c_void;
 
 pub(crate) mod combine;
+/// Coordinator dense operands (class 2 and staged class 3) as push-group ranks.
+pub(crate) mod dense;
 pub(crate) mod draft;
 pub(crate) mod exl3;
 pub(crate) mod fp8moe;

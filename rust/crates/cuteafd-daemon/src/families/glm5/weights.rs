@@ -132,7 +132,7 @@ impl<'a> GlmLoader<'a> {
     fn landed(&self, lands: &[Land], bytes: usize) -> Result<DeviceAllocation<'a>> {
         if let Some(push) = &self.push {
             let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
-            push.record(self.library.cuda_get_device()?, allocation.buffer, lands, bytes)?;
+            push.record(self.catalog, self.library.cuda_get_device()?, allocation.buffer, lands, bytes)?;
             return Ok(allocation);
         }
         self.upload(&landing::read(self.catalog, lands, bytes)?)

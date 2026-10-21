@@ -687,8 +687,7 @@ impl Opened {
                 let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
                 let planned = planning.model(&self.cfg, layers, owners.as_deref(), native).and_then(|model| {
                     let (records, deferred) = sink.take();
-                    let (plans, destinations) = push::plan_ranks(dense_catalog, &self.snapshot, &records, devices, sparks)?;
-                    let dense: (Vec<_>, Vec<_>) = (plans.into(), destinations.into());
+                    let dense = push::plan_ranks(&self.snapshot, records.clone(), devices, sparks)?;
                     Ok((model, records, deferred, dense))
                 });
                 let (planned, dense) = match planned {
@@ -702,13 +701,14 @@ impl Opened {
                     // Planning allocated nothing that survives; the mount loads as usual.
                     return Ok((loader.model(&self.cfg, layers, owners.as_deref(), native)?, None));
                 };
+                let rank_stream = |device: i32| if device == args.device { stream }
+                    else { peer_stream.map_or(stream, |(_, s)| s) };
                 if pushed.is_none() {
-                    push::fill_by_mount(&self.library, dense_catalog, &records)?;
+                    crate::shared::experts::rtx::dense::fill_by_mount(&self.library, &records, &[], rank_stream)?;
                 }
                 for job in &deferred {
                     crate::shared::memory::device::Device { library: &self.library, id: job.device }
-                        .run(|| job.run(&self.library, if job.device == args.device { stream }
-                            else { peer_stream.map_or(stream, |(_, s)| s) }))?;
+                        .run(|| job.run(&self.library, rank_stream(job.device)))?;
                 }
                 tracing::info!(pushed = pushed.is_some(), operands = records.len(),
                     "GLM coordinator dense operands landed");
