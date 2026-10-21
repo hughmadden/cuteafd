@@ -81,7 +81,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2;
     let legacy_marks = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
         opts.concurrency, opts.mimo_prefix_entries, 2 * mark_bytes, opts.mimo_prefix_mark_bytes));
-    let mark_demands = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+    let mut mark_demands = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
         "Kimi exact KDA marks", mark_bytes, Basis::Formula)).collect::<Vec<_>>();
     let mut fixed = Vec::new();
     for demand in &mark_demands {
@@ -143,12 +143,18 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0)?;
         fixed.extend(crate::families::kimi_k3::draft_bridge_demands(&layout)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
-        let (demand, peak) = layout.demands(1)?;
-        Ok((demand.movable(2)?, peak))
+        let bytes = layout.window_mark_bytes()? as u64;
+        if bytes > 0 && legacy_marks > 0 {
+            let per_mark = Demand::new(1, Category::Prefix, "Kimi exact draft windows", bytes, Basis::Exact);
+            let mut total = per_mark.clone();
+            total.bytes = bytes.checked_mul(legacy_marks).context("Kimi draft mark overflow")?;
+            fixed.push(total);
+            mark_demands.push(per_mark);
+        }
+        Ok(layout)
     }).transpose();
-    let (movables, startup) = match draft {
-        Ok(Some((movable, peak))) => (vec![movable], vec![peak]),
-        Ok(None) => (Vec::new(), Vec::new()),
+    let draft = match draft {
+        Ok(layout) => layout,
         Err(error) => {
             refusal(report, format!("Kimi native MLA draft inventory refused: {error:#}"),
                 "Provide a supported MLA DFlash2 checkpoint and matching native representation.");
@@ -177,9 +183,9 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         pool: PoolPolicy { compiled_context: context,
             requested: requested_pool, target: opts.target_pool_tokens.max(context), floor: context,
             ceiling: opts.target_pool_tokens.max(requested_pool.unwrap_or(0)).max(context), unit_rows: PAGE },
-        layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup, movables,
+        layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
         expert_workspace: 0, tp2_workspace: [0; 2], onboard, expert_gpus: 2, minimum_expert_layers: 0,
-        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating, expert_ownership: ExpertOwnership::Contiguous,
+        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Ranges, expert_ownership: ExpertOwnership::Contiguous,
             attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, AttentionPlacement::Heads)],
             ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: 0, lanes: 0,
@@ -191,9 +197,34 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             "Use automatic RTX expert selection or increase the explicit estimated Spark budget.");
         return memory;
     }
-    let selected = if legacy_marks == 0 {
-        solve(&request).map(|placed| (placed, MarkSelection { legacy_slots: 0, slots: 0, reduction_reason: None }))
-    } else { solve_with_marks(&request, legacy_marks, 1, &mark_demands) };
+    let groups = request.layers.iter().map(|layer|
+        (layer.kind == AttentionClass::Mla && request.attention_placement != Some(AttentionPlacement::Heads), layer.colocate))
+        .collect::<Vec<_>>();
+    let selected = attention::solve_owners(&groups, LayerOwnership::Ranges, request.layers_first_gpu,
+        request.onboard, |owners| -> anyhow::Result<_> {
+            let mut candidate = request.clone();
+            for (layer, (&owner, &(selected, _))) in candidate.layers.iter_mut().zip(owners.iter().zip(&groups)) {
+                if selected { layer.modes = vec![LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }]; }
+            }
+            let admit = |trial: &PlacementRequest| -> anyhow::Result<_> {
+                if legacy_marks == 0 {
+                    Ok((solve(trial)?, MarkSelection { legacy_slots: 0, slots: 0, reduction_reason: None }))
+                } else { Ok(solve_with_marks(trial, legacy_marks, 1, &mark_demands)?) }
+            };
+            if let Some(layout) = &draft {
+                settle_pool((candidate.pool.requested.unwrap_or(candidate.pool.target), ()), |tokens, _| -> anyhow::Result<_> {
+                    let mut trial = candidate.clone();
+                    let layout = layout.with_pool_tokens(usize::try_from(tokens)?)?;
+                    let (demand, peak) = layout.demands(1)?;
+                    trial.movables = vec![demand.movable(2)?];
+                    trial.startup = vec![peak];
+                    trial.pool.target = trial.pool.target.min(tokens);
+                    trial.pool.ceiling = trial.pool.ceiling.min(tokens);
+                    let (placed, marks) = admit(&trial)?;
+                    Ok((placed.pool_tokens, (), (placed, marks)))
+                })
+            } else { admit(&candidate) }
+        });
     let onboarded = match selected {
         Ok((placed, selection)) => {
             memory.notes.push(selection.summary());

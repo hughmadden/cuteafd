@@ -1733,7 +1733,7 @@ fn kimi_c8_marks_reduce_only_after_context_and_fixed_floors() {
         if demand.group == "Kimi exact KDA marks" { demand.bytes = mark; }
     }
     let expected = solve(&final_attempt).unwrap_err().to_string();
-    let Err(PlacementError::PrefixMarks { minimum: 1, reason }) = solve_with_marks(&req, legacy, 1, &parts)
+    let Err(PlacementError::PrefixMarks { minimum: 1, reason, .. }) = solve_with_marks(&req, legacy, 1, &parts)
         else { panic!("one-mark shortfall must be a typed refusal") };
     assert!(reason.contains("tried 18 complete-mark counts (18 down to 1)"));
     assert!(reason.ends_with(&format!("final attempt with 1 marks: {expected}")));
@@ -1877,6 +1877,54 @@ fn owner_specific_inventory_callback_matches_frozen_admission() {
     let invalid: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
         LayerOwnership::Ranges, 2, Onboard::Auto, |_| unreachable!());
     assert!(matches!(invalid, Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn fixed_expert_refusal_includes_experts_after_conditional_draft() {
+    let mut req = owner_balance_request();
+    req.onboard = Onboard::Layers(1);
+    req.pool.requested = Some(128 << 20);
+    req.pool.floor = 128 << 20;
+    req.pool.ceiling = 128 << 20;
+    for layer in &mut req.layers { layer.modes = vec![S0]; }
+    req.layers[0].experts = Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: 0 },
+        half: [Bytes2 { resident: GIB / 2, staging: 0 }; 2], tp2: true, spark_ok: true });
+    req.expert_gpus = 2;
+    req.tp2_workspace = [GIB / 4; 2];
+    let plain = solve(&req).unwrap_err();
+    req.movables.push(Movable { id: MovableId::Drafter, allowed: vec![1], expert_arena: false,
+        parts: vec![], conditional: vec![MovableDemands { placement_gpu: 1,
+            demands: vec![Demand::new(1, Category::Drafter, "draft workspace", 256, Basis::Exact)] }] });
+    let draft = solve(&req).unwrap_err();
+    let PlacementError::PoolDoesNotFit { limits: plain, .. } = plain else { panic!("{plain}") };
+    let PlacementError::PoolDoesNotFit { limits: draft, .. } = draft else { panic!("{draft}") };
+    assert_eq!(draft.0[0].available_bytes, plain.0[0].available_bytes);
+    assert_eq!(draft.0[1].available_bytes + 256, plain.0[1].available_bytes);
+}
+
+#[test]
+fn owner_refusal_reports_largest_pool_and_selected_split_through_marks_and_context() {
+    let groups = [(false, None), (true, None), (false, None), (true, None)];
+    let mut attempted = 0;
+    let refused: anyhow::Result<(Placement, ())> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 0, Onboard::Auto, |_| {
+            let fit = [100, 300, 200][attempted];
+            attempted += 1;
+            Err(anyhow::Error::new(PlacementError::PrefixMarks { minimum: 1,
+                reason: "one complete mark".into(),
+                source: Box::new(PlacementError::PoolDoesNotFit {
+                    requested: 400, fit, limits: PoolLimits(vec![]) }) }).context("native admission"))
+        });
+    assert_eq!(attempted, 3);
+    let error = refused.unwrap_err();
+    assert!(matches!(error.downcast_ref::<PlacementError>(), Some(PlacementError::OwnerCandidates {
+        fit: 300, rank0: 1, rank1: 1, .. })));
+    assert!(error.to_string().contains("rtx0=1, rtx1=1"));
+    // Equal failures retain the first legal candidate, as successful ties do.
+    let refused: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 1, Onboard::Auto, |_| Err(PlacementError::BelowFloor {
+            pool: 100, floor: 400, layers: 0, short: 300, limits: PoolLimits(vec![]) }));
+    assert!(matches!(refused, Err(PlacementError::OwnerCandidates { fit: 100, rank0: 2, rank1: 0, .. })));
 }
 
 #[test]
