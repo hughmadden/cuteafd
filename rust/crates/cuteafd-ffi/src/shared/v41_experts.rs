@@ -593,6 +593,22 @@ impl NativeLibrary {
         })
     }
 
+    /// Generate equal-pitch omitted row tails without touching source bytes.
+    /// # Safety
+    /// The destination is on the current device and stays live through completion.
+    pub unsafe fn zero_pitched_async(&self, destination: CuteafdDeviceBuffer,
+        pitch: usize, width: usize, rows: usize, stream: *mut c_void) -> Result<()> {
+        ensure!(width > 0 && rows > 0 && pitch >= width
+            && (rows - 1).checked_mul(pitch).and_then(|n| n.checked_add(width))
+                .is_some_and(|n| n <= destination.bytes), "zero pitch exceeds destination");
+        type F = unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, *mut c_void) -> i32;
+        let zero = unsafe { self.lib.get::<F>(b"cuteafd_zero_pitched_async")? };
+        let status = unsafe { zero(destination.ptr, destination.bytes as u64,
+            pitch as u64, width as u64, rows as u64, stream) };
+        ensure!(status == 0, "pitched zero failed with CUDA status {status}");
+        Ok(())
+    }
+
     /// Pack one fused raw plane out of place, using the mount packer's kernel.
     /// # Safety
     /// Both buffers must be live on the current device through stream completion.

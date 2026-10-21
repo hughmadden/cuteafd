@@ -101,6 +101,75 @@ fn fp8_scale_widening_and_generated_padding_are_exact() -> Result<()> {
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn padded_rows_coalesce_and_failed_zero_drains_before_free() -> Result<()> {
+    for (enqueue, drain) in [(0, 0), (1, 0), (1, 1)] {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let device = Device {
+            library: &library,
+            id: 0,
+        };
+        let directory =
+            tempfile::tempdir_in(std::env::var("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")?)?;
+        let path = directory.path().join("rows");
+        std::fs::write(&path, [7; 12])?;
+        let mut builder = Builder::new(directory.path(), vec![24]);
+        builder.rows(
+            &Source {
+                path,
+                offset: 0,
+                bytes: 12,
+            },
+            0,
+            4,
+            3,
+            3,
+            6,
+            Destination {
+                rank: 0,
+                offset: 0,
+                bytes: 24,
+            },
+        )?;
+        let plan = builder.finish()?;
+        let mut loading = LoadingArena::new(
+            device,
+            ArenaLayout::new([24], 24)?,
+            ExpectedCoverage::from_plan(&plan, 0)?,
+        )?;
+        for row in 0..4 {
+            library.copy_h2d(loading.destination(row * 6, 3)?, &[7; 3])?;
+            loading.copied((row * 6) as u64, 3)?;
+        }
+        let arena = loading.done()?;
+        fixture.configure_pack(&library, enqueue, drain)?;
+        let result = arena.zero_padding();
+        assert_eq!(result.is_ok(), enqueue == 0 && drain == 0);
+        if result.is_ok() {
+            let mut actual = vec![0; 24];
+            library.copy_d2h(&mut actual, arena.region(0)?)?;
+            assert_eq!(actual, [7, 7, 7, 0, 0, 0].repeat(4));
+        }
+        drop(arena);
+        let events = fixture.events()?;
+        assert_eq!(
+            events.matches('Z').count(),
+            1,
+            "one pitched enqueue per plane"
+        );
+        assert_eq!(events.matches('S').count(), 1, "one guaranteed drain");
+        if drain == 0 {
+            assert!(events.find('S').unwrap() < events.find('d').unwrap());
+        } else {
+            assert!(library.is_quarantined_after_failed_drain());
+            assert!(!events.contains('d'));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn exl3_semantics_reject_nonfinite_and_upload_exact_descriptors() -> Result<()> {
     use cuteafd_loader::{V41Exl3Layer, V41Exl3Load, V41Exl3ResidentBuffer};
     let fixture = Fixture::build()?;

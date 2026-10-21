@@ -50,6 +50,20 @@ extern "C" int32_t cuteafd_expert_packed_sizes(uint32_t intermediate,
   return cudaSuccess;
 }
 
+// Coalesced omitted row tails; never touch the delivered prefix of a row.
+extern "C" int32_t cuteafd_zero_pitched_async(void* destination,
+    uint64_t destination_bytes, uint64_t pitch, uint64_t width,
+    uint64_t rows, void* stream) {
+  if (!destination || !width || !rows || pitch < width ||
+      width > destination_bytes ||
+      rows - 1 > (destination_bytes - width) / pitch)
+    return cudaErrorInvalidValue;
+  if (rows == 1)
+    return cudaMemsetAsync(destination, 0, width, static_cast<cudaStream_t>(stream));
+  return cudaMemset2DAsync(destination, pitch, 0, width, rows,
+      static_cast<cudaStream_t>(stream));
+}
+
 // One plane of the already-fused source image. Reuse the exact mount pack
 // instantiations; the caller owns one out-of-place scratch across all planes.
 extern "C" int32_t cuteafd_pack_expert_plane_async(

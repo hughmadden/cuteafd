@@ -279,6 +279,16 @@ int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src, s
     return cuteafd_copy_h2d_async(dst, src.ptr, bytes, stream);
 }
 int cuteafd_cuda_zero_bytes(void *dst, size_t bytes) { memset(dst, 0, bytes); return 0; }
+int cuteafd_zero_pitched_async(void *dst, uint64_t bytes, uint64_t pitch,
+    uint64_t width, uint64_t rows, void *stream) {
+    (void)stream;
+    if (!dst || !width || !rows || pitch < width || width > bytes ||
+        rows - 1 > (bytes - width) / pitch) return 1;
+    for (uint64_t row = 0; row < rows; ++row)
+        memset((uint8_t *)dst + row * pitch, 0, width);
+    event('Z');
+    return pack_status;
+}
 int cuteafd_pack_expert_plane_async(const uint8_t *source, uint64_t source_bytes,
     uint8_t *destination, uint64_t destination_bytes, uint32_t intermediate,
     uint32_t plane, void *stream) {
