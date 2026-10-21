@@ -24,6 +24,74 @@ pub(super) fn land(plan: &CheckedPlan, mount: &Path) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn file_id_reuse_preserves_first_seen_order_and_checks_new_sources() {
+    let root = TempDir::new().unwrap();
+    let a = root.path().join("a");
+    let b = root.path().join("b");
+    std::fs::write(&a, [0u8; 16]).unwrap();
+    std::fs::write(&b, [1u8; 16]).unwrap();
+    let mut builder = Builder::new(root.path(), vec![16]);
+    assert_eq!(builder.file(&a).unwrap(), 0);
+    assert_eq!(builder.file(&a).unwrap(), 0);
+    assert_eq!(builder.file(&b).unwrap(), 1);
+    assert_eq!(builder.file(&a).unwrap(), 0);
+    assert_eq!(builder.plan.files, ["a", "b"]);
+    assert_eq!(builder.file_sizes, [16, 16]);
+    assert!(builder.file(&root.path().join("../outside")).is_err());
+    assert!(builder.file(&root.path().join("missing")).is_err());
+    assert_eq!(builder.plan.files.len(), 2);
+    let source = Source { path: a, offset: 0, bytes: 16 };
+    for offset in [0, 4] {
+        builder.contiguous(&source, offset, 4, Destination { rank: 0, offset, bytes: 4 }).unwrap();
+    }
+    assert!(builder.contiguous(&source, 14, 4,
+        Destination { rank: 0, offset: 8, bytes: 4 }).is_err());
+    let checked = builder.finish().unwrap();
+    assert_eq!(checked.plan.entries.len(), 2);
+    assert!(checked.plan.entries.iter().all(|entry| entry.file == 0));
+}
+
+#[test]
+fn resolved_exl3_loads_match_per_destination_plan_bytes() {
+    use crate::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+    let directory = TempDir::new().unwrap();
+    let (tensors, _) = qwen4_exl3(1, 4);
+    let tensors: Vec<_> = tensors.into_iter().filter(|tensor| !tensor.0.contains(".experts.")
+        || tensor.0.contains(".experts.0.")).collect();
+    let mut config = qwen4_config(1);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(directory.path(), &config, &tensors, None);
+    let catalog = crate::read_expert_catalog(directory.path()).unwrap();
+    for world in [2, 5] {
+        let residency = catalog.exl3().unwrap()
+            .balanced_residency(crate::V41Exl3Layer::Backbone(0), world, 0).unwrap();
+        let (offsets, bytes) = residency.device_arena_layout().unwrap();
+        let destination = Destination { rank: 0, offset: 0, bytes: bytes as u64 };
+        let mut actual = Builder::new(directory.path(), vec![bytes as u64]);
+        actual.exl3_residency(&catalog, &residency, &offsets, destination).unwrap();
+        let mut expected = Builder::new(directory.path(), vec![bytes as u64]);
+        for load in &residency.loads {
+            for &(buffer, relative) in &load.destinations {
+                let target = Destination { offset: (offsets[buffer] + relative) as u64,
+                    bytes: load.bytes as u64, ..destination };
+                if let Some(units) = &residency.unit_map {
+                    expected.exl3(&catalog, &load.tensor, units, load.expert.unwrap(), target).unwrap();
+                } else {
+                    let slice = catalog.exl3_tensor_slice(&load.tensor, world, 0).unwrap();
+                    expected.rows(&Builder::v41_source(&catalog, &load.tensor).unwrap(),
+                        slice.column_start_bytes as u64, slice.rows as u32,
+                        slice.selected_row_bytes as u32, slice.source_row_bytes as u64,
+                        slice.selected_row_bytes as u64, target).unwrap();
+                }
+            }
+        }
+        assert_eq!(serde_json::to_vec(&actual.finish().unwrap().plan).unwrap(),
+            serde_json::to_vec(&expected.finish().unwrap().plan).unwrap(), "TP{world}");
+    }
+}
+
+#[test]
 fn packed_balanced_columns_and_exact_scalars() {
     let root = TempDir::new().unwrap();
     let bytes = (0..192).map(|i| i as u8).collect::<Vec<_>>();

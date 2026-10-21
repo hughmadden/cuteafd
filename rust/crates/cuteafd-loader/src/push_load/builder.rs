@@ -8,7 +8,8 @@ mod tests;
 
 use nest_push::plan::{Dim, Entry, Pattern, Plan, Steps, Totals};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
+    ffi::OsString,
     ops::Range,
     path::{Component, Path, PathBuf},
 };
@@ -74,7 +75,8 @@ impl CheckedPlan {
 pub struct Builder {
     mount: PathBuf,
     plan: Plan,
-    file_ids: BTreeMap<PathBuf, u32>,
+    file_ids: HashMap<OsString, u32>,
+    last_file: Option<(OsString, u32)>,
     file_sizes: Vec<u64>,
     arenas: Vec<u64>,
 }
@@ -90,14 +92,23 @@ impl Builder {
                 patterns: vec![],
                 entries: vec![],
             },
-            file_ids: BTreeMap::new(),
+            file_ids: HashMap::new(),
+            last_file: None,
             file_sizes: vec![],
             arenas,
         }
     }
 
     fn file(&mut self, path: &Path) -> Result<u32> {
-        if let Some(&id) = self.file_ids.get(path) {
+        // Tensor entries usually share a shard; avoid component-wise Path comparisons.
+        let key = path.as_os_str();
+        if let Some((last, id)) = &self.last_file {
+            if last == key {
+                return Ok(*id);
+            }
+        }
+        if let Some(&id) = self.file_ids.get(key) {
+            self.last_file = Some((key.to_owned(), id));
             return Ok(id);
         }
         let relative = path
@@ -116,7 +127,8 @@ impl Builder {
         let id = u32::try_from(self.plan.files.len()).map_err(|_| invalid("too many files"))?;
         self.file_sizes.push(std::fs::metadata(path)?.len());
         self.plan.files.push(name.into());
-        self.file_ids.insert(path.into(), id);
+        self.file_ids.insert(key.to_owned(), id);
+        self.last_file = Some((key.to_owned(), id));
         Ok(id)
     }
 
@@ -463,6 +475,23 @@ impl Builder {
             }
         }
         for load in &residency.loads {
+            let tensor = catalog.tensor(&load.tensor)?;
+            let source = Source {
+                path: catalog.snapshot().join(&tensor.shard),
+                offset: tensor.metadata.byte_offset,
+                bytes: tensor.metadata.byte_length,
+            };
+            let (rows, source_pitch, columns) = if let Some(units) = &residency.unit_map {
+                let gather = catalog.exl3_tensor_gather_metadata(&tensor.metadata, units,
+                    load.expert.ok_or_else(|| invalid("EXL3 compact load lacks expert"))?)?;
+                (gather.rows, gather.source_row_bytes, gather.columns.iter()
+                    .map(|r| r.start as u64..r.end as u64).collect::<Vec<_>>())
+            } else {
+                let slice = catalog.exl3_tensor_slice_metadata(&tensor.metadata, residency.world, residency.rank)?;
+                let start = slice.column_start_bytes as u64;
+                (slice.rows, slice.source_row_bytes, vec![start..add(start, slice.selected_row_bytes as u64)?])
+            };
+            let rows = u32::try_from(rows).map_err(|_| invalid("too many EXL3 rows"))?;
             for &(buffer, relative) in &load.destinations {
                 let target_buffer = residency
                     .buffers
@@ -482,29 +511,7 @@ impl Builder {
                     )?,
                     bytes: load.bytes as u64,
                 };
-                if let Some(units) = &residency.unit_map {
-                    self.exl3(
-                        catalog,
-                        &load.tensor,
-                        units,
-                        load.expert
-                            .ok_or_else(|| invalid("EXL3 compact load lacks expert"))?,
-                        target,
-                    )?;
-                } else {
-                    let slice =
-                        catalog.exl3_tensor_slice(&load.tensor, residency.world, residency.rank)?;
-                    self.rows(
-                        &Self::v41_source(catalog, &load.tensor)?,
-                        slice.column_start_bytes as u64,
-                        u32::try_from(slice.rows).map_err(|_| invalid("too many EXL3 rows"))?,
-                        u32::try_from(slice.selected_row_bytes)
-                            .map_err(|_| invalid("EXL3 width exceeds u32"))?,
-                        slice.source_row_bytes as u64,
-                        slice.selected_row_bytes as u64,
-                        target,
-                    )?;
-                }
+                self.columns(&source, rows, source_pitch as u64, &columns, target)?;
             }
         }
         Ok(())
