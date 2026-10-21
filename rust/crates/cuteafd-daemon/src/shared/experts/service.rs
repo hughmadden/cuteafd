@@ -6,6 +6,7 @@ mod modules;
 mod routes;
 mod exlr8;
 mod push;
+mod push_fp8;
 
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
@@ -139,7 +140,7 @@ fn load_weights<'a>(
         return exlr8::load(library, catalog, config, modules.exlr8()?);
     }
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config, push); }
-    if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config, modules.take_fp8()?); }
+    if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config, modules.take_fp8()?, push); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);
     // NVFP4 backbone experts load through the format-aware ExpertWeights path.
     let nvfp4 = catalog.nvfp4().is_some();

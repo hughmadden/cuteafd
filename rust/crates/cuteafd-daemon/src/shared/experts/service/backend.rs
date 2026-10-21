@@ -504,9 +504,10 @@ pub(super) fn validate_fp8_recipe(package: &str, intermediate: usize, world: usi
 /// this rank's intermediate slice, run by the `fp8-<family>` package.
 pub(super) fn load_fp8<'a>(
     library: &'a NativeLibrary,
-    _catalog: &OfficialV41Catalog,
+    catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
-    groups: Vec<super::modules::Fp8Group>,
+    mut groups: Vec<super::modules::Fp8Group>,
+    push: Option<&mut std::net::TcpStream>,
 ) -> Result<(Weights<'a>, usize)> {
     ensure!(!groups.is_empty(), "native expert worker has no resident groups");
     let workspace = fp8_worker_workspace(config)?.checked_mul(groups.len())
@@ -535,12 +536,29 @@ pub(super) fn load_fp8<'a>(
     tracing::info!(groups = groups.len(), resident = totals.resident, scratch = totals.scratch,
         host = totals.host, pinned = totals.pinned, workspace, "native expert groups admitted before allocation");
     let mut owners = Vec::with_capacity(groups.len());
-    for (group, budget) in groups.into_iter().zip(budgets) {
-        owners.push(Rc::new(Fp8Experts::load_with_modules(library, &group.tensors, &group.directory,
+    for (group, budget) in groups.iter_mut().zip(budgets) {
+        owners.push(Fp8Experts::prepare_with_modules(library, &group.tensors, &group.directory,
             group.bf16_directory.as_deref(), &group.layers, config.world, config.rank,
-            config.capacity as usize, budget, Some(group.modules.context("native group modules already consumed")?))?));
+            config.capacity as usize, budget, Some(group.modules.take()
+                .context("native group modules already consumed")?))?);
     }
-    Ok((Weights::Fp8(owners), config.device_budget - permanent))
+    let pushed = push.map(|stream| super::push_fp8::load(library, catalog, config, &groups,
+        totals.resident, stream)).transpose()?.flatten();
+    if let Some(layers) = pushed {
+        // Match the prepared package groups without ever allocating mount weights.
+        for layer in layers {
+            let group = groups.iter().position(|group| group.layers.contains(&layer.layer))
+                .context("native push layer has no prepared package")?;
+            owners[group].layers.push(layer);
+        }
+    } else {
+        // Failed candidates have crossed the all-rank drain barrier. Reuse the
+        // original modules/scratch; no second package preparation on fallback.
+        for (owner, group) in owners.iter_mut().zip(&groups) {
+            owner.load_mount(library, &group.tensors, &group.layers, group.slicing)?;
+        }
+    }
+    Ok((Weights::Fp8(owners.into_iter().map(Rc::new).collect()), config.device_budget - permanent))
 }
 
 pub(super) fn load_exl3<'a>(

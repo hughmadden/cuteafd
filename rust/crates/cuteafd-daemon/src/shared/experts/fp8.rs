@@ -18,6 +18,8 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection, Slicing};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use crate::shared::memory::weight_arena::ReadyArena;
 
 pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize],
     tp: usize, rank: usize, slicing: Slicing) -> Result<()> {
@@ -201,10 +203,36 @@ pub(crate) fn bf16_sibling(directory: &Path) -> Option<PathBuf> {
 pub(crate) struct Fp8Layer<'a> {
     pub layer: usize,
     pub(crate) slice: cuteafd_core::SparkSlice,
-    regions: Vec<Option<DeviceAllocation<'a>>>,
+    regions: Vec<Option<Fp8Region<'a>>>,
+}
+
+struct Fp8Region<'a> {
+    buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+    _storage: Fp8Storage<'a>,
+}
+enum Fp8Storage<'a> {
+    Owned { _allocation: DeviceAllocation<'a> },
+    Shared { _arena: Rc<ReadyArena<'a>> },
+}
+impl<'a> From<DeviceAllocation<'a>> for Fp8Region<'a> {
+    fn from(allocation: DeviceAllocation<'a>) -> Self {
+        Self { buffer: allocation.buffer, _storage: Fp8Storage::Owned { _allocation: allocation } }
+    }
 }
 
 impl<'a> Fp8Layer<'a> {
+    pub(crate) fn from_push(owner: Rc<ReadyArena<'a>>, region: usize,
+        plan: &crate::shared::memory::push_fp8::LayerPlan, base: usize) -> Result<Self> {
+        let view = owner.region(region)?;
+        let regions = plan.planes.iter().map(|plane| {
+            if plane.is_empty() { return Ok(None); }
+            let offset = plane.start.checked_sub(base).context("native push plane precedes layer")?;
+            let buffer = view.subregion(offset, plane.len())?.buffer();
+            Ok(Some(Fp8Region { buffer, _storage: Fp8Storage::Shared { _arena: owner.clone() } }))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self { layer: plan.layer, slice: plan.slice.clone(), regions })
+    }
+
     fn loaded_slice(tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize,
         slicing: Slicing) -> Result<cuteafd_core::SparkSlice> {
         let (first, width) = tensors.rank_range_with(tp, rank, slicing)?;
@@ -292,7 +320,7 @@ impl<'a> Fp8Layer<'a> {
                 let region = if bytes.is_empty() { None } else {
                     let region = DeviceAllocation::new(library, bytes.len())?;
                     library.copy_h2d(region.buffer, bytes)?;
-                    Some(region)
+                    Some(region.into())
                 };
                 regions.push(region);
             }
@@ -364,14 +392,22 @@ impl<'a> Fp8Experts<'a> {
         let mut experts = Self::prepare_with_modules(library, tensors, directory, bf16_directory,
             layers, tp, rank, capacity, budget, modules)?;
         let slicing = tensors.slicing_for_directory(directory, tp);
-        experts.layers = super::load_in_rank_order(layers, rank, |_, layer| {
+        experts.load_mount(library, tensors, layers, slicing)?;
+        Ok(experts)
+    }
+
+    pub(crate) fn load_mount(&mut self, library: &'a NativeLibrary, tensors: &Fp8ExpertTensors,
+        layers: &[usize], slicing: Slicing) -> Result<()> {
+        ensure!(self.layers.is_empty(), "native expert weights already published");
+        let (tp, rank) = (self.tp, self.rank);
+        self.layers = super::load_in_rank_order(layers, rank, |_, layer| {
             let started = std::time::Instant::now();
             let loaded = Fp8Layer::load_with(library, &tensors.for_layer(layer)?, layer, tp, rank, slicing)?;
             tracing::info!(layer, tp, rank, elapsed_ms = started.elapsed().as_millis() as u64,
                 "FP8 expert layer resident");
             Ok(loaded)
         })?;
-        Ok(experts)
+        Ok(())
     }
 
     fn prepare(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
@@ -381,7 +417,7 @@ impl<'a> Fp8Experts<'a> {
             capacity, budget, None)
     }
 
-    fn prepare_with_modules(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
+    pub(crate) fn prepare_with_modules(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         bf16_directory: Option<&Path>, layers: &[usize], tp: usize, rank: usize, capacity: usize,
         budget: usize, modules: Option<Fp8Modules>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
@@ -454,7 +490,7 @@ impl<'a> Fp8Experts<'a> {
                         let (weights, _) = tensors.slice_bytes_with(projection, 2, rank, slicing[rank])?;
                         for bytes in [weights * tensors.shape().experts,
                             tensors.scale_region_bytes_with(projection, 2, rank, slicing[rank])?] {
-                            regions.push(if bytes == 0 { None } else { Some(DeviceAllocation::new(devices[rank].library, bytes)?) });
+                            regions.push(if bytes == 0 { None } else { Some(DeviceAllocation::new(devices[rank].library, bytes)?.into()) });
                         }
                     }
                     owners[rank].layers.push(Fp8Layer { layer,
