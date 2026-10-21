@@ -229,6 +229,11 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     fn record_format(&self) -> &'static str {
         "opaque_v1"
     }
+    /// Earliest retained row a continuing writer may change. Lagging predictors can write
+    /// before the target frontier; capture and restore must privately copy those pages.
+    fn write_frontier(&self, len: usize) -> usize {
+        len
+    }
     /// The metadata of a snapshot of `placement` at `len`, taken with its mark.
     fn capture_meta(&self, placement: &Self::Placement, len: usize) -> Result<M, BoxError> {
         let _ = (placement, len);

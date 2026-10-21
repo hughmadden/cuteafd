@@ -108,6 +108,7 @@ struct Fake {
     rings: usize,
     slots: usize,
     queue: RefCell<Vec<Op>>,
+    writable_lag: usize,
     fail_restore: Cell<bool>,
     fail_copy: Cell<bool>,
     fail_drain: Cell<bool>,
@@ -127,7 +128,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0 }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
@@ -207,6 +208,9 @@ impl Fake {
 
 impl PrefixFamily for Fake {
     type Placement = Placement;
+    fn write_frontier(&self, len: usize) -> usize {
+        len.saturating_sub(self.writable_lag)
+    }
     fn record_format(&self) -> &'static str {
         self.record_format.get()
     }
@@ -1378,4 +1382,86 @@ fn two_slot_host_working_set_retains_pages_and_promotes_only_marks_under_pressur
         assert_eq!((cache.stats().mark_promotions, cache.stats().promotions), (12, 0));
         assert_eq!((cache.stats().host_hits, cache.stats().device_hits), (12, 0));
     }
+}
+
+#[test]
+fn lagging_predictor_readers_and_writer_cannot_mutate_retained_snapshot() {
+    for frontier in [255, 256, 257, 512] {
+        for lag in [1, 5] {
+            for queued in [false, true] {
+                let fake = Fake { writable_lag: lag, ..Fake::new(600, 4, 2) };
+                let mut cache = cache(&fake, 2, 0);
+                let tokens = seq(100, frontier);
+                let build = |ring| move |pages| Placement { pages, ring, len: 0, ring_from: 0 };
+                let mut writer = cache.admit_cold(&fake, frontier, frontier + 1, build(0)).unwrap().placement;
+                fake.forward(&mut writer, &tokens).unwrap();
+                if queued {
+                    assert_eq!(cache.queue_capture(&fake, SnapshotKind::Turn, &tokens, &[], &writer,
+                        After::default()).unwrap(), Captured::Done);
+                } else {
+                    assert!(cache.capture(&fake, SnapshotKind::Turn, &tokens, &writer, After::default()).unwrap());
+                }
+                fake.drain().unwrap();
+                let row = |p: &Placement, position: usize| fake.page_row(p.pages[position / ROWS], position % ROWS);
+                let snapshot = |p: &Placement| (0..frontier).map(|i|
+                    fake.mem.borrow().read_device(row(p, i)).to_vec()).collect::<Vec<_>>();
+                let original = snapshot(&writer);
+                // A writer can close its own pending row after retaining the snapshot.
+                fake.mem.borrow_mut().write_device(row(&writer, frontier - lag), &value(4, &[900]));
+                let mut continuation = tokens.clone();
+                continuation.push(903);
+                let first = cache.admit(&fake, &continuation, frontier + 1, false, build(1)).unwrap();
+                assert_eq!(first.resume, frontier);
+                fake.drain().unwrap();
+                assert_eq!(snapshot(&first.placement), original);
+                fake.mem.borrow_mut().write_device(row(&first.placement, frontier - lag), &value(4, &[901]));
+                let second = cache.admit(&fake, &continuation, frontier + 1, false, build(2)).unwrap();
+                assert_eq!(second.resume, frontier);
+                fake.drain().unwrap();
+                assert_eq!(snapshot(&second.placement), original);
+                fake.mem.borrow_mut().write_device(row(&second.placement, frontier - lag), &value(4, &[902]));
+                assert_eq!(fake.mem.borrow().read_device(row(&first.placement, frontier - lag)), &value(4, &[901]));
+                let third = cache.admit(&fake, &continuation, frontier + 1, false, build(3)).unwrap();
+                assert_eq!(third.resume, frontier);
+                fake.drain().unwrap();
+                assert_eq!(snapshot(&third.placement), original, "frontier={frontier} lag={lag} queued={queued}");
+                for placement in [&writer, &first.placement, &second.placement, &third.placement] {
+                    cache.release(&fake, &placement.pages).unwrap();
+                }
+                cache.clear(&fake).unwrap();
+                assert_eq!(cache.pool().free(), fake.pages);
+            }
+        }
+    }
+}
+
+#[test]
+fn predictor_inclusive_host_pages_do_not_deduplicate_by_target_tokens() {
+    let fake = Fake { writable_lag: 1, ..Fake::new(600, 2, 2) };
+    let mut cache = cache(&fake, 2, 1 << 20);
+    let tokens = seq(100, 256);
+    let mut writer = cache.admit_cold(&fake, 256, 257,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    fake.forward(&mut writer, &tokens).unwrap();
+    let row = |p: &Placement| fake.page_row(p.pages[255 / ROWS], 255 % ROWS);
+    fake.mem.borrow_mut().write_device(row(&writer), &value(4, &[900]));
+    assert!(cache.capture(&fake, SnapshotKind::Prompt, &tokens, &writer, After::default()).unwrap());
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    fake.mem.borrow_mut().write_device(row(&writer), &value(4, &[901]));
+    assert!(cache.capture(&fake, SnapshotKind::Turn, &tokens, &writer, After::default()).unwrap());
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    cache.release(&fake, &writer.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    let mut continuation = tokens.clone();
+    continuation.push(902);
+    let restored = cache.admit(&fake, &continuation, 257, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(restored.resume, 256);
+    assert!(restored.source.unwrap().host);
+    fake.drain().unwrap();
+    assert_eq!(fake.mem.borrow().read_device(row(&restored.placement)), value(4, &[901]));
+    cache.release(&fake, &restored.placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
 }

@@ -4,9 +4,9 @@
 //! layers the unit's four 64-row record pages of BF16 K/V (2,048 B per row) and raw index keys
 //! (256 B per row), and the pool page of the same index (64 pooled block keys of 4 tokens,
 //! 256 B each) = 7.27 MB per unit (28,416 B per token); with `--mtp` the MTP layer's pages ride
-//! along (2,368 B per token more). Units are refcounted: full units are shared, nobody writes
-//! them again (every sequence appends past its own length), and a partial tail unit is copied
-//! (its rows and its complete blocks).
+//! along (2,368 B per token more). Refcounted units strictly below the earliest writable row
+//! are shared. The remaining retained units are copied, including the last full unit when
+//! MTP still needs to consume hidden(P-1) at a page-aligned target frontier.
 //!
 //! Mark: the GDN layers' recurrent state is per sequence and overwritten by every step, so a
 //! snapshot copies the sequence's whole state slot: every GDN layer's FP32 state `[48, 128,
@@ -161,6 +161,10 @@ impl Frontier {
 
 impl PrefixFamily<Frontier> for Qwen4Prefix<'_, '_> {
     type Placement = Qwen4Placement;
+
+    fn write_frontier(&self, len: usize) -> usize {
+        if self.engine.weights.mtp.is_some() { len.saturating_sub(1) } else { len }
+    }
 
     fn record_format(&self) -> &'static str {
         match self.engine.kv_format {
@@ -485,11 +489,37 @@ fn drafting_resume_check(engine: &Qwen4Engine<'_>, family: &Qwen4Prefix<'_, '_>,
         at + 1, false, Some(&compatible), place)?;
     ensure!(restored.resume == at, "Qwen drafting reader missed its predictor-complete turn");
     ensure!(canonical(&restored.placement)? == expected, "Qwen shared drafting cache hit differs from cold MTP state");
+    let pending_row = |placement: &Qwen4Placement| -> Result<Vec<u8>> {
+        let ranges = family.unit_ranges(placement.units[(at - 1) / UNIT_ROWS])?;
+        let records = ranges[ranges.len() - 3];
+        let offset = (at - 1) % UNIT_ROWS * engine.kv_record_bytes;
+        download(engine, view(records, offset, engine.kv_record_bytes)?)
+    };
+    let retained_pending = pending_row(&restored.placement)?;
     let mut hit_seq = MtpSeq::default();
     speculate::restore_pending(engine, &restored.placement, at, Some(tokens[at]), &mut hit_seq)?;
     ensure!(restored.placement.mtp_frontier.get() == at && hit_seq.pending.is_empty(),
         "Qwen continuation did not consume its restored final hidden row");
-    cache.release(family, &restored.placement.units)?;
+    let peer_place = |units| Qwen4Placement::new(units, 1, history_of(&engine.cfg, &[]));
+    let mut different = tokens[..at + 1].to_vec();
+    different[at] = (different[at] + 1) % engine.cfg.vocab_size as u32;
+    let peer = cache.admit_native_compatible(family, &different, &different, &[],
+        at + 1, false, Some(&compatible), peer_place)?;
+    ensure!(peer.resume == at && pending_row(&peer.placement)? == retained_pending,
+        "Qwen first continuation mutated retained predictor row");
+    let first_pending = pending_row(&restored.placement)?;
+    let mut peer_seq = MtpSeq::default();
+    speculate::restore_pending(engine, &peer.placement, at, Some(different[at]), &mut peer_seq)?;
+    let check_place = |units| Qwen4Placement::new(units, 2, history_of(&engine.cfg, &[]));
+    let check = cache.admit_native_compatible(family, &tokens[..at + 1], &tokens[..at + 1], &[],
+        at + 1, false, Some(&compatible), check_place)?;
+    ensure!(check.resume == at && pending_row(&check.placement)? == retained_pending,
+        "Qwen interleaved continuation mutated retained predictor row");
+    ensure!(canonical(&check.placement)? == expected && pending_row(&restored.placement)? == first_pending,
+        "Qwen continuations do not own independent canonical predictor state");
+    for placement in [&restored.placement, &peer.placement, &check.placement] {
+        cache.release(family, &placement.units)?;
+    }
     cache.clear(family)?;
     println!("Qwen MTP drafting turn restore at={at} stashed_rows=2 canonical_kv=true hidden_stash=true byte_exact=true");
     Ok(())
