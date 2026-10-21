@@ -489,6 +489,31 @@ fn join_start_and_stream_idle_deadlines_fall_back() {
 }
 
 #[test]
+fn hub_progress_resets_receive_idle_timeout_instead_of_total_load_deadline() {
+    let server = Server::new(|conn| {
+        created(&conn);
+        assert_eq!(request(&conn), Request::Start);
+        event(&conn, Event::Planned(Forecast::default()));
+        for done in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            event(&conn, Event::Progress { done, total: 20 });
+        }
+        event(&conn, Event::Done);
+    });
+    let client = PushClient::at(server.client.socket.clone(), Duration::from_secs(1)).unwrap();
+    let group = client.create(vec![], vec![]).unwrap();
+    group.start().unwrap();
+    let started = std::time::Instant::now();
+    for expected in 0..20 {
+        assert!(matches!(group.next().unwrap(), Event::Progress { done, .. } if done == expected));
+    }
+    assert!(started.elapsed() > Duration::from_secs(1));
+    assert!(matches!(group.next().unwrap(), Event::Done));
+    drop(group);
+    server.finish();
+}
+
+#[test]
 fn full_socket_backlog_cannot_hang_model_loading() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("full.sock");

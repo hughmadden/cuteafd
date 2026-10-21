@@ -78,7 +78,7 @@ fn installed_exl3_complete_rank_plans_fit_admission_and_control_frames() -> Resu
     // ADR-064; production activation still requires that attribute.
     let root = cuteafd_loader::push_load::namespace(&snapshot).map(|(root, _)| root)
         .unwrap_or_else(|_| snapshot.clone());
-    for world in [4, 6] {
+    for world in [2, 4, 6] {
         for rank in 0..world {
             let plan = RankPlan::new(&catalog, &layers, world, rank, usize::MAX)?;
             let admitted = plan.residencies.iter().map(|r| r.device_arena_layout().map(|(_, n)| n))
@@ -89,6 +89,20 @@ fn installed_exl3_complete_rank_plans_fit_admission_and_control_frames() -> Resu
             let frame = serde_json::to_vec(&serde_json::json!({"message":"offer", "offer":offer}))?;
             assert!(frame.len() + 1 <= 64 * 1024, "complete rank offer exceeds control bound");
             let checked = plan.checked(&catalog, &root, world, rank)?;
+            if world == 2 {
+                let mut payload = 0u64;
+                for (region, &layer) in layers.iter().enumerate() {
+                    let range = plan.layout.region(region)?;
+                    let bytes = checked.plan.entries.iter().filter(|entry|
+                        entry.dst_base >= range.start as u64 && entry.dst_base < range.end as u64)
+                        .map(|entry| checked.plan.patterns[entry.pattern as usize].check()
+                            .map(|extent| extent.bytes).map_err(anyhow::Error::msg))
+                        .collect::<Result<Vec<_>>>()?.into_iter().sum::<u64>();
+                    payload += bytes;
+                    eprintln!("EXL3 TP{world} rank {rank} layer {layer}: device={}..{}, payload={bytes}, cumulative_payload={payload}",
+                        range.start, range.end);
+                }
+            }
             eprintln!("EXL3 TP{world} rank {rank}: {} layers, {} device bytes, {} validation bytes, {} entries, {} offer bytes",
                 layers.len(), admitted, plan.validation.bytes(), checked.plan.entries.len(), frame.len() + 1);
         }

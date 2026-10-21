@@ -18,6 +18,8 @@ pub use nest_push::{client::{JoinArgs, Poll, Conn, Listener}, plan, proto, slot}
 pub mod builder;
 pub mod native;
 
+// Applied by nest-push as SO_RCVTIMEO/SO_SNDTIMEO for each blocking I/O,
+// not a wall-clock load limit: every received progress event renews the wait.
 pub const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HOSTS_XATTR: &str = "user.sparknest.hosts";
 
