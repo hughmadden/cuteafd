@@ -337,6 +337,8 @@ mod tests {
         use cuteafd_loader::{placement::{self, Baseline}, plan::{self, layout::LayoutOptions}};
         let mut args = args();
         args.snapshot = std::env::var("CUTEAFD_STEP5_SNAPSHOT")?.into();
+        args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
+            .unwrap_or_else(|_| "bf16".into()).parse()?;
         args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
         args.split_device = Some(1);
@@ -421,7 +423,7 @@ mod tests {
             let planned = plan::plan(&args.snapshot, &plan::PlanOptions {
                 placement: plan::ExpertPlacement::from_spark_ranks(6),
                 draft_ownership: Some(DraftOwnership::NativeMtp),
-                layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2],
+                layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2], step5_kv: args.kv_cache,
                     native_mtp_layers: usize::from(depth), workspace_manifest: Some(args.manifest.clone()),
                     ..Default::default() }), ..Default::default()
             })?;
@@ -440,6 +442,8 @@ mod tests {
         use cuteafd_engine::prefix::{After, PrefixFamily, SnapshotKind};
         use super::super::prefix::Placement;
         let mut args = live_mtp_args();
+        args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
+            .unwrap_or_else(|_| "bf16".into()).parse()?;
         args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
         args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
