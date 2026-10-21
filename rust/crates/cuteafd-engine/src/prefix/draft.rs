@@ -67,6 +67,7 @@ pub struct DraftPageId {
 /// additionally depends on the shared scheduler's checkpoint and stage-state predicate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftPageAttachment {
+    pub snapshot: DraftSnapshot,
     pub layout: u64,
     pub origin: usize,
     pub frontier: usize,
@@ -79,9 +80,13 @@ struct Sequence {
     end: usize,
     pages: Vec<u32>,
     pending: Option<DraftReservation>,
+    credit: usize,
 }
 
 struct Snapshot {
+    revocable: bool,
+    pins: usize,
+    used: u64,
     origin: usize,
     end: usize,
     pages: Vec<u32>,
@@ -136,8 +141,72 @@ impl DraftPagePool {
         // Callers preflight generation overflow before acquiring page references.
         self.generations[slot] += 1;
         let binding = DraftBinding { pool: self.id, slot, generation: self.generations[slot] };
-        self.slots[slot] = Some(Sequence { binding, origin, end, pages, pending: None });
+        self.slots[slot] = Some(Sequence { binding, origin, end, pages, pending: None, credit: 0 });
         binding
+    }
+
+    fn outstanding_credit(&self) -> usize {
+        self.slots.iter().flatten().map(|s| s.credit.saturating_sub(s.pages.len())).sum()
+    }
+
+    fn make_room(&mut self, needed: usize, keep: Option<DraftSnapshot>) -> Result<()> {
+        while self.free() < needed {
+            let victim = self.snapshots.iter().filter(|(id, s)| Some(**id) != keep && s.revocable && s.pins == 0)
+                .min_by_key(|(_, s)| s.used).map(|(&id, _)| id);
+            let Some(victim) = victim else {
+                return Err(PoolExhausted { needed, free: self.free(), capacity: self.capacity() }.into());
+            };
+            self.release_snapshot(victim)?;
+        }
+        Ok(())
+    }
+
+    /// Reserve the admitted request's entire growth plus a partial page and a proposal
+    /// block inside Q. Producers consume this credit; retained snapshots cannot borrow it.
+    pub fn admit(&mut self, binding: DraftBinding, end: usize, block: usize) -> Result<()> {
+        let s = self.sequence(binding)?;
+        if end < s.end || end > self.context || block == 0 { return Err(DraftPageError::Frontier); }
+        let credit = (end - s.origin).div_ceil(DRAFT_PAGE_ROWS)
+            .checked_add(block.div_ceil(DRAFT_PAGE_ROWS) + 1).ok_or(DraftPageError::Geometry)?;
+        let needed = self.outstanding_credit() - s.credit.saturating_sub(s.pages.len())
+            + credit.saturating_sub(s.pages.len());
+        if let Err(error) = self.make_room(needed, None) {
+            return match error {
+                DraftPageError::Exhausted(_) => Err(PoolExhausted {
+                    needed: credit, free: self.free().saturating_sub(needed.saturating_sub(credit)),
+                    capacity: self.capacity(),
+                }.into()),
+                error => Err(error),
+            };
+        }
+        self.slots[binding.slot].as_mut().expect("checked").credit = credit;
+        Ok(())
+    }
+
+    /// The caller has retired capture/host-store readers. Only these attachments may
+    /// be revoked automatically when a live admission needs their pages.
+    pub fn retain_snapshot(&mut self, snapshot: DraftSnapshot) -> Result<()> {
+        self.snapshots.get_mut(&snapshot).ok_or(DraftPageError::Snapshot)?.revocable = true;
+        Ok(())
+    }
+
+    /// Pin before enqueueing a restore or host copy; unpin only after its event retires.
+    pub fn pin_snapshot(&mut self, snapshot: DraftSnapshot) -> Result<()> {
+        let used = self.next_serial()?;
+        let s = self.snapshots.get_mut(&snapshot).ok_or(DraftPageError::Snapshot)?;
+        s.pins = s.pins.checked_add(1).ok_or(DraftPageError::Geometry)?;
+        s.used = used;
+        Ok(())
+    }
+
+    pub fn snapshot_revocable(&self, snapshot: DraftSnapshot) -> bool {
+        self.snapshots.get(&snapshot).is_some_and(|s| s.revocable && s.pins == 0)
+    }
+
+    pub fn unpin_snapshot(&mut self, snapshot: DraftSnapshot) -> Result<()> {
+        let s = self.snapshots.get_mut(&snapshot).ok_or(DraftPageError::Snapshot)?;
+        s.pins = s.pins.checked_sub(1).ok_or(DraftPageError::Snapshot)?;
+        Ok(())
     }
 
     /// Bind cold(P) without allocating a page or exposing the previous occupant's bytes.
@@ -162,7 +231,11 @@ impl DraftPagePool {
         }
         let total = (end - s.origin).div_ceil(DRAFT_PAGE_ROWS);
         let previous = s.pages.len();
+        if s.credit > 0 && total > s.credit { return Err(DraftPageError::Frontier); }
         let serial = self.next_serial()?;
+        let outstanding = self.outstanding_credit();
+        let own = self.sequence(binding)?.credit.saturating_sub(previous);
+        self.make_room(outstanding + (total - previous).saturating_sub(own), None)?;
         let fresh = self.pool.alloc(total - previous)?;
         let reservation = DraftReservation { binding, serial, start, end };
         let s = self.slots[binding.slot].as_mut().expect("validated binding");
@@ -209,46 +282,86 @@ impl DraftPagePool {
 
     /// Retain a committed prefix. Run the returned tail copy on every full layer,
     /// and complete its owner events before publishing this snapshot to lookup.
-    pub fn capture(&mut self, binding: DraftBinding) -> Result<(DraftSnapshot, Option<TailCopy>)> {
+    pub fn capture(&mut self, binding: DraftBinding) -> Result<(DraftSnapshot, Vec<TailCopy>)> {
+        let (_, frontier) = self.frontier(binding)?;
+        self.capture_writable(binding, frontier)
+    }
+
+    /// `write_frontier` is absolute, as for the target cache. Every retained page
+    /// overlapping writable rows is copied, even when the page is completely filled.
+    pub fn capture_writable(&mut self, binding: DraftBinding, write_frontier: usize)
+        -> Result<(DraftSnapshot, Vec<TailCopy>)> {
         let s = self.sequence(binding)?;
         if s.pending.is_some() { return Err(DraftPageError::Frontier); }
         let (origin, end, source) = (s.origin, s.end, s.pages.clone());
+        if !(origin..=end).contains(&write_frontier) { return Err(DraftPageError::Frontier); }
         let id = DraftSnapshot { pool: self.id, serial: self.next_serial()? };
         let len = end - origin;
-        let (pages, copy) = if len == 0 { (Vec::new(), None) } else {
-            let fork = self.pool.fork(&source, len, source.len())?;
-            (fork.pages, fork.copy)
+        let need = if len == 0 { 0 } else { source.len() - (write_frontier - origin) / DRAFT_PAGE_ROWS };
+        self.make_room(need + self.outstanding_credit(), None)?;
+        let (pages, copy) = if len == 0 { (Vec::new(), Vec::new()) } else {
+            self.pool.fork_writable(&source, len, source.len(), write_frontier - origin)?
         };
-        self.snapshots.insert(id, Snapshot { origin, end, pages });
+        self.snapshots.insert(id, Snapshot { origin, end, pages, revocable: false, pins: 0, used: id.serial });
         Ok((id, copy))
     }
 
     pub fn attachment(&self, snapshot: DraftSnapshot) -> Result<DraftPageAttachment> {
         let s = self.snapshots.get(&snapshot).ok_or(DraftPageError::Snapshot)?;
-        Ok(DraftPageAttachment { layout: self.layout, origin: s.origin, frontier: s.end,
+        Ok(DraftPageAttachment { snapshot, layout: self.layout, origin: s.origin, frontier: s.end,
             pages: s.pages.iter().map(|&index| DraftPageId {
                 index, generation: self.pool.generation(index) }).collect() })
+    }
+
+    /// Allocate unpublished destinations for a host restore. Saved device identities
+    /// are metadata only: the host owns its slabs after the original pool refs expire.
+    pub fn promote(&mut self, saved: &DraftPageAttachment) -> Result<DraftPageAttachment> {
+        let len = saved.frontier.checked_sub(saved.origin).ok_or(DraftPageError::Snapshot)?;
+        if saved.layout != self.layout || saved.frontier > self.context
+            || saved.pages.len() != len.div_ceil(DRAFT_PAGE_ROWS) {
+            return Err(DraftPageError::Snapshot);
+        }
+        let snapshot = DraftSnapshot { pool: self.id, serial: self.next_serial()? };
+        self.make_room(saved.pages.len() + self.outstanding_credit(), None)?;
+        let pages = self.pool.alloc(saved.pages.len())?;
+        self.snapshots.insert(snapshot, Snapshot { origin: saved.origin, end: saved.frontier, pages, revocable: false, pins: 0, used: snapshot.serial });
+        self.attachment(snapshot)
+    }
+
+    /// Verify the entire typed attachment, not just its reusable numeric page IDs.
+    pub fn check_attachment(&self, attachment: &DraftPageAttachment) -> Result<()> {
+        if self.attachment(attachment.snapshot)? != *attachment { return Err(DraftPageError::Snapshot); }
+        Ok(())
     }
 
     /// Reserve a private continuation of an exact snapshot, leaving the destination
     /// unbound on exhaustion. The returned tail copy must retire before any producer.
     pub fn restore(&mut self, slot: usize, snapshot: DraftSnapshot, frontier: usize)
-        -> Result<(DraftBinding, Option<TailCopy>)> {
+        -> Result<(DraftBinding, Vec<TailCopy>)> {
+        self.restore_writable(slot, snapshot, frontier, frontier)
+    }
+
+    pub fn restore_writable(&mut self, slot: usize, snapshot: DraftSnapshot, frontier: usize,
+        write_frontier: usize) -> Result<(DraftBinding, Vec<TailCopy>)> {
         self.vacant(slot)?;
         self.generations[slot].checked_add(1).ok_or(DraftPageError::Stale)?;
         let s = self.snapshots.get(&snapshot).ok_or(DraftPageError::Snapshot)?;
         if frontier != s.end { return Err(DraftPageError::Snapshot); }
         let (origin, end) = (s.origin, s.end);
+        if !(origin..=end).contains(&write_frontier) { return Err(DraftPageError::Frontier); }
         let len = end - origin;
-        let (pages, copy) = if len == 0 { (Vec::new(), None) } else {
-            let fork = self.pool.fork(&s.pages, len, s.pages.len())?;
-            (fork.pages, fork.copy)
+        let source = s.pages.clone();
+        let need = if len == 0 { 0 } else { source.len() - (write_frontier - origin) / DRAFT_PAGE_ROWS };
+        self.make_room(need + self.outstanding_credit(), Some(snapshot))?;
+        let (pages, copy) = if len == 0 { (Vec::new(), Vec::new()) } else {
+            self.pool.fork_writable(&source, len, source.len(), write_frontier - origin)?
         };
         Ok((self.install(slot, origin, end, pages), copy))
     }
 
     /// Call only after queued copies/readers of the snapshot have retired.
     pub fn release_snapshot(&mut self, snapshot: DraftSnapshot) -> Result<()> {
+        if self.snapshots.get(&snapshot).is_some_and(|s| s.pins != 0) { return Err(DraftPageError::Snapshot); }
         let s = self.snapshots.remove(&snapshot).ok_or(DraftPageError::Snapshot)?;
         self.pool.release(&s.pages);
         Ok(())
@@ -266,6 +379,100 @@ impl DraftPagePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_live_pressure_defers_instead_of_rejecting_a_request_that_fits_alone() {
+        let mut pool = DraftPagePool::new(5 * 64, 2, 1024, 1).unwrap();
+        let a = pool.bind(0, 0).unwrap();
+        let b = pool.bind(1, 0).unwrap();
+        pool.admit(a, 64, 8).unwrap();
+        let DraftPageError::Exhausted(error) = pool.admit(b, 64, 8).unwrap_err() else { panic!("expected pressure") };
+        assert_eq!(error.needed, 3);
+        assert!(error.needed <= error.capacity);
+        pool.release(a).unwrap();
+        pool.admit(b, 64, 8).unwrap();
+        let rows = pool.reserve(b, 0, 64).unwrap();
+        pool.commit(rows, 64).unwrap();
+        pool.release(b).unwrap();
+        assert_eq!(pool.free(), pool.capacity());
+    }
+
+    #[test]
+    fn live_admission_revokes_retained_snapshots_before_any_producer_can_fail() {
+        let mut pool = DraftPagePool::new(8 * 64, 2, 1024, 1).unwrap();
+        let mut saved = Vec::new();
+        for n in 0..8 {
+            let binding = pool.bind(0, n * 64).unwrap();
+            let rows = pool.reserve(binding, n * 64, 64).unwrap();
+            pool.commit(rows, 64).unwrap();
+            let (snapshot, _) = pool.capture(binding).unwrap();
+            pool.release(binding).unwrap();
+            pool.retain_snapshot(snapshot).unwrap();
+            saved.push(snapshot);
+        }
+        assert_eq!(pool.free(), 0);
+        let a = pool.bind(0, 0).unwrap();
+        let b = pool.bind(1, 100).unwrap();
+        pool.admit(a, 65, 8).unwrap();
+        pool.admit(b, 165, 8).unwrap();
+        assert!(saved.into_iter().all(|id| pool.attachment(id).is_err()));
+        // Each live request has two growth pages, a partial page and a block page.
+        // Snapshot pressure cannot steal the unmaterialized credit.
+        for (binding, start) in [(a, 0), (b, 100)] {
+            let rows = pool.reserve(binding, start, 64).unwrap();
+            pool.commit(rows, 64).unwrap();
+            let (snapshot, _) = pool.capture(binding).unwrap();
+            pool.retain_snapshot(snapshot).unwrap();
+            let proposal = pool.reserve(binding, start + 64, 8).unwrap();
+            pool.commit(proposal, 0).unwrap();
+        }
+        pool.release(a).unwrap();
+        pool.release(b).unwrap();
+        pool.make_room(pool.capacity(), None).unwrap();
+        assert_eq!(pool.free(), pool.capacity());
+    }
+
+    #[test]
+    fn revocation_never_reuses_restore_sources_before_the_copy_event_retires() {
+        let mut pool = DraftPagePool::new(5 * 64, 3, 1024, 1).unwrap();
+        let source = pool.bind(0, 0).unwrap();
+        let rows = pool.reserve(source, 0, 63).unwrap();
+        let physical = pool.destinations(rows).unwrap();
+        pool.commit(rows, 63).unwrap();
+        let (snapshot, copies) = pool.capture(source).unwrap();
+        let mut memory = vec![0u64; 5 * 64];
+        for (position, row) in physical.into_iter().enumerate() { memory[row as usize] = position as u64 + 1; }
+        for copy in copies {
+            for row in 0..copy.rows { memory[copy.to as usize * 64 + row] = memory[copy.from as usize * 64 + row]; }
+        }
+        pool.release(source).unwrap();
+        pool.retain_snapshot(snapshot).unwrap();
+        pool.pin_snapshot(snapshot).unwrap();
+        let (restored, copies) = pool.restore(1, snapshot, 63).unwrap();
+        let saved = pool.attachment(snapshot).unwrap();
+        let live = pool.bind(2, 0).unwrap();
+        pool.admit(live, 64, 8).unwrap();
+        let proposal = pool.reserve(live, 0, 64).unwrap();
+        let writes = pool.destinations(proposal).unwrap();
+        assert!(writes.iter().all(|row| *row as usize / 64 != saved.pages[0].index as usize));
+        assert!(pool.release_snapshot(snapshot).is_err());
+        assert!(pool.make_room(pool.capacity(), None).is_err());
+        // Simulate the queued event: sources must still contain their canonical bytes.
+        for copy in copies {
+            for row in 0..copy.rows {
+                let value = memory[copy.from as usize * 64 + row];
+                assert_eq!(value, row as u64 + 1);
+                memory[copy.to as usize * 64 + row] = value;
+            }
+        }
+        pool.unpin_snapshot(snapshot).unwrap();
+        pool.make_room(4, None).unwrap_err();
+        assert!(pool.attachment(snapshot).is_err());
+        pool.commit(proposal, 0).unwrap();
+        pool.release(live).unwrap();
+        pool.release(restored).unwrap();
+        assert_eq!(pool.free(), pool.capacity());
+    }
 
     #[test]
     fn handles_from_another_pool_never_alias() {
@@ -320,11 +527,11 @@ mod tests {
             let r = pool.reserve(a, 0, rows).unwrap();
             pool.commit(r, rows).unwrap();
             let (snapshot, copy) = pool.capture(a).unwrap();
-            assert_eq!(copy.map(|c| c.rows), (rows % 64 != 0).then_some(rows % 64));
+            assert_eq!(copy.first().map(|c| c.rows), (rows % 64 != 0).then_some(rows % 64));
             let attachment = pool.attachment(snapshot).unwrap();
             assert_eq!((attachment.origin, attachment.frontier, attachment.layout), (0, rows, 11));
             let (b, copy) = pool.restore(1, snapshot, rows).unwrap();
-            assert_eq!(copy.map(|c| c.rows), (rows % 64 != 0).then_some(rows % 64));
+            assert_eq!(copy.first().map(|c| c.rows), (rows % 64 != 0).then_some(rows % 64));
             let r = pool.reserve(b, rows, 1).unwrap();
             pool.commit(r, 0).unwrap();
             assert_eq!(pool.attachment(snapshot).unwrap(), attachment);
@@ -353,7 +560,7 @@ mod tests {
             pool.commit(append, end - start).unwrap();
         }
         let (snapshot, copy) = pool.capture(a).unwrap();
-        if let Some(copy) = copy {
+        for copy in copy {
             let saved = memory[copy.from as usize * 64..copy.from as usize * 64 + copy.rows].to_vec();
             memory[copy.to as usize * 64..copy.to as usize * 64 + copy.rows].copy_from_slice(&saved);
         }
@@ -368,7 +575,7 @@ mod tests {
         for row in pool.destinations(proposal).unwrap() { memory[row as usize] = u64::MAX; }
         pool.commit(proposal, 0).unwrap();
         let (b, copy) = pool.restore(1, snapshot, 191).unwrap();
-        if let Some(copy) = copy {
+        for copy in copy {
             let saved = memory[copy.from as usize * 64..copy.from as usize * 64 + copy.rows].to_vec();
             memory[copy.to as usize * 64..copy.to as usize * 64 + copy.rows].copy_from_slice(&saved);
         }
@@ -405,11 +612,62 @@ mod tests {
     }
 
     #[test]
+    fn host_promotions_reject_stale_or_incompatible_attachments_transactionally() {
+        let mut pool = DraftPagePool::new(512, 1, 1024, 17).unwrap();
+        let binding = pool.bind(0, 0).unwrap();
+        let reservation = pool.reserve(binding, 0, 65).unwrap();
+        pool.commit(reservation, 65).unwrap();
+        let (snapshot, _) = pool.capture(binding).unwrap();
+        let saved = pool.attachment(snapshot).unwrap();
+        pool.release_snapshot(snapshot).unwrap();
+        pool.release(binding).unwrap();
+        assert!(pool.check_attachment(&saved).is_err());
+        let promoted = pool.promote(&saved).unwrap();
+        pool.check_attachment(&promoted).unwrap();
+        assert_ne!(saved.snapshot, promoted.snapshot);
+        let before = pool.free();
+        let mut bad = saved.clone();
+        bad.layout += 1;
+        assert!(pool.promote(&bad).is_err());
+        bad = saved;
+        bad.pages.clear();
+        assert!(pool.promote(&bad).is_err());
+        assert_eq!(pool.free(), before);
+        pool.release_snapshot(promoted.snapshot).unwrap();
+        assert_eq!(pool.free(), 8);
+    }
+
+    #[test]
+    fn lagging_writer_copies_every_writable_page_at_aligned_frontiers() {
+        for (origin, rows, writable) in [(0, 64, 63), (513, 128, 576), (0, 193, 63)] {
+            let mut pool = DraftPagePool::new(2048, 2, 4096, 2).unwrap();
+            let a = pool.bind(0, origin).unwrap();
+            let r = pool.reserve(a, origin, rows).unwrap();
+            pool.commit(r, rows).unwrap();
+            let source = pool.sequence(a).unwrap().pages.clone();
+            let (snapshot, copies) = pool.capture_writable(a, writable).unwrap();
+            let saved = pool.snapshots.get(&snapshot).unwrap().pages.clone();
+            let shared = (writable - origin) / 64;
+            assert_eq!(&source[..shared], &saved[..shared]);
+            assert_eq!(copies.len(), rows.div_ceil(64) - shared);
+            for copy in copies { assert_ne!(copy.from, copy.to); }
+            let (b, copies) = pool.restore_writable(1, snapshot, origin + rows, writable).unwrap();
+            assert_eq!(copies.len(), rows.div_ceil(64) - shared);
+            for copy in copies { assert_ne!(copy.from, copy.to); }
+            assert!(pool.capture_writable(a, origin + rows + 1).is_err());
+            pool.release(a).unwrap();
+            pool.release(b).unwrap();
+            pool.release_snapshot(snapshot).unwrap();
+            assert_eq!(pool.free(), 32);
+        }
+    }
+
+    #[test]
     fn empty_and_cold_origin_snapshots_keep_their_semantics() {
         let mut pool = DraftPagePool::new(64, 2, 1024, 2).unwrap();
         let a = pool.bind(0, 513).unwrap();
         let (snapshot, copy) = pool.capture(a).unwrap();
-        assert!(copy.is_none());
+        assert!(copy.is_empty());
         assert_eq!(pool.free(), 1);
         let (b, _) = pool.restore(1, snapshot, 513).unwrap();
         assert_eq!(pool.frontier(b).unwrap(), (513, 513));
