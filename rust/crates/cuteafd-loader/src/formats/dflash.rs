@@ -120,6 +120,41 @@ pub struct MlaDraftCacheLayout {
     pub margin_bytes: u64,
 }
 
+/// Immutable full-layer pool and bounded-window inventory. The target's aggregate
+/// token budget is independent of both request count and checkpoint context extent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftCacheLayout {
+    pub target_tokens: usize,
+    pub page_rows: usize,
+    pub pages: usize,
+    pub record_bytes: usize,
+    pub full_layers: usize,
+    pub window_bytes: u64,
+    pub full_bytes: u64,
+    pub page_table_bytes: u64,
+    pub layer_bytes: Vec<usize>,
+}
+
+impl DraftCacheLayout {
+    pub fn cache_bytes(&self) -> Result<u64> {
+        self.full_bytes.checked_add(self.window_bytes)
+            .ok_or_else(|| unsupported("draft pool total overflow"))
+    }
+
+    /// Owner balancing moves the same inventory runtime allocates, not a per-slot
+    /// estimate. The one chosen owner holds every full-layer segment of a page ID.
+    pub fn demands(&self, gpu: u8) -> Result<Vec<crate::placement::Demand>> {
+        use crate::placement::Demand;
+        use cuteafd_core::memory_layout::{Basis, Category};
+        Ok(vec![Demand::new(gpu, Category::Drafter, "draft shared full-context KV pool",
+                self.full_bytes, Basis::Formula),
+            Demand::new(gpu, Category::Drafter, "draft bounded window rings",
+                self.window_bytes, Basis::Formula),
+            Demand::new(gpu, Category::Drafter, "draft page tables",
+                self.page_table_bytes, Basis::Formula)])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftCacheView {
     /// Absolute start, page-aligned relative to the slot's storage origin.
@@ -621,6 +656,41 @@ impl MlaDflashConfig {
         Ok(layout)
     }
 
+    /// Full-context pages come from the target's aggregate token budget. Window
+    /// rings retain their existing per-request append slack and table geometry.
+    pub fn paged_cache_layout(&self, slots: usize, context: usize, target_tokens: usize)
+        -> Result<DraftCacheLayout> {
+        let source = self.cache_layout(slots, context)?;
+        let pages = target_tokens.div_ceil(64);
+        if target_tokens == 0 || pages > i32::MAX as usize {
+            return Err(unsupported("draft pool token budget outside native page limits"));
+        }
+        let overflow = || unsupported("draft paged layout overflow");
+        let record_bytes = self.mla.kv_rank.checked_add(self.mla.rope)
+            .and_then(|n| n.checked_mul(2)).ok_or_else(overflow)?;
+        let full_layer = pages.checked_mul(64).and_then(|n| n.checked_mul(record_bytes))
+            .ok_or_else(overflow)?;
+        let (mut window_bytes, mut full_bytes, mut full_layers) = (0u64, 0u64, 0usize);
+        let mut layer_bytes = Vec::with_capacity(source.layers.len());
+        for layer in &source.layers {
+            let bytes = if layer.window.is_none() {
+                full_layers += 1;
+                full_bytes = full_bytes.checked_add(full_layer as u64).ok_or_else(overflow)?;
+                full_layer
+            } else {
+                let bytes = layer.rows_per_slot.checked_mul(slots)
+                    .and_then(|n| n.checked_mul(record_bytes)).ok_or_else(overflow)?;
+                window_bytes = window_bytes.checked_add(bytes as u64).ok_or_else(overflow)?;
+                bytes
+            };
+            layer_bytes.push(bytes);
+        }
+        let layout = DraftCacheLayout { target_tokens, page_rows: 64, pages, record_bytes,
+            full_layers, window_bytes, full_bytes, page_table_bytes: source.page_table_bytes, layer_bytes };
+        layout.cache_bytes()?;
+        Ok(layout)
+    }
+
     /// Cache admission shared by planner and runtime. Full layers admit the
     /// selected context (blocks must end inside it); sliding layers additionally
     /// admit a private block and page-offset slack in their virtual tables.
@@ -849,6 +919,28 @@ mod tests {
         unsupported.intermediate += 1;
         assert!(unsupported.weight_layout(Fp8Only).is_err());
         assert!(unsupported.weight_layout(Bf16Only).is_ok());
+    }
+
+    #[test]
+    fn pooled_full_layers_charge_target_tokens_not_slots_times_context() {
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        let tokens = 1 << 20;
+        for slots in [1, 8, 20] {
+            let layout = cfg.paged_cache_layout(slots, tokens, tokens).unwrap();
+            assert_eq!(layout.pages, tokens / 64);
+            assert_eq!(layout.full_layers, 1);
+            assert_eq!(layout.full_bytes, tokens as u64 * 1152);
+            assert_eq!(layout.window_bytes, 4 * slots as u64 * 4160 * 1152);
+            assert_eq!(layout.layer_bytes.iter().sum::<usize>() as u64, layout.cache_bytes().unwrap());
+            assert_eq!(layout.demands(1).unwrap().iter().map(|d| d.bytes).sum::<u64>(),
+                layout.cache_bytes().unwrap() + layout.page_table_bytes);
+        }
+        let layout = cfg.paged_cache_layout(8, tokens, tokens).unwrap();
+        assert_eq!(layout.cache_bytes().unwrap(), 1_361_313_792);
+        assert_eq!(cfg.paged_cache_layout(8, 262144, tokens).unwrap().full_bytes, layout.full_bytes);
+        assert_eq!(cfg.paged_cache_layout(8, tokens, 65).unwrap().full_bytes, 128 * 1152);
+        assert!(cfg.paged_cache_layout(8, tokens, 0).is_err());
+        assert!(cfg.paged_cache_layout(8, tokens, usize::MAX).is_err());
     }
 
     #[test]
