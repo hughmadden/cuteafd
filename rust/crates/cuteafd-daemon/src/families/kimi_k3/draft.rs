@@ -111,16 +111,22 @@ impl<'a> NativeDraft<'a> {
     }
 
     pub(crate) fn tap(&self, layer: usize, local: &mut super::device::LocalLane<'a>, rows: usize) -> Result<()> {
+        self.tap_at(layer, local, rows, 0)
+    }
+
+    pub(crate) fn tap_at(&self, layer: usize, local: &mut super::device::LocalLane<'a>,
+        rows: usize, to: usize) -> Result<()> {
         let Some(index) = self.owners.draft.tap_index(layer) else { return Ok(()) };
-        ensure!(rows <= TARGET_TAP_ROWS && Rc::ptr_eq(local.stream(), &self.target_streams[0]),
+        let cfg = &self.owners.draft.cfg;
+        let offset = tap_offset(to, rows, cfg.taps.len() * cfg.hidden)?;
+        ensure!(Rc::ptr_eq(local.stream(), &self.target_streams[0]),
             "Kimi draft taps exceed staging or use the wrong producer stream");
         let hidden = local.terminal_residual(rows)?;
-        let cfg = &self.owners.draft.cfg;
         local.stream().device.run(|| {
             // SAFETY: terminal_residual and this strided copy share the exact producer
             // stream; target staging survives every reader and is not graph-captured.
             unsafe { self.owners.draft.device.library.glm_dflash_tap(hidden.ptr.cast_const(),
-                self.taps.buffer.ptr, rows, cfg.hidden, cfg.taps.len() * cfg.hidden,
+                self.taps.buffer.ptr.wrapping_byte_add(offset), rows, cfg.hidden, cfg.taps.len() * cfg.hidden,
                 index * cfg.hidden, local.stream().raw) }
         })
     }
@@ -235,9 +241,43 @@ fn context_slices(rows: &[ContextRow]) -> Result<Vec<Vec<ContextRow>>> {
     Ok(slices)
 }
 
+fn tap_offset(to: usize, rows: usize, stride: usize) -> Result<usize> {
+    ensure!(to.checked_add(rows).is_some_and(|end| end <= TARGET_TAP_ROWS),
+        "Kimi draft tap destination exceeds staging");
+    to.checked_mul(stride).and_then(|offset| offset.checked_mul(2))
+        .context("Kimi draft tap offset overflow")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subwave_taps_match_full_chunk_bytes() -> Result<()> {
+        let (rows, hidden, taps) = (4096, 7, 3);
+        let stride = taps * hidden;
+        let mut full = vec![0u8; rows * stride * 2];
+        let mut split = full.clone();
+        for tap in 0..taps {
+            let source = (0..rows * hidden * 2).map(|i| (i * 13 + tap) as u8).collect::<Vec<_>>();
+            for row in 0..rows {
+                let at = row * stride * 2 + tap * hidden * 2;
+                full[at..at + hidden * 2].copy_from_slice(&source[row * hidden * 2..(row + 1) * hidden * 2]);
+            }
+            for (first, count) in [(0, 1408), (1408, 1408), (2816, 1280)] {
+                let base = tap_offset(first, count, stride)?;
+                for row in 0..count {
+                    let at = base + row * stride * 2 + tap * hidden * 2;
+                    let from = (first + row) * hidden * 2;
+                    split[at..at + hidden * 2].copy_from_slice(&source[from..from + hidden * 2]);
+                }
+            }
+        }
+        assert_eq!(split, full);
+        assert!(tap_offset(4095, 2, stride).is_err());
+        assert!(tap_offset(usize::MAX, 1, stride).is_err());
+        Ok(())
+    }
 
     fn native_hosted_tail(dense: &[bool], csv: &str) -> Result<(usize, Vec<usize>)> {
         let hosted = csv.split(',').map(str::parse)

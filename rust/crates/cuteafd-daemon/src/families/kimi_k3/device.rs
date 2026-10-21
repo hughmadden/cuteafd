@@ -305,7 +305,7 @@ impl LaneLayout {
                     "Kimi allocated lane operand {name} differs from admitted extent/device");
                 Ok((*name, allocation))
             }).collect::<Result<BTreeMap<_, _>>>()?;
-        let lane = Lane { stream, operands, arena: Some(arena), layout: self.clone() };
+        let lane = Lane { stream, operands, arena: Some(arena), layout: self.clone(), window: None };
         lane.prime_attention()?;
         Ok(lane)
     }
@@ -318,6 +318,7 @@ pub(crate) struct Lane<'a> {
     operands: BTreeMap<&'static str, Allocation<'a>>,
     arena: Option<Allocation<'a>>,
     layout: LaneLayout,
+    window: Option<std::ops::Range<usize>>,
 }
 
 impl Drop for Lane<'_> {
@@ -328,17 +329,34 @@ impl Drop for Lane<'_> {
     }
 }
 
+fn subwave_extent(name: &str, bytes: usize, capacity: usize, window: &std::ops::Range<usize>)
+    -> Result<(usize, usize)> {
+    ensure!(capacity > 0 && bytes % capacity == 0 && window.start < window.end && window.end <= capacity,
+        "Kimi sub-wave operand {name} differs from admitted row layout");
+    let stride = bytes / capacity;
+    Ok((window.start * stride, window.len() * stride))
+}
+
 impl Lane<'_> {
     pub(crate) fn buffer(&self, name: &str) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
         if let Some(&offset) = self.layout.arena_offsets.get(name) {
             let arena = self.arena.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi lane arena absent"))?;
             return view(arena.buffer, offset, self.layout.operands[name]);
         }
-        self.operands.get(name).map(|allocation| allocation.buffer)
-            .ok_or_else(|| anyhow::anyhow!("unknown Kimi lane operand {name}"))
+        let buffer = self.operands.get(name).map(|allocation| allocation.buffer)
+            .ok_or_else(|| anyhow::anyhow!("unknown Kimi lane operand {name}"))?;
+        match &self.window {
+            Some(window) if !ATTENTION_METADATA.contains(&name) => {
+                let (offset, bytes) = subwave_extent(name, self.layout.operands[name], self.layout.rows, window)?;
+                view(buffer, offset, bytes)
+            }
+            _ => Ok(buffer),
+        }
     }
 
-    pub(crate) fn rows(&self) -> usize { self.layout.rows }
+    pub(crate) fn rows(&self) -> usize {
+        self.window.as_ref().map_or(self.layout.rows, |window| window.len())
+    }
 
     fn prime_attention(&self) -> Result<()> {
         for name in ATTENTION_METADATA {
@@ -533,10 +551,19 @@ impl<'a> LocalLane<'a> {
         })
     }
 
+    /// Views partition existing persistent row operands. Phase scratch and metadata
+    /// are reused only on this exact serialized stream; no allocation is added.
+    pub(crate) fn select_subwave(&mut self, window: Option<std::ops::Range<usize>>) -> Result<()> {
+        ensure!(window.as_ref().is_none_or(|w| w.start < w.end && w.end <= self.lane.layout.rows),
+            "Kimi sub-wave outside admitted storage");
+        self.lane.window = window;
+        Ok(())
+    }
+
     pub(crate) fn enable_replay(&mut self, enabled: bool) { self.replay_enabled = enabled; }
 
     fn replay(&mut self, rows: usize, op: super::graphs::Op) -> Result<bool> {
-        if !self.replay_enabled { return Ok(false); }
+        if !self.replay_enabled || self.lane.window.is_some() { return Ok(false); }
         let rank = self.rank;
         let key = super::graphs::Key { lane: self.lane_index, rank, rows, op };
         let stream = self.stream().clone();
@@ -999,6 +1026,31 @@ mod tests {
     }
 
     #[test]
+    fn subwave_views_partition_persistent_rows_and_preserve_residual_planes() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let layout = LaneLayout::new(&cfg, 4096, 1_048_576, NativeScratch { kda: 16, mla: [16; 3] })?;
+        let windows = crate::shared::prefill_pipeline::subwave_ranges(4096, 3, 64, 256)?;
+        for (&name, &bytes) in &layout.operands {
+            if layout.arena_offsets.contains_key(name) || ATTENTION_METADATA.contains(&name) { continue; }
+            let mut end = 0;
+            for window in &windows {
+                let (offset, len) = subwave_extent(name, bytes, layout.rows, window)?;
+                assert_eq!(offset, end, "{name} views overlap or leave a gap");
+                assert_eq!(offset % 16, 0, "{name} alignment");
+                if name == "residual arena" {
+                    let plane_bytes = window.len() * 7168 * 2;
+                    assert_eq!(len, 9 * plane_bytes);
+                    assert_eq!(offset + 8 * plane_bytes + plane_bytes, offset + len);
+                }
+                end = offset + len;
+            }
+            assert_eq!(end, bytes, "{name} admission extent changed");
+        }
+        assert!(subwave_extent("invalid", 4095, 4096, &(0..256)).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn attention_rows_keep_mla_shape_independent_of_sequence_partition() -> Result<()> {
         let mut pool = cuteafd_engine::prefix::RefPagePool::with_reserved(8, 64, 1);
         let a = pool.alloc(2)?;
@@ -1099,7 +1151,7 @@ mod tests {
         layout.arena_bytes = 0;
         let operands = device.run(|| layout.operands.iter().map(|(&name, &bytes)|
             Ok((name, Allocation::new(device, bytes)?))).collect::<Result<BTreeMap<_, _>>>())?;
-        let lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands, arena: None, layout };
+        let lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands, arena: None, layout, window: None };
         lane.prime_attention()?;
         let primed = fixture.events()?;
         assert_eq!(primed.matches('C').count(), 6);
@@ -1174,7 +1226,7 @@ mod tests {
             operands: BTreeMap::from([("delta", Allocation::new(device, 16)?)]),
             arena: Some(Allocation::new(device, 32)?),
             layout: LaneLayout { rows: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
-                arena_offsets: BTreeMap::new(), arena_bytes: 32 } };
+                arena_offsets: BTreeMap::new(), arena_bytes: 32 }, window: None };
         assert!(!fixture.events()?.contains('d'));
         drop(lane);
         let events = fixture.events()?;
