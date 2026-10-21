@@ -22,6 +22,7 @@ pub(crate) struct SparkAdmission {
     selection: WorkerSelection,
     assignments: Vec<SparkAssignment>,
     push_snapshot: Option<std::path::PathBuf>,
+    push_manifest: Option<String>,
 }
 
 impl SparkAdmission {
@@ -93,14 +94,15 @@ impl SparkAdmission {
                     .with_context(|| format!("Spark admission rank {rank} checkpoint assignment"))
             }).collect::<Result<Vec<_>>>()?
         };
-        let push_snapshot = if manifest.is_none() && catalog.is_some_and(|c| c.exl3().is_some() || c.fp8().is_some())
+        let push_snapshot = if catalog.is_some_and(|c| c.exl3().is_some() || c.fp8().is_some()
+            || (manifest.is_some() && c.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8))
             && !working.spark_layers.is_empty() && assignments.iter().all(|a| a.resident_bytes > 0)
             && topology.is_none_or(|t| t.tp() as usize == world)
             && cuteafd_loader::push_load::namespace(snapshot).is_ok() {
             Some(snapshot.to_path_buf())
         } else { None };
         let selection = if push_snapshot.is_some() { selection.with_push_weights() } else { selection };
-        Ok(Self { selection, assignments, push_snapshot })
+        Ok(Self { selection, assignments, push_snapshot, push_manifest: manifest.map(str::to_owned) })
     }
 
     fn reconcile(&self, reports: &[ModelAdmissionResponse]) -> Result<()> {
@@ -120,6 +122,7 @@ impl SparkAdmission {
         let pending = if let Some(snapshot) = self.push_snapshot.clone() {
             let assignments = self.assignments.clone();
             let layers = self.selection.layers();
+            let manifest = self.push_manifest.clone();
             let cancel = pending.cancellation_streams()?;
             AdmissionWait::Push(PushAdmissionDriver { cancel, thread: Some(std::thread::spawn(move || {
                 let mut pending = pending;
@@ -128,7 +131,9 @@ impl SparkAdmission {
                     let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
                     tracing::info!(elapsed_ms = started.elapsed().as_millis(),
                         "Spark push admission catalog opened");
-                    if catalog.exl3().is_some() {
+                    if let Some(manifest) = manifest.as_deref() {
+                        super::memory::push_exlr8::prepare(&snapshot, manifest, &layers, &assignments, offers)
+                    } else if catalog.exl3().is_some() {
                         super::memory::push_exl3::prepare(&snapshot, &catalog, &layers, &assignments, offers)
                     } else {
                         super::memory::push_fp8::prepare(&snapshot, &catalog, &assignments, offers)

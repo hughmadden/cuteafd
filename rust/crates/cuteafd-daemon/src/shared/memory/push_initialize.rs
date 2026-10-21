@@ -485,6 +485,27 @@ pub(crate) fn exlr8(
         }
         Ok(())
     })?;
+    // Match mount's unit checksums before publishing relocated descriptors.
+    let started = std::time::Instant::now();
+    let mut scratch = vec![0; residency.staging_bytes];
+    let mut checked_bytes = 0usize;
+    arena.device().run(|| {
+        for unit in &residency.loads {
+            let mut cursor = 0usize;
+            for (source, &offset) in unit.source.iter().zip(&unit.destination) {
+                let end = cursor.checked_add(source.bytes).context("EXLR8 checksum size overflow")?;
+                let output = scratch.get_mut(cursor..end).context("EXLR8 checksum scratch under-admitted")?;
+                arena.device().library.copy_d2h(output, sub(owner, offset, source.bytes)?)?;
+                cursor = end;
+            }
+            unit.verify_bytes(&scratch[..cursor])?;
+            checked_bytes = checked_bytes.checked_add(cursor).context("EXLR8 checksum total overflow")?;
+        }
+        Ok(())
+    })?;
+    tracing::info!(layer = residency.layer, rank = residency.rank, checked_bytes,
+        checksum_seconds = started.elapsed().as_secs_f64(),
+        "EXLR8 push post-Done checksums verified");
     let (pointers, bits) = residency.descriptors(owner.ptr as u64)?;
     ensure!(
         residency.resident_bytes <= owner.bytes,

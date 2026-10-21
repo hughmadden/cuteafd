@@ -7,6 +7,7 @@ mod routes;
 mod exlr8;
 mod push;
 mod push_fp8;
+mod push_exlr8;
 
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
@@ -135,7 +136,7 @@ fn load_weights<'a>(
         "coordinator selected experts before this checkpoint's routed boundary {first}");
     validate_topology(config, catalog)?;
     if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
-        return exlr8::load(library, catalog, config, modules.exlr8()?);
+        return exlr8::load(library, catalog, config, modules.exlr8()?, push);
     }
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config, push); }
     if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config, modules.take_fp8()?, push); }
