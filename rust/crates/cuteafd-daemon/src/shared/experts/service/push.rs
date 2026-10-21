@@ -42,6 +42,7 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
     checked: &cuteafd_loader::push_load::builder::CheckedPlan, budgets: &[ExpertLoadBudget],
     rank_id: usize, client: &PushClient, stream: &mut TcpStream, group: u64, token: u64,
 ) -> Result<Option<Vec<Exl3Weights<'a>>>> {
+    tracing::info!(group, rank = rank_id, "Spark push rank joining load group");
     let device = Device { library, id: library.cuda_get_device()? };
     let joined = (|| -> Result<_> {
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
@@ -61,10 +62,10 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
         plan.residencies.into_iter().zip(budgets).enumerate().map(|(region, (layout, &budget))|
             Exl3Weights::from_push(ready.clone(), region, layout, budget)).collect::<Result<Vec<_>>>()
     });
-    if let Err(error) = &candidate { tracing::info!(%error, "Spark push candidate rejected"); }
+    if let Err(error) = &candidate { tracing::info!(group, rank = rank_id, %error, "Spark push candidate rejected"); }
     if push::completed(stream, candidate.is_ok())? {
         let weights = candidate?;
-        tracing::info!(rank = rank_id, layers = weights.len(), "Spark EXL3 push committed; publishing ready rank arena");
+        tracing::info!(group, rank = rank_id, layers = weights.len(), "Spark EXL3 push committed; publishing ready rank arena");
         return Ok(Some(weights));
     }
     // Drop every rank-arena reference before the drained acknowledgment. The
@@ -72,6 +73,6 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
     drop(candidate);
     ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe mount retry");
     push::drained(stream)?;
-    tracing::info!(rank = rank_id, "whole Spark push group discarded; loading through mount");
+    tracing::info!(group, rank = rank_id, "whole Spark push group discarded; loading through mount");
     Ok(None)
 }
