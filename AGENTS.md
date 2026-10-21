@@ -153,7 +153,7 @@ before → after tables with conditions.
 - Host checks: `cargo check/test --workspace` from `rust/` with
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
-  (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
+  (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers "huggingface-hub>=2.2" jsonschema pyyaml pillow matplotlib safetensors);
   `scripts/dev/cpu-gate --task NAME --jobs N` runs both suites concurrently
   (or set `CUTEAFD_TEST_JOBS`; default half the logical CPUs). The gate uses
   nextest when present on PATH or in the persistent architecture Cargo home,
