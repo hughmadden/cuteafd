@@ -603,17 +603,26 @@ PYSTATE
 # the PROFILE comment in scripts/launch/run-family.sh.
 # release_profile_docker_args sets RELEASE_PROFILE_ARGS (docker environment and
 # mount arguments, for the coordinator and every Spark worker) in the caller's
-# shell, so a bad value stops the launch. Arguments: PROFILE PROFILE_DIR HOST.
+# shell, so a bad value stops the launch. Arguments: PROFILE PROFILE_DIR HOST
+# [PROFILE_SPARK].
 release_profile_switches='census transport-timing expert-timing expert-routes draft-timing nsys ncu'
 # nsys sessions are per container; the window is opened and closed with
 # `docker exec <coordinator> nsys start|stop --session=$RELEASE_NSYS_SESSION`.
 RELEASE_NSYS_SESSION=cuteafd-profile
 release_profile_docker_args() {
-  local profile="$1" dir="$2" host="$3" switch
+  local profile="$1" dir="$2" host="$3" spark="${4-}" switch
   local -a switches=()
   RELEASE_PROFILE_ARGS=()
+  if [[ -z "$profile" && -z "$spark" ]]; then
+    [[ -z "$dir" ]] || release_die "PROFILE_DIR needs PROFILE or PROFILE_SPARK"
+    return 0
+  fi
   if [[ -z "$profile" ]]; then
-    [[ -z "$dir" ]] || release_die "PROFILE_DIR needs PROFILE"
+    # PROFILE_SPARK alone: every container still gets the host name and the
+    # shared PROFILE_DIR mount (release_profile_spark_wrapper checks the rest).
+    [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE_SPARK=$spark needs an absolute PROFILE_DIR (the report goes there)"
+    [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid profile host: $host"
+    RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_PROFILE_HOST=$host" -v "$dir:$dir" -e "CUTEAFD_PROFILE_DIR=$dir")
     return 0
   fi
   [[ "$profile" =~ ^[a-z-]+(,[a-z-]+)*$ ]] ||
@@ -628,7 +637,7 @@ release_profile_docker_args() {
       expert-routes) [[ -n "$dir" ]] || release_die "PROFILE=expert-routes needs PROFILE_DIR (the route log goes there)"
         RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_ROUTES=1) ;;
       draft-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_DRAFT_TIMING=1) ;;
-      # Process wrappers (release_profile_wrapper), coordinator only.
+      # Process wrappers (release_profile_wrapper); Spark workers take PROFILE_SPARK.
       nsys|ncu) [[ -n "$dir" ]] || release_die "PROFILE=$switch needs PROFILE_DIR (the report goes there)" ;;
       *) release_die "unknown PROFILE switch $switch (known: ${release_profile_switches// /, })" ;;
     esac
@@ -743,11 +752,13 @@ release_profile_container_wrapper() {
 # ...`), and RELEASE_PROFILE_WRAPPER_DOCKER_ARGS (docker arguments before the
 # image: the profiler replaces the wrapper shell before serving, so `docker stop`
 # sends it SIGINT and waits up to 300 s for the report; the cuteafd.graceful-stop
-# label makes smoke teardown and release_stop_local_container use that stop
-# before removing), both empty unless PROFILE names nsys or ncu. Coordinator
-# only: a Spark worker asked to wrap fails closed (Spark workers still get the
-# environment switches from release_profile_docker_args). Call after that helper,
-# which has validated PROFILE and PROFILE_DIR.
+# label makes smoke teardown, release_stop_local_container and
+# release_stop_remote_containers use that stop before removing), both empty
+# unless PROFILE names nsys or ncu. This is the coordinator's wrapper: a Spark
+# role fails closed here (Spark workers take PROFILE_SPARK through
+# release_profile_spark_wrapper, and the environment switches from
+# release_profile_docker_args). Call after that helper, which has validated
+# PROFILE and PROFILE_DIR.
 # The profiler binary is not chosen here. The host install and the image install
 # differ (the dev image has ncu at /opt/nvidia/nsight-compute/<version>/ncu, which
 # may or may not be linked from /usr/local/bin/ncu). The wrapper command resolves
@@ -756,45 +767,110 @@ release_profile_container_wrapper() {
 # and SM activity): `all` samples every GPU the container sees (use this), or an
 # index list in nsys's own device order, which is not CUDA's or nvidia-smi's
 # (`nsys profile --gpu-metrics-devices=help` lists it).
-# Arguments: PROFILE PROFILE_DIR HOST ROLE NCU_KERNEL NCU_COUNT NCU_SET NSYS_GPU_METRICS.
+# PROFILE_NCU_SKIP=N skips the first N launches that match PROFILE_NCU_KERNEL
+# (`ncu --launch-skip`), so the replayed ones are past readiness.
+# Arguments: PROFILE PROFILE_DIR HOST ROLE NCU_KERNEL NCU_COUNT NCU_SET NSYS_GPU_METRICS NCU_SKIP.
 release_profile_wrapper() {
-  local profile="$1" dir="$2" host="$3" role="$4" kernel="${5:-}" count="${6:-}" set="${7:-}" metrics="${8:-}"
+  local profile="$1" dir="$2" host="$3" role="$4" kernel="${5:-}" count="${6:-}" set="${7:-}" metrics="${8:-}" skip="${9:-}"
   RELEASE_PROFILE_WRAPPER=() RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=()
   local wrapped=
   [[ ",$profile," == *,nsys,* ]] && wrapped=nsys
   [[ ",$profile," == *,ncu,* ]] && wrapped=ncu
   if [[ -z "$wrapped" ]]; then
-    [[ -z "$kernel$count$set" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET need PROFILE=ncu"
+    [[ -z "$kernel$count$set$skip" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET/SKIP need PROFILE=ncu"
     [[ -z "$metrics" ]] || release_die "PROFILE_NSYS_GPU_METRICS needs PROFILE=nsys"
     return 0
   fi
   [[ "$role" == coordinator ]] ||
-    release_die "PROFILE=$wrapped wraps the coordinator only; a Spark worker cannot run it (role $role)"
+    release_die "PROFILE=$wrapped wraps the coordinator only; a Spark worker takes PROFILE_SPARK (role $role)"
   [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE=$wrapped needs an absolute PROFILE_DIR"
   [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid profile host: $host"
+  _release_profile_tool_wrapper PROFILE "$wrapped" "$dir/$wrapped-$host" "$kernel" "$count" "$set" "$skip" "$metrics"
+}
+
+# Builds RELEASE_PROFILE_WRAPPER(_DOCKER_ARGS) for one container. KEY is the
+# setting family the messages name (PROFILE or PROFILE_SPARK); OUTPUT is the
+# report path without its suffix. Arguments: KEY TOOL OUTPUT NCU_KERNEL NCU_COUNT
+# NCU_SET NCU_SKIP NSYS_GPU_METRICS.
+_release_profile_tool_wrapper() {
+  local key="$1" tool="$2" output="$3" kernel="$4" count="$5" set="$6" skip="$7" metrics="$8"
   RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=(--stop-signal SIGINT --stop-timeout 300 --label cuteafd.graceful-stop=1)
-  if [[ "$wrapped" == nsys ]]; then
-    [[ -z "$kernel$count$set" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET need PROFILE=ncu"
+  if [[ "$tool" == nsys ]]; then
+    [[ -z "$kernel$count$set$skip" ]] || release_die "${key}_NCU_KERNEL/COUNT/SET/SKIP need $key=ncu"
     # Collection starts paused (nsys start/stop through docker exec open and
     # close the window); stopping the session or the container writes the report.
     release_profile_container_wrapper nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
       --sample=none --cpuctxsw=none --start-later=true "--session-new=$RELEASE_NSYS_SESSION" \
-      "--output=$dir/nsys-$host" --force-overwrite=true
+      "--output=$output" --force-overwrite=true
     if [[ -n "$metrics" ]]; then
       [[ "$metrics" == all || "$metrics" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
-        release_die "PROFILE_NSYS_GPU_METRICS must be all or an nsys GPU index list (e.g. 0 or 0,1)"
+        release_die "${key}_NSYS_GPU_METRICS must be all or an nsys GPU index list (e.g. 0 or 0,1)"
       RELEASE_PROFILE_WRAPPER+=("--gpu-metrics-devices=$metrics")
     fi
     return 0
   fi
-  [[ -z "$metrics" ]] || release_die "PROFILE_NSYS_GPU_METRICS needs PROFILE=nsys"
-  [[ -n "$kernel" ]] || release_die "PROFILE=ncu needs PROFILE_NCU_KERNEL (a kernel-name regex); it replays every matched launch"
-  [[ "$kernel" != *[[:space:]]* ]] || release_die "PROFILE_NCU_KERNEL must not contain whitespace"
-  count="${count:-20}" set="${set:-full}"
-  [[ "$count" =~ ^[1-9][0-9]{0,3}$ ]] || release_die "PROFILE_NCU_COUNT must be 1..9999"
-  [[ "$set" =~ ^[a-z_]+$ ]] || release_die "PROFILE_NCU_SET must be an ncu section set name (e.g. full, basic)"
-  release_profile_container_wrapper ncu --kernel-name "regex:$kernel" --launch-count "$count" --set "$set" \
-    --graph-profiling node --target-processes all --export "$dir/ncu-$host" --force-overwrite
+  [[ -z "$metrics" ]] || release_die "${key}_NSYS_GPU_METRICS needs $key=nsys"
+  [[ -n "$kernel" ]] || release_die "$key=ncu needs ${key}_NCU_KERNEL (a kernel-name regex); it replays every matched launch"
+  [[ "$kernel" != *[[:space:]]* ]] || release_die "${key}_NCU_KERNEL must not contain whitespace"
+  count="${count:-20}" set="${set:-full}" skip="${skip:-0}"
+  [[ "$count" =~ ^[1-9][0-9]{0,3}$ ]] || release_die "${key}_NCU_COUNT must be 1..9999"
+  [[ "$set" =~ ^[a-z_]+$ ]] || release_die "${key}_NCU_SET must be an ncu section set name (e.g. full, basic)"
+  [[ "$skip" =~ ^(0|[1-9][0-9]{0,8})$ ]] || release_die "${key}_NCU_SKIP must be 0..999999999 matched launches"
+  local -a skip_args=()
+  [[ "$skip" == 0 ]] || skip_args=(--launch-skip "$skip")
+  release_profile_container_wrapper ncu --kernel-name "regex:$kernel" ${skip_args[@]+"${skip_args[@]}"} \
+    --launch-count "$count" --set "$set" \
+    --graph-profiling node --target-processes all --export "$output" --force-overwrite
+}
+
+# PROFILE_SPARK=nsys|ncu wraps the expert worker of each Spark rank listed in
+# PROFILE_SPARK_RANKS (comma list, default 0: every profiled rank perturbs the
+# exchange) the way PROFILE wraps the coordinator, independently of it: same
+# in-container binary resolution, host user, no capabilities, graceful-stop
+# label. Reports are PROFILE_DIR/<tool>-HOST-rankR.<nsys-rep|ncu-rep> on the
+# Spark. nsys starts paused under session cuteafd-profile in the worker container
+# (`ssh HOST docker exec WORKER nsys start|stop --session=cuteafd-profile`);
+# PROFILE_SPARK_NSYS_GPU_METRICS samples the GB10 (all, or nsys's index list).
+# ncu replays PROFILE_SPARK_NCU_COUNT (default 20) launches matching the required
+# regex PROFILE_SPARK_NCU_KERNEL after skipping PROFILE_SPARK_NCU_SKIP matching
+# launches (default 0), collecting PROFILE_SPARK_NCU_SET (default full); its
+# report is written when the worker stops (`docker stop`, never `rm -f`).
+# Sets RELEASE_PROFILE_WRAPPER(_DOCKER_ARGS) for RANK, empty when RANK is not
+# selected; an empty RANK only validates. Every value is checked on every call,
+# so the first call stops a bad launch before any worker starts.
+# Arguments: PROFILE_SPARK RANKS PROFILE_DIR HOST RANK WORLD NCU_KERNEL NCU_COUNT
+# NCU_SET NCU_SKIP NSYS_GPU_METRICS.
+release_profile_spark_wrapper() {
+  local tool="$1" ranks="$2" dir="$3" host="$4" rank="$5" world="$6"
+  local kernel="${7:-}" count="${8:-}" set="${9:-}" skip="${10:-}" metrics="${11:-}" selected listed
+  local -a listed_ranks=()
+  local -A seen=()
+  RELEASE_PROFILE_WRAPPER=() RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=()
+  if [[ -z "$tool" ]]; then
+    [[ -z "$ranks$kernel$count$set$skip$metrics" ]] ||
+      release_die "PROFILE_SPARK_RANKS/NCU_*/NSYS_GPU_METRICS need PROFILE_SPARK"
+    return 0
+  fi
+  [[ "$tool" == nsys || "$tool" == ncu ]] || release_die "PROFILE_SPARK must be nsys or ncu"
+  [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE_SPARK=$tool needs an absolute PROFILE_DIR (the report goes there)"
+  [[ "$world" =~ ^[0-9]+$ ]] && ((world > 0)) || release_die "PROFILE_SPARK=$tool needs Spark expert workers (SPARK_COUNT=$world)"
+  ranks="${ranks:-0}"
+  [[ "$ranks" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]] || release_die "PROFILE_SPARK_RANKS must be a comma list of Spark ranks (e.g. 0 or 0,3)"
+  IFS=, read -ra listed_ranks <<<"$ranks"
+  selected=0
+  for listed in "${listed_ranks[@]}"; do
+    [[ "$listed" == 0 || "$listed" != 0* ]] || release_die "PROFILE_SPARK_RANKS must be a comma list of Spark ranks (e.g. 0 or 0,3)"
+    ((10#$listed < world)) || release_die "PROFILE_SPARK_RANKS names rank $listed; this launch has ranks 0..$((world - 1))"
+    [[ -z "${seen[$listed]:-}" ]] || release_die "PROFILE_SPARK_RANKS lists rank $listed twice"
+    seen[$listed]=1
+    [[ "$listed" != "$rank" ]] || selected=1
+  done
+  # Validate the tool's own settings even when this rank is not profiled.
+  _release_profile_tool_wrapper PROFILE_SPARK "$tool" "$dir/$tool-x" "$kernel" "$count" "$set" "$skip" "$metrics"
+  RELEASE_PROFILE_WRAPPER=() RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=()
+  ((selected)) || return 0
+  [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid profile host: $host"
+  _release_profile_tool_wrapper PROFILE_SPARK "$tool" "$dir/$tool-$host-rank$rank" "$kernel" "$count" "$set" "$skip" "$metrics"
 }
 
 # Shared key grammar for release lifecycle scripts and the family launcher.
@@ -824,7 +900,8 @@ release_known_key() {
     GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
     NATIVE_K6) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
-    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NSYS_GPU_METRICS|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
+    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
+    PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
@@ -1067,7 +1144,15 @@ release_load_config() {
   PROFILE_NCU_KERNEL=
   PROFILE_NCU_COUNT=
   PROFILE_NCU_SET=
+  PROFILE_NCU_SKIP=
   PROFILE_NSYS_GPU_METRICS=
+  PROFILE_SPARK=
+  PROFILE_SPARK_RANKS=
+  PROFILE_SPARK_NCU_KERNEL=
+  PROFILE_SPARK_NCU_COUNT=
+  PROFILE_SPARK_NCU_SET=
+  PROFILE_SPARK_NCU_SKIP=
+  PROFILE_SPARK_NSYS_GPU_METRICS=
   PROFILE_EXPERT_INPUT_SAMPLE=
   PROFILE_EXPERT_ROUTE_WEIGHTS=
   ADDR=0.0.0.0:8000
@@ -1671,7 +1756,12 @@ for container in "$@"; do
   fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "$container")" == true ]]; then
     echo "  $host: stopping $container"
-    docker stop -t 30 "$container" >/dev/null
+    # A profiled worker (PROFILE_SPARK) keeps its own stop signal and timeout.
+    if [[ "$(docker inspect -f '{{index .Config.Labels "cuteafd.graceful-stop"}}' "$container")" == 1 ]]; then
+      docker stop "$container" >/dev/null
+    else
+      docker stop -t 30 "$container" >/dev/null
+    fi
   else
     echo "  $host: removing stopped $container"
   fi
