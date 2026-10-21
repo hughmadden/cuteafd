@@ -252,7 +252,7 @@ mod tests {
             256 * 16 * 3 * (3 * 8 + 4) * 2 + 256 * 17 * 8);
         // Each bank must drain its previous DMA before readers overwrite it;
         // the final drain precedes returning the arena and dropping both banks.
-        let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
+        let source = include_str!("exlr8.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let reuse = source.find("library.cuda_stream_synchronize(streams[bank].raw)").unwrap();
         let readers = source.find("unit.read_verified(bytes)").unwrap();
         let upload = source.find("library.copy_host_buffer_h2d_async(").unwrap();

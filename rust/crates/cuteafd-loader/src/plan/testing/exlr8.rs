@@ -148,4 +148,3 @@ pub fn fixture(root: &Path, padded: bool) {
         tensors,
     );
 }
-
