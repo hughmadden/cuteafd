@@ -524,3 +524,29 @@ fn sparknest_model_two_ranks_on_one_host_stall_under_the_shared_budget() {
     // One rank per host (the Spark-only groups) completes under today's policy.
     assert!(run(Policy::ReleasingRank, &[0, 1], 128, 64, &streams));
 }
+
+/// The 1-RTX GLM Flash pair's shape: one coordinator rank on its own host,
+/// its dense tensors spread over every source and interleaved with two Spark
+/// ranks' expert files in each source's plan order. Group ...669 stalled in
+/// production in this shape, but this simple model does NOT reproduce that
+/// stall under today's policy (one rank per host completes here), so the real
+/// cause involves behaviour the model omits; only the floor's completion is
+/// pinned here.
+#[test]
+fn sparknest_model_one_coordinator_rank_beside_spark_ranks() {
+    use sparknest_credit_model::{run, Policy};
+    // Six sources; ranks 0 and 1 are Sparks (heavy), rank 2 the coordinator
+    // (a short run of dense rows between each Spark tensor's runs).
+    let streams: Vec<Vec<usize>> = (0..6).map(|s| {
+        let mut v = Vec::new();
+        for block in 0..40 {
+            v.extend(std::iter::repeat_n(0, 24 + (block + s) % 5));
+            v.extend(std::iter::repeat_n(2, 1 + (block + 2 * s) % 3));
+            v.extend(std::iter::repeat_n(1, 24 + (block + 3 * s) % 5));
+        }
+        v
+    }).collect();
+    let hosts = [0, 1, 2];
+    assert!(run(Policy::SourceFloor, &hosts, 128, 64, &streams),
+        "a per-(source, rank) credit floor outside the shared budget must complete");
+}

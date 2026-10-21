@@ -1881,6 +1881,8 @@ impl Opened {
                         Err(error) => (None, Err(error)),
                     };
                     let catalog = self.experts.as_ref().filter(|_| !tp2_layers.is_empty());
+                    // Receive (or fallback fill) through landing: the dense load's wall time.
+                    let split = crate::shared::memory::load_timing::Split::start();
                     let (pushed, embedding) = push.receive_with(devices, catalog, sparks, Some(dense), || {
                         crate::shared::token_io::TokenEmbedding::load(&self.library, embed, args.token_io.embed_placement,
                             || Ok(()))
@@ -1895,6 +1897,7 @@ impl Opened {
                                 crate::shared::experts::rtx::dense::fill_by_mount(&self.library, &operands, &steps,
                                     rank_stream)?;
                             }
+                            split.log(if pushed.is_some() { "glm5_flash dense push" } else { "glm5_flash dense mount fill" });
                             tracing::info!(pushed = pushed.is_some(), operands = operands.len(), steps = steps.len(),
                                 "GLM Flash coordinator dense operands landed");
                             model

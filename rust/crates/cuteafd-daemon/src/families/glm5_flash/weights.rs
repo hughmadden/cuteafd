@@ -1241,7 +1241,7 @@ impl<'a> GlmfLoader<'a> {
         crate::shared::memory::staging::release_staging();
         // The pinned GPU-quantization source and tables live only for the load.
         drop(self.dense.mount.borrow_mut().take());
-        split.log("glm5_flash dense");
+        split.log(if self.dense.pushing() { "glm5_flash dense planning" } else { "glm5_flash dense" });
         Ok((weights, shares.collect()))
     }
 }
