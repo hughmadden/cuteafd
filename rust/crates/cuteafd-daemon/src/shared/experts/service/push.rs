@@ -6,7 +6,7 @@ use crate::shared::{experts::{exl3::Exl3Weights, layer::ExpertLoadBudget}, memor
     device::Device, push_consumer, push_exl3::RankPlan, push_initialize,
     weight_arena::{ExpectedCoverage, LoadingArena},
 }};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{push_ring::{RegisteredRing, DEFAULT_SLOT_BYTES, DEFAULT_SLOTS}, NativeLibrary};
 use cuteafd_loader::{push_load::{JoinArgs, PushClient}, OfficialV41Catalog};
 use cuteafd_transport::worker_selection::push::{self, Offer};
@@ -22,11 +22,16 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         let checked = plan.checked(catalog, &root, config.world, config.rank)?;
         ensure!(checked.plan.files.iter().all(|file| cuteafd_loader::push_load::is_push_shard(&root.join(file))),
             "push source is not a SparkNest shard");
-        // Do not exceed the already admitted mount loader's transient host peaks.
-        let pinned = budgets.iter().map(|b| b.pinned_host_bytes).max().unwrap_or(0);
         let host_budget = budgets.iter().map(|b| b.read_scratch_bytes).max().unwrap_or(0);
-        ensure!(DEFAULT_SLOTS * DEFAULT_SLOT_BYTES <= pinned && plan.validation.bytes() <= host_budget,
-            "push ring or validation exceeds existing mount admission");
+        let available = library.cuda_allocatable_memory_info()
+            .context("query Spark push allocatable memory for admission")?.0;
+        let headroom = super::spark_runtime_headroom()?;
+        let peak = admit_peak(plan.layout.bytes(), plan.validation.bytes(), host_budget,
+            headroom, available)?;
+        tracing::info!(rank = config.rank, resident_bytes = plan.layout.bytes(),
+            ring_bytes = DEFAULT_SLOTS * DEFAULT_SLOT_BYTES, validation_bytes = plan.validation.bytes(),
+            headroom_bytes = headroom, load_peak_bytes = peak, available_bytes = available,
+            "Spark push admitted independent ring and validation host memory");
         let offer = Offer { rank: config.rank, host, arena_bytes: plan.layout.logical_bytes() as u64,
             placement: plan.placement.clone() };
         Ok((plan, checked, offer))
@@ -36,6 +41,21 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     let Some((group, token)) = credentials else { return Ok(None); };
     let (plan, checked, _) = planned?;
     receive(library, plan, &checked, budgets, config.rank, &PushClient::default(), stream, group, token)
+}
+
+// Push and mount are alternative loaders. Charge the actual push transient,
+// not the mount loader's pinned staging, against the unified host/device pool.
+fn admit_peak(resident: usize, validation: usize, validation_budget: usize,
+    headroom: usize, available: usize) -> Result<usize> {
+    ensure!(validation <= validation_budget, "push validation exceeds admitted read scratch");
+    let peak = DEFAULT_SLOTS.checked_mul(DEFAULT_SLOT_BYTES)
+        .and_then(|ring| resident.checked_add(ring))
+        .and_then(|bytes| bytes.checked_add(validation))
+        .and_then(|bytes| bytes.checked_add(headroom))
+        .context("Spark push load peak overflow")?;
+    ensure!(peak <= available,
+        "Spark push needs {peak} bytes at load but only {available} bytes are available");
+    Ok(peak)
 }
 
 fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,

@@ -5,6 +5,61 @@ use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
     push_load::{builder::Builder, proto::{Event, Request}, slot, Listener}};
 use std::{fs::File, os::unix::fs::FileExt, time::Duration};
 
+#[test]
+fn independent_ring_peak_rejects_short_memory_validation_and_overflow() -> Result<()> {
+    let ring = DEFAULT_SLOTS * DEFAULT_SLOT_BYTES;
+    let peak = 4096 + ring + 128 + 1024;
+    assert_eq!(admit_peak(4096, 128, 128, 1024, peak)?, peak);
+    assert!(admit_peak(4096, 128, 128, 1024, peak - 1).is_err());
+    assert!(admit_peak(4096, 128, 127, 1024, peak).is_err());
+    assert!(admit_peak(usize::MAX, 0, 0, 0, usize::MAX).is_err());
+    assert!(admit_peak(0, usize::MAX, usize::MAX, 0, usize::MAX).is_err());
+    assert!(admit_peak(0, 0, 0, usize::MAX, usize::MAX).is_err());
+    Ok(())
+}
+
+fn installed_tp6_admission() -> Result<usize> {
+    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_PUSH_EXL3")
+        .context("set CUTEAFD_PUSH_EXL3 to the installed EXL3 snapshot")?);
+    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+    let shape = catalog.routed_experts();
+    let layers: Vec<_> = (shape.first_layer..shape.layers).collect();
+    let mut largest_pinned = 0;
+    for rank in 0..6 {
+        let budgets = layers.iter().map(|&layer| Exl3Weights::plan(&catalog,
+            crate::shared::experts::layer::ExpertLayer::BackboneExl3Tp { layer, rank, world: 6 }))
+            .collect::<Result<Vec<_>>>()?;
+        let resident = budgets.iter().map(|budget| budget.resident_bytes).sum();
+        let pinned = budgets.iter().map(|budget| budget.pinned_host_bytes).max().unwrap();
+        let scratch = budgets.iter().map(|budget| budget.read_scratch_bytes).max().unwrap();
+        let plan = RankPlan::new(&catalog, &layers, 6, rank, resident)?;
+        let headroom = usize::try_from(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES)?;
+        let peak = plan.layout.bytes() + DEFAULT_SLOTS * DEFAULT_SLOT_BYTES + plan.validation.bytes() + headroom;
+        assert_eq!(admit_peak(plan.layout.bytes(), plan.validation.bytes(), scratch, headroom, peak)?, peak);
+        assert!(admit_peak(plan.layout.bytes(), plan.validation.bytes(), scratch, headroom, peak - 1).is_err());
+        eprintln!("EXL3 TP6 rank {rank}: resident={resident}, mount_pinned={pinned}, push_ring={}, validation={}, push_peak={peak}",
+            DEFAULT_SLOTS * DEFAULT_SLOT_BYTES, plan.validation.bytes());
+        largest_pinned = largest_pinned.max(pinned);
+    }
+    Ok(largest_pinned)
+}
+
+#[test]
+#[ignore = "requires an installed EXL3 checkpoint selected by CUTEAFD_PUSH_EXL3"]
+fn installed_exl3_tp6_admits_ring_independently_from_mount_staging() -> Result<()> {
+    installed_tp6_admission()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires installed GLM K4 headers selected by CUTEAFD_PUSH_EXL3"]
+fn installed_glm_k4_tp6_admits_ring_larger_than_mount_staging() -> Result<()> {
+    let pinned = installed_tp6_admission()?;
+    assert_eq!(pinned, 114_499_584, "select the GLM K4 checkpoint headers");
+    assert!(pinned < DEFAULT_SLOTS * DEFAULT_SLOT_BYTES);
+    Ok(())
+}
+
 fn control_pair() -> Result<(TcpStream, TcpStream)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let client = TcpStream::connect(listener.local_addr()?)?;
