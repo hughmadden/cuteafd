@@ -88,7 +88,7 @@ impl VocabularyPlan {
                     .checked_add(bytes as u64)
                     .context("native vocabulary file extent overflow")?;
             }
-            // Validate the complete checksum partition even on the non-owning rank.
+            // Validate the complete native partition even on the non-owning rank.
             record.slice(0, vocabulary)?;
             selected.push(record.clone());
         }
@@ -200,7 +200,7 @@ impl<'a> NativeVocabulary<'a> {
     }
 }
 
-/// Source order is payload then scales. Verify the whole block before any upload.
+/// Source order is payload then scales. Read the whole block before any upload.
 /// The callback is blocking, so staging is reusable and partial owners can drop safely.
 fn stream_rows(
     slice: &DenseSlice,
@@ -215,11 +215,11 @@ fn stream_rows(
     for (index, unit) in slice.units.iter().enumerate() {
         ensure!(
             unit.block == index && unit.source.len() == 2,
-            "native vocabulary checksum order"
+            "native vocabulary block order"
         );
         let bytes = unit.staging_bytes()?;
         ensure!(bytes <= staging.len(), "native vocabulary staging extent");
-        unit.read_verified(&mut staging[..bytes])?;
+        unit.read(&mut staging[..bytes])?;
         let mut at = 0;
         for (i, source) in unit.source.iter().enumerate() {
             let component = &slice.components[i].source;
@@ -300,8 +300,6 @@ mod tests {
         let scales = vec![37; n * 4];
         let path = root.join(name);
         std::fs::write(&path, [&payload[..], &scales[..]].concat()).unwrap();
-        // Independent XXH64(seed=0) fixtures, payload then F32 scale bytes per 128 rows.
-        let checksums = vec![11568522690785905222, 4674914931189703081];
         DenseRecord {
             tensor: name.into(),
             encoding: DenseEncoding::RowFp8,
@@ -311,6 +309,7 @@ mod tests {
             rotation_id: 0,
             rotation: None,
             hessian_solved: false,
+            native_blocks: n.div_ceil(128),
             components: vec![
                 DenseComponent {
                     suffix: "fp8".into(),
@@ -333,7 +332,6 @@ mod tests {
                     },
                 },
             ],
-            checksums,
         }
     }
 
@@ -372,11 +370,11 @@ mod tests {
     }
 
     #[test]
-    fn native_vocabulary_rejects_corruption_before_block_publication() -> Result<()> {
+    fn native_vocabulary_rejects_bad_block_order_before_publication() -> Result<()> {
         let root = tempfile::tempdir()?;
         let record = record(root.path(), EMBEDDING);
         let mut slice = record.slice(0, 256)?;
-        slice.units[0].checksum ^= 1;
+        slice.units[0].block = 1;
         let mut published = 0;
         assert!(
             stream_rows(&slice, &mut vec![0; 1536], |_, _, _| {
@@ -419,6 +417,7 @@ mod tests {
             let mut item = record(root.path(), "small-fixture");
             item.tensor = name.into();
             item.shape = vec![N, K];
+            item.native_blocks = N / 128;
             item.components[0].shape = vec![N, K];
             item.components[0].source = DenseRange {
                 path: path.clone(),
@@ -431,7 +430,6 @@ mod tests {
                 offset: (N * K) as u64,
                 bytes: N * 4,
             };
-            item.checksums = vec![15457107923344197484; N / 128];
             records.push(item);
         }
         // SAFETY: the sealed runner supplies this engine's pinned native library.
@@ -529,7 +527,7 @@ mod tests {
                 2 => bad[0].side = ShardSide::Input,
                 3 => bad[0].components[1].dtype = "F16".into(),
                 4 => bad[0].components[0].source.bytes -= 1,
-                5 => bad[0].checksums.pop().map(|_| ()).unwrap(),
+                5 => bad[0].native_blocks -= 1,
                 _ => bad[0].components.swap(0, 1),
             }
             assert!(

@@ -49,7 +49,8 @@ pub(super) struct Worker<'w, 'a> {
 }
 
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
-    config: &NativeExpertServiceConfig, programs: &'a Programs<'a>)
+    config: &NativeExpertServiceConfig, programs: &'a Programs<'a>,
+    push: Option<&mut std::net::TcpStream>)
     -> Result<(backend::Weights<'a>, usize)> {
     let manifest = config.exlr8_manifest.as_deref().context("EXLR8 worker requires a manifest")?;
     let model = config.model_admission.as_ref().context("EXLR8 requires model admission")?;
@@ -82,6 +83,12 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         "EXLR8 admission exceeds budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
+    if let Some(stream) = push {
+        if let Some(weights) = super::push_exlr8::load(library, config, &plans, &budgets,
+            resident, workspace, retained_host, descriptors, stream)? {
+            return Ok((backend::Weights::Exlr8(weights), config.device_budget - resident - retained_host));
+        }
+    }
     let mut plans: Vec<_> = plans.into_iter().map(Some).collect();
     let mut remaining = config.device_budget;
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, _| {

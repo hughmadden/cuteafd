@@ -146,16 +146,6 @@ impl Exlr8Descriptors {
     }
 }
 
-/// ADR-063 deliberately omits EXLR8 per-unit checksums on delivered push bytes.
-/// Mount still calls Unit::read_verified; this mode never performs mount reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Exlr8Integrity {
-    PushCheckedPlanNoUnitHash,
-}
-pub(crate) fn exlr8_push_integrity() -> Exlr8Integrity {
-    Exlr8Integrity::PushCheckedPlanNoUnitHash
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,10 +365,6 @@ mod tests {
             }
             assert_eq!(addresses.len(), if nvfp4 { 8 } else { 4 });
         }
-        assert_eq!(
-            exlr8_push_integrity(),
-            Exlr8Integrity::PushCheckedPlanNoUnitHash
-        );
         Ok(())
     }
 }

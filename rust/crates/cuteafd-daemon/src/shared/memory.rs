@@ -36,6 +36,8 @@ pub(crate) mod push_consumer;
 pub(crate) mod push_initialize;
 #[path = "memory/push_exl3.rs"]
 pub(crate) mod push_exl3;
+#[path = "memory/push_exlr8.rs"]
+pub(crate) mod push_exlr8;
 #[path = "memory/push_fp8.rs"]
 pub(crate) mod push_fp8;
 
