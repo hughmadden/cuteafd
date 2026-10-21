@@ -196,9 +196,17 @@ PROFILE_DIR
 PROFILE_NCU_KERNEL
 PROFILE_NCU_COUNT
 PROFILE_NCU_SET
+PROFILE_NCU_SKIP
 PROFILE_NSYS_GPU_METRICS
 PROFILE_EXPERT_INPUT_SAMPLE
 PROFILE_EXPERT_ROUTE_WEIGHTS
+PROFILE_SPARK
+PROFILE_SPARK_RANKS
+PROFILE_SPARK_NCU_KERNEL
+PROFILE_SPARK_NCU_COUNT
+PROFILE_SPARK_NCU_SET
+PROFILE_SPARK_NCU_SKIP
+PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' RTX_EXPERT_LAYERS NATIVE_K6
     [[ "$1" != step5 ]] || echo SPECULATOR_DEPTH
@@ -237,9 +245,17 @@ PROFILE_DIR
 PROFILE_NCU_KERNEL
 PROFILE_NCU_COUNT
 PROFILE_NCU_SET
+PROFILE_NCU_SKIP
 PROFILE_NSYS_GPU_METRICS
 PROFILE_EXPERT_INPUT_SAMPLE
 PROFILE_EXPERT_ROUTE_WEIGHTS
+PROFILE_SPARK
+PROFILE_SPARK_RANKS
+PROFILE_SPARK_NCU_KERNEL
+PROFILE_SPARK_NCU_COUNT
+PROFILE_SPARK_NCU_SET
+PROFILE_SPARK_NCU_SKIP
+PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
   _spark_slot_keys HOST LANE_A
   case "$1" in
@@ -411,7 +427,15 @@ PROFILE_EXPERT_ROUTE_WEIGHTS
 PROFILE_NCU_COUNT
 PROFILE_NCU_KERNEL
 PROFILE_NCU_SET
+PROFILE_NCU_SKIP
 PROFILE_NSYS_GPU_METRICS
+PROFILE_SPARK
+PROFILE_SPARK_RANKS
+PROFILE_SPARK_NCU_KERNEL
+PROFILE_SPARK_NCU_COUNT
+PROFILE_SPARK_NCU_SET
+PROFILE_SPARK_NCU_SKIP
+PROFILE_SPARK_NSYS_GPU_METRICS
 RDMA_BOND_BALANCE
 RTX_EXPERT_LAYERS
 RTX_GPUS
@@ -616,15 +640,33 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 #                     PROFILE_NSYS_GPU_METRICS=all also samples every GPU's clocks,
 #                     power and DRAM/SM activity into the same report (an index
 #                     list uses nsys's device order, not CUDA's).
-#   ncu               the coordinator runs under `ncu`, replaying the first
-#                     PROFILE_NCU_COUNT (default 20) launches whose name matches the
-#                     required regex PROFILE_NCU_KERNEL, collecting section set
-#                     PROFILE_NCU_SET (default full), into PROFILE_DIR/ncu-HOST.ncu-rep,
-#                     written when the coordinator stops (`docker stop`). There is
-#                     no window: the first matches are usually during readiness.
-#                     For steady-state kernels, use the native harnesses.
-# nsys and ncu wrap the coordinator only (one of them per launch); Spark workers
-# get the other switches. Both run as the host user; they need the driver's
+#   ncu               the coordinator runs under `ncu`, replaying PROFILE_NCU_COUNT
+#                     (default 20) launches whose name matches the required regex
+#                     PROFILE_NCU_KERNEL after skipping the first PROFILE_NCU_SKIP
+#                     matching launches (default 0; `ncu --launch-skip`, so the
+#                     replayed ones are steady-state serving, not readiness),
+#                     collecting section set PROFILE_NCU_SET (default full), into
+#                     PROFILE_DIR/ncu-HOST.ncu-rep, written when the coordinator
+#                     stops (`docker stop`).
+# nsys and ncu wrap the coordinator (one of them per launch); Spark workers get
+# the other switches. PROFILE_SPARK=nsys|ncu wraps Spark expert workers the same
+# way, independently of PROFILE (coordinator and Sparks in one launch, or either
+# alone; it needs PROFILE_DIR too):
+#   PROFILE_SPARK_RANKS  comma list of the wrapped Spark ranks (default 0: every
+#                     profiled rank perturbs the exchange timing).
+#   nsys              paused under session cuteafd-profile in each wrapped worker;
+#                     wip-cards opens and closes it with the coordinator's window
+#                     (`ssh HOST docker exec WORKER nsys start|stop --session=...`).
+#                     PROFILE_SPARK_NSYS_GPU_METRICS=all samples the GB10's metrics.
+#                     Report: PROFILE_DIR/nsys-HOST-rankR.nsys-rep on that Spark.
+#   ncu               PROFILE_SPARK_NCU_KERNEL (required regex), PROFILE_SPARK_NCU_COUNT
+#                     (default 20), PROFILE_SPARK_NCU_SKIP (default 0) and
+#                     PROFILE_SPARK_NCU_SET (default full), as for the coordinator.
+#                     Report: PROFILE_DIR/ncu-HOST-rankR.ncu-rep, written when the
+#                     worker stops (`docker stop`, never `docker rm -f`).
+# A wrapped container carries the cuteafd.graceful-stop label (SIGINT, 300 s), so
+# ./stop.sh and smoke teardown stop it gracefully before removing it. Both
+# profilers run as the host user; they need the driver's
 # RmProfilingAdminOnly=0 and no extra capabilities. The binary is resolved inside
 # the container at start, not from the host's install: /usr/local/bin/<tool> if
 # it is there, otherwise the newest versioned copy (ncu under
@@ -635,15 +677,24 @@ done < <(compgen -e CUTEAFD_DIAG_ | sort)
 # at the same path and passed as CUTEAFD_PROFILE_DIR; writers name files by host
 # and rank. wip-cards owns PROFILE_DIR and copies Spark files back.
 shared_profile_args() {
-release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)"
+release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" "$(get PROFILE_SPARK)"
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
 release_profile_sample_args "$(get PROFILE)" "$(get PROFILE_EXPERT_INPUT_SAMPLE)" "$(get PROFILE_EXPERT_ROUTE_WEIGHTS)"
 profile_args+=(${RELEASE_PROFILE_SAMPLE_ARGS[@]+"${RELEASE_PROFILE_SAMPLE_ARGS[@]}"})
 release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator \
-  "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)" "$(get PROFILE_NSYS_GPU_METRICS)"
+  "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)" "$(get PROFILE_NSYS_GPU_METRICS)" "$(get PROFILE_NCU_SKIP)"
 profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})
 profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}"})
 [[ -z "$(get PROFILE_DIR)" ]] || { mkdir -p "$(get PROFILE_DIR)"; release_require_writable_state "$(get PROFILE_DIR)"; }
+}
+# Sets spark_profile_wrapper and spark_profile_wrapper_args for one Spark rank
+# (empty unless PROFILE_SPARK selects it). Arguments: HOST RANK WORLD.
+spark_profile_wrapper_for() {
+release_profile_spark_wrapper "$(get PROFILE_SPARK)" "$(get PROFILE_SPARK_RANKS)" "$(get PROFILE_DIR)" "$1" "$2" "$3" \
+  "$(get PROFILE_SPARK_NCU_KERNEL)" "$(get PROFILE_SPARK_NCU_COUNT)" "$(get PROFILE_SPARK_NCU_SET)" \
+  "$(get PROFILE_SPARK_NCU_SKIP)" "$(get PROFILE_SPARK_NSYS_GPU_METRICS)"
+spark_profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})
+spark_profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}"})
 }
 shared_graph_census_args() {
 graph_census_args=()
@@ -1364,9 +1415,16 @@ for i in "${!hosts[@]}"; do
     remote_args+=("$encoder_rank" "$encoder_port" "$encoder_hash" "$RELEASE_MODEL_REVISION")
   fi
   # Docker options for this worker follow a sentinel, after every positional argument:
-  # PROFILE switches (absent unless set) and the shared worker environment.
-  release_profile_docker_args "${PROFILE:-}" "${PROFILE_DIR:-}" "$host"
+  # PROFILE switches (absent unless set), the shared worker environment and a
+  # PROFILE_SPARK rank's stop options; its profiler argv follows --profile-wrapper.
+  release_profile_docker_args "${PROFILE:-}" "${PROFILE_DIR:-}" "$host" "${PROFILE_SPARK:-}"
   remote_args+=(--profile-args ${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"} "${shared_worker_env_args[@]}")
+  release_profile_spark_wrapper "${PROFILE_SPARK:-}" "${PROFILE_SPARK_RANKS:-}" "${PROFILE_DIR:-}" "$host" "$i" "$SPARK_COUNT" \
+    "${PROFILE_SPARK_NCU_KERNEL:-}" "${PROFILE_SPARK_NCU_COUNT:-}" "${PROFILE_SPARK_NCU_SET:-}" \
+    "${PROFILE_SPARK_NCU_SKIP:-}" "${PROFILE_SPARK_NSYS_GPU_METRICS:-}"
+  if ((${#RELEASE_PROFILE_WRAPPER[@]})); then
+    remote_args+=("${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}" --profile-wrapper "${RELEASE_PROFILE_WRAPPER[@]}")
+  fi
   release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args; CUTEAFD_NAMESPACE_ROOT=$(printf %q "$namespace_root") bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 namespace_root="${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}"
@@ -1396,9 +1454,16 @@ if [[ "$wip_slot" != __none__ ]]; then
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
     --entrypoint /opt/cuteafd/share/release-entrypoint.sh)
 fi
-profile_args=()
+profile_args=() profile_wrapper=()
 for ((profile_at = 1; profile_at <= $#; profile_at++)); do
   [[ "${!profile_at}" != --profile-args ]] || { profile_args=("${@:profile_at+1}"); break; }
+done
+for ((profile_at = 0; profile_at < ${#profile_args[@]}; profile_at++)); do
+  if [[ "${profile_args[profile_at]}" == --profile-wrapper ]]; then
+    profile_wrapper=("${profile_args[@]:profile_at+1}")
+    profile_args=("${profile_args[@]:0:profile_at}")
+    break
+  fi
 done
 for ((profile_at = 0; profile_at + 1 < ${#profile_args[@]}; profile_at++)); do
   [[ "${profile_args[profile_at]}" != -v ]] || { mkdir -p "${profile_args[profile_at+1]%%:*}"; release_require_writable_state "${profile_args[profile_at+1]%%:*}"; }
@@ -1414,7 +1479,7 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # positional argument, so the worker argument contract is unchanged.
 release_serving_docker_args
 cuteafd_cdi_gpu_args all || exit 2
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$namespace_root:$namespace_root:ro" "$image" cuteafd expertd-native --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$namespace_root:$namespace_root:ro" "$image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd expertd-native --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done
@@ -2807,14 +2872,17 @@ for ((rank = 0; rank < ranks; rank++)); do
       encoder_args+=" --audio-encoder --audio-encoder-listen 0.0.0.0:$audio_encoder_port --audio-encoder-plan-hash $audio_encoder_hash --audio-encoder-revision $revision"
     fi
   done
-  release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$host"
-  worker_profile="" worker_prep=""
+  release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$host" "$(get PROFILE_SPARK)"
+  spark_profile_wrapper_for "$host" "$rank" "$ranks"
+  RELEASE_PROFILE_ARGS+=(${spark_profile_wrapper_args[@]+"${spark_profile_wrapper_args[@]}"})
+  worker_profile="" worker_prep="" worker_wrapper=""
   ((${#RELEASE_PROFILE_ARGS[@]} == 0)) || worker_profile=" $(printf '%q ' "${RELEASE_PROFILE_ARGS[@]}")"
+  ((${#spark_profile_wrapper[@]} == 0)) || worker_wrapper="$(printf '%q ' "${spark_profile_wrapper[@]}")"
   [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && release_require_writable_state $(printf '%q' "$(get PROFILE_DIR)") && "
   ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no \"\${CUTEAFD_CDI_ARGS[@]}\" --network host \
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info $(printf '%q ' "${shared_worker_env_args[@]}")$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
     -v $(printf %q "$namespace_root:$namespace_root:ro") '$spark_image' \
-    cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
+    ${worker_wrapper}cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --device-budget-bytes $budget $spark_worker_args \
     --listen 0.0.0.0:$port $encoder_args >/dev/null" &
 done

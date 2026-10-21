@@ -217,13 +217,13 @@ def test_ncu_wraps_with_filter_count_and_set():
 
 
 @pytest.mark.parametrize('args,message', [
-    (('nsys', '/data/prof', 'kiwi', 'spark'), 'wraps the coordinator only'),
-    (('ncu', '/data/prof', 'kiwi', 'spark', 'gemm'), 'wraps the coordinator only'),
+    (('nsys', '/data/prof', 'kiwi', 'spark'), 'a Spark worker takes PROFILE_SPARK'),
+    (('ncu', '/data/prof', 'kiwi', 'spark', 'gemm'), 'a Spark worker takes PROFILE_SPARK'),
     (('ncu', '/data/prof', 'raptor', 'coordinator'), 'PROFILE=ncu needs PROFILE_NCU_KERNEL'),
     (('ncu', '/data/prof', 'raptor', 'coordinator', 'a b'), 'must not contain whitespace'),
     (('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm', '0'), 'PROFILE_NCU_COUNT must be'),
     (('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm', '5', 'Full;x'), 'PROFILE_NCU_SET must be'),
-    (('nsys', '/data/prof', 'raptor', 'coordinator', 'gemm'), 'need PROFILE=ncu'),
+    (('nsys', '/data/prof', 'raptor', 'coordinator', 'gemm'), 'NCU_KERNEL/COUNT/SET/SKIP need PROFILE=ncu'),
     (('census', '/data/prof', 'raptor', 'coordinator', 'gemm'), 'need PROFILE=ncu'),
 ])
 def test_wrapper_refuses_bad_values(args, message):
@@ -316,7 +316,7 @@ release_profile_exec "$@"
 @pytest.mark.parametrize('profile,directory,message', [
     ('census,flamegraph', '', 'unknown PROFILE switch flamegraph'),
     ('census;rm', '', 'PROFILE must be a comma list'),
-    ('', '/data/prof', 'PROFILE_DIR needs PROFILE'),
+    ('', '/data/prof', 'PROFILE_DIR needs PROFILE or PROFILE_SPARK'),
     ('census', 'relative', 'PROFILE_DIR must be an absolute directory'),
     ('nsys', '', 'PROFILE=nsys needs PROFILE_DIR'),
     ('ncu', '', 'PROFILE=ncu needs PROFILE_DIR'),

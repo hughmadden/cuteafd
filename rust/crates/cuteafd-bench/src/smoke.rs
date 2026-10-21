@@ -758,11 +758,12 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} worker_stop={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
-                e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.fabric.unwrap_or(true), e.set);
+                e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.fabric.unwrap_or(true),
+                WORKER_STOP, e.set);
         }
         return Ok(());
     }
@@ -959,11 +960,23 @@ fn teardown(entry: &Entry, config: &HashMap<String, String>, log: &mut File) {
                     .stderr(Stdio::from(file)).status();
             }
         }
-        let script = format!("ids=$(docker ps -aq --filter name=^{worker}$); \
-            [ -z \"$ids\" ] || docker rm -f $ids >/dev/null 2>&1 || true");
-        let _ = Command::new("ssh").args(["-o", "BatchMode=yes", host, &script]).status();
+        let _ = Command::new("ssh").args(["-o", "BatchMode=yes", host, &worker_teardown_script(&worker)]).status();
     }
     let _ = writeln!(log, "teardown {} ({coordinator})", entry.name);
+}
+
+/// Advertised by `--dry-run` (`worker_stop=graceful`): wip-cards refuses a
+/// PROFILE_SPARK card on an older binary that would `rm -f` a profiled worker.
+const WORKER_STOP: &str = "graceful";
+
+/// Removes one Spark worker. A worker labelled cuteafd.graceful-stop=1 (a
+/// profiled worker, PROFILE_SPARK) first gets `docker stop`, with its own stop
+/// signal and timeout, so the profiler writes its report before the removal.
+fn worker_teardown_script(worker: &str) -> String {
+    format!("ids=$(docker ps -aq --filter name=^{worker}$); \
+        if [ -n \"$ids\" ] && [ \"$(docker inspect -f '{{{{index .Config.Labels \"cuteafd.graceful-stop\"}}}}' {worker} 2>/dev/null)\" = 1 ]; then \
+        docker stop {worker} >/dev/null 2>&1 || true; fi; \
+        [ -z \"$ids\" ] || docker rm -f $ids >/dev/null 2>&1 || true")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1327,6 +1340,34 @@ mod tests {
         let override_hook = Hook { argv: vec!["false".into()], ..merged.prelaunch.clone().unwrap() };
         let override_entry = Entry { prelaunch: Some(override_hook.clone()), ..original };
         assert_eq!(override_entry.merged(&defaults).prelaunch, Some(override_hook));
+    }
+
+    #[test]
+    fn worker_teardown_stops_a_labelled_worker_before_removing_it() {
+        let dir = std::env::temp_dir().join(format!("cuteafd-teardown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let docker = dir.join("docker");
+        // A fake docker: logs each call; `ps` finds the worker, `inspect` prints LABEL.
+        std::fs::write(&docker, "#!/bin/sh\necho \"$*\" >>\"$LOG\"\ncase \"$1\" in ps) echo id1;; inspect) printf '%s\\n' \"$LABEL\";; esac\n").unwrap();
+        std::fs::set_permissions(&docker, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let script = worker_teardown_script("cuteafd-spark-expert-kiwi-19441");
+        for (label, stopped) in [("1", true), ("", false)] {
+            let log = dir.join(format!("log-{stopped}"));
+            let status = Command::new("sh").arg("-c").arg(&script)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.display())).env("LOG", &log).env("LABEL", label)
+                .status().unwrap();
+            assert!(status.success());
+            let calls = std::fs::read_to_string(&log).unwrap();
+            let lines: Vec<&str> = calls.lines().collect();
+            assert!(lines.iter().any(|l| l.starts_with("inspect -f {{index .Config.Labels \"cuteafd.graceful-stop\"}} cuteafd-spark-expert-kiwi-19441")), "{calls}");
+            assert_eq!(lines.iter().any(|l| *l == "stop cuteafd-spark-expert-kiwi-19441"), stopped, "{calls}");
+            assert_eq!(lines.last(), Some(&"rm -f id1"), "{calls}");
+            if stopped {
+                let stop = lines.iter().position(|l| l.starts_with("stop ")).unwrap();
+                assert!(stop < lines.len() - 1);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
