@@ -104,6 +104,15 @@ impl KdaGeometry {
     /// and the per-head norm replicate. Conv and dt_bias become F32; o_norm
     /// retains the geometry's native dtype. A_log arrives padded and raw.
     pub fn pack(&self, operand: KdaOperand, ranks: usize,
+        read: impl FnMut(KdaRole) -> Result<KdaTensor, KdaError>) -> Result<Vec<KdaTensor>, KdaError>
+    {
+        self.pack_with(operand, ranks, true, read)
+    }
+
+    /// [`Self::pack`], optionally leaving BF16 conv/dt_bias sources narrow
+    /// (`widen` false): every role of such an operand must then be BF16, and the
+    /// parts come back BF16 for the caller to widen (exactly, on its device).
+    pub fn pack_with(&self, operand: KdaOperand, ranks: usize, widen: bool,
         mut read: impl FnMut(KdaRole) -> Result<KdaTensor, KdaError>) -> Result<Vec<KdaTensor>, KdaError>
     {
         self.validate(ranks)?;
@@ -118,9 +127,18 @@ impl KdaGeometry {
             Op::ONorm => self.o_norm_dtype.clone(),
             _ => DType::Bf16,
         };
+        let mut dtype = dtype;
         let mut out = vec![KdaTensor { dtype: dtype.clone(), shape: Vec::new(), bytes: Vec::new() }; ranks];
-        for role in roles {
+        for (index, role) in roles.into_iter().enumerate() {
             let mut tensor = read(role)?;
+            if !widen && matches!(operand, Op::ConvW | Op::DtBias) {
+                if index == 0 && tensor.dtype == DType::Bf16 {
+                    dtype = DType::Bf16;
+                    for part in &mut out { part.dtype = DType::Bf16; }
+                } else if (dtype == DType::Bf16) != (tensor.dtype == DType::Bf16) {
+                    return Err(tensor_error(role, "unwidened parts mix BF16 and F32 sources"));
+                }
+            }
             let element: usize = match tensor.dtype { DType::Bf16 => 2, DType::F32 => 4,
                 _ => return Err(tensor_error(role, format!("unsupported dtype {:?}", tensor.dtype))) };
             let expected = match role {

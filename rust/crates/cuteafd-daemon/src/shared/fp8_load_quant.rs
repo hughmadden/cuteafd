@@ -125,4 +125,36 @@ impl<'a> GpuQuantizer<'a> {
             self.library.cuda_stream_synchronize(stream)
         }
     }
+
+    /// The first `elements` BF16 values of the staged source widened to F32
+    /// into `dst` on the current device (exact), drained before return.
+    pub fn widen(&mut self, elements: usize, dst: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        let source = self.source.as_ref().context("no staged source")?;
+        ensure!(elements > 0 && elements * 2 <= source.buffer.bytes && elements * 4 <= dst.bytes,
+            "BF16 widening exceeds its source or destination");
+        // SAFETY: the pinned source holds `elements` BF16 values and `dst` room
+        // for as many F32 (checked above); the stream drains before return.
+        unsafe {
+            self.library.load_widen_bf16_f32(source.buffer.ptr.cast_const(), dst.ptr, elements, stream)?;
+            self.library.cuda_stream_synchronize(stream)
+        }
+    }
+
+    /// The staged MLA `kv_b` [heads_total * (nope + v), lat] (BF16) absorbed for
+    /// heads `h0..h0 + heads` into `uk` [heads][lat][nope] and `uv` [heads][v][lat]
+    /// on the current device, drained before return.
+    #[allow(clippy::too_many_arguments)]
+    pub fn absorb(&mut self, heads_total: usize, h0: usize, heads: usize, nope: usize, v: usize, lat: usize,
+        uk: CuteafdDeviceBuffer, uv: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        let source = self.source.as_ref().context("no staged source")?;
+        ensure!(heads > 0 && h0 + heads <= heads_total && heads_total * (nope + v) * lat * 2 <= source.buffer.bytes
+            && uk.bytes >= heads * lat * nope * 2 && uv.bytes >= heads * v * lat * 2,
+            "kv_b absorption exceeds its source or operands");
+        // SAFETY: the pinned source holds the whole kv_b and both operands hold
+        // `heads` heads (checked above); the stream drains before return.
+        unsafe {
+            self.library.load_kvb_absorb(source.buffer.ptr.cast_const(), uk.ptr, uv.ptr, h0, heads, nope, v, lat, stream)?;
+            self.library.cuda_stream_synchronize(stream)
+        }
+    }
 }

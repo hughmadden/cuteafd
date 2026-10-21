@@ -542,6 +542,36 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// BF16 `src` (device-visible, e.g. pinned host) widened to F32 `dst` (exact).
+    ///
+    /// # Safety
+    /// `src` holds `n` BF16 values and `dst` `n` F32 on the stream's device, live until it drains.
+    pub unsafe fn load_widen_bf16_f32(&self, src: *const c_void, dst: *mut c_void, n: usize, stream: *mut c_void)
+        -> Result<()> {
+        type Widen = unsafe extern "C" fn(*const c_void, *mut c_void, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Widen>(b"cuteafd_load_widen_bf16_f32") }?;
+        let status = unsafe { f(src, dst, i64::try_from(n)?, stream) };
+        ensure!(status == 0, "BF16 load widening failed with {status}");
+        Ok(())
+    }
+
+    /// MLA `kv_b` [heads * (nope + v), lat] (BF16, device-visible) absorbed per head
+    /// into `uk` [heads][lat][nope] and `uv` [heads][v][lat] for heads `h0..h0 + heads`.
+    ///
+    /// # Safety
+    /// `kv_b` holds the whole tensor; `uk`/`uv` hold `heads` heads on the stream's
+    /// device; all live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_kvb_absorb(&self, kv_b: *const c_void, uk: *mut c_void, uv: *mut c_void, h0: usize,
+        heads: usize, nope: usize, v: usize, lat: usize, stream: *mut c_void) -> Result<()> {
+        type Absorb = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i64, i64, i64, i64, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Absorb>(b"cuteafd_load_kvb_absorb") }?;
+        let status = unsafe { f(kv_b, uk, uv, i64::try_from(h0)?, i64::try_from(heads)?, i64::try_from(nope)?,
+            i64::try_from(v)?, i64::try_from(lat)?, stream) };
+        ensure!(status == 0, "kv_b load absorption failed with {status}");
+        Ok(())
+    }
+
     /// The load-quantization `Job` ABI: (job bytes, segment bytes, max columns).
     pub fn fp8_load_quant_abi(&self) -> Result<(u64, u64, u64)> {
         type Abi = unsafe extern "C" fn(*mut u64, *mut u64, *mut u64) -> i32;

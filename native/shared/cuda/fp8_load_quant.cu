@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include <algorithm>
+
 #include "fp8_load_quant.h"
 
 namespace lq = cuteafd_load_quant;
@@ -76,6 +78,45 @@ extern "C" int32_t cuteafd_fp8_load_quant(const void* jobs, int32_t count, void*
   if (count == 0) return cudaSuccess;
   load_quant_kernel<<<unsigned(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const Job*>(jobs));
+  return cudaGetLastError();
+}
+
+namespace {
+__global__ void widen_kernel(const uint16_t* src, uint32_t* dst, int64_t n) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
+    dst[i] = lq::widen_bf16(src[i]);
+}
+__global__ void absorb_kernel(const uint16_t* kv_b, uint16_t* uk, uint16_t* uv, int64_t h0, int64_t heads,
+                              int64_t nope, int64_t v, int64_t lat) {
+  const int64_t nk = heads * lat * nope, nv = heads * v * lat;
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < nk + nv; i += int64_t(gridDim.x) * blockDim.x) {
+    if (i < nk) uk[i] = lq::absorb_uk(kv_b, h0, nope, v, lat, i);
+    else uv[i - nk] = lq::absorb_uv(kv_b, h0, nope, v, lat, i - nk);
+  }
+}
+unsigned grid_for(int64_t n) {
+  int device = 0, sms = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  return unsigned(std::min<int64_t>((n + 255) / 256, int64_t(sms > 0 ? sms : 1) * 8));
+}
+}  // namespace
+
+// BF16 `src` (device-visible, e.g. pinned host) widened to F32 `dst`, `n` elements.
+extern "C" int32_t cuteafd_load_widen_bf16_f32(const void* src, void* dst, int64_t n, void* stream) {
+  if (n < 1) return cudaErrorInvalidValue;
+  widen_kernel<<<grid_for(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint16_t*>(src), static_cast<uint32_t*>(dst), n);
+  return cudaGetLastError();
+}
+
+// MLA kv_b absorbed per head into uk/uv for heads [h0, h0 + heads) (see fp8_load_quant.h).
+extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv, int64_t h0, int64_t heads,
+                                           int64_t nope, int64_t v, int64_t lat, void* stream) {
+  if (heads < 1 || nope < 1 || v < 1 || lat < 1 || h0 < 0) return cudaErrorInvalidValue;
+  absorb_kernel<<<grid_for(heads * (nope + v) * lat), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint16_t*>(kv_b), static_cast<uint16_t*>(uk), static_cast<uint16_t*>(uv), h0, heads, nope,
+      v, lat);
   return cudaGetLastError();
 }
 

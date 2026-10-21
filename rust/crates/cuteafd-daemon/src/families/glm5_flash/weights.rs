@@ -162,10 +162,6 @@ enum QuantPart<'b> {
     Bytes { bytes: &'b [u8], rows: usize, cols: usize },
 }
 
-fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect()
-}
-
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -518,53 +514,67 @@ impl<'a> GlmfLoader<'a> {
         self.upload(&bytes)
     }
 
-    /// A BF16 (or FP32) tensor widened to FP32.
+    /// Runs `body` with this load's GPU quantizer (pinned source and tables).
+    fn with_quantizer<T>(&self, body: impl FnOnce(&mut crate::shared::fp8_load_quant::GpuQuantizer<'a>) -> Result<T>)
+        -> Result<T> {
+        let mut slot = self.quantizer.borrow_mut();
+        if slot.is_none() { *slot = Some(crate::shared::fp8_load_quant::GpuQuantizer::new(self.library)?); }
+        body(slot.as_mut().context("GPU quantizer")?)
+    }
+
+    /// BF16 `bytes` widened to FP32 on the current device (`stream`) into a new
+    /// allocation, through the pinned source.
+    fn gpu_widen(&self, bytes: &[u8], stream: *mut c_void) -> Result<DeviceAllocation<'a>> {
+        ensure!(!bytes.is_empty() && bytes.len() % 2 == 0, "BF16 widening takes whole BF16 values");
+        let out = DeviceAllocation::new(self.library, (bytes.len() * 2).max(256))?;
+        self.with_quantizer(|quantizer| {
+            quantizer.source_mut(bytes.len())?.copy_from_slice(bytes);
+            crate::shared::memory::load_timing::quantize(bytes.len(), ||
+                quantizer.widen(bytes.len() / 2, out.buffer, stream))
+        })?;
+        Ok(out)
+    }
+
+    /// A BF16 (or FP32) tensor widened to FP32 (BF16 widens on the GPU).
     fn f32(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("f32");
-        let mut values = Vec::new();
-        for name in names {
-            let (bytes, dtype, _) = self.raw(name)?;
-            match dtype {
-                DType::Bf16 => values.extend(bf16_to_f32(&bytes)),
-                DType::F32 => values.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()))),
-                other => anyhow::bail!("{name}: expected BF16 or FP32, found {other:?}"),
-            }
+        let [name] = names else { anyhow::bail!("{names:?}: FP32 operands are one tensor") };
+        let (bytes, dtype, _) = self.raw(name)?;
+        match dtype {
+            DType::Bf16 => self.gpu_widen(&bytes, self.stream),
+            DType::F32 => self.upload(&bytes),
+            other => anyhow::bail!("{name}: expected BF16 or FP32, found {other:?}"),
         }
-        self.upload(&f32_bytes(&values))
     }
 
     /// `kv_b_proj [N*(nope+v), 512]` -> `w_uk [N, 512, nope]` (key rows transposed per head)
-    /// and `w_uv [N, v, 512]`.
-    fn absorbed(&self, cfg: &GlmNextConfig, name: &str) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
-        let (uk, uv) = self.absorbed_host(cfg, name)?;
-        Ok((self.upload(&uk)?, self.upload(&uv)?))
-    }
-
-    /// [`Self::absorbed`]'s host bytes.
-    fn absorbed_host(&self, cfg: &GlmNextConfig, name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    /// and `w_uv [N, v, 512]`, per rank its head share `r * N / ranks ..`, absorbed on
+    /// each rank's GPU from one pinned read.
+    fn absorbed(&self, cfg: &GlmNextConfig, name: &str, ranks: usize)
+        -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
-        let (bytes, dtype, shape) = self.raw(name)?;
+        let tensor = self.tensor(name)?;
         let (n, nope, v, lat) = (cfg.heads, cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank);
-        ensure!(dtype == DType::Bf16 && shape == [n * (nope + v), lat], "{name}: expected BF16 [{}, {lat}]",
-            n * (nope + v));
-        let at = |row: usize, col: usize| -> [u8; 2] {
-            let i = (row * lat + col) * 2;
-            [bytes[i], bytes[i + 1]]
-        };
-        let mut uk = Vec::with_capacity(n * lat * nope * 2);
-        let mut uv = Vec::with_capacity(n * v * lat * 2);
-        for h in 0..n {
-            let base = h * (nope + v);
-            for c in 0..lat {
-                for d in 0..nope {
-                    uk.extend_from_slice(&at(base + d, c));
-                }
-            }
-            for r in 0..v {
-                uv.extend_from_slice(&bytes[(base + nope + r) * lat * 2..(base + nope + r + 1) * lat * 2]);
-            }
-        }
-        Ok((uk, uv))
+        ensure!(tensor.meta.dtype == DType::Bf16 && tensor.meta.shape == [n * (nope + v), lat],
+            "{name}: expected BF16 [{}, {lat}]", n * (nope + v));
+        ensure!(n % ranks == 0, "{n} MLA heads do not split over {ranks} GPUs");
+        let heads = n / ranks;
+        self.with_quantizer(|quantizer| {
+            let staged = quantizer.source_mut(tensor.meta.byte_length as usize)?;
+            crate::shared::memory::load_timing::read(staged.len(), || std::fs::File::open(self.checkpoint.snapshot
+                .join(&tensor.shard))?.read_exact_at(staged, tensor.meta.byte_offset))
+                .with_context(|| format!("reading {name}"))?;
+            (0..ranks).map(|rank| {
+                let stream = self.rank_stream(rank)?;
+                self.on_rank(rank, || {
+                    let uk = DeviceAllocation::new(self.library, (heads * lat * nope * 2).max(256))?;
+                    let uv = DeviceAllocation::new(self.library, (heads * v * lat * 2).max(256))?;
+                    crate::shared::memory::load_timing::quantize(heads * (nope + v) * lat * 2, ||
+                        quantizer.absorb(n, rank * heads, heads, nope, v, lat, uk.buffer, uv.buffer, stream))?;
+                    Ok((uk, uv))
+                })
+            }).collect()
+        })
     }
 
     fn mla_operands(&self, cfg: &GlmNextConfig, prefix: &str,
@@ -572,7 +582,7 @@ impl<'a> GlmfLoader<'a> {
         let a = |name: &str| format!("{prefix}.self_attn.{name}");
         ops.insert("q_a_norm", self.one(&a("q_a_layernorm.weight"))?);
         ops.insert("kv_a_norm", self.one(&a("kv_a_layernorm.weight"))?);
-        let (uk, uv) = self.absorbed(cfg, &a("kv_b_proj.weight"))?;
+        let (uk, uv) = self.absorbed(cfg, &a("kv_b_proj.weight"), 1)?.remove(0);
         ops.insert("w_uk", uk);
         ops.insert("w_uv", uv);
         let block = super::fp8::Layout::Block;
@@ -742,16 +752,35 @@ impl<'a> GlmfLoader<'a> {
         let native_fp8 = matches!(operand, KdaOperand::WIn | KdaOperand::WFg)
             && names.iter().any(|name| self.tensor(name).is_ok_and(|tensor| tensor.meta.dtype == DType::F8E4M3));
         if native_fp8 { return self.rows(&names); }
-        self.upload(&self.kda_parts(cfg, prefix, operand, 1)?.remove(0))
+        Ok(self.kda_operand(cfg, prefix, operand, 1)?.remove(0))
     }
 
     fn kda_parts(&self, cfg: &GlmNextConfig, prefix: &str, operand: KdaOperand, ranks: usize)
         -> Result<Vec<Vec<u8>>> {
-        Ok(Self::kda_geometry(cfg).pack(operand, ranks, |role| {
+        Ok(self.kda_tensors(cfg, prefix, operand, ranks, true)?.into_iter().map(|tensor| tensor.bytes).collect())
+    }
+
+    fn kda_tensors(&self, cfg: &GlmNextConfig, prefix: &str, operand: KdaOperand, ranks: usize, widen: bool)
+        -> Result<Vec<KdaTensor>> {
+        Ok(Self::kda_geometry(cfg).pack_with(operand, ranks, widen, |role| {
             let name = Self::kda_name(prefix, role);
             let (bytes, dtype, shape) = self.raw(&name).map_err(|error| KdaError::Source(error.to_string()))?;
             Ok(KdaTensor { dtype, shape, bytes })
-        })?.into_iter().map(|tensor| tensor.bytes).collect())
+        })?)
+    }
+
+    /// A packed KDA operand on each rank's GPU; BF16 conv/dt_bias sources widen
+    /// to FP32 there.
+    fn kda_operand(&self, cfg: &GlmNextConfig, prefix: &str, operand: KdaOperand, ranks: usize)
+        -> Result<Vec<DeviceAllocation<'a>>> {
+        let parts = self.kda_tensors(cfg, prefix, operand, ranks, false)?;
+        parts.into_iter().enumerate().map(|(rank, part)| {
+            let stream = self.rank_stream(rank)?;
+            self.on_rank(rank, || {
+                let widen = matches!(operand, KdaOperand::ConvW | KdaOperand::DtBias) && part.dtype == DType::Bf16;
+                if widen { self.gpu_widen(&part.bytes, stream) } else { self.upload(&part.bytes) }
+            })
+        }).collect()
     }
 
     /// The selected source's 2-D `name` as E4M3 blocks, quantized from BF16
@@ -961,7 +990,7 @@ impl<'a> GlmfLoader<'a> {
                 }
                 for operand in [KdaOperand::WFg, KdaOperand::ConvW, KdaOperand::ALog,
                     KdaOperand::DtBias, KdaOperand::ONorm] {
-                    put(&mut ops, operand.name(), self.upload_ranks(self.kda_parts(cfg, &p, operand, ranks)?)?);
+                    put(&mut ops, operand.name(), self.kda_operand(cfg, &p, operand, ranks)?);
                 }
                 if layout.is_none() {
                     put(&mut ops, "w_o", self.upload_ranks(w_o)?);
@@ -985,11 +1014,9 @@ impl<'a> GlmfLoader<'a> {
                 put(&mut ops, "q_a_norm", self.replicate(self.one(&a("q_a_layernorm.weight"))?)?);
                 put(&mut ops, "kv_a_norm", self.replicate(self.one(&a("kv_a_layernorm.weight"))?)?);
                 // W_UK / W_UV are head-major: rank r takes heads r * N / ranks ..
-                let (uk, uv) = self.absorbed_host(cfg, &a("kv_b_proj.weight"))?;
-                let part = |bytes: &[u8], rank: usize| bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks]
-                    .to_vec();
-                put(&mut ops, "w_uk", self.upload_ranks((0..ranks).map(|r| part(&uk, r)).collect())?);
-                put(&mut ops, "w_uv", self.upload_ranks((0..ranks).map(|r| part(&uv, r)).collect())?);
+                let (uk, uv): (Vec<_>, Vec<_>) = self.absorbed(cfg, &a("kv_b_proj.weight"), ranks)?.into_iter().unzip();
+                put(&mut ops, "w_uk", uk);
+                put(&mut ops, "w_uv", uv);
                 let (q, s) = self.fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], super::fp8::Layout::Block)?;
                 put(&mut ops, "w_qkv_a_fp8", self.replicate(q)?);
                 put(&mut ops, "w_qkv_a_scale", self.replicate(s)?);

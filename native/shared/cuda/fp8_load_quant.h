@@ -252,6 +252,21 @@ CUTEAFD_LQ_FN void quantize_unit_from(const Src& src, uint8_t* q, float* scales,
   for (int64_t i = 0; i < rows * cols; ++i) q[i] = e4m3(fdiv(src.at(i), scales[(i % cols) / 128]));
 }
 
+// BF16 -> F32 widening (exact).
+CUTEAFD_LQ_FN uint32_t widen_bf16(uint16_t v) { return uint32_t(v) << 16; }
+
+// MLA kv_b [heads * (nope + v), lat] BF16 split per head into
+// uk [heads][lat][nope] (key rows transposed) and uv [heads][v][lat] (value
+// rows copied), for heads [h0, h0 + count): element `i` of that output range.
+CUTEAFD_LQ_FN uint16_t absorb_uk(const uint16_t* kv_b, int64_t h0, int64_t nope, int64_t v, int64_t lat, int64_t i) {
+  const int64_t h = h0 + i / (lat * nope), c = (i / nope) % lat, d = i % nope;
+  return kv_b[(h * (nope + v) + d) * lat + c];
+}
+CUTEAFD_LQ_FN uint16_t absorb_uv(const uint16_t* kv_b, int64_t h0, int64_t nope, int64_t v, int64_t lat, int64_t i) {
+  const int64_t h = h0 + i / (v * lat), r = (i / lat) % v, c = i % lat;
+  return kv_b[(h * (nope + v) + nope + r) * lat + c];
+}
+
 #if !defined(__CUDA_ARCH__)
 // One job sequentially (the CPU fake DSO's load kernel and the self-test oracle).
 inline void run_job(const Job& job) {
