@@ -1046,7 +1046,7 @@ def test_profile_collection_pulls_each_spark_and_records_failures(entry, tmp_pat
 
 
 def test_nsys_profile_frames_the_sweep_with_a_window(entry, tmp_path):
-    with pytest.raises(ValueError, match='PROFILE=nsys captures the timed sweep'):
+    with pytest.raises(ValueError, match='PROFILE=nsys and PROFILE_SPARK=nsys capture the timed sweep'):
         cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1)
     job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key',
                          {'PROFILE': 'nsys,draft-timing'}, set(), None, 1)
