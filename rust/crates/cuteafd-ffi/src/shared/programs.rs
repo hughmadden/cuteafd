@@ -525,6 +525,34 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Load-time BF16 -> E4M3 quantization of `count` scale units (the `Job`
+    /// ABI of native/shared/cuda/fp8_load_quant.h), each reading device-visible
+    /// (pinned or mapped host) source fragments and writing its final rows and
+    /// scales; bit-for-bit the coordinator loaders' host rule.
+    ///
+    /// # Safety
+    /// `jobs` holds `count` valid jobs in device-visible memory; every source,
+    /// value and scale pointer they name stays live and unaliased until the
+    /// stream drains. Values and scales are on the stream's device.
+    pub unsafe fn fp8_load_quant(&self, jobs: *const c_void, count: usize, stream: *mut c_void) -> Result<()> {
+        type Quant = unsafe extern "C" fn(*const c_void, i32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_load_quant") }?;
+        let status = unsafe { f(jobs, i32::try_from(count)?, stream) };
+        ensure!(status == 0, "FP8 load quantization failed with {status}");
+        Ok(())
+    }
+
+    /// The load-quantization `Job` ABI: (job bytes, segment bytes, max columns).
+    pub fn fp8_load_quant_abi(&self) -> Result<(u64, u64, u64)> {
+        type Abi = unsafe extern "C" fn(*mut u64, *mut u64, *mut u64) -> i32;
+        let f = *unsafe { self.lib.get::<Abi>(b"cuteafd_fp8_load_quant_abi") }?;
+        let (mut job, mut segment, mut cols) = (0, 0, 0);
+        // SAFETY: three writable u64 outputs.
+        let status = unsafe { f(&mut job, &mut segment, &mut cols) };
+        ensure!(status == 0, "FP8 load quantization ABI query failed with {status}");
+        Ok((job, segment, cols))
+    }
+
     /// FP32 128x128 block `grid` [ceil(rows/128), kb] widened to per-row scales
     /// stored K-block major, `kmajor` [kb, rows] (exact gather).
     ///

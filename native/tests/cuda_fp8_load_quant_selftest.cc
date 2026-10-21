@@ -20,13 +20,7 @@ extern "C" int32_t cuteafd_fp8_load_quant_abi(uint64_t* job_bytes, uint64_t* seg
 namespace lq = cuteafd_load_quant;
 
 namespace {
-struct Job {
-  const lq::Segment* segments;
-  int32_t count, rows, cols, layout, rule;
-  uint8_t* q;
-  int64_t q_stride;
-  float* scales;
-};
+using Job = lq::Job;
 
 template <typename T>
 T take(const std::vector<uint8_t>& bytes, size_t& at) {
@@ -99,8 +93,8 @@ int main(int argc, char** argv) {
     size_t cursor = 0;
     for (size_t u = 0; u < units; ++u) {
       std::copy(lists[u].begin(), lists[u].end(), segments + cursor);
-      jobs[u] = Job{segments + cursor, int32_t(lists[u].size()), unit, int32_t(cols), layout, rule,
-                    q + u * unit * cols, int64_t(cols), s + u * kb};
+      jobs[u] = Job{segments + cursor, int32_t(lists[u].size()), unit, int32_t(cols), layout, rule, 0, 0,
+                    int64_t(cols), q + u * unit * cols, int64_t(cols), s + u * kb, 1};
       cursor += lists[u].size();
     }
     CHECK(cudaError_t(cuteafd_fp8_load_quant(jobs, int32_t(units), nullptr)));

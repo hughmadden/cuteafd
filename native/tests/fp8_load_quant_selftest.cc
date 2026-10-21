@@ -80,6 +80,42 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "case %u layout %d rule %d: segmented source differs\n", c, layout, rule);
       return 1;
     }
+    // Column windows (a TP column share): Block and Row128 scales are per
+    // 128-column block, so a window's quantization is the whole tensor's slice.
+    // Row128 scales go K-block major ([kb, rows]), as the KDA programs read them.
+    if (layout != lq::kChannel) {
+      const uint8_t* source = reinterpret_cast<const uint8_t*>(w.data());
+      for (const int64_t window : {int64_t(128), int64_t(cols) - 128}) {
+        for (int64_t col0 = 0; col0 + window <= int64_t(cols); col0 += window) {
+          const int64_t wkb = window / 128;
+          std::vector<uint8_t> wq(size_t(rows) * window);
+          std::vector<float> ws(scale_rows * wkb);
+          const bool kmajor = layout == lq::kRow128;
+          for (size_t u = 0; u < scale_rows; ++u) {
+            // One unit's rows start at u * unit rows of the full source.
+            const std::vector<lq::Segment> unit_seg{{0, source + u * unit * cols * 2, uint64_t(unit) * cols * 2}};
+            lq::Job job{unit_seg.data(), 1, int32_t(unit), int32_t(window), layout, rule, 0, col0, int64_t(cols),
+                        wq.data() + u * unit * window, window, ws.data() + (kmajor ? u : u * wkb),
+                        kmajor ? int64_t(scale_rows) : 1};
+            lq::run_job(job);
+          }
+          for (size_t r = 0; r < rows; ++r)
+            if (std::memcmp(wq.data() + r * window, expected_q + r * cols + col0, window) != 0) {
+              std::fprintf(stderr, "case %u: column window %lld+%lld values differ\n", c, (long long)col0, (long long)window);
+              return 1;
+            }
+          for (size_t u = 0; u < scale_rows; ++u)
+            for (int64_t b = 0; b < wkb; ++b) {
+              const float got = kmajor ? ws[b * scale_rows + u] : ws[u * wkb + b];
+              if (got != expected_s[u * kb + col0 / 128 + b]) {
+                std::fprintf(stderr, "case %u: column window scales differ\n", c);
+                return 1;
+              }
+            }
+        }
+      }
+    }
+
     if (rule == lq::kBest)
       for (size_t i = 0; i < s.size(); ++i) {
         const uint32_t b = lq::f32_bits(s[i]);
@@ -95,7 +131,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "Best cases picked pow2 %zu, amax %zu: both branches required\n", pow2_picked, amax_kept);
     return 1;
   }
-  std::printf("fp8 load quant: %u cases byte-exact (contiguous and fragmented); Best picked pow2 %zu, amax/448 %zu\n", cases, pow2_picked,
+  std::printf("fp8 load quant: %u cases byte-exact (contiguous, fragmented, column windows); Best picked pow2 %zu, amax/448 %zu\n", cases, pow2_picked,
               amax_kept);
   return 0;
 }

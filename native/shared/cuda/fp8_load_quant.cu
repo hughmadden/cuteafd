@@ -12,24 +12,14 @@
 namespace lq = cuteafd_load_quant;
 
 namespace {
-struct Job {
-  const lq::Segment* segments;  // device-visible (pinned host) fragment list
-  int32_t count;
-  int32_t rows;  // 128 (Block) or 1 (Row128/Channel)
-  int32_t cols;
-  int32_t layout;
-  int32_t rule;
-  uint8_t* q;          // rows x cols E4M3, row stride q_stride
-  int64_t q_stride;
-  float* scales;       // kb scales (one unit)
-};
+using Job = lq::Job;
 
 constexpr int kThreads = 256;
 constexpr int kMaxBlocks = 512;  // cols <= 65536
 
 __global__ void load_quant_kernel(const Job* jobs) {
   const Job job = jobs[blockIdx.x];
-  const lq::Segmented src{job.segments, job.count};
+  const lq::Strided<lq::Segmented> src{lq::Segmented{job.segments, job.count}, job.cols, job.col0, job.pitch};
   const int64_t rows = job.rows, cols = job.cols, kb = cols / 128;
   __shared__ float scales[kMaxBlocks];
   __shared__ double ra[128], rp[128];
@@ -73,7 +63,7 @@ __global__ void load_quant_kernel(const Job* jobs) {
       for (int64_t b = 1; b < kb; ++b) scales[b] = scales[0];
   }
   __syncthreads();
-  for (int64_t b = threadIdx.x; b < kb; b += kThreads) job.scales[b] = scales[b];
+  for (int64_t b = threadIdx.x; b < kb; b += kThreads) job.scales[b * job.scale_stride] = scales[b];
   for (int64_t i = threadIdx.x; i < rows * cols; i += kThreads)
     job.q[(i / cols) * job.q_stride + i % cols] = lq::e4m3(lq::fdiv(src.at(i), scales[(i % cols) / 128]));
 }

@@ -1,0 +1,128 @@
+//! Coordinator load-time BF16 -> FP8 on the GPU: the source tensor's bytes sit
+//! in pinned host memory the kernel reads directly (no device staging), and
+//! each scale unit writes its final E4M3 rows and scales into the operand.
+//! Bit-for-bit the host rule (`glm5_flash::fp8::quantize`); see
+//! native/shared/cuda/fp8_load_quant.h.
+use crate::families::glm5_flash::fp8::Layout;
+use crate::shared::{fp8_linear::Fp8Scales, memory::HostAllocation};
+use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
+use std::ffi::c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Segment { offset: u64, ptr: *const u8, bytes: u64 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Job {
+    segments: *const Segment,
+    count: i32,
+    rows: i32,
+    cols: i32,
+    layout: i32,
+    rule: i32,
+    pad: i32,
+    col0: i64,
+    pitch: i64,
+    q: *mut u8,
+    q_stride: i64,
+    scales: *mut f32,
+    scale_stride: i64,
+}
+
+fn layout_code(layout: Layout) -> i32 {
+    match layout { Layout::Block => 0, Layout::Row128 => 1, Layout::Channel => 2 }
+}
+
+/// Where a quantized window lands: E4M3 rows (row stride `q_stride` bytes) and
+/// its scales, row-major (`kmajor` false: `[units, kb]`) or K-block major
+/// (`[kb, scale_rows]`, unit `u` at column `scale_row0 + u`).
+#[derive(Clone, Copy)]
+pub(crate) struct Target {
+    pub q: CuteafdDeviceBuffer,
+    pub q_stride: usize,
+    pub scales: CuteafdDeviceBuffer,
+    pub kmajor: Option<(usize, usize)>,
+}
+
+/// One load's pinned source and job tables, reused across tensors.
+pub(crate) struct GpuQuantizer<'a> {
+    library: &'a NativeLibrary,
+    source: Option<HostAllocation<'a>>,
+    tables: Option<HostAllocation<'a>>,
+}
+
+impl<'a> GpuQuantizer<'a> {
+    pub fn new(library: &'a NativeLibrary) -> Result<Self> {
+        let (job, segment, _) = library.fp8_load_quant_abi()?;
+        ensure!(job as usize == std::mem::size_of::<Job>() && segment as usize == std::mem::size_of::<Segment>(),
+            "FP8 load quantization ABI differs from this daemon");
+        Ok(Self { library, source: None, tables: None })
+    }
+
+    fn grow(library: &'a NativeLibrary, slot: &mut Option<HostAllocation<'a>>, bytes: usize) -> Result<()> {
+        if slot.as_ref().is_none_or(|a| a.buffer.bytes < bytes) {
+            drop(slot.take());
+            *slot = Some(HostAllocation::named(library, bytes.max(1 << 20), "staging/fp8-load-quant")?);
+        }
+        Ok(())
+    }
+
+    /// The pinned source buffer, at least `bytes` long, for the caller to fill
+    /// with one tensor's BF16 rows before `quantize`.
+    pub fn source_mut(&mut self, bytes: usize) -> Result<&mut [u8]> {
+        Self::grow(self.library, &mut self.source, bytes)?;
+        Ok(&mut self.source.as_mut().context("pinned source")?.bytes_mut()[..bytes])
+    }
+
+    /// Quantizes rows `rows` of the staged source (rows of `pitch` elements),
+    /// columns `col0..col0 + cols`, into `target` on the current device, and
+    /// drains `stream` before returning (the tables and source are reused).
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize(&mut self, rows: std::ops::Range<usize>, pitch: usize, col0: usize, cols: usize,
+        layout: Layout, rule: Fp8Scales, target: Target, stream: *mut c_void) -> Result<()> {
+        let unit = if layout == Layout::Block { 128 } else { 1 };
+        ensure!(cols > 0 && cols % 128 == 0 && col0 + cols <= pitch && rows.len() % unit == 0 && rows.start % unit == 0,
+            "FP8 load quantization window is not whole scale units");
+        ensure!(layout != Layout::Channel || (col0 == 0 && cols == pitch), "channel scales span whole rows");
+        let source = self.source.as_ref().context("no staged source")?;
+        ensure!(rows.end * pitch * 2 <= source.buffer.bytes, "window exceeds the staged source");
+        let (units, kb) = (rows.len() / unit, cols / 128);
+        ensure!(target.q.bytes >= rows.len() * target.q_stride && target.q_stride >= cols,
+            "quantized rows exceed their operand");
+        let scale_need = match target.kmajor { Some((scale_rows, row0)) => (kb - 1) * scale_rows + row0 + units, None => units * kb };
+        ensure!(target.scales.bytes >= scale_need * 4, "quantized scales exceed their operand");
+        let tables = std::mem::size_of::<Segment>() * units + std::mem::size_of::<Job>() * units;
+        Self::grow(self.library, &mut self.tables, tables)?;
+        let base = source.buffer.ptr.cast::<u8>().cast_const();
+        let table = self.tables.as_mut().context("pinned tables")?;
+        let (segments, jobs) = table.bytes_mut().split_at_mut(std::mem::size_of::<Segment>() * units);
+        let segments = segments.as_mut_ptr().cast::<Segment>();
+        let jobs_ptr = jobs.as_mut_ptr().cast::<Job>();
+        for u in 0..units {
+            let first = rows.start + u * unit;
+            // SAFETY: both tables were sized for `units` entries above and are
+            // pinned, device-visible memory owned by this quantizer.
+            unsafe {
+                let segment = segments.add(u);
+                // SAFETY (pointer math): `first * pitch * 2` is inside the staged source (checked above).
+                segment.write(Segment { offset: 0, ptr: base.add(first * pitch * 2), bytes: (unit * pitch * 2) as u64 });
+                let (scales, scale_stride) = match target.kmajor {
+                    Some((scale_rows, row0)) => (target.scales.ptr.cast::<f32>().add(row0 + u), scale_rows as i64),
+                    None => (target.scales.ptr.cast::<f32>().add(u * kb), 1),
+                };
+                jobs_ptr.add(u).write(Job { segments: segment, count: 1, rows: unit as i32, cols: cols as i32,
+                    layout: layout_code(layout), rule: rule.code(), pad: 0, col0: col0 as i64, pitch: pitch as i64,
+                    q: target.q.ptr.cast::<u8>().add(u * unit * target.q_stride), q_stride: target.q_stride as i64,
+                    scales, scale_stride });
+            }
+        }
+        // SAFETY: the jobs name the pinned source, these pinned tables and the
+        // target operands, all live until the stream drains below.
+        unsafe {
+            self.library.fp8_load_quant(jobs_ptr.cast(), units, stream)?;
+            self.library.cuda_stream_synchronize(stream)
+        }
+    }
+}

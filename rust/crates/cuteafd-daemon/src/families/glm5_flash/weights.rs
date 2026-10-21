@@ -151,6 +151,15 @@ pub(crate) struct GlmfLoader<'a> {
     pub device: i32,
     /// The other GPU of a head split (rank 1), if any.
     pub peers: Vec<RankDevice>,
+    /// BF16 -> FP8 runs on the GPU from pinned host bytes (one load's buffers).
+    pub quantizer: std::rc::Rc<std::cell::RefCell<Option<crate::shared::fp8_load_quant::GpuQuantizer<'a>>>>,
+}
+
+/// One part of a row concatenation quantized on the GPU: a checkpoint tensor
+/// (read straight into pinned memory) or BF16 bytes the loader already sliced.
+enum QuantPart<'b> {
+    Tensor(&'b str),
+    Bytes { bytes: &'b [u8], rows: usize, cols: usize },
 }
 
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
@@ -323,6 +332,10 @@ impl<'a> GlmfLoader<'a> {
                 return Ok(copy);
             }
         }
+        if self.all_bf16(names)? {
+            let parts = names.iter().map(|n| QuantPart::Tensor(n)).collect::<Vec<_>>();
+            return self.gpu_fp8(&parts, layout, false, self.stream);
+        }
         let (values, scales, _) = self.fp8_host(names, layout)?;
         Ok((self.upload(&values)?, self.upload(&scales)?))
     }
@@ -366,6 +379,76 @@ impl<'a> GlmfLoader<'a> {
         })
     }
 
+    /// `parts` row-concatenated and quantized on the current device: E4M3 values
+    /// and FP32 scales (row-major per unit, or K-block major `[K/128, N]`),
+    /// allocated as the host path allocated them.
+    fn gpu_fp8(&self, parts: &[QuantPart<'_>], layout: super::fp8::Layout, kmajor: bool, stream: *mut c_void)
+        -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        use crate::shared::fp8_load_quant::{GpuQuantizer, Target};
+        let source = self.fp8_source.unwrap_or(self.checkpoint);
+        let geometry = |part: &QuantPart<'_>| -> Result<(usize, usize)> {
+            Ok(match part {
+                QuantPart::Tensor(name) => {
+                    let at = source.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+                        .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
+                    let meta = &source.tensors[at].meta;
+                    ensure!(meta.dtype == DType::Bf16 && meta.shape.len() == 2, "{name}: GPU quantization takes BF16 matrices");
+                    (meta.shape[0], meta.shape[1])
+                }
+                QuantPart::Bytes { rows, cols, .. } => (*rows, *cols),
+            })
+        };
+        let shapes = parts.iter().map(geometry).collect::<Result<Vec<_>>>()?;
+        let cols = shapes.first().context("no FP8 parts")?.1;
+        ensure!(shapes.iter().all(|&(_, c)| c == cols), "FP8 rows must share columns");
+        let total: usize = shapes.iter().map(|&(r, _)| r).sum();
+        let (kb, unit) = (cols / 128, if layout == super::fp8::Layout::Block { 128 } else { 1 });
+        let values = DeviceAllocation::new(self.library, (total * cols).max(256))?;
+        let scales = DeviceAllocation::new(self.library, (total / unit * kb * 4).max(256))?;
+        let mut slot = self.quantizer.borrow_mut();
+        if slot.is_none() { *slot = Some(GpuQuantizer::new(self.library)?); }
+        let quantizer = slot.as_mut().context("GPU quantizer")?;
+        let mut row = 0;
+        for (part, &(rows, _)) in parts.iter().zip(&shapes) {
+            let staged = quantizer.source_mut(rows * cols * 2)?;
+            match part {
+                QuantPart::Tensor(name) => {
+                    let at = source.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+                        .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
+                    let tensor = &source.tensors[at];
+                    crate::shared::memory::load_timing::read(staged.len(), || std::fs::File::open(source.snapshot.join(&tensor.shard))?
+                        .read_exact_at(staged, tensor.meta.byte_offset)).with_context(|| format!("reading {name}"))?;
+                }
+                QuantPart::Bytes { bytes, .. } => staged.copy_from_slice(bytes),
+            }
+            let target = Target {
+                // SAFETY: rows row..row + rows lie inside `values` (allocated for `total` rows).
+                q: CuteafdDeviceBuffer { ptr: unsafe { values.buffer.ptr.cast::<u8>().add(row * cols) }.cast(),
+                    bytes: rows * cols, ..values.buffer },
+                q_stride: cols,
+                scales: if kmajor { scales.buffer } else { CuteafdDeviceBuffer {
+                    // SAFETY: this part's scale rows lie inside `scales`.
+                    ptr: unsafe { scales.buffer.ptr.cast::<u8>().add(row / unit * kb * 4) }.cast(),
+                    bytes: rows / unit * kb * 4, ..scales.buffer } },
+                kmajor: kmajor.then_some((total, row)),
+            };
+            crate::shared::memory::load_timing::quantize(rows * cols * 2, ||
+                quantizer.quantize(0..rows, cols, 0, cols, layout, self.fp8_scales, target, stream))?;
+            row += rows;
+        }
+        Ok((values, scales))
+    }
+
+    /// Whether every name is a BF16 matrix in the source checkpoint (quantized on the GPU).
+    fn all_bf16(&self, names: &[String]) -> Result<bool> {
+        let source = self.fp8_source.unwrap_or(self.checkpoint);
+        names.iter().try_fold(true, |all, name| {
+            let at = source.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+                .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
+            Ok(all && source.tensors[at].meta.dtype == DType::Bf16 && source.tensors[at].meta.shape.len() == 2)
+        })
+    }
+
     /// Per-row FP8 `names` (`layout` Row128 or Channel) with its scales stored
     /// K-block major (`[K/128, N]`), the one layout the `kda_w8` decode and
     /// prefill programs both read: (values, K-major scales).
@@ -373,6 +456,10 @@ impl<'a> GlmfLoader<'a> {
         -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         ensure!(layout != super::fp8::Layout::Block, "{names:?}: K-major scales are per-row scales");
+        if self.all_bf16(names)? {
+            let parts = names.iter().map(|n| QuantPart::Tensor(n)).collect::<Vec<_>>();
+            return self.gpu_fp8(&parts, layout, true, self.stream);
+        }
         let (values, scales, cols) = self.fp8_host(names, layout)?;
         Ok((self.upload(&values)?, self.upload(&kmajor_scales(&scales, values.len() / cols, cols / 128))?))
     }
@@ -702,6 +789,9 @@ impl<'a> GlmfLoader<'a> {
     fn fp8_split(&self, names: &[String], axis: Axis, ranks: usize)
         -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
         ensure!(axis == Axis::Rows || names.len() == 1, "{names:?}: concatenated weights split by rows");
+        if self.all_bf16(names)? {
+            return self.gpu_fp8_split(names, axis, ranks);
+        }
         let (mut values, mut grids) = (vec![Vec::new(); ranks], vec![Vec::new(); ranks]);
         for name in names {
             let (v, g, rows, cols) = Self::fp8_block_host(self.fp8_source.unwrap_or(self.checkpoint), name,
@@ -716,6 +806,73 @@ impl<'a> GlmfLoader<'a> {
         }
         values.into_iter().zip(grids).enumerate()
             .map(|(rank, (v, g))| self.on_rank(rank, || Ok((self.upload(&v)?, self.upload(&g)?)))).collect()
+    }
+
+    /// The load stream of rank `rank` (its device is current inside `on_rank`).
+    fn rank_stream(&self, rank: usize) -> Result<*mut c_void> {
+        Ok(if rank == 0 { self.stream } else { self.peers.get(rank - 1).context("rank stream")?.stream })
+    }
+
+    /// [`Self::fp8_split`] for BF16 sources on the GPU: each tensor is read once
+    /// into pinned memory, then each rank quantizes its own window of it (whole
+    /// 128-row or 128-column blocks, so the same blocks as the whole tensor's).
+    fn gpu_fp8_split(&self, names: &[String], axis: Axis, ranks: usize)
+        -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        use crate::shared::fp8_load_quant::{GpuQuantizer, Target};
+        let source = self.fp8_source.unwrap_or(self.checkpoint);
+        let tensor = |name: &str| -> Result<&CheckpointTensor> {
+            let at = source.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+                .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
+            Ok(&source.tensors[at])
+        };
+        let shapes = names.iter().map(|n| { let s = &tensor(n)?.meta.shape; Ok((s[0], s[1])) }).collect::<Result<Vec<_>>>()?;
+        for (name, &(rows, cols)) in names.iter().zip(&shapes) {
+            let along = if axis == Axis::Rows { rows } else { cols };
+            ensure!(rows % 128 == 0 && cols % 128 == 0 && along % (128 * ranks) == 0,
+                "{name}: [{rows}, {cols}] does not split into whole 128 blocks over {ranks} GPUs");
+        }
+        let cols = shapes[0].1;
+        ensure!(shapes.iter().all(|&(_, c)| c == cols), "{names:?}: FP8 rows must share columns");
+        let (rank_rows, rank_cols) = match axis {
+            Axis::Rows => (shapes.iter().map(|&(r, _)| r / ranks).sum::<usize>(), cols),
+            Axis::Cols => (shapes[0].0, cols / ranks),
+        };
+        let mut out = (0..ranks).map(|rank| self.on_rank(rank, || Ok((
+            DeviceAllocation::new(self.library, (rank_rows * rank_cols).max(256))?,
+            DeviceAllocation::new(self.library, (rank_rows / 128 * (rank_cols / 128) * 4).max(256))?,
+        )))).collect::<Result<Vec<_>>>()?;
+        let mut slot = self.quantizer.borrow_mut();
+        if slot.is_none() { *slot = Some(GpuQuantizer::new(self.library)?); }
+        let quantizer = slot.as_mut().context("GPU quantizer")?;
+        let mut row = 0;
+        for (name, &(rows, _)) in names.iter().zip(&shapes) {
+            let tensor = tensor(name)?;
+            let staged = quantizer.source_mut(rows * cols * 2)?;
+            crate::shared::memory::load_timing::read(staged.len(), || std::fs::File::open(source.snapshot.join(&tensor.shard))?
+                .read_exact_at(staged, tensor.meta.byte_offset)).with_context(|| format!("reading {name}"))?;
+            for (rank, (values, grid)) in out.iter_mut().enumerate() {
+                let (window, col0, height) = match axis {
+                    Axis::Rows => (rank * rows / ranks..(rank + 1) * rows / ranks, 0, rows / ranks),
+                    Axis::Cols => (0..rows, rank * rank_cols, rows),
+                };
+                let target = Target {
+                    // SAFETY: this name's rows of the rank's share lie inside its operands.
+                    q: CuteafdDeviceBuffer { ptr: unsafe { values.buffer.ptr.cast::<u8>().add(row * rank_cols) }.cast(),
+                        bytes: height * rank_cols, ..values.buffer },
+                    q_stride: rank_cols,
+                    scales: CuteafdDeviceBuffer {
+                        ptr: unsafe { grid.buffer.ptr.cast::<u8>().add(row / 128 * (rank_cols / 128) * 4) }.cast(),
+                        bytes: height / 128 * (rank_cols / 128) * 4, ..grid.buffer },
+                    kmajor: None,
+                };
+                let stream = self.rank_stream(rank)?;
+                self.on_rank(rank, || crate::shared::memory::load_timing::quantize(height * rank_cols * 2, ||
+                    quantizer.quantize(window, cols, col0, rank_cols, super::fp8::Layout::Block, self.fp8_scales,
+                        target, stream)))?;
+            }
+            row += if axis == Axis::Rows { rows / ranks } else { rows };
+        }
+        Ok(out)
     }
 
     /// Layer `layer`, one share per rank of this loader's head split (see the module
@@ -778,20 +935,24 @@ impl<'a> GlmfLoader<'a> {
                     for (parts, key, cols) in [(&w_in, "w_in", h), (&w_o, "w_o", o_cols)] {
                         let (fp8, kscale) = if key == "w_in" { ("w_in_fp8", "w_in_kscale") } else { ("w_o_fp8", "w_o_kscale") };
                         if key == "w_o" && axis.is_none() {
-                            let (q, k) = quantize_kda_part(&bytes, o_rows, o_cols, layout, self.fp8_scales);
-                            put(&mut ops, fp8, self.replicate(self.upload(&q)?)?);
-                            put(&mut ops, kscale, self.replicate(self.upload(&k)?)?);
+                            let (q, k) = self.gpu_fp8(&[QuantPart::Bytes { bytes: &bytes, rows: o_rows, cols: o_cols }],
+                                layout, true, self.stream)?;
+                            put(&mut ops, fp8, self.replicate(q)?);
+                            put(&mut ops, kscale, self.replicate(k)?);
                             continue;
                         }
+                        // Each rank's head share quantized on its own GPU, K-major scales.
                         let (mut values, mut kmajor) = (Vec::new(), Vec::new());
-                        for part in parts {
+                        for (rank, part) in parts.iter().enumerate() {
                             let n = part.len() / 2 / cols;
-                            let (q, k) = quantize_kda_part(part, n, cols, layout, self.fp8_scales);
+                            let stream = self.rank_stream(rank)?;
+                            let (q, k) = self.on_rank(rank, || self.gpu_fp8(
+                                &[QuantPart::Bytes { bytes: part, rows: n, cols }], layout, true, stream))?;
                             values.push(q);
                             kmajor.push(k);
                         }
-                        put(&mut ops, fp8, self.upload_ranks(values)?);
-                        put(&mut ops, kscale, self.upload_ranks(kmajor)?);
+                        put(&mut ops, fp8, values);
+                        put(&mut ops, kscale, kmajor);
                     }
                 } else {
                     put(&mut ops, "w_in", self.upload_ranks(w_in)?);
@@ -890,6 +1051,8 @@ impl<'a> GlmfLoader<'a> {
             },
         };
         crate::shared::memory::staging::release_staging();
+        // The pinned GPU-quantization source and tables live only for the load.
+        drop(self.quantizer.borrow_mut().take());
         split.log("glm5_flash dense");
         Ok((weights, shares.collect()))
     }

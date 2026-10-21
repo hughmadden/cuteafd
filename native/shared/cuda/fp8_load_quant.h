@@ -156,6 +156,36 @@ struct Segmented {
   }
 };
 
+// A unit that is a column window of wider source rows: unit element (r, c)
+// is source element r * pitch + col0 + c (all in elements).
+template <typename Src>
+struct Strided {
+  Src src;
+  int64_t cols, col0, pitch;
+  CUTEAFD_LQ_FN float at(int64_t i) const { return src.at((i / cols) * pitch + col0 + i % cols); }
+};
+
+// One unit of a load: `rows` (128 Block, 1 Row128/Channel) by `cols` source
+// elements at column `col0` of rows `pitch` elements wide, read from host
+// fragments; E4M3 rows at `q` (row stride `q_stride`) and its `cols / 128`
+// scales at `scales` with stride `scale_stride` (1 row-major; the row count for
+// K-block-major). Shared by the CUDA kernel, the CPU fake DSO and the self-tests.
+struct Job {
+  const Segment* segments;
+  int32_t count;
+  int32_t rows;
+  int32_t cols;
+  int32_t layout;
+  int32_t rule;
+  int32_t pad;
+  int64_t col0;
+  int64_t pitch;
+  uint8_t* q;
+  int64_t q_stride;
+  float* scales;
+  int64_t scale_stride;
+};
+
 // Scale-block amax over the unit's rows (order-independent).
 template <typename Src>
 CUTEAFD_LQ_FN float block_amax(const Src& src, int64_t rows, int64_t cols, int64_t b) {
@@ -223,6 +253,19 @@ CUTEAFD_LQ_FN void quantize_unit_from(const Src& src, uint8_t* q, float* scales,
 }
 
 #if !defined(__CUDA_ARCH__)
+// One job sequentially (the CPU fake DSO's load kernel and the self-test oracle).
+inline void run_job(const Job& job) {
+  const Strided<Segmented> src{Segmented{job.segments, job.count}, job.cols, job.col0, job.pitch};
+  const int64_t rows = job.rows, cols = job.cols, kb = cols / 128;
+  float scales[512];
+  double ra[128], rp[128];
+  for (int64_t b = 0; b < kb; ++b) scales[b] = block_amax(src, rows, cols, b);
+  select_scales(src, scales, rows, cols, job.layout, job.rule, ra, rp);
+  for (int64_t b = 0; b < kb; ++b) job.scales[b * job.scale_stride] = scales[b];
+  for (int64_t i = 0; i < rows * cols; ++i)
+    job.q[(i / cols) * job.q_stride + i % cols] = e4m3(fdiv(src.at(i), scales[(i % cols) / 128]));
+}
+
 // Rows [0, rows) of contiguous `w` as one scale unit: `rows` is 128 for Block,
 // 1 for Row128/Channel. Host convenience over quantize_unit_from.
 inline void quantize_unit(const uint16_t* w, uint8_t* q, float* scales, int64_t rows, int64_t cols,
