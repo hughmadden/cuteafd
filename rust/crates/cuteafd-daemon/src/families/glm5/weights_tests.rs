@@ -74,7 +74,7 @@ fn head_split_operands_match_the_mount_golden() -> Result<()> {
     let cfg = GlmDsaConfig::read(root.path())?;
     let stream = std::ptr::null_mut();
     let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }] };
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: None };
     let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
     let layers: Vec<Vec<GlmLayer<'_>>> = std::iter::once(model.layers).chain(shares).collect();
     let actual = digests(&library, &layers, &model.norm, &model.head)?;
@@ -86,6 +86,56 @@ fn head_split_operands_match_the_mount_golden() -> Result<()> {
     assert_eq!(actual.keys().collect::<Vec<_>>(), golden.keys().collect::<Vec<_>>(), "operand inventory changed");
     for (key, digest) in &golden {
         assert_eq!(&actual[key], digest, "{key} differs from the mount golden");
+    }
+    Ok(())
+}
+
+/// The same operands pushed: the loader allocates and records class-2
+/// operands, each GPU's plan replays through a ring into them, and the
+/// deferred transforms run after delivery. Every operand matches the mount golden.
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
+    let fixture_dso = Fixture::build()?;
+    let library = fixture_dso.load()?;
+    for device in 0..2 { fixture_dso.configure_memory(&library, device, 64 << 30)?; }
+    let root = tempfile::tempdir_in(fixture_dso.directory())?;
+    let tensors = fixture::glm5_tensors(|name, n, k| (0..256).flat_map(|expert|
+        fixture::fp8(&name.replace(".experts.0.", &format!(".experts.{expert}.")), n, k, None)).collect());
+    fixture::write_snapshot(root.path(), &fixture::glm5_config(), &tensors, None);
+    fill(root.path())?;
+    let mut catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+    let cfg = GlmDsaConfig::read(root.path())?;
+    let stream = std::ptr::null_mut();
+    let sink = std::rc::Rc::new(super::landing::PushSink::default());
+    let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: Some(sink.clone()) };
+    let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
+    let (records, deferred) = sink.take();
+    let (sparks, world) = (6usize, 8usize);
+    for gpu in 0..2 {
+        use crate::shared::experts::rtx::dense::{DenseArena, RankLayout};
+        let device = crate::shared::memory::device::Device { library: &library, id: gpu };
+        let layout = RankLayout::new(records.clone(), Vec::new(), gpu)?;
+        let checked = layout.checked(root.path(), world, sparks + gpu as usize)?;
+        let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, (sparks + gpu as usize) as u32)?;
+        device.run(|| -> Result<()> {
+            let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES)?;
+            let fake = crate::shared::experts::rtx::dense::testing::FakeRank::new(&checked, root.path(), (sparks + gpu as usize) as u32, &ring)?;
+            let arena = DenseArena::new(device, layout, expected)?;
+            crate::shared::memory::push_consumer::consume(device, arena, ring, fake, 8)
+        })?;
+    }
+    for job in &deferred {
+        crate::shared::memory::device::Device { library: &library, id: job.device }.run(|| job.run(&library, stream))?;
+    }
+    let layers: Vec<Vec<GlmLayer<'_>>> = std::iter::once(model.layers).chain(shares).collect();
+    let actual = digests(&library, &layers, &model.norm, &model.head)?;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/glm5/weights_golden.json");
+    let golden: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(&path)?)?;
+    for (key, digest) in &golden {
+        assert_eq!(&actual[key], digest, "pushed {key} differs from the mount golden");
     }
     Ok(())
 }

@@ -102,6 +102,8 @@ void fixture_configure_drain_after(int after) { drain_after = after; }
 
 int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
     if (posix_memalign(&out->ptr, 256, bytes)) return 1;
+    /* Zeroed so operand digests never read unspecified padding. */
+    memset(out->ptr, 0, bytes);
     out->bytes = bytes;
     out->device_id = current_device;
     out->flags = 1;
