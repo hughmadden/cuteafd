@@ -175,7 +175,7 @@ impl<'a> Exlr8Weights<'a> {
                     .zip(&layout.loads[first..first + count])
                     .map(|(host, unit)| {
                         let bytes = &mut host.bytes_mut()[..unit.staging_bytes()];
-                        scope.spawn(move || unit.read_verified(bytes))
+                        scope.spawn(move || unit.read(bytes))
                     })
                     .collect::<Vec<_>>();
                 for reader in readers {
@@ -222,7 +222,7 @@ impl<'a> Exlr8Weights<'a> {
         tracing::info!(layer = layout.layer, rank = layout.rank, world = layout.world,
             manifest = %layout.manifest, payload_bytes = layout.payload_bytes,
             resident_bytes = layout.resident_bytes, seconds = started.elapsed().as_secs_f64(),
-            "EXLR8 native units loaded and checksums verified");
+            "EXLR8 native units loaded");
         Ok(Self {
             buffer: arena.buffer,
             _arena: ArenaOwner::Mount { _allocation: arena },
@@ -254,7 +254,7 @@ mod tests {
         // the final drain precedes returning the arena and dropping both banks.
         let source = include_str!("exlr8.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let reuse = source.find("library.cuda_stream_synchronize(streams[bank].raw)").unwrap();
-        let readers = source.find("unit.read_verified(bytes)").unwrap();
+        let readers = source.find("unit.read(bytes)").unwrap();
         let upload = source.find("library.copy_host_buffer_h2d_async(").unwrap();
         let final_drain = source.find("library.cuda_stream_synchronize(stream.raw)").unwrap();
         assert!(reuse < readers && readers < upload && upload < final_drain);

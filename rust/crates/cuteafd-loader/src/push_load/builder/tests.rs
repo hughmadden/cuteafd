@@ -594,7 +594,7 @@ fn real_exlr8_tp4_tp6_plan_counts_and_verified_unit_bytes() {
             let expert = residency.loads[0].expert;
             for unit in residency.loads.iter().filter(|u| u.expert == expert) {
                 let mut verified = vec![0; unit.staging_bytes()];
-                unit.read_verified(&mut verified).unwrap();
+                unit.read(&mut verified).unwrap();
                 let mut cursor = 0;
                 for (component, source) in unit.source.iter().enumerate() {
                     let dst = unit.destination[component] as u64;

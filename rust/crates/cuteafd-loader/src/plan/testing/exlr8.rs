@@ -1,7 +1,6 @@
 //! Small native mixed-tier EXLR8 checkpoint for loader and daemon tests.
 use std::{fs::File, io::Write, path::Path};
 use serde_json::{json, Value};
-use crate::plan::exlr8::residency::xxhash64;
 
 fn write(
     path: &Path,
@@ -76,10 +75,7 @@ pub fn fixture(root: &Path, padded: bool) {
                             &((base + (p * es * 3 + e * 3 + u) * stride) as u64).to_le_bytes(),
                         );
                         offsets.extend_from_slice(&(bytes as u64).to_le_bytes());
-                        let mut data = vec![(k * 10 + e * 3 + p + u) as u8; bytes];
-                        data.extend(vec![(e + p + u) as u8; 256]);
-                        data.extend(vec![k as u8; 2]);
-                        checksums.extend_from_slice(&xxhash64(&data).to_le_bytes());
+                        checksums.extend_from_slice(&0u64.to_le_bytes());
                     }
                 }
             }

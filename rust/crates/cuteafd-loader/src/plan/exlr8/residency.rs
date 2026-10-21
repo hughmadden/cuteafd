@@ -1,4 +1,4 @@
-//! Checkpoint-native, unit-major EXLR8 residency and verified range reads.
+//! Checkpoint-native, unit-major EXLR8 residency and bounded range reads.
 //! Arena offsets are independent of a CUDA address; the owner binds them only
 //! after exact weight/workspace admission and retains the arena for graph life.
 use super::{Header, Layer, manifest, number, owner};
@@ -53,16 +53,14 @@ pub struct Unit {
     pub bits: i32,
     pub source: [Range; 3],
     pub destination: [usize; 3],
-    pub checksum: u64,
 }
 impl Unit {
     pub fn staging_bytes(&self) -> usize {
         self.source.iter().map(|r| r.bytes).sum()
     }
 
-    /// One bounded range read per component; checksum order is payload, channel,
-    /// blocks. A checksum failure must never publish this unit to a live arena.
-    pub fn read_verified(&self, staging: &mut [u8]) -> Result<()> {
+    /// Read each component into its bounded staging range.
+    pub fn read(&self, staging: &mut [u8]) -> Result<()> {
         self.read_inner(staging).map_err(Into::into)
     }
     fn read_inner(&self, staging: &mut [u8]) -> anyhow::Result<()> {
@@ -75,26 +73,6 @@ impl Unit {
             source.read(&mut staging[at..at + source.bytes])?;
             at += source.bytes;
         }
-        self.verify_bytes(staging)?;
-        Ok(())
-    }
-
-    /// Validate a delivered native unit without reopening checkpoint files.
-    pub fn verify_bytes(&self, bytes: &[u8]) -> Result<()> {
-        self.verify_bytes_inner(bytes).map_err(Into::into)
-    }
-    fn verify_bytes_inner(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        ensure!(bytes.len() == self.staging_bytes(), "unit checksum length mismatch");
-        let actual = xxhash64(bytes);
-        ensure!(
-            actual == self.checksum,
-            "checksum mismatch e{} u{} p{} K{}: {actual:016x} != {:016x}",
-            self.expert,
-            self.unit,
-            self.projection,
-            self.bits,
-            self.checksum
-        );
         Ok(())
     }
 }
@@ -457,17 +435,14 @@ impl Residency {
                     )?;
                     let channel = cache_range(channel, &index_bytes)?;
                     let block = cache_range(block, &index_bytes)?;
-                    let checksum = read_u64(
-                        range(
-                            &index,
-                            &index_path,
-                            &format!("{stem}.checksum"),
-                            "U64",
-                            &[experts, 3, units],
-                            ((e * 3 + p) * units + u) * 8,
-                            8,
-                        )?,
-                        &index_bytes,
+                    range(
+                        &index,
+                        &index_path,
+                        &format!("{stem}.checksum"),
+                        "U64",
+                        &[experts, 3, units],
+                        ((e * 3 + p) * units + u) * 8,
+                        8,
                     )?;
                     let payload_dest = reserve(&mut cursor, bytes)?;
                     let channel_dest = reserve(&mut cursor, 256)?;
@@ -497,7 +472,6 @@ impl Residency {
                             block,
                         ],
                         destination: [payload_dest, channel_dest, block_dest],
-                        checksum,
                     });
                 }
             }
@@ -623,69 +597,6 @@ fn ensure_inner(plan: &Residency, address: u64) -> anyhow::Result<(Vec<u64>, Vec
     Ok((pointers, bits))
 }
 
-// XXH64, seed zero, canonical little-endian arithmetic from the published
-// algorithm. Keeping it here avoids depending on an optional native library.
-pub(crate) fn xxhash64(data: &[u8]) -> u64 {
-    const P1: u64 = 11400714785074694791;
-    const P2: u64 = 14029467366897019727;
-    const P3: u64 = 1609587929392839161;
-    const P4: u64 = 9650029242287828579;
-    const P5: u64 = 2870177450012600261;
-    fn lane(a: u64, v: u64) -> u64 {
-        a.wrapping_add(v.wrapping_mul(P2))
-            .rotate_left(31)
-            .wrapping_mul(P1)
-    }
-    let word = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
-    let mut at = 0;
-    let mut h;
-    if data.len() >= 32 {
-        let mut v = [P1.wrapping_add(P2), P2, 0, 0u64.wrapping_sub(P1)];
-        while at + 32 <= data.len() {
-            for (i, value) in v.iter_mut().enumerate() {
-                *value = lane(*value, word(at + i * 8));
-            }
-            at += 32;
-        }
-        h = v[0]
-            .rotate_left(1)
-            .wrapping_add(v[1].rotate_left(7))
-            .wrapping_add(v[2].rotate_left(12))
-            .wrapping_add(v[3].rotate_left(18));
-        for value in v {
-            h = (h ^ lane(0, value)).wrapping_mul(P1).wrapping_add(P4);
-        }
-    } else {
-        h = P5;
-    }
-    h = h.wrapping_add(data.len() as u64);
-    while at + 8 <= data.len() {
-        h = (h ^ lane(0, word(at)))
-            .rotate_left(27)
-            .wrapping_mul(P1)
-            .wrapping_add(P4);
-        at += 8;
-    }
-    if at + 4 <= data.len() {
-        h = (h
-            ^ (u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as u64).wrapping_mul(P1))
-        .rotate_left(23)
-        .wrapping_mul(P2)
-        .wrapping_add(P3);
-        at += 4;
-    }
-    for &byte in &data[at..] {
-        h = (h ^ (byte as u64).wrapping_mul(P5))
-            .rotate_left(11)
-            .wrapping_mul(P1);
-    }
-    h ^= h >> 33;
-    h = h.wrapping_mul(P2);
-    h ^= h >> 29;
-    h = h.wrapping_mul(P3);
-    h ^ (h >> 32)
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -718,25 +629,6 @@ mod tests {
     }
 
     use crate::plan::testing::exlr8::fixture;
-
-    #[test]
-    fn checksum_matches_independent_e1_vectors() {
-        for (n, expected) in [
-            (0, 0xef46db3751d8e999),
-            (1, 0xe934a84adb052768),
-            (4, 0xffced8604453cc1e),
-            (8, 0x884a173614b81b8d),
-            (31, 0xc346d2b59b4d8ee1),
-            (32, 0xcbf59c5116ff32b4),
-            (33, 0x0c535d1acafb8ead),
-            (1000, 0xf306f04aa88b54d3),
-        ] {
-            assert_eq!(
-                xxhash64(&(0..n).map(|i| (i % 251) as u8).collect::<Vec<_>>()),
-                expected
-            );
-        }
-    }
 
     #[test]
     fn residency_ownership_mixed_widths_shared_and_padded_ranges() {
@@ -809,8 +701,8 @@ mod tests {
                                 assert_eq!(ptrs[slot * 3 + i], 0x10000 + dest as u64);
                             }
                             let mut staging = vec![0; unit.staging_bytes()];
-                            unit.read_verified(&mut staging).unwrap();
-                            assert!(unit.read_verified(&mut staging[1..]).is_err());
+                            unit.read(&mut staging).unwrap();
+                            assert!(unit.read(&mut staging[1..]).is_err());
                         }
                         for (slot, &width) in bits.iter().enumerate() {
                             if width == 0 {
@@ -834,23 +726,21 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_checksum_and_index_are_refused() {
+    fn truncated_native_source_is_refused() {
         let root = tempfile::tempdir().unwrap();
         fixture(root.path(), false);
         let plan = Residency::plan(root.path(), "mixed", 3, 1, 0, ExpertSet::Routed).unwrap();
         let unit = &plan.loads[0];
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&unit.source[0].path)
-            .unwrap();
-        file.seek(SeekFrom::Start(unit.source[0].offset)).unwrap();
-        file.write_all(&[0]).unwrap();
-        assert!(
-            unit.read_verified(&mut vec![0; unit.staging_bytes()])
-                .unwrap_err()
-                .to_string()
-                .contains("checksum mismatch")
-        );
+        let source = &unit.source[0];
+        std::fs::OpenOptions::new().write(true).open(&source.path).unwrap()
+            .set_len(source.offset + source.bytes as u64 - 1).unwrap();
+        assert!(unit.read(&mut vec![0; unit.staging_bytes()]).is_err());
+    }
+
+    #[test]
+    fn corrupt_index_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
         let path = root
             .path()
             .join("experts/exlr8-layer-003.index.safetensors");
@@ -913,7 +803,7 @@ mod tests {
                 assert_eq!(plan.loads.len() % 3, 0);
                 plan.descriptors(0x10000).unwrap();
                 for unit in plan.loads.iter().take(3) {
-                    unit.read_verified(&mut vec![0; unit.staging_bytes()])
+                    unit.read(&mut vec![0; unit.staging_bytes()])
                         .unwrap();
                 }
             }

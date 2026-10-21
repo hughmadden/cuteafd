@@ -34,7 +34,7 @@ impl RankPlan {
                     source.path.strip_prefix(snapshot)?, source.offset, source.bytes)))
                     .collect::<Result<Vec<_>>>()?;
                 Ok((unit.expert, unit.unit, unit.projection, unit.bits, components,
-                    unit.destination, unit.checksum))
+                    unit.destination))
             }).collect::<Result<Vec<_>>>()?;
             let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&(
                 &slice, &r.set_id, &r.manifest, r.resident_bytes, r.signs_offsets,
