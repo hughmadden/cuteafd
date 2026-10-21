@@ -70,6 +70,202 @@ fn report_context(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, po
 }
 
 #[test]
+fn coordinator_headers_include_native_mtp_only_when_selected() -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+    let fixture = snapshot("fp8");
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let off = Checkpoint::coordinator(path, false, false)?;
+        let on = Checkpoint::coordinator(path, false, true)?;
+        let inventory = Checkpoint::inventory(path)?;
+        let model = Model::open(&inventory)?;
+        let names = |cp: &Checkpoint| cp.tensors.iter()
+            .map(|tensor| tensor.meta.name.clone()).collect::<BTreeSet<_>>();
+        let off_names = names(&off);
+        let on_names = names(&on);
+        let expected_off = inventory.tensor_names().filter(|name| {
+            model.tensors.get(*name).is_some_and(|tensor| !matches!(tensor.role.component,
+                Component::Speculator | Component::SpeculatorExpert | Component::RoutedExpert
+                    | Component::Vision | Component::Audio))
+        }).map(str::to_owned).collect::<BTreeSet<_>>();
+        assert_eq!(off_names, expected_off, "MTP-off target resident set changed");
+        let predictors = inventory.tensor_names().filter(|name| {
+            (92..95).any(|layer| name.starts_with(&format!("model.layers.{layer}.")))
+        }).map(str::to_owned).collect::<BTreeSet<_>>();
+        assert!(!predictors.is_empty());
+        assert_eq!(on_names.difference(&off_names).cloned().collect::<BTreeSet<_>>(), predictors);
+        assert!(off_names.is_subset(&on_names));
+        assert_eq!(off.weight_map, on.weight_map);
+        for stage in 0..3 {
+            let layout = coordinator::RankWeightLayout::for_mtp_stage(&on, stage)?;
+            assert_eq!(layout.operands.len(), 16);
+            for operand in &layout.operands {
+                assert!(!operand.sources.is_empty(), "native operand must retain source headers");
+                for source in &operand.sources {
+                    let header = on.tensors.iter().find(|tensor| tensor.meta.name == source.meta.name)
+                        .expect("indexed predictor source must resolve to its own shard header");
+                    assert_eq!(on.weight_map.get(&source.meta.name), Some(&header.shard));
+                    assert!(!off_names.contains(&source.meta.name));
+                }
+            }
+        }
+        assert_eq!(names(&Checkpoint::coordinator(path, false, false)?), off_names);
+        eprintln!("Step-5 coordinator headers: target={} predictor={} stages=3 index_bound=true mtp_off_unchanged=true",
+            off_names.len(), predictors.len());
+        Ok(())
+    };
+    check(fixture.path())?;
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_HEADER_SNAPSHOT") {
+        check(std::path::Path::new(&snapshot))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn native_mtp_contract_accepts_only_validated_predictor_headers() -> anyhow::Result<()> {
+    let fixture = snapshot("fp8");
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let cp = Checkpoint::coordinator(path, false, true)?;
+        let model = Model::open(&cp)?;
+        let groups = format::group_by_stem(&cp.tensors);
+        let scale = format::TensorScale { encoding: format::ScaleEncoding::F32 };
+        let mut count = 0;
+        for (stem, members) in &groups {
+            let Some(role) = STEP5.classify(model.spec(), stem) else { continue; };
+            if role.component != Component::Speculator { continue; }
+            let operand = format::detect(members)?;
+            assert!(model.accepts(&role, stem, &mut operand.clone()).is_ok(), "{stem}");
+            for mutation in 0..8 {
+                let mut wrong = operand.clone();
+                match mutation {
+                    0 => wrong.logical[0] -= 1,
+                    1 => wrong.stored[0] -= 1,
+                    2 => wrong.encoding = format::Encoding::F16,
+                    3 => wrong.global_scale = Some(scale),
+                    4 => wrong.input_scale = Some(scale),
+                    5 => wrong.scale = Some(format::BlockScale {
+                        tensor: "weight_scale_inv".into(), encoding: format::ScaleEncoding::F32,
+                        direction: format::ScaleDirection::Multiply,
+                        rows: format::RowTiling::Uniform { rows: 128 }, cols: 128, grid: vec![1, 1],
+                    }),
+                    6 => wrong.container = "F16".into(),
+                    _ => wrong.companions.push("bias".into()),
+                }
+                assert!(model.accepts(&role, stem, &mut wrong).is_err(), "{stem} mutation {mutation}");
+            }
+            for wrong in [TensorRole::layer(Component::Speculator, 91),
+                TensorRole::layer(Component::Speculator, 95), TensorRole::layer(Component::Attention, role.layer.unwrap())] {
+                assert!(model.accepts(&wrong, stem, &mut operand.clone()).is_err(), "{stem} {wrong:?}");
+            }
+            let unknown = format!("model.layers.{}.unvalidated", role.layer.unwrap());
+            assert!(model.accepts(&role, &unknown, &mut operand.clone()).is_err());
+            count += 1;
+        }
+        assert_eq!(count, 51, "only the qualified 17 operands per stage may be admitted");
+        assert!(STEP5.component_hint(Component::Speculator).is_none());
+        Ok(())
+    };
+    check(fixture.path())?;
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_HEADER_SNAPSHOT") {
+        check(std::path::Path::new(&snapshot))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> anyhow::Result<()> {
+    use crate::placement::{inventory::{self, ArchContext}, *};
+    use super::admission::{self, MarkRule, RuntimeInputs};
+    let fixture = snapshot("fp8");
+    let checkpoint_path = std::env::var_os("CUTEAFD_STEP5_FORECAST_SNAPSHOT")
+        .map(std::path::PathBuf::from).unwrap_or_else(|| fixture.path().to_path_buf());
+    let cp = Checkpoint::open(&checkpoint_path)?;
+    let manifest_path = std::env::var_os("CUTEAFD_STEP5_FORECAST_MANIFEST")
+        .map(std::path::PathBuf::from).unwrap_or_else(|| native_manifest(fixture.path()));
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
+    let capacity = inventory::PRO_TOTAL_BYTES;
+    let arch = ArchContext::coordinator(capacity, None);
+    let inputs = RuntimeInputs {
+        inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
+            baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
+            headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
+        rows: 256, sequences: 16, context: 1_048_576,
+        requested_pool: Some(1_048_576),
+        marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
+        pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
+            "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
+        peer_diagnostics: false, startup: vec![],
+    };
+    let baseline = admission::forecast_mtp(&cp, &inputs, 0)?;
+    for depth in 0..=3 {
+        let admitted = admission::forecast_mtp(&cp, &inputs, depth)?;
+        assert_eq!(admitted.cache.context, 1_048_576);
+        assert_eq!(admitted.placement.pool_tokens, 1_048_576);
+        assert_eq!(admitted.marks, 2);
+        assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
+        assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
+        let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
+        let ownership = inputs.ownership(&Config::parse(&cp)?)?;
+        let target = native::rank_admission(&cp, &ownership, 0, inputs.rows)?.workspace;
+        let workspace = target.max(native::mtp_forecast_workspace(inputs.rows, depth)?) - target;
+        let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
+            .map(|item| item.bytes).sum::<u64>();
+        let active_delta = admitted.reservations[0].active - baseline.reservations[0].active;
+        let marks_delta = admitted.reservations[0].marks - baseline.reservations[0].marks;
+        assert_eq!(charged(&admitted, 0) - charged(&baseline, 0),
+            weights + workspace + active_delta as u64 + marks_delta as u64);
+        assert_eq!(charged(&admitted, 1), charged(&baseline, 1));
+        let planned = plan::plan(&checkpoint_path, &PlanOptions {
+            placement: ExpertPlacement::from_spark_ranks(6),
+            draft_ownership: if depth == 0 { Some(spec::DraftOwnership::None) } else { None },
+            layout: Some(layout::LayoutOptions {
+                rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool,
+                context_tokens: inputs.context, concurrency: inputs.sequences as u64,
+                prefill_rows: inputs.rows as u64, headroom_bytes: 1 << 30,
+                native_mtp_layers: depth, workspace_manifest: Some(manifest_path.clone()),
+                mimo_prefix_entries: inputs.marks.entries as u64,
+                mimo_prefix_mark_bytes: inputs.marks.budget_bytes,
+                ..Default::default()
+            }), ..Default::default()
+        })?;
+        assert!(planned.wip_launchable(), "depth {depth}: {:?}", planned.hints);
+        let memory = planned.memory_layout.as_ref().expect("depth-aware Step-5 layout");
+        assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
+        for rank in 0..2 {
+            let device = &memory.devices[rank];
+            for category in [cuteafd_core::memory_layout::Category::Weights,
+                cuteafd_core::memory_layout::Category::Kv,
+                cuteafd_core::memory_layout::Category::Prefix,
+                cuteafd_core::memory_layout::Category::Workspace] {
+                let expected = admitted.placement.items[rank].iter()
+                    .filter(|item| item.category == category).map(|item| item.bytes).sum::<u64>();
+                let actual = device.items.iter().filter(|item| item.category == category)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(actual, expected, "depth {depth}, rank {rank}, {category:?}");
+            }
+        }
+        let by_category = (0..2).map(|rank| {
+            let mut categories = std::collections::BTreeMap::new();
+            for item in &admitted.placement.items[rank] {
+                *categories.entry(format!("{:?}", item.category)).or_insert(0u64) += item.bytes;
+            }
+            serde_json::json!({"rank": rank, "charged": charged(&admitted, rank),
+                "context": arch.context_bytes, "headroom": 1u64 << 30,
+                "remaining": capacity - arch.context_bytes - (1 << 30) - charged(&admitted, rank),
+                "categories": categories})
+        }).collect::<Vec<_>>();
+        eprintln!("Step-5 full-context forecast {}", serde_json::json!({
+            "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
+            "sequences": inputs.sequences, "rows": inputs.rows,
+            "marks": admitted.marks, "predictor_weights": weights,
+            "predictor_arena_growth": workspace,
+            "active_delta": active_delta, "mark_delta": marks_delta, "ranks": by_category }));
+    }
+    assert!(admission::forecast_mtp(&cp, &inputs, 4).is_err());
+    Ok(())
+}
+
+#[test]
 fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
     use crate::placement::{FfnMode, LayerMode};
     use crate::serving_capacity::{step5::Step5CacheLayout, KvPlacement};
@@ -172,11 +368,11 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
                 assert_eq!(weights[rank].operands.iter().any(|o| o.name == "model.embed_tokens.weight"), rank == 0);
                 assert_eq!(weights[rank].operands.iter().any(|o| o.name == "lm_head.weight"), rank == head as usize);
                 for frontier in [0, 63, 64, 65, 575, 576, 1024] {
-                    let spans = layout.snapshot_spans(rank, frontier).unwrap();
+                    let spans = layout.snapshot_spans(rank, frontier, &vec![0; state.mtp_lengths.len()]).unwrap();
                     let expected = 8 + state.sliding.iter().map(|s| 2 * frontier.min(512) * s.key.bytes / layout.ring.rows).sum::<u64>()
                         + state.regions.len() as u64 * (2 * 8 * 256 * 2 + frontier / 8 * 256);
                     assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
-                    let copies = layout.snapshot_copies(rank, frontier, 3, 2, 4, 3).unwrap();
+                    let copies = layout.snapshot_copies(rank, frontier, &[], 3, 2, 4, 3).unwrap();
                     assert_eq!(copies.iter().map(|s| s.active.bytes).sum::<u64>(), expected);
                     assert!(copies.iter().all(|c| c.active.offset + c.active.bytes <= state.bytes * 3
                         && c.mark.offset >= state.bytes * 3 && c.mark.offset + c.mark.bytes <= state.bytes * 4));
@@ -186,6 +382,7 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64).unwrap();
             for (rank, state) in mtp.ranks.iter().enumerate() {
                 assert_eq!(state.mtp_hidden.is_some(), rank == head as usize);
+                assert_eq!(state.mtp_stage_hidden.len(), if rank == head as usize { 3 } else { 0 });
                 assert_eq!(state.sliding.iter().filter(|s| s.mtp).count(), if rank == head as usize { 3 } else { 0 });
             }
         }
@@ -276,6 +473,97 @@ fn step5_routed_replication_bindings_are_single_wave_and_disjoint_from_heads() {
 }
 
 #[test]
+fn predictor_histories_are_private_charged_and_snapshotted_without_append_slack() {
+    use crate::serving_capacity::step5::Step5CacheLayout;
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    for depth in 0..=3 {
+        let layout = Step5CacheLayout::new(&cfg, 2, 1 << 20, depth, 256).unwrap();
+        let state = &layout.ranks[0];
+        assert_eq!(state.mtp_stage_hidden.len(), depth);
+        assert!(layout.ranks[1].mtp_stage_hidden.is_empty());
+        if depth == 0 {
+            assert_eq!(layout.mtp_hidden_rows, 0);
+            assert!(state.mtp_hidden.is_none());
+            continue;
+        }
+        assert_eq!(layout.mtp_hidden_rows, 832);
+        let histories = state.mtp_stage_hidden.iter().copied().chain(state.mtp_hidden)
+            .collect::<Vec<_>>();
+        assert_eq!(histories.iter().map(|span| span.bytes).sum::<u64>(),
+            832 * 4096 * (4 * depth as u64 + 2));
+        for (index, span) in histories.iter().enumerate() {
+            assert!(histories[index + 1..].iter().all(|other|
+                span.offset + span.bytes <= other.offset || other.offset + other.bytes <= span.offset));
+            assert!(span.offset + span.bytes <= state.bytes);
+        }
+        for frontier in [0u64, 511, 512, 831, 832, 1 << 20] {
+            let stages: Vec<_> = (0..depth).map(|stage| frontier.saturating_sub(stage as u64 + 1)).collect();
+            let copies = layout.snapshot_copies(0, frontier, &stages, 16, 15, 32, 31).unwrap();
+            for (component, end) in std::iter::once((state.mtp_hidden.unwrap(), frontier))
+                .chain(state.mtp_stage_hidden.iter().copied().zip(stages.iter().copied())) {
+                let at = component.offset * 16 + component.bytes * 15;
+                let retained = copies.iter().filter(|c| c.active.offset >= at
+                    && c.active.offset < at + component.bytes).map(|c| c.active.bytes).sum::<u64>();
+                assert_eq!(retained, end.min(512 + depth as u64 + 1) * component.bytes / layout.mtp_hidden_rows);
+                assert!(retained < component.bytes, "proposal slack must not enter a mark");
+            }
+            assert!(layout.snapshot_spans(0, frontier, &stages).is_ok());
+        }
+        // An entire proposed wave must not overwrite any history needed by
+        // the previous frontier, including all shifted teacher-forced inputs.
+        let retained = 512 + depth as u64 + 1;
+        for base in [retained, 831, 832, 2 * 832, 1 << 20] {
+            let old = (base - retained..base).map(|p| p % layout.mtp_hidden_rows)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!((base..base + 256).all(|p| !old.contains(&(p % layout.mtp_hidden_rows))));
+        }
+    }
+}
+
+#[test]
+fn predictor_marks_validate_independent_frontiers_and_ignore_rejected_rows() {
+    use crate::serving_capacity::step5::Step5CacheLayout;
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    let layout = Step5CacheLayout::new(&cfg, 1, 1024, 3, 64).unwrap();
+    let state = &layout.ranks[0];
+    for stages in [[600, 0, 0], [600, 598, 0], [600, 598, 597]] {
+        let copies = layout.snapshot_copies(0, 603, &stages, 1, 0, 1, 0).unwrap();
+        for (stage, &end) in stages.iter().enumerate() {
+            let ring = state.sliding.iter().find(|s| s.layer == 92 + stage).unwrap();
+            for (component, rows, keep) in [(ring.key, layout.ring.rows, 512),
+                (ring.value, layout.ring.rows, 512),
+                (state.mtp_stage_hidden[stage], layout.mtp_hidden_rows, 516)] {
+                let stride = component.bytes / rows;
+                let mut retained = Vec::new();
+                for copy in copies.iter().filter(|c| c.active.offset >= component.offset
+                    && c.active.offset < component.offset + component.bytes) {
+                    assert_eq!(copy.active.bytes % stride, 0);
+                    for row in 0..copy.active.bytes / stride {
+                        let source = (copy.active.offset - component.offset) / stride + row;
+                        let canonical = (copy.mark.offset - component.offset) / stride + row;
+                        retained.push((canonical, source));
+                    }
+                }
+                retained.sort_unstable();
+                let expected: Vec<_> = (end.saturating_sub(keep)..end).enumerate()
+                    .map(|(canonical, logical)| (canonical as u64, logical % rows)).collect();
+                assert_eq!(retained, expected);
+                let proposed: std::collections::BTreeSet<_> = (end..end + 64).map(|p| p % rows).collect();
+                assert!(retained.iter().all(|(_, source)| !proposed.contains(source)),
+                    "rejected rows may never enter a canonical mark");
+            }
+        }
+    }
+    for invalid in [vec![], vec![600], vec![603, 0, 0], vec![600, 601, 0], vec![600, 598, 599]] {
+        assert!(layout.snapshot_spans(0, 603, &invalid).is_err());
+    }
+}
+
+#[test]
 fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
     use crate::serving_capacity::step5::{Step5CacheLayout, PAGE_ROWS, REGION_ROWS};
     let dir = snapshot("fp8");
@@ -283,7 +571,9 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
     let cfg = Model::open(&cp).unwrap().cfg;
     for ranks in [1, 2] {
         let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3, 64).unwrap();
-        assert_eq!(layout.mtp_hidden_rows, 516);
+        assert_eq!(layout.mtp_hidden_rows, 640);
+        assert_eq!(layout.ranks[0].mtp_stage_hidden.len(), 3);
+        assert!(layout.ranks[0].mtp_stage_hidden.iter().all(|span| span.bytes == 640 * 4096 * 4));
         assert_eq!(layout.window(), 512);
         assert_eq!(layout.capture_reach(), 0);
         assert_eq!(layout.geometry.logical_unit_rows, PAGE_ROWS);
@@ -301,13 +591,15 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
             assert_eq!(geometry.retained_mark_bytes, state.bytes);
             assert_eq!(geometry.active_state_per_sequence_bytes, state.bytes);
             for frontier in [0, 1, 7, 8, 63, 64, 65, 511, 512, 513, 1 << 20] {
-                let spans = layout.snapshot_spans(rank, frontier).unwrap();
+                let spans = layout.snapshot_spans(rank, frontier, &vec![0; state.mtp_lengths.len()]).unwrap();
                 assert!(spans.iter().all(|s| s.offset.checked_add(s.bytes).unwrap() <= state.bytes));
                 let summary_bytes = if rank == 0 { 23 * (frontier / REGION_ROWS) * 256 } else { 0 };
-                let maximum: u64 = layout.snapshot_spans(rank, 1 << 20).unwrap().iter().map(|s| s.bytes).sum();
+                let maximum: u64 = layout.snapshot_spans(rank, 1 << 20, &vec![0; state.mtp_lengths.len()]).unwrap().iter().map(|s| s.bytes).sum();
                 let missing_rings: u64 = state.sliding.iter().filter(|s| !s.mtp)
                     .map(|s| 2 * (512 - frontier.min(512)) * s.key.bytes / layout.ring.rows).sum();
-                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 } - missing_rings;
+                let missing_history = state.mtp_hidden.map_or(0, |span|
+                    (516 - frontier.min(516)) * span.bytes / layout.mtp_hidden_rows);
+                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 } - missing_rings - missing_history;
                 assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
                 assert!(state.regions.iter().all(|region| spans.contains(&region.pending_key)
                     && spans.contains(&region.pending_z)));
@@ -315,7 +607,7 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
                     for component in [ring.key, ring.value] {
                         let retained: u64 = spans.iter().filter(|s| s.offset >= component.offset
                             && s.offset < component.offset + component.bytes).map(|s| s.bytes).sum();
-                        assert_eq!(retained, if ring.mtp { component.bytes }
+                        assert_eq!(retained, if ring.mtp { 0 }
                             else { frontier.min(512) * component.bytes / layout.ring.rows });
                     }
                 }
@@ -331,13 +623,13 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         assert!(arena.iter().sum::<u64>() > 2 << 30);
         assert_eq!(arena[0], slots * layout.ranks[0].bytes);
         assert_eq!(layout.prefix_arena_bytes(16, 0, 2 << 30).unwrap(), (0, vec![0; ranks]));
-        assert!(layout.snapshot_spans(ranks, 0).is_err());
-        assert!(layout.snapshot_spans(0, (1 << 20) + 1).is_err());
+        assert!(layout.snapshot_spans(ranks, 0, &[]).is_err());
+        assert!(layout.snapshot_spans(0, (1 << 20) + 1, &[0; 3]).is_err());
         assert!(layout.csa_tail_bytes(0, 65).is_err());
         let mut occupied = Vec::new();
         for sequence in 0..3 {
-            let copies = layout.snapshot_copies(0, 65, 3, sequence, 4, sequence).unwrap();
-            let spans = layout.snapshot_spans(0, 65).unwrap();
+            let copies = layout.snapshot_copies(0, 65, &[0; 3], 3, sequence, 4, sequence).unwrap();
+            let spans = layout.snapshot_spans(0, 65, &[0; 3]).unwrap();
             assert_eq!(copies.len(), spans.len());
             for (copy, span) in copies.iter().zip(spans) {
                 assert!(copy.mark.offset >= sequence * layout.ranks[0].bytes
@@ -353,9 +645,9 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         }
         occupied.sort_unstable();
         assert!(occupied.windows(2).all(|pair| pair[0].1 <= pair[1].0));
-        assert!(layout.snapshot_copies(0, 0, 3, 3, 4, 0).is_err());
-        assert!(layout.snapshot_copies(0, 0, 3, 0, 4, 4).is_err());
-        assert!(layout.snapshot_copies(0, 0, u64::MAX, 0, 4, 0).is_err());
+        assert!(layout.snapshot_copies(0, 0, &[0; 3], 3, 3, 4, 0).is_err());
+        assert!(layout.snapshot_copies(0, 0, &[0; 3], 3, 0, 4, 4).is_err());
+        assert!(layout.snapshot_copies(0, 0, &[0; 3], u64::MAX, 0, 4, 0).is_err());
     }
     assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0, 64).is_err());
     assert!(Step5CacheLayout::new(&cfg, 1, 0, 0, 64).is_err());

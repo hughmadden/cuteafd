@@ -1493,8 +1493,8 @@ case "$family" in
 esac
 # Kimi K3 (#273) and Step-5 (#274) are under qualification: WIP slots only,
 # automatic attention placement, text only (their bundled vision towers are not
-# in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5's native
-# MTP is opt-in (SPECULATOR=mtp) while it qualifies, never a default.
+# in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5 defaults
+# to native MTP depth 3 (SPECULATOR=off disables it).
 qualifying=0
 [[ "$family" != kimi_k3 && "$family" != step5 ]] || qualifying=1
 if ((qualifying)); then
@@ -1717,6 +1717,10 @@ if [[ -z "$speculator" ]]; then
     speculator=dspark
     echo "note: DeepSeek V4 drafts with its bundled dSpark; SPECULATOR=off disables it" >&2
   fi
+  if [[ $speculator == off && $family == step5 ]]; then
+    speculator=mtp
+    echo "note: Step-5 drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
+  fi
   # Only the resident local paths are qualified (EXL3, and NVFP4 with its FP8
   # MTP package). Spark workers serve backbone layers, not mtp.layers.0; other
   # expert formats keep their opt-in status. SPECULATOR=off disables the default.
@@ -1799,6 +1803,8 @@ if [[ $family == mimo_v2 ]]; then
   done
 fi
 case "$speculator" in
+  off)
+    [[ "$family" != step5 ]] || family_args+=(--mtp 0) ;;
   dflash2|dspark)
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
@@ -1815,6 +1821,7 @@ case "$speculator" in
     fi ;;
   mtp)
     mtp_depth=1
+    [[ "$family" != step5 ]] || mtp_depth=3
     [[ ( $qwen_exl3 != 1 && $qwen_nvfp4 != 1 ) || $qwen_mtp != 1 ]] || mtp_depth=3
     family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
@@ -2538,6 +2545,11 @@ audio_encoder_hash=""
   if ((count_explicit)) || [[ "$backend" == local ]]; then count_args+=(--spark-ranks "$ranks"); fi
   # The plan charges the drafter this launch actually serves (SPECULATOR=off charges none).
   count_args+=(--speculator "$speculator")
+  if [[ "$family" == step5 ]]; then
+    plan_mtp_depth=0
+    [[ "$speculator" != mtp ]] || plan_mtp_depth="$(get SPECULATOR_DEPTH "$mtp_depth")"
+    plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth")
+  fi
   for pair in 'CONCURRENCY:--concurrency' 'PREFIX_CACHE_ENTRIES:--prefix-cache-entries' \
     'MAX_CONTEXT_TOKENS:--context-tokens' 'PREFILL_BATCH_TOKENS:--prefill-rows' \
     'RTX_EXPERT_LAYERS:--rtx-expert-layers'; do
