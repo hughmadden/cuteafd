@@ -347,9 +347,16 @@ impl<'a> Engine<'a> {
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, io, experts } = &mut *lanes;
             for binding in &mut local[0] { binding.enable_replay(graphed); }
-            let result = self.execution.run(scope, &self.peer, &self.hops,
-                &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
-                super::layers::Output::Normalized, self.draft.as_ref(), Some(&self.draft_probe));
+            let windows = crate::shared::prefill_pipeline::subwave_ranges(rows, 3, 64, 256)?;
+            let result = if !speculative && sequences.len() == 1 && windows.len() > 1 {
+                self.execution.run_subwaves(scope, &self.peer, &self.hops, &mut local[0],
+                    &mut routed[0], &mut experts[0], &windows, &metadata[0], pool,
+                    self.draft.as_ref()).map(|output| vec![output])
+            } else {
+                self.execution.run(scope, &self.peer, &self.hops,
+                    &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
+                    super::layers::Output::Normalized, self.draft.as_ref(), Some(&self.draft_probe))
+            };
             for binding in &mut local[0] { binding.enable_replay(true); }
             let normalized = result?[0];
             let input = crate::shared::prefix::view(normalized,
@@ -530,9 +537,15 @@ impl<'a> Engine<'a> {
                 lanes.io[lane][0].embed(ids, lanes.local[lane][0].buffer("delta")?)?;
             }
             let Lanes { local, routed, io, experts } = &mut *lanes;
-            let normalized = self.execution.run(scope, &self.peer, &self.hops,
-                &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
-                super::layers::Output::Normalized, None, None)?;
+            let windows = crate::shared::prefill_pipeline::subwave_ranges(rows[0], 3, 64, 256)?;
+            let normalized = if tokens.len() == 1 && sequences[0].len() == 1 && windows.len() > 1 {
+                vec![self.execution.run_subwaves(scope, &self.peer, &self.hops, &mut local[0],
+                    &mut routed[0], &mut experts[0], &windows, &sequences[0][0], pool, None)?]
+            } else {
+                self.execution.run(scope, &self.peer, &self.hops,
+                    &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
+                    super::layers::Output::Normalized, None, None)?
+            };
             for (lane, normalized) in normalized.into_iter().enumerate() {
                 let stream = local[lane][1].stream();
                 for first in (0..rows[lane]).step_by(64) {

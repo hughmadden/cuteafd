@@ -98,6 +98,67 @@ impl<'a> Execution<'a> {
         bindings.iter_mut().map(|binding| binding.output(output)).collect()
     }
 
+    /// Ordered row windows share the one admitted main lane and Spark link.
+    /// Only the previous FFN waits; the next window's attention runs first.
+    pub(crate) fn run_subwaves(&self, scope: &SubmissionScope<'_>, peer: &PeerExchange<'a>,
+        hops: &HopLink<'a>, local: &mut [LocalLane<'a>; 2], routed: &mut RoutedLane<'a>,
+        experts: &mut [Option<Exl3Tp2<'a>>; 2], windows: &[std::ops::Range<usize>],
+        sequence: &super::device::SequenceRows<'_>, pool: &cuteafd_engine::prefix::RefPagePool,
+        draft: Option<&super::draft::NativeDraft<'a>>) -> Result<CuteafdDeviceBuffer> {
+        use crate::shared::{prefill_pipeline::{subwave_actions, SubwaveAction},
+            peer_split::attention::{pipeline_attention, pipeline_hops}};
+        let protocol = self.protocol(peer, hops)?;
+        let mut binding = Bindings::new(local, routed, experts, self, peer, hops, scope, 0,
+            windows[0].len(), false)?;
+        binding.draft = draft;
+        binding.defer_publication = true;
+        let mut completed = vec![0; windows.len()];
+        let mut consumed = vec![vec![0; self.plan.hops().len()]; windows.len()];
+        let mut pending = None;
+        for action in subwave_actions(self.plan.modes().len(), windows.len()) {
+            let (layer, wave) = match action {
+                SubwaveAction::Attention { layer, wave } | SubwaveAction::Begin { layer, wave }
+                    | SubwaveAction::Finish { layer, wave } => (layer, wave),
+            };
+            let window = &windows[wave];
+            for local in binding.local.iter_mut() { local.select_subwave(Some(window.clone()))?; }
+            binding.rows = window.len();
+            binding.completed = completed[wave];
+            binding.tap_first = window.start;
+            match action {
+                SubwaveAction::Attention { .. } => {
+                    binding.pending = None;
+                    let metadata = [super::device::SequenceRows { slot: sequence.slot,
+                        start: sequence.start + window.start, rows: window.len(), pages: sequence.pages }];
+                    for local in binding.local.iter_mut() { local.stage_attention(&metadata, pool)?; }
+                    pipeline_attention(&protocol, &self.plan, layer, 0, window.len(),
+                        &mut binding, &mut consumed[wave])?;
+                }
+                SubwaveAction::Begin { .. } => {
+                    binding.pending = None;
+                    pending = Some(binding.begin_ffn(layer, None)?);
+                }
+                SubwaveAction::Finish { .. } => {
+                    let ticket = pending.take().context("Kimi missing sub-wave FFN ticket")?;
+                    binding.pending = Some(ticket);
+                    binding.finish_ffn(layer, ticket)?;
+                    completed[wave] += 1;
+                }
+            }
+        }
+        for (wave, window) in windows.iter().enumerate() {
+            binding.rows = window.len();
+            binding.completed = completed[wave];
+            for local in binding.local.iter_mut() { local.select_subwave(Some(window.clone()))?; }
+            pipeline_hops(&protocol, &self.plan, HopPoint::Exit, 0, window.len(),
+                &mut binding, &mut consumed[wave])?;
+            binding.output(Output::Normalized)?;
+        }
+        ensure!(consumed.iter().flatten().all(|&count| count == 1), "Kimi sub-wave hop inventory");
+        for local in binding.local.iter_mut() { local.select_subwave(None)?; }
+        binding.local[1].buffer("normalized")
+    }
+
     /// Accepted replay writes every KDA layer on this lane. Publish those exact
     /// streams into the same dependency chain consumed by the next attention.
     pub(crate) fn commit_kda(&self, locals: &[LocalLane<'a>; 2], tables: &[i32]) -> Result<()> {
@@ -306,6 +367,8 @@ pub(crate) struct Bindings<'e, 'a, 's> {
     pending: Option<FfnTicket>,
     draft: Option<&'e super::draft::NativeDraft<'a>>,
     probe: Option<&'e DraftProbe<'a>>,
+    tap_first: usize,
+    defer_publication: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -344,7 +407,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         }
         for rank in 0..2 { peer.recv(rank, lane)?; }
         ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
-        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None })
+        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false })
     }
 
     fn with_probe(&self, work: impl FnOnce(&mut crate::shared::draft::probe::RoundProbe<'a>) -> Result<()>) -> Result<()> {
@@ -566,13 +629,14 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
                 Some(ticket)
             }
         };
-        self.publish("ffn output")?;
+        if !self.defer_publication { self.publish("ffn output")?; }
         let ticket = FfnTicket { layer, spark, rtx: rtx.then_some(owner) };
         self.pending = Some(ticket);
         Ok(ticket)
     }
     fn finish_ffn(&mut self, layer: usize, ticket: FfnTicket) -> Result<()> {
         ensure!(self.pending == Some(ticket) && ticket.layer == layer, "Kimi FFN ticket differs from pending layer");
+        if self.defer_publication { self.publish("ffn output")?; }
         if ticket.spark.is_some() || ticket.rtx.is_some() {
             self.meet("ffn output", "shared output")?;
             let rank = super::weights::routed_owner(self.local[0].config(), layer)?;
@@ -597,7 +661,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         }
         // Checkpoint taps are the completed decoder prefix plus final FFN
         // delta, before the following residual mixer or final output norm.
-        if let Some(draft) = self.draft { draft.tap(layer, &mut self.local[0], self.rows)?; }
+        if let Some(draft) = self.draft { draft.tap_at(layer, &mut self.local[0], self.rows, self.tap_first)?; }
         self.with_probe(|probe| {
             // SAFETY: the FFN join above orders both ranks before this rank0 mark.
             unsafe { probe.mark(layer, self.local[0].stream().raw) }
