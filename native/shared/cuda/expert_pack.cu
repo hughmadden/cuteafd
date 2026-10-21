@@ -1,6 +1,8 @@
 #include "cuteafd_experts.h"
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <algorithm>
+#include "expert_pack_layout.h"
 
 namespace {
 
@@ -8,25 +10,10 @@ namespace {
 template<bool Gated, bool Scales>
 __global__ void pack(const uint8_t* first, const uint8_t* second, uint8_t* output,
     uint32_t n, uint32_t k, uint32_t n_pad, uint64_t count) {
-  const uint32_t k_tiles = (k + 127) / 128;
-  constexpr uint32_t tile_elements = Scales ? 1024 : 4096;
   for (uint64_t index = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
        index < count; index += uint64_t(gridDim.x) * blockDim.x) {
-    const uint64_t tile = index / tile_elements;
-    const uint32_t local = index % tile_elements;
-    const uint32_t nt = tile / k_tiles, kt = tile % k_tiles;
     uint32_t row, col;
-    if constexpr (Scales) {
-      row = nt * 256 + local / 4;
-      col = kt * 4 + local % 4;
-    } else {
-      const uint32_t n8i = local & 3;
-      const uint32_t combined = (local >> 2) & 31;
-      const uint32_t n8c = (local >> 7) & 7;
-      const uint32_t k32 = local >> 10;
-      row = nt * 256 + n8c * 32 + n8i * 8 + (combined >> 2);
-      col = kt * 16 + k32 * 4 + (combined & 3);
-    }
+    cuteafd_expert_pack_coordinates(index, k, Scales, &row, &col);
     const uint8_t* source = first;
     if constexpr (Gated) {
       if (row >= n_pad) { row -= n_pad; source = second; }
@@ -61,6 +48,62 @@ extern "C" int32_t cuteafd_expert_packed_sizes(uint32_t intermediate,
   bytes[2] = hidden * padded / 2;
   bytes[3] = hidden * padded / 32;
   return cudaSuccess;
+}
+
+// Coalesced omitted row tails; never touch the delivered prefix of a row.
+extern "C" int32_t cuteafd_zero_pitched_async(void* destination,
+    uint64_t destination_bytes, uint64_t pitch, uint64_t width,
+    uint64_t rows, void* stream) {
+  if (!destination || !width || !rows || pitch < width ||
+      width > destination_bytes ||
+      rows - 1 > (destination_bytes - width) / pitch)
+    return cudaErrorInvalidValue;
+  if (rows == 1)
+    return cudaMemsetAsync(destination, 0, width, static_cast<cudaStream_t>(stream));
+  return cudaMemset2DAsync(destination, pitch, 0, width, rows,
+      static_cast<cudaStream_t>(stream));
+}
+
+// One plane of the already-fused source image. Reuse the exact mount pack
+// instantiations; the caller owns one out-of-place scratch across all planes.
+extern "C" int32_t cuteafd_pack_expert_plane_async(
+    const uint8_t* source, uint64_t source_bytes, uint8_t* destination,
+    uint64_t destination_bytes, uint32_t intermediate, uint32_t plane, void* stream) {
+  uint64_t sizes[4];
+  if (plane >= 4 || !source || !destination ||
+      cuteafd_expert_packed_sizes(intermediate, sizes)) return cudaErrorInvalidValue;
+  const auto hidden = cuteafd_expert_hidden();
+  const auto padded = (intermediate + 127) / 128 * 128;
+  const bool gated = plane < 2, scales = plane % 2;
+  const uint64_t required = gated ? sizes[plane]
+      : uint64_t(hidden) * intermediate / (scales ? 32 : 2);
+  if (source_bytes < required || destination_bytes < sizes[plane] ||
+      reinterpret_cast<uintptr_t>(source) % 4 ||
+      reinterpret_cast<uintptr_t>(destination) % 16 ||
+      overlaps(source, required, destination, sizes[plane])) return cudaErrorInvalidValue;
+  int device, sms;
+  auto status = cudaGetDevice(&device);
+  if (status != cudaSuccess) return status;
+  status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  if (status != cudaSuccess) return status;
+  if (sms <= 0) return cudaErrorInvalidDevice;
+  const uint64_t count = sizes[plane] / (scales ? 1 : 4);
+  const unsigned blocks = static_cast<unsigned>(
+      std::min<uint64_t>((count + 255) / 256, uint64_t(sms) * 4));
+  auto s = static_cast<cudaStream_t>(stream);
+  if (gated && !scales)
+    pack<false, false><<<blocks, 256, 0, s>>>(source, nullptr, destination,
+        2 * padded, hidden, 0, sizes[plane] / 4);
+  else if (gated)
+    pack<false, true><<<blocks, 256, 0, s>>>(source, nullptr, destination,
+        2 * padded, hidden, 0, sizes[plane]);
+  else if (!scales)
+    pack<false, false><<<blocks, 256, 0, s>>>(source, nullptr, destination,
+        hidden, intermediate, 0, sizes[plane] / 4);
+  else
+    pack<false, true><<<blocks, 256, 0, s>>>(source, nullptr, destination,
+        hidden, intermediate, 0, sizes[plane]);
+  return cudaGetLastError();
 }
 
 extern "C" int32_t cuteafd_pack_expert_async(const uint8_t* const sources[6],

@@ -30,6 +30,8 @@ pub(crate) mod weight_validation;
 pub(crate) mod weight_views;
 #[path = "memory/push_consumer.rs"]
 pub(crate) mod push_consumer;
+#[path = "memory/push_initialize.rs"]
+pub(crate) mod push_initialize;
 
 pub(crate) struct DeviceAllocation<'a> {
     pub(crate) library: &'a NativeLibrary,

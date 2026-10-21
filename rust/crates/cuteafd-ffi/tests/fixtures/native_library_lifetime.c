@@ -4,12 +4,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../../../../native/shared/cuda/expert_pack_layout.h"
 
 struct host_buffer { void *ptr; size_t bytes; uint64_t flags; };
 static char *event_path;
 static int quiet_events;
 void fixture_quiet_events(int quiet) { quiet_events = quiet; }
 static int pack_status, drain_status, drain_calls, drain_after, current_device;
+static int bind_after = -1, bind_calls;
+void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;
 
 void fixture_configure_memory(int device, size_t total, size_t used, size_t graph) {
@@ -95,8 +98,7 @@ void fixture_configure_pack(int pack, int drain) {
 void fixture_configure_drain_after(int after) { drain_after = after; }
 
 int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
-    out->ptr = malloc(bytes);
-    if (!out->ptr) return 1;
+    if (posix_memalign(&out->ptr, 256, bytes)) return 1;
     out->bytes = bytes;
     out->device_id = current_device;
     out->flags = 1;
@@ -258,13 +260,73 @@ int cuteafd_cuda_stream_destroy(void *stream) {
     return 0;
 }
 
-int cuteafd_cuda_set_device(int device) { current_device = device; return 0; }
+int cuteafd_cuda_set_device(int device) {
+    if (bind_after >= 0 && bind_calls++ >= bind_after) return 1;
+    current_device = device;
+    return 0;
+}
 
 int cuteafd_copy_h2d(struct device_buffer dst, const void *source, size_t bytes) {
     if (bytes > dst.bytes) return 1;
     memcpy(dst.ptr, source, bytes);
     event('H');
     return 0;
+}
+
+int cuteafd_copy_d2h(void *dst, struct device_buffer src, size_t bytes) {
+    if (bytes > src.bytes) return 1;
+    memcpy(dst, src.ptr, bytes); return 0;
+}
+int cuteafd_copy_d2d(struct device_buffer dst, struct device_buffer src, size_t bytes) {
+    if (bytes > dst.bytes || bytes > src.bytes) return 1;
+    memcpy(dst.ptr, src.ptr, bytes); return 0;
+}
+int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src, size_t bytes, void *stream) {
+    return cuteafd_copy_h2d_async(dst, src.ptr, bytes, stream);
+}
+int cuteafd_cuda_zero_bytes(void *dst, size_t bytes) { memset(dst, 0, bytes); return 0; }
+int cuteafd_zero_pitched_async(void *dst, uint64_t bytes, uint64_t pitch,
+    uint64_t width, uint64_t rows, void *stream) {
+    (void)stream;
+    if (!dst || !width || !rows || pitch < width || width > bytes ||
+        rows - 1 > (bytes - width) / pitch) return 1;
+    for (uint64_t row = 0; row < rows; ++row)
+        memset((uint8_t *)dst + row * pitch, 0, width);
+    event('Z');
+    return pack_status;
+}
+int cuteafd_pack_expert_plane_async(const uint8_t *source, uint64_t source_bytes,
+    uint8_t *destination, uint64_t destination_bytes, uint32_t intermediate,
+    uint32_t plane, void *stream) {
+    int status = cuteafd_cuda_stream_synchronize(stream);
+    if (status) return status;
+    if (pack_status) return pack_status;
+    uint32_t padded = (intermediate + 127) / 128 * 128;
+    uint32_t n = plane < 2 ? 2 * padded : 5120;
+    uint32_t k = plane < 2 ? 5120 : intermediate;
+    int scales = plane % 2;
+    uint32_t element = scales ? 1 : 4, divisor = scales ? 32 : 8;
+    for (uint64_t index = 0; index < destination_bytes / element; ++index) {
+        uint32_t row, col;
+        cuteafd_expert_pack_coordinates(index, k, scales, &row, &col);
+        uint64_t at = ((uint64_t)row * (k / divisor) + col) * element;
+        if (row < n && col < k / divisor && at + element <= source_bytes)
+            memcpy(destination + index * element, source + at, element);
+        else memset(destination + index * element, 0, element);
+    }
+    event('P'); return 0;
+}
+int cuteafd_cuda_nvfp4_swizzle_scale_async(struct device_buffer src, struct device_buffer dst,
+    size_t rows, size_t cols, void *stream) {
+    int status = cuteafd_cuda_stream_synchronize(stream);
+    if (status) return status;
+    if (pack_status) return pack_status;
+    size_t rp = (rows + 127) / 128 * 128, cp = (cols + 3) / 4 * 4;
+    if (src.bytes < rows * cols || dst.bytes < rp * cp) return 1;
+    for (size_t row = 0; row < rp; ++row) for (size_t col = 0; col < cp; ++col)
+        ((uint8_t *)dst.ptr)[cuteafd_nvfp4_scale_offset(row, col, cp)] =
+            row < rows && col < cols ? ((uint8_t *)src.ptr)[row * cols + col] : 0;
+    event('P'); return 0;
 }
 
 int cuteafd_copy_d2d_2d_async(struct device_buffer dst, size_t dst_pitch,

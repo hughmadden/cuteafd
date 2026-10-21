@@ -199,6 +199,7 @@ pub(crate) struct DeliveredArena<'a> {
     allocation: Allocation<'a>,
     layout: ArenaLayout,
     validation: Vec<u8>,
+    expected: ExpectedCoverage,
 }
 
 pub(crate) struct ReadyArena<'a> {
@@ -322,11 +323,64 @@ impl<'a> LoadingArena<'a> {
             allocation: self.allocation,
             layout: self.layout,
             validation: self.validation,
+            expected: self.expected,
         })
     }
 }
 
 impl<'a> DeliveredArena<'a> {
+    pub fn device(&self) -> Device<'a> { self.allocation.device }
+    pub fn buffer(&self, range: Range<usize>) -> Result<CuteafdDeviceBuffer> {
+        slice(self.allocation.buffer, range)
+    }
+    /// Only omitted bytes are generated. Delivered source bytes are never
+    /// replaced by zero padding, including replayed or sparse tensor images.
+    pub fn zero_padding(&self) -> Result<()> {
+        let result = self.device().run(|| {
+            let queued = (|| {
+                // Fold adjacent equal-width/equal-pitch gaps in constant host
+                // memory. A padded plane then needs one enqueue, not one per row.
+                let mut pending: Option<(usize, usize, usize, usize)> = None;
+                let flush = |(start, width, pitch, rows): (usize, usize, usize, usize)| -> Result<()> {
+                    let end = start + (rows - 1) * pitch + width;
+                    // SAFETY: only checked complement gaps are selected; this
+                    // owner is retained until the unconditional drain below.
+                    unsafe { self.device().library.zero_pitched_async(
+                        self.buffer(start..end)?, pitch, width, rows, std::ptr::null_mut()) }
+                };
+                let mut gap = |start: usize, end: usize| -> Result<()> {
+                    if start == end { return Ok(()); }
+                    let width = end - start;
+                    if let Some((base, previous_width, pitch, rows)) = pending {
+                        if previous_width == width && (rows == 1 || Some(start - base) == rows.checked_mul(pitch)) {
+                            pending = Some((base, width, if rows == 1 { start - base } else { pitch }, rows + 1));
+                            return Ok(());
+                        }
+                        flush((base, previous_width, pitch, rows))?;
+                    }
+                    pending = Some((start, width, width, 1));
+                    Ok(())
+                };
+                let mut cursor = 0usize;
+                for (&start, &end) in &self.expected.0.intervals {
+                    let start = usize::try_from(start)?.min(self.layout.bytes);
+                    gap(cursor, start)?;
+                    cursor = usize::try_from(end)?.min(self.layout.bytes);
+                }
+                gap(cursor, self.layout.bytes)?;
+                if let Some(group) = pending { flush(group)?; }
+                Ok(())
+            })();
+            // A failed enqueue can still leave earlier zero fills in flight.
+            // SAFETY: the current device owns the default stream and arena.
+            let drained = unsafe { self.device().library.cuda_stream_synchronize(std::ptr::null_mut()) };
+            drained?;
+            Ok(queued)
+        });
+        // Device binding/restoration can fail outside the drain closure too.
+        if result.is_err() { self.device().library.quarantine_module_after_failed_drain(); }
+        result?
+    }
     pub fn validation(&self) -> &[u8] {
         &self.validation
     }

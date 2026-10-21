@@ -16,6 +16,7 @@ use nest_push::{
 
 pub use nest_push::{client::{JoinArgs, Poll, Conn, Listener}, plan, proto, slot};
 pub mod builder;
+pub mod native;
 
 pub const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HOSTS_XATTR: &str = "user.sparknest.hosts";

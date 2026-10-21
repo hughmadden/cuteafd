@@ -2,6 +2,64 @@ use super::tests::{land, snapshot, real_pattern_headroom};
 use super::*;
 
 #[test]
+fn real_native_resident_planes_match_mount_staging_after_plan_fusion() {
+    for (variable, nv) in [("CUTEAFD_PUSH_V41", false), ("CUTEAFD_PUSH_V41_NVFP4", true)] {
+        let Some(root) = snapshot(variable) else { continue; };
+        let catalog = crate::read_official_v41_catalog(&root).unwrap();
+        for world in [1usize, 4, 6] {
+            for rank in 0..world {
+                let selection = if world == 1 { crate::V41ExpertSelection::BackboneFull { layer: 0, expert: 0 } }
+                    else { crate::V41ExpertSelection::BackboneTp { layer: 0, expert: 0, world, rank } };
+                let (names, ranges, raw, width) = if nv {
+                    let staging = catalog.nvfp4_expert_staging(selection).unwrap();
+                    let mut raw = vec![0; staging.staging_bytes()];
+                    staging.read_into(&mut raw, &mut vec![0; staging.minimum_read_scratch_bytes()]).unwrap();
+                    (staging.tensor_names().to_vec(), staging.tensor_ranges().to_vec(), raw, staging.intermediate_size())
+                } else {
+                    let staging = catalog.expert_staging(selection).unwrap();
+                    let mut raw = vec![0; staging.staging_bytes()];
+                    staging.read_into(&mut raw, &mut vec![0; staging.minimum_read_scratch_bytes()]).unwrap();
+                    (staging.tensor_names().to_vec(), staging.tensor_ranges().to_vec(), raw, staging.intermediate_size())
+                };
+                let hidden = catalog.config().text().hidden_size;
+                let layout = super::super::native::NativePlanes::new(hidden, width, width.div_ceil(128) * 128, 1, nv).unwrap();
+                let total = layout.bytes + layout.scalar_bytes();
+                let mut builder = Builder::new(&root, vec![total as u64]);
+                builder.v41_resident(&catalog, &names, &layout, 0, world as u32, rank as u32,
+                    Destination { rank: 0, offset: 0, bytes: layout.bytes as u64 },
+                    nv.then_some(Destination { rank: 0, offset: layout.bytes as u64, bytes: layout.scalar_bytes() as u64 })).unwrap();
+                let plan = builder.finish().unwrap();
+                real_pattern_headroom(&plan, "native final-plane placement");
+                let landed = land(&plan, &root).remove(0);
+                let mut expected = vec![0; total];
+                for slot in 0..6 {
+                    let down = names[slot].contains(".w2.");
+                    let gate = names[slot].contains(".w1.");
+                    let scale = slot >= 3;
+                    let plane = usize::from(down) * 2 + usize::from(scale);
+                    let divisor = if scale { if nv { 16 } else { 32 } } else { 2 };
+                    let (offset, _) = layout.expert_plane(plane, 0).unwrap();
+                    let half = if gate { layout.kernel_intermediate * hidden / divisor } else { 0 };
+                    let row = if down { width / divisor } else { hidden / divisor };
+                    let pitch = if down && nv { layout.kernel_intermediate / divisor } else { row };
+                    for (index, source) in raw[ranges[slot].clone()].chunks_exact(row).enumerate() {
+                        let start = offset + half + index * pitch;
+                        expected[start..start + row].copy_from_slice(source);
+                    }
+                }
+                if nv { for slot in 0..6 {
+                    expected[layout.bytes + slot * 4..layout.bytes + slot * 4 + 4]
+                        .copy_from_slice(&raw[ranges[6 + slot].clone()]);
+                }}
+                assert_eq!(landed, expected, "nv={nv} TP{world} rank={rank}");
+                assert_eq!(plan.plan.entries.len(), if nv { 12 } else { 6 });
+                eprintln!("native nv={nv} TP{world} rank={rank}: scratch={} bytes, final-plane image byte exact", layout.scratch_bytes());
+            }
+        }
+    }
+}
+
+#[test]
 fn real_v41_native_tp4_tp6_and_coordinator_tp2_match_staging() {
     let Some(snapshot) = snapshot("CUTEAFD_PUSH_V41") else {
         return;
