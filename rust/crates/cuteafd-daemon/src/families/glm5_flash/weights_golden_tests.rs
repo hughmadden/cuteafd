@@ -1,6 +1,6 @@
 //! GLM 5.3 Flash coordinator operands from the installed checkpoint
-//! (CUTEAFD_PUSH_GLMF), through the fake native DSO with a two-GPU head split:
-//! one KDA and one MLA layer, the final norm and the FP8 head, under the
+//! (CUTEAFD_PUSH_GLMF), through the fake native DSO with a two-GPU head split
+//! and on one GPU: one KDA, one MLA and one dense layer, the final norm and the FP8 head, under the
 //! production KDA row128 representation and two FP8 scale rules. Digests are
 //! pinned to the host-quantize loader, so moving transforms to the GPU (and
 //! push landings) must reproduce it bit for bit.
@@ -32,11 +32,19 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true, kda_nvfp4: None,
             fp8_scales: rule, device: 0, peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
             quantizer: Default::default() };
-        for layer in [kda, mla] {
+        let dense = (0..cfg.layers).find(|&l| cfg.dense[l]).context("no dense layer")?;
+        for layer in [kda, mla, dense] {
             for (rank, share) in loader.layer_shares(&cfg, layer, LayerMode::HeadSplit)?.iter().enumerate() {
                 for (name, allocation) in &share.operands {
                     actual.insert(format!("{rule:?}.layer{layer}.rank{rank}.{name}"), digest(&library, allocation.buffer)?);
                 }
+            }
+        }
+        // The one-GPU coordinator (every operand whole on one device).
+        let single = GlmfLoader { peers: Vec::new(), ..loader.clone() };
+        for layer in [kda, mla, dense] {
+            for (name, allocation) in &single.layer(&cfg, layer)?.operands {
+                actual.insert(format!("{rule:?}.single.layer{layer}.{name}"), digest(&library, allocation.buffer)?);
             }
         }
         let (values, scales) = loader.fp8(&["lm_head.weight".to_string()], crate::families::glm5_flash::fp8::Layout::Row128)?;
