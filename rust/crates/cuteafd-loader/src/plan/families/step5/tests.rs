@@ -186,6 +186,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let capacity = inventory::PRO_TOTAL_BYTES;
     let arch = ArchContext::coordinator(capacity, None);
     let inputs = RuntimeInputs {
+                kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
         inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
             baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
             headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
@@ -207,7 +208,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
         let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
         let ownership = inputs.ownership(&Config::parse(&cp)?)?;
         let target = native::rank_admission(&cp, &ownership, 0, inputs.rows)?.workspace;
-        let workspace = target.max(native::mtp_forecast_workspace(inputs.rows, depth)?) - target;
+        let workspace = target.max(native::mtp_forecast_workspace(inputs.rows, depth, crate::families::qwen4::Qwen4KvCache::Bf16)?) - target;
         let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
             .map(|item| item.bytes).sum::<u64>();
         let active_delta = admitted.reservations[0].active - baseline.reservations[0].active;

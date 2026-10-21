@@ -177,7 +177,7 @@ mod tests {
             #[command(flatten)]
             prefix: crate::shared::prefix::PrefixArgs,
         }
-        for (context, pool, launchable, host, entries) in [
+        for ((context, pool, launchable, host, entries), kv_format) in [
             (262_144, Some(262_144), true, None, 20),
             (1_048_576, None, true, None, 20),
             (1_048_576, Some(262_144), false, None, 20),
@@ -185,8 +185,11 @@ mod tests {
             (1_048_576, None, true, Some(1 << 30), 20),
             (1_048_576, None, true, None, 0),
             (1_048_576, None, true, Some(0), 0),
-        ] {
+        ].into_iter().flat_map(|case| [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8]
+            .into_iter().map(move |format| (case, format))) {
             let opts = LayoutOptions {
+                step5_kv: kv_format,
                 rtx_bytes: vec![96 << 30; ranks],
                 pool_tokens: pool,
                 context_tokens: context,
@@ -235,6 +238,7 @@ mod tests {
                 })
                 .collect();
             let mut inputs = RuntimeInputs {
+                kv_format,
                 inventory: Inventory {
                     gpus,
                     spark_ranks: sparks,

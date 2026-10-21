@@ -107,6 +107,8 @@ fn retained_wave_rows(rows: usize, sequences: usize) -> Result<usize> {
     .context("Step-5 retained wave rows overflow")
 }
 pub fn staging_bytes(layout: &Step5CacheLayout, rank: usize, sequences: usize) -> Result<usize> {
+    let compact = layout.target_pack_planes(rank)?.into_iter().try_fold(0usize,
+        |sum, bytes| sum.checked_add(bytes)).context("Step-5 compact staging overflow")?;
     let layers = layout
         .ranks
         .get(rank)
@@ -141,6 +143,7 @@ pub fn staging_bytes(layout: &Step5CacheLayout, rank: usize, sequences: usize) -
         .and_then(|n| n.checked_add(step.checked_mul(8)?.max(256)))
         .and_then(|n| n.checked_add(step.checked_mul(4)?.max(256)))
         .and_then(|n| n.checked_add(table.checked_mul(sequences.checked_add(1)?)?))
+        .and_then(|n| n.checked_add(compact))
         .context("Step-5 staging bytes overflow")
 }
 
@@ -159,6 +162,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// All demands are future to the pre-weight inventory. Startup phases are
 /// absolute additional peaks above that same sample, not steady-state deltas.
 pub struct RuntimeInputs {
+    pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub inventory: Inventory,
     pub rows: usize,
     pub sequences: usize,
@@ -319,7 +323,7 @@ pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) 
     ensure!((1..=cfg.mtp).contains(&depth) && inputs.rows > depth,
         "Step-5 predictor depth must fit checkpoint and row capacity");
     let weights = super::coordinator::RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes;
-    let workspace = super::native::mtp_forecast_workspace(inputs.rows, depth)?;
+    let workspace = super::native::mtp_forecast_workspace(inputs.rows, depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {
             let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.rows)?;
@@ -377,7 +381,7 @@ fn admit_depth_with(
         (initial, inputs.context.min(initial)),
         |tokens, &context| {
             let cache =
-                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.rows as u64, crate::families::qwen4::Qwen4KvCache::Bf16)?;
+                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.rows as u64, inputs.kv_format)?;
             let mark_bytes = usize::try_from(checked_sum(cache.ranks.iter().map(|r| r.bytes))?)?;
             let marks = inputs.marks.slots(mark_bytes);
             let mut fixed = Vec::new();
@@ -647,6 +651,7 @@ mod tests {
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
         RuntimeInputs {
+                kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             inventory: Inventory {
                 gpus: vec![
                     GpuBudget {

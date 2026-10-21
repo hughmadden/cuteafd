@@ -169,6 +169,7 @@ pub(super) fn layout(
         peer_access: coordinators == 2,
     };
     let inputs = RuntimeInputs {
+                kv_format: opts.step5_kv,
         inventory,
         rows,
         sequences,

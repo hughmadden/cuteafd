@@ -292,9 +292,9 @@ pub(crate) struct PlanArgs {
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
-    /// Qwen full-attention KV format for --layout.
-    #[arg(long = "kv-cache", default_value_t = cuteafd_loader::families::qwen4::Qwen4KvCache::default())]
-    pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
+    /// Qwen or Step-5 KV format for --layout (family default when omitted).
+    #[arg(long = "kv-cache")]
+    pub(crate) kv_format: Option<cuteafd_loader::families::qwen4::Qwen4KvCache>,
     /// Qwen projection residency for --layout.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) fp8_decode: bool,
@@ -658,9 +658,9 @@ mod tests {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
         let base = ["cuteafd", "plan", "/model"];
         for (flags, expected) in [
-            (vec![], Qwen4KvCache::Fp8),
-            (vec!["--kv-cache", "bf16"], Qwen4KvCache::Bf16),
-            (vec!["--kv-cache", "fp8"], Qwen4KvCache::Fp8),
+            (vec![], None),
+            (vec!["--kv-cache", "bf16"], Some(Qwen4KvCache::Bf16)),
+            (vec!["--kv-cache", "fp8"], Some(Qwen4KvCache::Fp8)),
         ] {
             let super::Commands::Plan(args) = super::Cli::try_parse_from(
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected plan"); };

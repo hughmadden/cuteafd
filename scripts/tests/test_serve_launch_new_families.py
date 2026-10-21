@@ -278,6 +278,16 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert lines[probe].endswith("serve-step5 --help ") and probe < lines.index(plan)
 
 
+@pytest.mark.parametrize("value,expected", [(None, "bf16"), ("bf16", "bf16"), ("fp8", "fp8")])
+def test_step5_cache_format_matches_plan_and_serve(tmp_path: Path, value, expected) -> None:
+    keys = "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6)
+    if value is not None:
+        keys += f"KV_CACHE={value}\n"
+    result = _step5(tmp_path, keys)
+    assert _flag(_line(result, "cuteafd serve-step5 --snapshot"), "--kv-cache") == expected
+    assert _flag(_line(result, "cuteafd plan"), "--kv-cache") == expected
+
+
 @pytest.mark.parametrize("keys,diagnostic", [
     ("SPECULATOR=dflash2\n", "SPECULATOR=dflash2 does not apply to step5"),
     ("ATTENTION_PLACEMENT=heads\n", "step5 supports only ATTENTION_PLACEMENT=auto"),
@@ -286,7 +296,7 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "Step-5 has no local-expert layout"),
     ("EMBEDDING=host\n", "step5 serves GPU token embeddings only"),
     ("RTX_EXPERT_LAYERS=4\n", "unused configuration key: RTX_EXPERT_LAYERS"),
-    ("KV_CACHE=bf16\n", "unused configuration key: KV_CACHE"),
+    ("KV_CACHE=int8\n", "KV_CACHE must be bf16 or fp8"),
 ])
 def test_step5_refuses_unsupported_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:
     result = _step5(tmp_path, "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6) + keys)

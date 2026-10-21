@@ -55,6 +55,7 @@ impl Frontier {
 pub(super) struct Step5Prefix<'e, 'a, T = ()> {
     ranks: Vec<&'e RefCell<CacheRank<'a>>>,
     layout: FamilyLayout,
+    kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     sequences: u64,
     context: u64,
     pending: Pending<T>,
@@ -100,7 +101,7 @@ impl<'e, 'a, T> Step5Prefix<'e, 'a, T> {
         let layout = FamilyLayout { page_rows: 64, pages: usize::try_from(pages)?, page_bytes,
             mark_bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform };
-        Ok(Self { ranks, layout, sequences, context, pending })
+        Ok(Self { ranks, layout, kv_format: shape.kv_format, sequences, context, pending })
     }
 
     pub(super) fn slots(&self) -> usize { self.ranks[0].borrow().slots() as usize }
@@ -137,7 +138,12 @@ impl<T> PrefixFamily<Frontier> for Step5Prefix<'_, '_, T> {
     type Placement = Placement;
 
     fn layout(&self) -> FamilyLayout { self.layout }
-    fn record_format(&self) -> &'static str { "step5_bf16_csa64_dense_e4m3_marks_v1" }
+    fn record_format(&self) -> &'static str {
+        match self.kv_format {
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16 => "step5_bf16_csa64_dense_e4m3_marks_v1",
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 => "step5_fp8_head_scales_csa64_dense_e4m3_marks_v1",
+        }
+    }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.pages }
     fn commit_point(&self, placement: &Placement) -> usize { placement.committed }
 
@@ -273,11 +279,17 @@ mod tests {
         }
         let retired = Rc::new(Cell::new(0));
         let pending = Pending::default();
-        let family = Step5Prefix { ranks: Vec::new(), sequences: 0, context: 0,
+        let mut family = Step5Prefix { ranks: Vec::new(), sequences: 0, context: 0,
+            kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             layout: FamilyLayout { page_rows: 64, pages: 1, page_bytes: 64,
                 mark_bytes: 0, draft_bytes: 0, rule: ReuseRule::EXACT,
                 mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform },
             pending: pending.clone() };
+        let bf16_identity = family.record_format();
+        family.kv_format = cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8;
+        assert_ne!(family.record_format(), bf16_identity);
+        family.kv_format = cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16;
+        assert_eq!(family.record_format(), bf16_identity);
         let mut placement = Placement { pages: vec![0], sequence: 0, committed: 1 };
         pending.verify(|| Ok((Evidence(retired.clone()), ())))?;
         assert!(family.bind(&mut placement).is_err());

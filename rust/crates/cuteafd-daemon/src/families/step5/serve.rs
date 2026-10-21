@@ -28,6 +28,9 @@ pub(crate) struct ServeArgs {
     peers: Vec<SocketAddr>,
     #[arg(long)]
     pool_tokens: Option<u64>,
+    /// Immutable target and native predictor KV storage.
+    #[arg(long, default_value = "bf16")]
+    kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long, default_value_t = 1_048_576)]
     max_context: u64,
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
@@ -145,7 +148,7 @@ fn with_backend<T>(args: &ServeArgs,
         &library, id, rank, ids.len() == 2, "step5", &format.package_name("step5"), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
-    let mut inputs = RuntimeInputs { inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
+    let mut inputs = RuntimeInputs { kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: args.prefill_rows as usize,
         sequences: usize::from(args.max_sequences), context: args.max_context,
@@ -178,7 +181,7 @@ fn with_backend<T>(args: &ServeArgs,
         let mut native = native;
         if rank == usize::from(admission.ownership.execution().spec().head_gpu) {
             native.workspace = native.workspace.max(
-                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(args.mtp))?);
+                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(args.mtp), inputs.kv_format)?);
         }
         let native = native.check(u64::MAX, &[])?;
         let total = admission.placement.items[rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
@@ -363,6 +366,7 @@ mod tests {
         let arch = placement::inventory::ArchContext::coordinator(capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
         let mut inputs = RuntimeInputs {
+                kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
                 headroom_bytes: LayoutOptions::default().headroom_bytes }; 2], spark_ranks: 6, peer_access: true },
@@ -395,7 +399,7 @@ mod tests {
                     &admitted.ownership, rank, inputs.rows)?;
                 if rank == head_rank {
                     native.workspace = native.workspace.max(
-                        plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(depth))?);
+                        plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(depth), inputs.kv_format)?);
                 }
                 let native = native.check(u64::MAX, &[])?;
                 let total = admitted.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();

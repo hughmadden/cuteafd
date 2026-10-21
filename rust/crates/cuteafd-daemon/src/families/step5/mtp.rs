@@ -1,9 +1,10 @@
 //! Predictor input and independent cache coordinates; no scheduler frontier advances here.
-use super::{weights::load_operand, scratch::{Arena, Plane}};
+use super::{weights::load_operand, scratch::{Arena, CompactKv, Plane}};
 use cuteafd_loader::plan::families::step5::native;
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
+use cuteafd_loader::families::qwen4::Qwen4KvCache;
 use cuteafd_ffi::{programs::{Program, ProgramSpec, Programs, Scalar}, CuteafdDeviceBuffer};
 use cuteafd_loader::plan::{checkpoint::Checkpoint,
     families::step5::{Config, coordinator::{RankWeightLayout, WeightOperand}}};
@@ -192,6 +193,8 @@ pub(super) struct StageOwner<'a> {
     attention: super::swa::SwaLayer<'a>,
     head: super::head::TargetHeadOwner<'a>,
     metadata: Vec<Plane<'a>>,
+    compact: Option<CompactKv<'a>>,
+    kv_format: Qwen4KvCache,
     stage: usize,
     rows: usize,
     cache_owner: std::cell::Cell<Option<usize>>,
@@ -200,7 +203,7 @@ impl<'a> StageOwner<'a> {
     pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint, stage: usize, rows: usize,
         rope: Rc<super::rope::TargetTables<'a>>, available: u64, reservations: &[u64],
-        arena: &Arena<'a>, stream: Rc<Stream<'a>>) -> Result<Self> {
+        arena: &Arena<'a>, stream: Rc<Stream<'a>>, kv_format: Qwen4KvCache) -> Result<Self> {
         let input = InputPlan::prepare(programs, checkpoint, stage, rows)?;
         let head = super::head::HeadPlan::for_mtp_stage(programs, checkpoint, stage, rows)?;
         let immutable = RankWeightLayout::for_mtp_stage(checkpoint, stage)?.resident_bytes;
@@ -210,7 +213,7 @@ impl<'a> StageOwner<'a> {
             "Step-5 predictor owner and reservations exceed admission");
         let input = InputOwner::load(device, programs, checkpoint, input, stream.clone(), available, &[], arena)?;
         let attention = super::swa::SwaLayer::for_mtp_stage(device, programs, checkpoint,
-            stage, rows, rope, available, &[], arena)?;
+            stage, rows, rope, available, &[], arena, kv_format)?;
         let head = super::head::TargetHeadOwner::load_in(device, programs, checkpoint,
             head, available, &[], Some((arena, 0)))?;
         let sizes = native::mtp_metadata_planes(rows)?;
@@ -218,8 +221,13 @@ impl<'a> StageOwner<'a> {
             usize::try_from(native::mtp_metadata_offset(rows)?)?)?;
         // Tokens selected by earlier stages must survive reuse of shared scratch.
         metadata.extend(arena.planes(device, &sizes[4..],
-            usize::try_from(native::mtp_scratch_core(rows)?)? + stage * 256)?);
-        Ok(Self { stream, input, attention, head, metadata, stage, rows,
+            usize::try_from(native::mtp_scratch_core(rows, kv_format)?)? + stage * 256)?);
+        let compact = if kv_format == Qwen4KvCache::Fp8 {
+            Some(CompactKv::new(device, programs, rows, &[64],
+                native::mtp_compact_planes(rows, kv_format)?,
+                Some((arena, usize::try_from(native::mtp_compact_offset(rows)?)?)))?)
+        } else { None };
+        Ok(Self { stream, input, attention, head, metadata, compact, kv_format, stage, rows,
             cache_owner: std::cell::Cell::new(None) })
     }
 
@@ -240,7 +248,8 @@ impl<'a> StageOwner<'a> {
         let state = &cache.layout().ranks[cache.rank()];
         let sliding = state.sliding.iter().find(|s| s.mtp && s.layer == 92 + self.stage)
             .context("Step-5 predictor cache layer missing")?;
-        ensure!(sliding.query_heads == 64 && sliding.key.bytes == cache.layout().ring.rows * 4 * 192 * 2
+        ensure!(cache.layout().kv_format == self.kv_format && sliding.query_heads == 64
+            && sliding.key.bytes == cache.layout().ring.rows * self.kv_format.plane_record_bytes(4, 192) as u64
             && sliding.value.bytes == sliding.key.bytes,
             "Step-5 predictor cache KV geometry");
         let length = *state.mtp_lengths.get(self.stage).context("Step-5 predictor length missing")?;
@@ -427,11 +436,15 @@ impl<'e, 'a> StageStep<'e, 'a> {
         })?;
         owner.attention.project_on(rows, owner.metadata[0].buffer, stream)?;
         let projected = owner.attention.predictor_projection()?;
+        let projected = if let Some(compact) = &owner.compact {
+            compact.enqueue(stream, projected, rows, 64)?
+        } else { projected };
+        let row_bytes = owner.kv_format.plane_record_bytes(4, 192);
         for run in self.cache.layout().ring.proposal(self.coordinates.base, rows as u64)
             .context("Step-5 predictor proposal ring")? {
             for (target, source) in self.components[..2].iter().copied().zip(projected) {
-                let source = slice(source, run.offset as usize * 1536, run.rows as usize * 1536)?;
-                let target = slice(target, run.slot as usize * 1536, source.bytes)?;
+                let source = slice(source, run.offset as usize * row_bytes, run.rows as usize * row_bytes)?;
+                let target = slice(target, run.slot as usize * row_bytes, source.bytes)?;
                 stream.device.run(|| {
                     // SAFETY: append-only proposal slots do not overlap committed
                     // visible KV rows; all source and destination owners are retained.
@@ -442,7 +455,7 @@ impl<'e, 'a> StageStep<'e, 'a> {
         owner.attention.predictor_finish_on(super::transaction::AttentionRead {
             inputs: super::transaction::StepInputs { stream, positions: owner.metadata[1].buffer,
                 requests: owner.metadata[2].buffer, rows, base: self.coordinates.base as usize,
-                extent: (self.coordinates.end + owner.stage as u64 + 1) as usize, heads: 64 },
+                extent: (self.coordinates.end + owner.stage as u64 + 1) as usize, heads: 64, kv_format: owner.kv_format },
             start: 0, key: self.components[0], value: self.components[1], summaries: None,
             table: owner.metadata[3].buffer, table_width: self.coordinates.table.len(),
             pages: self.cache.layout().ring.rows as usize / 64,
@@ -540,7 +553,7 @@ impl<'a> Runtime<'a> {
         for stage in 0..depth {
             let owner = StageOwner::load(cache.stream.device, programs, checkpoint, stage,
                 rows, execution.predictor_rope(), available, &[], execution.predictor_arena(),
-                execution.predictor_stream())?;
+                execution.predictor_stream(), cache.layout().kv_format)?;
             owner.bind_cache(cache)?;
             stages.push(owner);
         }
@@ -707,7 +720,9 @@ mod tests {
         ensure!(checkpoint.snapshot.file_name().and_then(|s| s.to_str()) == manifest["snapshot"].as_str(),
             "MTP fixture checkpoint identity");
         let cfg = Config::parse(&checkpoint)?;
-        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+        let kv_format: Qwen4KvCache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
+            .unwrap_or_else(|_| "bf16".into()).parse()?;
+        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, kv_format)?;
         let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
         let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
         let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);
@@ -730,7 +745,9 @@ mod tests {
         };
         let dump = std::env::var_os("CUTEAFD_STEP5_MTP_TRACE_DIR").map(std::path::PathBuf::from);
         let mut agreement = true;
-        eprintln!("MTP mode={}", if same_input { "reference" } else { "chained" });
+        eprintln!("MTP kv_cache={kv_format} mode={}", if same_input { "reference" } else { "chained" });
+        // Compact storage changes numerics: external-reference model fidelity
+        // and lossless verification gate FP8; this fixture gates exact replay.
         for pass in 0..2 {
             cache.reset_sequence(0)?;
             device.run(|| library.copy_h2d(cache.length(0, false)?, &target_end.to_le_bytes()))?;
@@ -762,9 +779,9 @@ mod tests {
                 let expected_logits = load("logits.bin", probes.len() * 128896 * 4)?;
                 let embedding = Allocation::new(device, 64 * H * 2)?;
                 let hidden = Allocation::new(device, 64 * H * 4)?;
-                let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3)?)?)?;
+                let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
                 let mut owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
-                    rope.clone(), u64::MAX, &[], &arena, Rc::new(Stream::new(device)?))?;
+                    rope.clone(), u64::MAX, &[], &arena, Rc::new(Stream::new(device)?), kv_format)?;
                 owner.bind_cache(&cache)?;
                 let mut boundaries: Vec<(&str, usize, Vec<u8>)> = [
                     ("enorm", H), ("hnorm", H), ("concat", 2 * H), ("eh", H),
@@ -853,7 +870,7 @@ mod tests {
                         (e/n).sqrt()
                     }).fold(0f64, f64::max);
                     eprintln!("MTP pass={pass} stage={stage} {name} rel_l2={relative:.9e} max_abs={maximum:.9e} worst_row_rel_l2={worst:.9e}");
-                    if same_input {
+                    if same_input && kv_format == Qwen4KvCache::Bf16 {
                         agreement &= relative <= 0.01 && worst <= 0.01;
                     }
                 }
@@ -940,19 +957,22 @@ mod tests {
 
     #[test]
     fn predictor_scratch_is_max_shared_and_only_tokens_survive_stage_reuse() -> Result<()> {
-        for rows in [1, 16, 64, 256, 4096] {
+        for (rows, kv_format) in [1, 16, 64, 256, 4096].into_iter().flat_map(|rows|
+            [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter().map(move |format| (rows, format))) {
             let metadata = native::mtp_metadata_planes(rows)?;
             assert!(metadata.iter().all(|n| *n >= 256));
             let input = native::plane_bytes(&planes(rows)?)?;
             let layer = native::layer_workspace(rows, false, 64, false)?;
             let head = native::plane_bytes(&native::head_planes(rows)?)?;
-            let core = native::mtp_scratch_core(rows)?;
+            let core = native::mtp_scratch_core(rows, kv_format)?;
             assert_eq!(native::mtp_input_offset(rows)?, layer);
             assert_eq!(native::mtp_metadata_offset(rows)?, layer + input);
-            assert_eq!(core, (layer + input + native::plane_bytes(&metadata[..4])?).max(head));
-            assert_eq!(native::mtp_forecast_workspace(rows, 0)?, 0);
+            let compact = native::plane_bytes(&native::mtp_compact_planes(rows, kv_format)?)?;
+            assert_eq!(native::mtp_compact_offset(rows)?, layer + input + native::plane_bytes(&metadata[..4])?);
+            assert_eq!(core, (native::mtp_compact_offset(rows)? + compact).max(head));
+            assert_eq!(native::mtp_forecast_workspace(rows, 0, kv_format)?, 0);
             for depth in 1..=3 {
-                assert_eq!(native::mtp_forecast_workspace(rows, depth)?, core + depth as u64 * 256);
+                assert_eq!(native::mtp_forecast_workspace(rows, depth, kv_format)?, core + depth as u64 * 256);
                 assert!(core + (depth as u64 - 1) * 256 >= head);
             }
         }

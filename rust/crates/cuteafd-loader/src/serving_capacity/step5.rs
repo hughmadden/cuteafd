@@ -216,6 +216,19 @@ impl Step5CacheLayout {
             .ok_or_else(|| invalid("attention layer is not owned on rank"))
     }
 
+    /// One compact producer pair per target lane, reused after stream-ordered
+    /// copies into retained storage. Predictor staging is separate.
+    pub fn target_pack_planes(&self, rank: usize) -> Result<[usize; 2], CacheGeometryError> {
+        let state = self.ranks.get(rank).ok_or_else(|| invalid("attention rank"))?;
+        let heads = state.sliding.iter().filter(|s| !s.mtp).map(|s| s.query_heads)
+            .chain(state.regions.iter().map(|s| s.query_heads)).max().unwrap_or(0);
+        let bytes = if self.kv_format == Qwen4KvCache::Fp8 && heads > 0 {
+            mul(&[self.ring.step, self.kv_format.plane_record_bytes(heads / 16, 192) as u64])?
+        } else { 0 };
+        let bytes = usize::try_from(bytes).map_err(|_| invalid("producer staging extent"))?;
+        Ok([bytes; 2])
+    }
+
     /// Canonical marks contain only committed rows, never proposal slack.
     /// Predictor frontiers are actual stage-local lengths, not inferred target shifts.
     pub fn snapshot_spans(&self, rank: usize, frontier: u64, stages: &[u64]) -> Result<Vec<ByteSpan>, CacheGeometryError> {

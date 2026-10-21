@@ -400,6 +400,11 @@ pub(super) mod tests {
     }
 
     pub(in crate::families::step5) fn layout_for(context: u64, ranks: usize, mtp: usize, step: u64) -> Step5CacheLayout {
+        layout_with_format(context, ranks, mtp, step, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)
+    }
+
+    pub(in crate::families::step5) fn layout_with_format(context: u64, ranks: usize, mtp: usize, step: u64,
+        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Step5CacheLayout {
         let config = cuteafd_loader::plan::families::step5::Config {
             norm_eps: 1e-5, hidden: 4096, vocab: 128896, layers: 92, mtp: 3,
             dense: 13824, experts: 352, intermediate: 1536, shared: 1536, topk: 8,
@@ -409,16 +414,19 @@ pub(super) mod tests {
             rope_scaling: None, scale_full: false, scale_sliding: false,
             activation: Vec::new(), shared_activation: Vec::new(),
         };
-        Step5CacheLayout::new(&config, ranks, context, mtp, step, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16).unwrap()
+        Step5CacheLayout::new(&config, ranks, context, mtp, step, kv_format).unwrap()
     }
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
     fn native_cold_slot_reset_clears_both_banks_without_touching_other_slots() -> Result<()> {
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
         // SAFETY: the selected library implements the native CUDA ABI.
         let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&library)?;
-        let layout = layout_for(65, 1, 3, 64);
+        for (kv_format, depth) in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter()
+            .flat_map(|format| (0..=3).map(move |depth| (format, depth))) {
+        let layout = layout_with_format(65, 1, depth, 64, kv_format);
         let cache = CacheRank::new(device, layout.clone(), 0, 2, 1, 2, usize::MAX)?;
         let initial = vec![0xa5; cache.active.buffer.bytes];
         device.run(|| library.copy_h2d(cache.active.buffer, &initial))?;
@@ -441,6 +449,7 @@ pub(super) mod tests {
         assert!(cache.reset_sequence(1).is_err());
         cache.busy[1].set(false);
         assert!(cache.reset_sequence(2).is_err());
+        }
         Ok(())
     }
 
@@ -498,39 +507,45 @@ pub(super) mod tests {
         // SAFETY: the explicitly selected native library implements the CUDA ABI.
         let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&library)?;
-        let layout = layout();
+        for kv_format in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+        for depth in 0..=3 {
+        let layout = layout_with_format(65, 1, depth, 64, kv_format);
+        let stages = [64u64, 62, 60][..depth].to_vec();
         let mut cache = CacheRank::new(device, layout.clone(), 0, 2, 2, 1, usize::MAX)?;
         assert_eq!(cache.bytes(), Reservation::new(&layout, 0, 2, 2, 1, usize::MAX)?.total);
         assert!(cache.page_pool().bytes > 0);
-        let copies = layout.snapshot_copies(0, 65, &[0; 3], 2, 0, 2, 0)?;
+        let copies = layout.snapshot_copies(0, 65, &stages, 2, 0, 2, 0)?;
         for (i, copy) in copies.iter().enumerate() {
             let plane = view(cache.active.buffer, copy.active)?;
             let data: Vec<u8> = (0..plane.bytes).map(|n| (n.wrapping_mul(37) + i) as u8).collect();
             device.run(|| library.copy_h2d(plane, &data))?;
         }
-        for &span in &layout.ranks[0].mtp_lengths {
-            device.run(|| library.copy_h2d(cache.request_component(span, 0)?, &0u64.to_le_bytes()))?;
+        for (&span, &frontier) in layout.ranks[0].mtp_lengths.iter().zip(&stages) {
+            device.run(|| library.copy_h2d(cache.request_component(span, 0)?, &frontier.to_le_bytes()))?;
         }
         assert!(cache.restore(0, 0, 65).is_err());
         cache.capture(0, 0, 65)?;
         assert!(cache.restore(1, 0, 64).is_err());
         device.run(|| library.copy_h2d(cache.active.buffer, &vec![0xa5; cache.active.buffer.bytes]))?;
         cache.restore(1, 0, 65)?;
-        let restored = layout.snapshot_copies(0, 65, &[0; 3], 2, 1, 2, 0)?;
+        let restored = layout.snapshot_copies(0, 65, &stages, 2, 1, 2, 0)?;
         let mut actual = vec![0; cache.active.buffer.bytes];
         device.run(|| library.copy_d2h(&mut actual, cache.active.buffer))?;
         let mut expected = vec![0xa5; actual.len()];
         for (i, copy) in restored.iter().enumerate() {
             let at = copy.active.offset as usize;
-            let predictor_length = layout.ranks[0].mtp_lengths.iter().any(|s|
-                copy.mark.offset == s.offset);
+            let predictor_length = layout.ranks[0].mtp_lengths.iter().position(|s|
+                copy.mark.offset == s.offset).map(|stage| stages[stage].to_le_bytes());
             for n in 0..copy.active.bytes as usize {
-                expected[at + n] = if predictor_length { 0 } else { (n.wrapping_mul(37) + i) as u8 };
+                expected[at + n] = if let Some(length) = predictor_length { length[n] } else { (n.wrapping_mul(37) + i) as u8 };
             }
         }
         assert_eq!(actual, expected);
         assert!(cache.capture(2, 0, 65).is_err());
         assert!(cache.capture(0, 2, 65).is_err());
+        }
+        }
         Ok(())
     }
 }
