@@ -82,25 +82,25 @@
       "kind": "agentic",
       "path": "codex/rollout-2026-10-05T07-05-37-01a1092a-6d9d-7ba1-b94a-1e87f89a0498.jsonl.zst",
       "sha256": "288ec24814ca7f9e56ce060db0d25c58cd1db5c3b9d35f9a451991d014a428d5",
-      "rendered_sha256": "d9298412a56278e3ff17904da8e54e78b26a20200eb4d3879e6393f03881be12"
+      "rendered_sha256": "f293c78aa24ecbaaeeb80197468efb1b9cc1e6abdab7cb75c8486501e7436224"
     },
     {
       "kind": "agentic",
       "path": "codex/rollout-2026-10-05T07-05-30-01a1092a-4fe7-7491-aa9d-683b0e1b233d.jsonl.zst",
       "sha256": "508bb41a83453ad46729fbb8ff00921aa64fffa393d7538cbb416101776798dc",
-      "rendered_sha256": "f7106583bbf8f75b0a238f388784ce5430aa21e93d5821e7e0bb0d5c23497c8c"
+      "rendered_sha256": "7451053367c9ee6ba7e32ec1fdb7ae03349d9f320c6dc3d53f988230d494e97b"
     },
     {
       "kind": "agentic",
       "path": "codex/rollout-2026-10-05T07-05-22-01a1092a-2fb2-7b41-87ed-8f5db0f2b5f1.jsonl.zst",
       "sha256": "f300db68166c93e71828bc36a906c012543535538fba7a85549624df13f50776",
-      "rendered_sha256": "7ab12bb48fb8840388d49df4fd4435d461e4391065832727cc1a99641543a1c4"
+      "rendered_sha256": "96119ae7e9801215fc34c90232ff76ab4c4ba10582312b5731eb7b2f923d7102"
     },
     {
       "kind": "agentic",
       "path": "codex/rollout-2026-10-05T07-04-46-01a10929-a42d-7133-af3f-f8b79b9a5c39.jsonl.zst",
       "sha256": "7fc5e50d0b29bf3ceb21c175ce478d1e2c8473fc9b85982ec8ef6d7205d7eecc",
-      "rendered_sha256": "df943f3a91ba321dce210c0b7a5050a24a858a6e772ec52b316f7d82ff0bd9ca"
+      "rendered_sha256": "c0e3bba6ee827cd9fb72d1f7e4742cee8a0b5abe16e6206c5edd456c25860761"
     }
   ],
   "banks": [
@@ -115,10 +115,10 @@
     {
       "kind": "agentic",
       "path": "agentic.txt",
-      "sha256": "1beeaf7691b5718dd6ba2a53a96139241c3d5bf5a9353eb2ff8e15cb4ff7577d",
-      "bytes": 114725,
-      "reference_tokens": 39249,
-      "chunks": 1227
+      "sha256": "6ed7a5a8f45d803fe0694052f495810af024e8e05e442c8b53c6be9250285982",
+      "bytes": 113039,
+      "reference_tokens": 37878,
+      "chunks": 1184
     },
     {
       "kind": "prose",
