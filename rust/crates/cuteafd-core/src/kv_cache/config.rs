@@ -13,8 +13,8 @@ use crate::{
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MlaCacheFormat {
-    #[default]
     Bf16,
+    #[default]
     Fp8,
 }
 
@@ -276,6 +276,7 @@ mod mla_format_tests {
     use super::*;
     #[test]
     fn shared_mla_record_is_the_existing_glm_contract() {
+        assert_eq!(MlaCacheFormat::default(), MlaCacheFormat::Fp8);
         assert_eq!(MlaCacheFormat::Bf16.record_bytes(), 1152);
         assert_eq!(MlaCacheFormat::Fp8.record_bytes(), 512 + 4 * 4 + 64 * 2);
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {

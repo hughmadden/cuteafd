@@ -2014,7 +2014,7 @@ if ((qualifying)); then
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
 fi
 if [[ $family == kimi_k3 ]]; then
-  kv_cache="$(get KV_CACHE bf16)"
+  kv_cache="$(get KV_CACHE fp8)"
   case "$kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$kv_cache")
   local_layers="$(get RTX_EXPERT_LAYERS auto)"

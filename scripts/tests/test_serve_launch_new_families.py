@@ -115,7 +115,7 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
 @pytest.mark.parametrize("cache", [None, "bf16", "fp8"])
 def test_kimi_kv_format_reaches_both_plan_and_target_drafter(tmp_path: Path, cache) -> None:
     result = _kimi(tmp_path, "" if cache is None else f"KV_CACHE={cache}\n")
-    expected = cache or "bf16"
+    expected = cache or "fp8"
     assert _flag(_line(result, "cuteafd serve-kimi --snapshot"), "--kv-cache") == expected
     assert _flag(_line(result, "cuteafd plan"), "--kv-cache") == expected
 

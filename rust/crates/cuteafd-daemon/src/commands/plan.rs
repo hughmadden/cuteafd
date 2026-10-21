@@ -773,9 +773,21 @@ mod tests {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
         let mut args = args(std::path::Path::new("/model"), 6, false);
         assert_eq!(options(&args).unwrap().layout.unwrap().step5_kv, Qwen4KvCache::Fp8);
-        for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
-            args.kv_format = Some(format);
+        for (selected, format) in [(cuteafd_core::MlaCacheFormat::Bf16, Qwen4KvCache::Bf16),
+            (cuteafd_core::MlaCacheFormat::Fp8, Qwen4KvCache::Fp8)] {
+            args.kv_format = Some(selected);
             assert_eq!(options(&args).unwrap().layout.unwrap().step5_kv, format);
+        }
+    }
+
+    #[test]
+    fn kimi_plan_defaults_to_fp8_and_preserves_explicit_bf16() {
+        use cuteafd_core::MlaCacheFormat;
+        let mut args = args(std::path::Path::new("/model"), 6, false);
+        assert_eq!(options(&args).unwrap().layout.unwrap().mla_kv, MlaCacheFormat::Fp8);
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            args.kv_format = Some(format);
+            assert_eq!(options(&args).unwrap().layout.unwrap().mla_kv, format);
         }
     }
 

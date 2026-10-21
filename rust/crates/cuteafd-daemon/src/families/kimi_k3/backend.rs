@@ -65,7 +65,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
         let cache = PrefixCache::new_with_draft_pages(layout, config, host, family.draft_page_bytes())?;
         cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-            "BF16 owned MLA + exact TP2 KDA", host_bytes);
+            family.record_format(), host_bytes);
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {

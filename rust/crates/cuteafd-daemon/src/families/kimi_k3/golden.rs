@@ -22,7 +22,7 @@ const SOURCE: [(&str, &str); 3] = [
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct GoldenArgs {
-    #[arg(long, default_value = "bf16")] kv_cache: cuteafd_core::MlaCacheFormat,
+    #[arg(long, default_value = "fp8")] kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
@@ -440,6 +440,10 @@ mod tests {
         let parsed = crate::cli::Cli::try_parse_from(args)?;
         let crate::cli::Commands::KimiGolden(parsed) = parsed.command else { panic!("Kimi command"); };
         assert_eq!(parsed.last_layer, Some(3));
+        assert_eq!(parsed.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
+        let crate::cli::Commands::KimiGolden(bf16) = crate::cli::Cli::try_parse_from(
+            args.into_iter().chain(["--kv-cache", "bf16"]))?.command else { panic!("Kimi command"); };
+        assert_eq!(bf16.kv_cache, cuteafd_core::MlaCacheFormat::Bf16);
         assert_eq!(parsed.reference_state.as_deref(), Some(Path::new("/state")));
         for flag in ["--last-layer", "--reference-state"] {
             let at = args.iter().position(|arg| *arg == flag).unwrap();

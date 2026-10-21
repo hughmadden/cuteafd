@@ -9,7 +9,7 @@ use cuteafd_loader::families::kimi_k3::{COMPILED_CONTEXT, DEFAULT_CONTEXT};
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
     /// Target and drafter share the exact selected MLA record.
-    #[arg(long, default_value = "bf16")] pub kv_cache: cuteafd_core::MlaCacheFormat,
+    #[arg(long, default_value = "fp8")] pub kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
@@ -194,7 +194,9 @@ mod tests {
         let defaults = args(&["--peers", peers])?;
         defaults.validate()?;
         assert_eq!(defaults.max_context, 524_288);
-        assert_eq!(defaults.kv_cache, cuteafd_core::MlaCacheFormat::Bf16);
+        assert_eq!(defaults.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
+        assert_eq!(cuteafd_loader::plan::LayoutOptions::default().mla_kv, defaults.kv_cache);
+        assert_eq!(args(&["--peers", peers, "--kv-cache", "bf16"])?.kv_cache, cuteafd_core::MlaCacheFormat::Bf16);
         assert_eq!(args(&["--peers", peers, "--kv-cache", "fp8"])?.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
         assert!(args(&["--peers", peers, "--kv-cache", "int8"]).is_err());
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
