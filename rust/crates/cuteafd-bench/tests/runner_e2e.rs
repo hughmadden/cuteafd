@@ -57,6 +57,11 @@ async fn share_run_completes_and_locks_out_other_clients() {
     }).await.unwrap();
     let (id, report) = outcome;
     assert_eq!(report["status"], "done", "{report:#}");
+    assert_eq!(report["prompt_content"], "realistic-v1");
+    let mut historical = report.clone();
+    historical.as_object_mut().unwrap().remove("prompt_content");
+    let historical: cuteafd_bench::report::Report = serde_json::from_value(historical).unwrap();
+    assert!(historical.prompt_content.is_none());
     let report: cuteafd_bench::report::Report = serde_json::from_value(report).unwrap();
     assert_eq!(report.status, RunStatus::Done);
     let baseline = report.baseline.as_ref().expect("baseline");

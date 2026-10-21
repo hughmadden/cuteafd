@@ -393,6 +393,7 @@ gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
 fingerprint=test
 hf_home=/models
+namespace_root=/mnt/sparknest
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
 SPARK_DEVICE_BUDGET_BYTES=107374182400
@@ -1476,6 +1477,7 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
 engine_commit=engine-revision
 sparkinfer_commit=sparkinfer-revision
 snapshot_rel=hub/models--x--M/snapshots/rev
+namespace_root=/mnt/sparknest
 host=dodo
 model_is_exl3={exl3}
 exl3_family_tag={family}

@@ -8,7 +8,7 @@
 use crate::client::Client;
 use crate::panels::common::{aggregate, median, plain, wave, Timed};
 use crate::panels::speed::CONTENT;
-use crate::text::{filler, nonce};
+use crate::text::{corpus, nonce};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,6 +53,8 @@ pub struct PrefillPoint {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Sweep {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_content: Option<String>,
     pub points: Vec<Point>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefill: Vec<PrefillPoint>,
@@ -150,17 +152,17 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     Ok((point, prompts))
 }
 
-/// Cold prefill at each length: fit tokens per filler word from two short
+/// Cold prefill at each length: fit tokens per reference token from two short
 /// requests, then per length one untimed warm request and one measured request
 /// with a fresh prefix (it must reuse no cached tokens).
 fn prefill(client: &Client, lengths: &[u64], max_context: u64, on_timed: &mut OnTimed) -> Result<Vec<PrefillPoint>> {
     let ask = |words: usize, seed: u64| -> Result<crate::client::Chat> {
-        client.chat(plain(client, &format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(seed, words)), 1), None)
+        client.chat(plain(client, &format!("[{}] Summarize in one word.\n\n{}", nonce(), corpus(seed, words)), 1), None)
     };
-    let (a, b) = (ask(300, 101)?, ask(900, 102)?);
+    let (a, b) = (ask(300, 101)?, ask(900, 101)?);
     let slope = (b.timing.prompt_tokens as f64 - a.timing.prompt_tokens as f64) / 600.0;
     let intercept = a.timing.prompt_tokens as f64 - slope * 300.0;
-    let (slope, intercept) = if slope.is_finite() && slope > 0.3 { (slope, intercept) } else { (1.3, 20.0) };
+    let (slope, intercept) = if slope.is_finite() && slope > 0.3 { (slope, intercept) } else { (1.0, 20.0) };
     let mut points = Vec::new();
     for &length in lengths {
         let target = length.min(max_context.saturating_sub(64)) as f64;
@@ -213,7 +215,7 @@ pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
     let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key).with_fabric(fabric);
     let _subscription = client.fabric_subscription();
     let record = client.discover().context("sweep: /v1/models")?;
-    let mut sweep = Sweep::default();
+    let mut sweep = Sweep { prompt_content: Some(crate::text::PROMPT_CONTENT.into()), ..Sweep::default() };
     if !prefill_lengths.is_empty() {
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let mark = client.thermal_mark();

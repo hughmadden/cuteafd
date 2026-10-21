@@ -21,6 +21,7 @@ fn admission_timeout(value: Option<&str>) -> Result<Duration> {
 pub(crate) struct SparkAdmission {
     selection: WorkerSelection,
     assignments: Vec<SparkAssignment>,
+    push_snapshot: Option<std::path::PathBuf>,
 }
 
 impl SparkAdmission {
@@ -92,7 +93,14 @@ impl SparkAdmission {
                     .with_context(|| format!("Spark admission rank {rank} checkpoint assignment"))
             }).collect::<Result<Vec<_>>>()?
         };
-        Ok(Self { selection, assignments })
+        let push_snapshot = if manifest.is_none() && catalog.is_some_and(|c| c.exl3().is_some())
+            && !working.spark_layers.is_empty() && assignments.iter().all(|a| a.resident_bytes > 0)
+            && topology.is_none_or(|t| t.tp() as usize == world)
+            && cuteafd_loader::push_load::namespace(snapshot).is_ok() {
+            Some(snapshot.to_path_buf())
+        } else { None };
+        let selection = if push_snapshot.is_some() { selection.with_push_weights() } else { selection };
+        Ok(Self { selection, assignments, push_snapshot })
     }
 
     fn reconcile(&self, reports: &[ModelAdmissionResponse]) -> Result<()> {
@@ -109,6 +117,17 @@ impl SparkAdmission {
         let pending = cuteafd_transport::worker_selection::start_model_admission(
             peers, &self.selection, timeout)
             .with_context(|| format!("Spark worker admission start failed (timeout {} s)", timeout.as_secs()))?;
+        let pending = if let Some(snapshot) = self.push_snapshot.clone() {
+            let assignments = self.assignments.clone();
+            let layers = self.selection.layers();
+            let cancel = pending.cancellation_streams()?;
+            AdmissionWait::Push(PushAdmissionDriver { cancel, thread: Some(std::thread::spawn(move || {
+                let mut pending = pending;
+                pending.push_weights(|offers| super::memory::push_exl3::prepare(
+                    &snapshot, &layers, &assignments, offers))?;
+                pending.wait()
+            })) })
+        } else { AdmissionWait::Mount(pending) };
         Ok(PendingSparkAdmission { plan: self, pending, timeout })
     }
 
@@ -117,15 +136,40 @@ impl SparkAdmission {
     }
 }
 
+struct PushAdmissionDriver {
+    cancel: Vec<std::net::TcpStream>,
+    thread: Option<std::thread::JoinHandle<Result<Vec<ModelAdmissionResponse>>>>,
+}
+impl PushAdmissionDriver {
+    fn wait(mut self) -> Result<Vec<ModelAdmissionResponse>> {
+        self.thread.take().expect("owned admission driver").join()
+            .map_err(|_| anyhow::anyhow!("Spark push admission driver panicked"))?
+    }
+}
+impl Drop for PushAdmissionDriver {
+    fn drop(&mut self) {
+        for stream in &self.cancel { let _ = stream.shutdown(std::net::Shutdown::Both); }
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
+}
+
+enum AdmissionWait {
+    Mount(cuteafd_transport::worker_selection::PendingModelAdmission),
+    Push(PushAdmissionDriver),
+}
+
 pub(crate) struct PendingSparkAdmission {
     plan: SparkAdmission,
-    pending: cuteafd_transport::worker_selection::PendingModelAdmission,
+    pending: AdmissionWait,
     timeout: Duration,
 }
 
 impl PendingSparkAdmission {
     pub(crate) fn wait(self) -> Result<()> {
-        let reports = self.pending.wait()
+        let reports = match self.pending {
+            AdmissionWait::Mount(pending) => pending.wait(),
+            AdmissionWait::Push(driver) => driver.wait(),
+        }
             .with_context(|| format!("Spark worker admission failed (timeout {} s)", self.timeout.as_secs()))?;
         self.plan.reconcile(&reports)?;
         for report in reports {
@@ -170,7 +214,7 @@ mod tests {
         let timeout = Duration::from_secs(5);
         let pending = cuteafd_transport::worker_selection::start_model_admission(
             &peers, &plan.selection, timeout)?;
-        Ok((PendingSparkAdmission { plan, pending, timeout }, listeners))
+        Ok((PendingSparkAdmission { plan, pending: AdmissionWait::Mount(pending), timeout }, listeners))
     }
 
     #[test]
@@ -299,7 +343,7 @@ mod tests {
         let timeout = Duration::from_secs(1);
         let pending = cuteafd_transport::worker_selection::start_model_admission(
             &peers, &plan.selection, timeout)?;
-        let result = PendingSparkAdmission { plan, pending, timeout }.wait();
+        let result = PendingSparkAdmission { plan, pending: AdmissionWait::Mount(pending), timeout }.wait();
         let _ = release.send(());
         worker.join().unwrap();
         let error = format!("{:#}", result.unwrap_err());
@@ -456,6 +500,58 @@ mod tests {
             assert!(!assignment.slices[0].projection_counts.is_empty());
         }
         check_reports(&plan)
+    }
+
+    #[test]
+    fn kimi_tp6_push_plans_match_admitted_exl3_residency() -> Result<()> {
+        use crate::shared::{experts::{exl3::Exl3Weights, layer::ExpertLayer}, memory::push_exl3};
+        use cuteafd_transport::worker_selection::push::Offer;
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_snapshot(root.path(), true);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
+            ..Default::default() };
+        let admission = SparkAdmission::plan(root.path(), catalog.routed_experts().geometry()?,
+            Some(&catalog), &working, 6, None, fixture_model())?;
+        assert_eq!(admission.selection.layers(), [1]);
+        for (rank, assignment) in admission.assignments.iter().enumerate() {
+            assert_eq!(assignment.slices[0].width, 512);
+            let budget = Exl3Weights::plan(&catalog, ExpertLayer::BackboneExl3Tp { layer: 1, rank, world: 6 })?;
+            assert_eq!(assignment.resident_bytes, budget.resident_bytes as u64);
+            let plan = push_exl3::RankPlan::new(&catalog, &[1], 6, rank, budget.resident_bytes)?;
+            let offer = Offer { rank, host: format!("rank-{rank}"),
+                arena_bytes: plan.layout.logical_bytes() as u64, placement: plan.placement.clone() };
+            push_exl3::validate_offer(&offer, rank, assignment, &plan.placement, offer.arena_bytes)?;
+            let checked = plan.checked(&catalog, root.path(), 6, rank)?;
+            assert!(!checked.plan.entries.is_empty());
+            assert_eq!(checked.arenas[rank], offer.arena_bytes);
+            // Mount staging is not a push limit; service::push tests exercise
+            // independent ring admission against the actual allocatable pool.
+            let ring = cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES;
+            assert_eq!(ring, 134_217_728);
+            assert_eq!(budget.pinned_host_bytes, 44_826_624);
+            assert_eq!(budget.read_scratch_bytes, 268_435_456);
+            assert!(ring > budget.pinned_host_bytes, "Kimi push must admit its ring independently");
+            assert!(plan.validation.bytes() <= budget.read_scratch_bytes);
+        }
+        check_reports(&admission)?;
+        use cuteafd_loader::plan::testing::{exl3, glm5_config, write_snapshot};
+        let glm = tempfile::tempdir()?;
+        let tensors = (0..256).flat_map(|expert| [
+            ("gate_proj", 2048, 6144), ("up_proj", 2048, 6144), ("down_proj", 6144, 2048),
+        ].into_iter().flat_map(move |(projection, n, k)|
+            exl3(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4))).collect::<Vec<_>>();
+        let mut config = glm5_config();
+        config["quantization_config"] = serde_json::json!({"quant_method": "exl3", "bits": 4.0,
+            "checkpoint_format": "exl3", "format": "exl3"});
+        write_snapshot(glm.path(), &config, &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(glm.path())?;
+        let budget = Exl3Weights::plan(&catalog, ExpertLayer::BackboneExl3Tp { layer: 1, rank: 0, world: 6 })?;
+        assert_eq!(budget.pinned_host_bytes, 114_499_584);
+        assert_eq!(budget.read_scratch_bytes, 268_435_456);
+        assert!(cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES
+            > budget.pinned_host_bytes, "GLM K4 push must admit its ring independently");
+        Ok(())
     }
 
     #[test]

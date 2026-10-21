@@ -32,18 +32,21 @@ _cdi_spec.loader.exec_module(_cdi)
 cdi_gpu_args = _cdi.cdi_gpu_args
 sys.path.insert(0, str(REPO / 'scripts/lib'))
 from wip_aot_scopes import family_scopes
-# PROFILE switches that wrap the coordinator in a profiler, and their report suffix.
+# Profilers that wrap a serving process (PROFILE on the coordinator, PROFILE_SPARK
+# on Spark workers), and their report suffix.
 PROFILER_REPORTS = {'nsys': '.nsys-rep', 'ncu': '.ncu-rep'}
 NSYS_SESSION = 'cuteafd-profile'  # RELEASE_NSYS_SESSION in scripts/lib/release-common.sh
 HOSTS = ('ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa')
-# Out-of-pool build seeds: compile, export and seal Spark slots, never serve.
-# kakapo has no RoCE (10 GbE only): its staging lanes are its LAN address and
-# wip.sh moves its sealed slots through sparknest.
-SEED_HOSTS = ('kakapo',)
-SEEDS = ('rhea', 'moa', *SEED_HOSTS)
-# kakapo passed its gate 2026-10-13 (mimo26-flash-max: cold build sealed, distributed
-# through sparknest, served at C1 with 0 errors); it isolates seed CPU load from serving.
-DEFAULT_SEED = 'kakapo'
+# LAN-only build seeds: compile, export and seal Spark slots, never serve. They have
+# no RoCE (10 GbE only): their staging lanes are their LAN address and wip.sh moves
+# their sealed slots through sparknest. Keep in sync with release_lan_seed_hosts
+# (scripts/lib/release-common.sh). kakapo passed its gate 2026-10-13 (cold build
+# sealed, distributed through sparknest, served at C1 with 0 errors).
+SEED_HOSTS = ('kakapo', 'cassowary')
+SEEDS = ('auto', 'rhea', 'moa', *SEED_HOSTS)
+# 'auto': wip.sh picks the less-loaded LAN-only seed, then rhea/moa. A named seed
+# is a placement request (wip.sh --seed).
+DEFAULT_SEED = 'auto'
 CORRECTNESS = {'sim-5090', 'fidelity', 'cache', 'image', 'no-fit', 'packed-check'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
@@ -292,21 +295,28 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     label = f'{card}-{arm_name}-r{repeat}' + ('-simulated' if simulated else '')
     dest = state / label
     dest.mkdir(parents=True, exist_ok=True)
-    if values.get('PROFILE'):
+    if values.get('PROFILE') or values.get('PROFILE_SPARK'):
         # One per-job directory, mounted on the coordinator and every Spark at
         # the same path; Spark-side files are collected back after the run.
         values['PROFILE_DIR'] = str(dest / 'profile')
         (dest / 'profile').mkdir(exist_ok=True)
-        if 'nsys' in values['PROFILE'].split(','):
-            # The coordinator's nsys session starts paused; smoke opens it after
-            # the sweep's first warm wave and closes it (writing the report) at
-            # sweep end, or before teardown if the sweep stopped in between.
+        # nsys sessions start paused (the coordinator's under PROFILE=nsys, each
+        # selected Spark rank's under PROFILE_SPARK=nsys); smoke opens them after
+        # the sweep's first warm wave and closes them (writing the reports) at
+        # sweep end, or before teardown if the sweep stopped in between.
+        sessions = []
+        if 'nsys' in values.get('PROFILE', '').split(','):
+            sessions.append(['docker', 'exec', 'cuteafd-coordinator-' + values['INSTANCE'], '/usr/local/cuda/bin/nsys'])
+        if values.get('PROFILE_SPARK') == 'nsys':
+            for rank in spark_profile_ranks(values, hosts):
+                worker = f"cuteafd-spark-expert-{hosts[rank]}-{values.get('EXPERT_PORT', '19441')}"
+                sessions.append(['ssh', '-o', 'BatchMode=yes', hosts[rank], 'docker', 'exec', worker, '/usr/local/cuda/bin/nsys'])
+        if sessions:
             if not (entry.get('levels') or entry.get('prefill_lengths')):
-                raise ValueError(card + ': PROFILE=nsys captures the timed sweep; pass --levels or --prefill-lengths')
-            exec_nsys = ['docker', 'exec', 'cuteafd-coordinator-' + values['INSTANCE'], '/usr/local/cuda/bin/nsys']
+                raise ValueError(card + ': PROFILE=nsys and PROFILE_SPARK=nsys capture the timed sweep; pass --levels or --prefill-lengths')
             entry['window'] = dict(
-                open=dict(argv=exec_nsys + ['start', '--session=' + NSYS_SESSION], timeout_s=120, required=True),
-                close=dict(argv=exec_nsys + ['stop', '--session=' + NSYS_SESSION], timeout_s=1800, required=True))
+                open=dict(argv=window_argv([s + ['start', '--session=' + NSYS_SESSION] for s in sessions]), timeout_s=120, required=True),
+                close=dict(argv=window_argv([s + ['stop', '--session=' + NSYS_SESSION] for s in sessions]), timeout_s=1800, required=True))
     elif 'PROFILE_DIR' in values:
         raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
     if exact_state:
@@ -801,6 +811,39 @@ def ledger(dest):
     return {'lines': lines, 'spark_ring_peak_bytes': rings, 'device_used_peak_bytes': device_peaks}
 
 
+def spark_profile_ranks(values, hosts):
+    """The Spark ranks PROFILE_SPARK wraps (PROFILE_SPARK_RANKS, default rank 0),
+    checked against this card's Spark count; the launcher checks them again."""
+    text = values.get('PROFILE_SPARK_RANKS') or '0'
+    if not re.fullmatch(r'(0|[1-9][0-9]?)(,(0|[1-9][0-9]?))*', text):
+        raise ValueError('PROFILE_SPARK_RANKS must be a comma list of Spark ranks (e.g. 0 or 0,3)')
+    ranks = [int(r) for r in text.split(',')]
+    if len(set(ranks)) != len(ranks):
+        raise ValueError('PROFILE_SPARK_RANKS lists a rank twice')
+    if not hosts:
+        raise ValueError('PROFILE_SPARK needs a card with Spark expert workers')
+    if max(ranks) >= len(hosts):
+        raise ValueError(f'PROFILE_SPARK_RANKS names rank {max(ranks)}; this card has ranks 0..{len(hosts) - 1}')
+    return ranks
+
+
+def window_argv(commands):
+    """One hook argv for one or more window commands: a single command runs as
+    is; several run in order, every one attempted, failing if any failed."""
+    if len(commands) == 1:
+        return commands[0]
+    script = 'rc=0; ' + ' '.join(shlex.join(c) + ' || rc=1;' for c in commands) + ' exit $rc'
+    return ['sh', '-c', script, 'profile-window']
+
+
+def expected_spark_reports(values, hosts):
+    """Report files PROFILE_SPARK writes, one per selected rank, named by host and rank."""
+    tool = values.get('PROFILE_SPARK')
+    if tool not in PROFILER_REPORTS:
+        return []
+    return [f'{tool}-{hosts[rank]}-rank{rank}{PROFILER_REPORTS[tool]}' for rank in spark_profile_ranks(values, hosts)]
+
+
 def collect_profile(job):
     """Copies Spark-side PROFILE files back into the job's profile directory
     (the coordinator writes there directly). Missing hosts are recorded, not fatal.
@@ -809,7 +852,9 @@ def collect_profile(job):
     directory = values.get('PROFILE_DIR')
     if not directory:
         return None
-    result = {'dir': directory, 'switches': values.get('PROFILE', '').split(','), 'hosts': {}}
+    result = {'dir': directory, 'switches': [s for s in values.get('PROFILE', '').split(',') if s], 'hosts': {}}
+    if values.get('PROFILE_SPARK'):
+        result['spark'] = {'tool': values['PROFILE_SPARK'], 'expected': expected_spark_reports(values, job['entry']['sparks'])}
     for host in job['entry']['sparks']:
         try:
             subprocess.run(['rsync', '-a', '-e', 'ssh -o BatchMode=yes', f'{host}:{directory}/', directory + '/'],
@@ -955,8 +1000,15 @@ def summarize_job(job, exit_code):
     if profile:
         row['profile'] = profile
         for switch, suffix in PROFILER_REPORTS.items():
-            if switch in profile['switches'] and not any(r['name'].endswith(suffix) and r['bytes'] for r in profile['reports']):
+            # The coordinator's report is named by its host alone; Spark reports add the rank.
+            if switch in profile['switches'] and not any(r['name'].endswith(suffix) and r['bytes'] and '-rank' not in r['name']
+                                                         for r in profile['reports']):
                 fail(row, f'PROFILE={switch} produced no {suffix} report in {profile["dir"]}', 'measurement')
+        if profile.get('spark'):
+            sizes = {r['name']: r['bytes'] for r in profile['reports']}
+            missing = [name for name in profile['spark']['expected'] if not sizes.get(name)]
+            if missing:
+                fail(row, f"PROFILE_SPARK={profile['spark']['tool']} produced no {', '.join(missing)} in {profile['dir']}", 'measurement')
         if 'expert-routes' in profile['switches']:
             logs = sorted(Path(profile['dir']).glob('expert-routes-*.jsonl'))
             profile['expert_routes'] = [{'name': p.name, 'bytes': p.stat().st_size} for p in logs]
@@ -1503,6 +1555,8 @@ BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_E
               'COORDINATOR_GPU_UUID', 'COORDINATOR_GPU_PCI_BUS_ID', 'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
               'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS',
+              'PROFILE_NCU_SKIP', 'PROFILE_SPARK', 'PROFILE_SPARK_RANKS', 'PROFILE_SPARK_NCU_KERNEL', 'PROFILE_SPARK_NCU_COUNT',
+              'PROFILE_SPARK_NCU_SET', 'PROFILE_SPARK_NCU_SKIP', 'PROFILE_SPARK_NSYS_GPU_METRICS',
               'PROFILE_EXPERT_INPUT_SAMPLE', 'PROFILE_EXPERT_ROUTE_WEIGHTS', 'COORDINATOR_DOCKER_INFERENCE', 'SPARK_EXPERT_DOCKER_INFERENCE'}
 
 
@@ -1545,12 +1599,39 @@ def staging_hosts(union, seed, separate):
     return hosts if len(hosts) in (2, 3, 4, 6) else hosts + spare[:6 - len(hosts)]
 
 
+def lan_seeds_known(revision):
+    """The LAN-only seeds `revision`'s tooling knows: its release_lan_seed_hosts, or
+    kakapo alone before that set existed (such a wip.sh neither balances nor
+    detects cassowary's down RoCE ports)."""
+    shown = subprocess.run(['git', '-C', str(REPO), 'show', revision + ':scripts/lib/release-common.sh'],
+                           capture_output=True, text=True, timeout=120)
+    found = re.search(r'^release_lan_seed_hosts=\(([^)]*)\)', shown.stdout, re.M) if shown.returncode == 0 else None
+    return tuple(found[1].split()) if found else ('kakapo',)
+
+
+def resolve_seed(seed, revision, separate):
+    """(seed wip.sh starts from, whether it is a placement request, hosts it may build
+    on). 'auto' starts from kakapo and lets wip.sh balance over the LAN-only seeds
+    this revision knows, then fall back to rhea/moa; a named seed is passed as
+    `--seed`, a placement request."""
+    known = lan_seeds_known(revision)
+    if seed == 'auto':
+        return 'kakapo', False, (*known, 'rhea', 'moa') if separate else ('kakapo',)
+    if seed in SEED_HOSTS and seed not in known:
+        raise ValueError(f'{revision} predates the LAN-only seed {seed}; use --seed auto, '
+                         f'{", ".join(known)}, rhea or moa for this arm')
+    return seed, True, (seed,)
+
+
 def seed_env(arm, seed, dry):
     """wip.sh's seed parameters for a Spark build: WIP_SEED_HOST, plus the bulk
-    transfer address of a seed off the RoCE fabric. Legacy wip.sh reads neither."""
+    transfer address of a named seed off the RoCE fabric (an automatic one is
+    resolved by wip.sh after it balances). Legacy wip.sh reads neither."""
     if not arm.get('seed_separate') or arm.get('build_role') != 'both':
         return {}
-    return dict(WIP_SEED_HOST=seed, **({} if seed in HOSTS else {'WIP_SEED_ADDR': seed_lanes(seed, dry)[0]}))
+    if seed in HOSTS or not arm.get('seed_explicit', True):
+        return dict(WIP_SEED_HOST=seed)
+    return dict(WIP_SEED_HOST=seed, WIP_SEED_ADDR=seed_lanes(seed, dry)[0])
 
 
 def seed_lanes(seed, dry):
@@ -1644,6 +1725,10 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         # unless this revision's wip.sh predates it.
         union = {h for card in cards for h in card.get('sparks', [])}
         arm['seed_separate'] = seed_option_capable(revision)
+        requested = seed
+        seed, arm['seed_explicit'], seed_candidates = resolve_seed(requested, revision, arm['seed_separate'])
+        if build_role == 'both' and arm['seed_separate'] and arm['seed_explicit']:
+            build_cmd += ['--seed', seed]
         # A coordinator-only slot stages to no Spark: SPARK_COUNT=0, no ranks named.
         hosts = staging_hosts(union, seed, arm['seed_separate']) if build_role == 'both' else []
         if build_role == 'both' and len(hosts) > 6:
@@ -1651,8 +1736,9 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                              f'{seed} plus the {len(union)}-Spark union makes {len(hosts)} ranks; use --seed rhea|moa '
                              'for this arm or build a revision with the separate seed (#117)')
         if build_role == 'both':
-            print(f"# build seed {name}: {seed} ({'WIP_SEED_HOST' if arm['seed_separate'] else 'legacy SPARK_0_HOST'}); "
-                  f"Spark targets ({len(hosts)}): {','.join(hosts)}")
+            via = ('--seed' if arm['seed_explicit'] else 'WIP_SEED_HOST') if arm['seed_separate'] else 'legacy SPARK_0_HOST'
+            shown = f"auto: {seed} or least loaded of {','.join(seed_candidates)}" if requested == 'auto' and arm['seed_separate'] else seed
+            print(f"# build seed {name}: {shown} ({via}); Spark targets ({len(hosts)}): {','.join(hosts)}")
         build_config = state / ('build-' + name + '.config')
         # A staging config: the first card's model and its --set/--arm-set
         # overrides, the union of Spark hosts, and no serving topology. Export
@@ -1711,10 +1797,17 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                         # A fair turn (hwlock), so a seed wait never overtakes an older queued job.
                         subprocess.run([sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
                                         '--wait', str(seed_wait), '--', 'true'], check=True, timeout=seed_wait + 60)
-                    for host in (('raptor', *HOSTS, *([seed] if seed not in HOSTS else [])) if build_role == 'both' else ('raptor',)):
+                    seed_hosts = [h for h in seed_candidates if h not in HOSTS]
+                    for host in (('raptor', *HOSTS, *seed_hosts) if build_role == 'both' else ('raptor',)):
                         marker = owner_marker_script(root, task, arm['instance'], arm['slot'], revision)
                         mark = ['python3', '-c', marker]
-                        run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
+                        try:
+                            run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
+                        except subprocess.CalledProcessError as error:
+                            # An unreachable automatic seed is skipped by wip.sh too; anything else stops.
+                            if arm['seed_explicit'] or host not in seed_hosts or error.returncode != 255:
+                                raise
+                            print(f'# build seed {host} unreachable; wip.sh will not choose it')
                     env = {**os.environ, **scopes, 'WIP_INSTANCE': arm['instance'], 'WIP_ROOT': str(root)}
                     env.pop('WIP_SEED_HOST', None)
                     env.pop('WIP_SEED_ADDR', None)
@@ -1788,8 +1881,9 @@ def main():
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
     parser.add_argument('--build-only', action='store_true', help='build and seal selected arms without generating or launching smoke jobs')
     parser.add_argument('--seed', '--seed-host', dest='seed_host', default=DEFAULT_SEED, choices=SEEDS,
-                        help=f'out-of-serving Spark that compiles and seals --build arms (default {DEFAULT_SEED}); '
-                        'kakapo is a 10 GbE build-only seed whose slots reach the serving Sparks through sparknest')
+                        help=f'out-of-serving Spark that compiles and seals --build arms (default {DEFAULT_SEED}: the '
+                        'less-loaded LAN-only seed, kakapo or cassowary, then rhea/moa). The LAN-only seeds are 10 GbE '
+                        'build-only hosts whose slots reach the serving Sparks through sparknest; a named seed is a placement request')
     parser.add_argument('--cleanup', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)
@@ -2058,7 +2152,8 @@ def main():
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \
         (['lossless_dump'] if any(job['entry'].get('lossless_dump') for job in jobs) else []) + \
-        (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else [])
+        (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else []) + \
+        (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
     for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
         binary_supports(args.binary, job['launcher']['repo'], job, fields)
     # Everything checkable without hardware, before any queue ticket.

@@ -140,9 +140,10 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
   A shared-build toggle (`--arm-wip`) isolates a flag from the build.
 - **Judge on the paired median**, not on the ratio of arm medians, and report
   the raw pairs and their order.
-- **Builds:** `--build` arms seed on kakapo by default (`--seed rhea|moa` to
-  override). kakapo only builds (10 GbE; its slots reach the Sparks through
-  sparknest), so its CPU load never skews a serving card; rhea and
+- **Builds:** `--build` arms seed on the less-loaded LAN-only seed (kakapo or
+  cassowary) by default (`--seed kakapo|cassowary|rhea|moa` places it). LAN-only
+  seeds only build (10 GbE; their slots reach the Sparks through sparknest),
+  so their CPU load never skews a serving card; rhea and
   moa serve cards too, so wait for an idle one without holding locks; never
   wrap `wip.sh` in a Spark lock yourself.
 - **Page cache:** GB10 CUDA allocations reclaim Linux page cache. Keep caches

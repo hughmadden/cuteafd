@@ -124,6 +124,43 @@ pub fn head_planes(rows: usize) -> Result<[usize; 4]> {
     Ok([rows * H * 2, rows * H * 2, rows * 128896 * 4, 4 << 20])
 }
 
+/// Global RoPE positions, rebased KV positions, request ids, a bounded page
+/// table and publication scratch. All planes have the native 256-byte floor.
+pub fn mtp_metadata_planes(rows: usize) -> Result<[usize; 5]> {
+    ensure!((1..=4096).contains(&rows), "Step-5 predictor metadata rows");
+    let pages = (512 + 63 + rows).div_ceil(64);
+    Ok([rows * 8, rows * 8, rows * 4, pages * 4, 8].map(|n| n.max(256)))
+}
+
+/// One sequential predictor scratch recipe, shared with the target arena.
+/// Only greedy token/status words survive across stages within a draft chain.
+pub fn mtp_forecast_workspace(rows: usize, depth: usize) -> Result<u64> {
+    ensure!(depth <= 3, "Step-5 predictor depth must be 0..=3");
+    if depth == 0 { return Ok(0); }
+    mtp_scratch_core(rows)?.checked_add((depth * 256) as u64)
+        .context("Step-5 MTP workspace overflow")
+}
+
+pub fn mtp_input_planes(rows: usize) -> Result<[usize; 6]> {
+    ensure!((1..=4096).contains(&rows), "Step-5 predictor input rows");
+    Ok([2, 2, 2, 4, 2, 4].map(|element| rows * H * element))
+}
+
+pub fn mtp_input_offset(rows: usize) -> Result<u64> {
+    layer_workspace(rows, false, 64, false)
+}
+
+pub fn mtp_metadata_offset(rows: usize) -> Result<u64> {
+    mtp_input_offset(rows)?.checked_add(plane_bytes(&mtp_input_planes(rows)?)?)
+        .context("Step-5 predictor input offset overflow")
+}
+
+pub fn mtp_scratch_core(rows: usize) -> Result<u64> {
+    Ok(mtp_metadata_offset(rows)?.checked_add(plane_bytes(&mtp_metadata_planes(rows)?[..4])?)
+        .context("Step-5 predictor metadata offset overflow")?
+        .max(plane_bytes(&head_planes(rows)?)?))
+}
+
 pub fn rank_admission(
     checkpoint: &Checkpoint,
     ownership: &ExecutionOwnership,

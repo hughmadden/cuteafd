@@ -396,7 +396,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     let default = match family {
         "glm5" | "glm5_flash" => "dflash2",
         "mimo_v2" if snapshot.join("dflash").is_dir() => "dflash2",
-        "mimo_v2" | "qwen4" if args.native_mtp_layers > 0 => "mtp",
+        "mimo_v2" | "qwen4" | "step5" if args.native_mtp_layers > 0 => "mtp",
         "deepseek_v4" | "deepseek_v41" if args.native_mtp_layers > 0 => "dspark",
         _ => "off",
     };
@@ -421,7 +421,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     }
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
-        | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "mtp")
+        | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
         _ => false,
     };
@@ -1103,6 +1103,47 @@ mod tests {
         request.native_mtp_layers = 0;
         resolve_speculator(&mut request, dir.path(), "deepseek_v4", &Default::default()).unwrap();
         assert_eq!(request.speculator, "off");
+    }
+
+    #[test]
+    fn step5_mtp_defaults_on_and_preserves_admitted_depth() {
+        use cuteafd_loader::plan::spec::DraftOwnership;
+        let dir = tempfile::tempdir().unwrap();
+        let mut automatic = args(dir.path(), 6, false);
+        automatic.layout = true;
+        resolve_speculator(&mut automatic, dir.path(), "step5", &Default::default()).unwrap();
+        assert_eq!(automatic.speculator, "mtp");
+        assert_eq!(automatic.native_mtp_layers, 3);
+        assert_eq!(options(&automatic).unwrap().layout.unwrap().native_mtp_layers, 3);
+        for disabled in ["flag", "config", "depth"] {
+            let mut request = args(dir.path(), 6, false);
+            let cfg = if disabled == "config" {
+                std::collections::BTreeMap::from([("SPECULATOR".into(), "off".into())])
+            } else { Default::default() };
+            if disabled == "flag" { request.no_speculator = true; }
+            if disabled == "depth" { request.native_mtp_layers = 0; }
+            resolve_speculator(&mut request, dir.path(), "step5", &cfg).unwrap();
+            assert_eq!(request.speculator, "off", "{disabled}");
+            assert_eq!(DraftOwnership::selected("step5", &request.speculator), DraftOwnership::None);
+        }
+        for depth in 1..=3 {
+            for configured in [false, true] {
+                let mut request = args(dir.path(), 6, false);
+                request.layout = true;
+                request.rtx = 2;
+                request.native_mtp_layers = depth;
+                let cfg = if configured {
+                    std::collections::BTreeMap::from([("SPECULATOR".into(), "mtp".into())])
+                } else {
+                    request.speculator = "mtp".into();
+                    Default::default()
+                };
+                resolve_speculator(&mut request, dir.path(), "step5", &cfg).unwrap();
+                assert_eq!(request.speculator, "mtp");
+                assert_eq!(DraftOwnership::selected("step5", &request.speculator), DraftOwnership::NativeMtp);
+                assert_eq!(options(&request).unwrap().layout.unwrap().native_mtp_layers, depth);
+            }
+        }
     }
 
     #[test]

@@ -409,6 +409,15 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         return {"case": case, "containers": runs, "plans": plans}
 
 
+def namespace_launch_contract(run: dict) -> dict:
+    """Apply the explicit full-namespace migration to an old parsed capture."""
+    run["env"]["HF_HOME"] = "/mnt/sparknest/hf-home"
+    run["mounts"] = sorted("/mnt/sparknest:/mnt/sparknest:ro" if mount.endswith(":/hf/hub:ro")
+                           else mount for mount in run["mounts"])
+    run["command"] = [value.replace("/hf/hub/", "<root>/hf/hub/") for value in run["command"]]
+    return run
+
+
 def parse_run(argv: list[str]) -> dict:
     """A `docker run -d` argv as {options, env, mounts, image, command}, order-free where Docker is."""
     options, env, mounts = [], {}, []

@@ -255,6 +255,7 @@ pub fn fingerprint(info: &ServerInfo) -> String {
         hasher.update(b"\n");
     };
     if !info.configuration.supports_thinking_off() { line("thinking", info.configuration.thinking_label()); }
+    line("prompt_content", crate::text::PROMPT_CONTENT);
     line("model", &info.model);
     line("revision", info.revision.as_deref().unwrap_or(""));
     line("build", &info.build.label());

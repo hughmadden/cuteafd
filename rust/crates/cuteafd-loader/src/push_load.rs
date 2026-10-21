@@ -18,6 +18,8 @@ pub use nest_push::{client::{JoinArgs, Poll, Conn, Listener}, plan, proto, slot}
 pub mod builder;
 pub mod native;
 
+// Applied by nest-push as SO_RCVTIMEO/SO_SNDTIMEO for each blocking I/O,
+// not a wall-clock load limit: every received progress event renews the wait.
 pub const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HOSTS_XATTR: &str = "user.sparknest.hosts";
 
@@ -27,6 +29,22 @@ const HOSTS_XATTR: &str = "user.sparknest.hosts";
 pub fn is_push_shard(shard: &Path) -> bool {
     let mut value = [0u8; 65536];
     rustix::fs::getxattr(shard, HOSTS_XATTR, &mut value[..]).is_ok()
+}
+
+/// Discover the namespace root and this host from ADR-064, never from a
+/// container hostname or a coordinator-side address-to-host guess.
+pub fn namespace(path: &Path) -> io::Result<(std::path::PathBuf, String)> {
+    let path = path.canonicalize()?;
+    for root in path.ancestors() {
+        let mut bytes = vec![0; 65536];
+        if let Ok(size) = rustix::fs::getxattr(root, "user.sparknest.cluster", &mut bytes[..]) {
+            let value: serde_json::Value = serde_json::from_slice(&bytes[..size])?;
+            let host = value["me"].as_str().filter(|host| !host.is_empty())
+                .ok_or_else(|| io::Error::other("SparkNest cluster has no local host"))?;
+            return Ok((root.into(), host.into()));
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "not a SparkNest namespace"))
 }
 
 #[derive(Debug)]
@@ -93,14 +111,24 @@ pub struct PushClient {
 
 impl Default for PushClient {
     fn default() -> Self {
-        Self {
-            socket: SOCKET.into(),
-            timeout: PUSH_IDLE_TIMEOUT,
-        }
+        Self::configured(std::env::var("CUTEAFD_PUSH_SOCKET").ok())
     }
 }
 
 impl PushClient {
+    fn configured(socket: Option<String>) -> Self {
+        Self { socket: socket.filter(|name| !name.is_empty()).unwrap_or_else(|| SOCKET.into()),
+            timeout: PUSH_IDLE_TIMEOUT }
+    }
+
+    /// Explicit endpoint for embedding and isolated startup protocol fixtures.
+    pub fn at(socket: String, timeout: Duration) -> io::Result<Self> {
+        if socket.is_empty() || timeout.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid push endpoint or timeout"));
+        }
+        Ok(Self { socket, timeout })
+    }
+
     pub fn create(&self, ranks: Vec<RankSpec>, files: Vec<String>) -> io::Result<PushGroup> {
         Coordinator::create(&self.socket, ranks, files, Some(self.timeout))
             .map(|coordinator| PushGroup { coordinator })

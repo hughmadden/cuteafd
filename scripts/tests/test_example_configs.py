@@ -438,7 +438,9 @@ def test_family_starting_config_matches_the_launcher_defaults(path: Path, tmp_pa
     keep = _coordinator(_family_launch(tmp_path / "example", path))
     bare = _strip(path, tmp_path, SPECULATOR_KEYS + POOL_KEYS)
     default = _coordinator(_family_launch(tmp_path / "bare", bare))
-    assert _speculation(keep) == _speculation(default)
+    # Separate sandbox roots now remain visible at their original container paths.
+    assert _speculation(keep.replace(str(tmp_path / "example"), "<root>")) == _speculation(
+        default.replace(str(tmp_path / "bare"), "<root>"))
     assert _speculation(keep), keep
     assert re.findall(r"--pool-tokens \S+", keep) == re.findall(r"--pool-tokens \S+", default)
 

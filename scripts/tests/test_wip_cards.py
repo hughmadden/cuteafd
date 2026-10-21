@@ -652,10 +652,16 @@ def _trace_tools(tmp_path, extra=None):
 
 def test_spark_leg_does_not_reacquire_its_parent_resource(tmp_path):
     function = _wip_function('build_expert() (', '\n# Role builders end here.') + '\nnative_store_has() { return 1; }\n'
+    text = (ROOT / 'wip.sh').read_text()
+    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
     trace = tmp_path / 'trace'
+    lease = tmp_path / 'lease'
+    lease.mkdir()
+    # The lease process (build-resource.py) grants the export turn; rhea's is its exclusive lease.
+    (lease / 'export-granted').write_text('{}')
     setup = f'''set -euo pipefail
 repo_root={str(ROOT)!r}
 sync_seed_source() {{ :; }}
@@ -663,7 +669,8 @@ release_die() {{ exit 2; }}
 slot=test seed_host=rhea spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
-'''
+wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
+''' + turn
     subprocess.run(['bash', '-c', setup + function + '\nbuild_expert'], check=True,
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
@@ -673,6 +680,8 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
     finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
     assert rust < native < finalize
     assert not any(line.startswith('flock') for line in lines)
+    # The export ran inside the granted turn, and the turn was handed back.
+    assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
 
 
 def test_coordinator_export_follows_rust_with_memory_caps(tmp_path):
@@ -1046,7 +1055,7 @@ def test_profile_collection_pulls_each_spark_and_records_failures(entry, tmp_pat
 
 
 def test_nsys_profile_frames_the_sweep_with_a_window(entry, tmp_path):
-    with pytest.raises(ValueError, match='PROFILE=nsys captures the timed sweep'):
+    with pytest.raises(ValueError, match='PROFILE=nsys and PROFILE_SPARK=nsys capture the timed sweep'):
         cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1)
     job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key',
                          {'PROFILE': 'nsys,draft-timing'}, set(), None, 1)
@@ -1910,3 +1919,62 @@ def test_owner_marker_adopts_only_matching_sealed_retry_root(tmp_path, damage):
     else:
         assert result.returncode == 0, result.stderr
         assert json.loads(marker.read_text()) == dict(task='task', instance='test')
+
+
+def _expert_leg(tmp_path, has):
+    """build_expert with native_store_has answering from `has` in order; returns (trace lines, lease dir)."""
+    function = _wip_function('build_expert() (', '\n# Role builders end here.')
+    text = (ROOT / 'wip.sh').read_text()
+    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
+    tools = _trace_tools(tmp_path)
+    home = tmp_path / 'home'
+    (home / '.cache/cuteafd').mkdir(parents=True)
+    trace = tmp_path / 'trace'
+    lease = tmp_path / 'lease'
+    lease.mkdir()
+    (lease / 'export-granted').write_text('{}')
+    answers = tmp_path / 'answers'
+    answers.write_text(''.join(f'{int(not a)}\n' for a in has))
+    setup = f'''set -euo pipefail
+repo_root={str(ROOT)!r}
+sync_seed_source() {{ :; }}
+release_die() {{ exit 2; }}
+slot=test seed_host=kakapo spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
+wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
+CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
+wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
+''' + turn
+    stub = f'''
+native_store_has() {{ local rc; rc="$(head -1 {str(answers)!r})"; sed -i 1d {str(answers)!r}; printf 'has %s\\n' "$rc" >> "$TRACE"; return "$rc"; }}
+'''
+    subprocess.run(['bash', '-c', setup + function + stub + '\nbuild_expert'], check=True, timeout=30,
+                   env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
+    return trace.read_text().splitlines(), lease
+
+
+def test_native_cache_hit_on_a_lan_seed_takes_no_export_turn(tmp_path):
+    lines, lease = _expert_leg(tmp_path, [True])
+    assert not (lease / 'export-request').exists() and not (lease / 'export-done').exists()
+    native = [line for line in lines if line.endswith('/wip/output/expert native')]
+    assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
+
+
+def test_an_export_published_while_waiting_is_restored_not_rebuilt(tmp_path):
+    # A build ahead of us in the seed's export queue exported this very key.
+    lines, lease = _expert_leg(tmp_path, [False, True])
+    assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
+    native = [line for line in lines if line.endswith('/wip/output/expert native')]
+    assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
+
+
+def test_export_turn_failure_stops_the_build(tmp_path):
+    text = (ROOT / 'wip.sh').read_text()
+    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
+    lease = tmp_path / 'lease'
+    lease.mkdir()
+    (lease / 'export-failed').write_text('no turn for kakapo-export after 14400 s')
+    script = f'''release_die() {{ echo "die: $*"; exit 3; }}
+seed_host=kakapo wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
+''' + turn + '\nwip_seed_export_turn\necho unreachable'
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 3 and 'die: no GPU export turn on kakapo' in result.stdout

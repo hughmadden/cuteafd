@@ -84,6 +84,7 @@ gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
 fingerprint=test
 hf_home=/models
+namespace_root=/mnt/sparknest
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
 SPARK_DEVICE_BUDGET_BYTES=1000000

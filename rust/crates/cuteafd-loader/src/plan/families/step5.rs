@@ -319,7 +319,7 @@ impl Model {
                 "CSA compresses index keys only: one E4M3 proxy256 summary per eight tokens, original GQA K/V retained; provider-group top-512 regions".into(),
                 "FP32 residual and zero-centered norms; post-SiLU clamp + FP32 product, one BF16 round, for routed/shared/dense FFNs".into(),
                 "ssmax_s [64] FP32 is retained and validated, unused by released kernels; ordinary attention scale 1/sqrt(192)".into(),
-                "Target-only eager native admission on the WIP FP8 max card; no release, MTP or media qualification".into(),
+                "Eager native admission on qualified WIP cards; native MTP defaults to depth 3, with exact predictor header contracts; no release or media qualification".into(),
             ] };
         let mut spec = spec;
         if complete {
@@ -369,8 +369,6 @@ impl Family for Step5 {
         match component {
             Component::Vision => Some(Hint { what: "Step-5 bundled vision is not qualified".into(),
                 how: "Use text-only serving; qualify the official bundled encoder before enabling media.".into() }),
-            Component::Speculator => Some(Hint { what: "Step-5 native MTP remains deferred".into(),
-                how: "Use target-only NoDraft; layers 92..94 are not serving owners.".into() }),
             _ => None,
         }
     }
@@ -428,7 +426,9 @@ impl FamilyModel for Model {
                 return Ok(());
             }
         }
-        if !matches!(role.component, Component::RoutedExpert | Component::Vision | Component::Speculator) {
+        // Predictor headers in this same contract are the three qualified SWA/dense
+        // stages, including their private EH projection, norms and shared head.
+        if !matches!(role.component, Component::RoutedExpert | Component::Vision) {
             if let Some(tensor) = self.tensors.get(stem).or_else(|| self.tensors.get(&format!("{stem}.weight"))) {
                 let encoding = match tensor.dtype {
                     DType::Bf16 => Some(crate::plan::format::Encoding::Bf16),
@@ -441,14 +441,16 @@ impl FamilyModel for Model {
                         && stem.ends_with(".self_attn.sparse_indexer_k_norm")
                         && self.tensors.get(&format!("{stem}.bias")).is_some_and(|bias|
                             bias.role == *role && bias.dtype == DType::F32 && bias.shape == tensor.shape));
+                let container = role.component != Component::Speculator || matches!(
+                    (&tensor.dtype, operand.container.as_str()), (DType::Bf16, "bf16") | (DType::F32, "f32"));
                 if tensor.role == *role && tensor.shape == operand.logical && tensor.shape == operand.stored
-                    && encoding == Some(operand.encoding) && operand.scale.is_none()
+                    && container && encoding == Some(operand.encoding) && operand.scale.is_none()
                     && operand.global_scale.is_none() && operand.input_scale.is_none() && companions {
                     return Ok(());
                 }
             }
         }
-        Err(format!("{stem}: Step-5 {:?} operand is outside the validated target-only native contract", role.component))
+        Err(format!("{stem}: Step-5 {:?} operand is outside the validated native contract", role.component))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let package = if operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
