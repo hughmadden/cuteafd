@@ -344,7 +344,7 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
         None => { default = CaseSet::default_set(); &default }
     };
     let speculator = ctx.info.configuration.speculator.clone().unwrap_or_default();
-    let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, record_rows: TOKENS as usize, top_k: 2,
+    let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, pair_exempt: true, record_rows: TOKENS as usize, top_k: 2,
         ..ProbeSpec::default() };
     // A new run directory: the probes' leaves are exclusive and never overwrite an earlier run.
     let run_dir = dump.map(|(_, root)| -> Result<std::path::PathBuf> {
@@ -477,6 +477,7 @@ mod tests {
         let dump = RowDump::parse("c0,c2:48-52").unwrap();
         dump.validate(&s).unwrap();
         let (value, specs) = run_fake(&s, Some((&dump, root.path())));
+        assert!(specs.iter().all(|s| s.pair_exempt));
         assert_eq!(value["gate"], "fail");
         let dir = std::path::PathBuf::from(value["row_dump"]["dir"].as_str().unwrap());
         assert!(dir.starts_with(root.path()) && dir.file_name().unwrap().to_str().unwrap().starts_with("spec-lossless-rows-"));
@@ -518,6 +519,7 @@ mod tests {
         let s = set(2);
         let root = tempfile::tempdir().unwrap();
         let (value, specs) = run_fake(&s, None);
+        assert!(specs.iter().all(|s| s.pair_exempt));
         assert!(specs.iter().all(|s| s.dump_rows.is_none() && s.dump_window.is_none()));
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         let mut keys: Vec<&String> = value.as_object().unwrap().keys().collect();

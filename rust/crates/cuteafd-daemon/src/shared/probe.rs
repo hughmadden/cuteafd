@@ -114,9 +114,12 @@ fn prompt_token_hash(ids: &[u32]) -> u64 {
 
 /// The evidence line for one admission. A prompt that re-renders model output
 /// differs between engines by design, so it is reported without a hash: a
-/// matched pair compares the hashes of input-determined prompts only.
+/// matched pair compares the hashes of shared, input-determined prompts only.
+/// Panel-local diagnostics may run on just one arm and also carry no hash.
 fn matched_prompt_line(probe: &ProbeRef, engine: &str, ids: &[u32]) {
-    if probe.as_ref().is_none_or(|probe| probe.input_determined()) {
+    if probe.as_ref().is_some_and(|probe| probe.spec.pair_exempt) {
+        tracing::info!(engine, prompt_tokens = ids.len(), "benchmark arm-local prompt");
+    } else if probe.as_ref().is_none_or(|probe| probe.input_determined()) {
         tracing::info!(engine, prompt_tokens = ids.len(), prompt_token_hash = format_args!("{:016x}", prompt_token_hash(ids)), "matched benchmark prompt");
     } else {
         tracing::info!(engine, prompt_tokens = ids.len(), "benchmark output-dependent prompt");
@@ -173,6 +176,16 @@ mod matched_prompt_tests {
         let line = evidence_line(probe);
         assert!(line.contains("benchmark output-dependent prompt"), "{line}");
         assert!(!line.contains("prompt_token_hash"), "{line}");
+    }
+
+    #[test]
+    fn an_arm_local_prompt_logs_no_token_hash() {
+        for output_dependent in [false, true] {
+            let probe = Some(Probe::new(ProbeSpec { pair_exempt: true, output_dependent, ..ProbeSpec::default() }));
+            let line = evidence_line(probe);
+            assert!(line.contains("benchmark arm-local prompt"), "{line}");
+            assert!(!line.contains("prompt_token_hash"), "{line}");
+        }
     }
 
     #[test]
