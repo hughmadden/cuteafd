@@ -38,7 +38,7 @@ const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GoldenArgs {
     /// Same immutable target KV storage as serving.
-    #[arg(long, default_value = "bf16")]
+    #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long)]
     snapshot: PathBuf,

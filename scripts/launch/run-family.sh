@@ -1639,7 +1639,7 @@ if [[ "$family" == kimi_k3 ]]; then
     release_die "Kimi K3 serves its routed experts on exactly six Spark ranks (TP6), not $ranks; set SPARK_COUNT=6"
 fi
 if [[ "$family" == step5 ]]; then
-  step5_kv_cache="$(get KV_CACHE bf16)"
+  step5_kv_cache="$(get KV_CACHE fp8)"
   case "$step5_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   [[ "$backend" != local && "$ranks" != 0 ]] ||
     release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (FP8: 6, NVFP4: 4 or 6)"

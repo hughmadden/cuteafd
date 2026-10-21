@@ -29,7 +29,7 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pool_tokens: Option<u64>,
     /// Immutable target and native predictor KV storage.
-    #[arg(long, default_value = "bf16")]
+    #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long, default_value_t = 1_048_576)]
     max_context: u64,
@@ -559,6 +559,16 @@ mod tests {
         let mut args = args();
         args.validate()?;
         assert_eq!((args.max_context, args.max_sequences, args.mtp), (1_048_576, 16, 3));
+        assert_eq!(args.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
+        assert_eq!(cuteafd_loader::plan::layout::LayoutOptions::default().step5_kv, args.kv_cache);
+        for format in ["bf16", "fp8"] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+                "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4",
+                "--kv-cache", format])?;
+            let crate::cli::Commands::ServeStep5(explicit) = cli.command else { panic!("Step-5 dispatch") };
+            explicit.validate()?;
+            assert_eq!(explicit.kv_cache.to_string(), format);
+        }
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4",
             "--mtp", "0"])?;

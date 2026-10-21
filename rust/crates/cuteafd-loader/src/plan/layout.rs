@@ -214,7 +214,7 @@ impl Default for LayoutOptions {
             context_tokens: 0,
             native_mtp_layers: 3,
             qwen_kv: Default::default(),
-            step5_kv: crate::families::qwen4::Qwen4KvCache::Bf16,
+            step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,
