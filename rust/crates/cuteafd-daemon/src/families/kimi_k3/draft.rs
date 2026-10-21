@@ -23,7 +23,7 @@ impl Options {
     pub(crate) fn layout(&self, slots: usize, context: usize, sms: usize) -> Result<MlaDraftRuntimeLayout> {
         let cfg = MlaDflashConfig::read(&self.snapshot)?;
         cfg.runtime_layout(self.representation(), GlmDraftCapacity::new(slots, slots.min(8), cfg.block)?,
-            context, sms, Fp8Rows::W8a16.code() as u8).map_err(Into::into)
+            context, slots.checked_mul(context).context("draft pool overflow")?, sms, Fp8Rows::W8a16.code() as u8).map_err(Into::into)
     }
 }
 
@@ -457,7 +457,7 @@ mod tests {
             placement.len = start + 1;
             backend.accept(&mut [scheduler::Verified { placement: &mut placement, seq: &mut seq,
                 start, history: (), rows: &common_verify, first_row: 0,
-                kept: Some((1, common_verify[1])), finished: false }], true, true)?;
+                kept: Some((1, common_verify[1])), finished: false, neural: true }], true)?;
             if arm < 2 { states.push(draft.readback(0, 1)?); }
             backend.cancel(&placement)?;
             family.drain().map_err(prefix_error)?;

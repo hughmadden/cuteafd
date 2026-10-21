@@ -25,7 +25,7 @@ use crate::snapshot::{
     DevicePageId, EvictionOrder, Hit, HostSnapshot, Key, PageRef, SnapshotMeta, Snapshots, StorePlan,
 };
 use cuteafd_core::prefix::ReuseRule;
-use crate::{SnapshotKind, COMPRESSORS};
+use crate::{SnapshotKind, PAGE_BANKS};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -45,7 +45,7 @@ pub struct DevicePage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceSnapshot {
     pub meta: SnapshotMeta,
-    pub pages: [Vec<DevicePage>; COMPRESSORS],
+    pub pages: [Vec<DevicePage>; PAGE_BANKS],
     pub tail: Vec<DeviceRange>,
     pub draft: Option<Vec<DeviceRange>>,
     pub scores: Vec<DeviceRange>,
@@ -54,10 +54,11 @@ pub struct DeviceSnapshot {
 /// Where a restore writes: the engine's fresh destinations, in the same shape and with the same
 /// segment lengths as the stored snapshot. Pages carry their new device identities so the cache
 /// records them as shared after a successful restore (a later store of the same snapshot then
-/// copies nothing).
+/// copies nothing). An empty full-draft page bank explicitly requests a target-only restore;
+/// the caller must bind the drafter cold when its optional attachment cannot be admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreTarget {
-    pub pages: [Vec<DevicePage>; COMPRESSORS],
+    pub pages: [Vec<DevicePage>; PAGE_BANKS],
     pub tail: Vec<DeviceRange>,
     pub draft: Option<Vec<DeviceRange>>,
     pub scores: Vec<DeviceRange>,
@@ -273,7 +274,7 @@ impl<'a> RestorePlan<'a> {
         let mut shared = Vec::new();
         let mut bytes = 0u64;
         for (compressor, list) in snapshot.pages.iter().enumerate() {
-            if mark_only { continue; }
+            if mark_only || (compressor == crate::DRAFT_PAGE_BANK && target.pages[compressor].is_empty()) { continue; }
             let targets = target.pages.get(compressor)?;
             if targets.len() != list.len() {
                 return None;
@@ -281,7 +282,9 @@ impl<'a> RestorePlan<'a> {
             for (page, device_page) in list.iter().zip(targets) {
                 let host = snapshots.page_location(*page)?;
                 let total = segment_bytes(&device_page.segments);
-                if total == 0 || total > layout.page {
+                let bank = device_page.id.compressor as usize;
+                if (bank != compressor && !(compressor < crate::COMPRESSORS && bank == compressor + 0x80))
+                    || total == 0 || total > layout.page_size(compressor) {
                     return None;
                 }
                 bytes += total as u64;
@@ -801,9 +804,11 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         } else {
             snapshot.scores.is_empty()
         };
-        snapshot.pages.iter().all(|list| {
+        snapshot.pages.iter().enumerate().all(|(bank, list)| {
             list.iter()
-                .all(|page| bytes(&page.segments) <= self.layout.page)
+                .all(|page| (page.id.compressor as usize == bank
+                    || (bank < crate::COMPRESSORS && page.id.compressor as usize == bank + 0x80))
+                    && bytes(&page.segments) > 0 && bytes(&page.segments) <= self.layout.page_size(bank))
         }) && bytes(&snapshot.tail) > 0
             && bytes(&snapshot.tail) <= self.layout.tail
             && draft_ok
@@ -934,7 +939,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
     /// Synchronous host work at store planning (deferred until device eviction in OnEvict mode),
     /// never at copy completion.
     fn plan_store_evicting(&mut self, meta: &SnapshotMeta,
-        device_pages: &[Vec<DevicePageId>; COMPRESSORS]) -> Option<StorePlan> {
+        device_pages: &[Vec<DevicePageId>; PAGE_BANKS]) -> Option<StorePlan> {
         let snapshots = self.snapshots.as_mut()?;
         let started = std::time::Instant::now();
         let (victims, freed) = snapshots.make_room(meta, device_pages, self.config.eviction_headroom);
@@ -954,7 +959,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
 
     /// Plan and issue a store's copies, evicting unpinned snapshots if a class is exhausted.
     fn plan_and_issue(&mut self, snapshot: &DeviceSnapshot) -> StoreIssue {
-        let device_pages: [Vec<DevicePageId>; COMPRESSORS] =
+        let device_pages: [Vec<DevicePageId>; PAGE_BANKS] =
             std::array::from_fn(|c| snapshot.pages[c].iter().map(|page| page.id).collect());
         let Some(plan) = self.plan_store_evicting(&snapshot.meta, &device_pages) else {
             return StoreIssue::Exhausted;
@@ -1103,6 +1108,40 @@ mod tests {
     }
 
     #[test]
+    fn target_only_restore_omits_optional_draft_pages_without_registering_them() {
+        let layout = layout();
+        let mut store = crate::snapshot::testing::snapshots_with_layout(1 << 30, layout);
+        let mut stored = pages(&[id(1)]);
+        let draft_id = DevicePageId { compressor: crate::DRAFT_PAGE_BANK as u8,
+            page: 7, generation: 3 };
+        stored[crate::DRAFT_PAGE_BANK].push(draft_id);
+        let plan = store.plan_store(meta(SnapshotKind::Turn, &[1, 2], false), &stored).unwrap();
+        let key = store.commit_store(plan, 0);
+        let snapshot = store.get(key).unwrap();
+        let mut target = RestoreTarget {
+            pages: Default::default(),
+            tail: vec![DeviceRange { addr: 0, bytes: layout.tail }],
+            draft: None,
+            scores: vec![DeviceRange { addr: 0, bytes: layout.scores }],
+        };
+        target.pages[0].push(DevicePage { id: id(9),
+            segments: vec![DeviceRange { addr: 0, bytes: layout.page }] });
+        let cold = RestorePlan::build(&store, snapshot, &target, &layout).unwrap();
+        assert_eq!(cold.pages.len(), 1);
+        assert_eq!(cold.shared.len(), 1);
+        assert_eq!(cold.bytes, (layout.page + layout.tail + layout.scores) as u64);
+        let cold_bytes = cold.bytes;
+        drop(cold);
+        target.pages[crate::DRAFT_PAGE_BANK].push(DevicePage { id: draft_id,
+            segments: vec![DeviceRange { addr: 0, bytes: layout.draft_page }] });
+        let warm = RestorePlan::build(&store, snapshot, &target, &layout).unwrap();
+        assert_eq!(warm.pages.len(), 2);
+        assert_eq!(warm.bytes, cold_bytes + layout.draft_page as u64);
+        target.pages[crate::DRAFT_PAGE_BANK][0].id.compressor = 0x80;
+        assert!(RestorePlan::build(&store, snapshot, &target, &layout).is_none());
+    }
+
+    #[test]
     fn restore_plan_matches_the_stored_shape() {
         let mut store = snapshots(1 << 30);
         let plan = store
@@ -1145,6 +1184,9 @@ mod tests {
         );
         assert_eq!(plan.shared, vec![(id(9), snapshot.pages[0][0])]);
 
+        let mut wrong_bank = target.clone();
+        wrong_bank.pages[0][0].id.compressor = crate::DRAFT_PAGE_BANK as u8;
+        assert!(RestorePlan::build(&store, snapshot, &wrong_bank, &layout).is_none());
         // A target with the wrong page count is rejected.
         let mut short = target.clone();
         short.pages[0].clear();

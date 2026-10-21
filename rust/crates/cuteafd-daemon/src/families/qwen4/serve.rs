@@ -19,9 +19,10 @@
 //! prompt is retained at prompt end (unless it was a whole hit), the
 //! conversation at a normal finish (`Turn`; its kept rows are committed to
 //! the state first), a prefill whose client left is parked at its last chunk;
-//! a decode whose client left is not retained. A restored sequence's MTP
-//! drafts once its own rows reach the stash. `prompt_cache_hit_tokens`
-//! reports the restored rows; `/v1/stats` carries the cache's counters.
+//! a decode whose client left is not retained. Drafting hits require canonical
+//! MTP history and restore the final pending hidden row with the target mark.
+//! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
+//! the cache's counters.
 use super::engine::{Qwen4Engine, DECODE_ROWS};
 use super::prefix::Qwen4Prefix;
 use super::open;
@@ -229,7 +230,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator),
 /// its mark arena sized for `lanes` decoding sequences.
 fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: usize)
-    -> Result<(Qwen4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    -> Result<(Qwen4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>, super::prefix::Frontier>)> {
     let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_rows } else { 64 },
         engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
@@ -318,8 +319,17 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     type History = cuteafd_loader::families::qwen4::NgramHistory;
     type Coordinates = cuteafd_loader::families::qwen4::RopePositions;
     type Encoder = crate::shared::qwen::Encoder;
-    type Meta = ();
+    type Meta = super::prefix::Frontier;
     type Prefix = Qwen4Prefix<'e, 'a>;
+
+    fn restore_draft(&self, placement: &Self::Placement, frontier: usize, tokens: &[u32],
+        draft: &mut Self::Draft) -> Result<()> {
+        super::speculate::restore_pending(self.engine, placement, frontier, tokens.get(frontier).copied(), draft)
+    }
+    fn needs_snapshot_filter(&self, neural: bool) -> bool { neural }
+    fn snapshot_compatible(&self, saved: &Self::Meta, frontier: usize, neural: bool) -> bool {
+        !neural || saved.supports_predictors(frontier)
+    }
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "qwen4", vocab_size: self.engine.cfg.vocab_size,
@@ -328,7 +338,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.engine.library }
     fn profile(&self) -> &std::cell::RefCell<[f64; 2]> { &self.engine.profile }
-    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
+    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, super::prefix::Frontier>)> {
         prefix_cache(self.engine, args, lanes)
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>)
@@ -394,8 +404,8 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         super::speculate::draft(self.engine, sequences, timing)
     }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Self::Placement, Self::Draft, Self::History>],
-        speculative: bool, draft: bool) -> Result<()> {
-        super::speculate::accept(self.engine, verified, speculative, draft)
+        speculative: bool) -> Result<()> {
+        super::speculate::accept(self.engine, verified, speculative)
     }
     fn probe_begin(&self, rows: usize) { self.engine.probe_begin(rows); }
     fn probe_end(&self) { self.engine.probe_end(); }

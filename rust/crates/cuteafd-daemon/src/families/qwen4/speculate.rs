@@ -48,6 +48,7 @@ impl MtpSeq {
 /// after the chunk, if known), and the chunk's last row stashed otherwise.
 pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement, start: usize, chunk: &[u32], next: Option<u32>, seq: &mut MtpSeq) -> Result<()> {
     let n = chunk.len();
+    ensure!(placement.mtp_frontier.get() == start, "MTP prefill requires contiguous canonical history");
     ensure!(n > 0 && seq.pending.is_empty(), "MTP prefill of an empty chunk or behind pending rows");
     let known = if next.is_some() { n } else { n - 1 };
     if next.is_none() {
@@ -55,6 +56,7 @@ pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement
         engine.mtp_stash(false, &[(placement.slot, n - 1, 1, 0)])?;
         seq.pending.push((start + n - 1, 0));
         seq.open = true;
+        placement.mtp_snapshot_pending.set(true);
     }
     if known == 0 {
         return Ok(());
@@ -63,6 +65,7 @@ pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement
     let rows = (0..known).map(|i| MtpRow { position: start + i, token: tokens[i], source: i as i32 }).collect();
     engine.mtp_step(false, &[MtpGroup { placement, rows }], MtpSource::Target, &[], MtpTokens::Host(&tokens),
         MtpOut::Download { logits: false })?;
+    placement.mtp_frontier.set(start + known);
     Ok(())
 }
 
@@ -117,6 +120,9 @@ pub(crate) fn draft(engine: &Qwen4Engine<'_>, seqs: &mut [DraftSeq<'_>], timing:
     timing.steps += 1;
     drop(groups);
     for s in seqs.iter_mut() {
+        if let Some(&(position, _)) = s.seq.pending.last() {
+            s.placement.mtp_frontier.set(position + 1);
+        }
         s.seq.pending.clear();
     }
     // Per step, the sequences it drafted for, in draft order (step 0: by head).
@@ -178,13 +184,14 @@ pub(crate) type Verified<'p> = crate::shared::qwen::scheduler::Verified<'p, Qwen
 
 /// After a speculative verify: commits each sequence's kept rows to the GDN
 /// and PLE state, rewinds its placement, and stashes the kept rows' streams
-/// with their next tokens for the MTP (not for finished sequences).
-pub(crate) fn accept(engine: &Qwen4Engine<'_>, verified: &mut [Verified<'_>], spec: bool, mtp: bool) -> Result<()> {
+/// with their next tokens for the MTP. Finished retained turns normalize
+/// canonical pending rows before snapshot capture.
+pub(crate) fn accept(engine: &Qwen4Engine<'_>, verified: &mut [Verified<'_>], spec: bool) -> Result<()> {
     let mut commits = Vec::new();
     let mut stash = Vec::new();
     for v in verified.iter_mut() {
-        // Finished sequences are released: nothing to commit or stash.
-        let Some((kept, after)) = v.kept else { continue };
+        // None means no retained frontier (cancelled/failed emission).
+        let Some((kept, _after)) = v.kept else { continue };
         ensure!(kept >= 1 && kept <= v.rows.len(), "kept {kept} of {} rows", v.rows.len());
         if spec {
             commits.push((v.placement.slot, v.first_row, kept));
@@ -192,20 +199,113 @@ pub(crate) fn accept(engine: &Qwen4Engine<'_>, verified: &mut [Verified<'_>], sp
         } else {
             ensure!(kept == v.rows.len(), "a plain step keeps every row");
         }
-        if !mtp || v.finished {
-            continue;
-        }
-        let at = v.seq.pending.len();
-        ensure!(at + kept <= MTP_PENDING_ROWS, "the MTP stash of a sequence overflows");
-        stash.push((v.placement.slot, v.first_row, kept, at));
-        for j in 0..kept {
-            let next = if j + 1 < kept { v.rows[j + 1] } else { after };
-            v.seq.pending.push((v.start + j, next));
+        let neural_kept = v.neural_kept();
+        if let Some(at) = stash_accepted(v.seq, v.start, v.rows, neural_kept, false)? {
+            stash.push((v.placement.slot, v.first_row, kept, at));
         }
     }
     engine.commit(&commits)?;
-    if mtp {
+    if !stash.is_empty() {
         engine.mtp_stash(true, &stash)?;
     }
+    for row in verified.iter_mut().filter(|row| row.neural && row.finished && row.kept.is_some()) {
+        normalize_snapshot(engine, row.placement, row.seq)?;
+    }
     Ok(())
+}
+
+/// Consume every canonical pending row except hidden(P-1), then retain that
+/// row verbatim. The next token is outside the snapshot and is filled on restore.
+pub(crate) fn normalize_snapshot(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement, seq: &mut MtpSeq) -> Result<()> {
+    let n = seq.pending.len();
+    ensure!(n > 0, "Qwen drafting snapshot has no final hidden row");
+    if n > 1 {
+        consume_pending(engine, placement, &seq.pending[..n - 1])?;
+    }
+    let position = seq.pending[n - 1].0;
+    ensure!(position + 1 == placement.len && placement.mtp_frontier.get() == position,
+        "Qwen snapshot pending row differs from canonical frontier");
+    engine.mtp_keep_last_pending(placement.slot, n - 1)?;
+    seq.pending.clear();
+    seq.pending.push((position, 0));
+    seq.open = true;
+    placement.mtp_snapshot_pending.set(true);
+    Ok(())
+}
+
+fn consume_pending(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement, pending: &[(usize, u32)]) -> Result<()> {
+    ensure!(!pending.is_empty() && pending[0].0 == placement.mtp_frontier.get()
+        && pending.windows(2).all(|rows| rows[1].0 == rows[0].0 + 1), "noncontiguous canonical MTP stash");
+    let rows = pending.iter().enumerate().map(|(source, &(position, token))|
+        MtpRow { position, token, source: source as i32 }).collect();
+    let tokens: Vec<_> = pending.iter().map(|&(_, token)| token).collect();
+    engine.mtp_step(true, &[MtpGroup { placement, rows }], MtpSource::Pending, &[],
+        MtpTokens::Host(&tokens), MtpOut::Download { logits: false })?;
+    placement.mtp_frontier.set(pending.last().unwrap().0 + 1);
+    Ok(())
+}
+
+pub(crate) fn restore_pending(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement, frontier: usize,
+    next: Option<u32>, seq: &mut MtpSeq) -> Result<()> {
+    if frontier == 0 { return Ok(()); }
+    if placement.mtp_frontier.get() == frontier { return Ok(()); }
+    ensure!(placement.mtp_snapshot_pending.get() && placement.mtp_frontier.get() == frontier - 1,
+        "Qwen restore is missing canonical MTP hidden row");
+    seq.pending.push((frontier - 1, next.unwrap_or(0)));
+    seq.open = next.is_none();
+    if next.is_some() {
+        consume_pending(engine, placement, &seq.pending)?;
+        seq.pending.clear();
+        placement.mtp_snapshot_pending.set(false);
+    }
+    Ok(())
+}
+
+fn stash_accepted(seq: &mut MtpSeq, start: usize, rows: &[u32], kept: Option<(usize, u32)>,
+    finished: bool) -> Result<Option<usize>> {
+    let Some((kept, after)) = kept.filter(|_| !finished) else { return Ok(None); };
+    ensure!(kept > 0 && kept <= rows.len(), "invalid accepted MTP stash extent");
+    let at = seq.pending.len();
+    ensure!(at + kept <= MTP_PENDING_ROWS, "the MTP stash of a sequence overflows");
+    for j in 0..kept {
+        let next = if j + 1 < kept { rows[j + 1] } else { after };
+        seq.pending.push((start + j, next));
+    }
+    Ok(Some(at))
+}
+
+#[cfg(test)]
+mod request_state_tests {
+    use super::*;
+
+    #[test]
+    fn mtp_cache_hit_and_interleaved_probe_keep_request_local_stashes() -> Result<()> {
+        for start in [1usize, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1492] {
+            // Only predictor-complete marks are eligible for drafting;
+            // accepted hidden rows remain local to the reader.
+            let mut hit = MtpSeq::default();
+            let mut cold = MtpSeq::default();
+            let mut probe = MtpSeq { pending: vec![(0, 77)], open: false };
+            let probe_before = probe.pending.clone();
+            for position in start..start + 3 {
+                let rows = [11, 13];
+                let mut placements = [(), (), ()];
+                let mut seqs = [&mut hit, &mut probe, &mut cold];
+                for (index, (placement, seq)) in placements.iter_mut().zip(&mut seqs).enumerate() {
+                    let v = crate::shared::qwen::scheduler::Verified { placement, seq: &mut **seq,
+                        start: position, history: (), rows: &rows, first_row: 2 * index,
+                        kept: Some((2, 17)), finished: false, neural: index != 1 };
+                    let kept = v.neural_kept();
+                    assert_eq!(stash_accepted(v.seq, v.start, v.rows, kept, v.finished)?.is_some(), index != 1);
+                }
+                assert_eq!(hit.pending, cold.pending);
+                assert_eq!(probe.pending, probe_before);
+                assert!(!probe.open);
+                // The next draft consumes each request's own canonical rows.
+                hit.pending.clear();
+                cold.pending.clear();
+            }
+        }
+        Ok(())
+    }
 }

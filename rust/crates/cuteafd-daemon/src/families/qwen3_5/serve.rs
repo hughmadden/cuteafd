@@ -148,8 +148,8 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     }
     fn draft(&self, _sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], _timing: &mut scheduler::DraftTiming)
         -> Result<Vec<Vec<u32>>> { anyhow::bail!("dense drafter adapter is not yet qualified") }
-    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool, draft: bool) -> Result<()> {
-        ensure!(!draft, "dense drafter adapter is not yet qualified");
+    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool) -> Result<()> {
+        ensure!(!verified.iter().any(|v| v.neural), "dense drafter adapter is not yet qualified");
         if !speculative {
             ensure!(self.pending.borrow().is_none(), "dense plain accept has pending speculative state");
             for sequence in verified {

@@ -253,54 +253,12 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
 
     // 1. Explicit attention placement is strict. Auto retains the existing
     // policy until a qualified memory lever is needed.
-    let executor = &request.executor;
     let layer_selected = |layer: &LayerDemand| selected_attention(request, flips, layer.kind) == AttentionPlacement::Layers
         && layer_whole_mode(request, layer, 0).is_some() && layer_whole_mode(request, layer, 1).is_some();
     let owners = if let Some(modes) = frozen {
         modes.iter().map(|mode| match mode { LayerMode::Whole { gpu, .. } => *gpu, _ => 0 }).collect()
-    } else { layer_owners(request, &layer_selected)? };
-    let modes = request.layers.iter().enumerate().map(|(index, layer)| {
-        if let Some(modes) = frozen {
-            let mode = modes[index];
-            if !layer.modes.contains(&mode) || !executable(mode, gpus, split) || !executor.runs(mode) {
-                return Err(PlacementError::UnsupportedMode { family: executor.family, layer: index, mode });
-            }
-        }
-        let selected = Some(selected_attention(request, flips, layer.kind));
-        let desired = match selected {
-            Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
-            Some(AttentionPlacement::Context) => Some(LayerMode::HeadSplit),
-            Some(AttentionPlacement::Layers) if layer_selected(layer) => {
-                let owner = owners[index];
-                layer_whole_mode(request, layer, owner)
-            }
-            // Fixed whole-layer executors already encode their owner in the
-            // allowed modes; only flexible layers need the owner chooser.
-            Some(AttentionPlacement::Layers) => Some(layer.modes.iter().copied()
-                .find(|mode| matches!(mode, LayerMode::Whole { .. }) && executable(*mode, gpus, split)
-                    && executor.runs(*mode)).unwrap_or(LayerMode::HeadSplit)),
-            // Heads is the established replicated layout.
-            Some(AttentionPlacement::Heads) => None,
-            _ => None,
-        };
-        if let Some(mode) = desired {
-            if !layer.modes.contains(&mode) || !executable(mode, gpus, split) || !executor.runs(mode) {
-                return Err(PlacementError::UnsupportedMode { family: executor.family, layer: index, mode });
-            }
-            if frozen.is_some_and(|modes| modes[index] != mode) {
-                return Err(PlacementError::Inventory("frozen mode differs from attention policy"));
-            }
-            return Ok(mode);
-        }
-        let wanted = request.policy.preference(layer.kind);
-        let preferred = wanted.iter().copied().chain(layer.modes.iter().copied())
-            .find(|mode| layer.modes.contains(mode) && executable(*mode, gpus, split) && executor.runs(*mode))
-            .ok_or_else(|| PlacementError::NoMode { layer: index, allowed: layer.modes.clone() })?;
-        if frozen.is_some_and(|modes| modes[index] != preferred) {
-            return Err(PlacementError::Inventory("frozen mode differs from attention policy"));
-        }
-        Ok(preferred)
-    }).collect::<Result<Vec<_>, _>>()?;
+    } else { layer_owners(request, flips, &layer_selected)? };
+    let modes = resolve_modes(request, flips, frozen, &owners)?;
     for (index, (layer, &mode)) in request.layers.iter().zip(&modes).enumerate() {
         if !matches!(mode, LayerMode::Whole { .. }) {
             if let Some(demand) = layer.extra.iter().find(|d| d.residency == LayerResidency::Owner) {
@@ -310,8 +268,8 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     }
     // Residual homes and the hops the modes imply (one GPU never hops).
     let (residual, hops) = residual_plan(&modes, &request.hops, gpus)?;
-    if let Some(hop) = hops.iter().find(|h| h.at != HopPoint::Entry).filter(|_| !executor.hops) {
-        return Err(PlacementError::UnsupportedHop { family: executor.family, hop: *hop });
+    if let Some(hop) = hops.iter().find(|h| h.at != HopPoint::Entry).filter(|_| !request.executor.hops) {
+        return Err(PlacementError::UnsupportedHop { family: request.executor.family, hop: *hop });
     }
 
     // 2. Fixed demands, including mode-dependent layer weights.
@@ -630,6 +588,57 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     })
 }
 
+fn resolve_modes(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)],
+    frozen: Option<&[LayerMode]>, owners: &[u8]) -> Result<Vec<LayerMode>, PlacementError> {
+    let gpus = request.inventory.gpus.len();
+    let split = gpus == 2 && request.inventory.peer_access;
+    let executor = &request.executor;
+    let layer_selected = |layer: &LayerDemand| selected_attention(request, flips, layer.kind) == AttentionPlacement::Layers
+        && layer_whole_mode(request, layer, 0).is_some() && layer_whole_mode(request, layer, 1).is_some();
+    request.layers.iter().enumerate().map(|(index, layer)| {
+        if let Some(modes) = frozen {
+            let mode = modes[index];
+            if !layer.modes.contains(&mode) || !executable(mode, gpus, split) || !executor.runs(mode) {
+                return Err(PlacementError::UnsupportedMode { family: executor.family, layer: index, mode });
+            }
+        }
+        let selected = Some(selected_attention(request, flips, layer.kind));
+        let desired = match selected {
+            Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
+            Some(AttentionPlacement::Context) => Some(LayerMode::HeadSplit),
+            Some(AttentionPlacement::Layers) if layer_selected(layer) => {
+                let owner = owners[index];
+                layer_whole_mode(request, layer, owner)
+            }
+            // Fixed whole-layer executors already encode their owner in the
+            // allowed modes; only flexible layers need the owner chooser.
+            Some(AttentionPlacement::Layers) => Some(layer.modes.iter().copied()
+                .find(|mode| matches!(mode, LayerMode::Whole { .. }) && executable(*mode, gpus, split)
+                    && executor.runs(*mode)).unwrap_or(LayerMode::HeadSplit)),
+            // Heads is the established replicated layout.
+            Some(AttentionPlacement::Heads) => None,
+            _ => None,
+        };
+        if let Some(mode) = desired {
+            if !layer.modes.contains(&mode) || !executable(mode, gpus, split) || !executor.runs(mode) {
+                return Err(PlacementError::UnsupportedMode { family: executor.family, layer: index, mode });
+            }
+            if frozen.is_some_and(|modes| modes[index] != mode) {
+                return Err(PlacementError::Inventory("frozen mode differs from attention policy"));
+            }
+            return Ok(mode);
+        }
+        let wanted = request.policy.preference(layer.kind);
+        let preferred = wanted.iter().copied().chain(layer.modes.iter().copied())
+            .find(|mode| layer.modes.contains(mode) && executable(*mode, gpus, split) && executor.runs(*mode))
+            .ok_or_else(|| PlacementError::NoMode { layer: index, allowed: layer.modes.clone() })?;
+        if frozen.is_some_and(|modes| modes[index] != preferred) {
+            return Err(PlacementError::Inventory("frozen mode differs from attention policy"));
+        }
+        Ok(preferred)
+    }).collect()
+}
+
 fn selected_attention(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)],
     kind: AttentionClass) -> AttentionPlacement {
     request.attention_placement
@@ -641,12 +650,12 @@ fn selected_attention(request: &PlacementRequest, flips: &[(AttentionClass, Atte
         } else { AttentionPlacement::Heads })
 }
 
-fn layer_owners(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> bool)
+fn layer_owners(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)], selected: &impl Fn(&LayerDemand) -> bool)
     -> Result<Vec<u8>, PlacementError> {
     if !request.layers.iter().any(selected) { return Ok(vec![0; request.layers.len()]); }
     match request.policy.ownership {
         LayerOwnership::Ranges | LayerOwnership::NonemptyRanges => {
-            let switch = layer_switch(request, selected)?;
+            let switch = layer_switch(request, flips, selected)?;
             Ok((0..request.layers.len()).map(|index| if index < switch { request.layers_first_gpu }
                 else { 1 - request.layers_first_gpu }).collect())
         }
@@ -660,105 +669,17 @@ fn layer_whole_mode(request: &PlacementRequest, layer: &LayerDemand, gpu: u8) ->
         .find(|mode| layer.modes.contains(mode) && request.executor.runs(*mode))
 }
 
-/// One ownership boundary, never inside an indexer/colocate group. Balance
-/// owner-local weights, state and KV at the wanted pool, plus mandatory TP2
-/// residency. A fixed demand is owner-only when its (category, group) appears
-/// on only one rank: name head/MTP demands separately from paired rank groups.
-/// Paired groups (even with unequal bytes) and transient staging affect only
-/// the secondary actual-fit score. Auto with Sparks has no mandatory experts.
-fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> bool) -> Result<usize, PlacementError> {
-    let mut groups = std::collections::BTreeMap::new();
-    for demand in &request.fixed {
-        *groups.entry((demand.category, demand.group.as_str())).or_insert(0u8) |= 1 << demand.gpu;
-    }
-    let mut owner_fixed = [0u64; 2];
-    for demand in &request.fixed {
-        if groups[&(demand.category, demand.group.as_str())].count_ones() == 1 {
-            let gpu = usize::from(demand.gpu);
-            owner_fixed[gpu] = owner_fixed[gpu].checked_add(demand.bytes)
-                .ok_or(PlacementError::Overflow("owner-only fixed"))?;
-        }
-    }
-    let mandatory_tp2 = mandatory_tp2_arenas(request)?;
-    let mut best = None;
-    for k in 0..=request.layers.len() {
-        if request.policy.ownership == LayerOwnership::NonemptyRanges
-            && (!request.layers[..k].iter().any(selected) || !request.layers[k..].iter().any(selected)) {
-            continue;
-        }
-        if request.layers.iter().enumerate().any(|(i, layer)| selected(layer) && layer.colocate.is_some_and(|group|
-            request.layers.iter().enumerate().any(|(j, other)| selected(other) && other.colocate == Some(group) && (i < k) != (j < k)))) { continue; }
-        let mut kv = [0u64; 2];
-        let mut fixed = owner_fixed;
-        for gpu in 0..2 {
-            fixed[gpu] = fixed[gpu].checked_add(mandatory_tp2[gpu].resident)
-                .ok_or(PlacementError::Overflow("owned TP2 residency"))?;
-        }
-        for (i, layer) in request.layers.iter().enumerate().filter(|(_, l)| selected(l)) {
-            let gpu = usize::from(if i < k { request.layers_first_gpu } else { 1 - request.layers_first_gpu });
-            kv[gpu] = kv[gpu].checked_add(layer.kv_unit.unit_bytes_whole).ok_or(PlacementError::Overflow("owned KV bytes"))?;
-            fixed[gpu] = fixed[gpu].checked_add(layer.fixed_bytes.whole).and_then(|n| n.checked_add(layer.weights.whole))
-                .ok_or(PlacementError::Overflow("owned state and weights"))?;
-            for demand in &layer.extra {
-                fixed[gpu] = fixed[gpu].checked_add(demand.bytes)
-                    .ok_or(PlacementError::Overflow("owned layer extras"))?;
-            }
-        }
-        let mut owned = [0u64; 2];
-        for gpu in 0..2 { owned[gpu] = kv[gpu].checked_mul(request.pool.wanted_units()).and_then(|b| b.checked_add(fixed[gpu]))
-            .ok_or(PlacementError::Overflow("owned pool bytes"))?; }
-        let mut pool_bytes = request.pool_overhead.clone();
-        let mut base = mandatory_tp2.each_ref().map(|arena| arena.peak);
-        for demand in &request.fixed {
-            let g = usize::from(demand.gpu);
-            base[g] = base[g].checked_add(demand.bytes).ok_or(PlacementError::Overflow("ownership fixed"))?;
-        }
-        for (i, layer) in request.layers.iter().enumerate() {
-            for g in 0..request.inventory.gpus.len() {
-                let owner = usize::from(if i < k { request.layers_first_gpu } else { 1 - request.layers_first_gpu });
-                let (bytes, state, weights) = if selected(layer) {
-                    if g == owner { (layer.kv_unit.unit_bytes_whole, layer.fixed_bytes.whole, layer.weights.whole) } else { (0, 0, 0) }
-                } else { (layer.kv_unit.unit_bytes_split[g], layer.fixed_bytes.split[g], layer.weights.split[g]) };
-                pool_bytes[g] = pool_bytes[g].checked_add(bytes).ok_or(PlacementError::Overflow("ownership pool"))?;
-                base[g] = base[g].checked_add(state).and_then(|n| n.checked_add(weights)).ok_or(PlacementError::Overflow("ownership fixed"))?;
-                let mode = if selected(layer) { LayerMode::Whole { gpu: owner as u8, ffn: FfnMode::Owner } }
-                    else { LayerMode::HeadSplit };
-                for demand in &layer.extra {
-                    if demand.on_gpu(mode, g) {
-                        base[g] = base[g].checked_add(demand.bytes)
-                            .ok_or(PlacementError::Overflow("ownership layer extras"))?;
-                    }
-                }
-            }
-        }
-        let available = request.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
-        let fit = pool_fit(request, &available, &base[..available.len()],
-            &vec![Arena::default(); available.len()], &pool_bytes);
-        let score = (owned[0].max(owned[1]), std::cmp::Reverse(fit), k);
-        if best.as_ref().is_none_or(|(old, _)| score < *old) { best = Some((score, k)); }
-    }
-    best.map(|(_, k)| k).ok_or(PlacementError::Inventory("no legal layer ownership boundary"))
-}
-
-/// Only the compulsory routed prefix is known before choosing layer owners.
-/// Match place_tp2's resident workspace and largest retained staging peak.
-fn mandatory_tp2_arenas(request: &PlacementRequest) -> Result<[Arena; 2], PlacementError> {
-    let mut arenas = [Arena::default(), Arena::default()];
-    let routed = count_moe(request);
-    let mandatory = request.onboard.layers(routed).unwrap_or_else(||
-        if request.inventory.spark_ranks == 0 { routed } else { 0 });
-    if request.expert_gpus == 0 { return Ok(arenas); }
-    for cost in request.layers.iter().filter_map(|layer| layer.experts).take(mandatory) {
-        if !cost.tp2 { break; }
-        for gpu in 0..2 {
-            arenas[gpu].open(request.tp2_workspace[gpu]);
-            arenas[gpu].add(cost.half[gpu])?;
-            arenas[gpu].staging = arenas[gpu].staging.max(cost.half[gpu].staging);
-            arenas[gpu].peak = arenas[gpu].resident.checked_add(arenas[gpu].staging)
-                .ok_or(PlacementError::Overflow("mandatory TP2 peak"))?;
-        }
-    }
-    Ok(arenas)
+/// Score every legal boundary with the same admission that installs it. Frozen
+/// modes bypass this chooser, including recursive expert-prefix trials.
+fn layer_switch(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)],
+    selected: &impl Fn(&LayerDemand) -> bool) -> Result<usize, PlacementError> {
+    let groups = request.layers.iter().map(|layer| (selected(layer), layer.colocate)).collect::<Vec<_>>();
+    attention::solve_owners(&groups, request.policy.ownership, request.layers_first_gpu, request.onboard, |owners| {
+        let modes = resolve_modes(request, flips, None, owners)?;
+        let placed = solve_once(request, flips, Some(&modes))?;
+        let boundary = owners.iter().take_while(|&&owner| owner == request.layers_first_gpu).count();
+        Ok((placed, boundary))
+    }).map(|(_, boundary)| boundary)
 }
 
 /// The residual's home at every layer boundary (`[0]`: the embedding's GPU,

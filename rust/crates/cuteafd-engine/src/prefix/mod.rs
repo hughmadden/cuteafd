@@ -10,6 +10,7 @@
 mod admission;
 mod cache;
 mod chain;
+mod draft;
 mod entry;
 mod family;
 mod marks;
@@ -24,6 +25,8 @@ pub use admission::{fit_output, AdmissionPoll, AdmissionStats, DeferredAdmission
 pub use cache::{Admitted, Captured, Hit, HostPayload, PrefixCache, PrefixConfig, PrefixError, PrefixStats, Source};
 pub use chain::{content_id, page_chain, CONTENT_CLASS};
 pub use cuteafd_core::prefix::{ReuseRule, SnapshotKind};
+pub use draft::{DraftBinding, DraftPageAttachment, DraftPageError, DraftPageId, DraftPagePool,
+    DraftReservation, DraftSnapshot, DRAFT_PAGE_ROWS};
 pub use entry::{greedy, victim, After, EntryId, Mark};
 pub use family::{BoxError, CaptureTicket, Eviction, FamilyLayout, LaggedState, MarkStore, PageOwners, PrefixFamily, RestoreCandidate,
     RestoreContext, RestoreFidelity, RestorePlan};
