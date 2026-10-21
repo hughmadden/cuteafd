@@ -70,14 +70,14 @@ pub fn report(failed: bool) -> Report {
                     runs: (0..width).map(|_| ConcurrentTiming { sent_s: 0.0,
                         timing: timing(320, 319.0 / per_stream_median_tok_s) }).collect(), warmup_s: 3.0 }).collect(),
             prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![] }),
-            warmup_s: Some(14.2),
+            warmup_s: Some(14.2), prompt_token_ratio: None,
             capacity: Some(Capacity { kv_tokens: Some(14_710_000), kv_pages: Some(28_728),
                 kv_format: Some("FP4 compressed (CSA/HCA) + FP8 window".into()), max_requests: Some(16),
                 max_context: Some(1 << 20), max_output: Some(393_216), host_cache_bytes: Some(64 << 30) }) },
         quality, seconds: 151.0, thermal: None, fabric: vec![],
     };
     Report {
-        schema: SCHEMA.into(), id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
+        schema: SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
         finished: Some("2026-10-02T10:14:31Z".into()), status: RunStatus::Done, profile: "smoke".into(),
         plan: vec![PlannedPanel { id: "hardware".into(), passes: 1 }, PlannedPanel { id: "configuration".into(), passes: 1 }],
         server: ServerInfo { model: "deepseek-ai/DeepSeek-V4.1-Flash".into(), family: Some("deepseek_v41".into()),

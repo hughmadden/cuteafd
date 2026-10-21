@@ -29,6 +29,11 @@ DGX Sparks serves the routed experts over RoCE.
   connect directly. [Client APIs](docs/client-apis.md)
 - **Own your intelligence:** your weights, your hardware, no rate limits.
 
+Prefill reports without `prompt_content: "realistic-v1"` used synthetic filler.
+New prefill benchmarks use fixed real code, agent/tool transcripts and technical
+prose; their prefill numbers are not directly comparable to the older content.
+Decode and agentic-session workloads are unchanged.
+
 ## What's new in v3.0.0
 
 - **Two-GPU placement for every family:** experts run TP2 across both RTX

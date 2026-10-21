@@ -4,7 +4,7 @@ use super::common::{self, plain, table};
 use super::{Ctx, Panel, Rates};
 use crate::client::Chat;
 use crate::report::ServerInfo;
-use crate::text::{filler, nonce};
+use crate::text::{corpus, nonce};
 use anyhow::Result;
 use serde_json::{json, Value};
 
@@ -109,7 +109,7 @@ impl Panel for Needle {
     fn id(&self) -> &'static str { "needle" }
     fn title(&self) -> &'static str { "Long-context needle" }
     fn description(&self) -> &'static str {
-        "A passphrase hidden at five depths of filler from 2K tokens to the model's context limit; the heatmap \
+        "A passphrase hidden at five depths of corpus from 2K tokens to the model's context limit; the heatmap \
          shows retrieval (thinking off)."
     }
     fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
@@ -118,7 +118,7 @@ impl Panel for Needle {
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let grid = Self::grid(ctx.max_context);
         let total: usize = grid.iter().map(|(_, d)| d.len()).sum();
-        let words_per_token = 1.0 / common::tokens_per_word(ctx);
+        let words_per_token = 1.0 / common::prompt_token_ratio(ctx);
         let mut cells = Vec::new();
         for (length, depths) in &grid {
             for &depth in depths {
@@ -127,13 +127,12 @@ impl Panel for Needle {
                 let secret = format!("{}-{}", ["amber", "cobalt", "violet", "saffron", "jade"][cells.len() % 5],
                     1000 + (cells.len() * 7919 + *length as usize) % 9000);
                 let words = ((*length as f64 - 80.0) * words_per_token).max(50.0) as usize;
-                let text = filler(*length ^ cells.len() as u64, words);
-                let mut parts: Vec<&str> = text.split(' ').collect();
-                let at = ((parts.len() as f64) * depth) as usize;
-                let needle = format!("The secret passphrase is {secret}.");
-                parts.insert(at.min(parts.len()), &needle);
+                let mut text = corpus(*length ^ cells.len() as u64, words);
+                let mut at = ((text.len() as f64) * depth) as usize;
+                while !text.is_char_boundary(at) { at -= 1; }
+                text.insert_str(at, &format!("\nThe secret passphrase is {secret}.\n"));
                 let prompt = format!("[{}] {}\n\nWhat is the secret passphrase mentioned in the text above? Reply \
-                    with the passphrase only.", nonce(), parts.join(" "));
+                    with the passphrase only.", nonce(), text);
                 let chat = ctx.client.chat(plain(ctx.client, &prompt, 24), None);
                 let (found, tokens) = match &chat {
                     Ok(chat) => (chat.content.contains(&secret), chat.timing.prompt_tokens),
