@@ -70,7 +70,7 @@ fn push_shard() -> NamedTempFile {
     rustix::fs::setxattr(
         shard.path(),
         HOSTS_XATTR,
-        b"[]",
+        b"rank-a,rank-b",
         rustix::fs::XattrFlags::empty(),
     )
     .unwrap();
@@ -141,6 +141,50 @@ fn empty_hosts_is_still_sparknest_and_snapshot_symlinks_are_followed() {
     )
     .unwrap();
     assert!(is_push_shard(shard.path()));
+}
+
+#[test]
+fn namespace_uses_mount_identity_and_follows_snapshot_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let snapshot = directory.path().join("snapshot");
+    std::fs::create_dir(&snapshot).unwrap();
+    rustix::fs::setxattr(directory.path(), "user.sparknest.cluster", br#"{"me":"namespace-rank"}"#,
+        rustix::fs::XattrFlags::empty()).unwrap();
+    assert_eq!(namespace(&snapshot).unwrap(), (directory.path().into(), "namespace-rank".into()));
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("snapshot-link");
+    std::os::unix::fs::symlink(&snapshot, &alias).unwrap();
+    assert_eq!(namespace(&alias).unwrap(), (directory.path().into(), "namespace-rank".into()));
+    rustix::fs::setxattr(directory.path(), "user.sparknest.cluster", b"{}",
+        rustix::fs::XattrFlags::empty()).unwrap();
+    assert!(namespace(&snapshot).is_err());
+    assert!(PushClient::at(String::new(), Duration::from_secs(1)).is_err());
+    assert!(PushClient::at("fixture".into(), Duration::ZERO).is_err());
+}
+
+#[test]
+fn container_subtree_bind_does_not_guess_the_hidden_namespace_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let namespace_root = directory.path().join("namespace");
+    let original = namespace_root.join("hf-home/hub/model/snapshots/revision");
+    std::fs::create_dir_all(&original).unwrap();
+    rustix::fs::setxattr(&namespace_root, "user.sparknest.cluster", br#"{"me":"namespace-rank"}"#,
+        rustix::fs::XattrFlags::empty()).unwrap();
+    assert_eq!(namespace(&original).unwrap().0, namespace_root);
+    // A subtree bind exposes the hub inode and descendants, not the FUSE root.
+    // A separate directory models that ancestor visibility without mount privileges.
+    let bind_root = directory.path().join("container/hf/hub");
+    let exposed = bind_root.join("model/snapshots/revision");
+    std::fs::create_dir_all(&exposed).unwrap();
+    assert!(namespace(&exposed).is_err(), "subtree-only serving bind must remain on mount");
+    // If the actual namespace root is bound at this path, its root attribute
+    // must be visible there; paths are then relative to precisely that root.
+    rustix::fs::setxattr(&bind_root, "user.sparknest.cluster", br#"{"me":"namespace-rank"}"#,
+        rustix::fs::XattrFlags::empty()).unwrap();
+    let (root, host) = namespace(&exposed).unwrap();
+    assert_eq!(root, bind_root);
+    assert_eq!(host, "namespace-rank");
+    assert_eq!(exposed.strip_prefix(root).unwrap(), Path::new("model/snapshots/revision"));
 }
 
 #[test]
@@ -551,4 +595,12 @@ fn eof_refusal_failure_and_wrong_phase_events_are_errors() {
         assert!(group.next().is_err());
         server.finish();
     }
+}
+
+#[test]
+fn socket_setting_defaults_and_accepts_an_explicit_endpoint() {
+    for setting in [None, Some(String::new())] {
+        assert_eq!(PushClient::configured(setting).socket, SOCKET);
+    }
+    assert_eq!(PushClient::configured(Some("@isolated-push".into())).socket, "@isolated-push");
 }

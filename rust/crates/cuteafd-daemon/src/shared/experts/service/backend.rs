@@ -547,6 +547,7 @@ pub(super) fn load_exl3<'a>(
     library: &'a NativeLibrary,
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
+    push: Option<&mut std::net::TcpStream>,
 ) -> Result<(Weights<'a>, usize)> {
     let exl3_directory = config.exl3_directory(catalog)?;
     Exl3Worker::validate_exports(&exl3_directory, config.capacity, config.rank,
@@ -587,6 +588,11 @@ pub(super) fn load_exl3<'a>(
         pinned_host_bytes=pinned, read_scratch_bytes=scratch, load_peak_bytes=peak.load_peak,
         serve_peak_bytes=peak.serve_peak, "EXL3 Spark admitted loader peak");
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
+    if let Some(stream) = push {
+        if let Some(weights) = super::push::load(library, catalog, config, &layers, &plans, resident, stream)? {
+            return Ok((Weights::Exl3(Rc::new(weights)), config.device_budget - resident));
+        }
+    }
     let mut remaining = config.device_budget;
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, layer| {
         let plan = &plans[index];

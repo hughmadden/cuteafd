@@ -21,6 +21,7 @@ fn admission_timeout(value: Option<&str>) -> Result<Duration> {
 pub(crate) struct SparkAdmission {
     selection: WorkerSelection,
     assignments: Vec<SparkAssignment>,
+    push_snapshot: Option<std::path::PathBuf>,
 }
 
 impl SparkAdmission {
@@ -92,7 +93,14 @@ impl SparkAdmission {
                     .with_context(|| format!("Spark admission rank {rank} checkpoint assignment"))
             }).collect::<Result<Vec<_>>>()?
         };
-        Ok(Self { selection, assignments })
+        let push_snapshot = if manifest.is_none() && catalog.is_some_and(|c| c.exl3().is_some())
+            && !working.spark_layers.is_empty() && assignments.iter().all(|a| a.resident_bytes > 0)
+            && topology.is_none_or(|t| t.tp() as usize == world)
+            && cuteafd_loader::push_load::namespace(snapshot).is_ok() {
+            Some(snapshot.to_path_buf())
+        } else { None };
+        let selection = if push_snapshot.is_some() { selection.with_push_weights() } else { selection };
+        Ok(Self { selection, assignments, push_snapshot })
     }
 
     fn reconcile(&self, reports: &[ModelAdmissionResponse]) -> Result<()> {
@@ -109,6 +117,17 @@ impl SparkAdmission {
         let pending = cuteafd_transport::worker_selection::start_model_admission(
             peers, &self.selection, timeout)
             .with_context(|| format!("Spark worker admission start failed (timeout {} s)", timeout.as_secs()))?;
+        let pending = if let Some(snapshot) = self.push_snapshot.clone() {
+            let assignments = self.assignments.clone();
+            let layers = self.selection.layers();
+            let cancel = pending.cancellation_streams()?;
+            AdmissionWait::Push(PushAdmissionDriver { cancel, thread: Some(std::thread::spawn(move || {
+                let mut pending = pending;
+                pending.push_weights(|offers| super::memory::push_exl3::prepare(
+                    &snapshot, &layers, &assignments, offers))?;
+                pending.wait()
+            })) })
+        } else { AdmissionWait::Mount(pending) };
         Ok(PendingSparkAdmission { plan: self, pending, timeout })
     }
 
@@ -117,15 +136,40 @@ impl SparkAdmission {
     }
 }
 
+struct PushAdmissionDriver {
+    cancel: Vec<std::net::TcpStream>,
+    thread: Option<std::thread::JoinHandle<Result<Vec<ModelAdmissionResponse>>>>,
+}
+impl PushAdmissionDriver {
+    fn wait(mut self) -> Result<Vec<ModelAdmissionResponse>> {
+        self.thread.take().expect("owned admission driver").join()
+            .map_err(|_| anyhow::anyhow!("Spark push admission driver panicked"))?
+    }
+}
+impl Drop for PushAdmissionDriver {
+    fn drop(&mut self) {
+        for stream in &self.cancel { let _ = stream.shutdown(std::net::Shutdown::Both); }
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
+}
+
+enum AdmissionWait {
+    Mount(cuteafd_transport::worker_selection::PendingModelAdmission),
+    Push(PushAdmissionDriver),
+}
+
 pub(crate) struct PendingSparkAdmission {
     plan: SparkAdmission,
-    pending: cuteafd_transport::worker_selection::PendingModelAdmission,
+    pending: AdmissionWait,
     timeout: Duration,
 }
 
 impl PendingSparkAdmission {
     pub(crate) fn wait(self) -> Result<()> {
-        let reports = self.pending.wait()
+        let reports = match self.pending {
+            AdmissionWait::Mount(pending) => pending.wait(),
+            AdmissionWait::Push(driver) => driver.wait(),
+        }
             .with_context(|| format!("Spark worker admission failed (timeout {} s)", self.timeout.as_secs()))?;
         self.plan.reconcile(&reports)?;
         for report in reports {
@@ -170,7 +214,7 @@ mod tests {
         let timeout = Duration::from_secs(5);
         let pending = cuteafd_transport::worker_selection::start_model_admission(
             &peers, &plan.selection, timeout)?;
-        Ok((PendingSparkAdmission { plan, pending, timeout }, listeners))
+        Ok((PendingSparkAdmission { plan, pending: AdmissionWait::Mount(pending), timeout }, listeners))
     }
 
     #[test]
@@ -299,7 +343,7 @@ mod tests {
         let timeout = Duration::from_secs(1);
         let pending = cuteafd_transport::worker_selection::start_model_admission(
             &peers, &plan.selection, timeout)?;
-        let result = PendingSparkAdmission { plan, pending, timeout }.wait();
+        let result = PendingSparkAdmission { plan, pending: AdmissionWait::Mount(pending), timeout }.wait();
         let _ = release.send(());
         worker.join().unwrap();
         let error = format!("{:#}", result.unwrap_err());
