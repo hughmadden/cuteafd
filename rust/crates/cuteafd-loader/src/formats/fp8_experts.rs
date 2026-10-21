@@ -246,6 +246,15 @@ impl Fp8ExpertTensors {
 
     pub(crate) fn finish_reads(&self) { self.reader.clear(); }
 
+    pub(crate) fn push_source(&self, name: &str) -> Result<(crate::push_load::builder::Source, DType)> {
+        let tensor = self.located(name)?;
+        Ok((crate::push_load::builder::Source {
+            path: self.snapshot.join(&tensor.shard),
+            offset: tensor.offset,
+            bytes: tensor.bytes,
+        }, tensor.dtype.clone()))
+    }
+
     pub fn name(&self, layer: usize, expert: usize, projection: Fp8Projection) -> String {
         if self.mtp_layers && layer >= self.shape.layers {
             let stage = layer - self.shape.layers;

@@ -1009,10 +1009,11 @@ def summarize_job(job, exit_code):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
         hashes = prompt_token_hashes(text)
         # Concurrent admission reorders requests, so pairs match on the whole
-        # set of input-determined prompts; a follow-up prompt is reported but
-        # not compared.
+        # set of shared input-determined prompts; follow-up and arm-local
+        # diagnostic prompts are reported but not compared.
         row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[0] if hashes else None,
                    prompt_token_hashes=sorted(hashes), follow_up_prompts=follow_up_prompts(text),
+                   arm_local_prompts=arm_local_prompts(text),
                    requests=matched_requests(dest), state=str(dest))
         # Prefill-only sweeps (max_tokens 1) emit no decode rounds; the prompt
         # token hash above is what matches their requests.
@@ -1058,8 +1059,10 @@ def lossless_set_result(report):
 # re-renders model output (a follow-up turn, or ids taken from a response)
 # logs as an output-dependent prompt with no hash, because two engines
 # legitimately tokenize model text differently.
+# Panel-local diagnostics also log without hashes: not every arm runs them.
 MATCHED_PROMPT = re.compile(r'matched benchmark prompt.*?prompt_token_hash\s*=\s*"?([0-9a-f]{16})')
 FOLLOW_UP_PROMPT = re.compile(r'benchmark output-dependent prompt')
+ARM_LOCAL_PROMPT = re.compile(r'benchmark arm-local prompt')
 
 
 def prompt_token_hashes(text):
@@ -1070,6 +1073,11 @@ def prompt_token_hashes(text):
 def follow_up_prompts(text):
     """Output-dependent prompts reported, which pairs do not compare."""
     return len(FOLLOW_UP_PROMPT.findall(text))
+
+
+def arm_local_prompts(text):
+    """Panel-local diagnostic prompts reported, which pairs do not compare."""
+    return len(ARM_LOCAL_PROMPT.findall(text))
 
 
 def matched_requests(dest):

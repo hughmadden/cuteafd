@@ -484,13 +484,29 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert startup.index("draft.prime(&engine.embedding, engine.draft_head())?") < startup.index("let result = with_startup_graphs(")
 
 
-def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() -> None:
+def test_shared_startup_load_overlaps_admission_before_serving_allocation() -> None:
+    for family, engine in [("glm5", "GlmEngine"), ("glm5_flash", "GlmfEngine"), ("mimo_v2", "MimoEngine")]:
+        source = (ROOT / f"rust/crates/cuteafd-daemon/src/families/{family}/mod.rs").read_text()
+        start = source.index("let admission = if")
+        body = source[start:]
+        assert body.index(".start(&peers)?") < body.index("load_while_admitting(admission,")
+        assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
+        assert body.index("TokenEmbedding::load(") < body.index(f"engine::{engine}::new(")
+        assert ".select(&peers)?" not in body
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/placement.rs").read_text()
+    helper = shared.split("pub(crate) fn load_while_admitting", 1)[1].split("#[cfg(test)]", 1)[0]
+    assert helper.index("let loaded = load()?") < helper.index("pending.wait()?") < helper.index("Ok(loaded)")
+
+
+def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> None:
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
     body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]
     assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("SparkAdmission::plan(")
     assert body.index("SparkAdmission::plan(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
-    assert "model)?.select(&peers)?" in body
+    assert "model)?.start(&peers)?)" in body
+    assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
+    assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body
     assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
     assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
@@ -551,6 +567,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           physical_gpus: tuple[int, ...] = (0, 1), *, preflight_error: bool = False,
                           restart: bool = False, preferred_ranks: int | None = None,
                           gpu_free_mib: int = 97000, gpu_total_mib: int = 98304,
+                          cuda_total_bytes: int | None = None,
                           container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
                           previous_peers: str | None = None, encoder_plan: dict | None = None,
@@ -569,6 +586,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     copy_input(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     copy_input(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
+    from launcher_sandbox import stub_cuda_capacity
+    stub_cuda_capacity(repo / "scripts/lib/release-common.sh",
+                       cuda_total_bytes if cuda_total_bytes is not None else gpu_total_mib * 2**20)
     copy_input(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
     capacity = Path("rust/crates/cuteafd-core/src/serving_capacity.rs")
     (repo / capacity.parent).mkdir(parents=True)
@@ -653,11 +673,11 @@ exec python3 -c "$code" "$@"
     (bin_dir / "curl").chmod(0o755)
     (bin_dir / "nvidia-smi").write_text('#!/usr/bin/env bash\ncase "$*" in *memory.total*) echo ' + str(gpu_total_mib) +
                                          ' ;; *memory.free*) echo ' + str(gpu_free_mib) +
-                                         " ;; *) printf '%s\\n' " + " ".join(map(str, physical_gpus)) +
+                                         " ;; *query-gpu=uuid*) echo GPU-00000000-0000-0000-0000-000000000000 ;; *) printf '%s\\n' " + " ".join(map(str, physical_gpus)) +
                                          ' ;; esac\n' if preferred_ranks is None else
                                          '#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo ' + str(gpu_free_mib) +
                                          ' ;; *memory.total*) echo ' + str(gpu_total_mib) +
-                                         ' ;; *query-compute-apps*) printf \'%s\\n\' ' +
+                                         ' ;; *query-gpu=uuid*) echo GPU-00000000-0000-0000-0000-000000000000 ;; *query-compute-apps*) printf \'%s\\n\' ' +
                                          " ".join(f"'{pid}, {mib}'" for pid, mib in gpu_allocations) +
                                          ' ;; *) echo 0; echo 1 ;; esac\n')
     (bin_dir / "nvidia-smi").chmod(0o755)
@@ -3371,3 +3391,41 @@ def test_worker_env_survives_the_remote_worker_shell(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     workers = [line for line in result.stderr.splitlines() if "expertd-native" in line]
     assert workers and all("CUTEAFD_THERMAL=" in worker for worker in workers)
+
+
+@pytest.mark.parametrize("family", ["glm5_flash", "glm5", "mimo_v2", "deepseek_v4", "qwen4", "deepseek_v41"])
+@pytest.mark.parametrize("budget", ["", "96", "90"])
+def test_launcher_plans_against_cuda_total_not_nvml_total(tmp_path, family, budget):
+    config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+              if family == "glm5" else {"model_type": "deepseek_v4"} if family == "deepseek_v4"
+              else {"model_type": "deepseek_v41"} if family == "deepseek_v41"
+              else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
+    total = 101_973_491_712
+    result = _family_launch_result(tmp_path, config,
+        "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model",
+        f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+        + ("GLM5_FLASH_FP8_MODEL_ID=off\n" if family == "glm5_flash" else "")
+        + ("SPARK_COUNT=4\n" + "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(4))
+           if family == "deepseek_v41" else ""),
+        gpu_total_mib=97887, gpu_free_mib=97887, cuda_total_bytes=total,
+        extra_args=("--wip", "capacity-test") if family == "deepseek_v41" else ())
+    assert result.returncode == 0, result.stderr
+    plan = next(line for line in result.stderr.splitlines() if " plan " in line and "--deployment" in line)
+    args = plan.split()
+    expected = min(total / 2**30, float(budget) if budget else float("inf"))
+    assert float(args[args.index("--coordinator-gpu-budget-gib") + 1]) == expected
+    assert expected < 97887 / 1024
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_qwen_external_occupancy_is_nvml_used_subtracted_from_cuda_capacity(tmp_path, restart):
+    total = 101_973_491_712
+    result = _family_launch_result(tmp_path,
+        {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}},
+        "test/model", "INSTANCE=own\nSPARK_COUNT=0\n", preferred_ranks=0, restart=restart,
+        gpu_total_mib=97887, gpu_free_mib=12000, cuda_total_bytes=total,
+        container_pids=(123,), gpu_allocations=((123, 84000), (456, 2000)))
+    assert result.returncode == 0, result.stderr
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line).split()
+    used = (97887 - 12000 - (84000 if restart else 0)) * 2**20
+    assert float(plan[plan.index("--coordinator-gpu-budget-gib") + 1]) == (total - used) / 2**30

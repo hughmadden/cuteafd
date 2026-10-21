@@ -8,7 +8,44 @@ release_die() {
   exit 2
 }
 
-# Resolve total capacity, never free memory. Rust owns the literal default rule.
+# CUDA and NVML can enumerate cards differently. UUID is the only join key;
+# querying the driver here creates no context or device allocation.
+release_cuda_total_bytes() {
+  python3 - "$1" <<'PYCAPACITY'
+import ctypes, sys, uuid
+try:
+    wanted = uuid.UUID(sys.argv[1].removeprefix('GPU-')).bytes
+    cuda = ctypes.CDLL('libcuda.so.1')
+    def checked(name, *args):
+        function = getattr(cuda, name)
+        function.restype = ctypes.c_int
+        code = function(*args)
+        if code:
+            raise ValueError(f'{name} failed with CUDA error {code}')
+    checked('cuInit', ctypes.c_uint(0))
+    count = ctypes.c_int()
+    checked('cuDeviceGetCount', ctypes.byref(count))
+    for ordinal in range(count.value):
+        device = ctypes.c_int()
+        checked('cuDeviceGet', ctypes.byref(device), ctypes.c_int(ordinal))
+        identity = (ctypes.c_ubyte * 16)()
+        checked('cuDeviceGetUuid_v2', ctypes.byref(identity), device)
+        if bytes(identity) != wanted:
+            continue
+        total = ctypes.c_size_t()
+        checked('cuDeviceTotalMem_v2', ctypes.byref(total), device)
+        if total.value == 0:
+            raise ValueError('CUDA reported zero device capacity')
+        print(total.value)
+        break
+    else:
+        raise ValueError(f'no CUDA device matches UUID {sys.argv[1]}')
+except (OSError, AttributeError, ValueError) as error:
+    sys.exit(f'coordinator CUDA capacity: {error}')
+PYCAPACITY
+}
+
+# Resolve total capacity in bytes, never free memory. Rust owns the default rule.
 release_coordinator_profile() {
   local registry="${repo_root:?}/rust/crates/cuteafd-core/src/serving_capacity.rs"
   python3 - "$registry" "$1" "${2:-}" <<'PYPROFILE'
@@ -29,7 +66,7 @@ try:
         'LARGE_CARD_DEFAULT_CONCURRENCY'))
     if not (0 < threshold < 2**64 and 0 < small <= large <= 0xffffffff):
         raise ValueError('invalid capacity registry geometry')
-    physical = Decimal(sys.argv[2].strip()) * 2**20
+    physical = Decimal(sys.argv[2].strip())
     budget = Decimal(sys.argv[3]) * 2**30 if sys.argv[3] else physical
     if not all(value.is_finite() and 1 <= value < 2**64 for value in (physical, budget)):
         raise ValueError('GPU capacity must be finite, positive and representable in bytes')

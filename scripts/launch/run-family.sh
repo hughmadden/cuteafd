@@ -817,8 +817,8 @@ docker image inspect "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 ||
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 release_resolve_local_model_revision "$hf_home"
 release_resolve_coordinator_gpu_identity
-profile_mib="$(nvidia-smi --id="$RELEASE_COORDINATOR_GPU_UUID" --query-gpu=memory.total --format=csv,noheader,nounits)"
-profile="$(release_coordinator_profile "$profile_mib" "$COORDINATOR_GPU_BUDGET_GIB")" || release_die "cannot resolve coordinator capacity profile"
+profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
+profile="$(release_coordinator_profile "$profile_bytes" "$COORDINATOR_GPU_BUDGET_GIB")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
 ((RELEASE_CONCURRENCY_EXPLICIT)) || CONCURRENCY="$default_concurrency"
 if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
@@ -1734,8 +1734,9 @@ draft_args=()
 embedding="$(get EMBEDDING gpu)"
 default_context=0
 profile_gpu="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; profile_gpu="${profile_gpu%%,*}"
-profile_mib="$(nvidia-smi -i "$profile_gpu" --query-gpu=memory.total --format=csv,noheader,nounits)"
-profile="$(release_coordinator_profile "$profile_mib" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
+profile_uuid="$(nvidia-smi -i "$profile_gpu" --query-gpu=uuid --format=csv,noheader,nounits)"
+profile_bytes="$(release_cuda_total_bytes "$profile_uuid")" || release_die "cannot query coordinator CUDA capacity"
+profile="$(release_coordinator_profile "$profile_bytes" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
 [[ "$family" != qwen3_5 ]] || default_concurrency=4
 effective_concurrency="$(get CONCURRENCY "$default_concurrency")"
@@ -2446,9 +2447,9 @@ audio_peers=()
 audio_encoder_hash=""
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
-  total_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')"
-  plan_gib="${coordinator_budget:-$(python3 -c 'import sys; print(float(sys.argv[1])/1024)' "$total_mib")}"
+  plan_gib="$profile_gib"
   if [[ "$family" == qwen4 ]]; then
+    total_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')"
     free_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d ' ')"
     if ((restart)); then
       own_pids="$(docker top "$coordinator_name" -eo pid 2>/dev/null | python3 -c 'import sys; print(" ".join(x.strip() for x in sys.stdin if x.strip().isdigit()))' || true)"
@@ -2458,7 +2459,9 @@ audio_encoder_hash=""
         free_mib=$((free_mib + own_mib))
       fi
     fi
-    plan_gib="$(python3 -c 'import sys;f,t=map(float,sys.argv[1:3]);b=float(sys.argv[3]) if sys.argv[3] else t/1024;print(max(0,min(f/1024,b-(t-f)/1024)))' "$free_mib" "$total_mib" "$coordinator_budget")"
+    # Occupancy stays wholly NVML-derived, including our restart PID credit.
+    # Subtract that explicit used-memory term from the CUDA/logical capacity.
+    plan_gib="$(python3 -c 'import sys;f,t,b=map(float,sys.argv[1:]);print(max(0,b-(t-f)/1024))' "$free_mib" "$total_mib" "$profile_gib")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
   if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
