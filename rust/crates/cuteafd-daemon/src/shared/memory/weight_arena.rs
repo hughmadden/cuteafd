@@ -251,6 +251,13 @@ impl<'a> LoadingArena<'a> {
         })
     }
 
+    pub fn device_bytes(&self) -> usize { self.layout.bytes() }
+    pub fn logical_bytes(&self) -> usize { self.layout.logical_bytes() }
+    pub fn check_fragment(&self, offset: u64, bytes: u64) -> Result<()> {
+        ensure!(bytes > 0 && self.expected.contains(offset, bytes), "fragment outside checked footprint");
+        Ok(())
+    }
+
     /// Copy-only destination. The ring consumer must retain this owner and
     /// drain its streams before dropping it on every failure path.
     pub fn destination(&self, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
