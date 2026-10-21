@@ -123,6 +123,9 @@ fn reported_rank_plans_match_balanced_layout_and_checked_sources() -> Result<()>
     write_snapshot(directory.path(), &config, &tensors, None);
     let catalog = cuteafd_loader::read_expert_catalog(directory.path())?;
     for world in [2, 4, 5] {
+        let mut assignments = Vec::new();
+        let mut offers = Vec::new();
+        let mut serial = Builder::new(directory.path(), vec![u64::MAX; world]);
         for rank in 0..world {
             let plan = RankPlan::new(&catalog, &[0], world, rank, usize::MAX)?;
             let mounted = catalog.exl3().unwrap()
@@ -132,7 +135,67 @@ fn reported_rank_plans_match_balanced_layout_and_checked_sources() -> Result<()>
             let checked = plan.checked(&catalog, directory.path(), world, rank)?;
             assert!(!checked.plan.entries.is_empty());
             assert_eq!(checked.arenas[rank], plan.layout.logical_bytes() as u64);
+            assignments.push(cuteafd_loader::placement::SparkAssignment { rank: rank as u32,
+                resident_bytes: plan.layout.bytes() as u64,
+                slices: plan.placement.iter().map(|p| p.slice.clone()).collect(), io: Default::default() });
+            offers.push(Offer { rank, host: format!("rank-{rank}"),
+                arena_bytes: plan.layout.logical_bytes() as u64, placement: plan.placement.clone() });
+            plan.append(&mut serial, &catalog, rank as u32)?;
         }
+        let mut parallel = Builder::new(directory.path(), vec![u64::MAX; world]);
+        for (rank, plan) in rank_plans(&catalog, &[0], &assignments, &offers)?.iter().enumerate() {
+            assert_eq!(plan.placement, offers[rank].placement);
+            plan.append(&mut parallel, &catalog, rank as u32)?;
+        }
+        assert_eq!(serde_json::to_vec(&serial.finish()?.plan)?, serde_json::to_vec(&parallel.finish()?.plan)?);
+        offers[world - 1].placement[0].fingerprint.push('x');
+        assert!(rank_plans(&catalog, &[0], &assignments, &offers).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an installed EXL3 checkpoint selected by CUTEAFD_PUSH_EXL3"]
+fn installed_exl3_tp6_prepare_serial_parallel_equivalence_and_timing() -> Result<()> {
+    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_PUSH_EXL3")
+        .expect("set CUTEAFD_PUSH_EXL3 to the installed snapshot"));
+    let opened = std::time::Instant::now();
+    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+    eprintln!("catalog_ms={}", opened.elapsed().as_millis());
+    let shape = catalog.routed_experts();
+    let layers: Vec<_> = (shape.first_layer..shape.layers).collect();
+    let root = cuteafd_loader::push_load::namespace(&snapshot).map(|(root, _)| root)
+        .unwrap_or_else(|_| snapshot.clone());
+    let mut assignments = Vec::new();
+    let mut offers = Vec::new();
+    let started = std::time::Instant::now();
+    let serial = (0..6).map(|rank| RankPlan::new(&catalog, &layers, 6, rank, usize::MAX))
+        .collect::<Result<Vec<_>>>()?;
+    let serial_rank_ms = started.elapsed().as_millis();
+    for (rank, plan) in serial.iter().enumerate() {
+        assignments.push(cuteafd_loader::placement::SparkAssignment { rank: rank as u32,
+            resident_bytes: plan.layout.bytes() as u64,
+            slices: plan.placement.iter().map(|p| p.slice.clone()).collect(), io: Default::default() });
+        offers.push(Offer { rank, host: format!("rank-{rank}"),
+            arena_bytes: plan.layout.logical_bytes() as u64, placement: plan.placement.clone() });
+    }
+    let mut expected = None;
+    for (name, plans, rank_ms) in [("serial", serial, serial_rank_ms), ("parallel", {
+        let started = std::time::Instant::now();
+        let plans = rank_plans(&catalog, &layers, &assignments, &offers)?;
+        eprintln!("parallel_rank_ms={}", started.elapsed().as_millis());
+        plans
+    }, 0)] {
+        let started = std::time::Instant::now();
+        let mut builder = Builder::new(&root, offers.iter().map(|o| o.arena_bytes).collect());
+        for (rank, plan) in plans.iter().enumerate() { plan.append(&mut builder, &catalog, rank as u32)?; }
+        let appended = started.elapsed();
+        let checked = builder.finish()?;
+        let check_ms = (started.elapsed() - appended).as_millis();
+        let seal = format!("{:x}", Sha256::digest(serde_json::to_vec(&checked.plan)?));
+        eprintln!("{name}: rank_ms={rank_ms}, append_ms={}, check_ms={check_ms}, entries={}, seal={seal}",
+            appended.as_millis(), checked.plan.entries.len());
+        if let Some(expected) = &expected { assert_eq!(&seal, expected); } else { expected = Some(seal); }
     }
     Ok(())
 }

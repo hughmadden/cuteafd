@@ -991,7 +991,7 @@ mod budget_tests {
             let (server, _) = listener.accept()?;
             write_control(&mut client, &serde_json::json!({
                 "message": "worker_selection_start", "rank": rank,
-                "selection": sent, "digest": sent.digest()?
+                "selection": sent, "digest": sent.digest()?, "admission_timeout_ms": 3000
             }))?;
             let installed = crate::worker_selection::InstalledModelAdmission::new(0, selection.clone(), None)?;
             let result = LocalVerbsExpertConnection::accept_with_selection(

@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, io::{BufRead, BufReader, Read, Write}, net::{So
 pub mod push;
 
 const CONTROL_LIMIT: usize = 64 * 1024;
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 fn check_version(actual: u64, expected: u32) -> Result<()> {
     ensure!(actual == u64::from(expected),
@@ -478,7 +478,7 @@ impl InstalledExpertGrouping {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Start { message: String, rank: usize, selection: WorkerSelection, digest: String }
+struct Start { message: String, rank: usize, selection: WorkerSelection, digest: String, admission_timeout_ms: u64 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ready {
@@ -532,6 +532,14 @@ pub fn receive_worker_selection(stream: &TcpStream, rank: usize, timeout: Durati
     ensure!(start.rank == rank && rank < start.selection.identity.world as usize, "worker selection rank mismatch");
     start.selection.validate()?;
     ensure!(start.digest == start.selection.digest()?, "worker selection digest mismatch");
+    let admission_timeout = Duration::from_millis(start.admission_timeout_ms);
+    ensure!(!admission_timeout.is_zero()
+        && std::time::Instant::now().checked_add(admission_timeout).is_some(),
+        "invalid coordinator admission timeout");
+    // Selection parsing is short; checkpoint planning/loading has the explicit
+    // coordinator bound, not the inherited bootstrap read timeout.
+    stream.set_read_timeout(Some(admission_timeout))?;
+    stream.set_write_timeout(Some(admission_timeout))?;
     Ok(start.selection)
 }
 
@@ -657,6 +665,10 @@ pub struct PendingModelAdmission {
 pub fn start_model_admission(peers: &[SocketAddr], selection: &WorkerSelection,
     timeout: Duration) -> Result<PendingModelAdmission> {
     selection.validate()?;
+    let admission_timeout_ms = u64::try_from(timeout.as_millis())?;
+    ensure!(admission_timeout_ms > 0
+        && std::time::Instant::now().checked_add(timeout).is_some(),
+        "invalid coordinator admission timeout");
     ensure!(selection.model().is_some(), "Spark selection requires typed ModelAdmission");
     ensure!(peers.len() == selection.identity.world as usize, "worker peer world mismatch");
     ensure!(peers.iter().collect::<std::collections::BTreeSet<_>>().len() == peers.len(), "duplicate worker peer");
@@ -670,7 +682,7 @@ pub fn start_model_admission(peers: &[SocketAddr], selection: &WorkerSelection,
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))?;
             write(&mut stream, &Start { message: "worker_selection_start".into(), rank,
-                selection: selection.clone(), digest: selection.digest()? })?;
+                selection: selection.clone(), digest: selection.digest()?, admission_timeout_ms })?;
             Ok(stream)
         })).collect::<Vec<_>>();
         let mut streams = Vec::new();
@@ -928,7 +940,7 @@ mod tests {
             write(&mut client, &serde_json::json!({"message":message,
                 "selection":{"version":1,"identity":{"legacy":true}}}))?;
             let error = read::<serde_json::Value>(&server).unwrap_err().to_string();
-            assert!(error.contains("version 1; expected 4"), "{error}");
+            assert!(error.contains("version 1; expected 5"), "{error}");
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let mut client = TcpStream::connect(listener.local_addr()?)?;
@@ -936,9 +948,9 @@ mod tests {
         write(&mut client, &serde_json::json!({"message":"worker_selection_start",
             "selection":{"version":1}}))?;
         let error = receive_worker_selection(&server, 0, Duration::from_secs(3)).unwrap_err();
-        assert!(error.to_string().contains("version 1; expected 4"));
+        assert!(error.to_string().contains("version 1; expected 5"));
         let rejection = read::<serde_json::Value>(&client).unwrap_err();
-        assert!(rejection.to_string().contains("version 1; expected 4"));
+        assert!(rejection.to_string().contains("version 1; expected 5"));
         let envelope = serde_json::to_value(admission_selection())?;
         assert!(envelope["identity"].get("manifest").is_none());
         assert_eq!(envelope["version"], VERSION);
@@ -982,7 +994,7 @@ mod tests {
         InstalledExpertGrouping::new(loaded, rank, 256, ExpertGroupingSelector::Native, variants).unwrap()
     }
 
-    fn admission_selection() -> WorkerSelection {
+    pub(super) fn admission_selection() -> WorkerSelection {
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
         WorkerSelection::new(WorkerIdentity { world: 1, topology: [1, 1], ..identity() }, &[13]).unwrap()
             .with_model(ModelAdmission { capacity: 4096, compiled_capacity: 4096,
@@ -1234,7 +1246,7 @@ mod tests {
             let (mut server, _) = listener.accept()?;
             installed.acknowledge_repeat(&mut server, serde_json::to_value(Start {
                 message: "worker_selection_start".into(), rank: 0,
-                selection: selection.clone(), digest: selection.digest()?,
+                selection: selection.clone(), digest: selection.digest()?, admission_timeout_ms: 5000,
             })?)?;
             let ready: Ready = read(&mut client)?;
             assert_eq!(ready.admission, Some(report.clone()));
@@ -1246,7 +1258,7 @@ mod tests {
         let (mut server, _) = listener.accept()?;
         assert!(installed.acknowledge_repeat(&mut server, serde_json::to_value(Start {
             message: "worker_selection_start".into(), rank: 0,
-            digest: changed.digest()?, selection: changed,
+            digest: changed.digest()?, selection: changed, admission_timeout_ms: 5000,
         })?).is_err());
         Ok(())
     }
@@ -1639,7 +1651,7 @@ mod tests {
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (server, _) = listener.accept().unwrap();
             write(&mut client, &Start { message: "worker_selection_start".into(), rank,
-                selection: selection.clone(), digest }).unwrap();
+                selection: selection.clone(), digest, admission_timeout_ms: 5000 }).unwrap();
             assert!(receive_worker_selection(&server, 0, Duration::from_secs(3)).is_err());
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
