@@ -40,6 +40,8 @@ pub(crate) mod push_exl3;
 pub(crate) mod push_exlr8;
 #[path = "memory/push_fp8.rs"]
 pub(crate) mod push_fp8;
+#[path = "memory/push_native.rs"]
+pub(crate) mod push_native;
 
 pub(crate) struct DeviceAllocation<'a> {
     pub(crate) library: &'a NativeLibrary,

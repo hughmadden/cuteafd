@@ -286,10 +286,35 @@ impl ExpertLoadBudget {
     }
 }
 
+/// A resident plane owns either its mount allocation or a completed rank arena.
+pub(crate) struct ResidentPlane<'a> {
+    pub(crate) library: &'a NativeLibrary,
+    pub(crate) buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+    _owner: PlaneOwner<'a>,
+}
+enum PlaneOwner<'a> {
+    Mount { _allocation: DeviceAllocation<'a> },
+    Push { _rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>> },
+}
+impl<'a> From<DeviceAllocation<'a>> for ResidentPlane<'a> {
+    fn from(allocation: DeviceAllocation<'a>) -> Self {
+        Self { library: allocation.library, buffer: allocation.buffer,
+            _owner: PlaneOwner::Mount { _allocation: allocation } }
+    }
+}
+impl<'a> ResidentPlane<'a> {
+    fn pushed(library: &'a NativeLibrary,
+        rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
+        region: usize, offset: usize, bytes: usize) -> Result<Self> {
+        let buffer = rank.region(region)?.subregion(offset, bytes)?.buffer();
+        Ok(Self { library, buffer, _owner: PlaneOwner::Push { _rank: rank } })
+    }
+}
+
 /// Resident packed weights borrow the native library; no logical layer copy remains.
 /// Captured graphs must be destroyed before this owner is dropped.
 pub(crate) struct ExpertWeights<'a> {
-    pub(crate) buffers: [DeviceAllocation<'a>; 4],
+    pub(crate) buffers: [ResidentPlane<'a>; 4],
     pub(crate) layer: ExpertLayer,
     experts: usize,
     pub(crate) budget: ExpertLoadBudget,
@@ -484,7 +509,7 @@ impl<'a> ExpertWeights<'a> {
             staging_bytes_per_expert = budget.device_staging_bytes,
             "native expert load timeline");
         Ok(Self {
-            buffers,
+            buffers: buffers.map(Into::into),
             layer,
             experts,
             budget,
@@ -523,7 +548,7 @@ impl<'a> ExpertWeights<'a> {
                 devices[rank].run(|| {
                     let mut owned = Vec::with_capacity(4);
                     for bytes in sizes { owned.push(DeviceAllocation::new(devices[rank].library, bytes)?); }
-                    weights[rank].push(Self { buffers: owned.try_into().ok().expect("four native slabs"),
+                    weights[rank].push(Self { buffers: <[DeviceAllocation<'a>; 4]>::try_from(owned).ok().expect("four native slabs").map(Into::into),
                         layer: selection, experts, budget, nvfp4: None, format: ExpertFormat::Native });
                     Ok(())
                 })?;
@@ -628,6 +653,32 @@ impl<'a> ExpertWeights<'a> {
             format: ExpertFormat::Nvfp4,
         })
     }
+    pub(crate) fn from_push(library: &'a NativeLibrary,
+        rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
+        region: usize, layer: ExpertLayer, layout: &cuteafd_loader::push_load::native::NativePlanes,
+        mut budget: ExpertLoadBudget) -> Result<Self> {
+        ensure!(rank.region(region)?.buffer().bytes == layout.bytes && layout.bytes == budget.resident_bytes,
+            "native pushed layer differs from admission");
+        let mut planes = Vec::new();
+        for (offset, bytes) in layout.planes {
+            planes.push(ResidentPlane::pushed(library, rank.clone(), region, offset, bytes)?);
+        }
+        let nvfp4 = if layout.nvfp4 {
+            let vector = |index: usize| {
+                let (offset, bytes) = layout.vectors[index];
+                ResidentPlane::pushed(library, rank.clone(), region, offset, bytes)
+            };
+            Some(nvfp4::Nvfp4Side { alphas: vector(0)?, down_alphas: vector(1)?,
+                input_scales: vector(2)?, down_input_scales: vector(3)? })
+        } else { None };
+        budget.device_staging_bytes = 0;
+        budget.pinned_host_bytes = 0;
+        budget.read_scratch_bytes = 0;
+        Ok(Self { buffers: planes.try_into().ok().expect("four native planes"), layer,
+            experts: layout.experts, budget, nvfp4,
+            format: if layout.nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Native } })
+    }
+
     /// Intermediate values per expert held by this resident layer.
     ///
     /// Dimensional check: the W2 carrier for one expert is `hidden * intermediate

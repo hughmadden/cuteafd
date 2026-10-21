@@ -8,7 +8,7 @@
 //! zero-padded into the AOT's resident width. Scale planes are swizzled on device; the
 //! scalar vectors are computed on the host from the checkpoint's per-tensor
 //! `weight_scale_2` and `input_scale`.
-use super::{ExpertLayer, ExpertLoadBudget, EXPERT_READ_LANES};
+use super::{ExpertLayer, ExpertLoadBudget, ResidentPlane, EXPERT_READ_LANES};
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -56,13 +56,13 @@ fn fc1_launch_scales(
 /// path serves W4A4 without a second weights type.
 pub(crate) struct Nvfp4Side<'a> {
     /// Per-expert FC1 and FC2 runtime alphas bound to slots 38/39.
-    pub(crate) alphas: DeviceAllocation<'a>,
-    pub(crate) down_alphas: DeviceAllocation<'a>,
+    pub(crate) alphas: ResidentPlane<'a>,
+    pub(crate) down_alphas: ResidentPlane<'a>,
     /// Per-expert activation-scale vectors. Uploaded once per layer, then
     /// bound to the kernel's `input_global_scale` (slot 37) and `global_scale`
     /// (slot 40) pointers so no per-launch copy is needed.
-    pub(crate) input_scales: DeviceAllocation<'a>,
-    pub(crate) down_input_scales: DeviceAllocation<'a>,
+    pub(crate) input_scales: ResidentPlane<'a>,
+    pub(crate) down_input_scales: ResidentPlane<'a>,
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
@@ -119,6 +119,16 @@ impl<'a> Nvfp4Side<'a> {
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,
     ) -> Result<ExpertLoadBudget> {
+        let role = match layer {
+            ExpertLayer::Backbone { .. } => 1,
+            ExpertLayer::BackboneTp2 { .. } => 3,
+            ExpertLayer::BackboneFull { .. } => 2,
+            ExpertLayer::BackboneReplicatedTp { world: 3, .. } => 4,
+            ExpertLayer::BackboneReplicatedTp { world: 6, .. } => 5,
+            _ => anyhow::bail!("NVFP4 covers backbone routed experts only"),
+        };
+        ensure!(!library.v41_nvfp4_shared_input(role)?,
+            "NVFP4 requires per-expert input calibration; rebuild the native library");
         let (_, experts) = Self::rank_planes(layer, catalog)?;
         let staging = catalog.nvfp4_expert_staging(layer.expert(0))?;
         let sizes = plane_sizes(Self::kernel_intermediate(library, catalog, layer)?);
@@ -148,17 +158,7 @@ impl<'a> Nvfp4Side<'a> {
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,
         available_device_bytes: usize,
-    ) -> Result<([DeviceAllocation<'a>; 4], Self)> {
-        let role = match layer {
-            ExpertLayer::Backbone { .. } => 1,
-            ExpertLayer::BackboneTp2 { .. } => 3,
-            ExpertLayer::BackboneFull { .. } => 2,
-            ExpertLayer::BackboneReplicatedTp { world: 3, .. } => 4,
-            ExpertLayer::BackboneReplicatedTp { world: 6, .. } => 5,
-            _ => anyhow::bail!("NVFP4 covers backbone routed experts only"),
-        };
-        ensure!(!library.v41_nvfp4_shared_input(role)?,
-            "NVFP4 requires per-expert input calibration; rebuild the native library");
+    ) -> Result<([ResidentPlane<'a>; 4], Self)> {
         let (intermediate, experts) = Self::rank_planes(layer, catalog)?;
         let kernel_intermediate = Self::kernel_intermediate(library, catalog, layer)?;
         let budget = Self::plan(library, catalog, layer)?;
@@ -384,12 +384,12 @@ impl<'a> Nvfp4Side<'a> {
             uploaded.and(drained)?;
         }
         Ok((
-            buffers,
+            buffers.map(Into::into),
             Self {
-                alphas,
-                down_alphas,
-                input_scales: input_scales_device,
-                down_input_scales: down_input_scales_device,
+                alphas: alphas.into(),
+                down_alphas: down_alphas.into(),
+                input_scales: input_scales_device.into(),
+                down_input_scales: down_input_scales_device.into(),
             },
         ))
     }
